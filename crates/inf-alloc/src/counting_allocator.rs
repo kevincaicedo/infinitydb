@@ -10,14 +10,18 @@ thread_local! {
     /// cannot itself allocate (a lazily-initialised TLS slot inside a
     /// global allocator would recurse).
     static THREAD_ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    /// Per-thread bytes requested (alloc/alloc_zeroed sizes plus realloc
+    /// new sizes) — churn, not live memory: frees are not subtracted.
+    static THREAD_BYTES: Cell<u64> = const { Cell::new(0) };
 }
 
 /// `try_with` because TLS is unavailable during thread teardown; an
 /// allocation there is not attributable to any test window and is dropped
 /// rather than panicking inside the allocator.
 #[inline]
-fn bump_thread() {
+fn bump_thread(bytes: usize) {
     let _ = THREAD_ALLOCATIONS.try_with(|c| c.set(c.get().wrapping_add(1)));
+    let _ = THREAD_BYTES.try_with(|c| c.set(c.get().wrapping_add(bytes as u64)));
 }
 
 pub struct CountingAllocator {
@@ -50,6 +54,15 @@ impl CountingAllocator {
     pub fn thread_allocations(&self) -> u64 {
         THREAD_ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
     }
+
+    /// Bytes requested by the **calling thread** — a churn counter (frees
+    /// are never subtracted), for "this path allocates O(x), not O(y)"
+    /// assertions where the count alone cannot tell a 16-byte box from a
+    /// cloned match set.
+    #[inline]
+    pub fn thread_bytes(&self) -> u64 {
+        THREAD_BYTES.try_with(Cell::get).unwrap_or(0)
+    }
 }
 
 impl Default for CountingAllocator {
@@ -64,7 +77,7 @@ impl Default for CountingAllocator {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
-        bump_thread();
+        bump_thread(layout.size());
         // SAFETY: forwarded unchanged under the caller's allocation contract.
         unsafe { System.alloc(layout) }
     }
@@ -76,14 +89,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
-        bump_thread();
+        bump_thread(layout.size());
         // SAFETY: forwarded unchanged under the caller's allocation contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
-        bump_thread();
+        bump_thread(new_size);
         // SAFETY: forwarded unchanged under the caller's reallocation contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -104,6 +117,19 @@ mod tests {
         assert_eq!(alloc.allocations(), 1);
         // SAFETY: `ptr` came from `alloc` with `layout` above and is live.
         unsafe { alloc.dealloc(ptr, layout) };
+    }
+
+    #[test]
+    fn thread_bytes_sum_requested_sizes() {
+        static ALLOC: CountingAllocator = CountingAllocator::new();
+        let layout = Layout::from_size_align(96, 8).expect("layout");
+        let before = ALLOC.thread_bytes();
+        // SAFETY: allocated and freed here with the same layout.
+        let ptr = unsafe { ALLOC.alloc(layout) };
+        assert!(!ptr.is_null());
+        // SAFETY: `ptr` came from the `alloc` directly above.
+        unsafe { ALLOC.dealloc(ptr, layout) };
+        assert_eq!(ALLOC.thread_bytes() - before, 96, "frees are not subtracted");
     }
 
     #[test]

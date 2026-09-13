@@ -313,7 +313,7 @@ fn run<'a>(
             // possible, so the item becomes a Fresh frame first — the
             // saved state then resumes exactly here.
             consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
-            return Ok(EvalStep::Yield(Box::new(save(&stack, &path, &matches))));
+            return Ok(EvalStep::Yield(Box::new(save(&stack, path, matches))));
         }
         budget -= 1;
         consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
@@ -751,7 +751,14 @@ fn resolve_slice(spec: &super::ast::SliceSpec, len: i64) -> (i64, i64, i64) {
     }
 }
 
-fn save(stack: &[Frame<'_>], path: &[u32], matches: &Matches) -> EvalState {
+/// Serialize the live stack into owned counters. The trail and the match
+/// set move in unchanged — a yield costs O(frames), never O(matches)
+/// (ADR-0040 D6). Cloning the match set here made every yield pay for
+/// every match so far: at a per-slice budget the churn is
+/// O(nodes / budget × matches) — the `path_program` nightly OOM of
+/// 2026-09-12 (three `..[union]..[union]` inputs on a 20-node fixture,
+/// 139 MiB churned for 1,872 matches at budget 3).
+fn save(stack: &[Frame<'_>], path: Vec<u32>, matches: Matches) -> EvalState {
     let frames = stack
         .iter()
         .map(|f| SavedFrame {
@@ -774,7 +781,7 @@ fn save(stack: &[Frame<'_>], path: &[u32], matches: &Matches) -> EvalState {
             },
         })
         .collect();
-    EvalState { frames, path: path.to_vec(), matches: matches.clone() }
+    EvalState { frames, path, matches }
 }
 
 /// Re-derive live frames from saved counters: each frame's node comes
