@@ -1365,36 +1365,69 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         let next = table.scan_slots(cursor, count, |hash, addr| slots.push((hash, addr)));
         (next, slots)
     };
+    // Cold slots are named a **chunk** at a time (review of 2026-08-30,
+    // F-L17-13 — L3): every intent of a chunk is in the cold FIFO before
+    // the page suspends, which is ADR-0055 D1's premise — the drain
+    // merges neighbouring windows (D4) and the device runs at queue depth
+    // (D2) instead of one round trip and one reactor iteration per key.
+    // The chunk is the engine's QD cap: the most the device takes at
+    // once, and the most one page holds before it yields to other
+    // connections. Naming a cold key is what a beyond-RAM enumeration
+    // inherently costs (SCAN allows duplicates/races; the decoded key is
+    // authoritative). A typed read failure fails the whole page — the
+    // client retries its cursor — never a silently shorter page with an
+    // advanced cursor (C2; the DBSIZE drain's rule).
+    let chunk = {
+        let tier = shared.tier.borrow();
+        tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(1, inf_runtime::ColdReads::qd_cap).max(1)
+    };
+    let fail = |shared: &Rc<Shared<O, F>>, message: &'static str| {
+        if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
+            table.note_cold_read_error();
+        }
+        done_error(shared, proto, message)
+    };
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(slots.len());
-    for (hash, addr) in slots {
-        let ram_key = {
-            let ks = shared.store.borrow();
-            let Some(table) = ks.tiered_store(ns) else { break };
-            match table.space().resolve(addr) {
-                inf_store::AddrClass::Cold => None,
-                _ => Some(table.record(addr).key.to_vec()),
-            }
-        };
-        match ram_key {
-            Some(key) => keys.push(key),
-            None => {
-                // Cold slot: fetch the record head to name the key — what
-                // a beyond-RAM enumeration inherently costs (SCAN allows
-                // duplicates/races; the decoded key is authoritative). A
-                // typed read failure fails the whole page — the client
-                // retries its cursor — never a silently shorter page with
-                // an advanced cursor (review of 2026-08-30, C2; the
-                // DBSIZE drain's rule).
-                match fetch_key(shared, ns, hash, addr).await {
-                    Ok(Some(key)) => keys.push(key),
-                    Ok(None) => {}
-                    Err(message) => {
-                        if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
-                            table.note_cold_read_error();
-                        }
-                        return done_error(shared, proto, message);
-                    }
+    let mut plans: Vec<ColdPlan> = Vec::with_capacity(chunk);
+    let mut at = 0usize;
+    while at < slots.len() {
+        // Pass 1: RAM keys inline; cold intents enqueued, one chunk.
+        while at < slots.len() && plans.len() < chunk {
+            let (hash, addr) = slots[at];
+            let ram_key = {
+                let ks = shared.store.borrow();
+                let Some(table) = ks.tiered_store(ns) else {
+                    return done_error(shared, proto, "ERR the selected namespace was dropped");
+                };
+                match table.space().resolve(addr) {
+                    inf_store::AddrClass::Cold => None,
+                    _ => Some(table.record(addr).key.to_vec()),
                 }
+            };
+            match ram_key {
+                Some(key) => keys.push(key),
+                None => match plan_key_fetch(shared, ns, hash, addr) {
+                    Ok(KeyFetch::Planned(plan)) => plans.push(plan),
+                    Ok(KeyFetch::Skip) => {}
+                    // A full FIFO with intents of ours queued: drain them
+                    // (their completions free the queue), then retry this
+                    // slot. With nothing queued the page is refused typed,
+                    // as before.
+                    Ok(KeyFetch::Busy) if !plans.is_empty() => break,
+                    Ok(KeyFetch::Busy) => return fail(shared, ERR_COLD_BUSY),
+                    Err(message) => return fail(shared, message),
+                },
+            }
+            at += 1;
+        }
+        // Pass 2: await in enqueue order — the awaited intent is never
+        // behind another of ours in the FIFO, so a dry pool cannot wait
+        // on a completion this page holds unpolled.
+        for plan in plans.drain(..) {
+            match decode_key(plan).await {
+                Ok(Some(key)) => keys.push(key),
+                Ok(None) => {}
+                Err(message) => return fail(shared, message),
             }
         }
     }
@@ -1516,58 +1549,73 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
     }
 }
 
-/// Fetches the key at a cold slot (SCAN key resolution). One window
-/// suffices: the plan clamps to `min(4, frames-to-file-end)` frames — a
-/// single-frame window means the record ends inside it (a record never
-/// outruns its file's data), and any wider window holds at least
-/// `2·TIER_FRAME_DATA − skip ≥ 4093` data bytes, past the 268-byte bound
-/// of header + TTL + key (`TieredTable::key_from_prefix`). `Ok(None)` is
-/// a slot displaced *and* re-indexed mid-scan (the SCAN contract's
-/// mutation case); `Err` is a typed cold-read failure the caller must
-/// surface. The review of 2026-08-30 (C2, F-L07-05) found the previous
-/// whole-record demand here silently omitted every cold value past one
-/// window — and every read failure — while the cursor advanced.
-async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+/// A cold slot's key fetch, planned (SCAN key resolution).
+enum KeyFetch {
+    /// Enqueued; [`decode_key`] awaits and names the key.
+    Planned(ColdPlan),
+    /// The slot was displaced *and* re-indexed mid-scan (the SCAN
+    /// contract's mutation case) — nothing to name.
+    Skip,
+    /// The cold FIFO refused the intent (`overflow_cap`, or the C2′ fault
+    /// point) — the caller decides between draining and refusing.
+    Busy,
+}
+
+/// Plans and enqueues the read that names the key at a cold slot. The
+/// window is the frames covering the record's first
+/// [`TieredTable::KEY_PREFIX_LEN`] bytes (header + TTL + the longest key
+/// — `TieredTable::key_from_prefix`'s bound): one or two frames, so a
+/// page's neighbouring windows merge at the drain instead of each
+/// costing the pool buffer. `Err` is a typed cold-read failure the caller
+/// must surface. The review of 2026-08-30 (C2, F-L07-05) found the
+/// previous whole-record demand here silently omitted every cold value
+/// past one window — and every read failure — while the cursor advanced.
+fn plan_key_fetch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     hash: u64,
     addr: LogicalAddr,
-) -> Result<Option<Vec<u8>>, &'static str> {
-    let planned = {
-        let tier = shared.tier.borrow();
-        let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
-            return Err("ERR the selected namespace was dropped (INF.NS USE again)");
-        };
-        let Some(cold) = tier.as_ref().and_then(|t| t.cold.clone()) else {
-            return Err(ERR_COLD_IO);
-        };
-        match t.plan_cold_read(addr, TieredTable::RECORD_HEADER_LEN) {
-            Some((fd, file, offset, frames, skip)) => {
-                let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
-                // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
-                let now_us = shared.now.get().as_micros();
-                // The BUSY leg's fault point (review of 2026-08-30, C2′):
-                // a saturated queue fails the SCAN page typed.
-                if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
-                    return Err(ERR_COLD_BUSY);
-                }
-                let wait = cold
-                    .enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
-                    .map_err(|_| ERR_COLD_BUSY)?;
-                Some(ColdPlan { wait, addr, frames, skip })
+) -> Result<KeyFetch, &'static str> {
+    let tier = shared.tier.borrow();
+    let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
+        return Err("ERR the selected namespace was dropped (INF.NS USE again)");
+    };
+    let Some(cold) = tier.as_ref().and_then(|t| t.cold.clone()) else {
+        return Err(ERR_COLD_IO);
+    };
+    match t.plan_cold_prefix(addr, TieredTable::KEY_PREFIX_LEN) {
+        Some((fd, file, offset, frames, skip)) => {
+            let bytes = frames as usize * inf_log::TIER_FRAME_BYTES;
+            // Same-clock stamp as `on_completion` (the `cold_read_p99_us` pair).
+            let now_us = shared.now.get().as_micros();
+            // The BUSY leg's fault point (review of 2026-08-30, C2′):
+            // a saturated queue fails the SCAN page typed.
+            if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
+                return Ok(KeyFetch::Busy);
             }
-            None => None,
+            match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
+            {
+                Ok(wait) => Ok(KeyFetch::Planned(ColdPlan { wait, addr, frames, skip })),
+                Err(_) => Ok(KeyFetch::Busy),
+            }
         }
-    };
-    let Some(plan) = planned else {
-        // Outside every catalogued file: either the slot was displaced
-        // and its file retired mid-scan (the index has moved on — a
-        // legal mutation skip) or the index still names the pair (an
-        // index/catalog inconsistency — say so, never drop the key).
-        let ks = shared.store.borrow();
-        let still = ks.tiered_store(ns).is_some_and(|t| t.contains_pair(hash, addr));
-        return if still { Err(ERR_COLD_IO) } else { Ok(None) };
-    };
+        None => {
+            // Outside every catalogued file: either the slot was displaced
+            // and its file retired mid-scan (the index has moved on — a
+            // legal mutation skip) or the index still names the pair (an
+            // index/catalog inconsistency — say so, never drop the key).
+            drop(tier);
+            let ks = shared.store.borrow();
+            let still = ks.tiered_store(ns).is_some_and(|t| t.contains_pair(hash, addr));
+            if still { Err(ERR_COLD_IO) } else { Ok(KeyFetch::Skip) }
+        }
+    }
+}
+
+/// Awaits a planned key fetch and names the key. `Ok(None)` never
+/// happens for a window planned by [`plan_key_fetch`] (it always covers
+/// the key) and is refused typed if it does.
+async fn decode_key(plan: ColdPlan) -> Result<Option<Vec<u8>>, &'static str> {
     let done = plan.wait.await;
     if done.outcome().is_err() {
         return Err(ERR_COLD_IO);
@@ -1585,7 +1633,7 @@ async fn fetch_key<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     match key {
         Some(key) => Ok(Some(key)),
         None => {
-            debug_assert!(false, "one cold window always covers the record key");
+            debug_assert!(false, "a key-prefix window always covers the record key");
             Err(ERR_COLD_IO)
         }
     }

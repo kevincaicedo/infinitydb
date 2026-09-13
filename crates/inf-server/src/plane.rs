@@ -39,7 +39,8 @@ use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 use inf_alloc::{BufferId, LeaseKind};
 use inf_fabric::{
-    ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, Op, Outcome, SendError,
+    ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
+    Outcome, SendError,
 };
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
@@ -3657,8 +3658,10 @@ fn stage_argv_block(bytes: &mut Vec<u8>, argv: &[&[u8]]) -> u32 {
 }
 
 /// Decode a staged argv block into `out`, returning argc — the inverse of
-/// [`stage_argv_block`] (argc ≤ [`MAX_APPLY_ARGS`] by codec construction).
-fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]; MAX_APPLY_ARGS]) -> usize {
+/// [`stage_argv_block`] (argc ≤ `out.len()` by the stage gates: the parse
+/// stage's `PARSE_STAGE_MAX_ARGS`, the fabric stage's
+/// [`MAX_INLINE_APPLY_ARGS`]).
+fn read_argv_block<'b>(bytes: &'b [u8], off: u32, out: &mut [&'b [u8]]) -> usize {
     let block = &bytes[off as usize..];
     let argc = u32::from_le_bytes(block[..4].try_into().expect("block header")) as usize;
     let mut start = 4 + 4 * argc;
@@ -3813,7 +3816,10 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     orphans: &mut u64,
 ) {
     match op {
-        Op::Apply { token, cmd, args, program, .. } => {
+        // The stage's argv width is the codec's inline width; a wider apply
+        // (ADR-0120 D2 — a spilled argv, rare by construction) runs inline
+        // behind the stage like any other order barrier.
+        Op::Apply { token, cmd, args, program, .. } if args.len() <= MAX_INLINE_APPLY_ARGS => {
             let argv = args.as_slice();
             let db = u16::from(cmd >> 4);
             let (hash, has_key) = match argv.get(1) {
@@ -3883,7 +3889,7 @@ fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             }
         }
     }
-    let mut argv_buf: [&[u8]; MAX_APPLY_ARGS] = [b""; MAX_APPLY_ARGS];
+    let mut argv_buf: [&[u8]; MAX_INLINE_APPLY_ARGS] = [b""; MAX_INLINE_APPLY_ARGS];
     for e in stage.iter() {
         let argc = read_argv_block(stage_bytes, e.off, &mut argv_buf);
         handle_apply(
@@ -7407,8 +7413,8 @@ async fn send_apply_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         Protocol::Resp3 => 3,
         Protocol::Resp2 => 2,
     };
+    let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args, program };
     loop {
-        let op = Op::ApplyNs { token, slot, cmd: proto_byte, ns: ns.0, args, program };
         let sent = shared.fabric.borrow_mut().send(to, &op);
         match sent {
             Ok(()) => break,
@@ -7510,16 +7516,16 @@ async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // until FABRIC-OUT publishes it, after this synchronous stretch — so
     // no reply can precede the registration (and the gate parks any value
     // arriving before the waiter's first poll regardless).
-    let (token, mut sent) = {
+    let (token, op, mut sent) = {
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        let sent = fabric.send(to, &Op::Apply { token, slot, cmd: cmd_byte, args, program });
-        (token, sent)
+        let op = Op::Apply { token, slot, cmd: cmd_byte, args, program };
+        let sent = fabric.send(to, &op);
+        (token, op, sent)
     };
     let waiter = shared.gate.waiter(token.0);
     while let Err(SendError::NoCredit { .. }) = sent {
         shared.credit_waiters.wait(to).await;
-        let op = Op::Apply { token, slot, cmd: cmd_byte, args, program };
         sent = shared.fabric.borrow_mut().send(to, &op);
     }
     // RTT pairing relies on in-order replies; `INF.PUB` replies are deferred

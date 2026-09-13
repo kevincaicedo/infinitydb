@@ -305,6 +305,11 @@ pub struct TieredNodeReport {
     pub tier_read_error_replies: u64,
     /// Armed faults the audit never consumed (disarmed after it).
     pub tier_read_faults_unconsumed: u64,
+    /// F-L17-13 (L3): `SCAN` pages that resolved cold slots, and the cold
+    /// intents they enqueued — the batching oracle's coverage (a walk
+    /// that never met a cold page proves nothing about batching).
+    pub scan_cold_pages: u64,
+    pub scan_cold_reads: u64,
     /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
     /// (the `EINVAL` seeds) and sections sealed for the bound (the
     /// section-bound seeds), summed over cells at phase 10b.
@@ -736,6 +741,7 @@ fn scan_all_keys(
     clock: &Rc<VirtualClock>,
     disk: &SimDisk,
     scenario: &TieredScenario,
+    report: &mut TieredNodeReport,
 ) -> Result<Vec<Vec<u8>>, String> {
     struct FirstWalk {
         keys: Vec<Vec<u8>>,
@@ -754,10 +760,43 @@ fn scan_all_keys(
         for _ in 0..4096 {
             let cursor_text = cursor.to_string();
             let scan: &[&[u8]] = &[b"SCAN", cursor_text.as_bytes(), b"COUNT", b"512"];
-            let reply = match probe.call(node, rng, clock, disk, scenario.step_ns_max, scan) {
-                Ok(Some(reply)) => reply,
-                other => return Err(format!("SCAN on cell {cell} answered {other:?}")),
+            // F-L17-13 (L3): a page that resolves K cold slots must not
+            // cost K reactor iterations — the sequential loop paid one
+            // device round trip *and* one iteration per key; a batched
+            // page enqueues a chunk before it suspends. Cold intents come
+            // from the cell's own `INFO tiering` (the counters are
+            // cell-scoped, and so is this probe); iterations are the
+            // steps this page took to answer.
+            let cold_before =
+                info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
+                    .map(|t| info_field(&t, "cold_reads_enqueued"))?;
+            probe.send(node, scan);
+            let mut steps = 0u64;
+            let reply = loop {
+                if steps >= STALL_STEPS {
+                    return Err(format!("SCAN on cell {cell} stalled after {steps} steps"));
+                }
+                node.step(rng, clock, disk, scenario.step_ns_max)
+                    .map_err(|e| format!("SCAN on cell {cell}: {e}"))?;
+                steps += 1;
+                if let Some(reply) = probe.recv(node) {
+                    break reply;
+                }
             };
+            let cold = info_tiering(&mut probe, node, rng, clock, disk, scenario.step_ns_max)
+                .map(|t| info_field(&t, "cold_reads_enqueued"))?
+                .saturating_sub(cold_before);
+            if cold > 0 {
+                report.scan_cold_pages += 1;
+                report.scan_cold_reads += cold;
+            }
+            if cold >= SCAN_BATCH_ORACLE_MIN_COLD && steps >= cold {
+                report.violations.push(format!(
+                    "SCAN BATCHING VIOLATION: cell {cell} page at cursor {cursor} resolved \
+                     {cold} cold slots in {steps} iterations — one device round trip per \
+                     key, never a batch (F-L17-13, L3 / ADR-0055 D1)"
+                ));
+            }
             let (next, named) = parse_scan_reply(&reply)
                 .ok_or_else(|| format!("SCAN on cell {cell}: unparsable {}", preview(&reply)))?;
             keys.extend(named);
@@ -815,6 +854,11 @@ fn parse_scan_reply(reply: &[u8]) -> Option<(u64, Vec<Vec<u8>>)> {
     }
     Some((cursor, keys))
 }
+
+/// Cold slots a `SCAN` page must resolve before the batching oracle
+/// speaks: below this a page's iteration count is dominated by the
+/// reply itself, not by its reads.
+const SCAN_BATCH_ORACLE_MIN_COLD: u64 = 16;
 
 fn info_field(text: &str, key: &str) -> u64 {
     text.lines()
@@ -1663,7 +1707,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             }
         }
         // SCAN names both keys (a collision key is never hidden).
-        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
             Ok(keys) => {
                 for (side, key) in [(0, &pair.0[..]), (1, &pair.1[..])] {
                     if !keys.iter().any(|k| k == key) {
@@ -1900,7 +1944,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         report.open_verified_pending = after_drain[3];
         // (3) SCAN names each same key twice — its twin is a cold slot
         //     like any other (ADR-0093 A3).
-        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
             Ok(keys) => {
                 for key in &open_same_keys {
                     let named = keys.iter().filter(|k| *k == key).count();
@@ -1988,7 +2032,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             );
         }
         report.open_collision_verdicts += collisions;
-        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
             Ok(keys) => {
                 for (i, triple) in open_triples.iter().enumerate() {
                     for (side, key) in triple.iter().enumerate() {
@@ -2491,7 +2535,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         ),
         Err(err) => bail7c!("phase-7c DBSIZE: {err}"),
     }
-    match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario) {
+    match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
         Ok(keys) => {
             let named = |k: &[u8]| keys.iter().any(|x| x == k);
             if !named(t0)

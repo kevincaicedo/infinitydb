@@ -1763,6 +1763,99 @@ fn durable_mset_midway_failure_stages_on_the_fabric_path() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Review of 2026-08-30, F-L17-15 (ADR-0120): a named-namespace command
+/// whose keys share one **remote** owner ships whole whatever its width —
+/// the fabric's apply bound follows the client parser (1024 slices), so
+/// an `MSET` of 9 pairs (19 slices) and one of 511 pairs (1023 slices,
+/// the widest argv a client can send) answer `+OK` from either cell and
+/// read back through the same arm. Red on the 16-slice codec: the
+/// non-owner cell answered `-ERR too many arguments for cross-cell
+/// execution` for the command the owner cell accepted — one outcome per
+/// `--cells`/slot layout, none of them in the matrix.
+#[test]
+fn named_ns_wide_mset_ships_whole_to_its_remote_owner() {
+    let dir = temp_data_dir("ns-wide-mset");
+    let node = Node::start_durable(2, &dir);
+    let mut boot = node.connect();
+    boot.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"wide",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut boot, b"+OK\r\n");
+    drop(boot);
+    // Every key carries the `{w}` hashtag: one slot, one owner, under
+    // every topology (ADR-0116 D1's portable guarantee).
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(b"{w}0")).0;
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+        (0..9).map(|i| (format!("{{w}}{i}").into_bytes(), format!("v{i}").into_bytes())).collect();
+    let mut mset: Vec<&[u8]> = vec![b"MSET"];
+    for (k, v) in &pairs {
+        mset.push(k);
+        mset.push(v);
+    }
+    let mut mget: Vec<&[u8]> = vec![b"MGET"];
+    let mut want = format!("*{}\r\n", pairs.len()).into_bytes();
+    for (k, v) in &pairs {
+        mget.push(k);
+        want.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+        want.extend_from_slice(v);
+        want.extend_from_slice(b"\r\n");
+    }
+    // The non-owner cell: the whole argv rides `ApplyNs` to the owner.
+    let mut remote = conn_on_cell_use(&node, 1 - owner, b"wide");
+    remote.write_all(&cmd(&mset)).expect("write");
+    read_exactly(&mut remote, b"+OK\r\n");
+    remote.write_all(&cmd(&mget)).expect("write");
+    read_exactly(&mut remote, &want);
+    // The widest client argv (`ParserLimits::max_args` = 1024): 511 pairs.
+    let wide: Vec<(Vec<u8>, Vec<u8>)> = (0..511)
+        .map(|i| (format!("{{w}}big{i}").into_bytes(), format!("x{i}").into_bytes()))
+        .collect();
+    let mut widest: Vec<&[u8]> = vec![b"MSET"];
+    for (k, v) in &wide {
+        widest.push(k);
+        widest.push(v);
+    }
+    assert_eq!(widest.len(), 1023);
+    remote.write_all(&cmd(&widest)).expect("write");
+    read_exactly(&mut remote, b"+OK\r\n");
+    remote.write_all(&cmd(&[b"GET", &wide[510].0])).expect("write");
+    read_exactly(&mut remote, b"$4\r\nx510\r\n");
+    remote.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut remote, b":520\r\n");
+    // The owner cell sees the same keys locally — the discriminator the
+    // finding named (the same command passed on the owner and failed on
+    // the peer).
+    let mut local = conn_on_cell_use(&node, owner, b"wide");
+    local.write_all(&cmd(&mget)).expect("write");
+    read_exactly(&mut local, &want);
+    drop(local);
+    drop(remote);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0120 D1: every argv the client parser admits ships whole across
+/// the fabric — the two bounds are one contract, checked where both
+/// crates are visible (`inf-fabric` cannot name `inf-wire`).
+#[test]
+fn fabric_apply_bound_covers_every_client_argv() {
+    let client = inf_wire::ParserLimits::default().max_args;
+    assert!(
+        inf_fabric::MAX_APPLY_ARGS >= client,
+        "fabric apply bound {} < client argv bound {client}: a client-legal command can be \
+         refused by slot ownership (F-L17-15)",
+        inf_fabric::MAX_APPLY_ARGS
+    );
+}
+
 /// `--conn-default-ns` is an operator requirement, not a best-effort hint:
 /// an unresolved name must never route a command to db0. Namespace DDL and
 /// explicit selection remain available, and an `always` ack written after
@@ -2509,6 +2602,98 @@ fn tiered_scan_names_every_cold_key_across_the_window() {
         &missing[..missing.len().min(5)],
         &phantom[..phantom.len().min(5)],
     );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-08-30, F-L17-13 (L3 — batch every boundary): a `SCAN`
+/// page resolves its cold keys one **batch** at a time — every intent of
+/// a `COLD-READ-QD`-sized chunk is in the FIFO before the page suspends,
+/// so ADR-0055 D4's merge sees them together and the device runs at
+/// queue depth. Red on the sequential loop: one intent per drain can
+/// never merge (`cold_reads_issued == cold_reads_enqueued` over the
+/// page, by construction) and `cold_read_qd_p99` stayed at 1 — a
+/// `COUNT 10000` page was up to 10 000 device round trips inside one
+/// command.
+#[test]
+fn tiered_scan_batches_its_cold_key_reads() {
+    let dir = temp_data_dir("tiered-scan-batch");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // ~96 K records of ~70 B (dozens per 4 KiB tier frame): the dense
+    // cold region where a batched page has adjacent windows to merge.
+    let keys = 98_304usize;
+    let batch = 2048usize;
+    for start in (0..keys).step_by(batch) {
+        let mut wire = Vec::with_capacity(batch * 64);
+        for i in start..start + batch {
+            let key = format!("k:{i:06}").into_bytes();
+            wire.extend_from_slice(&cmd(&[b"SET", &key, &[b'v'; 32]]));
+        }
+        c.write_all(&wire).expect("write");
+        for _ in 0..batch {
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+    }
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    let mut last = (0u64, 0u64);
+    for _ in 0..1500 {
+        last = (
+            info_u64(&mut c, "tiering_flush_confirmed_bytes:"),
+            info_u64(&mut c, "tiering_region_decommit_pages:"),
+        );
+        // ~5 MB of records against a 3 MB budget: the demoter flushes
+        // the ~2 MB excess (a dense cold region of ~40 K records).
+        if last.0 > 1 << 20 && last.1 > 0 {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never released (flushed {}, decommitted pages {})", last.0, last.1);
+    let before = (info_u64(&mut c, "cold_reads_enqueued:"), info_u64(&mut c, "cold_reads_issued:"));
+    c.write_all(&cmd(&[b"SCAN", b"0", b"COUNT", b"4096"])).expect("write");
+    let (_, named) = read_scan_page(&mut c);
+    let after = (info_u64(&mut c, "cold_reads_enqueued:"), info_u64(&mut c, "cold_reads_issued:"));
+    let enqueued = after.0 - before.0;
+    let issued = after.1 - before.1;
+    assert!(!named.is_empty(), "empty page");
+    assert!(enqueued >= 256, "the page touched {enqueued} cold slots — not the cold regime");
+    let qd = info_u64(&mut c, "cold_read_qd_p99:");
+    eprintln!(
+        "scan page: {} keys, {enqueued} cold intents, {issued} device reads, qd p99 {qd}",
+        named.len()
+    );
+    assert!(
+        issued < enqueued,
+        "no coalescing on the page: {issued} device reads for {enqueued} cold keys — one \
+         intent per drain (F-L17-13)"
+    );
+    assert!(qd > 1, "the page ran at queue depth 1 (cold_read_qd_p99 {qd}) — sequential awaits");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

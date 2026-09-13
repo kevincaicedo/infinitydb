@@ -728,6 +728,13 @@ impl ColdReads {
         self.state.borrow().counters
     }
 
+    /// The in-flight device-read cap (ADR-0055 D2) — the most intents one
+    /// command should have queued before it suspends (`SCAN`'s chunk).
+    #[must_use]
+    pub fn qd_cap(&self) -> usize {
+        self.state.borrow().config.qd_cap
+    }
+
     /// Leak hook: after a storm drains, every lease is back, nothing is
     /// queued or in flight, no window holds custody, and no file stays
     /// pinned.

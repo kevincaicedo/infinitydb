@@ -21,8 +21,8 @@ mod msg;
 mod ring;
 
 pub use codec::{
-    ApplyArgs, CODEC_VERSION, CodecError, ErrCode, MAX_APPLY_ARGS, MAX_BATCH_OPS, Op, Outcome,
-    WriteFlags, decode, encode,
+    ApplyArgs, CODEC_VERSION, CodecError, ErrCode, MAX_APPLY_ARGS, MAX_BATCH_OPS,
+    MAX_INLINE_APPLY_ARGS, Op, Outcome, WriteFlags, decode, encode,
 };
 #[cfg(not(loom))]
 pub use mesh::{CellFabric, FabricStats, Mesh, MeshConfig, SendError};

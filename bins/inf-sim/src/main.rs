@@ -533,6 +533,8 @@ fn main() {
             let mut tier_read_faults_fired = 0u64;
             let mut tier_read_error_replies = 0u64;
             let mut tier_read_faults_unconsumed = 0u64;
+            let mut scan_cold_pages = 0u64;
+            let mut scan_cold_reads = 0u64;
             let mut ckpt_downgrades = 0u64;
             let mut ckpt_bound_splits = 0u64;
             let mut diskfull_refusals = 0u64;
@@ -617,6 +619,8 @@ fn main() {
                 tier_read_faults_fired += report.tier_read_faults_fired;
                 tier_read_error_replies += report.tier_read_error_replies;
                 tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
+                scan_cold_pages += report.scan_cold_pages;
+                scan_cold_reads += report.scan_cold_reads;
                 ckpt_downgrades += report.ckpt_downgrades;
                 ckpt_bound_splits += report.ckpt_bound_splits;
                 diskfull_refusals += report.diskfull_refusals;
@@ -652,7 +656,8 @@ fn main() {
                  dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
                  fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
                  ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
-                 {tier_read_faults_unconsumed} unconsumed), \
+                 {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle on \
+                 {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
                  ckpt arms [downgrades {ckpt_downgrades} bound_splits \
                  {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
                  drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
@@ -688,6 +693,7 @@ fn main() {
                      tier_read_faults_fired={tier_read_faults_fired} \
                      tier_read_error_replies={tier_read_error_replies} \
                      tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
+                     scan_cold_pages={scan_cold_pages} scan_cold_reads={scan_cold_reads} \
                      ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
                      diskfull_refusals={diskfull_refusals} \
                      drop_values={drop_values} drop_other={drop_other} \
@@ -748,7 +754,8 @@ fn main() {
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
              (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
-             / bound splits {}, trace {} bytes, hash {:#018x}",
+             / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), trace \
+             {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -789,16 +796,21 @@ fn main() {
             report.tier_read_error_replies,
             report.ckpt_downgrades,
             report.ckpt_bound_splits,
+            report.scan_cold_pages,
+            report.scan_cold_reads,
             report.trace.len(),
             report.trace_hash
         );
         println!(
             "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
-             tier_read_faults_fired={} tier_read_error_replies={}",
+             tier_read_faults_fired={} tier_read_error_replies={} scan_cold_pages={} \
+             scan_cold_reads={}",
             report.sim_seconds,
             report.tier_read_fault_arm,
             report.tier_read_faults_fired,
-            report.tier_read_error_replies
+            report.tier_read_error_replies,
+            report.scan_cold_pages,
+            report.scan_cold_reads
         );
         if verify {
             let second = run_one(seed);

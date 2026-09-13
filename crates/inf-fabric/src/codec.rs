@@ -18,8 +18,10 @@
 //! [`decode`] is **total**: any byte input either parses or returns a typed
 //! [`CodecError`] — no panics, no UB (fuzzed by `fuzz/fuzz_targets/
 //! fabric_codec.rs`, which runs in the CI fuzz job). Decoding borrows all
-//! byte payloads from the input — zero copies (the only decode allocation is
-//! the `Vec` of nested ops in `Batch`, flagged as an M1 optimization).
+//! byte payloads from the input — zero copies (the decode allocations are
+//! the `Vec` of nested ops in `Batch`, flagged as an M1 optimization, and
+//! the slice table of an `Apply`/`ApplyNs` wider than
+//! [`MAX_INLINE_APPLY_ARGS`] — ADR-0120 D2, sized by the frame).
 
 use core::fmt;
 
@@ -31,8 +33,18 @@ use crate::msg::FabricToken;
 /// Wire version emitted and accepted by this codec.
 pub const CODEC_VERSION: u8 = 0;
 
-/// Maximum number of argument slices in an [`Op::Apply`] / [`Op::ApplyNs`].
-pub const MAX_APPLY_ARGS: usize = 16;
+/// Argument slices an [`ApplyArgs`] stores inline — the allocation-free
+/// width every plane-composed program and every client command up to
+/// this width rides (ADR-0120 D2; the codec's whole width before it).
+pub const MAX_INLINE_APPLY_ARGS: usize = 16;
+
+/// Maximum number of argument slices in an [`Op::Apply`] / [`Op::ApplyNs`]
+/// — the client parser's argv bound (`inf_wire::ParserLimits::max_args`;
+/// `inf-server` asserts this is not narrower), so every argv a client
+/// can present ships whole to its owner whatever cell it lands on
+/// (ADR-0120 D1, review of 2026-08-30 F-L17-15). Wider argvs beyond
+/// the inline width spill to one exact-sized table (D2).
+pub const MAX_APPLY_ARGS: usize = 1024;
 
 /// Maximum number of nested ops in an [`Op::Batch`].
 pub const MAX_BATCH_OPS: usize = 256;
@@ -170,32 +182,43 @@ pub enum Outcome<'a> {
 }
 
 /// Argument slices for [`Op::Apply`] / [`Op::ApplyNs`] — at most
-/// [`MAX_APPLY_ARGS`], stored inline (no allocation on encode or decode).
-#[derive(Copy, Clone)]
+/// [`MAX_APPLY_ARGS`]. Up to [`MAX_INLINE_APPLY_ARGS`] live inline (no
+/// allocation on encode or decode — the shipped hot path, unchanged);
+/// a wider argv lives in one exact-sized table (ADR-0120 D2).
+#[derive(Clone)]
 pub struct ApplyArgs<'a> {
-    args: [&'a [u8]; MAX_APPLY_ARGS],
-    len: u8,
+    inline: [&'a [u8]; MAX_INLINE_APPLY_ARGS],
+    len: u16,
+    /// Every slice when `len > MAX_INLINE_APPLY_ARGS`; empty (never
+    /// allocated) otherwise.
+    spill: Vec<&'a [u8]>,
 }
 
 impl<'a> ApplyArgs<'a> {
     /// No arguments.
-    pub const EMPTY: ApplyArgs<'static> = ApplyArgs { args: [&[]; MAX_APPLY_ARGS], len: 0 };
+    pub const EMPTY: ApplyArgs<'static> =
+        ApplyArgs { inline: [&[]; MAX_INLINE_APPLY_ARGS], len: 0, spill: Vec::new() };
 
     /// Builds from a slice of slices; `None` if more than [`MAX_APPLY_ARGS`].
     pub fn new(args: &[&'a [u8]]) -> Option<ApplyArgs<'a>> {
         if args.len() > MAX_APPLY_ARGS {
             return None;
         }
-        let mut packed: [&'a [u8]; MAX_APPLY_ARGS] = [&[]; MAX_APPLY_ARGS];
-        packed[..args.len()].copy_from_slice(args);
-        // Length fits in u8 because MAX_APPLY_ARGS < 256.
-        Some(ApplyArgs { args: packed, len: args.len() as u8 })
+        let mut inline: [&'a [u8]; MAX_INLINE_APPLY_ARGS] = [&[]; MAX_INLINE_APPLY_ARGS];
+        let spill = if args.len() <= MAX_INLINE_APPLY_ARGS {
+            inline[..args.len()].copy_from_slice(args);
+            Vec::new()
+        } else {
+            args.to_vec()
+        };
+        // Length fits in u16 because MAX_APPLY_ARGS < 65536.
+        Some(ApplyArgs { inline, len: args.len() as u16, spill })
     }
 
     /// The argument slices.
     #[inline]
     pub fn as_slice(&self) -> &[&'a [u8]] {
-        &self.args[..usize::from(self.len)]
+        if self.spill.is_empty() { &self.inline[..usize::from(self.len)] } else { &self.spill }
     }
 
     /// Number of arguments.
@@ -549,22 +572,8 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
             let token = reader.token()?;
             let slot = reader.slot()?;
             let cmd = reader.u8()?;
-            let argc = reader.varint()?;
-            if argc > MAX_APPLY_ARGS as u64 {
-                return Err(CodecError::TooManyArgs(argc));
-            }
-            let mut packed: [&[u8]; MAX_APPLY_ARGS] = [&[]; MAX_APPLY_ARGS];
-            for arg in packed.iter_mut().take(argc as usize) {
-                *arg = reader.bytes()?;
-            }
-            // argc <= MAX_APPLY_ARGS < 256, so the cast is lossless.
-            Op::Apply {
-                token,
-                slot,
-                cmd,
-                args: ApplyArgs { args: packed, len: argc as u8 },
-                program,
-            }
+            let args = reader.apply_args()?;
+            Op::Apply { token, slot, cmd, args, program }
         }
         OP_APPLY_NS => {
             let token = reader.token()?;
@@ -574,23 +583,8 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
             if ns < APPLY_NS_MIN {
                 return Err(CodecError::ApplyNsDefault(ns));
             }
-            let argc = reader.varint()?;
-            if argc > MAX_APPLY_ARGS as u64 {
-                return Err(CodecError::TooManyArgs(argc));
-            }
-            let mut packed: [&[u8]; MAX_APPLY_ARGS] = [&[]; MAX_APPLY_ARGS];
-            for arg in packed.iter_mut().take(argc as usize) {
-                *arg = reader.bytes()?;
-            }
-            // argc <= MAX_APPLY_ARGS < 256, so the cast is lossless.
-            Op::ApplyNs {
-                token,
-                slot,
-                cmd,
-                ns,
-                args: ApplyArgs { args: packed, len: argc as u8 },
-                program,
-            }
+            let args = reader.apply_args()?;
+            Op::ApplyNs { token, slot, cmd, ns, args, program }
         }
         OP_BATCH => {
             if nested {
@@ -674,6 +668,36 @@ impl<'a> Reader<'a> {
         let len = self.varint()?;
         let len = usize::try_from(len).map_err(|_| CodecError::Truncated)?;
         self.take(len)
+    }
+
+    /// `argc` then `argc` byte slices. The spill table (ADR-0120 D2) is
+    /// sized only after the frame proves it can carry that many slices
+    /// — every slice costs at least its one-byte length — so a hostile
+    /// argc is `Truncated`, never an allocation.
+    fn apply_args(&mut self) -> Result<ApplyArgs<'a>, CodecError> {
+        let argc = self.varint()?;
+        if argc > MAX_APPLY_ARGS as u64 {
+            return Err(CodecError::TooManyArgs(argc));
+        }
+        let argc = argc as usize;
+        if argc > self.buf.len() {
+            return Err(CodecError::Truncated);
+        }
+        let mut inline: [&'a [u8]; MAX_INLINE_APPLY_ARGS] = [&[]; MAX_INLINE_APPLY_ARGS];
+        let spill = if argc <= MAX_INLINE_APPLY_ARGS {
+            for arg in inline.iter_mut().take(argc) {
+                *arg = self.bytes()?;
+            }
+            Vec::new()
+        } else {
+            let mut spill = Vec::with_capacity(argc);
+            for _ in 0..argc {
+                spill.push(self.bytes()?);
+            }
+            spill
+        };
+        // argc <= MAX_APPLY_ARGS < 65536, so the cast is lossless.
+        Ok(ApplyArgs { inline, len: argc as u16, spill })
     }
 
     fn token(&mut self) -> Result<FabricToken, CodecError> {
@@ -998,6 +1022,56 @@ mod tests {
         });
     }
 
+    /// Review of 2026-08-30, F-L17-15 (ADR-0120): the apply bound follows
+    /// the client parser, not the inline array — an argv one past the
+    /// inline width, and one at the full bound, ship whole on both opcodes
+    /// (byte-exact round trip; the spilled slices decode to the same
+    /// values). Red on the 16-slice codec: `ApplyArgs::new` answered
+    /// `None` and `decode` answered `TooManyArgs(17)`.
+    #[test]
+    fn apply_args_beyond_the_inline_width_round_trip() {
+        for argc in [17, 64, MAX_APPLY_ARGS] {
+            let owned: Vec<Vec<u8>> = (0..argc).map(|i| vec![(i % 251) as u8; i % 7]).collect();
+            let slices: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            let args = ApplyArgs::new(&slices).unwrap_or_else(|| panic!("{argc} args refused"));
+            assert_eq!(args.len(), argc);
+            assert_eq!(args.as_slice(), slices.as_slice());
+            let frame = round_trip(&Op::Apply {
+                token: token(2, 7),
+                slot: slot(9),
+                cmd: 0x13,
+                args: args.clone(),
+                program: false,
+            });
+            let decoded = decode(&frame).expect("decodes");
+            let Op::Apply { args: back, .. } = decoded else { panic!("opcode") };
+            assert_eq!(back.as_slice(), slices.as_slice(), "argc {argc}");
+            round_trip(&Op::ApplyNs {
+                token: token(2, 8),
+                slot: slot(9),
+                cmd: 0x03,
+                ns: 16,
+                args,
+                program: true,
+            });
+        }
+    }
+
+    /// The decoder's spill is bounded by the frame: an argc past the bytes
+    /// that could carry it is `Truncated` before any allocation (a hostile
+    /// argc never sizes a table — L9).
+    #[test]
+    fn hostile_argc_is_truncated_before_any_spill() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&token(1, 1).0.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0); // cmd
+        varint::encode_u64(MAX_APPLY_ARGS as u64, &mut payload);
+        payload.push(0); // one empty arg; the other 1023 are missing
+        let frame = frame_with(OP_APPLY, &payload);
+        assert_eq!(decode(&frame), Err(CodecError::Truncated));
+    }
+
     /// ADR-0015 D1: defaults ride `Op::Apply` — an `ApplyNs` frame naming a
     /// default namespace (`ns < 16`) has no canonical meaning and is a typed
     /// decode error, not a silent alias.
@@ -1198,7 +1272,7 @@ mod tests {
                 any::<u64>(),
                 0..16384u16,
                 any::<u8>(),
-                prop::collection::vec(bytes.clone(), 0..MAX_APPLY_ARGS),
+                prop::collection::vec(bytes.clone(), 0..3 * MAX_INLINE_APPLY_ARGS),
                 any::<bool>()
             )
                 .prop_map(|(token, slot, cmd, args, program)| OwnedOp::Apply {
@@ -1213,7 +1287,7 @@ mod tests {
                 0..16384u16,
                 any::<u8>(),
                 16..=u32::MAX, // ns < 16 is not encodable (ADR-0015 D1)
-                prop::collection::vec(bytes.clone(), 0..MAX_APPLY_ARGS),
+                prop::collection::vec(bytes.clone(), 0..3 * MAX_INLINE_APPLY_ARGS),
                 any::<bool>()
             )
                 .prop_map(|(token, slot, cmd, ns, args, program)| OwnedOp::ApplyNs {
