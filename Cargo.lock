@@ -502,6 +502,7 @@ dependencies = [
  "inf-foundation",
  "inf-log",
  "inf-simd",
+ "inf-store",
  "libc",
  "proptest",
 ]

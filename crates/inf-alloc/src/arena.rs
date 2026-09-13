@@ -22,6 +22,21 @@
 //! gave is a logic error: it corrupts *accounting* (and `debug_assert`s
 //! where cheap) but cannot escape mapped memory — `bytes` bounds-checks
 //! against the owning chunk.
+//!
+//! Freeing a classed slot twice panics (F-L16-04): the free-list head is
+//! compared always, and a debug build also tags every freed slot's bytes
+//! 8..16 so a slot deeper in the list is caught too — the same
+//! fail-loudly rule the buffer pools apply. A huge double free panics on
+//! the zeroed chunk entry.
+//!
+//! A huge chunk's table slot is **recycled** after unmap (a long-lived
+//! arena must not grow its table by one slot per huge allocation — 2^27
+//! slots then a hard panic). A stale huge `ArenaAddr` is therefore
+//! bounds-checked against whatever mapping owns the slot *now*: the
+//! zeroed entry while unrecycled (panic), the successor's live mapping
+//! once recycled (a wrong read, never a dead pointer). `ArenaAddr` has
+//! no generation bits to close that ABA; the addr's owner (the index
+//! slot) is updated in the same step that frees (F-L16-03).
 
 use core::fmt;
 
@@ -149,10 +164,16 @@ fn class_of(len: usize, large_threshold: usize) -> Option<usize> {
 const PAGE: usize = 4096;
 const NONE_U64: u64 = u64::MAX;
 const NONE_U32: u32 = u32::MAX;
+/// Debug free-slot tag, xor'ed with the slot's own addr into bytes 8..16
+/// (every class is ≥ 16 B). The top two bytes differ, so no repeated-byte
+/// fill of a live record can forge it; a 48-bit addr never reaches them.
+#[cfg(debug_assertions)]
+const FREE_TAG: u64 = 0x5AA5_F0E1_D2C3_B4A5;
 
 struct Chunk {
     base: *mut u8,
-    /// Mapped length; 0 after a huge chunk is unmapped (entry recycled).
+    /// Mapped length; 0 after a huge chunk is unmapped, until the slot is
+    /// recycled by the next `map_chunk` (see the module contract).
     len: usize,
 }
 
@@ -231,6 +252,8 @@ impl Arena {
         if head != NONE_U64 {
             let addr = ArenaAddr(head);
             let next = self.read_freelink(addr);
+            #[cfg(debug_assertions)]
+            self.write_free_tag(addr, 0);
             let st = &mut self.classes[class];
             st.free_head = next;
             st.free_slots -= 1;
@@ -261,11 +284,23 @@ impl Arena {
     /// passed to the `alloc` that produced `addr`.
     ///
     /// # Panics
-    /// Panics if `addr` does not refer to a live chunk.
+    /// Panics if `addr` does not refer to a live chunk, or on a double
+    /// free (always when the slot heads its free list; in debug builds
+    /// anywhere in it).
     pub fn free(&mut self, addr: ArenaAddr, len: usize) {
         match class_of(len, self.large_threshold) {
             Some(class) => {
                 let head = self.classes[class].free_head;
+                assert!(head != addr.to_raw(), "double free of arena slot");
+                #[cfg(debug_assertions)]
+                {
+                    let tag = addr.to_raw() ^ FREE_TAG;
+                    debug_assert!(
+                        self.read_free_tag(addr) != tag,
+                        "double free of arena slot (deep)"
+                    );
+                    self.write_free_tag(addr, tag);
+                }
                 self.write_freelink(addr, head);
                 let st = &mut self.classes[class];
                 st.free_head = addr.to_raw();
@@ -357,6 +392,18 @@ impl Arena {
 
     fn write_freelink(&mut self, addr: ArenaAddr, next: u64) {
         self.bytes_mut(addr, 8).copy_from_slice(&next.to_le_bytes());
+    }
+
+    #[cfg(debug_assertions)]
+    fn read_free_tag(&self, addr: ArenaAddr) -> u64 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&self.bytes(addr, 16)[8..]);
+        u64::from_le_bytes(raw)
+    }
+
+    #[cfg(debug_assertions)]
+    fn write_free_tag(&mut self, addr: ArenaAddr, tag: u64) {
+        self.bytes_mut(addr, 16)[8..].copy_from_slice(&tag.to_le_bytes());
     }
 
     fn map_chunk(&mut self, len: usize) -> Option<u32> {
@@ -521,6 +568,83 @@ mod tests {
         let addr = arena.alloc(len).expect("huge");
         arena.free(addr, len);
         let _ = arena.bytes(addr, len);
+    }
+
+    /// F-L16-03 (review of 2026-08-30): the recycle ABA, pinned as it is.
+    /// The review's spelling (`should_panic("escapes chunk")` on the same
+    /// sequence) ran red — `test did not panic` — which proved the old
+    /// SAFETY.md sentence false. Recycling stays (the alternative grows
+    /// the chunk table by one slot per huge allocation until the 2^27
+    /// panic); the contract is now the bounds check against the slot's
+    /// *current* mapping — the successor's bytes on a recycled slot, never
+    /// a dead pointer (Miri runs this test), a panic when the successor
+    /// is smaller.
+    #[test]
+    fn stale_huge_addr_after_slot_recycle_reads_the_successor_never_a_dead_pointer() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let len = 1 << 20;
+        let a = arena.alloc(len).expect("huge a");
+        arena.free(a, len);
+        let b = arena.alloc(len).expect("huge b — recycles a's chunk slot");
+        assert_eq!(a, b, "the slot was recycled");
+        arena.bytes_mut(b, len).fill(0xBB);
+        let probe = if cfg!(miri) { 64 } else { len };
+        assert!(arena.bytes(a, len)[..probe].iter().all(|&x| x == 0xBB));
+        arena.free(b, len);
+    }
+
+    #[test]
+    #[should_panic(expected = "escapes chunk")]
+    fn stale_huge_addr_after_a_smaller_recycle_panics() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let len = 1 << 20;
+        let a = arena.alloc(len).expect("huge a");
+        arena.free(a, len);
+        let _b = arena.alloc(520 << 10).expect("smaller huge b — recycles a's slot");
+        let _ = arena.bytes(a, len);
+    }
+
+    /// F-L16-04 (review of 2026-08-30): a classed double free panics
+    /// before it can alias. The review's spelling (`assert_ne!(x, y)` after
+    /// two frees) ran red — `ArenaAddr(0) == ArenaAddr(0)` in both
+    /// profiles — with a second live allocation holding `live_allocs`
+    /// above zero (its original spelling tripped the accounting
+    /// underflow in debug instead).
+    #[test]
+    #[should_panic(expected = "double free of arena slot")]
+    fn double_free_at_the_list_head_panics_in_every_profile() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let a = arena.alloc(64).expect("a");
+        let _keep = arena.alloc(64).expect("keep");
+        arena.free(a, 64);
+        arena.free(a, 64);
+    }
+
+    /// The deep case — the slot is no longer the head — is the debug tag's.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "double free of arena slot (deep)")]
+    fn double_free_deeper_in_the_list_panics_in_debug() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let a = arena.alloc(64).expect("a");
+        let b = arena.alloc(64).expect("b");
+        let _keep = arena.alloc(64).expect("keep");
+        arena.free(a, 64);
+        arena.free(b, 64);
+        arena.free(a, 64);
+    }
+
+    /// The debug tag is cleared on reuse: alloc → free → alloc (never
+    /// written) → free is one free per allocation, not a double free.
+    #[test]
+    fn reused_slot_left_untouched_frees_cleanly() {
+        let mut arena = Arena::new(ArenaConfig::default());
+        let a = arena.alloc(64).expect("a");
+        arena.free(a, 64);
+        let b = arena.alloc(64).expect("b reuses a");
+        assert_eq!(a, b);
+        arena.free(b, 64);
+        assert_eq!(arena.report().live_allocs, 0);
     }
 
     #[test]

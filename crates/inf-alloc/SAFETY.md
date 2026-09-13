@@ -7,7 +7,7 @@ unit tests under Miri.
 | Location | Invariant | Coverage |
 |----------|-----------|----------|
 | `arena.rs::map_chunk` (`libc::mmap`) | anonymous private mapping, result checked against `MAP_FAILED` before use | unit tests + Miri (`storm_reconciles_byte_exact`) |
-| `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; entry zeroed after unmap so stale addrs hit the bounds assert, never the dead pointer | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub` |
+| `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; the entry is zeroed after unmap and its slot recycled by the next `map_chunk`, so a stale addr is always bounds-checked against the slot's *current* entry — the zeroed one (panic) or the successor's live mapping (a wrong read, never the dead pointer). No generation bits exist to close that ABA (F-L16-03, batch 47 of the 2026-08-30 review); the caller's index slot is updated in the step that frees | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub`, `stale_huge_addr_after_slot_recycle_reads_the_successor_never_a_dead_pointer`, `stale_huge_addr_after_a_smaller_recycle_panics` |
 | `arena.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | `offset.checked_add(len)` bounds-checked against the owning chunk's mapped length before the slice is formed (total: a `len` near `usize::MAX` cannot wrap under the bound — batch 14 of the 2026-08-30 review; `bytes_refuses_a_wrapping_len` runs red on the plain add); `&self`/`&mut self` provide aliasing discipline; chunk memory lives until unmap/drop | whole arena test suite under Miri |
 | `counting_allocator.rs::GlobalAlloc` (test/feature-only) | every operation delegates the caller's pointer/layout contract unchanged to `System`; the relaxed counter does not alter allocation semantics | `delegates_and_counts_allocations` + `inf-doc/tests/scalar_patch_alloc.rs`; Miri compiles the unit-test arm |
 | `region.rs::map_reservation` (`libc::mmap`, both cfg arms) | anonymous private mapping (PROT_NONE + NORESERVE; READ\|WRITE under Miri), no fixed address, result checked against `MAP_FAILED` before use | region unit tests under Miri (`commit_write_read_round_trip`, spans, recommit) |
@@ -20,6 +20,12 @@ unit tests under Miri.
 | `aligned.rs::buffers_mut` (`from_raw_parts_mut`, M4-S08 registration pass) | base/total are exactly the live allocation made in `new`; `&mut self` makes the iterator the only borrow of any buffer; `chunks_exact_mut` yields disjoint slices | `buffers_mut_yields_disjoint_registration_slices` under Miri |
 
 `buffer_pool` remains 100% safe code.
+
+Lifecycle errors fail loudly in every pool (F-L16-04): `Arena::free` panics
+on a classed double free at the free-list head in every profile, and on one
+deeper in the list under `debug_assertions` (a per-slot tag in bytes 8..16
+of the freed slot, cleared on reuse); a huge double free panics on the
+zeroed entry (`unmap_chunk`).
 
 Rules:
 - New `unsafe` requires: an entry here, a `// SAFETY:` comment at the block

@@ -102,8 +102,9 @@ pub use tiered::shadow::{
     COLLISION_KEY_PREFIX, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP,
     SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters, ShadowProbe, ShadowRead,
     ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket, ShadowVerdict,
-    forced_collision_pair, forced_collision_triple,
 };
+#[cfg(feature = "collision-oracle")]
+pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};
 pub use tiered::{RELOC_ORIGIN_CAP, RecordParts, TieredLookup, TieredTable};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,

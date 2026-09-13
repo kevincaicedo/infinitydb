@@ -82,7 +82,10 @@ pub use inf_foundation::COLLISION_KEY_PREFIX;
 /// (ADR-0093 A7 as amended by ADR-0094 D3): the collision oracle for the
 /// store suite and the simulators; `tag` selects the triple. Ordinary
 /// distinct keys in a shipping build, where no collision is
-/// constructible. Never an engine capability.
+/// constructible. Never an engine capability — the builders are gated
+/// like the hasher branch (L16 style row, batch 47): a shipping build
+/// carries neither half of the oracle.
+#[cfg(feature = "collision-oracle")]
 #[must_use]
 pub fn forced_collision_triple(tag: u64) -> [[u8; 48]; 3] {
     let head = tag.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -98,6 +101,7 @@ pub fn forced_collision_triple(tag: u64) -> [[u8; 48]; 3] {
 }
 
 /// The first two keys of [`forced_collision_triple`].
+#[cfg(feature = "collision-oracle")]
 #[must_use]
 pub fn forced_collision_pair(tag: u64) -> ([u8; 48], [u8; 48]) {
     let [first, second, _] = forced_collision_triple(tag);

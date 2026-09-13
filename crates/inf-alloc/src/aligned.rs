@@ -47,6 +47,10 @@ pub struct AlignedPool {
     buf_size: usize,
     leased: Box<[bool]>,
     leased_count: usize,
+    /// Free ids, popped on lease (O(1), like `BufferPool` — the linear
+    /// scan it replaced was O(capacity) per cold read: L16 performance
+    /// row, batch 47). Capacity `count`, so push never allocates.
+    free: Vec<u32>,
 }
 
 impl AlignedPool {
@@ -71,11 +75,14 @@ impl AlignedPool {
         // reads as initialized bytes, never uninit.
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "aligned pool allocation failed");
+        let count_u32 = u32::try_from(count).expect("aligned pool count fits u32");
         AlignedPool {
             base,
             buf_size,
             leased: vec![false; count].into_boxed_slice(),
             leased_count: 0,
+            // Reversed so the first lease is id 0 (the registration order).
+            free: (0..count_u32).rev().collect(),
         }
     }
 
@@ -106,10 +113,11 @@ impl AlignedPool {
     /// Leases one buffer. `None` when the pool is dry — backpressure,
     /// never an error (the caller parks or degrades).
     pub fn try_lease(&mut self) -> Option<AlignedBufId> {
-        let free = self.leased.iter().position(|leased| !leased)?;
-        self.leased[free] = true;
+        let free = self.free.pop()?;
+        debug_assert!(!self.leased[free as usize], "free stack holds a leased id");
+        self.leased[free as usize] = true;
         self.leased_count += 1;
-        Some(AlignedBufId(free as u32))
+        Some(AlignedBufId(free))
     }
 
     /// Returns a leased buffer.
@@ -122,6 +130,7 @@ impl AlignedPool {
         assert!(*slot, "release of a non-leased aligned buffer {}", id.0);
         *slot = false;
         self.leased_count -= 1;
+        self.free.push(id.0);
     }
 
     /// Borrows a buffer's bytes.

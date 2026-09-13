@@ -1290,7 +1290,9 @@ impl<F: SegmentFs> DurableCell<F> {
                 // this completion — the distribution behind the
                 // ≥ 0.8× available-in-flight-writes gate.
                 debug_assert!(seq >= self.acked_seq, "ack seq regressed — frame_seqs FIFO broken");
-                self.group_hist_records.record(seq - self.acked_seq);
+                // Saturating like the round target below: a regressed seq
+                // is a wrong sample, never a wrapped one (F-L16-02).
+                self.group_hist_records.record(seq.saturating_sub(self.acked_seq));
                 // ADR-0092 D1 (amended by campaigns A and B): the round the
                 // group hold waits for is the population this barrier's
                 // completion reveals — the records it acks plus every

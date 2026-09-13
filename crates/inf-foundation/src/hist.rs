@@ -4,7 +4,11 @@
 
 const SUB_BITS: u32 = 5;
 const SUB: usize = 1 << SUB_BITS; // 32 linear sub-buckets per octave
-const BUCKETS: usize = (64 - SUB_BITS as usize) * SUB; // covers full u64 range
+// The 32 exact slots for `value < SUB`, then one octave per exponent
+// `SUB_BITS..=63` — `64 - SUB_BITS` octaves — so `index_of` is total over
+// `u64` (F-L16-02: the `+ 1` was missing and every value ≥ 2^63 indexed
+// past the array).
+const BUCKETS: usize = (64 - SUB_BITS as usize + 1) * SUB;
 
 pub struct LogHistogram {
     counts: Box<[u64; BUCKETS]>,
@@ -39,9 +43,13 @@ impl LogHistogram {
         let sub = (index % SUB) as u64;
         let exp = block + SUB_BITS - 1;
         let width = 1u64 << (exp - SUB_BITS);
-        (1u64 << exp) + (sub + 1) * width - 1
+        // Grouped so the top bucket (`exp == 63`, `sub == 31`) lands on
+        // `u64::MAX` without passing through 2^64.
+        (1u64 << exp) + ((sub + 1) * width - 1)
     }
 
+    /// Total over `u64`: every value has a bucket (`BUCKETS` covers the
+    /// exact slots plus every octave through `2^63..=u64::MAX`).
     #[inline]
     pub fn record(&mut self, value: u64) {
         self.counts[Self::index_of(value)] += 1;
@@ -156,6 +164,28 @@ mod tests {
         let p99 = h.percentile(99.0);
         let p999 = h.percentile(99.9);
         assert!(p50 <= p99 && p99 <= p999 && p999 <= h.max());
+    }
+
+    /// F-L16-02 (review of 2026-08-30): `record` is total over `u64` —
+    /// the top octave (every value ≥ 2^63) was one `BUCKETS` short and
+    /// indexed past the array (`the len is 1888 but the index is 1888`).
+    #[test]
+    fn record_is_total_over_u64() {
+        let mut h = LogHistogram::new();
+        for v in [0u64, 1, 31, 32, 1 << 62, (1 << 63) - 1, 1 << 63, u64::MAX] {
+            h.record(v);
+        }
+        assert_eq!(h.count(), 8);
+        assert_eq!(h.max(), u64::MAX);
+        assert!(h.percentile(100.0) >= (1u64 << 63));
+        assert_eq!(h.percentile(100.0), u64::MAX);
+        // The top octave is real buckets, not a clamp: 2^63 and u64::MAX
+        // are told apart (a clamp would flatter p99.9 — L10).
+        let mut top = LogHistogram::new();
+        top.record(1 << 63);
+        assert!(top.percentile(100.0) < u64::MAX);
+        assert_eq!(LogHistogram::index_of(u64::MAX), BUCKETS - 1);
+        assert_eq!(LogHistogram::bucket_upper(BUCKETS - 1), u64::MAX);
     }
 
     #[test]

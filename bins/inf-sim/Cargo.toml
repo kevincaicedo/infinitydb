@@ -26,7 +26,12 @@ path = "src/main.rs"
 # builds the simulator passes `-p inf-sim --features dst`, and `main`
 # refuses to run without it (a plain-built sim would silently inject no
 # faults). `scripts/check-shipping-features.sh` asserts the graph.
-dst = ["inf-foundation/collision-oracle", "inf-foundation/fault-points"]
+dst = [
+    "inf-foundation/collision-oracle",
+    "inf-foundation/fault-points",
+    # The collision-key builders live behind inf-store's forwarder (batch 47).
+    "inf-store/collision-oracle",
+]
 
 [dependencies]
 inf-foundation.workspace = true
