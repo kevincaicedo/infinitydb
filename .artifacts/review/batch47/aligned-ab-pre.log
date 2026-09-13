@@ -1,0 +1,16 @@
+# pre-fix (linear scan), 5 replicates, dev box, governor state not recorded (dev tier)
+count=64 ns/op=27.9
+count=512 ns/op=46.2
+count=4096 ns/op=297.7
+count=64 ns/op=19.0
+count=512 ns/op=45.9
+count=4096 ns/op=295.7
+count=64 ns/op=18.7
+count=512 ns/op=45.4
+count=4096 ns/op=296.6
+count=64 ns/op=19.5
+count=512 ns/op=45.6
+count=4096 ns/op=296.2
+count=64 ns/op=19.0
+count=512 ns/op=45.8
+count=4096 ns/op=296.5

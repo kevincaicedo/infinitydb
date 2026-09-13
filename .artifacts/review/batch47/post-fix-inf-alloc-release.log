@@ -1,0 +1,2 @@
+test aligned::tests::exhaustion_is_backpressure_not_error ... ok
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.15s

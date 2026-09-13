@@ -1,0 +1,18 @@
+---- arena::tests::double_free_does_not_alias stdout ----
+
+thread 'arena::tests::double_free_does_not_alias' (748434) panicked at crates/inf-alloc/src/arena.rs:553:9:
+assertion `left != right` failed: two live allocations must not share an address
+  left: ArenaAddr(0)
+ right: ArenaAddr(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+---- arena::tests::stale_huge_addr_after_slot_recycle_is_caught stdout ----
+note: test did not panic as expected at crates/inf-alloc/src/arena.rs:530:8
+
+failures:
+    arena::tests::double_free_does_not_alias
+    arena::tests::stale_huge_addr_after_slot_recycle_is_caught
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-alloc --lib`

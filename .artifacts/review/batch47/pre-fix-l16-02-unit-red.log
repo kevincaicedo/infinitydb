@@ -1,0 +1,15 @@
+failures:
+
+---- hist::tests::record_is_total_over_u64 stdout ----
+
+thread 'hist::tests::record_is_total_over_u64' (747966) panicked at crates/inf-foundation/src/hist.rs:47:9:
+index out of bounds: the len is 1888 but the index is 1888
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    hist::tests::record_is_total_over_u64
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-foundation --lib`

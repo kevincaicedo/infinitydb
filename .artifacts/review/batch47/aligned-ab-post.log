@@ -1,0 +1,17 @@
+    Finished `release` profile [optimized] target(s) in 1.87s
+# post-fix (free stack), 5 replicates, same box/session
+count=64 ns/op=2.4
+count=512 ns/op=2.1
+count=4096 ns/op=2.2
+count=64 ns/op=2.5
+count=512 ns/op=2.1
+count=4096 ns/op=2.1
+count=64 ns/op=4.6
+count=512 ns/op=2.4
+count=4096 ns/op=2.2
+count=64 ns/op=3.6
+count=512 ns/op=2.5
+count=4096 ns/op=2.1
+count=64 ns/op=4.2
+count=512 ns/op=3.2
+count=4096 ns/op=2.7

@@ -1,0 +1,8 @@
+inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+├── inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+│   ├── inf-server feature "default"
+│   │   └── infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+│   │       └── infinityd feature "default" (command-line)
+│   └── inf-server feature "doc"
+│       └── inf-server feature "default" (*)
+└── infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd) (*)
