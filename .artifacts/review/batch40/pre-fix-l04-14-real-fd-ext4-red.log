@@ -1,0 +1,4 @@
+thread 'tier_torn_frame_lands_on_a_real_direct_fd' (273694) panicked at tests/crash-matrix/tests/tier_direct.rs:251:13:
+the torn write lands on the O_DIRECT fd (EINVAL = the finding): Write(Os { code: 22, kind: InvalidInput, message: "Invalid argument" })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+

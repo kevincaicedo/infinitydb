@@ -21,8 +21,9 @@ use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::manifest::{TierFileRange, TierNsManifest};
 use inf_log::{
-    NsId, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TierDrive, TierFlush,
-    TierFlushConfig, TierIdentity, TierIoMode, TierWriter, inspect_tier_bytes,
+    NsId, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TierDecodeError,
+    TierDrive, TierFlush, TierFlushConfig, TierIdentity, TierIoMode, TierWriter,
+    inspect_tier_bytes, probe_tier_file,
 };
 use inf_store::KeyHasher;
 use inf_store::{AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig};
@@ -219,10 +220,15 @@ fn tier_footer_torn_reseal_at_watermark() {
     assert!(err.to_string().contains("tier_footer_torn"), "typed + named: {err}");
     assert!(fault::fired("tier_footer_torn") >= 1, "the row is not vacuous");
     fault::disarm_all();
-    // Pre-recovery: no valid footer — the image is unsealed.
+    // Pre-recovery: the footer block landed with its CRC cover torn (a
+    // whole legal block — F-L04-14): the verification decoder refuses it
+    // typed, and the product probe reads the file as unsealed (its
+    // CRC-refuse branch — the sub-block prefix of old never reached it).
     let image = fs.contents(&path).expect("file exists");
-    let summary = inspect_tier_bytes(&image).expect("unsealed image parses");
-    assert!(summary.sealed.is_none(), "a torn footer never reads as sealed");
+    assert_eq!(image.len(), 4096 + 3 * TIER_FRAME_BYTES + TIER_FOOTER_BYTES, "block landed");
+    assert_eq!(inspect_tier_bytes(&image), Err(TierDecodeError::BadCrc));
+    let (_, footer) = probe_tier_file(&fs, &path).expect("header intact");
+    assert!(footer.is_none(), "a torn footer never reads as sealed");
     // Recovery reseals at the manifested watermark; the seal is redone.
     let path = TierWriter::<MemFs>::recover_seal_existing(
         &fs,
@@ -590,7 +596,8 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
 /// The m4.toml definition itself stays well-formed and every row names
 /// a carrying test file (self-policing, the m2 pattern; S12's rows are
 /// carried by `recovery_v2.rs`, M4.5-S34/S35's by `fua.rs`, M4.5-S36's
-/// by `ickv3.rs` — each polices its own subset).
+/// by `ickv3.rs`, F-L04-14's Direct-mode rows by `tier_direct.rs` —
+/// each polices its own subset).
 #[test]
 fn m4_rows_are_carried_here() {
     let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
@@ -602,7 +609,8 @@ fn m4_rows_are_carried_here() {
                 || row.test == "recovery_v2.rs"
                 || row.test == "blob.rs"
                 || row.test == "fua.rs"
-                || row.test == "ickv3.rs",
+                || row.test == "ickv3.rs"
+                || row.test == "tier_direct.rs",
             "row {:?} names an unknown carrier {:?}",
             row.point,
             row.test

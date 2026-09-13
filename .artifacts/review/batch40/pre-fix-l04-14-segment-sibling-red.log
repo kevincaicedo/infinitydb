@@ -1,0 +1,5 @@
+test sync_tier_torn_points_inject_on_a_direct_segment ... FAILED
+thread 'sync_tier_torn_points_inject_on_a_direct_segment' (275766) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 2730 is not 4096-aligned
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p inf-log --test direct_segments`

@@ -138,11 +138,13 @@ pub trait SegmentFs {
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File>;
     /// Create a tier file in `mode` (M4-S09, ADR-0054 D1). The default
     /// delegates to [`create_segment`](Self::create_segment) ignoring the
-    /// mode — honest **by construction** on the in-memory/sim tiers, whose
+    /// mode — honest **by construction** on the in-memory tier, whose
     /// byte-visibility model has no page cache to bypass (`Buffered ≡
     /// Direct` there), never a silent fallback on a real filesystem:
     /// [`StdSegmentFs`] implements the real thing and refuses typed when
-    /// `Direct` does not take effect (D3). Wrappers must forward this
+    /// `Direct` does not take effect (D3); the sim overrides it so a
+    /// `Direct` file asserts the `O_DIRECT` alignment contract on every
+    /// write (F-L04-14, ADR-0119 A1). Wrappers must forward this
     /// explicitly (falling into the default would drop the flag).
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         let _ = mode;
@@ -151,9 +153,9 @@ pub trait SegmentFs {
     /// Open an **existing** tier file in `mode` (M4-S11, ADR-0056 D5 —
     /// the recovery reopen). Same honesty contract as
     /// [`create_tier`](Self::create_tier): the default delegates to
-    /// [`open_write`](Self::open_write) (mode-equivalent on
-    /// in-memory/sim tiers), [`StdSegmentFs`] applies and verifies
-    /// `O_DIRECT`, and wrappers must forward explicitly.
+    /// [`open_write`](Self::open_write) (mode-equivalent on the in-memory
+    /// tier), [`StdSegmentFs`] applies and verifies `O_DIRECT`, the sim
+    /// flags the inode, and wrappers must forward explicitly.
     fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         let _ = mode;
         self.open_write(path)
@@ -165,7 +167,10 @@ pub trait SegmentFs {
     /// before any durable ack can reference it. A create-time sync here
     /// blocks the reactor behind foreign journal writeback (the boot-wedge
     /// mechanism). The default falls back to the synced create: correct,
-    /// but it pays the barrier at create time.
+    /// but it pays the barrier at create time — and on the sim it would
+    /// make the prealloc length durable at creation, which `set_len`
+    /// never is (F-L04-05): the sim overrides it, length pending until
+    /// the caller's barrier.
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         self.create_segment(path, prealloc_bytes)
     }

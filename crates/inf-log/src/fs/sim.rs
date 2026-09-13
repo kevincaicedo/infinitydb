@@ -24,9 +24,15 @@
 //!   vanishes with all its data, fdatasync'd or not (the classic
 //!   fsync-the-directory lesson); a remove that did not survive
 //!   resurrects the file (ADR-0017's boot-GC re-collection).
-//! - `create_segment`'s prealloc extent is durable-if-the-name-survives
-//!   (`StdSegmentFs` syncs the file at create); `create_meta` carries no
-//!   durability side effects (ADR-0017).
+//! - `create_segment`'s prealloc **length** is durable-if-the-name-
+//!   survives (`StdSegmentFs` syncs the file at create; the blocks are
+//!   holes — ADR-0119 D1); `create_segment_unsynced`'s length is pending
+//!   until a barrier on the fd, like its bytes (F-L04-05, ADR-0119 A2);
+//!   `create_meta` carries no durability side effects (ADR-0017).
+//! - A `Direct` tier file (`create_tier`/`open_tier`) and a `Direct`
+//!   segment assert the `O_DIRECT` alignment contract on every write
+//!   (offset and length on the 4 KiB block) — the sim catches what tmpfs
+//!   swallows (F-L04-14, ADR-0119 A1).
 //! - **Power cut** ([`SimDisk::power_cut`]): per surviving inode, each
 //!   pending write is split into **sectors** (`sector_bytes` grid,
 //!   absolute file offsets); each sector independently survives a
@@ -98,7 +104,7 @@ use std::rc::Rc;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 
-use super::{SegmentFile, SegmentFs, SegmentIoMode};
+use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 
 /// Fake-fd base for inode handles (dir handles sit above it). High
 /// enough that no simulated socket fd space collides.
@@ -1334,11 +1340,40 @@ impl SegmentFs for SimDisk {
     }
 
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
-        // StdSegmentFs syncs the file at create: the prealloc extent is
-        // durable-if-the-name-survives; the name still needs the dir
-        // barrier.
+        // StdSegmentFs syncs the file at create: the prealloc length is
+        // durable-if-the-name-survives (the blocks are holes — ADR-0119
+        // D1); the name still needs the dir barrier.
         let len = usize::try_from(prealloc_bytes).expect("prealloc fits usize");
         self.create_inode(path, vec![0; len], vec![0; len])
+    }
+
+    fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        // No create-time sync (M2.5-S01): the OS sees the `set_len` length,
+        // the journal has not committed it — a cut before the caller's
+        // barrier leaves the file at 0 or at the end of whichever pending
+        // piece survived, never at the prealloc length (F-L04-05,
+        // ADR-0119 A2). A barrier on the fd makes the length durable.
+        let len = usize::try_from(prealloc_bytes).expect("prealloc fits usize");
+        self.create_inode(path, vec![0; len], Vec::new())
+    }
+
+    fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        // Synced at create like the std tier (empty either way); `Direct`
+        // flags the inode so every tier write is alignment-asserted — the
+        // `O_DIRECT` contract the fault points broke unseen while the sim
+        // took the mode-blind default (F-L04-14, ADR-0119 A1).
+        self.create_inode_full(path, Vec::new(), Vec::new(), 0, mode == TierIoMode::Direct, false)
+    }
+
+    /// Same per-inode shape as [`open_segment_append`](Self::open_segment_append)
+    /// (F-L04-07's caveat applies to both).
+    fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        let file = self.open_write(path)?;
+        let mut state = self.state.borrow_mut();
+        let ino = state.ino_of(path)?;
+        let inode = state.inodes.get_mut(&ino).expect("ino_of resolved the inode");
+        inode.direct = mode == TierIoMode::Direct;
+        Ok(file)
     }
 
     fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {

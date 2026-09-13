@@ -1,0 +1,18 @@
+test tier_short_write_injects_on_a_direct_tier_file ... FAILED
+test blob_short_write_injects_on_a_direct_extent ... FAILED
+test tier_torn_frame_keeps_the_old_sectors_beyond_the_tear ... FAILED
+test tier_footer_torn_injects_on_a_direct_tier_file ... FAILED
+test tier_torn_frame_injects_on_a_direct_tier_file ... FAILED
+test tier_torn_frame_lands_on_a_real_direct_fd ... FAILED
+thread 'tier_short_write_injects_on_a_direct_tier_file' (273662) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 2048 is not 4096-aligned
+thread 'blob_short_write_injects_on_a_direct_extent' (273660) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 2048 is not 4096-aligned
+thread 'tier_torn_frame_keeps_the_old_sectors_beyond_the_tear' (273664) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 2730 is not 4096-aligned
+thread 'tier_footer_torn_injects_on_a_direct_tier_file' (273661) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 12 is not 4096-aligned
+thread 'tier_torn_frame_injects_on_a_direct_tier_file' (273663) panicked at crates/inf-log/src/fs/sim.rs:1114:9:
+assertion `left == right` failed: direct write length 2730 is not 4096-aligned
+thread 'tier_torn_frame_lands_on_a_real_direct_fd' (273665) panicked at tests/crash-matrix/tests/tier_direct.rs:262:5:
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

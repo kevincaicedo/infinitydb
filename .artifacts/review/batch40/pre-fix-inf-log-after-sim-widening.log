@@ -1,0 +1,370 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 107 tests
+test blob::tests::names_parse_back_and_foreign_names_do_not ... ok
+test blob::tests::staging_stays_bounded_regardless_of_value_size ... ok
+test blob::tests::listing_returns_extent_ids_only_and_tolerates_absence ... ok
+test blob::tests::a_torn_image_is_incomplete_never_a_panic ... ok
+test ckpt::tests::counts_hop_fallback_covers_every_v2_section_class ... ok
+test blob::tests::unlink_reclaims_and_the_fault_defers_nonfatally ... ok
+test blob::tests::quarantine_revive_and_second_verdict_lifecycle ... ok
+test ckpt::tests::every_section_block_costs_two_dependent_reads ... ok
+test blob::tests::the_header_is_the_ground_truth_the_sweep_reads ... ok
+test ckpt::tests::every_section_class_is_bounded_by_the_loader_config ... ok
+test ckpt::tests::derived_checkpoint_interval_is_clamped_to_the_recovery_gate ... ok
+test ckpt::tests::idx_sidecar_sections_round_trip_and_audit ... ok
+test ckpt::tests::staging_orphan_never_parses_as_complete ... ok
+test ckpt::tests::counts_peek_matches_the_streamed_footer ... ok
+test ckpt::tests::round_trips_and_audits ... ok
+test ckpt::tests::the_footer_probe_hits_with_an_empty_namespace ... ok
+test ckpt::tests::v2_live_set_round_trips_and_audits ... ok
+test commit::tests::a_due_frame_waits_behind_in_flight_plain_frames_then_links ... ok
+test commit::tests::always_traffic_makes_the_frame_sync ... ok
+test commit::tests::boot_barrier_completion_never_covers_data ... ok
+test commit::tests::boot_barriers_fence_acks_by_ledger_order ... ok
+test ckpt::tests::blob_ref_sections_round_trip_and_audit ... ok
+test ckpt::tests::version_gates_hold ... ok
+test commit::tests::completion_issue_fires_only_with_a_reserved_linked_slot ... ok
+test commit::tests::dues_accumulate_behind_the_in_flight_sync ... ok
+test commit::tests::everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight ... ok
+test commit::tests::everysec_tick_is_free_when_clean_and_dedupes_against_pending ... ok
+test ckpt::tests::v3_refuses_a_non_zero_padding_byte ... ok
+test commit::tests::failed_fsync_freezes_the_watermark ... ok
+test commit::tests::late_front_write_fills_the_reorder_window_then_the_plan_waits ... ok
+test commit::tests::k_write_through_frames_in_flight_ack_only_on_the_prefix ... ok
+test commit::tests::linked_fsync_latency_rebases_at_write_completion ... ok
+test commit::tests::pipeline_bound_two_allows_a_second_linked_sync_and_no_more ... ok
+test commit::tests::prealloc_barrier_is_coverage_neutral ... ok
+test commit::tests::queueing_into_a_full_reorder_window_panics - should panic ... ok
+test commit::tests::rebase_clock_ignores_completed_and_failed_tickets ... ok
+test commit::tests::recycled_segment_frames_are_fenced_behind_the_rename_barrier ... ok
+test commit::tests::standalone_covers_written_not_queued ... ok
+test commit::tests::watermark_advances_only_on_completion_and_by_done_prefix ... ok
+test commit::tests::write_through_completes_at_log_written_and_skips_the_pipeline_bound ... ok
+test commit::tests::write_through_in_flight_does_not_block_a_flush_class_sync ... ok
+test commit::tests::write_through_is_never_held_and_a_seal_ahead_restores_the_prefix ... ok
+test commit::tests::write_through_requires_the_durable_prefix ... ok
+test blob::tests::extent_round_trips_across_frame_boundaries ... ok
+test commit::tests::written_for_a_popped_frame_panics - should panic ... ok
+test ckpt::tests::v3_block_stays_aligned_when_a_record_outruns_the_section_target ... ok
+test commit::tests::written_prefix_is_completion_ordered ... ok
+test commit::tests::zero_fill_barrier_is_coverage_neutral ... ok
+test effect::tests::every_effect_round_trips_through_its_record ... ok
+test flush::tests::drive_flip_with_a_staged_round_panics - should panic ... ok
+test flush::tests::a_failed_creation_stages_nothing ... ok
+test flush::tests::a_failed_rotation_keeps_only_the_seal_it_staged ... ok
+test flush::tests::drive_flip_with_staged_seam_frames_panics - should panic ... ok
+test flush::tests::fsync_failure_is_fatal_typed ... ok
+test flush::tests::non_contiguous_range_without_gap_seal_panics - should panic ... ok
+test flush::tests::capacity_rotation_seals_at_range_boundaries ... ok
+test ckpt::tests::file_names_round_trip ... ok
+test flush::tests::queued_gap_orders_seal_before_crossing ... ok
+test frame::tests::first_lsn_offset_past_the_offset_ceiling_is_a_decode_error ... ok
+test frame::tests::first_lsn_offset_inside_the_header_is_a_decode_error ... ok
+test flush::tests::sealed_handles_drain_once_in_seal_order ... ok
+test flush::tests::gap_seal_and_confirmable_end ... ok
+test fs::sim::stall_tests::plain_writes_defer_only_when_armed_and_off_the_flush_timeline ... ok
+test frame::tests::frame_ending_at_the_offset_ceiling_decodes_and_walks ... ok
+test fs::sim::stall_tests::bandwidth_term_queues_every_class_on_one_byte_timeline ... ok
+test fs::sim::stall_tests::power_cut_resets_the_timeline_but_not_the_stream ... ok
+test fs::sim::stall_tests::unarmed_disk_schedules_nothing ... ok
+test fs::sim::stall_tests::wedge_delays_every_nth_plain_write_only ... ok
+test lsn::tests::advance_stays_in_segment ... ok
+test blob::tests::short_reads_are_looped_never_reported_as_corruption ... ok
+test lsn::tests::lsn_orders_by_segment_then_offset ... ok
+test fs::sim::stall_tests::episodes_wedge_the_device_for_tens_of_ms ... ok
+test lsn::tests::segment_len_bound_is_the_representable_end ... ok
+test fs::sim::stall_tests::schedule_is_deterministic_and_fifo ... ok
+test lsn::tests::to_u64_preserves_order ... ok
+test flush::tests::queued_capacity_seal_commits_at_completion ... ok
+test manifest::tests::every_field_violation_is_named ... ok
+test manifest::tests::roundtrip_is_byte_exact ... ok
+test manifest::tests::legacy_epochs_are_refused_by_name ... ok
+test manifest::tests::every_tier_violation_is_named ... ok
+test flush::tests::queued_round_defers_durability_to_completion ... ok
+test record::tests::all_variants_round_trip ... ok
+test manifest::tests::tiered_roundtrip_and_truncation ... ok
+test ckpt::tests::v3_covers_every_section_class ... ok
+test record::tests::ckpt_begin_rejects_trailing_bytes ... ok
+test record::tests::cold_displace_round_trips_canonically ... ok
+test record::tests::key_overrun_is_detected ... ok
+test record::tests::truncation_is_detected ... ok
+test record::tests::unknown_type_and_flags_fail_stop ... ok
+test segment::tests::segment_names_are_canonical ... ok
+test tier::tests::seal_footer_inspect_round_trip ... ok
+test staging::frames_in_flight_tests::auto_is_class_derived_and_fixed_wins ... ok
+test ckpt::tests::v3_round_trips_on_aligned_blocks_and_audits ... ok
+test tier::tests::tail_frame_extends_across_syncs ... ok
+test flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch ... ok
+test tier::tests::non_contiguous_append_panics - should panic ... ok
+test tier::tests::round_refuses_the_257th_op - should panic ... ok
+test tier::tests::corruption_is_detected_per_frame ... ok
+test tier::tests::inspect_rejects_hostile_images_typed ... ok
+test tier::tests::recover_seal_refuses_mismatch_and_corruption ... ok
+test tier::tests::direct_mode_round_trip_on_real_fs ... ok
+test tier::tests::recover_seal_truncates_to_the_manifested_watermark ... ok
+test tier::tests::append_sync_extract_round_trip ... ok
+test blob::tests::write_faults_abandon_the_extent_typed ... ok
+test ckpt::tests::v2_hybrid_round_trips_and_audits ... ok
+test ckpt::tests::single_byte_corruption_is_always_caught ... ok
+test ckpt::tests::a_partial_section_never_grows_past_the_loader_bound ... ok
+
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+
+     Running tests/boot_scan.rs (target/debug/deps/boot_scan-a20045ec14ff726c)
+
+running 6 tests
+test empty_dir_is_a_clean_fresh_boot ... ok
+test missing_dir_is_io_error ... ok
+test padded_duplicate_is_named ... ok
+test interior_gap_is_named ... ok
+test contiguous_ranges_scan_clean ... ok
+test foreign_files_are_named ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/direct_segments.rs (target/debug/deps/direct_segments-2a9b634f7e8ac8d4)
+
+running 17 tests
+test frames_above_fua_max_are_not_write_through ... ok
+test frame_iter_follows_each_frames_successor_rule ... ok
+test not_ready_rotation_waits_for_the_slice_then_degrades_loudly ... ok
+test reopen_reads_the_prezeroed_fact_from_the_file ... ok
+test zero_fill_then_class_upgrade_rotation ... ok
+test reader_skips_padding_across_window_boundaries ... ok
+test sim_write_through_needs_no_fdatasync ... ok
+test packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation ... ok
+test direct_rotor_on_memfs_writes_aligned_write_through_frames ... ok
+test v3_frame_is_v2_with_an_aligned_successor ... ok
+test sim_write_through_into_a_hole_rides_the_cut ... ok
+test sim_write_through_is_durable_and_supersedes_overlaps ... ok
+test std_direct_segment_reports_allocation_honestly ... ok
+test tail_scan_skips_v3_padding ... ok
+test reopen_after_a_torn_zero_fill_runs_flush_class ... ok
+test sim_torn_zero_fill_is_not_fully_allocated ... ok
+test zero_fill_is_paced_by_the_active_segments_fill ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/fault_points.rs (target/debug/deps/fault_points-33794f6f3a0f53ed)
+
+running 8 tests
+test dir_fsync_fail_fires_at_every_barrier_class ... ok
+test manifest_rename_fail_leaves_the_old_unit_authoritative ... ok
+test log_append_short_write_fails_the_append_and_leaves_a_short_prefix ... ok
+test torn_frame_lands_a_prefix_and_lies ... ok
+test power_cut_after_seal_leaves_a_durable_sealed_segment ... ok
+test dir_fsync_fail_fires_at_the_recycle_rename_barrier ... ok
+test fsync_err_fails_the_seal_typed_and_non_recoverable ... ok
+test prealloc_no_space_fires_the_enospc_discipline ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/frame_roundtrip.rs (target/debug/deps/frame_roundtrip-b12bfa1455608bb4)
+
+running 5 tests
+test builder_reuse_is_clean ... ok
+test minimal_frame_round_trips ... ok
+test truncation_never_decodes ... ok
+test single_byte_corruption_is_detected ... ok
+test frames_round_trip_byte_exact ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/group_commit_loop.rs (target/debug/deps/group_commit_loop-0832edb886b4a4a6)
+
+running 9 tests
+test failed_write_cancels_linked_fsync_and_freezes_watermark ... ok
+test fsync_failure_freezes_watermark_and_emits_zero_acks ... ok
+test everysec_only_load_never_touches_the_gate ... ok
+test short_write_delivers_exactly_one_sync_after_full_coverage ... ok
+test log_ops_ride_the_single_iteration_submit ... ok
+test mixed_load_one_write_per_iteration_replays_identically ... ok
+test four_frames_in_flight_pipeline_rotates_drained_and_replays_identically ... ok
+test every_seal_gets_its_fsync_and_segments_replay ... ok
+test everysec_fires_within_tolerance_24h_virtual ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.98s
+
+     Running tests/manifest_swap.rs (target/debug/deps/manifest_swap-ddd176c6b3441272)
+
+running 3 tests
+test old_unit_survives_until_the_new_manifest_is_durable ... ok
+test gaps_below_the_floor_are_stale_not_errors ... ok
+test crash_at_every_swap_step_recovers_old_or_new_never_both_partial ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/meta_swap.rs (target/debug/deps/meta_swap-25ed2c5abb0500da)
+
+running 11 tests
+test empty_payload_round_trips ... ok
+test bad_magic_is_named ... ok
+test flipped_payload_byte_is_a_crc_mismatch ... ok
+test fsync_failure_aborts_the_swap_and_preserves_old_meta ... ok
+test rewrite_replaces_previous_payload ... ok
+test absent_meta_reads_none ... ok
+test round_trip_over_mem_fs ... ok
+test stale_staging_debris_does_not_break_the_next_swap ... ok
+test trailing_bytes_are_a_length_mismatch ... ok
+test truncated_file_is_named ... ok
+test std_fs_round_trip_smoke ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reader_roundtrip.rs (target/debug/deps/reader_roundtrip-f78c69e06768aff8)
+
+running 9 tests
+test foreign_bytes_at_a_frame_boundary_are_bad_magic ... ok
+test interior_corruption_is_a_typed_error_never_a_skip ... ok
+test misdirected_frame_is_an_lsn_mismatch ... ok
+test read_end_feeds_open_existing_round_trip ... ok
+test tail_ends_are_facts_zero_tail_and_file_end ... ok
+test next_step_carries_the_end_and_repeats_a_terminal_error ... ok
+test torn_tail_surfaces_as_typed_truncation_facts ... ok
+test random_grouping_and_geometry_round_trip ... ok
+test million_random_writes_replay_byte_identically ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+     Running tests/residue_scan_cost.rs (target/debug/deps/residue_scan_cost-6a1ed660ab46587c)
+
+running 1 test
+test residue_scan_cost ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/segment_lifecycle.rs (target/debug/deps/segment_lifecycle-1c9885d2e99f14cf)
+
+running 8 tests
+test edquot_is_the_disk_full_class ... ok
+test fsync_failure_on_seal_is_fatal ... ok
+test oversized_frame_is_rejected ... ok
+test enospc_surfaces_in_maintain_before_writes_need_it ... ok
+test time_seal_fires_only_when_configured_and_dirty ... ok
+test std_fs_lifecycle_smoke ... ok
+test rotation_is_pointer_swap_with_preallocated_next ... ok
+test unmaintained_rotation_counts_inline_prealloc ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/segment_prealloc_wait.rs (target/debug/deps/segment_prealloc_wait-1b5c6e91187680b7)
+
+running 13 tests
+test policy_spellings_round_trip ... ok
+test the_first_generation_after_boot_preallocates_at_once ... ok
+test an_empty_pool_expires_the_wait_into_exactly_one_fresh_fallback_at_the_bound ... ok
+test a_packed_tail_reopened_buffered_never_waits ... ok
+test the_eighth_bound_expires_at_an_eighth ... ok
+test enospc_on_the_fallback_is_found_at_the_bound_and_retries_without_a_second_wait ... ok
+test pool_arrival_before_the_bound_satisfies_the_wait_with_the_recycled_segment ... ok
+test time_sealing_rotors_never_wait ... ok
+test the_immediate_policy_never_waits ... ok
+test a_pool_arrival_after_expiry_serves_the_following_generation ... ok
+test a_pool_arrival_whose_open_fails_ends_the_wait_and_falls_back_fresh ... ok
+test a_recovered_prezeroed_tail_preallocates_at_once_then_waits_from_its_second_generation ... ok
+test the_fallbacks_zero_fill_is_paced_from_its_origin_and_completes_before_rotation ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running tests/segment_recycle.rs (target/debug/deps/segment_recycle-42da549f852bdcd2)
+
+running 9 tests
+test an_empty_pool_is_a_counted_miss_that_zero_fills ... ok
+test foreign_segment_fuzz_seed ... ok
+test a_failed_rename_falls_back_to_a_fresh_prealloc ... ok
+test pool_is_bounded_and_the_overflow_is_unlinked ... ok
+test recycling_off_or_buffered_never_pools ... ok
+test a_pooled_file_that_reads_sparse_falls_back_to_the_fill ... ok
+test recycled_residue_reads_as_foreign_segment_frames_never_data ... ok
+test a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor ... ok
+test covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_disk.rs (target/debug/deps/sim_disk-946b0a0c4018c3c3)
+
+running 11 tests
+test handles_follow_inodes_and_cross_dir_renames_refuse ... ok
+test cut_after_ops_kills_then_power_cut_revives ... ok
+test fsync_is_the_only_data_barrier ... ok
+test remove_without_dir_fsync_may_resurrect ... ok
+test driver_ops_execute_against_the_same_layers ... ok
+test create_without_dir_fsync_may_vanish_despite_fdatasync ... ok
+test metadata_survival_is_a_prefix_of_issue_order ... ok
+test un_synced_overwrites_reorder ... ok
+test rename_is_ordered_only_by_dir_fsync ... ok
+test same_seed_yields_byte_identical_surviving_image ... ok
+test tears_have_sector_granularity ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_faults.rs (target/debug/deps/sim_faults-d9269ed83992280e)
+
+running 3 tests
+test write_eio_lands_nothing ... ok
+test read_eio_is_one_file_one_op ... ok
+test recovery_read_eio_is_typed_never_a_torn_tail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/staging_alloc.rs (target/debug/deps/staging_alloc-dcdd6eb5bdf5e9c1)
+
+running 1 test
+test append_path_performs_zero_heap_allocations ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/staging_ring.rs (target/debug/deps/staging_ring-62148dda98e36b80)
+
+running 6 tests
+test stale_token_is_rejected_by_generation_check - should panic ... ok
+test backlogged_ring_keeps_staging_and_stays_bounded ... ok
+test full_ring_refuses_with_typed_backpressure_and_bounded_memory ... ok
+test ring_of_k_plus_one_buffers_releases_leases_in_any_order ... ok
+test accounting_is_exact_at_every_append_and_drain_site ... ok
+test storm_loses_and_reorders_nothing ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tail_bounds.rs (target/debug/deps/tail_bounds-61312ab473fbea0b)
+
+running 3 tests
+test largest_representable_segment_keeps_exact_offsets ... ok
+test oversized_segment_is_invalid_data ... ok
+test oversized_segment_is_refused_by_the_replay_reader ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tail_scan.rs (target/debug/deps/tail_scan-bcd42a3520a8d816)
+
+running 11 tests
+test frame_spanning_the_chunk_boundary_is_found ... ok
+test garbage_before_a_validating_frame_still_finds_the_frame ... ok
+test magic_at_eof_without_room_is_garbage ... ok
+test from_beyond_file_size_is_all_zero ... ok
+test mislocated_remnant_frame_is_garbage_not_data ... ok
+test magic_claiming_more_bytes_than_the_file_holds_is_garbage ... ok
+test crc_damaged_frame_is_garbage_not_data ... ok
+test pristine_tail_is_all_zero ... ok
+test remnant_bytes_without_a_frame_are_garbage ... ok
+test zero_runs_larger_than_the_window_are_skipped ... ok
+test validating_frame_after_a_zero_gap_is_found ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/watermark_acks.rs (target/debug/deps/watermark_acks-89ce6aabe0650f29)
+
+running 2 tests
+test no_ack_before_covering_fsync_across_random_schedules ... ok
+test wake_storm_50k_drains_under_the_execute_budget ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+   Doc-tests inf_log
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

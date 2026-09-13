@@ -30,6 +30,17 @@
 //! | `tier_write_nospace` | `tier::device_write` | `StorageFull`-kind write refusal, no byte lands (M4-S21, ADR-0063 D4): the flush slice fails typed, the store latches its device leg, MAINTAIN retries — a later success clears the latch (recovery is automatic). `FromNth` arming models "disk stays full" |
 //! | `blob_write_nospace` | `blob::device_write` | `StorageFull`-kind write refusal, no byte lands (M4-S21, ADR-0063 D4): the extent is abandoned typed (`DISKFULL` at the caller), never latched — the next attempt is its own recovery probe |
 //!
+//! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
+//! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the
+//! 512 B sector grid as whole 4 KiB blocks (`tier::write_torn_prefix`;
+//! byte-granular only on a packed `Buffered` segment): the sectors
+//! beyond the tear keep their prior on-device content. A sub-block
+//! prefix is refused `EINVAL` by an `O_DIRECT` fd and asserted by the
+//! sim on a `Direct` inode — the points once wrote one and never
+//! injected on the default tier mode. `tier_footer_torn` lands the
+//! whole footer block with its CRC cover torn (the probe's CRC-refuse
+//! input).
+//!
 //! The reactor-tier analogs (driver `LogWrite`/`Fdatasync` failures) are
 //! injected by the scripted driver today and by the M2-S18 sim disk,
 //! which consumes this same registry for power-cut scheduling.

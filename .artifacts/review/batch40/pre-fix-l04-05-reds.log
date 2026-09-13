@@ -1,0 +1,10 @@
+test deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail ... FAILED
+thread 'deferred_prealloc_reboots_short_and_reopens_as_the_empty_tail' (272475) panicked at crates/inf-log/tests/prealloc_unsynced.rs:73:5:
+assertion `left == right` failed: unsynced prealloc: length lost
+  left: 65536
+ right: 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test unsynced_prealloc_length_is_pending_until_a_barrier ... FAILED
+thread 'unsynced_prealloc_length_is_pending_until_a_barrier' (272488) panicked at crates/inf-log/tests/sim_disk.rs:380:20:
+seed 0: length 4096 — the prealloc length is not durable
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

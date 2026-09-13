@@ -1,0 +1,14 @@
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test tier_footer_torn_reseal_at_watermark ... FAILED
+thread 'tier_footer_torn_reseal_at_watermark' (275230) panicked at tests/crash-matrix/tests/tier.rs:224:46:
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p crash-matrix --test tier`
+test tier_footer_torn_injects_on_a_direct_tier_file ... FAILED
+thread 'tier_footer_torn_injects_on_a_direct_tier_file' (275238) panicked at tests/crash-matrix/tests/tier_direct.rs:170:46:
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p crash-matrix --test tier_direct`
+error: 2 targets failed:
+=== ext4 leg
+test tier_torn_frame_lands_on_a_real_direct_fd ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.01s

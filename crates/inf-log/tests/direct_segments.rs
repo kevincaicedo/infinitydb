@@ -801,3 +801,46 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
     assert_eq!(rotor.stats().reopened_packed_tails, 0);
 }
+
+// ---- F-L04-14 sibling: the sync tier's injecting points on a Direct segment ----
+
+/// Goal: `torn_frame` and `log_append_short_write` inject on a `Direct`
+/// segment at the sync tier (`commit_frame` — the staging ring's path):
+/// the landed prefix is sector-granular, whole-block shaped, and the
+/// torn frame never decodes. Method: `SimDisk` asserts the O_DIRECT
+/// contract on the direct inode; before the fix both points wrote a
+/// sub-block prefix and died in that assertion.
+#[test]
+fn sync_tier_torn_points_inject_on_a_direct_segment() {
+    use inf_foundation::fault::{self, FaultSpec};
+    fault::disarm_all();
+    for (point, succeeds) in [("torn_frame", true), ("log_append_short_write", false)] {
+        let disk = SimDisk::new();
+        let dir = PathBuf::from("log");
+        disk.create_dir_all(&dir).expect("dir");
+        let mut rotor = SegmentRotor::create_fresh(disk.clone(), dir.clone(), direct_cfg(64 << 10))
+            .expect("fresh");
+        // A ~3 KiB record: the frame's CRC sits past every tear below, so
+        // the torn block never decodes (a ~250-byte frame would survive
+        // whole inside the first sector — honest, but vacuous here).
+        let mut b = FrameBuilder::new();
+        b.append(&RecordView::StringPostImage { ns: NsId(1), key: b"key", value: &[0x5A; 3000] });
+        let slot = rotor.begin_frame(b.frame_len(), 0).expect("reserve");
+        let frame = b.finalize(slot.first_record_lsn(), stamp(1), FrameLayout::Aligned).to_vec();
+        assert_eq!(frame.len() as u32, FRAME_ALIGN, "one aligned block");
+        fault::arm(point, FaultSpec::Nth(1));
+        let outcome = rotor.commit_frame(slot, &frame);
+        assert_eq!(fault::fired(point), 1, "{point} fired");
+        fault::disarm_all();
+        assert_eq!(outcome.is_ok(), succeeds, "{point}: {outcome:?}");
+        let image = disk.contents(&dir.join("seg-000000.ilog")).expect("exists");
+        let cut = if succeeds { 4096 * 2 / 3 / 512 * 512 } else { 2048 };
+        assert_eq!(&image[..cut], &frame[..cut], "{point}: the sector-rounded prefix landed");
+        assert!(image[cut..4096].iter().all(|&b| b == 0), "{point}: nothing beyond the tear");
+        assert_eq!(
+            FrameIter::new(&image, DEFAULT_MAX_FRAME_LEN).filter_map(Result::ok).count(),
+            0,
+            "{point}: the torn frame never decodes"
+        );
+    }
+}
