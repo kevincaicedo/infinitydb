@@ -387,11 +387,74 @@ fn reopen_reads_the_prezeroed_fact_from_the_file() {
     assert!(rotor.active_write_through());
 }
 
+/// F-L04-01 at the rotor: the whole zero-fill written, its barrier lost to
+/// the cut. On every seed where the top sector survived the segment has
+/// its full length with holes under it (32 sectors at a 1/2 coin: an
+/// intact image is a 2⁻³² event), and the reopened rotor must run FLUSH
+/// class. The old sim read the length alone and reopened write-through.
+#[test]
+fn reopen_after_a_torn_zero_fill_runs_flush_class() {
+    let dir = PathBuf::from("log");
+    let segment_bytes = 16 << 10;
+    let mut full_length_seeds = 0;
+    for seed in 0..32u64 {
+        let disk = SimDisk::new();
+        disk.create_dir_all(&dir).expect("dir");
+        {
+            let mut rotor = SegmentRotor::create_fresh_deferred(
+                disk.clone(),
+                dir.clone(),
+                direct_cfg(segment_bytes),
+            )
+            .expect("fresh");
+            rotor.maintain_deferred(0).expect("maintain");
+            disk.sync_dir(&dir).expect("names durable");
+            // Every slice written, the barrier owed but never issued.
+            while let Some(slice) = rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
+                let zeros = vec![0u8; slice.len as usize];
+                disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+                rotor.note_zero_slice_written();
+            }
+            assert!(rotor.take_zero_fill_barrier().is_some(), "barrier owed");
+        }
+        disk.power_cut(seed);
+        let next = dir.join("seg-000001.ilog");
+        let len = disk.contents(&next).expect("name survives").len();
+        if len != segment_bytes as usize {
+            continue;
+        }
+        full_length_seeds += 1;
+        let scanned = inf_log::scan_log_dir(&disk, &dir).expect("scan");
+        let rotor = SegmentRotor::open_existing(
+            disk.clone(),
+            dir.clone(),
+            direct_cfg(segment_bytes),
+            &scanned,
+            0,
+        )
+        .expect("reopen");
+        assert_eq!(rotor.active_segment(), SegmentId(1));
+        assert!(
+            !rotor.active_write_through(),
+            "seed {seed}: a full-length torn fill reopened write-through"
+        );
+    }
+    assert!(full_length_seeds > 0, "no seed kept the top sector — nothing tested");
+}
+
 // ---- SimDisk write-through model ------------------------------------------
 
-/// A write-through lands durably at completion, supersedes the pending
-/// writes it overlaps (a later FUA-acknowledged write cannot be
-/// resurrected over), and leaves later plain writes to the cut's coin.
+/// Zero-fills `[0, len)` through the driver and commits the mapping with
+/// the barrier — the ADR-0086 D4 discipline a write-through relies on.
+fn commit_extent(disk: &SimDisk, fd: i32, len: usize) {
+    disk.driver_write_at(fd, 0, &vec![0u8; len]).expect("zero-fill");
+    disk.driver_fdatasync(fd).expect("barrier");
+}
+
+/// A write-through onto a committed extent lands durably at completion,
+/// supersedes the pending writes it overlaps (a later FUA-acknowledged
+/// write cannot be resurrected over), and leaves later plain writes to
+/// the cut's coin.
 #[test]
 fn sim_write_through_is_durable_and_supersedes_overlaps() {
     let disk = SimDisk::new();
@@ -401,6 +464,7 @@ fn sim_write_through_is_durable_and_supersedes_overlaps() {
     let file = disk.create_segment(&path, 0).expect("create");
     disk.sync_dir(dir).expect("name");
     let fd = file.raw_fd().expect("sim fd");
+    commit_extent(&disk, fd, 14);
     // Pending plain write over [0, 8), then a write-through over [4, 12).
     disk.driver_write_at(fd, 0, &[1u8; 8]).expect("plain");
     disk.driver_write_through(fd, 4, &[2u8; 8]).expect("through");
@@ -422,6 +486,7 @@ fn sim_write_through_is_durable_and_supersedes_overlaps() {
         let file = disk.create_segment(&path, 0).expect("create");
         disk.sync_dir(dir).expect("name");
         let fd = file.raw_fd().expect("sim fd");
+        commit_extent(&disk, fd, 14);
         disk.driver_write_at(fd, 0, &[1u8; 8]).expect("plain");
         disk.driver_write_through(fd, 4, &[2u8; 8]).expect("through");
         disk.driver_write_at(fd, 10, &[3u8; 4]).expect("plain");
@@ -432,13 +497,17 @@ fn sim_write_through_is_durable_and_supersedes_overlaps() {
             assert!(b == 0 || b == 1, "seed {seed}: byte {i} is the plain write or zero");
         }
         for (i, &b) in image[10..].iter().enumerate() {
-            assert!(b == 2 || b == 3, "seed {seed}: byte {} is old-through or new-plain", 10 + i);
+            // Past the through's end the committed extent's zero shows
+            // where the plain write was lost.
+            let legal = if 10 + i < 12 { b == 2 || b == 3 } else { b == 0 || b == 3 };
+            assert!(legal, "seed {seed}: byte {} is old-through, new-plain or zero", 10 + i);
         }
     }
 }
 
 /// `FsyncLies`-class behavior is the driver's business; the disk itself
-/// must count a write-through as durable with no barrier at all.
+/// must count a write-through onto a committed extent as durable with no
+/// barrier of its own.
 #[test]
 fn sim_write_through_needs_no_fdatasync() {
     let disk = SimDisk::new();
@@ -448,9 +517,78 @@ fn sim_write_through_needs_no_fdatasync() {
     let file = disk.create_segment(&path, 0).expect("create");
     disk.sync_dir(dir).expect("name");
     let fd = file.raw_fd().expect("sim fd");
+    commit_extent(&disk, fd, 512);
     disk.driver_write_through(fd, 0, b"durable").expect("through");
     disk.power_cut(7);
-    assert_eq!(disk.contents(&path).expect("survives"), b"durable");
+    assert_eq!(&disk.contents(&path).expect("survives")[..7], b"durable");
+}
+
+/// F-L04-01 / ADR-0119 D1: a write-through into a hole is data under a
+/// mapping no barrier committed — it rides the cut's coin like a plain
+/// write (some seeds keep it, some lose it), never "durable at
+/// completion". The sim's old model kept it on every seed, which is why
+/// a rotor that *assumed* pre-zeroing could never lose a frame here.
+#[test]
+fn sim_write_through_into_a_hole_rides_the_cut() {
+    let dir = Path::new("d");
+    let path = dir.join("f");
+    let (mut kept, mut lost) = (0, 0);
+    for seed in 0..64u64 {
+        let disk = SimDisk::new();
+        disk.create_dir_all(dir).expect("dir");
+        let file = disk.create_segment(&path, 0).expect("create");
+        disk.sync_dir(dir).expect("name");
+        let fd = file.raw_fd().expect("sim fd");
+        disk.driver_write_through(fd, 0, b"durable").expect("through");
+        disk.power_cut(seed);
+        match disk.contents(&path).expect("name survives").as_slice() {
+            b"durable" => kept += 1,
+            b"" => lost += 1,
+            other => panic!("seed {seed}: torn to {other:?}"),
+        }
+    }
+    assert!(kept > 0 && lost > 0, "the coin must fall both ways ({kept} kept, {lost} lost)");
+}
+
+/// F-L04-01: a torn zero-fill — full length because the top sector
+/// survived, holes underneath — reads `fully_allocated() == false`, as
+/// `st_blocks` does on the device. The old length-based rule read `true`
+/// on every such seed and sent the rotor's FUA frames into holes. The
+/// fill is a non-zero pattern so a lost sector is visible in the image.
+#[test]
+fn sim_torn_zero_fill_is_not_fully_allocated() {
+    let dir = Path::new("d");
+    let path = dir.join("seg");
+    let target = 64usize << 10;
+    let (mut full_length, mut torn_at_full_length) = (0, 0);
+    for seed in 0..64u64 {
+        let disk = SimDisk::new();
+        disk.create_dir_all(dir).expect("dir");
+        let file = disk.create_segment_direct(&path, target as u64).expect("create");
+        disk.sync_dir(dir).expect("name");
+        let fd = file.raw_fd().expect("sim fd");
+        assert!(!file.fully_allocated().expect("fact"), "born sparse");
+        for piece in 0..target / 4096 {
+            disk.driver_write_at(fd, (piece * 4096) as u64, &[0xAB; 4096]).expect("fill");
+        }
+        assert!(file.fully_allocated().expect("fact"), "written through, barrier pending");
+        drop(file);
+        disk.power_cut(seed);
+        let image = disk.contents(&path).expect("name survives");
+        let hole = image.iter().any(|&b| b != 0xAB);
+        let file = disk.open_segment_append(&path, SegmentIoMode::Direct).expect("open");
+        let allocated = file.fully_allocated().expect("fact");
+        assert_eq!(
+            allocated,
+            image.len() == target && !hole,
+            "seed {seed}: len {} hole {hole}",
+            image.len()
+        );
+        full_length += u64::from(image.len() == target);
+        torn_at_full_length += u64::from(image.len() == target && hole);
+    }
+    assert!(full_length > 0, "no seed kept the top sector");
+    assert!(torn_at_full_length > 0, "no seed tore under a full length — nothing tested");
 }
 
 // ---- std tier: the pre-zeroing fact -------------------------------------

@@ -264,10 +264,11 @@ I	2	crates/inf-log/src/fs.rs	expect	offset fits usize	u64 → usize is lossless 
 I	1	crates/inf-log/src/fs.rs	expect	prealloc fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	1	crates/inf-log/src/fs/sim.rs	assert_eq	direct write length {len} is not {align}-aligned	the simulator's O_DIRECT oracle: a misaligned direct write is the ADR-0091 invariant the sim exists to catch (DST-only drive)
 I	1	crates/inf-log/src/fs/sim.rs	assert_eq	direct write offset {offset} is not {align}-aligned	the simulator's O_DIRECT oracle: a misaligned direct write is the ADR-0091 invariant the sim exists to catch (DST-only drive)
-I	2	crates/inf-log/src/fs/sim.rs	expect	ino_of resolved the inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
+I	3	crates/inf-log/src/fs/sim.rs	expect	ino_of resolved the inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
 I	1	crates/inf-log/src/fs/sim.rs	expect	length fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	6	crates/inf-log/src/fs/sim.rs	expect	offset fits usize	u64 → usize is lossless on every supported (64-bit) target
-I	3	crates/inf-log/src/fs/sim.rs	expect	open handle pins its inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
+I	4	crates/inf-log/src/fs/sim.rs	expect	open handle pins its inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
+I	3	crates/inf-log/src/fs/sim.rs	expect	sector index fits usize	u64 → usize is lossless on every supported (64-bit) target (a sector index is a byte offset / 512)
 I	1	crates/inf-log/src/fs/sim.rs	expect	prealloc fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	1	crates/inf-log/src/fs/sim.rs	expect	sim fd fits i32	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
 I	1	crates/inf-log/src/lsn.rs	expect	LSN offset overflow	offsets are bounded by segment_bytes (u32); `SegmentWriter` reserves within the segment

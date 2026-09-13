@@ -1,0 +1,64 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+error[E0432]: unresolved import `inf_log::fs::sim::DeviceFault`
+ --> crates/inf-log/tests/sim_faults.rs:8:24
+  |
+8 | use inf_log::fs::sim::{DeviceFault, SimDisk};
+  |                        ^^^^^^^^^^^ no `DeviceFault` in `fs::sim`
+
+error[E0599]: no method named `inject` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:31:10
+   |
+31 |     disk.inject(&a, DeviceFault::ReadEio, 1).expect("armed");
+   |          ^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `faults_fired` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:35:21
+   |
+35 |     assert_eq!(disk.faults_fired(), 1);
+   |                     ^^^^^^^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `faults_fired` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:40:21
+   |
+40 |     assert_eq!(disk.faults_fired(), 1);
+   |                     ^^^^^^^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `inject` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:42:10
+   |
+42 |     disk.inject(&a, DeviceFault::ReadEio, 1).expect("armed");
+   |          ^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `faults_fired` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:47:21
+   |
+47 |     assert_eq!(disk.faults_fired(), 2);
+   |                     ^^^^^^^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `inject` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:60:10
+   |
+60 |     disk.inject(&path, DeviceFault::WriteEio, 3).expect("armed");
+   |          ^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `faults_fired` found for struct `SimDisk` in the current scope
+  --> crates/inf-log/tests/sim_faults.rs:66:21
+   |
+66 |     assert_eq!(disk.faults_fired(), 3);
+   |                     ^^^^^^^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `inject` found for struct `SimDisk` in the current scope
+   --> crates/inf-log/tests/sim_faults.rs:108:10
+    |
+108 |     disk.inject(&path, DeviceFault::ReadEio, 1).expect("armed");
+    |          ^^^^^^ method not found in `SimDisk`
+
+error[E0599]: no method named `faults_fired` found for struct `SimDisk` in the current scope
+   --> crates/inf-log/tests/sim_faults.rs:116:21
+    |
+116 |     assert_eq!(disk.faults_fired(), 1, "the armed fault fired exactly once");
+    |                     ^^^^^^^^^^^^ method not found in `SimDisk`
+
+Some errors have detailed explanations: E0432, E0599.
+For more information about an error, try `rustc --explain E0432`.
+error: could not compile `inf-log` (test "sim_faults") due to 10 previous errors

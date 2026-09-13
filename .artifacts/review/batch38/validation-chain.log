@@ -1,0 +1,31 @@
+=== just check (21:00:48)
+just check exit 1
+(docs/release-assert-inventory.tsv — ADR-0107 D2): I invariant, C caller-claim with the enforcing
+check named, F sanctioned fail-stop. An operating condition is a typed error, never a row.
+error: Recipe `check` failed on line 14 with exit code 1
+=== cargo deny check (21:00:57)
+cargo deny exit 0
+=== just sim-smoke (21:00:57)
+sim-smoke exit 0
+inf-sim: sim_seconds=33.189050 published=0 delivered=0 tier_read_fault_arm=false tier_read_faults_fired=0 tier_read_error_replies=0
+inf-sim: sim_seconds=35.227703 published=0 delivered=0 tier_read_fault_arm=true tier_read_faults_fired=2 tier_read_error_replies=2
+=== m4-tiered sweep 96 (21:01:02)
+m4-tiered sweep exit 0
+scenario=m4-tiered base_seed=0xb38a0000 sweep=96 shard=0/4 seeds_run=24 violations=0 refused=0 commands=130833 keys_audited=3418 flushed_pre_cut=18908615 cold_resolves=5028 blob_sets=10483 dir_open_fault_seeds=0 dir_open_faults_fired=0 tier_read_fault_seeds=0 
+scenario=m4-tiered base_seed=0xb38a0000 sweep=96 shard=1/4 seeds_run=24 violations=0 refused=0 commands=137644 keys_audited=3455 flushed_pre_cut=18902490 cold_resolves=5069 blob_sets=10679 dir_open_fault_seeds=12 dir_open_faults_fired=12 tier_read_fault_seeds=
+scenario=m4-tiered base_seed=0xb38a0000 sweep=96 shard=2/4 seeds_run=24 violations=0 refused=0 commands=130438 keys_audited=3376 flushed_pre_cut=16805661 cold_resolves=4926 blob_sets=10462 dir_open_fault_seeds=0 dir_open_faults_fired=0 tier_read_fault_seeds=0 
+scenario=m4-tiered base_seed=0xb38a0000 sweep=96 shard=3/4 seeds_run=24 violations=0 refused=0 commands=110056 keys_audited=3419 flushed_pre_cut=9455197 cold_resolves=4783 blob_sets=10434 dir_open_fault_seeds=0 dir_open_faults_fired=0 tier_read_fault_seeds=12 
+=== m2-durable sweep 400 (21:01:08)
+durable sweep exit 0
+scenario=m2-durable base_seed=0xd5ee0000 sweep=400 shard=0/4 plant=None replay_canary=false seeds_run=100 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classe
+scenario=m2-durable base_seed=0xd5ee0000 sweep=400 shard=1/4 plant=None replay_canary=false seeds_run=100 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classe
+scenario=m2-durable base_seed=0xd5ee0000 sweep=400 shard=2/4 plant=None replay_canary=false seeds_run=100 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classe
+scenario=m2-durable base_seed=0xd5ee0000 sweep=400 shard=3/4 plant=None replay_canary=false seeds_run=100 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut_classe
+=== m2-mode-transition sweep 200 (21:01:10)
+transition sweep exit 0
+scenario=m2-mode-transition base_seed=0x7a4e0000 sweep=200 shard=0/4 plant=None replay_canary=false seeds_run=50 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut
+scenario=m2-mode-transition base_seed=0x7a4e0000 sweep=200 shard=1/4 plant=None replay_canary=false seeds_run=50 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut
+scenario=m2-mode-transition base_seed=0x7a4e0000 sweep=200 shard=2/4 plant=None replay_canary=false seeds_run=50 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=639 c
+scenario=m2-mode-transition base_seed=0x7a4e0000 sweep=200 shard=3/4 plant=None replay_canary=false seeds_run=50 violations=0 refused=0 equivalence_checks=0 documents_compared=0 corpus_documents=0 cut
+CHAIN DONE
+just check exit 0

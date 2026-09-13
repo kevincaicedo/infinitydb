@@ -41,6 +41,15 @@ pub enum Plant {
     /// plane re-arms (its retry timer) or a `Close` returns an fd — a
     /// plane that never re-arms strands every later client (`STALL`).
     AcceptError,
+    /// One `EIO` on the next read of every tier file, armed on the sim
+    /// disk before the cold re-read sweep (`m4-tiered` phase 7; review
+    /// 2026-08-30, F-L04-02 / ADR-0119 D2): a device error under a cold
+    /// read must reach the client as the typed `ERR cold read failed`
+    /// reply and the `tiering_cold_read_errors` counter — one reply per
+    /// fault, never a nil or a stale value (the L06-02 fold). The arm
+    /// lives on the disk, not the net; `m4-tiered` also runs it on every
+    /// seed ≡ 7 (mod 8) without the flag.
+    TierReadEio,
 }
 
 #[derive(Debug, Default)]

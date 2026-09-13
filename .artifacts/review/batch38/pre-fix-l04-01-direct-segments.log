@@ -1,0 +1,52 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.99s
+     Running tests/direct_segments.rs (target/debug/deps/direct_segments-2a9b634f7e8ac8d4)
+
+running 17 tests
+test frames_above_fua_max_are_not_write_through ... ok
+test frame_iter_follows_each_frames_successor_rule ... ok
+test not_ready_rotation_waits_for_the_slice_then_degrades_loudly ... ok
+test sim_write_through_needs_no_fdatasync ... ok
+test reopen_reads_the_prezeroed_fact_from_the_file ... ok
+test direct_rotor_on_memfs_writes_aligned_write_through_frames ... ok
+test zero_fill_then_class_upgrade_rotation ... ok
+test packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation ... ok
+test v3_frame_is_v2_with_an_aligned_successor ... ok
+test reopen_after_a_torn_zero_fill_runs_flush_class ... FAILED
+test reader_skips_padding_across_window_boundaries ... ok
+test sim_write_through_is_durable_and_supersedes_overlaps ... ok
+test std_direct_segment_reports_allocation_honestly ... ok
+test sim_torn_zero_fill_is_not_fully_allocated ... FAILED
+test tail_scan_skips_v3_padding ... ok
+test sim_write_through_into_a_hole_rides_the_cut ... FAILED
+test zero_fill_is_paced_by_the_active_segments_fill ... ok
+
+failures:
+
+---- reopen_after_a_torn_zero_fill_runs_flush_class stdout ----
+
+thread 'reopen_after_a_torn_zero_fill_runs_flush_class' (24219) panicked at crates/inf-log/tests/direct_segments.rs:437:9:
+seed 1: a full-length torn fill reopened write-through
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- sim_torn_zero_fill_is_not_fully_allocated stdout ----
+
+thread 'sim_torn_zero_fill_is_not_fully_allocated' (24221) panicked at crates/inf-log/tests/direct_segments.rs:581:9:
+assertion `left == right` failed: seed 0: len 65536 hole true
+  left: true
+ right: false
+
+---- sim_write_through_into_a_hole_rides_the_cut stdout ----
+
+thread 'sim_write_through_into_a_hole_rides_the_cut' (24222) panicked at crates/inf-log/tests/direct_segments.rs:550:5:
+the coin must fall both ways (64 kept, 0 lost)
+
+
+failures:
+    reopen_after_a_torn_zero_fill_runs_flush_class
+    sim_torn_zero_fill_is_not_fully_allocated
+    sim_write_through_into_a_hole_rides_the_cut
+
+test result: FAILED. 14 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `-p inf-log --test direct_segments`

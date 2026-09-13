@@ -1,0 +1,10 @@
+inf-sim: sim_seconds=25.818905 published=0 delivered=0 tier_read_fault_arm=true tier_read_faults_fired=2 tier_read_error_replies=0
+inf-sim: VIOLATION: TIER-READ PROBE VIOLATION seed 0x7 key "k:0:0": audit observed "$3739\r\ni:0:336:i:0:336:i:0:336:i:0:336:i:0:336:i"…, probe read "$-1\r\n"
+inf-sim: VIOLATION: TIER-READ PROBE VIOLATION seed 0x7 key "k:0:12": audit observed "$3967\r\ni:0:382:i:0:382:i:0:382:i:0:382:i:0:382:i"…, probe read "$-1\r\n"
+inf-sim: VIOLATION: TIER-READ FAULT FOLDED seed 0x7: 2 device errors fired, 0 typed replies reached the client (F-L04-02 / L06-02: a device error is never a miss or a value)
+inf-sim: VIOLATION: TIER-READ FAULT UNCOUNTED seed 0x7: 2 device errors fired, tiering_cold_read_errors rose by 0
+inf-sim: sim_seconds=29.054227 published=0 delivered=0 tier_read_fault_arm=true tier_read_faults_fired=2 tier_read_error_replies=0
+inf-sim: VIOLATION: TIER-READ PROBE VIOLATION seed 0xc0ffef key "k:0:11": audit observed "$3515\r\ni:0:369:i:0:369:i:0:369:i:0:369:i:0:369:i"…, probe read "$-1\r\n"
+inf-sim: VIOLATION: TIER-READ PROBE VIOLATION seed 0xc0ffef key "k:0:13": audit observed "$3144\r\ni:0:362:i:0:362:i:0:362:i:0:362:i:0:362:i"…, probe read "$-1\r\n"
+inf-sim: VIOLATION: TIER-READ FAULT FOLDED seed 0xc0ffef: 2 device errors fired, 0 typed replies reached the client (F-L04-02 / L06-02: a device error is never a miss or a value)
+inf-sim: VIOLATION: TIER-READ FAULT UNCOUNTED seed 0xc0ffef: 2 device errors fired, tiering_cold_read_errors rose by 0
