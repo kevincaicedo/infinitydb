@@ -1,0 +1,7 @@
+== release post-fix
+test extents::tests::reviving_a_handed_out_candidate_is_refused_in_every_profile - should panic ... ok
+test extents::tests::relocating_onto_a_live_reference_is_refused_in_every_profile - should panic ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 175 filtered out; finished in 0.00s
+test flush::tests::drive_flip_with_staged_seam_frames_panics - should panic ... ok
+test flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s

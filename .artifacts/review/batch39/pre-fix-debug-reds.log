@@ -1,0 +1,6 @@
+== debug: inf-store extents
+test extents::tests::refcount_follows_the_reference_map_exactly ... ok
+test extents::tests::reviving_a_handed_out_candidate_is_refused_in_every_profile - should panic ... ok
+test extents::tests::relocating_onto_a_live_reference_is_refused_in_every_profile - should panic ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 181 filtered out; finished in 0.00s
+== debug: inf-log flush drive-switch

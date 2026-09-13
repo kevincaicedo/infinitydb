@@ -1,0 +1,23 @@
+== debug: inf-log flush (F-L04-13)
+== release: inf-store extents (F-L04-12)
+test extents::tests::refcount_follows_the_reference_map_exactly ... ok
+test extents::tests::relocating_onto_a_live_reference_is_refused_in_every_profile - should panic ... FAILED
+test extents::tests::reviving_a_handed_out_candidate_is_refused_in_every_profile - should panic ... FAILED
+note: test did not panic as expected at crates/inf-store/src/extents.rs:647:8
+note: test did not panic as expected at crates/inf-store/src/extents.rs:632:8
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.00s
+== release: inf-log flush (F-L04-13)
+== debug: inf-log flush (F-L04-13)
+test flush::tests::drive_flip_with_staged_seam_frames_panics - should panic ... FAILED
+test flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch ... FAILED
+note: test did not panic as expected at crates/inf-log/src/flush.rs:1297:8
+thread 'flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch' (129898) panicked at crates/inf-log/src/tier.rs:477:9:
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s
+== --release: inf-log flush (F-L04-13)
+test flush::tests::drive_flip_with_staged_seam_frames_panics - should panic ... FAILED
+test flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch ... FAILED
+note: test did not panic as expected at crates/inf-log/src/flush.rs:1297:8
+thread 'flush::tests::seam_window_never_reaches_the_pool_across_a_drive_switch' (130002) panicked at crates/inf-log/src/flush.rs:1284:9:
+  left: 4294967295
+ right: 0
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s

@@ -1,0 +1,32 @@
+warning[license-not-encountered]: license was not encountered
+  ┌─ /home/kcaicedo/Documents/Projects/databases/infinitydb/deny.toml:8:6
+  │
+8 │     "BSD-2-Clause",
+  │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+  ┌─ /home/kcaicedo/Documents/Projects/databases/infinitydb/deny.toml:9:6
+  │
+9 │     "BSD-3-Clause",
+  │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/kcaicedo/Documents/Projects/databases/infinitydb/deny.toml:12:6
+   │
+12 │     "ISC",
+   │      ━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/kcaicedo/Documents/Projects/databases/infinitydb/deny.toml:10:6
+   │
+10 │     "Unicode-3.0",
+   │      ━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /home/kcaicedo/Documents/Projects/databases/infinitydb/deny.toml:11:6
+   │
+11 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+cargo deny exit=0

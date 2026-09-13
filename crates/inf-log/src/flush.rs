@@ -284,11 +284,14 @@ impl<F: SegmentFs> TierFlush<F> {
     /// before any flush work (fresh creation or recovery install).
     ///
     /// # Panics
-    /// Panics with a round in flight or pending seals — the drive never
-    /// changes mid-flight.
+    /// Panics with a round in flight, pending seals, or staged frames —
+    /// the drive never changes mid-flight.
     pub fn set_drive(&mut self, drive: TierDrive) {
         assert!(self.round.is_none(), "drive change with a round in flight");
         assert!(self.pending_seals.is_empty(), "drive change with pending seals");
+        if let Some(w) = &mut self.writer {
+            w.release_batch_window(&mut self.pool);
+        }
         self.drive = drive;
     }
 
@@ -296,6 +299,13 @@ impl<F: SegmentFs> TierFlush<F> {
     #[must_use]
     pub fn drive(&self) -> TierDrive {
         self.drive
+    }
+
+    /// Windows the pool has out (tests: the count is exact after every
+    /// round — F-L04-13).
+    #[cfg(test)]
+    pub(crate) fn pool_outstanding(&self) -> u32 {
+        self.pool.outstanding()
     }
 
     /// Whether a staged round exists (in flight or awaiting `finish_round`).
@@ -1006,6 +1016,21 @@ mod tests {
     use crate::fs::sim::SimDisk;
     use inf_foundation::fault::FaultSpec;
 
+    fn sim_seam_pipeline(disk: &SimDisk, capacity: u64) -> TierFlush<SimDisk> {
+        TierFlush::new(
+            disk.clone(),
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: NsId(17),
+                mode: TierIoMode::Buffered,
+                file_capacity: capacity,
+                slice_bytes: 4096,
+            },
+            0,
+        )
+    }
+
     fn sim_pipeline(disk: &SimDisk, capacity: u64) -> TierFlush<SimDisk> {
         let mut flush = TierFlush::new(
             disk.clone(),
@@ -1235,5 +1260,47 @@ mod tests {
         let mut flush = sim_pipeline(&disk, 1 << 20);
         flush.append_range_queued(LogicalAddr::ZERO, &[0x11; 64]).expect("stage");
         flush.set_drive(TierDrive::Seam);
+    }
+
+    /// F-L04-13: a writer that staged on the seam owns a private batch
+    /// window. The drive switch must not let that window reach a round —
+    /// `recycle` would return it to the pool and the count would go one
+    /// below truth (a debug panic; `u32::MAX` in release, so the L5 bound
+    /// assert misfires later with the wrong message).
+    #[test]
+    fn seam_window_never_reaches_the_pool_across_a_drive_switch() {
+        let disk = SimDisk::new();
+        let mut flush = sim_seam_pipeline(&disk, 1 << 20);
+        let frame = vec![0xA5u8; TIER_FRAME_DATA];
+        flush.append_range(LogicalAddr::ZERO, &frame).expect("seam append");
+        flush.sync().expect("seam sync"); // batch flushed, the window retained
+        flush.set_drive(TierDrive::Reactor);
+        let next = LogicalAddr::ZERO.advanced(TIER_FRAME_DATA as u64).expect("fits");
+        flush.append_range_queued(next, &frame).expect("queued append");
+        flush.sync_queued();
+        let effects = run_round(&disk, &mut flush);
+        for effect in effects {
+            if let RoundEffect::DurableTo { data_len } = effect {
+                flush.confirm_durable_to(data_len);
+            }
+        }
+        assert_eq!(flush.pool_outstanding(), 0, "every window a round carries is the pool's");
+        assert_eq!(flush.confirmable_end(), Some(2 * TIER_FRAME_DATA as u64));
+        let back = flush
+            .read_span_blocking(0, 2 * TIER_FRAME_DATA)
+            .expect("read")
+            .expect("both frames are on the file");
+        assert!(back.iter().all(|&b| b == 0xA5), "both frames landed");
+    }
+
+    /// F-L04-13: the switch refuses staged, unflushed seam frames — a
+    /// second named cause, so the pool never inherits half a batch.
+    #[test]
+    #[should_panic(expected = "drive change with staged frames")]
+    fn drive_flip_with_staged_seam_frames_panics() {
+        let disk = SimDisk::new();
+        let mut flush = sim_seam_pipeline(&disk, 1 << 20);
+        flush.append_range(LogicalAddr::ZERO, &[0x11; TIER_FRAME_DATA]).expect("seam append");
+        flush.set_drive(TierDrive::Reactor);
     }
 }
