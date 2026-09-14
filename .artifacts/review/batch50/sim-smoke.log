@@ -1,0 +1,266 @@
+== 2026-09-14T00:12:22-04:00
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 55.65s
+     Running `target/release/inf-sim --scenario m0-smoke --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105240 apply events, 6045 steps, trace 4964163 bytes, hash 0x7d48ca3ff1d41b65
+inf-sim: sim_seconds=0.051971 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=0 idle_closed=0 idle_survived=0
+inf-sim: determinism verified — second run trace byte-identical
+# F-L11-05: an accept-path error is a counter, never connection teardown.
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --plant accept-error
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m0-smoke --seed 0xC0FFEE --plant accept-error`
+inf-sim: scenario m0-smoke seed 0xc0ffee: 100000 commands, 105240 apply events, 11904 steps, trace 4963289 bytes, hash 0x93eec65356914989
+inf-sim: sim_seconds=0.101761 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=true accept_resumes=3 fabric_skip_streak_max=0 refused_clients=0 idle_closed=0 idle_survived=0
+# Group 0 (review 2026-08-30 §5.5): adversarial key/value lengths at
+# 4 cells — the two parameters no other gate exercises.
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism`
+inf-sim: scenario m0-adversarial seed 0xc0ffee: 40000 commands, 43960 apply events, 12664 steps, trace 187638754 bytes, hash 0x5afb7e8f596e03af
+inf-sim: sim_seconds=0.108033 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=0 idle_closed=0 idle_survived=0
+inf-sim: determinism verified — second run trace byte-identical
+# F-L19-05/06: namespace-bound + SELECTed clients, SCAN/KEYS/DBSIZE/
+# RANDOMKEY/FLUSH* under audit, values + deadlines reconciled.
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism`
+inf-sim: scenario m0-surface seed 0xc0ffee: 40000 commands, 47412 apply events, 4104 steps, trace 2867593 bytes, hash 0x331a099f351d673f
+inf-sim: sim_seconds=0.035253 published=0 delivered=0 audits=8 flushes=3 scan_walks=142 replays_skipped=13207 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=0 idle_closed=0 idle_survived=0
+inf-sim: determinism verified — second run trace byte-identical
+# F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines —
+# FABRIC-IN must reach every peer within `cells − 2` exhausted drains.
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-fabric-fairness --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m0-fabric-fairness --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m0-fabric-fairness seed 0xc0ffee: 400000 commands, 418259 apply events, 329 steps, trace 18768738 bytes, hash 0xb833f546d25b2c17
+inf-sim: sim_seconds=0.002725 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=1 refused_clients=0 idle_closed=0 idle_survived=0
+inf-sim: determinism verified — second run trace byte-identical
+# F-L15-05 (ADR-0123): maxclients refusal at accept + the idle reaper
+# under an oracle (share bound, refusal frame, counter fold, deadline).
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-admission --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m0-admission --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m0-admission seed 0xc0ffee: 4200 commands, 4448 apply events, 2629 steps, trace 203340 bytes, hash 0x507567de3e56a9bc
+inf-sim: sim_seconds=1.324846 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=18 idle_closed=4 idle_survived=4
+inf-sim: determinism verified — second run trace byte-identical
+# F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m45-backfill --seed 0xC0FFEE --verify-determinism`
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+inf-sim: scenario m45-backfill seed 0xc0ffee: 5 boots, cuts ["before-backfill(scanned=0)", "mid-walk(scanned=2053)", "cell-ready(scanned=8000)", "fleet-ready(scanned=8000)"], 8 ready checks, 16 refused bindings, 0 raced mutations, 159 steps, hash 0x565af8aead83585e
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.04s
+     Running `target/release/inf-sim --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism`
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar)
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (1499 entries; tail caught up)
+cell 1: index 16/1 sidecar loaded (1493 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1493 entries; tail caught up)
+cell 0: index 16/1 rebuilding (degraded) — was serving before the crash
+cell 0: index 16/2 rebuilding (degraded) — was serving before the crash
+inf-sim: scenario m45-sidecar seed 0xc0ffee: 5 boots, cuts ["mid-write(extra=3,published=0)", "post-publish(storm=8)", "degraded-tail"], 4 loaded, 8 storm-during-stream, 14 ready checks, 6 refused bindings, 2 degraded-tail rebuilds, 539 steps, hash 0x056d1a46bed814c6
+cell 1: index 16/1 rebuilding (no-sidecar)
+cell 1: index 16/2 rebuilding (no-sidecar)
+cell 0: index 16/1 rebuilding (no-sidecar)
+cell 0: index 16/2 rebuilding (no-sidecar)
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+cell 1: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/1 sidecar loaded (1500 entries; tail caught up)
+cell 0: index 16/2 sidecar loaded (1499 entries; tail caught up)
+cell 1: index 16/1 sidecar loaded (1493 entries; tail caught up)
+cell 1: index 16/2 sidecar loaded (1493 entries; tail caught up)
+cell 0: index 16/1 rebuilding (degraded) — was serving before the crash
+cell 0: index 16/2 rebuilding (degraded) — was serving before the crash
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-steel --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m4-steel seed 0xc0ffee: 400 cold reads, 36 promotions, hash 0xfba5f770dc642b8b
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-pressure --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-pressure --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m4-pressure seed 0xc0ffee: 78 stalls (p50 8000 µs, p99 250000 µs), 8 timeouts, peak committed 266240 B, hash 0x38f279bd2c391e8f
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-cold --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m4-cold seed 0xc0ffee: 6668 gets (3503 cold, 10 chunked, 0 restarts, 101 cancelled [44 early / 57 late]), 176 merged waiters (queue hw 5), 355 unlinks (50 deferrals), hash 0x4a8f23af6a517856
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-recovery --seed 0xC0FFEE --verify-determinism`
+inf-sim: m4-recovery seed 0xc0ffee: 4 lives, 1568 refs, 1599 images, 2997 tail records, 2 cut-before-publish, 1 flush-lag, 7719 keys audited, 12 live-set entries, 170 relocations, 0 retired, 0 unlinked, 0 left-to-boot-gc, 311 blobs, 40 orphans-planted, 360 blob-reclaims, shadow 154 opened / 35 open at a cut / 50 re-formed / 118 same-key / 1 collision, 167 collide-ops, 1 settled-at-boot, 4 drain-checks, 0 multi-ticket winners / 0 DELs, 2 twin-origin rows / 2 origins covered, 2 held rows / 2 re-formed / 0 not restored, trace 0xd7ee36b1cda9a9cd
+inf-sim: determinism verified (two runs, identical traces)
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m4-diskfull seed 0xc0ffee: 40 refusals, 8 reopens, 137291 B relocated, 36 files retired, peak disk 1929216 B, 313 keys verified, hash 0xb9151af01b4b54e4
+inf-sim: determinism verified — second run hash-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-tiered --seed 0xC0FFEE --verify-determinism`
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 17 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered seed 0xc0ffee: 6027 commands, 12580 steps, 144 keys audited, 1508 required ops, 6 allowed-lost, 0 B flushed pre-cut, 1049037 B flushed final, 233 cold resolves, 403 blob sets, 1 DISKFULL refusals (reopened: true), drop-race 18 values / 12 typed-other, post-drop reboot true (MANIFEST residue true), cut inside DROP after 16 steps: Swept, refused-boot false, shadow arm true (67 tickets, 0 open at the cut, 67 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 195; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 10 replans, dir-open fault arm false (fired 0), tier-read EIO arm false (fired 0, 0 typed replies), ckpt downgrades 6 / bound splits 0, SCAN batching oracle on 17 cold pages (1167 cold intents), trace 21680858 bytes, hash 0x5da563865137245c
+inf-sim: sim_seconds=48.054993 published=0 delivered=0 tier_read_fault_arm=false tier_read_faults_fired=0 tier_read_error_replies=0 scan_cold_pages=17 scan_cold_reads=1167
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 17 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: determinism verified — second run trace byte-identical
+# F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply and
+# one counter increment — the forced arm must fire (vacuous = red).
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --plant tier-read-eio
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m4-tiered --seed 0xC0FFEE --plant tier-read-eio`
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 9 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 8 aborted at I/O: EINVAL under O_DIRECT
+cell 0: swept dropped namespace 16 residue (13 files) — ADR-0100 D6
+cell 1: swept dropped namespace 16 residue (6 files) — ADR-0100 D6
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 17 aborted at I/O: EINVAL under O_DIRECT
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 19 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: m4-tiered seed 0xc0ffee: 6027 commands, 12592 steps, 144 keys audited, 1508 required ops, 6 allowed-lost, 0 B flushed pre-cut, 1049037 B flushed final, 364 cold resolves, 403 blob sets, 1 DISKFULL refusals (reopened: true), drop-race 18 values / 12 typed-other, post-drop reboot true (MANIFEST residue true), cut inside DROP after 29 steps: Swept, refused-boot false, shadow arm true (67 tickets, 0 open at the cut, 67 same-key / 0 collision, 0 stale, 0 fallbacks; phase 6b cold resolves 195; phase 6c 4 pairs: 8 tickets, 4 collision verdicts, 0 ticketed fallbacks, 0 DBSIZE drains, 0 SCAN twins), blob-key race 10 replans, dir-open fault arm false (fired 0), tier-read EIO arm true (fired 2, 2 typed replies), ckpt downgrades 6 / bound splits 0, SCAN batching oracle on 17 cold pages (1101 cold intents), trace 22249848 bytes, hash 0xab1aed4722992e3c
+inf-sim: sim_seconds=49.026242 published=0 delivered=0 tier_read_fault_arm=true tier_read_faults_fired=2 tier_read_error_replies=2 scan_cold_pages=17 scan_cold_reads=1101
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-ns-create-window seed 0xc0ffee: 8 commands, 318 steps, swap held 301 steps, 2 USE attempts (2 refused, 0 writes acked in the window), 0 untombstoned unknown-ns skips, 2 released keys found, trace 658 bytes, hash 0xa1f3f1fb99338571
+inf-sim: sim_seconds=0.396849 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-ns-ddl-race seed 0xc0ffee: 38 commands, 103 steps, DROP after 6 steps (found, origin frozen 0 steps), 'x' served on 0 cells before the cut / 0 after, refused leg 1 left 0 cells serving 'y', 0 untombstoned unknown-ns skips, 4 released keys found, trace 3056 bytes, hash 0x950cf499bebdc1f7
+inf-sim: sim_seconds=0.362817 published=0 delivered=0
+inf-sim: determinism verified (second run identical)
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-device-budget seed 0xc0ffee: 1120 commands, 6276 steps, 233 keys audited, 821 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 4 fsync_entries_max 3 write_through_entries_max 1 hold_episode_violations 0], trace 71891 bytes, hash 0x73d69ddf3c8fd12a
+inf-sim: sim_seconds=7.602437 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism`
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+inf-sim: scenario m2-mode-transition seed 0xc0ffee: 2000 commands, 7452 steps, 96 keys audited, 1340 required ops, 101 allowed-lost, 0 equivalence checks, 0 documents compared, 13 corpus docs, cut classes [], lift regime true (tiered ops 224, indexed ops 257, sidecars loaded 2, stale slacks lifted 0; plant: cells 2, lifts 2, sidecars 2; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 3 fsync_entries_max 4 write_through_entries_max 2 hold_episode_violations 0], trace 836369 bytes, hash 0x5536781aaf57fdab
+inf-sim: sim_seconds=8.379731 published=0 delivered=0
+cell 1: index 19/1 rebuilding (no-sidecar)
+cell 0: index 19/1 rebuilding (no-sidecar)
+cell 1: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (3 entries; tail caught up)
+cell 1: index 19/1 sidecar loaded (10 entries; tail caught up)
+cell 0: index 19/1 sidecar loaded (10 entries; tail caught up)
+inf-sim: determinism verified — second run trace byte-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-reorder-window seed 0xc0ffee: 1120 commands, 5570 steps, 36 keys audited, 720 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 17 fsync_entries_max 1 write_through_entries_max 0 hold_episode_violations 0], trace 59330 bytes, hash 0xd36db106214e40c0
+inf-sim: sim_seconds=5.834332 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism`
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: scenario m2-ckpt-refused seed 0xc0ffee: 1120 commands, 5573 steps, 36 keys audited, 720 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 2 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 3 fsync_entries_max 2 write_through_entries_max 0 hold_episode_violations 0], trace 59377 bytes, hash 0xf2704ffd99992392
+inf-sim: sim_seconds=5.845999 published=0 delivered=0
+cell 1: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 1: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+cell 0: checkpoint staging downgraded to buffered I/O — O_DIRECT I/O refused (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:1)
+cell 0: checkpoint 1 aborted at I/O: EINVAL under O_DIRECT
+inf-sim: determinism verified — second run trace byte-identical
+cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.03s
+     Running `target/release/inf-sim --scenario m2-recycle --seed 0xC0FFEE --verify-determinism`
+inf-sim: scenario m2-recycle seed 0xc0ffee: 3200 commands, 15533 steps, 36 keys audited, 2065 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 5 fsync_entries_max 4 write_through_entries_max 2 hold_episode_violations 0], trace 167448 bytes, hash 0x3a6d53f1202ff92d
+inf-sim: sim_seconds=15.841744 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical
+SIM SMOKE EXIT=0
+CHAIN DONE

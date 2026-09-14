@@ -1,0 +1,14 @@
+== fixed tree 2026-09-14T00:05:09-04:00
+
+running 8 tests
+test config_set_eight_pairs_reaches_every_cell ... ok
+test many_connections_spread_across_cells ... ok
+test accepted_sockets_carry_tcp_keepalive ... ok
+test slow_subscriber_hits_the_output_cap_and_dies ... ok
+test maxclients_refuses_the_next_connection_like_redis ... ok
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+test client_output_buffer_limit_normal_kills_a_non_reading_client ... ok
+test timeout_closes_idle_connections_but_not_subscribers ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 78 filtered out; finished in 2.51s
+

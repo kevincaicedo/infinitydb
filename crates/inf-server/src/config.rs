@@ -26,8 +26,9 @@ pub enum ReloadClass {
 enum Kind {
     /// Byte size with Redis memory units (`100mb` → `104857600`).
     Memory,
-    /// Plain integer.
-    Int,
+    /// Integer within `[min, max]` (Redis's per-key bounds; `ANY_INT`
+    /// for keys Redis leaves unbounded).
+    Int(i64, i64),
     /// One of a fixed token set (case-insensitive, stored lowercase).
     Enum(&'static [&'static str]),
     /// Free-form string.
@@ -84,6 +85,11 @@ pub const MAXMEMORY_POLICIES: &[&str] = &[
     "volatile-lfu",
 ];
 
+/// `Kind::Int` bounds for the keys Redis leaves unbounded.
+const ANY_INT: (i64, i64) = (i64::MIN, i64::MAX);
+/// Redis's `0..=INT_MAX` bound (`timeout`, `tcp-keepalive`).
+const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
+
 /// The M1 key subset. Defaults mirror Redis 8 so `CONFIG GET` byte-diffs.
 #[derive(Debug)]
 pub struct ConfigStore {
@@ -107,11 +113,23 @@ impl Default for ConfigStore {
                     Kind::OutputBufferLimit,
                     "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
                 ),
-                e("databases", ReloadClass::BootOnly, Kind::Int, "16"),
+                e("databases", ReloadClass::BootOnly, Kind::Int(ANY_INT.0, ANY_INT.1), "16"),
                 // M3-S10 (ADR-0041 D2): per-cell compiled-path-program
                 // cache entries; 0 disables. Applied at plane assembly.
-                e("doc-path-cache-size", ReloadClass::BootOnly, Kind::Int, "1024"),
-                e("maxclients", ReloadClass::BootOnly, Kind::Int, "10000"),
+                e(
+                    "doc-path-cache-size",
+                    ReloadClass::BootOnly,
+                    Kind::Int(ANY_INT.0, ANY_INT.1),
+                    "1024",
+                ),
+                // ADR-0123 D1: the node bound, divided per cell like
+                // `maxmemory`; the accept path refuses past the share.
+                e(
+                    "maxclients",
+                    ReloadClass::HotPerCell,
+                    Kind::Int(1, i64::from(u32::MAX)),
+                    "10000",
+                ),
                 e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
                 e(
                     "maxmemory-policy",
@@ -119,13 +137,24 @@ impl Default for ConfigStore {
                     Kind::Enum(MAXMEMORY_POLICIES),
                     "noeviction",
                 ),
-                e("maxmemory-samples", ReloadClass::HotPerCell, Kind::Int, "5"),
+                e(
+                    "maxmemory-samples",
+                    ReloadClass::HotPerCell,
+                    Kind::Int(ANY_INT.0, ANY_INT.1),
+                    "5",
+                ),
                 // ADR-0122: the parser's bulk cap — the record bound by
                 // default (16 MiB; Redis 512 MiB), floored at Redis's
                 // 1 MiB, pushed to every live parser on the MAINTAIN sweep.
                 e("proto-max-bulk-len", ReloadClass::HotPerCell, Kind::Memory, "16777216"),
                 e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
-                e("tcp-keepalive", ReloadClass::Hot, Kind::Int, "300"),
+                // ADR-0123 D3: set on sockets accepted after the change.
+                e(
+                    "tcp-keepalive",
+                    ReloadClass::HotPerCell,
+                    Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                    "300",
+                ),
                 // M4.5-S30 (ADR-0085 D6): read-driven promotion
                 // admission. `no` is fully inert (the pre-S30 read
                 // path) — the same-binary A/B arm and the escape hatch
@@ -172,7 +201,14 @@ impl Default for ConfigStore {
                     Kind::Memory,
                     "274877906944",
                 ),
-                e("timeout", ReloadClass::Hot, Kind::Int, "0"),
+                // ADR-0123 D2: idle unsubscribed connections close in
+                // the MAINTAIN sweep; 0 = off.
+                e(
+                    "timeout",
+                    ReloadClass::HotPerCell,
+                    Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                    "0",
+                ),
             ],
         }
     }
@@ -219,9 +255,15 @@ impl ConfigStore {
                     key: key_str.clone(),
                     value: text.clone(),
                 })?,
-            Kind::Int => text.parse::<i64>().map(|v| v.to_string()).map_err(|_| {
-                ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() }
-            })?,
+            Kind::Int(min, max) => text
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (min..=max).contains(v))
+                .map(|v| v.to_string())
+                .ok_or_else(|| ConfigSetError::Invalid {
+                    key: key_str.clone(),
+                    value: text.clone(),
+                })?,
             Kind::Enum(tokens) => {
                 let lower = text.to_lowercase();
                 if !tokens.contains(&lower.as_str()) {
@@ -317,16 +359,48 @@ fn merge_output_buffer_limit(current: &str, update: &str) -> Option<String> {
     Some(rendered.join(" "))
 }
 
-/// The pubsub class triple `(hard, soft, soft_ms)` for the plane's
-/// output-cap enforcement (M1-S11). Zeros disable a limit.
-pub(crate) fn pubsub_output_limit(cfg: &ConfigStore) -> (u64, u64, u64) {
+/// An output-buffer class triple `(hard, soft, soft_ms)` for the plane's
+/// output-cap enforcement (M1-S11; the `normal` class since ADR-0123
+/// D4). Zeros disable a limit. Classes: 0 = normal, 2 = pubsub.
+pub(crate) fn output_limit(cfg: &ConfigStore, class: usize) -> (u64, u64, u64) {
     let Some(text) = cfg.get("client-output-buffer-limit") else { return (0, 0, 0) };
     let Some(groups) = parse_output_buffer_groups(text) else { return (0, 0, 0) };
     groups
         .iter()
         .rev()
-        .find(|(class, _)| *class == 2)
+        .find(|(c, _)| *c == class)
         .map_or((0, 0, 0), |(_, [hard, soft, secs])| (*hard, *soft, secs.saturating_mul(1000)))
+}
+
+/// The connection knobs the plane caches from the config store (ADR-0123
+/// D5): read at assembly and on every version-compared MAINTAIN sweep.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnKnobs {
+    /// This cell's `maxclients` share: `max(1, maxclients / cells)` — the
+    /// `push_pressure` division (cells are symmetric).
+    pub maxclients_share: usize,
+    /// `timeout` in milliseconds; 0 = off.
+    pub timeout_ms: u64,
+    /// `tcp-keepalive` seconds; 0 = off.
+    pub keepalive_secs: u32,
+    /// `client-output-buffer-limit normal` and `pubsub`.
+    pub cob_normal: (u64, u64, u64),
+    pub cob_pubsub: (u64, u64, u64),
+}
+
+pub(crate) fn conn_knobs(cfg: &ConfigStore, cells: u16) -> ConnKnobs {
+    let int = |key: &str, default: u64| {
+        cfg.get(key).and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+    };
+    let cells = u64::from(cells.max(1));
+    let maxclients = int("maxclients", 10_000);
+    ConnKnobs {
+        maxclients_share: usize::try_from((maxclients / cells).max(1)).unwrap_or(usize::MAX),
+        timeout_ms: int("timeout", 0).saturating_mul(1000),
+        keepalive_secs: u32::try_from(int("tcp-keepalive", 300)).unwrap_or(u32::MAX),
+        cob_normal: output_limit(cfg, 0),
+        cob_pubsub: output_limit(cfg, 2),
+    }
 }
 
 /// Redis memory-unit grammar: bare bytes, or `k/kb/m/mb/g/gb` suffixes
@@ -411,6 +485,50 @@ mod tests {
             Err(ConfigSetError::Invalid { .. })
         ));
         assert_eq!(cfg.get("proto-max-bulk-len"), Some("1048576"));
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-05): `maxclients` is settable at
+    /// runtime as in Redis (hot per cell — the accept path reads its
+    /// share), and the three integer keys the node now applies carry
+    /// Redis's bounds: `maxclients` 1..=4294967295, `timeout` and
+    /// `tcp-keepalive` 0..=2147483647. Pre-fix `maxclients` was
+    /// `BootOnly` and every integer was accepted.
+    #[test]
+    fn applied_integer_keys_are_hot_and_bounded_like_redis() {
+        let mut cfg = ConfigStore::default();
+        assert_eq!(cfg.set(b"maxclients", b"5"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(cfg.get("maxclients"), Some("5"));
+        assert!(matches!(cfg.set(b"maxclients", b"0"), Err(ConfigSetError::Invalid { .. })));
+        assert!(matches!(cfg.set(b"maxclients", b"-1"), Err(ConfigSetError::Invalid { .. })));
+        assert_eq!(cfg.get("maxclients"), Some("5"), "a refused value mutates nothing");
+        assert_eq!(cfg.set(b"timeout", b"0"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(cfg.set(b"timeout", b"2147483647"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(cfg.set(b"timeout", b"-1"), Err(ConfigSetError::Invalid { .. })));
+        assert!(matches!(cfg.set(b"timeout", b"2147483648"), Err(ConfigSetError::Invalid { .. })));
+        assert_eq!(cfg.set(b"tcp-keepalive", b"0"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(cfg.set(b"tcp-keepalive", b"-1"), Err(ConfigSetError::Invalid { .. })));
+    }
+
+    /// ADR-0123 D1/D4/D5: the plane's cached knobs — the per-cell
+    /// `maxclients` share never floors to zero, `timeout` is milliseconds,
+    /// and the `normal` class reads independently of `pubsub`.
+    #[test]
+    fn conn_knobs_divide_maxclients_and_read_both_output_classes() {
+        let mut cfg = ConfigStore::default();
+        let k = conn_knobs(&cfg, 4);
+        assert_eq!(k.maxclients_share, 2_500);
+        assert_eq!(k.timeout_ms, 0);
+        assert_eq!(k.keepalive_secs, 300);
+        assert_eq!(k.cob_normal, (0, 0, 0));
+        assert_eq!(k.cob_pubsub, (33_554_432, 8_388_608, 60_000));
+        cfg.set(b"maxclients", b"3").expect("hot");
+        cfg.set(b"timeout", b"7").expect("hot");
+        cfg.set(b"client-output-buffer-limit", b"normal 64mb 16mb 10").expect("hot");
+        let k = conn_knobs(&cfg, 4);
+        assert_eq!(k.maxclients_share, 1, "a configured bound never floors to zero");
+        assert_eq!(k.timeout_ms, 7_000);
+        assert_eq!(k.cob_normal, (64 << 20, 16 << 20, 10_000));
+        assert_eq!(k.cob_pubsub, (33_554_432, 8_388_608, 60_000));
     }
 
     #[test]

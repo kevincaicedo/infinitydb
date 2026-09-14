@@ -84,20 +84,25 @@ pub(crate) fn info(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
+    // Redis's section set: a bare `INFO` (or `all`/`default`/`everything`
+    // anywhere in argv) is every section; otherwise only the named ones,
+    // and a name this build lacks selects nothing — `INFO nosuchsection`
+    // is an empty body (F-L15-10: "nothing selected" once meant
+    // "everything", so an argv of only unknown names rendered it all).
     let mut selected: Vec<&str> = Vec::new();
+    let mut everything = argv.len() == 1;
     for i in 1..argv.len() {
         let arg = argv.arg(i).to_ascii_lowercase();
         match arg.as_slice() {
-            b"all" | b"default" | b"everything" => selected.clear(),
+            b"all" | b"default" | b"everything" => everything = true,
             section => {
                 if let Some(name) = SECTIONS.iter().find(|s| s.as_bytes() == section) {
                     selected.push(name);
                 }
-                // Unknown sections yield nothing for that name (Redis shape).
             }
         }
     }
-    let wants = |name: &str| selected.is_empty() || selected.contains(&name);
+    let wants = |name: &str| everything || selected.contains(&name);
     let mut text = String::new();
     let push = |text: &mut String, line: &str| {
         text.push_str(line);
@@ -152,17 +157,22 @@ pub(crate) fn info(
     };
     #[cfg(not(feature = "doc"))]
     let report = ks.report();
-    if wants("memory") {
-        // M3-S25 attribution fix: `used_memory_rss` is process-wide, so
-        // the byte gauges beside it must be node-wide too. The serving
-        // cell publishes its fresh gauges and folds the board (peers lag
-        // their MAINTAIN publish by at most one period); without a board
-        // (bare harness) the section renders cell scope and says so.
-        let local = crate::exec::memory_gauges_of(&report, node);
-        let (scope, g) = match node.publish_and_total_memory(local) {
+    // M3-S25 attribution fix: `used_memory_rss` is process-wide, so the
+    // byte gauges beside it must be node-wide too. The serving cell
+    // publishes its fresh gauges and folds the board (peers lag their
+    // MAINTAIN publish by at most one period); without a board (bare
+    // harness) the sections render cell scope and say so. One fold serves
+    // `# Memory` and `# Keyspace` (ADR-0122 A2).
+    let fold = if wants("memory") || wants("keyspace") {
+        let local = crate::exec::memory_gauges_of(&report, node, ks);
+        Some(match node.publish_and_total_memory(local) {
             Some(totals) => ("node", totals),
             None => ("cell", local),
-        };
+        })
+    } else {
+        None
+    };
+    if let Some((scope, g)) = fold.filter(|_| wants("memory")) {
         let used = g.used_bytes;
         let rss = process_rss_bytes();
         push(&mut text, "# Memory");
@@ -568,6 +578,9 @@ pub(crate) fn info(
             &mut text,
             &format!("client_output_buffer_limit_disconnections:{}", node.cob_disconnections.get()),
         );
+        // ADR-0123 D2: idle closes under `timeout` (cell scope, like the
+        // output-cap kills above).
+        push(&mut text, &format!("idle_disconnections:{}", node.idle_disconnections.get()));
         push(&mut text, "latest_fork_usec:0");
         text.push_str("\r\n");
     }
@@ -640,20 +653,14 @@ pub(crate) fn info(
         push(&mut text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
         text.push_str("\r\n");
     }
-    if wants("keyspace") {
+    if let Some((scope, g)) = fold.filter(|_| wants("keyspace")) {
         push(&mut text, "# Keyspace");
-        // One line per non-empty database (Redis shape) — per-ns numbers
-        // reconcile with the aggregated sections above (M1-S09).
-        for (db, store) in ks.dbs() {
-            if !store.is_empty() {
-                push(
-                    &mut text,
-                    &format!(
-                        "db{db}:keys={},expires={},avg_ttl=0",
-                        store.len(),
-                        store.stats().ttl_live
-                    ),
-                );
+        // The node fold, like `DBSIZE` (ADR-0122 A2, F-L15-03): one line
+        // per db with a nonzero folded count (Redis shape), scope first.
+        push(&mut text, &format!("keyspace_scope:{scope}"));
+        for (db, (keys, expires)) in g.db_keys.iter().zip(g.db_expires).enumerate() {
+            if *keys != 0 {
+                push(&mut text, &format!("db{db}:keys={keys},expires={expires},avg_ttl=0"));
             }
         }
         text.push_str("\r\n");
@@ -2130,6 +2137,72 @@ mod tests {
         // Both scopes are disclosed beside the numbers they qualify.
         assert!(all.contains("memory_scope:"), "{all}");
         assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-10): a section name this build
+    /// does not have yields nothing for that name — `INFO nosuchsection`
+    /// is an empty body (Redis 8.0.5: `$0\r\n\r\n`), `INFO server
+    /// nosuchsection` is `# Server` alone, and `INFO nosuchsection all`
+    /// is everything. Pre-fix "nothing selected" meant "everything", so
+    /// an argv of only unknown names rendered the whole body.
+    #[test]
+    fn info_unknown_section_renders_an_empty_body() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let raw = run(&mut cx, &mut store, &[b"INFO", b"nosuchsection"]);
+        assert_eq!(raw, b"$0\r\n\r\n", "{:?}", String::from_utf8_lossy(&raw));
+        let raw = run(&mut cx, &mut store, &[b"INFO", b"commandstats", b"latencystats"]);
+        assert_eq!(raw, b"$0\r\n\r\n", "{:?}", String::from_utf8_lossy(&raw));
+        let one = String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"server", b"nosuch"]))
+            .expect("ascii");
+        assert!(one.contains("# Server"), "{one}");
+        assert_eq!(one.matches("\n# ").count(), 1, "only one section: {one}");
+        let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"nosuch", b"all"]))
+            .expect("ascii");
+        for section in ["# Server", "# Memory", "# Keyspace"] {
+            assert!(all.contains(section), "`all` beside an unknown name: {all}");
+        }
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-03): `# Keyspace` says which
+    /// scope its counts are — `keyspace_scope:cell` on the bare harness
+    /// (no board), the node fold with a board. Pre-fix the section
+    /// rendered the serving cell's counts with no scope line while
+    /// `DBSIZE` folded the node.
+    #[test]
+    fn info_keyspace_discloses_its_scope() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let keyspace =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"keyspace"])).expect("ascii");
+        assert!(keyspace.contains("db0:keys=1,expires=0,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(keyspace.contains("keyspace_scope:cell\r\n"), "no scope line: {keyspace}");
+    }
+
+    /// ADR-0122 A2 (batch 50, F-L15-03): with a board, `# Keyspace` is the
+    /// node fold — the serving cell's fresh counts plus every peer's last
+    /// publication — under `keyspace_scope:node`.
+    #[test]
+    fn info_keyspace_folds_the_board() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"SETEX", b"t", b"100", b"v"]), b"+OK\r\n");
+        let board = std::sync::Arc::new(crate::control::MemoryBoard::new(2));
+        let mut peer = crate::control::MemoryGauges::default();
+        peer.db_keys[0] = 40;
+        peer.db_expires[0] = 3;
+        peer.db_keys[5] = 7;
+        board.slot(1).publish(peer);
+        cx.node.cell.set(0);
+        *cx.node.memory_board.borrow_mut() = Some(std::sync::Arc::clone(&board));
+        let keyspace =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"keyspace"])).expect("ascii");
+        assert!(keyspace.contains("keyspace_scope:node\r\n"), "{keyspace}");
+        assert!(keyspace.contains("db0:keys=42,expires=4,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(keyspace.contains("db5:keys=7,expires=0,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(!keyspace.contains("db1:"), "empty dbs render no line: {keyspace}");
     }
 
     /// Batch 49 (review 2026-08-30, F-L15-07): `# Tripwires` is wholly cell

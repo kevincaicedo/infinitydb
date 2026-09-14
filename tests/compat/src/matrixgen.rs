@@ -135,7 +135,7 @@ pub static DECLARED: &[Declared] = &[
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1); client-smoke CI is the open M1-S14 AC",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -243,7 +243,7 @@ pub static DECLARED: &[Declared] = &[
         "CONFIG",
         Status::Partial,
         "M1",
-        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients`/`timeout`/`tcp-keepalive` are accepted and not yet applied (F-L15-05)",
+        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell refuses with Redis's error while a sibling may have headroom), `timeout` closes idle unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to connections accepted after the change (ADR-0123); `client-output-buffer-limit` enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF)",
     ),
     d(
         "CLIENT",

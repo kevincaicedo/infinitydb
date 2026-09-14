@@ -15,7 +15,7 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 628 byte-compared executions · 61 documented deviations · 0 tolerated failures.
+**Corpus:** 635 byte-compared executions · 64 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 54 full · 32 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -53,7 +53,7 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `TTL` | full | M0 | readonly fast | 2 | 20 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
-| `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1); client-smoke CI is the open M1-S14 AC |
+| `INFO` | partial | M0 | admin | -1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 |  |
 | `MSET` | full | M1 | write denyoom | -3 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
@@ -81,7 +81,7 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PEXPIRETIME` | full | M1 | readonly fast | 2 | 4 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `SELECT` | full | M1 | fast | 2 | 7 |  |
-| `CONFIG` | partial | M1 | admin | -2 | 34 | typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients`/`timeout`/`tcp-keepalive` are accepted and not yet applied (F-L15-05) |
+| `CONFIG` | partial | M1 | admin | -2 | 40 | typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell refuses with Redis's error while a sibling may have headroom), `timeout` closes idle unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to connections accepted after the change (ADR-0123); `client-output-buffer-limit` enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF) |
 | `CLIENT` | partial | M1 | admin | -2 | 5 | KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros |
 | `LOLWUT` | partial | M1 | readonly | -1 | 0 | the whole reply is version art (nothing byte-comparable by design) |
 | `SUBSCRIBE` | full | M1 | fast | -2 | 5 |  |

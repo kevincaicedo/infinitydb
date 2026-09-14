@@ -1,0 +1,27 @@
+== fixed tree 2026-09-14T00:05:00-04:00
+test admin::tests::info_keyspace_discloses_its_scope ... ok
+test admin::tests::info_memory_aggregates_across_cells_via_the_board ... ok
+test admin::tests::info_keyspace_folds_the_board ... ok
+test admin::tests::info_exposes_every_document_and_tripwire_domain ... ok
+test config::tests::applied_integer_keys_are_hot_and_bounded_like_redis ... ok
+test admin::tests::info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered ... ok
+test admin::tests::info_persistence_renders_admission_busy_refusals ... ok
+test admin::tests::info_tripwires_renders_recycle_pool_bytes ... ok
+test config::tests::defaults_match_redis_shapes ... ok
+test config::tests::conn_knobs_divide_maxclients_and_read_both_output_classes ... ok
+test admin::tests::info_sections_filter ... ok
+test admin::tests::info_tripwires_carries_no_process_wide_gauge ... ok
+test config::tests::glob_get_is_nocase_and_multi_pattern ... ok
+test admin::tests::info_tiering_renders_per_namespace_watermarks_and_write_counters ... ok
+test config::tests::proto_max_bulk_len_default_is_the_cap_the_parser_enforces ... ok
+test admin::tests::info_unknown_section_renders_an_empty_body ... ok
+test config::tests::set_validates_and_normalizes ... ok
+test admin::tests::info_tiering_reports_write_amplification_per_namespace ... ok
+test config::tests::validate_is_pure_and_apply_completes_it ... ok
+test admin::tests::info_tiering_splits_the_blob_write_amplification_leg ... ok
+test admin::tests::info_all_names_every_field_once ... ok
+test admin::tests::info_tiering_is_all_zero_without_a_tiered_namespace ... ok
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 120 filtered out; finished in 0.00s
+test net::tests::two_listeners_share_a_port ... ok
+test net::tests::keepalive_is_set_and_cleared_on_a_tcp_socket ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 0.00s

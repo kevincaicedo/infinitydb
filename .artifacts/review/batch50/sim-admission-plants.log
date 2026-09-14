@@ -1,0 +1,20 @@
+== plant A: reaper disabled (timeout never closes) 2026-09-14T00:09:56-04:00
+inf-sim: scenario m0-admission seed 0xc0ffee: 4200 commands, 4448 apply events, 2629 steps, trace 203340 bytes, hash 0x507567de3e56a9bc
+inf-sim: sim_seconds=1.324846 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=18 idle_closed=0 idle_survived=4
+inf-sim: ORACLE VIOLATION: idle client 4: still open 5118555 ns past its 1000000000 ns deadline
+inf-sim: ORACLE VIOLATION: idle client 6: still open 5118555 ns past its 1000000000 ns deadline
+inf-sim: ORACLE VIOLATION: idle client 0: still open 5703015 ns past its 1000000000 ns deadline
+inf-sim: ORACLE VIOLATION: idle client 2: still open 5703015 ns past its 1000000000 ns deadline
+inf-sim: ORACLE VIOLATION: idle phase: no plain idle client was reaped
+exit=1
+== plant B: share check removed (accept never refuses) 2026-09-14T00:10:52-04:00
+inf-sim: scenario m0-admission seed 0xc0ffee: 6000 commands, 6339 apply events, 2657 steps, trace 291250 bytes, hash 0xc023ba7098ddec47
+inf-sim: sim_seconds=1.337884 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=0 idle_closed=4 idle_survived=4
+inf-sim: ORACLE VIOLATION: cell 1: 24 live connections over its maxclients share 15
+inf-sim: ORACLE VIOLATION: cell 2: 24 live connections over its maxclients share 15
+inf-sim: ORACLE VIOLATION: cell 1: 24 live connections over its maxclients share 15
+inf-sim: ORACLE VIOLATION: cell 2: 24 live connections over its maxclients share 15
+inf-sim: ORACLE VIOLATION: cell 1: 24 live connections over its maxclients share 15
+exit=1
+== plants reverted
+ 1 file changed, 133 insertions(+), 26 deletions(-)

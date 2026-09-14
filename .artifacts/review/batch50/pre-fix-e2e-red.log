@@ -1,0 +1,56 @@
+== baseline 644d2bb 2026-09-13T23:58:50-04:00
+
+running 5 tests
+test maxclients_refuses_the_next_connection_like_redis ... FAILED
+test accepted_sockets_carry_tcp_keepalive ... FAILED
+test info_keyspace_counts_the_whole_node_like_dbsize ... FAILED
+test timeout_closes_idle_connections_but_not_subscribers ... FAILED
+test client_output_buffer_limit_normal_kills_a_non_reading_client has been running for over 60 seconds
+test client_output_buffer_limit_normal_kills_a_non_reading_client ... FAILED
+
+failures:
+
+---- maxclients_refuses_the_next_connection_like_redis stdout ----
+
+thread 'maxclients_refuses_the_next_connection_like_redis' (100547) panicked at crates/inf-server/tests/node_e2e.rs:665:5:
+assertion `left == right` failed: reply mismatch: got "-ERR " want "+OK\r\n"
+  left: [45, 69, 82, 82, 32]
+ right: [43, 79, 75, 13, 10]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- accepted_sockets_carry_tcp_keepalive stdout ----
+
+thread 'accepted_sockets_carry_tcp_keepalive' (100544) panicked at crates/inf-server/tests/node_e2e.rs:7039:5:
+the server-side socket carries no keepalive timer:
+Recv-Q Send-Q Local Address:Port  Peer Address:Port 
+0      0          127.0.0.1:40017    127.0.0.1:53392
+
+
+---- info_keyspace_counts_the_whole_node_like_dbsize stdout ----
+
+thread 'info_keyspace_counts_the_whole_node_like_dbsize' (100546) panicked at crates/inf-server/tests/node_e2e.rs:6933:13:
+cell 0: no scope line, db0:keys=32 vs DBSIZE 64 (×0.50): # Keyspace
+db0:keys=32,expires=0,avg_ttl=0
+
+
+---- timeout_closes_idle_connections_but_not_subscribers stdout ----
+
+thread 'timeout_closes_idle_connections_but_not_subscribers' (100548) panicked at crates/inf-server/tests/node_e2e.rs:882:19:
+idle connection past `timeout 1`: the server never closed the connection (Resource temporarily unavailable (os error 11))
+
+---- client_output_buffer_limit_normal_kills_a_non_reading_client stdout ----
+
+thread 'client_output_buffer_limit_normal_kills_a_non_reading_client' (100545) panicked at crates/inf-server/tests/node_e2e.rs:7075:23:
+the server never closed the connection after 104863232 bytes (Resource temporarily unavailable (os error 11))
+
+
+failures:
+    accepted_sockets_carry_tcp_keepalive
+    client_output_buffer_limit_normal_kills_a_non_reading_client
+    info_keyspace_counts_the_whole_node_like_dbsize
+    maxclients_refuses_the_next_connection_like_redis
+    timeout_closes_idle_connections_but_not_subscribers
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 81 filtered out; finished in 74.28s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

@@ -1,0 +1,5 @@
+== m0-admission 2026-09-14T00:08:39-04:00
+inf-sim: scenario m0-admission seed 0xc0ffee: 4200 commands, 4448 apply events, 2629 steps, trace 203340 bytes, hash 0x507567de3e56a9bc
+inf-sim: sim_seconds=1.324846 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=0 refused_clients=18 idle_closed=4 idle_survived=4
+inf-sim: determinism verified — second run trace byte-identical
+exit=

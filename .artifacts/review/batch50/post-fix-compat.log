@@ -1,0 +1,43 @@
+== fixed tree 2026-09-14T00:05:13-04:00
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.88s
+
+running 10 tests
+test info_names_every_field_once_on_a_real_node ... ok
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+test info_unknown_section_is_empty_like_redis ... ok
+test maxclients_refusal_matches_redis ... ok
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+test node_matrix_replies_match_redis ... ok
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+test timeout_closes_an_idle_connection_like_redis ... FAILED
+
+failures:
+
+---- timeout_closes_an_idle_connection_like_redis stdout ----
+
+thread 'timeout_closes_an_idle_connection_like_redis' (108817) panicked at tests/compat/src/harness.rs:207:13:
+server closed the connection mid-script
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    timeout_closes_an_idle_connection_like_redis
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+error: test failed, to rerun pass `-p compat --test node_diff`
+
+running 1 test
+test matrix_replies_match_redis ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+test declared_statuses_are_mechanically_enforced ... ok
+test generated_matrix_is_current ... ok
+test rendered_matrix_covers_the_json_section ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== fixed tree, timeout lane rerun 2026-09-14T00:08:18-04:00
+test timeout_closes_an_idle_connection_like_redis ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 2.61s

@@ -336,6 +336,10 @@ struct Conn {
     cob_soft_since_ms: u64,
     /// The output-cap kill was already requested (idempotent counter guard).
     cob_kill_sent: bool,
+    /// Injected-clock ms of the last received buffer (accept counts);
+    /// the `timeout` reaper's input (ADR-0123 D2) — one store per
+    /// `Recv`, never per command.
+    last_active_ms: u64,
     /// Remote-publish sequence (ADR-0101 D1): a subscribed connection's
     /// forwarded `PUBLISH` carries `(key, seq)` so the owner's fan leg
     /// back to this cell can pair the publisher's own frames with its
@@ -373,6 +377,9 @@ impl Conn {
 /// reserved for the accept the slab refused (see `on_completion`'s
 /// `Accepted` arm) so its `Close` completion routes to no connection.
 const CONN_SLOT_CAP: u32 = inf_runtime::MAX_SLOT;
+
+/// Redis's reply past `maxclients` (networking.c, measured 8.0.5).
+const MAXCLIENTS_REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
 
 /// The accept-retry wheel key (F-L11-02): after the driver parks the
 /// accept arm on an exhaustion/broken failure, the plane re-arms it at this
@@ -518,9 +525,10 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// queue preserves per-publisher delivery order across fan-outs).
     pub_queue: RefCell<VecDeque<OwnerPub>>,
     pub_pump_active: Cell<bool>,
-    /// Parsed `client-output-buffer-limit pubsub` `(hard, soft, soft_ms)`
-    /// (M1-S11); refreshed by the MAINTAIN config sweep. Zeros disable.
-    cob_pubsub: Cell<(u64, u64, u64)>,
+    /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
+    /// `tcp-keepalive`, both output-buffer classes — read at assembly,
+    /// refreshed by the MAINTAIN config sweep.
+    knobs: Cell<crate::config::ConnKnobs>,
     /// `proto-max-bulk-len` as parser limits (ADR-0122): taken by every
     /// accept, pushed to every live parser by the same sweep.
     parser_limits: Cell<ParserLimits>,
@@ -1498,6 +1506,10 @@ pub struct ServerPlane<
     everysec_armed: bool,
     /// An accept-retry wheel key is pending (F-L11-02: at most one).
     accept_retry_armed: bool,
+    /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
+    /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
+    /// no TCP stack and leaves this off.
+    tcp_transport: bool,
     /// Last manual-checkpoint epoch observed on the control handle
     /// (M2-S10 — one relaxed load per MAINTAIN, edge-detected).
     ckpt_epoch_seen: u64,
@@ -1575,6 +1587,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 .unwrap_or(inf_doc::path::PROGRAM_CACHE_DEFAULT_ENTRIES);
             node.path_cache.replace(inf_doc::ProgramCache::new(size));
         }
+        // ADR-0123 D5: the connection knobs before the first accept.
+        let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
         ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -1602,7 +1616,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
-                cob_pubsub: Cell::new((0, 0, 0)),
+                knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
                 tier: RefCell::new(None),
@@ -1638,6 +1652,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             config_pushed: u64::MAX,
             everysec_armed: false,
             accept_retry_armed: false,
+            tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
             boot: None,
@@ -2102,6 +2117,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 
     /// Enables the M2.5-S21 early fabric publish (A/B lever): remote ops
     /// staged during EXECUTE are published at the head of MAINTAIN.
+    /// Accepted fds are real TCP sockets: apply `tcp-keepalive` at accept
+    /// (ADR-0123 D3). Off by default (the DST's fds are not sockets).
+    pub fn set_tcp_transport(&mut self, on: bool) {
+        self.tcp_transport = on;
+    }
+
     pub fn set_early_fabric_flush(&mut self, on: bool) {
         self.early_fabric_flush = on;
     }
@@ -2264,6 +2285,44 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// Refuses an accepted socket (ADR-0123 D1): counted in
+    /// `rejected_connections`, Redis's error frame sent on the reserved
+    /// top slot with the fd in the token's generation, and closed on that
+    /// send's completion — never a `Close` queued beside its `Send`, which
+    /// io_uring may cancel. A dry send pool closes at once, silently.
+    fn refuse_accept(&self, cx: &mut LoopCx<'_>, fd: RawFd) {
+        let node = &self.shared.node;
+        node.rejected_connections.set(node.rejected_connections.get() + 1);
+        let frame = MAXCLIENTS_REFUSAL;
+        match (u32::try_from(fd), cx.pool.try_lease(LeaseKind::Send)) {
+            (Ok(generation), Some(buf)) if frame.len() <= cx.pool.buf_size() => {
+                cx.pool.bytes_mut(buf)[..frame.len()].copy_from_slice(frame);
+                cx.push(IoOp::Send {
+                    fd,
+                    buf,
+                    len: frame.len() as u32,
+                    token: CompletionToken::new(TokenClass::Send, CONN_SLOT_CAP, generation),
+                });
+            }
+            (_, lease) => {
+                if let Some(buf) = lease {
+                    cx.pool.release(buf);
+                }
+                let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
+                cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
+            }
+        }
+    }
+
+    /// Closes the fd a reserved-slot send named (see `refuse_accept`).
+    fn close_refused(&self, cx: &mut LoopCx<'_>, token: CompletionToken) {
+        // `refuse_accept` stored a non-negative fd (`u32::try_from` passed),
+        // so the cast is exact.
+        let fd = token.generation() as RawFd;
+        let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
+        cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
+    }
+
     /// Spawn the per-connection windowed pump with its first command.
     fn spawn_pump(&self, cx: &mut LoopCx<'_>, key: ConnKey, first: OwnedCmd) {
         let shared = Rc::clone(&self.shared);
@@ -2297,6 +2356,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
             CompletionResult::Accepted { fd } => {
+                let knobs = self.shared.knobs.get();
+                // `maxclients` (ADR-0123 D1): this cell's share of the node
+                // bound; past it the socket gets Redis's error and a close.
+                if self.shared.conns.borrow().live >= knobs.maxclients_share {
+                    self.refuse_accept(cx, fd);
+                    return;
+                }
                 let ns = self.conn_default_ns();
                 let inserted = self.shared.conns.borrow_mut().insert(Conn {
                     fd,
@@ -2322,21 +2388,22 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     rearm_recv: false,
                     cob_soft_since_ms: 0,
                     cob_kill_sent: false,
+                    last_active_ms: cx.now.as_millis(),
                     publish_seq: 0,
                     self_push: Vec::new(),
                 });
                 let Some(key) = inserted else {
                     // Admission bound (batch 12): the slab is full below
-                    // the token slot width. Close the accepted socket and
-                    // count it — the `Closed` completion carries the
-                    // reserved top slot, which no connection ever holds,
-                    // so it routes to nothing.
-                    let node = &self.shared.node;
-                    node.rejected_connections.set(node.rejected_connections.get() + 1);
-                    let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
-                    cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
+                    // the token slot width — the same refusal as the
+                    // `maxclients` share.
+                    self.refuse_accept(cx, fd);
                     return;
                 };
+                if self.tcp_transport {
+                    // New connections only (Redis's `tcp-keepalive`
+                    // semantics); failure is ignored like `TCP_NODELAY`'s.
+                    let _ = inf_runtime::net::set_keepalive(fd, knobs.keepalive_secs);
+                }
                 let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
                 self.shared.with_conn(key, |conn| conn.cx.id = id);
                 let node = &self.shared.node;
@@ -2363,6 +2430,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
             CompletionResult::Sent { buf } => {
                 cx.pool.release(buf);
+                if c.token.slot() == CONN_SLOT_CAP {
+                    // The refusal frame left: close the refused socket.
+                    self.close_refused(cx, c.token);
+                    return;
+                }
                 let key = Self::key_of(c.token);
                 self.shared.with_conn(key, |conn| conn.send_inflight = false);
             }
@@ -2450,6 +2522,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     if !self.accept_retry_armed {
                         self.accept_retry_armed = true;
                         cx.timers.insert(cx.now + ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY);
+                    }
+                    return;
+                }
+                // The reserved slot is a refused accept (ADR-0123 D1): a
+                // failed refusal send still closes its fd; nothing else
+                // rides that slot.
+                if c.token.slot() == CONN_SLOT_CAP {
+                    if c.token.class() == TokenClass::Send {
+                        self.close_refused(cx, c.token);
                     }
                     return;
                 }
@@ -2762,6 +2843,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     cx.pool.release(buf);
                     continue;
                 }
+                conn.last_active_ms = cx.now.as_millis();
                 let data = &cx.pool.bytes(buf)[..len as usize];
                 let pump_was_active = conn.pump_active;
                 // Field split: the parser iterator borrows `conn.parser`
@@ -2975,13 +3057,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             self.memory_publish_in = 64;
             let node = &self.shared.node;
             if let Some(board) = node.memory_board.borrow().as_ref() {
+                let store = self.shared.store.borrow();
                 #[cfg_attr(not(feature = "doc"), allow(unused_mut))]
-                let mut report = self.shared.store.borrow().report();
+                let mut report = store.report();
                 #[cfg(feature = "doc")]
                 node.add_cell_doc_memory(&mut report);
                 board
                     .slot(self.shared.cell.0)
-                    .publish(crate::exec::memory_gauges_of(&report, node));
+                    .publish(crate::exec::memory_gauges_of(&report, node, &store));
             }
         }
         if let Some(board) = &self.loading_board {
@@ -3088,10 +3171,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         if config_version != self.config_pushed {
             self.config_pushed = config_version;
             crate::admin::push_pressure(&mut self.shared.store.borrow_mut(), &self.shared.node);
-            // Output-cap config rides the same hot-per-cell sweep (M1-S11).
-            self.shared
-                .cob_pubsub
-                .set(crate::config::pubsub_output_limit(&self.shared.node.config.borrow()));
+            // The connection knobs ride the same hot-per-cell sweep
+            // (M1-S11 output caps; ADR-0123 `maxclients`/`timeout`/
+            // `tcp-keepalive`).
+            self.shared.knobs.set(crate::config::conn_knobs(
+                &self.shared.node.config.borrow(),
+                self.shared.cells,
+            ));
             // `proto-max-bulk-len` (ADR-0122 D2): the accept-time limits,
             // and every live parser of this cell — bounded by the slab,
             // once per config change, never per command.
@@ -3322,24 +3408,47 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.pubsub_patterns.set(ps.live_pattern_count());
             node.pubsub_state_bytes.set(ps.state_bytes() as u64);
         }
-        let caps = self.shared.cob_pubsub.get();
+        let knobs = self.shared.knobs.get();
+        let now_ms = cx.now.as_millis();
         let mut conns = self.shared.conns.borrow_mut();
         node.connections.set(conns.live as u64);
         let mut bytes = 0usize;
-        for conn in conns.slots.iter_mut().flatten() {
+        let mut idle: Vec<ConnKey> = Vec::new();
+        let ConnSlab { slots, gens, .. } = &mut *conns;
+        for (slot, entry) in slots.iter_mut().enumerate() {
+            let Some(conn) = entry.as_mut() else { continue };
             bytes += conn.state_bytes();
-            // Soft-cap aging continues between deliveries (M1-S11): a
-            // stalled subscriber over the soft limit dies on schedule even
-            // when no further message arrives.
-            if conn.cob_soft_since_ms != 0 {
-                enforce_output_cap(node, conn, cx.now.as_millis(), caps);
+            // The output-buffer class follows the subscription state
+            // (Redis's CLIENT_PUBSUB flag; ADR-0123 D4). Soft-cap aging
+            // continues between deliveries (M1-S11): a stalled client
+            // over the soft limit dies on schedule even when nothing
+            // more is written to it.
+            let subscribed = !conn.cx.sub_channels.is_empty() || !conn.cx.sub_patterns.is_empty();
+            let caps = if subscribed { knobs.cob_pubsub } else { knobs.cob_normal };
+            if conn.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
+                enforce_output_cap(node, conn, now_ms, caps);
+            }
+            // `timeout` (ADR-0123 D2): idle unsubscribed connections
+            // close; subscribers are exempt, as in Redis.
+            if knobs.timeout_ms != 0
+                && !subscribed
+                && !conn.closing
+                && now_ms.saturating_sub(conn.last_active_ms) >= knobs.timeout_ms
+            {
+                idle.push(ConnKey { slot: slot as u32, generation: gens[slot] });
             }
         }
         node.conn_state_bytes.set(bytes as u64);
+        drop(conns);
         // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
         // running sums maintained at the push/pop sites, flushed here.
         node.reply_pool_bytes.set(self.shared.reply_pool_bytes.get());
         node.cmd_pool_bytes.set(self.shared.cmd_pool_bytes.get());
+        let shared = Rc::clone(&self.shared);
+        for key in idle {
+            shared.node.idle_disconnections.set(shared.node.idle_disconnections.get() + 1);
+            self.initiate_close(cx, key);
+        }
     }
 
     fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
@@ -6242,7 +6351,7 @@ fn deliver_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     write: impl FnOnce(&mut Vec<u8>, Protocol),
 ) -> bool {
     let now_ms = shared.now.get().as_millis();
-    let caps = shared.cob_pubsub.get();
+    let caps = shared.knobs.get().cob_pubsub;
     shared
         .with_conn(key, |conn| {
             if conn.closing {
