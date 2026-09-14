@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/direct_segments.rs (target/debug/deps/direct_segments-2a9b634f7e8ac8d4)
+
+running 4 tests
+test buffered_handle_is_not_alignment_checked_after_a_direct_reopen ... ok
+test each_open_is_its_own_file_description ... ok
+test direct_handle_stays_alignment_checked_after_a_buffered_reopen - should panic ... ok
+test packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+

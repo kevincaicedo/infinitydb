@@ -844,3 +844,62 @@ fn sync_tier_torn_points_inject_on_a_direct_segment() {
         );
     }
 }
+
+// ---- F-L04-07: `O_DIRECT` is a property of the open file description ----
+
+/// F-L04-07: a `Direct` handle stays alignment-checked after the same
+/// file is reopened `Buffered` (the ADR-0086 D7 packed-tail reopen).
+/// Pre-fix the reopen cleared the *inode's* flag, so a misaligned
+/// write-through on the still-open direct fd — `EINVAL` on a real
+/// `O_DIRECT` fd — passed the simulator silently.
+#[test]
+#[should_panic(expected = "direct write offset 7 is not 4096-aligned")]
+fn direct_handle_stays_alignment_checked_after_a_buffered_reopen() {
+    let disk = SimDisk::new();
+    let dir = PathBuf::from("log");
+    disk.create_dir_all(&dir).expect("dir");
+    let path = dir.join("seg-000000.ilog");
+    let direct = disk.create_segment_direct(&path, 64 << 10).expect("create direct");
+    let direct_fd = direct.raw_fd().expect("sim fd");
+    let _buffered = disk.open_segment_append(&path, SegmentIoMode::Buffered).expect("reopen");
+    disk.driver_write_through(direct_fd, 7, &[0u8; 13]).expect("misaligned on the direct fd");
+}
+
+/// F-L04-07, the converse: a `Buffered` handle is never alignment-checked
+/// because the same file was later reopened `Direct` — pre-fix the
+/// reopen armed the inode and a legal packed write on the buffered fd
+/// died in the sim's assertion.
+#[test]
+fn buffered_handle_is_not_alignment_checked_after_a_direct_reopen() {
+    let disk = SimDisk::new();
+    let dir = PathBuf::from("log");
+    disk.create_dir_all(&dir).expect("dir");
+    let path = dir.join("seg-000000.ilog");
+    let buffered = disk.create_segment(&path, 64 << 10).expect("create buffered");
+    let buffered_fd = buffered.raw_fd().expect("sim fd");
+    let _direct = disk.open_segment_append(&path, SegmentIoMode::Direct).expect("reopen");
+    disk.driver_write_at(buffered_fd, 7, &[0x5A; 13]).expect("packed write on the buffered fd");
+    let image = disk.contents(&path).expect("exists");
+    assert_eq!(&image[7..20], &[0x5A; 13], "the packed write landed");
+}
+
+/// F-L04-07's mechanism: every open is its own file description with its
+/// own fd (pre-fix the fd *was* the inode, so two handles shared one fd
+/// and a mode could only live on the inode). Closing one handle closes
+/// its fd (`EBADF`, F-L01-02) and leaves the other serving.
+#[test]
+fn each_open_is_its_own_file_description() {
+    let disk = SimDisk::new();
+    let dir = PathBuf::from("log");
+    disk.create_dir_all(&dir).expect("dir");
+    let path = dir.join("seg-000000.ilog");
+    let first = disk.create_segment(&path, 64 << 10).expect("create");
+    let second = disk.open_segment_append(&path, SegmentIoMode::Buffered).expect("reopen");
+    let (a, b) = (first.raw_fd().expect("fd"), second.raw_fd().expect("fd"));
+    assert_ne!(a, b, "two opens, two file descriptions");
+    drop(first);
+    let err = disk.driver_write_at(a, 0, &[1u8; 8]).expect_err("closed fd");
+    assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
+    disk.driver_write_at(b, 0, &[2u8; 8]).expect("the live handle's fd serves");
+    assert_eq!(&disk.contents(&path).expect("exists")[..8], &[2u8; 8]);
+}

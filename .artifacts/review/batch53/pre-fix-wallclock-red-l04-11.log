@@ -1,0 +1,15 @@
+failures:
+
+---- extents::tests::large_backlog_seeds_and_drains_in_bounded_time stdout ----
+
+thread 'extents::tests::large_backlog_seeds_and_drains_in_bounded_time' (159934) panicked at crates/inf-store/src/extents.rs:784:9:
+seed + drain of 50000 orphans took 12.065884601s (F-L04-11)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    extents::tests::large_backlog_seeds_and_drains_in_bounded_time
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 186 filtered out; finished in 12.07s
+
+error: test failed, to rerun pass `-p inf-store --lib`

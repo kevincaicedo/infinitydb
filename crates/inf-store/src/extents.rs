@@ -19,7 +19,6 @@
 //! logged; ADR-0061 D5), then on the plane's in-flight read pins.
 
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 
 /// Default out-of-line threshold: exactly the u24 inline ceiling, so the
 /// default changes no existing value's path (ADR-0061 D1). Values at or
@@ -31,8 +30,9 @@ pub const BLOB_MAX_BYTES_DEFAULT: u64 = 1 << 30;
 /// Default unlink candidates one MAINTAIN reclaim slice hands the plane
 /// (M4-S18): each candidate is one syscall-class unlink, so the bound
 /// keeps a slice's wall time flat regardless of backlog depth — the
-/// backlog itself stays visible as `blob_reclaimable`. A plane budget,
-/// not an `INF.NS` key (the `EvictBudget` class of bound).
+/// queue is stamp-ordered and a slice pops at most `max` from its front
+/// (F-L04-11) — the backlog itself stays visible as `blob_reclaimable`.
+/// A plane budget, not an `INF.NS` key (the `EvictBudget` class of bound).
 pub const BLOB_RECLAIM_PER_SLICE_DEFAULT: usize = 8;
 
 /// Per-namespace blob routing bounds (ADR-0061 D1). Construction
@@ -103,19 +103,29 @@ pub struct ReclaimCandidate {
     pub origin: ReclaimOrigin,
 }
 
-/// A reclaim candidate: refcount hit zero; `stamp` is the WAL epoch its
-/// killing record staged under (0 = durable by construction — replayed
-/// or orphaned). `len` is the dead extent's declared value length — its
-/// bytes stay on the device until the unlink completes, so the
-/// disk-budget accounting (M4-S19, ADR-0062 D5) carries it through the
-/// queue. Boot-sweep orphans carry 0 (the sweep lists names only — a
-/// bounded under-count that heals at their unlink, disclosed).
+/// A reclaim candidate: refcount hit zero. `len` is the dead extent's
+/// declared value length — its bytes stay on the device until the
+/// unlink completes, so the disk-budget accounting (M4-S19, ADR-0062
+/// D5) carries it through the queue. Boot-sweep orphans carry 0 (the
+/// sweep lists names only — a bounded under-count that heals at their
+/// unlink, disclosed).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Reclaimable {
     extent_id: u64,
     len: u64,
-    stamp: u64,
     origin: ReclaimOrigin,
+}
+
+/// The reclaim queue's hand-out order (F-L04-11): `stamp` is the WAL
+/// epoch the killing record staged under (0 = durable by construction —
+/// replayed, orphaned, or re-offered), `seq` keeps arrival order within
+/// a stamp. Stamps arrive monotone (`stage_wal` epochs), so the set
+/// eligible under any durable epoch is a prefix of this order and one
+/// slice never examines past its `max`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReclaimKey {
+    stamp: u64,
+    seq: u64,
 }
 
 /// Observable blob-extent state (`INFO tiering` + the §3.3 zero-assert
@@ -171,9 +181,14 @@ pub struct ExtentRefs {
     /// `(extent id, value len)` — the len rides the whole queue for the
     /// D5 disk accounting.
     parked: Vec<(u64, u64)>,
-    /// Stamped candidates, drained by `reclaim_work` under the plane's
-    /// durable epoch.
-    reclaimable: VecDeque<Reclaimable>,
+    /// Stamped candidates in hand-out order; `reclaim_work` pops at most
+    /// `max` from the front under the plane's durable epoch.
+    reclaimable: BTreeMap<ReclaimKey, Reclaimable>,
+    /// extent id → its queue key: the boot sweep's candidacy test and a
+    /// replay revival's retraction in O(log n), never a queue walk.
+    queued: BTreeMap<u64, ReclaimKey>,
+    /// Arrival counter for [`ReclaimKey::seq`].
+    reclaim_seq: u64,
     /// Candidates handed out and not yet confirmed or deferred, as
     /// `(extent id, value len, origin)`.
     in_reclaim: Vec<(u64, u64, ReclaimOrigin)>,
@@ -181,6 +196,10 @@ pub struct ExtentRefs {
     /// durable artifact can name the id.
     next_extent_id: u64,
     stats: ExtentStats,
+    /// Candidates a reclaim slice or a sweep candidacy test examined —
+    /// the F-L04-11 cost witness (test-only; shipped code pays nothing).
+    #[cfg(test)]
+    scan_steps: u64,
 }
 
 impl ExtentRefs {
@@ -220,9 +239,7 @@ impl ExtentRefs {
         // same at-least-once physics that makes `apply_ref` idempotent
         // (D4 rule 3), applied to the reclaim queue.
         self.parked.retain(|&(id, _)| id != extent_id);
-        if let Some(at) = self.reclaimable.iter().position(|r| r.extent_id == extent_id) {
-            self.reclaimable.remove(at);
-        }
+        self.dequeue(extent_id);
         // Release-checked (F-L04-12): a candidate the plane holds is
         // being disposed of on this very slice — a revival here would
         // leave a live reference to an unlinked file.
@@ -285,13 +302,29 @@ impl ExtentRefs {
     /// at or before this epoch, so `epoch ≤ durable` implies the death
     /// is durable; ADR-0061 D5).
     pub fn stamp(&mut self, wal_epoch: u64) {
-        for (extent_id, len) in self.parked.drain(..) {
-            self.reclaimable.push_back(Reclaimable {
-                extent_id,
-                len,
-                stamp: wal_epoch,
-                origin: ReclaimOrigin::Death,
-            });
+        let parked = std::mem::take(&mut self.parked);
+        for &(extent_id, len) in &parked {
+            self.enqueue(extent_id, len, wal_epoch, ReclaimOrigin::Death);
+        }
+        // Keep the drained Vec's capacity (no allocation per stamp).
+        self.parked = parked;
+        self.parked.clear();
+    }
+
+    /// Queues one candidate at the back of its stamp's arrival order.
+    fn enqueue(&mut self, extent_id: u64, len: u64, stamp: u64, origin: ReclaimOrigin) {
+        let key = ReclaimKey { stamp, seq: self.reclaim_seq };
+        self.reclaim_seq += 1;
+        // Release-checked: a twice-queued id is a double disposal.
+        assert!(self.queued.insert(extent_id, key).is_none(), "an extent queued for reclaim twice");
+        self.reclaimable.insert(key, Reclaimable { extent_id, len, origin });
+    }
+
+    /// Retracts a queued candidate (a replay revival); no-op when the id
+    /// is not queued.
+    fn dequeue(&mut self, extent_id: u64) {
+        if let Some(key) = self.queued.remove(&extent_id) {
+            self.reclaimable.remove(&key);
         }
     }
 
@@ -314,12 +347,7 @@ impl ExtentRefs {
                 // Orphans list by name only (D6 — no content reads at
                 // boot), so their device bytes are unknown: len 0 is the
                 // disclosed under-count that heals at unlink.
-                self.reclaimable.push_back(Reclaimable {
-                    extent_id,
-                    len: 0,
-                    stamp: 0,
-                    origin: ReclaimOrigin::BootOrphan,
-                });
+                self.enqueue(extent_id, 0, 0, ReclaimOrigin::BootOrphan);
             }
         }
         let mut revive = Vec::new();
@@ -329,24 +357,32 @@ impl ExtentRefs {
                 self.stats.quarantine_revived += 1;
                 revive.push(extent_id);
             } else if self.sweep_candidate(extent_id) {
-                self.reclaimable.push_back(Reclaimable {
-                    extent_id,
-                    len: 0,
-                    stamp: 0,
-                    origin: ReclaimOrigin::Quarantined,
-                });
+                self.enqueue(extent_id, 0, 0, ReclaimOrigin::Quarantined);
             }
         }
         revive
     }
 
     /// True when a listed id is neither referenced nor already queued —
-    /// the sweep's candidacy test.
-    fn sweep_candidate(&self, extent_id: u64) -> bool {
+    /// the sweep's candidacy test: one index probe per id (F-L04-11;
+    /// `in_reclaim` holds at most one slice, answered before any sweep).
+    fn sweep_candidate(&mut self, extent_id: u64) -> bool {
+        #[cfg(test)]
+        {
+            self.scan_steps += 1;
+        }
         let live = self.extents.contains_key(&extent_id);
-        let queued = self.reclaimable.iter().any(|r| r.extent_id == extent_id)
+        let queued = self.queued.contains_key(&extent_id)
             || self.in_reclaim.iter().any(|&(id, _, _)| id == extent_id);
         !live && !queued
+    }
+
+    /// Candidates examined so far (the F-L04-11 witness): a reclaim
+    /// slice must examine at most `max + 1`, a boot sweep at most one
+    /// per listed id.
+    #[cfg(test)]
+    fn scan_steps(&self) -> u64 {
+        self.scan_steps
     }
 
     /// Hands the plane up to `max` disposal candidates whose killing
@@ -358,21 +394,26 @@ impl ExtentRefs {
     /// [`reclaim_done`](Self::reclaim_done),
     /// [`reclaim_quarantined`](Self::reclaim_quarantined), or
     /// [`reclaim_deferred`](Self::reclaim_deferred).
+    ///
+    /// Cost: at most `max` pops from the front of the stamp order plus
+    /// one peek (F-L04-11) — never a walk of the backlog; the oldest
+    /// eligible stamp hands out first, arrival order within a stamp.
     pub fn reclaim_work(&mut self, durable_epoch: u64, max: usize) -> Vec<ReclaimCandidate> {
-        let mut out = Vec::new();
-        let mut kept = VecDeque::new();
-        while let Some(candidate) = self.reclaimable.pop_front() {
-            if out.len() < max && candidate.stamp <= durable_epoch {
-                out.push(ReclaimCandidate {
-                    extent_id: candidate.extent_id,
-                    origin: candidate.origin,
-                });
-                self.in_reclaim.push((candidate.extent_id, candidate.len, candidate.origin));
-            } else {
-                kept.push_back(candidate);
+        let mut out = Vec::with_capacity(max.min(self.reclaimable.len()));
+        while out.len() < max {
+            #[cfg(test)]
+            {
+                self.scan_steps += 1;
             }
+            let Some(front) = self.reclaimable.first_entry() else { break };
+            if front.key().stamp > durable_epoch {
+                break;
+            }
+            let candidate = front.remove();
+            self.queued.remove(&candidate.extent_id);
+            out.push(ReclaimCandidate { extent_id: candidate.extent_id, origin: candidate.origin });
+            self.in_reclaim.push((candidate.extent_id, candidate.len, candidate.origin));
         }
-        self.reclaimable = kept;
         if !out.is_empty() {
             self.stats.reclaim_slices += 1;
         }
@@ -407,7 +448,8 @@ impl ExtentRefs {
         let at = at.expect("reclaim_deferred for a candidate reclaim_work handed out");
         let (_, len, origin) = self.in_reclaim.swap_remove(at);
         self.stats.reclaim_deferred += 1;
-        self.reclaimable.push_back(Reclaimable { extent_id, len, stamp: 0, origin });
+        // Stamp 0: durable already — re-offered at the next slice's front.
+        self.enqueue(extent_id, len, 0, origin);
     }
 
     /// The reference at `addr`, if that record stores out of line.
@@ -464,7 +506,7 @@ impl ExtentRefs {
             (self.parked.len() + self.reclaimable.len() + self.in_reclaim.len()) as u64;
         stats.disk_bytes = self.extents.values().map(|e| extent_device_bytes(e.len)).sum::<u64>()
             + self.parked.iter().map(|&(_, len)| extent_device_bytes(len)).sum::<u64>()
-            + self.reclaimable.iter().map(|r| extent_device_bytes(r.len)).sum::<u64>()
+            + self.reclaimable.values().map(|r| extent_device_bytes(r.len)).sum::<u64>()
             + self.in_reclaim.iter().map(|&(_, len, _)| extent_device_bytes(len)).sum::<u64>();
         stats
     }
@@ -655,5 +697,107 @@ mod tests {
         x.register(100, 1, 64);
         x.register(200, 2, 64);
         x.relocate(100, 200);
+    }
+
+    /// F-L04-11: a MAINTAIN reclaim slice examines at most `max + 1`
+    /// candidates whatever the backlog — the flat-cost claim the
+    /// `BLOB_RECLAIM_PER_SLICE_DEFAULT` doc makes. Pre-fix every slice
+    /// drained and rebuilt the whole queue (steps == backlog).
+    #[test]
+    fn reclaim_slice_examines_at_most_max_plus_one_candidates() {
+        let mut x = ExtentRefs::new();
+        let backlog = 10_000u64;
+        for i in 0..backlog {
+            let e = x.allocate_id();
+            x.register(i, e, 64);
+            x.note_death(i);
+            if i % 100 == 99 {
+                x.stamp(i / 100 + 1); // epochs 1..=100, 100 deaths each
+            }
+        }
+        assert_eq!(x.stats().reclaimable, backlog);
+        let before = x.scan_steps();
+        let work = x.reclaim_work(u64::MAX, 8);
+        assert_eq!(work.len(), 8);
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 9, "one slice examined {steps} candidates for 8 hand-outs (F-L04-11)");
+        for c in work {
+            x.reclaim_done(c.extent_id);
+        }
+        // A partially durable epoch: eligible = the first 50 epochs. The
+        // slice still costs max + 1, and it hands out the oldest first.
+        let before = x.scan_steps();
+        let work = x.reclaim_work(50, 8);
+        assert_eq!(work.len(), 8);
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 9, "partial epoch: {steps} candidates examined");
+        for c in work {
+            x.reclaim_done(c.extent_id);
+        }
+        // Nothing eligible: one peek, no scan of the ineligible tail.
+        let before = x.scan_steps();
+        assert!(x.reclaim_work(0, 8).is_empty());
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 1, "nothing eligible cost {steps} steps");
+    }
+
+    /// F-L04-11: seeding the boot sweep costs one candidacy probe per
+    /// listed id — never a walk of the queue per id (pre-fix O(n²):
+    /// every listed id scanned every already-queued candidate).
+    #[test]
+    fn boot_sweep_seeding_is_linear_in_the_listing() {
+        let mut x = ExtentRefs::new();
+        // Half the listing is already queued (replayed deaths the
+        // directory also lists — the common boot shape); half is orphans.
+        let n = 20_000u64;
+        for i in 0..n / 2 {
+            let e = x.allocate_id();
+            x.register(i, e, 64);
+            x.note_death(i);
+        }
+        let listed: Vec<u64> = (1..=n).collect();
+        let before = x.scan_steps();
+        assert!(x.sweep_seed(&listed, &[]).is_empty());
+        let steps = x.scan_steps() - before;
+        assert!(
+            steps <= n,
+            "seeding {n} listed ids examined {steps} queued candidates (F-L04-11: O(n²))"
+        );
+        assert_eq!(x.stats().reclaimable, n, "every listed id queued exactly once");
+    }
+
+    /// F-L04-11, the regime witness (run explicitly — a wall-clock
+    /// bound has no place in the parallel suite): 50 000 boot orphans
+    /// seeded then drained eight per slice. Pre-fix: seconds (the
+    /// quadratic seed plus a full queue rebuild per slice); after: tens
+    /// of milliseconds. `cargo test -p inf-store --lib -- --ignored
+    /// large_backlog_seeds_and_drains_in_bounded_time`.
+    #[test]
+    #[ignore = "wall-clock witness; run explicitly"]
+    #[allow(clippy::disallowed_methods, reason = "test-only wall-clock witness, not cell code")]
+    fn large_backlog_seeds_and_drains_in_bounded_time() {
+        let n = 50_000u64;
+        let mut x = ExtentRefs::new();
+        let listed: Vec<u64> = (1..=n).collect();
+        let started = std::time::Instant::now();
+        assert!(x.sweep_seed(&listed, &[]).is_empty());
+        let mut slices = 0u64;
+        loop {
+            let work = x.reclaim_work(0, BLOB_RECLAIM_PER_SLICE_DEFAULT);
+            if work.is_empty() {
+                break;
+            }
+            slices += 1;
+            for c in work {
+                x.reclaim_quarantined(c.extent_id);
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(slices, n / BLOB_RECLAIM_PER_SLICE_DEFAULT as u64);
+        assert_eq!(x.stats().reclaimable, 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "seed + drain of {n} orphans took {elapsed:?} (F-L04-11)"
+        );
     }
 }

@@ -1,0 +1,37 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.95s
+     Running unittests src/lib.rs (target/debug/deps/inf_store-58c556ded8d3a37b)
+
+running 11 tests
+test extents::tests::large_backlog_seeds_and_drains_in_bounded_time ... ignored, wall-clock witness; run explicitly
+test extents::tests::entries_below_filters_and_orders ... ok
+test extents::tests::deferred_unlinks_reoffer_and_orphans_sweep ... ok
+test extents::tests::mid_walk_death_below_the_cursor_never_hides_an_entry ... ok
+test extents::tests::quarantined_ids_revive_when_referenced_and_unlink_on_the_second_verdict ... ok
+test extents::tests::refcount_follows_the_reference_map_exactly ... ok
+test extents::tests::duplicate_registration_counts_once ... ok
+test extents::tests::relocating_onto_a_live_reference_is_refused_in_every_profile - should panic ... ok
+test extents::tests::reviving_a_handed_out_candidate_is_refused_in_every_profile - should panic ... ok
+test extents::tests::reclaim_slice_examines_at_most_max_plus_one_candidates ... FAILED
+test extents::tests::boot_sweep_seeding_is_linear_in_the_listing ... FAILED
+
+failures:
+
+---- extents::tests::reclaim_slice_examines_at_most_max_plus_one_candidates stdout ----
+
+thread 'extents::tests::reclaim_slice_examines_at_most_max_plus_one_candidates' (159908) panicked at crates/inf-store/src/extents.rs:710:9:
+one slice examined 10000 candidates for 8 hand-outs (F-L04-11)
+
+---- extents::tests::boot_sweep_seeding_is_linear_in_the_listing stdout ----
+
+thread 'extents::tests::boot_sweep_seeding_is_linear_in_the_listing' (159902) panicked at crates/inf-store/src/extents.rs:749:9:
+seeding 20000 listed ids examined 200000000 queued candidates (F-L04-11: O(n²))
+
+
+failures:
+    extents::tests::boot_sweep_seeding_is_linear_in_the_listing
+    extents::tests::reclaim_slice_examines_at_most_max_plus_one_candidates
+
+test result: FAILED. 8 passed; 2 failed; 1 ignored; 0 measured; 176 filtered out; finished in 1.74s
+
+error: test failed, to rerun pass `-p inf-store --lib`

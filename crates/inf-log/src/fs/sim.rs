@@ -106,8 +106,10 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 
 use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 
-/// Fake-fd base for inode handles (dir handles sit above it). High
-/// enough that no simulated socket fd space collides.
+/// Fake-fd base for file handles (dir handles sit above it). High
+/// enough that no simulated socket fd space collides. One fd per
+/// *open* (F-L04-07): two handles on one inode are two fds, as the
+/// kernel's open file descriptions are.
 const FILE_FD_BASE: i64 = 0x4000_0000;
 const DIR_FD_BASE: i64 = 0x6000_0000;
 
@@ -430,21 +432,28 @@ struct Inode {
     /// this inode answer `EIO` and touch nothing.
     read_faults_left: u64,
     write_faults_left: u64,
-    /// Opened `O_DIRECT` (segments and v3 checkpoints): every driver
-    /// write must be [`crate::ckpt::ICK_BLOCK_ALIGN`]-aligned in offset
-    /// and length, asserted here so the simulator catches what tmpfs
-    /// swallows (ADR-0088 D3).
-    direct: bool,
     /// Direct-meta refusal budget (ADR-0088 D3 as amended): `Some(n)` on
     /// a `create_meta_direct` inode while the disk's refusal is armed —
     /// `n` more direct writes to *this file* succeed, every later one
     /// answers `InvalidInput`. `None` on every other inode.
     direct_writes_left: Option<u64>,
-    /// Open [`SimFile`] handles on this inode. At zero the fd is closed:
-    /// a driver op naming it answers `EBADF`, as the kernel would — a
-    /// staged op outliving its handle is a use-after-close the model
-    /// refuses to serve (review 2026-08-30, F-L01-02).
-    open_handles: u32,
+}
+
+/// One open file description (F-L04-07): the fd's inode and the mode
+/// of *this* open. `O_DIRECT` lives here, as in the kernel — a segment
+/// created `Direct` and reopened `Buffered` (ADR-0086 D7's packed tail)
+/// has one checked and one unchecked fd on the same inode. Dropping the
+/// [`SimFile`] closes the fd: a driver op naming it answers `EBADF`, as
+/// the kernel would — a staged op outliving its handle is a
+/// use-after-close the model refuses to serve (F-L01-02).
+#[derive(Debug, Clone, Copy)]
+struct OpenFile {
+    ino: u64,
+    /// Opened `O_DIRECT` (segments, tier files, v3 checkpoints): every
+    /// write through this fd must be [`crate::ckpt::ICK_BLOCK_ALIGN`]-
+    /// aligned in offset and length, asserted so the simulator catches
+    /// what tmpfs swallows (ADR-0088 D3).
+    direct: bool,
 }
 
 impl Inode {
@@ -648,6 +657,10 @@ struct DiskState {
     pending_meta: BTreeMap<PathBuf, Vec<MetaOp>>,
     inodes: BTreeMap<u64, Inode>,
     next_ino: u64,
+    /// Open file descriptions by fd index (`raw_fd − FILE_FD_BASE`);
+    /// an index below `next_file_fd` and absent here is a closed fd.
+    open_files: BTreeMap<u64, OpenFile>,
+    next_file_fd: u64,
     /// Dir-handle fd → directory (driver dir-fsync routing).
     dir_fds: BTreeMap<i64, PathBuf>,
     next_dir_fd: i64,
@@ -699,18 +712,31 @@ impl DiskState {
         Ok(())
     }
 
-    /// The inode behind a driver file fd, refusing a closed one with
-    /// `EBADF` (no open handle) and an unknown one with `NotFound`.
-    fn open_inode_mut(&mut self, fd: i32) -> io::Result<&mut Inode> {
-        let ino = file_fd_ino(fd)?;
+    /// The open file description behind a driver file fd and its inode,
+    /// refusing a closed one with `EBADF`, one never issued with
+    /// `NotFound`, and one whose inode a power cut discarded with
+    /// `NotFound` (the dead life's handle).
+    fn open_file_mut(&mut self, fd: i32) -> io::Result<(OpenFile, &mut Inode)> {
+        let index = file_fd_index(fd)?;
+        if index >= self.next_file_fd {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")));
+        }
+        let Some(open) = self.open_files.get(&index).copied() else {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        };
         let inode = self
             .inodes
-            .get_mut(&ino)
+            .get_mut(&open.ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
-        if inode.open_handles == 0 {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
-        Ok(inode)
+        Ok((open, inode))
+    }
+
+    /// Issues an fd for a new open of `ino` in `direct` mode.
+    fn open_fd(&mut self, ino: u64, direct: bool) -> u64 {
+        let index = self.next_file_fd;
+        self.next_file_fd += 1;
+        self.open_files.insert(index, OpenFile { ino, direct });
+        index
     }
 
     fn ino_of(&self, path: &Path) -> io::Result<u64> {
@@ -958,9 +984,11 @@ impl SimDisk {
     pub fn driver_write_at(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let inode = state.open_inode_mut(fd)?;
-        assert_direct_aligned(inode, offset, data.len());
-        inode.direct_write_gate()?;
+        let (open, inode) = state.open_file_mut(fd)?;
+        assert_direct_aligned(open.direct, offset, data.len());
+        if open.direct {
+            inode.direct_write_gate()?;
+        }
         if inode.take_write_fault() {
             state.faults_fired += 1;
             return Err(eio());
@@ -978,9 +1006,11 @@ impl SimDisk {
     pub fn driver_write_through(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let inode = state.open_inode_mut(fd)?;
-        assert_direct_aligned(inode, offset, data.len());
-        inode.direct_write_gate()?;
+        let (open, inode) = state.open_file_mut(fd)?;
+        assert_direct_aligned(open.direct, offset, data.len());
+        if open.direct {
+            inode.direct_write_gate()?;
+        }
         if inode.take_write_fault() {
             state.faults_fired += 1;
             return Err(eio());
@@ -1000,7 +1030,7 @@ impl SimDisk {
     pub fn driver_read_at(&self, fd: i32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let inode = state.open_inode_mut(fd)?;
+        let (_, inode) = state.open_file_mut(fd)?;
         if inode.take_read_fault() {
             state.faults_fired += 1;
             return Err(eio());
@@ -1033,7 +1063,7 @@ impl SimDisk {
             // A dropped directory handle: closed, as the kernel sees it.
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        let inode = state.open_inode_mut(fd)?;
+        let (_, inode) = state.open_file_mut(fd)?;
         inode.sync();
         Ok(())
     }
@@ -1095,9 +1125,7 @@ impl SimDisk {
                 committed: SectorMap::default(),
                 read_faults_left: 0,
                 write_faults_left: 0,
-                direct,
                 direct_writes_left,
-                open_handles: 1,
             },
         );
         state.os_names.insert(path.to_path_buf(), ino);
@@ -1106,15 +1134,26 @@ impl SimDisk {
             .entry(parent)
             .or_default()
             .push(MetaOp::Create { name: path.to_path_buf(), ino });
-        Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
+        let fd = state.open_fd(ino, direct);
+        Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
+    }
+
+    /// Opens an existing file in `direct` mode — its own file
+    /// description (F-L04-07).
+    fn open_handle(&self, path: &Path, direct: bool) -> io::Result<SimFile> {
+        let mut state = self.state.borrow_mut();
+        state.dead_check()?;
+        let ino = state.ino_of(path)?;
+        let fd = state.open_fd(ino, direct);
+        Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
     }
 }
 
-/// A direct inode takes only aligned writes — the `O_DIRECT` contract
+/// A direct open takes only aligned writes — the `O_DIRECT` contract
 /// the kernel enforces with `EINVAL`, enforced here as an invariant so a
 /// misaligned block is a sim failure, never a device-only one.
-fn assert_direct_aligned(inode: &Inode, offset: u64, len: usize) {
-    if inode.direct {
+fn assert_direct_aligned(direct: bool, offset: u64, len: usize) {
+    if direct {
         let align = crate::ckpt::ICK_BLOCK_ALIGN as u64;
         assert_eq!(offset % align, 0, "direct write offset {offset} is not {align}-aligned");
         assert_eq!(len as u64 % align, 0, "direct write length {len} is not {align}-aligned");
@@ -1125,7 +1164,7 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
 }
 
-fn file_fd_ino(fd: i32) -> io::Result<u64> {
+fn file_fd_index(fd: i32) -> io::Result<u64> {
     let fd = i64::from(fd);
     if (FILE_FD_BASE..DIR_FD_BASE).contains(&fd) {
         Ok((fd - FILE_FD_BASE) as u64)
@@ -1134,7 +1173,8 @@ fn file_fd_ino(fd: i32) -> io::Result<u64> {
     }
 }
 
-/// One open handle: follows its inode across renames (POSIX fd
+/// One open handle — one open file description with its own fd and
+/// mode (F-L04-07): follows its inode across renames (POSIX fd
 /// semantics); dir handles map `sync_data` to the directory barrier.
 #[derive(Debug)]
 pub struct SimFile {
@@ -1144,7 +1184,7 @@ pub struct SimFile {
 
 #[derive(Debug)]
 enum Target {
-    Ino(u64),
+    File { ino: u64, fd: u64, direct: bool },
     Dir(PathBuf, i64),
 }
 
@@ -1152,12 +1192,11 @@ impl Drop for SimFile {
     fn drop(&mut self) {
         let mut state = self.state.borrow_mut();
         match &self.target {
-            // A power cut may already have discarded the inode (the dead
-            // process's handles drop after the cut): nothing to close.
-            Target::Ino(ino) => {
-                if let Some(inode) = state.inodes.get_mut(ino) {
-                    inode.open_handles = inode.open_handles.saturating_sub(1);
-                }
+            // Closes the fd; the inode stays while a name or another
+            // handle reaches it (a power cut may already have discarded
+            // it — the dead process's handles drop after the cut).
+            Target::File { fd, .. } => {
+                state.open_files.remove(fd);
             }
             Target::Dir(_, fd) => {
                 state.dir_fds.remove(fd);
@@ -1171,13 +1210,15 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, direct, .. } => {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
                 // The blocking tier sees the same direct-write physics as
                 // the driver tier (ADR-0088 D3 as amended): alignment
                 // asserted, the refusal gate consulted.
-                assert_direct_aligned(inode, offset, data.len());
-                inode.direct_write_gate()?;
+                assert_direct_aligned(*direct, offset, data.len());
+                if *direct {
+                    inode.direct_write_gate()?;
+                }
                 if inode.take_write_fault() {
                     state.faults_fired += 1;
                     return Err(eio());
@@ -1195,7 +1236,7 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.dead_check()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 if state.inodes.get_mut(ino).expect("open handle pins its inode").take_read_fault()
                 {
                     state.faults_fired += 1;
@@ -1218,7 +1259,7 @@ impl SegmentFile for SimFile {
         let state = self.state.borrow();
         state.dead_check()?;
         match &self.target {
-            Target::Ino(ino) => Ok(state.inodes[ino].os.len() as u64),
+            Target::File { ino, .. } => Ok(state.inodes[ino].os.len() as u64),
             Target::Dir(..) => Ok(0),
         }
     }
@@ -1227,7 +1268,7 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
                 let len = usize::try_from(len).expect("length fits usize");
                 // OS view honors the new length immediately; the durable
@@ -1251,7 +1292,7 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 state.inodes.get_mut(ino).expect("open handle pins its inode").sync();
                 Ok(())
             }
@@ -1267,7 +1308,7 @@ impl SegmentFile for SimFile {
 
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         let fd = match &self.target {
-            Target::Ino(ino) => FILE_FD_BASE + *ino as i64,
+            Target::File { fd, .. } => FILE_FD_BASE + *fd as i64,
             Target::Dir(_, fd) => *fd,
         };
         Some(i32::try_from(fd).expect("sim fd fits i32"))
@@ -1277,7 +1318,7 @@ impl SegmentFile for SimFile {
         let state = self.state.borrow();
         state.dead_check()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 // `st_blocks × 512 ≥ st_size` at the target (F-L04-01):
                 // every sector of the length written, in the OS view.
                 let inode = &state.inodes[ino];
@@ -1365,15 +1406,9 @@ impl SegmentFs for SimDisk {
         self.create_inode_full(path, Vec::new(), Vec::new(), 0, mode == TierIoMode::Direct, false)
     }
 
-    /// Same per-inode shape as [`open_segment_append`](Self::open_segment_append)
-    /// (F-L04-07's caveat applies to both).
+    /// The mode of *this* open, as [`open_segment_append`](Self::open_segment_append).
     fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
-        let file = self.open_write(path)?;
-        let mut state = self.state.borrow_mut();
-        let ino = state.ino_of(path)?;
-        let inode = state.inodes.get_mut(&ino).expect("ino_of resolved the inode");
-        inode.direct = mode == TierIoMode::Direct;
-        Ok(file)
+        self.open_handle(path, mode == TierIoMode::Direct)
     }
 
     fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
@@ -1418,11 +1453,7 @@ impl SegmentFs for SimDisk {
     }
 
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
-        let mut state = self.state.borrow_mut();
-        state.dead_check()?;
-        let ino = state.ino_of(path)?;
-        state.inodes.get_mut(&ino).expect("ino_of resolved the inode").open_handles += 1;
-        Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
+        self.open_handle(path, false)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
@@ -1431,17 +1462,13 @@ impl SegmentFs for SimDisk {
 
     /// The reopened tail takes the mode of *this* open (ADR-0086 D4 as
     /// amended): `O_DIRECT` is a property of the open file description,
-    /// not the inode, so a segment created direct and reopened `Buffered`
-    /// (the FUA → FLUSH transition, packed frames at the v3 tail's
-    /// aligned end) takes packed writes, and a buffered segment reopened
-    /// `Direct` asserts alignment from here on.
+    /// not the inode (F-L04-07), so a segment created direct and
+    /// reopened `Buffered` (the FUA → FLUSH transition, packed frames at
+    /// the v3 tail's aligned end) takes packed writes on the new fd while
+    /// any still-open direct fd stays alignment-checked, and a buffered
+    /// segment reopened `Direct` asserts alignment on the new fd only.
     fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
-        let file = self.open_write(path)?;
-        let mut state = self.state.borrow_mut();
-        let ino = state.ino_of(path)?;
-        let inode = state.inodes.get_mut(&ino).expect("ino_of resolved the inode");
-        inode.direct = mode == SegmentIoMode::Direct;
-        Ok(file)
+        self.open_handle(path, mode == SegmentIoMode::Direct)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
