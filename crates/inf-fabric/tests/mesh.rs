@@ -343,3 +343,90 @@ fn send_rejects_reply_ops() {
     let token = a.next_token();
     let _ = a.send(CellId(1), &Op::Reply { token, outcome: Outcome::Ok });
 }
+
+/// Sends `n` reads `from → to`, flushing after each so every frame is in
+/// the ring (not staged). Returns how many were admitted (credit-bound).
+fn blast(from: &mut CellFabric, to: CellId, n: usize) -> usize {
+    let mut admitted = 0;
+    for _ in 0..n {
+        let token = from.next_token();
+        if from.send(to, &read_op(token, b"hot")).is_err() {
+            break;
+        }
+        admitted += 1;
+    }
+    from.flush();
+    admitted
+}
+
+/// F-L12-02 (review of 2026-08-30): `drain` is documented round-robin. Two
+/// peers each present more frames than one drain's budget; the second
+/// drain must start at the peer the first one never reached.
+#[test]
+fn a_budget_exhausted_drain_resumes_at_the_next_peer() {
+    // The binary's mesh config (`infinityd`: 4096 / 1024).
+    let mut cells = small_mesh(3, 4096, 1024);
+    let mut c2 = cells.pop().expect("cell 2");
+    let mut c1 = cells.pop().expect("cell 1");
+    let mut c0 = cells.pop().expect("cell 0");
+    assert_eq!(blast(&mut c0, CellId(2), 600), 600);
+    assert_eq!(blast(&mut c1, CellId(2), 600), 600);
+
+    let mut counts = [0usize; 3];
+    c2.drain(64, |from, _| counts[usize::from(from.0)] += 1);
+    // Packed slots overshoot the frame budget by at most one chunk (the
+    // documented bound), so peer 0 yields ≥ 64 here — and peer 1 nothing.
+    assert!(
+        counts[0] >= 64 && counts[1] == 0,
+        "the first drain spends its budget on peer 0: {counts:?}"
+    );
+    c2.drain(64, |from, _| counts[usize::from(from.0)] += 1);
+    assert!(
+        counts[1] > 0,
+        "peer 1 was skipped by a budget-exhausted drain and not served next: {counts:?}"
+    );
+    // Peer 1 was skipped exactly once (the first drain) — the bound is
+    // `peers − 1 = 1`.
+    assert_eq!(c2.stats().drain_skip_streak_max, 1);
+}
+
+/// F-L12-02, the sustained shape: peer 0 keeps its ring topped up above
+/// the drain budget (replies return its credits every round). Peer 1's
+/// 600 frames must still all arrive — bounded by the round-robin, not by
+/// peer 0 running dry.
+#[test]
+fn a_saturating_peer_cannot_starve_its_neighbour() {
+    let mut cells = small_mesh(3, 4096, 1024);
+    let mut c2 = cells.pop().expect("cell 2");
+    let mut c1 = cells.pop().expect("cell 1");
+    let mut c0 = cells.pop().expect("cell 0");
+    let budget = 64;
+    assert_eq!(blast(&mut c1, CellId(2), 600), 600);
+    assert_eq!(blast(&mut c0, CellId(2), 1024), 1024);
+
+    let mut counts = [0usize; 3];
+    let mut rounds = 0;
+    while counts[1] < 600 && rounds < 64 {
+        rounds += 1;
+        let mut owed = Vec::new();
+        c2.drain(budget, |from, op| {
+            counts[usize::from(from.0)] += 1;
+            if let (CellId(0), Op::Read { token, .. }) = (from, op) {
+                owed.push(token);
+            }
+        });
+        for token in owed {
+            c2.reply(CellId(0), token, &Outcome::Nil);
+        }
+        c2.flush();
+        // Peer 0 collects its replies (credits back) and refills the ring.
+        c0.drain(usize::MAX, |_, _| {});
+        blast(&mut c0, CellId(2), budget);
+    }
+    assert_eq!(
+        counts[1], 600,
+        "peer 1 starved behind a saturating peer 0 for {rounds} drains: {counts:?}"
+    );
+    assert!(counts[0] > 0);
+    assert!(c2.stats().drain_skip_streak_max <= 1, "{:?}", c2.stats());
+}

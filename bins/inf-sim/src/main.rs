@@ -105,7 +105,7 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
@@ -1096,10 +1096,11 @@ fn main() {
         "m0-smoke" => Scenario::m0_smoke(seed),
         "m0-adversarial" => Scenario::m0_adversarial(seed),
         "m0-surface" => Scenario::m0_surface(seed),
+        "m0-fabric-fairness" => Scenario::m0_fabric_fairness(seed),
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, m1-cache, \
+                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, m0-fabric-fairness, m1-cache, \
                  m2-durable, m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, \
                  m4-cold, m4-recovery, m4-diskfull, m4-tiered)"
             );
@@ -1130,7 +1131,8 @@ fn main() {
     // Machine-readable line for the nightly fleet (sim-seconds budget sum).
     println!(
         "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
-         scan_walks={} replays_skipped={} plant_fired={} accept_resumes={}",
+         scan_walks={} replays_skipped={} plant_fired={} accept_resumes={} \
+         fabric_skip_streak_max={}",
         report.sim_seconds,
         report.published,
         report.delivered,
@@ -1139,7 +1141,8 @@ fn main() {
         report.scan_walks,
         report.replays_skipped,
         report.plant_fired,
-        report.accept_resumes
+        report.accept_resumes,
+        report.fabric_skip_streak_max
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)

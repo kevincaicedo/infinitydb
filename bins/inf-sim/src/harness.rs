@@ -81,8 +81,17 @@ pub struct Scenario {
     /// Total commands across all clients.
     pub commands: u64,
     pub key_space: u64,
-    /// Every Nth client pipelines 4-deep instead of awaiting each reply.
+    /// Every Nth client pipelines `pipeline_window`-deep instead of
+    /// awaiting each reply.
     pub pipelined_every: usize,
+    /// Window of a pipelined client (4 in every frozen scenario; the
+    /// fairness scenario runs deep windows so one peer saturates a cell's
+    /// FABRIC-IN budget — F-L12-02).
+    pub pipeline_window: u64,
+    /// Mesh sizing. The frozen scenarios keep 1024 / 256 (a peer can never
+    /// fill the 1024-frame drain budget alone, so the drain order was
+    /// unobservable); the fairness scenario runs the binary's 4096 / 1024.
+    pub fabric: MeshConfig,
     pub plant: Plant,
     /// Pub/sub plane (M1-S15): dedicated subscriber connections. 0 keeps the
     /// M0 shape (and the M0 RNG stream) exactly.
@@ -152,6 +161,8 @@ impl Scenario {
             commands: 100_000,
             key_space: 2_000,
             pipelined_every: 5,
+            pipeline_window: 4,
+            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -181,6 +192,8 @@ impl Scenario {
             commands: 40_000,
             key_space: 500,
             pipelined_every: 5,
+            pipeline_window: 4,
+            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -210,6 +223,8 @@ impl Scenario {
             commands: 40_000,
             key_space: 400,
             pipelined_every: 5,
+            pipeline_window: 4,
+            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -226,6 +241,35 @@ impl Scenario {
     /// The M1-S15 scenario: the m0 mix plus TTL traffic, cross-cell pub/sub
     /// fan-out (channel + pattern subscribers), and the delivery/accounting
     /// oracles armed.
+    /// F-L12-02 (review of 2026-08-30): the binary's mesh sizing (4096 /
+    /// 1024), one hot key so every cross-cell frame targets one owner, and
+    /// 64-deep pipelines on every client so each source cell keeps the
+    /// owner's 1024-frame FABRIC-IN budget saturated. The fixed-order drain
+    /// starved the higher-numbered source for hundreds of consecutive
+    /// drains; the rotating cursor bounds the skip streak at `cells − 2`.
+    pub fn m0_fabric_fairness(seed: u64) -> Scenario {
+        Scenario {
+            seed,
+            cells: 3,
+            connections: 192,
+            commands: 400_000,
+            key_space: 1,
+            pipelined_every: 1,
+            pipeline_window: 256,
+            fabric: MeshConfig { ring_capacity: 4096, data_credits: 1024 },
+            plant: Plant::None,
+            subscribers: 0,
+            channels: 0,
+            publish_percent: 0,
+            step_ns_max: 15_000,
+            adversarial_percent: 0,
+            namespaces: 0,
+            surface_percent: 0,
+            audit_every: 0,
+            canary: Canary::None,
+        }
+    }
+
     pub fn m1_cache(seed: u64) -> Scenario {
         Scenario {
             seed,
@@ -234,6 +278,8 @@ impl Scenario {
             commands: 60_000,
             key_space: 2_000,
             pipelined_every: 5,
+            pipeline_window: 4,
+            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
             plant: Plant::None,
             subscribers: 8,
             channels: 8,
@@ -279,6 +325,11 @@ pub struct SimReport {
     /// a `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
     /// were never let in (and the run stalls).
     pub accept_resumes: u64,
+    /// Longest run of budget-exhausted drains that skipped a peer with
+    /// frames waiting, over every cell (F-L12-02; bound `cells − 2`).
+    /// Disclosed so a fairness run that never exhausted a budget cannot
+    /// pass as coverage.
+    pub fabric_skip_streak_max: u32,
 }
 
 impl SimReport {
@@ -1060,7 +1111,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     // Cells: real plane + loop over the sim driver.
     let mut nets = Vec::new();
     let mut cells = Vec::new();
-    let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
+    let fabrics = Mesh::new(scenario.cells, scenario.fabric);
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
         let driver = SimDriver::new(Rc::clone(&net));
@@ -1100,8 +1151,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     for i in 0..scenario.connections {
         let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
         let fd = nets[cell].borrow_mut().connect();
-        let window =
-            if scenario.pipelined_every > 0 && i % scenario.pipelined_every == 0 { 4 } else { 1 };
+        let window = if scenario.pipelined_every > 0 && i % scenario.pipelined_every == 0 {
+            scenario.pipeline_window
+        } else {
+            1
+        };
         clients.push(SimClient {
             id: i,
             cell,
@@ -1195,6 +1249,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         replays_skipped: 0,
         plant_fired: false,
         accept_resumes: 0,
+        fabric_skip_streak_max: 0,
     };
     let mut violations: Vec<String> = Vec::new();
 
@@ -1416,6 +1471,22 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         } else {
             idle_steps = 0;
             last_progress = progress;
+        }
+    }
+
+    // Drain-fairness oracle (F-L12-02): a peer with a rung doorbell is
+    // reached within `peers − 1` budget-exhausted drains — the rotating
+    // cursor's bound. The frozen mesh sizing never exhausts the budget
+    // (streak 0 trivially); `m0-fabric-fairness` does.
+    let streak_bound = u32::from(scenario.cells.saturating_sub(2));
+    for (i, (_, plane)) in cells.iter().enumerate() {
+        let streak = plane.fabric_stats().drain_skip_streak_max;
+        report.fabric_skip_streak_max = report.fabric_skip_streak_max.max(streak);
+        if streak > streak_bound {
+            violations.push(format!(
+                "cell {i}: a peer went unvisited for {streak} consecutive budget-exhausted \
+                 drains (bound {streak_bound}) — FABRIC-IN starved it"
+            ));
         }
     }
 

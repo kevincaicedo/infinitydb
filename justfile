@@ -86,6 +86,9 @@ sim-smoke:
     # F-L19-05/06: namespace-bound + SELECTed clients, SCAN/KEYS/DBSIZE/
     # RANDOMKEY/FLUSH* under audit, values + deadlines reconciled.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
+    # F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines —
+    # FABRIC-IN must reach every peer within `cells − 2` exhausted drains.
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-fabric-fairness --seed 0xC0FFEE --verify-determinism
     # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism

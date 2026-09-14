@@ -207,6 +207,40 @@ fn an_unmarked_apply_carrying_an_internal_command_is_unknown() {
     assert_eq!(rig.local(owner, &[b"GET", key]), b"$1\r\nv\r\n", "only the marked frame landed");
 }
 
+/// L12 style row (review of 2026-08-30): `handle_apply` indexed `argv[0]`
+/// bare while the codec admits a zero-argument `Apply`. An empty apply is
+/// an in-process malformation — answered with the typed refusal (the
+/// origin's credit comes back), never a cell panic.
+#[test]
+fn an_apply_without_arguments_is_refused_not_a_panic() {
+    let rig = Rig::new(0);
+    let shared = &rig.planes[1].shared;
+    for program in [false, true] {
+        let op = Op::Apply {
+            token: FabricToken::new(CellId(0), 1),
+            slot: SlotRouter::slot_of(&rig.target),
+            cmd: 2,
+            args: ApplyArgs::EMPTY,
+            program,
+        };
+        let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+        handle_fabric_op(
+            shared,
+            shared.now.get(),
+            CellId(0),
+            op,
+            &mut scratch,
+            &mut staged,
+            &mut pubs,
+            &mut gated,
+            &mut orphans,
+        );
+        let (_, _, reply) = staged.pop().expect("one staged reply");
+        assert!(matches!(reply, StagedReply::Refused), "program={program}");
+    }
+}
+
 /// The destination leg: `INF.PUT` for the renames, `SET` for COPY
 /// (ADR-0110 third amendment).
 fn is_put(args: &[&[u8]]) -> bool {
