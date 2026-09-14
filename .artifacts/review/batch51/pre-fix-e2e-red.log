@@ -1,0 +1,31 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.27s
+     Running tests/node_e2e.rs (target/debug/deps/node_e2e-fbed072c93bd1071)
+
+running 2 tests
+test client_kill_by_id_reaches_the_first_connection_of_a_cell ... FAILED
+test run_id_is_one_value_across_cells ... FAILED
+
+failures:
+
+---- client_kill_by_id_reaches_the_first_connection_of_a_cell stdout ----
+
+thread 'client_kill_by_id_reaches_the_first_connection_of_a_cell' (219804) panicked at crates/inf-server/tests/node_e2e.rs:7142:5:
+first client id is 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- run_id_is_one_value_across_cells stdout ----
+
+thread 'run_id_is_one_value_across_cells' (219805) panicked at crates/inf-server/tests/node_e2e.rs:7118:9:
+assertion `left == right` failed: 00000000000000000000000000000000
+  left: 32
+ right: 40
+
+
+failures:
+    client_kill_by_id_reaches_the_first_connection_of_a_cell
+    run_id_is_one_value_across_cells
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 86 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

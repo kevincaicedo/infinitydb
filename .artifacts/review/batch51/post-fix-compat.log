@@ -1,0 +1,12 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.83s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 2 tests
+test client_id_is_positive_and_killable_like_redis ... ok
+test run_id_is_40_hex_and_stable_like_redis ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.11s
+

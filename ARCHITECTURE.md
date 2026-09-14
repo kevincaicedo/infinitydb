@@ -60,6 +60,16 @@ a command on cell A needs a key owned by cell B, it crosses the **fabric**
 never waking per message — as a typed fabric op, and the command future
 suspends until the reply arrives.
 
+A node **stops** on `SIGTERM`/`SIGINT` (ADR-0124): every cell stops
+admitting, flushes and closes its connections (every executed command is
+answered, then a FIN), and once every cell is quiet each durable cell
+publishes a stop checkpoint and lands its final sync; the process exits 0
+only when every cell is drained — every acked write of every class is in
+the image the next boot recovers, and that boot replays nothing. A second
+signal, or the `--shutdown-timeout-ms` bound (exit 1, phase named), is
+the crash path the M2 contract already covers. `SHUTDOWN` the command is
+absent until M9.
+
 Durability is the **log spine**: every durable fact is an append to a
 per-cell, per-namespace segmented log, group-committed once per reactor
 iteration with an fsync policy chosen per namespace (`always` /

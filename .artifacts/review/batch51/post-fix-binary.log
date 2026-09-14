@@ -1,0 +1,12 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.15s
+     Running tests/graceful_stop.rs (target/debug/deps/graceful_stop-c28059de20adb6e5)
+
+running 3 tests
+test shutdown_checkpoint_off_is_a_clean_exit_that_replays ... ok
+test sigterm_drains_and_exits_zero ... ok
+test sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+

@@ -92,6 +92,9 @@ sim-smoke:
     # F-L15-05 (ADR-0123): maxclients refusal at accept + the idle reaper
     # under an oracle (share bound, refusal frame, counter fold, deadline).
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-admission --seed 0xC0FFEE --verify-determinism
+    # ADR-0124 (F-L15-08): a graceful stop before the cut keeps every acked
+    # everysec op, every client sees its close, and the reboot replays nothing.
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-clean-stop --seed 0xC0FFEE --verify-determinism
     # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism

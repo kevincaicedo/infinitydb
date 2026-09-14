@@ -122,15 +122,7 @@ pub(crate) fn info(
         push(&mut text, "redis_mode:standalone");
         push(&mut text, &format!("os:{}", std::env::consts::OS));
         push(&mut text, "arch_bits:64");
-        push(&mut text, &format!("process_id:{}", std::process::id()));
-        push(
-            &mut text,
-            &format!(
-                "run_id:{:032x}",
-                u128::from(node.rng_state.get()) << 64 | u128::from(node.cell.get())
-            ),
-        );
-        push(&mut text, &format!("tcp_port:{}", node.tcp_port.get()));
+        push(&mut text, &format!("run_id:{}", render_run_id(node)));
         push(&mut text, &format!("server_time_usec:{}", wall_ms(node, now) * 1000));
         push(&mut text, &format!("uptime_in_seconds:{uptime_secs}"));
         push(&mut text, &format!("uptime_in_days:{}", uptime_secs / 86_400));
@@ -485,6 +477,7 @@ pub(crate) fn info(
             ("recover_finish_us", phases.finish_ns / 1000),
             ("recover_stale_files_removed", node.recover_stale_files_removed.get()),
             ("recover_records", node.recover_records.get()),
+            ("recover_replay_records", node.recover_replay_records.get()),
             ("recover_total_us", phases.total_ns / 1000),
         ] {
             push(&mut text, &format!("{field}:{value}"));
@@ -589,7 +582,7 @@ pub(crate) fn info(
         push(&mut text, "role:master");
         push(&mut text, "connected_slaves:0");
         push(&mut text, "master_failover_state:no-failover");
-        push(&mut text, &format!("master_replid:{:040x}", node.rng_state.get()));
+        push(&mut text, &format!("master_replid:{}", render_run_id(node)));
         push(&mut text, "master_repl_offset:0");
         text.push_str("\r\n");
     }
@@ -977,6 +970,13 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
 }
 
 /// VmRSS from procfs (Linux); 0 where unavailable.
+/// The 40-hex node identity (ADR-0124 D5) — `run_id` and, until M9
+/// brings a replication history, `master_replid`.
+fn render_run_id(node: &NodeInfo) -> String {
+    let [a, b, c] = node.run_id.get();
+    format!("{a:016x}{b:016x}{:08x}", c as u32)
+}
+
 fn process_rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -2972,5 +2972,34 @@ mod tests {
             debug_sleep.starts_with(b"-ERR The command has no key arguments"),
             "{debug_sleep:?}"
         );
+    }
+    /// Review 2026-08-30 F-L15-02 (batch 51, ADR-0124 D5): `run_id` is a
+    /// node identity — 40 hex digits, the same value before and after a
+    /// `RANDOMKEY` (pre-fix it was the RANDOMKEY RNG cursor, 32 digits),
+    /// and `master_replid` renders the same identity.
+    #[test]
+    fn run_id_survives_randomkey() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let field = |cx: &mut ConnCx, store: &mut Keyspace, section: &[u8], name: &str| {
+            let reply = run(cx, store, &[b"INFO", section]);
+            let text = String::from_utf8(reply).expect("ascii");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("{name} missing: {text}"))
+                .trim()
+                .to_string()
+        };
+        let before = field(&mut cx, &mut store, b"server", "run_id");
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        for _ in 0..3 {
+            assert_eq!(run(&mut cx, &mut store, &[b"RANDOMKEY"]), b"$1\r\nk\r\n");
+        }
+        let after = field(&mut cx, &mut store, b"server", "run_id");
+        assert_eq!(after, before, "run_id moved with the RANDOMKEY stream");
+        assert_eq!(before.len(), 40, "run_id is 40 hex digits like Redis: {before}");
+        assert!(before.bytes().all(|b| b.is_ascii_hexdigit()), "{before}");
+        let replid = field(&mut cx, &mut store, b"replication", "master_replid");
+        assert_eq!(replid, before, "master_replid is the same identity");
     }
 }

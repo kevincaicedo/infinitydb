@@ -1,0 +1,3 @@
+inf-sim: scenario m2-clean-stop seed 0xc0ffee: 1120 commands, 5970 steps, 36 keys audited, 720 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0, lifts 0, sidecars 0; torn plants 0), arms [ckpt_downgrades 0 bound_splits 0 waits_fill 0 waits_group 0 plant_fired false], log oracles [idle_tick_violations 0 frames_awaiting_max 3 fsync_entries_max 2 write_through_entries_max 0 hold_episode_violations 0], clean stop [steps 399 replay_records 0], trace 66643 bytes, hash 0xb58a0df6f3035fb2
+inf-sim: sim_seconds=6.268731 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical

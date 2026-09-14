@@ -1,0 +1,32 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.82s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 2 tests
+test client_id_is_positive_and_killable_like_redis ... FAILED
+test run_id_is_40_hex_and_stable_like_redis ... FAILED
+
+failures:
+
+---- client_id_is_positive_and_killable_like_redis stdout ----
+
+thread 'client_id_is_positive_and_killable_like_redis' (220890) panicked at tests/compat/tests/node_diff.rs:812:9:
+node: first client id 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- run_id_is_40_hex_and_stable_like_redis stdout ----
+
+thread 'run_id_is_40_hex_and_stable_like_redis' (220891) panicked at tests/compat/tests/node_diff.rs:775:9:
+assertion `left == right` failed: node: 9e367819e17760fe0000000000000001
+  left: 32
+ right: 40
+
+
+failures:
+    client_id_is_positive_and_killable_like_redis
+    run_id_is_40_hex_and_stable_like_redis
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p compat --test node_diff`

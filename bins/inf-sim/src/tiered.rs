@@ -232,6 +232,7 @@ impl TieredScenario {
             ckpt_section_bound: self.ckpt_section_bound,
             stall: self.stall.clone(),
             replay_canary: false,
+            clean_stop: false,
             io_mode: inf_server::SegmentIoMode::Buffered,
             frames_in_flight: 1,
             device: Default::default(),
@@ -1400,7 +1401,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     for writer in &writers {
         for (key, ops) in &writer.ledger {
             report.audited_keys += 1;
-            let required = required_index(NsClass::Always, ops, cut_time);
+            let required = required_index(NsClass::Always, ops, cut_time, false);
             report.required_ops += required.map_or(0, |i| i as u64 + 1);
             report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
             let reply = match audit.call(

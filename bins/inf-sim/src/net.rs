@@ -32,6 +32,10 @@ pub enum Plant {
     /// eats acked bytes. Models any path that acks ahead of durable
     /// coverage; the oracle must catch it within 1,000 seeds.
     FsyncLies,
+    /// ADR-0124's teeth: the stop request is a process death instead of
+    /// a drain (the pre-fix `SIGTERM`), so the clean-stop rule — every
+    /// acked `everysec` op required — must go red.
+    StopKill,
     /// One accept-path error (`EMFILE`) on the listener token while
     /// connections are queued — the F-L11-05 canary (review 2026-08-30):
     /// an accept failure is a counter, never connection housekeeping;

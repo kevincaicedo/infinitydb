@@ -32,6 +32,7 @@ pub mod gate;
 pub mod net;
 mod reactor;
 mod sched;
+pub mod signal;
 mod timer;
 mod token;
 

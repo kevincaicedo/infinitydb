@@ -80,6 +80,17 @@ boot-scoped read-ahead worker). The kernel copies the mask; no caller
 memory is retained. tid 0 = the calling thread; a full mask is intersected
 with the online set by the kernel, so no error path depends on topology.
 
+## 1d. Termination signals (`signal.rs`, ADR-0124 D1)
+
+One `sigaction` per signal (`SIGTERM`, `SIGINT`) from a zeroed struct with
+the handler stored through `sa_sigaction`, `SA_RESETHAND | SA_RESTART`,
+an emptied mask and no old-action pointer. The handler is `extern "C"`
+and performs exactly one `AtomicBool` store into a `static` — the only
+operation it does is async-signal-safe; nothing allocates, locks or
+formats. The flag outlives every reader (`'static`). The test raises the
+signal at the test process once; the reset disposition then makes a
+second delivery default, which no test performs.
+
 ## 2. Rc waker vtable (`executor.rs`)
 
 `RawWakerVTable` whose data pointer is `Rc<TaskHeader>` — refcounts are

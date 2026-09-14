@@ -3,10 +3,15 @@
 //! parser + executor + store slice + fabric endpoint), one `SO_REUSEPORT`
 //! listener per cell (master plan §4/§5).
 //!
-//! M0 surface: flags only, no config file (anti-goal); no signal handling —
-//! there is no durable state before M2, so the OS reclaiming the process IS
-//! clean shutdown. `--route-local-only` is the cross-cell penalty A/B leg
-//! (§6 gate): the router treats every key as local to the accepting cell.
+//! Surface: flags only, no config file (anti-goal). `SIGTERM`/`SIGINT` is a
+//! graceful stop (ADR-0124): every cell stops admitting, flushes and closes
+//! its connections, a durable cell publishes a stop checkpoint and its
+//! final sync, and the node exits 0 once every cell is drained — every
+//! acked write is in the image the next boot recovers, and that boot
+//! replays nothing. A second signal terminates at once; the drain is
+//! bounded by `--shutdown-timeout-ms` (exit 1, phase named).
+//! `--route-local-only` is the cross-cell penalty A/B leg (§6 gate): the
+//! router treats every key as local to the accepting cell.
 #![forbid(unsafe_code)]
 
 use std::os::fd::IntoRawFd;
@@ -118,6 +123,15 @@ struct Args {
     /// trade (resident = 2 × capacity × cells), and shrinking it is the
     /// deliberate way to provoke the pressure regime on a healthy device.
     log_staging_mib: u32,
+    /// The graceful stop's bound per cell (ADR-0124 D3; Redis's
+    /// `shutdown-timeout` is 10 s). Past it the node exits 1.
+    shutdown_timeout_ms: u64,
+    /// Take a checkpoint on a graceful stop (ADR-0124 D2 step 3; the
+    /// next boot then replays nothing). `off` = final sync only.
+    shutdown_checkpoint: bool,
+    /// The node identity (`INFO server:run_id`, ADR-0124 D5): seeded once
+    /// in `main`, the same in every cell.
+    run_id: [u64; 3],
     /// M2.5-S21 A/B knob: publish staged fabric ops at the head of
     /// MAINTAIN so the hop RTT overlaps local execution.
     early_fabric_flush: bool,
@@ -183,6 +197,9 @@ impl Default for Args {
             device_probe: DeviceProbe::Auto,
             probe_seconds: inf_probe::BOOT_SECONDS_PER_ROW,
             log_staging_mib: 4,
+            shutdown_timeout_ms: 10_000,
+            shutdown_checkpoint: true,
+            run_id: [0; 3],
             early_fabric_flush: false,
             remote_first_execute: false,
             fabric_apply_prefetch: true,
@@ -362,6 +379,18 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--log-staging-mib is 1..=64 (the frame decoder bound)".into());
                 }
             }
+            "--shutdown-timeout-ms" => {
+                args.shutdown_timeout_ms = take("--shutdown-timeout-ms")?
+                    .parse()
+                    .map_err(|e| format!("--shutdown-timeout-ms: {e}"))?;
+            }
+            "--shutdown-checkpoint" => {
+                args.shutdown_checkpoint = match take("--shutdown-checkpoint")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--shutdown-checkpoint is on|off, got {other}")),
+                };
+            }
             "--version" | "-V" => {
                 println!("{}", version_line());
                 std::process::exit(0);
@@ -377,6 +406,7 @@ fn parse_args() -> Result<Args, String> {
                      [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--flush-group-window-us 250] [--device-probe auto|off] \
                      [--probe-seconds 1] [--log-staging-mib 4] \
+                     [--shutdown-timeout-ms 10000] [--shutdown-checkpoint on|off] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
@@ -660,13 +690,32 @@ fn version_line() -> String {
 }
 
 fn main() {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(args) => args,
         Err(e) => {
             eprintln!("infinityd: {e}");
             std::process::exit(2);
         }
     };
+    // The graceful stop (ADR-0124 D1): one flag every cell polls.
+    let stop = match inf_runtime::signal::install_stop_flag() {
+        Ok(flag) => flag,
+        Err(e) => {
+            eprintln!("infinityd: signal handler: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The node identity (ADR-0124 D5): one value for the process life.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "process main thread: the identity seed, never oracle input"
+    )]
+    let identity_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ u64::from(std::process::id()).rotate_left(32);
+    args.run_id = splitmix_triple(identity_seed);
     // `fabrics` is only borrowed mutably to install eventfd wakeups, which is
     // Linux-only (see the cfg block below); on other targets the binding is
     // consumed by `into_iter()` and never needs `mut`.
@@ -679,6 +728,12 @@ fn main() {
     let park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
         (0..args.cells).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
     );
+    let wiring = std::sync::Arc::new(NodeWiring {
+        stop,
+        quiet_cells: std::sync::atomic::AtomicU16::new(0),
+        drained_cells: std::sync::atomic::AtomicU16::new(0),
+        park_flags: std::sync::Arc::clone(&park_flags),
+    });
     #[cfg(target_os = "linux")]
     let mut wake_fds = Vec::new();
     #[cfg(target_os = "linux")]
@@ -936,7 +991,7 @@ fn main() {
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let args = args.clone();
         let boot = boot.clone();
-        let park_flags = std::sync::Arc::clone(&park_flags);
+        let wiring = std::sync::Arc::clone(&wiring);
         #[cfg(target_os = "linux")]
         let wake_fd = wake_fds[i].take();
         #[cfg(not(target_os = "linux"))]
@@ -953,7 +1008,7 @@ fn main() {
                     // an io_uring_setup failure nobody printed. A cell that
                     // cannot run takes the node down loudly, here and now.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell_main(i as u16, &args, boot, hasher, fabric, park_flags, wake_fd)
+                        cell_main(i as u16, &args, boot, hasher, fabric, wake_fd, &wiring)
                     }));
                     match outcome {
                         Ok(Ok(())) => Ok::<(), std::io::Error>(()),
@@ -985,6 +1040,32 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // Every cell returned `Ok` — only a drained stop does that.
+    eprintln!("infinityd: clean stop ({} cells)", args.cells);
+}
+
+/// What every cell shares with the node: the park board (doorbell
+/// wakeups, M0-R1) and the graceful stop (ADR-0124 D3) — the signal flag
+/// and the count of cells that reached `Drained`.
+struct NodeWiring {
+    stop: &'static std::sync::atomic::AtomicBool,
+    quiet_cells: std::sync::atomic::AtomicU16,
+    drained_cells: std::sync::atomic::AtomicU16,
+    park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
+}
+
+/// Three SplitMix64 outputs — the 40-hex identity's digits.
+fn splitmix_triple(seed: u64) -> [u64; 3] {
+    let mut state = seed;
+    let mut out = [0u64; 3];
+    for word in &mut out {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        *word = z ^ (z >> 31);
+    }
+    out
 }
 
 type Boot = Option<(
@@ -1005,8 +1086,8 @@ fn cell_main(
     boot: Boot,
     hasher: KeyHasher,
     fabric: CellFabric,
-    park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
     wake_fd: Option<std::os::fd::OwnedFd>,
+    wiring: &NodeWiring,
 ) -> std::io::Result<()> {
     // Setup-phase narration (M2.5-S01): the 500-cycle storm caught cells
     // stalling BEFORE the first loop iteration ("spawned" forever) — every
@@ -1057,6 +1138,7 @@ fn cell_main(
         .unwrap_or(0);
     node.wall_anchor.set((0, unix_ms));
     node.rng_state.set(unix_ms ^ (u64::from(cell) << 48) ^ 0x9E37_79B9_7F4A_7C15);
+    node.run_id.set(args.run_id);
     node.tcp_port.set(args.port);
     if let Some(name) = &args.conn_default_ns {
         *node.conn_default_ns.borrow_mut() = Some(name.clone().into_bytes());
@@ -1162,6 +1244,7 @@ fn cell_main(
     // board only helps when the driver has a wake watch.
     // Accepted fds are TCP sockets: `tcp-keepalive` applies (ADR-0123 D3).
     plane.set_tcp_transport(true);
+    plane.set_stop_checkpoint(args.shutdown_checkpoint);
     plane.set_early_fabric_flush(args.early_fabric_flush);
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
     plane.set_parse_batch_prefetch(args.parse_batch_prefetch);
@@ -1174,9 +1257,7 @@ fn cell_main(
         plane.set_blind_overwrite_ceiling(true);
     }
     #[cfg(target_os = "linux")]
-    plane.set_park_flags(park_flags);
-    #[cfg(not(target_os = "linux"))]
-    let _ = park_flags;
+    plane.set_park_flags(std::sync::Arc::clone(&wiring.park_flags));
     // Multi-cell dev-tier (kqueue, no wakeups) still parks briefly so a
     // parked peer notices doorbells within the ceiling.
     let park_us = args.park_us.unwrap_or(if args.cells > 1 { 500 } else { 5_000 });
@@ -1189,6 +1270,13 @@ fn cell_main(
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;
+    // The graceful stop (ADR-0124 D3): `deadline` is set at the request.
+    // Two node-wide barriers: every cell `Quiet` (no connection anywhere,
+    // so no client-driven hop is in flight) before any cell's stop
+    // checkpoint, and every cell `Drained` before any thread returns.
+    let mut deadline: Option<std::time::Instant> = None;
+    let mut counted_quiet = false;
+    let mut counted = false;
     loop {
         cell_loop.run_iteration(&mut plane)?;
         if let Some(err) = plane.take_boot_error() {
@@ -1196,6 +1284,51 @@ fn cell_main(
             // immediately (a half-recovered node must never serve).
             eprintln!("infinityd: cell {cell} recovery failed (fail-stop, §8.4): {err}");
             std::process::exit(1);
+        }
+        if deadline.is_none() && wiring.stop.load(std::sync::atomic::Ordering::Acquire) {
+            if cell == 0 {
+                eprintln!("infinityd: stop requested — draining {} cells", args.cells);
+            }
+            plane.request_stop();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the operator's wall-clock stop bound, never oracle input"
+            )]
+            let now = std::time::Instant::now();
+            deadline = Some(now + std::time::Duration::from_millis(args.shutdown_timeout_ms));
+        }
+        if let Some(due) = deadline {
+            let phase = plane.stop_phase();
+            if !counted_quiet
+                && matches!(phase, inf_server::StopPhase::Quiet | inf_server::StopPhase::Drained)
+            {
+                counted_quiet = true;
+                wiring.quiet_cells.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            if wiring.quiet_cells.load(std::sync::atomic::Ordering::Acquire) == args.cells {
+                plane.finish_stop();
+            }
+            if !counted && phase == inf_server::StopPhase::Drained {
+                counted = true;
+                wiring.drained_cells.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            if wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire) == args.cells {
+                return Ok(());
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "the operator's wall-clock stop bound, never oracle input"
+            )]
+            let now = std::time::Instant::now();
+            if now > due {
+                return Err(std::io::Error::other(format!(
+                    "stop drain timed out after {} ms in phase {:?} ({} of {} cells drained)",
+                    args.shutdown_timeout_ms,
+                    plane.stop_phase(),
+                    wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire),
+                    args.cells
+                )));
+            }
         }
         iterations += 1;
         if iterations.is_multiple_of(STATS_EVERY) {

@@ -132,7 +132,9 @@ fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_
     let Some(admission) = cx.node.doc_log_admission.get() else {
         return true;
     };
-    let ns = cx.ns.named().expect("durable capture is named-namespace-only");
+    // Cleared for non-JSON writes and numbered dbs across two files; a
+    // miss here means nothing to fit, never a cell panic.
+    let Some(ns) = cx.ns.named() else { return true };
     let full = inf_log::RecordView::DocFull {
         ns,
         key,
@@ -920,6 +922,10 @@ fn str_append(
     } else {
         (argv.arg(2), argv.arg(3))
     };
+    // Default limits on purpose (L15 style note, batch 51): the operand is
+    // one wire-bounded scalar; the namespace's size limit binds the
+    // *result* below (`document too large`), and parsing the operand under
+    // it would turn that refusal into `value is not a string`.
     let mut parser = inf_doc::JsonParser::new();
     let Ok(operand_doc) = parser.parse(value) else {
         return w.error("ERR value is not a string");
@@ -1193,8 +1199,10 @@ fn arr_pop(
     // document-serializing reply (ADR-0099 D4) — escape amplification
     // alone can sextuple a string element's stored bytes.
     let reply_budget = store.doc_max_reply_bytes();
-    let popped_bulk = |at: u32, w: &mut RespWriter<'_>| {
-        let mut text = Vec::new();
+    // One buffer for the whole reply loop, not one per popped element.
+    let mut text = Vec::new();
+    let mut popped_bulk = |at: u32, w: &mut RespWriter<'_>| {
+        text.clear();
         let ok = serialize_into_bounded(
             DocValue::from(doc.value_at(at as usize)),
             &SerializeOpts::default(),
@@ -1256,6 +1264,8 @@ enum Needle {
     Str(Vec<u8>),
 }
 
+/// Default limits on purpose: a scalar needle is wire-bounded and never
+/// stored (L15 style note, batch 51).
 fn parse_scalar_needle(text: &[u8]) -> Option<Needle> {
     let mut parser = inf_doc::JsonParser::new();
     let idoc = parser.parse(text).ok()?;

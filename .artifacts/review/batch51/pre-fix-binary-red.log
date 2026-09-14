@@ -1,0 +1,40 @@
+infinityd af9bebf (git af9bebf748b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 2 cells, port 0, backend io_uring, route natural
+infinityd: listening on 36909
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 2 cells serving (41 ms)
+
+  left: None
+ right: Some(0)
+
+---- sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing stdout ----
+
+thread 'sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing' (221089) panicked at bins/infinityd/tests/graceful_stop.rs:246:5:
+assertion `left == right` failed: not a clean exit: signal: 15 (SIGTERM) — infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x28194e144cfe9d8c; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 2 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd af9bebf (git af9bebf748b6-dirty, x86_64-unknown-linux-gnu)
+infinityd: 2 cells, port 0, backend io_uring, route natural
+infinityd: listening on 37527
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 2 cells serving (40 ms)
+
+  left: None
+ right: Some(0)
+
+
+failures:
+    shutdown_checkpoint_off_is_a_clean_exit_that_replays
+    sigterm_drains_and_exits_zero
+    sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p infinityd --test graceful_stop`

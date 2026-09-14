@@ -1,0 +1,20 @@
+running 1 test
+test admin::tests::run_id_survives_randomkey ... FAILED
+
+failures:
+
+---- admin::tests::run_id_survives_randomkey stdout ----
+
+thread 'admin::tests::run_id_survives_randomkey' (219253) panicked at crates/inf-server/src/admin.rs:2999:9:
+assertion `left == right` failed: run_id moved with the RANDOMKEY stream
+  left: "daa66d2c7ddf743f0000000000000000"
+ right: "00000000000000000000000000000000"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    admin::tests::run_id_survives_randomkey
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 142 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --lib`

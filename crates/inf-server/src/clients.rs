@@ -28,6 +28,9 @@ pub struct ClientInfo {
     pub sub: u32,
     pub psub: u32,
     pub kill_requested: bool,
+    /// The plane's connection key (packed), for the kill sweep; `None`
+    /// for callers the plane never saw (`ensure`).
+    pub key: Option<u64>,
 }
 
 /// BTreeMap keyed by client id: CLIENT LIST output is id-ordered, and the
@@ -38,7 +41,7 @@ pub struct ClientRegistry {
 }
 
 impl ClientRegistry {
-    pub fn register(&mut self, id: u64, addr: String, created_ms: u64) {
+    pub fn register(&mut self, id: u64, key: u64, addr: String, created_ms: u64) {
         self.clients.insert(
             id,
             ClientInfo {
@@ -50,6 +53,7 @@ impl ClientRegistry {
                 sub: 0,
                 psub: 0,
                 kill_requested: false,
+                key: Some(key),
             },
         );
     }
@@ -70,6 +74,7 @@ impl ClientRegistry {
             sub: 0,
             psub: 0,
             kill_requested: false,
+            key: None,
         })
     }
 
@@ -101,6 +106,11 @@ impl ClientRegistry {
             }
             None => false,
         }
+    }
+
+    /// The plane key registered for `id` (the kill sweep's map back).
+    pub fn conn_key(&self, id: u64) -> Option<u64> {
+        self.clients.get(&id).and_then(|c| c.key)
     }
 
     /// Drains kill marks (plane MAINTAIN sweep).
@@ -159,8 +169,8 @@ mod tests {
     #[test]
     fn register_kill_sweep_roundtrip() {
         let mut reg = ClientRegistry::default();
-        reg.register(7, "1.2.3.4:5".into(), 1000);
-        reg.register(9, "1.2.3.4:6".into(), 2000);
+        reg.register(7, 70, "1.2.3.4:5".into(), 1000);
+        reg.register(9, 90, "1.2.3.4:6".into(), 2000);
         assert!(reg.request_kill(9));
         assert!(!reg.request_kill(404));
         assert_eq!(reg.take_kill_requests(), vec![9]);

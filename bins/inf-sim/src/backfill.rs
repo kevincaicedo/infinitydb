@@ -116,6 +116,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         ckpt_section_bound: None,
         stall: None,
         replay_canary: false,
+        clean_stop: false,
         io_mode: inf_server::SegmentIoMode::Buffered,
         frames_in_flight: 1,
         device: Default::default(),

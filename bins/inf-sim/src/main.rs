@@ -74,6 +74,7 @@ fn main() {
                         "fsync-lies" => Plant::FsyncLies,
                         "accept-error" => Plant::AcceptError,
                         "tier-read-eio" => Plant::TierReadEio,
+                        "stop-kill" => Plant::StopKill,
                         other => return Err(format!("unknown plant {other}")),
                     }
                 }
@@ -105,9 +106,9 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m0-admission|m1-cache|m2-durable|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m0-admission|m1-cache|m2-durable|m2-clean-stop|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio] [--replay-canary] [--lift-regime] [--cells N] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]]"
                     );
@@ -128,6 +129,7 @@ fn main() {
     if matches!(
         scenario_name.as_str(),
         "m2-durable"
+            | "m2-clean-stop"
             | "m2-device-budget"
             | "m2-mode-transition"
             | "m2-reorder-window"
@@ -1198,6 +1200,7 @@ fn run_durable(
     let run_one = |seed: u64| -> inf_sim::DurableReport {
         let mut scenario = match scenario_name {
             "m2-durable" => DurableScenario::m2_durable(seed),
+            "m2-clean-stop" => DurableScenario::m2_clean_stop(seed),
             "m2-device-budget" => DurableScenario::m2_device_budget(seed),
             "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
             "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
@@ -1225,7 +1228,7 @@ fn run_durable(
              sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
              {} waits_group {} plant_fired {}], log oracles [idle_tick_violations {} \
              frames_awaiting_max {} fsync_entries_max {} write_through_entries_max {} \
-             hold_episode_violations {}], trace {} \
+             hold_episode_violations {}], clean stop [steps {} replay_records {}], trace {} \
              bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
@@ -1255,6 +1258,8 @@ fn run_durable(
             report.fsync_entries_max,
             report.write_through_entries_max,
             report.hold_episode_violations,
+            report.clean_stop_steps,
+            report.clean_stop_replay_records,
             report.trace.len(),
             report.trace_hash
         );
