@@ -287,8 +287,10 @@ pub static DECLARED: &[Declared] = &[
          families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): \
          `MAXMEMORY`/`EVICTION` on named *memory* namespaces are enforced and Hot via `SET` \
          (`inherit`/`0` reset them); a namespace with its own budget answers the Redis-exact \
-         OOM error scoped to that namespace and reclaims only its own keys; durable and \
-         tiered namespaces refuse both keys typed (tiered budgets belong to `MEM-BUDGET`)",
+         OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave \
+         the node `maxmemory` comparison — the node budget bounds the pool, numbered dbs + \
+         budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys \
+         typed (tiered budgets belong to `MEM-BUDGET`)",
     ),
     d(
         "INF.CKPT",

@@ -520,3 +520,74 @@ fn eviction_and_wheel_stay_consistent() {
     assert_eq!(stats.expired_active + stats.expired_lazy + evicted, 100, "census closes exactly");
     assert_eq!(ks.db_mut(0).len(), 0);
 }
+
+/// F-L05-02 (ADR-0068 A1): a named memory namespace with its own
+/// `MAXMEMORY` is its own budget authority — its bytes count in
+/// `used_bytes` (L5 attribution, D5) but never drive the node hand.
+/// Pre-fix the global target was computed from bytes the hand may not
+/// reclaim, so a cache *inside* its budget drained db0 through MAINTAIN
+/// alone, then the drained pool answered OOM forever.
+#[test]
+fn budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    for i in 0..100 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    for i in 0..400 {
+        ns_set(&mut ks, 16, &format!("c:{i}"), 200);
+    }
+    let cache_used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(cache_used * 2))
+        .expect("hot");
+    assert!(!ks.ns_over_limit(NsId(16)), "the cache is comfortably inside its budget");
+    // The node limit sits below db0 + cache, above db0 alone.
+    let limit = ks.used_bytes() * 3 / 4;
+    assert!(ks.pool_used_bytes() < limit, "db0 alone fits the node budget");
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    let db0_before = ks.db_mut(0).len();
+    for _ in 0..100 {
+        ks.evict_tick(NOW, EvictBudget::default());
+    }
+    assert_eq!(
+        ks.db_mut(0).len(),
+        db0_before,
+        "a namespace inside its budget evicted db0 keys (F-L05-02)"
+    );
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").len(), 400, "the cache lost nothing");
+    assert!(!ks.over_limit(), "the pool is inside the node budget: no global pressure");
+    assert!(ks.used_bytes() > limit, "attribution still counts the cache (ADR-0068 D5)");
+    // The write path agrees with MAINTAIN: db0 writes are admitted.
+    assert_eq!(gated_set(&mut ks, "db0:new", 200), Ok(()));
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").stats().evicted_keys, 0);
+}
+
+/// The pool half of the same rule: db0 growth alone still evicts db0
+/// (the node budget bounds the pool, Redis semantics) and never reaches
+/// into the budgeted namespace.
+#[test]
+fn pool_pressure_reclaims_from_the_pool_only() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    for i in 0..200 {
+        ns_set(&mut ks, 16, &format!("c:{i}"), 200);
+    }
+    let cache_used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(cache_used * 2))
+        .expect("hot");
+    for i in 0..400 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    let limit = ks.pool_used_bytes() * 3 / 4;
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    assert!(ks.over_limit(), "db0 alone exceeds the pool budget");
+    let mut slices = 0;
+    while ks.over_limit() && slices < 10_000 {
+        ks.evict_tick(NOW, EvictBudget::default());
+        slices += 1;
+    }
+    assert!(ks.pool_used_bytes() <= limit, "MAINTAIN reaches the pool budget");
+    assert!(ks.db_mut(0).len() < 400, "db0 paid for its own growth");
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").len(), 200, "the cache lost nothing");
+    assert!(ks.used_bytes() > ks.pool_used_bytes(), "attribution unchanged (D5)");
+}

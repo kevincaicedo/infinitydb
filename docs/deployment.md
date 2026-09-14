@@ -165,7 +165,13 @@ redis-cli INF.NS SET sessions MAXMEMORY 0            # remove the budget
   isolation: it never displaces other namespaces' keys, and other
   namespaces never reclaim from it. OOM refusals at its budget are scoped
   to connections using that namespace — the error is the Redis-exact
-  `OOM` string, but the scope is the namespace, not the node.
+  `OOM` string, but the scope is the namespace, not the node. Its bytes
+  are **outside** the node `maxmemory` comparison (ADR-0068 A1): the
+  node budget bounds the *pool* — the numbered databases plus every
+  namespace without a budget of its own — so total memory is bounded by
+  `maxmemory + Σ per-namespace MAXMEMORY`, and `INFO memory`
+  `used_memory` (which counts every namespace) may sit above
+  `maxmemory` in steady state.
 - **Without one**, the namespace inherits the node `maxmemory`/policy and
   participates in node-wide eviction like the numbered databases.
 - `EVICTION` unset (or `inherit`) follows `maxmemory-policy`; an explicit
