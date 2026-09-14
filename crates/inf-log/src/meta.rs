@@ -46,7 +46,16 @@ pub const META_MAGIC: [u8; 8] = *b"INFMETA1";
 const HEADER_LEN: usize = META_MAGIC.len() + 4;
 const TRAILER_LEN: usize = 4;
 /// Smallest well-formed envelope: magic + length + empty payload + CRC.
-const MIN_ENVELOPE_LEN: usize = HEADER_LEN + TRAILER_LEN;
+/// The smallest envelope: header + trailer around an empty payload.
+pub const MIN_ENVELOPE_LEN: usize = HEADER_LEN + TRAILER_LEN;
+/// The largest envelope file the reader will materialize (review
+/// 2026-08-30 F-L02-05): 64 MiB — the log's one-object bound
+/// (`DEFAULT_MAX_FRAME_LEN`), sixteen times the largest honest MANIFEST
+/// (`MAX_SEGMENTS` ids at 4 bytes) and far beyond any catalog. Checked
+/// against the inode length **before** the read buffer is allocated, so
+/// a wrong restore or a corrupt length is a named refusal, never an
+/// allocation of the file's size.
+pub const MAX_ENVELOPE_LEN: u64 = 64 << 20;
 
 /// Durably replace `dir/META` with an envelope holding `payload`.
 ///
@@ -129,7 +138,20 @@ pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    let len = usize::try_from(file.file_size()?).expect("envelope size fits usize");
+    // Bound before allocate (F-L02-05): the inode length is untrusted
+    // input like every other envelope field, and it is the one the read
+    // buffer is sized from.
+    let size = file.file_size()?;
+    if size > MAX_ENVELOPE_LEN {
+        return Err(invalid(format!(
+            "envelope {} is {size} bytes, over the {MAX_ENVELOPE_LEN}-byte envelope bound — \
+             refusing to read it",
+            path.display()
+        )));
+    }
+    let len = usize::try_from(size).map_err(|_| {
+        invalid(format!("envelope {} is {size} bytes: unaddressable", path.display()))
+    })?;
     let mut buf = vec![0u8; len];
     let mut read = 0;
     while read < buf.len() {

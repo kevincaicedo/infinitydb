@@ -12,9 +12,9 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    FRAME_ALIGN, FrameBuilder, FrameLayout, FrameStamp, NsId, ReadError, ReaderConfig, RecordView,
-    SealedDisposal, SegmentConfig, SegmentId, SegmentReader, SegmentRotor, ZERO_FILL_SLICE_BYTES,
-    scan_region_evidence, segment_file_name,
+    FRAME_ALIGN, FillSource, FrameBuilder, FrameLayout, FrameStamp, NsId, ReadError, ReaderConfig,
+    RecordView, SealedDisposal, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
+    ZERO_FILL_SLICE_BYTES, build_recycle_sentinel, scan_region_evidence, segment_file_name,
 };
 
 const SEGMENT_BYTES: u32 = 16 << 10;
@@ -64,8 +64,14 @@ impl Lab {
             self.disk.driver_fdatasync(fd).expect("dir barrier");
         }
         while let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
-            let zeros = vec![0u8; slice.len as usize];
-            self.disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+            let bytes = match slice.source {
+                FillSource::Zeros => vec![0u8; slice.len as usize],
+                FillSource::RecycleSentinel { old } => {
+                    let mut b = FrameBuilder::with_capacity(FRAME_ALIGN as usize);
+                    build_recycle_sentinel(&mut b, old, SEGMENT_BYTES).to_vec()
+                }
+            };
+            self.disk.driver_write_at(slice.fd, slice.offset, &bytes).expect("fill write");
             self.rotor.note_zero_slice_written();
         }
         if let Some(fd) = self.rotor.take_zero_fill_barrier() {
@@ -105,9 +111,9 @@ impl Lab {
 }
 
 /// Goal: a covered pre-zeroed segment is pooled at truncation and renamed
-/// into the next id by MAINTAIN — no zero-fill, the dir barrier returned.
-/// Method: two rotations on a `Direct` sim rotor, forget both sealed
-/// segments, maintain again.
+/// into the next id by MAINTAIN — no zero-fill (one sentinel block, ADR-0090
+/// A15), the dir barrier returned. Method: two rotations on a `Direct`
+/// sim rotor, forget both sealed segments, maintain again.
 #[test]
 fn covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id() {
     let mut lab = Lab::new(1);
@@ -133,11 +139,27 @@ fn covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id() {
     let (report, barrier) = lab.rotor.maintain_deferred(0).expect("maintain");
     assert_eq!(report.preallocated, Some(SegmentId(3)));
     assert!(barrier.is_some(), "the rename's dir entry rides the prealloc barrier");
-    assert_eq!(lab.rotor.next_ready(), Some(SegmentId(3)), "ready at once: no fill");
-    assert!(!lab.rotor.next_zero_filling());
-    assert!(lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none());
+    assert_eq!(lab.rotor.next_ready(), Some(SegmentId(3)));
+    // ADR-0090 A15: the take owes one block — the sentinel — before the
+    // file is ready; no zero-fill.
+    assert!(lab.rotor.next_zero_filling(), "the sentinel block is pending");
+    let slice = lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).expect("the sentinel slice");
+    assert_eq!(slice.source, FillSource::RecycleSentinel { old: SegmentId(1) });
+    assert_eq!(slice.offset, u64::from(SEGMENT_BYTES - FRAME_ALIGN));
+    assert_eq!(slice.len, FRAME_ALIGN);
+    assert!(lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none(), "one slice in flight");
+    let mut b = FrameBuilder::with_capacity(FRAME_ALIGN as usize);
+    let image = build_recycle_sentinel(&mut b, SegmentId(1), SEGMENT_BYTES);
+    lab.disk.driver_write_at(slice.fd, slice.offset, image).expect("sentinel write");
+    lab.rotor.note_zero_slice_written();
+    assert!(lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none(), "one block, no more");
+    let fd = lab.rotor.take_zero_fill_barrier().expect("the fill barrier");
+    lab.disk.driver_fdatasync(fd).expect("barrier");
+    lab.rotor.note_zero_fill_synced();
+    assert!(!lab.rotor.next_zero_filling(), "ready after the sentinel's barrier");
     let stats = lab.rotor.stats();
     assert_eq!(stats.segments_recycled, 1);
+    assert_eq!(stats.recycle_sentinels, 1);
     assert_eq!(stats.recycle_misses, 2, "the two first-generation preallocs found no pool");
     assert_eq!(stats.recycle_fallbacks, 0);
     assert_eq!(stats.zero_fill_bytes, zero_fill_before, "the second write was not paid");
@@ -389,6 +411,62 @@ fn recycled_residue_reads_as_foreign_segment_frames_never_data() {
             .expect("scan");
     assert_eq!(evidence.valid_frames, 0);
     assert!(evidence.is_recycled_residue(), "a shifted copy is garbage, not a frame");
+}
+
+/// Goal (ADR-0090 A15, review 2026-08-30 F-L02-02): the take writes the
+/// sentinel into the recycled file's **last block** and nothing else —
+/// a v3 frame that decodes at its own offset, stamped for the old id:
+/// self-located under the old name, foreign under the new one, so the
+/// slack scanner counts one foreign frame from any data end. Method:
+/// pool seg 1, take it as seg 3 through the Lab's plane-shaped MAINTAIN,
+/// compare the file to its image before the take.
+#[test]
+fn a_take_writes_the_sentinel_into_the_last_block() {
+    let mut lab = Lab::new(1);
+    lab.maintain();
+    lab.rotate();
+    lab.maintain();
+    lab.rotate();
+    let before = lab.disk.contents(&lab.dir.join(segment_file_name(SegmentId(1)))).expect("seg 1");
+    assert_eq!(lab.rotor.forget_sealed(SegmentId(1)), SealedDisposal::Recycled);
+    lab.maintain();
+    assert_eq!(lab.rotor.next_ready(), Some(SegmentId(3)));
+    assert!(!lab.rotor.next_zero_filling(), "the Lab drove the sentinel and its barrier");
+    assert_eq!(lab.rotor.stats().recycle_sentinels, 1);
+
+    let after = lab.disk.contents(&lab.dir.join(segment_file_name(SegmentId(3)))).expect("seg 3");
+    let last = (SEGMENT_BYTES - FRAME_ALIGN) as usize;
+    assert_eq!(after.len(), before.len());
+    assert_eq!(&after[..last], &before[..last], "residue below the last block is untouched");
+    let (frame, _) =
+        inf_log::decode_frame(&after[last..], inf_log::DEFAULT_MAX_FRAME_LEN).expect("a frame");
+    assert_eq!(frame.first_lsn(), inf_log::Lsn::new(SegmentId(1), last as u32 + 40));
+    assert_eq!(frame.padded_len(), FRAME_ALIGN);
+    let records: Vec<_> = frame.records().map(|r| r.expect("record")).collect();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0].1,
+        RecordView::Delete { ns: NsId(0), key } if key == inf_log::RECYCLE_SENTINEL_KEY
+    ));
+    // Foreign under seg 3 …
+    let evidence = scan_region_evidence(
+        &lab.disk,
+        &lab.dir,
+        SegmentId(3),
+        last as u32,
+        ReaderConfig::default(),
+    )
+    .expect("scan");
+    assert_eq!((evidence.valid_frames, evidence.foreign_frames), (0, 1));
+    assert!(evidence.is_recycled_residue());
+    // … and it would self-locate under seg 1 (a lost rename leaves a
+    // below-floor file boot GC unlinks unread).
+    let mut reader =
+        SegmentReader::open(&lab.disk, &lab.dir, SegmentId(3), ReaderConfig::default())
+            .expect("open");
+    assert!(matches!(reader.next_frame(), Err(ReadError::ForeignSegment { offset: 0, .. })));
+    assert_eq!(lab.rotate(), SegmentId(3));
+    assert!(lab.rotor.active_write_through(), "ready write-through, as before A15");
 }
 
 /// Goal: a named fuzz-corpus seed for the foreign-segment shape (ADR-0090

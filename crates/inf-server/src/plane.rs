@@ -3502,6 +3502,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             node.recycle_fallbacks.set(stats.recycle_fallbacks);
             node.recycle_pool_bytes.set(stats.recycle_pool_bytes);
             node.recycle_pool_full.set(stats.recycle_pool_full);
+            node.recycle_sentinels.set(stats.recycle_sentinels);
             node.segment_rotations.set(stats.segment_rotations);
             node.segment_preallocs.set(stats.segment_preallocs);
             node.segment_inline_preallocs.set(stats.segment_inline_preallocs);

@@ -17,6 +17,12 @@
 //!    reader's yield count on an image whose first misplaced frame is
 //!    foreign. Both paths are fuzzed from the same bytes so the two
 //!    classifications can never drift apart.
+//! 4. Both scanners from an **arbitrary** `from` (review 2026-08-30 L02:
+//!    `scan_region`, the stop-at-first-valid form, had no fuzz target and
+//!    the evidence scanner was only ever started at 0 or at the reader's
+//!    stop): `scan_region(from)` equals `scan_region_evidence(from)
+//!    .summary()` — the early stop never changes the verdict — and
+//!    neither panics when `from` lands inside a frame body.
 #![no_main]
 
 use std::path::Path;
@@ -25,12 +31,12 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     DEFAULT_MAX_FRAME_LEN, FrameIter, Lsn, ReadError, ReaderConfig, SegmentId, SegmentReader,
-    scan_region_evidence,
+    scan_region, scan_region_evidence,
 };
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|input: (u16, &[u8])| {
-    let (chunk_seed, data) = input;
+fuzz_target!(|input: (u16, u32, &[u8])| {
+    let (chunk_seed, from_seed, data) = input;
     // Window from 8 bytes (smaller than a header — forces refill/compact
     // paths) up to 64 KiB.
     let chunk = 8 + usize::from(chunk_seed) % (64 << 10);
@@ -109,4 +115,10 @@ fuzz_target!(|input: (u16, &[u8])| {
     // plus what lies beyond that stop — and never a foreign one as valid.
     let evidence = scan_region_evidence(&fs, dir, SegmentId(0), 0, cfg).expect("scan");
     assert!(evidence.valid_frames as usize >= seen, "every yielded frame self-locates");
+    // Oracle 4: an arbitrary start inside the image (a frame body, a
+    // padding run, the tail) — the two scanners agree on the verdict.
+    let from = u32::try_from(from_seed as usize % (data.len() + 1)).expect("fits");
+    let early = scan_region(&fs, dir, SegmentId(0), from, cfg).expect("scan");
+    let full = scan_region_evidence(&fs, dir, SegmentId(0), from, cfg).expect("scan");
+    assert_eq!(early, full.summary(), "stop-at-first-valid changed the verdict");
 });

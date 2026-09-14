@@ -103,6 +103,13 @@ pub struct DurableScenario {
     pub ops_per_writer: u64,
     pub keys_per_writer: u64,
     pub value_max: u64,
+    /// Filler bytes appended to every `always` writer's `SET` value,
+    /// `0..value_pad_max` (0 = none): the only way a KeyValue frame spans
+    /// several blocks — `value_max` bounds a number inside a ~10-byte
+    /// string. ADR-0090 A15's clean-stop class needs multi-block residue
+    /// frames; `everysec` values stay small so the deferral oracle
+    /// measures the ack, not the pad.
+    pub value_pad_max: u64,
     /// Max virtual nanoseconds per scheduler step. Sized so runs span
     /// several simulated seconds — the everysec window is real.
     pub step_ns_max: u64,
@@ -377,6 +384,7 @@ impl DurableScenario {
             ops_per_writer: 140,
             keys_per_writer: 6,
             value_max: 48,
+            value_pad_max: 0,
             // ~1 ms average steps: runs span several simulated seconds, so
             // everysec ticks fire mid-run and the loss window genuinely
             // divides the ledger into required vs allowed-lost.
@@ -486,6 +494,24 @@ impl DurableScenario {
         }
         scenario.recycle_oracle = true;
         scenario.recycle_open_fault = seed % 8 == 3;
+        // ADR-0090 A15 (F-L02-02): one seed class in four stops cleanly
+        // with values large enough for multi-block `everysec` frames, so
+        // a life's data end can land inside the last residue frame's
+        // body — the placement no surviving foreign header proves. The
+        // clean-stop boot then asserts no torn tail (the oracle above).
+        if seed % 4 == 1 {
+            scenario.clean_stop = true;
+            scenario.double_cut = false;
+            scenario.cells = 4;
+            scenario.segment_bytes = 64 << 10;
+            scenario.ckpt_interval_bytes = 32 << 10;
+            scenario.ops_per_writer = 300;
+            // Frames of one to four blocks (four `always` writers batch
+            // at most ~48 KiB, under the 64 KiB segment): the last
+            // residue frame's body spans several aligned offsets, so a
+            // stop's data end lands inside one on a fair share of boots.
+            scenario.value_pad_max = 12_000;
+        }
         scenario
     }
 
@@ -753,6 +779,7 @@ impl DurableScenario {
             ops_per_writer: 160,
             keys_per_writer: 40,
             value_max: 512,
+            value_pad_max: 0,
             step_ns_max: 2_000_000,
             double_cut: seed % 8 == 3,
             plant: Plant::None,
@@ -811,6 +838,7 @@ impl DurableScenario {
             ops_per_writer: 180,
             keys_per_writer: 1,
             value_max: 1,
+            value_pad_max: 0,
             step_ns_max: 2_000_000,
             double_cut: seed % 8 == 3,
             plant: Plant::None,
@@ -947,8 +975,17 @@ pub struct DurableReport {
     pub segments_recycled: u64,
     pub recycle_misses: u64,
     pub recycle_fallbacks: u64,
+    /// Recycle sentinels written (ADR-0090 A15): every recycled take
+    /// leaves one, so `== segments_recycled` at the cut on the sync
+    /// tier and `≤` it on the driver tier (a take whose slice has not
+    /// issued yet).
+    pub recycle_sentinels: u64,
     pub segment_rotations: u64,
     pub recycled_residue_slacks: u64,
+    /// Boots after a **clean stop** (ADR-0124) that reported a torn tail
+    /// — a drained log has none, so any report is a phantom (review
+    /// 2026-08-30 F-L02-02, ADR-0090 A15). Always 0 on a passing run.
+    pub clean_stop_torn_tails: u64,
     /// ADR-0090 D9 coverage: pool waits begun / fed / expired across the
     /// cells at the cut, and inline preallocs (a rotation that found no
     /// next segment — the wait must never cause one).
@@ -1310,9 +1347,18 @@ impl Writer {
         let key = self.key(scenario.keys_per_writer);
         let roll = self.rng.next_below(100);
         if roll < 70 {
-            let value =
+            let mut value =
                 format!("v:{}:{}:{}", self.id, self.sent, self.rng.next_below(scenario.value_max))
                     .into_bytes();
+            // `always` writers only: their frames are what the residue is
+            // made of, and an `everysec` ack must stay inside its 30 ms
+            // deferral bound whatever the device is doing (the oracle
+            // below) — padding those would measure the pad, not the ack.
+            if scenario.value_pad_max > 0 && self.class == NsClass::Always {
+                let pad =
+                    usize::try_from(self.rng.next_below(scenario.value_pad_max)).expect("fits");
+                value.extend(std::iter::repeat_n(b'p', pad));
+            }
             let wire = if roll < 10 {
                 // Far-future TTL: the ExpireAt record rides the log too.
                 encode(&[b"SET", &key, &value, b"EX", b"100000"])
@@ -1690,8 +1736,10 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         segments_recycled: 0,
         recycle_misses: 0,
         recycle_fallbacks: 0,
+        recycle_sentinels: 0,
         segment_rotations: 0,
         recycled_residue_slacks: 0,
+        clean_stop_torn_tails: 0,
         recycle_waits_started: 0,
         recycle_waits_satisfied: 0,
         recycle_waits_expired: 0,
@@ -2240,6 +2288,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.segments_recycled += stats.segments_recycled;
             report.recycle_misses += stats.recycle_misses;
             report.recycle_fallbacks += stats.recycle_fallbacks;
+            report.recycle_sentinels += stats.recycle_sentinels;
             report.segment_rotations += stats.segment_rotations;
             report.recycle_waits_started += stats.recycle_waits_started;
             report.recycle_waits_satisfied += stats.recycle_waits_satisfied;
@@ -2579,6 +2628,27 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         let residue = node.control.recovery_board().slot(cell as u16).residue();
         report.recycled_residue_slacks += residue.recycled_residue_slacks;
         report.stale_residue_slacks += residue.stale_residue_slacks;
+    }
+    // ADR-0090 A15 (review 2026-08-30 F-L02-02): a boot after a clean stop
+    // never reports a torn tail — the stop drained every frame, so a
+    // torn verdict can only be residue misread as this life's garbage
+    // (the data end inside the last residue frame's body).
+    if scenario.clean_stop && scenario.plant != Plant::StopKill {
+        for cell in 0..usize::from(scenario.cells) {
+            let slot = node.control.recovery_board().slot(cell as u16);
+            if let Some(at) = slot.torn_truncated_at() {
+                report.clean_stop_torn_tails += 1;
+                fail(
+                    &mut report,
+                    format!(
+                        "PHANTOM TORN TAIL seed {:#x}: cell {cell} booted after a clean stop \
+                         with torn_truncated_at = {at} ({} recycled residue slacks)",
+                        scenario.seed,
+                        slot.residue().recycled_residue_slacks
+                    ),
+                );
+            }
+        }
     }
     if scenario.lift_regime {
         for writer in &writers {

@@ -270,6 +270,121 @@ fn a_torn_this_life_write_over_residue_resumes_at_the_data_end() {
     assert_eq!(rotor.active_written(), FRAME_ALIGN);
 }
 
+/// A whole life on the synchronous `Direct` rotor over `MemFs`: frames
+/// sized by value, rotations, the pool fed by `forget_sealed`, the take
+/// by MAINTAIN — the recycled file's residue is what the rotor itself
+/// left there, not a hand-built image.
+struct RotorLog {
+    rotor: SegmentRotor<MemFs>,
+    seq: u64,
+}
+
+impl RotorLog {
+    fn new(fs: &MemFs) -> RotorLog {
+        let dirs = create_cell_dirs(fs, std::path::Path::new("data/shard-0")).expect("dirs");
+        let segment = SegmentConfig { recycle_slots: 1, ..cfg().segment };
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, segment).expect("rotor");
+        RotorLog { rotor, seq: 0 }
+    }
+
+    /// One `SET key value` frame at the active tail; returns its padded
+    /// on-disk length.
+    fn frame(&mut self, key: &[u8], value_len: usize) -> u32 {
+        let value = vec![0x5Au8; value_len];
+        // Sized up front: a growing builder loses its aligned base.
+        let mut b = FrameBuilder::with_capacity(value_len + 4 * FRAME_HEADER_LEN);
+        b.append(&RecordView::StringPostImage { ns: NS, key, value: &value });
+        let slot = self.rotor.begin_frame(b.frame_len(), 0).expect("reserve");
+        self.seq += 1;
+        let bytes =
+            b.finalize(slot.first_record_lsn(), stamp(1, self.seq, 0), FrameLayout::Aligned);
+        self.rotor.commit_frame(slot, bytes).expect("commit");
+        bytes.len() as u32
+    }
+
+    fn maintain(&mut self) {
+        self.rotor.maintain(0).expect("maintain");
+    }
+}
+
+/// Row (review 2026-08-30 F-L02-02, ADR-0090 A15): this life's data end
+/// lands strictly inside the **body of the last residue frame** — the one
+/// placement where no foreign header survives above the data end. Before
+/// the take-time sentinel the audit saw garbage and no foreign frame, and
+/// a healthy log booted with a phantom `torn_truncated_at`, the empty
+/// preallocated next segment removed. Method: life 1 fills a segment with
+/// three-block frames and seals it; the pool feeds it back as the next
+/// id through the rotor's own take; life 2 writes one-block frames until
+/// its data end sits two blocks into the last residue frame's body.
+#[test]
+fn a_data_end_inside_the_last_residue_frames_body_is_proven_residue_not_torn() {
+    let fs = MemFs::new();
+    let mut log = RotorLog::new(&fs);
+    // Three-block frames: five fill a 64 KiB segment (60 KiB), the sixth
+    // rotates. The last one's body spans (48 KiB, ~58 KiB).
+    let big = 10_000;
+    log.maintain();
+    let padded = log.frame(b"g", big);
+    assert_eq!(padded, 3 * FRAME_ALIGN, "a three-block residue frame");
+    for _ in 1..5 {
+        log.frame(b"g", big);
+    }
+    assert_eq!(log.rotor.active_written(), 15 * FRAME_ALIGN);
+    log.frame(b"g", big); // rotates onto seg-1
+    assert_eq!(log.rotor.active_segment(), SegmentId(1));
+    log.maintain(); // seg-2 preallocated fresh
+    for _ in 1..6 {
+        log.frame(b"g", big); // fills seg-1 … and rotates onto seg-2
+    }
+    assert_eq!(log.rotor.active_segment(), SegmentId(2));
+    // The floor moved past seg-0: pooled, then taken as seg-3 by MAINTAIN.
+    assert_eq!(log.rotor.forget_sealed(SegmentId(0)), inf_log::SealedDisposal::Recycled);
+    log.maintain();
+    assert_eq!(log.rotor.next_ready(), Some(SegmentId(3)));
+    assert_eq!(log.rotor.stats().segments_recycled, 1);
+    // Fill seg-2 exactly (one big frame from the rotation, four more, a
+    // one-block frame in the last block) and rotate onto the recycled
+    // seg-3; thirteen one-block frames put life 2's data end at 52 KiB —
+    // inside the last residue frame's body (48 KiB < 52 KiB < 58 KiB),
+    // its header block overwritten by the thirteenth frame.
+    for _ in 0..4 {
+        log.frame(b"g", big);
+    }
+    log.frame(b"h", 100);
+    assert_eq!(log.rotor.active_segment(), SegmentId(2));
+    assert_eq!(log.rotor.active_written(), SEGMENT_BYTES, "seg-2 is exactly full");
+    for i in 1..14 {
+        log.frame(format!("h{i}").as_bytes(), 100);
+    }
+    assert_eq!(log.rotor.active_segment(), SegmentId(3));
+    assert_eq!(log.rotor.active_written(), 13 * FRAME_ALIGN);
+    log.maintain(); // seg-4: the healthy, empty next segment
+    assert_eq!(log.rotor.next_ready(), Some(SegmentId(4)));
+    drop(log);
+
+    let mut ks = fresh_keyspace();
+    let (rotor, stats) = recover(&fs, &mut ks).expect("a healthy recycled log recovers");
+    eprintln!("recover stats: {stats:?}");
+    assert_eq!(get(&mut ks, b"h13").as_deref(), Some(&[0x5Au8; 100][..]));
+    // A clean tail: the empty preallocated seg-4 is the resume point
+    // (offset 0) and seg-3 is an ordinary sealed segment with a proven
+    // residue slack — exactly the healthy shape, nothing re-paid.
+    assert_eq!(rotor.active_segment(), SegmentId(4));
+    assert_eq!(rotor.active_written(), 0, "resume in the kept next segment");
+    assert_eq!(
+        stats.torn_truncated_at, None,
+        "a healthy recycled log must never report a torn tail (ADR-0090 A1)"
+    );
+    assert_eq!(stats.torn_segments_removed, 0, "the empty next segment is kept");
+    assert_eq!(stats.recycled_residue_slacks, 1, "seg-3's slack is proven residue");
+    assert_eq!(stats.segment_residue_stops, 0, "the data end was garbage, not a foreign frame");
+    assert!(
+        fs.contents(&PathBuf::from("data/shard-0/log").join(segment_file_name(SegmentId(4))))
+            .is_some(),
+        "seg-4 survives the boot"
+    );
+}
+
 /// Row: a file recycled twice carries residue stamped with two previous
 /// ids — both foreign, the same verdict.
 #[test]

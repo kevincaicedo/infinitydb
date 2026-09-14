@@ -236,6 +236,7 @@ pub struct NodeInfo {
     pub recycle_fallbacks: Cell<u64>,
     pub recycle_pool_bytes: Cell<u64>,
     pub recycle_pool_full: Cell<u64>,
+    pub recycle_sentinels: Cell<u64>,
     pub segment_rotations: Cell<u64>,
     pub segment_preallocs: Cell<u64>,
     pub segment_inline_preallocs: Cell<u64>,

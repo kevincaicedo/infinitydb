@@ -70,11 +70,13 @@ pub(crate) fn tier_round_bytes(view: &TierOpView<'_>) -> StableBytes {
 /// `LogWrite` (M4.5-S34, ADR-0086 D4).
 ///
 /// The window is the stability proof: one `AlignedBox` owned by the
-/// `DurableCell` for the cell's whole life, zeroed at birth and never
-/// written — there is no writer to race, and the allocation never moves.
-/// At most one zero slice is in flight per cell (`SegmentRotor` hands out
-/// the next only after the previous `LogWritten`), and the box outlives
-/// every op because the cell outlives its durable plane.
+/// `DurableCell` for the cell's whole life — the zero window is zeroed
+/// at birth and never written; the sentinel window (ADR-0090 A15) is
+/// rewritten only between fills, before its op is pushed — so there is
+/// no writer to race while an op is in flight, and the allocation never
+/// moves. At most one fill slice is in flight per cell (`SegmentRotor`
+/// hands out the next only after the previous `LogWritten`), and the box
+/// outlives every op because the cell outlives its durable plane.
 pub(crate) fn zero_window(window: &AlignedBox, len: u32) -> StableBytes {
     let bytes = &window.bytes()[..len as usize];
     // SAFETY: per the window argument above — the pointee is immutable,

@@ -116,6 +116,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         ops_per_writer: 0,
         keys_per_writer: 0,
         value_max: 0,
+        value_pad_max: 0,
         step_ns_max: scenario.step_ns_max,
         double_cut: false,
         plant: Plant::None,

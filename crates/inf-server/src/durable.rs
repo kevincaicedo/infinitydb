@@ -23,9 +23,10 @@ use inf_alloc::AlignedBox;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
-    FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, IdxSidecarMeta, Lsn, MutationEffect,
-    NsId, RecordView, SealedDisposal, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
-    ZERO_FILL_SLICE_BYTES,
+    FRAME_ALIGN, FillSource, FrameBuilder, FrameId, FramePlan, FsyncClass, FsyncTicket,
+    GroupCommit, IdxSidecarMeta, Lsn, MutationEffect, NsId, RecordView, SealedDisposal,
+    SegmentConfig, SegmentRotor, StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES,
+    build_recycle_sentinel,
 };
 use inf_runtime::{
     Admission, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
@@ -533,6 +534,8 @@ pub struct DurableStats {
     /// count with misses beside it says truncation comes in bursts the
     /// bound cannot hold (ADR-0090 A5), not that the pool never fills.
     pub recycle_pool_full: u64,
+    /// Recycle sentinels written (ADR-0090 A15) — one per recycled take.
+    pub recycle_sentinels: u64,
     /// Rotations and preallocs (MAINTAIN + inline) this boot life — the
     /// denominators the S39b row and the `m2-recycle` oracle read
     /// `segments_recycled` against.
@@ -594,10 +597,17 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// Frames sealed and awaiting `LogWritten`, queue order; bounded by
     /// the ring's `frames_in_flight` and allocated once (never grows).
     in_flight: VecDeque<InFlightFrame>,
-    /// The cell's zero window (ADR-0086 D4): 1 MiB of zeros, 4 KiB-aligned,
+    /// The cell's zero window (ADR-0086 D4): `ZERO_FILL_SLICE_BYTES` (256
+    /// KiB) of zeros, 4 KiB-aligned,
     /// never written — the source of every zero-fill `LogWrite`.
     /// Attributed to the log-staging domain.
     zero_window: AlignedBox,
+    /// The recycle-sentinel window (ADR-0090 A15): one block, 4 KiB-
+    /// aligned, rewritten from `sentinel_builder` just before each
+    /// sentinel `LogWrite` is pushed and never while one is in flight
+    /// (the rotor hands out one fill slice at a time).
+    sentinel_window: AlignedBox,
+    sentinel_builder: FrameBuilder,
     /// The zero-fill barrier's ticket while in flight: its `Synced` makes
     /// the next segment ready.
     zero_fill_ticket: Option<FsyncTicket>,
@@ -722,6 +732,8 @@ impl<F: SegmentFs> DurableCell<F> {
             manifest,
             in_flight,
             zero_window: AlignedBox::new(ZERO_FILL_SLICE_BYTES as usize),
+            sentinel_window: AlignedBox::new(FRAME_ALIGN as usize),
+            sentinel_builder: FrameBuilder::with_capacity(FRAME_ALIGN as usize),
             zero_fill_ticket: None,
             fua_p50_us_probed,
             fua_degraded_windows: 0,
@@ -912,10 +924,24 @@ impl<F: SegmentFs> DurableCell<F> {
                 return;
             };
             self.budget.refund(IoClass::ZeroFill, bound - u64::from(slice.len), 0);
+            let data = match slice.source {
+                FillSource::Zeros => log_bytes::zero_window(&self.zero_window, slice.len),
+                // ADR-0090 A15: the recycled file's one-block sentinel,
+                // built for its old id and copied into the aligned window.
+                FillSource::RecycleSentinel { old } => {
+                    let image = build_recycle_sentinel(
+                        &mut self.sentinel_builder,
+                        old,
+                        self.rotor.segment_bytes(),
+                    );
+                    self.sentinel_window.bytes_mut().copy_from_slice(image);
+                    log_bytes::zero_window(&self.sentinel_window, slice.len)
+                }
+            };
             cx.push(IoOp::LogWrite {
                 fd: slice.fd,
                 offset: slice.offset,
-                data: log_bytes::zero_window(&self.zero_window, slice.len),
+                data,
                 token: CompletionToken::new(TokenClass::ZeroFillWrite, 0, 0),
                 barrier: WriteBarrier::None,
             });
@@ -2080,6 +2106,7 @@ impl<F: SegmentFs> DurableCell<F> {
             recycle_fallbacks: rotor.recycle_fallbacks,
             recycle_pool_bytes: self.rotor.recycle_pool_bytes(),
             recycle_pool_full: rotor.recycle_pool_full,
+            recycle_sentinels: rotor.recycle_sentinels,
             segment_rotations: rotor.rotations,
             segment_preallocs: rotor.preallocs + rotor.inline_preallocs,
             segment_inline_preallocs: rotor.inline_preallocs,

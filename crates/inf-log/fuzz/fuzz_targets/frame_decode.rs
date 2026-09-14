@@ -17,6 +17,12 @@
 //!
 //! The successor invariant rides along: a v3 frame's `padded_len` is the
 //! 4 KiB round-up of its `frame_len`, and `FrameIter` advances by it.
+//!
+//! 4. The `max_frame_len` boundary (review 2026-08-30 F-L02-04): the same
+//!    bytes are walked under the permissive cap `u32::MAX` as well as the
+//!    shipped 64 MiB one — the only way the u32 extent bound (ADR-0072 D1
+//!    as amended) is ever exercised — and every yielded frame's padded
+//!    extent fits below the ceiling from its own base.
 #![no_main]
 
 use inf_log::{DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FrameBuilder, FrameIter, FrameLayout};
@@ -28,6 +34,22 @@ fuzz_target!(|data: &[u8]| {
         inf_simd::scalar_crc32c_update(0, data),
         "CRC32C hardware/software divergence"
     );
+
+    // The permissive cap: every admitted frame's extent from its own
+    // base must fit a u32 segment, and the walk must terminate (a
+    // wrapped `padded_len` once re-decoded the same frame forever).
+    let mut steps = 0usize;
+    for result in FrameIter::new(data, u32::MAX) {
+        steps += 1;
+        assert!(steps <= data.len(), "FrameIter walked more frames than bytes");
+        let Ok((_, frame)) = result else { break };
+        let base = u64::from(frame.first_lsn().offset) - frame.header_len() as u64;
+        assert!(frame.padded_len() >= frame.frame_len(), "padding never shrinks a frame");
+        assert!(
+            base + u64::from(frame.padded_len()) <= u64::from(u32::MAX),
+            "an admitted frame's padded extent crosses the u32 ceiling"
+        );
+    }
 
     let mut builder = FrameBuilder::new();
     for result in FrameIter::new(data, DEFAULT_MAX_FRAME_LEN) {
