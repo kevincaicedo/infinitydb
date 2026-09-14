@@ -1,0 +1,9 @@
+     Running tests/memfs_model.rs (target/debug/deps/memfs_model-633b7ac2fb0a3302)
+
+running 3 tests
+test create_dir_all_is_a_charged_mutating_op ... ok
+test removing_a_segment_credits_its_preallocation_back ... ok
+test rename_clobber_credits_the_replaced_file ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

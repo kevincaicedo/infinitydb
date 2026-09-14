@@ -1,0 +1,29 @@
+
+running 3 tests
+test fs::sim::model_tests::image_digest_copies_nothing ... FAILED
+test fs::sim::model_tests::in_place_sync_matches_the_clone_reference ... ok
+test fs::sim::model_tests::fdatasync_copies_dirty_bytes_not_the_file ... FAILED
+
+failures:
+
+---- fs::sim::model_tests::image_digest_copies_nothing stdout ----
+
+thread 'fs::sim::model_tests::image_digest_copies_nothing' (287369) panicked at crates/inf-log/src/fs/sim.rs:1791:9:
+assertion `left == right` failed: image_digest materialized a copy of the disk
+  left: 8388608
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- fs::sim::model_tests::fdatasync_copies_dirty_bytes_not_the_file stdout ----
+
+thread 'fs::sim::model_tests::fdatasync_copies_dirty_bytes_not_the_file' (287368) panicked at crates/inf-log/src/fs/sim.rs:1780:9:
+1000 barriers copied 67108864000 bytes (O(file) per fsync)
+
+
+failures:
+    fs::sim::model_tests::fdatasync_copies_dirty_bytes_not_the_file
+    fs::sim::model_tests::image_digest_copies_nothing
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 114 filtered out; finished in 17.66s
+
+error: test failed, to rerun pass `-p inf-log --lib`

@@ -1,0 +1,4 @@
+## baseline (pre-fix), release, 3 replicates
+500000 appends: 41.231349ms
+500000 appends: 41.983342ms
+500000 appends: 43.016122ms

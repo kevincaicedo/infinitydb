@@ -1,0 +1,4 @@
+
+thread 'main' (288663) panicked at bins/inf-sim/src/durable.rs:1381:5:
+harness: the write-vs-fsync reorder window is closed on this disk (F-L04-06) — arm StallConfig::write_reorder() or the m2 stall device
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

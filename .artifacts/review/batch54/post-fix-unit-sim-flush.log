@@ -1,0 +1,10 @@
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 4 tests
+test flush::locate_tests::locating_a_span_bisects_the_catalog ... ok
+test fs::sim::model_tests::fdatasync_copies_dirty_bytes_not_the_file ... ok
+test fs::sim::model_tests::in_place_sync_matches_the_clone_reference ... ok
+test fs::sim::model_tests::image_digest_copies_nothing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 113 filtered out; finished in 0.02s
+

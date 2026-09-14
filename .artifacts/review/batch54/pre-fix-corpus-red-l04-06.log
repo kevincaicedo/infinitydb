@@ -1,0 +1,5 @@
+test corpus_seeds_replay_green ... FAILED
+thread 'corpus_seeds_replay_green' (289776) panicked at bins/inf-sim/src/durable.rs:1381:5:
+harness: the write-vs-fsync reorder window is closed on this disk (F-L04-06) — arm StallConfig::write_reorder() or the m2 stall device
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+error: test failed, to rerun pass `-p inf-sim --test corpus`

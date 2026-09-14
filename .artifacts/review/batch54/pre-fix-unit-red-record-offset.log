@@ -1,0 +1,16 @@
+     Running unittests src/lib.rs (target/debug/deps/inf_store-58c556ded8d3a37b)
+
+running 1 test
+test record::tests::decode_refuses_a_non_zero_v1_offset - should panic ... FAILED
+
+failures:
+
+---- record::tests::decode_refuses_a_non_zero_v1_offset stdout ----
+note: test did not panic as expected at crates/inf-store/src/record.rs:429:8
+
+failures:
+    record::tests::decode_refuses_a_non_zero_v1_offset
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-store --lib`

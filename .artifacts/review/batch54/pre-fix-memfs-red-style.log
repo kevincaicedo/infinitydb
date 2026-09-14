@@ -1,0 +1,34 @@
+     Running tests/memfs_model.rs (target/debug/deps/memfs_model-633b7ac2fb0a3302)
+
+running 3 tests
+test create_dir_all_is_a_charged_mutating_op ... FAILED
+test removing_a_segment_credits_its_preallocation_back ... FAILED
+test rename_clobber_credits_the_replaced_file ... FAILED
+
+failures:
+
+---- create_dir_all_is_a_charged_mutating_op stdout ----
+
+thread 'create_dir_all_is_a_charged_mutating_op' (288457) panicked at crates/inf-log/tests/memfs_model.rs:17:5:
+the dead fs created a dir
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- removing_a_segment_credits_its_preallocation_back stdout ----
+
+thread 'removing_a_segment_credits_its_preallocation_back' (288458) panicked at crates/inf-log/tests/memfs_model.rs:35:42:
+the freed bytes are back: Custom { kind: StorageFull, error: "injected ENOSPC" }
+
+---- rename_clobber_credits_the_replaced_file stdout ----
+
+thread 'rename_clobber_credits_the_replaced_file' (288459) panicked at crates/inf-log/tests/memfs_model.rs:52:40:
+b's bytes came back: Custom { kind: StorageFull, error: "injected ENOSPC" }
+
+
+failures:
+    create_dir_all_is_a_charged_mutating_op
+    removing_a_segment_credits_its_preallocation_back
+    rename_clobber_credits_the_replaced_file
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --test memfs_model`

@@ -27,6 +27,7 @@ use inf_doc::path::{EvalLimits, compile, eval, resolve};
 use inf_doc::{DocValue, PathProgram, TapeDoc};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::StallConfig;
 use inf_store::{
     CheckpointImage, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState,
     Keyspace, NsId, OrderedCursor, index_key_encode,
@@ -89,9 +90,9 @@ impl BackfillReport {
     }
 }
 
-/// Boot parameters: no writers (traffic is scenario-driven), no stall
-/// device (instant fsyncs keep the phase windows deterministic and the
-/// run fast), checkpoints effectively off (index sidecars are S06 — this
+/// Boot parameters: no writers (traffic is scenario-driven), the
+/// reorder-only device (F-L04-06: plain writes land off the timeline,
+/// fsyncs instant so the phase windows stay tight), checkpoints effectively off (index sidecars are S06 — this
 /// scenario must exercise the rebuild-from-log path).
 fn base(scenario: &BackfillScenario) -> DurableScenario {
     DurableScenario {
@@ -114,7 +115,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         ckpt_stream_bytes_per_sec: None,
         ckpt_section_bytes: None,
         ckpt_section_bound: None,
-        stall: None,
+        stall: Some(StallConfig::write_reorder()),
         replay_canary: false,
         clean_stop: false,
         io_mode: inf_server::SegmentIoMode::Buffered,
@@ -316,7 +317,7 @@ fn check_serving_contract(
 /// oracle-verified.
 pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = build_disk(scenario.seed, None);
+    let disk = build_disk(scenario.seed, base(scenario).stall.as_ref());
     let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0xBACF_1115);
     let mut report = BackfillReport::default();

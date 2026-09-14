@@ -3,7 +3,7 @@
 //! power-cut reboots of populated dirs — with two oracles aimed at the
 //! ADR-0022 D7 wedge class:
 //!
-//! 1. **The ready path is fsync-free.** [`SimDisk::sync_dir_calls`] must
+//! 1. **The ready path is fsync-free.** [`inf_log::fs::sim::SimDisk::sync_dir_calls`] must
 //!    not move between boot start and `RecoveryBoard::all_ready`: a
 //!    blocking metadata sync on a reactor thread is exactly the mechanism
 //!    that wedged cell 2 for minutes behind entangled journal writeback.
@@ -27,9 +27,9 @@ use std::rc::Rc;
 use inf_foundation::hash64;
 use inf_foundation::rng::SplitMix64;
 use inf_foundation::time::{Nanos, VirtualClock};
-use inf_server::SimDisk;
+use inf_log::fs::sim::StallConfig;
 
-use crate::durable::{DurableScenario, MiniClient, TraceObserver, boot};
+use crate::durable::{DurableScenario, MiniClient, TraceObserver, boot, build_disk};
 
 /// Scheduler-step budget for a node to reach all-ready: empty and
 /// small-log recoveries complete in a handful of steps; the budget only
@@ -76,7 +76,10 @@ impl BootStormReport {
 #[must_use]
 pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = SimDisk::new();
+    // The reorder-only device (F-L04-06): plain writes land off the
+    // timeline, fsyncs stay instant — the ready-path oracle counts
+    // blocking dir barriers, which a stall model would not change.
+    let disk = build_disk(scenario.seed, Some(&StallConfig::write_reorder()));
     let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0xB007_5708);
     let mut report =

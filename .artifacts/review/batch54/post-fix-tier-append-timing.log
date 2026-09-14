@@ -1,0 +1,4 @@
+## post-fix, release, 3 replicates
+500000 appends: 31.601495ms
+500000 appends: 27.801171ms
+500000 appends: 27.582773ms

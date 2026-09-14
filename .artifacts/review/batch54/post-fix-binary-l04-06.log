@@ -1,0 +1,14 @@
+-- boot-storm 0xB007
+inf-sim: scenario boot-storm seed 0xb007: 6 boots, ready-steps max 9, hash 0x4816e7896a266a00
+inf-sim: determinism verified — second run hash-identical
+exit=0
+-- m45-backfill 0x5EED0001
+cell 0: index 16/1 rebuilding (no-sidecar) — was serving before the crash
+cell 0: index 16/2 rebuilding (no-sidecar) — was serving before the crash
+inf-sim: determinism verified — second run hash-identical
+exit=0
+-- m45-sidecar 0x5EED0001
+cell 1: index 16/1 rebuilding (degraded) — was serving before the crash
+cell 1: index 16/2 rebuilding (degraded) — was serving before the crash
+inf-sim: determinism verified — second run hash-identical
+exit=0

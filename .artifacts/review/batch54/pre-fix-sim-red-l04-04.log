@@ -1,0 +1,38 @@
+     Running tests/sim_disk.rs (target/debug/deps/sim_disk-946b0a0c4018c3c3)
+
+running 5 tests
+test refused_sync_dir_is_not_counted ... FAILED
+test rename_clobbered_inodes_are_freed_at_the_barrier ... FAILED
+test removed_but_resurrectable_inodes_are_retained_until_the_cut ... ok
+test dropped_dir_handles_leave_the_table ... ok
+test removed_files_free_their_inodes_after_the_barrier ... FAILED
+
+failures:
+
+---- refused_sync_dir_is_not_counted stdout ----
+
+thread 'refused_sync_dir_is_not_counted' (287641) panicked at crates/inf-log/tests/sim_disk.rs:479:5:
+assertion `left == right` failed: a refused sync_dir was counted
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- rename_clobbered_inodes_are_freed_at_the_barrier stdout ----
+
+thread 'rename_clobbered_inodes_are_freed_at_the_barrier' (287644) panicked at crates/inf-log/tests/sim_disk.rs:429:9:
+swap 1: 3 inodes resident
+
+---- removed_files_free_their_inodes_after_the_barrier stdout ----
+
+thread 'removed_files_free_their_inodes_after_the_barrier' (287643) panicked at crates/inf-log/tests/sim_disk.rs:411:5:
+1000 inodes resident after 1000 committed removes
+
+
+failures:
+    refused_sync_dir_is_not_counted
+    removed_files_free_their_inodes_after_the_barrier
+    rename_clobbered_inodes_are_freed_at_the_barrier
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p inf-log --test sim_disk`

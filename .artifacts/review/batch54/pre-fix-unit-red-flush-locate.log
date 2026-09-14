@@ -1,0 +1,20 @@
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 1 test
+test flush::locate_tests::locating_a_span_bisects_the_catalog ... FAILED
+
+failures:
+
+---- flush::locate_tests::locating_a_span_bisects_the_catalog stdout ----
+
+thread 'flush::locate_tests::locating_a_span_bisects_the_catalog' (288343) panicked at crates/inf-log/src/flush.rs:1384:13:
+hit: examined 10000 catalog entries for 10 000 files
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    flush::locate_tests::locating_a_span_bisects_the_catalog
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 116 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --lib`

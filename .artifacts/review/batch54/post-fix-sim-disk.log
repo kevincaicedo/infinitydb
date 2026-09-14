@@ -1,0 +1,23 @@
+     Running tests/sim_disk.rs (target/debug/deps/sim_disk-946b0a0c4018c3c3)
+
+running 17 tests
+test cut_after_ops_kills_then_power_cut_revives ... ok
+test refused_sync_dir_is_not_counted ... ok
+test handles_follow_inodes_and_cross_dir_renames_refuse ... ok
+test fsync_is_the_only_data_barrier ... ok
+test remove_without_dir_fsync_may_resurrect ... ok
+test removed_but_resurrectable_inodes_are_retained_until_the_cut ... ok
+test dropped_dir_handles_leave_the_table ... ok
+test create_without_dir_fsync_may_vanish_despite_fdatasync ... ok
+test metadata_survival_is_a_prefix_of_issue_order ... ok
+test driver_ops_execute_against_the_same_layers ... ok
+test rename_is_ordered_only_by_dir_fsync ... ok
+test unsynced_prealloc_length_is_pending_until_a_barrier ... ok
+test un_synced_overwrites_reorder ... ok
+test same_seed_yields_byte_identical_surviving_image ... ok
+test tears_have_sector_granularity ... ok
+test rename_clobbered_inodes_are_freed_at_the_barrier ... ok
+test removed_files_free_their_inodes_after_the_barrier ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

@@ -654,10 +654,19 @@ impl<F: SegmentFs> TierFlush<F> {
         use crate::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
         let covers =
             |base: u64, data_len: u64| addr >= base && addr + len as u64 <= base + data_len;
-        let located = self
-            .sealed
-            .iter()
-            .find(|m| covers(m.base.to_raw(), m.data_len))
+        // The catalog ascends by base (asserted at `with_catalog`, kept by
+        // in-order seals and id-keyed detaches): the only file that can
+        // cover `addr` is the last one based at or below it — a bisection,
+        // not a scan (L04 perf row; the S37 rebuild calls this per slot).
+        let at = self.sealed.partition_point(|m| {
+            note_span_locate_step();
+            m.base.to_raw() <= addr
+        });
+        let located = at
+            .checked_sub(1)
+            .map(|i| &self.sealed[i])
+            .inspect(|_| note_span_locate_step())
+            .filter(|m| covers(m.base.to_raw(), m.data_len))
             .map(|m| (m.base.to_raw(), m.path.clone()))
             .or_else(|| {
                 let (_, base, _, durable_len, path) = self.active()?;
@@ -884,6 +893,22 @@ pub fn unlink_tier_file<F: SegmentFs>(fs: &F, meta: &TierFileMeta) -> std::io::R
     }
     fs.remove_file(&meta.path)
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Catalog entries `read_span_blocking` examined to locate a span —
+    /// the L04 perf-row witness (O(log n), not O(n)).
+    static SPAN_LOCATE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_span_locate_step() {
+    SPAN_LOCATE_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_span_locate_step() {}
 
 #[cfg(test)]
 mod tests {
@@ -1306,5 +1331,65 @@ mod tests {
         let mut flush = sim_seam_pipeline(&disk, 1 << 20);
         flush.append_range(LogicalAddr::ZERO, &[0x11; TIER_FRAME_DATA]).expect("seam append");
         flush.set_drive(TierDrive::Reactor);
+    }
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::fs::mem::MemFs;
+    use crate::tier::tier_file_name;
+
+    fn steps() -> u64 {
+        SPAN_LOCATE_STEPS.with(|c| c.replace(0))
+    }
+
+    fn catalog(files: u32) -> TierFlush<MemFs> {
+        let sealed = (0..files)
+            .map(|id| TierFileMeta {
+                id,
+                base: LogicalAddr::ZERO.advanced(u64::from(id) * 1000).expect("fits"),
+                data_len: 1000,
+                reason: SealReason::Capacity,
+                path: Path::new("shard-0/cold").join(tier_file_name(id)),
+            })
+            .collect();
+        TierFlush::with_catalog(
+            MemFs::new(),
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: NsId(17),
+                mode: TierIoMode::Buffered,
+                file_capacity: 1000,
+                slice_bytes: 4096,
+            },
+            files,
+            sealed,
+        )
+    }
+
+    /// L04 perf row: the S37 rebuild path calls this once per unpaired
+    /// slot against a catalog of thousands — locating the covering file
+    /// is a bisection over the ascending catalog, never a scan.
+    #[test]
+    fn locating_a_span_bisects_the_catalog() {
+        let flush = catalog(10_000);
+        steps();
+        // A hit in the last file: the open then fails (no bytes on the
+        // fs) — the locate cost is what is measured.
+        let err = flush.read_span_blocking(9_999 * 1000 + 10, 100).expect_err("no file bytes");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let hit = steps();
+        // A miss past every file, and one in a range gap.
+        assert!(flush.read_span_blocking(10_000_000, 1).expect("miss").is_none());
+        let miss_past = steps();
+        assert!(flush.read_span_blocking(4_999 * 1000 + 990, 100).expect("gap").is_none());
+        let miss_gap = steps();
+        for (what, n) in [("hit", hit), ("miss past", miss_past), ("miss in a gap", miss_gap)] {
+            assert!(n <= 16, "{what}: examined {n} catalog entries for 10 000 files");
+        }
     }
 }

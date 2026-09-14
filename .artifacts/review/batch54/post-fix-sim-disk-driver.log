@@ -1,0 +1,10 @@
+     Running tests/disk.rs (target/debug/deps/disk-109ff1a248b74440)
+
+running 4 tests
+test every_driver_tier_scenario_arms_the_reorder_window ... ok
+test failed_write_cancels_the_linked_sync ... ok
+test log_write_is_buffered_until_the_linked_sync ... ok
+test the_reorder_window_is_closed_on_the_instant_device_and_open_on_write_reorder ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

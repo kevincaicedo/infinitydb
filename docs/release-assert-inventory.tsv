@@ -270,7 +270,7 @@ I	1	crates/inf-log/src/fs/sim.rs	assert_eq	direct write length {len} is not {ali
 I	1	crates/inf-log/src/fs/sim.rs	assert_eq	direct write offset {offset} is not {align}-aligned	the simulator's O_DIRECT oracle: a misaligned direct write is the ADR-0091 invariant the sim exists to catch (DST-only drive)
 I	1	crates/inf-log/src/fs/sim.rs	expect	ino_of resolved the inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
 I	1	crates/inf-log/src/fs/sim.rs	expect	length fits usize	u64 → usize is lossless on every supported (64-bit) target
-I	6	crates/inf-log/src/fs/sim.rs	expect	offset fits usize	u64 → usize is lossless on every supported (64-bit) target
+I	7	crates/inf-log/src/fs/sim.rs	expect	offset fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	4	crates/inf-log/src/fs/sim.rs	expect	open handle pins its inode	sim-fs inode / fd table invariants (DST-only drive; handles pin their inodes)
 I	3	crates/inf-log/src/fs/sim.rs	expect	sector index fits usize	u64 → usize is lossless on every supported (64-bit) target (a sector index is a byte offset / 512)
 I	2	crates/inf-log/src/fs/sim.rs	expect	prealloc fits usize	u64 → usize is lossless on every supported (64-bit) target
@@ -652,6 +652,7 @@ C	1	crates/inf-store/src/record.rs	assert	key exceeds u8 length	`crates/inf-stor
 C	1	crates/inf-store/src/record.rs	assert	value exceeds u24 length	`crates/inf-store/src/store.rs:check_bounds` (every CellStore writer), `crates/inf-store/src/tiered.rs:TieredTable::append` (every tiered writer; `update`'s in-place arm rewrites an existing record's exact length under the same key), `TieredTable::append_extent`, `TieredTable::apply_image`, and `crates/inf-server/src/exec.rs` pre-checks MSET pairs
 I	1	crates/inf-store/src/record.rs	assert_eq	buffer must be exact	the destination slice is allocated at `spec.encoded_len()` in the same statement
 I	1	crates/inf-store/src/record.rs	assert_eq	extent reference is exactly 24 bytes	pair with `ExtentRef::encode`: StringExtent values are store-written
+I	1	crates/inf-store/src/record.rs	assert_eq	v1 extent references start at offset 0	ADR-0061 D2: `offset` is 0 in v1 and asserted so on both sides of the boundary; a non-zero decode is a lifecycle bug or a CRC-passing corruption, never input (batch 54, L04 style row)
 I	3	crates/inf-store/src/record.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-store/src/record.rs	expect	validated in new	the type-tag nibble was validated by `RecordView::new`
 C	1	crates/inf-store/src/router.rs	assert	cell count must be in 1..=16384	`bins/infinityd/src/main.rs:parse_args` (--cells 1..=16384) and `crates/inf-server/src/topology.rs:parse_topology` (catalog cells ≤ SLOT_COUNT)

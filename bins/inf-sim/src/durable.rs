@@ -331,7 +331,7 @@ pub(crate) fn m2_stall_config() -> StallConfig {
 
 /// Builds the scenario's disk: stall-modeled when armed, instant
 /// otherwise. The stall seed derives from the scenario seed (L7).
-pub(crate) fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
+pub fn build_disk(seed: u64, stall: Option<&StallConfig>) -> SimDisk {
     match stall {
         Some(cfg) => SimDisk::with_stall(SimDiskConfig::default(), cfg.clone(), seed ^ 0x57A1_1ED0),
         None => SimDisk::new(),
@@ -1374,6 +1374,15 @@ pub(crate) fn boot(
     clock: &Rc<VirtualClock>,
     observer: &TraceObserver,
 ) -> std::io::Result<Node> {
+    // F-L04-06: a driver-tier durable boot runs on a device whose plain
+    // writes can land after a later-issued fsync (ADR-0087 D7) — the
+    // instant device orders everything by submission and proves nothing
+    // about the drain rule. `StallConfig::write_reorder()` is the floor.
+    assert!(
+        disk.write_reorder_armed(),
+        "harness: the write-vs-fsync reorder window is closed on this disk (F-L04-06) — \
+         arm StallConfig::write_reorder() or the m2 stall device"
+    );
     let catalog = load_catalog_from(disk, &data_dir)?;
     let (control, inbox) = inf_server::ControlHandle::detached_with_catalog(
         catalog.as_ref(),

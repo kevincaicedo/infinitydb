@@ -1,0 +1,6 @@
+test record::tests::max_bounds_roundtrip ... ok
+test record::tests::view_reads_back_every_field ... ok
+test record::tests::version_wraps_mod_2_pow_24 ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 178 filtered out; finished in 0.00s
+
