@@ -151,16 +151,21 @@ impl ExtentRef {
     /// Decodes a [`TypeTag::StringExtent`] record's value bytes.
     ///
     /// # Panics
-    /// Panics when `value` is not exactly [`EXTENT_REF_LEN`] bytes —
-    /// extent records are written only by this crate, so a wrong length
-    /// is a record-lifecycle bug, not input.
+    /// Panics when `value` is not exactly [`EXTENT_REF_LEN`] bytes or its
+    /// offset is not 0 (ADR-0061 D2) — extent records are written only by
+    /// this crate, so either is a record-lifecycle bug, not input.
     #[inline]
     #[must_use]
     pub fn decode(value: &[u8]) -> ExtentRef {
         assert_eq!(value.len(), EXTENT_REF_LEN, "extent reference is exactly 24 bytes");
+        let offset = u64::from_le_bytes(value[8..16].try_into().expect("8 bytes"));
+        // ADR-0061 D2, checked where the bytes come back in: a non-zero v1
+        // offset is a lifecycle bug (or a CRC-passing corruption), not a
+        // value the extent reader's bounds arithmetic should ever see.
+        assert_eq!(offset, 0, "v1 extent references start at offset 0");
         ExtentRef {
             extent_id: u64::from_le_bytes(value[0..8].try_into().expect("8 bytes")),
-            offset: u64::from_le_bytes(value[8..16].try_into().expect("8 bytes")),
+            offset,
             len: u64::from_le_bytes(value[16..24].try_into().expect("8 bytes")),
         }
     }
@@ -420,6 +425,17 @@ impl core::fmt::Debug for RecordView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0061 D2: `offset` is 0 in v1 and asserted so — on the decode
+    /// side too (L04 style row), where a CRC-passing corrupt reference
+    /// would otherwise reach the extent reader's bounds arithmetic.
+    #[test]
+    #[should_panic(expected = "v1 extent references start at offset 0")]
+    fn decode_refuses_a_non_zero_v1_offset() {
+        let mut bytes = ExtentRef { extent_id: 7, offset: 0, len: 16 }.encode();
+        bytes[8] = 1;
+        let _ = ExtentRef::decode(&bytes);
+    }
 
     fn roundtrip(spec: RecordSpec<'_>) -> Vec<u8> {
         let mut buf = vec![0u8; spec.encoded_len()];

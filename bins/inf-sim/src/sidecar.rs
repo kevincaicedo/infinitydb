@@ -36,6 +36,7 @@ use inf_doc::path::compile;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::StallConfig;
 use inf_store::{
     IndexId, IndexKeyType, IndexSpec, IndexState, NsId, SidecarBootDecision, SidecarRebuildReason,
 };
@@ -100,7 +101,8 @@ impl SidecarReport {
 }
 
 /// Boot parameters: automatic checkpoints off (`INF.CKPT` drives them at
-/// scenario-chosen instants), no stall device, scenario-driven traffic.
+/// scenario-chosen instants), the reorder-only device (F-L04-06),
+/// scenario-driven traffic.
 fn base(scenario: &SidecarScenario) -> DurableScenario {
     DurableScenario {
         seed: scenario.seed,
@@ -125,7 +127,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         ckpt_stream_bytes_per_sec: Some(2 << 20),
         ckpt_section_bytes: None,
         ckpt_section_bound: None,
-        stall: None,
+        stall: Some(StallConfig::write_reorder()),
         replay_canary: false,
         clean_stop: false,
         io_mode: inf_server::SegmentIoMode::Buffered,
@@ -230,7 +232,7 @@ fn check_serving_contract(
 /// Runs one seeded scenario (module docs for the structure).
 pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
-    let disk = build_disk(scenario.seed, None);
+    let disk = build_disk(scenario.seed, base(scenario).stall.as_ref());
     let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0x51DE_CA55);
     let mut report = SidecarReport::default();

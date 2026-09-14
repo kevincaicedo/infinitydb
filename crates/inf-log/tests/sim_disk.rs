@@ -393,3 +393,91 @@ fn unsynced_prealloc_length_is_pending_until_a_barrier() {
         assert_eq!(bytes.len(), 4096, "seed {seed}: a synced length is law");
     }
 }
+
+/// F-L04-04: a removed file's inode is freed once nothing reaches it —
+/// 1000 create/remove/barrier cycles of a 1 MiB segment leave a bounded
+/// model, not a gigabyte of dead images.
+#[test]
+fn removed_files_free_their_inodes_after_the_barrier() {
+    let disk = disk();
+    for i in 0..1000u32 {
+        let name = format!("seg-{i:06}.ilog");
+        let file = disk.create_segment(&path(&name), 1 << 20).expect("create");
+        disk.sync_dir(Path::new(DIR)).expect("commit the name");
+        drop(file);
+        disk.remove_file(&path(&name)).expect("remove");
+        disk.sync_dir(Path::new(DIR)).expect("commit the remove");
+    }
+    assert!(
+        disk.inode_count() <= 1,
+        "{} inodes resident after 1000 committed removes",
+        disk.inode_count()
+    );
+}
+
+/// F-L04-04: a rename-clobbered destination is unreachable from every
+/// name once the dir barrier commits the rename — its inode goes too.
+#[test]
+fn rename_clobbered_inodes_are_freed_at_the_barrier() {
+    let disk = disk();
+    disk.create_segment(&path("MANIFEST"), 4096).expect("create");
+    disk.sync_dir(Path::new(DIR)).expect("commit");
+    for i in 0..500u32 {
+        drop(disk.create_meta(&path("MANIFEST.new")).expect("stage"));
+        disk.rename(&path("MANIFEST.new"), &path("MANIFEST")).expect("swap");
+        disk.sync_dir(Path::new(DIR)).expect("commit the swap");
+        assert!(disk.inode_count() <= 2, "swap {i}: {} inodes resident", disk.inode_count());
+    }
+}
+
+/// The retention ADR-0020 D6 requires stays: a remove whose create is
+/// still un-barriered keeps its inode, because the cut may resurrect the
+/// name — and the resurrected file carries its bytes.
+#[test]
+fn removed_but_resurrectable_inodes_are_retained_until_the_cut() {
+    let mut resurrected = 0u32;
+    for seed in 0..32u64 {
+        let disk = disk();
+        let mut file = disk.create_segment(&path("seg-000000.ilog"), 512).expect("create");
+        file.write_at(0, b"stale").expect("write");
+        file.sync_data().expect("fsync");
+        drop(file);
+        // No dir barrier: the create is pending, so is the remove.
+        disk.remove_file(&path("seg-000000.ilog")).expect("remove");
+        assert_eq!(disk.inode_count(), 1, "seed {seed}: a resurrectable inode is retained");
+        disk.power_cut(seed);
+        if let Some(bytes) = disk.contents(&path("seg-000000.ilog")) {
+            assert_eq!(&bytes[..5], b"stale", "seed {seed}: resurrected with its bytes");
+            resurrected += 1;
+        } else {
+            assert_eq!(disk.inode_count(), 0, "seed {seed}: nothing reaches the inode");
+        }
+    }
+    assert!(resurrected > 0, "no seed resurrected the un-barriered remove");
+}
+
+/// F-L04-04 (dir half, closed by batch 53's per-open fd table): a
+/// dropped directory handle leaves the fd table.
+#[test]
+fn dropped_dir_handles_leave_the_table() {
+    let disk = disk();
+    for _ in 0..1000 {
+        let dir = disk.open_dir(Path::new(DIR)).expect("open dir");
+        assert_eq!(disk.open_dir_count(), 1);
+        drop(dir);
+    }
+    assert_eq!(disk.open_dir_count(), 0);
+}
+
+/// L04 style row: the M2.5-S01 boot-storm counter counts blocking dir
+/// barriers the disk *served* — one the dead switch refused is not one.
+#[test]
+fn refused_sync_dir_is_not_counted() {
+    let disk = disk();
+    disk.cut_after_ops(0);
+    assert!(disk.sync_dir(Path::new(DIR)).is_err(), "the dead disk refuses");
+    assert_eq!(disk.sync_dir_calls(), 0, "a refused sync_dir was counted");
+    disk.power_cut(1);
+    disk.sync_dir(Path::new(DIR)).expect("served");
+    assert_eq!(disk.sync_dir_calls(), 1);
+}

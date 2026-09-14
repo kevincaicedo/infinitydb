@@ -141,3 +141,93 @@ fn failed_write_cancels_the_linked_sync() {
         "standalone fsync on a dead disk is EIO"
     );
 }
+
+/// F-L04-06, the model: a plain write followed by an independently issued
+/// fdatasync. On the instant device the write is always covered — the
+/// window is closed; on `StallConfig::write_reorder()` the sync completes
+/// first and the write rides the cut, lost on some seed.
+#[test]
+fn the_reorder_window_is_closed_on_the_instant_device_and_open_on_write_reorder() {
+    use inf_foundation::time::{Nanos, VirtualClock};
+    use inf_log::fs::sim::{SimDiskConfig, StallConfig};
+    use std::rc::Rc;
+
+    let lost_over = |stall: Option<StallConfig>| -> u32 {
+        let mut lost = 0u32;
+        for seed in 0..24u64 {
+            let disk = match &stall {
+                Some(cfg) => SimDisk::with_stall(SimDiskConfig::default(), cfg.clone(), seed),
+                None => SimDisk::new(),
+            };
+            disk.create_dir_all(Path::new(DIR)).expect("dirs");
+            let seg =
+                disk.create_segment(&Path::new(DIR).join("seg-000000.ilog"), 4096).expect("create");
+            disk.sync_dir(Path::new(DIR)).expect("commit");
+            let fd = seg.raw_fd().expect("fd");
+            let clock = Rc::new(VirtualClock::new(Nanos(1_000)));
+            let net = CellNet::new(0, 7, Plant::None);
+            let mut driver = SimDriver::with_disk_stall(net, disk.clone(), Rc::clone(&clock));
+            let mut pool = BufferPool::new(8, 512);
+            driver.push(IoOp::LogWrite {
+                fd,
+                offset: 0,
+                data: stable(&[0x5A; 4096]),
+                token: token(TokenClass::LogWrite, 1),
+                barrier: WriteBarrier::None,
+            });
+            driver.push(IoOp::Fdatasync { fd, token: token(TokenClass::Fsync, 2) });
+            let mut done = reap(&mut driver, &mut pool);
+            // Let every deferred op land.
+            clock.advance(Nanos(1_000_000));
+            done.extend(reap(&mut driver, &mut pool));
+            assert_eq!(done.len(), 2, "seed {seed}: both ops complete");
+            disk.power_cut(seed);
+            let bytes = disk.contents(&Path::new(DIR).join("seg-000000.ilog")).expect("named");
+            if bytes.len() < 4096 || bytes[..4096].iter().any(|b| *b != 0x5A) {
+                lost += 1;
+            }
+        }
+        lost
+    };
+    assert_eq!(lost_over(None), 0, "the instant device orders the write before the later sync");
+    assert!(
+        lost_over(Some(StallConfig::write_reorder())) > 0,
+        "write_reorder(): no seed let the write land after the later-issued sync"
+    );
+    assert!(!SimDisk::new().write_reorder_armed());
+    assert!(
+        SimDisk::with_stall(SimDiskConfig::default(), StallConfig::write_reorder(), 1)
+            .write_reorder_armed()
+    );
+}
+
+/// F-L04-06, the harness: every driver-tier durable scenario table row
+/// builds a disk with the window open (the `boot` gate refuses the rest;
+/// `corpus.rs` drives the backfill / sidecar / boot-storm runners
+/// through it).
+#[test]
+fn every_driver_tier_scenario_arms_the_reorder_window() {
+    use inf_sim::durable::build_disk;
+    use inf_sim::{DurableScenario, TieredScenario};
+    let rows: Vec<(&str, DurableScenario)> = vec![
+        ("m2-durable", DurableScenario::m2_durable(1)),
+        ("m2-clean-stop", DurableScenario::m2_clean_stop(1)),
+        ("m2-device-budget", DurableScenario::m2_device_budget(1)),
+        ("m2-mode-transition", DurableScenario::m2_mode_transition(1)),
+        ("m2-reorder-window", DurableScenario::m2_reorder_window(1)),
+        ("m2-fill-tick", DurableScenario::m2_fill_tick(1)),
+        ("m2-group-hold", DurableScenario::m2_group_hold(1)),
+        ("m2-fua-pending", DurableScenario::m2_fua_pending(1)),
+        ("m2-ckpt-refused", DurableScenario::m2_ckpt_refused(1)),
+        ("m2-recycle", DurableScenario::m2_recycle(1)),
+        ("m3-document", DurableScenario::m3_document(1)),
+    ];
+    for (name, scenario) in &rows {
+        assert!(
+            build_disk(scenario.seed, scenario.stall.as_ref()).write_reorder_armed(),
+            "{name}: the reorder window is closed"
+        );
+    }
+    let tiered = TieredScenario::m4_tiered(1);
+    assert!(build_disk(tiered.seed, tiered.stall.as_ref()).write_reorder_armed(), "m4-tiered");
+}

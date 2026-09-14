@@ -189,10 +189,13 @@ pub struct StallConfig {
     pub wedge_ns: u64,
 }
 
-impl Default for StallConfig {
-    fn default() -> Self {
-        // The instant device — byte-identical to the pre-S14 sim.
-        // Durable scenarios opt in with concrete numbers.
+impl StallConfig {
+    /// The instant device: every op completes inline, in submission
+    /// order — byte-identical to the pre-S14 sim. Name it when a scenario
+    /// deliberately runs order-preserving (F-L04-06); the driver tier's
+    /// durable boots refuse it.
+    #[must_use]
+    pub const fn instant() -> StallConfig {
         StallConfig {
             base_ns: 0,
             tail_permille: 0,
@@ -207,6 +210,30 @@ impl Default for StallConfig {
             wedge_every_writes: 0,
             wedge_ns: 0,
         }
+    }
+
+    /// The smallest device that opens the ADR-0087 D7 window (F-L04-06):
+    /// plain writes pay ~8 µs off the flush timeline, so a write can land
+    /// after an fdatasync issued later; fsyncs, write-throughs and reads
+    /// stay instant, no stall episodes, no bandwidth term. For driver-tier
+    /// scenarios whose oracles are not about device timing.
+    #[must_use]
+    pub const fn write_reorder() -> StallConfig {
+        StallConfig { write_base_ns: 8_000, ..StallConfig::instant() }
+    }
+
+    /// True when plain writes can complete out of submission order
+    /// against a later fsync — `write_base_ns` or `write_bytes_per_s`
+    /// non-zero, the exact condition [`SimDisk::schedule_write`] defers on.
+    #[must_use]
+    pub const fn opens_write_reorder_window(&self) -> bool {
+        self.write_base_ns != 0 || self.write_bytes_per_s != 0
+    }
+}
+
+impl Default for StallConfig {
+    fn default() -> Self {
+        StallConfig::instant()
     }
 }
 
@@ -371,6 +398,22 @@ fn eio() -> io::Error {
     io::Error::from_raw_os_error(libc::EIO)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes the model copied wholesale — `Inode::sync` images and
+    /// `image()` clones — the perf witness for the sync / digest rows.
+    static COPIED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_copied(bytes: usize) {
+    COPIED_BYTES.with(|c| c.set(c.get() + bytes as u64));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_copied(_bytes: usize) {}
+
 /// Sector coverage of one inode — a bitset over the tear grid.
 #[derive(Clone, Debug, Default)]
 struct SectorMap {
@@ -437,6 +480,11 @@ struct Inode {
     /// `n` more direct writes to *this file* succeed, every later one
     /// answers `InvalidInput`. `None` on every other inode.
     direct_writes_left: Option<u64>,
+    /// A truncate since the last barrier: the in-place barrier cannot
+    /// replay pending writes over a shortened image (bytes a truncate
+    /// dropped and a later write re-zeroed would come back), so the next
+    /// `sync` images the file wholesale instead (rare — ADR-0056 D5).
+    truncated_since_sync: bool,
 }
 
 /// One open file description (F-L04-07): the fd's inode and the mode
@@ -574,8 +622,33 @@ impl Inode {
     }
 
     /// fdatasync: data, length, and every written sector's mapping.
+    /// O(dirty bytes): the pending writes replay onto the durable image
+    /// in issue order (write-throughs already landed in both layers, and
+    /// trimmed what they superseded). After a truncate the replay would
+    /// resurrect bytes the OS view dropped, so that barrier images the
+    /// file wholesale (L04 perf row).
     fn sync(&mut self) {
-        self.durable = self.os.clone();
+        if self.truncated_since_sync {
+            note_copied(self.os.len());
+            self.durable.clear();
+            self.durable.extend_from_slice(&self.os);
+            self.truncated_since_sync = false;
+        } else {
+            for write in &self.pending {
+                let from = usize::try_from(write.offset).expect("offset fits usize");
+                let to = from + write.data.len();
+                note_copied(write.data.len());
+                if to > self.durable.len() {
+                    self.durable.resize(to, 0);
+                }
+                self.durable[from..to].copy_from_slice(&write.data);
+            }
+            // An unsynced create's `set_len` is holes: zeros in the OS view
+            // with no pending write to replay — the barrier commits the
+            // length (F-L04-05).
+            debug_assert!(self.durable.len() <= self.os.len(), "replayed image length");
+            self.durable.resize(self.os.len(), 0);
+        }
         self.pending.clear();
         self.committed = self.written.clone();
     }
@@ -616,6 +689,7 @@ impl Inode {
         self.durable = image;
         self.os = self.durable.clone();
         self.pending.clear();
+        self.truncated_since_sync = false;
         self.written = self.committed.clone();
     }
 }
@@ -739,6 +813,47 @@ impl DiskState {
         index
     }
 
+    /// Commits `dir`'s pending metadata ops to the durable namespace (the
+    /// dir barrier), then frees every inode the commit orphaned.
+    fn commit_dir(&mut self, dir: &Path) {
+        let ops = self.pending_meta.remove(dir).unwrap_or_default();
+        let mut displaced = Vec::new();
+        for op in &ops {
+            let victim = match op {
+                MetaOp::Create { .. } => None,
+                MetaOp::Rename { to, .. } => self.durable_names.get(to).copied(),
+                MetaOp::Remove { name } => self.durable_names.get(name).copied(),
+            };
+            apply_meta(&mut self.durable_names, op);
+            displaced.extend(victim);
+        }
+        for ino in displaced {
+            self.release_if_orphan(ino);
+        }
+    }
+
+    /// Frees `ino` once nothing can reach it (F-L04-04): no name in the
+    /// OS or durable namespace, no pending create a cut could still
+    /// commit (ADR-0020 D6 resurrection), no open handle. A removed or
+    /// clobbered file otherwise keeps its full image for the life of the
+    /// sim.
+    fn release_if_orphan(&mut self, ino: u64) {
+        let named = self.os_names.values().any(|&i| i == ino)
+            || self.durable_names.values().any(|&i| i == ino);
+        if named {
+            return;
+        }
+        let creatable = self
+            .pending_meta
+            .values()
+            .flatten()
+            .any(|op| matches!(op, MetaOp::Create { ino: pending, .. } if *pending == ino));
+        if creatable || self.open_files.values().any(|open| open.ino == ino) {
+            return;
+        }
+        self.inodes.remove(&ino);
+    }
+
     fn ino_of(&self, path: &Path) -> io::Result<u64> {
         self.os_names.get(path).copied().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("no file {}", path.display()))
@@ -830,6 +945,30 @@ impl SimDisk {
             return None;
         }
         Some(model.schedule_write(now_ns, len))
+    }
+
+    /// Whether the write-vs-fsync reorder window is open on this disk
+    /// (F-L04-06): a stall model armed with a non-zero plain-write base
+    /// or bandwidth. `SimDisk::new()` answers `false` — the instant,
+    /// submission-ordered device — and a driver-tier durable scenario
+    /// must not boot on it unless it says so.
+    #[must_use]
+    pub fn write_reorder_armed(&self) -> bool {
+        self.state.borrow().stall.as_ref().is_some_and(|m| m.cfg.opens_write_reorder_window())
+    }
+
+    /// Inodes resident in the model (F-L04-04): a removed or clobbered
+    /// file's inode is freed once no name in either namespace, no pending
+    /// create and no open handle reaches it.
+    #[must_use]
+    pub fn inode_count(&self) -> usize {
+        self.state.borrow().inodes.len()
+    }
+
+    /// Open directory handles (F-L04-04): dropped handles leave the table.
+    #[must_use]
+    pub fn open_dir_count(&self) -> usize {
+        self.state.borrow().dir_fds.len()
     }
 
     /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
@@ -952,17 +1091,23 @@ impl SimDisk {
         state
             .os_names
             .iter()
-            .map(|(path, ino)| (path.clone(), state.inodes[ino].os.clone()))
+            .map(|(path, ino)| {
+                note_copied(state.inodes[ino].os.len());
+                (path.clone(), state.inodes[ino].os.clone())
+            })
             .collect()
     }
 
     /// Chained `hash64` over [`Self::image`].
     #[must_use]
     pub fn image_digest(&self) -> u64 {
+        // Hashed in place over the resident image — no second copy of the
+        // disk (L04 perf row); the same chain `image()` would feed.
+        let state = self.state.borrow();
         let mut acc = 0xD15C_0BAD_5EED_0001;
-        for (path, bytes) in self.image() {
+        for (path, ino) in &state.os_names {
             acc = hash64(path.as_os_str().as_encoded_bytes(), acc);
-            acc = hash64(&bytes, acc);
+            acc = hash64(&state.inodes[ino].os, acc);
         }
         acc
     }
@@ -1053,10 +1198,7 @@ impl SimDisk {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         if let Some(dir) = state.dir_fds.get(&i64::from(fd)).cloned() {
-            let ops = state.pending_meta.remove(&dir).unwrap_or_default();
-            for op in &ops {
-                apply_meta(&mut state.durable_names, op);
-            }
+            state.commit_dir(&dir);
             return Ok(());
         }
         if i64::from(fd) >= DIR_FD_BASE {
@@ -1126,6 +1268,7 @@ impl SimDisk {
                 read_faults_left: 0,
                 write_faults_left: 0,
                 direct_writes_left,
+                truncated_since_sync: false,
             },
         );
         state.os_names.insert(path.to_path_buf(), ino);
@@ -1195,8 +1338,9 @@ impl Drop for SimFile {
             // Closes the fd; the inode stays while a name or another
             // handle reaches it (a power cut may already have discarded
             // it — the dead process's handles drop after the cut).
-            Target::File { fd, .. } => {
+            Target::File { ino, fd, .. } => {
                 state.open_files.remove(fd);
+                state.release_if_orphan(*ino);
             }
             Target::Dir(_, fd) => {
                 state.dir_fds.remove(fd);
@@ -1272,11 +1416,14 @@ impl SegmentFile for SimFile {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
                 let len = usize::try_from(len).expect("length fits usize");
                 // OS view honors the new length immediately; the durable
-                // image keeps the old tail until the next sync, and
-                // retained pending writes may resurrect bytes beyond the
-                // cut at power-cut time — real ftruncate physics, which
-                // is why ADR-0056 D5 syncs before any new flush.
+                // image keeps the old tail until the next sync. Pending
+                // writes beyond the cut stay pending: a cut before the
+                // barrier can land them (writeback that reached media
+                // before an un-journaled truncate) — never after a
+                // barrier, which clears them. That is why ADR-0056 D5
+                // syncs before any new flush.
                 inode.os.resize(len, 0);
+                inode.truncated_since_sync = true;
                 // A shrink deallocates in the OS view; a grow is a hole.
                 let (_, keep) = inode.sectors(0, len as u64);
                 inode.written.truncate(keep);
@@ -1297,10 +1444,8 @@ impl SegmentFile for SimFile {
                 Ok(())
             }
             Target::Dir(dir, _) => {
-                let ops = state.pending_meta.remove(dir).unwrap_or_default();
-                for op in &ops {
-                    apply_meta(&mut state.durable_names, op);
-                }
+                let dir = dir.clone();
+                state.commit_dir(&dir);
                 Ok(())
             }
         }
@@ -1347,7 +1492,6 @@ impl SegmentFs for SimDisk {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        state.sync_dir_calls += 1;
         state.tick_op()?;
         if !state.dirs.contains(dir) {
             return Err(io::Error::new(
@@ -1355,10 +1499,10 @@ impl SegmentFs for SimDisk {
                 format!("no dir {}", dir.display()),
             ));
         }
-        let ops = state.pending_meta.remove(dir).unwrap_or_default();
-        for op in &ops {
-            apply_meta(&mut state.durable_names, op);
-        }
+        // Counted once served: a barrier the dead switch refused never
+        // blocked the ready path (M2.5-S01 oracle; L04 style row).
+        state.sync_dir_calls += 1;
+        state.commit_dir(dir);
         Ok(())
     }
 
@@ -1495,30 +1639,34 @@ impl SegmentFs for SimDisk {
             io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
         })?;
         // Replaces an existing destination atomically, like POSIX rename.
-        state.os_names.insert(to.to_path_buf(), ino);
+        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
         state
             .pending_meta
             .entry(parent)
             .or_default()
             .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+        if let Some(old) = clobbered {
+            state.release_if_orphan(old);
+        }
         Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        if state.os_names.remove(path).is_none() {
+        let Some(ino) = state.os_names.remove(path) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no file {}", path.display()),
             ));
-        }
+        };
         let parent = parent_dir(path);
         state
             .pending_meta
             .entry(parent)
             .or_default()
             .push(MetaOp::Remove { name: path.to_path_buf() });
+        state.release_if_orphan(ino);
         Ok(())
     }
 }
@@ -1668,5 +1816,102 @@ mod stall_tests {
         assert!(due >= 200_000_000 + 120_000);
         // Idle device: base + tail only, unless an episode straddles.
         assert!(due <= 200_000_000 + 120_000 * 9 + 90_000_000);
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn copied() -> u64 {
+        COPIED_BYTES.with(|c| c.replace(0))
+    }
+
+    fn disk_with(name: &str, len: usize) -> (SimDisk, SimFile) {
+        let disk = SimDisk::new();
+        disk.create_dir_all(Path::new("d")).expect("dirs");
+        let file = disk.create_segment(&Path::new("d").join(name), len as u64).expect("create");
+        disk.sync_dir(Path::new("d")).expect("commit");
+        (disk, file)
+    }
+
+    /// Perf row (L04): an fdatasync costs the dirty bytes, not the file —
+    /// 1000 barriers over a 4 KiB write on a 64 MiB segment copy 4 MB,
+    /// not 64 GB.
+    #[test]
+    fn fdatasync_copies_dirty_bytes_not_the_file() {
+        let (_disk, mut file) = disk_with("seg-000000.ilog", 64 << 20);
+        copied();
+        for i in 0..1000u64 {
+            file.write_at(i * 4096, &[7u8; 4096]).expect("write");
+            file.sync_data().expect("fsync");
+        }
+        let bytes = copied();
+        assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
+    }
+
+    /// Perf row (L04): the determinism digest hashes the resident image
+    /// in place — no second copy of the disk.
+    #[test]
+    fn image_digest_copies_nothing() {
+        let (disk, mut file) = disk_with("seg-000000.ilog", 8 << 20);
+        file.write_at(0, b"hello").expect("write");
+        copied();
+        let digest = disk.image_digest();
+        assert_eq!(copied(), 0, "image_digest materialized a copy of the disk");
+        // The digest is the chained hash over `image()`, unchanged.
+        let mut acc = 0xD15C_0BAD_5EED_0001;
+        for (path, bytes) in disk.image() {
+            acc = hash64(path.as_os_str().as_encoded_bytes(), acc);
+            acc = hash64(&bytes, acc);
+        }
+        assert_eq!(digest, acc);
+    }
+
+    /// The in-place barrier equals the clone it replaces on every op mix:
+    /// plain writes, write-throughs, truncates, barriers, cuts — the
+    /// durable image after each barrier is the OS image, byte for byte.
+    #[test]
+    fn in_place_sync_matches_the_clone_reference() {
+        for seed in 0..64u64 {
+            let mut rng = SplitMix64::new(seed ^ 0x5C1E_0000);
+            let mut inode = Inode { sector: 512, ..Inode::default() };
+            // Odd seeds start as an unsynced create: a length the OS sees
+            // and no barrier has committed (F-L04-05).
+            if seed % 2 == 1 {
+                inode.os = vec![0; 4096];
+            }
+            for step in 0..200u32 {
+                match rng.next_below(10) {
+                    0..=4 => {
+                        let off = rng.next_below(8192);
+                        let len = 1 + rng.next_below(2048) as usize;
+                        let byte = (rng.next_below(256)) as u8;
+                        inode.write(off, &vec![byte; len]);
+                    }
+                    5 => {
+                        let off = rng.next_below(8192);
+                        let len = 1 + rng.next_below(2048) as usize;
+                        inode.write_through(off, &vec![0xA5; len]);
+                    }
+                    6 => {
+                        let len = rng.next_below(10_240) as usize;
+                        inode.os.resize(len, 0);
+                        let (_, keep) = inode.sectors(0, len as u64);
+                        inode.written.truncate(keep);
+                        inode.truncated_since_sync = true;
+                    }
+                    7 | 8 => {
+                        inode.sync();
+                        assert_eq!(inode.durable, inode.os, "seed {seed} step {step}: barrier");
+                        assert!(inode.pending.is_empty());
+                    }
+                    _ => {
+                        inode.cut(&mut rng, 512);
+                        assert_eq!(inode.durable, inode.os, "seed {seed} step {step}: cut");
+                    }
+                }
+            }
+        }
     }
 }

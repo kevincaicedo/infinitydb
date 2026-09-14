@@ -512,12 +512,21 @@ pub mod mem {
 
     use super::{SegmentFile, SegmentFs};
 
+    /// One file: its bytes and the preallocation the budget was debited
+    /// for at create (credited back on remove / rename-clobber).
+    #[derive(Debug)]
+    struct Entry {
+        data: Rc<RefCell<Vec<u8>>>,
+        debited: u64,
+    }
+
     #[derive(Debug, Default)]
     struct State {
         dirs: std::collections::BTreeSet<PathBuf>,
-        files: BTreeMap<PathBuf, Rc<RefCell<Vec<u8>>>>,
+        files: BTreeMap<PathBuf, Entry>,
         /// Remaining preallocation budget; `None` = unlimited. Debited by
-        /// `create_segment` — the ENOSPC injection point.
+        /// `create_segment` — the ENOSPC injection point — and credited
+        /// by `remove_file` / a clobbering `rename` (L04 style row).
         capacity: Option<u64>,
         /// The errno an over-capacity create reports (`None` = the
         /// `StorageFull` kind). `Some(libc::EDQUOT)` models a quota'd
@@ -542,6 +551,13 @@ pub mod mem {
     }
 
     impl State {
+        /// Returns a removed file's preallocation to the budget.
+        fn credit(&mut self, bytes: u64) {
+            if let Some(capacity) = self.capacity.as_mut() {
+                *capacity += bytes;
+            }
+        }
+
         /// Charge one mutating operation against the crash countdown.
         fn tick_op(&mut self) -> io::Result<()> {
             match self.ops_until_fault {
@@ -623,7 +639,7 @@ pub mod mem {
         /// Raw contents of a file (test assertions).
         #[must_use]
         pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
-            self.state.borrow().files.get(path).map(|data| data.borrow().clone())
+            self.state.borrow().files.get(path).map(|entry| entry.data.borrow().clone())
         }
 
         /// `read_at` calls so far across every file (test assertions).
@@ -705,6 +721,9 @@ pub mod mem {
 
         fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
+            // Charged like the sim tier's: a crash-at-step index means the
+            // same op on both (L04 style row).
+            state.tick_op()?;
             let mut current = PathBuf::new();
             for part in dir.components() {
                 current.push(part);
@@ -770,7 +789,8 @@ pub mod mem {
                 usize::try_from(prealloc_bytes)
                     .expect("prealloc fits usize")
             ]));
-            state.files.insert(path.to_path_buf(), Rc::clone(&data));
+            let debited = if state.capacity.is_some() { prealloc_bytes } else { 0 };
+            state.files.insert(path.to_path_buf(), Entry { data: Rc::clone(&data), debited });
             Ok(MemFile { data, fs: Rc::clone(&self.state) })
         }
 
@@ -808,10 +828,10 @@ pub mod mem {
 
         fn open_write(&self, path: &Path) -> io::Result<Self::File> {
             let state = self.state.borrow();
-            let data = state.files.get(path).ok_or_else(|| {
+            let entry = state.files.get(path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("no file {}", path.display()))
             })?;
-            Ok(MemFile { data: Rc::clone(data), fs: Rc::clone(&self.state) })
+            Ok(MemFile { data: Rc::clone(&entry.data), fs: Rc::clone(&self.state) })
         }
 
         fn open_read(&self, path: &Path) -> io::Result<Self::File> {
@@ -828,23 +848,27 @@ pub mod mem {
                     format!("no dir {}", parent.display()),
                 ));
             }
-            let data = state.files.remove(from).ok_or_else(|| {
+            let entry = state.files.remove(from).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
             })?;
-            // Replaces an existing destination atomically, like POSIX rename.
-            state.files.insert(to.to_path_buf(), data);
+            // Replaces an existing destination atomically, like POSIX
+            // rename; the clobbered file's bytes return to the budget.
+            if let Some(old) = state.files.insert(to.to_path_buf(), entry) {
+                state.credit(old.debited);
+            }
             Ok(())
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
             state.tick_op()?;
-            if state.files.remove(path).is_none() {
+            let Some(entry) = state.files.remove(path) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no file {}", path.display()),
                 ));
-            }
+            };
+            state.credit(entry.debited);
             Ok(())
         }
     }

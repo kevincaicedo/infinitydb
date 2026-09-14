@@ -547,6 +547,9 @@ pub struct TierWriter<F: SegmentFs> {
     /// Partial tail-frame payload (zero-padded on write).
     tail: Box<[u8]>,
     tail_fill: usize,
+    /// `append`'s rewind snapshot of the filled tail prefix, reused across
+    /// calls (capacity `TIER_FRAME_DATA`, allocated once at create).
+    tail_snapshot: Vec<u8>,
     /// Data bytes covered by the last `sync` (fdatasync barrier).
     durable_len: u64,
     /// Single-block window (header, footer, partial tail frame, reads).
@@ -644,6 +647,7 @@ impl<F: SegmentFs> TierWriter<F> {
             mode,
             data_len: 0,
             tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
+            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
             tail_fill: 0,
             durable_len: 0,
             staging,
@@ -700,6 +704,7 @@ impl<F: SegmentFs> TierWriter<F> {
             mode,
             data_len: 0,
             tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
+            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
             tail_fill: 0,
             durable_len: 0,
             staging: FrameStaging::new(1),
@@ -868,8 +873,10 @@ impl<F: SegmentFs> TierWriter<F> {
         let tail_fill0 = self.tail_fill;
         let batch_frames0 = self.batch_frames;
         let device_bytes0 = self.device_bytes;
-        let mut tail0 = [0u8; TIER_FRAME_DATA];
-        tail0[..tail_fill0].copy_from_slice(&self.tail[..tail_fill0]);
+        // The rewind snapshot is the filled prefix only — no per-append
+        // frame-sized zeroing (L04 perf row).
+        self.tail_snapshot.clear();
+        self.tail_snapshot.extend_from_slice(&self.tail[..tail_fill0]);
         let mut bytes = bytes;
         let result = loop {
             if bytes.is_empty() {
@@ -897,7 +904,7 @@ impl<F: SegmentFs> TierWriter<F> {
             // window over the new slot contents would rewrite garbage).
             self.data_len = data_len0;
             self.tail_fill = tail_fill0;
-            self.tail[..tail_fill0].copy_from_slice(&tail0[..tail_fill0]);
+            self.tail[..tail_fill0].copy_from_slice(&self.tail_snapshot);
             self.tail[tail_fill0..].fill(0);
             self.batch_frames = if self.device_bytes > device_bytes0 { 0 } else { batch_frames0 };
         }
@@ -1917,5 +1924,34 @@ mod tests {
         )
         .expect("create");
         writer.append(LogicalAddr::from_raw(64).expect("fits"), &[0u8; 8]).expect("append");
+    }
+}
+
+#[cfg(test)]
+mod append_cost_tests {
+    use super::*;
+    use crate::fs::mem::MemFs;
+
+    /// L04 perf row, dev-tier witness (run alone, `--release`): 500 000
+    /// 100-byte appends. Pre-fix every append zeroed a 4092-byte stack
+    /// snapshot; the snapshot is now the filled prefix only.
+    #[test]
+    #[ignore = "wall-clock witness for the ledger; run alone"]
+    #[allow(clippy::disallowed_methods, reason = "test-only wall-clock witness, not cell code")]
+    fn small_appends_pay_for_their_bytes_not_a_frame() {
+        let fs = MemFs::new();
+        let shard = Path::new("shard-0");
+        fs.create_dir_all(shard).expect("dirs");
+        let mut writer =
+            TierWriter::create(&fs, shard, 0, 0, NsId(1), LogicalAddr::ZERO, TierIoMode::Buffered)
+                .expect("create");
+        let record = [0xABu8; 100];
+        let start = std::time::Instant::now();
+        let mut addr = LogicalAddr::ZERO;
+        for _ in 0..500_000u64 {
+            writer.append(addr, &record).expect("append");
+            addr = addr.advanced(record.len() as u64).expect("fits");
+        }
+        eprintln!("500000 appends: {:?}", start.elapsed());
     }
 }
