@@ -537,6 +537,7 @@ impl Node {
                     NoopObserver,
                     false,
                 );
+                plane.set_tcp_transport(true);
                 plane.set_fabric_apply_prefetch(apply_prefetch);
                 plane.set_parse_batch_prefetch(parse_prefetch);
                 plane.set_deasync_dispatch(deasync_dispatch);
@@ -6890,5 +6891,209 @@ fn client_list_reports_the_db_and_subscriptions_of_another_connection() {
         .find(|l| l.starts_with(&format!("id={id} ")))
         .unwrap_or_else(|| panic!("client {id} missing from CLIENT LIST:\n{list}"));
     assert!(line.contains(" db=7 sub=3 psub=0 "), "{line}");
+    node.stop();
+}
+
+// ---- Batch 50 (review 2026-08-30): F-L15-03 + F-L15-05 --------------------
+
+/// Batch 50 (review 2026-08-30, F-L15-03): `INFO keyspace` counts the
+/// whole node, like `DBSIZE` — the node fold of every cell's per-db
+/// counts, labelled `keyspace_scope:node` (a durable node assembles the
+/// control plane, so the board exists). Pre-fix the section rendered the
+/// serving cell's counts with no scope line: half of `DBSIZE` on two cells.
+#[test]
+fn info_keyspace_counts_the_whole_node_like_dbsize() {
+    const CELLS: u16 = 2;
+    let dir = temp_data_dir("keyspace-fold");
+    let node = Node::start_durable(CELLS, &dir);
+    let mut c = node.connect();
+    for i in 0..64u32 {
+        let key = format!("kf:{i}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    let line = read_line(&mut c);
+    let dbsize: u64 =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert_eq!(dbsize, 64);
+    let keys_of = |text: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix("db0:keys="))
+            .and_then(|r| r.split(',').next())
+            .unwrap_or_else(|| panic!("no db0 line: {text}"))
+            .parse()
+            .expect("u64")
+    };
+    for cell in 0..CELLS {
+        let mut peer = conn_on_cell(&node, cell);
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let keyspace = info_text(&mut peer, b"keyspace");
+            let keys = keys_of(&keyspace);
+            assert!(
+                keyspace.contains("keyspace_scope:"),
+                "cell {cell}: no scope line, db0:keys={keys} vs DBSIZE {dbsize} (×{:.2}): {keyspace}",
+                keys as f64 / dbsize as f64
+            );
+            if keys == dbsize && keyspace.contains("keyspace_scope:node\r\n") {
+                break;
+            }
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            let overdue = Instant::now() >= deadline;
+            assert!(!overdue, "cell {cell}: db0:keys={keys} vs DBSIZE {dbsize}: {keyspace}");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `maxclients`): the bound is
+/// divided per cell like `maxmemory` (ADR-0123); a connection landing on
+/// a full cell gets Redis's `-ERR max number of clients reached` and a
+/// close. Two cells, `maxclients 2` → one slot each: at most two
+/// connections are admitted, the third is refused. Pre-fix `CONFIG SET
+/// maxclients` was refused as immutable and no bound existed below the
+/// 2^24 slab cap.
+#[test]
+fn maxclients_refuses_the_next_connection_like_redis() {
+    let node = Node::start(2);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"maxclients", b"2"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    // The share lands on every cell within one MAINTAIN sweep.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(50));
+    let mut held = vec![admin];
+    let mut refused: Option<TcpStream> = None;
+    for attempt in 0..8 {
+        let mut s = node.connect();
+        s.write_all(&cmd(&[b"PING"])).expect("write");
+        let line = read_line(&mut s);
+        if line == b"+PONG\r\n" {
+            held.push(s);
+            continue;
+        }
+        assert_eq!(
+            line,
+            b"-ERR max number of clients reached\r\n",
+            "attempt {attempt}: {:?}",
+            String::from_utf8_lossy(&line)
+        );
+        refused = Some(s);
+        break;
+    }
+    let mut refused = refused.expect("a connection past the per-cell share is refused");
+    assert_closed_or_reset(&mut refused, "refused connection");
+    assert!(held.len() <= 2, "{} connections admitted under maxclients 2", held.len());
+    drop(held);
+    node.stop();
+}
+
+/// Closed by the server — FIN, or RST when the server closed with our
+/// bytes still unread (a refused accept never reads).
+fn assert_closed_or_reset(stream: &mut TcpStream, what: &str) {
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => assert!(rest.is_empty(), "{what}: bytes after the refusal: {rest:?}"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("{what}: the server never closed the connection ({e})"),
+    }
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `timeout`): an idle connection
+/// is closed after `timeout` seconds; a subscribed one is exempt (Redis's
+/// `clientsCronHandleTimeout`). Single cell — the §5.5 regime. Pre-fix
+/// `CONFIG SET timeout 1` answered `+OK` and nothing ever closed.
+#[test]
+fn timeout_closes_idle_connections_but_not_subscribers() {
+    let node = Node::start(1);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"timeout", b"1"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    let mut idle = node.connect();
+    idle.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut idle, b"+PONG\r\n");
+    let mut sub = node.connect();
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_closed(&mut idle, "idle connection past `timeout 1`");
+    sub.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut sub, b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+    let mut probe = node.connect();
+    let stats = info_text(&mut probe, b"stats");
+    assert_eq!(info_field(&stats, "idle_disconnections"), 2, "{stats}");
+    node.stop();
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `tcp-keepalive`): accepted
+/// sockets carry `SO_KEEPALIVE` with the configured idle time (default
+/// 300 s), visible as the kernel's keepalive timer on the server-side
+/// socket. Pre-fix no accepted socket had keepalive set.
+#[test]
+fn accepted_sockets_carry_tcp_keepalive() {
+    let node = Node::start(1);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    let client_port = c.local_addr().expect("local addr").port();
+    let filter = format!("( sport = :{} and dport = :{client_port} )", node.port);
+    let Ok(out) =
+        std::process::Command::new("ss").args(["-tno", "state", "established", &filter]).output()
+    else {
+        eprintln!("SKIPPED: `ss` (iproute2) not runnable — keepalive not observed");
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("timer:(keepalive"),
+        "the server-side socket carries no keepalive timer:\n{text}"
+    );
+    node.stop();
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `client-output-buffer-limit
+/// normal`): a client that stops reading while replies pile up is killed
+/// at the normal class's hard cap, like a stalled subscriber at the
+/// pubsub cap (M1-S11). 512 × 200 KiB replies the victim never reads;
+/// pre-fix every byte was delivered and the connection stayed open.
+#[test]
+fn client_output_buffer_limit_normal_kills_a_non_reading_client() {
+    let node = Node::start(1);
+    let mut admin = node.connect();
+    admin
+        .write_all(&cmd(&[b"CONFIG", b"SET", b"client-output-buffer-limit", b"normal 1mb 0 0"]))
+        .expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    let big = vec![b'x'; 200 * 1024];
+    admin.write_all(&cmd(&[b"SET", b"big", &big])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(50));
+    let mut victim = node.connect();
+    victim.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let get = cmd(&[b"GET", b"big"]);
+    for _ in 0..512 {
+        victim.write_all(&get).expect("write");
+    }
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match victim.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => panic!("the server never closed the connection after {total} bytes ({e})"),
+        }
+    }
+    let every_reply = 512 * (big.len() + 11);
+    assert!(total < every_reply, "every reply was delivered ({total} bytes) — no cap fired");
+    let mut probe = node.connect();
+    let stats = info_text(&mut probe, b"stats");
+    assert_eq!(info_field(&stats, "client_output_buffer_limit_disconnections"), 1, "{stats}");
     node.stop();
 }

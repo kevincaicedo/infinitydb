@@ -1160,6 +1160,8 @@ fn cell_main(
     // Doorbell wakeups (Linux): peers end this cell's park via eventfd, so
     // the park timeout is a fallback, not the hop-latency ceiling. The park
     // board only helps when the driver has a wake watch.
+    // Accepted fds are TCP sockets: `tcp-keepalive` applies (ADR-0123 D3).
+    plane.set_tcp_transport(true);
     plane.set_early_fabric_flush(args.early_fabric_flush);
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
     plane.set_parse_batch_prefetch(args.parse_batch_prefetch);

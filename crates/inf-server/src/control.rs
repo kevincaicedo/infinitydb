@@ -372,6 +372,10 @@ pub struct MemoryGauges {
     /// Index-tree domains (M4.5-S03, ADR-0075 D6 — L5).
     pub idx_tree_bytes: u64,
     pub idx_slack_bytes: u64,
+    /// Per-db live keys and keys with a deadline (ADR-0122 A2): the
+    /// `# Keyspace` fold, so `INFO keyspace` counts what `DBSIZE` counts.
+    pub db_keys: [u64; inf_store::DEFAULT_DBS],
+    pub db_expires: [u64; inf_store::DEFAULT_DBS],
 }
 
 /// Per-cell memory publication slot. Same L1 control-plane carve-out
@@ -392,6 +396,8 @@ pub struct MemorySlot {
     doc_path_cache_bytes: AtomicU64,
     idx_tree_bytes: AtomicU64,
     idx_slack_bytes: AtomicU64,
+    db_keys: [AtomicU64; inf_store::DEFAULT_DBS],
+    db_expires: [AtomicU64; inf_store::DEFAULT_DBS],
 }
 
 impl MemorySlot {
@@ -407,6 +413,12 @@ impl MemorySlot {
         self.doc_path_cache_bytes.store(g.doc_path_cache_bytes, Ordering::Relaxed);
         self.idx_tree_bytes.store(g.idx_tree_bytes, Ordering::Relaxed);
         self.idx_slack_bytes.store(g.idx_slack_bytes, Ordering::Relaxed);
+        for (slot, v) in self.db_keys.iter().zip(g.db_keys) {
+            slot.store(v, Ordering::Relaxed);
+        }
+        for (slot, v) in self.db_expires.iter().zip(g.db_expires) {
+            slot.store(v, Ordering::Relaxed);
+        }
     }
 
     fn read(&self) -> MemoryGauges {
@@ -422,6 +434,8 @@ impl MemorySlot {
             doc_path_cache_bytes: self.doc_path_cache_bytes.load(Ordering::Relaxed),
             idx_tree_bytes: self.idx_tree_bytes.load(Ordering::Relaxed),
             idx_slack_bytes: self.idx_slack_bytes.load(Ordering::Relaxed),
+            db_keys: core::array::from_fn(|i| self.db_keys[i].load(Ordering::Relaxed)),
+            db_expires: core::array::from_fn(|i| self.db_expires[i].load(Ordering::Relaxed)),
         }
     }
 }
@@ -468,6 +482,12 @@ impl MemoryBoard {
             t.doc_path_cache_bytes += g.doc_path_cache_bytes;
             t.idx_tree_bytes += g.idx_tree_bytes;
             t.idx_slack_bytes += g.idx_slack_bytes;
+            for (sum, v) in t.db_keys.iter_mut().zip(g.db_keys) {
+                *sum += v;
+            }
+            for (sum, v) in t.db_expires.iter_mut().zip(g.db_expires) {
+                *sum += v;
+            }
         }
         t
     }

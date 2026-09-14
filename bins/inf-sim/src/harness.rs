@@ -131,6 +131,21 @@ pub struct Scenario {
     /// reconciliation — the oracle's teeth, testable. `Canary::None` in
     /// every shipping scenario.
     pub canary: Canary,
+    /// `maxclients` seeded into every cell's config before it serves
+    /// (ADR-0123 D1; 0 = the default 10000). Clients past a cell's share
+    /// must see exactly Redis's refusal frame and a close, no cell may
+    /// exceed its share, and the folded `rejected_connections` must equal
+    /// the refused count.
+    pub maxclients: u32,
+    /// `timeout` seconds seeded into every cell's config (ADR-0123 D2;
+    /// 0 = off): the idle phase's deadline.
+    pub timeout_secs: u32,
+    /// Idle phase (runs once every regular client is done and every
+    /// server-side connection unwound): this many plain clients send one
+    /// `PING` and go silent, and as many subscribers `SUBSCRIBE` and go
+    /// silent. Under `timeout_secs` every plain one must be closed by the
+    /// server at its deadline and every subscriber must survive it.
+    pub idle_clients: usize,
 }
 
 /// Model-side plants for the content oracle's canary tests (F-L19-06's
@@ -173,6 +188,9 @@ impl Scenario {
             surface_percent: 0,
             audit_every: 0,
             canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
         }
     }
 
@@ -204,6 +222,9 @@ impl Scenario {
             surface_percent: 0,
             audit_every: 0,
             canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
         }
     }
 
@@ -235,6 +256,9 @@ impl Scenario {
             surface_percent: 20,
             audit_every: 5_000,
             canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
         }
     }
 
@@ -267,6 +291,41 @@ impl Scenario {
             surface_percent: 0,
             audit_every: 0,
             canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
+        }
+    }
+
+    /// F-L15-05 (ADR-0123): the admission bound and the idle reaper. 60
+    /// clients on 3 cells under `maxclients 45` (15 per cell) — the
+    /// seeded spread puts ~20 on a cell, so every cell refuses some; then
+    /// an idle phase under `timeout 1` with 4 plain + 4 subscribed idle
+    /// clients. Coarser virtual steps so one virtual second is a few
+    /// thousand steps, under the stall bound.
+    pub fn m0_admission(seed: u64) -> Scenario {
+        Scenario {
+            seed,
+            cells: 3,
+            connections: 60,
+            commands: 6_000,
+            key_space: 500,
+            pipelined_every: 5,
+            pipeline_window: 4,
+            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            plant: Plant::None,
+            subscribers: 0,
+            channels: 0,
+            publish_percent: 0,
+            step_ns_max: 1_000_000,
+            adversarial_percent: 0,
+            namespaces: 0,
+            surface_percent: 0,
+            audit_every: 0,
+            canary: Canary::None,
+            maxclients: 45,
+            timeout_secs: 1,
+            idle_clients: 4,
         }
     }
 
@@ -290,6 +349,9 @@ impl Scenario {
             surface_percent: 0,
             audit_every: 0,
             canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
         }
     }
 }
@@ -330,6 +392,13 @@ pub struct SimReport {
     /// Disclosed so a fairness run that never exhausted a budget cannot
     /// pass as coverage.
     pub fabric_skip_streak_max: u32,
+    /// Admission oracle coverage (ADR-0123): clients refused at accept,
+    /// idle clients the server closed at their `timeout` deadline, idle
+    /// subscribers that outlived it. Disclosed so a run that never
+    /// refused or never reaped cannot pass as coverage.
+    pub refused_clients: u64,
+    pub idle_closed: u64,
+    pub idle_survived: u64,
 }
 
 impl SimReport {
@@ -507,6 +576,9 @@ struct SimClient {
     rx: Vec<u8>,
     rng: SplitMix64,
     closed: bool,
+    /// Refused at accept (`maxclients`, ADR-0123 D1): saw exactly the
+    /// refusal frame, never a reply; its commands never ran.
+    refused: bool,
     /// Per-channel PUBLISH sequence counters (m1 mixes only).
     pub_seq: Vec<u64>,
     /// The client-side check per in-flight command, parallel to the
@@ -1111,6 +1183,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     // Cells: real plane + loop over the sim driver.
     let mut nets = Vec::new();
     let mut cells = Vec::new();
+    let mut nodes: Vec<Rc<NodeInfo>> = Vec::new();
     let fabrics = Mesh::new(scenario.cells, scenario.fabric);
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
@@ -1120,6 +1193,21 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
         let node = Rc::new(NodeInfo::default());
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
+        // ADR-0123: the admission and idle knobs are boot config here
+        // (the plane reads them at assembly — D5).
+        if scenario.maxclients != 0 {
+            node.config
+                .borrow_mut()
+                .set(b"maxclients", scenario.maxclients.to_string().as_bytes())
+                .expect("maxclients is hot");
+        }
+        if scenario.timeout_secs != 0 {
+            node.config
+                .borrow_mut()
+                .set(b"timeout", scenario.timeout_secs.to_string().as_bytes())
+                .expect("timeout is hot");
+        }
+        nodes.push(Rc::clone(&node));
         // Memory-only scenarios never enable the durable tier; pin the
         // defaulted filesystem parameter (M2-S19).
         // Surface scenarios seed their memory namespaces into every cell
@@ -1167,6 +1255,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             rx: Vec::new(),
             rng: SplitMix64::new(scenario.seed ^ (0xC11E_0000 + i as u64)),
             closed: false,
+            refused: false,
             pub_seq: vec![0; scenario.channels as usize],
             checks: VecDeque::new(),
             scope: ClientScope::for_client(i, scenario.namespaces),
@@ -1250,11 +1339,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         plant_fired: false,
         accept_resumes: 0,
         fabric_skip_streak_max: 0,
+        refused_clients: 0,
+        idle_closed: 0,
+        idle_survived: 0,
     };
     let mut violations: Vec<String> = Vec::new();
 
     let mut last_progress = (0u64, 0u64);
     let mut idle_steps = 0u64;
+    let mut idle: IdlePhase = IdlePhase::new(scenario.idle_clients);
     let mut order: VecDeque<usize> = (0..cells.len()).collect();
 
     loop {
@@ -1325,6 +1418,24 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             let rx = net.client_recv(client.fd);
             client_bytes += rx.len() as u64;
             client.rx.extend_from_slice(&rx);
+            // Refused at accept (ADR-0123 D1): the first bytes on the wire
+            // are Redis's refusal frame and nothing else ever follows.
+            if client.replied == 0 && client.rx.starts_with(REFUSAL_FRAME) {
+                if client.rx.len() != REFUSAL_FRAME.len() {
+                    violations.push(format!(
+                        "client {}: bytes beside the refusal frame: {:?}",
+                        client.id,
+                        String::from_utf8_lossy(&client.rx)
+                    ));
+                }
+                client.refused = true;
+                client.closed = true;
+                client.checks.clear();
+                client.rx.clear();
+                report.refused_clients += 1;
+                net.client_abandon(client.fd);
+                continue;
+            }
             while let Some(n) = reply_len(&client.rx) {
                 let check = client.checks.pop_front().unwrap_or(Check::None);
                 let raw: Vec<u8> = client.rx.drain(..n).collect();
@@ -1440,12 +1551,43 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             }
         }
 
+        // Admission bound (ADR-0123 D1): no cell ever holds more live
+        // connections than its `maxclients` share.
+        if scenario.maxclients != 0 {
+            let share = (scenario.maxclients as usize / usize::from(scenario.cells)).max(1);
+            for (i, (_, plane)) in cells.iter().enumerate() {
+                if plane.connections() > share {
+                    violations.push(format!(
+                        "cell {i}: {} live connections over its maxclients share {share}",
+                        plane.connections()
+                    ));
+                }
+            }
+        }
+
+        // Idle phase (ADR-0123 D2): once every regular client is done and
+        // every server-side connection unwound, idle clients connect,
+        // speak once, and go silent under `timeout`.
+        let idle_phase_done = drive_idle_phase(
+            scenario,
+            &mut idle,
+            &nets,
+            &clock,
+            &mut rng,
+            clients.iter().all(|c| c.closed)
+                && subs.iter().all(|s| s.state == SubState::Closed)
+                && cells.iter().all(|(_, plane)| plane.connections() == 0),
+            &mut report,
+            &mut violations,
+        );
+
         // Virtual time per scheduler step, seeded (m0: 1–16 µs).
         clock.advance(Nanos(1_000 + rng.next_u64() % scenario.step_ns_max));
 
         let all_done = clients.iter().all(|c| c.closed)
             && subs.iter().all(|s| s.state == SubState::Closed)
             && auditors.iter().all(|a| a.closed)
+            && idle_phase_done
             && nets.iter().all(|n| n.borrow().pending_bytes() == 0)
             && cells.iter().all(|(_, plane)| plane.suspended() == 0);
         if all_done {
@@ -1460,7 +1602,13 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
 
         let progress = (
             oracle.0.borrow().events,
-            report.commands_done + client_bytes + sub_bytes + report.delivered,
+            report.commands_done
+                + client_bytes
+                + sub_bytes
+                + report.delivered
+                + report.idle_closed
+                + report.idle_survived
+                + idle.progress(),
         );
         if progress == last_progress {
             idle_steps += 1;
@@ -1487,6 +1635,40 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 "cell {i}: a peer went unvisited for {streak} consecutive budget-exhausted \
                  drains (bound {streak_bound}) — FABRIC-IN starved it"
             ));
+        }
+    }
+
+    // Admission reconciliation (ADR-0123 D1): the cells' `rejected_
+    // connections` fold equals the clients that saw the refusal frame,
+    // per cell; and a scenario that seeds the bound must have reached it.
+    if scenario.maxclients != 0 {
+        let mut refused_on = vec![0u64; usize::from(scenario.cells)];
+        for c in clients.iter().filter(|c| c.refused) {
+            refused_on[c.cell] += 1;
+        }
+        for (cell, n) in idle.refused_per_cell() {
+            refused_on[cell] += n;
+        }
+        for (i, node) in nodes.iter().enumerate() {
+            let counted = node.rejected_connections.get();
+            if counted != refused_on[i] {
+                violations.push(format!(
+                    "cell {i}: rejected_connections {counted} vs {} clients refused there",
+                    refused_on[i]
+                ));
+            }
+        }
+        if report.refused_clients == 0 {
+            violations
+                .push("admission: no client was refused — the bound was never reached".into());
+        }
+    }
+    if scenario.idle_clients != 0 && !report.stalled {
+        if report.idle_closed == 0 {
+            violations.push("idle phase: no plain idle client was reaped".into());
+        }
+        if report.idle_survived == 0 {
+            violations.push("idle phase: no idle subscriber outlived the deadline".into());
         }
     }
 
@@ -1966,4 +2148,189 @@ fn plant_canary(model: &mut Keyspace, canary: Canary, now: Nanos) -> Option<(Exe
         }
     }
     Some(target)
+}
+
+// ---- admission + idle phase (ADR-0123, batch 50) ------------------------------
+
+/// Redis's reply past `maxclients` (networking.c; the plane's constant).
+const REFUSAL_FRAME: &[u8] = b"-ERR max number of clients reached\r\n";
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum IdleKind {
+    /// `PING`, then silence: must be closed at the deadline.
+    Plain,
+    /// `SUBSCRIBE`, then silence: exempt, must survive the deadline.
+    Subscriber,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum IdleState {
+    /// Sent its one command, awaiting the reply.
+    Fresh,
+    /// Replied at `since`: idle from here.
+    Active { since: Nanos },
+    /// Refused at accept (the cell was full) — outside the timeout oracle.
+    Refused,
+    /// Server-closed at `at` (plain) or client-closed at the end (subscriber).
+    Closed { at: Nanos },
+}
+
+struct IdleClient {
+    cell: usize,
+    fd: RawFd,
+    kind: IdleKind,
+    state: IdleState,
+    rx: Vec<u8>,
+}
+
+struct IdlePhase {
+    wanted: usize,
+    clients: Vec<IdleClient>,
+    started: bool,
+    done: bool,
+}
+
+impl IdlePhase {
+    fn new(wanted: usize) -> IdlePhase {
+        IdlePhase { wanted, clients: Vec::new(), started: false, done: wanted == 0 }
+    }
+
+    /// A monotone step counter for the stall detector: state transitions
+    /// plus one per client waiting inside its deadline window.
+    fn progress(&self) -> u64 {
+        self.clients
+            .iter()
+            .map(|c| match c.state {
+                IdleState::Fresh => 0,
+                IdleState::Active { .. } => 1,
+                IdleState::Refused | IdleState::Closed { .. } => 2,
+            })
+            .sum()
+    }
+
+    fn refused_per_cell(&self) -> Vec<(usize, u64)> {
+        self.clients.iter().filter(|c| c.state == IdleState::Refused).map(|c| (c.cell, 1)).collect()
+    }
+}
+
+/// Drives the idle phase one step; true once it is over (or never wanted).
+#[allow(clippy::too_many_arguments)] // the scheduler-step context, not an API surface
+fn drive_idle_phase(
+    scenario: &Scenario,
+    idle: &mut IdlePhase,
+    nets: &[Rc<RefCell<CellNet>>],
+    clock: &Rc<VirtualClock>,
+    rng: &mut SplitMix64,
+    regular_unwound: bool,
+    report: &mut SimReport,
+    violations: &mut Vec<String>,
+) -> bool {
+    if idle.done {
+        return true;
+    }
+    if !idle.started {
+        // Wait for every regular connection to unwind server-side so the
+        // idle clients are admitted (the shares are free again).
+        if !regular_unwound {
+            return false;
+        }
+        idle.started = true;
+        for i in 0..idle.wanted * 2 {
+            let kind = if i % 2 == 0 { IdleKind::Plain } else { IdleKind::Subscriber };
+            let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+            let mut net = nets[cell].borrow_mut();
+            let fd = net.connect();
+            let wire = match kind {
+                IdleKind::Plain => encode(&[b"PING".to_vec()]),
+                IdleKind::Subscriber => {
+                    encode(&[b"SUBSCRIBE".to_vec(), format!("idle:{i}").into_bytes()])
+                }
+            };
+            net.client_send(fd, &wire);
+            idle.clients.push(IdleClient {
+                cell,
+                fd,
+                kind,
+                state: IdleState::Fresh,
+                rx: Vec::new(),
+            });
+        }
+        return false;
+    }
+    let timeout = Nanos(u64::from(scenario.timeout_secs) * 1_000_000_000);
+    // The plane stamps activity at the buffer's receipt (a step before the
+    // reply is observed) and compares whole milliseconds.
+    let lower = Nanos(timeout.0.saturating_sub(scenario.step_ns_max + 1_000_000));
+    let upper = Nanos(timeout.0 + 4 * scenario.step_ns_max + 1_000_000);
+    let now = clock.now();
+    for (i, c) in idle.clients.iter_mut().enumerate() {
+        let mut net = nets[c.cell].borrow_mut();
+        let rx = net.client_recv(c.fd);
+        c.rx.extend_from_slice(&rx);
+        match c.state {
+            IdleState::Fresh => {
+                if c.rx.starts_with(REFUSAL_FRAME) {
+                    c.state = IdleState::Refused;
+                    report.refused_clients += 1;
+                    net.client_abandon(c.fd);
+                    continue;
+                }
+                let replied = match c.kind {
+                    IdleKind::Plain => c.rx == b"+PONG\r\n",
+                    IdleKind::Subscriber => reply_len(&c.rx).is_some(),
+                };
+                if replied {
+                    c.rx.clear();
+                    c.state = IdleState::Active { since: now };
+                }
+            }
+            IdleState::Active { since } => {
+                let idle_for = Nanos(now.0.saturating_sub(since.0));
+                let closed = net.closed(c.fd);
+                match c.kind {
+                    IdleKind::Plain if closed => {
+                        if idle_for < lower {
+                            violations.push(format!(
+                                "idle client {i}: reaped after {} ns, before its {} ns deadline",
+                                idle_for.0, timeout.0
+                            ));
+                        }
+                        c.state = IdleState::Closed { at: now };
+                        report.idle_closed += 1;
+                    }
+                    IdleKind::Plain if idle_for > upper => {
+                        violations.push(format!(
+                            "idle client {i}: still open {} ns past its {} ns deadline",
+                            idle_for.0 - timeout.0,
+                            timeout.0
+                        ));
+                        net.client_close(c.fd);
+                        c.state = IdleState::Closed { at: now };
+                    }
+                    IdleKind::Subscriber if closed => {
+                        violations.push(format!(
+                            "idle subscriber {i}: closed by the server after {} ns — subscribers \
+                             are exempt from `timeout`",
+                            idle_for.0
+                        ));
+                        c.state = IdleState::Closed { at: now };
+                    }
+                    IdleKind::Subscriber if idle_for > upper => {
+                        // Outlived the deadline: leave, so the leak oracle
+                        // sees the server unwind it.
+                        net.client_close(c.fd);
+                        c.state = IdleState::Closed { at: now };
+                        report.idle_survived += 1;
+                    }
+                    _ => {}
+                }
+            }
+            IdleState::Refused | IdleState::Closed { .. } => {}
+        }
+    }
+    idle.done = idle
+        .clients
+        .iter()
+        .all(|c| matches!(c.state, IdleState::Refused | IdleState::Closed { .. }));
+    idle.done
 }

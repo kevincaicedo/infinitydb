@@ -61,6 +61,46 @@ pub fn listen_reuseport(port: u16) -> io::Result<TcpListener> {
     Ok(listener)
 }
 
+/// Sets TCP keepalive on an accepted socket the way Redis's
+/// `anetKeepAlive` does (ADR-0123 D3): `SO_KEEPALIVE` with `secs` idle,
+/// probes every `max(1, secs / 3)` seconds, three probes; `secs == 0`
+/// clears `SO_KEEPALIVE`. Lives here so the plane stays
+/// `forbid(unsafe_code)`.
+///
+/// # Errors
+/// The first failing `setsockopt` (a non-TCP fd; callers ignore it like
+/// `TCP_NODELAY`'s failure).
+pub fn set_keepalive(fd: std::os::fd::RawFd, secs: u32) -> io::Result<()> {
+    let set = |level: libc::c_int, opt: libc::c_int, value: libc::c_int| -> io::Result<()> {
+        // SAFETY: setsockopt with a valid int pointer of the stated length
+        // on a caller-owned fd; a bad fd fails with EBADF/ENOTSOCK.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                (&raw const value).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    };
+    if secs == 0 {
+        return set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0);
+    }
+    let idle = libc::c_int::try_from(secs).unwrap_or(libc::c_int::MAX);
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    #[cfg(target_os = "linux")]
+    {
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle)?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, (idle / 3).max(1))?;
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3)?;
+    }
+    #[cfg(target_os = "macos")]
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, idle)?;
+    Ok(())
+}
+
 /// The port a listener actually bound (port 0 = kernel-assigned; tests).
 ///
 /// # Errors
@@ -130,6 +170,35 @@ pub fn pin_current_thread(core: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0123 D3: the keepalive quartet lands on a live TCP socket and
+    /// `0` clears it (read back with `getsockopt`).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn keepalive_is_set_and_cleared_on_a_tcp_socket() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("c");
+        let (server, _) = listener.accept().expect("accept");
+        let fd = server.as_raw_fd();
+        let get = |level: libc::c_int, opt: libc::c_int| -> libc::c_int {
+            let mut v: libc::c_int = 0;
+            let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: getsockopt into a valid int of the stated length.
+            let rc = unsafe { libc::getsockopt(fd, level, opt, (&raw mut v).cast(), &raw mut len) };
+            assert_eq!(rc, 0, "getsockopt {opt}");
+            v
+        };
+        set_keepalive(fd, 60).expect("set");
+        assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 60);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 20);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 3);
+        set_keepalive(fd, 0).expect("clear");
+        assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
+        assert!(set_keepalive(-1, 60).is_err(), "a bad fd reports its error");
+        drop(client);
+    }
 
     #[test]
     fn two_listeners_share_a_port() {

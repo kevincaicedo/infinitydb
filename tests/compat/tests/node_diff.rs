@@ -544,3 +544,204 @@ fn quit_closes_a_namespace_bound_connection_like_redis() {
         }
     }
 }
+
+// ---- Batch 50 (review 2026-08-30): F-L15-03 / F-L15-05 / F-L15-10 ----------
+
+/// The `# …` header lines of an INFO body.
+fn info_headers(reply: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(reply);
+    let body = text.split_once("\r\n").map_or("", |(_, b)| b);
+    body.lines().filter(|l| l.starts_with('#')).map(str::to_string).collect()
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-10): `INFO <unknown>` is an empty
+/// body on both engines (byte-exact `$0`); an unknown name beside a known
+/// one selects the known one alone; `all` beside an unknown name is
+/// everything. Pre-fix the spawned node answered its whole body.
+#[test]
+fn info_unknown_section_is_empty_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    let o = cmd(&mut oracle, &mut ob, &["INFO", "nosuchsection"]);
+    let n = cmd(&mut node, &mut nb, &["INFO", "nosuchsection"]);
+    assert_eq!(o, b"$0\r\n\r\n", "oracle: {:?}", String::from_utf8_lossy(&o));
+    assert_eq!(n, o, "node: {:?}", String::from_utf8_lossy(&n));
+    let o = cmd(&mut oracle, &mut ob, &["INFO", "server", "nosuchsection"]);
+    let n = cmd(&mut node, &mut nb, &["INFO", "server", "nosuchsection"]);
+    assert_eq!(info_headers(&o), vec!["# Server"]);
+    assert_eq!(info_headers(&n), vec!["# Server"], "{:?}", String::from_utf8_lossy(&n));
+    let everything = info_headers(&cmd(&mut node, &mut nb, &["INFO"]));
+    let n = cmd(&mut node, &mut nb, &["INFO", "nosuchsection", "all"]);
+    assert_eq!(info_headers(&n), everything, "{:?}", String::from_utf8_lossy(&n));
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-03) at the binary: a spawned 4-cell
+/// `infinityd`'s `INFO keyspace` counts what `DBSIZE` counts — the node —
+/// under `keyspace_scope:node`, and reads the same count Redis reads for
+/// the same keys. Pre-fix one cell's share (≈ ¼) with no scope line.
+#[test]
+fn info_keyspace_counts_the_whole_node_like_dbsize() {
+    let Some((_node_guard, mut node)) = infinityd(4, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    for i in 0..400u32 {
+        let key = format!("kf:{i}");
+        for (who, stream, buf) in [("redis", &mut oracle, &mut ob), ("node", &mut node, &mut nb)] {
+            assert_eq!(cmd(stream, buf, &["SET", &key, "v"]), b"+OK\r\n", "{who} SET {key}");
+        }
+    }
+    let keys_of = |reply: &[u8]| -> u64 {
+        let text = String::from_utf8_lossy(reply);
+        text.lines()
+            .find_map(|l| l.strip_prefix("db0:keys="))
+            .and_then(|r| r.split(',').next())
+            .unwrap_or_else(|| panic!("no db0 line: {text}"))
+            .parse()
+            .expect("u64")
+    };
+    assert_eq!(cmd(&mut oracle, &mut ob, &["DBSIZE"]), b":400\r\n");
+    assert_eq!(cmd(&mut node, &mut nb, &["DBSIZE"]), b":400\r\n");
+    assert_eq!(keys_of(&cmd(&mut oracle, &mut ob, &["INFO", "keyspace"])), 400);
+    // Peers publish on their MAINTAIN cadence: poll, bounded.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let reply = cmd(&mut node, &mut nb, &["INFO", "keyspace"]);
+        let text = String::from_utf8_lossy(&reply).to_string();
+        let keys = keys_of(&reply);
+        assert!(
+            text.contains("keyspace_scope:"),
+            "no scope line, db0:keys={keys} vs DBSIZE 400 (×{:.2}): {text}",
+            keys as f64 / 400.0
+        );
+        if keys == 400 && text.contains("keyspace_scope:node\r\n") {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        let overdue = std::time::Instant::now() >= deadline;
+        assert!(!overdue, "db0:keys={keys} vs DBSIZE 400: {text}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A second client to whatever `stream` is connected to.
+fn sibling(stream: &TcpStream) -> TcpStream {
+    let peer = stream.peer_addr().expect("peer addr");
+    let s = TcpStream::connect(peer).expect("connect");
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");
+    s
+}
+
+/// Closed by the server — FIN, or RST when it closed with our PING still
+/// unread (a refused accept never reads its socket).
+fn assert_closed_or_reset(stream: &mut TcpStream, who: &str) {
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => assert!(rest.is_empty(), "{who}: bytes after the refusal: {rest:?}"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("{who} did not close the refused connection ({e})"),
+    }
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `maxclients`): past the bound
+/// both engines answer `-ERR max number of clients reached` and close.
+/// Redis: `maxclients 1` with one client held → the second is refused.
+/// Node: `maxclients 4` on four cells is one slot per cell (ADR-0123) →
+/// within eight attempts one connection lands on a full cell. Pre-fix
+/// the node refused `CONFIG SET maxclients` as immutable.
+#[test]
+fn maxclients_refusal_matches_redis() {
+    let Some((_node_guard, mut node)) = infinityd(4, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "maxclients", "1"]), b"+OK\r\n");
+    let mut o2 = sibling(&oracle);
+    let mut b2 = Vec::new();
+    let expected = cmd(&mut o2, &mut b2, &["PING"]);
+    assert_eq!(expected, b"-ERR max number of clients reached\r\n");
+    assert_closed_or_reset(&mut o2, "redis");
+    assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "maxclients", "10000"]), b"+OK\r\n");
+
+    assert_eq!(cmd(&mut node, &mut nb, &["CONFIG", "SET", "maxclients", "4"]), b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let mut held = Vec::new();
+    let mut refused = None;
+    for _ in 0..8 {
+        let mut s = sibling(&node);
+        let mut buf = Vec::new();
+        let reply = cmd(&mut s, &mut buf, &["PING"]);
+        if reply == b"+PONG\r\n" {
+            held.push(s);
+            continue;
+        }
+        assert_eq!(reply, expected, "node: {:?}", String::from_utf8_lossy(&reply));
+        refused = Some(s);
+        break;
+    }
+    let mut refused = refused.expect("node: no connection refused under maxclients 4 / 4 cells");
+    assert_closed_or_reset(&mut refused, "node");
+    assert!(held.len() <= 3, "node admitted {} beyond the holding client", held.len());
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `timeout`): an idle client is
+/// closed after `timeout` seconds on both engines (FIN, no bytes).
+/// Pre-fix the node answered `+OK` and never closed.
+#[test]
+fn timeout_closes_an_idle_connection_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "timeout", "1"]), b"+OK\r\n");
+    assert_eq!(cmd(&mut node, &mut nb, &["CONFIG", "SET", "timeout", "1"]), b"+OK\r\n");
+    let mut idle_o = sibling(&oracle);
+    let mut idle_n = sibling(&node);
+    let (mut bo, mut bn) = (Vec::new(), Vec::new());
+    assert_eq!(cmd(&mut idle_o, &mut bo, &["PING"]), b"+PONG\r\n");
+    assert_eq!(cmd(&mut idle_n, &mut bn, &["PING"]), b"+PONG\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    // The admin connections idled through the deadline too: both reaped.
+    for (who, stream) in [
+        ("redis", &mut idle_o),
+        ("node", &mut idle_n),
+        ("redis admin", &mut oracle),
+        ("node admin", &mut node),
+    ] {
+        let mut rest = Vec::new();
+        match stream.read_to_end(&mut rest) {
+            Ok(_) => assert!(rest.is_empty(), "{who}: bytes on an idle connection: {rest:?}"),
+            Err(e) => panic!("{who}: the server never closed the idle connection ({e})"),
+        }
+    }
+    // A pinned oracle (CI) outlives the test: restore its default.
+    let mut fresh = sibling(&idle_o);
+    let mut fb = Vec::new();
+    assert_eq!(cmd(&mut fresh, &mut fb, &["CONFIG", "SET", "timeout", "0"]), b"+OK\r\n");
+}

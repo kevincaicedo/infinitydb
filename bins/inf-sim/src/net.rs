@@ -155,6 +155,16 @@ impl CellNet {
         }
     }
 
+    /// Client side: give up on a refused connection — nothing queued
+    /// toward the server will ever be read (the server closed without
+    /// arming a receive), so it leaves the progress accounting.
+    pub fn client_abandon(&mut self, fd: RawFd) {
+        if let Some(conn) = self.conns.get_mut(&fd) {
+            conn.to_server.clear();
+            conn.client_closed = true;
+        }
+    }
+
     /// True once the server closed its side too (teardown complete).
     pub fn closed(&self, fd: RawFd) -> bool {
         self.conns.get(&fd).is_none_or(|c| c.server_closed)

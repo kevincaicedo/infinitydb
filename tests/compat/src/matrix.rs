@@ -534,6 +534,21 @@ pub static MATRIX: &[Case] = &[
     c(&["CONFIG", "SET", "maxmemory", "7mb", "timeout", "0"]),
     c(&["CONFIG", "GET", "maxmemory"]),
     c(&["CONFIG", "SET", "maxmemory", "0"]),
+    // Batch 50 (review 2026-08-30, F-L15-10): a section name this build
+    // lacks is an empty body, byte-exact (`$0`).
+    c(&["INFO", "nosuchsection"]),
+    // Batch 50 (F-L15-05, ADR-0123): `maxclients` is settable like Redis
+    // and both engines refuse the out-of-range values (detail text
+    // differs); the `normal` output-buffer class merges and echoes.
+    c(&["CONFIG", "SET", "maxclients", "20000"]),
+    c(&["CONFIG", "GET", "maxclients"]),
+    c(&["CONFIG", "SET", "maxclients", "10000"]),
+    skip(&["CONFIG", "SET", "maxclients", "0"], "error detail text differs; both reject"),
+    skip(&["CONFIG", "SET", "timeout", "-1"], "error detail text differs; both reject"),
+    skip(&["CONFIG", "SET", "tcp-keepalive", "-1"], "error detail text differs; both reject"),
+    c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 64mb 16mb 10"]),
+    c(&["CONFIG", "GET", "client-output-buffer-limit"]),
+    c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 0 0 0"]),
     c(&["CONFIG", "REWRITE"]),
     // --- CLIENT ---
     skip(&["CLIENT", "ID"], "connection ids are engine-internal counters"),

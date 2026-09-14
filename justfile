@@ -89,6 +89,9 @@ sim-smoke:
     # F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines —
     # FABRIC-IN must reach every peer within `cells − 2` exhausted drains.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-fabric-fairness --seed 0xC0FFEE --verify-determinism
+    # F-L15-05 (ADR-0123): maxclients refusal at accept + the idle reaper
+    # under an oracle (share bound, refusal frame, counter fold, deadline).
+    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-admission --seed 0xC0FFEE --verify-determinism
     # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
     cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism

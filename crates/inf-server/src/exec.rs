@@ -130,6 +130,9 @@ pub struct NodeInfo {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
+    /// idle_disconnections`, cell scope).
+    pub idle_disconnections: Cell<u64>,
     /// Durable-plane gauges (M2-S08, flushed by MAINTAIN — the S21
     /// vocabulary for `INFO persistence`).
     pub log_records_appended: Cell<u64>,
@@ -350,7 +353,18 @@ pub struct NodeInfo {
 pub(crate) fn memory_gauges_of(
     report: &inf_store::MemoryReport,
     node: &NodeInfo,
+    ks: &inf_store::Keyspace,
 ) -> crate::control::MemoryGauges {
+    // ADR-0122 A2: the per-db counts ride the same publication, so
+    // `# Keyspace` folds like `# Memory` and never drifts from it.
+    let mut db_keys = [0u64; inf_store::DEFAULT_DBS];
+    let mut db_expires = [0u64; inf_store::DEFAULT_DBS];
+    for (db, store) in ks.dbs() {
+        if let (Some(k), Some(e)) = (db_keys.get_mut(db), db_expires.get_mut(db)) {
+            *k = store.len() as u64;
+            *e = store.stats().ttl_live;
+        }
+    }
     crate::control::MemoryGauges {
         used_bytes: report.attributed_bytes()
             + node.wire_buffers_bytes.get()
@@ -365,6 +379,8 @@ pub(crate) fn memory_gauges_of(
         doc_path_cache_bytes: report.doc_path_cache_bytes,
         idx_tree_bytes: report.idx_tree_bytes,
         idx_slack_bytes: report.idx_slack_bytes,
+        db_keys,
+        db_expires,
     }
 }
 
