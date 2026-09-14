@@ -187,8 +187,14 @@ from the header and never bounded: a CRC-valid frame declaring
   ADR-0072 D1 restates it. **Cite `header_len`, never the constant 20.**
 - **`decode_frame` bounds the field** where it is read, for both formats:
   `header_len ≤ first_lsn.offset` and `(first_lsn.offset − header_len) +
-  frame_len ≤ u32::MAX`. A frame's first record is never inside its own
-  header, and a frame always fits inside a u32-addressed segment.
+  extent ≤ u32::MAX`, where `extent` is the frame's **on-device extent**
+  — `frame_len` for v1/v2, `align_up(frame_len)` for v3 (ADR-0072 D1 as
+  amended 2026-09-14, review F-L02-04: the successor address and every
+  segment cursor advance by the padded extent, so that is what must fit).
+  A v3 `frame_len` that cannot be padded inside a `u32` is `BadLength`;
+  `align_up_frame` itself saturates at `u32::MAX` instead of wrapping to
+  0. A frame's first record is never inside its own header, and a frame
+  always fits inside a u32-addressed segment.
 - **New public variant `FrameDecodeError::BadFirstLsn { offset: u32 }`** —
   corruption class, not the torn-tail class (`ZeroMagic` stays the only
   expected end-of-log signal). `FrameDecodeError` deliberately stays
@@ -235,7 +241,10 @@ ignores its unaddressable suffix.
   (`SegmentRotor::maintain`); rotation on the append path is a pointer
   swap; seal = fdatasync + write-handle drop (sealed segments are
   immutable by construction). Seal at `segment_bytes` (default 256 MiB)
-  or optional `seal_after_ms` (default off — M2 cut line).
+  or optional `seal_after_ms` (default off — M2 cut line; **synchronous
+  tier only**: `maintain_deferred` never time-seals — review 2026-08-30
+  L02, the synchronous `rotate()` would swap the active segment under an
+  in-flight frame).
 - **Segment recycling (M4.5-S39b, ADR-0090):** a sealed `Direct` segment
   that was pre-zeroed (`SealedMeta { id, prezeroed }`, recorded at seal)
   and falls below the MANIFEST floor is offered to a bounded per-cell
@@ -258,6 +267,20 @@ ignores its unaddressable suffix.
   pool empty), `recycle_fallbacks`, `recycle_pool_bytes`. Ids are never
   reissued: `N = active.next()` — a recycled file's residue is stamped
   with every previous id it carried, all ≠ `N`.
+  **The take-time sentinel (ADR-0090 A15, review F-L02-02):** every take
+  of a fully allocated pooled file writes one v3 frame stamped for the
+  file's **old** id into its **last block** (`build_recycle_sentinel(
+  &mut FrameBuilder, old, segment_bytes)`, record `Delete { ns: 0, key:
+  RECYCLE_SENTINEL_KEY }`, stamp `{1, 1, 0}`) — foreign under `N`, so the
+  slack scanner always meets one foreign frame and the residue stays
+  provable when the next life's data end lands inside the last residue
+  frame's body (the one placement no surviving header proved). It rides
+  the zero-fill state machine as a one-block `Filling` with
+  `FillSource::RecycleSentinel { old }` (unpaced; ready after the fill
+  barrier — durable before the file can be taken write-through) on the
+  driver tier, and is written + `sync_data`ed inline on the synchronous
+  tier. `zero_fill_bytes` counts zeros only; `recycle_sentinels` counts
+  sentinels (INFO `recycle_sentinels`).
 - **The pool wait (ADR-0090 D9 / A8):** `SegmentConfig::prealloc =
   PreallocPolicy::{Immediate, WaitForPool { bound: Quarter | Eighth }}`
   (`infinityd --recycle-wait off|quarter|eighth`, default `quarter`).
@@ -330,9 +353,12 @@ those driver ops against the same `SimDisk`.
   on `MemFs`; length ≥ preallocation target on the sim disk). Wrappers
   (`ReadAheadFs`) forward explicitly, as for `create_tier`.
 - Rotor zero-fill state machine (driver-ridden, never a blocking write):
-  `next_zero_slice(max_len) → ZeroSlice{fd, offset, len}` (paced against
+  `next_zero_slice(max_len) → ZeroSlice{fd, offset, len, source:
+  FillSource::{Zeros, RecycleSentinel { old }}}` (paced against
   `2 × active.written + ZERO_FILL_HEAD_START` while the active segment
-  is pre-zeroed; unpaced otherwise), `note_zero_slice_written()`,
+  is pre-zeroed and the source is zeros; unpaced otherwise — the plane
+  copies a sentinel image into its own aligned one-block window before
+  the push), `note_zero_slice_written()`,
   `take_zero_fill_barrier() → fd`, `note_zero_fill_synced()`;
   `FrameSlot::{len (padded), layout, write_through_ok}`;
   `LogError::NextNotReady` (a zero-fill op is in flight on the segment
@@ -1013,7 +1039,9 @@ per episode). A drained cell always seals — never slower than K = 1.
 - `shard-k/MANIFEST` names the recovery unit atomically:
   `{format epoch, ckpt id, begin-LSN, live segment set}` inside the
   `inf-log::meta` envelope (magic `INFMETA1` + length + CRC32C — one swap
-  protocol shared with the catalog). Payload: magic `INFMAN1\0`,
+  protocol shared with the catalog; the reader refuses any envelope file
+  over `MAX_ENVELOPE_LEN` = 64 MiB **by inode length, before allocating**
+  — review F-L02-05). Payload: magic `INFMAN1\0`,
   `epoch: u32 = 1`, `ckpt_id: u64`, packed `begin: u64`, count + u32
   segment ids (strictly ascending; `segments[0] == begin.segment` = the
   truncation floor). Canonical decode: trailing bytes / empty or

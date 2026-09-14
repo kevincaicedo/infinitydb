@@ -202,6 +202,41 @@ fn time_seal_fires_only_when_configured_and_dirty() {
     assert!(!rotor.maintain(90_000).expect("maintain").time_sealed);
 }
 
+/// Review 2026-08-30 L02 (performance / DX row): a time seal on the
+/// reactor tier ran through the **synchronous** `rotate()` — a blocking
+/// `sync_data` on the loop, no `SealHandoff` for the ledger, and no
+/// drained-ring guard (ADR-0087 D4) — so a MAINTAIN slice landing while a
+/// frame was reserved swapped the active segment under it and the
+/// commit died with `frame slot is stale`. Time seals stay a synchronous-
+/// tier feature (the M2 cut line): `maintain_deferred` never seals.
+#[test]
+fn a_time_seal_never_fires_on_the_deferred_tier() {
+    let fs = MemFs::new();
+    let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
+    let config = SegmentConfig {
+        segment_bytes: SEGMENT_BYTES,
+        seal_after_ms: Some(1_000),
+        ..Default::default()
+    };
+    let mut rotor =
+        SegmentRotor::create_fresh_deferred(fs.clone(), dirs.log, config).expect("rotor");
+    let value = [0xABu8; 100];
+    let mut builder = FrameBuilder::new();
+    builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: &value });
+    let (slot, handoff) = rotor.begin_frame_deferred(builder.frame_len(), 20_000).expect("slot");
+    assert!(handoff.is_none());
+    rotor.commit_frame_queued(slot);
+    // A frame is reserved (in flight) when the time bound passes.
+    let (slot, _) = rotor.begin_frame_deferred(builder.frame_len(), 20_500).expect("slot");
+    let (report, _) = rotor.maintain_deferred(21_000).expect("maintain");
+    // Pre-fix: the active segment was swapped under the reserved slot —
+    // `frame slot is stale (out-of-order commit)`.
+    let base = rotor.commit_frame_queued(slot);
+    assert_eq!(base.segment, SegmentId(0));
+    assert!(!report.time_sealed, "the deferred tier has no time seal (M2 cut line)");
+    assert_eq!(rotor.stats().time_seals, 0);
+}
+
 /// StdSegmentFs smoke: the same lifecycle against the real filesystem —
 /// create, append, reopen from a boot scan, append again, replay.
 #[test]

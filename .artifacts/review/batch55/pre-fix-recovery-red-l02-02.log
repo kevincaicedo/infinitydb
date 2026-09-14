@@ -1,0 +1,22 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running tests/recover_recycled.rs (target/debug/deps/recover_recycled-044d0149f2cfb5b4)
+
+running 1 test
+recover stats: RecoverStats { phases: RecoverPhases { start_ns: 0, ckpt_bytes: 0, ckpt_ns: 0, replay_bytes: 180224, replay_frames: 24, replay_ns: 0, audit_bytes: 81920, audit_valid_frames: 0, audit_foreign_frames: 0, audit_ns: 0, finish_ns: 0, total_ns: 0 }, segments: 4, frames: 24, records_applied: 24, records_skipped: 0, records_skipped_unknown_ns: 0, doc_deltas_skipped_stale: 0, doc_deltas_skipped_missing: 0, markers: 0, ckpt_records: 0, records_pre_begin: 0, ckpt_footer_probe_hit: None, stale_files_removed: 0, torn_truncated_at: Some(Lsn { segment: SegmentId(3), offset: 53248 }), torn_segments_removed: 1, shadow_settle_reads: 0, blob_revived: 0, dropped_ns_swept: 0, dropped_files_swept: 0, dropped_sections_skipped: 0, sealed_slack_remnants: 0, beyond_frames_discarded: 0, epoch_residue_stops: 0, stale_residue_slacks: 0, segment_residue_stops: 0, recycled_residue_slacks: 0 }
+
+thread 'a_data_end_inside_the_last_residue_frames_body_is_proven_residue_not_torn' (415966) panicked at crates/inf-server/tests/recover_recycled.rs:370:5:
+assertion `left == right` failed: a healthy recycled log must never report a torn tail (ADR-0090 A1)
+  left: Some(Lsn { segment: SegmentId(3), offset: 53248 })
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test a_data_end_inside_the_last_residue_frames_body_is_proven_residue_not_torn ... FAILED
+
+failures:
+
+failures:
+    a_data_end_inside_the_last_residue_frames_body_is_proven_residue_not_torn
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --test recover_recycled`

@@ -1,0 +1,90 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.32s
+     Running tests/direct_segments.rs (target/debug/deps/direct_segments-2a9b634f7e8ac8d4)
+
+running 21 tests
+test buffered_handle_is_not_alignment_checked_after_a_direct_reopen ... ok
+test direct_handle_stays_alignment_checked_after_a_buffered_reopen - should panic ... ok
+test frames_above_fua_max_are_not_write_through ... ok
+test sim_write_through_needs_no_fdatasync ... ok
+test direct_rotor_on_memfs_writes_aligned_write_through_frames ... ok
+test each_open_is_its_own_file_description ... ok
+test frame_iter_follows_each_frames_successor_rule ... ok
+test v3_frame_is_v2_with_an_aligned_successor ... ok
+test reopen_reads_the_prezeroed_fact_from_the_file ... ok
+test reader_skips_padding_across_window_boundaries ... ok
+test zero_fill_then_class_upgrade_rotation ... ok
+test sync_tier_torn_points_inject_on_a_direct_segment ... ok
+test not_ready_rotation_waits_for_the_slice_then_degrades_loudly ... ok
+test sim_write_through_into_a_hole_rides_the_cut ... ok
+test std_direct_segment_reports_allocation_honestly ... ok
+test packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation ... ok
+test sim_write_through_is_durable_and_supersedes_overlaps ... ok
+test tail_scan_skips_v3_padding ... ok
+test reopen_after_a_torn_zero_fill_runs_flush_class ... ok
+test sim_torn_zero_fill_is_not_fully_allocated ... ok
+test zero_fill_is_paced_by_the_active_segments_fill ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/fault_points.rs (target/debug/deps/fault_points-33794f6f3a0f53ed)
+
+running 8 tests
+test dir_fsync_fail_fires_at_every_barrier_class ... ok
+test prealloc_no_space_fires_the_enospc_discipline ... ok
+test manifest_rename_fail_leaves_the_old_unit_authoritative ... ok
+test torn_frame_lands_a_prefix_and_lies ... ok
+test log_append_short_write_fails_the_append_and_leaves_a_short_prefix ... ok
+test dir_fsync_fail_fires_at_the_recycle_rename_barrier ... ok
+test power_cut_after_seal_leaves_a_durable_sealed_segment ... ok
+test fsync_err_fails_the_seal_typed_and_non_recoverable ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/segment_prealloc_wait.rs (target/debug/deps/segment_prealloc_wait-1b5c6e91187680b7)
+
+running 13 tests
+test policy_spellings_round_trip ... ok
+test the_first_generation_after_boot_preallocates_at_once ... ok
+test a_packed_tail_reopened_buffered_never_waits ... ok
+test the_eighth_bound_expires_at_an_eighth ... ok
+test an_empty_pool_expires_the_wait_into_exactly_one_fresh_fallback_at_the_bound ... ok
+test enospc_on_the_fallback_is_found_at_the_bound_and_retries_without_a_second_wait ... ok
+test pool_arrival_before_the_bound_satisfies_the_wait_with_the_recycled_segment ... ok
+test time_sealing_rotors_never_wait ... ok
+test the_immediate_policy_never_waits ... ok
+test a_pool_arrival_whose_open_fails_ends_the_wait_and_falls_back_fresh ... ok
+test a_pool_arrival_after_expiry_serves_the_following_generation ... ok
+test a_recovered_prezeroed_tail_preallocates_at_once_then_waits_from_its_second_generation ... ok
+test the_fallbacks_zero_fill_is_paced_from_its_origin_and_completes_before_rotation ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+
+     Running tests/segment_recycle.rs (target/debug/deps/segment_recycle-42da549f852bdcd2)
+
+running 9 tests
+test foreign_segment_fuzz_seed ... ok
+test an_empty_pool_is_a_counted_miss_that_zero_fills ... ok
+test a_failed_rename_falls_back_to_a_fresh_prealloc ... ok
+test a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor ... ok
+test recycled_residue_reads_as_foreign_segment_frames_never_data ... ok
+test covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id ... FAILED
+test a_pooled_file_that_reads_sparse_falls_back_to_the_fill ... ok
+test recycling_off_or_buffered_never_pools ... ok
+test pool_is_bounded_and_the_overflow_is_unlinked ... ok
+
+failures:
+
+---- covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id stdout ----
+
+thread 'covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id' (418756) panicked at crates/inf-log/tests/segment_recycle.rs:143:5:
+assertion failed: !lab.rotor.next_zero_filling()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --test segment_recycle`

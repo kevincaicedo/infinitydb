@@ -1,0 +1,36 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running tests/segment_lifecycle.rs (target/debug/deps/segment_lifecycle-1c9885d2e99f14cf)
+
+running 9 tests
+test edquot_is_the_disk_full_class ... ok
+test a_time_seal_never_fires_on_the_deferred_tier ... ok
+test oversized_frame_is_rejected ... ok
+test fsync_failure_on_seal_is_fatal ... ok
+test time_seal_fires_only_when_configured_and_dirty ... ok
+test enospc_surfaces_in_maintain_before_writes_need_it ... ok
+test std_fs_lifecycle_smoke ... ok
+test unmaintained_rotation_counts_inline_prealloc ... ok
+test rotation_is_pointer_swap_with_preallocated_next ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/segment_prealloc_wait.rs (target/debug/deps/segment_prealloc_wait-1b5c6e91187680b7)
+
+running 13 tests
+test policy_spellings_round_trip ... ok
+test the_first_generation_after_boot_preallocates_at_once ... ok
+test an_empty_pool_expires_the_wait_into_exactly_one_fresh_fallback_at_the_bound ... ok
+test the_eighth_bound_expires_at_an_eighth ... ok
+test pool_arrival_before_the_bound_satisfies_the_wait_with_the_recycled_segment ... ok
+test a_packed_tail_reopened_buffered_never_waits ... ok
+test enospc_on_the_fallback_is_found_at_the_bound_and_retries_without_a_second_wait ... ok
+test time_sealing_rotors_never_wait ... ok
+test a_pool_arrival_after_expiry_serves_the_following_generation ... ok
+test a_pool_arrival_whose_open_fails_ends_the_wait_and_falls_back_fresh ... ok
+test a_recovered_prezeroed_tail_preallocates_at_once_then_waits_from_its_second_generation ... ok
+test the_immediate_policy_never_waits ... ok
+test the_fallbacks_zero_fill_is_paced_from_its_origin_and_completes_before_rotation ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.50s
+

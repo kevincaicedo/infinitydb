@@ -1,0 +1,14 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.56s
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 6 tests
+test frame::tests::align_up_saturates_at_the_ceiling ... ok
+test frame::tests::first_lsn_offset_past_the_offset_ceiling_is_a_decode_error ... ok
+test frame::tests::aligned_frame_len_that_cannot_be_padded_is_a_bad_length ... ok
+test frame::tests::first_lsn_offset_inside_the_header_is_a_decode_error ... ok
+test frame::tests::frame_ending_at_the_offset_ceiling_decodes_and_walks ... ok
+test frame::tests::aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 114 filtered out; finished in 0.00s
+

@@ -1,0 +1,18 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.27s
+     Running tests/recover_recycled.rs (target/debug/deps/recover_recycled-044d0149f2cfb5b4)
+
+running 10 tests
+test phase_accounting_counts_audit_bytes_and_foreign_frames_without_a_clock ... ok
+test a_twice_recycled_file_classifies_the_same ... ok
+test residue_behind_this_lifes_data_is_a_classified_end_never_data ... ok
+test a_same_segment_frame_behind_a_hole_still_refuses_through_the_new_rule ... ok
+test an_unattested_same_segment_frame_behind_a_hole_truncates_as_today ... ok
+test a_torn_this_life_write_over_residue_resumes_at_the_data_end ... ok
+test a_sealed_recycled_segment_does_not_stop_the_live_log ... ok
+test recycled_residue_recovery_is_deterministic ... ok
+test an_empty_recycled_next_segment_is_a_legal_tail ... ok
+test a_data_end_inside_the_last_residue_frames_body_is_proven_residue_not_torn ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

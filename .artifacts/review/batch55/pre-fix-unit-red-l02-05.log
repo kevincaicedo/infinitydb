@@ -1,0 +1,22 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running tests/envelope_bounds.rs (target/debug/deps/envelope_bounds-a7bf4cb2cf903920)
+
+running 1 test
+test an_oversized_envelope_is_refused_by_size_before_any_read ... FAILED
+
+failures:
+
+---- an_oversized_envelope_is_refused_by_size_before_any_read stdout ----
+
+thread 'an_oversized_envelope_is_refused_by_size_before_any_read' (412861) panicked at crates/inf-log/tests/envelope_bounds.rs:31:5:
+the refusal names the bound: envelope bad magic [00, 00, 00, 00, 00, 00, 00, 00]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    an_oversized_envelope_is_refused_by_size_before_any_read
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p inf-log --test envelope_bounds`

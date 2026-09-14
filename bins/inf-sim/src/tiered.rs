@@ -222,6 +222,7 @@ impl TieredScenario {
             ops_per_writer: 0,
             keys_per_writer: self.keys_per_writer,
             value_max: 0,
+            value_pad_max: 0,
             step_ns_max: self.step_ns_max,
             double_cut: self.double_cut,
             plant: Plant::None,

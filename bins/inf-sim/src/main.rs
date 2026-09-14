@@ -1332,6 +1332,8 @@ fn run_durable(
     let mut recycled = 0u64;
     let mut recycle_misses = 0u64;
     let mut recycle_fallbacks = 0u64;
+    let mut recycle_sentinels = 0u64;
+    let mut clean_stop_torn_tails = 0u64;
     let mut rotations = 0u64;
     let mut residue_slacks = 0u64;
     // Pool-wait coverage (ADR-0090 D9): both outcomes must occur in a
@@ -1377,6 +1379,8 @@ fn run_durable(
         recycled += report.segments_recycled;
         recycle_misses += report.recycle_misses;
         recycle_fallbacks += report.recycle_fallbacks;
+        recycle_sentinels += report.recycle_sentinels;
+        clean_stop_torn_tails += report.clean_stop_torn_tails;
         rotations += report.segment_rotations;
         residue_slacks += report.recycled_residue_slacks;
         waits_started += report.recycle_waits_started;
@@ -1457,7 +1461,8 @@ fn run_durable(
              write_through_entries_max={write_through_entries_max} \
              hold_episode_violations={hold_episode_violations} \
              segments_recycled={recycled} recycle_misses={recycle_misses} \
-             recycle_fallbacks={recycle_fallbacks} segment_rotations={rotations} \
+             recycle_fallbacks={recycle_fallbacks} recycle_sentinels={recycle_sentinels} \
+             clean_stop_torn_tails={clean_stop_torn_tails} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
              segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \

@@ -1,0 +1,40 @@
+== fixed tree 25625f3 (dirty: batch 55 working tree)
+    Finished `release` profile [optimized + debuginfo] target(s) in 58.57s
+seed=1 exit=0
+seed=5 exit=0
+seed=9 exit=0
+seed=13 exit=0
+seed=17 exit=0
+seed=21 exit=0
+seed=25 exit=0
+seed=29 exit=0
+seed=33 exit=0
+seed=37 exit=0
+seed=41 exit=0
+seed=45 exit=0
+seed=49 exit=0
+seed=53 exit=0
+seed=57 exit=0
+seed=61 exit=0
+seed=65 exit=0
+seed=69 exit=0
+seed=73 exit=0
+seed=77 exit=0
+seed=81 exit=0
+seed=85 exit=0
+seed=89 exit=0
+seed=93 exit=0
+seed=97 exit=0
+seed=101 exit=0
+seed=105 exit=0
+seed=109 exit=0
+seed=113 exit=0
+seed=117 exit=0
+seed=121 exit=0
+seed=125 exit=0
+== determinism on the red seed
+inf-sim: scenario m2-recycle seed 0x6d: 2400 commands, 11026 steps, 36 keys audited, 1530 required ops, 0 allowed-lost, 0 equivalence checks, 0 documents compared, 0 corpus docs, cut classes [], lift regime false (tiered ops 0, indexed ops 0, sidecars loaded 0, stale slacks lifted 0; plant: cells 0,
+inf-sim: sim_seconds=11.377301 published=0 delivered=0
+inf-sim: determinism verified — second run trace byte-identical
+seed=0x6d-verify exit=0
+SWEEP DONE

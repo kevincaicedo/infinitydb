@@ -1,0 +1,11 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running tests/envelope_bounds.rs (target/debug/deps/envelope_bounds-a7bf4cb2cf903920)
+
+running 3 tests
+test an_oversized_envelope_is_refused_by_size_before_any_read ... ok
+test a_sparse_multi_gib_manifest_is_a_named_refusal_not_an_allocation ... ok
+test an_envelope_at_the_bound_round_trips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+

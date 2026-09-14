@@ -291,14 +291,14 @@ I	1	crates/inf-log/src/manifest.rs	expect	tier file count	bounded by the decode 
 I	1	crates/inf-log/src/manifest.rs	expect	tier ns count	bounded by the decode caps (MAX_TIER_NS, MAX_TIER_FILES) and segment retention — far below u32 in any real catalog
 I	1	crates/inf-log/src/meta.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/meta.rs	expect	4-byte trailer	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	1	crates/inf-log/src/meta.rs	expect	envelope size fits usize	u64 → usize is lossless on every supported (64-bit) target
 I	2	crates/inf-log/src/reader.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	8-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	3	crates/inf-log/src/record.rs	expect	8 bytes	fixed-width sub-slice of a length-checked buffer — infallible by construction
-C	1	crates/inf-log/src/segment.rs	assert	Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}	`bins/infinityd/src/main.rs:main` exits 1 when --segment-bytes is not a multiple of FRAME_ALIGN under the fua class (the only Direct configurator)
+C	2	crates/inf-log/src/segment.rs	assert	Direct segments need segment_bytes to be a multiple of {FRAME_ALIGN}	`bins/infinityd/src/main.rs:main` exits 1 when --segment-bytes is not a multiple of FRAME_ALIGN under the fua class (the only Direct configurator); the second site is `recycle_sentinel_base` (ADR-0090 A15), reached only through a Direct rotor that passed `assert_valid`
 C	1	crates/inf-log/src/segment.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/recover.rs:Recovery::step_finish` derives the resume epoch as the recovered life + 1 (≥ 1) before `set_resume_epoch`
 I	1	crates/inf-log/src/segment.rs	assert	zero slice written with none in flight	NextState machine of the pre-zeroed next segment (ADR-0086 D2)
+I	1	crates/inf-log/src/segment.rs	expect	fill cursor within the segment	NextState machine: `Filling { cursor }` holds cursor < segment_bytes (`note_zero_slice_written` moves to AwaitBarrier at equality); review 2026-08-30 L02 style row, enforced in release
 I	1	crates/inf-log/src/segment.rs	assert_eq	frame bytes differ from reservation	FrameSlot reservation ⇄ commit pairing (M2.5-S13)
 I	2	crates/inf-log/src/segment.rs	assert_eq	frame slot is stale (out-of-order commit)	FrameSlot reservation ⇄ commit pairing (M2.5-S13)
 I	1	crates/inf-log/src/segment.rs	assert_eq	zero-fill synced out of order	NextState machine of the pre-zeroed next segment (ADR-0086 D2)

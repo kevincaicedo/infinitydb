@@ -1,0 +1,36 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running unittests src/lib.rs (target/debug/deps/inf_log-4ca621fdf3c76e67)
+
+running 3 tests
+test frame::tests::align_up_saturates_at_the_ceiling ... FAILED
+test frame::tests::aligned_frame_len_that_cannot_be_padded_is_a_bad_length ... FAILED
+test frame::tests::aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error ... FAILED
+
+failures:
+
+---- frame::tests::align_up_saturates_at_the_ceiling stdout ----
+
+thread 'frame::tests::align_up_saturates_at_the_ceiling' (409331) panicked at crates/inf-log/src/frame.rs:101:5:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- frame::tests::aligned_frame_len_that_cannot_be_padded_is_a_bad_length stdout ----
+
+thread 'frame::tests::aligned_frame_len_that_cannot_be_padded_is_a_bad_length' (409332) panicked at crates/inf-log/src/frame.rs:834:9:
+an unpaddable frame_len is a BadLength under a permissive max_frame_len
+
+---- frame::tests::aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error stdout ----
+
+thread 'frame::tests::aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error' (409333) panicked at crates/inf-log/src/frame.rs:802:9:
+a v3 frame whose padded extent crosses the u32 ceiling must not decode
+
+
+failures:
+    frame::tests::align_up_saturates_at_the_ceiling
+    frame::tests::aligned_frame_len_that_cannot_be_padded_is_a_bad_length
+    frame::tests::aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 117 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-log --lib`

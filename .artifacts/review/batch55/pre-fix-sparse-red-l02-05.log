@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/envelope_bounds.rs (target/debug/deps/envelope_bounds-a7bf4cb2cf903920)
+
+running 1 test
+memory allocation of 8589934592 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p inf-log --test envelope_bounds`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/envelope_bounds-a7bf4cb2cf903920 a_sparse_multi_gib_manifest` (signal: 6, SIGABRT: process abort signal)

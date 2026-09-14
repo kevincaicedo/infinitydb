@@ -1,0 +1,35 @@
+== baseline worktree 25625f3 + oracle/seed-class/value-pad patch only; --cells 4
+    Finished `release` profile [optimized + debuginfo] target(s) in 54.14s
+seed=1 exit=0
+seed=5 exit=0
+seed=9 exit=0
+seed=13 exit=0
+seed=17 exit=0
+seed=21 exit=0
+seed=25 exit=0
+seed=29 exit=0
+seed=33 exit=0
+seed=37 exit=0
+seed=41 exit=0
+seed=45 exit=0
+seed=49 exit=0
+seed=53 exit=0
+seed=57 exit=0
+seed=61 exit=0
+seed=65 exit=0
+seed=69 exit=0
+seed=73 exit=0
+seed=77 exit=0
+seed=81 exit=0
+seed=85 exit=0
+seed=89 exit=0
+seed=93 exit=0
+seed=97 exit=0
+seed=101 exit=0
+seed=105 exit=0
+seed=109 exit=0
+seed=113 exit=0
+seed=117 exit=0
+seed=121 exit=0
+seed=125 exit=0
+SWEEP DONE

@@ -9,6 +9,30 @@ use inf_log::{
 };
 use proptest::prelude::*;
 
+/// ADR-0072 D1 as amended (review F-L02-04): a named `frame_decode`
+/// corpus seed for the v3 padded-extent boundary — a CRC-valid aligned
+/// frame whose `frame_len` fits below the u32 ceiling from its base but
+/// whose padding does not, a shape random mutation almost never reaches.
+/// Writes `crates/inf-log/fuzz/corpora/frame_decode/v3-padded-extent-
+/// ceiling-20260914` when `INF_WRITE_FUZZ_SEED=1` (a no-op otherwise).
+#[test]
+fn v3_padded_extent_ceiling_fuzz_seed() {
+    if std::env::var_os("INF_WRITE_FUZZ_SEED").is_none() {
+        return;
+    }
+    let mut builder = FrameBuilder::new();
+    builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+    let frame_len = builder.frame_len();
+    let base = u32::MAX - frame_len;
+    let first = Lsn::new(SegmentId(0), base + FRAME_HEADER_LEN as u32);
+    let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+    let image = builder.finalize(first, stamp, FrameLayout::Aligned)[..frame_len as usize].to_vec();
+    assert!(decode_frame(&image, u32::MAX).is_err(), "the seed is the refused shape");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpora/frame_decode");
+    std::fs::create_dir_all(path).expect("corpora dir");
+    std::fs::write(format!("{path}/v3-padded-extent-ceiling-20260914"), &image).expect("seed");
+}
+
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
 /// attests nothing). `seq` matters only where a test builds sequential
 /// frames the recovery policy will walk; readers/scanners ignore it.

@@ -95,10 +95,17 @@ pub const fn frame_header_len(has_stamp: bool) -> usize {
 }
 
 /// `len` rounded up to the next [`FRAME_ALIGN`] multiple — the on-disk
-/// extent of a v3 frame and the base of its successor.
+/// extent of a v3 frame and the base of its successor. Saturates at
+/// `u32::MAX` for the top 4095 values (review 2026-08-30 F-L02-04: the
+/// plain multiply wrapped to 0 there); a frame the decoder admits never
+/// reaches saturation — `decode_frame` refuses any frame whose padded
+/// extent does not fit a u32 segment (ADR-0072 D1 as amended).
 #[must_use]
 pub const fn align_up_frame(len: u32) -> u32 {
-    len.div_ceil(FRAME_ALIGN) * FRAME_ALIGN
+    match len.checked_next_multiple_of(FRAME_ALIGN) {
+        Some(padded) => padded,
+        None => u32::MAX,
+    }
 }
 
 /// How a sealed frame lies on the device (ADR-0086 D3). The segment's I/O
@@ -576,6 +583,16 @@ pub fn decode_frame(
     if frame_len < shape.min_frame_len || frame_len > max_frame_len {
         return Err(FrameDecodeError::BadLength { len: frame_len });
     }
+    // The on-device extent (ADR-0072 D1 as amended, F-L02-04): a v3
+    // frame occupies `align_up(frame_len)`, and that is what the successor
+    // address and every segment cursor advance by — so it, not
+    // `frame_len`, is what must fit a u32-addressed segment.
+    let Some(extent) = (match shape.layout {
+        FrameLayout::Packed => Some(frame_len),
+        FrameLayout::Aligned => frame_len.checked_next_multiple_of(FRAME_ALIGN),
+    }) else {
+        return Err(FrameDecodeError::BadLength { len: frame_len });
+    };
     let frame_len_usize = frame_len as usize;
     if buf.len() < frame_len_usize {
         return Err(FrameDecodeError::Truncated { needed: frame_len_usize, available: buf.len() });
@@ -596,18 +613,19 @@ pub fn decode_frame(
         u32::from_le_bytes(frame[16..20].try_into().expect("4-byte slice")),
     );
     // An honest writer derives the first record's offset as `base +
-    // header_len` — 20 for v1, 40 for v2 — and the whole frame sits inside a
-    // u32-addressed segment (ADR-0011 D2 as restated per-version by
-    // ADR-0072 D1; D2's own text says "+ 20", which is v1-era wording).
-    // So the offset is at least one header in and the frame's own bytes fit
-    // below the ceiling. Without this bound a CRC-valid frame declaring a
+    // header_len` — 20 for v1, 40 for v2/v3 — and the whole frame, padding
+    // included, sits inside a u32-addressed segment (ADR-0011 D2 as
+    // restated per-version by ADR-0072 D1, extent as amended for v3;
+    // D2's own text says "+ 20", which is v1-era wording). So the offset
+    // is at least one header in and the frame's on-device bytes fit below
+    // the ceiling. Without this bound a CRC-valid frame declaring a
     // near-`u32::MAX` offset makes `RecordIter` advance the record cursor
-    // past the ceiling and panic in `Lsn::advance`, and makes
-    // `Phase::Replay`'s `first_lsn.offset - header_len` frame-base
-    // subtraction underflow.
+    // past the ceiling and panic in `Lsn::advance`, makes `Phase::Replay`'s
+    // `first_lsn.offset - header_len` frame-base subtraction underflow,
+    // and (v3) lets the successor address wrap past the ceiling.
     let header_len_u32 = shape.header_len as u32;
     if first_lsn.offset < header_len_u32
-        || (first_lsn.offset - header_len_u32).checked_add(frame_len).is_none()
+        || (first_lsn.offset - header_len_u32).checked_add(extent).is_none()
     {
         return Err(FrameDecodeError::BadFirstLsn { offset: first_lsn.offset });
     }
@@ -749,5 +767,97 @@ mod tests {
         assert_eq!(consumed, frame_len as usize);
         assert_eq!(frame.first_lsn().offset, last);
         assert_eq!(frame.records().filter(|r| r.is_ok()).count(), 1);
+    }
+
+    /// One honest single-record v3 frame with `first_lsn.offset` rewritten
+    /// (CRC repaired), padding included — the aligned shape whose extent
+    /// is `align_up(frame_len)`, not `frame_len`.
+    fn aligned_frame_with_first_offset(offset: u32) -> Vec<u8> {
+        let mut builder = FrameBuilder::new();
+        builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+        let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+        let frame_len = builder.frame_len() as usize;
+        let mut image = builder
+            .finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp, FrameLayout::Aligned)
+            .to_vec();
+        image[16..20].copy_from_slice(&offset.to_le_bytes());
+        let end = frame_len - FRAME_TRAILER_LEN;
+        let crc = crc32c(&image[..end]);
+        image[end..frame_len].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    /// Review 2026-08-30 F-L02-04: the aligned round-up saturates instead
+    /// of wrapping — `len.div_ceil(4096) * 4096` overflowed for the top
+    /// 4095 values (a debug multiply panic; `0` in release, which made
+    /// `FrameIter` re-decode the same frame forever).
+    #[test]
+    fn align_up_saturates_at_the_ceiling() {
+        assert_eq!(align_up_frame(u32::MAX - 4094), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX - 1), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX - 4095), u32::MAX - 4095);
+        assert_eq!(align_up_frame(1), FRAME_ALIGN);
+        assert_eq!(align_up_frame(0), 0);
+    }
+
+    /// ADR-0072 D1 as amended (F-L02-04): the second inequality bounds
+    /// the frame's **on-device extent**. A v3 frame whose `frame_len`
+    /// fits below the ceiling but whose padded extent does not is refused
+    /// — before this bound it decoded, and its successor address wrapped.
+    #[test]
+    fn aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error() {
+        let frame_len = aligned_frame_with_first_offset(FRAME_HEADER_LEN as u32)[4..8]
+            .try_into()
+            .map(u32::from_le_bytes)
+            .expect("4-byte slice");
+        assert!(frame_len < FRAME_ALIGN, "one-block test frame");
+        // base + frame_len == u32::MAX: legal under the old bound, and the
+        // padded extent base + 4096 crosses the ceiling.
+        let base = u32::MAX - frame_len;
+        let offset = base + FRAME_HEADER_LEN as u32;
+        let image = aligned_frame_with_first_offset(offset);
+        assert!(
+            matches!(
+                decode_frame(&image, DEFAULT_MAX_FRAME_LEN),
+                Err(FrameDecodeError::BadFirstLsn { offset: o }) if o == offset
+            ),
+            "a v3 frame whose padded extent crosses the u32 ceiling must not decode"
+        );
+        // The last legal aligned base: the padded extent ends exactly at
+        // the ceiling + 1 (`base + 4096 == 2^32` is one past — refused),
+        // so `base + 4096 - 1 == u32::MAX` is the boundary that decodes.
+        let last_base = u32::MAX - FRAME_ALIGN + 1;
+        let last = aligned_frame_with_first_offset(last_base + FRAME_HEADER_LEN as u32);
+        assert!(
+            decode_frame(&last, DEFAULT_MAX_FRAME_LEN).is_err(),
+            "an extent ending one past the ceiling is refused"
+        );
+        let legal_base = u32::MAX - 2 * FRAME_ALIGN + 1;
+        let legal = aligned_frame_with_first_offset(legal_base + FRAME_HEADER_LEN as u32);
+        let (frame, _) = decode_frame(&legal, DEFAULT_MAX_FRAME_LEN).expect("the last legal base");
+        assert_eq!(
+            u64::from(legal_base) + u64::from(frame.padded_len()),
+            u64::from(u32::MAX) - FRAME_ALIGN as u64 + 1
+        );
+    }
+
+    /// A v3 frame whose `frame_len` itself cannot be padded inside a u32
+    /// is a bad length whatever its position (the saturating round-up
+    /// must never be the only thing between the decoder and a wrap).
+    #[test]
+    fn aligned_frame_len_that_cannot_be_padded_is_a_bad_length() {
+        let mut image = aligned_frame_with_first_offset(FRAME_HEADER_LEN as u32);
+        let len = u32::MAX - 4094;
+        image[4..8].copy_from_slice(&len.to_le_bytes());
+        // Short buffer: the length bound must fire before the truncation
+        // check reads a 4 GiB frame, and before the CRC.
+        assert!(
+            matches!(
+                decode_frame(&image, u32::MAX),
+                Err(FrameDecodeError::BadLength { len: l }) if l == len
+            ),
+            "an unpaddable frame_len is a BadLength under a permissive max_frame_len"
+        );
     }
 }

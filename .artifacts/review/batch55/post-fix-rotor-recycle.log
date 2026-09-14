@@ -1,0 +1,18 @@
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.23s
+     Running tests/segment_recycle.rs (target/debug/deps/segment_recycle-42da549f852bdcd2)
+
+running 10 tests
+test foreign_segment_fuzz_seed ... ok
+test an_empty_pool_is_a_counted_miss_that_zero_fills ... ok
+test a_failed_rename_falls_back_to_a_fresh_prealloc ... ok
+test covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id ... ok
+test a_pooled_file_that_reads_sparse_falls_back_to_the_fill ... ok
+test a_take_writes_the_sentinel_into_the_last_block ... ok
+test pool_is_bounded_and_the_overflow_is_unlinked ... ok
+test recycled_residue_reads_as_foreign_segment_frames_never_data ... ok
+test recycling_off_or_buffered_never_pools ... ok
+test a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -428,6 +428,7 @@ pub(crate) fn info(
         push(&mut text, &format!("recycle_fallbacks:{}", node.recycle_fallbacks.get()));
         push(&mut text, &format!("recycle_pool_bytes:{}", node.recycle_pool_bytes.get()));
         push(&mut text, &format!("recycle_pool_full:{}", node.recycle_pool_full.get()));
+        push(&mut text, &format!("recycle_sentinels:{}", node.recycle_sentinels.get()));
         push(&mut text, &format!("segment_rotations:{}", node.segment_rotations.get()));
         push(&mut text, &format!("segment_preallocs:{}", node.segment_preallocs.get()));
         push(
