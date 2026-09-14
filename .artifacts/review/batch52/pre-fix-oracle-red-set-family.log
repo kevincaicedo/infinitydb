@@ -1,0 +1,21 @@
+test matrix_replies_match_redis ... FAILED
+compat-diff v1: 486 byte-compared cases, 44 documented deviations, 9 failures
+  oracle    "$-1\r\n"
+  candidate "-ERR syntax error\r\n"
+  oracle    "+OK\r\n"
+  candidate "-ERR syntax error\r\n"
+  oracle    "$2\r\nv7\r\n"
+  candidate "$2\r\nv6\r\n"
+  oracle    "+OK\r\n"
+  candidate "-ERR syntax error\r\n"
+  oracle    ":200\r\n"
+  candidate ":-1\r\n"
+  oracle    ":200\r\n"
+  candidate ":-1\r\n"
+  oracle    "$1\r\nv\r\n"
+  candidate "-ERR syntax error\r\n"
+  oracle    "$1\r\nv\r\n"
+  candidate "-ERR syntax error\r\n"
+  oracle    ":200\r\n"
+  candidate ":-1\r\n"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s

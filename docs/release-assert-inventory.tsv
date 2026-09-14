@@ -499,7 +499,6 @@ I	1	crates/inf-server/src/plane.rs	expect	log completion without durable plane	`
 I	1	crates/inf-server/src/plane.rs	expect	LogWritten without durable plane	`LogWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane.rs	expect	manifest completion without durable plane	`ManifestSync` tokens are minted by the durable cell's manifest driver, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane.rs	expect	materialized, checked above	`ns_store(id).is_none()` continued the loop on the line above; `ns_store_mut` on a known namespace materializes
-I	1	crates/inf-server/src/plane.rs	expect	record sizes fit usize	`need` is a record length (u64) on a 64-bit target; records are bounded by the frame cap
 I	1	crates/inf-server/src/plane.rs	expect	recovered namespace carries a tier block	`Recovery::recover_tiers` already refused a manifested tier section the catalog does not know (ADR-0100 D6), so every recovered namespace is catalogued tiered
 I	1	crates/inf-server/src/plane.rs	expect	scatter programs dispatch registered commands	`argv[0]` reached this program through a registry `lookup` in the dispatcher
 C	1	crates/inf-server/src/plane.rs	expect	set_control before begin_recovery	assembly order: `bins/infinityd/src/main.rs:main` and every harness call `set_control` first (`crates/inf-server/src/plane.rs:ServerPlane::begin_recovery` documents the panic)

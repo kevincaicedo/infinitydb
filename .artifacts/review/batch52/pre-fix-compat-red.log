@@ -1,0 +1,22 @@
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 1 test
+test tiered_namespace_argument_errors_match_redis ... FAILED
+
+failures:
+
+---- tiered_namespace_argument_errors_match_redis stdout ----
+
+thread 'tiered_namespace_argument_errors_match_redis' (21105) panicked at tests/compat/src/harness.rs:207:13:
+server closed the connection mid-script
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tiered_namespace_argument_errors_match_redis
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.19s
+
+error: test failed, to rerun pass `-p compat --test node_diff`

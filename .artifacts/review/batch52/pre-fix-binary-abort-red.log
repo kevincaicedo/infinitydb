@@ -1,0 +1,18 @@
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xb0d680fc97f5e841; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd 9871472 (git 9871472096b9, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 6399, backend io_uring, route natural
+infinityd: listening on 6399
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 1 cells serving (28 ms)
+memory allocation of 4611686018427387905 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+b'+OK\r\n'
+b'+OK\r\n'
+b''
+infinityd exited: status 134

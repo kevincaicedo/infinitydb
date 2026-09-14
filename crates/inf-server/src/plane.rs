@@ -2628,7 +2628,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 ) {
                     let mut durable = self.shared.durable.borrow_mut();
                     let cell = durable.as_mut().expect("log completion without durable plane");
-                    cell.on_log_error(c.token, errno);
+                    // `-> !`: the empty match pins the divergence here, so
+                    // the housekeeping tail below is unreachable by
+                    // construction (L13 style row) — a log token never
+                    // reaches the connection arms.
+                    match cell.on_log_error(c.token, errno) {}
                 }
                 // Checkpoint-op failures abort the checkpoint, never the
                 // process (ADR-0016: the old checkpoint + log stay valid);
@@ -4651,7 +4655,9 @@ fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
         CommandId::Config => sub.is_some_and(|s| {
             s.eq_ignore_ascii_case(b"SET") || s.eq_ignore_ascii_case(b"RESETSTAT")
         }),
-        CommandId::InfNs => is_ns_ddl_sub(sub),
+        // INF.NS DDL is a program (`program_ns_ddl`), routed ahead of the
+        // scatter arm on every node shape — never a scatter (L13 style
+        // row: the scatter arm's `InfNs` case was dead).
         _ => false,
     }
 }
@@ -4885,10 +4891,10 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     }
                     pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal });
                 }
-                CommandId::Flushdb | CommandId::Flushall | CommandId::Config | CommandId::InfNs => {
-                    // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT,
-                    // INF.NS CREATE/DROP): the local leg validates and
-                    // applies; an error reply short-circuits the fan-out.
+                CommandId::Flushdb | CommandId::Flushall | CommandId::Config => {
+                    // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT):
+                    // the local leg validates and applies; an error reply
+                    // short-circuits the fan-out.
                     // Every command on this arm must therefore be
                     // all-or-nothing locally (review of 2026-08-30, H1 /
                     // F-L17-12: `CONFIG SET` was not — ADR-0098 split it).
@@ -6999,7 +7005,13 @@ async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             break 'chain;
         }
         if applied.need > 0 {
-            need = usize::try_from(applied.need).expect("record sizes fit usize");
+            // A record length from an on-disk header: a typed stop, not
+            // an assert (the decoder-bounds rule; the cursor persists).
+            let Ok(n) = usize::try_from(applied.need) else {
+                debug_assert!(false, "record length {} exceeds usize", applied.need);
+                break 'chain;
+            };
+            need = n;
             continue;
         }
         if applied.consumed == 0 {

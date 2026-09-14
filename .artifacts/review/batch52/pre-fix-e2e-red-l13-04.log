@@ -1,0 +1,27 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.12s
+     Running tests/node_e2e.rs (target/debug/deps/node_e2e-fbed072c93bd1071)
+
+running 1 test
+test tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive ... FAILED
+
+failures:
+
+---- tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive stdout ----
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 1 cells serving (2 ms)
+
+thread '<unnamed>' (20553) panicked at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/raw_vec/mod.rs:28:5:
+capacity overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive' (20551) panicked at crates/inf-server/tests/node_e2e.rs:721:33:
+read reply: Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }
+
+
+failures:
+    tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 91 filtered out; finished in 5.25s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`

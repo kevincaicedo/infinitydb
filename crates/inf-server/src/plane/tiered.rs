@@ -1331,17 +1331,21 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     argv: &[&[u8]],
     proto: Protocol,
 ) -> TieredReply {
-    let Some(cursor) = std::str::from_utf8(argv.arg(1)).ok().and_then(|s| s.parse::<u64>().ok())
-    else {
+    let Some(cursor) = crate::exec::parse_cursor(argv.arg(1)) else {
         return done_error(shared, proto, "ERR invalid cursor");
     };
     let mut count = 10usize;
     let mut i = 2;
-    while i + 1 < argv.len() {
-        if argv.arg(i).eq_ignore_ascii_case(b"COUNT") {
-            match std::str::from_utf8(argv.arg(i + 1)).ok().and_then(|s| s.parse::<usize>().ok()) {
-                Some(n) if n > 0 => count = n.min(10_000),
-                _ => {
+    // The numbered-db grammar (`exec::scan`): an option without its value
+    // is a syntax error (a lone trailing `COUNT` used to pass); the count
+    // is bounded at 10 000 slots per call (the slice's allocation).
+    while i < argv.len() {
+        let opt = argv.arg(i);
+        if opt.eq_ignore_ascii_case(b"COUNT") && i + 1 < argv.len() {
+            match parse_i64(argv.arg(i + 1)) {
+                Some(n) if n >= 1 => count = usize::try_from(n).unwrap_or(usize::MAX).min(10_000),
+                Some(_) => return done_error(shared, proto, "ERR syntax error"),
+                None => {
                     return done_error(
                         shared,
                         proto,
@@ -1350,9 +1354,13 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 }
             }
             i += 2;
-        } else {
+        } else if (opt.eq_ignore_ascii_case(b"MATCH") || opt.eq_ignore_ascii_case(b"TYPE"))
+            && i + 1 < argv.len()
+        {
             // MATCH/TYPE filters are not wired on tiered namespaces yet.
             return done_error(shared, proto, ERR_UNSUPPORTED);
+        } else {
+            return done_error(shared, proto, "ERR syntax error");
         }
     }
     // Slice the index inside one borrow; resolve cold keys after.
@@ -1486,21 +1494,59 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
             table.shadow_unverified_tickets()
         })
     };
-    let Some(mut pending) = snapshot(shared) else {
+    let Some(pending) = snapshot(shared) else {
         return Err(error_bytes(shared, proto, "ERR the selected namespace was dropped"));
     };
-    let mut fenced = false;
-    // Two passes at most: the fence stops new tickets, and a ticket that
-    // moved under a concurrent overwrite is still verified by its cold
-    // address — a second snapshot only catches a read the first pass
-    // could not complete.
+    if !pending.is_empty() {
+        // The fence brackets the drain — one raise, one lower, whatever
+        // the drain answers (F-L13-09, review of 2026-08-30: three return
+        // paths each lowered it). The await inside cannot strand a raised
+        // fence: `CellExecutor` runs every task to completion (no
+        // cancellation API), so a suspended drain always resumes here.
+        let fence = |raise: bool| {
+            if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
+                table.shadow_fence(raise);
+            }
+        };
+        fence(true);
+        let drained = drain_shadow_tickets(shared, ns, proto, pending, snapshot).await;
+        fence(false);
+        drained?;
+    }
+    let mut ks = shared.store.borrow_mut();
+    match ks.tiered_store_mut(ns) {
+        Some(table) => {
+            if table.shadow_unverified() > 0 {
+                // Unreachable under the fence unless a read raced a
+                // retarget twice; say so rather than guess.
+                return Err(error_bytes(
+                    shared,
+                    proto,
+                    "ERR DBSIZE: shadow tickets still unverified after the drain",
+                ));
+            }
+            Ok(table.len() as u64)
+        }
+        None => Ok(0),
+    }
+}
+
+/// The fenced part of [`dbsize_count`]: verifies every open ticket by
+/// its cold twin. Two passes at most: the fence stops new tickets, and a
+/// ticket that moved under a concurrent overwrite is still verified by
+/// its cold address — a second snapshot only catches a read the first
+/// pass could not complete. `Err` is the typed reply; the caller lowers
+/// the fence on every outcome.
+async fn drain_shadow_tickets<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    proto: Protocol,
+    mut pending: Vec<inf_store::ShadowTicket>,
+    snapshot: impl Fn(&Rc<Shared<O, F>>) -> Option<Vec<inf_store::ShadowTicket>>,
+) -> Result<(), Vec<u8>> {
     for _pass in 0..2 {
         if pending.is_empty() {
             break;
-        }
-        if !fenced && let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
-            table.shadow_fence(true);
-            fenced = true;
         }
         for ticket in pending.drain(..) {
             let image =
@@ -1516,7 +1562,6 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 }
                 Err(cause) => {
                     table.shadow_read_failed(ticket.cold);
-                    table.shadow_fence(false);
                     let addr = ticket.cold.to_raw();
                     let mut reply = shared.take_reply_buf();
                     RespWriter::new(&mut reply, proto).error(&format!(
@@ -1528,25 +1573,7 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
         }
         pending = snapshot(shared).unwrap_or_default();
     }
-    let mut ks = shared.store.borrow_mut();
-    match ks.tiered_store_mut(ns) {
-        Some(table) => {
-            if fenced {
-                table.shadow_fence(false);
-            }
-            if table.shadow_unverified() > 0 {
-                // Unreachable under the fence unless a read raced a
-                // retarget twice; say so rather than guess.
-                return Err(error_bytes(
-                    shared,
-                    proto,
-                    "ERR DBSIZE: shadow tickets still unverified after the drain",
-                ));
-            }
-            Ok(table.len() as u64)
-        }
-        None => Ok(0),
-    }
+    Ok(())
 }
 
 /// A cold slot's key fetch, planned (SCAN key resolution).
@@ -1719,16 +1746,26 @@ async fn set_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let key = argv.arg(1);
     let value = argv.arg(2);
     let (mut nx, mut xx, mut get_old) = (false, false, false);
+    // The numbered-db grammar (`exec::set`, Redis's family rule): `NX XX`
+    // is a syntax error, a repeat is not; an unknown token is a syntax
+    // error; only the expiry family (`EX`/`PX`/`EXAT`/`PXAT`/`KEEPTTL`)
+    // answers the declared M4 refusal (L13 style row, review 2026-08-30).
     for i in 3..argv.len() {
         let opt = argv.arg(i);
-        if opt.eq_ignore_ascii_case(b"NX") {
-            nx = true;
-        } else if opt.eq_ignore_ascii_case(b"XX") {
-            xx = true;
+        if opt.eq_ignore_ascii_case(b"NX") || opt.eq_ignore_ascii_case(b"XX") {
+            let want_nx = opt.eq_ignore_ascii_case(b"NX");
+            if (want_nx && xx) || (!want_nx && nx) {
+                return done_error(shared, proto, "ERR syntax error");
+            }
+            nx |= want_nx;
+            xx |= !want_nx;
         } else if opt.eq_ignore_ascii_case(b"GET") {
             get_old = true;
-        } else {
+        } else if opt.eq_ignore_ascii_case(b"KEEPTTL") || crate::exec::expire_option(opt).is_some()
+        {
             return done_error(shared, proto, ERR_NO_EXPIRY);
+        } else {
+            return done_error(shared, proto, "ERR syntax error");
         }
     }
     // Conditional SETs resolve first; the write helper re-resolves per
@@ -1959,8 +1996,18 @@ async fn append<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     class: Option<FsyncClass>,
 ) -> TieredReply {
     let suffix = argv.arg(2).to_vec();
+    let Some(max) = blob_max(shared, ns) else {
+        return done_error(shared, proto, "ERR the selected namespace was dropped");
+    };
     let outcome = write_value(shared, ns, class, argv.arg(1), proto, |old, _| {
-        let mut value = old.map(<[u8]>::to_vec).unwrap_or_default();
+        let old_len = old.map_or(0, <[u8]>::len);
+        // Bound before building: a post-image past BLOB-MAX is refused
+        // typed, never materialised (F-L13-04).
+        if old_len.checked_add(suffix.len()).is_none_or(|end| end as u64 > max) {
+            return Err(error_bytes(shared, proto, ERR_TOO_LARGE));
+        }
+        let mut value = Vec::with_capacity(old_len + suffix.len());
+        value.extend_from_slice(old.unwrap_or_default());
         value.extend_from_slice(&suffix);
         Ok(value)
     })
@@ -1977,23 +2024,41 @@ async fn setrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     proto: Protocol,
     class: Option<FsyncClass>,
 ) -> TieredReply {
-    let Some(offset) = parse_i64(argv.arg(2)).filter(|o| *o >= 0) else {
+    let Some(offset) = parse_i64(argv.arg(2)) else {
+        return done_error(shared, proto, "ERR value is not an integer or out of range");
+    };
+    let Ok(offset) = usize::try_from(offset) else {
         return done_error(shared, proto, "ERR offset is out of range");
     };
-    let offset = offset as usize;
     let patch = argv.arg(3).to_vec();
+    // Redis `setrangeCommand`: an empty patch is a length read — no
+    // bound check, no write, `0` for a missing key.
+    if patch.is_empty() {
+        return strlen(shared, ns, argv.arg(1), proto).await;
+    }
+    // F-L13-04 (review of 2026-08-30): the post-image is bounded before
+    // a byte of it is built — `offset` is client-chosen, and a resize to
+    // it was a `capacity overflow` panic (`i64::MAX`) or an allocator
+    // abort of the whole node (`2^62`). BLOB-MAX is the namespace's
+    // declared value cap, the same answer a `SET` past it gets.
+    let Some(max) = blob_max(shared, ns) else {
+        return done_error(shared, proto, "ERR the selected namespace was dropped");
+    };
+    let Some(end) = offset.checked_add(patch.len()).filter(|end| *end as u64 <= max) else {
+        return done_error(shared, proto, ERR_TOO_LARGE);
+    };
     let outcome = write_value(shared, ns, class, argv.arg(1), proto, |old, _| {
-        let mut value = old.map(<[u8]>::to_vec).unwrap_or_default();
-        if value.len() < offset + patch.len() {
-            value.resize(offset + patch.len(), 0);
+        let old = old.unwrap_or_default();
+        let mut value = Vec::with_capacity(old.len().max(end));
+        value.extend_from_slice(old);
+        if value.len() < end {
+            value.resize(end, 0);
         }
-        value[offset..offset + patch.len()].copy_from_slice(&patch);
+        value[offset..end].copy_from_slice(&patch);
         Ok(value)
     })
     .await;
-    int_write_reply(shared, proto, class, outcome, |old| {
-        old.map_or(0, |v| v.len()).max(offset + patch.len()) as i64
-    })
+    int_write_reply(shared, proto, class, outcome, |old| old.map_or(0, |v| v.len()).max(end) as i64)
 }
 
 async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -2560,8 +2625,21 @@ fn int_write_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
+/// Redis `string2ll` (`exec::parse_i64`): the numbered-db rule, so a
+/// tiered namespace refuses `+5`, `007` and `-0` exactly as Redis does.
 fn parse_i64(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+    crate::exec::parse_i64(bytes).ok()
+}
+
+/// The namespace's declared value cap (`BLOB-MAX`) — the bound every
+/// grown post-image (`APPEND`, `SETRANGE`) is checked against before a
+/// byte of it is built (F-L13-04).
+fn blob_max(
+    shared: &Rc<Shared<impl PlaneObserver + 'static, impl SegmentFs + Clone + 'static>>,
+    ns: NsId,
+) -> Option<u64> {
+    let ks = shared.store.borrow();
+    Some(ks.tiered_store(ns)?.blob_config().max_bytes)
 }
 
 /// Redis's INCRBYFLOAT rendering: up to 17 significant digits, no

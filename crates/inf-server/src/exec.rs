@@ -1134,35 +1134,39 @@ fn set(
     w: &mut RespWriter<'_>,
 ) {
     let mut opts = SetOptions::default();
-    let mut have_cond = false;
-    let mut have_expire = false;
-    let mut expire = None;
+    let mut expire: Option<(&[u8], ExpireUnit)> = None;
     let mut i = 3;
+    // Redis `parseExtendedStringArgumentsOrReply`: an option conflicts
+    // only with a *different* one of its family (`NX XX`, `EX … PX …`,
+    // `EX … KEEPTTL`); a repeat is accepted, the last value wins
+    // (batch 52, review of 2026-08-30 — `NX NX` and `EX 1 EX 2` were
+    // syntax errors here, oracle-pinned otherwise).
     while i < argv.len() {
         let opt = argv.arg(i);
         if opt.eq_ignore_ascii_case(b"NX") || opt.eq_ignore_ascii_case(b"XX") {
-            if have_cond {
-                return w.error("ERR syntax error");
-            }
-            have_cond = true;
-            opts.cond = if opt.eq_ignore_ascii_case(b"NX") {
+            let cond = if opt.eq_ignore_ascii_case(b"NX") {
                 SetCond::IfAbsent
             } else {
                 SetCond::IfPresent
             };
+            if opts.cond != SetCond::Always && opts.cond != cond {
+                return w.error("ERR syntax error");
+            }
+            opts.cond = cond;
         } else if opt.eq_ignore_ascii_case(b"GET") {
             opts.get_old = true;
         } else if opt.eq_ignore_ascii_case(b"KEEPTTL") {
-            if have_expire {
+            if expire.is_some() {
                 return w.error("ERR syntax error");
             }
-            have_expire = true;
             opts.expire = SetExpire::Keep;
         } else if let Some(unit) = expire_option(opt) {
-            if have_expire || i + 1 >= argv.len() {
+            if opts.expire == SetExpire::Keep
+                || expire.is_some_and(|(_, prev)| prev != unit)
+                || i + 1 >= argv.len()
+            {
                 return w.error("ERR syntax error");
             }
-            have_expire = true;
             expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
@@ -1208,22 +1212,24 @@ fn getex(
     w: &mut RespWriter<'_>,
 ) {
     let mut update = TtlUpdate::Keep;
-    let mut have = false;
-    let mut expire = None;
+    let mut expire: Option<(&[u8], ExpireUnit)> = None;
     let mut i = 2;
+    // The same family rule as SET: `PERSIST PERSIST` and `EX 1 EX 2`
+    // are accepted, `EX … PERSIST` and `EX … PX …` are syntax errors.
     while i < argv.len() {
         let opt = argv.arg(i);
-        if have {
-            return w.error("ERR syntax error");
-        }
         if opt.eq_ignore_ascii_case(b"PERSIST") {
-            have = true;
-            update = TtlUpdate::Persist;
-        } else if let Some(unit) = expire_option(opt) {
-            if i + 1 >= argv.len() {
+            if expire.is_some() {
                 return w.error("ERR syntax error");
             }
-            have = true;
+            update = TtlUpdate::Persist;
+        } else if let Some(unit) = expire_option(opt) {
+            if matches!(update, TtlUpdate::Persist)
+                || expire.is_some_and(|(_, prev)| prev != unit)
+                || i + 1 >= argv.len()
+            {
+                return w.error("ERR syntax error");
+            }
             expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
@@ -1860,13 +1866,13 @@ pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
 
 /// A `SET`/`GETEX` expire option: its unit in ms and whether the value is
 /// a Unix instant (`EXAT`/`PXAT`) or a TTL (`EX`/`PX`).
-#[derive(Copy, Clone)]
-struct ExpireUnit {
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ExpireUnit {
     ms: i64,
     absolute: bool,
 }
 
-fn expire_option(opt: &[u8]) -> Option<ExpireUnit> {
+pub(crate) fn expire_option(opt: &[u8]) -> Option<ExpireUnit> {
     if opt.eq_ignore_ascii_case(b"EX") {
         Some(ExpireUnit { ms: 1000, absolute: false })
     } else if opt.eq_ignore_ascii_case(b"PX") {

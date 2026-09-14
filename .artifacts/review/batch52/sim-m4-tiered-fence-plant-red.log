@@ -1,0 +1,2 @@
+inf-sim: sim_seconds=21.431085 published=0 delivered=0 tier_read_fault_arm=false tier_read_faults_fired=0 tier_read_error_replies=0 scan_cold_pages=12 scan_cold_reads=86
+inf-sim: VIOLATION: seed 0x5eed0001: OPEN-TICKET VIOLATION seed 0x5eed0001: 1 DBSIZE fences still raised after the failed drain (F-L13-09)

@@ -97,6 +97,22 @@ pub static MATRIX: &[Case] = &[
     c(&["SET", "k1", "v", "EX", "10", "KEEPTTL"]),
     c(&["SET", "k1", "v", "NX", "XX"]),
     c(&["SET", "k1", "v", "BOGUSOPT"]),
+    // Batch 52 (review 2026-08-30, L13): Redis's option-family rule — a
+    // repeat is accepted (last value wins), only a conflict is a syntax
+    // error; PERSIST is GETEX-only.
+    c(&["SET", "k1", "v", "NX", "NX"]),
+    c(&["SET", "k1", "v7", "XX", "XX"]),
+    c(&["GET", "k1"]),
+    c(&["SET", "k1", "v", "EX", "100", "EX", "200"]),
+    c(&["TTL", "k1"]),
+    c(&["SET", "k1", "v", "EX", "10", "PX", "20"]),
+    c(&["SET", "k1", "v", "EXAT", "1", "EX", "10"]),
+    c(&["SET", "k1", "v8", "KEEPTTL", "KEEPTTL"]),
+    c(&["TTL", "k1"]),
+    c(&["SET", "k1", "v", "KEEPTTL", "EX", "10"]),
+    c(&["SET", "k1", "v", "PERSIST"]),
+    c(&["SET", "k1", "v9", "GET", "GET"]),
+    c(&["SET", "k1", "v6"]),
     // --- SETNX / SETEX / PSETEX ---
     c(&["SETNX", "k1", "loses"]),
     c(&["SETNX", "newnx", "wins"]),
@@ -303,6 +319,12 @@ pub static MATRIX: &[Case] = &[
     c(&["GETEX", "gx2", "EX", "0"]),
     c(&["GETEX", "gx2", "EX", "100", "PERSIST"]),
     c(&["GETEX", "gx2", "BOGUS"]),
+    c(&["GETEX", "gx2", "PERSIST", "PERSIST"]),
+    c(&["GETEX", "gx2", "EX", "100", "EX", "200"]),
+    c(&["TTL", "gx2"]),
+    c(&["GETEX", "gx2", "EX", "100", "PX", "5"]),
+    c(&["GETEX", "gx2", "PERSIST", "EX", "10"]),
+    c(&["GETEX", "gx2", "KEEPTTL"]),
     // --- INCRBYFLOAT ---
     c(&["SET", "fl", "10.5"]),
     c(&["INCRBYFLOAT", "fl", "0.1"]),

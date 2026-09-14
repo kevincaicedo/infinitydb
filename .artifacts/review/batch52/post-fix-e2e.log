@@ -1,0 +1,3 @@
+test tiered_namespace_parses_arguments_like_the_numbered_db ... ok
+test tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.01s
