@@ -7292,3 +7292,139 @@ fn client_ids_are_node_unique_so_a_foreign_kill_reaches_nothing() {
     read_exactly(&mut b, b"+PONG\r\n");
     node.stop();
 }
+
+// ---- Batch 52 (review 2026-08-30): F-L13-04 + the L13 tiered-parse items ----
+
+/// Creates a tiered namespace and binds `c` to it (the §5.5 regime: one
+/// cell, a namespace-bound connection).
+fn bind_tiered(c: &mut TcpStream, ns: &[u8]) {
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        ns,
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+    ]))
+    .expect("write");
+    read_exactly(c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    read_exactly(c, b"+OK\r\n");
+}
+
+/// F-L13-04 (review 2026-08-30, filed High, downgraded to Needs-proof on
+/// offsets up to 512 MB — the wrong regime): the tiered `SETRANGE` built
+/// its post-image at the raw client offset before any bound. Offset
+/// `i64::MAX` is `Vec::resize` past `isize::MAX` — a `capacity overflow`
+/// panic in the cell thread; `2^62` asks the allocator for 4 EiB — an
+/// abort of the whole process. Post-fix every post-image past `BLOB-MAX`
+/// (the namespace's declared value cap, 1 GiB default) refuses typed
+/// before a byte is built, an empty patch is a length read (Redis: no
+/// bound check, no write), and the node stays alive.
+#[test]
+fn tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive() {
+    let dir = temp_data_dir("l13-04-setrange-bound");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    bind_tiered(&mut c, b"hot");
+    c.write_all(&cmd(&[b"SET", b"k", b"value"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // The panic class, the abort class, and one byte past the cap.
+    for offset in [&b"9223372036854775807"[..], b"4611686018427387904", b"1073741824"] {
+        c.write_all(&cmd(&[b"SETRANGE", b"k", offset, b"x"])).expect("write");
+        read_exactly(&mut c, b"-ERR value exceeds BLOB-MAX for this namespace\r\n");
+        c.write_all(&cmd(&[b"SETRANGE", b"missing", offset, b"x"])).expect("write");
+        read_exactly(&mut c, b"-ERR value exceeds BLOB-MAX for this namespace\r\n");
+    }
+    // An empty patch never grows the value (Redis `setrangeCommand`):
+    // the existing length, or 0 for a missing key — no write either way.
+    c.write_all(&cmd(&[b"SETRANGE", b"k", b"9223372036854775807", b""])).expect("write");
+    read_exactly(&mut c, b":5\r\n");
+    c.write_all(&cmd(&[b"SETRANGE", b"missing", b"9223372036854775807", b""])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"GET", b"missing"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$5\r\nvalue\r\n");
+    // The last byte under the cap is the legal shape (no allocation
+    // here either: the refusal is a comparison, the acceptance a write
+    // this test does not need to pay for at 1 GiB — the bound itself is
+    // what is pinned).
+    c.write_all(&cmd(&[b"SETRANGE", b"k", b"1", b"ALUE"])).expect("write");
+    read_exactly(&mut c, b":5\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$5\r\nvALUE\r\n");
+    // APPEND shares the pre-image bound: a suffix that would cross
+    // BLOB-MAX refuses typed before the post-image is built.
+    let probe_len = 1usize << 20;
+    let chunk: Vec<u8> = vec![b'z'; probe_len];
+    c.write_all(&cmd(&[b"APPEND", b"k", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 5 + probe_len).as_bytes());
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    drop((c, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// L13 style items (review 2026-08-30): the tiered plane parsed integers
+/// with `str::parse` (accepting `+5`, `007`), answered every unknown
+/// `SET` option with the expiry refusal (and accepted `NX XX`), and let a
+/// trailing lone `COUNT` on `SCAN` pass. The numbered-db path — and Redis
+/// 8.0.5 — answer as pinned here; the expiry refusals stay the declared
+/// M4 deviation.
+#[test]
+fn tiered_namespace_parses_arguments_like_the_numbered_db() {
+    let dir = temp_data_dir("l13-style-tiered-parse");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    bind_tiered(&mut c, b"hot");
+    c.write_all(&cmd(&[b"SET", b"n", b"5"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const NOT_INT: &[u8] = b"-ERR value is not an integer or out of range\r\n";
+    const SYNTAX: &[u8] = b"-ERR syntax error\r\n";
+    const NO_EXPIRY: &[u8] = b"-ERR expiry is not supported on tiered namespaces in M4\r\n";
+    let rows: &[(&[&[u8]], &[u8])] = &[
+        (&[b"SETRANGE", b"n", b"007", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"+1", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"abc", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"-1", b"x"], b"-ERR offset is out of range\r\n"),
+        (&[b"INCRBY", b"n", b"+5"], NOT_INT),
+        (&[b"INCRBY", b"n", b"007"], NOT_INT),
+        (&[b"DECRBY", b"n", b"-0"], NOT_INT),
+        (&[b"GETRANGE", b"n", b"007", b"1"], NOT_INT),
+        (&[b"GETRANGE", b"n", b"0", b"+1"], NOT_INT),
+        (&[b"SET", b"n", b"v", b"BOGUS"], SYNTAX),
+        (&[b"SET", b"n", b"v", b"NX", b"XX"], SYNTAX),
+        (&[b"SET", b"n", b"v", b"NX", b"NX"], b"$-1\r\n"),
+        (&[b"SET", b"n", b"v", b"XX", b"NX"], SYNTAX),
+        (&[b"SET", b"g", b"v", b"GET", b"GET"], b"$-1\r\n"),
+        (&[b"SET", b"n", b"5", b"EX", b"10"], NO_EXPIRY),
+        (&[b"SET", b"n", b"5", b"KEEPTTL"], NO_EXPIRY),
+        (&[b"SET", b"n", b"5", b"EX"], NO_EXPIRY),
+        (&[b"SCAN", b"0", b"COUNT"], SYNTAX),
+        (&[b"SCAN", b"0", b"COUNT", b"007"], NOT_INT),
+        (&[b"SCAN", b"0", b"COUNT", b"0"], SYNTAX),
+        (&[b"SCAN", b"0", b"COUNT", b"10", b"MATCH"], SYNTAX),
+        (&[b"INCRBY", b"n", b"2"], b":7\r\n"),
+        (&[b"GETRANGE", b"n", b"0", b"-1"], b"$1\r\n7\r\n"),
+    ];
+    for (argv, want) in rows {
+        c.write_all(&cmd(argv)).expect("write");
+        let got = read_frame(&mut c);
+        assert_eq!(
+            got,
+            *want,
+            "{}: got {:?}",
+            argv.iter().map(|a| String::from_utf8_lossy(a)).collect::<Vec<_>>().join(" "),
+            String::from_utf8_lossy(&got)
+        );
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}

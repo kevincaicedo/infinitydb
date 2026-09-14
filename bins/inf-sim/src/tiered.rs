@@ -1028,6 +1028,9 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     let open_same_keys: Vec<Vec<u8>> =
         (0..OPEN_SAME_KEYS).map(|i| format!("open:sk:{i}").into_bytes()).collect();
     let open_fault_key: Vec<u8> = b"open:fault".to_vec();
+    // Batch 52 (F-L13-09): one more cold key, overwritten right after the
+    // failed drain — its ticket proves the fence came down.
+    let open_fence_key: Vec<u8> = b"open:fence".to_vec();
     let open_triples: Vec<[[u8; 48]; 3]> = (0..OPEN_TRIPLES)
         .map(|i| {
             inf_store::forced_collision_triple(
@@ -1036,7 +1039,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         })
         .collect();
     let open_value = |tag: u8, i: u64| value_bytes(tag, 7, i, 1792);
-    for (i, key) in open_same_keys.iter().chain(std::iter::once(&open_fault_key)).enumerate() {
+    for (i, key) in open_same_keys.iter().chain([&open_fault_key, &open_fence_key]).enumerate() {
         let value = open_value(b'o', i as u64);
         let set: &[&[u8]] = &[b"SET", key, &value];
         match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
@@ -1811,7 +1814,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
                 report.commands_done += 1;
             }};
         }
-        const OPEN_KEYS: [&str; 12] = [
+        const OPEN_KEYS: [&str; 13] = [
             "tiering_shadow_created",
             "tiering_shadow_dbsize_drains",
             "tiering_shadow_dbsize_reads",
@@ -1824,6 +1827,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             "tiering_shadow_read_errors",
             "tiering_shadow_reconcile_paused",
             "tiering_shadow_pending",
+            "tiering_shadow_dbsize_fence",
         ];
         macro_rules! scrape {
             () => {
@@ -2080,11 +2084,34 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             ),
         }
         let after_fault = scrape!();
+        // F-L13-09: the failed drain lowered its fence on every cell (the
+        // gauge is the exact witness; the SET below is the client face).
+        if after_fault[12] != 0 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} DBSIZE fences still raised after \
+                 the failed drain (F-L13-09)",
+                after_fault[12]
+            );
+        }
         let faults = after_fault[9] - before[9];
         if faults == 0 {
             bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: the injected twin read never failed");
         }
         report.open_read_fault_errors += faults;
+        // F-L13-09 (review of 2026-08-30): the failed drain must lower the
+        // fence it raised — a fresh overwrite of a cold key opens a ticket
+        // (a raised fence answers `ShadowRefusal::Fence`: no ticket, the
+        // fast path silently gone for the life of the table).
+        let fence_v = value_bytes(b'u', 8, 0, 1536);
+        expect!(&[b"SET", &open_fence_key, &fence_v], b"+OK\r\n", "SET open fence key");
+        let after_fence_set = scrape!();
+        if after_fence_set[0] - after_fault[0] != 1 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: the SET after the failed drain opened \
+                 {} tickets, wanted 1 — the DBSIZE fence stayed raised (F-L13-09)",
+                after_fence_set[0] - after_fault[0]
+            );
+        }
         count!(base - 2 + OPEN_TRIPLES, "after the fault healed");
         // (8) Resume the reconciler on every cell; phase 7b's quiescence
         //     oracle then settles the verified tickets without a read.
@@ -2107,11 +2134,13 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             observed.insert(triple[2].to_vec(), bulk(&t_v[i].1));
         }
         observed.insert(open_fault_key.clone(), bulk(&fault_v));
+        observed.insert(open_fence_key.clone(), bulk(&fence_v));
     } else {
         // The off arm never touches phase 6d's pre-cut material: it is
         // live as written, and the model must say so (the cardinality
         // oracle counts it; the cold sweep re-reads it).
-        for (i, key) in open_same_keys.iter().chain(std::iter::once(&open_fault_key)).enumerate() {
+        for (i, key) in open_same_keys.iter().chain([&open_fault_key, &open_fence_key]).enumerate()
+        {
             observed.insert(key.clone(), bulk(&open_value(b'o', i as u64)));
         }
         for (i, triple) in open_triples.iter().enumerate() {

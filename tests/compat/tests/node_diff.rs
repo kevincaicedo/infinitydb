@@ -829,3 +829,94 @@ fn client_id_is_positive_and_killable_like_redis() {
         assert_closed_or_reset(&mut first, who);
     }
 }
+
+// ---- Batch 52 (review 2026-08-30): F-L13-04 + the L13 tiered-parse items ----
+
+/// Batch 52 (review 2026-08-30, L13 style rows + F-L13-04): a connection
+/// bound to a tiered namespace parses integers, `SET` options and `SCAN`
+/// options exactly as Redis 8.0.5 does on its default database — the
+/// tiered plane used `str::parse` (`+5`, `007` accepted), answered every
+/// unknown `SET` option with the expiry refusal, and let a trailing lone
+/// `COUNT` through. The two bound-error rows compare by class: Redis
+/// names `proto-max-bulk-len`, the tiered namespace names its `BLOB-MAX`;
+/// both refuse, neither creates the key, and the node stays up (pre-fix
+/// the first one killed the cell thread).
+#[test]
+fn tiered_namespace_argument_errors_match_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    let (mut ob, mut nb) = (Vec::new(), Vec::new());
+    for preamble in [
+        &[
+            "INF.NS",
+            "CREATE",
+            "hot",
+            "MODE",
+            "durable",
+            "MEM-BUDGET",
+            "64mb",
+            "DISK-BUDGET",
+            "256mb",
+        ][..],
+        &["INF.NS", "USE", "hot"][..],
+    ] {
+        assert_eq!(cmd(&mut node, &mut nb, preamble), b"+OK\r\n", "preamble {preamble:?}");
+    }
+    let mut failures = Vec::new();
+    let exact: &[&[&str]] = &[
+        &["SET", "n", "5"],
+        &["SETRANGE", "n", "007", "x"],
+        &["SETRANGE", "n", "+1", "x"],
+        &["SETRANGE", "n", "abc", "x"],
+        &["SETRANGE", "n", "-1", "x"],
+        &["SETRANGE", "n", "9223372036854775807", ""],
+        &["SETRANGE", "missing", "9223372036854775807", ""],
+        &["EXISTS", "missing"],
+        &["INCRBY", "n", "+5"],
+        &["INCRBY", "n", "007"],
+        &["DECRBY", "n", "-0"],
+        &["GETRANGE", "n", "007", "1"],
+        &["GETRANGE", "n", "0", "+1"],
+        &["SET", "n", "v", "BOGUS"],
+        &["SET", "n", "v", "NX", "XX"],
+        &["SET", "n", "v", "NX", "NX"],
+        &["SET", "g", "v", "GET", "GET"],
+        &["SCAN", "0", "COUNT"],
+        &["SCAN", "0", "COUNT", "007"],
+        &["SCAN", "0", "COUNT", "0"],
+        &["SCAN", "0", "COUNT", "10", "MATCH"],
+        &["INCRBY", "n", "2"],
+        &["GETRANGE", "n", "0", "-1"],
+    ];
+    for argv in exact {
+        let o = cmd(&mut oracle, &mut ob, argv);
+        let n = cmd(&mut node, &mut nb, argv);
+        assert_pair(&o, &n, &argv.join(" "), &mut failures);
+    }
+    // Both refuse the post-image past their cap, neither creates the key.
+    for offset in ["9223372036854775807", "4611686018427387904"] {
+        let o = cmd(&mut oracle, &mut ob, &["SETRANGE", "missing", offset, "x"]);
+        let n = cmd(&mut node, &mut nb, &["SETRANGE", "missing", offset, "x"]);
+        if !(o.starts_with(b"-ERR ") && n.starts_with(b"-ERR ")) {
+            failures.push(format!(
+                "SETRANGE missing {offset} x: oracle {:?} node {:?}",
+                String::from_utf8_lossy(&o),
+                String::from_utf8_lossy(&n)
+            ));
+        }
+        let o = cmd(&mut oracle, &mut ob, &["EXISTS", "missing"]);
+        let n = cmd(&mut node, &mut nb, &["EXISTS", "missing"]);
+        assert_pair(&o, &n, &format!("EXISTS missing after SETRANGE {offset}"), &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "tiered-namespace parse rows diverge from Redis:\n{}",
+        failures.join("\n")
+    );
+}

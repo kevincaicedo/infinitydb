@@ -830,6 +830,7 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_shadow_deferred_origin:{}", shadow.deferred_origin));
     push(text, &format!("tiering_shadow_dbsize_drains:{}", shadow.dbsize_drains));
     push(text, &format!("tiering_shadow_dbsize_reads:{}", shadow.dbsize_reads));
+    push(text, &format!("tiering_shadow_dbsize_fence:{}", shadow.dbsize_fence));
     push(text, &format!("tiering_shadow_rebuild_reads:{}", shadow.rebuild_reads));
     push(
         text,
@@ -2448,6 +2449,7 @@ mod tests {
             "tiering_shadow_fallback_ticketed",
             "tiering_shadow_verified_pending",
             "tiering_shadow_dbsize_drains",
+            "tiering_shadow_dbsize_fence",
             "tiering_shadow_rebuild_reads",
             "tiering_shadow_scan_twins_emitted",
             "tiering_shadow_bytes",

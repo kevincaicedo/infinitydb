@@ -359,6 +359,9 @@ pub struct ShadowCounters {
     /// `DBSIZE` drains raised (A3) and the twins they read.
     pub dbsize_drains: u64,
     pub dbsize_reads: u64,
+    /// Gauge: drains in flight — the fence count (F-L13-09's witness: a
+    /// drain that ended without lowering it would show here forever).
+    pub dbsize_fence: u64,
     /// The recovery rebuild's boot reads (A4): slots read, settled as
     /// the same key, found distinct, and pairs beyond the cap.
     pub rebuild_reads: u64,
@@ -415,6 +418,7 @@ impl ShadowCounters {
             deferred_origin,
             dbsize_drains,
             dbsize_reads,
+            dbsize_fence,
             rebuild_reads,
             rebuild_settled_same_key,
             rebuild_settled_distinct,
@@ -590,6 +594,7 @@ impl TieredTable {
         counters.scan_twins_emitted = self.shadow.scan_twins.get();
         counters.enabled = u64::from(self.shadow.enabled);
         counters.reconcile_paused = u64::from(!self.shadow.reconcile);
+        counters.dbsize_fence = u64::from(self.shadow.fence);
         counters
     }
 

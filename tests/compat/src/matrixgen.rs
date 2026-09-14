@@ -118,7 +118,7 @@ pub static DECLARED: &[Declared] = &[
         "APPEND",
         Status::Full,
         "M0",
-        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built (F-L13-04)",
     ),
     d("STRLEN", Status::Full, "M0", ""),
     d(
@@ -161,7 +161,7 @@ pub static DECLARED: &[Declared] = &[
         "SETRANGE",
         Status::Full,
         "M1",
-        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB)",
+        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis (F-L13-04)",
     ),
     d(
         "GETEX",

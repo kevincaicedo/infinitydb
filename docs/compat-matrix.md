@@ -15,7 +15,7 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 635 byte-compared executions · 64 documented deviations · 0 tolerated failures.
+**Corpus:** 654 byte-compared executions · 64 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 54 full · 32 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -32,8 +32,8 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `ECHO` | full | M0 | fast | 2 | 3 |  |
 | `HELLO` | full | M0 | fast | -1 | 1 | identity fields (server/version) are InfinityDB's own, as for any non-Redis server |
 | `QUIT` | partial | M1 | fast | 1 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
-| `GET` | full | M0 | readonly fast | 2 | 29 |  |
-| `SET` | full | M0 | write denyoom | -3 | 95 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
+| `GET` | full | M0 | readonly fast | 2 | 30 |  |
+| `SET` | full | M0 | write denyoom | -3 | 105 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 |  |
 | `SETEX` | full | M0 | write denyoom | 4 | 6 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PSETEX` | full | M0 | write denyoom | 4 | 4 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
@@ -46,11 +46,11 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 |  |
 | `INCRBY` | full | M0 | write denyoom fast | 3 | 3 |  |
 | `DECRBY` | full | M0 | write denyoom fast | 3 | 2 |  |
-| `APPEND` | full | M0 | write denyoom fast | 3 | 4 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
+| `APPEND` | full | M0 | write denyoom fast | 3 | 4 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built (F-L13-04) |
 | `STRLEN` | full | M0 | readonly fast | 2 | 5 |  |
 | `EXPIRE` | full | M0 | write fast | -3 | 21 | TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PEXPIRE` | full | M0 | write fast | -3 | 4 | same u40 clamp |
-| `TTL` | full | M0 | readonly fast | 2 | 20 | a clamped deadline reads as the u40 bound (ADR-0111) |
+| `TTL` | full | M0 | readonly fast | 2 | 23 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
 | `INFO` | partial | M0 | admin | -1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
@@ -59,8 +59,8 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `MSET` | full | M1 | write denyoom | -3 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
 | `MSETNX` | partial | M1 | write denyoom | -3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
 | `GETRANGE` | full | M1 | readonly | 4 | 8 |  |
-| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB) |
-| `GETEX` | full | M1 | write fast | -2 | 20 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
+| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis (F-L13-04) |
+| `GETEX` | full | M1 | write fast | -2 | 25 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 |  |
 | `RENAME` | partial | M1 | write | 3 | 3 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
