@@ -1,0 +1,10 @@
+test ring::loom_tests::loom_stale_tail_cache_serves_without_a_refresh ... FAILED
+test ring::loom_tests::loom_publish_batch_single_release ... ok
+test ring::loom_tests::loom_empty_consume_races_first_publish ... ok
+test ring::loom_tests::loom_full_rejects_then_recovers ... ok
+test ring::loom_tests::loom_spsc_wraparound_sequence ... ok
+thread 'ring::loom_tests::loom_stale_tail_cache_serves_without_a_refresh' (912231) panicked at /home/kcaicedo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/loom-0.7.2/src/rt/location.rs:115:9:
+Causality violation: Concurrent read and write accesses to `UnsafeCell`.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+error: test failed, to rerun pass `-p inf-fabric --lib`

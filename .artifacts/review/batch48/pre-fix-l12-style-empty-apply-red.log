@@ -1,0 +1,4 @@
+test plane::move_tests::an_apply_without_arguments_is_refused_not_a_panic ... FAILED
+thread 'plane::move_tests::an_apply_without_arguments_is_refused_not_a_panic' (911292) panicked at crates/inf-server/src/plane.rs:677:38:
+index out of bounds: the len is 0 but the index is 0
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 135 filtered out; finished in 0.00s

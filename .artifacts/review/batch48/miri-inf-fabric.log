@@ -1,0 +1,59 @@
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running unittests src/lib.rs (target/miri/x86_64-unknown-linux-gnu/debug/deps/inf_fabric-9ed21d5b54ec7701)
+
+running 27 tests
+test codec::tests::apply_args_beyond_the_inline_width_round_trip ... ok
+test codec::tests::apply_ns_golden_wire_layout ... ok
+test codec::tests::apply_ns_round_trips_arg_extremes ... ok
+test codec::tests::decode_is_total ... ignored
+test codec::tests::encode_rejects_apply_ns_default - should panic ... ok
+test codec::tests::encode_rejects_reply_in_batch - should panic ... ok
+test codec::tests::hostile_argc_is_truncated_before_any_spill ... ok
+test codec::tests::non_minimal_varint_in_frame_is_rejected ... ok
+test codec::tests::op_sequences_round_trip_byte_exact ... ignored
+test codec::tests::program_flag_is_canonical_and_apply_only ... ok
+test codec::tests::rejects_apply_ns_default_namespace ... ok
+test codec::tests::rejects_invalid_batches ... ok
+test codec::tests::rejects_invalid_payload_fields ... ok
+test codec::tests::rejects_malformed_frames ... ok
+test codec::tests::rejects_too_many_apply_args ... ok
+test codec::tests::round_trip_every_variant ... ok
+test mesh::token_tests::next_token_wraps_at_the_48_bit_width ... ok
+test msg::tests::inline_and_spill_round_trip ... ok
+test msg::tests::token_packs_origin_and_seq ... ok
+test msg::tests::token_seq_overflow_panics - should panic ... ok
+test ring::tests::consume_batch_respects_max ... ok
+test ring::tests::full_empty_and_wraparound ... ok
+test ring::tests::non_power_of_two_capacity_panics - should panic ... ok
+test ring::tests::publish_batch_stops_at_capacity_without_eating_items ... ok
+test ring::tests::two_thread_stress_sequence_integrity ... ok
+test ring::tests::unconsumed_items_drop_exactly_once ... ok
+test ring::tests::zero_capacity_panics - should panic ... ok
+
+test result: ok. 25 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 19.50s
+
+     Running tests/mesh.rs (target/miri/x86_64-unknown-linux-gnu/debug/deps/mesh-6869542558ab9871)
+
+running 11 tests
+test a_budget_exhausted_drain_resumes_at_the_next_peer ... ok
+test a_saturating_peer_cannot_starve_its_neighbour ... ok
+test batch_costs_one_credit_per_nested_op ... ok
+test mesh_rejects_undersized_rings - should panic ... ok
+test no_credit_is_exact_and_recovers_after_replies ... ok
+test replies_always_fit_reserved_headroom_under_full_duplex_saturation ... ok
+test send_flush_drain_reply_returns_credit ... ok
+test send_rejects_reply_ops - should panic ... ok
+test slow_consumer_growth_is_bounded_by_credits_exactly ... ok
+test spill_tripwire_counts_oversize_frames ... ok
+test threaded_all_to_all_saturation_quiesces ... ignored, threaded integration smoke; Miri covers the unsafe leaves directly
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 49.59s
+
+   Doc-tests inf_fabric
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+miri exit=0

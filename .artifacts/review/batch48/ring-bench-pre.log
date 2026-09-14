@@ -1,0 +1,27 @@
+Benchmarking spsc_ring_2threads/msgs_64B_inline
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Warming up for 3.0000 s
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Collecting 10 samples in estimated 5.3246 s (440 iterations)
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Analyzing
+spsc_ring_2threads/msgs_64B_inline
+                        time:   [9.5010 ms 10.114 ms 11.106 ms]
+                        thrpt:  [90.039 Melem/s 98.871 Melem/s 105.25 Melem/s]
+                        time:   [+75.330% +101.49% +128.11%] (p = 0.00 < 0.05)
+                        thrpt:  [−56.161% −50.369% −42.965%]
+Benchmarking spsc_ring_2threads/msgs_64B_inline
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Warming up for 3.0000 s
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Collecting 10 samples in estimated 5.2588 s (495 iterations)
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Analyzing
+spsc_ring_2threads/msgs_64B_inline
+                        time:   [7.7898 ms 9.7831 ms 11.444 ms]
+                        thrpt:  [87.378 Melem/s 102.22 Melem/s 128.37 Melem/s]
+                        time:   [−23.660% −11.006% +2.5730%] (p = 0.14 > 0.05)
+                        thrpt:  [−2.5084% +12.367% +30.993%]
+Benchmarking spsc_ring_2threads/msgs_64B_inline
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Warming up for 3.0000 s
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Collecting 10 samples in estimated 5.4008 s (440 iterations)
+Benchmarking spsc_ring_2threads/msgs_64B_inline: Analyzing
+spsc_ring_2threads/msgs_64B_inline
+                        time:   [8.0101 ms 9.6053 ms 11.925 ms]
+                        thrpt:  [83.860 Melem/s 104.11 Melem/s 124.84 Melem/s]
+                        time:   [−13.663% +6.2764% +30.516%] (p = 0.57 > 0.05)
+                        thrpt:  [−23.381% −5.9057% +15.826%]

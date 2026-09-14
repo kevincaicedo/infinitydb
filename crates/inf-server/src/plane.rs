@@ -2146,6 +2146,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.gate.pending() + self.shared.credit_waiters.waiting()
     }
 
+    /// This cell's fabric counters (the DST's drain-fairness oracle,
+    /// F-L12-02; tooling — never the data plane).
+    pub fn fabric_stats(&self) -> inf_fabric::FabricStats {
+        self.shared.fabric.borrow().stats()
+    }
+
     /// Memory attribution for this cell's keyspace slice (sim accounting
     /// oracle, tooling — never the data plane).
     pub fn keyspace_report(&self) -> inf_store::MemoryReport {
@@ -3589,6 +3595,13 @@ fn handle_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
     pubs: &mut Vec<OwnerPub>,
 ) {
+    // The codec admits a zero-argument apply (`ApplyArgs::EMPTY`); no origin
+    // encodes one, since every apply carries a parsed argv. Refuse it typed
+    // rather than index an empty argv (L12 style row, review 2026-08-30).
+    if argv.is_empty() {
+        staged.push((from, token, StagedReply::Refused));
+        return;
+    }
     {
         {
             // Internal pub/sub fabric vocabulary (M1-S10) — intercepted

@@ -1,0 +1,8 @@
+test a_budget_exhausted_drain_resumes_at_the_next_peer ... FAILED
+test a_saturating_peer_cannot_starve_its_neighbour ... FAILED
+thread 'a_budget_exhausted_drain_resumes_at_the_next_peer' (910056) panicked at crates/inf-fabric/tests/mesh.rs:381:5:
+thread 'a_saturating_peer_cannot_starve_its_neighbour' (910057) panicked at crates/inf-fabric/tests/mesh.rs:420:5:
+assertion `left == right` failed: peer 1 starved behind a saturating peer 0 for 64 drains: [5056, 0, 0]
+  left: 0
+ right: 600
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s

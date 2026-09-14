@@ -1,0 +1,6 @@
+inf-sim: scenario m0-fabric-fairness seed 0xc0ffee: 400000 commands, 418259 apply events, 315 steps, trace 18768282 bytes, hash 0x7990a699aefd4982
+inf-sim: sim_seconds=0.002614 published=0 delivered=0 audits=0 flushes=0 scan_walks=0 replays_skipped=0 plant_fired=false accept_resumes=0 fabric_skip_streak_max=3
+inf-sim: ORACLE VIOLATION: cell 0: a peer went unvisited for 3 consecutive budget-exhausted drains (bound 1) — FABRIC-IN starved it
+inf-sim: ORACLE VIOLATION: cell 1: a peer went unvisited for 3 consecutive budget-exhausted drains (bound 1) — FABRIC-IN starved it
+inf-sim: ORACLE VIOLATION: cell 2: a peer went unvisited for 3 consecutive budget-exhausted drains (bound 1) — FABRIC-IN starved it
+exit=0

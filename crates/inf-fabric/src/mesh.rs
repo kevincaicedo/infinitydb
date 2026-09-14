@@ -167,6 +167,10 @@ impl Outbound {
 struct Inbound {
     consumer: Consumer<FabricMsg>,
     doorbell: Arc<Doorbell>,
+    /// Consecutive budget-exhausted drains that ended before reaching this
+    /// peer while its doorbell was rung (F-L12-02 fairness oracle; reset
+    /// on every visit). Bounded by `peers − 1` under the rotating cursor.
+    skip_streak: u32,
 }
 
 /// Always-on fabric counters (feeds `fabric_msgs_per_batch` and the spill
@@ -184,6 +188,10 @@ pub struct FabricStats {
     pub decode_errors: u64,
     /// Stale replies drained for tokens nobody waits on (counted, not fatal).
     pub orphan_replies: u64,
+    /// Longest run of consecutive budget-exhausted drains during which one
+    /// peer with a rung doorbell went unvisited (F-L12-02). The rotating
+    /// cursor bounds it by `peers − 1`; the DST asserts that bound.
+    pub drain_skip_streak_max: u32,
 }
 
 /// One cell's handle on the mesh: producers toward every peer, consumers
@@ -198,6 +206,10 @@ pub struct CellFabric {
     out: Vec<Option<Outbound>>,
     /// Indexed by source cell id; `None` at `self.cell`.
     inn: Vec<Option<Inbound>>,
+    /// Source index the next `drain` starts at: one past the peer a
+    /// budget-exhausted drain stopped in, so a hot low-numbered peer cannot
+    /// starve the rest (F-L12-02).
+    next_source: usize,
     /// Per-cell parked flags (single-writer, set by each cell's park
     /// handshake) — read at flush to decide a doorbell wakeup (M0-R1).
     park_flags: Option<Arc<Vec<AtomicBool>>>,
@@ -240,6 +252,7 @@ impl Mesh {
                 config,
                 out: (0..n).map(|_| None).collect(),
                 inn: (0..n).map(|_| None).collect(),
+                next_source: 0,
                 park_flags: None,
                 peer_wake: None,
                 stats: FabricStats::default(),
@@ -260,7 +273,7 @@ impl Mesh {
                     pack: Vec::with_capacity(PACK_SEAL_BYTES),
                     pack_frames: 0,
                 });
-                fabrics[dst].inn[src] = Some(Inbound { consumer, doorbell });
+                fabrics[dst].inn[src] = Some(Inbound { consumer, doorbell, skip_streak: 0 });
             }
         }
         fabrics
@@ -416,10 +429,17 @@ impl CellFabric {
         self.peer_wake = Some(Box::new(wake));
     }
 
-    /// FABRIC-IN: drains inbound frames up to a budget of `max` (round-robin
-    /// across peers, bounded), decoding each and handing it to `f(from, op)`.
-    /// `Op::Reply` frames return their credit to the `from` destination
-    /// *before* `f` sees them. Returns frames drained.
+    /// FABRIC-IN: drains inbound frames up to a budget of `max`, decoding
+    /// each and handing it to `f(from, op)`. `Op::Reply` frames return their
+    /// credit to the `from` destination *before* `f` sees them. Returns
+    /// frames drained.
+    ///
+    /// Round-robin across peers: each call starts at a rotating cursor and
+    /// visits peers in index order from there; when the budget runs out the
+    /// cursor moves one past the peer it stopped in, so every peer with
+    /// frames is reached within `peers − 1` further calls no matter how hot
+    /// its predecessors are (F-L12-02). A drain that finishes under budget
+    /// leaves the cursor where it is — every peer was served in full.
     ///
     /// Slots are packed (M0-R1): one slot carries up to [`PACK_SEAL_FRAMES`]
     /// concatenated frames, decoded in send order. Slots are consumed in
@@ -431,12 +451,18 @@ impl CellFabric {
     pub fn drain(&mut self, max: usize, mut f: impl FnMut(CellId, Op<'_>)) -> usize {
         let mut drained_total = 0;
         let peers = self.inn.len();
-        for source in 0..peers {
+        let start = self.next_source;
+        // Peers visited this call, as an offset count from `start`.
+        let mut visited = 0;
+        for offset in 0..peers {
             if drained_total >= max {
                 break;
             }
+            visited = offset + 1;
+            let source = (start + offset) % peers;
             let Some(inbound) = self.inn[source].as_mut() else { continue };
             inbound.doorbell.take();
+            inbound.skip_streak = 0;
             // Split borrows: credits live in `out[source]`, frames in
             // `inn[source]` — disjoint fields.
             let mut credits = self.out[source].as_mut().map(|o| &mut o.credits);
@@ -469,6 +495,24 @@ impl CellFabric {
                 drained_total += frames;
                 if consumed < chunk {
                     break;
+                }
+            }
+        }
+        if drained_total >= max && visited < peers {
+            // Budget-exhausted before every peer was reached: resume one
+            // past the last visited peer next call, and score the skipped
+            // peers that had frames waiting (their bells are still rung —
+            // untouched, so `before_park` keeps vetoing the park).
+            self.next_source = (start + visited) % peers;
+            for offset in visited..peers {
+                let source = (start + offset) % peers;
+                let Some(inbound) = self.inn[source].as_mut() else { continue };
+                if inbound.doorbell.pending() {
+                    inbound.skip_streak += 1;
+                    self.stats.drain_skip_streak_max =
+                        self.stats.drain_skip_streak_max.max(inbound.skip_streak);
+                } else {
+                    inbound.skip_streak = 0;
                 }
             }
         }

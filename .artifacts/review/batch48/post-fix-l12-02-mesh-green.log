@@ -1,0 +1,12 @@
+test send_flush_drain_reply_returns_credit ... ok
+test slow_consumer_growth_is_bounded_by_credits_exactly ... ok
+test spill_tripwire_counts_oversize_frames ... ok
+test mesh_rejects_undersized_rings - should panic ... ok
+test send_rejects_reply_ops - should panic ... ok
+test no_credit_is_exact_and_recovers_after_replies ... ok
+test replies_always_fit_reserved_headroom_under_full_duplex_saturation ... ok
+test batch_costs_one_credit_per_nested_op ... ok
+test a_budget_exhausted_drain_resumes_at_the_next_peer ... ok
+test a_saturating_peer_cannot_starve_its_neighbour ... ok
+test threaded_all_to_all_saturation_quiesces ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
