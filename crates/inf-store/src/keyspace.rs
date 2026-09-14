@@ -13,9 +13,13 @@
 //! are enforced per ADR-0068: a store without its own `MAXMEMORY` inherits
 //! the node policy and joins the global eviction hand; a store with its own
 //! budget carries a cached per-store `over_limit` flag and reclaims through
-//! its own step-limited pass — never through the global hand, so a
-//! namespace at its budget cannot disturb the numbered dbs (structural
-//! isolation, not tuning). Durable named namespaces stay hard-`NoEviction`
+//! its own step-limited pass — never through the global hand, and its
+//! bytes never drive the global hand either (ADR-0068 A1: the node
+//! `maxmemory` bounds the **pool** — numbered dbs plus every named store
+//! without a budget of its own — while a budgeted namespace is its own
+//! authority), so a namespace at or under its budget cannot disturb the
+//! numbered dbs (structural isolation, not tuning). `used_bytes` still
+//! counts everything (L5 attribution, D5). Durable named namespaces stay hard-`NoEviction`
 //! (ADR-0015 D5 — eviction without `Delete` records resurrects keys on
 //! replay); tiered namespaces refuse the knobs outright (ADR-0062 owns
 //! their budget — one authority per namespace, never two).
@@ -805,19 +809,38 @@ impl Keyspace {
         self.over_limit
     }
 
-    /// Logical used bytes across dbs, named stores, and index trees (the
-    /// `maxmemory` comparable). Every named store counts toward the
-    /// global flag — L5 attribution truth (ADR-0068 D5) — but reclaim
-    /// authority differs: budget-less memory stores join the global hand,
-    /// budgeted ones own their per-namespace pass, and durable/tiered
-    /// stores never evict, so their sustained pressure resolves as honest
-    /// OOM refusals. Index trees count too (ADR-0075 D6: an unattributed
-    /// byte is a lie) — eviction shrinks them back through the S04
-    /// removal hook, never directly.
+    /// Logical used bytes across dbs, named stores, and index trees —
+    /// L5 attribution truth (ADR-0068 D5), the `sum(domains)` figure.
+    /// Not the `maxmemory` comparable: that is
+    /// [`pool_used_bytes`](Self::pool_used_bytes) (ADR-0068 A1), which
+    /// leaves out the stores with a budget authority of their own.
+    /// Reclaim authority differs per store: budget-less memory stores
+    /// join the global hand, budgeted ones own their per-namespace pass,
+    /// and durable/tiered stores never evict, so their sustained pressure
+    /// resolves as honest OOM refusals. Index trees count too (ADR-0075
+    /// D6: an unattributed byte is a lie) — eviction shrinks them back
+    /// through the S04 removal hook, never directly.
     pub fn used_bytes(&self) -> u64 {
         let named: u64 = self.named_stores.iter().map(|e| e.store.used_bytes()).sum();
         let idx: u64 = self.all_stores().map(|s| s.idx_memory().idx_tree_bytes).sum();
         self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named + idx
+    }
+
+    /// Bytes the node hand may reclaim (ADR-0068 A1): the numbered dbs
+    /// and every named store **without** its own budget authority, index
+    /// trees included. A budgeted memory namespace is its own authority
+    /// — its bytes stay in [`used_bytes`](Self::used_bytes) (D5) but never
+    /// drive the global flag or the hand.
+    pub fn pool_used_bytes(&self) -> u64 {
+        let dbs: u64 =
+            self.dbs().map(|(_, s)| s.used_bytes() + s.idx_memory().idx_tree_bytes).sum();
+        let named: u64 = self
+            .named_stores
+            .iter()
+            .filter(|e| e.budget_share == 0)
+            .map(|e| e.store.used_bytes() + e.store.idx_memory().idx_tree_bytes)
+            .sum();
+        dbs + named
     }
 
     /// Recomputes the cached pressure flags — global and per-namespace
@@ -829,7 +852,7 @@ impl Keyspace {
     #[inline]
     pub fn refresh_pressure(&mut self) {
         self.over_limit =
-            self.pressure.limit_bytes != 0 && self.used_bytes() > self.pressure.limit_bytes;
+            self.pressure.limit_bytes != 0 && self.pool_used_bytes() > self.pressure.limit_bytes;
         for i in 0..self.named_stores.len() {
             let entry = &self.named_stores[i];
             if entry.budget_share == 0 {
@@ -935,7 +958,10 @@ impl Keyspace {
     /// memory store **without** its own budget whose effective policy
     /// evicts. One victim per step until usage reaches `target`, the
     /// budget is spent, or a dry rotation proves nothing qualifies —
-    /// [`DRY_STEPS_PER_MEMBER`] chances per rotation member.
+    /// [`DRY_STEPS_PER_MEMBER`] chances per rotation member. The target
+    /// is measured on the pool (ADR-0068 A1): the hand can reach every
+    /// byte it is asked to reclaim, so a budgeted namespace's growth can
+    /// never turn into numbered-db key death (F-L05-02).
     fn evict_toward(&mut self, target: u64, max_evictions: u32, now: Nanos) -> EvictStats {
         let mut stats = EvictStats::default();
         let samples = self.pressure.samples;
@@ -949,7 +975,7 @@ impl Keyspace {
         let rotation = DEFAULT_DBS + self.named_stores.len();
         let mut evicted = 0u32;
         let mut dry_steps = 0u32;
-        while self.used_bytes() > target && evicted < max_evictions && dry_steps < dry_limit {
+        while self.pool_used_bytes() > target && evicted < max_evictions && dry_steps < dry_limit {
             // Rotate to the next hand member without spending dry budget
             // on holes and out-of-hand stores (at least one member is
             // eligible — checked above — so this terminates); only real

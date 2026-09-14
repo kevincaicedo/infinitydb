@@ -1,0 +1,23 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.70s
+     Running tests/evict.rs (target/debug/deps/evict-751e3eaec44b615c)
+
+running 15 tests
+test node_policy_push_reaches_inheriting_stores_only ... ok
+test eviction_and_wheel_stay_consistent ... ok
+test durable_named_store_never_joins_any_hand ... ok
+test volatile_ttl_evicts_nearest_deadline_first ... ok
+test volatile_random_never_touches_persistent_keys ... ok
+test budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs ... ok
+test inheriting_named_ns_joins_the_global_hand ... ok
+test maintain_drives_budgeted_ns_to_its_low_watermark ... ok
+test pool_pressure_reclaims_from_the_pool_only ... ok
+test lfu_protects_frequent_keys ... ok
+test clock_lru_protects_hot_keys ... ok
+test named_ns_storm_holds_its_own_budget_and_leaves_db0_alone ... ok
+test write_storm_holds_the_limit_with_bounded_slack ... ok
+test eviction_accounting_reconciles_across_named_stores ... ok
+test lfu_beats_random_on_skewed_trace ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+

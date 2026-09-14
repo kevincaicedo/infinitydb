@@ -1,0 +1,13 @@
+policy b'+OK\r\n'
+create b'+OK\r\n'
+use b'+OK\r\n'
+INFO used_memory db0-only=18893352 with-cache=29425420 (node fold, not the comparable) -> maxmemory 4194304
+maxmemory b'+OK\r\n'
+db0 dbsize before b':0' cache dbsize before b':2000'
+db0 dbsize after b':0' cache dbsize after b':2000' db0 write b"-OOM command not allowed when used memory > 'maxmemory'." used 29425420
+phase 1 FAIL: F-L05-02 — the cache inside its budget drained db0 through the node hand
+control maxmemory b'+OK\r\n'
+control: db0 dbsize b':0' cache dbsize b':2000'
+control PASS
+VERDICT FAIL
+exit 1

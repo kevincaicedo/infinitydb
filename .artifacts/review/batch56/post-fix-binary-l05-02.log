@@ -1,0 +1,13 @@
+policy b'+OK\r\n'
+create b'+OK\r\n'
+use b'+OK\r\n'
+INFO used_memory db0-only=18893352 with-cache=29425420 (node fold, not the comparable) -> maxmemory 4194304
+maxmemory b'+OK\r\n'
+db0 dbsize before b':200' cache dbsize before b':2000'
+db0 dbsize after b':200' cache dbsize after b':2000' db0 write b'+OK' used 29425420
+phase 1 PASS
+control maxmemory b'+OK\r\n'
+control: db0 dbsize b':57' cache dbsize b':2000'
+control PASS
+VERDICT PASS
+exit 0

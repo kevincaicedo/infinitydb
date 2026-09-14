@@ -1,0 +1,25 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running tests/evict.rs (target/debug/deps/evict-751e3eaec44b615c)
+
+running 2 tests
+test budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs ... FAILED
+test pool_pressure_reclaims_from_the_pool_only ... ok
+
+failures:
+
+---- budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs stdout ----
+
+thread 'budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs' (15950) panicked at crates/inf-store/tests/evict.rs:552:5:
+assertion `left == right` failed: a namespace inside its budget evicted db0 keys (F-L05-02)
+  left: 0
+ right: 100
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.26s
+
+error: test failed, to rerun pass `-p inf-store --test evict`
