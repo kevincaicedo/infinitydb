@@ -135,7 +135,7 @@ pub static DECLARED: &[Declared] = &[
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store, F-L05-03); `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",

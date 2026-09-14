@@ -361,6 +361,10 @@ pub struct MemoryGauges {
     /// The cell's `used_memory` contribution (attributed keyspace bytes +
     /// wire buffers + connection state).
     pub used_bytes: u64,
+    /// The cell's `maxmemory` comparable (`Keyspace::pool_used_bytes`,
+    /// ADR-0068 A2): the pool's logical bytes, rendered as
+    /// `used_memory_pool` so the operator can see the distance to the limit.
+    pub pool_used_bytes: u64,
     pub docs_live: u64,
     pub doc_tape_bytes: u64,
     pub doc_arena_bytes: u64,
@@ -386,6 +390,7 @@ pub struct MemoryGauges {
 #[derive(Debug, Default)]
 pub struct MemorySlot {
     used_bytes: AtomicU64,
+    pool_used_bytes: AtomicU64,
     docs_live: AtomicU64,
     doc_tape_bytes: AtomicU64,
     doc_arena_bytes: AtomicU64,
@@ -403,6 +408,7 @@ pub struct MemorySlot {
 impl MemorySlot {
     pub fn publish(&self, g: MemoryGauges) {
         self.used_bytes.store(g.used_bytes, Ordering::Relaxed);
+        self.pool_used_bytes.store(g.pool_used_bytes, Ordering::Relaxed);
         self.docs_live.store(g.docs_live, Ordering::Relaxed);
         self.doc_tape_bytes.store(g.doc_tape_bytes, Ordering::Relaxed);
         self.doc_arena_bytes.store(g.doc_arena_bytes, Ordering::Relaxed);
@@ -424,6 +430,7 @@ impl MemorySlot {
     fn read(&self) -> MemoryGauges {
         MemoryGauges {
             used_bytes: self.used_bytes.load(Ordering::Relaxed),
+            pool_used_bytes: self.pool_used_bytes.load(Ordering::Relaxed),
             docs_live: self.docs_live.load(Ordering::Relaxed),
             doc_tape_bytes: self.doc_tape_bytes.load(Ordering::Relaxed),
             doc_arena_bytes: self.doc_arena_bytes.load(Ordering::Relaxed),
@@ -472,6 +479,7 @@ impl MemoryBoard {
         for slot in &self.cells {
             let g = slot.read();
             t.used_bytes += g.used_bytes;
+            t.pool_used_bytes += g.pool_used_bytes;
             t.docs_live += g.docs_live;
             t.doc_tape_bytes += g.doc_tape_bytes;
             t.doc_arena_bytes += g.doc_arena_bytes;

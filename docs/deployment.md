@@ -171,7 +171,9 @@ redis-cli INF.NS SET sessions MAXMEMORY 0            # remove the budget
   namespace without a budget of its own — so total memory is bounded by
   `maxmemory + Σ per-namespace MAXMEMORY`, and `INFO memory`
   `used_memory` (which counts every namespace) may sit above
-  `maxmemory` in steady state.
+  `maxmemory` in steady state. `INFO memory` `used_memory_pool` is the
+  figure `maxmemory` compares against (ADR-0068 A2): `maxmemory −
+  used_memory_pool` is the headroom before eviction runs.
 - **Without one**, the namespace inherits the node `maxmemory`/policy and
   participates in node-wide eviction like the numbered databases.
 - `EVICTION` unset (or `inherit`) follows `maxmemory-policy`; an explicit

@@ -380,6 +380,7 @@ pub(crate) fn memory_gauges_of(
         used_bytes: report.attributed_bytes()
             + node.wire_buffers_bytes.get()
             + node.conn_state_bytes.get(),
+        pool_used_bytes: ks.pool_used_bytes(),
         docs_live: report.docs_live,
         doc_tape_bytes: report.doc_tape_bytes,
         doc_arena_bytes: report.doc_arena_bytes,

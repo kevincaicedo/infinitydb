@@ -1880,6 +1880,18 @@ impl CellStore {
         out
     }
 
+    /// The wheel's standing debt in ms at `now` (0 with nothing armed —
+    /// an idle wheel snaps to `now` on its next tick, so a stale cursor
+    /// there is not backlog). Pure read, no tick: the per-store term of
+    /// the keyspace-wide `expiry_debt` fold (F-L05-03).
+    #[must_use]
+    pub fn expiry_lag_ms(&self, now: Nanos) -> u64 {
+        if self.wheel.live() == 0 {
+            return 0;
+        }
+        (now.0 / 1_000_000).saturating_sub(self.wheel.cursor_ms())
+    }
+
     // ---- eviction mechanism (M1-S06; policy logic lives in `evict.rs`) ----
 
     /// Applies an eviction policy: flips the access-tracking mode and

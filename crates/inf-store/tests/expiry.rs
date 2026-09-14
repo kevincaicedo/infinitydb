@@ -17,7 +17,10 @@
 use std::collections::HashMap;
 
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, ExpireCond, ExpiryBudget, SetExpire, SetOptions, StoreConfig};
+use inf_store::{
+    CellStore, EvictionPolicy, ExpireCond, ExpiryBudget, Keyspace, NsId, NsMode, NsSpec, SetExpire,
+    SetOptions, StoreConfig,
+};
 
 fn ms(v: u64) -> Nanos {
     Nanos(v * 1_000_000)
@@ -285,4 +288,85 @@ fn wheel_memory_stays_within_sixteen_bytes_per_ttl_key() {
     let pool = report.wheel_bytes - baseline;
     assert!(pool >= keys * 16, "pool under-reports: {pool}");
     assert!(pool <= keys * 16 * 2, "wheel pool exceeds 16 B/key + growth slack: {pool}");
+}
+
+// ---- F-L05-03 (review 2026-08-30, batch 57): the expiry slice rotates ----
+
+const SLICE: ExpiryBudget = ExpiryBudget { max_fires: 64, max_steps: 4096 };
+
+fn set_ttl_in(store: &mut CellStore, prefix: &str, n: u32, deadline_ms: u64) {
+    for i in 0..n {
+        set_with_ttl(store, format!("{prefix}{i}").as_bytes(), deadline_ms, ms(1));
+    }
+}
+
+fn sessions_ns() -> NsSpec {
+    NsSpec {
+        id: NsId(16),
+        name: b"sessions".to_vec(),
+        mode: NsMode::Memory,
+        fsync: None,
+        policy: Some(EvictionPolicy::NoEviction),
+        maxmemory: None,
+        tier: None,
+    }
+}
+
+/// The lane's reproduction plan, executed: db0 carries more due entries
+/// than one slice's fire budget, db1 a handful long past due. Pre-fix the
+/// slice walked `db0..db15` then named from the top every time, so db1
+/// never saw a fire while db0 had work; the cursor now starts each slice
+/// at the first store the previous one left unserved.
+#[test]
+fn a_busy_db0_does_not_starve_the_other_namespaces_wheels() {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    set_ttl_in(ks.db_mut(0), "hot:", 2_000, 50);
+    set_ttl_in(ks.db_mut(1), "cold:", 10, 50);
+    for _ in 0..20 {
+        ks.expire_tick(ms(1_000), SLICE);
+    }
+    assert_eq!(ks.db_mut(1).len(), 0, "db1's expired keys were never actively reaped");
+    // The rotation is fair both ways: the storm keeps draining.
+    let hot = ks.db_mut(0).len();
+    assert!(hot <= 2_000 - 64 * 18, "db0 lost its turns to the rotation: {hot} left");
+}
+
+/// The lane's failure scenario: a named memory namespace sits last in the
+/// chain, so a db0 storm kept its wheel from ever ticking — its expired
+/// records accumulated while `DBSIZE` and `INFO keyspace` kept counting
+/// them.
+#[test]
+fn a_named_namespace_last_in_the_chain_still_gets_its_wheel_ticks() {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    ks.ns_create(sessions_ns()).expect("create");
+    set_ttl_in(ks.ns_store_mut(NsId(16)).expect("registered"), "s:", 10, 10);
+    set_ttl_in(ks.db_mut(0), "hot:", 2_000, 50);
+    for _ in 0..20 {
+        ks.expire_tick(ms(1_000), SLICE);
+    }
+    let left = ks.ns_store(NsId(16)).expect("materialized").len();
+    assert_eq!(left, 0, "the sessions namespace's expired keys were never reaped");
+}
+
+/// The metric half: `lag_ms` folds every store's wheel, served or not, so
+/// the plane's debt escalation and the operator see a starved store.
+/// Pre-fix the fold covered only the stores the slice reached — db1's
+/// older debt was invisible behind db0's.
+#[test]
+fn the_debt_metric_sees_a_store_the_slice_never_reached() {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    set_ttl_in(ks.db_mut(0), "hot:", 2_000, 50);
+    set_ttl_in(ks.db_mut(1), "cold:", 10, 10);
+    let now = ms(1_000);
+    let first = ks.expire_tick(now, SLICE);
+    assert!(first.reaped == 64, "db0 alone spends the slice: {first:?}");
+    let db0_only = 1_000 - 50;
+    let db1 = ks.db(1).expect("materialized").expiry_lag_ms(now);
+    assert!(db1 > db0_only, "db1's wheel trails further than db0's: {db1}");
+    assert_eq!(first.lag_ms, db1, "the slice reported db0's debt, not the worst store's");
+    assert_eq!(ks.expiry_lag_ms(now), db1, "the INFO fold disagrees with the slice");
+    // An idle wheel is not debt: nothing armed reads 0, whatever its cursor.
+    let mut idle = CellStore::new(StoreConfig::default());
+    idle.set(b"k", b"v", SetOptions::default(), ms(1)).expect("set");
+    assert_eq!(idle.expiry_lag_ms(ms(1_000_000)), 0);
 }
