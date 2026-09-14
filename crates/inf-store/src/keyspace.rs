@@ -170,6 +170,9 @@ pub struct Keyspace {
     /// `0..DEFAULT_DBS` are the numbered dbs, `DEFAULT_DBS..` index into
     /// `named_stores` (ADR-0068 D2 inheritance leg).
     hand_db: usize,
+    /// Expiry rotation cursor over the same position space as `hand_db`:
+    /// the first store the previous slice left unserved (F-L05-03).
+    expire_hand: usize,
     /// This cell's share of the node's reserved-VA admission bound
     /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
     /// reservations refuses new creations, never evicts.
@@ -235,6 +238,7 @@ impl Keyspace {
             budget_shares: 1,
             over_limit: false,
             hand_db: 0,
+            expire_hand: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
             tier_promote: true,
             tier_shadow: false,
@@ -731,17 +735,35 @@ impl Keyspace {
         self.refresh_pressure();
     }
 
-    /// One budgeted expiry MAINTAIN slice across every materialized db
-    /// (M1-S05 over M1-S08): the fire/step budget is shared — later dbs see
-    /// what earlier dbs left, so a storm in one db cannot multiply the
-    /// slice by the db count. `lag_ms` reports the worst db (it drives the
-    /// plane's debt escalation).
+    /// One budgeted expiry MAINTAIN slice across every materialized store
+    /// (M1-S05 over M1-S08): the fire/step budget is shared — later stores
+    /// see what earlier ones left, so a storm in one db cannot multiply
+    /// the slice by the store count. The walk rotates (F-L05-03): each
+    /// slice starts at the first store the previous one left unserved
+    /// (`expire_hand`, the Redis `current_db` shape), so a db whose storm
+    /// exhausts every slice cannot starve the other wheels — it yields one
+    /// slice per rotation. `lag_ms` is the worst wheel debt across every
+    /// store, served or not (it drives the plane's debt escalation and
+    /// renders as `expiry_debt_ms`); a store the slice never reached
+    /// reports its standing debt, never 0.
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let mut total = ExpiryStats::default();
         let mut left = budget;
-        let named = self.named_stores.iter_mut().map(|e| e.store.as_mut());
-        for store in self.dbs.iter_mut().flatten().map(Box::as_mut).chain(named) {
+        let rotation = DEFAULT_DBS + self.named_stores.len();
+        let start = self.expire_hand % rotation;
+        self.expire_hand = start;
+        for k in 0..rotation {
+            let at = (start + k) % rotation;
+            let store = if at < DEFAULT_DBS {
+                match self.dbs[at].as_deref_mut() {
+                    Some(store) => store,
+                    None => continue,
+                }
+            } else {
+                self.named_stores[at - DEFAULT_DBS].store.as_mut()
+            };
             if left.max_fires == 0 || left.max_steps == 0 {
+                self.expire_hand = at;
                 break;
             }
             let s = store.expire_tick(now, left);
@@ -751,9 +773,9 @@ impl Keyspace {
             total.reaped += s.reaped;
             total.stale += s.stale;
             total.steps += s.steps;
-            total.lag_ms = total.lag_ms.max(s.lag_ms);
             total.armed += s.armed;
         }
+        total.lag_ms = self.expiry_lag_ms(now);
         if total.reaped > 0 {
             self.refresh_pressure();
         }
@@ -841,6 +863,14 @@ impl Keyspace {
             .map(|e| e.store.used_bytes() + e.store.idx_memory().idx_tree_bytes)
             .sum();
         dbs + named
+    }
+
+    /// The worst standing wheel debt across every materialized store at
+    /// `now` — the `expiry_debt` figure the plane escalates on and INFO
+    /// renders (F-L05-03: the fold covers stores the slice never reached).
+    #[must_use]
+    pub fn expiry_lag_ms(&self, now: Nanos) -> u64 {
+        self.all_stores().map(|s| s.expiry_lag_ms(now)).max().unwrap_or(0)
     }
 
     /// Recomputes the cached pressure flags — global and per-namespace

@@ -183,6 +183,12 @@ pub(crate) fn info(
             &format!("maxmemory_policy:{}", cfg.get("maxmemory-policy").unwrap_or("noeviction")),
         );
         drop(cfg);
+        // The figure `maxmemory` compares against (ADR-0068 A2): the
+        // pool's logical bytes — numbered dbs plus every namespace without
+        // a budget of its own — folded like `used_memory`. `used_memory`
+        // carries wire buffers, arena slack and budgeted namespaces, so it
+        // never says how far the node is from eviction; this does.
+        push(&mut text, &format!("used_memory_pool:{}", g.pool_used_bytes));
         let frag = if used > 0 { rss as f64 / used as f64 } else { 0.0 };
         push(&mut text, &format!("mem_fragmentation_ratio:{frag:.2}"));
         push(&mut text, "mem_allocator:inf-arena");
@@ -516,6 +522,10 @@ pub(crate) fn info(
         push(&mut text, &format!("expired_keys:{}", stats.expired_lazy + stats.expired_active));
         push(&mut text, &format!("expired_active:{}", stats.expired_active));
         push(&mut text, &format!("expired_lazy:{}", stats.expired_lazy));
+        // The M1-S05 `expiry_debt` backlog, cell scope like the counters
+        // beside it: the worst wheel debt across every store, served by
+        // the last slice or not (F-L05-03).
+        push(&mut text, &format!("expiry_debt_ms:{}", ks.expiry_lag_ms(now)));
         push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
         push(&mut text, &format!("keyspace_hits:{}", stats.keyspace_hits));
         push(&mut text, &format!("keyspace_misses:{}", stats.keyspace_misses));
@@ -1992,7 +2002,7 @@ pub(crate) fn debug(
 mod tests {
     use super::*;
     use crate::exec::execute;
-    use inf_store::StoreConfig;
+    use inf_store::{EvictionPolicy, SetExpire, SetOptions, StoreConfig};
     use inf_wire::{ConnParser, Parsed, ParserLimits};
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
@@ -2372,6 +2382,89 @@ mod tests {
         // The serving cell published its own slot at render time: the
         // totals now exceed the peer's contribution alone.
         assert!(board.totals().used_bytes > 1_000, "serving cell published its slot");
+    }
+
+    /// Batch 57 (review 2026-08-30, the L05-02 DX row; ADR-0068 A2):
+    /// `# Memory` renders the figure `maxmemory` compares against —
+    /// `used_memory_pool`, the pool's logical bytes folded across cells
+    /// like `used_memory`. A budgeted namespace's bytes are in
+    /// `used_memory` and out of the pool; a peer's publication adds in.
+    #[test]
+    fn info_memory_renders_the_maxmemory_comparable() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        for i in 0..8u32 {
+            let key = format!("db0:{i}");
+            assert_eq!(
+                run(&mut cx, &mut store, &[b"SET", key.as_bytes(), &[b'v'; 4096]]),
+                b"+OK\r\n"
+            );
+        }
+        store
+            .ns_create(inf_store::NsSpec {
+                id: inf_store::NsId(16),
+                name: b"cache".to_vec(),
+                mode: inf_store::NsMode::Memory,
+                fsync: None,
+                policy: Some(EvictionPolicy::AllKeysRandom),
+                maxmemory: Some(64 << 20),
+                tier: None,
+            })
+            .expect("create");
+        let cache = store.ns_store_mut(inf_store::NsId(16)).expect("registered");
+        for i in 0..64u32 {
+            let key = format!("c:{i}");
+            cache.set(key.as_bytes(), &[b'v'; 4096], SetOptions::default(), Nanos(1)).expect("set");
+        }
+        let field = |text: &str, name: &str| -> u64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+                .unwrap_or_else(|| panic!("missing {name}: {text}"))
+                .parse()
+                .expect("u64")
+        };
+        let bare =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        let pool = field(&bare, "used_memory_pool");
+        assert_eq!(pool, store.pool_used_bytes(), "{bare}");
+        assert!(pool >= 8 * 4096, "db0 is in the pool: {bare}");
+        assert!(pool < 64 * 4096, "the budgeted cache is out of the pool: {bare}");
+        assert!(field(&bare, "used_memory") > pool + 64 * 4096, "used_memory keeps it: {bare}");
+
+        let board = std::sync::Arc::new(crate::control::MemoryBoard::new(2));
+        board
+            .slot(1)
+            .publish(crate::control::MemoryGauges { pool_used_bytes: 777, ..Default::default() });
+        cx.node.cell.set(0);
+        *cx.node.memory_board.borrow_mut() = Some(board);
+        let noded =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        assert_eq!(field(&noded, "used_memory_pool"), pool + 777, "node fold: {noded}");
+    }
+
+    /// Batch 57 (review 2026-08-30, F-L05-03): the M1-S05 `expiry_debt`
+    /// backlog renders in `# Stats` as `expiry_debt_ms` — the worst wheel
+    /// debt across every store of the serving cell, whether or not the
+    /// last slice reached it (pre-fix the figure was plane-internal and
+    /// folded only the stores the slice ran).
+    #[test]
+    fn info_stats_renders_the_expiry_debt() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let idle =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"stats"])).expect("ascii");
+        assert!(idle.contains("expiry_debt_ms:0\r\n"), "{idle}");
+        // A deadline long past on db3, never ticked: the harness renders at
+        // `now = 1 ns`, so arm at 0 ms and read the debt from a later now.
+        let opts = SetOptions { expire: SetExpire::At(Nanos(0)), ..SetOptions::default() };
+        store.db_mut(3).set(b"stale", b"v", opts, Nanos(0)).expect("set");
+        let later = Nanos(5_000 * 1_000_000);
+        assert_eq!(store.expiry_lag_ms(later), 5_000);
+        let mut out = Vec::new();
+        let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+        info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");
     }
 
     /// M4-S03/S13 degenerate-case contract, as an operator sees it: on a

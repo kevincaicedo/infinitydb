@@ -6,20 +6,20 @@
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    EvictBudget, EvictionPolicy, Keyspace, NsId, NsMode, NsSpec, OpError, PressureConfig,
-    SetExpire, SetOptions, StoreConfig,
+    AddressSpaceConfig, CellStore, DemotionConfig, EvictBudget, EvictionPolicy, Keyspace,
+    LogicalAddr, NsId, NsMode, NsSpec, OpError, PressureConfig, SetExpire, SetOptions, StoreConfig,
 };
 
 const NOW: Nanos = Nanos(1_000_000_000); // 1 s
 
-fn fresh() -> Keyspace {
+fn fresh_cfg() -> StoreConfig {
     // Pre-sized index: growth steps are part of `used`, so a tight slack
     // assertion wants the table at steady-state capacity from the start.
-    Keyspace::new(StoreConfig {
-        evict_seed: 0xE71C_7E57,
-        initial_keys: 4096,
-        ..StoreConfig::default()
-    })
+    StoreConfig { evict_seed: 0xE71C_7E57, initial_keys: 4096, ..StoreConfig::default() }
+}
+
+fn fresh() -> Keyspace {
+    Keyspace::new(fresh_cfg())
 }
 
 /// A limit that budgets the RECORD bytes to `num/den` of their current
@@ -590,4 +590,70 @@ fn pool_pressure_reclaims_from_the_pool_only() {
     assert!(ks.db_mut(0).len() < 400, "db0 paid for its own growth");
     assert_eq!(ks.ns_store(NsId(16)).expect("live").len(), 200, "the cache lost nothing");
     assert!(ks.used_bytes() > ks.pool_used_bytes(), "attribution unchanged (D5)");
+}
+
+/// Batch 57 (review 2026-08-30, the L05-02 follow-up row): a tiered
+/// namespace's resident bytes are **not** in the pool comparable — its
+/// records live in the tiered table, which `used_bytes`/`pool_used_bytes`
+/// never sum (ADR-0062's `MEM-BUDGET` is their authority, rendered under
+/// `# Tiering`); the named `CellStore` shell the plane materializes beside
+/// the table stays empty by construction (replay intercepts tiered records,
+/// `reserve_ns` skips the shell), so it contributes an empty store's fixed
+/// overhead and nothing that grows. Verification, not a fix: green on the
+/// batch-56 tree by design — no A1 extension is needed.
+#[test]
+fn tiered_shells_carry_no_resident_bytes_into_the_pool() {
+    const NS: NsId = NsId(31);
+    const BUDGET: u64 = 256 << 10;
+    const PAGE: u64 = 4 << 10;
+    let mut ks = fresh();
+    ks.ns_create(NsSpec {
+        id: NS,
+        name: b"tiered".to_vec(),
+        mode: NsMode::Durable,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    })
+    .expect("register");
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let ring = demote.ring_reserve_bytes().expect("valid budget");
+    ks.materialize_tiered(
+        NS,
+        AddressSpaceConfig {
+            reserve_bytes: ring,
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::ZERO,
+        },
+        demote,
+        1024,
+    )
+    .expect("materialize");
+    for i in 0..100 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    // The plane's shape: the shell materializes beside the table. Its
+    // bytes are an empty store's fixed overhead under the keyspace's own
+    // config (the `initial_keys` index presize; 64 slots on the binary).
+    let shell = ks.ns_store_mut(NS).expect("registered").used_bytes();
+    assert_eq!(shell, CellStore::new(fresh_cfg()).used_bytes(), "an empty store");
+    assert_eq!(ks.ns_store(NS).expect("live").eviction_policy(), EvictionPolicy::NoEviction);
+    let pool_before = ks.pool_used_bytes();
+    let used_before = ks.used_bytes();
+    let hasher = ks.hasher();
+    let table = ks.tiered_store_mut(NS).expect("materialized");
+    for i in 0..2_000u32 {
+        let key = format!("t:{i}");
+        table.insert(key.as_bytes(), &[7u8; 64], hasher.hash(key.as_bytes())).expect("insert");
+    }
+    let usage = ks.tiering_usage();
+    assert!(usage.committed_bytes > 0 && usage.live_bytes > 0, "the table holds them: {usage:?}");
+    assert_eq!(ks.pool_used_bytes(), pool_before, "tiered records never enter the pool");
+    assert_eq!(ks.used_bytes(), used_before, "nor `used_bytes` (their authority is MEM-BUDGET)");
+    assert_eq!(ks.ns_store(NS).expect("live").len(), 0, "the shell stays empty");
+    // And the pool bound still cannot be moved by them: a limit above db0
+    // alone stays unpressured with 2,000 tiered records resident.
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, pool_before + 1);
+    assert!(!ks.over_limit(), "tiered residency raised the global flag");
 }
