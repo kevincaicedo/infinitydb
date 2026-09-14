@@ -6802,6 +6802,66 @@ fn info_names_every_field_once_on_a_multi_cell_node() {
     node.stop();
 }
 
+/// Batch 49 (review 2026-08-30, F-L15-07): every cell's `# Tripwires` is
+/// wholly its own slice, so folding the section across cells (the
+/// `inf-bench` scrape) sums cell numbers only. Pre-fix each cell's copy
+/// carried the whole process's `process_rss`: the fold read `cells × RSS`
+/// and a one-cell scrape's `sum(domains) / process_rss` read ≈ 1 / cells.
+/// `process_rss` renders once, in `# Memory`, beside `used_memory_rss`.
+#[test]
+fn info_tripwires_folds_across_cells_without_a_process_wide_gauge() {
+    const CELLS: u16 = 2;
+    let node = Node::start(CELLS);
+    let mut fold = std::collections::BTreeMap::<String, u64>::new();
+    for cell in 0..CELLS {
+        let mut c = conn_on_cell(&node, cell);
+        let tripwires = info_text(&mut c, b"tripwires");
+        assert!(tripwires.contains("tripwire_scope:cell\r\n"), "{tripwires}");
+        for line in tripwires.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let (name, value) =
+                line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+            if let Ok(v) = value.parse::<u64>() {
+                *fold.entry(name.to_string()).or_default() += v;
+            }
+        }
+    }
+    // The node runs in this process: its VmRSS is ours.
+    let rss = process_vm_rss_bytes();
+    assert!(rss > 0, "VmRSS unreadable");
+    if let Some(folded) = fold.get("process_rss") {
+        panic!(
+            "process_rss inside the cell-scope section: folded over {CELLS} cells = {folded} \
+             (this process's VmRSS {rss}, ×{:.2})",
+            *folded as f64 / rss as f64
+        );
+    }
+    let mut c = conn_on_cell(&node, 0);
+    let memory = info_text(&mut c, b"memory");
+    let field = |name: &str| -> u64 {
+        memory
+            .lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+            .unwrap_or_else(|| panic!("missing {name}: {memory}"))
+            .parse()
+            .expect("u64")
+    };
+    assert_eq!(field("process_rss"), field("used_memory_rss"), "{memory}");
+    assert_eq!(memory.matches("process_rss:").count(), 1, "{memory}");
+    node.stop();
+}
+
+/// `VmRSS` of this process from procfs (Linux), in bytes.
+fn process_vm_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
 /// Batch 45 (review 2026-08-30, F-L15-09): `CLIENT LIST` from one
 /// connection reports another's selected db and subscription counts.
 /// Pre-fix every line said `db=0 sub=0 psub=0`.

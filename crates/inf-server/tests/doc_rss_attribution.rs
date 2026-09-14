@@ -25,7 +25,9 @@ fn key_of(mut value: usize) -> [u8; 12] {
 fn snapshot(ks: &mut Keyspace, cx: &mut ConnCx, clock: &mut u64) -> BTreeMap<String, u64> {
     *clock += 1;
     let mut out = Vec::new();
-    execute_slices(&[b"INFO", b"tripwires"], ks, cx, Nanos(*clock), &mut out);
+    // The domains are `# Tripwires`, `process_rss` is `# Memory` (ADR-0122
+    // A1); every name renders once, so the flat map is exact.
+    execute_slices(&[b"INFO"], ks, cx, Nanos(*clock), &mut out);
     String::from_utf8(out)
         .expect("INFO is UTF-8")
         .lines()

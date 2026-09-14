@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+running 1 test
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... FAILED
+---- info_tripwires_is_wholly_cell_scope_on_a_real_node stdout ----
+thread 'info_tripwires_is_wholly_cell_scope_on_a_real_node' (21371) panicked at tests/compat/tests/node_diff.rs:497:5:
+a process-wide gauge inside the cell-scope section: # Tripwires
+tripwire_scope:cell
+loop_iter_p999_us:0
+fabric_rtt_p50_ns:0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    info_tripwires_is_wholly_cell_scope_on_a_real_node
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.05s
+error: test failed, to rerun pass `-p compat --test node_diff`

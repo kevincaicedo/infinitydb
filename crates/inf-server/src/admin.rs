@@ -169,6 +169,10 @@ pub(crate) fn info(
         push(&mut text, &format!("used_memory:{used}"));
         push(&mut text, &format!("used_memory_human:{}", human_bytes(used)));
         push(&mut text, &format!("used_memory_rss:{rss}"));
+        // The frozen L5 denominator, from the same read as `used_memory_rss`:
+        // process-wide, so it lives here beside the node fold, never in the
+        // cell-scope `# Tripwires` (ADR-0122 A1, F-L15-07).
+        push(&mut text, &format!("{}:{rss}", inf_foundation::tripwire::PROCESS_RSS));
         push(&mut text, &format!("memory_scope:{scope}"));
         let cfg = node.config.borrow();
         push(&mut text, &format!("maxmemory:{}", cfg.get("maxmemory").unwrap_or("0")));
@@ -588,7 +592,8 @@ pub(crate) fn info(
         let [sqes, cqes, cmds, fabric, p999] = node.tripwires.get();
         push(&mut text, "# Tripwires");
         // Every gauge below is this cell's slice (`inf-bench` scrapes each
-        // cell and sums); `process_rss` alone is process-wide.
+        // cell and sums); the process-wide `process_rss` renders in
+        // `# Memory` with the node fold (ADR-0122 A1).
         push(&mut text, "tripwire_scope:cell");
         push(&mut text, &format!("{}:{sqes}", tw::SQES_PER_SUBMIT));
         push(&mut text, &format!("{}:{cqes}", tw::CQES_PER_REAP));
@@ -633,7 +638,6 @@ pub(crate) fn info(
         push(&mut text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
         push(&mut text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
         push(&mut text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
-        push(&mut text, &format!("{}:{}", tw::PROCESS_RSS, process_rss_bytes()));
         text.push_str("\r\n");
     }
     if wants("keyspace") {
@@ -2128,6 +2132,37 @@ mod tests {
         assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
     }
 
+    /// Batch 49 (review 2026-08-30, F-L15-07): `# Tripwires` is wholly cell
+    /// scope. `process_rss` — the one process-wide number — renders in
+    /// `# Memory` beside `used_memory_rss`, under `memory_scope`, from the
+    /// same procfs read. Pre-fix it sat inside the cell section, so the
+    /// section's own L5 gate (`sum(domains)` vs RSS) read one cell's
+    /// domains over the whole process.
+    #[test]
+    fn info_tripwires_carries_no_process_wide_gauge() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let tripwires =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
+        assert!(tripwires.contains("tripwire_scope:cell\r\n"), "{tripwires}");
+        assert!(
+            !tripwires.contains("process_rss:"),
+            "a process-wide gauge inside the cell-scope section: {tripwires}"
+        );
+        let memory =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        let field = |name: &str| -> u64 {
+            memory
+                .lines()
+                .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+                .unwrap_or_else(|| panic!("missing {name}: {memory}"))
+                .parse()
+                .expect("u64")
+        };
+        assert!(field("process_rss") > 0, "{memory}");
+        assert_eq!(field("process_rss"), field("used_memory_rss"), "one read, two names: {memory}");
+    }
+
     /// Batch 45 (review 2026-08-30, F-L15-09): `db`, `sub` and `psub` are
     /// tracked state, so `CLIENT LIST`/`INFO` report them — RESP3 so the
     /// subscribed connection may still be inspected (Redis shape).
@@ -2228,7 +2263,9 @@ mod tests {
         let tripwires =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
         for name in inf_foundation::tripwire::ALL {
-            assert!(tripwires.contains(&format!("{name}:")), "missing {name}: {tripwires}");
+            let home =
+                if *name == inf_foundation::tripwire::PROCESS_RSS { &memory } else { &tripwires };
+            assert!(home.contains(&format!("{name}:")), "missing {name}: {home}");
         }
     }
 

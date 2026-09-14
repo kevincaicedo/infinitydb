@@ -1,0 +1,3 @@
+test info_names_every_field_once_on_a_real_node ... ok
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.10s

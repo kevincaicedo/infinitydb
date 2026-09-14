@@ -52,4 +52,9 @@ All unsafe blocks rest on one protocol, documented on `Shared<T>`:
 - **Miri**: the non-loom unit tests (including a two-thread stress test at
   reduced count) run under Miri in CI with strict provenance.
 - **`perf c2c`** false-sharing attribution of the `CachePadded` index lines
-  is **Linux-only and deferred to the reference box** (M0-S08 third AC).
+  (M0-S08 third AC, reference box, pinned P-cores 4/6): the only HITM
+  lines are the two index lines — offset 0x0 only, 128 B apart — and the
+  slot payload lines; remote HITM 0. Artifacts: `.artifacts/m0/2026-06-11-
+  linux-devbox/spsc-ring-perf-c2c.txt` (95,778 samples) and
+  `.artifacts/review/batch49/spsc-ring-perf-c2c-20260913.txt` (92,609
+  samples, the same shape at the post-batch-48 tree).

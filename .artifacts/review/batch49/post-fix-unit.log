@@ -1,0 +1,13 @@
+test admin::tests::info_persistence_renders_admission_busy_refusals ... ok
+test admin::tests::info_memory_aggregates_across_cells_via_the_board ... ok
+test admin::tests::info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered ... ok
+test admin::tests::info_exposes_every_document_and_tripwire_domain ... ok
+test admin::tests::info_tiering_renders_per_namespace_watermarks_and_write_counters ... ok
+test admin::tests::info_tripwires_renders_recycle_pool_bytes ... ok
+test admin::tests::info_tripwires_carries_no_process_wide_gauge ... ok
+test admin::tests::info_sections_filter ... ok
+test admin::tests::info_tiering_reports_write_amplification_per_namespace ... ok
+test admin::tests::info_tiering_splits_the_blob_write_amplification_leg ... ok
+test admin::tests::info_tiering_is_all_zero_without_a_tiered_namespace ... ok
+test admin::tests::info_all_names_every_field_once ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.00s

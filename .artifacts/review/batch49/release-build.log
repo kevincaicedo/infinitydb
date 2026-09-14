@@ -1,0 +1,14 @@
+   Compiling inf-alloc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-alloc)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-wire v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire)
+   Compiling infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+   Compiling inf-probe v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-probe)
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `release` profile [optimized + debuginfo] target(s) in 26.34s
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 6.71s
+  Executable benches/ring.rs (target/release/deps/ring-ed6a02b419cb48b3)

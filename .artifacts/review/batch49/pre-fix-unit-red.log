@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_server-bb1ffe5a53420b44)
+running 1 test
+test admin::tests::info_tripwires_carries_no_process_wide_gauge ... FAILED
+---- admin::tests::info_tripwires_carries_no_process_wide_gauge stdout ----
+thread 'admin::tests::info_tripwires_carries_no_process_wide_gauge' (21351) panicked at crates/inf-server/src/admin.rs:2144:9:
+a process-wide gauge inside the cell-scope section: $781
+tripwire_scope:cell
+loop_iter_p999_us:0
+fabric_rtt_p50_ns:0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    admin::tests::info_tripwires_carries_no_process_wide_gauge
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 136 filtered out; finished in 0.00s
+error: test failed, to rerun pass `-p inf-server --lib`

@@ -1,0 +1,22 @@
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.75s
+     Running tests/node_e2e.rs (target/debug/deps/node_e2e-fbed072c93bd1071)
+
+running 1 test
+test info_tripwires_folds_across_cells_without_a_process_wide_gauge ... FAILED
+
+failures:
+
+---- info_tripwires_folds_across_cells_without_a_process_wide_gauge stdout ----
+
+thread 'info_tripwires_folds_across_cells_without_a_process_wide_gauge' (19986) panicked at crates/inf-server/tests/node_e2e.rs:6831:9:
+process_rss inside the cell-scope section: folded over 2 cells = 23789568 (this process's VmRSS 11972608, ×1.99)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    info_tripwires_folds_across_cells_without_a_process_wide_gauge
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 80 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --test node_e2e`
