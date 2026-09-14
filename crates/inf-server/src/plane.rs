@@ -1530,6 +1530,10 @@ pub struct ServerPlane<
     /// keyspace-report walk is cheap but not free, so peers' `INFO`
     /// totals refresh on a coarse cadence instead of every iteration.
     memory_publish_in: u32,
+    /// The graceful stop (ADR-0124 D2); `None` while serving.
+    stop: Option<StopDrive>,
+    /// Take a checkpoint before the final sync of a stop (D2 step 3).
+    stop_checkpoint: bool,
 }
 
 /// One cell's loop-resident boot recovery (M2-S15): the [`Recovery`]
@@ -1557,6 +1561,33 @@ enum StagedReply {
     Nil,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,
+}
+
+/// Where a cell is in its graceful stop (ADR-0124 D2): `Serving` until
+/// [`ServerPlane::request_stop`]; `Draining` while connections flush and
+/// close; `Quiet` once none is live — the cell still applies peers' hops
+/// and waits for the assembly's [`ServerPlane::finish_stop`] (every cell
+/// quiet: no client-driven hop is in flight anywhere); then the stop
+/// checkpoint publishes and the final sync lands; `Drained` once nothing
+/// durable is in motion.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum StopPhase {
+    Serving,
+    Draining,
+    Quiet,
+    Drained,
+}
+
+/// The drain's own state (one `Option` check per MAINTAIN while serving).
+struct StopDrive {
+    phase: StopPhase,
+    /// Every live connection has been marked `close_after_flush`.
+    conns_marked: bool,
+    /// The assembly saw every cell `Quiet` (`finish_stop`).
+    finish: bool,
+    /// The stop checkpoint's request epoch, once requested.
+    ckpt_epoch: Option<u64>,
+    final_sync_requested: bool,
 }
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
@@ -1659,6 +1690,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             boot_error: None,
             loading_board: None,
             memory_publish_in: 1,
+            stop: None,
+            stop_checkpoint: true,
         }
     }
 
@@ -1803,6 +1836,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                             .node
                             .recover_records
                             .set(stats.ckpt_records + stats.records_applied);
+                        self.shared.node.recover_replay_records.set(stats.records_applied);
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.mark_ready(
@@ -2157,6 +2191,94 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// Live connections (tests, stats).
+    /// Begins the graceful stop (ADR-0124 D2); idempotent. From the next
+    /// MAINTAIN on, accepts are closed unanswered, every connection
+    /// flushes and closes, a durable cell takes its stop checkpoint and
+    /// final sync, and [`stop_phase`](Self::stop_phase) reaches
+    /// `Drained`.
+    pub fn request_stop(&mut self) {
+        if self.stop.is_none() {
+            self.stop = Some(StopDrive {
+                phase: StopPhase::Draining,
+                conns_marked: false,
+                finish: false,
+                ckpt_epoch: None,
+                final_sync_requested: false,
+            });
+        }
+    }
+
+    /// The assembly's word that every cell is `Quiet` (ADR-0124 D3): no
+    /// client-driven hop is in flight anywhere, so this cell's stop
+    /// checkpoint and final sync capture everything. Idempotent; a no-op
+    /// before [`request_stop`](Self::request_stop).
+    pub fn finish_stop(&mut self) {
+        if let Some(stop) = self.stop.as_mut() {
+            stop.finish = true;
+        }
+    }
+
+    /// Where the cell is in its stop.
+    #[must_use]
+    pub fn stop_phase(&self) -> StopPhase {
+        self.stop.as_ref().map_or(StopPhase::Serving, |s| s.phase)
+    }
+
+    /// Whether a stop takes a checkpoint before its final sync (on by
+    /// default — the next boot then replays nothing; `infinityd
+    /// --shutdown-checkpoint off`).
+    pub fn set_stop_checkpoint(&mut self, on: bool) {
+        self.stop_checkpoint = on;
+    }
+
+    /// One MAINTAIN step of the drain (ADR-0124 D2). Returns without
+    /// touching anything while serving.
+    fn drive_stop(&mut self) {
+        let Some(stop) = self.stop.as_mut() else { return };
+        if stop.phase == StopPhase::Drained {
+            return;
+        }
+        // Step 2: connections flush and close (QUIT's path — bytes read
+        // after the mark are dropped; a command in flight finishes).
+        if !stop.conns_marked {
+            stop.conns_marked = true;
+            self.shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+        }
+        if self.shared.conns.borrow().live > 0 {
+            return;
+        }
+        stop.phase = StopPhase::Quiet;
+        if !stop.finish {
+            return;
+        }
+        // Steps 3–4: a durable cell publishes its stop checkpoint, then
+        // its final sync lands. A cell still in boot recovery has no
+        // durable plane yet: it acked nothing, and its disk is the
+        // previous life's — Drained.
+        let mut durable = self.shared.durable.borrow_mut();
+        if let Some(cell) = durable.as_mut() {
+            let control = self.shared.control.borrow();
+            if self.stop_checkpoint
+                && let Some(control) = control.as_ref()
+            {
+                let me = self.shared.cell.0;
+                let epoch = *stop.ckpt_epoch.get_or_insert_with(|| control.request_ckpt_cell(me));
+                if control.ckpt_board().slot(me).published() < epoch {
+                    return;
+                }
+            }
+            if !stop.final_sync_requested {
+                stop.final_sync_requested = true;
+                cell.request_final_sync();
+                return;
+            }
+            if !cell.quiescent() {
+                return;
+            }
+        }
+        stop.phase = StopPhase::Drained;
+    }
+
     pub fn connections(&self) -> usize {
         self.shared.conns.borrow().live
     }
@@ -2314,6 +2436,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// Closes an accepted socket without a frame (a stop drain), counted
+    /// with the refusals.
+    fn close_unadmitted(&self, cx: &mut LoopCx<'_>, fd: RawFd) {
+        let node = &self.shared.node;
+        node.rejected_connections.set(node.rejected_connections.get() + 1);
+        let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
+        cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
+    }
+
     /// Closes the fd a reserved-slot send named (see `refuse_accept`).
     fn close_refused(&self, cx: &mut LoopCx<'_>, token: CompletionToken) {
         // `refuse_accept` stored a non-negative fd (`u32::try_from` passed),
@@ -2356,6 +2487,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
             CompletionResult::Accepted { fd } => {
+                // A drain admits nothing (ADR-0124 D2 step 1): closed
+                // unanswered — the `SO_REUSEPORT` group still routes here,
+                // and the `maxclients` frame would be a lie.
+                if self.stop.is_some() {
+                    self.close_unadmitted(cx, fd);
+                    return;
+                }
                 let knobs = self.shared.knobs.get();
                 // `maxclients` (ADR-0123 D1): this cell's share of the node
                 // bound; past it the socket gets Redis's error and a close.
@@ -2404,13 +2542,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     // semantics); failure is ignored like `TCP_NODELAY`'s.
                     let _ = inf_runtime::net::set_keepalive(fd, knobs.keepalive_secs);
                 }
-                let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
-                self.shared.with_conn(key, |conn| conn.cx.id = id);
+                // The client id (ADR-0124 D6): `cell << 48 | seq`, seq from 1
+                // — node-unique and never reused, so a sibling's `CLIENT
+                // KILL ID` can never reach another connection (pre-fix ids
+                // were the slab key: 0 for the first, and equal across cells).
                 let node = &self.shared.node;
+                let seq = node.next_client_id.get() + 1;
+                node.next_client_id.set(seq);
+                let id = (u64::from(self.shared.cell.0) << 48) | seq;
+                self.shared.with_conn(key, |conn| conn.cx.id = id);
                 node.total_connections.set(node.total_connections.get() + 1);
                 // Peer address capture is a recorded deviation (CLIENT LIST
                 // placeholder) until the accept path carries peernames.
-                node.clients.borrow_mut().register(id, "0.0.0.0:0".to_string(), cx.now.as_millis());
+                node.clients.borrow_mut().register(
+                    id,
+                    key.packed(),
+                    "0.0.0.0:0".to_string(),
+                    cx.now.as_millis(),
+                );
                 cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
             }
             CompletionResult::Recv { buf, len } => {
@@ -2441,8 +2590,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             CompletionResult::Closed => {
                 let key = Self::key_of(c.token);
                 let removed = self.shared.conns.borrow_mut().remove(key);
-                let id = (u64::from(key.slot) << 32) | u64::from(key.generation);
-                self.shared.node.clients.borrow_mut().unregister(id);
+                if let Some(conn) = &removed {
+                    self.shared.node.clients.borrow_mut().unregister(conn.cx.id);
+                }
                 // Pub/sub cleanup (M1-S10): drop the connection from the
                 // local registries; 1→0 transitions notify the channel
                 // owners / every cell (patterns) off the close path.
@@ -3027,6 +3177,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
 
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
         self.shared.now.set(cx.now);
+        self.drive_stop();
         // ---- early fabric publish (M2.5-S21): remote ops staged during
         // EXECUTE become peer-visible NOW instead of at FABRIC-OUT (step
         // 8) — the peer drains them while this cell runs MAINTAIN/LOG/
@@ -3157,11 +3308,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
             }
         }
-        // ---- CLIENT KILL sweep: ids encode {slot:32 | generation:32}, so
-        // the registry mark maps straight back to the conn slab.
-        let kills = self.shared.node.clients.borrow_mut().take_kill_requests();
-        for id in kills {
-            let key = ConnKey { slot: (id >> 32) as u32, generation: id as u32 };
+        // ---- CLIENT KILL sweep: the registry carries each id's slab key
+        // (ADR-0124 D6), so the mark maps back to the connection.
+        let kills = {
+            let mut clients = self.shared.node.clients.borrow_mut();
+            let ids = clients.take_kill_requests();
+            ids.into_iter().filter_map(|id| clients.conn_key(id)).collect::<Vec<u64>>()
+        };
+        for key in kills.into_iter().map(ConnKey::unpack) {
             self.initiate_close(cx, key);
         }
         // ---- pressure config push (M1-E3, hot-per-cell within one MAINTAIN

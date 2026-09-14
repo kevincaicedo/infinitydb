@@ -97,6 +97,13 @@ pub struct NodeInfo {
     /// Injected RNG state (SplitMix64 stream; RANDOMKEY) — seeded by the
     /// assembly layer, deterministic under DST (L7).
     pub rng_state: Cell<u64>,
+    /// The node identity `INFO server:run_id` / `replication:master_replid`
+    /// render (ADR-0124 D5): 40 hex digits, seeded once at assembly and
+    /// never mutated — every cell of a node carries the same value.
+    pub run_id: Cell<[u64; 3]>,
+    /// Client ids issued by this cell (ADR-0124 D6): `cell << 48 | seq`,
+    /// seq from 1 — node-unique and never reused, like Redis's.
+    pub next_client_id: Cell<u64>,
     pub tcp_port: Cell<u16>,
     /// M4.5-S40 (`infinityd --conn-default-ns NAME`): every accepted
     /// connection starts as if it had sent `INF.NS USE NAME` — the
@@ -249,6 +256,9 @@ pub struct NodeInfo {
     /// Records recovered (checkpoint + tail applied) — the fixed-work
     /// identity a recovery row checks across arms.
     pub recover_records: Cell<u64>,
+    /// Tail records applied after the checkpoint's begin (ADR-0124 D4's
+    /// observable: a boot after a clean stop replays nothing).
+    pub recover_replay_records: Cell<u64>,
     /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
     /// ceiling arm wrote blind over a cold candidate.
     #[cfg(feature = "bench-diagnostics")]

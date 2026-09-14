@@ -597,6 +597,7 @@ pub fn rows() -> Vec<CommandRow> {
 // (old M6) shipped at M3 — caught by the M3-S13/S15 review.
 pub static ABSENT: &[(&str, &str)] = &[
     ("Persistence admin (SAVE, …)", "M9 — RDB import/export"),
+    ("SHUTDOWN", "M9 — persistence admin; the operator's stop is SIGTERM/SIGINT (ADR-0124)"),
     ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M5 — data types"),
     ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M5"),
     ("Connection control (RESET)", "M6 (RESET pairs with transaction state)"),
@@ -748,6 +749,17 @@ pub fn render() -> String {
     push("to 250 µs later than its barrier alone would allow, and `everysec` records");
     push("riding that held frame carry the same ≤ 250 µs of extra process-crash exposure.");
     push("The power-loss window is unchanged; durability semantics are unchanged.");
+    push("");
+    push("A **clean stop** (`SIGTERM`/`SIGINT`, ADR-0124) keeps every acked write of");
+    push("every class: each cell stops admitting, flushes and closes its connections (a");
+    push("pipeline still arriving is answered up to the stop — every executed command is");
+    push("answered — then a FIN), publishes a stop checkpoint (`--shutdown-checkpoint");
+    push("on|off`, default on: the next boot replays nothing) and lands its final sync;");
+    push("the node exits 0 only once every cell is drained, else 1 within");
+    push("`--shutdown-timeout-ms` (10 000, Redis's `shutdown-timeout`) with the phase named.");
+    push("The `everysec` window is a crash property only. Redis's `SIGTERM` handler fsyncs");
+    push("the AOF and closes clients without answering them; `SHUTDOWN` the command stays");
+    push("absent (below).");
     push("");
     push("## Absent (owner milestone)");
     push("");

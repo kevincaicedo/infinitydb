@@ -78,7 +78,12 @@ impl CkptTrigger {
 
 struct Node {
     port: u16,
+    cells: u16,
     stop: Arc<AtomicBool>,
+    /// The graceful stop (ADR-0124): cells drain and exit once every
+    /// cell is `Drained`.
+    graceful: Arc<AtomicBool>,
+    drained: Arc<std::sync::atomic::AtomicU16>,
     handles: Vec<std::thread::JoinHandle<()>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
@@ -425,6 +430,14 @@ impl Node {
         held_catalog: Option<Arc<AtomicBool>>,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
+        let graceful = Arc::new(AtomicBool::new(false));
+        let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        // The node identity (ADR-0124 D5): one value per node, every cell.
+        let run_id = {
+            let seed = u64::from(std::process::id()) << 32 | u64::from(port_seed());
+            [seed, seed.rotate_left(17) ^ 0xA5A5_5A5A, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)]
+        };
         let mut catalog_pump = None;
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
@@ -482,6 +495,9 @@ impl Node {
         let mut handles = Vec::new();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
             let stop = Arc::clone(&stop);
+            let graceful = Arc::clone(&graceful);
+            let quiet = Arc::clone(&quiet);
+            let drained = Arc::clone(&drained);
             let boot = boot.clone();
             let faults = faults.clone();
             let default_ns = default_ns.clone();
@@ -495,6 +511,7 @@ impl Node {
                 let mut driver = UringDriver::new(256).expect("uring");
                 driver.register_pool(&mut pool).expect("register");
                 let node = Rc::new(NodeInfo::default());
+                node.run_id.set(run_id);
                 *node.conn_default_ns.borrow_mut() = default_ns;
                 // Real wall anchor (the infinityd boot pattern): LASTSAVE/
                 // rdb_last_save_time report true unix seconds (M2-S20).
@@ -557,16 +574,40 @@ impl Node {
                     ..Default::default()
                 };
                 let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+                let (mut counted_quiet, mut counted) = (false, false);
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
                     if let Some(err) = plane.take_boot_error() {
                         panic!("cell {i} recovery failed (fail-stop, §8.4): {err}");
                     }
+                    if graceful.load(Ordering::Relaxed) {
+                        plane.request_stop();
+                        let phase = plane.stop_phase();
+                        if !counted_quiet
+                            && matches!(
+                                phase,
+                                inf_server::StopPhase::Quiet | inf_server::StopPhase::Drained
+                            )
+                        {
+                            counted_quiet = true;
+                            quiet.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if quiet.load(Ordering::Acquire) == cells {
+                            plane.finish_stop();
+                        }
+                        if !counted && phase == inf_server::StopPhase::Drained {
+                            counted = true;
+                            drained.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if drained.load(Ordering::Acquire) == cells {
+                            break;
+                        }
+                    }
                 }
             }));
         }
         let control = boot.map(|(_, _, control)| control);
-        let node = Node { port, stop, handles, control, catalog_pump };
+        let node = Node { port, cells, stop, graceful, drained, handles, control, catalog_pump };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
         // observe it (the throttle IS the -LOADING test's subject).
@@ -602,6 +643,21 @@ impl Node {
                 Err(e) => assert!(Instant::now() < deadline, "connect: {e}"),
             }
         }
+    }
+
+    /// The graceful stop (ADR-0124): every cell drains — connections
+    /// flush and close, the stop checkpoint publishes, the final sync
+    /// lands — and the threads exit once all are `Drained`; then the
+    /// same control-thread quiesce as `stop`.
+    fn stop_gracefully(self) {
+        self.graceful.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.drained.load(Ordering::Acquire) < self.cells {
+            assert!(Instant::now() < deadline, "the node did not drain in 30 s");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.stop();
     }
 
     fn stop(mut self) {
@@ -1324,6 +1380,12 @@ fn many_connections_spread_across_cells() {
 }
 
 // ---- M2-S08: durable namespaces ------------------------------------------------
+
+/// A per-node salt for the harness's `run_id` seed.
+fn port_seed() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
@@ -7095,5 +7157,138 @@ fn client_output_buffer_limit_normal_kills_a_non_reading_client() {
     let mut probe = node.connect();
     let stats = info_text(&mut probe, b"stats");
     assert_eq!(info_field(&stats, "client_output_buffer_limit_disconnections"), 1, "{stats}");
+    node.stop();
+}
+
+// ---- Review 2026-08-30 F-L15-02 + the id-0 kill gap (batch 51, ADR-0124) ----
+
+/// Every cell of one node answers the same 40-hex `run_id`, before and
+/// after `RANDOMKEY` (pre-fix: per-cell RNG cursors, 32 digits, moving).
+#[test]
+fn run_id_is_one_value_across_cells() {
+    let node = Node::start(2);
+    let mut ids = std::collections::BTreeMap::new();
+    for cell in 0..2u16 {
+        let mut conn = conn_on_cell(&node, cell);
+        let info = info_text(&mut conn, b"server");
+        let run_id = info
+            .lines()
+            .find_map(|l| l.strip_prefix("run_id:"))
+            .expect("run_id")
+            .trim()
+            .to_string();
+        assert_eq!(run_id.len(), 40, "{run_id}");
+        conn.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+        read_exactly(&mut conn, b"+OK\r\n");
+        conn.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+        let _ = read_bulk(&mut conn);
+        let again = info_text(&mut conn, b"server");
+        assert!(again.contains(&format!("run_id:{run_id}\r\n")), "run_id moved on cell {cell}");
+        ids.insert(cell, run_id);
+    }
+    let values: std::collections::BTreeSet<&String> = ids.values().collect();
+    assert_eq!(values.len(), 1, "cells disagree on run_id: {ids:?}");
+    node.stop();
+}
+
+/// The first connection a cell ever accepts has an id ≥ 1, so `CLIENT
+/// KILL ID` can reach it (pre-fix: id 0, refused with Redis's `client-id
+/// should be greater than 0`).
+#[test]
+fn client_kill_by_id_reaches_the_first_connection_of_a_cell() {
+    let node = Node::start(1);
+    let mut first = node.connect();
+    first.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+    let line = read_line(&mut first);
+    let id: i64 =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert!(id >= 1, "first client id is {id}");
+    let mut killer = node.connect();
+    killer.write_all(&cmd(&[b"CLIENT", b"KILL", b"ID", id.to_string().as_bytes()])).expect("write");
+    read_exactly(&mut killer, b":1\r\n");
+    let mut rest = Vec::new();
+    match first.read_to_end(&mut rest) {
+        Ok(_) => assert!(rest.is_empty(), "bytes after the kill: {rest:?}"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("the killed connection stayed open ({e})"),
+    }
+    node.stop();
+}
+
+/// F-L15-08 (ADR-0124) in-process: a durable 2-cell node with an
+/// `everysec` namespace and 2 000 acked pipelined writes stops
+/// gracefully — the client's pending replies flush before a FIN, the
+/// reboot has every key, loaded from the stop checkpoint with no tail
+/// replay, and a fresh connection during the drain is closed unanswered.
+#[test]
+fn graceful_stop_flushes_replies_and_closes_with_fin() {
+    let dir = temp_data_dir("graceful-stop");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"esec", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const N: usize = 2_000;
+    let mut wire = Vec::new();
+    for i in 0..N {
+        wire.extend_from_slice(&cmd(&[b"SET", format!("k{i}").as_bytes(), b"v"]));
+    }
+    c.write_all(&wire).expect("pipeline");
+    node.stop_gracefully();
+    let mut rest = Vec::new();
+    let read = c.read_to_end(&mut rest);
+    assert!(read.is_ok(), "the close was a reset, not a FIN: {read:?}");
+    let lines: Vec<&[u8]> = rest.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty() && lines.len() <= N, "{} replies", lines.len());
+    assert!(lines.iter().all(|l| *l == b"+OK\r"), "a reply is not +OK");
+    let acked = lines.len();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    let line = read_line(&mut c);
+    let dbsize: usize =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert!(dbsize >= acked, "acked writes lost: {dbsize} < {acked}");
+    for cell in 0..2u16 {
+        let mut conn = conn_on_cell(&node, cell);
+        let info = info_text(&mut conn, b"persistence");
+        assert_ne!(info_field(&info, "recover_ckpt_bytes"), 0, "cell {cell}: no stop checkpoint");
+        assert_eq!(info_field(&info, "recover_replay_records"), 0, "cell {cell}: {info}");
+    }
+    node.stop();
+}
+
+/// Ids are node-unique (`cell << 48 | seq`, ADR-0124 D6): a `CLIENT KILL
+/// ID` issued on another cell for an id it does not own answers `:0` and
+/// kills nothing — with per-cell slab ids (the first fix's `packed + 1`)
+/// cell 1's first connection was id 1 too, and the sibling killed itself
+/// (the full `just compat` run caught it: "server closed the connection
+/// mid-script").
+#[test]
+fn client_ids_are_node_unique_so_a_foreign_kill_reaches_nothing() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    let mut b = conn_on_cell(&node, 1);
+    let id_of = |c: &mut TcpStream| -> u64 {
+        c.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+        let line = read_line(c);
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int")
+    };
+    let (ia, ib) = (id_of(&mut a), id_of(&mut b));
+    assert_ne!(ia, ib, "two cells issued the same client id");
+    assert_eq!(ia >> 48, 0, "cell 0's id carries its cell: {ia:#x}");
+    assert_eq!(ib >> 48, 1, "cell 1's id carries its cell: {ib:#x}");
+    b.write_all(&cmd(&[b"CLIENT", b"KILL", b"ID", ia.to_string().as_bytes()])).expect("write");
+    read_exactly(&mut b, b":0\r\n");
+    // Both connections are still alive.
+    a.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut a, b"+PONG\r\n");
+    b.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut b, b"+PONG\r\n");
     node.stop();
 }

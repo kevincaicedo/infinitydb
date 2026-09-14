@@ -138,6 +138,11 @@ pub struct DurableScenario {
     /// replay skips the first `DocDelta` it sees — the planted bug the
     /// fleet must catch within 100 seeds.
     pub replay_canary: bool,
+    /// ADR-0124 (batch 51): after the traffic window every cell is asked
+    /// to stop and stepped until `Drained` before the power cut; the
+    /// §8.2 rule then requires every acked `everysec` op, every client
+    /// must have seen its close, and the reboot must replay nothing.
+    pub clean_stop: bool,
     /// Log-segment I/O mode (M4.5-S34, ADR-0086 D8): `Direct` runs the
     /// zero-fill state machine, v3 frames, write-through barriers, and
     /// the class-upgrade/not-ready rotations on the sim disk; `Buffered`
@@ -349,6 +354,16 @@ impl DurableScenario {
     /// The m2 shapes' section bound (see [`Self::section_bound_for`]).
     pub const M2_SECTION_BOUND: u32 = 64;
 
+    /// `m2-clean-stop` (ADR-0124): `m2-durable`'s shape, stopped
+    /// gracefully before the cut. Single-cut: the second cut lands
+    /// mid-recovery, which a clean stop never reaches.
+    pub fn m2_clean_stop(seed: u64) -> DurableScenario {
+        let mut scenario = Self::m2_durable(seed);
+        scenario.clean_stop = true;
+        scenario.double_cut = false;
+        scenario
+    }
+
     pub fn m2_durable(seed: u64) -> DurableScenario {
         DurableScenario {
             seed,
@@ -376,6 +391,7 @@ impl DurableScenario {
             ckpt_section_bound: Self::section_bound_for(seed, Self::M2_SECTION_BOUND),
             stall: Some(m2_stall_config()),
             replay_canary: false,
+            clean_stop: false,
             // Odd seeds run the FUA class (ADR-0086 D8): half of every
             // sweep exercises mixed write-through/FLUSH frames, zero-fill
             // barriers, and seal × write-through crossings under cuts.
@@ -747,6 +763,7 @@ impl DurableScenario {
             ckpt_section_bound: None,
             stall: Some(stall),
             replay_canary: false,
+            clean_stop: false,
             io_mode: SegmentIoMode::Direct,
             frames_in_flight: 3,
             device: inf_server::DeviceConfig {
@@ -804,6 +821,7 @@ impl DurableScenario {
             ckpt_section_bound: None,
             stall: Some(m2_stall_config()),
             replay_canary: false,
+            clean_stop: false,
             io_mode: SegmentIoMode::Buffered,
             frames_in_flight: 1,
             device: Default::default(),
@@ -835,6 +853,11 @@ pub struct DurableReport {
     pub trace_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
+    /// ADR-0124: scheduler steps the clean stop took to drain every cell
+    /// (0 without `clean_stop`), and the reboot's tail records applied
+    /// (must be 0 after a clean stop — the stop checkpoint covers it).
+    pub clean_stop_steps: u64,
+    pub clean_stop_replay_records: u64,
     pub commands_done: u64,
     pub sim_seconds: f64,
     /// Ledger ops the oracle *required* to survive (acked `always` +
@@ -1479,6 +1502,10 @@ impl Node {
         &self.cells[cell].1
     }
 
+    pub(crate) fn plane_mut(&mut self, cell: usize) -> &mut SimPlane {
+        &mut self.cells[cell].1
+    }
+
     /// Summed pub/sub registry gauges across cells (combined-scenario
     /// quiescence oracle, M2.5-S14): (channels, patterns, bytes).
     pub(crate) fn pubsub_gauges(&self) -> (u64, u64, usize) {
@@ -1550,12 +1577,19 @@ impl MiniClient {
 
 /// The §8.2 required index: the last op the promise binds for `class`
 /// at the cut instant (`None` = nothing required).
-pub(crate) fn required_index(class: NsClass, ops: &[OpRec], cut_time: Nanos) -> Option<usize> {
+pub(crate) fn required_index(
+    class: NsClass,
+    ops: &[OpRec],
+    cut_time: Nanos,
+    clean_stop: bool,
+) -> Option<usize> {
     ops.iter().rposition(|op| match op.acked_at {
         None => false,
         Some(at) => match class {
             NsClass::Always | NsClass::Tiered | NsClass::Indexed => true,
-            NsClass::Everysec => at + EVERYSEC_WINDOW <= cut_time,
+            // A clean stop (ADR-0124 D4) keeps every acked everysec op;
+            // the window is a crash property only.
+            NsClass::Everysec => clean_stop || at + EVERYSEC_WINDOW <= cut_time,
             NsClass::Memory => false,
         },
     })
@@ -1611,6 +1645,8 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         trace_hash: 0,
         violations: Vec::new(),
         stalled: false,
+        clean_stop_steps: 0,
+        clean_stop_replay_records: 0,
         commands_done: 0,
         sim_seconds: 0.0,
         required_ops: 0,
@@ -2108,6 +2144,77 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     }
     let _ = last_progress;
 
+    // ---- CLEAN STOP (ADR-0124) ------------------------------------------
+    // Every cell is asked to stop; the harness plays the assembly: once
+    // every cell is `Quiet` it says `finish_stop`, and steps until every
+    // cell is `Drained`. Replies still arriving are absorbed (they are
+    // acks the rule will require). `Plant::StopKill` is the pre-fix
+    // behaviour — the process dies at the request, no drain.
+    if scenario.clean_stop && scenario.plant == Plant::StopKill {
+        // The teeth fire here: the cut below is the stop.
+        report.plant_fired = true;
+    }
+    if scenario.clean_stop && scenario.plant != Plant::StopKill {
+        let cells = usize::from(scenario.cells);
+        for cell in 0..cells {
+            node.plane_mut(cell).request_stop();
+        }
+        let mut steps = 0u64;
+        loop {
+            let phases: Vec<inf_server::StopPhase> =
+                (0..cells).map(|c| node.plane(c).stop_phase()).collect();
+            if phases.iter().all(|p| *p == inf_server::StopPhase::Drained) {
+                break;
+            }
+            if phases
+                .iter()
+                .all(|p| matches!(p, inf_server::StopPhase::Quiet | inf_server::StopPhase::Drained))
+            {
+                for cell in 0..cells {
+                    node.plane_mut(cell).finish_stop();
+                }
+            }
+            steps += 1;
+            report.scheduler_steps += 1;
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                fail(&mut report, format!("clean stop: {err}"));
+                return finish(report, &observer, &clock);
+            }
+            for writer in &mut writers {
+                let bytes = node.nets[writer.cell].borrow_mut().client_recv(writer.fd);
+                writer.rx.extend_from_slice(&bytes);
+                while let Some(n) = reply_len(&writer.rx) {
+                    let reply: Vec<u8> = writer.rx.drain(..n).collect();
+                    writer.absorb_reply(reply, clock.now(), scenario.seed, &mut report);
+                }
+            }
+            if steps > STALL_STEPS {
+                report.stalled = true;
+                fail(
+                    &mut report,
+                    format!(
+                        "CLEAN STOP LIVENESS VIOLATION seed {:#x}: cells still {phases:?} after                          {steps} steps",
+                        scenario.seed
+                    ),
+                );
+                return finish(report, &observer, &clock);
+            }
+        }
+        report.clean_stop_steps = steps;
+        for writer in &writers {
+            if !node.nets[writer.cell].borrow().closed(writer.fd) {
+                fail(
+                    &mut report,
+                    format!(
+                        "CLEAN STOP VIOLATION seed {:#x}: writer {} ({:?}) never saw its close",
+                        scenario.seed, writer.id, writer.class
+                    ),
+                );
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+
     // ---- POWER CUT ----------------------------------------------------
     let cut_time = clock.now();
     for cell in 0..usize::from(scenario.cells) {
@@ -2419,6 +2526,43 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
+    // ADR-0124 D4's observable: a boot after a clean stop replays no tail
+    // record on any cell — the stop checkpoint covered everything.
+    if scenario.clean_stop && scenario.plant != Plant::StopKill {
+        for cell in 0..usize::from(scenario.cells) {
+            let mut probe = MiniClient::connect(&mut node, cell);
+            let reply = probe.call(
+                &mut node,
+                &mut rng,
+                &clock,
+                &disk,
+                scenario.step_ns_max,
+                &[b"INFO", b"persistence"],
+            );
+            let Ok(Some(text)) = reply else {
+                fail(&mut report, format!("clean stop: INFO on cell {cell} answered {reply:?}"));
+                return finish(report, &observer, &clock);
+            };
+            let text = String::from_utf8_lossy(&text);
+            let replayed: u64 = text
+                .lines()
+                .find_map(|l| l.strip_prefix("recover_replay_records:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(u64::MAX);
+            report.clean_stop_replay_records += replayed;
+            if replayed != 0 {
+                fail(
+                    &mut report,
+                    format!(
+                        "CLEAN STOP REPLAY VIOLATION seed {:#x}: cell {cell} replayed {replayed} \
+                         tail records after a clean stop (no stop checkpoint covered them)",
+                        scenario.seed
+                    ),
+                );
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
     // ADR-0090 D4: what the reboot proved about recycled residue — the
     // sweep's coverage disclosure (a sweep whose reboots never met
     // residue never exercised the rule).
@@ -2554,7 +2698,7 @@ fn audit_ledgers(
         for writer in writers.iter_mut().filter(|w| w.class == class) {
             for (key, ops) in &mut writer.ledger {
                 report.audited_keys += 1;
-                let required = required_index(class, ops, cut_time);
+                let required = required_index(class, ops, cut_time, scenario.clean_stop);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
                 report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
                 let document =
@@ -3119,7 +3263,7 @@ pub(crate) fn survival_audit(
         };
         for writer in writers.iter().filter(|w| w.class == class) {
             for (key, ops) in &writer.ledger {
-                let required = required_index(class, ops, cut_time);
+                let required = required_index(class, ops, cut_time, scenario.clean_stop);
                 tally.count(ops, required);
                 let got = store.get(key, now).map(<[u8]>::to_vec);
                 let admissible = admissible_states(ops, required);

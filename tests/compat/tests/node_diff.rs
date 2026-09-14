@@ -745,3 +745,87 @@ fn timeout_closes_an_idle_connection_like_redis() {
     let mut fb = Vec::new();
     assert_eq!(cmd(&mut fresh, &mut fb, &["CONFIG", "SET", "timeout", "0"]), b"+OK\r\n");
 }
+
+/// Batch 51 (review 2026-08-30, F-L15-02) at the binary: both engines
+/// render a 40-hex `run_id` that does not move across `RANDOMKEY`, and
+/// every cell of the spawned node answers the same one. Pre-fix the node
+/// answered 32 digits from the RANDOMKEY cursor, per cell.
+#[test]
+fn run_id_is_40_hex_and_stable_like_redis() {
+    let Some((_node_guard, mut node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    fn field(reply: &[u8], name: &str) -> String {
+        let text = String::from_utf8_lossy(reply);
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("{name} missing: {text}"))
+            .trim()
+            .to_string()
+    }
+    let mut seen = std::collections::BTreeMap::new();
+    for (who, stream) in [("oracle", &mut oracle), ("node", &mut node)] {
+        let mut buf = Vec::new();
+        let before = field(&cmd(stream, &mut buf, &["INFO", "server"]), "run_id");
+        assert_eq!(before.len(), 40, "{who}: {before}");
+        assert!(before.bytes().all(|b| b.is_ascii_hexdigit()), "{who}: {before}");
+        cmd(stream, &mut buf, &["SET", "runid:k", "v"]);
+        cmd(stream, &mut buf, &["RANDOMKEY"]);
+        let after = field(&cmd(stream, &mut buf, &["INFO", "server"]), "run_id");
+        assert_eq!(after, before, "{who}: run_id moved across RANDOMKEY");
+        let replid = field(&cmd(stream, &mut buf, &["INFO", "replication"]), "master_replid");
+        assert_eq!(replid.len(), 40, "{who}: {replid}");
+        seen.insert(who, before);
+    }
+    // Every cell of the node: the same identity.
+    for _ in 0..16 {
+        let mut sibling = sibling(&node);
+        let mut buf = Vec::new();
+        let run_id = field(&cmd(&mut sibling, &mut buf, &["INFO", "server"]), "run_id");
+        assert_eq!(&run_id, &seen["node"], "a cell answers a different run_id");
+    }
+}
+
+/// Batch 51 (the id-0 kill gap) at the binary: a fresh connection's
+/// `CLIENT ID` is ≥ 1 on both engines and `CLIENT KILL ID` from a sibling
+/// reaches it (`:1`, then a close). Pre-fix the first connection on a
+/// cell was id 0 and the kill was refused.
+#[test]
+fn client_id_is_positive_and_killable_like_redis() {
+    let Some((_node_guard, node)) = infinityd(2, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    for (who, mut first) in [("oracle", oracle), ("node", node)] {
+        let mut buf = Vec::new();
+        let reply = cmd(&mut first, &mut buf, &["CLIENT", "ID"]);
+        let id: i64 =
+            String::from_utf8_lossy(&reply).trim().trim_start_matches(':').parse().expect("int");
+        assert!(id >= 1, "{who}: first client id {id}");
+        // A second connection on the node may land on another cell: try
+        // siblings until one reports the kill (ids are per cell — an
+        // engine-internal counter, declared).
+        let mut killed = false;
+        for _ in 0..32 {
+            let mut killer = sibling(&first);
+            let mut kb = Vec::new();
+            let r = cmd(&mut killer, &mut kb, &["CLIENT", "KILL", "ID", &id.to_string()]);
+            assert!(r == b":1\r\n" || r == b":0\r\n", "{who}: {:?}", String::from_utf8_lossy(&r));
+            if r == b":1\r\n" {
+                killed = true;
+                break;
+            }
+        }
+        assert!(killed, "{who}: no sibling could kill client {id}");
+        assert_closed_or_reset(&mut first, who);
+    }
+}

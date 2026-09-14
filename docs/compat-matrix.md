@@ -138,7 +138,7 @@ bytes or post-state differ by an understood, reviewed design decision.
 
 ### `INFO`
 
-- section payloads differ (InfinityDB identity/tripwires); shape client-parseable
+- section payloads differ (InfinityDB identity/tripwires; run_id/master_replid are one 40-hex node identity, immutable for the process life — ADR-0124); shape client-parseable
 
 ### `COMMAND`
 
@@ -182,7 +182,7 @@ bytes or post-state differ by an understood, reviewed design decision.
 
 ### `CLIENT`
 
-- connection ids are engine-internal counters
+- connection ids are engine-internal (cell<<48|seq, ≥ 1, never reused — ADR-0124 D6)
 - addr/fd/timing fields differ; field vocabulary matches
 
 ### `LOLWUT`
@@ -313,11 +313,23 @@ to 250 µs later than its barrier alone would allow, and `everysec` records
 riding that held frame carry the same ≤ 250 µs of extra process-crash exposure.
 The power-loss window is unchanged; durability semantics are unchanged.
 
+A **clean stop** (`SIGTERM`/`SIGINT`, ADR-0124) keeps every acked write of
+every class: each cell stops admitting, flushes and closes its connections (a
+pipeline still arriving is answered up to the stop — every executed command is
+answered — then a FIN), publishes a stop checkpoint (`--shutdown-checkpoint
+on|off`, default on: the next boot replays nothing) and lands its final sync;
+the node exits 0 only once every cell is drained, else 1 within
+`--shutdown-timeout-ms` (10 000, Redis's `shutdown-timeout`) with the phase named.
+The `everysec` window is a crash property only. Redis's `SIGTERM` handler fsyncs
+the AOF and closes clients without answering them; `SHUTDOWN` the command stays
+absent (below).
+
 ## Absent (owner milestone)
 
 | Family | Arrives |
 |---|---|
 | Persistence admin (SAVE, …) | M9 — RDB import/export |
+| SHUTDOWN | M9 — persistence admin; the operator's stop is SIGTERM/SIGINT (ADR-0124) |
 | Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog | M5 — data types |
 | Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH) | M5 |
 | Connection control (RESET) | M6 (RESET pairs with transaction state) |

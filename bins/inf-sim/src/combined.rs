@@ -657,7 +657,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
         for writer in writers.iter().filter(|w| w.class == class) {
             for (key, ops) in &writer.ledger {
                 report.audited_keys += 1;
-                let required = required_index(class, ops, cut_time);
+                let required = required_index(class, ops, cut_time, false);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
                 report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
                 let reply = match audit.call(

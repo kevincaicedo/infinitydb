@@ -251,7 +251,8 @@ pub static MATRIX: &[Case] = &[
     skip(&["HELLO", "9"], "NOPROTO error text verified in unit tests"),
     skip(
         &["INFO"],
-        "section payloads differ (InfinityDB identity/tripwires); shape client-parseable",
+        "section payloads differ (InfinityDB identity/tripwires; run_id/master_replid are one \
+         40-hex node identity, immutable for the process life — ADR-0124); shape client-parseable",
     ),
     skip(&["COMMAND"], "registry is the M0+M1 surface, not the full Redis set"),
     skip(&["COMMAND", "COUNT"], "registry size differs by design"),
@@ -551,7 +552,10 @@ pub static MATRIX: &[Case] = &[
     c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 0 0 0"]),
     c(&["CONFIG", "REWRITE"]),
     // --- CLIENT ---
-    skip(&["CLIENT", "ID"], "connection ids are engine-internal counters"),
+    skip(
+        &["CLIENT", "ID"],
+        "connection ids are engine-internal (cell<<48|seq, ≥ 1, never reused — ADR-0124 D6)",
+    ),
     c(&["CLIENT", "GETNAME"]),
     c(&["CLIENT", "SETNAME", "compat-suite"]),
     c(&["CLIENT", "GETNAME"]),

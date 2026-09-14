@@ -81,7 +81,7 @@ pub use key_hash::{
     verify_key_hash_binding,
 };
 pub use plane::{
-    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane,
+    ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopPhase,
     fold_live_entries,
 };
 pub use readahead::boot_prefetch_threads_spawned;

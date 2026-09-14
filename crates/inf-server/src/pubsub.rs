@@ -303,7 +303,10 @@ pub(crate) fn publish_fallback(channel: &[u8], payload: &[u8], cx: &mut ConnCx, 
 /// one-client Redis. The plane path answers from the cell registries.
 pub(crate) fn pubsub_fallback(args: &[&[u8]], cx: &mut ConnCx, out: &mut Vec<u8>) {
     let mut w = RespWriter::new(out, cx.proto);
-    let sub = args[0];
+    // The registry arity (-2) guarantees a subcommand; a guard, not `args[0]`.
+    let Some(&sub) = args.first() else {
+        return w.error("ERR wrong number of arguments for 'pubsub' command");
+    };
     if sub.eq_ignore_ascii_case(b"CHANNELS") && args.len() <= 2 {
         let pattern = args.get(1).copied();
         let hits: Vec<&Vec<u8>> = cx
@@ -451,7 +454,9 @@ impl<K: Copy + Eq> PubSubCell<K> {
         if added_entry {
             self.bytes += name.len() + ENTRY_OVERHEAD + 4 * cells;
         }
-        let slot = &mut counts[usize::from(cell) % cells];
+        let slot = counts
+            .get_mut(usize::from(cell))
+            .expect("subscription delta names a cell inside the mesh");
         *slot = slot.saturating_add_signed(delta);
         if counts.iter().all(|&c| c == 0) {
             map.remove(name);
