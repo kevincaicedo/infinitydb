@@ -476,6 +476,42 @@ fn info_names_every_field_once_on_a_real_node() {
     assert!(body.contains("\r\ndoc_resident_bytes:"), "{body}");
 }
 
+/// Batch 49 (review 2026-08-30, F-L15-07) at the binary: a spawned 4-cell
+/// `infinityd`'s `# Tripwires` carries no process-wide gauge; `process_rss`
+/// renders once, in `# Memory`, beside `memory_scope:node` and
+/// `used_memory_rss`. Pre-fix every cell's `INFO tripwires` repeated the
+/// whole process's VmRSS under its `tripwire_scope:cell` line.
+#[test]
+fn info_tripwires_is_wholly_cell_scope_on_a_real_node() {
+    let Some((_node_guard, mut node)) = infinityd(4, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let mut nb = Vec::new();
+    let body = |reply: Vec<u8>| -> String {
+        let text = String::from_utf8_lossy(&reply);
+        text.split_once("\r\n").expect("bulk header").1.to_string()
+    };
+    let tripwires = body(cmd(&mut node, &mut nb, &["INFO", "tripwires"]));
+    assert!(tripwires.contains("tripwire_scope:cell\r\n"), "{tripwires}");
+    assert!(
+        !tripwires.contains("process_rss:"),
+        "a process-wide gauge inside the cell-scope section: {tripwires}"
+    );
+    let memory = body(cmd(&mut node, &mut nb, &["INFO", "memory"]));
+    assert!(memory.contains("memory_scope:node\r\n"), "{memory}");
+    let field = |name: &str| -> u64 {
+        memory
+            .lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+            .unwrap_or_else(|| panic!("missing {name}: {memory}"))
+            .parse()
+            .expect("u64")
+    };
+    assert!(field("process_rss") > 0, "{memory}");
+    assert_eq!(field("process_rss"), field("used_memory_rss"), "{memory}");
+}
+
 /// Batch 46 (review of 2026-08-30, F-L13-08): `QUIT` on a namespace-bound
 /// connection — the pump path — answers `+OK` and closes, as Redis does.
 /// Pre-fix the spawned binary answered `+OK` and held the socket open

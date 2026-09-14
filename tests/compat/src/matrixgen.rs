@@ -135,7 +135,7 @@ pub static DECLARED: &[Declared] = &[
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice (`tripwire_scope:cell`; ADR-0122 D3); client-smoke CI is the open M1-S14 AC",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",

@@ -53,7 +53,7 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `TTL` | full | M0 | readonly fast | 2 | 20 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 |  |
-| `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice (`tripwire_scope:cell`; ADR-0122 D3); client-smoke CI is the open M1-S14 AC |
+| `INFO` | partial | M0 | admin | -1 | 0 | sections + field vocabulary present; every name appears once per reply — `# Memory` is the node fold (`memory_scope`, the attribution family under `used_memory_*`, the process-wide `process_rss`), `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1); client-smoke CI is the open M1-S14 AC |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 |  |
 | `MSET` | full | M1 | write denyoom | -3 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
