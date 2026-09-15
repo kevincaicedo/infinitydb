@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use inf_doc::{DocValue, JsonParser, TapeDoc, path};
 use inf_query::access::{AccessStep, RangeEdge};
-use inf_query::page::{PageOutcome, PageResume, RangePager};
+use inf_query::page::{PageError, PageOutcome, PageResume, RangePager};
 use inf_query::partiql::{CatalogView, CompiledStatement, compile};
 use proptest::prelude::*;
 
@@ -96,7 +96,9 @@ fn run_page(
     let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else {
         panic!("count statements over a range compile to index ranges");
     };
-    let mut pager = RangePager::new(lo, hi, resume, scan_budget, limit_remaining);
+    let mut pager =
+        RangePager::new(lo, hi, resume, IndexKeyType::I64, scan_budget, limit_remaining)
+            .expect("well-formed resume");
     while let Some((_, pk)) = pager.next(tree) {
         let doc = docs.docs.get(&pk).expect("fixture keeps docs and entries in step");
         let matched = match &compiled.vm {
@@ -261,7 +263,7 @@ fn suspension_resumes_without_loss() {
     let compiled = compile(b"SELECT * FROM ns WHERE price >= 0", &catalog).expect("compiles");
     let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else { unreachable!() };
     // Take two candidates, then suspend mid-page.
-    let mut pager = RangePager::new(lo, hi, None, 100, None);
+    let mut pager = RangePager::new(lo, hi, None, IndexKeyType::I64, 100, None).expect("no resume");
     let mut emitted: Vec<u64> = Vec::new();
     for _ in 0..2 {
         let (_, pk) = pager.next(&tree).expect("candidates remain");
@@ -299,7 +301,8 @@ fn resume_below_the_lower_edge_serves_nothing_out_of_range() {
     let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else { unreachable!() };
     assert!(compiled.access.residual.is_none(), "the conjunct folds into the range");
     let forged = PageResume { key: i64_key(5), entry_ref: 5 };
-    let mut pager = RangePager::new(lo, hi, Some(&forged), 10_000, None);
+    let mut pager = RangePager::new(lo, hi, Some(&forged), IndexKeyType::I64, 10_000, None)
+        .expect("an 8-byte resume key");
     let mut served: Vec<u64> = Vec::new();
     while let Some((key, pk)) = pager.next(&tree) {
         assert!(lo.admits_from_below(key), "served pk {pk} below the lower edge (price > 1000)");
@@ -340,11 +343,48 @@ proptest! {
             .filter(|(key, _)| lo.admits_from_below(key) && hi.admits_from_above(key))
             .filter(|pair| resume.as_ref().is_none_or(|r| *pair > (r.key.clone(), r.entry_ref)))
             .collect();
-        let mut pager = RangePager::new(&lo, &hi, resume.as_ref(), 10_000, None);
+        let mut pager =
+            RangePager::new(&lo, &hi, resume.as_ref(), IndexKeyType::I64, 10_000, None)
+                .expect("8-byte resume keys");
         let mut served: Vec<(Vec<u8>, u64)> = Vec::new();
         while let Some((key, pk)) = pager.next(&tree) {
             served.push((key.to_vec(), pk));
         }
         prop_assert_eq!(served, expected, "lo={:?} hi={:?} resume={:?}", lo, hi, resume);
     }
+}
+
+// F-L08-03 (the length half): a resume key is client input, and a
+// mis-sized one used to reach `make_probe`'s release `assert!` on the
+// first `next` — a cell fail-stop from a truncated cursor token. The
+// pager now refuses it typed at construction, by the rule the access
+// program's edges already obey (`Fixed8` = 8 bytes, `Utf8` = 1..=cap).
+#[test]
+fn a_mis_sized_resume_key_is_a_typed_error_not_a_panic() {
+    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    for pk in 0..64u64 {
+        assert!(tree.insert(&i64_key(pk as i64), pk).expect("capacity"));
+    }
+    let lo = RangeEdge::Unbounded;
+    let hi = RangeEdge::Unbounded;
+    for bad in [0usize, 7, 9, 1025] {
+        let forged = PageResume { key: vec![0u8; bad], entry_ref: 0 };
+        let refused = RangePager::new(&lo, &hi, Some(&forged), IndexKeyType::I64, 8, None);
+        assert!(matches!(refused, Err(PageError::BadResumeKey)), "{bad}-byte key on I64");
+    }
+    // The Utf8 rule is the edge rule: empty and over-cap refused, the
+    // cap itself accepted.
+    let utf8 = IndexTree::Var(OrderedMap::<inf_store::VarKey>::new());
+    for (len, ok) in [(0usize, false), (1, true), (1024, true), (1025, false)] {
+        let forged = PageResume { key: vec![b'x'; len], entry_ref: 0 };
+        let built = RangePager::new(&lo, &hi, Some(&forged), IndexKeyType::Utf8, 8, None);
+        assert_eq!(built.is_ok(), ok, "{len}-byte key on Utf8");
+        if let Ok(mut pager) = built {
+            assert_eq!(pager.next(&utf8), None, "empty tree serves nothing");
+        }
+    }
+    let well_formed = PageResume { key: i64_key(3), entry_ref: 3 };
+    let mut pager = RangePager::new(&lo, &hi, Some(&well_formed), IndexKeyType::I64, 8, None)
+        .expect("8 bytes on I64");
+    assert_eq!(pager.next(&tree).map(|(_, pk)| pk), Some(4), "resumes strictly after the pair");
 }

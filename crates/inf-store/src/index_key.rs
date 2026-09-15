@@ -242,7 +242,7 @@ fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
     if !bytes.contains(&0) {
         out.bytes[..bytes.len()].copy_from_slice(bytes);
         out.bytes[bytes.len()] = 0x00;
-        out.len = (bytes.len() + 1) as u16;
+        out.len = buf_len(bytes.len() + 1);
         return;
     }
     let mut len: usize = 0;
@@ -255,7 +255,15 @@ fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
         }
     }
     out.bytes[len] = 0x00;
-    out.len = (len + 1) as u16;
+    out.len = buf_len(len + 1);
+}
+
+/// The buffer length as its `u16` field: every producer writes at most
+/// `ORDERED_KEY_MAX + 1` bytes (the D3 cap plus a terminator), so the
+/// narrowing is exact — stated here once instead of at each cast.
+fn buf_len(len: usize) -> u16 {
+    debug_assert!(len <= ORDERED_KEY_MAX + 1, "index key buffer past the D3 cap");
+    len as u16
 }
 
 /// The terminator-less escape image of `s`, truncated to
@@ -283,7 +291,7 @@ pub fn index_key_escape_prefix(s: &str, out: &mut IndexKeyBuf) -> usize {
             }
         }
     }
-    out.len = len as u16;
+    out.len = buf_len(len);
     debug_assert_eq!(len, full.min(ORDERED_KEY_MAX));
     full
 }

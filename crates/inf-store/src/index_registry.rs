@@ -642,7 +642,6 @@ mod tests {
         vec![1, 0, 1] // version, flags, Root — opaque without `doc`.
     }
 
-    /// Every D3-legal edge transitions; every illegal edge is the
     /// The catalog epoch (ADR-0080 D5) moves on exactly the mutations
     /// that can change what a statement compiles to — and not on
     /// cell-machine progress, which planning never reads (ADR-0075 D3).
@@ -669,6 +668,7 @@ mod tests {
         assert_eq!(reg.epoch(), 7);
     }
 
+    /// Every D3-legal edge transitions; every illegal edge is the
     /// explicit typed rejection — at both state scopes.
     #[test]
     fn lifecycle_edges_are_exactly_the_d3_set() {

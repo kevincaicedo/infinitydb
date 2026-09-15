@@ -330,11 +330,33 @@ struct KeyHeap {
     free: Vec<Vec<u32>>,
     free_bytes: u64,
     pad_bytes: u64,
+    /// The u32 address ceiling, lowered by tests to reach `HeapFull`
+    /// through the real refusal (F-L08-02).
+    #[cfg(test)]
+    ceiling: usize,
 }
 
 impl KeyHeap {
     fn new() -> Self {
-        KeyHeap { bytes: Vec::new(), free: Vec::new(), free_bytes: 0, pad_bytes: 0 }
+        KeyHeap {
+            bytes: Vec::new(),
+            free: Vec::new(),
+            free_bytes: 0,
+            pad_bytes: 0,
+            #[cfg(test)]
+            ceiling: NONE as usize,
+        }
+    }
+
+    fn ceiling(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.ceiling
+        }
+        #[cfg(not(test))]
+        {
+            NONE as usize
+        }
     }
 
     fn class_of(suffix_len: usize) -> usize {
@@ -355,7 +377,7 @@ impl KeyHeap {
             }
             None => {
                 let addr = self.bytes.len();
-                if addr + block > NONE as usize {
+                if addr + block > self.ceiling() {
                     return Err(OrderedMapError::HeapFull);
                 }
                 // Same bounded-growth rule as the node pools (L5).
@@ -409,6 +431,11 @@ pub struct OrderedMap<S: KeyScheme, const F: usize = 32> {
     /// Bumped on every successful mutation; cursors use it to tell an
     /// intact position hint from one that must re-seek.
     epoch: u64,
+    /// Removals that left a leaf below `LEAF_MIN` because the heap could
+    /// not copy a fence and no merge fit (F-L08-02). Occupancy only —
+    /// order, custody and `len` are exact; the next removal or insert
+    /// touching the leaf with heap room restores the minimum.
+    rebalance_deferred: u64,
     _scheme: PhantomData<S>,
 }
 
@@ -433,12 +460,20 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
             height: 0,
             len: 0,
             epoch: 0,
+            rebalance_deferred: 0,
             _scheme: PhantomData,
         }
     }
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Removals whose leaf rebalance was deferred at a full heap
+    /// (see the field) — an operating-condition counter, never a
+    /// correctness signal.
+    pub fn rebalance_deferred(&self) -> u64 {
+        self.rebalance_deferred
     }
 
     pub fn is_empty(&self) -> bool {
@@ -456,7 +491,9 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
             && (self.internals.nodes.len() as u64).saturating_add(margin) < u64::from(NONE)
     }
 
-    /// L5 attribution snapshot — O(1) from maintained pool/heap state.
+    /// L5 attribution snapshot from maintained pool/heap state plus one
+    /// walk over the heap's `HEAP_CLASSES + 1` free-list vectors
+    /// (MAINTAIN-rate; not O(1)).
     pub fn memory(&self) -> OrderedMapMemory {
         let heap_free_list_bytes: u64 =
             self.heap.free.iter().map(|f| (f.capacity() * size_of::<u32>()) as u64).sum();
@@ -981,9 +1018,10 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     // -- remove -------------------------------------------------------------
 
     /// Remove the exact pair; `false` when absent (remove-if-present).
-    /// Removal never allocates on its structural path — a borrow that
-    /// cannot copy its new fence falls back to a merge, which only
-    /// frees — so it cannot fail.
+    /// Removal cannot fail: the one allocation on its structural path
+    /// (a borrow's fence copy) falls back to a merge, which only frees,
+    /// and when the heap refuses the copy and no merge fits the leaf is
+    /// left underfull and counted (`rebalance_deferred`, F-L08-02).
     pub fn remove(&mut self, key: &[u8], entry_ref: u64) -> bool {
         if self.root == NONE {
             return false;
@@ -1032,16 +1070,30 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         }
         let level = self.height as usize - 1;
         let (parent_id, child_idx) = path[level];
-        if !self.leaf_borrow(parent_id, child_idx as usize, leaf_id) {
-            self.leaf_merge(parent_id, child_idx as usize, leaf_id);
+        // A deferred leaf may sit more than one below the minimum:
+        // borrow until it is back, bounded by the siblings' surplus.
+        while (self.leaves.get(leaf_id).count as usize) < Self::LEAF_MIN {
+            if !self.leaf_borrow(parent_id, child_idx as usize, leaf_id) {
+                break;
+            }
+        }
+        if self.leaves.get(leaf_id).count as usize >= Self::LEAF_MIN {
+            return;
+        }
+        if self.leaf_merge(parent_id, child_idx as usize, leaf_id) {
             self.rebalance_internals(path, level);
+        } else {
+            // Both siblings are above the minimum and neither fence copy
+            // could allocate (the heap at its ceiling): no merge fits, so
+            // the leaf stays underfull — order and custody intact.
+            self.rebalance_deferred += 1;
         }
     }
 
     /// Try to borrow one entry from a leaf sibling. The new fence is
-    /// copied *before* anything moves (plan-then-commit in miniature) —
-    /// if that copy cannot allocate, report `false` and let the caller
-    /// merge, which frees instead of allocating.
+    /// copied *before* anything moves (plan-then-commit in miniature);
+    /// a sibling whose copy cannot allocate is skipped for the other,
+    /// and `false` means no borrow happened.
     fn leaf_borrow(&mut self, parent_id: u32, child_idx: usize, leaf_id: u32) -> bool {
         let parent_count = self.internals.get(parent_id).count as usize;
         if child_idx > 0 {
@@ -1050,17 +1102,16 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
             if left_count > Self::LEAF_MIN {
                 // The moved entry (left's last) becomes our first — it
                 // is the new fence between left and us.
-                let Ok(sep) = self.copy_entry_as_sep(left_id, left_count - 1) else {
-                    return false;
-                };
-                let (left, cur) = self.leaves.get2_mut(left_id, leaf_id);
-                let last = left.count as usize - 1;
-                shift_right(cur, 0);
-                write_slot(cur, 0, left.prefixes[last], left.metas[last], left.refs[last]);
-                cur.count += 1;
-                left.count -= 1;
-                self.replace_sep(parent_id, child_idx - 1, sep);
-                return true;
+                if let Ok(sep) = self.copy_entry_as_sep(left_id, left_count - 1) {
+                    let (left, cur) = self.leaves.get2_mut(left_id, leaf_id);
+                    let last = left.count as usize - 1;
+                    shift_right(cur, 0);
+                    write_slot(cur, 0, left.prefixes[last], left.metas[last], left.refs[last]);
+                    cur.count += 1;
+                    left.count -= 1;
+                    self.replace_sep(parent_id, child_idx - 1, sep);
+                    return true;
+                }
             }
         }
         if child_idx < parent_count {
@@ -1068,17 +1119,16 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
             if self.leaves.get(right_id).count as usize > Self::LEAF_MIN {
                 // Right's second entry becomes right's first — the new
                 // fence between us and right.
-                let Ok(sep) = self.copy_entry_as_sep(right_id, 1) else {
-                    return false;
-                };
-                let (right, cur) = self.leaves.get2_mut(right_id, leaf_id);
-                let at = cur.count as usize;
-                write_slot(cur, at, right.prefixes[0], right.metas[0], right.refs[0]);
-                cur.count += 1;
-                shift_left(right, 0);
-                right.count -= 1;
-                self.replace_sep(parent_id, child_idx, sep);
-                return true;
+                if let Ok(sep) = self.copy_entry_as_sep(right_id, 1) {
+                    let (right, cur) = self.leaves.get2_mut(right_id, leaf_id);
+                    let at = cur.count as usize;
+                    write_slot(cur, at, right.prefixes[0], right.metas[0], right.refs[0]);
+                    cur.count += 1;
+                    shift_left(right, 0);
+                    right.count -= 1;
+                    self.replace_sep(parent_id, child_idx, sep);
+                    return true;
+                }
             }
         }
         false
@@ -1092,14 +1142,26 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         self.free_meta(old);
     }
 
-    /// Merge the underflowing leaf with a sibling (always possible when
-    /// borrowing was not) and drop the fence from the parent.
-    fn leaf_merge(&mut self, parent_id: u32, child_idx: usize, leaf_id: u32) {
+    /// Merge the underflowing leaf with a sibling it fits beside and
+    /// drop the fence from the parent; `false` when neither sibling fits
+    /// (only when every borrow was refused by the heap — a sibling at
+    /// the minimum always fits, F-L08-02).
+    fn leaf_merge(&mut self, parent_id: u32, child_idx: usize, leaf_id: u32) -> bool {
         // Canonical form: merge the RIGHT node into the LEFT node.
-        let (left_id, right_id, sep_idx) = if child_idx > 0 {
-            (self.internals.get(parent_id).children[child_idx - 1], leaf_id, child_idx - 1)
-        } else {
-            (leaf_id, self.internals.get(parent_id).children[child_idx + 1], child_idx)
+        let parent = self.internals.get(parent_id);
+        let count = self.leaves.get(leaf_id).count as usize;
+        let candidates = [
+            (child_idx > 0).then(|| (parent.children[child_idx - 1], leaf_id, child_idx - 1)),
+            (child_idx < parent.count as usize)
+                .then(|| (leaf_id, parent.children[child_idx + 1], child_idx)),
+        ];
+        let Some((left_id, right_id, sep_idx)) =
+            candidates.into_iter().flatten().find(|&(left_id, right_id, _)| {
+                let sibling = if left_id == leaf_id { right_id } else { left_id };
+                count + self.leaves.get(sibling).count as usize <= F
+            })
+        else {
+            return false;
         };
         let (left, right) = self.leaves.get2_mut(left_id, right_id);
         let (lc, rc) = (left.count as usize, right.count as usize);
@@ -1112,6 +1174,7 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
         self.leaves.release(right_id);
         let dropped = self.drop_sep(parent_id, sep_idx);
         self.free_meta(dropped);
+        true
     }
 
     /// Remove separator `sep_idx` and the child pointer to its right,
@@ -1786,6 +1849,66 @@ mod tests {
         map.check_invariants();
     }
 
+    type VarMap8 = OrderedMap<VarKey, 8>;
+
+    /// Leaf occupancy along the chain (test oracle for node shapes).
+    fn leaf_counts<S: KeyScheme, const F: usize>(map: &OrderedMap<S, F>) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut leaf = map.leftmost_leaf();
+        while leaf != NONE {
+            let node = map.leaves.get(leaf);
+            out.push(node.count as usize);
+            leaf = node.next;
+        }
+        out
+    }
+
+    fn key_with_suffix(i: u64, suffix_len: usize) -> Vec<u8> {
+        let mut key = i.to_be_bytes().to_vec();
+        key.extend(std::iter::repeat_n(b's', suffix_len));
+        key
+    }
+
+    // F-L08-02: a borrow whose fence copy hits `HeapFull` must not hand
+    // `leaf_merge` a sibling above `LEAF_MIN` (the merge overflowed the
+    // node array — a slice-range panic in release). With no sibling to
+    // borrow from and no merge that fits, the leaf stays underfull and
+    // the deferral is counted; the next removal with heap room heals it.
+    #[test]
+    fn heap_full_borrow_never_overflows_the_merge() {
+        let mut map = VarMap8::new();
+        // Sequential fill: leaves 8, 8, 8, 4 (rightmost splits fill full).
+        for i in 0..28u64 {
+            map.append(&key_with_suffix(i, 8), i).expect("ascending");
+        }
+        assert_eq!(leaf_counts(&map), vec![8, 8, 8, 4], "fill shape");
+        // The left sibling's tail entry takes a 16-byte suffix (class 2),
+        // a class no removal in the last leaf (class 1) frees.
+        assert!(map.remove(&key_with_suffix(23, 8), 23));
+        assert!(map.insert(&key_with_suffix(23, 16), 23).unwrap());
+        assert_eq!(leaf_counts(&map), vec![8, 8, 8, 4], "same shape, richer tail");
+        map.heap.free = vec![Vec::new(); HEAP_CLASSES + 1];
+        map.heap.ceiling = map.heap.bytes.len();
+        // Last leaf 4 -> 3: the borrow from the left needs a class-2
+        // fence copy the ceiling refuses; no right sibling; 8 + 3 > 8.
+        assert!(map.remove(&key_with_suffix(27, 8), 27));
+        assert_eq!(map.len(), 27);
+        assert_eq!(map.rebalance_deferred(), 1, "the underfull leaf was left in place");
+        assert_eq!(leaf_counts(&map), vec![8, 8, 8, 3]);
+        map.check_invariants();
+        for i in 0..27u64 {
+            let suffix = if i == 23 { 16 } else { 8 };
+            assert!(map.contains(&key_with_suffix(i, suffix), i), "pair {i} survives");
+        }
+        // Heap room again: the next removal borrows until the minimum.
+        map.heap.ceiling = NONE as usize;
+        assert!(map.remove(&key_with_suffix(26, 8), 26));
+        assert_eq!(leaf_counts(&map), vec![8, 8, 6, 4], "borrowed twice, back at LEAF_MIN");
+        assert_eq!(map.rebalance_deferred(), 1, "no new deferral");
+        map.check_invariants();
+        assert_eq!(map.len(), 26);
+    }
+
     fn full_scan_fixed(map: &FixedMap) -> Vec<(Vec<u8>, u64)> {
         let mut cursor = OrderedCursor::from_start();
         let mut out = Vec::new();
@@ -1828,6 +1951,41 @@ mod tests {
             let scanned = full_scan(&map);
             let want: Vec<(Vec<u8>, u64)> = model.iter().cloned().collect();
             prop_assert_eq!(scanned, want);
+        }
+
+        // The same model at a heap ceiling the ops keep hitting (the
+        // regime the storm never reached — F-L08-02): an insert `HeapFull`
+        // leaves the tree unchanged, a remove never panics, and contents
+        // still equal the model.
+        #[test]
+        fn matches_btree_model_at_the_heap_ceiling(
+            ops in prop::collection::vec(op_strategy(), 1..400),
+            ceiling in 8usize..256,
+        ) {
+            let mut map = VarMap::new();
+            map.heap.ceiling = ceiling;
+            let mut model = BTreeSet::new();
+            let mut heap_full = 0u32;
+            for op in &ops {
+                match op {
+                    Op::Insert(key, entry_ref) => match map.insert(key, *entry_ref) {
+                        Ok(inserted) => prop_assert_eq!(inserted, model.insert((key.clone(), *entry_ref))),
+                        Err(OrderedMapError::HeapFull) => {
+                            heap_full += 1;
+                            prop_assert_eq!(map.len(), model.len() as u64, "refused insert changed the tree");
+                        }
+                        Err(other) => prop_assert!(false, "unexpected {other:?}"),
+                    },
+                    Op::Remove(key, entry_ref) => {
+                        prop_assert_eq!(map.remove(key, *entry_ref), model.remove(&(key.clone(), *entry_ref)));
+                    }
+                }
+            }
+            map.check_invariants();
+            let scanned = full_scan(&map);
+            let want: Vec<(Vec<u8>, u64)> = model.iter().cloned().collect();
+            prop_assert_eq!(scanned, want);
+            let _ = heap_full;
         }
 
         // Cursor-under-mutation: pairs present for the WHOLE scan are

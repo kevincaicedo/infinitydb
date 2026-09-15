@@ -1,7 +1,7 @@
-//! The index-range page step (M4.5-S09, ADR-0080 D4, A1): one place
-//! owns the frozen form's paging semantics — seek (resume pair clamped
-//! to the lower edge), upper-edge check, scan-budget check, LIMIT
-//! countdown, resume production. The caller (S11's query future; the S09 tests) resolves
+//! The index-range page step (M4.5-S09, ADR-0080 D4, A1, A2): one place
+//! owns the frozen form's paging semantics — resume-key length gate,
+//! seek (resume pair clamped to the lower edge), upper-edge check,
+//! scan-budget check, LIMIT countdown, resume production. The caller (S11's query future; the S09 tests) resolves
 //! each candidate's pk ref, evaluates the residual VM, and reports
 //! matches back — evaluation stays with the owner of doc custody, the
 //! interpretation of the bounds does not fork.
@@ -13,9 +13,20 @@
 //! rebalancing cannot break them); mid-key resume matters because a
 //! multi-valued equality range holds many refs under one key.
 
-use inf_store::{IndexTree, OrderedCursor};
+use inf_store::{IndexKeyType, IndexTree, OrderedCursor};
 
-use crate::access::RangeEdge;
+use crate::access::{RangeEdge, edge_len_ok};
+
+/// Why a page could not start. The resume pair is client input (S11's
+/// cursor token), so its shape is checked here, at the layer that
+/// owns the seek — never by the tree's probe asserts (ADR-0080 A2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageError {
+    /// The resume key's length does not fit the index key type: a
+    /// `Fixed8` type is exactly 8 bytes, `Utf8` is `1..=ORDERED_KEY_MAX`
+    /// — the same rule the access program's edges obey (`BadEdge`).
+    BadResumeKey,
+}
 
 /// A page's resume point: the last `(encoded key, pk ref)` pair served.
 /// S11's cursor wire format embeds this (plus the `{index id,
@@ -66,15 +77,23 @@ impl RangePager {
     /// lower-edge check on every candidate (ADR-0080 A1). `limit_remaining`
     /// is the statement `LIMIT` minus prior pages' matches (`None` =
     /// unlimited); `scan_budget` bounds this page's work in entries
-    /// scanned (≥ 1 — a zero-work page is a caller bug).
+    /// scanned (≥ 1 — a zero-work page is a caller bug). `key_type` is
+    /// the index's: a resume key of the wrong length for it is refused
+    /// typed (A2) before any tree probe sees it.
     pub fn new(
         lo: &RangeEdge,
         hi: &RangeEdge,
         resume: Option<&PageResume>,
+        key_type: IndexKeyType,
         scan_budget: u32,
         limit_remaining: Option<u32>,
-    ) -> RangePager {
+    ) -> Result<RangePager, PageError> {
         debug_assert!(scan_budget >= 1, "a page scans at least one entry");
+        if let Some(r) = resume
+            && !edge_len_ok(r.key.len(), key_type)
+        {
+            return Err(PageError::BadResumeKey);
+        }
         let cursor = match resume {
             Some(r) if lo.admits_from_below(&r.key) => {
                 OrderedCursor::resume_after(&r.key, r.entry_ref)
@@ -85,7 +104,7 @@ impl RangePager {
                 RangeEdge::Excluded(key) => OrderedCursor::from_key(key, false),
             },
         };
-        RangePager {
+        Ok(RangePager {
             cursor,
             hi: hi.clone(),
             scan_budget,
@@ -95,7 +114,7 @@ impl RangePager {
             done: false,
             last_key: Vec::new(),
             last_ref: 0,
-        }
+        })
     }
 
     /// The next in-range candidate `(encoded key, pk ref)`, or `None`
