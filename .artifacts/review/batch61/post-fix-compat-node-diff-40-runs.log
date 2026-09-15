@@ -1,0 +1,43 @@
+run 1 rc=0
+run 2 rc=0
+run 3 rc=0
+run 4 rc=0
+run 5 rc=0
+run 6 rc=0
+run 7 rc=0
+run 8 rc=0
+run 9 rc=0
+run 10 rc=0
+run 11 rc=0
+run 12 rc=0
+run 13 rc=0
+run 14 rc=0
+run 15 rc=0
+run 16 rc=0
+run 17 rc=0
+run 18 rc=0
+run 19 rc=0
+run 20 rc=0
+run 21 rc=0
+run 22 rc=0
+run 23 rc=0
+run 24 rc=0
+run 25 rc=0
+run 26 rc=0
+run 27 rc=0
+run 28 rc=0
+run 29 rc=0
+run 30 rc=0
+run 31 rc=0
+run 32 rc=0
+run 33 rc=0
+run 34 rc=0
+run 35 rc=0
+run 36 rc=0
+run 37 rc=0
+run 38 rc=0
+run 39 rc=0
+run 40 rc=0
+LOOP_DONE
+
+[exited with code 0]

@@ -1,0 +1,316 @@
+
+running 17 tests
+[harness-trace] reserve port 31532
+[harness-trace] reserve port 31534
+[harness-trace] reserve port 31533
+[harness-trace] reserve port 31535
+[harness-trace] reserve port 31536
+[harness-trace] reserve port 31537
+[harness-trace] reserve port 31538
+[harness-trace] spawn pid 637179 port 31534 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534
+[harness-trace] reserve port 31539
+[harness-trace] spawn pid 637184 port 31533 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533
+[harness-trace] reserve port 31540
+[harness-trace] spawn pid 637176 port 31532 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532
+[harness-trace] reserve port 31541
+[harness-trace] spawn pid 637185 port 31535 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354650054-31535
+[harness-trace] spawn pid 637186 port 31536 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354663025-31536
+[harness-trace] spawn pid 637188 port 31538 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354731533-31538
+[harness-trace] spawn pid 637189 port 31539 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354779250-31539
+[harness-trace] spawn pid 637191 port 31541 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354881858-31541
+[harness-trace] spawn pid 637190 port 31540 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354849602-31540
+[harness-trace] spawn pid 637187 port 31537 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354689344-31537
+[harness-trace] reserve port 31543
+[harness-trace] reserve port 31542
+[harness-trace] reserve port 31544
+[harness-trace] reserve port 31545
+[harness-trace] reserve port 31546
+[harness-trace] reserve port 31548
+[harness-trace] reserve port 31547
+[harness-trace] spawn pid 637194 port 31543 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355756893-31543
+[harness-trace] spawn pid 637195 port 31542 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355786834-31542
+[harness-trace] spawn pid 637196 port 31546 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546
+[harness-trace] spawn pid 637197 port 31548 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356015173-31548
+[harness-trace] spawn pid 637199 port 31544 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355970947-31544
+[harness-trace] spawn pid 637198 port 31547 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356032242-31547
+[harness-trace] spawn pid 637200 port 31545 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355978040-31545
+[harness-trace] ready pid 637197 port 31548
+[harness-trace] ready pid 637199 port 31544
+[harness-trace] reserve port 31549
+[harness-trace] reserve port 31550
+[harness-trace] ready pid 637198 port 31547
+[harness-trace] spawn pid 637318 port 31547 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163411051447-31547
+[harness-trace] drop pid 637318 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163411051447-31547 exited=None panicking=false
+readiness refused: port 31547 is answered by pid 637198 (/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31547 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356032242-31547 --device-probe off), not the spawned infinityd (pid 637318) — a foreign node owns the port
+[harness-trace] ready pid 637187 port 31537
+[harness-trace] reserve port 31551
+[harness-trace] drop pid 637198 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356032242-31547 exited=None panicking=false
+test readiness_refuses_a_port_another_node_answers ... ok
+[harness-trace] ready pid 637188 port 31538
+[harness-trace] reserve port 31552
+[harness-trace] ready pid 637186 port 31536
+[harness-trace] reserve port 31553
+[harness-trace] ready pid 637190 port 31540
+[harness-trace] reserve port 31554
+[harness-trace] ready pid 637176 port 31532
+
+thread 'a_failing_test_keeps_the_node_log' (637165) panicked at tests/compat/tests/node_diff.rs:813:9:
+expected: this harness falsifier fails on purpose while holding the node guard
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[harness-trace] drop pid 637176 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xfdfadaf46b74a647; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 31532, backend io_uring, route natural
+infinityd: listening on 31532
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+test a_failing_test_keeps_the_node_log ... ok
+[harness-trace] ready pid 637189 port 31539
+[harness-trace] ready pid 637185 port 31535
+[harness-trace] reserve port 31555
+[harness-trace] drop pid 637185 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354650054-31535 exited=None panicking=false
+test info_names_every_field_once_on_a_real_node ... ok
+[harness-trace] drop pid 637293 dir /tmp/inf-compat-oracle-31549 exited=None panicking=false
+[harness-trace] drop pid 637197 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356015173-31548 exited=None panicking=false
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+[harness-trace] drop pid 637396 dir /tmp/inf-compat-oracle-31552 exited=None panicking=false
+[harness-trace] drop pid 637188 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354731533-31538 exited=None panicking=false
+test run_id_is_40_hex_and_stable_like_redis ... ok
+[harness-trace] ready pid 637195 port 31542
+[harness-trace] reserve port 31556
+[harness-trace] ready pid 637200 port 31545
+[harness-trace] reserve port 31557
+[harness-trace] ready pid 637194 port 31543
+[harness-trace] drop pid 637415 dir /tmp/inf-compat-oracle-31553 exited=None panicking=false
+[harness-trace] drop pid 637186 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354663025-31536 exited=None panicking=false
+test tiered_namespace_argument_errors_match_redis ... ok
+[harness-trace] drop pid 637194 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355756893-31543 exited=None panicking=false
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+[harness-trace] ready pid 637191 port 31541
+[harness-trace] spawn pid 637582 port 31541 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163496089133-31541
+[harness-trace] drop pid 637582 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163496089133-31541 exited=Some(ExitStatus(unix_wait_status(256))) panicking=false
+[harness-trace] drop pid 637564 dir /tmp/inf-compat-oracle-31555 exited=None panicking=false
+[harness-trace] drop pid 637191 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354881858-31541 exited=None panicking=false
+test a_second_node_on_an_owned_port_refuses_to_start ... ok
+[harness-trace] drop pid 637189 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354779250-31539 exited=None panicking=false
+test client_id_is_positive_and_killable_like_redis ... ok
+[harness-trace] drop pid 637571 dir /tmp/inf-compat-oracle-31557 exited=None panicking=false
+[harness-trace] drop pid 637200 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355978040-31545 exited=None panicking=false
+test maxclients_refusal_matches_redis ... ok
+compat-diff ns lane: 2 namespaces (durable + tiered) × 52 keys (4 at MAX_KEY_LEN), values to 64 KiB, SCAN set-equality, 4 pinned refusals, 0 failures
+[harness-trace] drop pid 637570 dir /tmp/inf-compat-oracle-31556 exited=None panicking=false
+[harness-trace] drop pid 637195 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355786834-31542 exited=None panicking=false
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+[harness-trace] INFO stats 500 ms after the reset: Some("total_connections_received:1 rejected_connections:0 accept_errors:0")
+[harness-trace] node log 500 ms after the reset (exit None):
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x6fb0fbf540104604; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 2 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 2 cells, port 31534, backend io_uring, route natural
+infinityd: listening on 31534
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 2 cells serving (100 ms)
+
+--- end
+
+thread 'info_unknown_section_is_empty_like_redis' (637172) panicked at tests/compat/src/harness.rs:305:21:
+[harness-trace] readiness read on port 31534 failed: Connection reset by peer (os error 104); local Ok(127.0.0.1:44348); child pid 637179 (State:	S (sleeping) Threads:	16; wchan futex_do_wait; stat 637179 (infinityd) S 637164 634033 634033 0 -1 4194304 9339 0 0 0 10 5 0 0 20 0 16 0 3547625 239120384 11084 18446744073709551615 99488457431728 99488463225184 140728905872672 0 0 0 0 4096 17474 0 0 0 17 22 0 0 0 0 0 99488463563456 99488463565960 99489533386752 140728905878877 140728905879116 140728905879116 140728905883562 0
+); sockets on the port:
+LISTEN    0      1024                                  0.0.0.0:31534                0.0.0.0:*                                           uid:1000 ino:828718 sk:b005 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-62b7073b-648b-4ac6-bacc-1f648604dd23.scope <->                             
+processes:
+   2238       1 Mon Sep 14 14:48:18 2026 /usr/bin/redis-server 127.0.0.1:6379
+  14200    5743 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node --liftoff-only --disable-warning=ExperimentalWarning /home/kcaicedo/.codegraph/versions/v1.6.0/lib/dist/bin/codegraph.js serve --mcp --path /home/kcaicedo/Documents/Projects/databases/infinitydb
+  14208   14200 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node -e  const fs = require('fs'); const parentPid = Number(process.argv[1]); const timeoutMs = Number(process.argv[2]); const capMs = Number(process.argv[3]); const progressPaths = process.argv.slice(4); const secs = Math.round(timeoutMs / 1000); function kill(extra) {   // Timestamped so daemon.log kills can be correlated with anything (#1431) —   // computed here at kill time; this child process is never the wedged one.   try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\n')); } catch (e) {}   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}   process.exit(0); } // Fingerprint of the watched files (size + mtime). A change between checks is // forward disk progress — a slow synchronous SQLite statement, not a wedge. function snap() {   let s = '';   for (const p of progressPaths) {     try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }   }   return s; } let lastSnap = progressPaths.length ? snap() : ''; let lastSnapAt = Date.now(); let silentSince = null; // start of the current continuous-silence episode function onTimeout() {   if (!progressPaths.length) return kill('');   const now = Date.now();   if (silentSince === null) silentSince = now - timeoutMs; // silence began ~one timeout ago   const cur = snap();   if (cur !== lastSnap && now - silentSince < capMs) {     // The event loop is blocked but the DB files are advancing: a legitimate     // long store on slow storage. Defer, re-baseline, keep watching.     lastSnap = cur;     timer = setTimeout(onTimeout, timeoutMs);     return;   }   kill(cur !== lastSnap ? ' despite ongoing disk activity (hard cap ' + Math.round(capMs / 1000) + 's reached)' : ''); } let timer = setTimeout(onTimeout, timeoutMs); process.stdin.on('data', () => {   silentSince = null;   // Keep the baseline fresh while healthy (throttled — a stat per second).   if (progressPaths.length) {     const t = Date.now();     if (t - lastSnapAt >= 1000) { lastSnap = snap(); lastSnapAt = t; }   }   clearTimeout(timer); timer = setTimeout(onTimeout, timeoutMs); }); process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone process.stdin.resume();  14200 60000 600000 /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db-wal
+ 637176  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31532 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532 --device-probe off
+ 637179  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31534 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534 --device-probe off
+ 637184  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31533 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533 --device-probe off
+ 637185  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31535 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354650054-31535 --device-probe off
+ 637186  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31536 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354663025-31536 --device-probe off
+ 637187  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31537 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354689344-31537 --device-probe off
+ 637188  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31538 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354731533-31538 --device-probe off
+ 637189  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31539 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354779250-31539 --device-probe off
+ 637190  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31540 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354849602-31540 --device-probe off
+ 637191  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31541 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354881858-31541 --device-probe off
+ 637194  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31543 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355756893-31543 --device-probe off
+ 637195  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31542 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355786834-31542 --device-probe off
+ 637196  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31546 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546 --device-probe off
+ 637197  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31548 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356015173-31548 --device-probe off
+ 637199  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31544 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355970947-31544 --device-probe off
+ 637200  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31545 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355978040-31545 --device-probe off
+[harness-trace] drop pid 637179 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x6fb0fbf540104604; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 2 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 2 cells, port 31534, backend io_uring, route natural
+infinityd: listening on 31534
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 2 cells serving (100 ms)
+--- end of log tail
+test info_unknown_section_is_empty_like_redis ... FAILED
+[harness-trace] INFO stats 500 ms after the reset: Some("total_connections_received:1 rejected_connections:0 accept_errors:0")
+[harness-trace] node log 500 ms after the reset (exit None):
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xb792960627be4cb2; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 31546, backend io_uring, route natural
+infinityd: listening on 31546
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+
+--- end
+
+thread 'node_matrix_replies_match_redis' (637177) panicked at tests/compat/src/harness.rs:305:21:
+[harness-trace] readiness read on port 31546 failed: Connection reset by peer (os error 104); local Ok(127.0.0.1:33676); child pid 637196 (State:	S (sleeping) Threads:	30; wchan futex_do_wait; stat 637196 (infinityd) S 637164 634033 634033 0 -1 4194304 18939 0 0 0 20 8 0 0 20 0 30 0 3547625 400216064 20800 18446744073709551615 95618570582704 95618576376160 140732615773232 0 0 0 0 4096 17474 0 0 0 17 5 0 0 0 0 0 95618576714432 95618576716936 95619566493696 140732615777629 140732615777868 140732615777868 140732615782314 0
+); sockets on the port:
+
+processes:
+   2238       1 Mon Sep 14 14:48:18 2026 /usr/bin/redis-server 127.0.0.1:6379
+  14200    5743 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node --liftoff-only --disable-warning=ExperimentalWarning /home/kcaicedo/.codegraph/versions/v1.6.0/lib/dist/bin/codegraph.js serve --mcp --path /home/kcaicedo/Documents/Projects/databases/infinitydb
+  14208   14200 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node -e  const fs = require('fs'); const parentPid = Number(process.argv[1]); const timeoutMs = Number(process.argv[2]); const capMs = Number(process.argv[3]); const progressPaths = process.argv.slice(4); const secs = Math.round(timeoutMs / 1000); function kill(extra) {   // Timestamped so daemon.log kills can be correlated with anything (#1431) —   // computed here at kill time; this child process is never the wedged one.   try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\n')); } catch (e) {}   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}   process.exit(0); } // Fingerprint of the watched files (size + mtime). A change between checks is // forward disk progress — a slow synchronous SQLite statement, not a wedge. function snap() {   let s = '';   for (const p of progressPaths) {     try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }   }   return s; } let lastSnap = progressPaths.length ? snap() : ''; let lastSnapAt = Date.now(); let silentSince = null; // start of the current continuous-silence episode function onTimeout() {   if (!progressPaths.length) return kill('');   const now = Date.now();   if (silentSince === null) silentSince = now - timeoutMs; // silence began ~one timeout ago   const cur = snap();   if (cur !== lastSnap && now - silentSince < capMs) {     // The event loop is blocked but the DB files are advancing: a legitimate     // long store on slow storage. Defer, re-baseline, keep watching.     lastSnap = cur;     timer = setTimeout(onTimeout, timeoutMs);     return;   }   kill(cur !== lastSnap ? ' despite ongoing disk activity (hard cap ' + Math.round(capMs / 1000) + 's reached)' : ''); } let timer = setTimeout(onTimeout, timeoutMs); process.stdin.on('data', () => {   silentSince = null;   // Keep the baseline fresh while healthy (throttled — a stat per second).   if (progressPaths.length) {     const t = Date.now();     if (t - lastSnapAt >= 1000) { lastSnap = snap(); lastSnapAt = t; }   }   clearTimeout(timer); timer = setTimeout(onTimeout, timeoutMs); }); process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone process.stdin.resume();  14200 60000 600000 /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db-wal
+ 637176  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31532 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532 --device-probe off
+ 637179  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31534 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534 --device-probe off
+ 637184  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31533 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533 --device-probe off
+ 637185  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31535 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354650054-31535 --device-probe off
+ 637186  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31536 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354663025-31536 --device-probe off
+ 637187  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31537 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354689344-31537 --device-probe off
+ 637188  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31538 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354731533-31538 --device-probe off
+ 637189  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31539 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354779250-31539 --device-probe off
+ 637190  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31540 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354849602-31540 --device-probe off
+ 637191  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31541 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354881858-31541 --device-probe off
+ 637194  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31543 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355756893-31543 --device-probe off
+ 637195  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31542 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355786834-31542 --device-probe off
+ 637196  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31546 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546 --device-probe off
+ 637197  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31548 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356015173-31548 --device-probe off
+ 637199  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31544 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355970947-31544 --device-probe off
+ 637200  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31545 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355978040-31545 --device-probe off
+[harness-trace] INFO stats 500 ms after the reset: Some("total_connections_received:1 rejected_connections:0 accept_errors:0")
+[harness-trace] node log 500 ms after the reset (exit None):
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xd63e472b0f6e3cf6; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 31533, backend io_uring, route natural
+infinityd: listening on 31533
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+
+--- end
+
+thread 'info_keyspace_counts_the_whole_node_like_dbsize' (637169) panicked at tests/compat/src/harness.rs:305:21:
+[harness-trace] readiness read on port 31533 failed: Connection reset by peer (os error 104); local Ok(127.0.0.1:58782); child pid 637184 (State:	S (sleeping) Threads:	30; wchan futex_do_wait; stat 637184 (infinityd) S 637164 634033 634033 0 -1 4194304 18940 0 0 0 18 6 0 0 20 0 30 0 3547625 400216064 20744 18446744073709551615 106304530709168 106304536502624 140727787589760 0 0 0 0 4096 17474 0 0 0 17 5 0 0 0 0 0 106304536840896 106304536843400 106304892653568 140727787593053 140727787593292 140727787593292 140727787597738 0
+); sockets on the port:
+
+processes:
+   2238       1 Mon Sep 14 14:48:18 2026 /usr/bin/redis-server 127.0.0.1:6379
+  14200    5743 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node --liftoff-only --disable-warning=ExperimentalWarning /home/kcaicedo/.codegraph/versions/v1.6.0/lib/dist/bin/codegraph.js serve --mcp --path /home/kcaicedo/Documents/Projects/databases/infinitydb
+  14208   14200 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node -e  const fs = require('fs'); const parentPid = Number(process.argv[1]); const timeoutMs = Number(process.argv[2]); const capMs = Number(process.argv[3]); const progressPaths = process.argv.slice(4); const secs = Math.round(timeoutMs / 1000); function kill(extra) {   // Timestamped so daemon.log kills can be correlated with anything (#1431) —   // computed here at kill time; this child process is never the wedged one.   try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\n')); } catch (e) {}   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}   process.exit(0); } // Fingerprint of the watched files (size + mtime). A change between checks is // forward disk progress — a slow synchronous SQLite statement, not a wedge. function snap() {   let s = '';   for (const p of progressPaths) {     try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }   }   return s; } let lastSnap = progressPaths.length ? snap() : ''; let lastSnapAt = Date.now(); let silentSince = null; // start of the current continuous-silence episode function onTimeout() {   if (!progressPaths.length) return kill('');   const now = Date.now();   if (silentSince === null) silentSince = now - timeoutMs; // silence began ~one timeout ago   const cur = snap();   if (cur !== lastSnap && now - silentSince < capMs) {     // The event loop is blocked but the DB files are advancing: a legitimate     // long store on slow storage. Defer, re-baseline, keep watching.     lastSnap = cur;     timer = setTimeout(onTimeout, timeoutMs);     return;   }   kill(cur !== lastSnap ? ' despite ongoing disk activity (hard cap ' + Math.round(capMs / 1000) + 's reached)' : ''); } let timer = setTimeout(onTimeout, timeoutMs); process.stdin.on('data', () => {   silentSince = null;   // Keep the baseline fresh while healthy (throttled — a stat per second).   if (progressPaths.length) {     const t = Date.now();     if (t - lastSnapAt >= 1000) { lastSnap = snap(); lastSnapAt = t; }   }   clearTimeout(timer); timer = setTimeout(onTimeout, timeoutMs); }); process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone process.stdin.resume();  14200 60000 600000 /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db-wal
+ 637176  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31532 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354360749-31532 --device-probe off
+ 637179  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31534 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354483376-31534 --device-probe off
+ 637184  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31533 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533 --device-probe off
+ 637185  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31535 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354650054-31535 --device-probe off
+ 637186  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31536 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354663025-31536 --device-probe off
+ 637187  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31537 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354689344-31537 --device-probe off
+ 637188  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31538 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354731533-31538 --device-probe off
+ 637189  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31539 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354779250-31539 --device-probe off
+ 637190  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31540 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354849602-31540 --device-probe off
+ 637191  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31541 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354881858-31541 --device-probe off
+ 637194  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31543 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355756893-31543 --device-probe off
+ 637195  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31542 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355786834-31542 --device-probe off
+ 637196  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31546 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546 --device-probe off
+ 637197  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31548 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356015173-31548 --device-probe off
+ 637199  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31544 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355970947-31544 --device-probe off
+ 637200  637164 Tue Sep 15 00:39:23 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 31545 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355978040-31545 --device-probe off
+ 637293  637164 Tue Sep 15 00:39:23 2026 redis-server 127.0.0.1:31549
+ 637294  637164 Tue Sep 15 00:39:23 2026 redis-server 127.0.0.1:31550
+[harness-trace] drop pid 637184 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354518734-31533 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xd63e472b0f6e3cf6; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 31533, backend io_uring, route natural
+infinityd: listening on 31533
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+--- end of log tail
+test info_keyspace_counts_the_whole_node_like_dbsize ... FAILED
+[harness-trace] drop pid 637196 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163356003507-31546 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xb792960627be4cb2; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 31546, backend io_uring, route natural
+infinityd: listening on 31546
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+--- end of log tail
+test node_matrix_replies_match_redis ... FAILED
+compat-diff large-value lane: 2 MiB + MAX_VAL_LEN byte-exact, 16 MiB + 1 pinned
+[harness-trace] drop pid 637445 dir /tmp/inf-compat-oracle-31554 exited=None panicking=false
+[harness-trace] drop pid 637190 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354849602-31540 exited=None panicking=false
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+[harness-trace] drop pid 637294 dir /tmp/inf-compat-oracle-31550 exited=None panicking=false
+[harness-trace] drop pid 637199 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163355970947-31544 exited=None panicking=false
+test deadline_millisecond_read_matches_redis ... ok
+[harness-trace] drop pid 637332 dir /tmp/inf-compat-oracle-31551 exited=None panicking=false
+[harness-trace] drop pid 637187 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447163354689344-31537 exited=None panicking=false
+test timeout_closes_an_idle_connection_like_redis ... ok
+
+failures:
+
+failures:
+    info_keyspace_counts_the_whole_node_like_dbsize
+    info_unknown_section_is_empty_like_redis
+    node_matrix_replies_match_redis
+
+test result: FAILED. 14 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+

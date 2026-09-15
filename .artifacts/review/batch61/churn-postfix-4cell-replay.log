@@ -1,0 +1,6 @@
+  log tail: ', total 11446.0)\ncontrol: cell 3 recovered (39 segments, 10468982784 bytes, 0 records; phases ms: start 0.2, ckpt 0.0 [0 B], replay 3.5 [0 B], audit 11435.0 [10468982784 B], finish 0.1, total 11438.8)'
+boot 38: odd-reply (b'-ERR namespace already exists\r\n', b'+OK\r\n', b'+OK\r\n') (loading replies 24)
+  log tail: '0 bytes) for 11s\ncontrol: cell 1 recovered (40 segments, 10737418240 bytes, 0 records; phases ms: start 0.2, ckpt 0.0 [0 B], replay 4.0 [0 B], audit 11747.5 [10737418240 B], finish 0.1, total 11751.8)'
+boot 39: odd-reply (b'-ERR namespace already exists\r\n', b'+OK\r\n', b'+OK\r\n') (loading replies 23)
+  log tail: ' audit (11005853696/11005853696 bytes) for 12s\ncontrol: cell 2 not ready — in audit (11005853696/11005853696 bytes) for 12s\ncontrol: cell 3 not ready — in audit (11005853696/11005853696 bytes) for 12s'
+40 boots (4 cells, replay 40000) in 256.2s: {'ok': 1, 'odd-reply': 39}; -LOADING replies seen: 524

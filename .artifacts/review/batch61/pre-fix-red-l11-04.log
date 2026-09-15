@@ -1,0 +1,43 @@
+warning: variable does not need to be mutable
+    --> crates/inf-runtime/src/cold.rs:1304:34
+     |
+1304 |         let (mut refunded_bytes, mut refunded_ops) = (0u64, 0u64);
+     |                                  ----^^^^^^^^^^^^
+     |                                  |
+     |                                  help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `inf-runtime` (lib test) generated 1 warning (run `cargo fix --lib -p inf-runtime --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 2 tests
+test cold::tests::a_pool_dry_stall_refunds_the_charged_op ... FAILED
+test cold::tests::a_deferred_maintain_keeps_its_grant ... FAILED
+
+failures:
+
+---- cold::tests::a_pool_dry_stall_refunds_the_charged_op stdout ----
+
+thread 'cold::tests::a_pool_dry_stall_refunds_the_charged_op' (596409) panicked at crates/inf-runtime/src/cold.rs:1323:9:
+assertion `left == right` failed: net ops = reads issued (drifts by pool_dry pre-fix)
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- cold::tests::a_deferred_maintain_keeps_its_grant stdout ----
+
+thread 'cold::tests::a_deferred_maintain_keeps_its_grant' (596408) panicked at crates/inf-runtime/src/cold.rs:1363:9:
+assertion `left == right` failed: the deferred maintain read goes first, not a refilled fff
+  left: 52428800
+ right: 104857600
+
+
+failures:
+    cold::tests::a_deferred_maintain_keeps_its_grant
+    cold::tests::a_pool_dry_stall_refunds_the_charged_op
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-runtime --lib`

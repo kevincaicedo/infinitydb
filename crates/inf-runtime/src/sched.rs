@@ -41,7 +41,8 @@ impl GroupScheduler {
     /// # Panics
     /// Panics if any weight or the quantum is zero — a zero-weight group
     /// would silently starve, which is exactly what this scheduler exists to
-    /// prevent.
+    /// prevent — or if `quantum × weight` does not fit `u32` (the initial
+    /// deficit; batch 61 — it wrapped in release).
     pub fn new(
         quantum: u32,
         max_deficit: u32,
@@ -53,11 +54,14 @@ impl GroupScheduler {
             quantum > 0 && fg_weight > 0 && maint_weight > 0 && ckpt_weight > 0,
             "zero quantum/weight"
         );
+        let deficit = |weight: u32| {
+            quantum.checked_mul(weight).expect("quantum × weight must fit u32 (initial deficit)")
+        };
         GroupScheduler {
             groups: [
-                Group { weight: fg_weight, deficit: quantum * fg_weight },
-                Group { weight: maint_weight, deficit: quantum * maint_weight },
-                Group { weight: ckpt_weight, deficit: quantum * ckpt_weight },
+                Group { weight: fg_weight, deficit: deficit(fg_weight) },
+                Group { weight: maint_weight, deficit: deficit(maint_weight) },
+                Group { weight: ckpt_weight, deficit: deficit(ckpt_weight) },
             ],
             quantum,
             max_deficit,
@@ -95,6 +99,15 @@ impl GroupScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Batch 61 (lane L11 `sched.rs:58-60`): the initial deficit is
+    /// `quantum × weight`; a product past `u32` is refused by name, not
+    /// wrapped in release.
+    #[test]
+    #[should_panic(expected = "quantum × weight")]
+    fn a_quantum_weight_product_past_u32_is_refused() {
+        let _ = GroupScheduler::new(1 << 20, 4096, 1 << 12, 1, 1);
+    }
 
     #[test]
     fn weighted_refill_and_cap() {

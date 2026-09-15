@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 4 tests
+test net::tests::pin_refuses_a_core_past_cpu_setsize ... ok
+test sched::tests::a_quantum_weight_product_past_u32_is_refused - should panic ... ok
+test timer::tests::advance_jumps_over_ticks_where_nothing_happens ... ok
+test timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.00s
+
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running tests/reactor.rs (target/debug/deps/reactor-c2d61d23215ff11f)
+
+running 1 test
+test the_first_iteration_polls_before_anything_is_armed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+

@@ -118,14 +118,68 @@ pub fn probe_port_unowned(port: u16) -> io::Result<()> {
     if port == 0 {
         return Ok(());
     }
-    match TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
-        Ok(_probe) => Ok(()),
+    match probe_addr_unowned(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port)) {
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("port {port} is already owned by another process (address in use)"),
         )),
         Err(e) => Err(e),
     }
+}
+
+/// Binds `addr` (`SO_REUSEADDR`, no reuseport, **no listen**) and closes
+/// it: `Ok` when nothing listens there. A bound socket never accepts, so
+/// a connection arriving inside the probe's window is refused, not
+/// accepted-then-reset — and a copy of the socket inherited by a
+/// concurrently spawned child (`posix_spawn` copies the fd table until
+/// the child execs) cannot answer either. Batch 61: `TcpListener::bind`
+/// listens, and the compat harness's listening probe lived on in a
+/// sibling test's spawning child long enough to accept — and then reset —
+/// the readiness `PING` on a just-reserved port.
+///
+/// # Errors
+/// `AddrInUse` when a listener owns the address; other socket/bind
+/// failures as they are.
+pub fn probe_addr_unowned(addr: std::net::SocketAddrV4) -> io::Result<()> {
+    // SAFETY: plain socket(2) FFI; the fd is checked before use and owned
+    // by `owned` (closed on every path below).
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the raw fd is fresh and owned exclusively here.
+    let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt with a valid int pointer on the live socket.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&raw const one).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sin = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: addr.port().to_be(),
+        sin_addr: libc::in_addr { s_addr: u32::from(*addr.ip()).to_be() },
+        sin_zero: [0; 8],
+        #[cfg(target_os = "macos")]
+        sin_len: 0,
+    };
+    // SAFETY: sin is a fully initialized sockaddr_in of the stated length.
+    let rc = unsafe {
+        libc::bind(fd, (&raw const sin).cast(), size_of::<libc::sockaddr_in>() as libc::socklen_t)
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The port a listener actually bound (port 0 = kernel-assigned; tests).
@@ -180,23 +234,78 @@ pub fn wake_pair() -> io::Result<(std::os::fd::OwnedFd, LoopWaker)> {
 }
 
 /// Pins the calling thread to `core` (Linux; best-effort no-op elsewhere —
-/// the dev tier runs unpinned).
-pub fn pin_current_thread(core: usize) {
+/// the dev tier runs unpinned). A core past `CPU_SETSIZE` is refused
+/// typed (batch 61): the value is CLI-supplied and `CPU_SET` would index
+/// out of bounds.
+///
+/// # Errors
+/// `InvalidInput` for a core the affinity mask cannot name; the
+/// `sched_setaffinity` failure itself is best-effort and not reported.
+pub fn pin_current_thread(core: usize) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    // SAFETY: sched_setaffinity on self with a properly built cpu_set_t;
-    // failure just leaves the thread unpinned.
-    unsafe {
-        let mut set: libc::cpu_set_t = core::mem::zeroed();
-        libc::CPU_SET(core, &mut set);
-        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set);
+    {
+        let cap = usize::try_from(libc::CPU_SETSIZE).unwrap_or(0);
+        if core >= cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("core {core} is past CPU_SETSIZE ({cap}) — pin start too high"),
+            ));
+        }
+        // SAFETY: sched_setaffinity on self with a properly built cpu_set_t
+        // (`core < CPU_SETSIZE` checked above); failure just leaves the
+        // thread unpinned.
+        unsafe {
+            let mut set: libc::cpu_set_t = core::mem::zeroed();
+            libc::CPU_SET(core, &mut set);
+            libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set);
+        }
     }
     #[cfg(not(target_os = "linux"))]
     let _ = core;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Batch 61: the owned-port probe must never *accept* — a connection
+    /// arriving inside its window is refused, not accepted-then-reset
+    /// (`TcpListener::bind` listens; a bound socket does not).
+    #[test]
+    fn the_port_probe_never_accepts_a_connection() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let port = bound_port(&listen_reuseport(0).expect("pick")).expect("port");
+        // The picker's listener is dropped with the temporary above; the
+        // port is free now.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let accepted = std::sync::Arc::new(AtomicU32::new(0));
+        let hammer = {
+            let (stop, accepted) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&accepted));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            probe_port_unowned(port).expect("free port");
+        }
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().expect("hammer");
+        assert_eq!(accepted.load(Ordering::Relaxed), 0, "the probe accepted connections");
+    }
+
+    /// Batch 61 (lane L11 `net.rs:122-123`): a core past `CPU_SETSIZE`
+    /// (CLI-supplied) is a typed refusal, not `CPU_SET`'s index panic.
+    #[test]
+    fn pin_refuses_a_core_past_cpu_setsize() {
+        let err = pin_current_thread(usize::MAX).expect_err("out of range");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains("CPU_SETSIZE"), "{err}");
+    }
 
     /// Batch 59: a reuseport group already listening on the port is
     /// exactly what a second node would silently join; the probe refuses

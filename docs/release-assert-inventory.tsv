@@ -411,6 +411,7 @@ I	1	crates/inf-runtime/src/kqueue.rs	expect	collected above	the fds were collect
 I	1	crates/inf-runtime/src/kqueue.rs	expect	eventlist fits i32	the event buffer is sized at construction (a small constant)
 I	2	crates/inf-runtime/src/kqueue.rs	expect	head exists	`while let Some(head) = queue.front_mut()` precedes the `pop_front`
 I	1	crates/inf-runtime/src/sched.rs	assert	zero quantum/weight	the only production constructor is `GroupScheduler::m0_default` (constants); no flag reaches `new`
+I	1	crates/inf-runtime/src/sched.rs	expect	quantum × weight must fit u32 (initial deficit)	same constructor, same constants (64 × 8 at most); the bound is stated instead of wrapped in release (batch 61, lane L11)
 I	1	crates/inf-runtime/src/timer.rs	expect	timer slab exceeds u32	one entry per armed connection/loop timer (≥ 32 B): 2^32 armed timers is 128 GiB — memory exhausts first; timers are armed per connection, and connections are admission-bounded
 I	1	crates/inf-runtime/src/timer.rs	unreachable	top level catches all deltas	the loop's last level takes every delta (`level == LEVELS - 1`)
 I	1	crates/inf-log/src/tier.rs	assert	tier round exceeds its 8-bit op index (ADR-0084 D3)	the round's own op count (`writes.len() + barriers.len()`) checked before every push; `ROUND_OPS_MAX = 256` is the width of the token's op-index field — a validated slice (≤ 64 MiB, ring ≥ slice) stages ≤ ~75 ops per round (batch 14; red first with 257 barriers)

@@ -1,0 +1,175 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.35s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 4 tests
+
+thread 'net::tests::pin_refuses_a_core_past_cpu_setsize' (600600) panicked at /home/kcaicedo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.186/src/unix/linux_like/linux_l4re_shared.rs:1534:9:
+index out of bounds: the len is 16 but the index is 288230376151711743
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'net::tests::pin_refuses_a_core_past_cpu_setsize' (600600) panicked at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:225:5:
+panic in a function that cannot unwind
+stack backtrace:
+   0:     0x5e97d785b8ea - std[e28293b1aa0f68bd]::backtrace_rs::backtrace::libunwind::trace
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1:     0x5e97d785b8ea - std[e28293b1aa0f68bd]::backtrace_rs::backtrace::trace_unsynchronized::<std[e28293b1aa0f68bd]::sys::backtrace::_print_fmt::{closure#1}>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2:     0x5e97d785b8ea - std[e28293b1aa0f68bd]::sys::backtrace::_print_fmt
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:74:9
+   3:     0x5e97d785b8ea - <<std[e28293b1aa0f68bd]::sys::backtrace::BacktraceLock>::print::DisplayBacktrace as core[c1f1a4ba060b9bfa]::fmt::Display>::fmt
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:44:26
+   4:     0x5e97d78707ba - <core[c1f1a4ba060b9bfa]::fmt::rt::Argument>::fmt
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/fmt/rt.rs:152:76
+   5:     0x5e97d78707ba - core[c1f1a4ba060b9bfa]::fmt::write
+   6:     0x5e97d7860ff2 - std[e28293b1aa0f68bd]::io::default_write_fmt::<std[e28293b1aa0f68bd]::sys::stdio::unix::Stderr>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/io/mod.rs:639:11
+   7:     0x5e97d7860ff2 - <std[e28293b1aa0f68bd]::sys::stdio::unix::Stderr as std[e28293b1aa0f68bd]::io::Write>::write_fmt
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/io/mod.rs:1994:13
+   8:     0x5e97d783a06f - <std[e28293b1aa0f68bd]::sys::backtrace::BacktraceLock>::print
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:47:9
+   9:     0x5e97d783a06f - std[e28293b1aa0f68bd]::panicking::default_hook::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:292:27
+  10:     0x5e97d78538b1 - std[e28293b1aa0f68bd]::panicking::default_hook
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:319:9
+  11:     0x5e97d77ea48c - <alloc[fdfd2bd8633a6659]::boxed::Box<dyn for<'a, 'b> core[c1f1a4ba060b9bfa]::ops::function::Fn<(&'a std[e28293b1aa0f68bd]::panic::PanicHookInfo<'b>,), Output = ()> + core[c1f1a4ba060b9bfa]::marker::Sync + core[c1f1a4ba060b9bfa]::marker::Send> as core[c1f1a4ba060b9bfa]::ops::function::Fn<(&std[e28293b1aa0f68bd]::panic::PanicHookInfo,)>>::call
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2254:9
+  12:     0x5e97d77ea48c - test[273d7611820c9051]::test_main_with_exit_callback::<test[273d7611820c9051]::test_main::{closure#0}>::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:145:21
+  13:     0x5e97d7853aa2 - <alloc[fdfd2bd8633a6659]::boxed::Box<dyn for<'a, 'b> core[c1f1a4ba060b9bfa]::ops::function::Fn<(&'a std[e28293b1aa0f68bd]::panic::PanicHookInfo<'b>,), Output = ()> + core[c1f1a4ba060b9bfa]::marker::Sync + core[c1f1a4ba060b9bfa]::marker::Send> as core[c1f1a4ba060b9bfa]::ops::function::Fn<(&std[e28293b1aa0f68bd]::panic::PanicHookInfo,)>>::call
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2254:9
+  14:     0x5e97d7853aa2 - std[e28293b1aa0f68bd]::panicking::panic_with_hook
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:833:13
+  15:     0x5e97d783a15a - std[e28293b1aa0f68bd]::panicking::panic_handler::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:691:13
+  16:     0x5e97d7831a19 - std[e28293b1aa0f68bd]::sys::backtrace::__rust_end_short_backtrace::<std[e28293b1aa0f68bd]::panicking::panic_handler::{closure#0}, !>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:182:18
+  17:     0x5e97d783affd - __rustc[b7974e8690430dd9]::rust_begin_unwind
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:689:5
+  18:     0x5e97d7870e7d - core[c1f1a4ba060b9bfa]::panicking::panic_nounwind_fmt::runtime
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:122:22
+  19:     0x5e97d7870e7d - core[c1f1a4ba060b9bfa]::panicking::panic_nounwind_fmt
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/intrinsics/mod.rs:2447:9
+  20:     0x5e97d7870dfb - core[c1f1a4ba060b9bfa]::panicking::panic_nounwind
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:225:5
+  21:     0x5e97d7870f87 - core[c1f1a4ba060b9bfa]::panicking::panic_cannot_unwind
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panicking.rs:337:5
+  22:     0x5e97d77b60e7 - libc::unix::linux_like::linux_l4re_shared::CPU_SET::h1dccfb6918349515
+                               at /home/kcaicedo/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.186/src/macros.rs:385:9
+  23:     0x5e97d779e74b - inf_runtime::net::pin_current_thread::h589f46c3281a228c
+                               at /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime/src/net.rs:190:9
+  24:     0x5e97d77b4bed - inf_runtime::net::tests::pin_refuses_a_core_past_cpu_setsize::h0712a45d4ab1fd92
+                               at /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime/src/net.rs:206:9
+  25:     0x5e97d77d1d57 - inf_runtime::net::tests::pin_refuses_a_core_past_cpu_setsize::{{closure}}::he0266fa5de4f65ac
+                               at /home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime/src/net.rs:204:45
+  26:     0x5e97d77dacb6 - core::ops::function::FnOnce::call_once::h149da506dc559e0f
+                               at /home/kcaicedo/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  27:     0x5e97d77de56b - <fn() -> core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String> as core[c1f1a4ba060b9bfa]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/ops/function.rs:250:5
+  28:     0x5e97d77de56b - test[273d7611820c9051]::__rust_begin_short_backtrace::<core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String>, fn() -> core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String>>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:663:18
+  29:     0x5e97d77eaf5b - test[273d7611820c9051]::run_test_in_process::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:686:74
+  30:     0x5e97d77eaf5b - <core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<test[273d7611820c9051]::run_test_in_process::{closure#0}> as core[c1f1a4ba060b9bfa]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panic/unwind_safe.rs:274:9
+  31:     0x5e97d77eaf5b - std[e28293b1aa0f68bd]::panicking::catch_unwind::do_call::<core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<test[273d7611820c9051]::run_test_in_process::{closure#0}>, core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String>>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:581:40
+  32:     0x5e97d77eaf5b - std[e28293b1aa0f68bd]::panicking::catch_unwind::<core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String>, core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<test[273d7611820c9051]::run_test_in_process::{closure#0}>>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:544:19
+  33:     0x5e97d77eaf5b - std[e28293b1aa0f68bd]::panic::catch_unwind::<core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<test[273d7611820c9051]::run_test_in_process::{closure#0}>, core[c1f1a4ba060b9bfa]::result::Result<(), alloc[fdfd2bd8633a6659]::string::String>>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panic.rs:359:14
+  34:     0x5e97d77eaf5b - test[273d7611820c9051]::run_test_in_process
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:686:27
+  35:     0x5e97d77eaf5b - test[273d7611820c9051]::run_test::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:607:43
+  36:     0x5e97d77e6674 - test[273d7611820c9051]::run_test::{closure#1}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/test/src/lib.rs:637:41
+  37:     0x5e97d77e6674 - std[e28293b1aa0f68bd]::sys::backtrace::__rust_begin_short_backtrace::<test[273d7611820c9051]::run_test::{closure#1}, ()>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/backtrace.rs:166:18
+  38:     0x5e97d77edb62 - std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked::<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/thread/lifecycle.rs:91:13
+  39:     0x5e97d77edb62 - <core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}> as core[c1f1a4ba060b9bfa]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/panic/unwind_safe.rs:274:9
+  40:     0x5e97d77edb62 - std[e28293b1aa0f68bd]::panicking::catch_unwind::do_call::<core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:581:40
+  41:     0x5e97d77edb62 - std[e28293b1aa0f68bd]::panicking::catch_unwind::<(), core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panicking.rs:544:19
+  42:     0x5e97d77edb62 - std[e28293b1aa0f68bd]::panic::catch_unwind::<core[c1f1a4ba060b9bfa]::panic::unwind_safe::AssertUnwindSafe<std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}::{closure#0}>, ()>
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/panic.rs:359:14
+  43:     0x5e97d77edb62 - std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked::<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/thread/lifecycle.rs:89:26
+  44:     0x5e97d77edb62 - <std[e28293b1aa0f68bd]::thread::lifecycle::spawn_unchecked<test[273d7611820c9051]::run_test::{closure#1}, ()>::{closure#1} as core[c1f1a4ba060b9bfa]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/ops/function.rs:250:5
+  45:     0x5e97d785af2f - <alloc[fdfd2bd8633a6659]::boxed::Box<dyn core[c1f1a4ba060b9bfa]::ops::function::FnOnce<(), Output = ()> + core[c1f1a4ba060b9bfa]::marker::Send> as core[c1f1a4ba060b9bfa]::ops::function::FnOnce<()>>::call_once
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2240:9
+  46:     0x5e97d785af2f - <std[e28293b1aa0f68bd]::sys::thread::unix::Thread>::new::thread_start
+                               at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/thread/unix.rs:118:17
+  47:     0x74f2c60a3dfa - start_thread
+                               at ./nptl/pthread_create.c:454:8
+  48:     0x74f2c61375cc - __GI___clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0
+  49:                0x0 - <unknown>
+thread caused non-unwinding panic. aborting.
+error: test failed, to rerun pass `-p inf-runtime --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/inf_runtime-f49ad358e4efa34e 'timer::tests::next_deadline_never_passes' 'timer::tests::advance_jumps' 'sched::tests::a_quantum_weight' 'net::tests::pin_refuses'` (signal: 6, SIGABRT: process abort signal)
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running tests/reactor.rs (target/debug/deps/reactor-c2d61d23215ff11f)
+
+running 1 test
+test the_first_iteration_polls_before_anything_is_armed ... FAILED
+
+failures:
+
+---- the_first_iteration_polls_before_anything_is_armed stdout ----
+
+thread 'the_first_iteration_polls_before_anything_is_armed' (600874) panicked at crates/inf-runtime/tests/reactor.rs:167:9:
+spin_iters 4: boot parked: ["park"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    the_first_iteration_polls_before_anything_is_armed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-runtime --test reactor`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 3 tests
+test sched::tests::a_quantum_weight_product_past_u32_is_refused - should panic ... FAILED
+test timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier ... FAILED
+test timer::tests::advance_jumps_over_ticks_where_nothing_happens ... FAILED
+
+failures:
+
+---- sched::tests::a_quantum_weight_product_past_u32_is_refused stdout ----
+
+thread 'sched::tests::a_quantum_weight_product_past_u32_is_refused' (600972) panicked at crates/inf-runtime/src/sched.rs:58:53:
+attempt to multiply with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+note: panic did not contain expected string
+      panic message: "attempt to multiply with overflow"
+ expected substring: "quantum × weight"
+---- timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier stdout ----
+
+thread 'timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier' (600974) panicked at crates/inf-runtime/src/timer.rs:257:9:
+park deadline Nanos(70000000) sleeps past the 65 ms timer
+
+---- timer::tests::advance_jumps_over_ticks_where_nothing_happens stdout ----
+
+thread 'timer::tests::advance_jumps_over_ticks_where_nothing_happens' (600973) panicked at crates/inf-runtime/src/timer.rs:278:9:
+walked 3600000 ticks
+
+
+failures:
+    sched::tests::a_quantum_weight_product_past_u32_is_refused
+    timer::tests::advance_jumps_over_ticks_where_nothing_happens
+    timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `-p inf-runtime --lib`

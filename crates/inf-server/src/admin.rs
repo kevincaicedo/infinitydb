@@ -122,6 +122,7 @@ pub(crate) fn info(
         push(&mut text, "redis_mode:standalone");
         push(&mut text, &format!("os:{}", std::env::consts::OS));
         push(&mut text, "arch_bits:64");
+        push(&mut text, &format!("process_id:{}", node.process_id.get()));
         push(&mut text, &format!("run_id:{}", render_run_id(node)));
         push(&mut text, &format!("server_time_usec:{}", wall_ms(node, now) * 1000));
         push(&mut text, &format!("uptime_in_seconds:{uptime_secs}"));
@@ -3072,6 +3073,19 @@ mod tests {
     /// Review 2026-08-30 F-L15-02 (batch 51, ADR-0124 D5): `run_id` is a
     /// node identity — 40 hex digits, the same value before and after a
     /// `RANDOMKEY` (pre-fix it was the RANDOMKEY RNG cursor, 32 digits),
+    /// Batch 61: `process_id` renders the pid assembly set — the identity
+    /// a harness checks its spawned child against (a foreign node on the
+    /// same port answers `PING` just as well).
+    #[test]
+    fn process_id_renders_the_assembled_pid() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.process_id.set(424_242);
+        let reply = run(&mut cx, &mut store, &[b"INFO", b"server"]);
+        let text = String::from_utf8(reply).expect("ascii");
+        assert!(text.contains("\r\nprocess_id:424242\r\n"), "{text}");
+    }
+
     /// and `master_replid` renders the same identity.
     #[test]
     fn run_id_survives_randomkey() {

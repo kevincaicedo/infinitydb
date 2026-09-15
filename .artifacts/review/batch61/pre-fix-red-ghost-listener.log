@@ -1,0 +1,33 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.04s
+     Running unittests src/lib.rs (target/debug/deps/compat-bed998fbbf4523cd)
+
+running 1 test
+test harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener ... FAILED
+
+failures:
+
+---- harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener stdout ----
+
+thread 'harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener' (639608) panicked at tests/compat/src/harness.rs:675:9:
+a spawned child answered on reserved ports [21310, 21376, 21417, 21460, 21499, 21551, 21562, 21622, 21623, 21626, 21783, 21863, 21922, 21957, 22101, 22110, 22155, 22197, 22224, 22264, 22304, 22425, 22462, 22484, 22504, 22563, 22605, 22698, 22738, 22779, 22789, 22852, 22919, 22930, 22942, 22981, 22982, 23103, 23122, 23151, 23189, 23254, 23265, 23273, 23304, 23343, 23401, 23418, 23467, 23486, 23513, 23543, 23578, 23661, 23677, 23718, 23723, 23909, 23931, 23948, 24088, 24186, 24398, 24399, 24407, 24437, 24626, 24630, 24645, 24669, 24684, 24723, 24743, 24799, 24836, 24965, 25002, 25139, 25167]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p compat --lib`
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 1 test
+test net::tests::the_port_probe_never_accepts_a_connection ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 1.03s
+

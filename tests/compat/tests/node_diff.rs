@@ -29,8 +29,8 @@ use std::net::TcpStream;
 use std::path::Path;
 
 use compat::harness::{
-    CaseOverride, Expect, candidate, infinityd, oracle, parse_int_reply, read_frames, run_matrix,
-    spawn_infinityd_at,
+    CaseOverride, Expect, candidate, infinityd, infinityd_at, oracle, parse_int_reply, read_frames,
+    run_matrix, spawn_infinityd_at,
 };
 use compat::matrix::MATRIX;
 use compat::resp::encode_command;
@@ -101,7 +101,9 @@ fn node_matrix_replies_match_redis() {
 /// Sends one command and reads one reply frame.
 fn cmd(stream: &mut TcpStream, buf: &mut Vec<u8>, argv: &[&str]) -> Vec<u8> {
     let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
-    stream.write_all(&encode_command(&owned)).expect("write");
+    if let Err(e) = stream.write_all(&encode_command(&owned)) {
+        panic!("write {argv:?} to {:?} failed: {e}", stream.peer_addr());
+    }
     read_frames(stream, buf, 1)
 }
 
@@ -737,6 +739,42 @@ fn a_second_node_on_an_owned_port_refuses_to_start() {
     assert!(log.contains(&format!("port {port} is already owned by another process")), "{log}");
     // The first node is untouched by the refused second.
     assert_eq!(cmd(&mut first, &mut fb, &["PING"]), b"+PONG\r\n");
+}
+
+/// Batch 61 (lane L19's batch-59 residual, seen as the batch-60 compat
+/// flake): readiness must pair a test with the process it spawned. A
+/// foreign node already answering on the port — a leftover measurement
+/// node, an operator's — answers the readiness `PING` before the spawned
+/// child even reaches its owned-port refusal, and pre-fix `infinityd_at`
+/// handed the test that foreign node (the kept log was empty because the
+/// child never served). Now `INFO server:process_id` must name the child.
+#[test]
+fn readiness_refuses_a_port_another_node_answers() {
+    let Some(bin) = candidate() else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((foreign_guard, mut foreign)) = infinityd(1, scratch_base()) else {
+        return;
+    };
+    let mut fb = Vec::new();
+    assert_eq!(cmd(&mut foreign, &mut fb, &["PING"]), b"+PONG\r\n");
+    let port = foreign.peer_addr().expect("peer addr").port();
+    let foreign_pid = foreign_guard.pid();
+    let paired = infinityd_at(&bin, 1, port, scratch_base());
+    let err = match paired {
+        Ok((_guard, _stream)) => {
+            panic!("readiness paired the test with a node it did not spawn (pid {foreign_pid})")
+        }
+        Err(err) => err,
+    };
+    eprintln!("readiness refused: {err}");
+    assert!(
+        err.contains(&format!("pid {foreign_pid}")) || err.contains("exited before answering"),
+        "the refusal names the foreign owner: {err}"
+    );
+    // The foreign node is untouched.
+    assert_eq!(cmd(&mut foreign, &mut fb, &["PING"]), b"+PONG\r\n");
 }
 
 /// Batch 59: a test that fails while the node is up keeps the node's

@@ -312,7 +312,7 @@ impl UringDriver {
         let Some(fd) = &self.wake_fd else { return };
         let raw = fd.as_raw_fd();
         let id = self.alloc_id(OpState::WakeWatch);
-        self.push_sqe(opcode::PollAdd::new(Fd(raw), libc::POLLIN as u32).build().user_data(id));
+        self.backlog_sqe(opcode::PollAdd::new(Fd(raw), libc::POLLIN as u32).build().user_data(id));
     }
 
     fn alloc_id(&mut self, state: OpState) -> u64 {
@@ -321,15 +321,16 @@ impl UringDriver {
         self.next_id
     }
 
-    /// Queue an SQE (backlog when the SQ is full; flushed next submit).
-    fn push_sqe(&mut self, entry: squeue::Entry) {
+    /// Append an SQE to the backlog — the SQ itself is touched only by
+    /// `flush_backlog` (batch 61: the name said "push").
+    fn backlog_sqe(&mut self, entry: squeue::Entry) {
         self.backlog.push_back(SqeChain { first: entry, linked: None });
     }
 
     /// Queue an `IOSQE_IO_LINK` pair. `first` must carry the link flag; the
     /// flush keeps both inside one submission window so the kernel actually
     /// chains them.
-    fn push_chain(&mut self, first: squeue::Entry, linked: squeue::Entry) {
+    fn backlog_chain(&mut self, first: squeue::Entry, linked: squeue::Entry) {
         self.backlog.push_back(SqeChain { first, linked: Some(linked) });
     }
 
@@ -350,7 +351,18 @@ impl UringDriver {
             if room < needed {
                 // SQ full (a chain also refuses to split across the submit
                 // boundary): hand the kernel what we have and retry once.
-                self.ring.submitter().submit()?;
+                // `EBUSY` (the CQ needs reaping first) is not fatal here
+                // any more than at the outer enter: the chain stays queued
+                // and the reap below makes room (batch 61, lane L11).
+                match self.ring.submitter().submit() {
+                    Ok(_) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                        self.stats.syscalls += 1;
+                        self.backlog.push_front(chain);
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
                 self.stats.syscalls += 1;
                 let room = {
                     let sq = self.ring.submission();
@@ -411,7 +423,7 @@ impl UringDriver {
                 .build()
                 .user_data(id),
         };
-        self.push_sqe(entry);
+        self.backlog_sqe(entry);
     }
 
     /// Arm a positional log-frame write under its barrier (ADR-0013 D1,
@@ -464,9 +476,9 @@ impl UringDriver {
                     .flags(types::FsyncFlags::DATASYNC)
                     .build()
                     .user_data(fid);
-                self.push_chain(entry.flags(squeue::Flags::IO_LINK), fentry);
+                self.backlog_chain(entry.flags(squeue::Flags::IO_LINK), fentry);
             }
-            None => self.push_sqe(entry),
+            None => self.backlog_sqe(entry),
         }
     }
 
@@ -479,7 +491,7 @@ impl UringDriver {
                 .build()
                 .user_data(id)
         };
-        self.push_sqe(entry);
+        self.backlog_sqe(entry);
         if let Some(arm) = self.accepts.get_mut(&listener) {
             arm.op_id = Some(id);
             arm.parked = None;
@@ -515,7 +527,7 @@ impl UringDriver {
         if self.caps.multishot_recv {
             let id = self.alloc_id(OpState::RecvMulti { fd, token });
             let entry = opcode::RecvMulti::new(Fd(fd), BGID).build().user_data(id);
-            self.push_sqe(entry);
+            self.backlog_sqe(entry);
             self.set_recv_op(fd, id);
             return;
         }
@@ -524,7 +536,7 @@ impl UringDriver {
             None => {
                 let id = self.alloc_id(OpState::PollDry { fd, token });
                 let entry = opcode::PollAdd::new(Fd(fd), libc::POLLIN as u32).build().user_data(id);
-                self.push_sqe(entry);
+                self.backlog_sqe(entry);
                 self.set_recv_op(fd, id);
             }
         }
@@ -541,7 +553,7 @@ impl UringDriver {
         let addr = pool.bytes_mut(buf).as_mut_ptr();
         let id = self.alloc_id(OpState::RecvOneshot { fd, token, buf });
         let entry = opcode::Recv::new(Fd(fd), addr, len).build().user_data(id);
-        self.push_sqe(entry);
+        self.backlog_sqe(entry);
         self.set_recv_op(fd, id);
     }
 
@@ -571,7 +583,7 @@ impl UringDriver {
                 // them.
                 let entry =
                     opcode::ProvideBuffers::new(addr, len, 1, BGID, bid).build().user_data(id);
-                self.push_sqe(entry);
+                self.backlog_sqe(entry);
             }
         }
         let paused: Vec<(RawFd, CompletionToken)> = self
@@ -621,7 +633,7 @@ impl UringDriver {
                     arm.disarmed = true;
                     if let Some(op_id) = arm.op_id {
                         let id = self.alloc_id(OpState::Cancel);
-                        self.push_sqe(opcode::AsyncCancel::new(op_id).build().user_data(id));
+                        self.backlog_sqe(opcode::AsyncCancel::new(op_id).build().user_data(id));
                     }
                 }
                 IoOp::Send { fd, buf, len, token } => {
@@ -641,7 +653,7 @@ impl UringDriver {
                         written: 0,
                         closing: None,
                     });
-                    self.push_sqe(opcode::Send::new(Fd(fd), addr, len).build().user_data(id));
+                    self.backlog_sqe(opcode::Send::new(Fd(fd), addr, len).build().user_data(id));
                 }
                 IoOp::Close { fd, token } => {
                     // Cancel everything in flight on this fd (ops hold file
@@ -679,7 +691,7 @@ impl UringDriver {
                     }
                     for op_id in cancel_ids {
                         let id = self.alloc_id(OpState::Cancel);
-                        self.push_sqe(opcode::AsyncCancel::new(op_id).build().user_data(id));
+                        self.backlog_sqe(opcode::AsyncCancel::new(op_id).build().user_data(id));
                     }
                     self.accepts.remove(&fd);
                     self.recvs.remove(&fd);
@@ -687,7 +699,7 @@ impl UringDriver {
                         close_id,
                         CloseWait { token, close_seen: false, close_result: 0, sends_left },
                     );
-                    self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(close_id));
+                    self.backlog_sqe(opcode::Close::new(Fd(fd)).build().user_data(close_id));
                 }
                 IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.arm_log_write(fd, offset, data, token, 0, barrier);
@@ -698,7 +710,7 @@ impl UringDriver {
                         .flags(types::FsyncFlags::DATASYNC)
                         .build()
                         .user_data(id);
-                    self.push_sqe(entry);
+                    self.backlog_sqe(entry);
                 }
                 IoOp::TierRead { fd, offset, buf, token } => {
                     self.arm_tier_read(fd, offset, buf, token, 0);
@@ -938,7 +950,7 @@ impl UringDriver {
                             written,
                             closing: None,
                         });
-                        self.push_sqe(
+                        self.backlog_sqe(
                             opcode::Send::new(Fd(fd), addr, len - written).build().user_data(id),
                         );
                         return;

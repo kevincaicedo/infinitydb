@@ -1,0 +1,148 @@
+
+running 17 tests
+[harness-trace] reserve port 29519
+[harness-trace] reserve port 29522
+[harness-trace] reserve port 29520
+[harness-trace] reserve port 29521
+[harness-trace] reserve port 29523
+[harness-trace] reserve port 29524
+[harness-trace] reserve port 29525
+[harness-trace] reserve port 29526
+[harness-trace] reserve port 29528
+[harness-trace] spawn pid 609629 port 29519 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321525854-29519
+[harness-trace] reserve port 29527
+[harness-trace] spawn pid 609632 port 29522 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321555707-29522
+[harness-trace] spawn pid 609634 port 29523 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321703312-29523
+[harness-trace] spawn pid 609635 port 29524 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321721983-29524
+[harness-trace] spawn pid 609637 port 29526 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321867933-29526
+[harness-trace] spawn pid 609636 port 29525 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321833701-29525
+[harness-trace] spawn pid 609638 port 29528 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321886925-29528
+[harness-trace] reserve port 29529
+[harness-trace] reserve port 29530
+[harness-trace] spawn pid 609639 port 29527 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321927681-29527
+[harness-trace] reserve port 29531
+[harness-trace] spawn pid 609641 port 29520 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321610343-29520
+[harness-trace] spawn pid 609643 port 29530 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322182895-29530
+[harness-trace] spawn pid 609642 port 29529 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322158400-29529
+[harness-trace] spawn pid 609644 port 29531 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322268455-29531
+[harness-trace] reserve port 29532
+[harness-trace] reserve port 29533
+[harness-trace] reserve port 29534
+[harness-trace] reserve port 29535
+[harness-trace] spawn pid 609645 port 29521 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321631462-29521
+
+thread 'tiered_namespace_argument_errors_match_redis' (609633) panicked at tests/compat/src/harness.rs:390:48:
+server read: Os { code: 104, kind: ConnectionReset, message: "Connection reset by peer" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[harness-trace] spawn pid 609646 port 29532 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323026037-29532
+[harness-trace] drop pid 609638 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321886925-29528 exited=None panicking=true
+[harness-trace] spawn pid 609647 port 29533 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323114085-29533
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321886925-29528 (test failed; process still running at teardown (killed)); log tail:
+--- end of log tail
+[harness-trace] spawn pid 609648 port 29534 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323133088-29534
+test tiered_namespace_argument_errors_match_redis ... FAILED
+[harness-trace] spawn pid 609649 port 29535 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323143425-29535
+[harness-trace] ready pid 609646 port 29532
+[harness-trace] spawn pid 609736 port 29532 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964379582651-29532
+[harness-trace] drop pid 609736 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964379582651-29532 exited=Some(ExitStatus(unix_wait_status(256))) panicking=false
+readiness refused: infinityd exited before answering PING on 29532: exit status: 1; log tail:
+infinityd: port 29532 is already owned by another process (address in use)
+
+[harness-trace] ready pid 609635 port 29524
+[harness-trace] reserve port 29536
+[harness-trace] ready pid 609644 port 29531
+[harness-trace] reserve port 29537
+[harness-trace] drop pid 609646 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323026037-29532 exited=None panicking=false
+test readiness_refuses_a_port_another_node_answers ... ok
+[harness-trace] ready pid 609642 port 29529
+[harness-trace] reserve port 29538
+[harness-trace] ready pid 609645 port 29521
+[harness-trace] reserve port 29539
+[harness-trace] ready pid 609636 port 29525
+[harness-trace] reserve port 29540
+[harness-trace] ready pid 609629 port 29519
+
+thread 'a_failing_test_keeps_the_node_log' (609616) panicked at tests/compat/tests/node_diff.rs:809:9:
+expected: this harness falsifier fails on purpose while holding the node guard
+[harness-trace] ready pid 609632 port 29522
+[harness-trace] reserve port 29541
+[harness-trace] ready pid 609643 port 29530
+[harness-trace] reserve port 29542
+[harness-trace] drop pid 609629 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321525854-29519 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321525854-29519 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xfc8b362ef843a71e; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd a02907c (git a02907c3ddba-dirty, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 29519, backend io_uring, route natural
+infinityd: listening on 29519
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+test a_failing_test_keeps_the_node_log ... ok
+[harness-trace] ready pid 609641 port 29520
+[harness-trace] ready pid 609647 port 29533
+[harness-trace] reserve port 29543
+[harness-trace] spawn pid 610006 port 29520 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964425072592-29520
+[harness-trace] drop pid 609745 dir /tmp/inf-compat-oracle-29536 exited=None panicking=false
+[harness-trace] drop pid 610006 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964425072592-29520 exited=Some(ExitStatus(unix_wait_status(256))) panicking=false
+[harness-trace] ready pid 609634 port 29523
+[harness-trace] drop pid 609635 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321721983-29524 exited=None panicking=false
+test client_id_is_positive_and_killable_like_redis ... ok
+[harness-trace] drop pid 609641 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321610343-29520 exited=None panicking=false
+test a_second_node_on_an_owned_port_refuses_to_start ... ok
+[harness-trace] drop pid 609634 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321703312-29523 exited=None panicking=false
+[harness-trace] ready pid 609637 port 29526
+test info_names_every_field_once_on_a_real_node ... ok
+[harness-trace] drop pid 609637 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321867933-29526 exited=None panicking=false
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+[harness-trace] ready pid 609648 port 29534
+[harness-trace] reserve port 29544
+[harness-trace] ready pid 609649 port 29535
+[harness-trace] reserve port 29545
+[harness-trace] ready pid 609639 port 29527
+[harness-trace] reserve port 29546
+[harness-trace] drop pid 609894 dir /tmp/inf-compat-oracle-29540 exited=None panicking=false
+[harness-trace] drop pid 609636 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321833701-29525 exited=None panicking=false
+[harness-trace] drop pid 609833 dir /tmp/inf-compat-oracle-29538 exited=None panicking=false
+test info_unknown_section_is_empty_like_redis ... ok
+[harness-trace] drop pid 609642 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322158400-29529 exited=None panicking=false
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+[harness-trace] drop pid 610013 dir /tmp/inf-compat-oracle-29544 exited=None panicking=false
+[harness-trace] drop pid 610015 dir /tmp/inf-compat-oracle-29546 exited=None panicking=false
+[harness-trace] drop pid 609648 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323133088-29534 exited=None panicking=false
+test run_id_is_40_hex_and_stable_like_redis ... ok
+[harness-trace] drop pid 609639 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321927681-29527 exited=None panicking=false
+test maxclients_refusal_matches_redis ... ok
+[harness-trace] drop pid 609970 dir /tmp/inf-compat-oracle-29541 exited=None panicking=false
+[harness-trace] drop pid 609632 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321555707-29522 exited=None panicking=false
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+compat-diff ns lane: 2 namespaces (durable + tiered) × 52 keys (4 at MAX_KEY_LEN), values to 64 KiB, SCAN set-equality, 4 pinned refusals, 0 failures
+[harness-trace] drop pid 610000 dir /tmp/inf-compat-oracle-29542 exited=None panicking=false
+[harness-trace] drop pid 609643 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322182895-29530 exited=None panicking=false
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+compat-diff node lane: 486 byte-compared cases on a 4-cell durable node, 44 documented deviations, 1 pinned node deviations, 0 failures
+  node deviation: case 529 ["FLUSHALL"]: FLUSHALL with durable namespaces refuses (ADR-0015 M2 cut)
+[harness-trace] drop pid 610007 dir /tmp/inf-compat-oracle-29543 exited=None panicking=false
+[harness-trace] drop pid 609647 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323114085-29533 exited=None panicking=false
+test node_matrix_replies_match_redis ... ok
+compat-diff large-value lane: 2 MiB + MAX_VAL_LEN byte-exact, 16 MiB + 1 pinned
+[harness-trace] drop pid 610014 dir /tmp/inf-compat-oracle-29545 exited=None panicking=false
+[harness-trace] drop pid 609649 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964323143425-29535 exited=None panicking=false
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+[harness-trace] drop pid 609893 dir /tmp/inf-compat-oracle-29539 exited=None panicking=false
+[harness-trace] drop pid 609645 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964321631462-29521 exited=None panicking=false
+test deadline_millisecond_read_matches_redis ... ok
+[harness-trace] drop pid 609747 dir /tmp/inf-compat-oracle-29537 exited=None panicking=false
+[harness-trace] drop pid 609644 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789445964322268455-29531 exited=None panicking=false
+test timeout_closes_an_idle_connection_like_redis ... ok
+
+failures:
+
+failures:
+    tiered_namespace_argument_errors_match_redis
+
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s
+

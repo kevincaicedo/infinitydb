@@ -1,0 +1,37 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.06s
+     Running unittests src/lib.rs (target/debug/deps/compat-bed998fbbf4523cd)
+
+running 14 tests
+test json_oracle::tests::an_unallowlisted_deviation_fails ... ok
+test json_oracle::tests::semantic_equality_is_diagnostic_only ... ok
+test resp::tests::encodes_argv_as_bulk_array ... ok
+test json_oracle::tests::case_and_allowlist_keys_are_unique_and_total ... ok
+test resp::tests::frames_attribute_with_its_payload ... ok
+test resp::tests::frames_bulk_variants ... ok
+test resp::tests::frames_aggregates ... ok
+test resp::tests::frames_line_types ... ok
+test resp::tests::incomplete_input_needs_more_bytes ... ok
+test resp::tests::parses_integer_replies ... ok
+test resp::tests::rejects_garbage ... ok
+test resp::tests::trailing_bytes_are_not_consumed ... ok
+test harness::tests::reserved_ports_never_repeat_within_a_process ... ok
+test harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-f49ad358e4efa34e)
+
+running 5 tests
+test net::tests::pin_refuses_a_core_past_cpu_setsize ... ok
+test net::tests::a_port_a_listener_group_owns_is_refused ... ok
+test net::tests::two_listeners_share_a_port ... ok
+test net::tests::keepalive_is_set_and_cleared_on_a_tcp_socket ... ok
+test net::tests::the_port_probe_never_accepts_a_connection ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 48 filtered out; finished in 0.06s
+

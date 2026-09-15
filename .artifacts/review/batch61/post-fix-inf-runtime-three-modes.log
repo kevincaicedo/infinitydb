@@ -1,0 +1,450 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.82s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-b51909c6ff47a3af)
+
+running 52 tests
+test budget::tests::a_class_past_its_cap_overflows_into_the_shared_pool ... ok
+test budget::tests::a_refund_returns_tokens_up_to_the_cap_and_corrects_the_counters ... ok
+test budget::tests::an_absent_model_grants_everything_and_still_counts ... ok
+test budget::tests::an_unbudgeted_dimension_never_defers_on_that_axis ... ok
+test budget::tests::an_unconditional_charge_drains_the_deficit_and_counts ... ok
+test budget::tests::caps_are_one_burst_horizon_and_never_below_one_slice ... ok
+test budget::tests::foreground_spend_reduces_the_grant_to_the_floor_and_no_further ... ok
+test budget::tests::reads_and_writes_are_separate_directions ... ok
+test budget::tests::refill_is_monotone_and_a_stalled_clock_is_a_no_op ... ok
+test budget::tests::seal_pace_paces_a_pipelined_cell_and_never_a_drained_one ... ok
+test budget::tests::share_divides_every_rate_by_the_cell_count ... ok
+test budget::tests::the_checkpoint_keeps_up_with_the_log_at_foreground_saturation ... ok
+test cold::tests::a_pool_dry_stall_refunds_the_charged_op ... ok
+test cold::tests::a_refused_foreground_ends_the_slice ... ok
+test cold::tests::adjacent_reads_coalesce_and_fan_out ... ok
+test cold::tests::coalesce_ratio_follows_the_d5_definition ... ok
+test cold::tests::cancellation_after_delivery_releases_with_the_parked_value ... ok
+test cold::tests::cancellation_while_queued_spends_no_device_read ... ok
+test cold::tests::a_deferred_maintain_keeps_its_grant ... ok
+test cold::tests::cancellation_before_completion_releases_at_the_gate ... ok
+test cold::tests::errored_read_returns_custody_typed ... ok
+test cold::tests::merged_read_survives_partial_cancellation ... ok
+test cold::tests::merging_never_crosses_files ... ok
+test cold::tests::latency_measures_the_delta_not_the_absolute_clock ... ok
+test cold::tests::pool_dry_stalls_drain_and_recovers ... ok
+test cold::tests::queue_full_refuses_without_side_effects ... ok
+test cold::tests::resumed_read_owns_then_releases_custody ... ok
+test net::tests::pin_refuses_a_core_past_cpu_setsize ... ok
+test cold::tests::merging_never_crosses_descriptors ... ok
+test net::tests::two_listeners_share_a_port ... ok
+test net::tests::a_port_a_listener_group_owns_is_refused ... ok
+test sched::tests::charge_is_saturating ... ok
+test sched::tests::a_quantum_weight_product_past_u32_is_refused - should panic ... ok
+test cold::tests::qd_cap_holds_and_overflow_drains_fifo ... ok
+test sched::tests::maintenance_keeps_progressing_under_foreground_load ... ok
+test net::tests::keepalive_is_set_and_cleared_on_a_tcp_socket ... ok
+test sched::tests::weighted_refill_and_cap ... ok
+test signal::tests::sigterm_sets_the_flag_once_installed ... ok
+test cold::tests::deficit_split_meters_contention_three_to_one ... ok
+test timer::tests::advance_jumps_over_ticks_where_nothing_happens ... ok
+test timer::tests::cancel_prevents_fire_and_detects_stale ... ok
+test timer::tests::fires_in_order_at_deadline ... ok
+test timer::tests::cascades_across_levels ... ok
+test timer::tests::idle_jump_does_not_walk_ticks ... ok
+test token::tests::oversized_slot_panics - should panic ... ok
+test timer::tests::next_deadline_is_conservative ... ok
+test token::tests::round_trips_all_fields ... ok
+test token::tests::unknown_class_byte_is_rejected ... ok
+test timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier ... ok
+test cold::tests::latency_percentile_holds_past_u32_sample_counts ... ok
+test budget::tests::a_fast_idle_loop_still_grants_ops_through_the_carry ... ok
+test budget::tests::two_budgets_fed_the_same_sequence_agree_exactly ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/accept_exhaustion.rs (target/debug/deps/accept_exhaustion-a52e53de8b114950)
+
+running 2 tests
+test table_agrees_on_every_backend ... ok
+test emfile_parks_the_arm_and_a_close_resumes_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/close_fd_reuse.rs (target/debug/deps/close_fd_reuse-2a5b2cb22b3fb1a1)
+
+running 1 test
+test a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/cold_hardened.rs (target/debug/deps/cold_hardened-a3ace1e126cad9d7)
+
+running 2 tests
+test cancellation_and_unlink_discipline_on_uring ... ok
+test cold_reads_share_the_cell_with_hot_commands ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/driver_conformance.rs (target/debug/deps/driver_conformance-36411f42904e4945)
+
+running 5 tests
+test peer_close_delivers_eof_recv ... ok
+test accept_recv_echo_send_close_roundtrip ... ok
+test pool_exhaustion_pauses_and_resumes_recv ... ok
+test close_cancels_blocked_sends_and_returns_buffers ... ok
+test buffer_lifecycle_storm_reconciles_to_zero ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/executor.rs (target/debug/deps/executor-88ac643ca248c6dc)
+
+running 12 tests
+test escaped_waker_clone_on_fast_path_is_harmless ... ok
+test delivery_before_first_poll_keeps_the_fast_path ... ok
+test io_gate_routes_by_completion_token ... ok
+test ready_future_never_allocates_a_task_slot ... ok
+test spawn_local_runs_under_budget ... ok
+test waitlist_drop_passes_the_baton ... ok
+test suspended_future_promotes_resumes_and_frees ... ok
+test waitlist_is_fifo_and_wake_one_wakes_exactly_one ... ok
+test wake_during_poll_requeues_without_losing_the_task ... ok
+test watermark_gate_wakes_at_or_below ... ok
+test mixed_fast_and_slow_paths_reconcile ... ok
+test random_suspend_resume_interleavings ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/file_ops.rs (target/debug/deps/file_ops-7dca5f3ea7e575be)
+
+running 4 tests
+test failed_write_cancels_the_linked_fsync ... ok
+test log_write_with_linked_fsync_orders_write_before_sync ... ok
+test standalone_fdatasync_and_sequential_offsets ... ok
+test write_through_completes_alone_and_lands ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/reactor.rs (target/debug/deps/reactor-0a2af57c24453805)
+
+running 8 tests
+test tripwires_report_the_frozen_names ... ok
+test a_task_woken_in_maintain_is_polled_before_any_park ... ok
+test remote_first_execute_early_flush_needs_a_resumed_future ... ok
+test idle_policy_spins_then_parks ... ok
+test pipeline_cannot_starve_second_connection ... ok
+test remote_first_execute_publishes_before_the_local_bulk ... ok
+test the_first_iteration_polls_before_anything_is_armed ... ok
+test armed_timer_fires_through_the_loop ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/steel_thread.rs (target/debug/deps/steel_thread-6a6f12a267aa1f76)
+
+running 2 tests
+test cold_read_histogram ... ignored, histogram harness — run explicitly for the .artifacts/m4/s04 artifact
+test steel_thread_write_flush_demote_cold_read ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests inf_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- INF_URING_NO_DEFER_TASKRUN=1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-b51909c6ff47a3af)
+
+running 52 tests
+test budget::tests::a_class_past_its_cap_overflows_into_the_shared_pool ... ok
+test budget::tests::a_refund_returns_tokens_up_to_the_cap_and_corrects_the_counters ... ok
+test budget::tests::an_unconditional_charge_drains_the_deficit_and_counts ... ok
+test budget::tests::caps_are_one_burst_horizon_and_never_below_one_slice ... ok
+test budget::tests::foreground_spend_reduces_the_grant_to_the_floor_and_no_further ... ok
+test budget::tests::seal_pace_paces_a_pipelined_cell_and_never_a_drained_one ... ok
+test budget::tests::share_divides_every_rate_by_the_cell_count ... ok
+test budget::tests::refill_is_monotone_and_a_stalled_clock_is_a_no_op ... ok
+test budget::tests::an_unbudgeted_dimension_never_defers_on_that_axis ... ok
+test cold::tests::a_pool_dry_stall_refunds_the_charged_op ... ok
+test cold::tests::adjacent_reads_coalesce_and_fan_out ... ok
+test cold::tests::cancellation_after_delivery_releases_with_the_parked_value ... ok
+test budget::tests::reads_and_writes_are_separate_directions ... ok
+test cold::tests::latency_measures_the_delta_not_the_absolute_clock ... ok
+test cold::tests::errored_read_returns_custody_typed ... ok
+test budget::tests::the_checkpoint_keeps_up_with_the_log_at_foreground_saturation ... ok
+test cold::tests::cancellation_before_completion_releases_at_the_gate ... ok
+test cold::tests::a_refused_foreground_ends_the_slice ... ok
+test cold::tests::cancellation_while_queued_spends_no_device_read ... ok
+test cold::tests::merging_never_crosses_descriptors ... ok
+test cold::tests::merged_read_survives_partial_cancellation ... ok
+test cold::tests::queue_full_refuses_without_side_effects ... ok
+test cold::tests::qd_cap_holds_and_overflow_drains_fifo ... ok
+test cold::tests::a_deferred_maintain_keeps_its_grant ... ok
+test budget::tests::an_absent_model_grants_everything_and_still_counts ... ok
+test net::tests::pin_refuses_a_core_past_cpu_setsize ... ok
+test cold::tests::merging_never_crosses_files ... ok
+test sched::tests::a_quantum_weight_product_past_u32_is_refused - should panic ... ok
+test sched::tests::charge_is_saturating ... ok
+test cold::tests::pool_dry_stalls_drain_and_recovers ... ok
+test sched::tests::maintenance_keeps_progressing_under_foreground_load ... ok
+test net::tests::keepalive_is_set_and_cleared_on_a_tcp_socket ... ok
+test sched::tests::weighted_refill_and_cap ... ok
+test cold::tests::resumed_read_owns_then_releases_custody ... ok
+test cold::tests::coalesce_ratio_follows_the_d5_definition ... ok
+test budget::tests::a_fast_idle_loop_still_grants_ops_through_the_carry ... ok
+test net::tests::a_port_a_listener_group_owns_is_refused ... ok
+test signal::tests::sigterm_sets_the_flag_once_installed ... ok
+test timer::tests::idle_jump_does_not_walk_ticks ... ok
+test net::tests::two_listeners_share_a_port ... ok
+test cold::tests::deficit_split_meters_contention_three_to_one ... ok
+test token::tests::oversized_slot_panics - should panic ... ok
+test timer::tests::next_deadline_is_conservative ... ok
+test token::tests::round_trips_all_fields ... ok
+test token::tests::unknown_class_byte_is_rejected ... ok
+test timer::tests::advance_jumps_over_ticks_where_nothing_happens ... ok
+test cold::tests::latency_percentile_holds_past_u32_sample_counts ... ok
+test timer::tests::cancel_prevents_fire_and_detects_stale ... ok
+test timer::tests::fires_in_order_at_deadline ... ok
+test timer::tests::cascades_across_levels ... ok
+test timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier ... ok
+test budget::tests::two_budgets_fed_the_same_sequence_agree_exactly ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/accept_exhaustion.rs (target/debug/deps/accept_exhaustion-a52e53de8b114950)
+
+running 2 tests
+test table_agrees_on_every_backend ... ok
+test emfile_parks_the_arm_and_a_close_resumes_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/close_fd_reuse.rs (target/debug/deps/close_fd_reuse-2a5b2cb22b3fb1a1)
+
+running 1 test
+test a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/cold_hardened.rs (target/debug/deps/cold_hardened-a3ace1e126cad9d7)
+
+running 2 tests
+test cancellation_and_unlink_discipline_on_uring ... ok
+test cold_reads_share_the_cell_with_hot_commands ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/driver_conformance.rs (target/debug/deps/driver_conformance-36411f42904e4945)
+
+running 5 tests
+test pool_exhaustion_pauses_and_resumes_recv ... ok
+test peer_close_delivers_eof_recv ... ok
+test accept_recv_echo_send_close_roundtrip ... ok
+test close_cancels_blocked_sends_and_returns_buffers ... ok
+test buffer_lifecycle_storm_reconciles_to_zero ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/executor.rs (target/debug/deps/executor-88ac643ca248c6dc)
+
+running 12 tests
+test delivery_before_first_poll_keeps_the_fast_path ... ok
+test io_gate_routes_by_completion_token ... ok
+test escaped_waker_clone_on_fast_path_is_harmless ... ok
+test ready_future_never_allocates_a_task_slot ... ok
+test spawn_local_runs_under_budget ... ok
+test suspended_future_promotes_resumes_and_frees ... ok
+test waitlist_drop_passes_the_baton ... ok
+test waitlist_is_fifo_and_wake_one_wakes_exactly_one ... ok
+test wake_during_poll_requeues_without_losing_the_task ... ok
+test watermark_gate_wakes_at_or_below ... ok
+test mixed_fast_and_slow_paths_reconcile ... ok
+test random_suspend_resume_interleavings ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/file_ops.rs (target/debug/deps/file_ops-7dca5f3ea7e575be)
+
+running 4 tests
+test failed_write_cancels_the_linked_fsync ... ok
+test log_write_with_linked_fsync_orders_write_before_sync ... ok
+test standalone_fdatasync_and_sequential_offsets ... ok
+test write_through_completes_alone_and_lands ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/reactor.rs (target/debug/deps/reactor-0a2af57c24453805)
+
+running 8 tests
+test a_task_woken_in_maintain_is_polled_before_any_park ... ok
+test idle_policy_spins_then_parks ... ok
+test remote_first_execute_publishes_before_the_local_bulk ... ok
+test remote_first_execute_early_flush_needs_a_resumed_future ... ok
+test tripwires_report_the_frozen_names ... ok
+test the_first_iteration_polls_before_anything_is_armed ... ok
+test pipeline_cannot_starve_second_connection ... ok
+test armed_timer_fires_through_the_loop ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/steel_thread.rs (target/debug/deps/steel_thread-6a6f12a267aa1f76)
+
+running 2 tests
+test cold_read_histogram ... ignored, histogram harness — run explicitly for the .artifacts/m4/s04 artifact
+test steel_thread_write_flush_demote_cold_read ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests inf_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- INF_URING_FORCE_DEGRADED=1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/inf_runtime-b51909c6ff47a3af)
+
+running 52 tests
+test budget::tests::an_absent_model_grants_everything_and_still_counts ... ok
+test budget::tests::reads_and_writes_are_separate_directions ... ok
+test budget::tests::share_divides_every_rate_by_the_cell_count ... ok
+test budget::tests::a_class_past_its_cap_overflows_into_the_shared_pool ... ok
+test budget::tests::refill_is_monotone_and_a_stalled_clock_is_a_no_op ... ok
+test budget::tests::seal_pace_paces_a_pipelined_cell_and_never_a_drained_one ... ok
+test cold::tests::a_refused_foreground_ends_the_slice ... ok
+test cold::tests::coalesce_ratio_follows_the_d5_definition ... ok
+test cold::tests::cancellation_before_completion_releases_at_the_gate ... ok
+test cold::tests::adjacent_reads_coalesce_and_fan_out ... ok
+test cold::tests::cancellation_after_delivery_releases_with_the_parked_value ... ok
+test budget::tests::an_unbudgeted_dimension_never_defers_on_that_axis ... ok
+test cold::tests::cancellation_while_queued_spends_no_device_read ... ok
+test budget::tests::caps_are_one_burst_horizon_and_never_below_one_slice ... ok
+test cold::tests::a_deferred_maintain_keeps_its_grant ... ok
+test net::tests::a_port_a_listener_group_owns_is_refused ... ok
+test budget::tests::foreground_spend_reduces_the_grant_to_the_floor_and_no_further ... ok
+test budget::tests::a_refund_returns_tokens_up_to_the_cap_and_corrects_the_counters ... ok
+test cold::tests::latency_measures_the_delta_not_the_absolute_clock ... ok
+test cold::tests::errored_read_returns_custody_typed ... ok
+test budget::tests::an_unconditional_charge_drains_the_deficit_and_counts ... ok
+test budget::tests::the_checkpoint_keeps_up_with_the_log_at_foreground_saturation ... ok
+test cold::tests::merging_never_crosses_files ... ok
+test net::tests::pin_refuses_a_core_past_cpu_setsize ... ok
+test cold::tests::deficit_split_meters_contention_three_to_one ... ok
+test cold::tests::queue_full_refuses_without_side_effects ... ok
+test budget::tests::a_fast_idle_loop_still_grants_ops_through_the_carry ... ok
+test cold::tests::a_pool_dry_stall_refunds_the_charged_op ... ok
+test cold::tests::pool_dry_stalls_drain_and_recovers ... ok
+test cold::tests::qd_cap_holds_and_overflow_drains_fifo ... ok
+test cold::tests::resumed_read_owns_then_releases_custody ... ok
+test net::tests::two_listeners_share_a_port ... ok
+test sched::tests::a_quantum_weight_product_past_u32_is_refused - should panic ... ok
+test sched::tests::charge_is_saturating ... ok
+test sched::tests::maintenance_keeps_progressing_under_foreground_load ... ok
+test sched::tests::weighted_refill_and_cap ... ok
+test signal::tests::sigterm_sets_the_flag_once_installed ... ok
+test cold::tests::merging_never_crosses_descriptors ... ok
+test timer::tests::advance_jumps_over_ticks_where_nothing_happens ... ok
+test cold::tests::merged_read_survives_partial_cancellation ... ok
+test timer::tests::cancel_prevents_fire_and_detects_stale ... ok
+test timer::tests::fires_in_order_at_deadline ... ok
+test timer::tests::cascades_across_levels ... ok
+test timer::tests::idle_jump_does_not_walk_ticks ... ok
+test net::tests::keepalive_is_set_and_cleared_on_a_tcp_socket ... ok
+test timer::tests::next_deadline_is_conservative ... ok
+test timer::tests::next_deadline_never_passes_a_cascade_that_fires_earlier ... ok
+test token::tests::oversized_slot_panics - should panic ... ok
+test token::tests::unknown_class_byte_is_rejected ... ok
+test cold::tests::latency_percentile_holds_past_u32_sample_counts ... ok
+test token::tests::round_trips_all_fields ... ok
+test budget::tests::two_budgets_fed_the_same_sequence_agree_exactly ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/accept_exhaustion.rs (target/debug/deps/accept_exhaustion-a52e53de8b114950)
+
+running 2 tests
+test table_agrees_on_every_backend ... ok
+test emfile_parks_the_arm_and_a_close_resumes_it ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/close_fd_reuse.rs (target/debug/deps/close_fd_reuse-2a5b2cb22b3fb1a1)
+
+running 1 test
+test a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/cold_hardened.rs (target/debug/deps/cold_hardened-a3ace1e126cad9d7)
+
+running 2 tests
+test cancellation_and_unlink_discipline_on_uring ... ok
+test cold_reads_share_the_cell_with_hot_commands ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/driver_conformance.rs (target/debug/deps/driver_conformance-36411f42904e4945)
+
+running 5 tests
+test pool_exhaustion_pauses_and_resumes_recv ... ok
+test peer_close_delivers_eof_recv ... ok
+test accept_recv_echo_send_close_roundtrip ... ok
+test close_cancels_blocked_sends_and_returns_buffers ... ok
+test buffer_lifecycle_storm_reconciles_to_zero ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/executor.rs (target/debug/deps/executor-88ac643ca248c6dc)
+
+running 12 tests
+test delivery_before_first_poll_keeps_the_fast_path ... ok
+test io_gate_routes_by_completion_token ... ok
+test escaped_waker_clone_on_fast_path_is_harmless ... ok
+test spawn_local_runs_under_budget ... ok
+test ready_future_never_allocates_a_task_slot ... ok
+test waitlist_drop_passes_the_baton ... ok
+test suspended_future_promotes_resumes_and_frees ... ok
+test waitlist_is_fifo_and_wake_one_wakes_exactly_one ... ok
+test watermark_gate_wakes_at_or_below ... ok
+test wake_during_poll_requeues_without_losing_the_task ... ok
+test mixed_fast_and_slow_paths_reconcile ... ok
+test random_suspend_resume_interleavings ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/file_ops.rs (target/debug/deps/file_ops-7dca5f3ea7e575be)
+
+running 4 tests
+test failed_write_cancels_the_linked_fsync ... ok
+test log_write_with_linked_fsync_orders_write_before_sync ... ok
+test standalone_fdatasync_and_sequential_offsets ... ok
+test write_through_completes_alone_and_lands ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/reactor.rs (target/debug/deps/reactor-0a2af57c24453805)
+
+running 8 tests
+test a_task_woken_in_maintain_is_polled_before_any_park ... ok
+test idle_policy_spins_then_parks ... ok
+test remote_first_execute_early_flush_needs_a_resumed_future ... ok
+test the_first_iteration_polls_before_anything_is_armed ... ok
+test remote_first_execute_publishes_before_the_local_bulk ... ok
+test tripwires_report_the_frozen_names ... ok
+test pipeline_cannot_starve_second_connection ... ok
+test armed_timer_fires_through_the_loop ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/steel_thread.rs (target/debug/deps/steel_thread-6a6f12a267aa1f76)
+
+running 2 tests
+test cold_read_histogram ... ignored, histogram harness — run explicitly for the .artifacts/m4/s04 artifact
+test steel_thread_write_flush_demote_cold_read ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests inf_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

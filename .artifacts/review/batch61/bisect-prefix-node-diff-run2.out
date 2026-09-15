@@ -1,0 +1,225 @@
+
+running 17 tests
+[harness-trace] reserve port 20113
+[harness-trace] reserve port 20114
+[harness-trace] reserve port 20116
+[harness-trace] reserve port 20115
+[harness-trace] reserve port 20117
+[harness-trace] reserve port 20118
+[harness-trace] reserve port 20119
+[harness-trace] reserve port 20120
+[harness-trace] reserve port 20121
+[harness-trace] reserve port 20122
+[harness-trace] spawn pid 638527 port 20114 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191015011-20114
+[harness-trace] spawn pid 638529 port 20116 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191039416-20116
+[harness-trace] spawn pid 638538 port 20120 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191205620-20120
+[harness-trace] reserve port 20123
+[harness-trace] spawn pid 638535 port 20119 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191135934-20119
+[harness-trace] spawn pid 638536 port 20118 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191097597-20118
+[harness-trace] reserve port 20125
+[harness-trace] spawn pid 638539 port 20121 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191271960-20121
+[harness-trace] reserve port 20124
+[harness-trace] reserve port 20126
+[harness-trace] spawn pid 638530 port 20115 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191055063-20115
+[harness-trace] spawn pid 638525 port 20113 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390190939829-20113
+[harness-trace] spawn pid 638533 port 20117 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191074948-20117
+[harness-trace] reserve port 20127
+[harness-trace] reserve port 20128
+[harness-trace] reserve port 20129
+[harness-trace] spawn pid 638541 port 20123 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191544544-20123
+[harness-trace] spawn pid 638543 port 20124 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191631055-20124
+[harness-trace] spawn pid 638540 port 20122 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191280794-20122
+[harness-trace] spawn pid 638542 port 20125 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191563717-20125
+[harness-trace] spawn pid 638544 port 20126 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191658791-20126
+[harness-trace] spawn pid 638545 port 20127 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191756628-20127
+[harness-trace] spawn pid 638546 port 20128 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191789578-20128
+[harness-trace] spawn pid 638547 port 20129 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191806024-20129
+[harness-trace] ready (unverified: no process_id) pid 638529 port 20116
+[harness-trace] reserve port 20130
+[harness-trace] ready (unverified: no process_id) pid 638546 port 20128
+[harness-trace] reserve port 20131
+[harness-trace] ready (unverified: no process_id) pid 638539 port 20121
+[harness-trace] reserve port 20132
+[harness-trace] ready (unverified: no process_id) pid 638541 port 20123
+[harness-trace] reserve port 20133
+[harness-trace] ready (unverified: no process_id) pid 638536 port 20118
+[harness-trace] reserve port 20134
+[harness-trace] ready (unverified: no process_id) pid 638544 port 20126
+[harness-trace] reserve port 20135
+[harness-trace] ready (unverified: no process_id) pid 638540 port 20122
+[harness-trace] spawn pid 638781 port 20122 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390260392662-20122
+[harness-trace] ready (unverified: no process_id) pid 638781 port 20122
+
+thread 'readiness_refuses_a_port_another_node_answers' (638531) panicked at tests/compat/tests/node_diff.rs:769:13:
+readiness paired the test with a node it did not spawn (pid 638540)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[harness-trace] drop pid 638781 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390260392662-20122 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390260392662-20122 (test failed; process still running at teardown (killed)); log tail:
+infinityd: port 20122 is already owned by another process (address in use)
+--- end of log tail
+[harness-trace] drop pid 638540 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191280794-20122 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191280794-20122 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x08093d445f787165; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd d60ef03 (git d60ef0315744, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 20122, backend io_uring, route natural
+infinityd: listening on 20122
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+test readiness_refuses_a_port_another_node_answers ... FAILED
+[harness-trace] ready (unverified: no process_id) pid 638530 port 20115
+[harness-trace] ready (unverified: no process_id) pid 638535 port 20119
+[harness-trace] reserve port 20136
+[harness-trace] drop pid 638530 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191055063-20115 exited=None panicking=false
+[harness-trace] ready (unverified: no process_id) pid 638527 port 20114
+[harness-trace] ready (unverified: no process_id) pid test info_names_every_field_once_on_a_real_node ... 638525ok port 
+20113
+[harness-trace] spawn pid 638846 port 20114 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390273566248-20114
+
+thread 'a_failing_test_keeps_the_node_log' (638514) panicked at tests/compat/tests/node_diff.rs:813:9:
+expected: this harness falsifier fails on purpose while holding the node guard
+[harness-trace] drop pid 638525 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390190939829-20113 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390190939829-20113 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x2d1ccafe674de242; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd d60ef03 (git d60ef0315744, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 20113, backend io_uring, route natural
+infinityd: listening on 20113
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+test a_failing_test_keeps_the_node_log ... ok
+[harness-trace] ready (unverified: no process_id) pid 638542 port 20125
+[harness-trace] reserve port 20137
+[harness-trace] ready (unverified: no process_id) pid 638547 port 20129
+[harness-trace] drop pid 638846 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390273566248-20114 exited=Some(ExitStatus(unix_wait_status(256))) panicking=false
+[harness-trace] drop pid 638547 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191806024-20129 exited=None panicking=false
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+[harness-trace] drop pid 638527 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191015011-20114 exited=None panicking=false
+test a_second_node_on_an_owned_port_refuses_to_start ... ok
+[harness-trace] drop pid 638650 dir /tmp/inf-compat-oracle-20130 exited=None panicking=false
+[harness-trace] drop pid 638529 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191039416-20116 exited=None panicking=false
+test client_id_is_positive_and_killable_like_redis ... ok
+[harness-trace] ready (unverified: no process_id) pid 638545 port 20127
+[harness-trace] reserve port 20138
+[harness-trace] ready (unverified: no process_id) pid 638543 port 20124
+[harness-trace] reserve port 20139
+[harness-trace] drop pid 638698 dir /tmp/inf-compat-oracle-20133 exited=None panicking=false
+[harness-trace] drop pid 638541 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191544544-20123 exited=None panicking=false
+[harness-trace] ready (unverified: no process_id) pid 638533 port 20117
+[harness-trace] reserve port 20140
+test run_id_is_40_hex_and_stable_like_redis ... ok
+[harness-trace] drop pid 638656 dir /tmp/inf-compat-oracle-20132 exited=None panicking=false
+[harness-trace] drop pid 638539 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191271960-20121 exited=None panicking=false
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+[harness-trace] drop pid 638822 dir /tmp/inf-compat-oracle-20136 exited=None panicking=false
+[harness-trace] drop pid 638535 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191135934-20119 exited=None panicking=false
+test info_unknown_section_is_empty_like_redis ... ok
+[harness-trace] drop pid 638780 dir /tmp/inf-compat-oracle-20135 exited=None panicking=false
+[harness-trace] drop pid 638544 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191658791-20126 exited=None panicking=false
+test tiered_namespace_argument_errors_match_redis ... ok
+[harness-trace] drop pid 638919 dir /tmp/inf-compat-oracle-20139 exited=None panicking=false
+[harness-trace] drop pid 638543 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191631055-20124 exited=None panicking=false
+test maxclients_refusal_matches_redis ... ok
+[harness-trace] drop pid 638930 dir /tmp/inf-compat-oracle-20140 exited=None panicking=false
+[harness-trace] drop pid 638533 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191074948-20117 exited=None panicking=false
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+compat-diff ns lane: 2 namespaces (durable + tiered) × 52 keys (4 at MAX_KEY_LEN), values to 64 KiB, SCAN set-equality, 4 pinned refusals, 0 failures
+[harness-trace] drop pid 638918 dir /tmp/inf-compat-oracle-20138 exited=None panicking=false
+[harness-trace] drop pid 638545 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191756628-20127 exited=None panicking=false
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+[harness-trace] INFO stats 500 ms after the reset: Some("total_connections_received:1 rejected_connections:0 accept_errors:0")
+[harness-trace] node log 500 ms after the reset (exit None):
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xc8a9621ae66384f2; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd: listening on 20120
+infinityd d60ef03 (git d60ef0315744, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 20120, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+
+--- end
+
+thread 'node_matrix_replies_match_redis' (638526) panicked at tests/compat/src/harness.rs:305:21:
+[harness-trace] readiness read on port 20120 failed: Connection reset by peer (os error 104); local Ok(127.0.0.1:33938); child pid 638538 (State:	S (sleeping) Threads:	30; wchan futex_do_wait; stat 638538 (infinityd-prefi) S 638513 638070 638070 0 -1 4194304 18941 0 3 0 16 10 0 0 20 0 30 0 3570309 400220160 20824 18446744073709551615 99180128964208 99180134761280 140722375209200 0 0 0 0 4096 17474 0 0 0 17 12 0 0 0 0 0 99180135099720 99180135102224 99180909232128 140722375212297 140722375212564 140722375212564 140722375217038 0
+); sockets on the port:
+LISTEN    0      1024                                  0.0.0.0:20120                0.0.0.0:*     users:(("infinityd-prefi",pid=638538,fd=14)) uid:1000 ino:827774 sk:d019 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-62b7073b-648b-4ac6-bacc-1f648604dd23.scope <->                             
+LISTEN    0      1024                                  0.0.0.0:20120                0.0.0.0:*     users:(("infinityd-prefi",pid=638538,fd=13)) uid:1000 ino:827773 sk:d01a cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-62b7073b-648b-4ac6-bacc-1f648604dd23.scope <->                             
+LISTEN    0      1024                                  0.0.0.0:20120                0.0.0.0:*     users:(("infinityd-prefi",pid=638538,fd=12)) uid:1000 ino:832753 sk:d01b cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-62b7073b-648b-4ac6-bacc-1f648604dd23.scope <->                             
+processes:
+   2238       1 Mon Sep 14 14:48:18 2026 /usr/bin/redis-server 127.0.0.1:6379
+  14200    5743 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node --liftoff-only --disable-warning=ExperimentalWarning /home/kcaicedo/.codegraph/versions/v1.6.0/lib/dist/bin/codegraph.js serve --mcp --path /home/kcaicedo/Documents/Projects/databases/infinitydb
+  14208   14200 Mon Sep 14 14:52:59 2026 /home/kcaicedo/.codegraph/versions/v1.6.0/node -e  const fs = require('fs'); const parentPid = Number(process.argv[1]); const timeoutMs = Number(process.argv[2]); const capMs = Number(process.argv[3]); const progressPaths = process.argv.slice(4); const secs = Math.round(timeoutMs / 1000); function kill(extra) {   // Timestamped so daemon.log kills can be correlated with anything (#1431) —   // computed here at kill time; this child process is never the wedged one.   try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\n')); } catch (e) {}   try { process.kill(parentPid, 'SIGKILL'); } catch (e) {}   process.exit(0); } // Fingerprint of the watched files (size + mtime). A change between checks is // forward disk progress — a slow synchronous SQLite statement, not a wedge. function snap() {   let s = '';   for (const p of progressPaths) {     try { const st = fs.statSync(p); s += st.size + ':' + st.mtimeMs + ';'; } catch (e) { s += 'x;'; }   }   return s; } let lastSnap = progressPaths.length ? snap() : ''; let lastSnapAt = Date.now(); let silentSince = null; // start of the current continuous-silence episode function onTimeout() {   if (!progressPaths.length) return kill('');   const now = Date.now();   if (silentSince === null) silentSince = now - timeoutMs; // silence began ~one timeout ago   const cur = snap();   if (cur !== lastSnap && now - silentSince < capMs) {     // The event loop is blocked but the DB files are advancing: a legitimate     // long store on slow storage. Defer, re-baseline, keep watching.     lastSnap = cur;     timer = setTimeout(onTimeout, timeoutMs);     return;   }   kill(cur !== lastSnap ? ' despite ongoing disk activity (hard cap ' + Math.round(capMs / 1000) + 's reached)' : ''); } let timer = setTimeout(onTimeout, timeoutMs); process.stdin.on('data', () => {   silentSince = null;   // Keep the baseline fresh while healthy (throttled — a stat per second).   if (progressPaths.length) {     const t = Date.now();     if (t - lastSnapAt >= 1000) { lastSnap = snap(); lastSnapAt = t; }   }   clearTimeout(timer); timer = setTimeout(onTimeout, timeoutMs); }); process.stdin.on('end', () => process.exit(0));   // parent closed the pipe (exited) -> no orphan process.stdin.on('error', () => process.exit(0)); // pipe broke -> parent gone process.stdin.resume();  14200 60000 600000 /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db /home/kcaicedo/Documents/Projects/databases/infinitydb/.codegraph/codegraph.db-wal
+ 638525  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20113 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390190939829-20113 --device-probe off
+ 638527  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20114 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191015011-20114 --device-probe off
+ 638529  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20116 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191039416-20116 --device-probe off
+ 638530  638513 Tue Sep 15 00:43:10 2026 [infinityd-prefi] <defunct>
+ 638533  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20117 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191074948-20117 --device-probe off
+ 638535  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20119 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191135934-20119 --device-probe off
+ 638536  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20118 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191097597-20118 --device-probe off
+ 638538  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20120 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191205620-20120 --device-probe off
+ 638539  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20121 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191271960-20121 --device-probe off
+ 638541  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20123 --cells 2 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191544544-20123 --device-probe off
+ 638542  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20125 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191563717-20125 --device-probe off
+ 638543  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20124 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191631055-20124 --device-probe off
+ 638544  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20126 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191658791-20126 --device-probe off
+ 638545  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20127 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191756628-20127 --device-probe off
+ 638546  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20128 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191789578-20128 --device-probe off
+ 638547  638513 Tue Sep 15 00:43:10 2026 /home/kcaicedo/Documents/Projects/databases/infinitydb/.artifacts/review/batch61/infinityd-prefix-d60ef03 --port 20129 --cells 4 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191806024-20129 --device-probe off
+ 638650  638513 Tue Sep 15 00:43:10 2026 redis-server 127.0.0.1:20130
+ 638652  638513 Tue Sep 15 00:43:10 2026 redis-server 127.0.0.1:20131
+ 638656  638513 Tue Sep 15 00:43:10 2026 redis-server --port 20132 --save  --appendonly no --bind 127.0.0.1 --enable-debug-command yes
+ 638698  638513 Tue Sep 15 00:43:10 2026 redis-server 127.0.0.1:20133
+[harness-trace] drop pid 638538 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191205620-20120 exited=None panicking=true
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191205620-20120 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xc8a9621ae66384f2; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd: listening on 20120
+infinityd d60ef03 (git d60ef0315744, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 20120, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+control: cell 0 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 1 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 2 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0)
+control: recovery complete — 4 cells serving (100 ms)
+--- end of log tail
+test node_matrix_replies_match_redis ... FAILED
+compat-diff large-value lane: 2 MiB + MAX_VAL_LEN byte-exact, 16 MiB + 1 pinned
+[harness-trace] drop pid 638912 dir /tmp/inf-compat-oracle-20137 exited=None panicking=false
+[harness-trace] drop pid 638542 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191563717-20125 exited=None panicking=false
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+[harness-trace] drop pid 638729 dir /tmp/inf-compat-oracle-20134 exited=None panicking=false
+[harness-trace] drop pid 638536 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191097597-20118 exited=None panicking=false
+test deadline_millisecond_read_matches_redis ... ok
+[harness-trace] drop pid 638652 dir /tmp/inf-compat-oracle-20131 exited=None panicking=false
+[harness-trace] drop pid 638546 dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789447390191789578-20128 exited=None panicking=false
+test timeout_closes_an_idle_connection_like_redis ... ok
+
+failures:
+
+failures:
+    node_matrix_replies_match_redis
+    readiness_refuses_a_port_another_node_answers
+
+test result: FAILED. 15 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+

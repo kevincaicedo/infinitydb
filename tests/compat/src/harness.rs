@@ -11,7 +11,7 @@
 //! no tier).
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -68,6 +68,11 @@ impl ProcessGuard {
         self.scratch.as_deref()
     }
 
+    /// The spawned process's pid (what `INFO server:process_id` must name).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Waits up to `timeout` for the process to exit on its own; `None`
     /// when it is still running (a refusal a test asserts on must exit).
     pub fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -101,13 +106,19 @@ impl ProcessGuard {
 /// counter from a per-process base, each candidate confirmed free by a
 /// plain bind (which a foreign reuseport group also refuses), so two
 /// callers here never share a port and a foreign owner is skipped.
+///
+/// The range sits below the kernel's ephemeral floor (`ip_local_port_range`
+/// starts at 32768 by default; batch 61): a process that took its port
+/// from `bind(0)` — every probe script, a leftover measurement node —
+/// can never land on a harness port, and only a hand-chosen `--port`
+/// remains, which readiness's identity check names.
 pub fn reserve_port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     // The base is per process (pid-derived) so two harness processes on
-    // one box start from different points of the high range.
+    // one box start from different points of the range.
     static NEXT: AtomicU16 = AtomicU16::new(0);
     const LOW: u16 = 20_000;
-    const SPAN: u16 = 40_000;
+    const SPAN: u16 = 12_768;
     if NEXT.load(Ordering::Relaxed) == 0 {
         let base = LOW + u16::try_from(std::process::id() % u32::from(SPAN)).expect("< SPAN");
         let _ = NEXT.compare_exchange(0, base, Ordering::Relaxed, Ordering::Relaxed);
@@ -118,7 +129,11 @@ pub fn reserve_port() -> u16 {
             port = LOW;
             NEXT.store(LOW + 1, Ordering::Relaxed);
         }
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        // Bind-only (batch 61): a listening probe copied into a sibling
+        // test's spawning child (posix_spawn keeps the fd table until the
+        // exec) answered the readiness `PING` and reset it at the exec.
+        let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port);
+        if inf_server::probe_addr_unowned(addr).is_ok() {
             return port;
         }
     }
@@ -223,14 +238,17 @@ pub fn candidate() -> Option<String> {
 /// Spawns `bin` on an explicit `port` and waits for readiness. `Err`
 /// carries the story when the process exits before answering `PING`
 /// (its status and log tail); a process that neither answers nor exits
-/// within 30 s panics with the log tail. On a port another node already
-/// serves, the readiness `PING` is answered by *that* node — a test for
-/// the owned-port refusal spawns with [`spawn_infinityd_at`] and waits
-/// for the exit instead.
+/// within 30 s panics with the log tail. A `PONG` is only readiness when
+/// `INFO server:process_id` names the spawned child (batch 61): a foreign
+/// node already on the port answers first, before the child reaches its
+/// owned-port refusal, and pre-fix the test was silently paired with it.
+/// A test for the owned-port refusal spawns with [`spawn_infinityd_at`]
+/// and waits for the exit instead.
 ///
 /// # Errors
-/// The process exited before readiness; the message names the exit
-/// status and quotes the log tail.
+/// The process exited before readiness (the message names the exit
+/// status and quotes the log tail), or another process answered on the
+/// port (the message names its pid and command line).
 pub fn infinityd_at(
     bin: &str,
     cells: u16,
@@ -255,9 +273,44 @@ pub fn infinityd_at(
             s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
             if s.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
                 let mut buf = Vec::new();
+                // A reset or EOF here is a foreign socket on the port or a
+                // dying node — name what the node was doing (batch 61).
+                let mut probe = [0u8; 64];
+                let first = s.read(&mut probe).and_then(|n| {
+                    if n == 0 { Err(std::io::Error::other("EOF before any reply")) } else { Ok(n) }
+                });
+                match first {
+                    Ok(n) => buf.extend_from_slice(&probe[..n]),
+                    Err(e) => {
+                        // Test orchestration thread — not cell code.
+                        #[allow(clippy::disallowed_methods)]
+                        std::thread::sleep(Duration::from_millis(300));
+                        let exit = guard.child.try_wait().ok().flatten();
+                        let log =
+                            std::fs::read_to_string(dir.join("infinityd.log")).unwrap_or_default();
+                        return Err(format!(
+                            "readiness read on port {port} failed: {e} (spawned infinityd pid {} \
+                             300 ms later: {exit:?}); its log:\n{log}",
+                            guard.child.id()
+                        ));
+                    }
+                }
                 let reply = read_frames(&mut s, &mut buf, 1);
                 if reply == b"+PONG\r\n" {
-                    break s;
+                    let child = guard.child.id();
+                    match info_process_id(&mut s, &mut buf) {
+                        Some(pid) if pid == child => break s,
+                        Some(pid) => {
+                            return Err(format!(
+                                "port {port} is answered by pid {pid} ({}), not the spawned \
+                                 infinityd (pid {child}) — a foreign node owns the port",
+                                cmdline_of(pid)
+                            ));
+                        }
+                        None => {
+                            return Err(format!("port {port}: INFO server names no process_id"));
+                        }
+                    }
                 }
                 // `-LOADING …` while recovery replays: retry below.
             }
@@ -267,6 +320,27 @@ pub fn infinityd_at(
         std::thread::sleep(Duration::from_millis(50));
     };
     Ok((guard, stream))
+}
+
+/// `INFO server:process_id` over `stream` (`None` when absent).
+fn info_process_id(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<u32> {
+    stream.write_all(b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n").ok()?;
+    let reply = read_frames(stream, buf, 1);
+    let text = String::from_utf8_lossy(&reply);
+    text.lines().find_map(|l| l.strip_prefix("process_id:")).and_then(|v| v.trim().parse().ok())
+}
+
+/// A pid's command line for the refusal message (Linux; empty elsewhere).
+fn cmdline_of(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .split('\0')
+                .filter(|a| !a.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
 }
 
 /// Spawns `bin` on `port` with a fresh scratch dir and its stderr in
@@ -546,12 +620,55 @@ mod tests {
     /// thousand draws (birthday bound) — in the full lane two spawning
     /// tests took one port, and the second node *joined* the first's
     /// reuseport group (batch 57's "eight PONGs", batch 58's reset).
+    /// Batch 61 — the compat flake's mechanism: `posix_spawn` copies the
+    /// parent's fd table until the child execs, so a *listening* probe
+    /// socket alive in one thread at the instant another thread spawns a
+    /// node lives on in that child for the exec's duration (milliseconds
+    /// for a debug `infinityd` under load) — accepting the readiness
+    /// `PING` on the just-reserved port and resetting it at exec. The
+    /// probe must never listen: a bound, non-listening socket refuses.
+    #[test]
+    fn a_reserved_port_is_never_answered_by_a_ghost_listener() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(mut c) = Command::new("/bin/true").spawn() {
+                            let _ = c.wait();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut ghosts = Vec::new();
+        for _ in 0..4000 {
+            let port = reserve_port();
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(_) => ghosts.push(port),
+                Err(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{port}: {e}")
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in spawners {
+            t.join().expect("spawner");
+        }
+        assert!(ghosts.is_empty(), "a spawned child answered on reserved ports {ghosts:?}");
+    }
+
     #[test]
     fn reserved_ports_never_repeat_within_a_process() {
         let mut seen = std::collections::HashSet::new();
         for i in 0..2000 {
             let port = reserve_port();
             assert!(seen.insert(port), "port {port} handed out twice (draw {i})");
+            // Batch 61: below the kernel's ephemeral floor, so no
+            // `bind(0)` process can ever be on a harness port.
+            assert!((20_000..32_768).contains(&port), "port {port} inside the ephemeral range");
         }
     }
 }
