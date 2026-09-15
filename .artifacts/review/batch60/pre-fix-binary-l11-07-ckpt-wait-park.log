@@ -1,0 +1,15 @@
+warm-up: 20 s idle so boot zero-fill is done and the cells park
+trial 0 group 0 target cell 0: 0.938 s
+trial 0 group 0 target cell 1: 0.703 s
+trial 0 group 1 target cell 0: 0.802 s
+trial 0 group 1 target cell 1: 0.840 s
+trial 1 group 0 target cell 0: 0.887 s
+trial 1 group 0 target cell 1: 0.675 s
+trial 1 group 1 target cell 0: 0.802 s
+trial 1 group 1 target cell 1: 0.804 s
+trial 2 group 0 target cell 0: 0.887 s
+trial 2 group 0 target cell 1: 0.711 s
+trial 2 group 1 target cell 0: 0.802 s
+trial 2 group 1 target cell 1: 0.832 s
+park=3.0s  latencies < park: 12  >= park: 0  max=0.938  min>=park=-
+VERDICT: GREEN (no wait exceeded two parks)

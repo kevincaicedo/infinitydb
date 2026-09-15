@@ -233,10 +233,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// errors arrive as completions.
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
-        // `before_park` runs only when spin is exhausted: the plane
-        // publishes its parked flag and vetoes the park if a final doorbell
-        // check finds work (the lost-wakeup handshake, M0-R1).
-        let parked = self.spin_left == 0 && !plane.before_park();
+        // A queued task vetoes the park outright (F-L11-07; also what makes
+        // `spin_iters == 0` safe). `before_park` runs only when spin is
+        // exhausted: the plane publishes its parked flag and vetoes the
+        // park if a final doorbell check finds work (the lost-wakeup
+        // handshake, M0-R1).
+        let parked = self.spin_left == 0 && !self.executor.has_ready() && !plane.before_park();
         let wait = if parked { Wait::Park { timeout: self.park_timeout() } } else { Wait::Poll };
         let submitted = self.ops.len() as u64;
         for op in self.ops.drain(..) {
@@ -325,13 +327,16 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             commands = cx.commands;
             fabric_msgs = cx.fabric_msgs;
 
-            // ---- step 10: IDLE policy for the next iteration.
+            // ---- step 10: IDLE policy for the next iteration. A task
+            // woken after run_ready (steps 5–8) is work too: parking on
+            // top of it would delay it a full park timeout (F-L11-07).
             let had_work = reaped > 0
                 || polled > 0
                 || commands > 0
                 || fabric_msgs > 0
                 || fabric_pending
-                || !cx.ops.is_empty();
+                || !cx.ops.is_empty()
+                || cx.executor.has_ready();
             if had_work {
                 self.spin_left = self.config.spin_iters;
             } else {

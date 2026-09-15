@@ -1,0 +1,6 @@
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.53s
+     Running unittests src/lib.rs (target/release/deps/inf_runtime-4687707b3e8997f2)
+
+running 1 test
+timeout exit=124 (124 = the drain never returned within 30 s)

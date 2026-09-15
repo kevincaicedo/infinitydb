@@ -1,0 +1,11 @@
+warm-up: 20 s idle so boot zero-fill is done and the cells park
+trial 0 INF.NS CREATE: 0.009 s
+trial 1 INF.NS CREATE: 0.018 s
+trial 2 INF.NS CREATE: 0.010 s
+trial 3 INF.NS CREATE: 0.044 s
+trial 4 INF.NS CREATE: 0.001 s
+trial 5 INF.NS CREATE: 0.007 s
+trial 6 INF.NS CREATE: 0.019 s
+trial 7 INF.NS CREATE: 0.060 s
+max=0.060 s  over-1.2s=0/8
+VERDICT: GREEN (every DDL wait answered within one park of the persist)

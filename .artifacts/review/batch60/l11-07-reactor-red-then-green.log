@@ -1,0 +1,8 @@
+== post-fix
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+== pre-fix (reactor/executor stashed)
+thread 'a_task_woken_in_maintain_is_polled_before_any_park' (516756) panicked at crates/inf-runtime/tests/reactor.rs:398:5:
+parked on top of a runnable task: ["park", "poll", "park", "park"]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+ M crates/inf-runtime/src/executor.rs
+ M crates/inf-runtime/src/reactor.rs

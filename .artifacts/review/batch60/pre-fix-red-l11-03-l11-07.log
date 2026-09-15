@@ -1,0 +1,10 @@
+== L11-03 debug (pre-fix)
+thread 'cold::tests::a_refused_foreground_ends_the_slice' (515200) panicked at crates/inf-runtime/src/cold.rs:456:17:
+assertion `left == right` failed: the foreground is never refused
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+== L11-03 release (pre-fix), 20 s timeout
+     Running unittests src/lib.rs (target/release/deps/inf_runtime-4687707b3e8997f2)
+timeout exit=0
+== L11-07 (pre-fix)
+thread 'a_task_woken_in_maintain_is_polled_before_any_park' (515513) panicked at crates/inf-runtime/tests/reactor.rs:383:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s

@@ -1,0 +1,2 @@
+slow-reader rounds=12 churn rounds=38798 leaks=0 connected_clients=1 (probe holds 1)
+VERDICT: GREEN (no leak observed in this run — a bounded attempt, not a proof)

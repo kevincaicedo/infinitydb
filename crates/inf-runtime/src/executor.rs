@@ -425,6 +425,12 @@ impl CellExecutor {
         self.live
     }
 
+    /// Whether a task is queued to run — work the loop's park decision
+    /// must see (a wake landing after `run_ready`, F-L11-07).
+    pub fn has_ready(&self) -> bool {
+        !self.ready.borrow().is_empty()
+    }
+
     /// Whether `id` still names a live task (slots are recycled; stale ids
     /// compare against the generation).
     pub fn is_live(&self, id: TaskId) -> bool {

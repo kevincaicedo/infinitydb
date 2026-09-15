@@ -1,0 +1,20 @@
+running 1 test
+test a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes ... FAILED
+
+failures:
+
+---- a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes stdout ----
+
+thread 'a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes' (513770) panicked at crates/inf-runtime/tests/close_fd_reuse.rs:275:5:
+assertion `left == right` failed: both closes complete exactly once
+  left: [200]
+ right: [100, 200]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+error: test failed, to rerun pass `-p inf-runtime --test close_fd_reuse`

@@ -428,7 +428,8 @@ impl ColdReads {
     /// asked with the pool buffer size (the window's bound); a refused
     /// `Maintain` read stays queued and the drain continues with the
     /// foreground only — "not this slice". `Foreground` is charged, never
-    /// refused (the caller's `admit` returns true for it by contract).
+    /// refused (the caller's `admit` returns true for it by contract; a
+    /// refusal ends the slice, bounded either way).
     /// After the op is built, `refund(class, unused)` returns the bound
     /// minus the issued window.
     pub fn drain_budgeted(
@@ -453,11 +454,13 @@ impl ColdReads {
             let class_enum = if class == 0 { ReadClass::Foreground } else { ReadClass::Maintain };
             let bound = state.pool.buf_size() as u64;
             if !admit(class_enum, bound) {
-                debug_assert_eq!(
-                    class_enum,
-                    ReadClass::Maintain,
-                    "the foreground is never refused"
-                );
+                if class_enum == ReadClass::Foreground {
+                    // Contract breach (ADR-0088 D2: the foreground is never
+                    // refused). Nothing changes within this slice, so it
+                    // ends here with the intent queued for the next one —
+                    // a `continue` would spin the cell (F-L11-03).
+                    break;
+                }
                 state.counters.maintain_deferred += 1;
                 maintain_allowed = false;
                 continue;
@@ -1262,6 +1265,28 @@ mod tests {
         assert_eq!(cold.latency_percentile_us(99.9), 12, "inside the recorded range");
         drop(block_on_ready(waiter));
         assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// F-L11-03: a caller whose `admit` refuses the foreground breaches
+    /// ADR-0088 D2 — the slice must END (the intent stays queued for the
+    /// next one), never spin on a refusal that cannot change within it.
+    #[test]
+    fn a_refused_foreground_ends_the_slice() {
+        let cold = path(2);
+        let _wait = ask(&cold, 3, TierFileId::new(7), FRAME, 100);
+        let mut asked = 0u32;
+        let issued = cold.drain_budgeted(
+            |_, _| {
+                asked += 1;
+                false
+            },
+            |_, _| {},
+            |_| panic!("a refused read never issues"),
+        );
+        assert_eq!(issued, 0);
+        assert_eq!(asked, 1, "one refusal ends the slice");
+        assert_eq!(cold.queue_depth(), 1, "the intent stays queued");
+        assert_eq!(cold.counters().maintain_deferred, 0, "not a maintain deferral");
     }
 
     /// Minimal single-future block_on for gate waiters whose value is

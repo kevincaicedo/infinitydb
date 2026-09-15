@@ -1,0 +1,9 @@
+    Checking inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+    Checking inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+    Checking inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+    Checking inf-sim v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/inf-sim)
+    Checking crash-matrix v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/crash-matrix)
+    Checking compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Checking infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.43s
+CLIPPY_EXIT=0

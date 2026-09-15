@@ -1,0 +1,8 @@
+== L11-03 debug (post-fix)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.00s
+== L11-03 release (post-fix)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.00s
+== L11-07 + reactor suite (post-fix)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+thread 'a_task_woken_in_maintain_is_polled_before_any_park' (516239) panicked at crates/inf-runtime/tests/reactor.rs:383:5:
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
