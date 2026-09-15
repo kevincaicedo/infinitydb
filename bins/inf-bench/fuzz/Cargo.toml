@@ -1,0 +1,24 @@
+# cargo-fuzz crate for bins/inf-bench (F-L18-07, review of 2026-08-30, batch 63:
+# every parser in `bins/` gets a fuzz target). Standalone workspace —
+# built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-bench-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+
+[[bin]]
+name = "bench_resp_frame"
+path = "fuzz_targets/bench_resp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

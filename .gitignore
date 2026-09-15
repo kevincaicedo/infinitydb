@@ -26,4 +26,5 @@ tests/client-smoke/node_modules/
 .artifacts/**/perf.data
 .artifacts/**/perf.data.*
 .artifacts/**/*.perf.script
-.codegraph
+.codegraphbins/*/fuzz/corpus/
+bins/*/fuzz/artifacts/

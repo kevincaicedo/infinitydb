@@ -1,42 +1,118 @@
 //! Minimal RESP reply framing for the sim clients: find where one reply
 //! ends. Handles RESP2 + the RESP3 types the M0 surface emits.
 
+/// The deepest reply nesting the sim accepts (F-L18-07, review of
+/// 2026-08-30): the framer is iterative with an explicit stack and this
+/// explicit depth limit; past it the reply is a finding (a panic naming
+/// it), never a stack overflow that aborts the sweep without its seed.
+pub const MAX_DEPTH: usize = 32;
+
+/// Why bytes could not be framed as one RESP reply — the server under
+/// test produced them, which is itself a finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Malformed {
+    /// A byte that is not a RESP type tag where one was expected.
+    Tag(u8),
+    /// A length header that is not ASCII digits (or overflows).
+    Length,
+    /// Nested past [`MAX_DEPTH`].
+    Nesting,
+}
+
+impl core::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Malformed::Tag(tag) => write!(f, "invalid RESP tag {tag:#04x}"),
+            Malformed::Length => f.write_str("RESP length is not ASCII digits"),
+            Malformed::Nesting => write!(f, "reply nesting exceeds {MAX_DEPTH}"),
+        }
+    }
+}
+
 /// `Some(n)` when `buf[..n]` is one complete reply; `None` = need more.
 ///
 /// # Panics
 /// Panics on malformed framing — the server under test produced it, which
 /// is itself a finding the panic surfaces with the seed.
 pub fn reply_len(buf: &[u8]) -> Option<usize> {
+    match frame(buf, 0) {
+        Ok(len) => len,
+        Err(err) => panic!("sim client saw malformed RESP: {err}"),
+    }
+}
+
+/// The total framer behind [`reply_len`]: `Ok(None)` = need more bytes,
+/// `Err` = the bytes can never frame (the fuzz target drives this one).
+///
+/// # Errors
+/// [`Malformed`] names the first violation.
+pub fn try_reply_len(buf: &[u8]) -> Result<Option<usize>, Malformed> {
     frame(buf, 0)
 }
 
-fn frame(buf: &[u8], at: usize) -> Option<usize> {
-    let tag = *buf.get(at)?;
-    match tag {
-        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => line_end(buf, at),
-        b'$' | b'=' => {
-            let header_end = line_end(buf, at)?;
-            let n = parse_len(&buf[at + 1..header_end - 2]);
-            if n < 0 {
-                return Some(header_end); // RESP2 null bulk
+fn frame(buf: &[u8], at: usize) -> Result<Option<usize>, Malformed> {
+    // Remaining items per open aggregate — the explicit stack (F-L18-07).
+    let mut pending = [0usize; MAX_DEPTH];
+    let mut depth = 0usize;
+    let mut pos = at;
+    loop {
+        let Some(&tag) = buf.get(pos) else { return Ok(None) };
+        let items = match tag {
+            b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
+                let Some(end) = line_end(buf, pos) else { return Ok(None) };
+                pos = end;
+                0
             }
-            let total = header_end + n as usize + 2;
-            (buf.len() >= total).then_some(total)
+            b'$' | b'=' => {
+                let Some(header_end) = line_end(buf, pos) else { return Ok(None) };
+                let n = parse_len(&buf[pos + 1..header_end - 2])?;
+                pos = if n < 0 {
+                    header_end // RESP2 null bulk
+                } else {
+                    let len = usize::try_from(n).map_err(|_| Malformed::Length)?;
+                    let total = header_end
+                        .checked_add(len)
+                        .and_then(|t| t.checked_add(2))
+                        .ok_or(Malformed::Length)?;
+                    if buf.len() < total {
+                        return Ok(None);
+                    }
+                    total
+                };
+                0
+            }
+            b'*' | b'%' | b'~' | b'>' => {
+                let Some(header_end) = line_end(buf, pos) else { return Ok(None) };
+                let n = parse_len(&buf[pos + 1..header_end - 2])?;
+                pos = header_end;
+                if n < 0 {
+                    0 // null array
+                } else {
+                    let n = usize::try_from(n).map_err(|_| Malformed::Length)?;
+                    if tag == b'%' { n.checked_mul(2).ok_or(Malformed::Length)? } else { n }
+                }
+            }
+            other => return Err(Malformed::Tag(other)),
+        };
+        if items > 0 {
+            if depth == MAX_DEPTH {
+                return Err(Malformed::Nesting);
+            }
+            pending[depth] = items;
+            depth += 1;
+            continue;
         }
-        b'*' | b'%' | b'~' | b'>' => {
-            let header_end = line_end(buf, at)?;
-            let n = parse_len(&buf[at + 1..header_end - 2]);
-            if n < 0 {
-                return Some(header_end); // null array
+        // One element is complete: close every aggregate it finishes.
+        while depth > 0 {
+            pending[depth - 1] -= 1;
+            if pending[depth - 1] > 0 {
+                break;
             }
-            let items = if tag == b'%' { n as usize * 2 } else { n as usize };
-            let mut pos = header_end;
-            for _ in 0..items {
-                pos = frame(buf, pos)?;
-            }
-            Some(pos)
+            depth -= 1;
         }
-        other => panic!("sim client saw invalid RESP tag {other:#04x}"),
+        if depth == 0 {
+            return Ok(Some(pos));
+        }
     }
 }
 
@@ -45,9 +121,8 @@ fn line_end(buf: &[u8], at: usize) -> Option<usize> {
     Some(at + nl + 2)
 }
 
-fn parse_len(digits: &[u8]) -> i64 {
-    let text = core::str::from_utf8(digits).expect("RESP length is ASCII");
-    text.parse().expect("RESP length parses")
+fn parse_len(digits: &[u8]) -> Result<i64, Malformed> {
+    core::str::from_utf8(digits).ok().and_then(|t| t.parse().ok()).ok_or(Malformed::Length)
 }
 
 /// One parsed RESP2 reply — the shapes the sim's surface clients and the
@@ -63,51 +138,72 @@ pub enum Reply {
     Array(Vec<Reply>),
 }
 
-/// Parses exactly one complete RESP2 reply.
+/// Parses exactly one complete RESP2 reply. Iterative: the open arrays
+/// live on an explicit stack, bounded by [`MAX_DEPTH`] through
+/// [`reply_len`] (F-L18-07).
 ///
 /// # Panics
 /// Panics on a malformed, incomplete, or over-long frame — the server
 /// under test produced it, which is itself a finding the panic surfaces
 /// with the seed.
 pub fn parse_reply(raw: &[u8]) -> Reply {
-    let (reply, end) = parse_at(raw, 0);
+    let end = reply_len(raw).expect("complete frame");
     assert_eq!(end, raw.len(), "trailing bytes after one reply: {raw:?}");
-    reply
-}
-
-fn parse_at(buf: &[u8], at: usize) -> (Reply, usize) {
-    let end = frame(buf, at).expect("complete frame");
-    match buf[at] {
-        b'+' => (Reply::Simple(buf[at + 1..end - 2].to_vec()), end),
-        b'-' => (Reply::Error(buf[at + 1..end - 2].to_vec()), end),
-        b':' => {
-            let text = core::str::from_utf8(&buf[at + 1..end - 2]).expect("int ASCII");
-            (Reply::Int(text.parse().expect("int parses")), end)
-        }
-        b'$' => {
-            let header = line_end(buf, at).expect("bulk header");
-            if parse_len(&buf[at + 1..header - 2]) < 0 {
-                (Reply::Nil, end)
-            } else {
-                (Reply::Bulk(buf[header..end - 2].to_vec()), end)
+    let len = |digits: &[u8]| parse_len(digits).expect("framed length");
+    let mut stack: Vec<(usize, Vec<Reply>)> = Vec::new();
+    let mut at = 0;
+    loop {
+        let header = line_end(raw, at).expect("framed line");
+        let mut value = match raw[at] {
+            b'+' => {
+                let line = raw[at + 1..header - 2].to_vec();
+                at = header;
+                Reply::Simple(line)
             }
-        }
-        b'*' => {
-            let header = line_end(buf, at).expect("array header");
-            let n = parse_len(&buf[at + 1..header - 2]);
-            if n < 0 {
-                return (Reply::Nil, end);
+            b'-' => {
+                let line = raw[at + 1..header - 2].to_vec();
+                at = header;
+                Reply::Error(line)
             }
-            let mut items = Vec::with_capacity(n as usize);
-            let mut pos = header;
-            for _ in 0..n {
-                let (item, next) = parse_at(buf, pos);
-                items.push(item);
-                pos = next;
+            b':' => {
+                let text = core::str::from_utf8(&raw[at + 1..header - 2]).expect("int ASCII");
+                at = header;
+                Reply::Int(text.parse().expect("int parses"))
             }
-            (Reply::Array(items), end)
+            b'$' => {
+                let n = len(&raw[at + 1..header - 2]);
+                if n < 0 {
+                    at = header;
+                    Reply::Nil
+                } else {
+                    let end = header + n as usize + 2;
+                    at = end;
+                    Reply::Bulk(raw[header..end - 2].to_vec())
+                }
+            }
+            b'*' => {
+                let n = len(&raw[at + 1..header - 2]);
+                at = header;
+                if n < 0 {
+                    Reply::Nil
+                } else if n == 0 {
+                    Reply::Array(Vec::new())
+                } else {
+                    stack.push((n as usize, Vec::with_capacity(n as usize)));
+                    continue;
+                }
+            }
+            other => panic!("sim reply parser saw RESP tag {other:#04x}"),
+        };
+        loop {
+            let Some((want, items)) = stack.last_mut() else { return value };
+            items.push(value);
+            if items.len() < *want {
+                break;
+            }
+            let (_, items) = stack.pop().expect("checked non-empty");
+            value = Reply::Array(items);
         }
-        other => panic!("sim reply parser saw RESP tag {other:#04x}"),
     }
 }
 
@@ -177,16 +273,18 @@ impl Item {
 fn parse_array(buf: &[u8]) -> Vec<Item> {
     assert_eq!(buf.first(), Some(&b'*'), "pub/sub frame is an array");
     let header = line_end(buf, 0).expect("complete frame");
-    let n = parse_len(&buf[1..header - 2]);
+    let n = parse_len(&buf[1..header - 2]).expect("array length");
     assert!(n >= 0, "pub/sub frame is non-null");
     let mut items = Vec::with_capacity(n as usize);
     let mut at = header;
     for _ in 0..n {
-        let end = frame(buf, at).expect("element of a complete frame is complete");
+        let end = frame(buf, at)
+            .expect("element of a complete frame is well formed")
+            .expect("element of a complete frame is complete");
         match buf[at] {
             b'$' => {
                 let h = line_end(buf, at).expect("bulk header");
-                if parse_len(&buf[at + 1..h - 2]) < 0 {
+                if parse_len(&buf[at + 1..h - 2]).expect("bulk length") < 0 {
                     items.push(Item::Nil);
                 } else {
                     items.push(Item::Bulk(buf[h..end - 2].to_vec()));
@@ -240,5 +338,36 @@ mod tests {
             assert_eq!(reply_len(reply), Some(want), "reply {reply:?}");
             assert_eq!(reply_len(&reply[..want - 1]), None, "partial {reply:?}");
         }
+    }
+
+    /// F-L18-07 (review of 2026-08-30): a reply nested past the depth cap
+    /// is the sim's usual finding — a panic naming it — never a stack
+    /// overflow (which aborts the whole sweep without a seed).
+    #[test]
+    #[should_panic(expected = "nesting")]
+    fn framing_past_the_cap_panics_typed() {
+        let deep = b"*1\r\n".repeat(200_000);
+        let _ = reply_len(&deep);
+    }
+
+    #[test]
+    #[should_panic(expected = "nesting")]
+    fn parsing_past_the_cap_panics_typed() {
+        let mut deep = b"*1\r\n".repeat(200_000);
+        deep.extend_from_slice(b":1\r\n");
+        let _ = parse_reply(&deep);
+    }
+
+    #[test]
+    fn framing_at_the_cap_is_legal() {
+        let mut at_cap = b"*1\r\n".repeat(MAX_DEPTH);
+        at_cap.extend_from_slice(b":1\r\n");
+        assert_eq!(reply_len(&at_cap), Some(at_cap.len()));
+        let mut inner = parse_reply(&at_cap);
+        for _ in 0..MAX_DEPTH {
+            let Reply::Array(mut items) = inner else { panic!("{inner:?}") };
+            inner = items.remove(0);
+        }
+        assert_eq!(inner, Reply::Int(1));
     }
 }
