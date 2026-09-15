@@ -43,8 +43,9 @@ check:
     cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
     cargo test -p inf-doc -p inf-store --features doc-intern-keys
     # Slim-build lane (L11, ADR-0041 D3): a docless server carries zero
-    # document/path code and must keep compiling that way.
-    cargo check -p inf-server -p inf-store --no-default-features
+    # document/path code and must keep compiling that way — warnings
+    # denied since ADR-0125 A2 (a doc-only const warned here for months).
+    cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
 
 build:
     cargo build --workspace

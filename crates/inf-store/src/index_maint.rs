@@ -50,6 +50,7 @@ pub const SCRATCH_RETAIN_ENTRIES: usize = 4096;
 /// Write sets up to this many keys are scanned linearly per death;
 /// wider ones are sorted at bracket open and binary-searched (the
 /// crossover measured between 64 and 256 keys — batch 62 A/B).
+#[cfg(feature = "doc")]
 const WRITE_SET_LINEAR_MAX: usize = 64;
 
 /// Why the bracket pre-half refused the mutation (typed, mapped to a
@@ -176,6 +177,13 @@ mod imp {
         len: u16,
     }
 
+    impl ScratchEntry {
+        /// The encoded key this entry spans in `bytes`.
+        fn key_in<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+            &bytes[self.off as usize..self.off as usize + self.len as usize]
+        }
+    }
+
     /// Per-store bracket scratch (pre/post entry sets) plus separate
     /// death-side buffers — a death hook may run *inside* an open
     /// bracket (inline eviction of a non-write-set victim) and must not
@@ -212,6 +220,47 @@ mod imp {
                 + entries(&self.new)
                 + entries(&self.death_entries)
                 + (self.write_hashes.capacity() * size_of::<u64>()) as u64
+        }
+
+        /// Fills the death-side buffers with `root`'s encoded keys for
+        /// `entry`, sorted — one hash per document, so dedup is byte
+        /// equality on the run. `Err` = the evaluation exceeded its caps:
+        /// the document cannot enter or leave the index whole, and the
+        /// caller degrades the index (ADR-0077 D7).
+        fn collect_death_keys(
+            &mut self,
+            entry: &mut AttachedIndex,
+            hash: u64,
+            root: DocValue<'_>,
+            limits: &EvalLimits,
+        ) -> Result<(), ()> {
+            self.death_bytes.clear();
+            self.death_entries.clear();
+            let matches = eval(&entry.program, root, limits).map_err(|_| ())?;
+            for steps in matches.iter() {
+                let Some(value) = resolve(root, steps) else { continue };
+                let Some(scalar) = scalar_of(value) else {
+                    entry.counters.skipped_sparse += 1;
+                    continue;
+                };
+                match index_key_encode(entry.key_type, scalar, &mut self.key_buf) {
+                    Ok(()) => {
+                        let encoded = self.key_buf.as_bytes();
+                        let off = self.death_bytes.len() as u32;
+                        self.death_bytes.extend_from_slice(encoded);
+                        self.death_entries.push(ScratchEntry {
+                            ord: 0,
+                            entry_ref: hash,
+                            off,
+                            len: encoded.len() as u16,
+                        });
+                    }
+                    Err(skip) => entry.counters.note_skip(skip),
+                }
+            }
+            let bytes = &self.death_bytes;
+            self.death_entries.sort_unstable_by(|a, b| a.key_in(bytes).cmp(b.key_in(bytes)));
+            Ok(())
         }
 
         /// Write-set membership: a linear scan up to
@@ -628,70 +677,10 @@ mod imp {
             }
             let CellIndexes { entries, scratch, .. } = self;
             let bytes = core::mem::take(&mut scratch.bytes);
-            let key = |e: &ScratchEntry| -> (u16, &[u8], u64) {
-                (e.ord, &bytes[e.off as usize..e.off as usize + e.len as usize], e.entry_ref)
-            };
+            let key = |e: &ScratchEntry| (e.ord, e.key_in(&bytes), e.entry_ref);
             scratch.old.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
             scratch.new.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-            let (mut oi, mut ni) = (0usize, 0usize);
-            let mut touched = 0u64;
-            while oi < scratch.old.len() || ni < scratch.new.len() {
-                // Deduplicate multi-match repeats — `(typed key, pk)`
-                // pairs collapse per document (§3.3): keep a run's last.
-                if oi + 1 < scratch.old.len() && key(&scratch.old[oi]) == key(&scratch.old[oi + 1])
-                {
-                    oi += 1;
-                    continue;
-                }
-                if ni + 1 < scratch.new.len() && key(&scratch.new[ni]) == key(&scratch.new[ni + 1])
-                {
-                    ni += 1;
-                    continue;
-                }
-                let verdict = match (scratch.old.get(oi), scratch.new.get(ni)) {
-                    (Some(o), Some(n)) => key(o).cmp(&key(n)),
-                    (Some(_), None) => core::cmp::Ordering::Less,
-                    (None, Some(_)) => core::cmp::Ordering::Greater,
-                    (None, None) => unreachable!("loop condition"),
-                };
-                match verdict {
-                    core::cmp::Ordering::Less => {
-                        let (ord, k, r) = key(&scratch.old[oi]);
-                        let entry = &mut entries[ord as usize];
-                        let found = entry.tree.remove(k, r);
-                        touched |= 1 << ord;
-                        entry.counters.maint_removes += 1;
-                        if entry.converged && mode == MaintMode::Strict {
-                            debug_assert!(found, "Strict: a converged remove finds its entry");
-                        }
-                        oi += 1;
-                    }
-                    core::cmp::Ordering::Greater => {
-                        let (ord, k, r) = key(&scratch.new[ni]);
-                        let entry = &mut entries[ord as usize];
-                        match entry.tree.insert(k, r) {
-                            Ok(fresh) => {
-                                touched |= 1 << ord;
-                                entry.counters.maint_inserts += 1;
-                                if entry.converged && mode == MaintMode::Strict {
-                                    debug_assert!(fresh, "Strict: a converged insert is fresh");
-                                }
-                            }
-                            Err(_) => {
-                                // Reservation said this cannot happen —
-                                // the backstop, not a control path.
-                                entry.degraded = true;
-                                entry.counters.degraded_trips += 1;
-                            }
-                        }
-                        ni += 1;
-                    }
-                    core::cmp::Ordering::Equal => {
-                        oi += 1;
-                        ni += 1;
-                    }
-                }
-            }
+            let touched = apply_diff(entries, scratch, &bytes, mode);
             // Cardinality reconciliation (ADR-0072 D5): tree len and its
             // attribution agree after every bracket.
             for (ord, entry) in entries.iter().enumerate() {
@@ -737,42 +726,15 @@ mod imp {
             if entry.degraded {
                 return Err(());
             }
-            scratch.death_bytes.clear();
-            scratch.death_entries.clear();
-            let Ok(matches) = eval(&entry.program, root, &limits) else {
+            if scratch.collect_death_keys(entry, hash, root, &limits).is_err() {
                 // A pre-declaration document whose matches exceed the cap
                 // cannot be indexed whole — degrade rather than serve a
                 // partial projection (the death-hook rule, ADR-0077 D7).
                 entry.degraded = true;
                 entry.counters.degraded_trips += 1;
                 return Err(());
-            };
-            for steps in matches.iter() {
-                let Some(value) = resolve(root, steps) else { continue };
-                let Some(scalar) = scalar_of(value) else {
-                    entry.counters.skipped_sparse += 1;
-                    continue;
-                };
-                match index_key_encode(entry.key_type, scalar, &mut scratch.key_buf) {
-                    Ok(()) => {
-                        let encoded = scratch.key_buf.as_bytes();
-                        let off = scratch.death_bytes.len() as u32;
-                        scratch.death_bytes.extend_from_slice(encoded);
-                        scratch.death_entries.push(ScratchEntry {
-                            ord: 0,
-                            entry_ref: hash,
-                            off,
-                            len: encoded.len() as u16,
-                        });
-                    }
-                    Err(skip) => entry.counters.note_skip(skip),
-                }
             }
-            let bytes = &scratch.death_bytes;
-            let key_of = |e: &ScratchEntry| -> &[u8] {
-                &bytes[e.off as usize..e.off as usize + e.len as usize]
-            };
-            scratch.death_entries.sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+            let key_of = |e: &ScratchEntry| e.key_in(&scratch.death_bytes);
             let headroom_wanted = scratch.death_entries.len() as u64;
             if fault::fire(crate::fault::IDX_BACKFILL_TRIP)
                 || !entry.tree.insert_headroom(headroom_wanted)
@@ -824,41 +786,14 @@ mod imp {
                 if entry.degraded {
                     continue;
                 }
-                scratch.death_bytes.clear();
-                scratch.death_entries.clear();
-                let Ok(matches) = eval(&entry.program, root, &limits) else {
+                if scratch.collect_death_keys(entry, hash, root, &limits).is_err() {
                     // A doc whose eval exceeds caps cannot have been
                     // inserted whole; degrade rather than leak.
                     entry.degraded = true;
                     entry.counters.degraded_trips += 1;
                     continue;
-                };
-                for steps in matches.iter() {
-                    let Some(value) = resolve(root, steps) else { continue };
-                    let Some(scalar) = scalar_of(value) else {
-                        entry.counters.skipped_sparse += 1;
-                        continue;
-                    };
-                    match index_key_encode(entry.key_type, scalar, &mut scratch.key_buf) {
-                        Ok(()) => {
-                            let encoded = scratch.key_buf.as_bytes();
-                            let off = scratch.death_bytes.len() as u32;
-                            scratch.death_bytes.extend_from_slice(encoded);
-                            scratch.death_entries.push(ScratchEntry {
-                                ord: 0,
-                                entry_ref: hash,
-                                off,
-                                len: encoded.len() as u16,
-                            });
-                        }
-                        Err(skip) => entry.counters.note_skip(skip),
-                    }
                 }
-                let bytes = &scratch.death_bytes;
-                let key_of = |e: &ScratchEntry| -> &[u8] {
-                    &bytes[e.off as usize..e.off as usize + e.len as usize]
-                };
-                scratch.death_entries.sort_unstable_by(|a, b| key_of(a).cmp(key_of(b)));
+                let key_of = |e: &ScratchEntry| e.key_in(&scratch.death_bytes);
                 let mut previous: Option<&ScratchEntry> = None;
                 for e in &scratch.death_entries {
                     // The ref is one hash for the whole document, so
@@ -876,6 +811,78 @@ mod imp {
             }
             scratch.shrink_retained();
         }
+    }
+
+    /// The bracket's sorted-set diff (the commit-half core): removes for
+    /// `old − new`, inserts for `new − old`, multi-match repeats
+    /// collapsed per document (§3.3: keep a run's last). A tree refusal
+    /// after reservation is the degraded backstop, never a wrong
+    /// result. Returns the mask of indexes touched.
+    fn apply_diff(
+        entries: &mut [AttachedIndex],
+        scratch: &MaintScratch,
+        bytes: &[u8],
+        mode: MaintMode,
+    ) -> u64 {
+        let key = |e: &ScratchEntry| (e.ord, e.key_in(bytes), e.entry_ref);
+        let (mut oi, mut ni) = (0usize, 0usize);
+        let mut touched = 0u64;
+        while oi < scratch.old.len() || ni < scratch.new.len() {
+            // Deduplicate multi-match repeats — `(typed key, pk)`
+            // pairs collapse per document (§3.3): keep a run's last.
+            if oi + 1 < scratch.old.len() && key(&scratch.old[oi]) == key(&scratch.old[oi + 1]) {
+                oi += 1;
+                continue;
+            }
+            if ni + 1 < scratch.new.len() && key(&scratch.new[ni]) == key(&scratch.new[ni + 1]) {
+                ni += 1;
+                continue;
+            }
+            let verdict = match (scratch.old.get(oi), scratch.new.get(ni)) {
+                (Some(o), Some(n)) => key(o).cmp(&key(n)),
+                (Some(_), None) => core::cmp::Ordering::Less,
+                (None, Some(_)) => core::cmp::Ordering::Greater,
+                (None, None) => unreachable!("loop condition"),
+            };
+            match verdict {
+                core::cmp::Ordering::Less => {
+                    let (ord, k, r) = key(&scratch.old[oi]);
+                    let entry = &mut entries[ord as usize];
+                    let found = entry.tree.remove(k, r);
+                    touched |= 1 << ord;
+                    entry.counters.maint_removes += 1;
+                    if entry.converged && mode == MaintMode::Strict {
+                        debug_assert!(found, "Strict: a converged remove finds its entry");
+                    }
+                    oi += 1;
+                }
+                core::cmp::Ordering::Greater => {
+                    let (ord, k, r) = key(&scratch.new[ni]);
+                    let entry = &mut entries[ord as usize];
+                    match entry.tree.insert(k, r) {
+                        Ok(fresh) => {
+                            touched |= 1 << ord;
+                            entry.counters.maint_inserts += 1;
+                            if entry.converged && mode == MaintMode::Strict {
+                                debug_assert!(fresh, "Strict: a converged insert is fresh");
+                            }
+                        }
+                        Err(_) => {
+                            // Reservation said this cannot happen —
+                            // the backstop, not a control path.
+                            entry.degraded = true;
+                            entry.counters.degraded_trips += 1;
+                        }
+                    }
+                    ni += 1;
+                }
+                core::cmp::Ordering::Equal => {
+                    oi += 1;
+                    ni += 1;
+                }
+            }
+        }
+        touched
     }
 
     /// The ADR-0076 D6 disjointness rule, conservative by construction:

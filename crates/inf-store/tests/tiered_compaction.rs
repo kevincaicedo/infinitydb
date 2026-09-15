@@ -19,46 +19,20 @@ use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TIER_FRAME_BYTES,
-    TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
-    tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
+    TierFlush, TierFlushConfig, decode_record, read_ick_hybrid, read_manifest, tier_extract,
+    tier_frame_offset, tier_frame_span, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
-    AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr,
-    TieredLookup, TieredTable, apply_live_set_section, apply_ref_section, recover_tiered_ns,
+    CompactionConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredLookup, TieredTable,
+    apply_live_set_section, apply_ref_section, recover_tiered_ns,
 };
 
+mod support;
+use support::*;
+
 const NS: NsId = NsId(47);
-const PAGE: u64 = 4 << 10;
-const BUDGET: u64 = 1 << 20;
 const FILE_CAPACITY: u64 = 48 << 10;
-const SHARD: &str = "shard-0";
-
-fn seeded(x: &mut u64) -> u64 {
-    *x ^= *x << 13;
-    *x ^= *x >> 7;
-    *x ^= *x << 17;
-    *x
-}
-
-fn flush_config() -> TierFlushConfig {
-    TierFlushConfig {
-        shard_dir: Path::new(SHARD).to_path_buf(),
-        cell: 0,
-        ns: NS,
-        mode: TierIoMode::Buffered,
-        file_capacity: FILE_CAPACITY,
-        slice_bytes: PAGE,
-    }
-}
-
-fn space_config(demote: DemotionConfig, origin: u64) -> AddressSpaceConfig {
-    AddressSpaceConfig {
-        reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
-        page_bytes: PAGE as usize,
-        life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Expect {
@@ -90,7 +64,7 @@ impl Rig {
         let fs = MemFs::new();
         let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
             .expect("ring");
-        let flush = TierFlush::new(fs.clone(), flush_config(), 0);
+        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
         Rig {
             table,
             fs,
@@ -104,35 +78,11 @@ impl Rig {
     }
 
     fn maintain(&mut self) {
-        loop {
-            let sealed = self.table.seal_slice();
-            let f = self.table.flush_slice(&mut self.flush).expect("flush slice");
-            let released = self.table.release_slice();
-            if sealed + released + f.appended_bytes + u64::from(f.gaps_crossed) == 0 {
-                break;
-            }
-        }
+        support::maintain(&mut self.table, &mut self.flush);
     }
 
     fn read_cold(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-        let contains = |base: u64, flen: u64| addr >= base && addr + len as u64 <= base + flen;
-        let (base, path) = self
-            .flush
-            .sealed()
-            .iter()
-            .find(|m| contains(m.base.to_raw(), m.data_len))
-            .map(|m| (m.base.to_raw(), m.path.clone()))
-            .or_else(|| {
-                let (_, base, _, durable_len, path) = self.flush.active()?;
-                contains(base.to_raw(), durable_len).then(|| (base.to_raw(), path.to_path_buf()))
-            })?;
-        let image = self.fs.contents(&path)?;
-        let (first, count, skip) = tier_frame_span(addr - base, len);
-        let from = tier_frame_offset(first) as usize;
-        let to = from + count as usize * TIER_FRAME_BYTES;
-        let mut out = Vec::new();
-        tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
-        Some(out)
+        support::read_cold(&self.flush, &self.fs, addr, len)
     }
 
     /// SET with the D4 marker discipline, D9 origin markers included.
@@ -479,7 +429,7 @@ fn stalled_relocation_resumes_after_window_progress() {
     let fs = MemFs::new();
     let table = TieredTable::new(space_config(demote, 0), demote, 2048, KeyHasher::default())
         .expect("ring");
-    let flush = TierFlush::new(fs.clone(), flush_config(), 0);
+    let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
     let mut rig = Rig {
         table,
         fs,
@@ -762,7 +712,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         fs.clone(),
         &tier,
         manifest.ckpt_id,
-        flush_config(),
+        flush_config(NS, FILE_CAPACITY),
         space_config(demote, 0),
         demote,
         2048,
@@ -918,7 +868,7 @@ fn endurance_slice_disk_oscillates_and_statvfs_reclaims() {
     // A small budget so the 1500-key working set demotes cold and the
     // reclaim pipeline actually cycles.
     let demote = DemotionConfig::for_budget(256 << 10, PAGE);
-    let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config() };
+    let config = TierFlushConfig { shard_dir: shard.clone(), ..flush_config(NS, FILE_CAPACITY) };
     let mut table = TieredTable::new(space_config(demote, 0), demote, 4096, KeyHasher::default())
         .expect("ring");
     table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });

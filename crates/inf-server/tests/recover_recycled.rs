@@ -12,70 +12,35 @@
 
 use std::path::PathBuf;
 
-use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
-    CkptConfig, FRAME_ALIGN, FRAME_HEADER_LEN, FrameBuilder, FrameLayout, FrameStamp, Lsn, NsId,
-    RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig, create_cell_dirs,
-    segment_file_name,
+    FRAME_ALIGN, FRAME_HEADER_LEN, FrameBuilder, FrameLayout, FrameStamp, Lsn, RecordView,
+    SegmentConfig, SegmentId, SegmentRotor, create_cell_dirs, segment_file_name,
 };
-use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
+use inf_server::DurableConfig;
+use inf_store::Keyspace;
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-const SEGMENT_BYTES: u32 = 64 << 10;
+mod support;
+use support::*;
 
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
+/// `Direct` segments: the aligned (v3) frame shape recycling carries.
 fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig {
-            segment_bytes: SEGMENT_BYTES,
-            io_mode: SegmentIoMode::Direct,
-            ..Default::default()
-        },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        flush_bound: 1,
-        fua_p50_us_probed: 0,
-        device: Default::default(),
-        fill: Default::default(),
-        group: Default::default(),
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
+    cfg_with(SegmentConfig {
+        segment_bytes: SEGMENT_BYTES,
+        io_mode: SegmentIoMode::Direct,
+        ..Default::default()
     })
-    .expect("ns");
-    ks
 }
 
-fn get(ks: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    ks.ns_store_mut(NS).expect("ns store").get(key, now()).map(<[u8]>::to_vec)
+fn recover(
+    fs: &MemFs,
+    ks: &mut Keyspace,
+) -> std::io::Result<(SegmentRotor<MemFs>, inf_server::RecoverStats)> {
+    recover_with(fs, ks, &cfg())
 }
 
-fn stamp(epoch: u32, seq: u64, covered_lsn: u64) -> FrameStamp {
-    FrameStamp { epoch, seq, covered_lsn }
-}
+const SEGMENT_BYTES: u32 = 64 << 10;
 
 /// A fresh `Direct` cell dir with `seg-000000.ilog`; aligned (v3) frames
 /// placed by hand at exact block offsets, stamped for whichever segment
@@ -134,14 +99,6 @@ impl HandLog {
         self.poke(file_segment, offset, &bytes);
         bytes
     }
-}
-
-fn recover(
-    fs: &MemFs,
-    ks: &mut Keyspace,
-) -> std::io::Result<(SegmentRotor<MemFs>, inf_server::RecoverStats)> {
-    open_cell_log(fs.clone(), ks, CELL, &cfg(), anchor(), now())
-        .map(|(rotor, stats, _seed)| (rotor, stats))
 }
 
 const OLD: SegmentId = SegmentId(7);

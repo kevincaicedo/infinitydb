@@ -11,32 +11,22 @@
 //! holes (ADR-0052 D2); sealed footers verify.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use inf_log::fs::mem::MemFs;
-use inf_log::{
-    NsId, SealReason, TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, inspect_tier_bytes,
-    tier_extract, tier_frame_offset, tier_frame_span,
-};
+use inf_log::{NsId, SealReason, TierFlush, inspect_tier_bytes};
 use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, StoreConfig,
     TieredLookup, TieredTable,
 };
 
+mod support;
+use support::*;
+
 const NS: NsId = NsId(41);
-const PAGE: u64 = 4 << 10;
-const BUDGET: u64 = 1 << 20;
 /// Small file capacity so the storm rotates files constantly.
 const FILE_CAPACITY: u64 = 96 << 10;
 const OPS: u64 = 200_000;
-
-fn seeded(x: &mut u64) -> u64 {
-    *x ^= *x << 13;
-    *x ^= *x >> 7;
-    *x ^= *x << 17;
-    *x
-}
 
 struct Rig {
     ks: Keyspace,
@@ -63,18 +53,7 @@ impl Rig {
             )
             .is_ok()
         );
-        let flush = TierFlush::new(
-            fs.clone(),
-            TierFlushConfig {
-                shard_dir: Path::new("shard-0").to_path_buf(),
-                cell: 0,
-                ns: NS,
-                mode: TierIoMode::Buffered,
-                file_capacity: FILE_CAPACITY,
-                slice_bytes: PAGE,
-            },
-            0,
-        );
+        let flush = TierFlush::new(fs.clone(), flush_config(NS, FILE_CAPACITY), 0);
         Rig { ks, fs, flush }
     }
 
@@ -113,27 +92,8 @@ impl Rig {
         }
     }
 
-    /// Reads one cold record straight from the tier-file bytes the
-    /// pipeline wrote (the audit's cold path — no table access).
     fn read_cold(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
-        let contains = |base: u64, flen: u64| addr >= base && addr + len as u64 <= base + flen;
-        let (base, path) = self
-            .flush
-            .sealed()
-            .iter()
-            .find(|m| contains(m.base.to_raw(), m.data_len))
-            .map(|m| (m.base.to_raw(), m.path.clone()))
-            .or_else(|| {
-                let (_, base, _, durable_len, path) = self.flush.active()?;
-                contains(base.to_raw(), durable_len).then(|| (base.to_raw(), path.to_path_buf()))
-            })?;
-        let image = self.fs.contents(&path)?;
-        let (first, count, skip) = tier_frame_span(addr - base, len);
-        let from = tier_frame_offset(first) as usize;
-        let to = from + count as usize * TIER_FRAME_BYTES;
-        let mut out = Vec::new();
-        tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
-        Some(out)
+        support::read_cold(&self.flush, &self.fs, addr, len)
     }
 }
 

@@ -17,60 +17,27 @@
 //! This is the composition proof, not the campaign: the durability
 //! oracle over the ack stream and the 10k-seed sweep bind at M2-S19.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use inf_foundation::rng::{Entropy, SplitMix64};
-use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, Lsn, MutationEffect, NsId, SegmentConfig, SegmentReader, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
+    Lsn, MutationEffect, SegmentConfig, SegmentReader, SegmentRotor, StagingRing, create_cell_dirs,
+    scan_log_dir, segment_file_name,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
+use inf_store::StateDigest;
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-const LOG_DIR: &str = "data/shard-0/log";
+mod support;
+use support::*;
 
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
+/// 8 KiB segments: many rotations per run.
 fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        flush_bound: 1,
-        fua_p50_us_probed: 0,
-        device: Default::default(),
-        fill: Default::default(),
-        group: Default::default(),
-    }
+    cfg_with(SegmentConfig { segment_bytes: 8 << 10, ..Default::default() })
 }
 
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
+const LOG_DIR: &str = "data/shard-0/log";
 
 /// Seeded tail-only workload on the sim disk: frames at random
 /// boundaries, occasional explicit fdatasync of the active segment (the

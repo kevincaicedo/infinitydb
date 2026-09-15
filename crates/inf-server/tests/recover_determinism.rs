@@ -17,61 +17,26 @@
 //! milestone plan.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use inf_foundation::KeyHasher;
-use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
-    SegmentId, SegmentReader, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    scan_log_dir, segment_file_name, write_manifest,
+    FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, RecordView, SegmentConfig, SegmentId,
+    SegmentReader, SegmentRotor, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
+    write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
+use inf_store::StateDigest;
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-const UNIX_BASE: u64 = 1_750_000_000_000;
+mod support;
+use support::*;
 
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: UNIX_BASE }
-}
-
+/// 8 KiB segments: many rotations per run.
 fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 8 << 10, ..Default::default() },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        flush_bound: 1,
-        fua_p50_us_probed: 0,
-        device: Default::default(),
-        fill: Default::default(),
-        group: Default::default(),
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
+    cfg_with(SegmentConfig { segment_bytes: 8 << 10, ..Default::default() })
 }
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
