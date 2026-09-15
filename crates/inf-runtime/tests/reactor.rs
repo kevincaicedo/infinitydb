@@ -155,6 +155,19 @@ impl CellPlane for BusyThenIdle {
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
+/// Batch 61 (lane L11 `reactor.rs:239`): the first iteration polls — the
+/// plane arms its accept in its first PARSE, which runs *after* the wait,
+/// so a park there costs boot one full `park_default` for nothing.
+#[test]
+fn the_first_iteration_polls_before_anything_is_armed() {
+    for spin_iters in [4, 0] {
+        let mut lp = test_loop(LoopConfig { spin_iters, ..LoopConfig::default() });
+        let mut plane = BusyThenIdle { busy_left: 0 };
+        let first = lp.run_iteration(&mut plane).expect("iteration");
+        assert!(!first.parked, "spin_iters {spin_iters}: boot parked: {:?}", lp.driver().waits);
+    }
+}
+
 #[test]
 fn idle_policy_spins_then_parks() {
     let spin = 4;
@@ -165,8 +178,8 @@ fn idle_policy_spins_then_parks() {
         lp.run_iteration(&mut plane).expect("iteration");
     }
     let waits = &lp.driver().waits;
-    // First iteration parks (nothing has happened yet), then work keeps it
-    // polling, then `spin` more polls, then parks forever.
+    // The first iteration polls (batch 61), work keeps it polling, then
+    // `spin` more polls, then it parks forever.
     let tail: Vec<_> = waits.iter().rev().take(3).collect();
     assert!(tail.iter().all(|w| **w == "park"), "loop must park when idle: {waits:?}");
     assert!(

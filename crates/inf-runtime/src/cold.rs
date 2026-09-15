@@ -420,7 +420,7 @@ impl ColdReads {
     /// idempotent when nothing is admissible). Returns device reads
     /// issued.
     pub fn drain(&self, push: impl FnMut(IoOp)) -> u32 {
-        self.drain_budgeted(|_, _| true, |_, _| {}, push)
+        self.drain_budgeted(|_, _| true, |_, _, _| {}, push)
     }
 
     /// [`drain`](Self::drain) under a device budget (M4.5-S36, ADR-0088
@@ -430,12 +430,16 @@ impl ColdReads {
     /// foreground only — "not this slice". `Foreground` is charged, never
     /// refused (the caller's `admit` returns true for it by contract; a
     /// refusal ends the slice, bounded either way).
-    /// After the op is built, `refund(class, unused)` returns the bound
-    /// minus the issued window.
+    /// Every `admit` is one device op beside its bytes. After the op is
+    /// built, `refund(class, unused_bytes, unused_ops)` returns the bound
+    /// minus the issued window and no op; a pool-dry stall issues nothing
+    /// and returns the whole bound and the op (F-L11-04). A deferred
+    /// maintain keeps its contention grant — "not this slice" is not a
+    /// turn taken.
     pub fn drain_budgeted(
         &self,
         mut admit: impl FnMut(ReadClass, u64) -> bool,
-        mut refund: impl FnMut(ReadClass, u64),
+        mut refund: impl FnMut(ReadClass, u64, u64),
         mut push: impl FnMut(IoOp),
     ) -> u32 {
         let mut issued = 0u32;
@@ -450,7 +454,7 @@ impl ColdReads {
             if state.pending[0].is_empty() && (state.pending[1].is_empty() || !maintain_allowed) {
                 break;
             }
-            let class = Self::pick_class(state, maintain_allowed);
+            let (class, grant_spent) = Self::pick_class(state, maintain_allowed);
             let class_enum = if class == 0 { ReadClass::Foreground } else { ReadClass::Maintain };
             let bound = state.pool.buf_size() as u64;
             if !admit(class_enum, bound) {
@@ -463,18 +467,21 @@ impl ColdReads {
                 }
                 state.counters.maintain_deferred += 1;
                 maintain_allowed = false;
+                if grant_spent {
+                    state.grants[1] += 1;
+                }
                 continue;
             }
             let Some(buf) = state.pool.try_lease() else {
                 state.counters.pool_dry += 1;
-                refund(class_enum, bound);
+                refund(class_enum, bound, 1);
                 break;
             };
             let op = Self::admit(state, &self.gate, class, buf);
             let IoOp::TierRead { buf: ref window, .. } = op else {
                 unreachable!("admit builds reads")
             };
-            refund(class_enum, bound.saturating_sub(u64::from(window.len())));
+            refund(class_enum, bound.saturating_sub(u64::from(window.len())), 0);
             drop(state_ref);
             push(op);
             issued += 1;
@@ -501,26 +508,28 @@ impl ColdReads {
 
     /// Deficit pick over non-empty classes: work-conserving when one
     /// class is idle (its grants are forfeit, not banked); 3:1 metering
-    /// only under contention (ADR-0055 D3).
-    fn pick_class(state: &mut ColdState, maintain_allowed: bool) -> usize {
+    /// only under contention (ADR-0055 D3). The flag says a contention
+    /// grant was spent on the pick (the caller gives it back on a
+    /// deferral).
+    fn pick_class(state: &mut ColdState, maintain_allowed: bool) -> (usize, bool) {
         let foreground = !state.pending[0].is_empty();
         let maintain = !state.pending[1].is_empty() && maintain_allowed;
         debug_assert!(foreground || maintain, "caller checked non-empty");
         if !maintain {
-            return 0;
+            return (0, false);
         }
         if !foreground {
-            return 1;
+            return (1, false);
         }
         if state.grants[0] == 0 && state.grants[1] == 0 {
             state.grants = [state.config.grants_foreground, state.config.grants_maintain];
         }
         if state.grants[0] > 0 {
             state.grants[0] -= 1;
-            0
+            (0, true)
         } else {
             state.grants[1] -= 1;
-            1
+            (1, true)
         }
     }
 
@@ -1280,13 +1289,89 @@ mod tests {
                 asked += 1;
                 false
             },
-            |_, _| {},
+            |_, _, _| {},
             |_| panic!("a refused read never issues"),
         );
         assert_eq!(issued, 0);
         assert_eq!(asked, 1, "one refusal ends the slice");
         assert_eq!(cold.queue_depth(), 1, "the intent stays queued");
         assert_eq!(cold.counters().maintain_deferred, 0, "not a maintain deferral");
+    }
+
+    /// F-L11-04 (review 2026-08-30 lane L11): every `admit` charges one
+    /// device op beside the byte bound; a pool-dry stall issues no SQE,
+    /// so the op must come back with the bytes — pre-fix only the bytes
+    /// did, and `io_budget_ops_cold_read_*` drifted by `pool_dry`.
+    #[test]
+    fn a_pool_dry_stall_refunds_the_charged_op() {
+        let cold = path(1);
+        let file = TierFileId::new(4);
+        // Far apart: the merge window must not join them.
+        let first = ask(&cold, 3, file, 0, 64);
+        let second = ask(&cold, 3, file, 1 << 20, 64);
+        let (mut charged_bytes, mut charged_ops) = (0u64, 0u64);
+        let (mut refunded_bytes, mut refunded_ops) = (0u64, 0u64);
+        let mut windows = 0u64;
+        let issued = cold.drain_budgeted(
+            |_, bytes| {
+                charged_bytes += bytes;
+                charged_ops += 1;
+                true
+            },
+            |_, bytes, ops| {
+                refunded_bytes += bytes;
+                refunded_ops += ops;
+            },
+            |op| {
+                let IoOp::TierRead { buf, .. } = op else { panic!("TierRead") };
+                windows += u64::from(buf.len());
+            },
+        );
+        assert_eq!(issued, 1, "one buffer, one device read");
+        assert_eq!(cold.counters().pool_dry, 1, "the second intent stalled on the pool");
+        assert_eq!(charged_bytes - refunded_bytes, windows, "net bytes = issued windows");
+        assert_eq!(
+            charged_ops - refunded_ops,
+            u64::from(issued),
+            "net ops = reads issued (drifts by pool_dry pre-fix)"
+        );
+        drop((first, second));
+    }
+
+    /// F-L11-04, the lane's second half: a maintain read the budget
+    /// defers keeps its contention grant — the deferral is "not this
+    /// slice", not a turn taken. Pre-fix the grant was spent on nothing
+    /// and the next slice refilled foreground-first.
+    #[test]
+    fn a_deferred_maintain_keeps_its_grant() {
+        let config = ColdReadConfig { merge: false, ..ColdReadConfig::default() };
+        let cold = shaped(16, config);
+        let file = TierFileId::new(13);
+        let mut waiters = Vec::new();
+        for lane in 0..4u64 {
+            waiters.push(ask(&cold, 3, file, lane << 20, 64));
+        }
+        waiters.push(
+            cold.enqueue(3, file, 100 << 20, 64, ReadClass::Maintain, 0).expect("queue sized"),
+        );
+        // Slice 1: fff, then the maintain turn (grants 3:1) is deferred,
+        // then the fourth foreground drains alone.
+        let mut first = Vec::new();
+        let issued = cold.drain_budgeted(
+            |class, _| class == ReadClass::Foreground,
+            |_, _, _| {},
+            |op| first.push(op),
+        );
+        assert_eq!(issued, 4);
+        assert_eq!(cold.counters().maintain_deferred, 1);
+        // Slice 2, under contention again: the deferred maintain's turn
+        // comes first — its grant survived the deferral.
+        waiters.push(ask(&cold, 3, file, 50 << 20, 64));
+        let mut second = Vec::new();
+        cold.drain_budgeted(|_, _| true, |_, _, _| {}, |op| second.push(op));
+        let IoOp::TierRead { offset, .. } = second[0] else { panic!("TierRead") };
+        assert_eq!(offset, 100 << 20, "the deferred maintain read goes first, not a refilled fff");
+        drop((first, second, waiters));
     }
 
     /// Minimal single-future block_on for gate waiters whose value is

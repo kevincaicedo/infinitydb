@@ -85,6 +85,10 @@ pub use plane::{
     fold_live_entries,
 };
 pub use readahead::boot_prefetch_threads_spawned;
+// Harness-facing (batch 61): the compat harness reserves ports with the
+// node's own bind-only probe; `inf-server` already owns the socket-facing
+// assembly, so no new dep-DAG edge.
+pub use inf_runtime::net::probe_addr_unowned;
 pub use recover::{
     RecoverPhase, RecoverPhases, RecoverStats, RecoveredManifest, Recovery, RecoveryProgress,
     open_cell_log,

@@ -2068,13 +2068,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     },
                     None => true,
                 },
-                |class, unused| {
+                |class, unused_bytes, unused_ops| {
                     if let Some(cell) = durable.borrow_mut().as_mut() {
                         let io_class = match class {
                             inf_runtime::ReadClass::Foreground => IoClass::ColdReadForeground,
                             inf_runtime::ReadClass::Maintain => IoClass::ColdReadMaintain,
                         };
-                        cell.refund_background_or_foreground(io_class, unused, 0);
+                        cell.refund_background_or_foreground(io_class, unused_bytes, unused_ops);
                     }
                 },
                 |op| cx.push(op),

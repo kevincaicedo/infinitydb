@@ -105,6 +105,10 @@ pub struct NodeInfo {
     /// seq from 1 — node-unique and never reused, like Redis's.
     pub next_client_id: Cell<u64>,
     pub tcp_port: Cell<u16>,
+    /// `INFO server:process_id` (Redis's field; batch 61): the OS pid,
+    /// set once at assembly. A harness pairs a test with the process it
+    /// spawned by it — a foreign node on the port answers `PING` too.
+    pub process_id: Cell<u32>,
     /// M4.5-S40 (`infinityd --conn-default-ns NAME`): every accepted
     /// connection starts as if it had sent `INF.NS USE NAME` — the
     /// operator's opt-in for clients that cannot send a per-connection

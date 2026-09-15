@@ -189,6 +189,8 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     config: LoopConfig,
     ops: Vec<IoOp>,
     completions: Vec<Completion>,
+    /// Due timer keys, collected then dispatched (reused across iterations).
+    due: Vec<u64>,
     iter_hist_us: LogHistogram,
     spin_left: u32,
     iterations: u64,
@@ -214,8 +216,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             config,
             ops: Vec::with_capacity(256),
             completions: Vec::with_capacity(256),
+            due: Vec::new(),
             iter_hist_us: LogHistogram::new(),
-            spin_left: 0,
+            // The first iteration polls: the plane arms its accept in its
+            // first PARSE, after the wait — a park there is a boot stall of
+            // one `park_default` (batch 61, lane L11).
+            spin_left: config.spin_iters.max(1),
             iterations: 0,
             submits: 0,
             enters_total: 0,
@@ -287,9 +293,10 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                 plane.on_completion(&mut cx, c);
             }
             // Timers: collect-then-dispatch keeps `cx` exclusive.
-            let mut due = Vec::new();
+            let due = &mut self.due;
+            due.clear();
             cx.timers.advance(start, |key| due.push(key));
-            for key in due {
+            for key in due.drain(..) {
                 plane.on_timer(&mut cx, key);
             }
 

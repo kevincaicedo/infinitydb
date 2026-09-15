@@ -1108,7 +1108,7 @@ fn cell_main(
         }
     };
     if let Some(start) = args.pin_start {
-        pin_current_thread(start + cell as usize * 2);
+        pin_current_thread(start + cell as usize * 2)?;
     }
     mark(10); // setup:listen
     let listener = listen_reuseport(args.port)?;
@@ -1149,6 +1149,7 @@ fn cell_main(
     node.rng_state.set(unix_ms ^ (u64::from(cell) << 48) ^ 0x9E37_79B9_7F4A_7C15);
     node.run_id.set(args.run_id);
     node.tcp_port.set(args.port);
+    node.process_id.set(std::process::id());
     if let Some(name) = &args.conn_default_ns {
         *node.conn_default_ns.borrow_mut() = Some(name.clone().into_bytes());
     }
