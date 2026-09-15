@@ -1146,6 +1146,8 @@ doc_case="$work/doc-artifacts"
 doc_root="$doc_case/infinitydb"
 mkdir -p "$doc_root/docs"
 printf '[workspace]\n' >"$doc_root/Cargo.toml"
+printf '# Architecture\n' >"$doc_root/ARCHITECTURE.md"
+printf '# Style\n' >"$doc_root/docs/INFINITY_STYLE.md"
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
 expect_output "docs: standalone discloses the absent governance scope" "parent governance absent, not validated" env INF_CHECK_ROOT="$doc_root" $DOCS
@@ -1156,6 +1158,8 @@ rm -f "$doc_root/docs/compat-matrix.md"
 expect red "docs: generated matrix missing" env INF_CHECK_ROOT="$doc_root" $DOCS
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 mkdir -p "$doc_case/docs/adr"
+mkdir -p "$doc_case/docs/milestones"
+printf '# M0\n' >"$doc_case/docs/milestones/m0.md"
 printf '# Master plan\n' >"$doc_case/docs/infinity-master-plan.md"
 cat >"$work/matrix-pointer" <<'EOF'
 # Compatibility matrix

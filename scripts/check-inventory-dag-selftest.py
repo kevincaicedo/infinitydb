@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the real inventory and DAG gates on isolated, deliberately invalid trees."""
+"""Plant invalid trees in the inventory, dependency and document gates."""
 
 import json
 import os
@@ -173,6 +173,255 @@ if overwrite.exists():
         self.prepare_dag()
         self.write("metadata.json", '{"packages": [], "workspace_members": []}')
         self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def reserve_edge(self, reason="ADR-0106 D16: M7 stub activation"):
+        with (self.root / "docs/dep-dag.toml").open("a") as policy:
+            policy.write(f'\n[unused.fake]\nother = {json.dumps(reason)}\n')
+
+    def remove_actual_edge(self):
+        metadata = self.metadata()
+        metadata["packages"][0]["dependencies"] = []
+        self.write("metadata.json", json.dumps(metadata))
+
+    def test_dag_unused_permission_needs_a_reservation(self):
+        self.prepare_dag(allowed=True)
+        self.remove_actual_edge()
+        result = self.gate("check-dep-dag.sh")
+        self.assert_red(result)
+        self.assertIn("fake -> other", result.stdout)
+
+    def test_dag_dev_edge_does_not_satisfy_normal_permission(self):
+        self.prepare_dag(kind="dev", allowed=True)
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_reserved_dev_only_permission_is_visible(self):
+        self.prepare_dag(kind="dev", allowed=True)
+        self.reserve_edge()
+        result = self.gate("check-dep-dag.sh")
+        self.assert_green(result)
+        self.assertIn("reserved edge: fake -> other", result.stdout)
+        self.assertIn("dev-edge exempt: fake -> other", result.stdout)
+
+    def test_dag_activation_requires_retiring_annotation(self):
+        self.prepare_dag(allowed=True)
+        self.reserve_edge()
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_annotation_cannot_authorize_forbidden_edge(self):
+        self.prepare_dag()
+        self.remove_actual_edge()
+        self.reserve_edge()
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_reservation_needs_reason_decision_and_milestone(self):
+        self.prepare_dag(allowed=True)
+        self.remove_actual_edge()
+        for reason in ["", "later", "ADR-0106 later", "M7 later"]:
+            with self.subTest(reason=reason):
+                self.write("docs/dep-dag.toml", '[edges]\nfake = ["other"]\nother = []\n')
+                self.reserve_edge(reason)
+                self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_missing_row_fails_even_without_dependencies(self):
+        self.prepare_dag()
+        self.remove_actual_edge()
+        self.write("docs/dep-dag.toml", "[edges]\nfake = []\n")
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_unknown_package_row_fails(self):
+        self.prepare_dag(allowed=True)
+        with (self.root / "docs/dep-dag.toml").open("a") as policy:
+            policy.write("retired = []\n")
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_unknown_target_fails(self):
+        self.prepare_dag(allowed=True)
+        self.write("docs/dep-dag.toml", '[edges]\nfake = ["other", "typo"]\nother = []\n')
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_duplicate_permission_fails(self):
+        self.prepare_dag(allowed=True)
+        self.write("docs/dep-dag.toml", '[edges]\nfake = ["other", "other"]\nother = []\n')
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_schema_does_not_accept_substring_membership(self):
+        self.prepare_dag(allowed=True)
+        self.write("docs/dep-dag.toml", '[edges]\nfake = "other-extra"\nother = []\n')
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_unknown_policy_section_fails(self):
+        self.prepare_dag(allowed=True)
+        with (self.root / "docs/dep-dag.toml").open("a") as policy:
+            policy.write("\n[unusd.fake]\nother = 'ADR-0106 M7 stub'\n")
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_unknown_empty_reservation_package_fails(self):
+        self.prepare_dag(allowed=True)
+        with (self.root / "docs/dep-dag.toml").open("a") as policy:
+            policy.write("\n[unused.typo]\n")
+        self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_incomplete_workspace_metadata_fails(self):
+        self.prepare_dag(allowed=True)
+        metadata = self.metadata()
+        metadata["workspace_members"].append("missing")
+        self.write("metadata.json", json.dumps(metadata))
+        result = self.gate("check-dep-dag.sh")
+        self.assert_red(result)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_dag_wrong_metadata_shape_is_named(self):
+        self.prepare_dag()
+        self.write("metadata.json", '{"packages": {}}')
+        result = self.gate("check-dep-dag.sh")
+        self.assert_red(result)
+        self.assertIn("SCOPE ERROR", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_dag_optional_target_edge_counts_before_feature_activation(self):
+        self.prepare_dag(allowed=True)
+        metadata = self.metadata()
+        metadata["packages"][0]["dependencies"][0]["optional"] = True
+        self.write("metadata.json", json.dumps(metadata))
+        self.assert_green(self.gate("check-dep-dag.sh"))
+
+    def test_dag_normal_and_build_declarations_count_as_one_edge(self):
+        self.prepare_dag(allowed=True)
+        metadata = self.metadata()
+        metadata["packages"][0]["dependencies"].append(
+            {"name": "other", "kind": "build", "target": None}
+        )
+        self.write("metadata.json", json.dumps(metadata))
+        self.assert_green(self.gate("check-dep-dag.sh"))
+
+    def test_dag_zero_dependency_policy_covers_external_packages(self):
+        self.prepare_dag()
+        self.write("docs/dep-dag.toml", 'zero-dependency = ["fake"]\n[edges]\nfake = []\nother = []\n')
+        for kind in [None, "build", "dev"]:
+            with self.subTest(kind=kind):
+                metadata = self.metadata(kind)
+                metadata["packages"][0]["dependencies"][0]["name"] = "external"
+                self.write("metadata.json", json.dumps(metadata))
+                self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_zero_dependency_policy_accepts_empty_package(self):
+        self.prepare_dag()
+        self.remove_actual_edge()
+        self.write("docs/dep-dag.toml", 'zero-dependency = ["fake"]\n[edges]\nfake = []\nother = []\n')
+        self.assert_green(self.gate("check-dep-dag.sh"))
+
+
+class DocumentPaths(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory(prefix="inf-doc-paths-")
+        self.addCleanup(self.scratch.cleanup)
+        self.parent = Path(self.scratch.name)
+        self.root = self.parent / "infinitydb"
+        (self.root / "docs").mkdir(parents=True)
+        (self.root / "Cargo.toml").write_text("[workspace]\n")
+        (self.root / "ARCHITECTURE.md").write_text("# Architecture\n")
+        (self.root / "docs/INFINITY_STYLE.md").write_text("# Style\n")
+        (self.root / "docs/compat-matrix.md").write_text("**GENERATED — do not edit.**\n")
+
+    def governance(self):
+        docs = self.parent / "docs"
+        (docs / "adr").mkdir(parents=True)
+        (docs / "milestones").mkdir()
+        (docs / "infinity-master-plan.md").write_text("# Master\n")
+        (docs / "milestones/m0.md").write_text("# M0\n")
+        (docs / "adr/0106-gates.md").write_text("# ADR-0106: Gates\n")
+        (docs / "compat-matrix.md").write_text(
+            "# Compatibility matrix\n\n"
+            "The generated [compatibility matrix](../infinitydb/docs/compat-matrix.md) "
+            "lives in the Rust workspace.\n"
+        )
+        return docs
+
+    def gate(self):
+        return subprocess.run(
+            ["bash", str(SCRIPTS / "check-doc-artifacts.sh")],
+            env=dict(os.environ, INF_CHECK_ROOT=str(self.root)),
+            text=True, capture_output=True, timeout=15,
+        )
+
+    def assert_red(self):
+        result = self.gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_doc_valid_workspace_and_parent_links(self):
+        self.governance()
+        (self.root / "ARCHITECTURE.md").write_text(
+            "[local](docs/INFINITY_STYLE.md#safety) [parent](../docs/infinity-master-plan.md)\n"
+        )
+        result = self.gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_doc_missing_local_link_in_standalone_is_red(self):
+        (self.root / "ARCHITECTURE.md").write_text("[wrong](docs/missing.md)\n")
+        self.assert_red()
+
+    def test_doc_titled_wrapped_and_reference_links_are_checked(self):
+        for link in ['[wrong](docs/missing.md "title")', '[wrong](<docs/missing.md>)',
+                     '[wrong]: docs/missing.md "title"']:
+            with self.subTest(link=link):
+                (self.root / "ARCHITECTURE.md").write_text(link + "\n")
+                self.assert_red()
+
+    def test_doc_standalone_parent_link_is_disclosed(self):
+        (self.root / "ARCHITECTURE.md").write_text("[parent](../docs/infinity-master-plan.md)\n")
+        result = self.gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 parent links unvalidated", result.stdout)
+
+    def test_doc_parent_links_are_checked_with_governance(self):
+        self.governance()
+        (self.root / "ARCHITECTURE.md").write_text("[wrong](../docs/missing.md)\n")
+        self.assert_red()
+
+    def test_doc_every_milestone_link_is_checked(self):
+        docs = self.governance()
+        (docs / "milestones/new.md").write_text("[wrong](missing.md)\n")
+        self.assert_red()
+
+    def test_doc_missing_governing_workspace_input_is_red(self):
+        (self.root / "ARCHITECTURE.md").unlink()
+        self.assert_red()
+
+    def test_doc_empty_milestone_scope_is_red(self):
+        docs = self.governance()
+        (docs / "milestones/m0.md").unlink()
+        self.assert_red()
+
+    def test_doc_missing_milestone_directory_is_red(self):
+        docs = self.governance()
+        (docs / "milestones/m0.md").unlink()
+        (docs / "milestones").rmdir()
+        self.assert_red()
+
+    def test_doc_obsolete_layout_root_is_red(self):
+        docs = self.governance()
+        (docs / "infinity-master-plan.md").write_text("```text\ninfinity/\n```\n")
+        self.assert_red()
+
+    def test_doc_obsolete_compat_path_is_red(self):
+        docs = self.governance()
+        (docs / "infinity-master-plan.md").write_text("`tests/compat-suite`\n")
+        self.assert_red()
+
+    def test_doc_landed_adr_placeholder_is_red(self):
+        docs = self.governance()
+        (docs / "milestones/m0.md").write_text("`docs/adr/00xx-log-io-tier.md`\n")
+        self.assert_red()
+
+    def test_doc_numbered_adr_citation_must_resolve(self):
+        docs = self.governance()
+        (docs / "milestones/m0.md").write_text("`docs/adr/0106-wrong-name.md`\n")
+        self.assert_red()
+
+    def test_doc_historical_legacy_path_is_not_a_current_link(self):
+        docs = self.governance()
+        (docs / "infinity-master-plan.md").write_text("`docs/vortex-master-plan.md`\n")
+        self.assert_red()
 
 
 if __name__ == "__main__":

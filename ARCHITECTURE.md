@@ -295,8 +295,10 @@ record-type ids with typed encode/decode and a memory domain; indexes
 register as log projections with build-from-replay, checkpoint-sidecar, and
 maintenance-slice hooks; cross-cell verbs register fabric opcodes. First-
 party engines are **required** to use these seams — the Linux-driver
-discipline: drivers prove the driver API — and a mechanical dep-DAG check
-makes bypassing them a build failure. This is what makes slim builds real
+discipline: drivers prove the driver API. The dependency gate rejects
+forbidden direct dependencies and distinguishes active declarations from
+reserved future edges; interface review checks use of the exposed APIs.
+This is what makes slim builds real
 (a cache-only binary contains zero document/query/vector code) and what the
 post-1.0 native extension SDK will stabilize.
 
@@ -376,5 +378,7 @@ The lineage this design stands on:
   events, and logic belong together.
 - **ScyllaDB Alternator** — the DynamoDB-gateway precedent.
 - **Kafka** — segment/retention/consumer-group storage model.
-- `docs/vortex-master-plan.md` and the Vortex artifacts — the measured
-  post-mortem this architecture answers, root cause by root cause.
+- The [master plan's post-mortem](../docs/infinity-master-plan.md#2-post-mortem-why-vortex-failed)
+  records the Vortex evidence this architecture answers. The legacy source
+  was removed by outer commit `d53f6db`; Appendix A names its historical
+  revision. It is not a document in the current checkout.

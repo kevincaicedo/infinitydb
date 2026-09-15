@@ -1,23 +1,27 @@
 # Allowed internal dependency edges (master plan §20, milestone M0 §3.3).
 #
-# `scripts/check-dep-dag.sh` parses `cargo metadata` and fails CI on any
-# *normal* (non-dev) dependency edge between workspace crates that is not
-# listed here. Arrows point down only: inf-store knows nothing about RESP,
+# ADR-0106 D16: every normal/build permission must occur in Cargo metadata
+# or have an unused annotation below. Activation removes the annotation.
+# Dev edges are exempt and printed; every workspace package needs a row.
+# Arrows point down only: inf-store knows nothing about RESP,
 # inf-wire knows nothing about storage, inf-runtime is the only crate that
 # names io_uring/kqueue symbols.
 #
 # Adding an edge here is an architecture decision — it needs an ADR.
 
+zero-dependency = ["inf-compare"] # ADR-0025: independent competitive instrument.
+
 [edges]
 inf-foundation = []
-inf-simd = ["inf-foundation"]
+inf-simd = []
 inf-alloc = ["inf-foundation"]
 inf-fabric = ["inf-foundation"]
 inf-runtime = ["inf-foundation", "inf-alloc"]
 inf-wire = ["inf-foundation", "inf-simd"]
 # inf-log → inf-simd: hardware CRC32C kernel for frame/checkpoint/manifest
 # checksums (ADR-0011, M2-S01).
-inf-log = ["inf-foundation", "inf-alloc", "inf-simd"]
+# inf-alloc is dev-only; ADR-0106 D16 retires ADR-0011's M2-S03 reservation.
+inf-log = ["inf-foundation", "inf-simd"]
 # inf-store → inf-log: effect/record vocabulary (`NsId`, `FsyncClass`,
 # `RecordView`) for durable namespaces, the catalog encoding, and
 # `Keyspace::apply_record` replay (ADR-0012 D1 direction, ADR-0015 D7 wiring).
@@ -43,12 +47,10 @@ inf-replica = ["inf-foundation", "inf-log"]
 # (`doc`); the arrow points down and inf-doc still never sees RESP,
 # records, sockets, or logs (M3 plan §3.3).
 # inf-server -> inf-query: the M4.5-S10/S11 command-surface edge
-# (ADR-0072 D9, authorized ahead of use — the ADR-0032 D7
-# allowed-but-unused posture): INF.QL/INF.IDX dispatch behind a `query`
+# (ADR-0072 D9, reserved below): INF.QL/INF.IDX dispatch behind a `query`
 # feature, the ADR-0041 D3 `doc` precedent. Slim builds compile it out.
 inf-server = [
     "inf-foundation",
-    "inf-simd",
     "inf-alloc",
     "inf-fabric",
     "inf-runtime",
@@ -77,8 +79,9 @@ infinityd = [
     "inf-server",
     "inf-probe",
 ]
-inf = ["inf-foundation", "inf-wire", "inf-probe"]
-inf-bench = ["inf-foundation", "inf-wire"]
+inf = ["inf-probe"]
+inf-bench = ["inf-foundation"]
+inf-compare = []
 # inf-sim → inf-log: the M2-S19 durability oracle's survival audit reads
 # the surviving disk image directly (ADR-0021 — DST tooling, not a kernel
 # boundary). inf-sim → inf-doc: the M3-S23 equivalence oracle's canonical
@@ -94,3 +97,31 @@ compat = ["inf-foundation", "inf-wire", "inf-store", "inf-server"]
 # drives the log/staging/recovery stack directly. Test-harness edges, the
 # compat class — not kernel boundaries.
 crash-matrix = ["inf-foundation", "inf-log", "inf-store", "inf-server"]
+
+# Reserved permissions are not shipped dependencies. ADR-0106 D16 retains
+# the M0 stubs and server/engine seams with their activation owners.
+[unused.inf-stream]
+inf-foundation = "ADR-0106 D16: M7 topic engine types (M0 stub)"
+inf-log = "ADR-0106 D16: M7 topic log seam (M0 stub)"
+inf-store = "ADR-0106 D16: M7 stream projections (M0 stub)"
+
+[unused.inf-vector]
+inf-foundation = "ADR-0106 D16: M8 vector engine types (M0 stub)"
+inf-simd = "ADR-0106 D16: M8 distance kernels (M0 stub)"
+inf-alloc = "ADR-0106 D16: M8 vector memory accounting (M0 stub)"
+
+[unused.inf-compute]
+inf-foundation = "ADR-0106 D16: M10 compute engine types (M0 stub)"
+inf-store = "ADR-0106 D16: M10 reducer store seam (M0 stub)"
+
+[unused.inf-replica]
+inf-foundation = "ADR-0106 D16: M9 replication types (M0 stub)"
+inf-log = "ADR-0106 D16: M9 log shipping seam (M0 stub)"
+
+[unused.infinity-embedded]
+inf-foundation = "ADR-0106 D16: M10 embedded API types (M0 stub)"
+inf-server = "ADR-0106 D16: M10 embedded transport (M0 stub)"
+
+[unused.inf-server]
+inf-query = "ADR-0072 D9: M4.5-S10/S11 query command surface"
+inf-stream = "ADR-0106 D16: M7 stream command surface (M0 reservation)"
