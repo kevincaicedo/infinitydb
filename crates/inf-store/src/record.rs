@@ -361,10 +361,15 @@ impl<'a> RecordView<'a> {
         Some(u64::from_le_bytes(raw))
     }
 
-    /// True if expired at `now` (expire-on-read, L7-deterministic).
+    /// True if expired at `now` (expire-on-read, L7-deterministic). The
+    /// deadline millisecond itself still serves the key — Redis's read
+    /// path is `now > when` (`PTTL` answers 0 there); the record is gone
+    /// from the next millisecond on (F-L05-05). One predicate serves
+    /// reads, scans, checkpoints, eviction and the wheel's fire check, so
+    /// the client view and the recovered view agree.
     #[inline]
     pub fn is_expired(self, now: Nanos) -> bool {
-        self.expire_at_ms().is_some_and(|at| now.0 / 1_000_000 >= at)
+        self.expire_at_ms().is_some_and(|at| now.0 / 1_000_000 > at)
     }
 
     /// The record's kind: type tag plus type-specific flag state.
@@ -535,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_is_inclusive_at_the_millisecond() {
+    fn expiry_is_exclusive_at_the_deadline_millisecond() {
         let spec = RecordSpec {
             key: b"k",
             value: b"",
@@ -546,7 +551,9 @@ mod tests {
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert!(!view.is_expired(Nanos(9_999_999)));
-        assert!(view.is_expired(Nanos(10_000_000)));
+        assert!(!view.is_expired(Nanos(10_000_000)), "the deadline ms is served (Redis)");
+        assert!(!view.is_expired(Nanos(10_999_999)));
+        assert!(view.is_expired(Nanos(11_000_000)));
     }
 
     #[test]

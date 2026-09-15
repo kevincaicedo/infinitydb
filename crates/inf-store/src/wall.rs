@@ -33,7 +33,9 @@ impl WallAnchor {
     /// as [`Nanos`]. Pre-anchor deadlines clamp to 0 (already expired);
     /// `None` means arithmetic overflow — the deadline is not representable
     /// on the internal clock and the caller decides the policy (replay
-    /// clamps to `now`; see `Keyspace::apply_record`).
+    /// clamps forward to `Nanos(u64::MAX)`, "never", so an unrepresentable
+    /// deadline can never resurrect as an already-expired key; see
+    /// `Keyspace::apply_record`).
     #[must_use]
     pub fn internal_from_unix(&self, unix_ms: u64) -> Option<Nanos> {
         let delta = i64::try_from(unix_ms).ok()?.checked_sub(i64::try_from(self.unix_ms).ok()?)?;

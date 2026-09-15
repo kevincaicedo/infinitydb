@@ -23,9 +23,13 @@
 //! a disk storm (the §3.3 index-only rule); memory tables' sidecar is
 //! zero-sized and every touch of it compiles away.
 //!
-//! M1 reserve: incremental split-order migration replaces the stop-and-copy
-//! `grow` below; the `(live, tombstones, growth_left)` bookkeeping is
-//! already per-table so the migration can move one group per MAINTAIN slice.
+//! Growth is stop-and-copy on the foreground write path (every key
+//! rehashed under SipHash; a 16 M-key doubling is one multi-hundred-
+//! millisecond stall), attributed by `StoreStats::index_grows`. The M1
+//! reserve for an incremental split-order migration (one group per
+//! MAINTAIN slice, on the per-table `(live, tombstones)` bookkeeping) was
+//! never taken up; it stays a design item, not a plan in flight (review
+//! 2026-08-30, lane L05).
 
 use inf_alloc::ArenaAddr;
 use inf_foundation::LogicalAddr;

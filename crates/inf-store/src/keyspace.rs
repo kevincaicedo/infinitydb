@@ -2193,7 +2193,11 @@ impl Keyspace {
     /// part of the state; L7 injects the clock that interprets them).
     ///
     /// Empty stores contribute nothing: a materialized-but-empty db
-    /// digests the same as one never touched.
+    /// digests the same as one never touched. **Tiered namespaces are not
+    /// folded** — their records live in the `TieredTable`s, whose
+    /// determinism oracle is the m4-tiered/m4-recovery DST's own
+    /// reconciliation (never-none + content audits), not this digest
+    /// (review 2026-08-30, lane L05).
     pub fn state_digest(&self, now: Nanos) -> StateDigest {
         let mut acc = StateDigest::default();
         for (db, store) in self.dbs() {
@@ -2205,8 +2209,10 @@ impl Keyspace {
         acc
     }
 
-    /// Every materialized store: default dbs, then named (aggregation
-    /// order is stable but unspecified).
+    /// Every materialized `CellStore`: default dbs, then named (aggregation
+    /// order is stable but unspecified). Tiered namespaces' tables are not
+    /// `CellStore`s and are not here — their footprint is
+    /// `tiering_committed_bytes` (ADR-0062), their content the tiered DST's.
     fn all_stores(&self) -> impl Iterator<Item = &CellStore> {
         self.dbs
             .iter()

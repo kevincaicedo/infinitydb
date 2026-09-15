@@ -172,8 +172,11 @@ impl TtlWheel {
         size_of::<[[u32; SLOTS]; TIERS]>() + size_of::<[u64; TIERS]>()
     }
 
-    /// Files `{hash, deadline_ms}`. Deadlines at or before the cursor file
-    /// into the imminent slot and fire on the next tick.
+    /// Files `{hash, deadline_ms}`. A deadline at or before the cursor
+    /// files into tier 0 at `deadline & 511` — not the cursor's own slot —
+    /// so it fires when the cursor next comes round to that slot, up to
+    /// 511 cursor milliseconds later. Lazy expiry and the eviction sweep
+    /// reap it meanwhile; the wheel never fires early.
     pub fn arm(&mut self, hash: u64, deadline_ms: u64) -> ArmOutcome {
         let deadline_ms = deadline_ms.min(DEADLINE_MASK);
         let Some(node) = self.alloc(hash, deadline_ms) else {

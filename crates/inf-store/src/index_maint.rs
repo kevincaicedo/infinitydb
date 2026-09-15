@@ -21,8 +21,9 @@
 //! open **and** covers the dying record's key hash; the bracket's diff
 //! owns write-set deaths (DEL, GETDEL, overwrites, RENAME's source).
 //!
-//! The primary-key ref is `hash64(key)` — the store's own key hash
-//! (ADR-0076 D2, collision odds disclosed there). The hook is `doc`-gated
+//! The primary-key ref is the store's own key hash — the keyed SipHash-1-3
+//! `CellStore::hash_key` since ADR-0094 (ADR-0076 D2 named `hash64`;
+//! collision odds disclosed there, the keyed hash's in ADR-0094 D1). The hook is `doc`-gated
 //! throughout: a slim build compiles it out entirely (it refuses
 //! index-bearing catalogs, ADR-0075 D2.5) — the degenerate-case
 //! discipline's strongest form.

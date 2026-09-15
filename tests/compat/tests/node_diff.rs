@@ -28,7 +28,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 
-use compat::harness::{CaseOverride, Expect, infinityd, oracle, read_frames, run_matrix};
+use compat::harness::{
+    CaseOverride, Expect, infinityd, oracle, parse_int_reply, read_frames, run_matrix,
+};
 use compat::matrix::MATRIX;
 use compat::resp::encode_command;
 
@@ -919,4 +921,83 @@ fn tiered_namespace_argument_errors_match_redis() {
         "tiered-namespace parse rows diverge from Redis:\n{}",
         failures.join("\n")
     );
+}
+
+/// Batch 58 (review 2026-08-30, F-L05-05): the deadline millisecond is
+/// served. Redis's read path is `now > when` — at `now == when` `PTTL`
+/// answers 0 and `GET` the value; the key is gone from the next
+/// millisecond. Both servers get the same shape: N keys with staggered
+/// `PXAT` deadlines, and a tight loop of pipelined `PTTL` + `GET` pairs
+/// per key until `PTTL` goes negative. Loopback samples the deadline
+/// millisecond tens of times per key, so "never a 0" is a semantic, not
+/// a sampling, outcome — the pre-fix node stepped from `1` to `-2`.
+#[test]
+fn deadline_millisecond_read_matches_redis() {
+    let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_oracle_guard, mut oracle)) = oracle() else {
+        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        return;
+    };
+    const KEYS: u64 = 8;
+    #[allow(clippy::disallowed_methods)] // wall-clock deadlines on the test thread, not cell code
+    fn sample(stream: &mut TcpStream, who: &str) -> (u64, BTreeSet<Vec<u8>>) {
+        let mut buf = Vec::new();
+        let unix_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let base = unix_ms() + 300;
+        for i in 0..KEYS {
+            let key = format!("dl:{i}");
+            let at = (base + 60 * i).to_string();
+            assert_eq!(cmd(stream, &mut buf, &["SET", &key, "v", "PXAT", &at]), b"+OK\r\n");
+        }
+        let mut zero_seen = 0u64;
+        let mut gets_at_zero = BTreeSet::new();
+        for i in 0..KEYS {
+            let key = format!("dl:{i}");
+            let deadline = base + 60 * i;
+            while unix_ms() + 30 < deadline {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut seen_zero_here = false;
+            loop {
+                let mut frame = encode_command(&["PTTL".to_string(), key.clone()]);
+                frame.extend_from_slice(&encode_command(&["GET".to_string(), key.clone()]));
+                stream.write_all(&frame).expect("write");
+                let pttl_reply = read_frames(stream, &mut buf, 1);
+                let get_reply = read_frames(stream, &mut buf, 1);
+                let pttl = parse_int_reply(&pttl_reply)
+                    .unwrap_or_else(|| panic!("{who}: PTTL reply {pttl_reply:?}"));
+                if pttl == 0 && !seen_zero_here {
+                    seen_zero_here = true;
+                    gets_at_zero.insert(get_reply);
+                }
+                if pttl < 0 {
+                    break;
+                }
+            }
+            zero_seen += u64::from(seen_zero_here);
+        }
+        (zero_seen, gets_at_zero)
+    }
+    let (oracle_zero, oracle_gets) = sample(&mut oracle, "redis");
+    assert!(oracle_zero > 0, "redis never sampled a deadline millisecond — box too loaded");
+    assert_eq!(
+        oracle_gets,
+        BTreeSet::from([b"$1\r\nv\r\n".to_vec()]),
+        "redis serves the value at PTTL 0"
+    );
+    let (node_zero, node_gets) = sample(&mut node, "node");
+    assert!(
+        node_zero > 0,
+        "node: PTTL never answered 0 on {KEYS} deadline milliseconds (inclusive expiry)"
+    );
+    assert_eq!(node_gets, oracle_gets, "node serves the value at PTTL 0, as redis");
 }

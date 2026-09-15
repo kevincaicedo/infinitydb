@@ -75,7 +75,7 @@ program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 | `FLUSHDB` | full | M1 | write | -1 | 4 |  |
 | `FLUSHALL` | partial | M1 | write | -1 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |
-| `DEBUG` | partial | M1 | admin | -2 | 3 | subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node |
+| `DEBUG` | partial | M1 | admin | -2 | 3 | subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node |
 | `EXPIREAT` | full | M1 | write fast | -3 | 10 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PEXPIREAT` | full | M1 | write fast | -3 | 3 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `EXPIRETIME` | full | M1 | readonly fast | 2 | 5 | a clamped deadline reads as the u40 bound (ADR-0111) |

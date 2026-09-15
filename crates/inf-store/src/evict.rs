@@ -280,13 +280,14 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
     };
 
     let clock = matches!(policy, EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru);
+    let lfu = matches!(policy, EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu);
     // CLOCK is a sweep, not a sample: the hand decrements every record it
     // passes and stops at the first generation-0 victim (the slot window
     // bounds the work). Sampled policies (LFU/TTL/random) examine
     // `samples` candidates per Redis `maxmemory-samples`.
     let sample_cap = if clock { usize::MAX } else { samples.max(1) as usize };
     // Best victim so far: (score, addr, key_hash, encoded_len, had_ttl).
-    let mut best: Option<(u64, inf_alloc::ArenaAddr, u64, usize, bool)> = None;
+    let mut best: Option<(u64, inf_alloc::ArenaAddr, Option<u64>, usize, bool)> = None;
     let mut seen = 0usize;
     let mut found_zero = false;
     let mut expired: Vec<(u64, inf_alloc::ArenaAddr, usize)> = Vec::new();
@@ -304,9 +305,8 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
                     return;
                 }
                 let view = crate::store::record_at(arena, addr);
-                let hash = store.hash_key(view.key());
                 if view.is_expired(now) {
-                    expired.push((hash, addr, view.encoded_len()));
+                    expired.push((store.hash_key(view.key()), addr, view.encoded_len()));
                     return;
                 }
                 let deadline = view.expire_at_ms();
@@ -314,6 +314,11 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
                     return;
                 }
                 seen += 1;
+                // Only LFU's CMS probe needs every sample's hash; the
+                // victim's is computed once at removal. Hashing every walked
+                // slot was ~4 µs of a 4.1 µs sparse-volatile step (A/B,
+                // `.artifacts/review/batch58/ab-evict-hash-*.log`).
+                let hash = lfu.then(|| store.hash_key(view.key()));
                 let score = score_of(policy, &view, hash, cms);
                 // CLOCK aging: a scanned non-victim loses one generation;
                 // the first generation-0 record ends the sweep (the hand
@@ -350,6 +355,8 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
         stats.freed_bytes += len as u64;
     }
     if let Some((_, addr, hash, len, had_ttl)) = best {
+        let hash = hash
+            .unwrap_or_else(|| store.hash_key(crate::store::record_at(&store.arena, addr).key()));
         store.evict_record(hash, addr, len, had_ttl);
         stats.evicted = 1;
         stats.freed_bytes += len as u64;
@@ -359,13 +366,18 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
 
 /// Lower score = better victim.
 #[inline]
-fn score_of(policy: EvictionPolicy, view: &RecordView<'_>, hash: u64, cms: Option<&Cms>) -> u64 {
+fn score_of(
+    policy: EvictionPolicy,
+    view: &RecordView<'_>,
+    hash: Option<u64>,
+    cms: Option<&Cms>,
+) -> u64 {
     match policy {
         // CLOCK: generation 0 evicts first; ties resolved by walk order.
         EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => u64::from(view.ref_level()),
-        // LFU: CMS estimate (Morris-scaled).
+        // LFU: CMS estimate (Morris-scaled); the walk hashes every LFU sample.
         EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
-            u64::from(cms.map_or(0, |c| c.estimate(hash)))
+            u64::from(cms.zip(hash).map_or(0, |(c, h)| c.estimate(h)))
         }
         // volatile-ttl: nearest deadline first.
         EvictionPolicy::VolatileTtl => view.expire_at_ms().unwrap_or(u64::MAX),
