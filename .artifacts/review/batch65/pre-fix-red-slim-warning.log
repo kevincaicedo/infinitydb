@@ -1,0 +1,4 @@
+# pre-fix red (batch 65): the slim lane under -D warnings
+$ cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
+crates/inf-store/src/index_maint.rs:53:7: error: constant `WRITE_SET_LINEAR_MAX` is never used
+error: could not compile `inf-store` (lib) due to 1 previous error

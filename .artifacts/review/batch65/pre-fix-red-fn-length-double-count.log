@@ -1,0 +1,43 @@
+# pre-fix red (batch 65): the fn-length gate counts emissions, not sites.
+# The gate's own recipe, breaches keyed by file:line — raw vs unique:
+  193 breaches-raw.tsv
+  134 breaches-uniq.tsv
+  327 total
+# files whose row is an emission count (raw) vs the site count (uniq):
+crates/inf-doc/src/apply.rs	2	1
+crates/inf-doc/src/json.rs	4	2
+crates/inf-doc/src/merge.rs	2	1
+crates/inf-doc/src/path/eval.rs	2	1
+crates/inf-doc/src/ser.rs	2	1
+crates/inf-doc/src/tape.rs	2	1
+crates/inf-fabric/src/codec.rs	2	1
+crates/inf-log/src/ckpt/read.rs	2	1
+crates/inf-log/src/reader.rs	2	1
+crates/inf-log/src/record.rs	4	2
+crates/inf-runtime/src/reactor.rs	2	1
+crates/inf-server/src/admin.rs	4	2
+crates/inf-server/src/ckpt.rs	2	1
+crates/inf-server/src/config.rs	2	1
+crates/inf-server/src/control.rs	2	1
+crates/inf-server/src/durable/ckpt.rs	4	2
+crates/inf-server/src/durable.rs	6	3
+crates/inf-server/src/exec.rs	4	2
+crates/inf-server/src/plane/cell_loop.rs	8	4
+crates/inf-server/src/plane/dispatch.rs	6	3
+crates/inf-server/src/plane/fabric.rs	2	1
+crates/inf-server/src/plane/ns_ddl.rs	4	2
+crates/inf-server/src/plane/publish.rs	4	2
+crates/inf-server/src/plane/pumps.rs	2	1
+crates/inf-server/src/plane.rs	6	3
+crates/inf-server/src/plane/shared.rs	4	2
+crates/inf-server/src/plane/tiered.rs	4	2
+crates/inf-server/src/plane/tiered/write.rs	2	1
+crates/inf-server/src/recover.rs	8	4
+crates/inf-server/src/tier_cell.rs	2	1
+crates/inf-store/src/doc.rs	2	1
+crates/inf-store/src/evict.rs	2	1
+crates/inf-store/src/index_maint.rs	4	2
+crates/inf-store/src/keyspace.rs	2	1
+crates/inf-store/src/store.rs	2	1
+crates/inf-store/src/tiered/compact.rs	2	1
+crates/inf-store/src/tiered_recover.rs	2	1

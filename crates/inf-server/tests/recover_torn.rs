@@ -6,123 +6,21 @@
 //! offset (§8.4). Scan mechanics live in `inf-log/tests/tail_scan.rs`;
 //! crash-matrix rows over these paths bind at M2-S17.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use inf_foundation::KeyHasher;
-use inf_foundation::time::Nanos;
 use inf_log::FrameLayout;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, NsId,
-    RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing,
-    create_cell_dirs, segment_file_name, write_manifest,
+    FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, RecordView,
+    SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
-fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        flush_bound: 1,
-        fua_p50_us_probed: 0,
-        device: Default::default(),
-        fill: Default::default(),
-        group: Default::default(),
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
-
-/// One flushed frame per call: `SET key value` records at known LSNs.
-struct LogBuilder {
-    fs: MemFs,
-    rotor: SegmentRotor<MemFs>,
-    ring: StagingRing,
-    log_dir: PathBuf,
-}
-
-impl LogBuilder {
-    fn new(fs: &MemFs, cfg: &DurableConfig) -> LogBuilder {
-        let dirs = create_cell_dirs(fs, &cfg.data_dir.join(format!("shard-{CELL}"))).expect("dirs");
-        let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-        LogBuilder { fs: fs.clone(), rotor, ring: StagingRing::new(cfg.staging), log_dir: dirs.log }
-    }
-
-    /// Stage `records` as one frame, flush it, and return the frame's
-    /// (base offset, per-record LSNs). Frames attest like a live `always`
-    /// plane (ADR-0031 D1): each stamps `covered_lsn` = its own base — the
-    /// watermark of a group commit that fsynced every prior frame.
-    fn frame(&mut self, records: &[MutationEffect<'_>]) -> (Lsn, Vec<Lsn>) {
-        let staged: Vec<_> =
-            records.iter().map(|effect| self.ring.stage(effect).expect("stage")).collect();
-        self.rotor.maintain(0).expect("maintain");
-        let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
-        let covered = slot.base().to_u64();
-        let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
-        let frame = self.ring.leased_frame(&lease).to_vec();
-        self.rotor.commit_frame(slot, &frame).expect("commit");
-        let lsns: Vec<Lsn> = staged.iter().map(|&at| lease.lsn_of(at)).collect();
-        self.ring.release(lease);
-        let first = lsns[0];
-        (Lsn::new(first.segment, first.offset - FRAME_HEADER_LEN as u32), lsns)
-    }
-
-    fn set_frame(&mut self, key: &[u8], value: &[u8]) -> (Lsn, Vec<Lsn>) {
-        self.frame(&[MutationEffect::StringSet { ns: NS, key, value }])
-    }
-
-    fn seg_path(&self, id: SegmentId) -> PathBuf {
-        self.log_dir.join(segment_file_name(id))
-    }
-
-    fn poke(&self, id: SegmentId, offset: u32, bytes: &[u8]) {
-        let mut file = self.fs.open_write(&self.seg_path(id)).expect("open");
-        file.write_at(u64::from(offset), bytes).expect("poke");
-    }
-}
-
-fn recover(
-    fs: &MemFs,
-    ks: &mut Keyspace,
-) -> std::io::Result<(SegmentRotor<MemFs>, inf_server::RecoverStats)> {
-    open_cell_log(fs.clone(), ks, CELL, &cfg(), anchor(), now())
-        .map(|(rotor, stats, _seed)| (rotor, stats))
-}
-
-fn get(ks: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    ks.ns_store_mut(NS).expect("ns store").get(key, now()).map(<[u8]>::to_vec)
-}
+mod support;
+use support::*;
 
 #[test]
 fn torn_final_frame_recovers_minus_the_torn_frame() {

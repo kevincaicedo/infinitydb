@@ -10,60 +10,21 @@
 
 use std::path::PathBuf;
 
-use inf_foundation::time::Nanos;
 use inf_log::FrameLayout;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, NsId, RecordView, SegmentConfig,
-    SegmentId, SegmentRotor, StagingConfig, create_cell_dirs, segment_file_name,
+    FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, NsId, RecordView, SegmentId, SegmentRotor,
+    create_cell_dirs, segment_file_name,
 };
-use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, TierSpec, WallAnchor};
+use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, TierSpec};
 
-const NS: NsId = NsId(16);
+mod support;
+use support::*;
+
 /// A tiered namespace beside the plain one (F-L14-01): its displacement
 /// markers are what the end-of-replay check audits.
 const TIER_NS: NsId = NsId(17);
-const CELL: u16 = 0;
-
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
-fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, ..Default::default() },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        flush_bound: 1,
-        fua_p50_us_probed: 0,
-        device: Default::default(),
-        fill: Default::default(),
-        group: Default::default(),
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
 
 /// `fresh_keyspace` plus a materialized tiered namespace (no MANIFEST —
 /// the first-crash shape: the catalog names it, no checkpoint does).
@@ -80,10 +41,6 @@ fn tiered_keyspace() -> Keyspace {
     })
     .expect("tiered ns");
     ks
-}
-
-fn get(ks: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    ks.ns_store_mut(NS).expect("ns store").get(key, now()).map(<[u8]>::to_vec)
 }
 
 /// A fresh cell dir with a preallocated `seg-000000.ilog`, frames placed
@@ -191,18 +148,6 @@ impl HandLog {
         self.offset += frame_len;
         at
     }
-}
-
-fn recover(
-    fs: &MemFs,
-    ks: &mut Keyspace,
-) -> std::io::Result<(SegmentRotor<MemFs>, inf_server::RecoverStats)> {
-    open_cell_log(fs.clone(), ks, CELL, &cfg(), anchor(), now())
-        .map(|(rotor, stats, _seed)| (rotor, stats))
-}
-
-fn stamp(epoch: u32, seq: u64, covered_lsn: u64) -> FrameStamp {
-    FrameStamp { epoch, seq, covered_lsn }
 }
 
 #[test]

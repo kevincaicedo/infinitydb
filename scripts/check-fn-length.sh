@@ -46,9 +46,15 @@ else
     }
 fi
 
-# `path:line:col: warning: this function has too many lines (N/70)`
+# `path:line:col: warning: this function has too many lines (N/70)`.
+# Keyed by site (`path:line`) and deduplicated before counting: cargo
+# emits a crate's diagnostics once per feature set it compiles, and the
+# simulator's `dst` lane recompiles every crate upstream of it under
+# `collision-oracle` — batch 64's baseline counted those twice (ADR-0125
+# A1). Two functions of the same length in one file are two sites.
 grep -E 'warning: this function has too many lines' "$work/clippy.log" \
-    | sed -E 's/^([^:]+):[0-9]+:[0-9]+: .*\(([0-9]+)\/[0-9]+\).*$/\1\t\2/' \
+    | sed -E 's/^([^:]+:[0-9]+):[0-9]+: .*\(([0-9]+)\/[0-9]+\).*$/\1\t\2/' \
+    | sort -u | sed -E 's/^([^\t]+):[0-9]+\t/\1\t/' \
     | sort > "$work/breaches"
 if [ ! -s "$work/breaches" ] && ! grep -q 'Finished\|Checking\|warning\|^$' "$work/clippy.log" && [ -z "${INF_FN_LENGTH_INPUT:-}" ]; then
     echo "FN-LENGTH SCOPE ERROR: clippy produced no output"

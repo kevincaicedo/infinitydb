@@ -1117,6 +1117,14 @@ log="$root/clippy.log"
 printf 'crates/fake/src/lib.rs:3:1: warning: this function has too many lines (90/70)\ncrates/fake/src/lib.rs:9:1: warning: this function has too many lines (80/70)\n' >"$log"
 printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
 expect green "fn-length: two breaches, baseline 2" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+# ADR-0125 A1: cargo re-emits a crate's warnings once per feature set it
+# compiles; a site counts once however often it is printed, while two
+# same-length functions at different lines are two sites.
+dup="$root/clippy-dup.log"
+cat "$log" "$log" >"$dup"
+expect green "fn-length: the same two sites emitted twice count 2, not 4" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$dup" $FNLEN
+printf 'crates/fake/src/lib.rs:3:1: warning: this function has too many lines (90/70)\ncrates/fake/src/lib.rs:9:1: warning: this function has too many lines (90/70)\n' >"$dup"
+expect green "fn-length: two same-length sites are two breaches" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$dup" $FNLEN
 printf '1\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
 expect red "fn-length: a new breach above the baseline" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
 printf '3\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
