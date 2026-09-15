@@ -144,7 +144,8 @@ pub(crate) fn restricted_error(
         _ => name.to_ascii_lowercase(),
     };
     w.error(&format!(
-        "ERR Can't execute '{display}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+        "ERR Can't execute '{display}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / \
+             RESET are allowed in this context"
     ));
 }
 

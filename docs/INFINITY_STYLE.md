@@ -56,7 +56,21 @@ translated to our world:
   and a reviewer who agrees.
 - **Hard limit: ~70 lines per function.** If you scroll, you split. The
   right split keeps control flow in the parent and moves straight-line work
-  to helpers — never the reverse.
+  to helpers — never the reverse. Mechanical since ADR-0125:
+  `scripts/check-fn-length.sh` runs clippy's `too_many_lines` at 70 code
+  lines on every production target and ratchets
+  `docs/fn-length-baseline.tsv` — a file's count never goes up, and the
+  row comes down with the code. A function opts out only with
+  `#[allow(clippy::too_many_lines, reason = "…")]`, and every opt-out is
+  printed on the gate's OK line.
+- **Hard limit: 2000 production lines per file.** Tests do not count
+  (`strip-test-modules.awk` decides, exactly as the panic-policy gate
+  sees the tree). Over the bar, a file becomes a folder: behaviour moves
+  into child modules (`plane/dispatch.rs`, `keyspace/index.rs`), the data
+  definitions and the module doc stay in the parent so it still reads
+  top-down like the design doc, `pub(super)` marks what crosses, and the
+  parent re-exports every public path so callers never move.
+  `scripts/check-file-length.sh` enforces it (ADR-0125).
 - **Every command is a resumable state machine (L6).** Suspension points are
   few, typed, and visible. Never hold buffer leases, response iovecs, ring
   slots, arena borrows, staged log records, or command-local guards across a
@@ -333,7 +347,10 @@ verdict of every shard.
 - Braces on every `if` unless the whole statement fits one line — defense
   in depth against `goto fail;`-class bugs.
 - One hundred columns fits two files side by side. Use the width; never
-  exceed it.
+  exceed it. `cargo fmt --check` cannot see a long string literal, comment,
+  attribute or macro body (rustfmt leaves them alone), so
+  `scripts/check-line-width.sh` counts every line of every Rust file
+  (ADR-0125).
 
 ## Dependencies
 

@@ -148,7 +148,8 @@ fn main() {
     println!("GET off-pipeline {:.2}M ops/s", off / 1e6);
     println!("GET on-pipeline  {:.2}M ops/s", on / 1e6);
     println!(
-        "PIPELINE GAIN   {:+.1}% (gate: >= +25% on the cache-miss-bound set, else demote to flag + ADR)",
+        "PIPELINE GAIN   {:+.1}% (gate: >= +25% on the cache-miss-bound set, else demote to flag + \
+             ADR)",
         (on / off - 1.0) * 100.0
     );
 }

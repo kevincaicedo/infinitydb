@@ -1275,7 +1275,7 @@ impl Drop for DataDirGuard {
 
 /// `inf-bench ycsb` — see the module doc. Artifacts default to
 /// `.artifacts/m4/s22`.
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
 pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
     let flags = Flags::parse(
         args,

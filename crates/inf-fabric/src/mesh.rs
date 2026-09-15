@@ -237,8 +237,9 @@ impl Mesh {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(cells: u16, config: MeshConfig) -> Vec<CellFabric> {
         assert!(cells > 0, "mesh needs at least one cell");
+        assert!(config.data_credits > 0, "data_credits must be non-zero");
         assert!(
-            config.data_credits > 0 && config.ring_capacity >= 2 * config.data_credits as usize,
+            config.ring_capacity >= 2 * config.data_credits as usize,
             "ring_capacity {} < 2 × data_credits {} — replies must always have headroom",
             config.ring_capacity,
             config.data_credits,

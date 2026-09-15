@@ -186,7 +186,9 @@ fn run_storm<F: SegmentFs>(fs: F, shard_dir: PathBuf, mode: TierIoMode, label: &
     let report = storm.table().space().report();
     println!("--- M4-S07/S11 demotion storm ({label}) ---");
     println!(
-        "ops {TOTAL_OPS} (+ maintain slices) | cold candidates {cold_hits} | demote slices {} | sealed {} B | flush slices {} | flushed {} B | files sealed {files_sealed} | stalls {}",
+        "ops {TOTAL_OPS} (+ maintain slices) | cold candidates {cold_hits} | demote slices {} | \
+             sealed {} B | flush slices {} | flushed {} B | files sealed {files_sealed} | stalls \
+             {}",
         counters.demote_slices,
         counters.demote_sealed_bytes,
         counters.flush_slices,

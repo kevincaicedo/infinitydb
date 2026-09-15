@@ -92,7 +92,8 @@ impl BackfillReport {
 
 /// Boot parameters: no writers (traffic is scenario-driven), the
 /// reorder-only device (F-L04-06: plain writes land off the timeline,
-/// fsyncs instant so the phase windows stay tight), checkpoints effectively off (index sidecars are S06 — this
+/// fsyncs instant so the phase windows stay tight), checkpoints effectively off (index sidecars are
+/// S06 — this
 /// scenario must exercise the rebuild-from-log path).
 fn base(scenario: &BackfillScenario) -> DurableScenario {
     DurableScenario {

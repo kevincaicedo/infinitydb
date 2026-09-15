@@ -50,10 +50,10 @@ impl GroupScheduler {
         maint_weight: u32,
         ckpt_weight: u32,
     ) -> GroupScheduler {
-        assert!(
-            quantum > 0 && fg_weight > 0 && maint_weight > 0 && ckpt_weight > 0,
-            "zero quantum/weight"
-        );
+        assert!(quantum > 0, "zero quantum");
+        assert!(fg_weight > 0, "zero fg_weight");
+        assert!(maint_weight > 0, "zero maint_weight");
+        assert!(ckpt_weight > 0, "zero ckpt_weight");
         let deficit = |weight: u32| {
             quantum.checked_mul(weight).expect("quantum × weight must fit u32 (initial deficit)")
         };

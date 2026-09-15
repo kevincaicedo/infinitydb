@@ -170,7 +170,11 @@ fn served_on(
 
 /// Runs one seeded `m2-ns-ddl-race` scenario.
 #[must_use]
-#[allow(clippy::too_many_lines)] // one linear phase script, like run_ns_create_window_scenario
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear phase script, like \
+     run_ns_create_window_scenario"
+)]
 pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
     let scenario = DurableScenario { cells: 4, ..DurableScenario::m2_durable(seed) };
     let clock = Rc::new(VirtualClock::new(Nanos(1)));

@@ -5,17 +5,58 @@
 //! discovers this inventory and fails CI on any declared-but-unwired or
 //! declared-but-untested point.
 //!
-//! | point | site | documented failure path |
-//! |---|---|---|
-//! | `durable_fsync_eio` | `DurableCell::on_synced` | the fsync completion arrives as a device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch can ever fire) and the process fail-stops with [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3) |
-//! | `shadow_twin_read_fail` | `plane::tiered::read_cold_record` | a shadow twin's cold read fails (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal |
-//! | `shadow_reconcile_read_fail` | `plane::shadow_pump` (the MAINTAIN reconciler's twin read only) | the reconciler's cold reads fail while `DBSIZE`'s and `DEL`'s own reads succeed (ADR-0093 D4.3): every open ticket stays open across MAINTAIN rounds — the lever that holds a **rebuilt** ticket set open on a real node (a boot pairs cold slots with their one RAM sibling before serving; the reconciler would otherwise resolve them within its first rounds) so `DEL` meets a winner carrying several tickets (review of 2026-08-30, F-L07-01, batch 23) |
-//! | `cold_enqueue_full` | `plane::tiered::probe` + `plane::tiered::fetch_key` | the `ColdReads` enqueue refuses `QueueFull` (the BUSY leg the review of 2026-08-30, C2′/F-L06-02/F-L06-04, found untestable deterministically): every read command answers the typed `BUSY cold-read queue saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`, or a silently shorter page |
-//! | `ns_drop_before_meta` | `plane::program_ns_ddl` (the DROP branch, after the local apply, before the catalog persist request) | the DDL stops with the origin's registry already lacking the namespace and nothing durable changed — the on-disk state of a power cut before the catalog swap (ADR-0100 D5): a restart restores the namespace whole, its tier files intact on every cell (the teardown hold never released) |
-//! | `ns_drop_after_meta` | `plane::program_ns_ddl` (the DROP branch, after the catalog swap is durable, before the fan) | the DDL stops with `META` lacking the namespace and carrying its tombstone while every `MANIFEST` still names it — the on-disk state of a power cut after the swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone |
-//! | `ns_create_after_meta` | `plane::program_ns_ddl` (the CREATE branch, after the catalog swap is durable, before the local apply) | the DDL stops with `META` naming a namespace no cell serves — the on-disk state of a power cut after the swap (ADR-0103 D1/D5): a restart seeds the namespace from `META` and serves it on every cell; nothing was acked, so nothing was promised |
-//! | `ns_create_fan_refused` | `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before its local apply) | the peer refuses the leg with a typed error — the stand-in for the OS refusing the tier ring reservation on that cell (ADR-0103 D3's one check the origin cannot run ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, fans `DROP` to every peer, persists the drop — and answers the leg's error; no cell serves the namespace and `META` never names it after the reply |
-//! | `mset_midway_oom` | `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) | a multi-key write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate stages the applied prefix anyway — recovery replays exactly the live store, never a silent rollback of read-visible keys |
+//! - point — site — documented failure path
+//! - ---|---|---
+//! - `durable_fsync_eio` — `DurableCell::on_synced` — the fsync completion arrives as a
+//!   device-reported EIO instead of `Synced` — the watermark freezes (no ack for the affected batch
+//!   can ever fire) and the process fail-stops with
+//!   [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP) (the fsyncgate rule; ADR-0020 D3)
+//! - `shadow_twin_read_fail` — `plane::tiered::read_cold_record` — a shadow twin's cold read fails
+//!   (M4.5-S37, ADR-0093 D4.3/A3): the reconciler leaves the ticket for the next round, `DBSIZE`'s
+//!   drain answers the typed `-ERR DBSIZE: shadow twin … unreadable` (relayed through a scattered
+//!   leg), `DEL`'s forced resolution answers its error — never an inexact count, never a removal
+//! - `shadow_reconcile_read_fail` — `plane::shadow_pump` (the MAINTAIN reconciler's twin read only)
+//!   — the reconciler's cold reads fail while `DBSIZE`'s and `DEL`'s own reads succeed (ADR-0093
+//!   D4.3): every open ticket stays open across MAINTAIN rounds — the lever that holds a
+//!   **rebuilt**
+//!   ticket set open on a real node (a boot pairs cold slots with their one RAM sibling before
+//!   serving; the reconciler would otherwise resolve them within its first rounds) so `DEL` meets a
+//!   winner carrying several tickets (review of 2026-08-30, F-L07-01, batch 23)
+//! - `cold_enqueue_full` — `plane::tiered::probe` + `plane::tiered::fetch_key` — the `ColdReads`
+//!   enqueue refuses `QueueFull` (the BUSY leg the review of 2026-08-30, C2′/F-L06-02/F-L06-04,
+//!   found
+//!   untestable deterministically): every read command answers the typed `BUSY cold-read queue
+//!   saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`,
+//!   or
+//!   a silently shorter page
+//! - `ns_drop_before_meta` — `plane::program_ns_ddl` (the DROP branch, after the local apply,
+//!   before the catalog persist request) — the DDL stops with the origin's registry already lacking
+//!   the namespace and nothing durable changed — the on-disk state of a power cut before the
+//!   catalog
+//!   swap (ADR-0100 D5): a restart restores the namespace whole, its tier files intact on every
+//!   cell
+//!   (the teardown hold never released)
+//! - `ns_drop_after_meta` — `plane::program_ns_ddl` (the DROP branch, after the catalog swap is
+//!   durable, before the fan) — the DDL stops with `META` lacking the namespace and carrying its
+//!   tombstone while every `MANIFEST` still names it — the on-disk state of a power cut after the
+//!   swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone
+//! - `ns_create_after_meta` — `plane::program_ns_ddl` (the CREATE branch, after the catalog swap is
+//!   durable, before the local apply) — the DDL stops with `META` naming a namespace no cell serves
+//!   —
+//!   the on-disk state of a power cut after the swap (ADR-0103 D1/D5): a restart seeds the
+//!   namespace
+//!   from `META` and serves it on every cell; nothing was acked, so nothing was promised
+//! - `ns_create_fan_refused` — `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before
+//!   its local apply) — the peer refuses the leg with a typed error — the stand-in for the OS
+//!   refusing the tier ring reservation on that cell (ADR-0103 D3's one check the origin cannot run
+//!   ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, fans `DROP` to
+//!   every peer, persists the drop — and answers the leg's error; no cell serves the namespace and
+//!   `META` never names it after the reply
+//! - `mset_midway_oom` — `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) — a multi-key
+//!   write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review
+//!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate
+//!   stages the applied prefix anyway — recovery replays exactly the live store, never a silent
+//!   rollback of read-visible keys
 //!
 //! The sync-tier seal fsync has its own point (`inf_log::fault::FSYNC_ERR`);
 //! this one exists because the reactor tier defers the seal fsync through

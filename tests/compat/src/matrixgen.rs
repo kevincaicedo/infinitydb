@@ -83,14 +83,19 @@ pub static DECLARED: &[Declared] = &[
         "QUIT",
         Status::Partial,
         "M1",
-        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite",
+        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus \
+             because closing tears down the shared oracle connection — covered by a unit test and \
+             the client-smoke suite",
     ),
     d("GET", Status::Full, "M0", ""),
     d(
         "SET",
         Status::Full,
         "M0",
-        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values \
+             are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 \
+             MiB): a longer one is a protocol error that closes the connection, as in Redis past \
+             its own cap (ADR-0122)",
     ),
     d("SETNX", Status::Full, "M0", ""),
     d(
@@ -118,7 +123,11 @@ pub static DECLARED: &[Declared] = &[
         "APPEND",
         Status::Full,
         "M0",
-        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built (F-L13-04)",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
+             Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
+             Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded \
+             by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built \
+             (F-L13-04)",
     ),
     d("STRLEN", Status::Full, "M0", ""),
     d(
@@ -135,7 +144,15 @@ pub static DECLARED: &[Declared] = &[
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store, F-L05-03); `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` and \
+             `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution \
+             family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares \
+             against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's \
+             publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the \
+             worst wheel debt across every store, F-L05-03); `# Persistence`/`# Tiering`/`# \
+             Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); \
+             an unknown section name selects nothing (empty body, Redis shape); client-smoke CI \
+             is the open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -148,7 +165,10 @@ pub static DECLARED: &[Declared] = &[
         "MSET",
         Status::Full,
         "M1",
-        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB)",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
+             Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
+             Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 \
+             KiB (Redis bounds the query buffer separately at 1 GiB)",
     ),
     d(
         "MSETNX",
@@ -161,7 +181,10 @@ pub static DECLARED: &[Declared] = &[
         "SETRANGE",
         Status::Full,
         "M1",
-        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis (F-L13-04)",
+        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 \
+             (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the \
+             namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty \
+             patch is a length read on every path, as in Redis (F-L13-04)",
     ),
     d(
         "GETEX",
@@ -173,26 +196,31 @@ pub static DECLARED: &[Declared] = &[
         "INCRBYFLOAT",
         Status::Partial,
         "M1",
-        "computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ",
+        "computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision \
+             tails may differ",
     ),
     d("SUBSTR", Status::Full, "M1", ""),
     d(
         "RENAME",
         Status::Partial,
         "M1",
-        "cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6",
+        "cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination \
+             refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; \
+             destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6",
     ),
     d(
         "RENAMENX",
         Status::Partial,
         "M1",
-        "same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source",
+        "same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 \
+             against the leftover destination copy without removing the source",
     ),
     d(
         "COPY",
         Status::Partial,
         "M1",
-        "cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME",
+        "cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is \
+             checked at write; same cross-owner window as RENAME",
     ),
     d("TOUCH", Status::Full, "M1", ""),
     d("UNLINK", Status::Full, "M1", ""),
@@ -210,7 +238,8 @@ pub static DECLARED: &[Declared] = &[
         "FLUSHALL",
         Status::Partial,
         "M1",
-        "atomic per cell, eventually complete across cells within one scatter round (no global pause)",
+        "atomic per cell, eventually complete across cells within one scatter round (no global \
+             pause)",
     ),
     d(
         "OBJECT",
@@ -222,7 +251,10 @@ pub static DECLARED: &[Declared] = &[
         "DEBUG",
         Status::Partial,
         "M1",
-        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node",
+        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel \
+             stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner \
+             cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never \
+             the node",
     ),
     d(
         "EXPIREAT",
@@ -243,13 +275,22 @@ pub static DECLARED: &[Declared] = &[
         "CONFIG",
         Status::Partial,
         "M1",
-        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell refuses with Redis's error while a sibling may have headroom), `timeout` closes idle unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to connections accepted after the change (ADR-0123); `client-output-buffer-limit` enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF)",
+        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 \
+             MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next \
+             MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell \
+             refuses with Redis's error while a sibling may have headroom), `timeout` closes idle \
+             unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
+             connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
+             enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \
+             replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF)",
     ),
     d(
         "CLIENT",
         Status::Partial,
         "M1",
-        "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros",
+        "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, \
+             resp, db, sub, psub) — addr/fd are placeholders until peername capture, and \
+             idle/cmd/tot-*/buffer gauges are untracked zeros",
     ),
     d(
         "LOLWUT",
@@ -317,19 +358,27 @@ pub static DECLARED: &[Declared] = &[
         "INF.TAKE",
         Status::Internal,
         "M1",
-        "fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110)",
+        "fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, \
+             executed only on a program-marked Apply; read/delete+TTL, IF value deadline \
+             conditionally deletes the matching string snapshot (ADR-0110)",
     ),
     d(
         "INF.PEEK",
         Status::Internal,
         "M1",
-        "fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110)",
+        "fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a \
+             string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss \
+             accounting (ADR-0110)",
     ),
     d(
         "INF.PUT",
         Status::Internal,
         "M1",
-        "fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment)",
+        "fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is \
+             byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX \
+             destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's \
+             replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still \
+             answers OOM (ADR-0110 third amendment)",
     ),
     // ---- M3-S11/S12 · `JSON.*` (ADR-0041). S21 supplies the pinned
     // RedisJSON RESP2/RESP3 byte corpus and explicit deviation allowlist;
@@ -644,7 +693,8 @@ pub fn render() -> String {
     push("byte-exact there, never silently excused.");
     push("");
     push(&format!(
-        "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 tolerated failures.",
+        "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 \
+             tolerated failures.",
     ));
     push(&format!(
         "**Surface:** {} commands — {} full · {} partial · {} stub · {} extension · {} internal.",

@@ -432,6 +432,8 @@ fn x86_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
 
 /// One 32-byte half of the AVX2 classification: 10 compares (`|0x20`
 /// folds `[`→`{`, `]`→`}` so the six structural chars need four).
+/// # Safety
+/// AVX2 enabled (the tier's dispatch) and `ptr..ptr + 32` inside the caller's buffer.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -486,6 +488,9 @@ unsafe fn avx2_block(ptr: *const u8) -> BlockMasks {
 }
 
 /// AVX2 tier of the batch scan.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
@@ -519,6 +524,9 @@ unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
 /// across iterations into a `vpinsrb` storm (~4× the whole batch scan,
 /// perf-annotated in the stage-fusion artifact) — the ptr-write shape
 /// keeps the movemask results scalar.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
@@ -811,6 +819,9 @@ pub fn scalar_json_copy_unescaped_fixstr(
 
 /// AVX2 tier of [`json_copy_unescaped_fixstr`]: one load, one masked
 /// classify, one header byte + one 32-byte store through one reservation.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_copy_unescaped_fixstr(
@@ -872,6 +883,9 @@ pub fn scalar_json_copy_unescaped_short(window: &[u8], len: usize, out: &mut Vec
 }
 
 /// AVX2 tier: one load, one masked classify, one store.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_copy_unescaped_short(window: &[u8], len: usize, out: &mut Vec<u8>) -> bool {
@@ -914,9 +928,14 @@ fn word_special(w: u64) -> u64 {
 /// block overlaps backward (`src.len() >= 32`, dispatcher-guaranteed) —
 /// the re-covered prefix already scanned clean, so any set mask bit is a
 /// genuinely new position.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+    /// # Safety
+    /// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
     #[target_feature(enable = "avx2")]
     #[inline]
     unsafe fn special_mask(v: __m256i) -> u32 {

@@ -54,7 +54,8 @@ pub fn render() -> String {
     push("> **GENERATED — do not edit.** Rendered by `tests/compat/src/replyshapes.rs`");
     push("> from `inf_server::JSON_REPLY_SHAPES` (the table beside the handlers).");
     push(
-        "> Regenerate: `INF_REGEN_REPLY_SHAPES=1 cargo test -p compat --test reply_shapes_artifact`",
+        "> Regenerate: `INF_REGEN_REPLY_SHAPES=1 cargo test -p compat --test \
+             reply_shapes_artifact`",
     );
     push("> (CI fails when this file is stale — the release pipeline inherits that refusal).");
     push("");

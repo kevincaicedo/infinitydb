@@ -13,6 +13,12 @@ check:
     # panic/unreachable in cell code is a classified inventory row.
     ./scripts/check-release-asserts.sh
     ./scripts/check-safety-inventory.sh
+    # ADR-0125 (review 2026-08-30, L18 R1/R2): the counted disciplines had
+    # no mechanical check — 2000 production lines per file, 100 columns
+    # on every line, and the 70-line function ratchet.
+    ./scripts/check-file-length.sh
+    ./scripts/check-line-width.sh
+    ./scripts/check-fn-length.sh
     # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
     # denies unsafe_code, the deny set is the audited-leaf list, and every
     # allow is module-scoped — the §17.3 posture, mechanical.

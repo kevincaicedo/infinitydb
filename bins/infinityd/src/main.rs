@@ -441,7 +441,8 @@ fn parse_args() -> Result<Args, String> {
     // The bound lives here, where every operator value is validated.
     if args.buffers > usize::from(u16::MAX) {
         return Err(format!(
-            "--buffers must be <= {} (the io_uring provided-buffer group addresses buffers by u16 id)",
+            "--buffers must be <= {} (the io_uring provided-buffer group addresses buffers by u16 \
+                 id)",
             u16::MAX
         ));
     }

@@ -95,7 +95,7 @@ impl SubFleet {
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
 pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m1")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m1");
@@ -217,7 +217,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             }
             // Bench poller thread, not cell code: ~5 ms DBSIZE cadence keeps
             // the probe load negligible against the foreground fleet.
-            #[allow(clippy::disallowed_methods)]
+            #[allow(clippy::disallowed_methods, reason = "bench orchestration, not cell code")]
             std::thread::sleep(Duration::from_millis(5));
         }
     });

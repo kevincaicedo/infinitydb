@@ -292,7 +292,7 @@ fn sweep_stale_row_dirs(data_root: &std::path::Path) {
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // orchestration script
+#[allow(clippy::too_many_lines, clippy::too_many_arguments, reason = "orchestration script")]
 fn pressure_leg(
     m: &mut Measurements,
     infinityd: &str,
@@ -872,7 +872,7 @@ fn pressure_rows(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
 pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m2")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m2");

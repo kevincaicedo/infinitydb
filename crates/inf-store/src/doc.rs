@@ -271,7 +271,8 @@ fn encode_tree_handle(
     cadence: DocCadence,
     lineage: DocLineage,
 ) -> [u8; 35] {
-    debug_assert!(mem.node_bytes <= u32::MAX as usize && mem.slack_bytes <= u32::MAX as usize);
+    debug_assert!(mem.node_bytes <= u32::MAX as usize);
+    debug_assert!(mem.slack_bytes <= u32::MAX as usize);
     let mut out = [0u8; 35];
     write_prefix(&mut out, FORM_TREE, cadence, lineage);
     out[15..23].copy_from_slice(&root.to_raw().to_le_bytes());

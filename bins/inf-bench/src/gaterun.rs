@@ -500,7 +500,8 @@ pub(crate) fn finish_report(
 
     let mut report = String::new();
     report.push_str(&format!(
-        "# {} gate-run report\n\ndate: {stamp} (unix) · {header_facts}\nenv-check: {}\ntier: {}\n\nnotes:\n",
+        "# {} gate-run report\n\ndate: {stamp} (unix) · {header_facts}\nenv-check: {}\ntier: \
+             {}\n\nnotes:\n",
         milestone.to_uppercase(),
         if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
         if reference_box { "reference-box (binding)" } else { "dev (non-binding)" },
@@ -789,7 +790,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
     ],
 );
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
 pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     let Some((milestone, rest)) = args.split_first() else {
         return Err("usage: gate-run m0|m1 [flags]".into());
@@ -805,7 +806,7 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
 fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m0")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m0");

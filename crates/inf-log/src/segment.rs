@@ -235,7 +235,8 @@ impl SegmentConfig {
 /// fail-stop. **No caller may catch this and continue**; CI greps for this
 /// type in non-fatal match arms (M2 §3.3, enforced from M2-S17).
 #[derive(Debug)]
-// fsync-fail-stop-allow: the type itself — an fsync failure's identity; constructed only in this file
+// fsync-fail-stop-allow: the type itself — an fsync failure's identity; constructed only in this
+// file
 pub struct FsyncFailed {
     pub segment: SegmentId,
     pub source: io::Error,
@@ -1113,7 +1114,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
         let base = recycle_sentinel_base(self.cfg.segment_bytes);
         file.write_at(u64::from(base), image)
             .map_err(|source| LogError::Io { segment: id, source })?;
-        // fsync-fail-stop-allow: the sentinel's data barrier: mapped to LogError::Fsync and returned
+        // fsync-fail-stop-allow: the sentinel's data barrier: mapped to LogError::Fsync and
+        // returned
         file.sync_data().map_err(|source| LogError::Fsync(FsyncFailed { segment: id, source }))?;
         self.stats.recycle_sentinels += 1;
         Ok(())
@@ -1560,7 +1562,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
         // M2-S16 `fsync_err`: the seal fsync fails — typed, non-recoverable
         // by contract (§8.4: no caller may catch and continue).
         if inf_foundation::fault::fire(crate::fault::FSYNC_ERR) {
-            // fsync-fail-stop-allow: fsync_err injection: constructs and returns typed — nothing catches it
+            // fsync-fail-stop-allow: fsync_err injection: constructs and returns typed — nothing
+            // catches it
             return Err(LogError::Fsync(FsyncFailed {
                 segment: self.active.id,
                 source: crate::fault::injected(crate::fault::FSYNC_ERR),
@@ -1571,7 +1574,8 @@ impl<F: SegmentFs> SegmentRotor<F> {
         self.active
             .file
             .sync_data()
-            // fsync-fail-stop-allow: the seal fsync: mapped to LogError::Fsync and propagated with `?`
+            // fsync-fail-stop-allow: the seal fsync: mapped to LogError::Fsync and propagated with
+            // `?`
             .map_err(|source| LogError::Fsync(FsyncFailed { segment: self.active.id, source }))?;
         // M2-S16 `power_cut_after_seal`: the seal is durable; the process
         // dies before anything after it exists (the pointer swap, the next

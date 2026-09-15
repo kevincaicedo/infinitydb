@@ -35,7 +35,8 @@ fn parses_single_and_pipelined_commands() {
     assert_eq!(err, None);
     assert_eq!(cmds, vec![args(&["GET", "user"])]);
 
-    let pipeline = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n*1\r\n$4\r\nPING\r\n*2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n";
+    let pipeline = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n*1\r\n$4\r\nPING\r\n*2\r\n$6\r\n\
+         EXISTS\r\n$1\r\nk\r\n";
     let (cmds, err) = drain(&mut parser, pipeline);
     assert_eq!(err, None);
     assert_eq!(cmds, vec![args(&["SET", "k", "value"]), args(&["PING"]), args(&["EXISTS", "k"])]);

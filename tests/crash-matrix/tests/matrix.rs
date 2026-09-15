@@ -54,7 +54,8 @@ fn every_declared_point_has_a_matrix_row() {
     for point in declared {
         assert!(
             def.rows.iter().any(|row| row.point == point),
-            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml + m45.toml)"
+            "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml + \
+                 m45.toml)"
         );
     }
     for row in &def.rows {

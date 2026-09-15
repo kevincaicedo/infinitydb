@@ -73,6 +73,9 @@ mod bits {
 /// 3/4-byte continuation cross-check. The trailing partial block is
 /// zero-padded into a stack buffer — NUL is ASCII, so padding terminates
 /// any dangling sequence exactly like end-of-input must.
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_utf8_is_valid(input: &[u8]) -> bool {
@@ -103,6 +106,8 @@ unsafe fn avx2_utf8_is_valid(input: &[u8]) -> bool {
 }
 
 /// One 32-byte block through the validator state.
+/// # Safety
+/// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -131,6 +136,8 @@ unsafe fn step(
 /// Bytes shifted right by `16 - IMM` with carry-in from the previous
 /// block (simdjson's `prev<N>` with `IMM = 16 - N`): per-lane `alignr`
 /// over `[prev_hi : cur_lo]`.
+/// # Safety
+/// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -142,6 +149,8 @@ unsafe fn shift_in<const IMM: i32>(current: __m256i, prev: __m256i) -> __m256i {
 /// The Keiser–Lemire classifier for one non-ASCII block: three nibble
 /// lookups intersect into per-byte error classes, then the 3/4-byte
 /// continuation obligation is cross-checked against `TWO_CONTS`.
+/// # Safety
+/// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -214,6 +223,8 @@ unsafe fn classify(current: __m256i, prev: __m256i) -> __m256i {
 
 /// Nonzero bytes where the block's tail opens a sequence it cannot close
 /// (a 2/3/4-byte lead within the last 1/2/3 bytes).
+/// # Safety
+/// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -229,6 +240,8 @@ unsafe fn incomplete(current: __m256i) -> __m256i {
 
 /// Per-byte 16-entry table lookup over nibble indices (both lanes carry
 /// the same table).
+/// # Safety
+/// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -318,7 +331,9 @@ mod tests {
     proptest::proptest! {
         /// Arbitrary bytes: the kernel is the std verdict, bit for bit.
         #[test]
-        fn equivalence_arbitrary(input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..600)) {
+        fn equivalence_arbitrary(
+            input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..600),
+        ) {
             agree(&input);
         }
 

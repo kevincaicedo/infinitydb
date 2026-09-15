@@ -111,7 +111,8 @@ pub fn render(
     }
     let _ = writeln!(
         md,
-        "| Parameters | duration={}s · threads={} · clients={} · value={} B · keyspace={} · pipeline={} · maxmemory={} |",
+        "| Parameters | duration={}s · threads={} · clients={} · value={} B · keyspace={} · \
+             pipeline={} · maxmemory={} |",
         p.duration, p.threads, p.clients, p.data_size, p.keyspace, pipelines, maxmem
     );
     let _ = writeln!(
@@ -150,7 +151,9 @@ pub fn render(
         let _ = writeln!(md, "## Results — memtier_benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (ops/s) | achieved/offered | avg (ms) | p50 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | server CPU (%) | device MiB written | RSS (MiB) |"
+            "| Engine | Workload | Pipe | Throughput (ops/s) | achieved/offered | avg (ms) | p50 \
+                 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | server CPU (%) | device MiB written | \
+                 RSS (MiB) |"
         );
         let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for c in cells {
@@ -219,7 +222,8 @@ pub fn render(
         let _ = writeln!(md, "## Cross-check — memtier vs redis-benchmark throughput\n");
         let _ = writeln!(
             md,
-            "Independent-generator agreement on the same engine/workload. Flagged when the two disagree by more than {:.0}%.\n",
+            "Independent-generator agreement on the same engine/workload. Flagged when the two \
+                 disagree by more than {:.0}%.\n",
             p.crosscheck_pct
         );
         let _ = writeln!(
@@ -245,7 +249,8 @@ pub fn render(
         let _ = writeln!(md, "## Memory attribution — bytes/key\n");
         let _ = writeln!(
             md,
-            "Fill the keyspace, then `(RSS_after − RSS_baseline) ÷ DBSIZE`. The L5 gate shape; the binding ≤ 1.0× Redis gate is `inf-bench gate-run m1` on the reference box.\n"
+            "Fill the keyspace, then `(RSS_after − RSS_baseline) ÷ DBSIZE`. The L5 gate shape; the \
+                 binding ≤ 1.0× Redis gate is `inf-bench gate-run m1` on the reference box.\n"
         );
         let _ = writeln!(
             md,
@@ -272,50 +277,73 @@ pub fn render(
     if !env.binding {
         let _ = writeln!(
             md,
-            "- **Non-citable run.** DEV-TIER numbers prove the harness and show relative shape only. A binding number needs `--reference-box` on a clean box (the M0-R2 standing obligation). Authoritative gate: `inf-bench env-check`."
+            "- **Non-citable run.** DEV-TIER numbers prove the harness and show relative shape \
+                 only. A binding number needs `--reference-box` on a clean box (the M0-R2 standing \
+                 obligation). Authoritative gate: `inf-bench env-check`."
         );
     }
     let _ = writeln!(
         md,
-        "- redis command execution is single-threaded, but its process tree was allowed the same {} CPUs as InfinityDB's cells so AOF rewrite children did not contend with the command thread on one pinned CPU. Each engine's config is recorded above.",
+        "- redis command execution is single-threaded, but its process tree was allowed the same \
+             {} CPUs as InfinityDB's cells so AOF rewrite children did not contend with the \
+             command thread on one pinned CPU. Each engine's config is recorded above.",
         p.threads
     );
     let _ = writeln!(
         md,
-        "- GET rows were measured after a {}s sequential populate; redis-benchmark uses its own key format, so its GET cross-check reads against keys memtier didn't write (throughput-comparable, hit rate not).",
+        "- GET rows were measured after a {}s sequential populate; redis-benchmark uses its own \
+             key format, so its GET cross-check reads against keys memtier didn't write \
+             (throughput-comparable, hit rate not).",
         p.fill_secs
     );
     let _ = writeln!(
         md,
-        "- redis-benchmark is request-count based (`-n {}`) and reports only p50/p95/p99; p99.9 always comes from memtier. The two are compared on throughput, not latency.",
+        "- redis-benchmark is request-count based (`-n {}`) and reports only p50/p95/p99; p99.9 \
+             always comes from memtier. The two are compared on throughput, not latency.",
         p.rb_requests
     );
     let _ = writeln!(
         md,
-        "- Pub/sub fan-out latency is **not** measured here — memtier/redis-benchmark don't set up subscribers. That row lives in `inf-bench gate-run m1` (delivery-acked)."
+        "- Pub/sub fan-out latency is **not** measured here — memtier/redis-benchmark don't set up \
+             subscribers. That row lives in `inf-bench gate-run m1` (delivery-acked)."
     );
     if p.mode.contains("docker") {
         let _ = writeln!(
             md,
-            "- Under docker, RSS is the container's `docker stats` memory (no separate peak); infinitydb runs with the io_uring seccomp profile because Docker's default seccomp denies io_uring."
+            "- Under docker, RSS is the container's `docker stats` memory (no separate peak); \
+                 infinitydb runs with the io_uring seccomp profile because Docker's default \
+                 seccomp denies io_uring."
         );
     }
     if p.rate.is_some() {
         let _ = writeln!(
             md,
-            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the generator (or the server) could not hold the rate and the latency columns are not an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU covers the host process plus Redis's completed AOF-child CPU and live descendants; device MiB written is the block device's sectors-written delta (journal and metadata included, NAND amplification not). Raw INFO before/after each row is under `raw/`."
+            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at \
+                 `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the \
+                 generator (or the server) could not hold the rate and the latency columns are not \
+                 an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU \
+                 covers the host process plus Redis's completed AOF-child CPU and live \
+                 descendants; device MiB written is the block device's sectors-written delta \
+                 (journal and metadata included, NAND amplification not). Raw INFO before/after \
+                 each row is under `raw/`."
         );
     }
     if p.redis_no_auto_rewrite {
         let _ = writeln!(
             md,
-            "- **Non-production diagnostic arm.** Redis ran `auto-aof-rewrite-percentage 0`; this isolates automatic rewrite cost and cannot support a production/default-config comparison."
+            "- **Non-production diagnostic arm.** Redis ran `auto-aof-rewrite-percentage 0`; this \
+                 isolates automatic rewrite cost and cannot support a production/default-config \
+                 comparison."
         );
     }
     if p.durability != "none (in-memory)" {
         let _ = writeln!(
             md,
-            "- **Durability {}.** redis ran `--appendonly yes --appendfsync everysec` (its AOF under the data root); infinitydb ran `--data-dir` with every connection starting in an `FSYNC everysec` namespace (`--conn-default-ns cmp`, proven by a probe key before the row) — the same ≤ 1 s power-loss window on both sides, each engine's own mechanism, both on the same device.",
+            "- **Durability {}.** redis ran `--appendonly yes --appendfsync everysec` (its AOF \
+                 under the data root); infinitydb ran `--data-dir` with every connection starting \
+                 in an `FSYNC everysec` namespace (`--conn-default-ns cmp`, proven by a probe key \
+                 before the row) — the same ≤ 1 s power-loss window on both sides, each engine's \
+                 own mechanism, both on the same device.",
             p.durability
         );
     }

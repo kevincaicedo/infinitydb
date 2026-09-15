@@ -403,7 +403,8 @@ fn validate_one(
     stack: &mut Vec<Scope>,
     dict_check: &mut DictCheck<'_>,
 ) -> Result<usize, DocError> {
-    debug_assert!(off < limit && limit <= body.len());
+    debug_assert!(off < limit);
+    debug_assert!(limit <= body.len());
     let tag = body[off];
     // Key positions accept only string forms; everything else is a value.
     let is_string = matches!(tag, TAG_STR8 | TAG_STR24) || (FIXSTR_BASE..=0x9F).contains(&tag);

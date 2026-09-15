@@ -312,7 +312,8 @@ pub fn cmd_zipfian(args: &[String]) -> Result<(), String> {
 
     let tier = if reference_box { "reference-box" } else { "DEV-TIER (indicative)" };
     println!(
-        "zipfian LFU parity [{tier}]: keyspace {keyspace}, θ={theta}, maxmemory {maxmemory_mb} MiB, \
+        "zipfian LFU parity [{tier}]: keyspace {keyspace}, θ={theta}, maxmemory {maxmemory_mb} \
+        MiB, \
          {warmup} warmup + {ops} measured ops, {cells} cell(s)"
     );
 
@@ -340,7 +341,8 @@ pub fn cmd_zipfian(args: &[String]) -> Result<(), String> {
          |---|---|---|---|---|\n\
          | InfinityDB | allkeys-lfu | {ih} | {it} | {infinity_pct:.3}% |\n\
          | Redis 8 | allkeys-lfu | {rh} | {rt} | {redis_pct:.3}% |\n\n\
-         gap (pp below Redis): {pp:+.3} · threshold: ≤ {threshold_pp:.2} pp · verdict: {verdict}\n\n\
+         gap (pp below Redis): {pp:+.3} · threshold: ≤ {threshold_pp:.2} pp · verdict: \
+         {verdict}\n\n\
          gate row: `hit_rate_parity` (source `external:zipfian_lfu`). \
          Hit rate is an eviction-algorithm property and reproduces independent of \
          CPU governor/thermal state; the only machine sensitivity is the shared LFU \

@@ -598,7 +598,11 @@ proptest! {
     /// budget. Two walks over one `advance` core must agree everywhere
     /// or the predicate VM's verdicts fork from path semantics.
     #[test]
-    fn visit_streams_the_recorded_matches(value in arb_value(), ast in arb_path_ast(), budget in 0u64..24) {
+    fn visit_streams_the_recorded_matches(
+        value in arb_value(),
+        ast in arb_path_ast(),
+        budget in 0u64..24,
+    ) {
         let text = path::ast::print(&ast);
         let program = compile(text.as_bytes()).expect("compiles");
         let bytes = model::encode(&value).expect("encodes");

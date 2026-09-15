@@ -87,7 +87,9 @@ fn json_matrix_matches_pinned_redisjson() {
         }
     }
     println!(
-        "redisjson-diff: image={REDIS_STACK_IMAGE}@{REDIS_STACK_DIGEST} module=ReJSON/{REDISJSON_MODULE_VERSION} cases={} protocols=2 exact={exact} allowed={allowed} semantic_equal_allowed={semantic_equal} failures={}",
+        "redisjson-diff: image={REDIS_STACK_IMAGE}@{REDIS_STACK_DIGEST} \
+             module=ReJSON/{REDISJSON_MODULE_VERSION} cases={} protocols=2 exact={exact} \
+             allowed={allowed} semantic_equal_allowed={semantic_equal} failures={}",
         JSON_CASES.len(),
         failures.len()
     );

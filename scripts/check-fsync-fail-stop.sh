@@ -98,6 +98,30 @@ allowed=0
 DISCARD='(let[[:space:]]+_[[:space:]]*=|\.ok\(\)|\.unwrap_or|\.is_ok\(\)|\.is_err\(\)|drop\()'
 SYNCCALL='(sync_data|sync_all|fdatasync|libc::fsync)[[:space:]]*\('
 syncs=0
+# marker-up.awk (inline): from site line n, look at n itself and then up
+# through the whole-line `//` comment block above it; print the reason
+# (want=reason) or "1" for a bare marker (want=bare).
+MARKER_UP="$work/marker-up.awk"
+cat >"$MARKER_UP" <<'AWK'
+{ line[NR] = $0 }
+END {
+    for (i = n; i >= 1; i--) {
+        if (i < n && line[i] !~ /^[[:space:]]*\/\//) break
+        if (match(line[i], /fsync-fail-stop-allow:[[:space:]]*[^ ].*/)) {
+            if (want == "reason") {
+                r = substr(line[i], RSTART + 22, RLENGTH - 22)
+                sub(/^[[:space:]]*/, "", r); sub(/[[:space:]]*\*\/[[:space:]]*$/, "", r)
+                # continuation lines of the wrapped reason, up to the site
+                for (j = i + 1; j < n; j++) {
+                    c = line[j]; sub(/^[[:space:]]*\/\/[[:space:]]*/, "", c)
+                    if (c != "") r = r " " c
+                }
+                if (r != "") { print r; exit }
+            }
+        } else if (line[i] ~ /fsync-fail-stop-allow:[[:space:]]*$/ && want == "bare") { print "1"; exit }
+    }
+}
+AWK
 for dir in crates/*/src bins/*/src; do
     [ -d "$dir" ] || continue
     while IFS= read -r f; do
@@ -116,14 +140,11 @@ for dir in crates/*/src bins/*/src; do
         # Markers live in the comments, so they are read from the raw file.
         while IFS=: read -r n text; do
             sites=$((sites + 1))
-            reason=$(awk -v n="$n" 'NR==n-1 || NR==n {
-                if (match($0, /fsync-fail-stop-allow:[[:space:]]*[^ ].*/)) {
-                    r = substr($0, RSTART + 22, RLENGTH - 22)
-                    sub(/^[[:space:]]*/, "", r); sub(/[[:space:]]*\*\/[[:space:]]*$/, "", r)
-                    if (r != "") { print r; exit }
-                }
-            }' "$f")
-            bare=$(awk -v n="$n" 'NR==n-1 || NR==n { if ($0 ~ /fsync-fail-stop-allow:[[:space:]]*$/) { print "1"; exit } }' "$f")
+            # The marker heads the comment block directly above the site
+            # (its reason may wrap onto further `//` lines — batch 64, the
+            # 100-column gate) or sits on the site line itself.
+            reason=$(awk -v n="$n" -f "$MARKER_UP" -v want=reason "$f")
+            bare=$(awk -v n="$n" -f "$MARKER_UP" -v want=bare "$f")
             if [ -n "$reason" ]; then
                 allowed=$((allowed + 1))
                 echo "  audited $f:$n — $reason"
@@ -146,7 +167,7 @@ for dir in crates/*/src bins/*/src; do
             # an unrelated `drop(staged);` is not a discard).
             window=$(awk -v n="$n" 'NR==n { print; if ($0 ~ /;[[:space:]]*$/) exit } NR==n+1 { print }' "$work/code")
             printf '%s' "$window" | grep -qE "$DISCARD" || continue
-            if awk -v n="$n" 'NR==n-1 || NR==n { if ($0 ~ /fsync-fail-stop-allow:[[:space:]]*[^ ]/) { f=1 } } END { exit !f }' "$f"; then
+            if [ -n "$(awk -v n="$n" -f "$MARKER_UP" -v want=reason "$f")" ]; then
                 continue
             fi
             echo "UNAUDITED discarded sync result: $f:$n:${text# }"
@@ -154,8 +175,13 @@ for dir in crates/*/src bins/*/src; do
         done < <(grep -nE "$SYNCCALL" "$work/code" || true)
         # A marker that guards nothing is stale scope.
         while IFS=: read -r n _; do
-            if ! awk -v n="$n" -v pat="$PATTERN" -v sc="$SYNCCALL" \
-                'NR==n || NR==n+1 { if ($0 ~ pat || $0 ~ sc) { f=1 } } END { exit !f }' "$work/code"; then
+            # A marker guards its own line or the first code line below its
+            # comment block (the code view has comments blanked, so the
+            # continuation lines are empty there).
+            if ! awk -v n="$n" -v pat="$PATTERN" -v sc="$SYNCCALL" '
+                NR==n { if ($0 ~ pat || $0 ~ sc) { f=1 } }
+                NR>n && !done { if ($0 ~ /^[[:space:]]*$/) next; done=1; if ($0 ~ pat || $0 ~ sc) { f=1 } }
+                END { exit !f }' "$work/code"; then
                 echo "STALE fsync-fail-stop marker: $f:$n guards no fsync-error site"
                 fail=1
             fi

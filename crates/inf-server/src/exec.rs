@@ -1544,7 +1544,9 @@ fn object(
             w.int(i64::from(store.object_freq(key, now).unwrap_or(0)));
         } else {
             w.error(
-                "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+                "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+                     Please note that when switching between policies at runtime LRU and LFU data \
+                     will take some time to adjust.",
             );
         }
     }
@@ -3180,7 +3182,9 @@ mod tests {
         // Disallowed commands answer the Redis-exact context error.
         assert_eq!(
             run(&mut cx, &mut ks, &[b"GET", b"k"]),
-            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n".to_vec()
+            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / \
+                 RESET are allowed in this context\r\n"
+                .to_vec()
         );
         // PING reshapes to [pong, <arg|"">] in RESP2 subscriber mode.
         assert_eq!(run(&mut cx, &mut ks, &[b"PING"]), b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");

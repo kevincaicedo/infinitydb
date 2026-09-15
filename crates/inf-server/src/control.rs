@@ -1377,7 +1377,8 @@ fn control_main(
                     0.0
                 };
                 eprintln!(
-                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta {eta:.0}s",
+                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta \
+                         {eta:.0}s",
                     board.ready_cells(),
                     board.cell_count(),
                     if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
@@ -1392,7 +1393,8 @@ fn control_main(
                         if !slot.ready() {
                             let (done, total) = slot.bytes();
                             eprintln!(
-                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for {elapsed:.0}s",
+                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for \
+                                     {elapsed:.0}s",
                                 CellRecoverySlot::phase_name(slot.phase()),
                             );
                         }

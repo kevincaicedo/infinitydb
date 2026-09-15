@@ -139,7 +139,8 @@ impl ExtentWriteFailure {
     pub fn is_storage_full(&self) -> bool {
         match self {
             ExtentWriteFailure::Write(e) => crate::fs::is_storage_exhausted(e),
-            // fsync-fail-stop-allow: is_retryable classifier: false — the ADR-0061 D3 typed abort is never retried
+            // fsync-fail-stop-allow: is_retryable classifier: false — the ADR-0061 D3 typed abort
+            // is never retried
             ExtentWriteFailure::Fsync(_) => false,
         }
     }
@@ -388,7 +389,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
                 crate::fault::BLOB_FSYNC_ERR,
             )));
         }
-        // fsync-fail-stop-allow: the extent barrier: mapped to ExtentWriteFailure::Fsync and propagated with `?`
+        // fsync-fail-stop-allow: the extent barrier: mapped to ExtentWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(ExtentWriteFailure::Fsync)?;
         Ok(SealedExtent {
             ns: self.ns,

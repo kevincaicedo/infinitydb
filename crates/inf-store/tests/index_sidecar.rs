@@ -3,21 +3,26 @@
 //!
 //! # The case table (written before the tests)
 //!
-//! | # | leg | outcome |
-//! |---|-----|---------|
-//! | 1 | fuzzy emission (mutations racing the cursor) → fresh boot → load → CatchUp tail → commit | every index `Loaded`; trees ≡ the from-scratch oracle; no jobs |
-//! | 2 | generation mismatch (rebuilt after the checkpoint) | `Rebuilt{generation-mismatch}`, tree empty, S05 rebuild converges |
-//! | 3 | encoding-version mismatch | `Rebuilt{encoding-version}` + rebuild |
-//! | 4 | key-scheme mismatch | `Rebuilt{scheme-mismatch}` + rebuild |
-//! | 5 | ordinal gap across sections | `Rebuilt{non-contiguous}` + rebuild |
-//! | 6 | cross-section key regression | `Rebuilt{out-of-order}` + rebuild |
-//! | 7 | stream without FINAL (abandoned mid-emission) | `Rebuilt{incomplete}` + rebuild |
-//! | 8 | sections after FINAL | `Rebuilt{after-final}` + rebuild |
-//! | 9 | sections naming a dropped declaration | swallowed; other indexes unaffected |
-//! | 10 | empty converged tree (zero-entry FINAL) | `Loaded{0}` |
-//! | 11 | tail deletes / overwrites / string-overwrite deaths under CatchUp | remove-may-miss legal; converges |
-//! | 12 | damaged-section notes | counted in the INFO fold, never fatal |
-//! | 13 | a veto raised by the `CatchUp` tail (the post-half eval overflow, client-reachable) | `Rebuilt{degraded}`, tree empty, veto clear, cell stays `Backfilling`; S05 rebuild converges (ADR-0078 A1, F-L07-04) |
+//! - # — leg — outcome
+//! - ---|-----|---------
+//! - 1 — fuzzy emission (mutations racing the cursor) → fresh boot → load → CatchUp tail → commit —
+//!   every index `Loaded`; trees ≡ the from-scratch oracle; no jobs
+//! - 2 — generation mismatch (rebuilt after the checkpoint) — `Rebuilt{generation-mismatch}`, tree
+//!   empty, S05 rebuild converges
+//! - 3 — encoding-version mismatch — `Rebuilt{encoding-version}` + rebuild
+//! - 4 — key-scheme mismatch — `Rebuilt{scheme-mismatch}` + rebuild
+//! - 5 — ordinal gap across sections — `Rebuilt{non-contiguous}` + rebuild
+//! - 6 — cross-section key regression — `Rebuilt{out-of-order}` + rebuild
+//! - 7 — stream without FINAL (abandoned mid-emission) — `Rebuilt{incomplete}` + rebuild
+//! - 8 — sections after FINAL — `Rebuilt{after-final}` + rebuild
+//! - 9 — sections naming a dropped declaration — swallowed; other indexes unaffected
+//! - 10 — empty converged tree (zero-entry FINAL) — `Loaded{0}`
+//! - 11 — tail deletes / overwrites / string-overwrite deaths under CatchUp — remove-may-miss
+//!   legal; converges
+//! - 12 — damaged-section notes — counted in the INFO fold, never fatal
+//! - 13 — a veto raised by the `CatchUp` tail (the post-half eval overflow, client-reachable) —
+//!   `Rebuilt{degraded}`, tree empty, veto clear, cell stays `Backfilling`; S05 rebuild converges
+//!   (ADR-0078 A1, F-L07-04)
 //!
 //! `TotalMismatch` is reachable only from hand-forged bytes (the writer
 //! asserts the total, and `NonContiguous` fires first on every writer-

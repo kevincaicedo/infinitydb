@@ -912,7 +912,8 @@ impl JsonParser {
         // Splice the rebuilt body over the original. Every open
         // placeholder (this object's and its ancestors') precedes
         // `body_start`, so no u24 moves — the D3 backpatch argument.
-        debug_assert!(body_start <= body_end && body_end == tape.out.len());
+        debug_assert!(body_start <= body_end);
+        debug_assert_eq!(body_end, tape.out.len());
         tape.out.truncate(body_start);
         tape.out.extend_from_slice(&self.rebuild);
     }
@@ -973,7 +974,8 @@ fn check_scalar_terminator(input: &[u8], end: usize) -> Result<(), JsonParseErro
 /// Digits-only slice → u64 via 8-digit SWAR chunks (caller guarantees
 /// ASCII digits and length ≤ 19, so no overflow is possible).
 fn parse_digits(bytes: &[u8]) -> u64 {
-    debug_assert!(bytes.len() <= 19 && bytes.iter().all(u8::is_ascii_digit));
+    debug_assert!(bytes.len() <= 19);
+    debug_assert!(bytes.iter().all(u8::is_ascii_digit));
     let mut acc: u64 = 0;
     let mut chunks = bytes.chunks_exact(8);
     for chunk in &mut chunks {

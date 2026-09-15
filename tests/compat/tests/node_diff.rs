@@ -176,7 +176,11 @@ fn scan_all(stream: &mut TcpStream, buf: &mut Vec<u8>, label: &str) -> BTreeSet<
 /// DBSIZE byte-exact, SCAN set-equality, cleanup via per-key DEL so both
 /// engines end the phase empty. `keys_supported` gates KEYS/RANDOMKEY
 /// (refused on tiered namespaces — the declared M4 string-family cut).
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear phase script; splitting would scatter the \
+     invariants"
+)]
 fn run_ns_phase(
     oracle: &mut TcpStream,
     ob: &mut Vec<u8>,
@@ -364,15 +368,18 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
                 "EXISTS", "s:0", "s:1", "s:2", "s:3", "s:4", "s:5", "s:6", "s:7", "s:8", "s:9",
                 "s:a", "s:b", "s:c", "s:d", "s:e", "s:f",
             ][..],
-            &b"-ERR multi-key commands spanning cells are not yet supported in named namespaces (M2)\r\n"[..],
+            &b"-ERR multi-key commands spanning cells are not yet supported in named namespaces \
+                 (M2)\r\n"[..],
         ),
         (
             &["KEYS", "*"][..],
-            &b"-ERR this command is not supported on tiered namespaces in M4 (string family only)\r\n"[..],
+            &b"-ERR this command is not supported on tiered namespaces in M4 (string family \
+                 only)\r\n"[..],
         ),
         (
             &["RANDOMKEY"][..],
-            &b"-ERR this command is not supported on tiered namespaces in M4 (string family only)\r\n"[..],
+            &b"-ERR this command is not supported on tiered namespaces in M4 (string family \
+                 only)\r\n"[..],
         ),
     ] {
         let n = cmd(&mut node, &mut nb, argv);

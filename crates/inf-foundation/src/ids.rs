@@ -6,7 +6,7 @@ use crate::crc::{crc16, hashtag};
 /// client expectations carry over unchanged (master plan §4.1).
 pub const SLOT_COUNT: u16 = 16384;
 
-/// Identity of one shard cell (one pinned core — L1).
+/// Identity of one cell (one pinned core — L1).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CellId(pub u16);
 

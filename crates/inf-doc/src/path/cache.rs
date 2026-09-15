@@ -516,7 +516,9 @@ mod tests {
         let pad = prop_oneof![Just(0usize), (NS_CAP - 128)..=NS_CAP];
         let op = (0usize..12, pad);
         let multi_victim = Cell::new(0u64);
-        proptest!(ProptestConfig::with_cases(512), |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
+        proptest!(
+            ProptestConfig::with_cases(512),
+            |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
             let mut cache = ProgramCache::new(capacity);
             for (idx, pad) in ops {
                 let before = cache.evictions();

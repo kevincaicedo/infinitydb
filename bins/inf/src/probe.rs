@@ -30,7 +30,8 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
         eprintln!("{line}");
     }
     eprintln!(
-        "wrote {} — barrier_class = \"{}\", fua_max_frame_bytes = {} (schema {}, identity {} {} {}, {:.1} s)",
+        "wrote {} — barrier_class = \"{}\", fua_max_frame_bytes = {} (schema {}, identity {} {} \
+             {}, {:.1} s)",
         path.display(),
         report.verdict.class.name(),
         report.verdict.fua_max_frame_bytes,

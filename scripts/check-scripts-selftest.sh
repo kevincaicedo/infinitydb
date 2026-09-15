@@ -920,6 +920,31 @@ else
     sed 's/^/    | /' "$inventory_dag_log"
 fi
 
+# Batch 64 (the 100-column gate wraps long reasons): the marker heads the
+# comment block above the site, continuation lines included.
+root=$(fsync_fixture fs-wrapped <<'RS'
+mod types;
+use types::*;
+impl Commit {
+    // fsync-fail-stop-allow: the reason is long enough to wrap onto a second
+    // comment line, and the marker still guards the site below the block
+    pub fn on_fsync_error(&mut self) {}
+}
+RS
+)
+expect green "fsync-fail-stop: a wrapped reason still pairs with the site under its block" env INF_CHECK_ROOT="$root" $FSYNC
+root=$(fsync_fixture fs-cut-off <<'RS'
+mod types;
+use types::*;
+impl Commit {
+    // fsync-fail-stop-allow: a marker cut off from its site by code
+    fn unrelated() {}
+    pub fn on_fsync_error(&mut self) {}
+}
+RS
+)
+expect red "fsync-fail-stop: a marker separated from the site by code guards nothing" env INF_CHECK_ROOT="$root" $FSYNC
+
 # ------------------------------------------- doc-read profile (D13)
 # ADR-0106 fourth amendment (F-L20-08): the parser-symbol profile gate's
 # verdict runs on a planted flat report through INF_PROFILE_REPORT — an
@@ -1051,9 +1076,65 @@ expect green "safety-inventory: the file named by its exact path" env INF_CHECK_
 printf '| `src/m.rs.old` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
 expect red "safety-inventory: a path that only contains the file name is not naming it" env INF_CHECK_ROOT="$root" $INVENTORY
 
+# --------------------------------------------- style limits (ADR-0125, batch 64)
+FILELEN=./scripts/check-file-length.sh
+LINEW=./scripts/check-line-width.sh
+FNLEN=./scripts/check-fn-length.sh
+# style_root <name>: crates/fake/src + bins/fake/src + tests/ so every gate's
+# scope assertion is satisfied; the caller writes the files.
+style_root() {
+    local root="$work/$1"
+    [ -n "$1" ] && [ -n "$work" ] || { echo "style_root: empty name" >&2; exit 2; }
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/fake/src" "$root/bins/fake/src" "$root/tests/t" "$root/docs"
+    printf 'fn main() {}\n' >"$root/bins/fake/src/main.rs"
+    printf 'fn t() {}\n' >"$root/tests/t/t.rs"
+    echo "$root"
+}
+root=$(style_root fl-over)
+{ printf 'pub fn f() {\n'; for _ in $(seq 1 1999); do printf '    let _x = 1;\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
+expect red "file-length: 2001 production lines" env INF_CHECK_ROOT="$root" $FILELEN
+{ printf 'pub fn f() {\n'; for _ in $(seq 1 1499); do printf '    let _x = 1;\n'; done; printf '}\n#[cfg(test)]\nmod tests {\n'; for _ in $(seq 1 600); do printf '    fn t() {}\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
+expect green "file-length: 2103 lines of which 602 are a test module" env INF_CHECK_ROOT="$root" $FILELEN
+expect_output "file-length: the OK line discloses the largest file" "largest: 1501 crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" $FILELEN
+rm -rf "$root/bins"
+expect red "file-length: a missing bins/ is a scope error, not a skip" env INF_CHECK_ROOT="$root" $FILELEN
+root=$(style_root lw)
+printf 'pub fn f() {}\n// %s\n' "$(printf 'x%.0s' $(seq 1 97))" >"$root/crates/fake/src/lib.rs"
+expect green "line-width: a 100-column comment" env INF_CHECK_ROOT="$root" $LINEW
+printf 'pub fn f() {}\n// %s\n' "$(printf 'x%.0s' $(seq 1 98))" >"$root/crates/fake/src/lib.rs"
+expect red "line-width: a 101-column comment (rustfmt would pass it)" env INF_CHECK_ROOT="$root" $LINEW
+printf 'pub fn f() {}\nconst S: &str = "%s";\n' "$(printf 'y%.0s' $(seq 1 90))" >"$root/crates/fake/src/lib.rs"
+expect red "line-width: a 109-column string literal" env INF_CHECK_ROOT="$root" $LINEW
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
+expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
+rm -rf "$root/tests"
+expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
+root=$(style_root fn)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+log="$root/clippy.log"
+printf 'crates/fake/src/lib.rs:3:1: warning: this function has too many lines (90/70)\ncrates/fake/src/lib.rs:9:1: warning: this function has too many lines (80/70)\n' >"$log"
+printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect green "fn-length: two breaches, baseline 2" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '1\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a new breach above the baseline" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '3\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a stale baseline above the tree (the ratchet)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '# empty\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a breach with no baseline row" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+printf '#[allow(clippy::too_many_lines)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: an opt-out without a reason" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(clippy::too_many_lines, reason = "one linear script")]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect green "fn-length: an opt-out with its reason" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+expect_output "fn-length: every opt-out is listed on the OK line" "opt-out: crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+rm -f "$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a missing baseline is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length each red on a planted violation)"

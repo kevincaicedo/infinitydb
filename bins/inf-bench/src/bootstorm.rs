@@ -174,7 +174,8 @@ pub(crate) fn cmd_boot_storm(args: &[String]) -> Result<(), String> {
          - data-root: {root} (must not be tmpfs)\n\n\
          | metric | value |\n|---|---|\n\
          | wedges (gate: 0) | {wedges} |\n\
-         | named fail-stop exits (ADR-0026 D3 Phase-H item; informational under pressure) | {spawn_failstops} |\n\
+         | named fail-stop exits (ADR-0026 D3 Phase-H item; informational under pressure) | \
+         {spawn_failstops} |\n\
          | retries consumed (by design) | 0 |\n\
          | time-to-all-ready p50 | {p50} ms |\n\
          | time-to-all-ready p99 | {p99} ms |\n\

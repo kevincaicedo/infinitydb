@@ -91,7 +91,8 @@ pub struct RecoveredTier<F: SegmentFs> {
 /// I/O failures; `InvalidData` when a named file is missing, its header
 /// identity mismatches, or a sealed footer covers less than the
 /// manifested range; `OutOfMemory` when the ring reservation fails.
-#[allow(clippy::too_many_arguments)] // the recovery entry's seven inputs + the key hasher (ADR-0094)
+// the recovery entry's seven inputs + the key hasher (ADR-0094)
+#[allow(clippy::too_many_arguments)]
 pub fn recover_tiered_ns<F: SegmentFs>(
     fs: F,
     tier: &TierNsManifest,
