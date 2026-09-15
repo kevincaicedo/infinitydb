@@ -239,9 +239,14 @@ verdict of every shard.
 Documentation identities are checked too (ADR-0106 D15):
 `check-doc-artifacts.sh` enforces unique ADR numbers and the link to the
 one generated compatibility matrix when the parent governance checkout
-is present. Standalone workspace CI explicitly reports that the private
-parent documents are absent and unvalidated. The release job checks the
-matrix against its renderer before packaging it.
+is present. D17 also checks local Markdown links in this document,
+`ARCHITECTURE.md`, the master plan and every milestone plan, numbered ADR
+paths, obsolete layout names and landed-ADR placeholders. Abbreviated module
+names and future deliverables remain review obligations. Standalone
+workspace CI explicitly reports absent parent documents and unvalidated
+parent links. The release job checks the matrix against its renderer before
+packaging it. The dependency gate (D16) checks active and reserved edges in
+both directions, requires a row for every package and prints dev exemptions.
 
 ## Performance
 
@@ -365,9 +370,10 @@ Not zero, but **near-zero and always deliberate**. The data plane owns its
 fate: core crates (`inf-foundation` through `inf-store`) carry effectively
 no third-party dependencies; the deliberate exceptions live at the edges
 (wasmtime for the M10 sandbox, mlua for M6 scripting — each its own ADR).
-Tooling binaries (`inf-bench`, `inf-compare`) are **zero-dependency by
-policy** so the measurement instrument shares no code or supply-chain
-surface with the system under test. Every new dependency is a reviewed
+The competitive instrument `inf-compare` is **zero-dependency by policy**,
+checked for all dependency kinds by `check-dep-dag.sh` (ADR-0025,
+ADR-0106 D16). The in-house gate instrument `inf-bench` deliberately uses
+`inf-foundation` and the tooling TOML parser. Every new dependency is a reviewed
 decision (`cargo deny check` gates licenses and advisories): each one is
 supply-chain risk, safety risk, compile-time cost, and a temptation to stop
 understanding our own stack. The usefulness of a dependency is inversely
