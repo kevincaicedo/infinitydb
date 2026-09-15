@@ -1140,9 +1140,63 @@ expect_output "fn-length: every opt-out is listed on the OK line" "opt-out: crat
 rm -f "$root/docs/fn-length-baseline.tsv"
 expect red "fn-length: a missing baseline is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
 
+# ---------------------------------------------------------- doc artifacts
+DOCS=./scripts/check-doc-artifacts.sh
+doc_case="$work/doc-artifacts"
+doc_root="$doc_case/infinitydb"
+mkdir -p "$doc_root/docs"
+printf '[workspace]\n' >"$doc_root/Cargo.toml"
+printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
+expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
+expect_output "docs: standalone discloses the absent governance scope" "parent governance absent, not validated" env INF_CHECK_ROOT="$doc_root" $DOCS
+rm -f "$doc_root/Cargo.toml"
+expect red "docs: workspace manifest missing" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '[workspace]\n' >"$doc_root/Cargo.toml"
+rm -f "$doc_root/docs/compat-matrix.md"
+expect red "docs: generated matrix missing" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
+mkdir -p "$doc_case/docs/adr"
+printf '# Master plan\n' >"$doc_case/docs/infinity-master-plan.md"
+cat >"$work/matrix-pointer" <<'EOF'
+# Compatibility matrix
+
+The generated [compatibility matrix](../infinitydb/docs/compat-matrix.md) lives in the Rust workspace.
+EOF
+cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
+printf '# ADR-NNNN: Title\n' >"$doc_case/docs/adr/0000-template.md"
+printf '# ADR-0072: Projection seam\n' >"$doc_case/docs/adr/0072-seam.md"
+expect green "docs: governance with unique identities and a pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
+expect_output "docs: governance scope names its ADR count" "1 ADR numbers" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '# ADR-0072: Frame decoder\n' >"$doc_case/docs/adr/0072-frame.md"
+expect red "docs: duplicate ADR number" env INF_CHECK_ROOT="$doc_root" $DOCS
+rm -f "$doc_case/docs/adr/0072-frame.md"
+printf '# ADR-0126: Wrong title\n' >"$doc_case/docs/adr/0072-seam.md"
+expect red "docs: title and filename disagree" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '' >"$doc_case/docs/adr/0072-seam.md"
+expect red "docs: empty ADR" env INF_CHECK_ROOT="$doc_root" $DOCS
+rm -f "$doc_case/docs/adr/0072-seam.md"
+expect red "docs: template alone is an empty decision set" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '# ADR-0072: Projection seam\n' >"$doc_case/docs/adr/0072-seam.md"
+printf '# A decision with no number\n' >"$doc_case/docs/adr/decision.md"
+expect red "docs: unnumbered decision" env INF_CHECK_ROOT="$doc_root" $DOCS
+rm -f "$doc_case/docs/adr/decision.md"
+mv "$doc_case/docs/adr" "$doc_case/adr-saved"
+expect red "docs: governance without ADR directory" env INF_CHECK_ROOT="$doc_root" $DOCS
+mv "$doc_case/adr-saved" "$doc_case/docs/adr"
+rm -f "$doc_case/docs/infinity-master-plan.md"
+expect red "docs: governance without master plan" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '# Master plan\n' >"$doc_case/docs/infinity-master-plan.md"
+rm -f "$doc_case/docs/compat-matrix.md"
+expect red "docs: governance without pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
+cp "$doc_root/docs/compat-matrix.md" "$doc_case/docs/compat-matrix.md"
+expect red "docs: second generated matrix" env INF_CHECK_ROOT="$doc_root" $DOCS
+cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
+printf '\n65 commands\n' >>"$doc_case/docs/compat-matrix.md"
+expect red "docs: counts added to the pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts each red on a planted violation)"

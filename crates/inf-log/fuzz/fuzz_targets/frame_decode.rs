@@ -20,7 +20,7 @@
 //!
 //! 4. The `max_frame_len` boundary (review 2026-08-30 F-L02-04): the same
 //!    bytes are walked under the permissive cap `u32::MAX` as well as the
-//!    shipped 64 MiB one — the only way the u32 extent bound (ADR-0072 D1
+//!    shipped 64 MiB one — the only way the u32 extent bound (ADR-0126 D1
 //!    as amended) is ever exercised — and every yielded frame's padded
 //!    extent fits below the ceiling from its own base.
 #![no_main]

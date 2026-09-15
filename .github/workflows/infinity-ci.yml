@@ -48,6 +48,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
+      - name: documentation artifact identities (ADR-0106 D15)
+        run: ./scripts/check-doc-artifacts.sh
       - name: dep-DAG law
         run: ./scripts/check-dep-dag.sh
       - name: cell deny-list

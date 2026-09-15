@@ -99,7 +99,7 @@ pub const fn frame_header_len(has_stamp: bool) -> usize {
 /// `u32::MAX` for the top 4095 values (review 2026-08-30 F-L02-04: the
 /// plain multiply wrapped to 0 there); a frame the decoder admits never
 /// reaches saturation — `decode_frame` refuses any frame whose padded
-/// extent does not fit a u32 segment (ADR-0072 D1 as amended).
+/// extent does not fit a u32 segment (ADR-0126 D1 as amended).
 #[must_use]
 pub const fn align_up_frame(len: u32) -> u32 {
     match len.checked_next_multiple_of(FRAME_ALIGN) {
@@ -331,7 +331,7 @@ pub enum FrameDecodeError {
     /// below one header length, or the frame's bytes would run past the
     /// `u32` offset ceiling. Honest writers derive it as `base + header_len`
     /// (20 for v1, 40 for v2) inside a segment — ADR-0011 D2 as restated
-    /// per-version by ADR-0072 D1 — so either shape is corruption.
+    /// per-version by ADR-0126 D1 — so either shape is corruption.
     BadFirstLsn {
         offset: u32,
     },
@@ -583,7 +583,7 @@ pub fn decode_frame(
     if frame_len < shape.min_frame_len || frame_len > max_frame_len {
         return Err(FrameDecodeError::BadLength { len: frame_len });
     }
-    // The on-device extent (ADR-0072 D1 as amended, F-L02-04): a v3
+    // The on-device extent (ADR-0126 D1 as amended, F-L02-04): a v3
     // frame occupies `align_up(frame_len)`, and that is what the successor
     // address and every segment cursor advance by — so it, not
     // `frame_len`, is what must fit a u32-addressed segment.
@@ -615,7 +615,7 @@ pub fn decode_frame(
     // An honest writer derives the first record's offset as `base +
     // header_len` — 20 for v1, 40 for v2/v3 — and the whole frame, padding
     // included, sits inside a u32-addressed segment (ADR-0011 D2 as
-    // restated per-version by ADR-0072 D1, extent as amended for v3;
+    // restated per-version by ADR-0126 D1, extent as amended for v3;
     // D2's own text says "+ 20", which is v1-era wording). So the offset
     // is at least one header in and the frame's on-device bytes fit below
     // the ceiling. Without this bound a CRC-valid frame declaring a
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(align_up_frame(0), 0);
     }
 
-    /// ADR-0072 D1 as amended (F-L02-04): the second inequality bounds
+    /// ADR-0126 D1 as amended (F-L02-04): the second inequality bounds
     /// the frame's **on-device extent**. A v3 frame whose `frame_len`
     /// fits below the ceiling but whose padded extent does not is refused
     /// — before this bound it decoded, and its successor address wrapped.

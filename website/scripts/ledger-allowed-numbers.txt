@@ -60,6 +60,10 @@
 # --- non-claims (documented) ---------------------------------------------
 16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
 16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
+1 mib           # non-claim: proto-max-bulk-len configuration floor in the generated compat matrix (ADR-0122)
+512 mib         # non-claim: Redis protocol bulk limit disclosed in the generated compat matrix (ADR-0122)
+64 kib          # non-claim: command-frame overhead bound in the generated compat matrix (ADR-0122)
+1 gib           # non-claim: BLOB-MAX default and Redis query-buffer limit in the generated compat matrix
 256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements
 2048 mb         # config example in the landing terminal (INF.NS ... MEM-BUDGET 2048mb) — a knob value, not a measurement
 
