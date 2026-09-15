@@ -1,0 +1,11 @@
+just-check exit=1
+cargo-deny exit=0
+sim-build exit=0
+sim-smoke exit=0
+compat exit=0
+loom exit=0
+ab-sim-diff exit=0
+durable-sweep exit=0
+CHAIN-DONE
+just-check-2 exit=101
+just-check-3 exit=0

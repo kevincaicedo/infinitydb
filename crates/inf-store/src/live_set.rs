@@ -144,7 +144,8 @@ impl LiveSet {
         life_origin: u64,
         boot_ckpt_id: u64,
     ) {
-        assert!(self.files.is_empty() && self.pending.is_empty(), "seed on a used live set");
+        assert!(self.files.is_empty(), "seed with files present");
+        assert!(self.pending.is_empty(), "seed with pending files");
         for meta in catalog {
             let base = meta.base.to_raw();
             if let Some(last) = self.files.last() {

@@ -423,7 +423,7 @@ fn wait_ready(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
         }
         // Tooling tier (never the data plane): a readiness poll legitimately
         // sleeps. The ban targets cell-resident code; mirrors inf-bench.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(clippy::disallowed_methods, reason = "bench orchestration, not cell code")]
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
@@ -930,8 +930,10 @@ mod tests {
 
     #[test]
     fn info_parser_and_selected_deltas_are_explicit() {
-        let before_raw = "aof_rewrites:2\r\naof_delayed_fsync:1\r\nused_cpu_sys_children:0.5\r\nused_cpu_user_children:1.0\r\n";
-        let after_raw = "aof_rewrites:5\r\naof_delayed_fsync:2\r\naof_last_bgrewrite_status:ok\r\nused_cpu_sys_children:1.0\r\nused_cpu_user_children:2.0\r\n";
+        let before_raw = "aof_rewrites:2\r\naof_delayed_fsync:1\r\nused_cpu_sys_children:0.5\r\nus\
+             ed_cpu_user_children:1.0\r\n";
+        let after_raw = "aof_rewrites:5\r\naof_delayed_fsync:2\r\naof_last_bgrewrite_status:ok\r\n\
+             used_cpu_sys_children:1.0\r\nused_cpu_user_children:2.0\r\n";
         let before = Observation {
             cpu_seconds: Some(0.0),
             raw_info: before_raw.into(),

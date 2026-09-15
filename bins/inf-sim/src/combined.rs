@@ -214,7 +214,7 @@ fn next_memory_command(
 
 /// Runs one seeded combined scenario. See the module docs for the phase
 /// order and oracle inventory.
-#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
 #[must_use]
 pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
     let dur = &scenario.durable;

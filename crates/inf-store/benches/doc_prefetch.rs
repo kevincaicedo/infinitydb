@@ -162,7 +162,8 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
     let thresholds = [0usize, 256, 512, 1_024, 2_048];
     let keys = trace(documents, operations, doc_corpus::CANONICAL_SEED ^ 0x5448_5245_5348);
     println!(
-        "threshold corpus=small-200B,deep-32,gate-1KiB,medium-2KiB documents={documents} operations={operations} reps={reps}"
+        "threshold corpus=small-200B,deep-32,gate-1KiB,medium-2KiB documents={documents} \
+             operations={operations} reps={reps}"
     );
     for threshold in thresholds {
         let mut store = CellStore::new(StoreConfig {
@@ -187,7 +188,9 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
         let read_rate = median(&mut rates);
         let ttl_rate = run_ttl(&mut store, &keys[..ttl_operations.min(keys.len())]);
         println!(
-            "threshold bytes={} inline_docs={} records_B_per_doc={:.3} doc_resident_B_per_doc={:.3} attributed_B_per_doc={:.3} load_mops={:.6} read_mops={:.6} ttl_mops={:.6}",
+            "threshold bytes={} inline_docs={} records_B_per_doc={:.3} \
+                 doc_resident_B_per_doc={:.3} attributed_B_per_doc={:.3} load_mops={:.6} \
+                 read_mops={:.6} ttl_mops={:.6}",
             threshold,
             domain.inline_docs,
             report.records_resident_bytes as f64 / documents as f64,
@@ -213,7 +216,8 @@ fn prefetch_rows(gate: &[u8]) {
         ..StoreConfig::default()
     });
     println!(
-        "prefetch corpus=gate-1KiB idoc_bytes={} documents={documents} operations={operations} batch={BATCH} seed=0x{:08X}",
+        "prefetch corpus=gate-1KiB idoc_bytes={} documents={documents} operations={operations} \
+             batch={BATCH} seed=0x{:08X}",
         gate.len(),
         doc_corpus::CANONICAL_SEED
     );
@@ -226,7 +230,8 @@ fn prefetch_rows(gate: &[u8]) {
     let elapsed = started.elapsed().as_secs_f64();
     let report = store.report();
     println!(
-        "prefetch load_seconds={elapsed:.6} load_mops={:.6} attributed_bytes={} doc_resident_bytes={} index_bytes={}",
+        "prefetch load_seconds={elapsed:.6} load_mops={:.6} attributed_bytes={} \
+             doc_resident_bytes={} index_bytes={}",
         documents as f64 / elapsed / 1e6,
         report.attributed_bytes(),
         report.doc_resident_bytes,

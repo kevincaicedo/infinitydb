@@ -300,8 +300,14 @@ fn checked_load(
     }
     let after = scrape_cells(spec.port, cells)?;
     raw.push_str(&format!(
-        "{label} ops/s={:.0} p50_us={} p99_us={} p999_us={} errors={} nils={} generator_cpu_pct={cpu_pct:.1}\n",
-        result.ops_per_sec, result.p50_us, result.p99_us, result.p999_us, result.errors, result.nils
+        "{label} ops/s={:.0} p50_us={} p99_us={} p999_us={} errors={} nils={} \
+             generator_cpu_pct={cpu_pct:.1}\n",
+        result.ops_per_sec,
+        result.p50_us,
+        result.p99_us,
+        result.p999_us,
+        result.errors,
+        result.nils
     ));
     raw.push_str(&format!("INFO before={before:?}\nINFO after={after:?}\n"));
     Ok(result)
@@ -338,8 +344,15 @@ pub(super) fn summarize_controls(rows: &[(String, f64, Controls)], m: &mut Measu
     m.set("s37:parity_c256", parity);
     m.set("s37:read_ops_b_over_a", read_ratio);
     m.set("s37:read_aa_absolute_delta", noise);
-    m.note(format!("D9 controls: tiered/flat c256={parity:.4}, read B/A={read_ratio:.4}, A/A absolute fractional difference={noise:.4}."));
-    m.note("D9 controls: matched non-tiered always c256 denominator, S35 c64/P16 filled hot read shape, consecutive A/A noise samples. Raw INFO carries tripwires and attribution; no competitor claim.");
+    m.note(format!(
+        "D9 controls: tiered/flat c256={parity:.4}, read B/A={read_ratio:.4}, A/A \
+         absolute fractional difference={noise:.4}."
+    ));
+    m.note(
+        "D9 controls: matched non-tiered always c256 denominator, S35 c64/P16 filled hot read \
+         shape, consecutive A/A noise samples. Raw INFO carries tripwires and attribution; no \
+         competitor claim.",
+    );
 }
 
 #[cfg(test)]

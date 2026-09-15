@@ -50,7 +50,8 @@ const fn skip(argv: &'static [&'static str], why: &'static str) -> Case {
 
 /// 130 bytes — two past the oracle's 128-byte argument/name budget, so a
 /// case using it sees the truncation and not just the copy (C6).
-const LONG_ARG: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const LONG_ARG: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /// The v0 script. Order matters: later cases read state earlier ones wrote.
 pub static MATRIX: &[Case] = &[
@@ -259,7 +260,8 @@ pub static MATRIX: &[Case] = &[
     c(&[LONG_ARG, "x"]),
     skip(
         &["NOSUCHCOMMAND", "a\0b"],
-        "Redis truncates the message at an embedded NUL (C `%s`); InfinityDB quotes the raw bytes — same framing, longer text",
+        "Redis truncates the message at an embedded NUL (C `%s`); InfinityDB quotes the raw bytes \
+             — same framing, longer text",
     ),
     // --- introspection (documented deviations) ---
     skip(&["HELLO"], "identity fields differ by design (L8: server/version)"),
@@ -461,7 +463,8 @@ pub static MATRIX: &[Case] = &[
     c(&["EXISTS", "ff"]),
     skip(
         &["PEXPIRETIME", "ff"],
-        "deadlines ≥ ~34.8 years clamp to the u40 record bound — the read-back reports the bound, not Redis's i64 instant (ADR-0008, ADR-0111)",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound — the read-back reports the bound, \
+             not Redis's i64 instant (ADR-0008, ADR-0111)",
     ),
     skip(&["PTTL", "ff"], "same u40 clamp — the remaining TTL is measured to the bound (ADR-0111)"),
     c(&["SET", "ff", "v", "EXAT", "9223372036854775"]),

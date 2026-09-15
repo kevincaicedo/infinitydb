@@ -1,0 +1,12 @@
+fn-length OK: 193 function(s) over 70 lines in 83 file(s) (the baseline backlog), 11 reasoned opt-out(s)
+    opt-out: bins/inf-bench/src/m4rows.rs:258:#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
+    opt-out: bins/inf-bench/src/m2rows.rs:295:#[allow(clippy::too_many_lines, clippy::too_many_arguments, reason = "orchestration script")]
+    opt-out: bins/inf-bench/src/m2rows.rs:875:#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
+    opt-out: bins/inf-bench/src/m1rows.rs:98:#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
+    opt-out: bins/inf-bench/src/ycsb.rs:1278:#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
+    opt-out: bins/inf-bench/src/gaterun.rs:793:#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
+    opt-out: bins/inf-bench/src/gaterun.rs:809:#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
+    opt-out: bins/inf-sim/src/tiered.rs:420:#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
+    opt-out: bins/inf-sim/src/nscreate.rs:114:#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
+    opt-out: bins/inf-sim/src/durable/run.rs:11:#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_scenario")]
+    opt-out: bins/inf-sim/src/combined.rs:217:#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]

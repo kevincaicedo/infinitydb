@@ -301,7 +301,9 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let mut image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed).to_vec();
+        let mut image = builder
+            .finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed)
+            .to_vec();
         let at = corrupt.index(image.len());
         image[at] ^= flip;
         match decode_frame(&image, DEFAULT_MAX_FRAME_LEN) {
@@ -325,7 +327,9 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed).to_vec();
+        let image = builder
+            .finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed)
+            .to_vec();
         for cut in 0..image.len() {
             prop_assert!(
                 decode_frame(&image[..cut], DEFAULT_MAX_FRAME_LEN).is_err(),

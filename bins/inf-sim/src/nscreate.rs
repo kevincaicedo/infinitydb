@@ -111,7 +111,7 @@ fn scrape_unknown_skips(node: &Node, cells: u16) -> u64 {
 
 /// Runs one seeded `m2-ns-create-window` scenario.
 #[must_use]
-#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
 pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     let scenario = DurableScenario::m2_durable(seed);
     let clock = Rc::new(VirtualClock::new(Nanos(1)));

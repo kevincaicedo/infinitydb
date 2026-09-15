@@ -3059,7 +3059,8 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     let dir = temp_data_dir("blob-ckpt-del-race");
     let blobs = 600usize;
     let fillers = 2400usize;
-    let blob_value = |i: usize| format!("V{i:04}!").into_bytes().repeat(700); // 4,200 B ≥ 4 KiB threshold
+    // 4,200 B ≥ 4 KiB threshold
+    let blob_value = |i: usize| format!("V{i:04}!").into_bytes().repeat(700);
     let mut deleted = std::collections::BTreeSet::new();
     {
         let node = Node::start_with(
@@ -3319,7 +3320,8 @@ fn tiered_cold_read_failure_is_typed_for_every_read_command() {
             Ok(_) => {
                 if exists != Ok(1) || touch != Ok(1) || mget_err {
                     disagreements.push(format!(
-                        "{key}: GET served but EXISTS {exists:?} / TOUCH {touch:?} / MGET err {mget_err}"
+                        "{key}: GET served but EXISTS {exists:?} / TOUCH {touch:?} / MGET err \
+                             {mget_err}"
                     ));
                 }
             }
@@ -3785,13 +3787,8 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     read_exactly(&mut c, b"+OK\r\n");
     #[cfg(feature = "doc")]
     {
-        c.write_all(&cmd(&[
-            b"JSON.SET",
-            b"book:doc",
-            b"$",
-            br#"{"n":40,"a":[1],"values":[1,1],"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
-        ]))
-        .expect("write");
+        let padded = format!(r#"{{"n":40,"a":[1],"values":[1,1],"pad":"{}"}}"#, "x".repeat(128));
+        c.write_all(&cmd(&[b"JSON.SET", b"book:doc", b"$", padded.as_bytes()])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"JSON.NUMINCRBY", b"book:doc", b".n", b"2"])).expect("write");
         read_exactly(&mut c, b"$2\r\n42\r\n");
@@ -6440,7 +6437,8 @@ fn connection_level_commands_ignore_the_bound_namespace() {
         failures.join("\n")
     );
     println!(
-        "conn-level: {} templates over {} KeyspaceScope::None commands, 3 bindings each, 0 failures",
+        "conn-level: {} templates over {} KeyspaceScope::None commands, 3 bindings each, 0 \
+             failures",
         templates.len(),
         COMMANDS.iter().filter(|m| keyspace_scope(m, None) == KeyspaceScope::None).count()
     );
@@ -6996,7 +6994,8 @@ fn info_keyspace_counts_the_whole_node_like_dbsize() {
             let keys = keys_of(&keyspace);
             assert!(
                 keyspace.contains("keyspace_scope:"),
-                "cell {cell}: no scope line, db0:keys={keys} vs DBSIZE {dbsize} (×{:.2}): {keyspace}",
+                "cell {cell}: no scope line, db0:keys={keys} vs DBSIZE {dbsize} (×{:.2}): \
+                     {keyspace}",
                 keys as f64 / dbsize as f64
             );
             if keys == dbsize && keyspace.contains("keyspace_scope:node\r\n") {

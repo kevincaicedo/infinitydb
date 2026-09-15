@@ -1,7 +1,8 @@
 //! The index-range page step (M4.5-S09, ADR-0080 D4, A1, A2): one place
 //! owns the frozen form's paging semantics — resume-key length gate,
 //! seek (resume pair clamped to the lower edge), upper-edge check,
-//! scan-budget check, LIMIT countdown, resume production. The caller (S11's query future; the S09 tests) resolves
+//! scan-budget check, LIMIT countdown, resume production. The caller (S11's query future; the S09
+//! tests) resolves
 //! each candidate's pk ref, evaluates the residual VM, and reports
 //! matches back — evaluation stays with the owner of doc custody, the
 //! interpretation of the bounds does not fork.

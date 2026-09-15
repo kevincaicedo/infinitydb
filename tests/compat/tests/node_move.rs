@@ -285,7 +285,8 @@ fn cross_cell_move_success_and_copy_variants() {
     }
     copy_and_overwrite_variants(&mut node);
     println!(
-        "H3 binary success matrix: {rows} large-binary rows plus COPY DB/REPLACE and overwrite controls, 0 failures"
+        "H3 binary success matrix: {rows} large-binary rows plus COPY DB/REPLACE and overwrite \
+             controls, 0 failures"
     );
 }
 

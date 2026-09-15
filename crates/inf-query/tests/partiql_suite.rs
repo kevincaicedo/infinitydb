@@ -195,7 +195,8 @@ const CASES: &[(&str, &str)] = &[
     ("utf8-begins-with", "SELECT * FROM orders WHERE begins_with(name, 'al')"),
     ("utf8-begins-with-empty", "SELECT * FROM orders WHERE begins_with(name, '')"),
     ("utf8-begins-with-unicode", "SELECT * FROM orders WHERE begins_with(name, 'café')"),
-    ("utf8-begins-with-and-range", "SELECT * FROM orders WHERE begins_with(name, 'al') AND name < 'alz'"),
+    ("utf8-begins-with-and-range", "SELECT * FROM orders WHERE begins_with(name, 'al') AND name < \
+         'alz'"),
     ("utf8-begins-with-case-fn", "SELECT * FROM orders WHERE BEGINS_WITH(name, 'al')"),
 
     // --- E. bool index ---
@@ -215,7 +216,8 @@ const CASES: &[(&str, &str)] = &[
     ("multi-range-not-candidate", "SELECT * FROM orders WHERE tags[*] > 'a'"),
     ("multi-range-explicit", "SELECT * FROM orders.tags_idx WHERE tags[*] > 'a'"),
     ("multi-begins-with-explicit", "SELECT * FROM orders.tags_idx WHERE begins_with(tags[*], 'a')"),
-    ("multi-eq-plus-range-explicit", "SELECT * FROM orders.tags_idx WHERE tags[*] = 'x' AND tags[*] > 'a'"),
+    ("multi-eq-plus-range-explicit", "SELECT * FROM orders.tags_idx WHERE tags[*] = 'x' AND \
+         tags[*] > 'a'"),
     ("multi-eq-explicit", "SELECT * FROM orders.tags_idx WHERE tags[*] = 'x'"),
     ("multi-numeric-eq", "SELECT * FROM orders WHERE nums[*] = 5"),
     ("multi-numeric-range-explicit", "SELECT * FROM orders.nums_idx WHERE nums[*] BETWEEN 1 AND 5"),
@@ -223,8 +225,10 @@ const CASES: &[(&str, &str)] = &[
 
     // --- G. resolution: path matching, naming, ambiguity ---
     ("resolve-two-indexes-ambiguous", "SELECT * FROM orders WHERE price > 10 AND region = 'eu'"),
-    ("resolve-explicit-disambiguation", "SELECT * FROM orders.price_idx WHERE price > 10 AND region = 'eu'"),
-    ("resolve-explicit-other-side", "SELECT * FROM orders.region_idx WHERE price > 10 AND region = 'eu'"),
+    ("resolve-explicit-disambiguation", "SELECT * FROM orders.price_idx WHERE price > 10 AND \
+         region = 'eu'"),
+    ("resolve-explicit-other-side", "SELECT * FROM orders.region_idx WHERE price > 10 AND region \
+         = 'eu'"),
     ("resolve-explicit-quoted", "SELECT * FROM orders.\"region_idx\" WHERE region = 'eu'"),
     ("resolve-not-ready", "SELECT * FROM orders WHERE pending = 3"),
     ("resolve-not-ready-explicit", "SELECT * FROM orders.pending_idx WHERE pending = 3"),
@@ -265,7 +269,8 @@ const CASES: &[(&str, &str)] = &[
     ("residual-exists-on-indexed-path", "SELECT * FROM orders WHERE price = 5 AND exists(name)"),
     ("residual-begins-with", "SELECT * FROM orders WHERE price = 5 AND begins_with(city, 'ab')"),
     ("residual-cross-family-cmp", "SELECT * FROM orders WHERE price = 5 AND city = 3"),
-    ("residual-nested-parens", "SELECT * FROM orders WHERE price = 5 AND (a = 1 OR (b = 2 AND c = 3))"),
+    ("residual-nested-parens", "SELECT * FROM orders WHERE price = 5 AND (a = 1 OR (b = 2 AND c = \
+         3))"),
     ("residual-double-not", "SELECT * FROM orders WHERE price = 5 AND NOT NOT qty = 2"),
     ("residual-not-parens", "SELECT * FROM orders WHERE price = 5 AND NOT (a = 1 OR b = 2)"),
     ("residual-wildcard-path", "SELECT * FROM orders WHERE price = 5 AND items[*].qty > 2"),
@@ -346,7 +351,10 @@ const CASES: &[(&str, &str)] = &[
     ("reject-null-between", "SELECT * FROM orders WHERE price = 1 AND a BETWEEN NULL AND 2"),
     ("reject-mixed-in", "SELECT * FROM orders WHERE price = 1 AND a IN (1, 'x')"),
     ("reject-mixed-in-bool", "SELECT * FROM orders WHERE price = 1 AND a IN (TRUE, 1)"),
-    ("reject-mixed-between-residual", "SELECT * FROM orders WHERE price = 1 AND a BETWEEN 1 AND 'z'"),
+    (
+        "reject-mixed-between-residual",
+        "SELECT * FROM orders WHERE price = 1 AND a BETWEEN 1 AND 'z'",
+    ),
     ("reject-unknown-function", "SELECT * FROM orders WHERE contains(name, 'a')"),
     ("reject-attr-call", "SELECT * FROM orders WHERE price(3)"),
 
@@ -416,7 +424,8 @@ const CASES: &[(&str, &str)] = &[
     ("op-not-precedence", "SELECT * FROM orders WHERE NOT a = 1 AND price = 5"),
     ("op-flat-and-chain", "SELECT * FROM orders WHERE price = 1 AND a = 2 AND b = 3 AND c = 4"),
     ("op-flat-or-chain", "SELECT * FROM orders.SCAN WHERE a = 1 OR b = 2 OR c = 3"),
-    ("op-paren-nesting-kept", "SELECT * FROM orders WHERE price = 1 AND (a = 2 AND (b = 3 AND c = 4))"),
+    ("op-paren-nesting-kept", "SELECT * FROM orders WHERE price = 1 AND (a = 2 AND (b = 3 AND c = \
+         4))"),
     ("op-or-group-with-anchor", "SELECT * FROM orders WHERE (a = 1 OR b = 2) AND price = 5"),
     ("count-multi-valued", "SELECT COUNT(*) FROM orders WHERE tags[*] = 'x'"),
     ("pk-limit-with-residual", "SELECT * FROM orders WHERE $key = 'u' AND price > 1 LIMIT 10"),

@@ -699,7 +699,8 @@ fn evict_step_timing_witness() {
             }
             let ns = t0.elapsed().as_nanos() / u128::from(STEPS);
             println!(
-                "evict-step-ab: policy={policy:?} ttl_every={ttl_every} rep={rep} ns_per_step={ns} evicted={evicted}"
+                "evict-step-ab: policy={policy:?} ttl_every={ttl_every} rep={rep} ns_per_step={ns} \
+                     evicted={evicted}"
             );
         }
     }

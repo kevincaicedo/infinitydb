@@ -148,7 +148,8 @@ fn main() {
         _ => TierIoMode::Direct,
     };
     println!(
-        "--- M4-S11 tier-flush bandwidth (dir {}, mode {mode:?}, {} MiB/leg, sync every {} MiB) ---",
+        "--- M4-S11 tier-flush bandwidth (dir {}, mode {mode:?}, {} MiB/leg, sync every {} MiB) \
+             ---",
         dir.display(),
         TOTAL >> 20,
         SYNC_EVERY >> 20

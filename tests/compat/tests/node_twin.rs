@@ -327,7 +327,8 @@ fn replay(
                     && count_frames(&b).is_some_and(|n| n >= 1);
                 if !ok {
                     report.failures.push(format!(
-                        "{name}: a tainted case answered incomplete frames:\n  1-cell {}\n  4-cell {}",
+                        "{name}: a tainted case answered incomplete frames:\n  1-cell {}\n  4-cell \
+                             {}",
                         show(&a),
                         show(&b)
                     ));

@@ -75,6 +75,9 @@ impl Default for CountingAllocator {
 // unchanged to `System`; the relaxed counter does not inspect or alter the
 // allocation, pointer, size, alignment, or lifetime.
 unsafe impl GlobalAlloc for CountingAllocator {
+    /// # Safety
+    /// As `GlobalAlloc::alloc`: `layout` has a non-zero size; the request is forwarded to `System`
+    /// unchanged.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
         bump_thread(layout.size());
@@ -82,11 +85,17 @@ unsafe impl GlobalAlloc for CountingAllocator {
         unsafe { System.alloc(layout) }
     }
 
+    /// # Safety
+    /// As `GlobalAlloc::dealloc`: `ptr` came from this allocator with `layout`; forwarded to
+    /// `System` unchanged.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded unchanged under the caller's deallocation contract.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    /// # Safety
+    /// As `GlobalAlloc::alloc_zeroed`: `layout` has a non-zero size; forwarded to `System`
+    /// unchanged.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
         bump_thread(layout.size());
@@ -94,6 +103,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
         unsafe { System.alloc_zeroed(layout) }
     }
 
+    /// # Safety
+    /// As `GlobalAlloc::realloc`: `ptr` came from this allocator with `layout` and `new_size` is
+    /// non-zero; forwarded to `System` unchanged.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         self.allocations.fetch_add(1, Ordering::Relaxed);
         bump_thread(new_size);

@@ -212,14 +212,16 @@ fn main() {
     let idoc = gate_doc();
     let (delta_bytes, full_bytes, ratio) = volume_ratio(&idoc, histories);
     println!(
-        "volume documents=normalized-1KiB history={histories} delta_cadence_bytes={delta_bytes} full_every_mutation_bytes={full_bytes} ratio={ratio:.6}"
+        "volume documents=normalized-1KiB history={histories} delta_cadence_bytes={delta_bytes} \
+             full_every_mutation_bytes={full_bytes} ratio={ratio:.6}"
     );
     for rep in 1..=reps {
         let seconds = replay_once(documents, histories, &idoc);
         let mutations = documents as f64 * histories as f64;
         let equivalent_gbps = mutations * idoc.len() as f64 / seconds / 1_000_000_000.0;
         println!(
-            "replay rep={rep} documents={documents} history={histories} mutations={} seconds={seconds:.6} equivalent_gbps={equivalent_gbps:.6}",
+            "replay rep={rep} documents={documents} history={histories} mutations={} \
+                 seconds={seconds:.6} equivalent_gbps={equivalent_gbps:.6}",
             mutations as u64,
         );
     }

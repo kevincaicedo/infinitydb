@@ -123,7 +123,8 @@ fn corpus_shape_bytes_per_document_table() {
     // default 2 MiB arena chunk tail without changing production config.
     const TARGET_LIVE_BYTES: usize = 32 << 20;
     eprintln!(
-        "shape          idoc_B   docs  records_B/doc  doc_live_B/doc  doc_res_B/doc  slack_B/doc  index_B/doc  attributed_B/doc  attributed/idoc"
+        "shape          idoc_B   docs  records_B/doc  doc_live_B/doc  doc_res_B/doc  slack_B/doc  \
+             index_B/doc  attributed_B/doc  attributed/idoc"
     );
     let mut parser = JsonParser::new();
     for doc in doc_corpus::generate(doc_corpus::CANONICAL_SEED) {
@@ -143,7 +144,8 @@ fn corpus_shape_bytes_per_document_table() {
         assert!(report.doc_resident_bytes >= report.doc_tape_bytes + report.doc_arena_bytes);
         let attributed_per_doc = per_document(report.attributed_bytes(), documents);
         eprintln!(
-            "{name:<14} {:>7} {:>6} {:>14.1} {:>15.1} {:>14.1} {:>12.1} {:>12.1} {:>17.1} {:>16.3}x",
+            "{name:<14} {:>7} {:>6} {:>14.1} {:>15.1} {:>14.1} {:>12.1} {:>12.1} {:>17.1} \
+                 {:>16.3}x",
             idoc.len(),
             documents,
             per_document(report.records_resident_bytes, documents),

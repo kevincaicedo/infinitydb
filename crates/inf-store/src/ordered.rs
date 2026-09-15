@@ -451,7 +451,9 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     const SEP_MIN: usize = (F - 1) / 2;
 
     pub fn new() -> Self {
-        const { assert!(F >= 8 && F <= 256 && F.is_multiple_of(2), "fanout: even, 8..=256") };
+        const { assert!(F >= 8, "fanout: at least 8") };
+        const { assert!(F <= 256, "fanout: at most 256") };
+        const { assert!(F.is_multiple_of(2), "fanout: even") };
         OrderedMap {
             leaves: Pool::new(),
             internals: Pool::new(),
@@ -1405,7 +1407,8 @@ fn write_slot<S: KeyScheme, const F: usize>(
 
 fn shift_right<S: KeyScheme, const F: usize>(leaf: &mut Leaf<S, F>, idx: usize) {
     let count = leaf.count as usize;
-    debug_assert!(count < F && idx <= count);
+    debug_assert!(count < F);
+    debug_assert!(idx <= count);
     leaf.prefixes.copy_within(idx..count, idx + 1);
     leaf.metas.copy_within(idx..count, idx + 1);
     leaf.refs.copy_within(idx..count, idx + 1);
@@ -1424,7 +1427,8 @@ fn shift_left<S: KeyScheme, const F: usize>(leaf: &mut Leaf<S, F>, idx: usize) {
 /// Open slot `idx` for a separator + right child (arrays shift right).
 fn shift_right_internal<S: KeyScheme, const F: usize>(node: &mut Internal<S, F>, idx: usize) {
     let count = node.count as usize;
-    debug_assert!(count < F - 1 && idx <= count);
+    debug_assert!(count < F - 1);
+    debug_assert!(idx <= count);
     node.prefixes.copy_within(idx..count, idx + 1);
     node.metas.copy_within(idx..count, idx + 1);
     node.refs.copy_within(idx..count, idx + 1);
@@ -1969,15 +1973,21 @@ mod tests {
             for op in &ops {
                 match op {
                     Op::Insert(key, entry_ref) => match map.insert(key, *entry_ref) {
-                        Ok(inserted) => prop_assert_eq!(inserted, model.insert((key.clone(), *entry_ref))),
+                        Ok(inserted) => {
+                            prop_assert_eq!(inserted, model.insert((key.clone(), *entry_ref)));
+                        }
                         Err(OrderedMapError::HeapFull) => {
                             heap_full += 1;
-                            prop_assert_eq!(map.len(), model.len() as u64, "refused insert changed the tree");
+                            prop_assert_eq!(map.len(), model.len() as u64, "refused insert changed \
+                                 the tree");
                         }
                         Err(other) => prop_assert!(false, "unexpected {other:?}"),
                     },
                     Op::Remove(key, entry_ref) => {
-                        prop_assert_eq!(map.remove(key, *entry_ref), model.remove(&(key.clone(), *entry_ref)));
+                        prop_assert_eq!(
+                            map.remove(key, *entry_ref),
+                            model.remove(&(key.clone(), *entry_ref))
+                        );
                     }
                 }
             }

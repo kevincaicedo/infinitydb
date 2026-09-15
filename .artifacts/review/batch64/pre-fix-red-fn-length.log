@@ -1,0 +1,57 @@
+FN-LENGTH violation: bins/inf-bench/src/m45rows.rs has 14 function(s) over the bar, baseline 4 — split the new one, never raise the baseline
+FN-LENGTH violation: bins/inf-sim/src/durable.rs has 5 function(s) over the bar, baseline 1 — split the new one, never raise the baseline
+FN-LENGTH violation: bins/inf-sim/src/harness.rs has 3 function(s) over the bar, baseline 1 — split the new one, never raise the baseline
+FN-LENGTH violation: bins/inf-sim/src/tiered.rs has 2 function(s) over the bar and no baseline row — split them (functions over 70 lines:)
+    bins/inf-sim/src/tiered.rs (71 lines)
+    bins/inf-sim/src/tiered.rs (76 lines)
+FN-LENGTH violation: bins/inf-sim/src/txmodel.rs has 5 function(s) over the bar and no baseline row — split them (functions over 70 lines:)
+    bins/inf-sim/src/txmodel.rs (74 lines)
+    bins/inf-sim/src/txmodel.rs (74 lines)
+    bins/inf-sim/src/txmodel.rs (85 lines)
+    bins/inf-sim/src/txmodel.rs (90 lines)
+    bins/inf-sim/src/txmodel.rs (94 lines)
+FN-LENGTH violation: crates/inf-log/src/ckpt.rs has 2 function(s) over the bar and no baseline row — split them (functions over 70 lines:)
+    crates/inf-log/src/ckpt.rs (74 lines)
+    crates/inf-log/src/ckpt.rs (74 lines)
+FN-LENGTH violation: crates/inf-server/src/admin.rs has 8 function(s) over the bar, baseline 4 — split the new one, never raise the baseline
+FN-LENGTH violation: crates/inf-server/src/durable.rs has 10 function(s) over the bar, baseline 6 — split the new one, never raise the baseline
+FN-LENGTH violation: crates/inf-server/src/plane.rs has 36 function(s) over the bar, baseline 6 — split the new one, never raise the baseline
+FN-LENGTH violation: crates/inf-server/src/plane/tiered.rs has 6 function(s) over the bar, baseline 4 — split the new one, never raise the baseline
+FN-LENGTH ratchet: bins/inf-bench/src/m45rows/s37.rs has no function over the bar, baseline 3 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-bench/src/m45rows/s39b.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-bench/src/m45rows/s39d.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-bench/src/m45rows/s40.rs has no function over the bar, baseline 3 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-bench/src/m45rows/s42.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/durable/audit.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/harness/audit.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/harness/idle.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/tiered/late.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/tiered/support.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/txmodel/acquisition.rs has no function over the bar, baseline 3 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/txmodel/durable.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: bins/inf-sim/src/txmodel/watch.rs has no function over the bar, baseline 1 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-log/src/ckpt/read.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/durable/ckpt.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/cell_loop.rs has no function over the bar, baseline 8 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/dispatch.rs has no function over the bar, baseline 6 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/fabric.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/ns_ddl.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/publish.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/pumps.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/shared.rs has no function over the bar, baseline 4 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH ratchet: crates/inf-server/src/plane/tiered/write.rs has no function over the bar, baseline 2 — delete the row in docs/fn-length-baseline.tsv
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/tiered.rs:899:#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/nsddl.rs:173:#[allow(clippy::too_many_lines)] // one linear phase script, like run_ns_create_window_scenario
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/nscreate.rs:114:#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/harness.rs:1174:#[allow(clippy::too_many_lines)] // one linear phase script; splitting would scatter the invariants
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/durable.rs:1688:#[allow(clippy::too_many_lines)] // one linear phase script, like run_scenario
+FN-LENGTH violation: opt-out without a reason — bins/inf-sim/src/combined.rs:217:#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/ycsb.rs:1278:#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/m4rows.rs:258:#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/m2rows.rs:295:#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // orchestration script
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/m2rows.rs:875:#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/m1rows.rs:98:#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/gaterun.rs:792:#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+FN-LENGTH violation: opt-out without a reason — bins/inf-bench/src/gaterun.rs:808:#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+FN-LENGTH violation: opt-out without a reason — tests/compat/tests/node_diff.rs:179:#[allow(clippy::too_many_lines)]
+fn-length FAILED: 193 function(s) over 70 lines in 63 file(s) (the baseline backlog), 14 reasoned opt-out(s)

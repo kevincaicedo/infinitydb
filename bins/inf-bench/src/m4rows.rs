@@ -255,7 +255,7 @@ fn binary_fingerprint(path: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(clippy::too_many_lines, reason = "orchestration script: linear rows, not branchy logic")]
 pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m4")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m4/s03");

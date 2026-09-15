@@ -236,7 +236,8 @@ impl fmt::Display for CatalogError {
             CatalogError::TierOwnsBudget(id) => {
                 write!(
                     f,
-                    "tiered namespace id {id} carries MAXMEMORY (MEM-BUDGET is its one budget authority)"
+                    "tiered namespace id {id} carries MAXMEMORY (MEM-BUDGET is its one budget \
+                         authority)"
                 )
             }
             CatalogError::InvalidIndexRecord(reason) => {

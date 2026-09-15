@@ -488,7 +488,8 @@ fn steel_thread_write_flush_demote_cold_read() {
 
 /// Cold-read latency histogram (informational, risk-gate input — L10:
 /// never quotable as a claim). Run explicitly:
-/// `INF_STEEL_DIR=<dir-on-nvme> cargo test -p inf-runtime --features uring --release -- --ignored cold_read_histogram --nocapture`
+/// `INF_STEEL_DIR=<dir-on-nvme> cargo test -p inf-runtime --features uring --release -- --ignored
+/// cold_read_histogram --nocapture`
 /// `INF_STEEL_DIR` must sit on the device under test (temp_dir is often
 /// tmpfs — a RAM histogram would be a lie); page cache is dropped per
 /// read via `posix_fadvise(DONTNEED)` so the number reflects the device.

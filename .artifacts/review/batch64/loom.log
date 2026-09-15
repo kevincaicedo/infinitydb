@@ -1,0 +1,31 @@
+RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-fabric --release loom_
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+   Compiling inf-foundation v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-foundation)
+warning: function `decode_prefix` is never used
+   --> crates/inf-fabric/src/codec.rs:521:8
+    |
+521 | pub fn decode_prefix(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
+    |        ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `inf-fabric` (lib) generated 1 warning
+warning: `inf-fabric` (lib test) generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3.81s
+     Running unittests src/lib.rs (target/release/deps/inf_fabric-41891388b060242e)
+
+running 5 tests
+test ring::loom_tests::loom_publish_batch_single_release ... ok
+test ring::loom_tests::loom_empty_consume_races_first_publish ... ok
+test ring::loom_tests::loom_full_rejects_then_recovers ... ok
+test ring::loom_tests::loom_stale_tail_cache_serves_without_a_refresh ... ok
+test ring::loom_tests::loom_spsc_wraparound_sequence ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/mesh.rs (target/release/deps/mesh-a9ed5c6373fbe9db)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

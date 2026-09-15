@@ -848,7 +848,12 @@ fn reply_corpus() -> Vec<(Vec<&'static str>, String)> {
         (vec!["JSON.NUMMULTBY", "k", "$.n", "2"], bulk("[12]")),
         (vec!["JSON.NUMINCRBY", "k", ".n", "0"], bulk("12")),
         (vec!["JSON.STRAPPEND", "k", "$.s", "\"y\""], "*1\r\n:2\r\n".into()),
-        (vec!["JSON.STRAPPEND", "k", "$.*", "\"!\""], "*8\r\n$-1\r\n:3\r\n$-1\r\n$-1\r\n$-1\r\n$-1\r\n$-1\r\n$-1\r\n".into()),
+        (
+            vec!["JSON.STRAPPEND", "k", "$.*", "\"!\""],
+            "*8\r\n$-1\r\n:3\r\n$-1\r\n$-1\r\n$-1\r\n$-1\
+             \r\n$-1\r\n$-1\r\n"
+                .into(),
+        ),
         (vec!["JSON.STRLEN", "k", "$.s"], "*1\r\n:3\r\n".into()),
         (vec!["JSON.STRLEN", "k", "$.n"], "*1\r\n$-1\r\n".into()),
         (vec!["JSON.STRLEN", "k", ".s"], ":3\r\n".into()),
@@ -856,7 +861,12 @@ fn reply_corpus() -> Vec<(Vec<&'static str>, String)> {
         (vec!["JSON.TOGGLE", "k", ".b"], bulk("true")),
         (vec!["JSON.CLEAR", "k", "$.o"], ":1\r\n".into()),
         (vec!["JSON.ARRAPPEND", "k", "$.a", "3"], "*1\r\n:3\r\n".into()),
-        (vec!["JSON.ARRAPPEND", "k", "$.*", "9"], "*8\r\n:4\r\n$-1\r\n$-1\r\n$-1\r\n$-1\r\n:1\r\n$-1\r\n$-1\r\n".into()),
+        (
+            vec!["JSON.ARRAPPEND", "k", "$.*", "9"],
+            "*8\r\n:4\r\n$-1\r\n$-1\r\n$-1\r\n$-1\r\n:1\r\n$\
+             -1\r\n$-1\r\n"
+                .into(),
+        ),
         (vec!["JSON.ARRINSERT", "k", "$.a", "0", "0"], "*1\r\n:5\r\n".into()),
         (vec!["JSON.ARRINSERT", "k", ".a", "0", "-1"], ":6\r\n".into()),
         (vec!["JSON.ARRINDEX", "k", "$.a", "2"], "*1\r\n:3\r\n".into()),
@@ -871,7 +881,12 @@ fn reply_corpus() -> Vec<(Vec<&'static str>, String)> {
         (vec!["JSON.ARRTRIM", "k", "$.a", "0", "1"], "*1\r\n:2\r\n".into()),
         (vec!["JSON.ARRTRIM", "k", ".a", "0", "0"], ":1\r\n".into()),
         (vec!["JSON.OBJKEYS", "k", "$.o"], "*1\r\n*0\r\n".into()),
-        (vec!["JSON.OBJKEYS", "k"], "*8\r\n$1\r\na\r\n$1\r\ns\r\n$1\r\nn\r\n$1\r\nb\r\n$1\r\no\r\n$1\r\ne\r\n$1\r\nf\r\n$2\r\nnl\r\n".into()),
+        (
+            vec!["JSON.OBJKEYS", "k"],
+            "*8\r\n$1\r\na\r\n$1\r\ns\r\n$1\r\nn\r\n$1\r\nb\r\n$1\r\no\r\n\
+             $1\r\ne\r\n$1\r\nf\r\n$2\r\nnl\r\n"
+                .into(),
+        ),
         (vec!["JSON.OBJLEN", "k", "$.o"], "*1\r\n:0\r\n".into()),
         (vec!["JSON.OBJLEN", "k", ".o"], ":0\r\n".into()),
         (vec!["JSON.MERGE", "k", "$.o", r#"{"z":1}"#], "+OK\r\n".into()),

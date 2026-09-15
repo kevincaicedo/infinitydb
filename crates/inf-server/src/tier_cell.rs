@@ -872,7 +872,8 @@ fn drive_flush_round<F: SegmentFs>(
         if let Some(errno) = round.fatal {
             // A failed durability barrier freezes the watermark exactly
             // where the last good round left it (ADR-0056 D4).
-            // fsync-fail-stop-allow: reactor-drive flush barrier: constructs and returns to maintain_ns, which routes it to DurableCell::fail_stop (ADR-0084 D4)
+            // fsync-fail-stop-allow: reactor-drive flush barrier: constructs and returns to
+            // maintain_ns, which routes it to DurableCell::fail_stop (ADR-0084 D4)
             return Err(TierFlushError::Fsync {
                 path: t.dir.join("cold"),
                 source: std::io::Error::from_raw_os_error(errno),

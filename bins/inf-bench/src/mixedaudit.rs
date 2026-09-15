@@ -477,12 +477,14 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     let probe_delta = delta_pct(cache_solo.ops_per_sec, probe_report.ops_per_sec);
     let saturation = if probe_delta.abs() < 5.0 {
         format!(
-            "generator unsaturated at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — \
+            "generator unsaturated at {CACHE_CONNS} conns (+50% conns moved ops/s \
+            {probe_delta:+.1}% — \
              the solo number is server-set)"
         )
     } else {
         format!(
-            "GENERATOR-LIMITED at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — solo \
+            "GENERATOR-LIMITED at {CACHE_CONNS} conns (+50% conns moved ops/s {probe_delta:+.1}% — \
+            solo \
              absolutes understate the server; deltas remain valid at fixed generator config)"
         )
     };

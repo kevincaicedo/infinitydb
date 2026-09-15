@@ -213,12 +213,9 @@ impl Arena {
     /// Panics if `chunk_size` is not a power of two `>= 64 KiB` or exceeds
     /// the 2 MiB address-packing bound.
     pub fn new(cfg: ArenaConfig) -> Arena {
-        assert!(
-            cfg.chunk_size.is_power_of_two()
-                && cfg.chunk_size >= (64 << 10)
-                && cfg.chunk_size <= (2 << 20),
-            "chunk_size must be a power of two in [64 KiB, 2 MiB]"
-        );
+        assert!(cfg.chunk_size.is_power_of_two(), "chunk_size must be a power of two");
+        assert!(cfg.chunk_size >= (64 << 10), "chunk_size must be at least 64 KiB");
+        assert!(cfg.chunk_size <= (2 << 20), "chunk_size must be at most 2 MiB");
         let n_classes = TIER_A_CLASSES + tier_b_classes(cfg.chunk_size);
         Arena {
             large_threshold: cfg.chunk_size / 4,
@@ -651,7 +648,8 @@ mod tests {
     fn budget_exhaustion_is_none_not_growth() {
         let cfg = ArenaConfig { chunk_size: 64 << 10, max_resident: Some(128 << 10) };
         let mut arena = Arena::new(cfg);
-        let a = arena.alloc(60 << 10).expect("first chunk-ish"); // huge for 64K chunks? threshold = 16K -> huge path, 60K mapped
+        // huge for 64K chunks? threshold = 16K -> huge path, 60K mapped
+        let a = arena.alloc(60 << 10).expect("first chunk-ish");
         assert!(arena.report().resident_bytes <= 128 << 10);
         // Next huge allocation would exceed the budget.
         assert_eq!(arena.alloc(80 << 10), None);

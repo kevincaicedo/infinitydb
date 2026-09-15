@@ -209,31 +209,36 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-get-after-abort",
         Protocol::Resp2,
         "JSON.ARRINSERT",
-        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error",
+        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match \
+             before a later index error",
     ),
     d(
         "edge-del-overlap",
         Protocol::Resp2,
         "JSON.DEL",
-        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical",
+        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; \
+             post-state is identical",
     ),
     d(
         "edge-wrongtype-get",
         Protocol::Resp2,
         "JSON.GET",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-wrongtype-arrlen",
         Protocol::Resp2,
         "JSON.ARRLEN",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-debug-memory",
         Protocol::Resp2,
         "JSON.DEBUG",
-        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator bytes",
+        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator \
+             bytes",
     ),
     d(
         "fuzz-exp-get",
@@ -251,13 +256,15 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-merge-overlap-get",
         Protocol::Resp2,
         "JSON.MERGE",
-        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results",
+        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor \
+             supersede descendants; RedisJSON cascades descendant results",
     ),
     d(
         "edge-trim-overlap",
         Protocol::Resp2,
         "JSON.ARRTRIM",
-        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error while InfinityDB reports per-match length/null results",
+        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error \
+             while InfinityDB reports per-match length/null results",
     ),
     d(
         "s15-debug-missing",
@@ -269,31 +276,36 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-get-after-abort",
         Protocol::Resp3,
         "JSON.ARRINSERT",
-        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error",
+        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match \
+             before a later index error",
     ),
     d(
         "edge-del-overlap",
         Protocol::Resp3,
         "JSON.DEL",
-        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical",
+        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; \
+             post-state is identical",
     ),
     d(
         "edge-wrongtype-get",
         Protocol::Resp3,
         "JSON.GET",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-wrongtype-arrlen",
         Protocol::Resp3,
         "JSON.ARRLEN",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-debug-memory",
         Protocol::Resp3,
         "JSON.DEBUG",
-        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator bytes",
+        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator \
+             bytes",
     ),
     d(
         "fuzz-exp-get",
@@ -311,13 +323,15 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-merge-overlap-get",
         Protocol::Resp3,
         "JSON.MERGE",
-        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results",
+        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor \
+             supersede descendants; RedisJSON cascades descendant results",
     ),
     d(
         "edge-trim-overlap",
         Protocol::Resp3,
         "JSON.ARRTRIM",
-        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error while InfinityDB reports per-match length/null results",
+        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error \
+             while InfinityDB reports per-match length/null results",
     ),
 ];
 
@@ -352,7 +366,8 @@ pub fn compare(
         return Ok(Comparison::Allowed { deviation_index, semantic_equal });
     }
     Err(format!(
-        "{} {} {}: unallowlisted byte mismatch (semantic_equal={semantic_equal})\n  oracle    {:?}\n  candidate {:?}",
+        "{} {} {}: unallowlisted byte mismatch (semantic_equal={semantic_equal})\n  oracle    \
+             {:?}\n  candidate {:?}",
         protocol.name(),
         case.id,
         case.argv[0],

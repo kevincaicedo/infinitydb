@@ -160,7 +160,8 @@ pub fn catalog() -> &'static [Workload] {
             requires_json: true,
             in_all: false, // opt-in via `json`
             redisbench_test: None,
-            about: "JSON.GET depth-4 path reads after a document preload (M3 read gate's cross-check)",
+            about: "JSON.GET depth-4 path reads after a document preload (M3 read gate's \
+                 cross-check)",
         },
     ]
 }

@@ -475,7 +475,9 @@ proptest! {
     /// Randomized op sequences reconcile exactly (the proptest arm of
     /// AC 3 — seeds beyond the deterministic storm's).
     #[test]
-    fn blob_refcounts_match_the_model(ops in proptest::collection::vec((0u8..10, 0u64..48), 1..400)) {
+    fn blob_refcounts_match_the_model(
+        ops in proptest::collection::vec((0u8..10, 0u64..48), 1..400),
+    ) {
         let mut rig = Rig::new();
         let mut generation = 0u64;
         for (op, id) in ops {

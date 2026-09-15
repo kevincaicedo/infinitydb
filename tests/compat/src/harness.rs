@@ -569,7 +569,8 @@ pub fn run_matrix(
                         deviations.push(format!("case {i} {:?}: {why}", case.argv));
                     } else {
                         failures.push(format!(
-                            "case {i} {:?} ({n} frames, candidate has {candidate_frames:?}):\n  oracle    {:?}\n  candidate {:?}",
+                            "case {i} {:?} ({n} frames, candidate has {candidate_frames:?}):\n  \
+                                 oracle    {:?}\n  candidate {:?}",
                             case.argv,
                             String::from_utf8_lossy(&oracle_reply),
                             String::from_utf8_lossy(&candidate_reply),

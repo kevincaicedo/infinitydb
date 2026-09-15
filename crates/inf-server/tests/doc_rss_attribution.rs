@@ -89,7 +89,8 @@ fn document_heavy_domains_track_incremental_rss_within_ten_percent() {
     assert!(rss_delta > 0, "document fill must raise VmRSS");
     let divergence = domain_delta.abs_diff(rss_delta) as f64 / rss_delta as f64 * 100.0;
     eprintln!(
-        "document RSS attribution: documents={DOCUMENTS} domains={domain_delta} rss={rss_delta} divergence={divergence:.3}%"
+        "document RSS attribution: documents={DOCUMENTS} domains={domain_delta} rss={rss_delta} \
+             divergence={divergence:.3}%"
     );
     assert!(
         divergence <= 10.0,

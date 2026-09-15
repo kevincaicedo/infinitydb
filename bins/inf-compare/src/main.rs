@@ -1,6 +1,7 @@
 #![allow(
     clippy::disallowed_methods,
-    reason = "inf-compare is the comparator load generator: the wall clock is its instrument; it drives engines over the wire and runs no cell"
+    reason = "inf-compare is the comparator load generator: the wall clock is its instrument; it \
+         drives engines over the wire and runs no cell"
 )]
 //! `inf-compare` — InfinityDB competitive benchmark harness.
 //!
@@ -56,14 +57,18 @@ OPTIONS (run):
     --maxmemory-mb  N               # cap all engines (allkeys-lru); enables `eviction`
     --rb-requests   N               # redis-benchmark request count (-n); default: 1000000
     --crosscheck-threshold PCT      # flag memtier/redis-benchmark divergence; default: 25
-    --rate          OPS_PER_SEC     # offered rate, total across connections (memtier --rate-limiting
-                                    # per connection = rate / (threads × clients)); default: closed loop
+    --rate          OPS_PER_SEC     # offered rate, total across connections (memtier
+                                    # --rate-limiting per connection = rate / (threads ×
+                                    # clients)); default: closed loop
     --durability    none|everysec   # everysec: redis --appendonly yes --appendfsync everysec,
                                     # infinitydb FSYNC everysec namespace every connection starts in
                                     # (--conn-default-ns); host launches only; default: none
-    --data-root     DIR             # durable state root (per-engine subdirs, wiped); default: .artifacts/compare-data
-    --probe-file    PATH            # io-properties.toml copied into infinitydb's data dir (barrier class)
-    --device-stat   DEV             # /sys/block/DEV/stat sectors-written sampled per row (e.g. nvme0n1)
+    --data-root     DIR             # durable state root (per-engine subdirs, wiped);
+                                    # default: .artifacts/compare-data
+    --probe-file    PATH            # io-properties.toml copied into infinitydb's data dir
+                                    # (barrier class)
+    --device-stat   DEV             # /sys/block/DEV/stat sectors-written sampled per row
+                                    # (e.g. nvme0n1)
     --redis-no-auto-rewrite         # diagnostic only: Redis auto-aof-rewrite-percentage 0
 
   Placement:
@@ -175,7 +180,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         // Mirrors the pinned M3 compat oracle (tests/compat json_oracle.rs).
         redis_stack: flags.str_or(
             "redis-stack-image",
-            "redis/redis-stack-server@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a",
+            "redis/redis-stack-server@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac9\
+                 51eefdf742a",
         ),
         dragonfly: flags.str_or("dragonfly-image", "docker.dragonflydb.io/dragonflydb/dragonfly"),
         infinitydb: flags.str_or("infinitydb-image", "infinitydb:dev"),
@@ -214,7 +220,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
     if workloads.iter().any(|w| w.name == "eviction") && maxmemory_mb.is_none() {
         eprintln!(
-            "inf-compare: WARNING — `eviction` without --maxmemory-mb is just a write storm (no cap)"
+            "inf-compare: WARNING — `eviction` without --maxmemory-mb is just a write storm (no \
+                 cap)"
         );
     }
 
@@ -222,7 +229,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let environment = env::gather(reference_box, unsafe_env);
     if reference_box && !environment.binding && !unsafe_env {
         return Err(format!(
-            "refusing a binding run on a non-clean box:\n  - {}\nfix the box, or pass --unsafe-env to proceed non-citably",
+            "refusing a binding run on a non-clean box:\n  - {}\nfix the box, or pass --unsafe-env \
+                 to proceed non-citably",
             environment.reasons.join("\n  - ")
         ));
     }
@@ -234,7 +242,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         let ambient = engine::ambient_redis_processes();
         if !ambient.is_empty() {
             return Err(format!(
-                "refusing durable comparison with unrelated redis-server process(es):\n  - {}\nstop them before the campaign",
+                "refusing durable comparison with unrelated redis-server process(es):\n  - \
+                     {}\nstop them before the campaign",
                 ambient.join("\n  - ")
             ));
         }
@@ -250,7 +259,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
     let mode_label = mode_label(docker, &attach, &engines);
     eprintln!(
-        "inf-compare: {} · {mode_label} · {} · {} engine(s) · {} workload(s) · pipeline {pipelines:?}",
+        "inf-compare: {} · {mode_label} · {} · {} engine(s) · {} workload(s) · pipeline \
+             {pipelines:?}",
         environment.tier,
         generators_label(generators),
         engines.len(),

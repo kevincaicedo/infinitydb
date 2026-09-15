@@ -1,0 +1,14 @@
+FILE-LENGTH violation: crates/inf-log/src/ckpt.rs has 2777 production lines (4197 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-server/src/admin.rs has 2001 production lines (3115 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-server/src/durable.rs has 2475 production lines (2647 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-server/src/plane/tiered.rs has 2659 production lines (2690 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-server/src/plane.rs has 7970 production lines (8256 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-store/src/keyspace.rs has 2391 production lines (3003 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-store/src/store.rs has 2279 production lines (2279 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: crates/inf-store/src/tiered.rs has 2173 production lines (2408 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: bins/inf-bench/src/m45rows.rs has 4494 production lines (4494 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: bins/inf-sim/src/durable.rs has 3600 production lines (3600 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: bins/inf-sim/src/harness.rs has 2336 production lines (2336 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: bins/inf-sim/src/tiered.rs has 3112 production lines (3112 with tests) — the bar is 2000; split it into a subfolder
+FILE-LENGTH violation: bins/inf-sim/src/txmodel.rs has 5296 production lines (6741 with tests) — the bar is 2000; split it into a subfolder
+file-length FAILED: 217 production files, bar 2000 lines, largest: 7970 crates/inf-server/src/plane.rs, 5296 bins/inf-sim/src/txmodel.rs, 4494 bins/inf-bench/src/m45rows.rs

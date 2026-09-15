@@ -14,12 +14,18 @@
 //! ## What each counter counts (frozen with this story — S16 divides
 //! exactly these units)
 //!
-//! | Counter | Charged where | Includes | Excludes |
-//! |---|---|---|---|
-//! | `user_bytes` | record boundary, `inf-store` | key + value bytes of every record image the namespace admitted | record headers, WAL framing, protocol bytes |
-//! | `wal_bytes` | WAL staging, [`TieredTable::stage_wal`](crate::TieredTable::stage_wal) | encoded log-record bytes, length prefix included | the shared frame header/trailer (see below) |
-//! | `flush_bytes` | tier device writes, `inf-log` | header blocks, frame writes (partial-tail rewrites included), footers, **and the re-flush of every relocated record** | nothing the block layer sees for this pipeline |
-//! | `compaction_bytes` | copy-forward, `inf-store` | bytes copy-forward relocated to the tail | the device write those bytes cause — that is `flush_bytes`' (ADR-0060 D2) |
+//! - Counter — Charged where — Includes — Excludes
+//! - ---|---|---|---
+//! - `user_bytes` — record boundary, `inf-store` — key + value bytes of every record image the
+//!   namespace admitted — record headers, WAL framing, protocol bytes
+//! - `wal_bytes` — WAL staging, [`TieredTable::stage_wal`](crate::TieredTable::stage_wal) — encoded
+//!   log-record bytes, length prefix included — the shared frame header/trailer (see below)
+//! - `flush_bytes` — tier device writes, `inf-log` — header blocks, frame writes (partial-tail
+//!   rewrites included), footers, **and the re-flush of every relocated record** — nothing the
+//!   block
+//!   layer sees for this pipeline
+//! - `compaction_bytes` — copy-forward, `inf-store` — bytes copy-forward relocated to the tail —
+//!   the device write those bytes cause — that is `flush_bytes`' (ADR-0060 D2)
 //!
 //! Three deliberate asymmetries, each a judgement rather than an
 //! oversight:

@@ -1004,7 +1004,8 @@ impl<F: SegmentFs> TierWriter<F> {
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
-        // fsync-fail-stop-allow: the tier sync barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
+        // fsync-fail-stop-allow: the tier sync barrier: mapped to TierWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         self.durable_len = self.data_len;
         Ok(())
@@ -1056,7 +1057,8 @@ impl<F: SegmentFs> TierWriter<F> {
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
-        // fsync-fail-stop-allow: the tier seal barrier: mapped to TierWriteFailure::Fsync and propagated with `?`
+        // fsync-fail-stop-allow: the tier seal barrier: mapped to TierWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         let outcome = SealOutcome {
             data_len: self.data_len,

@@ -1,4 +1,4 @@
-//! `inf-fabric` — the cross-shard plane (master plan §6, milestone M0-E3):
+//! `inf-fabric` — the cross-cell plane (master plan §6, milestone M0-E3):
 //! SPSC rings, the N×(N−1) mesh with doorbells and credit flow control, and
 //! the fabric op codec v0.
 //!

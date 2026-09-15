@@ -62,7 +62,7 @@ pub(crate) struct Streaming<File: SegmentFile> {
     pub stream: IckStream,
     /// Keeps the fd alive for the driver ops; dropped at publish/abort
     /// (never read — its job is ownership).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "ownership only: the fd lives as long as the driver ops")]
     pub file: File,
     pub fd: RawFd,
     /// Durable namespaces captured at stream open, ascending id. Namespaces

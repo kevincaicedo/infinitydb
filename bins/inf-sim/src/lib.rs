@@ -20,11 +20,15 @@
 //! device. Every **driver-tier** durable boot goes through
 //! [`durable::boot`], which refuses a closed window:
 //!
-//! | scenarios | device |
-//! |---|---|
-//! | `m2-*`, `m3-document`, `m2-combined`, `m4-tiered`, `m2-ns-create-window`, `m2-ns-ddl-race` | the m2 reference stall device (`durable::m2_stall_config`, writes 8 µs + tail) |
-//! | `m45-backfill`, `m45-sidecar`, `boot-storm` | `StallConfig::write_reorder()` — writes off the timeline, fsyncs instant |
-//! | `m4-steel`, `m4-cold`, `m4-pressure`, `m4-diskfull`, `m4-recovery` | **order-preserving by construction**: the flush pipeline runs the blocking `SegmentFile` tier (a `write_at` returns landed); the driver is used for tier reads only, so no write-vs-fsync window exists to open |
+//! - scenarios — device
+//! - ---|---
+//! - `m2-*`, `m3-document`, `m2-combined`, `m4-tiered`, `m2-ns-create-window`, `m2-ns-ddl-race` —
+//!   the m2 reference stall device (`durable::m2_stall_config`, writes 8 µs + tail)
+//! - `m45-backfill`, `m45-sidecar`, `boot-storm` — `StallConfig::write_reorder()` — writes off the
+//!   timeline, fsyncs instant
+//! - `m4-steel`, `m4-cold`, `m4-pressure`, `m4-diskfull`, `m4-recovery` — **order-preserving by
+//!   construction**: the flush pipeline runs the blocking `SegmentFile` tier (a `write_at` returns
+//!   landed); the driver is used for tier reads only, so no write-vs-fsync window exists to open
 
 // §17.3 as amended (ADR-0121, batch 44): the simulator's backend driver
 // (`net`) and its steel-thread tier reader (`steel`) execute driver ops

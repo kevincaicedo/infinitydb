@@ -91,8 +91,10 @@ mod tests {
 
     #[test]
     fn parses_the_matching_row() {
-        let csv = "\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n\
-                   \"SET\",\"176470.58\",\"0.017\",\"0.000\",\"0.015\",\"0.031\",\"0.039\",\"0.895\"\n";
+        let csv = "\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\
+                   \"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n\
+                   \"SET\",\"176470.58\",\"0.017\",\"0.000\",\"0.015\",\"0.031\",\"0.039\",\"0.895\
+                        \"\n";
         let m = parse_csv(csv, "set").unwrap();
         assert_eq!(m.rps, 176470.58);
         assert_eq!(m.p99_ms, 0.039);
@@ -100,7 +102,8 @@ mod tests {
 
     #[test]
     fn missing_test_is_an_error() {
-        let csv = "\"test\",\"rps\",\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"\n\"GET\",\"1\",\"0\",\"0\",\"0\",\"0\",\"0\",\"0\"\n";
+        let csv = "\"test\",\"rps\",\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"\n\"GET\",\"1\",\"0\",\"0\"\
+             ,\"0\",\"0\",\"0\",\"0\"\n";
         assert!(parse_csv(csv, "set").is_err());
     }
 }

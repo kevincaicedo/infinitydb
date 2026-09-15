@@ -106,9 +106,14 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m0-admission|m1-cache|m2-durable|m2-clean-stop|m2-device-budget|m2-mode-transition|m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending|m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario \
+                        m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m0-admission\
+                        |m1-cache|m2-durable|m2-clean-stop|m2-device-budget|m2-mode-transition\
+                        |m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending\
+                        |m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] [--replay-canary] [--lift-regime] [--cells N] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
+                         [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]]"
                     );
@@ -328,7 +333,8 @@ fn main() {
         };
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut lines = Vec::new();
             let mut violations = 0u64;
             let mut ran = 0u64;
@@ -520,7 +526,8 @@ fn main() {
         };
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut lines = Vec::new();
             let mut violations = 0u64;
             let mut refused = 0u64;
@@ -849,7 +856,8 @@ fn main() {
         let run_one = |seed: u64| inf_sim::run_ns_ddl_race_scenario(seed);
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut violations = 0u64;
             let mut ran = 0u64;
             let (mut found, mut phantoms, mut partial, mut skips) = (0u64, 0u64, 0u64, 0u64);
@@ -946,7 +954,8 @@ fn main() {
         let run_one = |seed: u64| inf_sim::run_ns_create_window_scenario(seed);
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut violations = 0u64;
             let mut ran = 0u64;
             let (mut attempts, mut refused, mut acked, mut skips, mut held) =
@@ -1103,7 +1112,8 @@ fn main() {
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, m0-fabric-fairness, m0-admission, m1-cache, \
+                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, \
+                m0-fabric-fairness, m0-admission, m1-cache, \
                  m2-durable, m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, \
                  m4-cold, m4-recovery, m4-diskfull, m4-tiered)"
             );
@@ -1289,7 +1299,8 @@ fn run_durable(
     };
 
     // Sweep mode: seeds base+i for i ≡ shard_i (mod shard_k).
-    assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+    assert!(shard_k > 0, "--shard I/K wants K > 0");
+    assert!(shard_i < shard_k, "--shard I/K wants I < K");
     let mut lines = Vec::new();
     let mut violations = 0u64;
     let mut refused = 0u64;
@@ -1425,10 +1436,12 @@ fn run_durable(
          violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
          checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
          [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
-         waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget [background_bytes:{budget_bytes} \
+         waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget \
+         [background_bytes:{budget_bytes} \
          deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
-         bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log oracles \
+         bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log \
+         oracles \
          [idle_tick_violations:{idle_tick_violations} frames_awaiting_max:{frames_awaiting_max} \
          fsync_entries_max:{fsync_entries_max} \
          write_through_entries_max:{write_through_entries_max} \
@@ -1452,7 +1465,8 @@ fn run_durable(
              documents_compared={documents_compared} corpus_documents={corpus_documents} \
              cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
              waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
-             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} budget_deferrals={budget_deferrals} \
+             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} \
+             budget_deferrals={budget_deferrals} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
              ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \
@@ -1542,7 +1556,8 @@ fn run_m2_combined(
         return;
     };
 
-    assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+    assert!(shard_k > 0, "--shard I/K wants K > 0");
+    assert!(shard_i < shard_k, "--shard I/K wants I < K");
     let mut lines = Vec::new();
     let mut violations = 0u64;
     let mut refused = 0u64;

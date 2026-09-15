@@ -11,20 +11,28 @@
 //! emitted K's home region; the single-threaded cell means W and H never
 //! interleave *within* one record.
 //!
-//! | # | class | who inserts | who removes stale | note |
-//! |---|-------|-------------|-------------------|------|
-//! | 1 | K pre-existing, untouched for the whole walk | W (only source) | — | the plain backfill case |
-//! | 2 | K created mid-walk, region already scanned | H at write time | — | W never sees it; H is the only source |
-//! | 3 | K created mid-walk, region not yet scanned | H at write time; W re-inserts | — | W's insert is a no-op (idempotent) |
-//! | 4 | K mutated after W scanned it | H's diff inserts new | H's diff removes W's old entries | the pre-image bracket sees the physical record |
-//! | 5 | K mutated before W scanned it | H's diff inserts new; W re-inserts current | H's remove may miss (legal — unconverged) | `Strict` asserts are scoped to converged indexes |
-//! | 6 | K deleted after W scanned it | — | H's diff / death hook removes W's entries | |
-//! | 7 | K deleted before W scanned it | — | removal misses (legal); W never emits a dead key | |
-//! | 8 | K deleted then re-created mid-walk | composition of 6/7 then 2/3 | composition | |
-//! | 9 | K expired-but-unreaped when W arrives | — | W reaps on encounter; the death hook removes write-time entries | keeps the ADR-0076 D4 physical-view invariant |
-//! | 10 | K expires after W scanned it | W inserted | the later reap's death hook removes them | post-convergence this is the `Strict` found assert |
-//! | 11 | rehash (doubling) mid-walk | W may emit K twice | — | at-least-once emission; duplicates are no-ops |
-//! | 12 | eviction victim mid-walk | — | the death hook at the eviction site | both eviction shapes |
+//! - # — class — who inserts — who removes stale — note
+//! - ---|-------|-------------|-------------------|------
+//! - 1 — K pre-existing, untouched for the whole walk — W (only source) — — — the plain backfill
+//!   case
+//! - 2 — K created mid-walk, region already scanned — H at write time — — — W never sees it; H is
+//!   the only source
+//! - 3 — K created mid-walk, region not yet scanned — H at write time; W re-inserts — — — W's
+//!   insert is a no-op (idempotent)
+//! - 4 — K mutated after W scanned it — H's diff inserts new — H's diff removes W's old entries —
+//!   the pre-image bracket sees the physical record
+//! - 5 — K mutated before W scanned it — H's diff inserts new; W re-inserts current — H's remove
+//!   may miss (legal — unconverged) — `Strict` asserts are scoped to converged indexes
+//! - 6 — K deleted after W scanned it — — — H's diff / death hook removes W's entries
+//! - 7 — K deleted before W scanned it — — — removal misses (legal); W never emits a dead key
+//! - 8 — K deleted then re-created mid-walk — composition of 6/7 then 2/3 — composition
+//! - 9 — K expired-but-unreaped when W arrives — — — W reaps on encounter; the death hook removes
+//!   write-time entries — keeps the ADR-0076 D4 physical-view invariant
+//! - 10 — K expires after W scanned it — W inserted — the later reap's death hook removes them —
+//!   post-convergence this is the `Strict` found assert
+//! - 11 — rehash (doubling) mid-walk — W may emit K twice — — — at-least-once emission; duplicates
+//!   are no-ops
+//! - 12 — eviction victim mid-walk — — — the death hook at the eviction site — both eviction shapes
 //!
 //! There is no third source and no third remover, so the compass
 //! property — every converged tree ≡ its from-scratch derivation off the

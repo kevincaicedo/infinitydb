@@ -223,7 +223,8 @@ fn audit_oracle_catches_a_planted_canary_on_the_served_surface() {
         .any(|v| v.starts_with("content reconciliation failed (final audit)"));
     assert!(
         dbsize && scan && content,
-        "served-surface audit missed the dropped key (dbsize {dbsize}, scan {scan}, content {content}): {:?}",
+        "served-surface audit missed the dropped key (dbsize {dbsize}, scan {scan}, content \
+             {content}): {:?}",
         report.oracle_violations
     );
 }

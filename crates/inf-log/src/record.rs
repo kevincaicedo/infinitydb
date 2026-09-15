@@ -287,7 +287,8 @@ impl RecordView<'_> {
                 operand,
             } => {
                 debug_assert_eq!(base_version & !DOC_VERSION_MASK, 0);
-                debug_assert!(match_count > 0 && post_len > 0);
+                debug_assert!(match_count > 0);
+                debug_assert!(post_len > 0);
                 debug_assert_eq!(post_len & !DOC_VERSION_MASK, 0);
                 out.push(RecordType::DocDelta as u8);
                 out.push(RECORD_FLAGS_V1);

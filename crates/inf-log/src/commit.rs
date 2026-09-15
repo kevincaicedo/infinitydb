@@ -550,7 +550,8 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// extends the durable prefix by construction — and its fdatasync is
     /// FLUSH-class, so it takes a pipeline slot; the LOG step decides
     /// before rotating, so the ledger cannot show the entry yet and the
-    /// slot arm counts it here — F-L01-05, batch 43). The `Wait` arm is the rule that keeps a due from starving behind
+    /// slot arm counts it here — F-L01-05, batch 43). The `Wait` arm is the rule that keeps a due
+    /// from starving behind
     /// barrier-less frames: sealing with no barrier while writes are in
     /// flight below would let every later frame find the same shape. The
     /// FLUSH-slot arm keeps §8.2 batching byte-for-byte (the due
@@ -1056,7 +1057,8 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// exactly-once by the driver contract.
     pub fn on_fsync_complete(&mut self, ticket: FsyncTicket, now: Nanos) -> Option<Lsn> {
         let entry = self.pending_mut(ticket).expect("fsync completion for an unknown ticket");
-        assert!(!entry.done && !entry.failed, "fsync ticket completed twice");
+        assert!(!entry.done, "fsync ticket completed twice");
+        assert!(!entry.failed, "fsync ticket completed after erroring");
         entry.done = true;
         let reason = entry.reason;
         // Seal durability and write-handle drop coincide (ADR-0013 D4);
@@ -1091,10 +1093,12 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// forever; the caller fail-stops the cell (§8.4 fsyncgate rule — this
     /// method exists so the freeze is observable in tests and the error
     /// path can name what was lost, never so the caller can continue).
-    // fsync-fail-stop-allow: freezes the watermark so the loss is observable and nameable; every caller fail-stops the cell next (§8.4) — this never resumes a commit
+    // fsync-fail-stop-allow: freezes the watermark so the loss is observable and nameable; every
+    // caller fail-stops the cell next (§8.4) — this never resumes a commit
     pub fn on_fsync_error(&mut self, ticket: FsyncTicket) -> SyncReason {
         let entry = self.pending_mut(ticket).expect("fsync error for an unknown ticket");
-        assert!(!entry.done && !entry.failed, "fsync ticket errored after completing");
+        assert!(!entry.done, "fsync ticket errored after completing");
+        assert!(!entry.failed, "fsync ticket errored twice");
         entry.failed = true;
         let reason = entry.reason;
         if reason != SyncReason::WriteThrough {

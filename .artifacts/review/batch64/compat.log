@@ -1,0 +1,244 @@
+cargo build -p infinityd
+   Compiling inf-foundation v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-foundation)
+   Compiling inf-alloc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-alloc)
+   Compiling inf-log v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-log)
+   Compiling inf-fabric v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-fabric)
+   Compiling inf-wire v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-wire)
+   Compiling inf-probe v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-probe)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling infinityd v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/bins/infinityd)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.16s
+INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN=/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd cargo test -p compat -- --nocapture
+   Compiling inf-runtime v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-runtime)
+   Compiling inf-server v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-server)
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.22s
+     Running unittests src/lib.rs (target/debug/deps/compat-bed998fbbf4523cd)
+
+running 14 tests
+test json_oracle::tests::an_unallowlisted_deviation_fails ... ok
+test json_oracle::tests::semantic_equality_is_diagnostic_only ... ok
+test json_oracle::tests::case_and_allowlist_keys_are_unique_and_total ... ok
+test resp::tests::encodes_argv_as_bulk_array ... ok
+test resp::tests::frames_attribute_with_its_payload ... ok
+test resp::tests::frames_aggregates ... ok
+test resp::tests::frames_bulk_variants ... ok
+test resp::tests::frames_line_types ... ok
+test resp::tests::incomplete_input_needs_more_bytes ... ok
+test resp::tests::parses_integer_replies ... ok
+test resp::tests::rejects_garbage ... ok
+test resp::tests::trailing_bytes_are_not_consumed ... ok
+test harness::tests::reserved_ports_never_repeat_within_a_process ... ok
+test harness::tests::a_reserved_port_is_never_answered_by_a_ghost_listener ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/diff.rs (target/debug/deps/diff-461c4ebd207487a5)
+
+running 1 test
+compat-diff v1: 486 byte-compared cases, 44 documented deviations, 0 failures
+test matrix_replies_match_redis ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/json_diff.rs (target/debug/deps/json_diff-2c904240237ea4cb)
+
+running 1 test
+SKIPPED: set INF_COMPAT_JSON_ORACLE_ADDR to redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+test json_matrix_matches_pinned_redisjson ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/matrix_artifact.rs (target/debug/deps/matrix_artifact-f461a176e6b1bce9)
+
+running 3 tests
+test declared_statuses_are_mechanically_enforced ... ok
+test generated_matrix_is_current ... ok
+test rendered_matrix_covers_the_json_section ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 17 tests
+
+thread 'a_failing_test_keeps_the_node_log' (472283) panicked at tests/compat/tests/node_diff.rs:818:9:
+expected: this harness falsifier fails on purpose while holding the node guard
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+readiness refused: port 32647 is answered by pid 472313 (/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/infinityd --port 32647 --cells 1 --data-dir /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789498021965816232-32647 --device-probe off), not the spawned infinityd (pid 472445) — a foreign node owns the port
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789498021965209147-32634 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0x88bad9c0346e1049; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 1 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd da57bfc (git da57bfc6366b-dirty, x86_64-unknown-linux-gnu)
+infinityd: 1 cells, port 32634, backend io_uring, route natural
+infinityd: listening on 32634
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+test a_failing_test_keeps_the_node_log ... ok
+test readiness_refuses_a_port_another_node_answers ... ok
+test info_names_every_field_once_on_a_real_node ... ok
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+test run_id_is_40_hex_and_stable_like_redis ... ok
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+test tiered_namespace_argument_errors_match_redis ... ok
+test client_id_is_positive_and_killable_like_redis ... ok
+test a_second_node_on_an_owned_port_refuses_to_start ... ok
+test info_unknown_section_is_empty_like_redis ... ok
+test maxclients_refusal_matches_redis ... ok
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+compat-diff ns lane: 2 namespaces (durable + tiered) × 52 keys (4 at MAX_KEY_LEN), values to 64 KiB, SCAN set-equality, 4 pinned refusals, 0 failures
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+compat-diff node lane: 486 byte-compared cases on a 4-cell durable node, 44 documented deviations, 1 pinned node deviations, 0 failures
+  node deviation: case 529 ["FLUSHALL"]: FLUSHALL with durable namespaces refuses (ADR-0015 M2 cut)
+test node_matrix_replies_match_redis ... ok
+compat-diff large-value lane: 2 MiB + MAX_VAL_LEN byte-exact, 16 MiB + 1 pinned
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+test deadline_millisecond_read_matches_redis ... ok
+test timeout_closes_an_idle_connection_like_redis ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.61s
+
+     Running tests/node_internal.rs (target/debug/deps/node_internal-c3e198f8ff5c4dd0)
+
+running 1 test
+ADR-0115 binary lane: internal commands unknown to clients, 0 differences from Redis
+test internal_commands_are_unknown_to_clients_at_the_binary ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/node_move.rs (target/debug/deps/node_move-1a8250aad26b9ec7)
+
+running 6 tests
+H3 binary bounds/missing matrix: 5 rows, 0 failures
+test cross_cell_move_bounds_and_missing_source ... ok
+test cross_cell_move_document_refuses_without_mutation ... ok
+H3 binary success matrix: 12 large-binary rows plus COPY DB/REPLACE and overwrite controls, 0 failures
+test cross_cell_move_success_and_copy_variants ... ok
+test cross_cell_move_namespace_refusals_preserve_source ... ok
+H3 binary INFO counters: 12 rows, 0 differences from Redis
+test cross_cell_rename_stats_match_redis ... ok
+H3 binary pressure matrix: 48 rows, 0 failures
+test cross_cell_move_pressure_matrix ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/node_twin.rs (target/debug/deps/node_twin-c718c0be18b2b207)
+
+running 2 tests
+twin coverage: 87 of 91 registry rows scripted (4 excluded with reasons)
+test every_registry_command_is_scripted ... ok
+compat twin lane (1-cell vs 4-cell infinityd): 4912 cases compared over 4 bindings × 2 passes — 4688 byte-identical, 40 tainted-by-shape, 72 spanning-key deviations (ADR-0015 M2 cut), 0 failures
+  DefaultDb/Spread: 614 compared (596 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  MemoryNs/Spread: 614 compared (561 byte-identical), 16 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  DurableNs/Spread: 614 compared (563 byte-identical), 16 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  TieredNs/Spread: 614 compared (573 byte-identical), 8 tainted-by-shape, 24 spanning-key deviations, 0 failures
+  DefaultDb/Tagged: 614 compared (597 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  MemoryNs/Tagged: 614 compared (597 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  DurableNs/Tagged: 614 compared (597 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  TieredNs/Tagged: 614 compared (604 byte-identical), 0 tainted-by-shape, 0 spanning-key deviations, 0 failures
+  deviation: matrix case 69 ["DEL", "d1", "d2", "d3"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 72 ["EXISTS", "e1", "e1", "nope", "e1"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 161 ["MSET", "m1", "v1", "m2", "v2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 162 ["MGET", "m1", "nope", "m2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 164 ["MSET", "m1", "v1", "m2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 166 ["MSETNX", "m1", "x", "mfresh", "y"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 168 ["MSETNX", "mn1", "a", "mn2", "b"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 169 ["MGET", "mn1", "mn2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 234 ["RENAME", "r1", "r2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 238 ["RENAME", "missing", "x"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 241 ["RENAMENX", "rnx1", "rnx2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 244 ["RENAMENX", "missing", "x"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 251 ["COPY", "cp1", "cp2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 254 ["COPY", "cp1", "cp2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 255 ["COPY", "cp1", "cp2", "REPLACE"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 256 ["COPY", "missing", "x"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 258 ["COPY", "cp1", "cp3", "DB", "0"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 259 ["COPY", "cp1", "cp4", "DB", "3"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 260 ["COPY", "cp1", "cp4", "DB", "3"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 261 ["COPY", "cp1", "cp4", "DB", "3", "REPLACE"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 263 ["COPY", "cp1", "cp4", "DB", "99"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 265 ["TOUCH", "cp1", "missing", "cp2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 266 ["UNLINK", "cp2", "cp3", "missing"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 483 ["MGET", "m1", "m2"] under MemoryNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 69 ["DEL", "d1", "d2", "d3"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 72 ["EXISTS", "e1", "e1", "nope", "e1"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 161 ["MSET", "m1", "v1", "m2", "v2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 162 ["MGET", "m1", "nope", "m2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 164 ["MSET", "m1", "v1", "m2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 166 ["MSETNX", "m1", "x", "mfresh", "y"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 168 ["MSETNX", "mn1", "a", "mn2", "b"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 169 ["MGET", "mn1", "mn2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 234 ["RENAME", "r1", "r2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 238 ["RENAME", "missing", "x"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 241 ["RENAMENX", "rnx1", "rnx2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 244 ["RENAMENX", "missing", "x"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 251 ["COPY", "cp1", "cp2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 254 ["COPY", "cp1", "cp2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 255 ["COPY", "cp1", "cp2", "REPLACE"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 256 ["COPY", "missing", "x"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 258 ["COPY", "cp1", "cp3", "DB", "0"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 259 ["COPY", "cp1", "cp4", "DB", "3"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 260 ["COPY", "cp1", "cp4", "DB", "3"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 261 ["COPY", "cp1", "cp4", "DB", "3", "REPLACE"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 263 ["COPY", "cp1", "cp4", "DB", "99"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 265 ["TOUCH", "cp1", "missing", "cp2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 266 ["UNLINK", "cp2", "cp3", "missing"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 483 ["MGET", "m1", "m2"] under DurableNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 69 ["DEL", "d1", "d2", "d3"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 72 ["EXISTS", "e1", "e1", "nope", "e1"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 161 ["MSET", "m1", "v1", "m2", "v2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 162 ["MGET", "m1", "nope", "m2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 164 ["MSET", "m1", "v1", "m2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 166 ["MSETNX", "m1", "x", "mfresh", "y"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 168 ["MSETNX", "mn1", "a", "mn2", "b"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 169 ["MGET", "mn1", "mn2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 234 ["RENAME", "r1", "r2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 238 ["RENAME", "missing", "x"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 241 ["RENAMENX", "rnx1", "rnx2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 244 ["RENAMENX", "missing", "x"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 251 ["COPY", "cp1", "cp2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 254 ["COPY", "cp1", "cp2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 255 ["COPY", "cp1", "cp2", "REPLACE"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 256 ["COPY", "missing", "x"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 258 ["COPY", "cp1", "cp3", "DB", "0"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 259 ["COPY", "cp1", "cp4", "DB", "3"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 260 ["COPY", "cp1", "cp4", "DB", "3"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 261 ["COPY", "cp1", "cp4", "DB", "3", "REPLACE"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 263 ["COPY", "cp1", "cp4", "DB", "99"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 265 ["TOUCH", "cp1", "missing", "cp2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 266 ["UNLINK", "cp2", "cp3", "missing"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+  deviation: matrix case 483 ["MGET", "m1", "m2"] under TieredNs/Spread: keys span cells — typed refusal (ADR-0015 M2)
+test one_cell_and_four_cell_nodes_answer_alike_under_every_binding ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running tests/reply_shapes_artifact.rs (target/debug/deps/reply_shapes_artifact-3a49270146d049f8)
+
+running 2 tests
+test shape_table_is_mechanically_enforced ... ok
+test generated_reply_shapes_are_current ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/required_binary.rs (target/debug/deps/required_binary-a72046ae2447f0ae)
+
+running 3 tests
+test binary_requirement_child ... ok
+test optional_binary_can_skip ... ok
+test required_binary_cannot_skip ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests compat
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -73,7 +73,8 @@ impl Prefetcher {
         let stop = Arc::new(AtomicBool::new(false));
         let t = Arc::clone(&target);
         let s = Arc::clone(&stop);
-        // Boot-scoped by type (ADR-0109, L17-02 fixed): only `Recovery::boot_reads` holds this wrapper.
+        // Boot-scoped by type (ADR-0109, L17-02 fixed): only `Recovery::boot_reads` holds this
+        // wrapper.
         // denylist-allow: boot-scoped prefetch thread (M2.5-S08, the §3.3 recovery exception).
         let worker = std::thread::Builder::new().name("inf-readahead".into()).spawn(move || {
             use std::os::unix::fs::FileExt;
