@@ -58,6 +58,18 @@ impl Json {
     }
 }
 
+/// The deepest nesting the reader accepts (F-L18-07, review of
+/// 2026-08-30): the parser is iterative with an explicit stack and this
+/// explicit depth limit. memtier's output nests about six deep.
+pub const MAX_DEPTH: usize = 32;
+
+/// One container still collecting on the explicit stack; an object also
+/// carries the key its next value belongs to.
+enum Open {
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>, String),
+}
+
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -74,19 +86,101 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses one value. Iterative: the open containers live on an
+    /// explicit stack bounded by [`MAX_DEPTH`] (F-L18-07).
     fn value(&mut self) -> Result<Json, String> {
-        self.skip_ws();
-        match self.bytes.get(self.pos) {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b't') => self.literal("true", Json::Bool(true)),
-            Some(b'f') => self.literal("false", Json::Bool(false)),
-            Some(b'n') => self.literal("null", Json::Null),
-            Some(&b) if b == b'-' || b.is_ascii_digit() => self.number(),
-            Some(&b) => Err(format!("unexpected byte `{}` at {}", b as char, self.pos)),
-            None => Err("unexpected end of input".into()),
+        let mut stack: Vec<Open> = Vec::new();
+        loop {
+            self.skip_ws();
+            let mut value = match self.bytes.get(self.pos) {
+                Some(b'{') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) == Some(&b'}') {
+                        self.pos += 1;
+                        Json::Obj(Vec::new())
+                    } else {
+                        let key = self.key()?;
+                        self.open(&mut stack, Open::Obj(Vec::new(), key))?;
+                        continue;
+                    }
+                }
+                Some(b'[') => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) == Some(&b']') {
+                        self.pos += 1;
+                        Json::Arr(Vec::new())
+                    } else {
+                        self.open(&mut stack, Open::Arr(Vec::new()))?;
+                        continue;
+                    }
+                }
+                Some(b'"') => Json::Str(self.string()?),
+                Some(b't') => self.literal("true", Json::Bool(true))?,
+                Some(b'f') => self.literal("false", Json::Bool(false))?,
+                Some(b'n') => self.literal("null", Json::Null)?,
+                Some(&b) if b == b'-' || b.is_ascii_digit() => self.number()?,
+                Some(&b) => return Err(format!("unexpected byte `{}` at {}", b as char, self.pos)),
+                None => return Err("unexpected end of input".into()),
+            };
+            // Deliver the value into the innermost open container, closing
+            // every container it completes.
+            loop {
+                let Some(top) = stack.last_mut() else { return Ok(value) };
+                self.skip_ws();
+                let next = self.bytes.get(self.pos).copied();
+                self.pos += usize::from(matches!(next, Some(b',' | b']' | b'}')));
+                match top {
+                    Open::Arr(items) => {
+                        items.push(value);
+                        match next {
+                            Some(b',') => break,
+                            Some(b']') => {}
+                            _ => return Err(format!("expected ',' or ']' at {}", self.pos)),
+                        }
+                    }
+                    Open::Obj(fields, key) => {
+                        fields.push((std::mem::take(key), value));
+                        match next {
+                            Some(b',') => {
+                                *key = self.key()?;
+                                break;
+                            }
+                            Some(b'}') => {}
+                            _ => return Err(format!("expected ',' or '}}' at {}", self.pos)),
+                        }
+                    }
+                }
+                value = match stack.pop().expect("checked non-empty") {
+                    Open::Arr(items) => Json::Arr(items),
+                    Open::Obj(fields, _) => Json::Obj(fields),
+                };
+            }
         }
+    }
+
+    fn open(&self, stack: &mut Vec<Open>, container: Open) -> Result<(), String> {
+        if stack.len() == MAX_DEPTH {
+            return Err(format!("nesting deeper than {MAX_DEPTH} at byte {}", self.pos));
+        }
+        stack.push(container);
+        Ok(())
+    }
+
+    /// An object key and its `:`.
+    fn key(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        if self.bytes.get(self.pos) != Some(&b'"') {
+            return Err(format!("expected object key at {}", self.pos));
+        }
+        let key = self.string()?;
+        self.skip_ws();
+        if self.bytes.get(self.pos) != Some(&b':') {
+            return Err(format!("expected ':' after key `{key}` at {}", self.pos));
+        }
+        self.pos += 1;
+        Ok(key)
     }
 
     fn literal(&mut self, word: &str, val: Json) -> Result<Json, String> {
@@ -95,61 +189,6 @@ impl Parser<'_> {
             Ok(val)
         } else {
             Err(format!("invalid literal at {}", self.pos))
-        }
-    }
-
-    fn object(&mut self) -> Result<Json, String> {
-        self.pos += 1; // consume '{'
-        let mut fields = Vec::new();
-        self.skip_ws();
-        if self.bytes.get(self.pos) == Some(&b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(fields));
-        }
-        loop {
-            self.skip_ws();
-            if self.bytes.get(self.pos) != Some(&b'"') {
-                return Err(format!("expected object key at {}", self.pos));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.bytes.get(self.pos) != Some(&b':') {
-                return Err(format!("expected ':' after key `{key}` at {}", self.pos));
-            }
-            self.pos += 1;
-            let val = self.value()?;
-            fields.push((key, val));
-            self.skip_ws();
-            match self.bytes.get(self.pos) {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Obj(fields));
-                }
-                _ => return Err(format!("expected ',' or '}}' at {}", self.pos)),
-            }
-        }
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.pos += 1; // consume '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.bytes.get(self.pos) == Some(&b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            items.push(self.value()?);
-            self.skip_ws();
-            match self.bytes.get(self.pos) {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Arr(items));
-                }
-                _ => return Err(format!("expected ',' or ']' at {}", self.pos)),
-            }
         }
     }
 
@@ -261,5 +300,22 @@ mod tests {
     #[test]
     fn rejects_trailing_garbage() {
         assert!(Json::parse("{} junk").is_err());
+    }
+
+    /// F-L18-07 (review of 2026-08-30): a document nested past the depth
+    /// cap is a typed error, never a stack overflow.
+    #[test]
+    fn nesting_past_the_cap_is_a_typed_error() {
+        let deep = "[".repeat(200_000);
+        let err = Json::parse(&deep).expect_err("typed");
+        assert!(err.contains("nesting"), "{err}");
+        let deep = "{\"k\":".repeat(200_000);
+        let err = Json::parse(&deep).expect_err("typed");
+        assert!(err.contains("nesting"), "{err}");
+        // Exactly at the cap: legal; one past: refused.
+        let at_cap = format!("{}1{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(Json::parse(&at_cap).is_ok());
+        let past = format!("{}1{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        assert!(Json::parse(&past).expect_err("typed").contains("nesting"));
     }
 }

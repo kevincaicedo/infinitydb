@@ -518,6 +518,10 @@ struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     /// Accept completions that failed (F-L11-05): `INFO stats
     /// accept_errors`, never connection housekeeping.
     accept_errors: Cell<u64>,
+    /// Leaf ops dropped from a batch nested inside a batch (F-L18-06).
+    /// The codec refuses that shape on the wire, so this counts only an
+    /// in-process producer that bypassed it — a tripwire, not a stat.
+    nested_batch_ops_dropped: Cell<u64>,
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
     pubsub: RefCell<PubSubCell<ConnKey>>,
@@ -1644,6 +1648,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 cmd_pool_bytes: Cell::new(0),
                 recv_dropped: Cell::new(0),
                 accept_errors: Cell::new(0),
+                nested_batch_ops_dropped: Cell::new(0),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
@@ -3683,8 +3688,55 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
 /// into `scratch` (the fabric itself is borrowed by the drain — replies
 /// ship right after it ends). `orphans` counts gate-less replies for the
 /// fabric tripwire.
+///
+/// `Batch` is flattened exactly one level here and the leaf handler never
+/// recurses (F-L18-06, INFINITY_STYLE §Control flow): the bound is the
+/// plane's own, not only the codec's `CodecError::NestedBatch`.
 #[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
 fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    now: Nanos,
+    from: CellId,
+    op: Op<'_>,
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+    gated: &mut Vec<GatedReply>,
+    orphans: &mut u64,
+) {
+    match op {
+        Op::Batch { ops } => {
+            for leaf in ops {
+                handle_fabric_leaf(shared, now, from, leaf, scratch, staged, pubs, gated, orphans);
+            }
+        }
+        leaf => handle_fabric_leaf(shared, now, from, leaf, scratch, staged, pubs, gated, orphans),
+    }
+}
+
+/// Drops a batch found inside a batch without recursion: an explicit work
+/// list unwinds the tree and every leaf op is counted on
+/// `nested_batch_ops_dropped`. Never reached from the wire (the codec
+/// refuses the shape); an in-process producer that builds one loses its
+/// ops here instead of the plane's stack.
+fn drop_nested_batch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    ops: Vec<Op<'_>>,
+) {
+    let mut pending = ops;
+    let mut dropped = 0u64;
+    while let Some(op) = pending.pop() {
+        match op {
+            Op::Batch { ops } => pending.extend(ops),
+            _ => dropped += 1,
+        }
+    }
+    shared.nested_batch_ops_dropped.set(shared.nested_batch_ops_dropped.get() + dropped);
+}
+
+/// The non-recursive body of [`handle_fabric_op`]: one leaf op.
+#[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
+fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     now: Nanos,
     from: CellId,
@@ -3837,11 +3889,8 @@ fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 }
             }
         }
-        Op::Batch { ops } => {
-            for nested in ops {
-                handle_fabric_op(shared, now, from, nested, scratch, staged, pubs, gated, orphans);
-            }
-        }
+        // A batch inside a batch: the plane's own bound (F-L18-06).
+        Op::Batch { ops } => drop_nested_batch(shared, ops),
         // The M0 plane speaks Apply; a typed Write from a future peer gets
         // a typed refusal rather than silence.
         Op::Write { token, .. } => staged.push((from, token, StagedReply::Refused)),
@@ -4106,9 +4155,59 @@ fn flush_parse_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 /// The FABRIC-IN drain callback with apply-prefetch on: `Apply` ops stage
 /// (copy + hash + index-line prefetch) instead of executing inline; any
 /// other op flushes the stage first — an order barrier, so execution and
-/// reply order per source pair are exactly the inline path's.
+/// reply order per source pair are exactly the inline path's. `Batch` is
+/// flattened exactly one level, never recursed (F-L18-06).
 #[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
 fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Shared<O, F>,
+    now: Nanos,
+    from: CellId,
+    op: Op<'_>,
+    stage: &mut Vec<StagedApply>,
+    stage_bytes: &mut Vec<u8>,
+    scratch: &mut Vec<u8>,
+    staged: &mut Vec<(CellId, FabricToken, StagedReply)>,
+    pubs: &mut Vec<OwnerPub>,
+    gated: &mut Vec<GatedReply>,
+    orphans: &mut u64,
+) {
+    match op {
+        Op::Batch { ops } => {
+            for leaf in ops {
+                stage_or_handle_leaf(
+                    shared,
+                    now,
+                    from,
+                    leaf,
+                    stage,
+                    stage_bytes,
+                    scratch,
+                    staged,
+                    pubs,
+                    gated,
+                    orphans,
+                );
+            }
+        }
+        leaf => stage_or_handle_leaf(
+            shared,
+            now,
+            from,
+            leaf,
+            stage,
+            stage_bytes,
+            scratch,
+            staged,
+            pubs,
+            gated,
+            orphans,
+        ),
+    }
+}
+
+/// The non-recursive body of [`stage_or_handle`]: one leaf op.
+#[allow(clippy::too_many_arguments)] // the FABRIC-IN drain context, not an API surface
+fn stage_or_handle_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Shared<O, F>,
     now: Nanos,
     from: CellId,
@@ -4143,26 +4242,12 @@ fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             let off = stage_argv_block(stage_bytes, argv);
             stage.push(StagedApply { from, token, cmd, program, off, hash, db, has_key });
         }
-        Op::Batch { ops } => {
-            for nested in ops {
-                stage_or_handle(
-                    shared,
-                    now,
-                    from,
-                    nested,
-                    stage,
-                    stage_bytes,
-                    scratch,
-                    staged,
-                    pubs,
-                    gated,
-                    orphans,
-                );
-            }
-        }
+        // A batch inside a batch: nothing executes, so no order barrier —
+        // dropped whole and counted (F-L18-06).
+        Op::Batch { ops } => drop_nested_batch(shared, ops),
         other => {
             flush_apply_stage(shared, stage, stage_bytes, scratch, staged, pubs);
-            handle_fabric_op(shared, now, from, other, scratch, staged, pubs, gated, orphans);
+            handle_fabric_leaf(shared, now, from, other, scratch, staged, pubs, gated, orphans);
         }
     }
 }
@@ -8048,3 +8133,124 @@ mod conn_slab_tests {
 #[cfg(test)]
 #[path = "move_tests.rs"]
 mod move_tests;
+
+#[cfg(test)]
+mod fabric_batch_depth {
+    use std::rc::Rc;
+
+    use inf_fabric::{FabricToken, Mesh, MeshConfig, Op};
+    use inf_foundation::KeySlot;
+    use inf_store::{Keyspace, StoreConfig};
+
+    use super::{
+        CellId, Nanos, NodeInfo, NoopObserver, ServerPlane, handle_fabric_op, stage_or_handle,
+    };
+
+    /// F-L18-06 (review of 2026-08-30): the data plane never recurses on
+    /// `Op::Batch`. The codec refuses a nested batch on the wire
+    /// (`CodecError::NestedBatch`); this proves the plane holds the bound
+    /// on its own — an in-process nested batch (a future sim backend, a
+    /// batching optimisation) is dropped whole and counted, on both the
+    /// inline and the apply-prefetch drain paths. Pre-fix: each level of
+    /// nesting was one more `handle_fabric_op` frame — 100 000 deep
+    /// overflowed the stack.
+    #[test]
+    fn a_nested_batch_is_dropped_whole_never_recursed() {
+        const DEPTH: usize = 100_000;
+        let mut fabrics = Mesh::new(2, MeshConfig::default());
+        let fabric = fabrics.remove(0);
+        let plane = ServerPlane::<_, crate::StdSegmentFs>::new(
+            CellId(0),
+            2,
+            -1,
+            Keyspace::new(StoreConfig::default()),
+            fabric,
+            Rc::new(NodeInfo::default()),
+            NoopObserver,
+            false,
+        );
+        let shared = &plane.shared;
+        let key: &[u8] = b"k";
+        let nested = |depth: usize| {
+            let mut op = Op::Read { token: FabricToken(7), slot: KeySlot::of_key(key), key };
+            for _ in 0..depth {
+                op = Op::Batch { ops: vec![op] };
+            }
+            op
+        };
+        for prefetch in [false, true] {
+            let (mut scratch, mut staged, mut pubs, mut gated, mut orphans) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0u64);
+            let (mut stage, mut stage_bytes) = (Vec::new(), Vec::new());
+            let op = nested(DEPTH);
+            if prefetch {
+                stage_or_handle(
+                    shared,
+                    Nanos(0),
+                    CellId(1),
+                    op,
+                    &mut stage,
+                    &mut stage_bytes,
+                    &mut scratch,
+                    &mut staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+            } else {
+                handle_fabric_op(
+                    shared,
+                    Nanos(0),
+                    CellId(1),
+                    op,
+                    &mut scratch,
+                    &mut staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+            }
+            assert!(staged.is_empty() && stage.is_empty(), "prefetch={prefetch}: {}", staged.len());
+            let dropped = shared.nested_batch_ops_dropped.get();
+            assert_eq!(dropped, if prefetch { 2 } else { 1 }, "one leaf per nested tree");
+            // The legal shape still executes: one level, one leaf, one reply.
+            let op = nested(1);
+            if prefetch {
+                stage_or_handle(
+                    shared,
+                    Nanos(0),
+                    CellId(1),
+                    op,
+                    &mut stage,
+                    &mut stage_bytes,
+                    &mut scratch,
+                    &mut staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+                super::flush_apply_stage(
+                    shared,
+                    &mut stage,
+                    &mut stage_bytes,
+                    &mut scratch,
+                    &mut staged,
+                    &mut pubs,
+                );
+            } else {
+                handle_fabric_op(
+                    shared,
+                    Nanos(0),
+                    CellId(1),
+                    op,
+                    &mut scratch,
+                    &mut staged,
+                    &mut pubs,
+                    &mut gated,
+                    &mut orphans,
+                );
+            }
+            assert_eq!(staged.len(), 1, "prefetch={prefetch}");
+        }
+    }
+}

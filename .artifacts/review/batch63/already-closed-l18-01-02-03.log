@@ -1,0 +1,16 @@
+test ns::tests::blob_threshold_default_derives_from_the_ring ... ok
+test ns::tests::tier_ranges_are_enforced ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 189 filtered out; finished in 0.00s
+test default_blob_threshold_derives_from_the_ring ... ok
+test inline_record_above_half_ring_refuses_typed ... ok
+test sub_floor_budget_refuses_at_the_spec_gauntlet ... ok
+test legacy_catalog_threshold_normalizes_at_seed ... ok
+test blob_stall_probe_never_sizes_from_the_value ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test rv_f_l05_01_incr_rejects_an_over_long_key_without_panicking ... ok
+test rv_f_l05_01_incrbyfloat_rejects_an_over_long_key_without_panicking ... ok
+test rv_f_l05_01_set_rejects_an_over_long_key_without_panicking ... ok
+test rv_f_l05_01_the_boundary_is_exactly_255_bytes ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test ns_create_sub_floor_budget_refuses_typed_and_node_survives ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 91 filtered out; finished in 0.01s

@@ -1,0 +1,4 @@
+exit=-6 depth=400000
+thread 'main' (18649) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+RED (the CLI aborted on a stack overflow)

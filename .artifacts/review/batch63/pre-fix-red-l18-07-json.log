@@ -1,0 +1,6 @@
+thread 'json::tests::nesting_past_the_cap_is_a_typed_error' (17472) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+error: test failed, to rerun pass `-p inf-compare --bin inf-compare`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/inf_compare-cd741dd7feefa007 'json::tests::nesting_past'` (signal: 6, SIGABRT: process abort signal)

@@ -1,0 +1,8 @@
+running 1 test
+
+thread 'reply::tests::nesting_past_the_cap_is_a_typed_protocol_error' (17293) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+error: test failed, to rerun pass `-p inf --bin inf`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/inf-891d18c51ac4cdc7 'reply::tests::nesting_past'` (signal: 6, SIGABRT: process abort signal)

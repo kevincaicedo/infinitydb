@@ -1,0 +1,3 @@
+exit=1 depth=400000
+(error) protocol error: reply nesting exceeds 32
+PASS (typed protocol error)

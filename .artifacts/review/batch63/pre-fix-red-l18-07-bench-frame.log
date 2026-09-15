@@ -1,0 +1,6 @@
+thread 'resp::tests::framing_past_the_cap_is_refused' (17715) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+error: test failed, to rerun pass `-p inf-bench --bin inf-bench`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/inf_bench-adf6455d9b4cbaf3 'resp::tests::framing_past'` (signal: 6, SIGABRT: process abort signal)

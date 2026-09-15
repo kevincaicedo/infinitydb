@@ -39,6 +39,15 @@ jobs:
           # Group 0 item 3 (review of 2026-08-30, §5.5 / the C3 lesson):
           # the whole command registry under adversarial argv shapes.
           - { dir: crates/inf-server, target: command_surface }
+          # F-L18-07 (review of 2026-08-30, batch 63): every parser in
+          # `bins/` — the CLI's reply decoder, the competitive harness's
+          # JSON reader and RESP framer, the load generator's framer, and
+          # the sim clients' framer. Iterative, depth-capped, fuzzed.
+          - { dir: bins/inf, target: cli_reply_parse }
+          - { dir: bins/inf-compare, target: memtier_json_parse }
+          - { dir: bins/inf-compare, target: compare_resp_frame }
+          - { dir: bins/inf-bench, target: bench_resp_frame }
+          - { dir: bins/inf-sim, target: sim_resp_frame }
           # Seeds the pinned first_lsn-offset-ceiling regression (this target
           # found it on the 08-17 night; ADR-0072, readiness F35).
           - { dir: crates/inf-log, target: frame_decode, seeds: fuzz/corpora/frame_decode }

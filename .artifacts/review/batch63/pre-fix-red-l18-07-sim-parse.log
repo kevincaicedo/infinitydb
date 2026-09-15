@@ -1,0 +1,6 @@
+thread 'resp::tests::parsing_past_the_cap_panics_typed' (18597) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+error: test failed, to rerun pass `-p inf-sim --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/kcaicedo/Documents/Projects/databases/infinitydb/target/debug/deps/inf_sim-7a26447881a6726c 'resp::tests::parsing_past_the_cap'` (signal: 6, SIGABRT: process abort signal)
