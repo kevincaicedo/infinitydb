@@ -1,0 +1,12 @@
+after writes: demote_slices 29 sealed_bytes 30413926 cold_reads_issued 0
+2200 writer connections open
+round 0: 0.107s cold reads +66 cold_pool_dry 2
+round 1: 0.091s cold reads +66 cold_pool_dry 3
+round 2: 0.090s cold reads +66 cold_pool_dry 4
+round 3: 0.090s cold reads +66 cold_pool_dry 5
+round 4: 0.091s cold reads +66 cold_pool_dry 6
+round 5: 0.091s cold reads +66 cold_pool_dry 7
+round 6: 0.096s cold reads +66 cold_pool_dry 8
+round 7: 0.090s cold reads +66 cold_pool_dry 9
+cold_reads_issued 528 cold_pool_dry 9 inflight 0 io_budget_ops_cold_read_foreground 528 (maintain 0)
+VERDICT: PASS (ops = reads issued with cold_pool_dry = 9; every stall refunded its op)

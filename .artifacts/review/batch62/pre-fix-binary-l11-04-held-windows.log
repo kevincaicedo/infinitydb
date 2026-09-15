@@ -1,0 +1,12 @@
+after writes: demote_slices 29 sealed_bytes 30413926 cold_reads_issued 0
+2200 writer connections open
+round 0: 0.111s cold reads +66 cold_pool_dry 2
+round 1: 0.090s cold reads +66 cold_pool_dry 4
+round 2: 0.089s cold reads +66 cold_pool_dry 5
+round 3: 0.090s cold reads +66 cold_pool_dry 6
+round 4: 0.090s cold reads +66 cold_pool_dry 7
+round 5: 0.091s cold reads +66 cold_pool_dry 8
+round 6: 0.090s cold reads +66 cold_pool_dry 9
+round 7: 0.090s cold reads +66 cold_pool_dry 10
+cold_reads_issued 528 cold_pool_dry 10 inflight 0 io_budget_ops_cold_read_foreground 538 (maintain 0)
+VERDICT: RED (ops drift by exactly cold_pool_dry = 10)

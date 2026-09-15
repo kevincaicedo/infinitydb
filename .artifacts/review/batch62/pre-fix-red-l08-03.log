@@ -1,0 +1,23 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+   Compiling inf-query v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-query)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.99s
+     Running tests/count_paging.rs (target/debug/deps/count_paging-f2a893d2de198768)
+
+running 1 test
+test a_mis_sized_resume_key_is_a_typed_error_not_a_panic ... FAILED
+
+failures:
+
+---- a_mis_sized_resume_key_is_a_typed_error_not_a_panic stdout ----
+
+thread 'a_mis_sized_resume_key_is_a_typed_error_not_a_panic' (755196) panicked at crates/inf-store/src/ordered.rs:197:9:
+Fixed8 keys are exactly 8 bytes
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_mis_sized_resume_key_is_a_typed_error_not_a_panic
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-query --test count_paging`

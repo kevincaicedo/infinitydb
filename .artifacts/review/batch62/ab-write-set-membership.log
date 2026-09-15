@@ -1,0 +1,13 @@
+N=     1  linear ns [min med max]         29         30        157   sort+bsearch ns [min med max]       28       30       72
+N=    16  linear ns [min med max]         87        112        358   sort+bsearch ns [min med max]      161      223      459
+N=   256  linear ns [min med max]      13070      14303      15800   sort+bsearch ns [min med max]     4923     5684    11381
+N=  4096  linear ns [min med max]    1435122    1436893    3291323   sort+bsearch ns [min med max]    86595    92949   145754
+N= 10000  linear ns [min med max]    8418849    8458440    9425960   sort+bsearch ns [min med max]   290682   315052   342197
+N=     1  linear ns [min med max]         29         30        176   hybrid(32) ns [min med max]       27       29       58
+N=    16  linear ns [min med max]         86        111        366   hybrid(32) ns [min med max]       89      123      412
+N=    32  linear ns [min med max]        239        249        519   hybrid(32) ns [min med max]      269      313      601
+N=    33  linear ns [min med max]        252        263        308   hybrid(32) ns [min med max]      473      491     1312
+N=    64  linear ns [min med max]        835        976       1320   hybrid(32) ns [min med max]      994     1074     1349
+N=   256  linear ns [min med max]      12958      13933      15466   hybrid(32) ns [min med max]     4934     5100     6354
+N=  4096  linear ns [min med max]    1488307    3291146    3295341   hybrid(32) ns [min med max]   100352   135896   144874
+N= 10000  linear ns [min med max]    8489417    8675450    8825592   hybrid(32) ns [min med max]   298938   311208   352420

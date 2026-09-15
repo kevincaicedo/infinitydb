@@ -1,0 +1,22 @@
+   Compiling inf-store v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-store)
+    Finished `release` profile [optimized + debuginfo] target(s) in 23.80s
+     Running unittests src/lib.rs (target/release/deps/inf_store-5b965241bcb7bbe7)
+
+running 1 test
+test ordered::tests::heap_full_borrow_never_overflows_the_merge ... FAILED
+
+failures:
+
+---- ordered::tests::heap_full_borrow_never_overflows_the_merge stdout ----
+
+thread 'ordered::tests::heap_full_borrow_never_overflows_the_merge' (754144) panicked at crates/inf-store/src/ordered.rs:1142:22:
+range end index 11 out of range for slice of length 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ordered::tests::heap_full_borrow_never_overflows_the_merge
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-store --lib`

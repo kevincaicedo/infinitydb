@@ -47,6 +47,10 @@ pub const BRACKET_ENTRY_CAP: usize = 65_536;
 pub const SCRATCH_RETAIN_BYTES: usize = 64 << 10;
 /// Entries per scratch set past which the set shrinks back.
 pub const SCRATCH_RETAIN_ENTRIES: usize = 4096;
+/// Write sets up to this many keys are scanned linearly per death;
+/// wider ones are sorted at bracket open and binary-searched (the
+/// crossover measured between 64 and 256 keys — batch 62 A/B).
+const WRITE_SET_LINEAR_MAX: usize = 64;
 
 /// Why the bracket pre-half refused the mutation (typed, mapped to a
 /// RESP error at the command layer — ADR-0072 D7.1: nothing changed).
@@ -133,7 +137,7 @@ mod imp {
 
     use super::{
         BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode, SCRATCH_RETAIN_BYTES,
-        SCRATCH_RETAIN_ENTRIES,
+        SCRATCH_RETAIN_ENTRIES, WRITE_SET_LINEAR_MAX,
     };
     use crate::doc;
     use crate::index_key::{IndexKeyBuf, IndexKeyType, IndexScalar, index_key_encode};
@@ -210,6 +214,18 @@ mod imp {
                 + (self.write_hashes.capacity() * size_of::<u64>()) as u64
         }
 
+        /// Write-set membership: a linear scan up to
+        /// `WRITE_SET_LINEAR_MAX` (the sort costs more than it saves
+        /// there), a binary search over the sorted set beyond it.
+        #[inline]
+        fn in_write_set(&self, hash: u64) -> bool {
+            if self.write_hashes.len() <= WRITE_SET_LINEAR_MAX {
+                self.write_hashes.contains(&hash)
+            } else {
+                self.write_hashes.binary_search(&hash).is_ok()
+            }
+        }
+
         /// Shrinks any buffer a pathological document grew past the
         /// retention bound (ADR-0076 A1) — a capacity compare per
         /// buffer on the common path, a reallocation only past it.
@@ -266,7 +282,7 @@ mod imp {
         /// key.
         #[inline]
         pub(crate) fn death_hook_wanted(&self, hash: u64) -> bool {
-            self.active && !(self.scratch.open && self.scratch.write_hashes.contains(&hash))
+            self.active && !(self.scratch.open && self.scratch.in_write_set(hash))
         }
 
         #[inline]
@@ -575,7 +591,14 @@ mod imp {
             Ok(())
         }
 
+        /// Opens the bracket over the noted write set; a wide set is
+        /// sorted once so the per-death membership test is a binary
+        /// search (a `DEL` of N keys was N² hash compares; the A/B is
+        /// in the batch-62 ledger entry).
         fn open(&mut self) {
+            if self.scratch.write_hashes.len() > WRITE_SET_LINEAR_MAX {
+                self.scratch.write_hashes.sort_unstable();
+            }
             self.scratch.open = true;
         }
 
@@ -1074,6 +1097,35 @@ mod tests {
 
     fn program(text: &str) -> PathProgram {
         compile(text.as_bytes()).expect("valid path")
+    }
+
+    /// The bracket's write-set exclusion holds on both membership paths
+    /// (review L08, perf/DX): a set past `WRITE_SET_LINEAR_MAX` is
+    /// sorted at open and binary-searched; a set within it is scanned.
+    /// Every noted key is excluded from the death hook, every other key
+    /// is not — on both sides of the crossover.
+    #[test]
+    fn write_set_exclusion_holds_across_the_membership_crossover() {
+        use super::WRITE_SET_LINEAR_MAX;
+        use crate::index_key::IndexKeyType;
+        use crate::index_registry::IndexId;
+        use crate::store::{CellStore, StoreConfig};
+        let mut store = CellStore::new(StoreConfig::default());
+        store.idx.install(IndexId(1), 1, IndexKeyType::I64, program("$.n").as_bytes());
+        for n in [1usize, WRITE_SET_LINEAR_MAX, WRITE_SET_LINEAR_MAX + 1, 4 * WRITE_SET_LINEAR_MAX]
+        {
+            let names: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+            let keys: Vec<&[u8]> = names.iter().map(|k| k.as_bytes()).collect();
+            store.idx_bracket_begin(&keys, None).expect("headroom");
+            assert!(store.idx.bracket_open());
+            for key in &keys {
+                let hash = store.hash_key(key);
+                assert!(!store.idx.death_hook_wanted(hash), "noted key excluded (n = {n})");
+            }
+            let other = store.hash_key(b"not-in-the-set");
+            assert!(store.idx.death_hook_wanted(other), "foreign key hooked (n = {n})");
+            store.idx_bracket_abort();
+        }
     }
 
     /// ADR-0076 A1 (review L07, perf/DX): a pathological wildcard

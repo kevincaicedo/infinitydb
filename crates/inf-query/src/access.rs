@@ -392,7 +392,8 @@ fn encode_edge(
 /// Fixed8 key types carry exactly 8 edge bytes — a mis-sized bound is
 /// corrupt, never a shorter range (ADR-0080 D2.1). Utf8 edges may be
 /// prefix images/successors, so anything in 1..=`ORDERED_KEY_MAX` goes.
-fn edge_len_ok(len: usize, key_type: IndexKeyType) -> bool {
+/// The pager's resume key obeys the same rule (A2).
+pub(crate) fn edge_len_ok(len: usize, key_type: IndexKeyType) -> bool {
     if key_type.fixed8() { len == 8 } else { (1..=ORDERED_KEY_MAX).contains(&len) }
 }
 
