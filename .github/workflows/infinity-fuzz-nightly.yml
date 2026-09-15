@@ -49,7 +49,7 @@ jobs:
           - { dir: bins/inf-bench, target: bench_resp_frame }
           - { dir: bins/inf-sim, target: sim_resp_frame }
           # Seeds the pinned first_lsn-offset-ceiling regression (this target
-          # found it on the 08-17 night; ADR-0072, readiness F35).
+          # found it on the 08-17 night; ADR-0126, readiness F35).
           - { dir: crates/inf-log, target: frame_decode, seeds: fuzz/corpora/frame_decode }
           - { dir: crates/inf-log, target: segment_read }
           - { dir: crates/inf-log, target: ick_decode }

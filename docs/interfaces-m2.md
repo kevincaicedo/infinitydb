@@ -173,7 +173,7 @@ write per frame is the point). `frame_len` excludes the padding;
   ADR-0054 D2 `align_offset` shape — no unsafe); `resident_bytes` =
   2 × (capacity + 8 KiB).
 
-## `first_lsn` bound — post-M2-exit amendment (ADR-0072, 2026-08-17)
+## `first_lsn` bound — post-M2-exit amendment (ADR-0126, 2026-08-17)
 
 Post-exit change to a frozen surface, ADR-gated per the freeze discipline.
 The nightly `frame_decode` campaign found that `first_lsn.offset` was read
@@ -184,11 +184,11 @@ from the header and never bounded: a CRC-valid frame declaring
 - **The derivation is per-version.** `first record = frame base +
   header_len` — 20 for v1, 40 for v2. ADR-0011 D2's text says "frame base
   + 20", which is v1-era wording from before ADR-0031's 40-byte v2 header;
-  ADR-0072 D1 restates it. **Cite `header_len`, never the constant 20.**
+  ADR-0126 D1 restates it. **Cite `header_len`, never the constant 20.**
 - **`decode_frame` bounds the field** where it is read, for both formats:
   `header_len ≤ first_lsn.offset` and `(first_lsn.offset − header_len) +
   extent ≤ u32::MAX`, where `extent` is the frame's **on-device extent**
-  — `frame_len` for v1/v2, `align_up(frame_len)` for v3 (ADR-0072 D1 as
+  — `frame_len` for v1/v2, `align_up(frame_len)` for v3 (ADR-0126 D1 as
   amended 2026-09-14, review F-L02-04: the successor address and every
   segment cursor advance by the padded extent, so that is what must fit).
   A v3 `frame_len` that cannot be padded inside a `u32` is `BadLength`;
@@ -198,7 +198,7 @@ from the header and never bounded: a CRC-valid frame declaring
 - **New public variant `FrameDecodeError::BadFirstLsn { offset: u32 }`** —
   corruption class, not the torn-tail class (`ZeroMagic` stays the only
   expected end-of-log signal). `FrameDecodeError` deliberately stays
-  exhaustive (no `#[non_exhaustive]`, ADR-0072 D3): the added variant is
+  exhaustive (no `#[non_exhaustive]`, ADR-0126 D3): the added variant is
   semver-breaking for external matchers, accepted pre-1.0 and revisited at
   1.0. Decoder error enums grow by ADR, each naming its semver impact.
 - The bound also makes `inf-server::recover`'s `first_lsn.offset −

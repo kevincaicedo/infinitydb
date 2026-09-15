@@ -85,17 +85,17 @@
 
   <div class="callout">
     <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
-    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-09-01. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
+    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on 2026-09-15. Upstream regenerate: <code>INF_REGEN_MATRIX=1 cargo test -p compat --test matrix_artifact</code> (CI fails when this file is stale — the release pipeline inherits that refusal).
   </div>
 
   <div class="stat-row">
-    <div class="stat"><div class="v">90</div><div class="l">commands declared</div></div>
+    <div class="stat"><div class="v">91</div><div class="l">commands declared</div></div>
     <div class="stat"><div class="v">54</div><div class="l">full</div></div>
     <div class="stat"><div class="v">32</div><div class="l">partial</div></div>
     <div class="stat"><div class="v">2</div><div class="l">extension</div></div>
-    <div class="stat"><div class="v">2</div><div class="l">internal</div></div>
+    <div class="stat"><div class="v">3</div><div class="l">internal</div></div>
   </div>
-  <p class="mono-note">CORPUS: 562 byte-compared executions · 59 documented deviations · 0 tolerated failures &middot; SURFACE: 90 commands — 54 full · 32 partial · 0 stub · 2 extension · 2 internal</p>
+  <p class="mono-note">CORPUS: 654 byte-compared executions · 64 documented deviations · 0 tolerated failures &middot; SURFACE: 91 commands — 54 full · 32 partial · 0 stub · 2 extension · 3 internal</p>
 
   <h2 style="margin-top:40px">Status vocabulary</h2>
   <ul>
@@ -108,11 +108,11 @@
 
   <h2>Commands</h2>
   <div class="filters" role="group" aria-label="Filter by status">
-    <button data-f="all" aria-pressed="true">ALL (90)</button>
+    <button data-f="all" aria-pressed="true">ALL (91)</button>
     <button data-f="full" aria-pressed="false">FULL (54)</button>
     <button data-f="partial" aria-pressed="false">PARTIAL (32)</button>
     <button data-f="extension" aria-pressed="false">EXTENSION (2)</button>
-    <button data-f="internal" aria-pressed="false">INTERNAL (2)</button>
+    <button data-f="internal" aria-pressed="false">INTERNAL (3)</button>
   </div>
   <div class="table-wrap">
     <table class="data" id="matrix">
@@ -124,40 +124,40 @@
         <tr data-status="full"><td><code>ECHO</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">fast</td><td>2</td><td>3</td><td></td></tr>
         <tr data-status="full"><td><code>HELLO</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">fast</td><td>-1</td><td>1</td><td>identity fields (server/version) are InfinityDB's own, as for any non-Redis server</td></tr>
         <tr data-status="partial"><td><code>QUIT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">fast</td><td>1</td><td>0</td><td>replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite</td></tr>
-        <tr data-status="full"><td><code>GET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>27</td><td></td></tr>
-        <tr data-status="full"><td><code>SET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>-3</td><td>73</td><td></td></tr>
+        <tr data-status="full"><td><code>GET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>30</td><td></td></tr>
+        <tr data-status="full"><td><code>SET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>-3</td><td>105</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by <code>proto-max-bulk-len</code> (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122)</td></tr>
         <tr data-status="full"><td><code>SETNX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
-        <tr data-status="full"><td><code>SETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td></td></tr>
-        <tr data-status="full"><td><code>PSETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>2</td><td></td></tr>
+        <tr data-status="full"><td><code>SETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>6</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>PSETEX</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
         <tr data-status="full"><td><code>GETSET</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
         <tr data-status="full"><td><code>GETDEL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>2</td><td>2</td><td></td></tr>
         <tr data-status="full"><td><code>DEL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write</td><td>-2</td><td>4</td><td></td></tr>
-        <tr data-status="full"><td><code>EXISTS</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>-2</td><td>10</td><td></td></tr>
+        <tr data-status="full"><td><code>EXISTS</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>-2</td><td>18</td><td></td></tr>
         <tr data-status="full"><td><code>TYPE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>4</td><td>only the string type exists until M3</td></tr>
         <tr data-status="full"><td><code>INCR</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>2</td><td>8</td><td></td></tr>
         <tr data-status="full"><td><code>DECR</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>2</td><td>2</td><td></td></tr>
         <tr data-status="full"><td><code>INCRBY</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>3</td><td></td></tr>
         <tr data-status="full"><td><code>DECRBY</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>2</td><td></td></tr>
-        <tr data-status="full"><td><code>APPEND</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>4</td><td></td></tr>
+        <tr data-status="full"><td><code>APPEND</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write denyoom fast</td><td>3</td><td>4</td><td>bulk values are bounded by <code>proto-max-bulk-len</code> (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built (F-L13-04)</td></tr>
         <tr data-status="full"><td><code>STRLEN</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td></td></tr>
-        <tr data-status="full"><td><code>EXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>17</td><td>TTLs ≥ ~34.8 years clamp to the u40 record bound</td></tr>
-        <tr data-status="full"><td><code>PEXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>1</td><td>same u40 clamp</td></tr>
-        <tr data-status="full"><td><code>TTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>18</td><td></td></tr>
-        <tr data-status="full"><td><code>PTTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>3</td><td></td></tr>
+        <tr data-status="full"><td><code>EXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>21</td><td>TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>PEXPIRE</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>-3</td><td>4</td><td>same u40 clamp</td></tr>
+        <tr data-status="full"><td><code>TTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>23</td><td>a clamped deadline reads as the u40 bound (ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>PTTL</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">readonly fast</td><td>2</td><td>3</td><td>a clamped deadline reads as the u40 bound (ADR-0111)</td></tr>
         <tr data-status="full"><td><code>PERSIST</code></td><td><span class="st st-full">full</span></td><td>M0</td><td class="faint">write fast</td><td>2</td><td>3</td><td></td></tr>
-        <tr data-status="partial"><td><code>INFO</code></td><td><span class="st st-partial">partial</span></td><td>M0</td><td class="faint">admin</td><td>-1</td><td>0</td><td>sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC)</td></tr>
+        <tr data-status="partial"><td><code>INFO</code></td><td><span class="st st-partial">partial</span></td><td>M0</td><td class="faint">admin</td><td>-1</td><td>1</td><td>sections + field vocabulary present; every name appears once per reply — <code># Memory</code> and <code># Keyspace</code> are the node fold (<code>memory_scope</code>/<code>keyspace_scope</code>, the attribution family under <code>used_memory_*</code>, <code>used_memory_pool</code> = the figure <code>maxmemory</code> compares against (ADR-0068 A2), the process-wide <code>process_rss</code>; <code># Keyspace</code> lags a peer's publish by ≤ one period, <code>DBSIZE</code> is exact), <code># Stats</code> carries <code>expiry_debt_ms</code> (the worst wheel debt across every store, F-L05-03); <code># Persistence</code>/<code># Tiering</code>/<code># Tripwires</code> are this cell's slice only (<code>tripwire_scope:cell</code>; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC</td></tr>
         <tr data-status="partial"><td><code>COMMAND</code></td><td><span class="st st-partial">partial</span></td><td>M0</td><td class="faint">admin</td><td>-1</td><td>3</td><td>COMMAND DOCS is an honest empty map; the registry covers the implemented surface only</td></tr>
         <tr data-status="full"><td><code>MGET</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>-2</td><td>4</td><td></td></tr>
-        <tr data-status="full"><td><code>MSET</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>3</td><td></td></tr>
+        <tr data-status="full"><td><code>MSET</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>3</td><td>bulk values are bounded by <code>proto-max-bulk-len</code> (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB)</td></tr>
         <tr data-status="partial"><td><code>MSETNX</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>3</td><td>cross-cell keys are check-then-set until M4 transactions; single-cell exact</td></tr>
         <tr data-status="full"><td><code>GETRANGE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>4</td><td>8</td><td></td></tr>
-        <tr data-status="full"><td><code>SETRANGE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td>values bound at 16 MiB − 1 (record format v0)</td></tr>
-        <tr data-status="full"><td><code>GETEX</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>8</td><td></td></tr>
+        <tr data-status="full"><td><code>SETRANGE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write denyoom</td><td>4</td><td>4</td><td>values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis (F-L13-04)</td></tr>
+        <tr data-status="full"><td><code>GETEX</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>25</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
         <tr data-status="partial"><td><code>INCRBYFLOAT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom fast</td><td>3</td><td>6</td><td>computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ</td></tr>
         <tr data-status="full"><td><code>SUBSTR</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly</td><td>4</td><td>1</td><td></td></tr>
-        <tr data-status="partial"><td><code>RENAME</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write</td><td>3</td><td>2</td><td>cross-owner pairs run as a two-cell fabric program — atomic per cell, not across cells until M4; same-owner pairs exact</td></tr>
-        <tr data-status="partial"><td><code>RENAMENX</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write fast</td><td>3</td><td>3</td><td>same cross-owner window as RENAME</td></tr>
-        <tr data-status="partial"><td><code>COPY</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>12</td><td>same cross-owner window as RENAME; TTL transfers as relative ms across cells</td></tr>
+        <tr data-status="partial"><td><code>RENAME</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write</td><td>3</td><td>3</td><td>cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6</td></tr>
+        <tr data-status="partial"><td><code>RENAMENX</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write fast</td><td>3</td><td>5</td><td>same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source</td></tr>
+        <tr data-status="partial"><td><code>COPY</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write denyoom</td><td>-3</td><td>12</td><td>cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME</td></tr>
         <tr data-status="full"><td><code>TOUCH</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>-2</td><td>1</td><td></td></tr>
         <tr data-status="full"><td><code>UNLINK</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>1</td><td></td></tr>
         <tr data-status="full"><td><code>DBSIZE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>1</td><td>5</td><td></td></tr>
@@ -167,14 +167,14 @@
         <tr data-status="full"><td><code>FLUSHDB</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write</td><td>-1</td><td>4</td><td></td></tr>
         <tr data-status="partial"><td><code>FLUSHALL</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">write</td><td>-1</td><td>2</td><td>atomic per cell, eventually complete across cells within one scatter round (no global pause)</td></tr>
         <tr data-status="partial"><td><code>OBJECT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>11</td><td>IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate</td></tr>
-        <tr data-status="partial"><td><code>DEBUG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>3</td><td>subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; SLEEP stalls one cell, never the node</td></tr>
-        <tr data-status="full"><td><code>EXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>6</td><td></td></tr>
-        <tr data-status="full"><td><code>PEXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>1</td><td></td></tr>
-        <tr data-status="full"><td><code>EXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td></td></tr>
-        <tr data-status="full"><td><code>PEXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>4</td><td></td></tr>
+        <tr data-status="partial"><td><code>DEBUG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>3</td><td>subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never the node</td></tr>
+        <tr data-status="full"><td><code>EXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>10</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>PEXPIREAT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">write fast</td><td>-3</td><td>3</td><td>deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>EXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>5</td><td>a clamped deadline reads as the u40 bound (ADR-0111)</td></tr>
+        <tr data-status="full"><td><code>PEXPIRETIME</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>4</td><td>a clamped deadline reads as the u40 bound (ADR-0111)</td></tr>
         <tr data-status="full"><td><code>SELECT</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>2</td><td>7</td><td></td></tr>
-        <tr data-status="partial"><td><code>CONFIG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>34</td><td>typed M1 key subset with frozen hot-reload classes</td></tr>
-        <tr data-status="partial"><td><code>CLIENT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>5</td><td>KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture</td></tr>
+        <tr data-status="partial"><td><code>CONFIG</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>40</td><td>typed M1 key subset with frozen hot-reload classes; <code>proto-max-bulk-len</code> defaults to 16 MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next MAINTAIN (ADR-0122); <code>maxclients</code> is divided per cell like <code>maxmemory</code> (a full cell refuses with Redis's error while a sibling may have headroom), <code>timeout</code> closes idle unsubscribed connections at MAINTAIN resolution, <code>tcp-keepalive</code> applies to connections accepted after the change (ADR-0123); <code>client-output-buffer-limit</code> enforces <code>normal</code> and <code>pubsub</code>, the <code>slave</code> class is accepted and inert until M9 replicas exist; <code>save</code>/<code>appendonly</code> are accepted and inert (no RDB/AOF)</td></tr>
+        <tr data-status="partial"><td><code>CLIENT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>5</td><td>KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, resp, db, sub, psub) — addr/fd are placeholders until peername capture, and idle/cmd/tot-*/buffer gauges are untracked zeros</td></tr>
         <tr data-status="partial"><td><code>LOLWUT</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-1</td><td>0</td><td>the whole reply is version art (nothing byte-comparable by design)</td></tr>
         <tr data-status="full"><td><code>SUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-2</td><td>5</td><td></td></tr>
         <tr data-status="full"><td><code>UNSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-1</td><td>5</td><td>bare-form confirmations emit in subscription order (Redis: dict order)</td></tr>
@@ -182,12 +182,13 @@
         <tr data-status="full"><td><code>PUNSUBSCRIBE</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>-1</td><td>3</td><td>same bare-form ordering note as UNSUBSCRIBE</td></tr>
         <tr data-status="full"><td><code>PUBLISH</code></td><td><span class="st st-full">full</span></td><td>M1</td><td class="faint">fast</td><td>3</td><td>4</td><td></td></tr>
         <tr data-status="partial"><td><code>PUBSUB</code></td><td><span class="st st-partial">partial</span></td><td>M1</td><td class="faint">readonly</td><td>-2</td><td>8</td><td>SHARDCHANNELS / SHARDNUMSUB arrive with sharded pub/sub (M3 cut line)</td></tr>
-        <tr data-status="extension"><td><code>INF.NS</code></td><td><span class="st st-ext">extension</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>0</td><td>namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; M4-S26 lifts the D8 <code>USE</code> refusal — the string family, <code>SCAN</code>, and <code>DBSIZE</code> serve tiered namespaces; two extension error classes are live on their writes: <code>DISKFULL …</code> (ADR-0063 — disk budget or device full; new-tier-byte placements only) and <code>STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)</code> (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the <code>EXPIRE</code> family + <code>SET</code> expiry options refuse typed; <code>TTL</code> = -1 for live keys), non-string families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): <code>MAXMEMORY</code>/<code>EVICTION</code> on named *memory* namespaces are enforced and Hot via <code>SET</code> (<code>inherit</code>/<code>0</code> reset them); a namespace with its own budget answers the Redis-exact OOM error scoped to that namespace and reclaims only its own keys; durable and tiered namespaces refuse both keys typed (tiered budgets belong to <code>MEM-BUDGET</code>)</td></tr>
+        <tr data-status="extension"><td><code>INF.NS</code></td><td><span class="st st-ext">extension</span></td><td>M1</td><td class="faint">admin</td><td>-2</td><td>0</td><td>namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; M4-S26 lifts the D8 <code>USE</code> refusal — the string family, <code>SCAN</code>, and <code>DBSIZE</code> serve tiered namespaces; two extension error classes are live on their writes: <code>DISKFULL …</code> (ADR-0063 — disk budget or device full; new-tier-byte placements only) and <code>STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)</code> (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the <code>EXPIRE</code> family + <code>SET</code> expiry options refuse typed; <code>TTL</code> = -1 for live keys), non-string families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): <code>MAXMEMORY</code>/<code>EVICTION</code> on named *memory* namespaces are enforced and Hot via <code>SET</code> (<code>inherit</code>/<code>0</code> reset them); a namespace with its own budget answers the Redis-exact OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave the node <code>maxmemory</code> comparison — the node budget bounds the pool, numbered dbs + budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys typed (tiered budgets belong to <code>MEM-BUDGET</code>)</td></tr>
         <tr data-status="extension"><td><code>INF.CKPT</code></td><td><span class="st st-ext">extension</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new MANIFEST is durable — no fork, per-cell timing (ADR-0021)</td></tr>
         <tr data-status="partial"><td><code>BGSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">admin</td><td>-1</td><td>0</td><td>maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and moot; reply byte-identical; memory-only nodes answer a documented error</td></tr>
         <tr data-status="partial"><td><code>LASTSAVE</code></td><td><span class="st st-partial">partial</span></td><td>M2</td><td class="faint">readonly fast</td><td>1</td><td>0</td><td>unix seconds of the newest durable MANIFEST publication; 0 before the first (Redis reports process-start time); loading flag docs-derived, not capture-verified</td></tr>
-        <tr data-status="internal"><td><code>INF.TAKE</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">write fast</td><td>2</td><td>0</td><td>cross-cell RENAME/COPY program primitive</td></tr>
-        <tr data-status="internal"><td><code>INF.PEEK</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">readonly fast</td><td>2</td><td>0</td><td>cross-cell COPY program primitive</td></tr>
+        <tr data-status="internal"><td><code>INF.TAKE</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">write fast</td><td>-2</td><td>0</td><td>fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110)</td></tr>
+        <tr data-status="internal"><td><code>INF.PEEK</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">readonly fast</td><td>-2</td><td>0</td><td>fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110)</td></tr>
+        <tr data-status="internal"><td><code>INF.PUT</code></td><td><span class="st st-int">internal</span></td><td>M1</td><td class="faint">write</td><td>-4</td><td>0</td><td>fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: <code>key value deadline [NX]</code>, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment)</td></tr>
         <tr data-status="partial"><td><code>JSON.SET</code></td><td><span class="st st-partial">partial</span></td><td>M3</td><td class="faint">write denyoom</td><td>-4</td><td>32</td><td>S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records</td></tr>
         <tr data-status="partial"><td><code>JSON.GET</code></td><td><span class="st st-partial">partial</span></td><td>M3</td><td class="faint">readonly</td><td>-2</td><td>36</td><td>S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches</td></tr>
         <tr data-status="partial"><td><code>JSON.MGET</code></td><td><span class="st st-partial">partial</span></td><td>M3</td><td class="faint">readonly</td><td>-3</td><td>2</td><td>S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time)</td></tr>
@@ -223,9 +224,13 @@
       <li>identity fields differ; proto switch verified locally</li>
       <li>NOPROTO error text verified in unit tests</li>
     </ul>
+    <h3><code>PTTL</code></h3>
+    <ul>
+      <li>same u40 clamp — the remaining TTL is measured to the bound (ADR-0111)</li>
+    </ul>
     <h3><code>INFO</code></h3>
     <ul>
-      <li>section payloads differ (InfinityDB identity/tripwires); shape client-parseable</li>
+      <li>section payloads differ (InfinityDB identity/tripwires; run_id/master_replid are one 40-hex node identity, immutable for the process life — ADR-0124); shape client-parseable</li>
     </ul>
     <h3><code>COMMAND</code></h3>
     <ul>
@@ -257,6 +262,10 @@
       <li>removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)</li>
       <li>value-address/serialized-length fields are engine-internal</li>
     </ul>
+    <h3><code>PEXPIRETIME</code></h3>
+    <ul>
+      <li>deadlines ≥ ~34.8 years clamp to the u40 record bound — the read-back reports the bound, not Redis's i64 instant (ADR-0008, ADR-0111)</li>
+    </ul>
     <h3><code>CONFIG</code></h3>
     <ul>
       <li>InfinityDB returns the typed M1 key subset</li>
@@ -265,7 +274,7 @@
     </ul>
     <h3><code>CLIENT</code></h3>
     <ul>
-      <li>connection ids are engine-internal counters</li>
+      <li>connection ids are engine-internal (cell&lt;&lt;48|seq, ≥ 1, never reused — ADR-0124 D6)</li>
       <li>addr/fd/timing fields differ; field vocabulary matches</li>
     </ul>
     <h3><code>LOLWUT</code></h3>

@@ -106,6 +106,8 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+      - name: generated compatibility matrix is current
+        run: cargo test --locked -p compat --test matrix_artifact
       - name: build static binaries
         run: |
           cargo build --release --locked --target ${{ matrix.target }} -p infinityd -p inf

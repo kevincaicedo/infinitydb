@@ -1,9 +1,10 @@
-# InfinityDB workspace tasks. Run from infinity/.
+# InfinityDB workspace tasks. Run from infinitydb/ (the published repo root).
 
 default: check
 
 check:
     cargo fmt --all --check
+    ./scripts/check-doc-artifacts.sh
     ./scripts/check-dep-dag.sh
     ./scripts/check-cell-denylist.sh
     ./scripts/check-fault-points.sh

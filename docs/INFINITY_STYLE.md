@@ -236,6 +236,13 @@ should have measured (the nightly's `sim_seconds=` lines come from the
 virtual clocks that advanced), and a sweep recipe's exit status is the
 verdict of every shard.
 
+Documentation identities are checked too (ADR-0106 D15):
+`check-doc-artifacts.sh` enforces unique ADR numbers and the link to the
+one generated compatibility matrix when the parent governance checkout
+is present. Standalone workspace CI explicitly reports that the private
+parent documents are absent and unvalidated. The release job checks the
+matrix against its renderer before packaging it.
+
 ## Performance
 
 > "The lack of back-of-the-envelope performance sketches is the root of all

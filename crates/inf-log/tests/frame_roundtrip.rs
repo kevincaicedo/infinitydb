@@ -9,7 +9,7 @@ use inf_log::{
 };
 use proptest::prelude::*;
 
-/// ADR-0072 D1 as amended (review F-L02-04): a named `frame_decode`
+/// ADR-0126 D1 as amended (review F-L02-04): a named `frame_decode`
 /// corpus seed for the v3 padded-extent boundary — a CRC-valid aligned
 /// frame whose `frame_len` fits below the u32 ceiling from its base but
 /// whose padding does not, a shape random mutation almost never reaches.
