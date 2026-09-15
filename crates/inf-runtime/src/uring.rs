@@ -10,6 +10,11 @@
 //!   oneshot accept/recv re-armed internally with explicit driver-leased
 //!   buffers. Identical observable contract — the kernel-matrix CI job
 //!   asserts the correctness suite passes in both modes.
+//! - `INF_URING_NO_DEFER_TASKRUN=1` (diagnostic): start the setup-flag
+//!   fallback chain below `DEFER_TASKRUN`, the tier a pre-6.1 kernel lands
+//!   on. Without deferred task work the kernel posts CQEs between enters,
+//!   so a send's completion can land after its fd's close was queued —
+//!   the regime `tests/close_fd_reuse.rs` pins.
 //!
 //! ## Buffer lifecycle (the Vortex proof, carried)
 //! Modern mode **stages** recv buffers into the kernel's provided group —
@@ -75,10 +80,15 @@ enum OpState {
         buf: BufferId,
         len: u32,
         written: u32,
+        /// The `Close` op this send is charged to once its fd is closing
+        /// (F-L11-01): the kernel recycles the fd number the moment the
+        /// close runs, so a send outliving its close must resolve against
+        /// the close it belongs to — never the fd's current owner — and a
+        /// short write must not resubmit its remainder on that number.
+        closing: Option<u64>,
     },
-    Close {
-        fd: RawFd,
-    },
+    /// The close's wait lives in `closing` under this op's id.
+    Close,
     Cancel,
     /// One provided buffer in flight to the kernel group; on failure the
     /// staging unwinds to the pool.
@@ -156,10 +166,14 @@ struct AcceptArm {
     parked: Option<AcceptFailure>,
 }
 
+/// A `Close` awaiting its CQE and the sends it cancelled — keyed by the
+/// close op's own id, not the fd (F-L11-01: the number is reused by the
+/// next accept while these sends are still resolving).
 struct CloseWait {
     token: CompletionToken,
     close_seen: bool,
     close_result: i32,
+    sends_left: u32,
 }
 
 /// io_uring [`BackendDriver`]. See module docs.
@@ -173,10 +187,10 @@ pub struct UringDriver {
     next_id: u64,
     accepts: DriverMap<RawFd, AcceptArm>,
     recvs: DriverMap<RawFd, RecvArm>,
-    /// Outstanding sends per fd — `Closed` is delivered only after they
-    /// resolve (cancelled sends return their buffers first, per contract).
-    sends_inflight: DriverMap<RawFd, u32>,
-    closing: DriverMap<RawFd, CloseWait>,
+    /// Closes in flight by close op id — `Closed` is delivered only after
+    /// the sends the close cancelled resolve (their buffers return first,
+    /// per contract).
+    closing: DriverMap<u64, CloseWait>,
     /// Buffers currently owned by the kernel's provided group, by bid.
     /// CQE `buffer_select` ids resolve through this map — never minted.
     provided: DriverMap<u16, BufferId>,
@@ -228,7 +242,7 @@ impl UringDriver {
         // pressure was the M2.5-S01 mechanism-2 capture) must propagate
         // untouched, never silently strip performance flags from one cell.
         let mut single_issuer = true;
-        let mut defer_taskrun = true;
+        let mut defer_taskrun = std::env::var_os("INF_URING_NO_DEFER_TASKRUN").is_none();
         let ring = loop {
             let mut builder = IoUring::builder();
             if single_issuer {
@@ -277,7 +291,6 @@ impl UringDriver {
             next_id: 0,
             accepts: DriverMap::default(),
             recvs: DriverMap::default(),
-            sends_inflight: DriverMap::default(),
             closing: DriverMap::default(),
             provided: DriverMap::default(),
             wake_fd: None,
@@ -620,41 +633,61 @@ impl UringDriver {
                         continue;
                     }
                     let addr = pool.bytes(buf).as_ptr();
-                    let id = self.alloc_id(OpState::Send { fd, token, buf, len, written: 0 });
+                    let id = self.alloc_id(OpState::Send {
+                        fd,
+                        token,
+                        buf,
+                        len,
+                        written: 0,
+                        closing: None,
+                    });
                     self.push_sqe(opcode::Send::new(Fd(fd), addr, len).build().user_data(id));
-                    *self.sends_inflight.entry(fd).or_insert(0) += 1;
                 }
                 IoOp::Close { fd, token } => {
                     // Cancel everything in flight on this fd (ops hold file
                     // refs; close alone would strand them), then close. The
-                    // `Closed` completion is held until in-flight sends
-                    // resolve so their buffers return first.
-                    let cancel_ids: Vec<u64> = self
-                        .states
-                        .iter()
-                        .filter_map(|(id, st)| match st {
-                            OpState::Accept { listener, .. } if *listener == fd => Some(*id),
+                    // `Closed` completion is held until the sends this close
+                    // cancelled resolve so their buffers return first. Sends
+                    // are charged to THIS close by op id: the fd number is
+                    // free for the next accept the moment the close runs,
+                    // and a send already charged to an earlier close on the
+                    // same number belongs to that connection, not this one.
+                    let close_id = self.alloc_id(OpState::Close);
+                    let mut sends_left = 0u32;
+                    let mut cancel_ids: Vec<u64> = Vec::new();
+                    for (id, st) in &mut self.states {
+                        match st {
+                            OpState::Accept { listener, .. } if *listener == fd => {
+                                cancel_ids.push(*id);
+                            }
+                            OpState::Send { fd: f, closing, .. }
+                                if *f == fd && closing.is_none() =>
+                            {
+                                *closing = Some(close_id);
+                                sends_left += 1;
+                                cancel_ids.push(*id);
+                            }
                             OpState::RecvMulti { fd: f, .. }
                             | OpState::RecvOneshot { fd: f, .. }
                             | OpState::PollDry { fd: f, .. }
-                            | OpState::Send { fd: f, .. }
                                 if *f == fd =>
                             {
-                                Some(*id)
+                                cancel_ids.push(*id);
                             }
-                            _ => None,
-                        })
-                        .collect();
+                            _ => {}
+                        }
+                    }
                     for op_id in cancel_ids {
                         let id = self.alloc_id(OpState::Cancel);
                         self.push_sqe(opcode::AsyncCancel::new(op_id).build().user_data(id));
                     }
                     self.accepts.remove(&fd);
                     self.recvs.remove(&fd);
-                    self.closing
-                        .insert(fd, CloseWait { token, close_seen: false, close_result: 0 });
-                    let id = self.alloc_id(OpState::Close { fd });
-                    self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(id));
+                    self.closing.insert(
+                        close_id,
+                        CloseWait { token, close_seen: false, close_result: 0, sends_left },
+                    );
+                    self.push_sqe(opcode::Close::new(Fd(fd)).build().user_data(close_id));
                 }
                 IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.arm_log_write(fd, offset, data, token, 0, barrier);
@@ -674,15 +707,14 @@ impl UringDriver {
         }
     }
 
-    /// Emit `Closed` once the close CQE arrived and no sends remain.
-    fn maybe_finish_close(&mut self, fd: RawFd, out: &mut Vec<Completion>) {
-        let sends_left = self.sends_inflight.get(&fd).copied().unwrap_or(0);
-        let Some(wait) = self.closing.get(&fd) else { return };
-        if !wait.close_seen || sends_left > 0 {
+    /// Emit `Closed` once the close CQE arrived and none of the sends it
+    /// cancelled remain.
+    fn maybe_finish_close(&mut self, close_id: u64, out: &mut Vec<Completion>) {
+        let Some(wait) = self.closing.get(&close_id) else { return };
+        if !wait.close_seen || wait.sends_left > 0 {
             return;
         }
-        let wait = self.closing.remove(&fd).expect("checked above");
-        self.sends_inflight.remove(&fd);
+        let wait = self.closing.remove(&close_id).expect("checked above");
         out.push(Completion {
             token: wait.token,
             result: if wait.close_result >= 0 {
@@ -695,11 +727,26 @@ impl UringDriver {
         self.resume_exhausted_accepts();
     }
 
-    fn send_resolved(&mut self, fd: RawFd, out: &mut Vec<Completion>) {
-        if let Some(n) = self.sends_inflight.get_mut(&fd) {
-            *n = n.saturating_sub(1);
+    /// Retire `id` from the recv arm on `fd` if that arm names it; false
+    /// when the arm belongs to another op (a successor on a recycled fd
+    /// number, or no arm at all).
+    fn release_recv_arm(&mut self, fd: RawFd, id: u64) -> bool {
+        match self.recvs.get_mut(&fd) {
+            Some(arm) if arm.op_id == Some(id) => {
+                arm.op_id = None;
+                true
+            }
+            _ => false,
         }
-        self.maybe_finish_close(fd, out);
+    }
+
+    /// A send charged to a close resolved: one fewer to wait for.
+    fn send_resolved(&mut self, closing: Option<u64>, out: &mut Vec<Completion>) {
+        let Some(close_id) = closing else { return };
+        if let Some(wait) = self.closing.get_mut(&close_id) {
+            wait.sends_left = wait.sends_left.saturating_sub(1);
+        }
+        self.maybe_finish_close(close_id, out);
     }
 
     fn dispatch_cqe(
@@ -716,7 +763,7 @@ impl UringDriver {
             return;
         }
         let Some(state) = self.states.remove(&id) else { return };
-        self.dispatch_terminal_cqe(state, result, flags, pool, out);
+        self.dispatch_terminal_cqe(id, state, result, flags, pool, out);
     }
 
     /// Non-terminal multishot CQE (`F_MORE` set): the op stays armed.
@@ -750,14 +797,19 @@ impl UringDriver {
                 }
             }
             Multi::Recv(fd, token) => {
-                self.handle_recv_payload(fd, token, result, flags, pool, out);
+                let arm = self.recvs.get_mut(&fd).filter(|a| a.op_id == Some(id));
+                Self::handle_recv_payload(&mut self.provided, arm, token, result, flags, pool, out);
             }
         }
     }
 
-    /// Terminal CQE: the op id is retired; multishot ops may re-arm.
+    /// Terminal CQE: the op id is retired; multishot ops may re-arm. An
+    /// arm is touched only by the op it currently names (`id`): a
+    /// predecessor's final CQE on a recycled fd number must not clear or
+    /// re-arm the successor's arm.
     fn dispatch_terminal_cqe(
         &mut self,
+        id: u64,
         state: OpState,
         result: i32,
         flags: u32,
@@ -807,21 +859,19 @@ impl UringDriver {
                 }
             }
             OpState::RecvMulti { fd, token } => {
-                if let Some(arm) = self.recvs.get_mut(&fd) {
-                    arm.op_id = None;
-                }
-                self.handle_recv_payload(fd, token, result, flags, pool, out);
+                let owns_arm = self.release_recv_arm(fd, id);
+                let arm = self.recvs.get_mut(&fd).filter(|_| owns_arm);
+                Self::handle_recv_payload(&mut self.provided, arm, token, result, flags, pool, out);
                 // Multishot stream ended: re-arm unless disarmed/paused/EOF.
-                let rearm =
-                    result > 0 && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
+                let rearm = owns_arm
+                    && result > 0
+                    && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
                 if rearm {
                     self.arm_recv_sqe(fd, token, pool);
                 }
             }
             OpState::RecvOneshot { fd, token, buf } => {
-                if let Some(arm) = self.recvs.get_mut(&fd) {
-                    arm.op_id = None;
-                }
+                let owns_arm = self.release_recv_arm(fd, id);
                 if result >= 0 {
                     out.push(Completion {
                         token,
@@ -838,16 +888,19 @@ impl UringDriver {
                         });
                     }
                 }
-                let rearm =
-                    result > 0 && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
+                let rearm = owns_arm
+                    && result > 0
+                    && self.recvs.get(&fd).is_some_and(|a| !a.disarmed && !a.paused);
                 if rearm {
                     // Dry pool degrades to the PollDry watch internally.
                     self.arm_recv_sqe(fd, token, pool);
                 }
             }
             OpState::PollDry { fd, token } => {
+                if !self.release_recv_arm(fd, id) {
+                    return;
+                }
                 let Some(arm) = self.recvs.get_mut(&fd) else { return };
-                arm.op_id = None;
                 if result == -libc::ECANCELED || arm.disarmed {
                     return;
                 }
@@ -870,20 +923,41 @@ impl UringDriver {
                     }
                 }
             }
-            OpState::Send { fd, token, buf, len, written } => {
+            OpState::Send { fd, token, buf, len, written, closing } => {
                 if result >= 0 {
                     let written = written + result as u32;
-                    if written < len {
+                    if written < len && closing.is_none() {
                         // Short write: resubmit the remainder; the op id is
                         // re-allocated, the buffer stays consumer-owned.
                         let addr = pool.bytes(buf)[written as usize..].as_ptr();
-                        let id = self.alloc_id(OpState::Send { fd, token, buf, len, written });
+                        let id = self.alloc_id(OpState::Send {
+                            fd,
+                            token,
+                            buf,
+                            len,
+                            written,
+                            closing: None,
+                        });
                         self.push_sqe(
                             opcode::Send::new(Fd(fd), addr, len - written).build().user_data(id),
                         );
                         return;
                     }
-                    out.push(Completion { token, result: CompletionResult::Sent { buf } });
+                    if written < len {
+                        // Short write reaped after its close was queued: the
+                        // remainder must never go out on a number that may
+                        // already be the next connection's. Cancelled, as
+                        // the close contract says.
+                        out.push(Completion {
+                            token,
+                            result: CompletionResult::Error {
+                                errno: libc::ECANCELED,
+                                buf: Some(buf),
+                            },
+                        });
+                    } else {
+                        out.push(Completion { token, result: CompletionResult::Sent { buf } });
+                    }
                 } else {
                     let errno = if result == -libc::ECANCELED { libc::ECANCELED } else { -result };
                     out.push(Completion {
@@ -891,14 +965,14 @@ impl UringDriver {
                         result: CompletionResult::Error { errno, buf: Some(buf) },
                     });
                 }
-                self.send_resolved(fd, out);
+                self.send_resolved(closing, out);
             }
-            OpState::Close { fd, .. } => {
-                if let Some(wait) = self.closing.get_mut(&fd) {
+            OpState::Close => {
+                if let Some(wait) = self.closing.get_mut(&id) {
                     wait.close_seen = true;
                     wait.close_result = result;
                 }
-                self.maybe_finish_close(fd, out);
+                self.maybe_finish_close(id, out);
             }
             OpState::Cancel => {}
             OpState::WakeWatch => {
@@ -1011,9 +1085,12 @@ impl UringDriver {
     }
 
     /// Shared recv-payload handling for multishot CQEs (terminal or not).
+    /// `arm` is the recv arm only when the CQE's op is the one it names; a
+    /// predecessor's stream on a recycled number delivers its payload but
+    /// never pauses the successor's arm.
     fn handle_recv_payload(
-        &mut self,
-        fd: RawFd,
+        provided: &mut DriverMap<u16, BufferId>,
+        arm: Option<&mut RecvArm>,
         token: CompletionToken,
         result: i32,
         flags: u32,
@@ -1024,8 +1101,7 @@ impl UringDriver {
             match cqueue::buffer_select(flags) {
                 Some(bid) => {
                     // Buffer leaves the kernel group; custody → consumer.
-                    let buf = self
-                        .provided
+                    let buf = provided
                         .remove(&bid)
                         .expect("kernel returned a bid this driver never provided");
                     pool.promote_staged(buf);
@@ -1045,7 +1121,7 @@ impl UringDriver {
                             result: CompletionResult::Recv { buf, len: 0 },
                         }),
                         None => {
-                            if let Some(arm) = self.recvs.get_mut(&fd) {
+                            if let Some(arm) = arm {
                                 arm.paused = true;
                             }
                             out.push(Completion { token, result: CompletionResult::RecvDropped });
@@ -1054,7 +1130,7 @@ impl UringDriver {
                 }
             }
         } else if result == -libc::ENOBUFS {
-            if let Some(arm) = self.recvs.get_mut(&fd)
+            if let Some(arm) = arm
                 && !arm.paused
             {
                 arm.paused = true;

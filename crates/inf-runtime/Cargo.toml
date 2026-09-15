@@ -82,3 +82,8 @@ required-features = ["uring"]
 name = "accept_exhaustion"
 path = "tests/accept_exhaustion.rs"
 required-features = ["uring"]
+
+[[test]]
+name = "close_fd_reuse"
+path = "tests/close_fd_reuse.rs"
+required-features = ["uring"]

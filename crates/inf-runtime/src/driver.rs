@@ -177,7 +177,11 @@ pub enum IoOp {
     /// ownership returns in the completion (`Sent` or `Error`).
     Send { fd: RawFd, buf: BufferId, len: u32, token: CompletionToken },
     /// Close the fd. Pending sends on it complete with `Error(ECANCELED)`
-    /// (returning their buffers) before `Closed` is delivered.
+    /// (returning their buffers) before `Closed` is delivered — a send
+    /// short-written when the close is queued included: its remainder is
+    /// never sent, the fd number may already be the next connection's
+    /// (F-L11-01). Exactly one `Closed` per `Close`, whatever the kernel
+    /// does with the number in between.
     Close { fd: RawFd, token: CompletionToken },
     /// Positional write of one sealed log frame (M2-S05, ADR-0013). Short
     /// writes are resubmitted internally: `LogWritten` means ALL bytes hit
