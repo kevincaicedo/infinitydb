@@ -49,6 +49,12 @@ use crate::tape::{FIXINT_MAX, FIXINT_MIN, FIXSTR_BASE, FIXSTR_MAX_LEN, TAG_ARR, 
 /// per-key hash64 cost more than the compares it saved on real shapes.
 const LINEAR_SCAN_MAX: usize = 256;
 
+/// Entries a pooled object frame (and each dup-scan vector) keeps after a
+/// parse: 65 536 × 12 B = 768 KiB per frame. Objects wider than this are
+/// the pathological end of the S07 corpus; a steady state past it pays one
+/// regrow per parse instead of pinning its peak (see `trim_scratch`).
+const OBJ_ENTRIES_RETAIN_MAX: usize = 1 << 16;
+
 /// A typed parse failure at a byte offset.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct JsonParseError {
@@ -267,6 +273,12 @@ pub struct JsonParser {
     unescape: Vec<u8>,
     rebuild: Vec<u8>,
     obj_frames: Vec<ObjFrame>,
+    /// Close-time duplicate scan scratch (entry ids by key, then the
+    /// replacement map), pooled like the frames: an object past
+    /// `LINEAR_SCAN_MAX` used to allocate both fresh on every parse
+    /// (lane L10 perf row, batch 59).
+    dup_order: Vec<u32>,
+    dup_target: Vec<u32>,
     limits: ParseLimits,
 }
 
@@ -337,6 +349,8 @@ impl JsonParser {
             unescape: Vec::new(),
             rebuild: Vec::new(),
             obj_frames: Vec::new(),
+            dup_order: Vec::new(),
+            dup_target: Vec::new(),
             limits,
         }
     }
@@ -371,6 +385,28 @@ impl JsonParser {
                 .iter()
                 .map(|f| f.entries.capacity() * size_of::<ObjEntry>())
                 .sum::<usize>()
+            + (self.dup_order.capacity() + self.dup_target.capacity()) * size_of::<u32>()
+    }
+
+    /// After a parse: the per-object scratch keeps at most
+    /// `OBJ_ENTRIES_RETAIN_MAX` entries per frame (and the dup-scan
+    /// vectors the same), so one wide object never pins its peak — 12 B
+    /// per key, about 2× the text of a `{"k":0,…}` shape, for the life of
+    /// the cell (lane L10 perf row, batch 59). A steady state wider than
+    /// the cap regrows once per parse: one `Vec` doubling from the cap.
+    fn trim_scratch(&mut self) {
+        for frame in &mut self.obj_frames {
+            if frame.entries.capacity() > OBJ_ENTRIES_RETAIN_MAX {
+                frame.entries.clear();
+                frame.entries.shrink_to(OBJ_ENTRIES_RETAIN_MAX);
+            }
+        }
+        for v in [&mut self.dup_order, &mut self.dup_target] {
+            if v.capacity() > OBJ_ENTRIES_RETAIN_MAX {
+                v.clear();
+                v.shrink_to(OBJ_ENTRIES_RETAIN_MAX);
+            }
+        }
     }
 
     /// Parse JSON text into canonical idoc bytes (header included) —
@@ -414,6 +450,7 @@ impl JsonParser {
         let result = self.parse_tokens(input, &mut tokens, &mut frames, out);
         self.blocks = blocks;
         self.frames = frames;
+        self.trim_scratch();
         result
     }
 
@@ -434,6 +471,7 @@ impl JsonParser {
         let result = self.parse_tokens(input, &mut tokens, &mut frames, &mut out);
         self.indices = indices;
         self.frames = frames;
+        self.trim_scratch();
         result.map(|()| out)
     }
 
@@ -826,14 +864,18 @@ impl JsonParser {
                 &tape.out[e.key_at as usize..(e.key_at + u32::from(e.key_len)) as usize]
             }
         };
-        let mut by_key: Vec<u32> = (0..entries.len() as u32).collect();
+        let by_key = &mut self.dup_order;
+        by_key.clear();
+        by_key.extend(0..entries.len() as u32);
         by_key.sort_unstable_by(|&a, &b_idx| {
             key_of(&entries[a as usize]).cmp(key_of(&entries[b_idx as usize]))
         });
         // replace_with[idx]: idx (emit own span), the last dup's idx (emit
         // that span at this position), or SKIP.
         const SKIP: u32 = u32::MAX;
-        let mut replace_with: Vec<u32> = (0..entries.len() as u32).collect();
+        let replace_with = &mut self.dup_target;
+        replace_with.clear();
+        replace_with.extend(0..entries.len() as u32);
         let mut any_dup = false;
         let mut run = 0usize;
         while run < by_key.len() {

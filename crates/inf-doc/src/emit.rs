@@ -197,6 +197,9 @@ pub(crate) fn begin(out: &mut Vec<u8>, tag: u8) -> usize {
 /// children never move (the D3 backpatch argument).
 #[inline]
 pub(crate) fn end(out: &mut [u8], len_at: usize) {
+    // `len_at + 3 <= out.len()` for every placeholder `begin` returned;
+    // a wrong `len_at` wraps here in release and then trips the slice
+    // index below before any byte lands (lane L10 style row, batch 59).
     let body_len = out.len() - (len_at + 3);
     debug_assert!(body_len <= DOC_BYTES_MAX, "cap enforced incrementally by the driver");
     let bytes = (body_len as u32).to_le_bytes();

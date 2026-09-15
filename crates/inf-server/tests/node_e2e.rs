@@ -7026,9 +7026,9 @@ fn maxclients_refuses_the_next_connection_like_redis() {
     let mut admin = node.connect();
     admin.write_all(&cmd(&[b"CONFIG", b"SET", b"maxclients", b"2"])).expect("write");
     read_exactly(&mut admin, b"+OK\r\n");
-    // The share lands on every cell within one MAINTAIN sweep.
-    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-    std::thread::sleep(Duration::from_millis(50));
+    // No settle wait (batch 59): each cell's knobs follow its apply within
+    // the same iteration (MAINTAIN precedes the next accept reap), and the
+    // origin's precede its `+OK`.
     let mut held = vec![admin];
     let mut refused: Option<TcpStream> = None;
     for attempt in 0..8 {

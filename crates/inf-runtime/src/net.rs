@@ -101,6 +101,33 @@ pub fn set_keepalive(fd: std::os::fd::RawFd, secs: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Refuses a port another process already listens on (batch 59, review
+/// 2026-08-30 lane L19 addendum): `SO_REUSEPORT` lets a second node of
+/// the same uid *join* a running node's listener group, and the kernel
+/// then splits new connections between two keyspaces — silently. A plain
+/// bind (no reuseport) fails `EADDRINUSE` against any listener on the
+/// port, so a node probes once, before its cells bind the group. Port 0
+/// (kernel-assigned) needs no probe. The window between the probe's
+/// close and the group's bind is a foreign-process race the probe cannot
+/// close; it turns a silent split into a loud one everywhere else.
+///
+/// # Errors
+/// `AddrInUse` (with the port named) when the port is owned; other bind
+/// failures as they are.
+pub fn probe_port_unowned(port: u16) -> io::Result<()> {
+    if port == 0 {
+        return Ok(());
+    }
+    match TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)) {
+        Ok(_probe) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("port {port} is already owned by another process (address in use)"),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 /// The port a listener actually bound (port 0 = kernel-assigned; tests).
 ///
 /// # Errors
@@ -170,6 +197,22 @@ pub fn pin_current_thread(core: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Batch 59: a reuseport group already listening on the port is
+    /// exactly what a second node would silently join; the probe refuses
+    /// it, names the port, and leaves the group untouched.
+    #[test]
+    fn a_port_a_listener_group_owns_is_refused() {
+        let group_head = listen_reuseport(0).expect("listen");
+        let port = bound_port(&group_head).expect("port");
+        let err = probe_port_unowned(port).expect_err("an owned port is refused");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains(&port.to_string()), "{err}");
+        // The probe took nothing: the group still accepts a joiner.
+        let joiner = listen_reuseport(port).expect("own cells still join");
+        drop((joiner, group_head));
+        probe_port_unowned(0).expect("port 0 is never probed");
+    }
 
     /// ADR-0123 D3: the keepalive quartet lands on a live TCP socket and
     /// `0` clears it (read back with `getsockopt`).

@@ -103,7 +103,12 @@ fn op_to_segment(op: Op<'_>) -> Segment {
 }
 
 /// Encode a parsed AST — the only writer, so canonical by construction.
-pub(crate) fn encode(ast: &PathAst) -> PathProgram {
+/// Encoding is not size-preserving (a child costs its varint length
+/// prefix on top of the text's dot or quotes), so a text under the text
+/// ceiling can encode past `PROGRAM_BYTES_CEILING`; that is refused here,
+/// typed, and never emitted — the validator's bound is the writer's
+/// bound (F-L10-04, review 2026-08-30).
+pub(crate) fn encode(ast: &PathAst) -> Result<PathProgram, PathError> {
     let mut out = Vec::with_capacity(16);
     out.push(PROGRAM_VERSION);
     out.push(if ast.legacy { FLAG_LEGACY } else { 0 });
@@ -111,9 +116,11 @@ pub(crate) fn encode(ast: &PathAst) -> PathProgram {
     for segment in &ast.segments {
         encode_segment(&mut out, segment);
     }
-    debug_assert!(out.len() < PROGRAM_BYTES_CEILING, "parser caps text < ceiling");
+    if out.len() >= PROGRAM_BYTES_CEILING {
+        return verr(PathErrorKind::PathTooLong, 0);
+    }
     debug_assert!(validate(&out).is_ok(), "encoder output validates");
-    PathProgram { bytes: Rc::from(out) }
+    Ok(PathProgram { bytes: Rc::from(out) })
 }
 
 /// One selector accepted by the allocation-free scalar patch lane

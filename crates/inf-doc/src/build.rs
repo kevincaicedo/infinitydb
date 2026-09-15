@@ -50,8 +50,10 @@ impl TapeBuilder {
     }
 
     /// Cap the body below the format ceiling (per-namespace config, S07).
+    /// Clamped to `DOC_BYTES_MAX`: the u24 emitters' bound is enforced by
+    /// construction, not by the caller (lane L10 style row, batch 59).
     pub fn with_max_body(max_body: usize) -> TapeBuilder {
-        debug_assert!(max_body <= DOC_BYTES_MAX);
+        let max_body = max_body.min(DOC_BYTES_MAX);
         let mut out = Vec::with_capacity(64);
         out.resize(header::HEADER_LEN, 0);
         TapeBuilder { out, stack: Vec::new(), root_done: false, max_body }
@@ -65,7 +67,7 @@ impl TapeBuilder {
         mut stack: Vec<BFrame>,
         max_body: usize,
     ) -> TapeBuilder {
-        debug_assert!(max_body <= DOC_BYTES_MAX);
+        let max_body = max_body.min(DOC_BYTES_MAX);
         out.clear();
         out.resize(header::HEADER_LEN, 0);
         stack.clear();
@@ -250,6 +252,19 @@ mod tests {
         b.end();
         let bytes = b.finish().expect("finishes");
         TapeDoc::from_bytes(&bytes).expect("builder output always validates");
+    }
+
+    /// Lane L10 style row (review 2026-08-30, batch 59): the public
+    /// constructors clamp the body cap to the format ceiling instead of
+    /// asserting it in debug — the u24 emitters' bound is type-enforced.
+    #[test]
+    fn max_body_clamps_to_the_format_ceiling() {
+        let mut b = TapeBuilder::with_max_body(usize::MAX);
+        assert_eq!(b.max_body, DOC_BYTES_MAX);
+        let big = "a".repeat(DOC_BYTES_MAX + 1);
+        assert!(matches!(b.str_value(&big), Err(DocError::TooLarge { .. })));
+        let r = TapeBuilder::with_recycled(Vec::new(), Vec::new(), usize::MAX);
+        assert_eq!(r.max_body, DOC_BYTES_MAX);
     }
 
     #[test]

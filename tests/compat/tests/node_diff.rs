@@ -29,7 +29,8 @@ use std::net::TcpStream;
 use std::path::Path;
 
 use compat::harness::{
-    CaseOverride, Expect, infinityd, oracle, parse_int_reply, read_frames, run_matrix,
+    CaseOverride, Expect, candidate, infinityd, oracle, parse_int_reply, read_frames, run_matrix,
+    spawn_infinityd_at,
 };
 use compat::matrix::MATRIX;
 use compat::resp::encode_command;
@@ -685,8 +686,10 @@ fn maxclients_refusal_matches_redis() {
     assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "maxclients", "10000"]), b"+OK\r\n");
 
     assert_eq!(cmd(&mut node, &mut nb, &["CONFIG", "SET", "maxclients", "4"]), b"+OK\r\n");
-    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // No settle wait (batch 59): a peer applies the fan leg and its knobs
+    // in one iteration (FABRIC-IN, then MAINTAIN) before it reaps another
+    // accept, and the origin's knobs precede its `+OK` the same way. The
+    // batch-57 "eight PONGs" was a port shared with another test's node.
     let mut held = Vec::new();
     let mut refused = None;
     for _ in 0..8 {
@@ -704,6 +707,79 @@ fn maxclients_refusal_matches_redis() {
     let mut refused = refused.expect("node: no connection refused under maxclients 4 / 4 cells");
     assert_closed_or_reset(&mut refused, "node");
     assert!(held.len() <= 3, "node admitted {} beyond the holding client", held.len());
+}
+
+/// Batch 59 (lane L19 addendum, found behind the batch-57/58 flakes): a
+/// second `infinityd` started on a port a running node owns must refuse
+/// to start. Pre-fix it *joined* the first node's `SO_REUSEPORT` group —
+/// the kernel then split new connections between two keyspaces with no
+/// error anywhere (two `run_id`s behind one port). Client-reachable by
+/// any operator who starts a node twice.
+#[test]
+fn a_second_node_on_an_owned_port_refuses_to_start() {
+    let Some(bin) = candidate() else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let Some((_first_guard, mut first)) = infinityd(4, scratch_base()) else {
+        return;
+    };
+    let mut fb = Vec::new();
+    assert_eq!(cmd(&mut first, &mut fb, &["PING"]), b"+PONG\r\n");
+    let port = first.peer_addr().expect("peer addr").port();
+    let mut second = spawn_infinityd_at(&bin, 4, port, scratch_base());
+    // A refusal exits; a joiner serves — its log then says "listening".
+    let status = second.wait_exit(std::time::Duration::from_secs(5)).unwrap_or_else(|| {
+        panic!("a second node stayed up on the owned port {port}; its log:\n{}", second.log_text())
+    });
+    let log = second.log_text();
+    assert_eq!(status.code(), Some(1), "{status}; log:\n{log}");
+    assert!(log.contains(&format!("port {port} is already owned by another process")), "{log}");
+    // The first node is untouched by the refused second.
+    assert_eq!(cmd(&mut first, &mut fb, &["PING"]), b"+PONG\r\n");
+}
+
+/// Batch 59: a test that fails while the node is up keeps the node's
+/// scratch directory and prints the `infinityd.log` tail. Pre-fix the
+/// guard removed the directory — and the log — on drop, so a node that
+/// died mid-test left no evidence (batches 57/58 each lost one flake to
+/// this). The falsifier panics while holding the guard, then reads the
+/// log the way a reader of the failure would.
+#[test]
+fn a_failing_test_keeps_the_node_log() {
+    let Some((guard, mut node)) = infinityd(1, scratch_base()) else {
+        eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
+        return;
+    };
+    let mut nb = Vec::new();
+    assert_eq!(cmd(&mut node, &mut nb, &["PING"]), b"+PONG\r\n");
+    // The scratch dir is named by the node's port — recoverable without
+    // the guard, exactly as a reader of a real failure would find it.
+    let port = node.peer_addr().expect("peer addr").port();
+    let dir = std::fs::read_dir(scratch_base())
+        .expect("scratch base")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with("inf-compat-node-") && n.ends_with(&format!("-{port}"))
+            })
+        })
+        .expect("the node's scratch dir exists while it runs");
+    let log = dir.join("infinityd.log");
+    assert!(log.is_file(), "{} missing while the node runs", log.display());
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = guard;
+        panic!("expected: this harness falsifier fails on purpose while holding the node guard");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let text = std::fs::read(&log)
+        .unwrap_or_else(|e| panic!("{} did not survive the failing test: {e}", log.display()));
+    assert!(!text.is_empty(), "the kept log is empty");
+    // What a real failure leaves for its reader, this test cleans up.
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }
 
 /// Batch 50 (review 2026-08-30, F-L15-05 `timeout`): an idle client is

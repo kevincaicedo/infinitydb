@@ -765,6 +765,15 @@ fn main() {
             }
         });
 
+    // The port's owner check (batch 59): a second node of the same uid
+    // would *join* a running node's reuseport group and split its
+    // connections between two keyspaces, silently. Refuse before any cell
+    // binds; port 0 is kernel-assigned and never probed.
+    if let Err(e) = inf_runtime::net::probe_port_unowned(args.port) {
+        eprintln!("infinityd: {e}");
+        std::process::exit(1);
+    }
+
     // The key-hash secret (ADR-0094 D2): a data directory's persisted
     // secret — created from OS entropy at its first boot, read on every
     // later one, refused when the directory holds data that predates the
