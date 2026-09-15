@@ -462,6 +462,7 @@ I	1	crates/inf-server/src/durable.rs	unreachable	just opened	`open_stream` set `
 I	1	crates/inf-server/src/durable.rs	unreachable	matched above	the `matches!` on the line above saw `CkptPhase::Stream`
 C	1	crates/inf-server/src/exec.rs	unreachable	keyspace-level and pub/sub commands dispatch in execute()	`crates/inf-server/src/exec.rs:execute` routes those `CommandId`s before `execute_db`; a table-iterating compat test covers every registry row
 I	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	`delta` is called from `commit_delta` only when `changed`, which requires a non-skipped result
+I	2	crates/inf-server/src/json.rs	expect	a prefix of an accepted program encodes under the ceiling	the same function compiled `path` a few lines above (the ceiling check is the encoder's, F-L10-04); the parent AST is that program's segments minus the last, so its encoding is a strict byte prefix of bytes the ceiling admitted
 I	2	crates/inf-server/src/json.rs	expect	compile above accepted this text	the same function compiled `path` a few lines above; `parse_ast` accepts what the compiler accepted
 I	1	crates/inf-server/src/json.rs	expect	matches resolve on their document	`matches` was just evaluated on `read.root`; `resolve` walks the same tape
 I	1	crates/inf-server/src/json.rs	expect	matches resolve on their own document	`matches` was just evaluated on `root`; `resolve` walks the same tape

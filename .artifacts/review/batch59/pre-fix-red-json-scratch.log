@@ -1,0 +1,20 @@
+     Running tests/json_limits.rs (target/debug/deps/json_limits-9143b5009a868f82)
+
+running 1 test
+test retained_scratch_after_a_wide_object_is_bounded ... FAILED
+
+failures:
+
+---- retained_scratch_after_a_wide_object_is_bounded stdout ----
+
+thread 'retained_scratch_after_a_wide_object_is_bounded' (364434) panicked at crates/inf-doc/tests/json_limits.rs:164:5:
+retained scratch 31457488 B after one 12582923 B parse of 1245582 keys
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    retained_scratch_after_a_wide_object_is_bounded
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 2.28s
+
+error: test failed, to rerun pass `-p inf-doc --test json_limits`

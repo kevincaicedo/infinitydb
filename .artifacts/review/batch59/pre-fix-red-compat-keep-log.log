@@ -1,0 +1,25 @@
+   Compiling compat v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/tests/compat)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 1 test
+test a_failing_test_keeps_the_node_log ... FAILED
+
+failures:
+
+---- a_failing_test_keeps_the_node_log stdout ----
+
+thread 'a_failing_test_keeps_the_node_log' (367981) panicked at tests/compat/tests/node_diff.rs:779:9:
+expected: this harness falsifier fails on purpose while holding the node guard
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'a_failing_test_keeps_the_node_log' (367981) panicked at tests/compat/tests/node_diff.rs:783:9:
+/home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789436319064506506-43971/infinityd.log did not survive the failing test: No such file or directory (os error 2)
+
+
+failures:
+    a_failing_test_keeps_the_node_log
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p compat --test node_diff`

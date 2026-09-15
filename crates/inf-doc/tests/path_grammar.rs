@@ -355,9 +355,44 @@ proptest! {
     /// encoded bytes revalidate through the foreign-byte boundary.
     #[test]
     fn bytecode_round_trip(ast in arb_path()) {
-        let program = path::encode_ast(&ast);
+        let program = path::encode_ast(&ast).expect("a generated AST encodes under the ceiling");
         prop_assert_eq!(&program.decode(), &ast);
         let revalidated = inf_doc::PathProgram::from_bytes(program.as_bytes()).expect("validates");
         prop_assert_eq!(&revalidated, &program);
     }
+}
+
+/// F-L10-04 (review 2026-08-30, batch 59): the encoder is the only
+/// writer of program bytes, so nothing it emits may be refused by its
+/// own trust boundary. Encoding is not size-preserving (`$.<name>` is
+/// `2 + n` text bytes and `7 + n` program bytes), so a text under the
+/// ceiling can encode past it; the compiler now refuses that typed
+/// (`PathTooLong`) instead of emitting bytes `from_bytes` rejects.
+#[test]
+fn encoded_programs_always_revalidate() {
+    let ceiling = path::PATH_BYTES_CEILING;
+    let (mut accepted, mut refused) = (0, 0);
+    for slack in 0..16 {
+        let text = format!("$.{}", "a".repeat(ceiling - 2 - slack));
+        assert_eq!(text.len(), ceiling - slack);
+        match path::compile_with_max_bytes(text.as_bytes(), ceiling) {
+            Ok(program) => {
+                accepted += 1;
+                inf_doc::PathProgram::from_bytes(program.as_bytes()).unwrap_or_else(|e| {
+                    panic!(
+                        "text {} B encoded to {} B, which the validator refuses: {e:?}",
+                        text.len(),
+                        program.as_bytes().len()
+                    )
+                });
+            }
+            Err(e) => {
+                refused += 1;
+                assert_eq!(e.kind, K::PathTooLong, "text {} B", text.len());
+            }
+        }
+    }
+    // Both arms are real: the ceiling text is refused, a few bytes of
+    // slack compiles and revalidates.
+    assert!(accepted >= 1 && refused >= 1, "{accepted} accepted, {refused} refused");
 }

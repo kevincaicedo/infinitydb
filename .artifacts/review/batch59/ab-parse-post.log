@@ -1,0 +1,15 @@
+       gate-1KiB      1024 B           707 ns/parse    1449.2 MB/s  scratch 1376 B
+     medium-2KiB      2048 B          1273 ns/parse    1608.8 MB/s  scratch 1920 B
+     large-64KiB     65536 B         31672 ns/parse    2069.2 MB/s  scratch 33632 B
+    wide-5k-keys     48891 B        616873 ns/parse      79.3 MB/s  scratch 171840 B
+  wide-200k-keys   2288891 B      30793931 ns/parse      74.3 MB/s  scratch 2455904 B
+       gate-1KiB      1024 B           731 ns/parse    1401.3 MB/s  scratch 1376 B
+     medium-2KiB      2048 B          1275 ns/parse    1606.6 MB/s  scratch 1920 B
+     large-64KiB     65536 B         31329 ns/parse    2091.9 MB/s  scratch 33632 B
+    wide-5k-keys     48891 B        617484 ns/parse      79.2 MB/s  scratch 171840 B
+  wide-200k-keys   2288891 B      30766767 ns/parse      74.4 MB/s  scratch 2455904 B
+       gate-1KiB      1024 B           705 ns/parse    1452.6 MB/s  scratch 1376 B
+     medium-2KiB      2048 B          1274 ns/parse    1607.5 MB/s  scratch 1920 B
+     large-64KiB     65536 B         31351 ns/parse    2090.4 MB/s  scratch 33632 B
+    wide-5k-keys     48891 B        620579 ns/parse      78.8 MB/s  scratch 171840 B
+  wide-200k-keys   2288891 B      30806913 ns/parse      74.3 MB/s  scratch 2455904 B

@@ -1,0 +1,20 @@
+os:linux
+arch_bits:64
+run_id:0000000000000000000000000000000000000000
+server_time_usec:0
+uptime_in_seconds:0
+uptime_in_days:0
+config_file:
+cell:0
+cells:0
+
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    admin::tests::info_server_reports_config_application
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-server --lib`

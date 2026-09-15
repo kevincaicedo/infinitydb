@@ -1,0 +1,23 @@
+   Compiling inf-alloc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-alloc)
+   Compiling inf-doc v0.0.0 (/home/kcaicedo/Documents/Projects/databases/infinitydb/crates/inf-doc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.98s
+     Running tests/path_grammar.rs (target/debug/deps/path_grammar-cbbdf6bd27254837)
+
+running 1 test
+test encoded_programs_always_revalidate ... FAILED
+
+failures:
+
+---- encoded_programs_always_revalidate stdout ----
+
+thread 'encoded_programs_always_revalidate' (361818) panicked at crates/inf-doc/src/path/program.rs:114:5:
+parser caps text < ceiling
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    encoded_programs_always_revalidate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-doc --test path_grammar`

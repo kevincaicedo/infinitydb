@@ -1,0 +1,7 @@
+test a_second_node_on_an_owned_port_refuses_to_start ... FAILED
+thread 'a_second_node_on_an_owned_port_refuses_to_start' (377306) panicked at tests/compat/tests/node_diff.rs:733:9:
+a second node stayed up on the owned port 45451; its log:
+infinityd: listening on 45451
+infinityd: listening on 45451
+infinityd: listening on 45451
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 5.06s

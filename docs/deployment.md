@@ -105,7 +105,7 @@ infinityd [--port 6379] [--cells N] [--buffers 4096] [--buf-size 4096]
 
 | Flag | Meaning |
 |---|---|
-| `--port` | TCP port to listen on (default 6379). |
+| `--port` | TCP port to listen on (default 6379). A port another process already listens on is refused at startup (`port N is already owned by another process`, exit 1): the cells share the port through `SO_REUSEPORT`, which would otherwise let a second node silently join the first's listener group and split its clients between two keyspaces. |
 | `--cells` | Number of cells (cores). Defaults to a value derived from the machine. |
 | `--buffers` / `--buf-size` | `io_uring` provided-buffer pool size and per-buffer bytes. |
 | `--pin-start` | First core index to pin cells to (cell *i* pins to `pin-start + i`). |

@@ -1,0 +1,20 @@
+     Running unittests src/lib.rs (target/debug/deps/inf_doc-f05dfcf617d00fee)
+
+running 1 test
+test build::tests::max_body_clamps_to_the_format_ceiling ... FAILED
+
+failures:
+
+---- build::tests::max_body_clamps_to_the_format_ceiling stdout ----
+
+thread 'build::tests::max_body_clamps_to_the_format_ceiling' (362071) panicked at crates/inf-doc/src/build.rs:54:9:
+assertion failed: max_body <= DOC_BYTES_MAX
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    build::tests::max_body_clamps_to_the_format_ceiling
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p inf-doc --lib`

@@ -1,0 +1,17 @@
+test a_failing_test_keeps_the_node_log ... ok
+test info_tripwires_is_wholly_cell_scope_on_a_real_node ... ok
+test info_names_every_field_once_on_a_real_node ... ok
+test client_id_is_positive_and_killable_like_redis ... ok
+test info_unknown_section_is_empty_like_redis ... ok
+test quit_closes_a_namespace_bound_connection_like_redis ... ok
+test tiered_namespace_argument_errors_match_redis ... ok
+test a_second_node_on_an_owned_port_refuses_to_start ... ok
+test run_id_is_40_hex_and_stable_like_redis ... ok
+test maxclients_refusal_matches_redis ... ok
+test info_keyspace_counts_the_whole_node_like_dbsize ... ok
+test node_matrix_replies_match_redis ... ok
+test node_fanout_and_tier_match_redis_under_namespace ... ok
+test large_values_match_redis_up_to_the_bulk_cap ... ok
+test deadline_millisecond_read_matches_redis ... ok
+test timeout_closes_an_idle_connection_like_redis ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.62s

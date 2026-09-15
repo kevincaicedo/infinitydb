@@ -1,0 +1,33 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/node_diff.rs (target/debug/deps/node_diff-414dc14f3498c426)
+
+running 2 tests
+test hot_per_cell_config_set_is_observable_on_every_cell ... FAILED
+test a_failing_test_keeps_the_node_log ... ok
+
+failures:
+
+---- hot_per_cell_config_set_is_observable_on_every_cell stdout ----
+
+thread 'hot_per_cell_config_set_is_observable_on_every_cell' (365104) panicked at tests/compat/src/harness.rs:277:37:
+admin INFO server
+--- kept /home/kcaicedo/Documents/Projects/databases/infinitydb/target/tmp/inf-compat-node-1789435867763829677-38255 (test failed; process still running at teardown (killed)); log tail:
+infinityd: key-hash secret: key-hash.toml (created at this first boot — siphash13, ADR-0094; id 0xf490c92fe43b3443; 0 manifest(s) bound, 0 shard(s) unpublished)
+infinityd: topology: 4 cells (stamped at this first boot — ADR-0095; topology.toml)
+infinityd: io-properties: absent (--device-probe off): the FLUSH class, K = 1, no device budget — the dev tier; `--device-probe auto` or `inf probe-device` enables the probed classes (ADR-0091)
+infinityd: log barrier class flush (source: absent; fua_max_frame_bytes 262144; probed p50 fua 0 µs / flush 0 µs); frames in flight 1 (auto: flush) × 4 MiB staging
+infinityd: device model absent (io-properties schema 1): background I/O is unbudgeted and frame sealing unpaced — run `inf probe-device` to enable the device budget (ADR-0088)
+infinityd: checkpoint cap replay term 1024 MiB/s per cell (the D4 constant — no probed read row; ADR-0088 D4 as amended)
+infinityd: listening on 38255
+infinityd a991dde (git a991ddeab361-dirty, x86_64-unknown-linux-gnu)
+infinityd: 4 cells, port 38255, backend io_uring, route natural
+infinityd: capabilities Capabilities { backend: "io_uring", multishot_accept: true, multishot_recv: true, provided_buffers: true, fixed_buffers: true, single_issuer: true, defer_taskrun: true, performance_tier: true }
+--- end of log tail
+
+
+failures:
+    hot_per_cell_config_set_is_observable_on_every_cell
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p compat --test node_diff`

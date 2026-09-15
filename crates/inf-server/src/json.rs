@@ -486,7 +486,8 @@ fn set_parsed(
         let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
             legacy: ast.legacy,
             segments: ast.segments[..ast.segments.len() - 1].to_vec(),
-        });
+        })
+        .expect("a prefix of an accepted program encodes under the ceiling");
         let name = name.clone();
         return set_apply(
             store,
@@ -1514,7 +1515,8 @@ fn merge_parsed(
         let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
             legacy: ast.legacy,
             segments: ast.segments[..ast.segments.len() - 1].to_vec(),
-        });
+        })
+        .expect("a prefix of an accepted program encodes under the ceiling");
         let name = name.clone();
         let created = inf_doc::merge_absent_document(fragment);
         let op = ApplyOp::SetMember { key: &name, fragment: &created[inf_doc::HEADER_LEN..] };

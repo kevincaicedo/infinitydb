@@ -1,0 +1,4 @@
+node a: alive; log tail: control: cell 3 recovered (0 segments, 0 bytes, 0 records; phases ms: start 0.0, ckpt 0.0 [0 B], replay 0.0 [0 B], audit 0.0 [0 B], finish 0.0, total 0.0) | control: recovery complete — 4 cells serving (100 ms)
+node b: exited 1; log tail: infinityd: port 40387 is already owned by another process (address in use)
+distinct run_ids over 16 connections on port 40387: 1
+exit 0
