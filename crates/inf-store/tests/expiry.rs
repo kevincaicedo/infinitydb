@@ -78,8 +78,9 @@ fn active_wheel_reaps_without_any_reads() {
     assert_eq!(drain(&mut store, ms(99)), 0);
     assert_eq!(store.len(), 1001);
 
-    // Halfway: exactly the due half is gone — via the wheel alone.
-    let reaped = drain(&mut store, ms(599));
+    // Halfway: exactly the due half is gone — via the wheel alone. A
+    // deadline is due from the millisecond after it (F-L05-05).
+    let reaped = drain(&mut store, ms(600));
     assert_eq!(reaped, 500, "deadlines 100..=599");
     assert_eq!(store.len(), 501);
 
@@ -109,8 +110,9 @@ fn wheel_matches_reference_model_under_churn() {
     for op in 0..ops {
         now_ms += rand() % 20;
         let now = ms(now_ms);
-        // Purge the model of expired entries before mutating against it.
-        model.retain(|_, deadline| deadline.is_none_or(|d| d > now_ms));
+        // Purge the model of expired entries before mutating against it
+        // (alive through the deadline millisecond — F-L05-05).
+        model.retain(|_, deadline| deadline.is_none_or(|d| d >= now_ms));
         let key = format!("key:{}", rand() % 256).into_bytes();
         match rand() % 5 {
             0 => {
@@ -145,7 +147,7 @@ fn wheel_matches_reference_model_under_churn() {
     // Catch up fully: visible state must equal the model exactly.
     now_ms += 1;
     drain(&mut store, ms(now_ms));
-    model.retain(|_, deadline| deadline.is_none_or(|d| d > now_ms));
+    model.retain(|_, deadline| deadline.is_none_or(|d| d >= now_ms));
     assert_eq!(store.len(), model.len(), "live census after catch-up");
     let final_now = ms(now_ms);
     for (key, _) in model {
@@ -236,19 +238,20 @@ fn dst_virtual_time_48h_campaign() {
     assert_eq!(store.stats().ttl_live, keys);
 
     // Walk virtual time in random bucket strides; sample each census at
-    // `bucket·width − 1` — the last instant where exactly the buckets below
-    // are due (expiry is INCLUSIVE at the deadline millisecond, so sampling
-    // ON a boundary would under-count by the boundary keys; the full 10M
-    // campaign caught exactly that harness off-by-one).
+    // `bucket·width` — the last instant where exactly the buckets below are
+    // due (a deadline is due from the millisecond AFTER it, F-L05-05, so
+    // the boundary key `bucket·width` is not yet due there; under the old
+    // inclusive predicate the sample sat at `− 1`, and the full 10M
+    // campaign once caught the harness off by one at exactly this edge).
     let mut bucket = 0usize;
     while bucket < BUCKETS {
         bucket = (bucket + 1 + (rand() % 24) as usize).min(BUCKETS);
         // The last stride overshoots 48 h (BUCKETS × width > HOURS_48_MS by
-        // ~2 s), which the measured clock exposed: the campaign stops at the
-        // 48 h edge, where every deadline is due, and the drain below is the
-        // +2 ms step past it — so the reported sim-seconds are the campaign's
-        // actual span, not an artefact of the bucket arithmetic.
-        let now_ms = (bucket as u64 * bucket_width - 1).min(HOURS_48_MS + 1);
+        // ~2 s), which the measured clock exposed: the campaign stops at
+        // `HOURS_48_MS + 2`, the first instant every deadline (≤ 48 h + 1)
+        // is due — so the reported sim-seconds are the campaign's actual
+        // span, not an artefact of the bucket arithmetic.
+        let now_ms = (bucket as u64 * bucket_width).min(HOURS_48_MS + 2);
         drain(&mut store, clock.advance(ms(now_ms)));
         let expected_gone: u64 = due_by_bucket[..bucket].iter().sum();
         assert_eq!(
@@ -369,4 +372,39 @@ fn the_debt_metric_sees_a_store_the_slice_never_reached() {
     let mut idle = CellStore::new(StoreConfig::default());
     idle.set(b"k", b"v", SetOptions::default(), ms(1)).expect("set");
     assert_eq!(idle.expiry_lag_ms(ms(1_000_000)), 0);
+}
+
+/// F-L05-05 (review 2026-08-30, batch 58): the deadline millisecond still
+/// serves the key. Redis's read path is `now > when`, so at `now == when`
+/// `GET` answers the value and `PTTL` answers 0; the key is gone from the
+/// next millisecond on. One predicate serves reads, scans and the wheel.
+#[test]
+fn the_deadline_millisecond_still_serves_the_key() {
+    let mut store = CellStore::new(StoreConfig::default());
+    set_with_ttl(&mut store, b"k", 100, ms(1));
+    assert_eq!(store.get(b"k", ms(100)), Some(b"v".as_slice()), "served at the deadline ms");
+    assert_eq!(store.ttl(b"k", ms(100)), inf_store::Ttl::Ms(0), "PTTL 0 at the deadline ms");
+    assert!(store.exists(b"k", ms(100)));
+    assert_eq!(store.get(b"k", ms(101)), None, "gone one millisecond later");
+    assert_eq!(store.ttl(b"k", ms(101)), inf_store::Ttl::Missing);
+}
+
+/// F-L05-05: active expiry fires at the first millisecond the record
+/// reads as expired — never at the deadline itself (a fire there would
+/// fail validation and strand the entry as a stale drop, leaving the
+/// record to lazy expiry alone).
+#[test]
+fn active_expiry_fires_at_the_first_expired_millisecond() {
+    let mut store = CellStore::new(StoreConfig::default());
+    set_with_ttl(&mut store, b"k", 100, ms(1));
+    let budget = ExpiryBudget { max_fires: 1024, max_steps: 1 << 20 };
+    let at_deadline = store.expire_tick(ms(100), budget);
+    assert_eq!(at_deadline.reaped, 0, "not reaped at the deadline ms");
+    assert_eq!(at_deadline.stale, 0, "and not dropped as stale either");
+    assert_eq!(store.len(), 1);
+    let after = store.expire_tick(ms(101), budget);
+    assert_eq!(after.reaped, 1, "reaped by the wheel one millisecond later");
+    assert_eq!(after.stale, 0);
+    assert_eq!(store.len(), 0);
+    assert_eq!(store.stats().expired_active, 1, "active, not lazy");
 }

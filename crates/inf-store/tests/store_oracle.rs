@@ -18,8 +18,9 @@ struct Model {
 
 impl Model {
     fn live(&mut self, key: &[u8], now_ms: u64) -> Option<&(Vec<u8>, Option<u64>)> {
+        // Exclusive at the deadline millisecond, as Redis (F-L05-05).
         if let Some((_, Some(at))) = self.map.get(key)
-            && *at <= now_ms
+            && *at < now_ms
         {
             self.map.remove(key);
         }
@@ -291,4 +292,73 @@ fn out_of_memory_is_an_error_not_a_panic() {
     // The store stays consistent after OOM: reads and deletes still work.
     assert!(store.get(b"fill:0", now).is_some());
     assert!(store.del(b"fill:0", now));
+}
+
+/// F-L05-04 (review 2026-08-30, batch 58): a batched read must never read
+/// a record the exact path reaped. Shape: key `i` sits behind a
+/// fingerprint false positive `x` in its own chain (a full home group
+/// pushes `i` one group on), and a later key `j` in the same chunk probes
+/// to `i`'s record as *its* first fingerprint match. `i` is expired, so
+/// `i`'s exact path reaps `i`'s record — an address `get_many` never
+/// marked stale, because it marked `x`'s instead — and `j` then decoded
+/// the freed slot's free-list link as a record header (pre-fix: `arena
+/// range escapes chunk`). The keys are precomputed for the fixed test
+/// secret (`.tmp/review-harness/l05_04_collide.rs`); the relations are
+/// asserted so a changed secret fails loudly instead of passing vacuously.
+#[test]
+fn get_many_never_reads_a_record_the_exact_path_reaped() {
+    const FILLERS: [&str; 16] = [
+        "l05-04:x:26758200",
+        "l05-04:f:10",
+        "l05-04:f:35",
+        "l05-04:f:44",
+        "l05-04:f:56",
+        "l05-04:f:60",
+        "l05-04:f:74",
+        "l05-04:f:77",
+        "l05-04:f:83",
+        "l05-04:f:91",
+        "l05-04:f:92",
+        "l05-04:f:96",
+        "l05-04:f:102",
+        "l05-04:f:111",
+        "l05-04:f:125",
+        "l05-04:f:127",
+    ];
+    const KEY_I: &str = "l05-04:i:8";
+    const KEY_J: &str = "l05-04:j:16700306";
+    // The default table is 128 slots = 8 groups (`initial_keys.max(64)`).
+    const GROUP_MASK: u64 = 7;
+    let mut store = CellStore::new(StoreConfig::default());
+    let fp = |h: u64| h >> 42;
+    let (h_i, h_x, h_j) = (
+        store.hash_key(KEY_I.as_bytes()),
+        store.hash_key(FILLERS[0].as_bytes()),
+        store.hash_key(KEY_J.as_bytes()),
+    );
+    assert_eq!(fp(h_x), fp(h_i), "x shares i's 22-bit fingerprint (secret changed?)");
+    assert_eq!(fp(h_j), fp(h_i), "j shares i's 22-bit fingerprint (secret changed?)");
+    assert_eq!(h_i & GROUP_MASK, 0, "i homes in group 0");
+    assert_eq!(h_j & GROUP_MASK, 1, "j homes in group 1");
+    for key in FILLERS {
+        assert_eq!(store.hash_key(key.as_bytes()) & GROUP_MASK, 0, "filler {key} homes in group 0");
+        store.set(key.as_bytes(), b"f", SetOptions::default(), ms(1)).expect("set");
+    }
+    store
+        .set(
+            KEY_I.as_bytes(),
+            b"dying",
+            SetOptions { expire: SetExpire::At(ms(5)), ..Default::default() },
+            ms(1),
+        )
+        .expect("set");
+    assert_eq!(store.probe_groups(KEY_I.as_bytes()), 2, "i's record sits one group past its home");
+    store.set(KEY_J.as_bytes(), b"vj", SetOptions::default(), ms(1)).expect("set");
+
+    let keys: [&[u8]; 2] = [KEY_I.as_bytes(), KEY_J.as_bytes()];
+    let mut got: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+    store.get_many(&keys, ms(10), |i, v| got[i] = v.map(<[u8]>::to_vec));
+    assert_eq!(got, vec![None, Some(b"vj".to_vec())], "batched results match scalar semantics");
+    assert_eq!(store.get(KEY_J.as_bytes(), ms(10)), Some(b"vj".as_slice()));
+    assert_eq!(store.len(), 17, "i reaped exactly once, everything else live");
 }

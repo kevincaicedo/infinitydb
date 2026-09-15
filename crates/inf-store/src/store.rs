@@ -706,19 +706,23 @@ impl CellStore {
                     }
                 };
                 debug_assert!(exact_path);
-                match self.resolve_hashed(key, hashes[i], now) {
-                    Some((addr, len)) => {
+                match self.lookup_hashed(key, hashes[i], now) {
+                    Lookup::Live(addr, len) => {
                         let view = RecordView::new(self.arena.bytes(addr, len));
                         self.stats.keyspace_hits += 1;
                         let value = (view.type_tag() == TypeTag::String).then(|| view.value());
                         out(base + i, value);
                     }
-                    None => {
-                        // The exact path may itself have reaped an expired
-                        // record; invalidate matching later candidates.
-                        if let Some(addr) = candidates[i] {
-                            mark_stale(&mut redo, &candidates, i, addr);
-                        }
+                    Lookup::Reaped(addr) => {
+                        // The exact path reaped this key's own record — not
+                        // `candidates[i]`, which was a fingerprint false
+                        // positive on another key (F-L05-04). A later slot
+                        // whose candidate is the freed address must redo.
+                        mark_stale(&mut redo, &candidates, i, addr);
+                        self.stats.keyspace_misses += 1;
+                        out(base + i, None);
+                    }
+                    Lookup::Absent => {
                         self.stats.keyspace_misses += 1;
                         out(base + i, None);
                     }
@@ -1988,8 +1992,13 @@ impl CellStore {
         self.docs.release(payload);
     }
 
+    /// Files the record's expiry at `deadline_ms + 1` — the first
+    /// millisecond `is_expired` is true (the deadline millisecond itself
+    /// still serves the key, as Redis's `now > when`; F-L05-05). A fire at
+    /// the deadline would fail validation and strand the entry as a stale
+    /// drop, leaving the record to lazy expiry alone.
     pub(crate) fn arm_wheel(&mut self, hash: u64, deadline_ms: u64) {
-        if self.wheel.arm(hash, deadline_ms) == ArmOutcome::PoolFull {
+        if self.wheel.arm(hash, deadline_ms.saturating_add(1)) == ArmOutcome::PoolFull {
             self.stats.wheel_fallback += 1;
         }
     }
@@ -2016,18 +2025,32 @@ impl CellStore {
         self.resolve_hashed(key, self.hash_key(key), now)
     }
 
+    #[inline]
     fn resolve_hashed(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<(ArenaAddr, usize)> {
+        match self.lookup_hashed(key, hash, now) {
+            Lookup::Live(addr, len) => Some((addr, len)),
+            Lookup::Reaped(_) | Lookup::Absent => None,
+        }
+    }
+
+    /// [`resolve_hashed`](Self::resolve_hashed) that also names the address
+    /// it freed: a batched caller holding unverified candidate addresses
+    /// must invalidate the one that was reaped, not the one it probed to
+    /// (F-L05-04).
+    fn lookup_hashed(&mut self, key: &[u8], hash: u64, now: Nanos) -> Lookup {
         let arena = &self.arena;
-        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
+        let Some(addr) = self.index.find(hash, |addr| record_at(arena, addr).key() == key) else {
+            return Lookup::Absent;
+        };
         let view = record_at(arena, addr);
         let len = view.encoded_len();
         if view.is_expired(now) {
             self.free_record(hash, addr, len);
             self.note_reap_lazy();
-            return None;
+            return Lookup::Reaped(addr);
         }
         self.touch_access(hash, addr);
-        Some((addr, len))
+        Lookup::Live(addr, len)
     }
 
     /// Eviction access tracking (M1-S06): one cached branch when no LRU/LFU
@@ -2160,6 +2183,15 @@ pub(crate) fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
     v = v.reverse_bits();
     v = v.wrapping_add(1);
     v.reverse_bits()
+}
+
+/// What an expire-on-read lookup found: the live record, the address of
+/// the expired record it just freed, or nothing under the key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Lookup {
+    Live(ArenaAddr, usize),
+    Reaped(ArenaAddr),
+    Absent,
 }
 
 /// Reads the record at `addr`: header first (fixed 8 bytes) to learn the

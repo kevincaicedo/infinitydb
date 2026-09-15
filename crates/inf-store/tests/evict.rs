@@ -657,3 +657,50 @@ fn tiered_shells_carry_no_resident_bytes_into_the_pool() {
     pressure(&mut ks, EvictionPolicy::AllKeysRandom, pool_before + 1);
     assert!(!ks.over_limit(), "tiered residency raised the global flag");
 }
+
+/// Lane L05 perf row (batch 58 A/B witness, `--ignored --release`): the
+/// cost of one `evict_step` under a non-LFU policy, where the per-slot
+/// key hash is needed only for the victim and for expired records. Prints
+/// ns per step over three replicates; compare the pre- and post-change
+/// trees on the same box (`.artifacts/review/batch58/ab-evict-hash-*.log`).
+#[test]
+#[ignore = "timing witness, run explicitly in release"]
+#[allow(clippy::disallowed_methods)] // wall-clock timing on the test thread, not cell code
+fn evict_step_timing_witness() {
+    const KEYS: u32 = 200_000;
+    const STEPS: u32 = 2_000;
+    // `ttl_every`: 1 = every key volatile (short walks — the sample cap
+    // binds); 100 = one key in a hundred (the volatile policies walk the
+    // full 256-slot span past non-qualifying records — the row's regime).
+    for (policy, ttl_every) in [
+        (EvictionPolicy::AllKeysLru, 1),
+        (EvictionPolicy::VolatileTtl, 1),
+        (EvictionPolicy::VolatileTtl, 100),
+        (EvictionPolicy::VolatileLru, 100),
+    ] {
+        let mut store =
+            CellStore::new(StoreConfig { initial_keys: KEYS as usize, ..StoreConfig::default() });
+        for i in 0..KEYS {
+            let key = format!("k:{i:08}");
+            let expire = if i % ttl_every == 0 {
+                SetExpire::At(Nanos(1_000_000_000_000))
+            } else {
+                SetExpire::Keep
+            };
+            let opts = SetOptions { expire, ..Default::default() };
+            store.set(key.as_bytes(), b"12345678", opts, Nanos(1)).expect("set");
+        }
+        store.set_eviction_policy(policy);
+        for rep in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut evicted = 0u64;
+            for _ in 0..STEPS {
+                evicted += store.evict_step(5, Nanos(2)).evicted;
+            }
+            let ns = t0.elapsed().as_nanos() / u128::from(STEPS);
+            println!(
+                "evict-step-ab: policy={policy:?} ttl_every={ttl_every} rep={rep} ns_per_step={ns} evicted={evicted}"
+            );
+        }
+    }
+}
