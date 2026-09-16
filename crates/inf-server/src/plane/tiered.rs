@@ -613,8 +613,19 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Ram(addr) => {
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
+            // Planted-bug canary (ADR-0129 A1, `scripts/sim-canaries.sh`):
+            // the tiered read path lies like `exec.rs`'s GET, so the
+            // tiered writers' own expectation is proven to have teeth.
+            #[cfg(inf_canary_reply_lie)]
+            w.bulk(&[table.record(addr).value, b"!"].concat());
+            #[cfg(not(inf_canary_reply_lie))]
             w.bulk(table.record(addr).value);
         }
+        #[cfg(inf_canary_reply_lie)]
+        Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => {
+            w.bulk(&[value.as_slice(), b"!"].concat());
+        }
+        #[cfg(not(inf_canary_reply_lie))]
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
         Resolved::Fail(message) => w.error(message),
     }

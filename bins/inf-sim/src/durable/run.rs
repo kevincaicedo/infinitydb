@@ -59,6 +59,8 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         segments_recycled: 0,
         recycle_misses: 0,
         recycle_fallbacks: 0,
+        recycle_served: 0,
+        recycle_open_unreached: false,
         recycle_sentinels: 0,
         segment_rotations: 0,
         recycled_residue_slacks: 0,
@@ -612,6 +614,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
             report.segments_recycled += stats.segments_recycled;
             report.recycle_misses += stats.recycle_misses;
             report.recycle_fallbacks += stats.recycle_fallbacks;
+            report.recycle_served += served_preallocs(&stats);
             report.recycle_sentinels += stats.recycle_sentinels;
             report.segment_rotations += stats.segment_rotations;
             report.recycle_waits_started += stats.recycle_waits_started;
@@ -660,9 +663,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 // prealloc, so the pool was fed only after the last one.
                 // A prealloc that found the pool non-empty (not a miss, not
                 // a space failure) must have recycled or fallen back.
-                let served = stats
-                    .segment_preallocs
-                    .saturating_sub(stats.recycle_misses + stats.segment_prealloc_failures);
+                let served = served_preallocs(&stats);
                 if served > 0 && stats.segments_recycled == 0 && stats.recycle_fallbacks == 0 {
                     fail(
                         &mut report,
@@ -1072,25 +1073,86 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     if scenario.recycle_open_fault {
         let fired = inf_foundation::fault::fired(inf_log::fault::RECYCLE_OPEN_FAIL);
         inf_foundation::fault::disarm(inf_log::fault::RECYCLE_OPEN_FAIL);
-        if fired == 0 {
-            fail(
-                &mut report,
-                format!(
-                    "RECYCLE-OPEN FAULT VACUOUS seed {:#x}: no pooled file was reused",
-                    scenario.seed
-                ),
-            );
-        } else if report.recycle_fallbacks == 0 {
-            fail(
-                &mut report,
-                format!(
-                    "RECYCLE-OPEN FALLBACK MISSING seed {:#x}: the point fired {fired}× and no \
-                     generation fell back fresh",
-                    scenario.seed
-                ),
-            );
+        // ADR-0090 A17 (F-L19-20): the arm's precondition is A16's — a
+        // prealloc that found the pool non-empty is the take the point
+        // intercepts. The point stays armed through the recovered life,
+        // so that life's takes and fallbacks count too (sampled here, on
+        // the audited node). A seed whose lives never reached the pool
+        // (seed 0xd5ee0103: 6 preallocs, 6 misses) is unreached, disclosed.
+        let mut fallbacks = report.recycle_fallbacks;
+        for cell in 0..usize::from(scenario.cells) {
+            if let Some(stats) = node.plane(cell).durable_stats() {
+                report.recycle_served += served_preallocs(&stats);
+                fallbacks += stats.recycle_fallbacks;
+            }
+        }
+        match open_fault_verdict(scenario.seed, report.recycle_served, fired, fallbacks) {
+            OpenFaultVerdict::Ok => {}
+            OpenFaultVerdict::Unreached => report.recycle_open_unreached = true,
+            OpenFaultVerdict::Violation(what) => fail(&mut report, what),
         }
     }
 
     finish(report, &observer, &clock)
+}
+
+/// Preallocs that found the pool non-empty — neither a miss nor a space
+/// failure (ADR-0090 A16): the takes the recycle rules are about.
+fn served_preallocs(stats: &inf_server::DurableStats) -> u64 {
+    stats.segment_preallocs.saturating_sub(stats.recycle_misses + stats.segment_prealloc_failures)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OpenFaultVerdict {
+    Ok,
+    /// No take ever happened: the arm proves nothing on this seed.
+    Unreached,
+    Violation(String),
+}
+
+/// The `recycle_open_fail` arm's rule (ADR-0090 A14, precondition A17):
+/// a take is what the point intercepts, so `served` takes and no fire is
+/// the vacuity; no take is unreached; a fire with no fresh fallback is
+/// the A14 defect.
+fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> OpenFaultVerdict {
+    if fired == 0 && served > 0 {
+        OpenFaultVerdict::Violation(format!(
+            "RECYCLE-OPEN FAULT VACUOUS seed {seed:#x}: {served} preallocs found the pool \
+             non-empty and the armed point never fired"
+        ))
+    } else if fired == 0 {
+        OpenFaultVerdict::Unreached
+    } else if fallbacks == 0 {
+        OpenFaultVerdict::Violation(format!(
+            "RECYCLE-OPEN FALLBACK MISSING seed {seed:#x}: the point fired {fired}× and no \
+             generation fell back fresh"
+        ))
+    } else {
+        OpenFaultVerdict::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpenFaultVerdict, open_fault_verdict};
+
+    /// F-L19-20: the four corners of the arm's rule. The batch-16 rule
+    /// answered the `(served 0, fired 0)` corner with the vacuity
+    /// violation — seed `0xd5ee0103`'s shape (6 preallocs, 6 misses).
+    #[test]
+    fn open_fault_rule_distinguishes_unreached_from_vacuous() {
+        assert_eq!(open_fault_verdict(0xd5ee0103, 0, 0, 0), OpenFaultVerdict::Unreached);
+        assert!(matches!(
+            open_fault_verdict(0xd5ee0003, 3, 0, 0),
+            OpenFaultVerdict::Violation(w) if w.contains("VACUOUS") && w.contains("3 preallocs")
+        ));
+        assert!(matches!(
+            open_fault_verdict(0xd5ee0003, 3, 1, 0),
+            OpenFaultVerdict::Violation(w) if w.contains("FALLBACK MISSING")
+        ));
+        assert_eq!(open_fault_verdict(0xd5ee0003, 3, 1, 1), OpenFaultVerdict::Ok);
+        // A take in the recovered life alone (served counted there) still
+        // needs its fallback counted from that life — the sampling rule.
+        assert_eq!(open_fault_verdict(0xd5ee000b, 1, 1, 1), OpenFaultVerdict::Ok);
+    }
 }

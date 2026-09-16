@@ -29,7 +29,7 @@ use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, loo
 
 use crate::admin;
 use crate::clients::ClientRegistry;
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, DATABASES};
 use crate::glob::glob_match;
 #[cfg(feature = "doc")]
 use crate::json;
@@ -1371,7 +1371,7 @@ fn copy(
                 return w.error("ERR syntax error");
             }
             match parse_i64(argv.arg(i + 1)) {
-                Ok(n @ 0..=15) => dst_db = n as u16,
+                Ok(n) if (0..i64::from(DATABASES)).contains(&n) => dst_db = n as u16,
                 Ok(_) => return w.error("ERR DB index is out of range"),
                 Err(()) => return w.error("ERR value is not an integer or out of range"),
             }
@@ -1579,7 +1579,7 @@ fn select(
     w: &mut RespWriter<'_>,
 ) {
     match parse_i64(argv.arg(1)) {
-        Ok(n @ 0..=15) => {
+        Ok(n) if (0..i64::from(DATABASES)).contains(&n) => {
             cx.db = n as u16;
             cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.

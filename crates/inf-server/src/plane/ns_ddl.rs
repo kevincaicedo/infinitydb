@@ -778,8 +778,7 @@ pub(super) fn try_send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
         Protocol::Resp3 => 3,
         Protocol::Resp2 => 2,
     };
-    debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
-    let cmd_byte = proto_byte | ((db as u8) << 4);
+    let cmd_byte = proto_byte | (db_nibble(db) << 4);
     let (token, sent) = {
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
@@ -819,13 +818,12 @@ pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone 
     // applies carry the empty-key slot).
     let slot = SlotRouter::slot_of(argv.get(1).copied().unwrap_or(b""));
     // `cmd` packs `{db:4 | proto:4}` (ADR-0009) — SELECT travels with the
-    // op on the byte the codec already had; db is < 16 by SELECT bounds.
+    // op on the byte the codec already had; db fits the nibble by `DATABASES`.
     let proto_byte: u8 = match proto {
         Protocol::Resp3 => 3,
         Protocol::Resp2 => 2,
     };
-    debug_assert!(db < 16, "db rides 4 bits of the Apply cmd byte");
-    let cmd_byte = proto_byte | ((db as u8) << 4);
+    let cmd_byte = proto_byte | (db_nibble(db) << 4);
     // Token draw + first send attempt share one fabric borrow (M2.5
     // Phase H). Registering the waiter *after* staging stays safe: `send`
     // only stages into the outbound pack — the peer cannot observe the op
@@ -851,4 +849,16 @@ pub(super) async fn send_apply<O: PlaneObserver + 'static, F: SegmentFs + Clone 
         shared.rtt_sent.borrow_mut()[usize::from(to.0)].push_back((token.0, shared.now.get()));
     }
     Ok(waiter)
+}
+
+// `db` rides 4 bits of the fabric `Apply` cmd byte; the one owner of the
+// database count proves it fits at compile time (review 2026-08-30 L17
+// E6b) — a wider `DATABASES` fails the build, never mis-routes.
+const _: () = assert!(crate::config::DATABASES <= 16, "db rides 4 bits of the Apply cmd byte");
+
+/// The db index as the cmd byte's high nibble (`db < DATABASES ≤ 16` by
+/// `SELECT`/`COPY` bounds and the assert above).
+fn db_nibble(db: u16) -> u8 {
+    debug_assert!(db < crate::config::DATABASES);
+    (db & 0xF) as u8
 }

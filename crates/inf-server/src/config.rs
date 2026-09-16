@@ -87,6 +87,12 @@ pub const MAXMEMORY_POLICIES: &[&str] = &[
 
 /// `Kind::Int` bounds for the keys Redis leaves unbounded.
 const ANY_INT: (i64, i64) = (i64::MIN, i64::MAX);
+
+/// Databases per keyspace — the one owner of "16" (review 2026-08-30 L17
+/// E6(b)): `SELECT`/`COPY … DB` bound their index by it, the `databases`
+/// row admits exactly it, and the fabric `Apply` packing asserts at
+/// compile time that it fits the cmd byte's 4-bit db field.
+pub const DATABASES: u16 = 16;
 /// Redis's `0..=INT_MAX` bound (`timeout`, `tcp-keepalive`).
 const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
 
@@ -113,7 +119,13 @@ impl Default for ConfigStore {
                     Kind::OutputBufferLimit,
                     "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
                 ),
-                e("databases", ReloadClass::BootOnly, Kind::Int(ANY_INT.0, ANY_INT.1), "16"),
+                // Exactly `DATABASES`: the fabric db field's capacity (L17 E6b).
+                e(
+                    "databases",
+                    ReloadClass::BootOnly,
+                    Kind::Int(i64::from(DATABASES), i64::from(DATABASES)),
+                    "16",
+                ),
                 // M3-S10 (ADR-0041 D2): per-cell compiled-path-program
                 // cache entries; 0 disables. Applied at plane assembly.
                 e(
@@ -430,6 +442,23 @@ mod tests {
         assert_eq!(cfg.get("maxmemory"), Some("0"));
         assert_eq!(cfg.get("maxmemory-policy"), Some("noeviction"));
         assert_eq!(cfg.get("databases"), Some("16"));
+    }
+
+    /// Review 2026-08-30 L17 E6(b): `db` rides 4 bits of the fabric
+    /// `Apply` cmd byte, so the `databases` row admits exactly the value
+    /// that field can carry — one owner (`DATABASES`) for SELECT/COPY,
+    /// the row and the packing, never a literal that a boot-time setter
+    /// could outgrow into a silent mis-route.
+    #[test]
+    fn databases_row_admits_only_the_fabric_field_capacity() {
+        let cfg = ConfigStore::default();
+        let entry = cfg.entries.iter().find(|e| e.key == "databases").expect("row");
+        assert!(
+            matches!(entry.kind, Kind::Int(lo, hi) if lo == i64::from(DATABASES) && hi == lo),
+            "databases admits {:?}, the fabric field carries exactly {DATABASES}",
+            entry.kind
+        );
+        assert_eq!(cfg.get("databases").and_then(|v| v.parse::<u16>().ok()), Some(DATABASES));
     }
 
     #[test]

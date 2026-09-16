@@ -987,6 +987,14 @@ pub struct DurableReport {
     pub segments_recycled: u64,
     pub recycle_misses: u64,
     pub recycle_fallbacks: u64,
+    /// Preallocs that found the pool non-empty (neither a miss nor a
+    /// space failure), both lives (ADR-0090 A16/A17): the precondition
+    /// of the engagement rule and of the `recycle_open_fail` arm.
+    pub recycle_served: u64,
+    /// The `recycle_open_fail` arm was planted and no prealloc ever
+    /// reached the pool (F-L19-20): disclosed, not a violation — the seed
+    /// proves nothing about the fallback rule.
+    pub recycle_open_unreached: bool,
     /// Recycle sentinels written (ADR-0090 A15): every recycled take
     /// leaves one, so `== segments_recycled` at the cut on the sync
     /// tier and `≤` it on the driver tier (a take whose slice has not
@@ -1288,7 +1296,7 @@ impl Writer {
         };
         if reply != pending.expect {
             report.violations.push(format!(
-                "writer {} key {:?}: expected {:?}, got {:?}",
+                "REPLY VIOLATION writer {} key {:?}: expected {:?}, got {:?}",
                 self.id,
                 String::from_utf8_lossy(&pending.key),
                 String::from_utf8_lossy(&pending.expect),

@@ -94,7 +94,7 @@ pub(super) fn pump_writers(
             };
             if reply != pending.expect {
                 report.violations.push(format!(
-                    "writer {} key {:?}: expected {}, got {}",
+                    "REPLY VIOLATION writer {} key {:?}: expected {}, got {}",
                     writer.id,
                     String::from_utf8_lossy(&pending.key),
                     preview(&pending.expect),

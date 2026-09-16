@@ -21,6 +21,12 @@ rows=(
   # shared-store replay cannot see it (both sides run the same code); the
   # shadow model (bins/inf-sim/src/harness/shadow.rs) must.
   "inf_canary_reply_lie m0-smoke divergence"
+  # ADR-0129 A1 (batch 72): the durable and tiered runners keep their own
+  # oracle — each writer expects the reply its own write sequence implies
+  # (`REPLY VIOLATION`); the same cfg lies in the tiered read path too
+  # (`plane/tiered.rs::read_value`), so both rows prove those teeth.
+  "inf_canary_reply_lie m2-durable REPLY"
+  "inf_canary_reply_lie m4-tiered REPLY"
 )
 
 cargo build --release -p inf-sim --features dst --bin inf-sim

@@ -1347,6 +1347,8 @@ fn run_durable(
     let mut recycled = 0u64;
     let mut recycle_misses = 0u64;
     let mut recycle_fallbacks = 0u64;
+    let mut recycle_served = 0u64;
+    let mut open_unreached = 0u64;
     let mut recycle_sentinels = 0u64;
     let mut clean_stop_torn_tails = 0u64;
     let mut rotations = 0u64;
@@ -1394,6 +1396,8 @@ fn run_durable(
         recycled += report.segments_recycled;
         recycle_misses += report.recycle_misses;
         recycle_fallbacks += report.recycle_fallbacks;
+        recycle_served += report.recycle_served;
+        open_unreached += u64::from(report.recycle_open_unreached);
         recycle_sentinels += report.recycle_sentinels;
         clean_stop_torn_tails += report.clean_stop_torn_tails;
         rotations += report.segment_rotations;
@@ -1451,7 +1455,8 @@ fn run_durable(
          write_through_entries_max:{write_through_entries_max} \
          hold_episode_violations:{hold_episode_violations}], \
          recycling [recycled:{recycled} misses:{recycle_misses} \
-         fallbacks:{recycle_fallbacks} rotations:{rotations} residue_slacks:{residue_slacks} \
+         fallbacks:{recycle_fallbacks} served:{recycle_served} \
+         open_unreached:{open_unreached} rotations:{rotations} residue_slacks:{residue_slacks} \
          waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
          waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
          [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
@@ -1479,7 +1484,8 @@ fn run_durable(
              write_through_entries_max={write_through_entries_max} \
              hold_episode_violations={hold_episode_violations} \
              segments_recycled={recycled} recycle_misses={recycle_misses} \
-             recycle_fallbacks={recycle_fallbacks} recycle_sentinels={recycle_sentinels} \
+             recycle_fallbacks={recycle_fallbacks} recycle_served={recycle_served} \
+             recycle_open_unreached={open_unreached} recycle_sentinels={recycle_sentinels} \
              clean_stop_torn_tails={clean_stop_torn_tails} segment_rotations={rotations} \
              recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
              recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \

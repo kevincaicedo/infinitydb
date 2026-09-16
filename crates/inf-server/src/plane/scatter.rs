@@ -583,7 +583,7 @@ fn move_options(cmd: CommandId, argv: &[&[u8]], db: u16) -> Result<(u16, bool), 
             replace = true;
         } else if argv[i].eq_ignore_ascii_case(b"DB") && i + 1 < argv.len() {
             target_db = match crate::exec::parse_i64(argv[i + 1]) {
-                Ok(n @ 0..=15) => n as u16,
+                Ok(n) if (0..i64::from(crate::config::DATABASES)).contains(&n) => n as u16,
                 Ok(_) => return Err("ERR DB index is out of range"),
                 Err(()) => return Err("ERR value is not an integer or out of range"),
             };

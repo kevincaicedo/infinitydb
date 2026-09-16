@@ -129,7 +129,11 @@ K = 1 alternation otherwise carries half the population per barrier
 since its binding A/B of 2026-08-26, `0` the off arm; inert on the FUA
 class). Everything else — the hash index, document trees,
 secondary indexes, stream offsets, vector graphs — is a rebuildable
-projection over that log. Checkpoints are fuzzy snapshots streamed by the
+projection over that log, of one of two named classes (ADR-0130):
+*log-rebuildable* (re-derived by replay; the memory hash index, the
+M4.5 indexes) or *checkpoint-rebuildable* (loaded from the checkpoint
+that gates truncation, then replayed forward; the tiered hash index,
+ADR-0057/0094 — never re-derived from cold data). Checkpoints are fuzzy snapshots streamed by the
 owning cell in budgeted background slices (no fork, no stop-the-world)
 as 4 KiB-aligned `O_DIRECT` blocks — no page-cache lump the kernel repays
 at once — at an interval **derived** from the last checkpoint's size and
@@ -192,7 +196,8 @@ AOF-class durability, DynamoDB-class commit semantics, Kafka-class topics,
 replication, CDC, and point-in-time recovery. A cache is the log with
 durability off. A queue is the log read forward by consumer groups. A
 replica is the log shipped to a follower. Indexes are projections over it,
-rebuildable by replay. This is why the feature set can be broad while the
+rebuildable by replay or from the checkpoint the log's truncation is
+gated on (ADR-0130 names which is which). This is why the feature set can be broad while the
 trusted computing base stays small: there is one durability mechanism to
 make correct, not five.
 
