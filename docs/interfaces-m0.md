@@ -95,8 +95,6 @@ impl Arena {
 
 ## 3. `inf-runtime` — backend driver + executor + loop (implemented — the code is the spec)
 
-> Deviations from the original sketch are deliberate and recorded in
-> `reviews/infinity-m0-skeleton.md` §"Interface deviations": `generation()`
 > (edition-2024 keyword), the Pin-sound `PollImmediate` shape,
 > `FabricGate<V>`, `submit_stats()`/`performance_tier`, fallible
 > `run_iteration`, `CellPlane::on_timer`.
@@ -359,7 +357,7 @@ See [ADR-0115](../../docs/adr/0115-internal-command-origin-fence.md).
 ## 5. `inf-wire` — RESP port + command metadata (implemented — the code is the spec)
 
 > Deviation from the original sketch (recorded in
-> `reviews/infinity-m0-skeleton.md`): `FrameIter` is a **lending** iterator —
+> `reviews/milestones/2026-06-11/m0-skeleton.md`): `FrameIter` is a **lending** iterator —
 > `next(&mut self) -> Option<Parsed<'_>>`, items borrow the iterator. The
 > sketched plain `Iterator` was unsound: accumulator-backed frames could
 > outlive accumulator maintenance. The lending shape also compiler-enforces
@@ -450,7 +448,7 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest orac
 ## 6. `inf-store` — records, index, ops, router (implemented — the code is the spec)
 
 > Deviations from the original sketch (recorded in
-> `reviews/infinity-m0-skeleton.md`): the "8 B fixed" header is honored by
+> `reviews/milestones/2026-06-11/m0-skeleton.md`): the "8 B fixed" header is honored by
 > narrowing `version` to **u24** (the sketch's field list summed to 72
 > bits — it never fit u64; the 8 B header is load-bearing: the (16 B, 64 B)
 > gate record lands exactly in the 88 B size class with zero slack, putting
@@ -647,7 +645,7 @@ exercised on real Linux (kernel 7.0): conformance suite green in probed
 lifecycle storms reconcile in both, and the S04 echo gate passes ×30+
 (artifacts under `infinitydb/.artifacts/m0/2026-06-11-linux-devbox/`). The
 first live run found and fixed three driver bugs — recorded in
-`reviews/infinity-m0-skeleton.md`. Still pending: the 5.15/6.1 kernel-matrix
+`reviews/milestones/2026-06-11/m0-skeleton.md`. Still pending: the 5.15/6.1 kernel-matrix
 CI legs and the reference-box gate campaign (S21).
 
 

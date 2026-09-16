@@ -31,8 +31,7 @@
 //!
 //! ## Validation status
 //! Conformance suite green on Linux 7.0 in probed and `INF_URING_FORCE_DEGRADED`
-//! modes (2026-06-11); kernel-matrix CI legs and reference-box performance
-//! evidence tracked in `reviews/infinity-m0-skeleton.md`.
+//! modes (2026-06-11); kernel-matrix CI legs and reference-box performance.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;

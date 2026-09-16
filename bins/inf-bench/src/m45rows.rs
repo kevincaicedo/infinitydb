@@ -23,8 +23,7 @@
 //! rate** (ADR-0081 D5 was written for closed-loop saturation; the bar
 //! binds at the rate the comparators were measured at).
 //!
-//! The defect this row pins (2026-08-19 finding,
-//! `reviews/tiered-always-group-commit-finding-20260819.md`): fabric
+//! The defect this row pins: fabric
 //! tiered applies were serialized one-per-fsync-window per origin FIFO
 //! (the pump held its queue across the durable-ack wait), so a tiered
 //! `always` namespace served a flat ~3.6k ops/s across an 8×

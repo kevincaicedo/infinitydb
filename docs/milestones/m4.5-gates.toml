@@ -1,7 +1,6 @@
 # M4.5 gate rows — machine-readable encoding of the M4.5 milestone plan's
 # E4.5 performance stories. First occupant: the S29 tiered-`always`
-# concurrency-scaling row (opened 2026-08-19, remediated same session —
-# `reviews/tiered-always-group-commit-finding-20260819.md`). Second:
+# concurrency-scaling row. Second:
 # the S27 durable-write-backpressure row (ADR-0083 D7 — refusals,
 # decay, and max in the provoked `--log-staging-mib 1` regime; the
 # ADR-0081 D5 bar restated for the gate harness, binding on the
