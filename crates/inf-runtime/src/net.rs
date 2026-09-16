@@ -101,6 +101,45 @@ pub fn set_keepalive(fd: std::os::fd::RawFd, secs: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// This process's resident set in bytes: Linux from `/proc/self/status`
+/// (`VmRSS`), macOS from `proc_pidinfo(PROC_PIDTASKINFO)`; `None` where
+/// no reader exists (lane L11 N19, batch 70 — a gauge abstains, never
+/// reports 0 for "could not read"). Tooling only, never the data plane.
+pub fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        line.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+        let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, a
+        // buffer of exactly that size, and returns the bytes it filled.
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if filled != size {
+            return None;
+        }
+        // SAFETY: the kernel filled every byte of the struct (checked above).
+        let info = unsafe { info.assume_init() };
+        Some(info.pti_resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// Refuses a port another process already listens on (batch 59, review
 /// 2026-08-30 lane L19 addendum): `SO_REUSEPORT` lets a second node of
 /// the same uid *join* a running node's listener group, and the kernel
@@ -142,14 +181,27 @@ pub fn probe_port_unowned(port: u16) -> io::Result<()> {
 /// `AddrInUse` when a listener owns the address; other socket/bind
 /// failures as they are.
 pub fn probe_addr_unowned(addr: std::net::SocketAddrV4) -> io::Result<()> {
+    // `SOCK_CLOEXEC` is Linux-only (batch 61 broke the macOS build with
+    // it); the dev tier sets the flag after the fact, which leaves a
+    // spawn-race window the probe's doc already declares foreign.
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
     // SAFETY: plain socket(2) FFI; the fd is checked before use and owned
     // by `owned` (closed on every path below).
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(libc::AF_INET, kind, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the raw fd is fresh and owned exclusively here.
     let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: fcntl on the live fd owned above; a failure only leaves the
+    // probe socket inheritable for the microseconds until `_owned` drops.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
     let one: libc::c_int = 1;
     // SAFETY: setsockopt with a valid int pointer on the live socket.
     let rc = unsafe {
@@ -300,6 +352,8 @@ mod tests {
 
     /// Batch 61 (lane L11 `net.rs:122-123`): a core past `CPU_SETSIZE`
     /// (CLI-supplied) is a typed refusal, not `CPU_SET`'s index panic.
+    /// Linux only: pinning is a documented no-op elsewhere.
+    #[cfg(target_os = "linux")]
     #[test]
     fn pin_refuses_a_core_past_cpu_setsize() {
         let err = pin_current_thread(usize::MAX).expect_err("out of range");

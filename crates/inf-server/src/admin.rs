@@ -1292,6 +1292,8 @@ mod tests {
                 .parse()
                 .expect("u64")
         };
+        // Linux reads `/proc/self/status`, macOS `proc_pidinfo` (batch 70,
+        // lane L11 N19): a gauge that cannot read abstains, never 0 here.
         assert!(field("process_rss") > 0, "{memory}");
         assert_eq!(field("process_rss"), field("used_memory_rss"), "one read, two names: {memory}");
     }

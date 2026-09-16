@@ -96,7 +96,9 @@ lines=0
 sites=0
 allowed=0
 DISCARD='(let[[:space:]]+_[[:space:]]*=|\.ok\(\)|\.unwrap_or|\.is_ok\(\)|\.is_err\(\)|drop\()'
-SYNCCALL='(sync_data|sync_all|fdatasync|libc::fsync)[[:space:]]*\('
+# `[(]`, not `\(`: awk -v unescapes the backslash, and BSD awk then refuses
+# the unbalanced group ("illegal primary") — the gate was red on macOS.
+SYNCCALL='(sync_data|sync_all|fdatasync|libc::fsync)[[:space:]]*[(]'
 syncs=0
 # marker-up.awk (inline): from site line n, look at n itself and then up
 # through the whole-line `//` comment block above it; print the reason

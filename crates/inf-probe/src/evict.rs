@@ -12,6 +12,7 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -109,7 +110,9 @@ mod tests {
     use super::*;
 
     /// A directory tree is walked to its files, each synced and advised;
-    /// the report counts files, bytes and directories exactly.
+    /// the report counts files, bytes and directories exactly. Linux only:
+    /// the advice is `Unsupported` elsewhere by design.
+    #[cfg(target_os = "linux")]
     #[test]
     fn evicts_every_regular_file_under_the_directory() {
         let root = std::env::temp_dir().join(format!("inf-probe-evict-{}", std::process::id()));

@@ -79,10 +79,10 @@ fixture() {
 # ---------------------------------------------------------------- deny-list
 DENY=./scripts/check-cell-denylist.sh
 
-root=$(fixture clean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() -> u64 { 1 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture clean)
 expect green "deny-list: clean crate" env INF_CHECK_ROOT="$root" $DENY
 expect_output "deny-list: scope line discloses the scan" "1 crates, 1 files, 1 lines scanned" env INF_CHECK_ROOT="$root" $DENY
 
@@ -91,10 +91,10 @@ mkdir -p "$work/empty/crates"
 expect red "deny-list: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $DENY
 
 # A stale exclusion (a path that evaporated) is a failure.
-root=$(fixture stale <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
 EOF
-)
+root=$(printf '%s' "$body" | fixture stale)
 first=${CELL_CRATE_EXCLUDE[0]%%|*}
 [ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "$root/$first"
 expect red "deny-list: exclusion naming a missing directory fails" env INF_CHECK_ROOT="$root" $DENY
@@ -118,7 +118,7 @@ do
 done
 
 # The same hit inside a test-only module is not cell code.
-root=$(fixture testmod <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
 
 #[cfg(test)]
@@ -128,10 +128,10 @@ mod tests {
     }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture testmod)
 expect green "deny-list: wall clock inside #[cfg(test)] mod tests is stripped" env INF_CHECK_ROOT="$root" $DENY
 
-root=$(fixture loommod <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
 
 #[cfg(all(test, not(loom)))]
@@ -139,22 +139,22 @@ mod tests {
     fn t() { std::thread::spawn(|| {}); }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture loommod)
 expect green "deny-list: #[cfg(all(test, …))] module is stripped" env INF_CHECK_ROOT="$root" $DENY
 
 # `any(test, feature)` is NOT test-only: it compiles under the feature.
-root=$(fixture anymod <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 #[cfg(any(test, feature = "probe"))]
 mod probe {
     pub fn t() { std::thread::spawn(|| {}); }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture anymod)
 expect red "deny-list: #[cfg(any(test, feature))] module is scanned" env INF_CHECK_ROOT="$root" $DENY
 
 # The P1c shape, applied here: an inline #[cfg(test)] item must not swallow
 # the rest of the file.
-root=$(fixture inline <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub struct S;
 impl S {
     #[cfg(test)]
@@ -162,71 +162,71 @@ impl S {
 }
 pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture inline)
 expect red "deny-list: a violation after an inline #[cfg(test)] item is still seen" env INF_CHECK_ROOT="$root" $DENY
 
 # Sanctioned sites: the marker with a reason, on the line or the one above.
-root=$(fixture allowsame <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn t() -> std::time::Instant { std::time::Instant::now() } // denylist-allow: fixture reason
 EOF
-)
+root=$(printf '%s' "$body" | fixture allowsame)
 expect green "deny-list: marker with a reason on the same line" env INF_CHECK_ROOT="$root" $DENY
 expect_output "deny-list: allowed sites are listed" "allowed crates/fake/src/lib.rs:1: fixture reason" env INF_CHECK_ROOT="$root" $DENY
 
-root=$(fixture allowabove <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 // denylist-allow: fixture reason on the line above
 pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture allowabove)
 expect green "deny-list: marker with a reason on the line above" env INF_CHECK_ROOT="$root" $DENY
 
-root=$(fixture allowbare <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn t() -> std::time::Instant { std::time::Instant::now() } // denylist-allow
 EOF
-)
+root=$(printf '%s' "$body" | fixture allowbare)
 expect red "deny-list: a bare marker without a reason fails" env INF_CHECK_ROOT="$root" $DENY
 
-root=$(fixture allowfar <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 // denylist-allow: two lines up does not count
 //
 pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture allowfar)
 expect red "deny-list: a marker two lines above does not apply" env INF_CHECK_ROOT="$root" $DENY
 
 # A `mod name;` under #[cfg(test)] makes the named file test-only.
-root=$(fixture modfile <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 #[cfg(test)]
 mod scratch;
 pub fn ok() {}
 EOF
-)
+root=$(printf '%s' "$body" | fixture modfile)
 echo 'pub fn t() -> std::time::Instant { std::time::Instant::now() }' >"$root/crates/fake/src/scratch.rs"
 expect green "deny-list: a #[cfg(test)] mod file is test-only" env INF_CHECK_ROOT="$root" $DENY
 
 # A test module whose closing brace never comes back to its indent would
 # blank the rest of the file: that is a scope error, not a pass.
-root=$(fixture unterminated <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 #[cfg(test)]
 mod tests {
     fn t() {}
   }
 pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture unterminated)
 expect red "deny-list: an unterminated test module is a scope error" env INF_CHECK_ROOT="$root" $DENY
 
 # --------------------------------------------------------------- panic policy
 PANIC=./scripts/check-panic-policy.sh
 
-root=$(fixture pclean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(v: Option<u8>) -> u8 { v.unwrap_or(0) }
 pub fn ok2(v: Option<u8>) -> u8 { v.unwrap_or_default() }
 pub fn ok3(v: Option<u8>) -> u8 { v.expect("invariant: caller checked") }
 /// Docs may say `.unwrap()` without being code.
 pub fn ok4() {}
 EOF
-)
+root=$(printf '%s' "$body" | fixture pclean)
 expect green "panic-policy: unwrap_or / expect / doc-comment unwrap are fine" env INF_CHECK_ROOT="$root" $PANIC
 
 for snippet in \
@@ -241,7 +241,7 @@ done
 
 # The P1c shape exactly: an inline #[cfg(test)] accessor, then a naked
 # unwrap further down the same file.
-root=$(fixture p1c <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub struct S { mode: u8 }
 impl S {
     #[cfg(test)]
@@ -249,11 +249,11 @@ impl S {
 }
 pub fn t(v: Option<u8>) -> u8 { v.unwrap() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture p1c)
 expect red "panic-policy: the ckpt.rs shape (inline cfg(test) then unwrap) is caught" env INF_CHECK_ROOT="$root" $PANIC
 expect_output "panic-policy: inline items are disclosed" "1 inline cfg(test) items scanned as production" env INF_CHECK_ROOT="$root" $PANIC
 
-root=$(fixture ptest <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
 
 #[cfg(test)]
@@ -267,21 +267,21 @@ mod more {
     fn t() { let _ = Some(1u8).unwrap(); }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ptest)
 expect green "panic-policy: unwrap inside test-only modules is stripped" env INF_CHECK_ROOT="$root" $PANIC
 expect_output "panic-policy: stripped lines are disclosed" "9 test-only lines stripped" env INF_CHECK_ROOT="$root" $PANIC
 
-root=$(fixture pallow <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 // panic-policy-allow: fixture reason
 pub fn t(v: Option<u8>) -> u8 { v.unwrap() }
 EOF
-)
+root=$(printf '%s' "$body" | fixture pallow)
 expect green "panic-policy: marker with a reason on the line above" env INF_CHECK_ROOT="$root" $PANIC
 
-root=$(fixture pbare <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn t(v: Option<u8>) -> u8 { v.unwrap() } // panic-policy-allow
 EOF
-)
+root=$(printf '%s' "$body" | fixture pbare)
 expect red "panic-policy: a bare marker without a reason fails" env INF_CHECK_ROOT="$root" $PANIC
 
 expect red "panic-policy: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $PANIC
@@ -334,7 +334,7 @@ manifest() {
     echo "$root"
 }
 
-root=$(manifest ship-clean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
@@ -344,24 +344,24 @@ inf-foundation = { workspace = true }
 [dev-dependencies]
 inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-clean)
 expect green "shipping: dev-dependency edge may request the features" env INF_CHECK_ROOT="$root" $SHIP
 expect_output "shipping: scope line discloses the scan" "1 manifests scanned" env INF_CHECK_ROOT="$root" $SHIP
 
 mkdir -p "$work/ship-empty/crates"
 expect red "shipping: no manifests at all is a failure, not OK" env INF_CHECK_ROOT="$work/ship-empty" $SHIP
 
-root=$(manifest ship-normal <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
 [dependencies]
 inf-foundation = { workspace = true, features = ["collision-oracle", "fault-points"] }
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-normal)
 expect red "shipping: the F-L16-01 shape — a normal edge requests the features" env INF_CHECK_ROOT="$root" $SHIP
 
-root=$(manifest ship-table <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
@@ -369,20 +369,20 @@ name = "fake"
 workspace = true
 features = ["fault-points"]
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-table)
 expect red "shipping: a [dependencies.NAME] table requesting the feature" env INF_CHECK_ROOT="$root" $SHIP
 
-root=$(manifest ship-target <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
 [target.'cfg(unix)'.dependencies]
 inf-foundation = { workspace = true, features = ["fault-points"] }
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-target)
 expect red "shipping: a target-cfg dependency edge is a normal edge" env INF_CHECK_ROOT="$root" $SHIP
 
-root=$(manifest ship-default <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
@@ -394,10 +394,10 @@ dst = ["inf-foundation/fault-points"]
 [dependencies]
 inf-foundation = { workspace = true }
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-default)
 expect red "shipping: default reaching a forwarder (transitively)" env INF_CHECK_ROOT="$root" $SHIP
 
-root=$(manifest ship-forwarder <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
@@ -410,7 +410,7 @@ dst = [
 [dependencies]
 inf-foundation = { workspace = true }
 EOF
-)
+root=$(printf '%s' "$body" | manifest ship-forwarder)
 expect green "shipping: a non-default forwarder feature (inf-sim's dst shape)" env INF_CHECK_ROOT="$root" $SHIP
 expect_output "shipping: forwarders are counted" "1 forwarder feature(s)" env INF_CHECK_ROOT="$root" $SHIP
 
@@ -428,7 +428,7 @@ inventory() {
     cat >"$root/docs/release-assert-inventory.tsv"
 }
 
-root=$(fixture ra-clean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(n: u64) -> u64 {
     assert!(n > 0, "n is positive");
     let v: Option<u64> = Some(n);
@@ -440,7 +440,7 @@ mod tests {
     fn scratch() { assert!(false, "never counted"); }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-clean)
 inventory "$root" <<'EOF'
 # fixture
 I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
@@ -448,41 +448,44 @@ I	1	crates/fake/src/lib.rs	expect	just built	built two lines up
 EOF
 expect green "release-asserts: matching inventory" env INF_CHECK_ROOT="$root" $RELEASE
 expect_output "release-asserts: scope line discloses sites and classes" "2 release-panic sites in 2 identities" env INF_CHECK_ROOT="$root" $RELEASE
+# Batch 70: the stripped-line count is a number, not the last stripped
+# file's temp path (the proof-pointer loop reused the variable).
+expect_output "release-asserts: scope line counts stripped lines" "[0-9] test-only lines stripped" env INF_CHECK_ROOT="$root" $RELEASE
 
-root=$(fixture ra-missing <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-missing)
 expect red "release-asserts: no inventory file is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
 
-root=$(fixture ra-new <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(n: u64) -> u64 {
     assert!(n > 0, "n is positive");
     assert!(n < 10, "n is small");
     n
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-new)
 inventory "$root" <<'EOF'
 I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
 EOF
 expect red "release-asserts: a new site is unclassified" env INF_CHECK_ROOT="$root" $RELEASE
 
-root=$(fixture ra-stale <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-stale)
 inventory "$root" <<'EOF'
 I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
 I	1	crates/fake/src/lib.rs	expect	gone	vanished
 EOF
 expect red "release-asserts: a stale row is red" env INF_CHECK_ROOT="$root" $RELEASE
 
-root=$(fixture ra-count <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn a(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
 pub fn b(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-count)
 inventory "$root" <<'EOF'
 I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
 EOF
@@ -493,7 +496,7 @@ expect red "release-asserts: a second site behind one identity is a count mismat
 # rust-symbol-defined.awk over the stripped file. The fixture defines a
 # free fn, a `Type::method` inside a multi-line generic `impl Trait for`,
 # a const, and a test-only fn that must not count.
-root=$(fixture ra-caller <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn write(len: usize) { assert!(len <= 255, "caller validated the length"); }
 pub fn check_bounds(len: usize) -> bool { len <= 255 }
 pub const MAX_LEN: usize = 255;
@@ -516,7 +519,7 @@ mod tests {
     pub fn check_bounds_test_only() {}
 }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-caller)
 inventory "$root" <<'EOF'
 C	1	crates/fake/src/lib.rs	assert	caller validated the length	trust me
 EOF
@@ -576,10 +579,10 @@ Q	1	crates/fake/src/lib.rs	assert	caller validated the length	`crates/fake/src/l
 EOF
 expect red "release-asserts: an unknown class is red" env INF_CHECK_ROOT="$root" $RELEASE
 
-root=$(fixture ra-debug <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok(n: u64) -> u64 { debug_assert!(n > 0, "debug only"); n }
 EOF
-)
+root=$(printf '%s' "$body" | fixture ra-debug)
 inventory "$root" <<'EOF'
 # nothing: debug asserts are not release sites
 EOF
@@ -597,10 +600,10 @@ clock_fixture() {
     cp clippy.toml "$root/clippy.toml"
     echo "$root"
 }
-root=$(clock_fixture clock-clean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() -> u64 { 1 }
 EOF
-)
+root=$(printf '%s' "$body" | clock_fixture clock-clean)
 expect green "clock-ban: clean crate under the real config" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: scope line discloses config, scan and the skipped probe" "config 9/9 entries, 0 shadow configs, 1 cell crates / 1 files scanned, 0 allowed sites in cell code; probe: skipped (fixture mode)" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 [ -n "$root" ] && rm -f "$root/clippy.toml"
@@ -628,16 +631,16 @@ do
     expect red "clock-ban: planted '$snippet'" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 done
 # The multi-line shape rustfmt produces, without a reason.
-root=$(clock_fixture clock-multiline-bare <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 #[allow(
     clippy::disallowed_methods
 )]
 pub fn t() {}
 EOF
-)
+root=$(printf '%s' "$body" | clock_fixture clock-multiline-bare)
 expect red "clock-ban: a multi-line allow without a reason is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 # Sanctioned shapes: a per-site allow with a reason, one-line and rustfmt's.
-root=$(clock_fixture clock-sanctioned <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 #[allow(clippy::disallowed_methods, reason = "control thread: boot narration")]
 pub fn t() {}
 #[allow(
@@ -646,13 +649,13 @@ pub fn t() {}
 )]
 pub fn u() {}
 EOF
-)
+root=$(printf '%s' "$body" | clock_fixture clock-sanctioned)
 expect green "clock-ban: per-site allows with reasons are green" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: the one-line site is listed with its reason" "allowed crates/fake/src/lib.rs:1: control thread: boot narration" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: the multi-line site is listed with its reason" "allowed crates/fake/src/lib.rs:3: the injected clock's origin" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: the scope line counts both" "2 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 # An allow inside a test-only module is not cell code.
-root=$(clock_fixture clock-testmod <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() {}
 
 #[cfg(test)]
@@ -661,7 +664,7 @@ mod tests {
     fn scratch() -> u128 { 0 }
 }
 EOF
-)
+root=$(printf '%s' "$body" | clock_fixture clock-testmod)
 expect green "clock-ban: a bare allow inside a test-only module is stripped" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 expect_output "clock-ban: the stripped module counts no site" "0 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 
@@ -697,6 +700,32 @@ asm=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
          waker_vtable; } | waker_asm waker-clean )
 expect green "waker: a clean vtable scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 expect_output "waker: the scope line discloses instructions actually scanned" "4 wakers + 0 called bodies, 8 instruction lines scanned" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+
+# Mach-O (batch 70, lane L11 N18): rustc's DWARF labels there are `Lfunc_beginN`
+# and `LBBn_m` — no dot. The batch-69 scanner took `Lfunc_begin` for the body's
+# owner, so every waker was "unresolved" on macOS and the gate scanned nothing.
+macho_body() { # <sym> <instructions…>
+    local sym=$1; shift
+    printf '\t.globl\t_%s\n_%s:\nLfunc_begin_%s:\n\t.cfi_startproc\n' "$sym" "$sym" "$sym"
+    printf '\t%b\n' "$@"
+    printf '\t.cfi_endproc\n'
+}
+macho_vtable() {
+    printf '__ZN5probe12WAKER_VTABLE17hE:\n'
+    printf '\t.quad\t_%s\n' waker_clone waker_wake waker_wake_by_ref waker_drop
+    printf '\n.subsections_via_symbols\n'
+}
+asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n\t.build_version macos, 15, 0\n'
+         macho_body waker_clone 'b\tLBB0_2' 'ret'
+         for f in waker_wake waker_wake_by_ref waker_drop; do macho_body "$f" 'mov\tx0, x1' 'ret'; done
+         macho_vtable; } | waker_asm waker-macho-clean )
+expect green "waker: a Mach-O vtable with DWARF labels scans green" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: Mach-O bodies are scanned, not swallowed by Lfunc_begin" "4 wakers + 0 called bodies, 8 instruction lines scanned, 0 unresolved" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n'
+         macho_body waker_wake 'cbz\tx0, LBB1_2' 'ldaddal\tw8, w9, [x0]' 'ret'
+         for f in waker_clone waker_wake_by_ref waker_drop; do macho_body "$f" 'ret'; done
+         macho_vtable; } | waker_asm waker-macho-atomic )
+expect red "waker: a Mach-O arm64 atomic past a local label is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 
 # The F-L20-03 defect itself: an atomic in the SECOND basic block, past the
 # local label the old awk stopped at.
@@ -831,38 +860,38 @@ impl Commit {
 TYPES
     echo "$root"
 }
-root=$(fsync_fixture fs-clean <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() -> u64 { 1 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-clean)
 expect green "fsync: the declarations alone, each marked, are green" env INF_CHECK_ROOT="$root" $FSYNC
 expect_output "fsync: the scope line discloses the derived pattern set" "derived fsync-error patterns" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-catch <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn swallow(r: Result<(), LogError>) {
     if let Err(LogError::Fsync(_)) = r {}
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-catch)
 expect red "fsync: a catch-and-continue anywhere is red (there is no file allow-list)" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-discard <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn seal(file: &mut std::fs::File) {
     let _ = file.sync_data();
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-discard)
 expect red "fsync: a discarded raw sync_data is red with no named type involved" env INF_CHECK_ROOT="$root" $FSYNC
-root=$(fsync_fixture fs-discard-ok <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn seal(file: &mut std::fs::File) -> std::io::Result<()> {
     file.sync_data()?;
     Ok(())
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-discard-ok)
 expect green "fsync: a propagated sync_data is green" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-newtype <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub enum CkptWriteFailure {
     Write(std::io::Error),
     Fsync(std::io::Error),
@@ -871,34 +900,34 @@ pub fn barrier(r: Result<(), CkptWriteFailure>) {
     if let Err(CkptWriteFailure::Fsync(_)) = r {}
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-newtype)
 expect red "fsync: a brand-new fsync error type is derived and gated" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-bare <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 // fsync-fail-stop-allow:
 pub fn swallow(r: Result<(), LogError>) {
     if let Err(LogError::Fsync(_)) = r {}
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-bare)
 expect red "fsync: a bare marker (no reason) does not audit a site" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-stale <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 // fsync-fail-stop-allow: guards nothing
 pub fn ok() -> u64 { 1 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-stale)
 expect red "fsync: a marker guarding no site is stale scope" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-prose <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 //! LogError::Fsync is non-recoverable by contract (§8.4).
 /// Returns TierFlushError::Fsync on a failed barrier.
 pub fn ok() -> u64 { 1 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-prose)
 expect green "fsync: prose naming the contract is not a site" env INF_CHECK_ROOT="$root" $FSYNC
 
-root=$(fsync_fixture fs-testmod <<'EOF'
+IFS= read -r -d '' body <<'EOF' || true
 pub fn ok() -> u64 { 1 }
 
 #[cfg(test)]
@@ -906,7 +935,7 @@ mod tests {
     fn t(r: Result<(), LogError>) { if let Err(LogError::Fsync(_)) = r {} }
 }
 EOF
-)
+root=$(printf '%s' "$body" | fsync_fixture fs-testmod)
 expect green "fsync: a test-only module is stripped" env INF_CHECK_ROOT="$root" $FSYNC
 
 # The inventory + dep-DAG fixtures plant whole crate trees and a `cargo`
@@ -1080,6 +1109,15 @@ expect red "safety-inventory: a path that only contains the file name is not nam
 FILELEN=./scripts/check-file-length.sh
 LINEW=./scripts/check-line-width.sh
 FNLEN=./scripts/check-fn-length.sh
+# Batch 69 (ADR-0106 D2, macOS tier): a heredoc inside `$( )` whose body
+# holds an unbalanced parenthesis is a parse error under bash 3.2 — this
+# script aborted at its first such fixture and `just check` still saw exit
+# 0. Fixtures are read into a variable first; every gate must parse here.
+parse_ok=0
+for gate in ./scripts/*.sh; do
+    bash -n "$gate" || parse_ok=1
+done
+expect green "scripts: every gate parses under this bash ($BASH_VERSION)" [ "$parse_ok" -eq 0 ]
 # style_root <name>: crates/fake/src + bins/fake/src + tests/ so every gate's
 # scope assertion is satisfied; the caller writes the files.
 style_root() {
@@ -1131,6 +1169,15 @@ printf '3\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
 expect red "fn-length: a stale baseline above the tree (the ratchet)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
 printf '# empty\n' >"$root/docs/fn-length-baseline.tsv"
 expect red "fn-length: a breach with no baseline row" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+# ADR-0125 A7 (batch 69): the baseline's host is Linux. A row whose file
+# shows no breach is the ratchet there and a disclosed note elsewhere (a
+# cfg-gated file this host never compiled); a new breach fails everywhere.
+printf '2\tcrates/fake/src/lib.rs\n1\tcrates/fake/src/linux_only.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a baseline row with no breach is the ratchet on Linux" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Linux $FNLEN
+expect green "fn-length: a baseline row with no breach is a note on another host" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
+expect_output "fn-length: the row skipped on another host is disclosed" "not compiled on this host (Darwin)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
+printf '# empty\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a new breach fails on another host too" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
 printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
 printf '#[allow(clippy::too_many_lines)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
 expect red "fn-length: an opt-out without a reason" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN

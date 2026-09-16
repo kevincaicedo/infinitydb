@@ -9,12 +9,18 @@
 //! page, and calls each kernel in a forked child. A child that dies on
 //! SIGSEGV over-read; a child that exits 0 did not.
 //!
-//! Every length in `0..=PAGE` is exercised so both the block loop and the
+//! Every length in `0..=page` is exercised so both the block loop and the
 //! tail path are hit at every alignment relative to the guard.
 
 use std::process::abort;
 
-const PAGE: usize = 4096;
+/// The host's page size — 4 KiB on x86-64, 16 KiB on Apple arm64: a 4 KiB
+/// guard would sit inside a writable page and arm nothing (batch 69).
+fn page() -> usize {
+    // SAFETY: sysconf takes an integer name and touches no memory.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(n).expect("page size")
+}
 
 /// Maps 2 pages, makes the second inaccessible, and returns a slice of
 /// `len` bytes ending exactly at the guard boundary, filled by `fill`.
@@ -23,13 +29,14 @@ const PAGE: usize = 4096;
 /// The returned slice borrows a leaked mapping; the caller must not outlive
 /// the process. Only used inside forked children that immediately exit.
 unsafe fn guarded(len: usize, fill: impl Fn(usize) -> u8) -> &'static [u8] {
-    assert!(len <= PAGE);
+    let page = page();
+    assert!(len <= page);
     // SAFETY: standard anonymous mapping of two pages; the pointer is
     // checked against MAP_FAILED before any dereference.
     let base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            PAGE * 2,
+            page * 2,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -39,10 +46,10 @@ unsafe fn guarded(len: usize, fill: impl Fn(usize) -> u8) -> &'static [u8] {
     assert_ne!(base, libc::MAP_FAILED, "mmap failed");
     let base = base.cast::<u8>();
     // SAFETY: `base` is a live 2-page mapping; the second page is in range.
-    let rc = unsafe { libc::mprotect(base.add(PAGE).cast(), PAGE, libc::PROT_NONE) };
+    let rc = unsafe { libc::mprotect(base.add(page).cast(), page, libc::PROT_NONE) };
     assert_eq!(rc, 0, "mprotect failed");
-    let start = PAGE - len;
-    // SAFETY: `start + len == PAGE`, wholly inside the first, writable page.
+    let start = page - len;
+    // SAFETY: `start + len == page`, wholly inside the first, writable page.
     let data = unsafe { std::slice::from_raw_parts_mut(base.add(start), len) };
     for (i, byte) in data.iter_mut().enumerate() {
         *byte = fill(i);
@@ -69,11 +76,11 @@ fn signal_of(body: impl FnOnce()) -> Option<i32> {
     if libc::WIFSIGNALED(status) { Some(libc::WTERMSIG(status)) } else { None }
 }
 
-/// Calls `kernel` on a guard-backed buffer of every length 0..=PAGE and
+/// Calls `kernel` on a guard-backed buffer of every length 0..=page and
 /// returns the lengths at which the child died, with the killing signal.
 fn scan_lengths(name: &str, kernel: fn(&[u8])) -> Vec<(usize, i32)> {
     let mut faults = Vec::new();
-    for len in 0..=PAGE {
+    for len in 0..=page() {
         let sig = signal_of(|| {
             // SAFETY: the child exits immediately after the call.
             let data = unsafe { guarded(len, |i| (i % 251) as u8) };
@@ -133,7 +140,12 @@ fn rv_simd_kernels_do_not_over_read_past_a_guard_page() {
         std::hint::black_box(unsafe { past.read_volatile() });
         abort();
     });
-    assert_eq!(control, Some(libc::SIGSEGV), "guard page is not armed — results would be vacuous");
+    // Linux faults a `PROT_NONE` page with SIGSEGV, macOS with SIGBUS; a
+    // guard that is not armed reaches `abort()` instead (SIGTRAP/SIGABRT).
+    assert!(
+        matches!(control, Some(libc::SIGSEGV | libc::SIGBUS)),
+        "guard page is not armed — results would be vacuous: {control:?}"
+    );
 
     type Kernel = (&'static str, fn(&[u8]));
     let kernels: &[Kernel] = &[

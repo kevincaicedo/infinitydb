@@ -24,7 +24,7 @@ use compat::matrix::MATRIX;
 #[test]
 fn matrix_replies_match_redis() {
     let Some((_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let mut candidate = Candidate::new();

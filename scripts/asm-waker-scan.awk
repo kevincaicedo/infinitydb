@@ -17,6 +17,14 @@
 # FIRST line of every body, it scanned two lines and zero instructions per
 # waker while printing OK (review 2026-08-30, F-L20-03).
 #
+# Local labels are ELF's `.L…` and Mach-O's `L…` (no dot: `Lfunc_begin0`,
+# `LBB1_2`, `Ltmp3`). The batch-69 scanner knew only `.L`, so on Mach-O the
+# DWARF `Lfunc_beginN:` right under every symbol became the body's owner
+# and the vtable's four wakers had no body at all — "0 instruction lines
+# scanned, 4 unresolved edges" on every Mach-O host (lane L11 N18, batch
+# 70). The flavor is known before the first body: Mach-O opens with
+# `.section __TEXT,…` / `.build_version`, ELF with `.text` and `@function`.
+#
 # Mnemonics are matched on the instruction's FIRST TWO fields, so an x86
 # `lock` prefix — emitted as its own tab-separated field, `lock<TAB><TAB>
 # cmpxchgq` — is caught. The old pattern anchored the whole set at the line
@@ -35,10 +43,18 @@ function is_branch(m) {
     return m ~ /^(call|callq|calll|jmp|jmpq|bl|br|blr|b)$/
 }
 
+# A compiler-local label: never a body owner, never a call target.
+function is_local(lbl) {
+    if (flavor == "macho") return lbl ~ /^L/
+    return lbl ~ /^\.L/
+}
+
 BEGIN { flavor = "unknown"; inbody = 0 }
 
 # ---- flavor -------------------------------------------------------------
 /,[[:space:]]*@function/ { if (flavor == "unknown") flavor = "elf" }
+/^[[:space:]]*\.section[[:space:]]+__TEXT/ { flavor = "macho" }
+/^[[:space:]]*\.build_version/ { flavor = "macho" }
 /\.subsections_via_symbols/ { flavor = "macho" }
 
 # ---- the RawWakerVTable static ------------------------------------------
@@ -71,7 +87,7 @@ inbody == 1 {
         tgt = $2
         sub(/^\*/, "", tgt)
         if (tgt ~ /^[%]/ || tgt ~ /^[xw][0-9]+$/ || tgt == "") { print "INDIRECT " cur " " NR }
-        else if (tgt !~ /^\.L/) {
+        else if (!is_local(tgt)) {
             sub(/@.*$/, "", tgt)
             sub(/\(%rip\)$/, "", tgt)
             print "CALL " cur " " NR " " tgt
@@ -84,7 +100,7 @@ inbody == 1 {
 /^[A-Za-z_$.][A-Za-z0-9_$.]*:[[:space:]]*$/ {
     lbl = $0
     sub(/:[[:space:]]*$/, "", lbl)
-    if (lbl !~ /^\.L/) { pending = lbl; pline = NR }
+    if (!is_local(lbl)) { pending = lbl; pline = NR }
     next
 }
 

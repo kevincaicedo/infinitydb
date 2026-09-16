@@ -129,6 +129,10 @@ struct Args {
     /// Take a checkpoint on a graceful stop (ADR-0124 D2 step 3; the
     /// next boot then replays nothing). `off` = final sync only.
     shutdown_checkpoint: bool,
+    /// Rotate accepted sockets across cells over the fabric (ADR-0128):
+    /// on where the kernel does not spread a `SO_REUSEPORT` group (XNU
+    /// hands every connection to one listener), off where it does.
+    accept_handoff: bool,
     /// The node identity (`INFO server:run_id`, ADR-0124 D5): seeded once
     /// in `main`, the same in every cell.
     run_id: [u64; 3],
@@ -199,6 +203,7 @@ impl Default for Args {
             log_staging_mib: 4,
             shutdown_timeout_ms: 10_000,
             shutdown_checkpoint: true,
+            accept_handoff: cfg!(target_os = "macos"),
             run_id: [0; 3],
             early_fabric_flush: false,
             remote_first_execute: false,
@@ -391,6 +396,13 @@ fn parse_args() -> Result<Args, String> {
                     other => return Err(format!("--shutdown-checkpoint is on|off, got {other}")),
                 };
             }
+            "--accept-handoff" => {
+                args.accept_handoff = match take("--accept-handoff")?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--accept-handoff is on|off, got {other}")),
+                };
+            }
             "--version" | "-V" => {
                 println!("{}", version_line());
                 std::process::exit(0);
@@ -407,6 +419,7 @@ fn parse_args() -> Result<Args, String> {
                      [--flush-group-window-us 250] [--device-probe auto|off] \
                      [--probe-seconds 1] [--log-staging-mib 4] \
                      [--shutdown-timeout-ms 10000] [--shutdown-checkpoint on|off] \
+                     [--accept-handoff on|off] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
@@ -726,6 +739,7 @@ fn main() {
     // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
     // peers wake a parked cell through the park board + LoopWaker. The dev
     // tier (kqueue) falls back to the park-timeout ceiling.
+    #[cfg(target_os = "linux")]
     let park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
         (0..args.cells).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
     );
@@ -733,6 +747,7 @@ fn main() {
         stop,
         quiet_cells: std::sync::atomic::AtomicU16::new(0),
         drained_cells: std::sync::atomic::AtomicU16::new(0),
+        #[cfg(target_os = "linux")]
         park_flags: std::sync::Arc::clone(&park_flags),
     });
     #[cfg(target_os = "linux")]
@@ -1038,11 +1053,12 @@ fn main() {
     }
     eprintln!("{}", version_line());
     eprintln!(
-        "infinityd: {} cells, port {}, backend {}, route {}",
+        "infinityd: {} cells, port {}, backend {}, route {}, accept-handoff {}",
         args.cells,
         args.port,
         backend_name(),
-        if args.route_local_only { "local-only" } else { "natural" }
+        if args.route_local_only { "local-only" } else { "natural" },
+        if args.accept_handoff { "on" } else { "off" }
     );
     for handle in handles {
         if let Err(e) = handle.join().expect("cell thread panicked") {
@@ -1061,6 +1077,7 @@ struct NodeWiring {
     stop: &'static std::sync::atomic::AtomicBool,
     quiet_cells: std::sync::atomic::AtomicU16,
     drained_cells: std::sync::atomic::AtomicU16,
+    #[cfg(target_os = "linux")]
     park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1256,6 +1273,7 @@ fn cell_main(
     // Accepted fds are TCP sockets: `tcp-keepalive` applies (ADR-0123 D3).
     plane.set_tcp_transport(true);
     plane.set_stop_checkpoint(args.shutdown_checkpoint);
+    plane.set_accept_handoff(args.accept_handoff);
     plane.set_early_fabric_flush(args.early_fabric_flush);
     plane.set_fabric_apply_prefetch(args.fabric_apply_prefetch);
     plane.set_parse_batch_prefetch(args.parse_batch_prefetch);

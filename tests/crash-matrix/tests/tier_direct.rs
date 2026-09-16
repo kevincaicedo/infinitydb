@@ -13,6 +13,7 @@ use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
+#[cfg(target_os = "linux")]
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     ExtentId, ExtentWriter, NsId, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,

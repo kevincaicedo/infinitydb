@@ -60,7 +60,7 @@ fn node_matrix_replies_match_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let mut node_buf = Vec::new();
@@ -309,7 +309,7 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -413,7 +413,7 @@ fn large_values_match_redis_up_to_the_bulk_cap() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let mut nb = Vec::new();
@@ -535,7 +535,7 @@ fn quit_closes_a_namespace_bound_connection_like_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -577,7 +577,7 @@ fn info_unknown_section_is_empty_like_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -605,7 +605,7 @@ fn info_keyspace_counts_the_whole_node_like_dbsize() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -682,7 +682,7 @@ fn maxclients_refusal_matches_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -837,7 +837,7 @@ fn timeout_closes_an_idle_connection_like_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -880,7 +880,7 @@ fn run_id_is_40_hex_and_stable_like_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     fn field(reply: &[u8], name: &str) -> String {
@@ -925,7 +925,7 @@ fn client_id_is_positive_and_killable_like_redis() {
         return;
     };
     let Some((_oracle_guard, oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     for (who, mut first) in [("oracle", oracle), ("node", node)] {
@@ -971,7 +971,7 @@ fn tiered_namespace_argument_errors_match_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
@@ -1059,7 +1059,7 @@ fn deadline_millisecond_read_matches_redis() {
         return;
     };
     let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — compat AC stays evidence-pending");
+        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
         return;
     };
     const KEYS: u64 = 8;

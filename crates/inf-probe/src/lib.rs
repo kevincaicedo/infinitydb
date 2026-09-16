@@ -548,22 +548,18 @@ fn measure_read_concurrent(
 }
 
 /// A read-only `O_DIRECT` handle on the scratch (the read row's class).
+#[cfg(target_os = "linux")]
 fn open_direct_read(scratch: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECT);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the direct read row is Linux-only (ADR-0086 D1)",
-        ));
-    }
-    options.open(scratch)
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(scratch)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_direct_read(_scratch: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the direct read row is Linux-only (ADR-0086 D1)",
+    ))
 }
 
 fn row(rows: &[Row], policy: Policy, bytes: usize) -> Option<&Row> {

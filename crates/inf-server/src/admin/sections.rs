@@ -1038,15 +1038,10 @@ fn render_run_id(node: &NodeInfo) -> String {
     format!("{a:016x}{b:016x}{:08x}", c as u32)
 }
 
+/// The process RSS via the runtime's reader (Linux `/proc`, macOS
+/// `proc_pidinfo`); 0 only where no reader exists (lane L11 N19).
 fn process_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-        })
-        .map_or(0, |kb| kb * 1024)
+    inf_runtime::net::process_rss_bytes().unwrap_or(0)
 }
 
 /// (sys, user) CPU seconds from `/proc/self/stat` (USER_HZ=100 assumption,

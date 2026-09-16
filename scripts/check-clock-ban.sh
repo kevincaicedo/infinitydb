@@ -20,6 +20,11 @@
 #      with its path, no CONTROL line may be, the ALLOWED shape must not.
 # Portable bash 3.2. Step 4 runs cargo; a fixture root (INF_CHECK_ROOT)
 # may set INF_CLOCK_BAN_PROBE=off and the scope line says so.
+# The two TSC spellings exist only on x86_64 (ADR-0106 D18): on another
+# architecture (INF_CLOCK_BAN_ARCH, default `uname -m`) clippy cannot
+# resolve them and the probe's `cfg(x86_64)` plants are not compiled —
+# both are disclosed on the scope line, never counted as failures, and
+# the x86_64 legs remain authoritative for those two entries.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
@@ -27,6 +32,11 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 . "$SCRIPT_DIR/cell-crates.sh"
 STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 PROBE_SRC="$SCRIPT_DIR/clock-ban-probe"
+ARCH="${INF_CLOCK_BAN_ARCH:-$(uname -m)}"
+TSC="core::arch::x86_64::_rdtsc core::arch::x86_64::__rdtscp"
+tsc_here=1
+case "$ARCH" in x86_64|amd64) ;; *) tsc_here=0 ;; esac
+is_tsc() { case " $TSC " in *" $1 "*) return 0 ;; esac; return 1; }
 
 fail=0
 # ---- 1. the config ------------------------------------------------------
@@ -125,10 +135,15 @@ else
     (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
     plants=0
     controls=0
+    tsc_skipped=0
     # expected: line -> path, from the source markers
     while IFS=$'\t' read -r line kind path; do
         case "$kind" in
             PLANT|PLANT-TYPE)
+                if [ "$tsc_here" -eq 0 ] && is_tsc "$path"; then
+                    tsc_skipped=$((tsc_skipped + 1))
+                    continue
+                fi
                 plants=$((plants + 1))
                 if ! grep -q "src/lib.rs:$line:[0-9]*: warning: use of a disallowed \(method\|type\) \`$path\`" "$diag"; then
                     echo "CLOCK-BAN violation: probe line $line ($path) was NOT reported — the ban does not resolve this spelling"
@@ -155,6 +170,11 @@ else
     # green — batch 14's `_rdtscp` (the intrinsic is `__rdtscp`) was inert
     # for four months (batch 34, ADR-0106 D7.5).
     while IFS= read -r row; do
+        entry=${row#\`}
+        entry=${entry%%\`*}
+        if [ "$tsc_here" -eq 0 ] && is_tsc "$entry"; then
+            continue
+        fi
         echo "CLOCK-BAN violation: clippy.toml entry does not resolve — $row"
         fail=1
     done < <(grep -o '`[^`]*` does not refer to a reachable [a-z]*' "$diag" | sort -u)
@@ -164,6 +184,9 @@ else
         fail=1
     fi
     probe="$plants planted bypasses red, $controls controls green"
+    if [ "$tsc_here" -eq 0 ]; then
+        probe="$probe; $tsc_skipped TSC plants and 2 TSC entries not resolvable on $ARCH (enforced on x86_64)"
+    fi
 fi
 
 scope="config $entries/9 entries, $shadows shadow configs, ${#DIRS[@]} cell crates / $files files scanned, $allowed allowed sites in cell code; probe: $probe"

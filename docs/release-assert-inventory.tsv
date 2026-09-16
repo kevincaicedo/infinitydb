@@ -143,6 +143,7 @@ C	1	crates/inf-fabric/src/codec.rs	assert	ApplyNs ns {ns} is a default namespace
 C	1	crates/inf-fabric/src/codec.rs	expect	fabric frame payload exceeds u32::MAX	one op carries one parsed command's argv: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds a frame to `ParserLimits::max_frame_bytes` (bulk cap + 64 KiB; 16 MiB + 64 KiB default — ADR-0122) and `max_args`; the senders (`crates/inf-server/src/plane/ns_ddl.rs:send_apply`) hand the encoder one op at a time
 C	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Batch (codec v0)	no production code constructs `Op::Batch` — the plane sends point ops only (`crates/inf-server/src/plane/ns_ddl.rs:send_apply`, `send_apply_ns`, `try_send_apply`); the batch shape exists for the codec's tests
 C	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest Reply (codec v0)	no production code constructs `Op::Batch` — the plane sends point ops only (`crates/inf-server/src/plane/ns_ddl.rs:send_apply`, `send_apply_ns`, `try_send_apply`); the batch shape exists for the codec's tests
+C	1	crates/inf-fabric/src/codec.rs	panic	Batch must not nest AdoptConn (ADR-0128)	the one sender of `Op::AdoptConn` is `crates/inf-server/src/plane.rs:try_handoff`, a point send — no production code constructs `Op::Batch`; the batch shape exists for the codec's tests
 C	1	crates/inf-fabric/src/mesh.rs	assert	mesh needs at least one cell	`bins/infinityd/src/main.rs:parse_args` (`--cells` 1..=SLOT_COUNT); the DST and bench harnesses pass literals
 C	1	crates/inf-fabric/src/mesh.rs	assert	Op::Reply goes through CellFabric::reply (reserved headroom)	every `send` caller passes an `Op::Apply`/`Op::ApplyNs` it just built (`crates/inf-server/src/plane/ns_ddl.rs:send_apply`, `send_apply_ns`, `try_send_apply`); replies ride `CellFabric::reply` from the FABRIC-IN drain
 C	1	crates/inf-fabric/src/mesh.rs	assert	ring_capacity {} < 2 × data_credits {} — replies must always have headroom	`MeshConfig` is a constant, never a flag: `{4096, 1024}` at `bins/infinityd/src/main.rs:main`, `crates/inf-fabric/src/mesh.rs:MeshConfig::default` (`{1024, 512}`) in the harnesses
@@ -413,10 +414,10 @@ I	1	crates/inf-runtime/src/gate.rs	panic	GateWait polled after completion	the `F
 I	1	crates/inf-runtime/src/gate.rs	panic	ListWait polled after cancellation	the `Future` contract on a cancelled waiter (this crate's own wait list)
 I	1	crates/inf-runtime/src/gate.rs	unreachable	matched Delivered above	the `remove` returns the `Delivered` the match arm just saw
 I	1	crates/inf-runtime/src/gate.rs	unreachable	watermark waiters are never cancelled	the watermark list never sets `Cancelled` (this crate's own list type)
-I	1	crates/inf-runtime/src/kqueue.rs	expect	changelist fits i32	the change list holds at most two entries per registered fd of this driver; the fd table is bounded by the process's descriptor limit
+I	1	crates/inf-runtime/src/kqueue.rs	expect	changelist fits i32	the change list holds a few entries per fd per batch (arm, disable, delete) and the batch is bounded by the ops queued; the fd table is bounded by the process's descriptor limit
 I	1	crates/inf-runtime/src/kqueue.rs	expect	collected above	the fds were collected from `self.recvs` in the statement above
 I	1	crates/inf-runtime/src/kqueue.rs	expect	eventlist fits i32	the event buffer is sized at construction (a small constant)
-I	2	crates/inf-runtime/src/kqueue.rs	expect	head exists	`while let Some(head) = queue.front_mut()` precedes the `pop_front`
+I	1	crates/inf-runtime/src/kqueue.rs	expect	head exists	`while let Some(head) = queue.front_mut()` precedes the `pop_front`
 I	1	crates/inf-runtime/src/sched.rs	expect	quantum × weight must fit u32 (initial deficit)	same constructor, same constants (64 × 8 at most); the bound is stated instead of wrapped in release (batch 61, lane L11)
 I	1	crates/inf-runtime/src/sched.rs	assert	zero ckpt_weight	the only production constructor is `GroupScheduler::m0_default` (constants); no flag reaches `new`
 I	1	crates/inf-runtime/src/sched.rs	assert	zero fg_weight	the only production constructor is `GroupScheduler::m0_default` (constants); no flag reaches `new`

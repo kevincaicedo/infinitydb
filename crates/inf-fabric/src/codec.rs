@@ -62,6 +62,9 @@ const OP_APPLY: u8 = 3;
 const OP_BATCH: u8 = 4;
 const OP_REPLY: u8 = 5;
 const OP_APPLY_NS: u8 = 6;
+/// An accepted socket handed to another cell of the same process
+/// (ADR-0128, lane L11 N19): the additive opcode reserved by ADR-0009 §4.
+const OP_ADOPT_CONN: u8 = 7;
 
 /// Smallest namespace id an [`Op::ApplyNs`] may carry: ids `0..16` are the
 /// default namespaces (`db0..db15`) and ride [`Op::Apply`]'s packed `cmd`
@@ -298,6 +301,12 @@ pub enum Op<'a> {
     Batch { ops: Vec<Op<'a>> },
     /// Routed back to `token.origin_cell()`; returns one data-op credit.
     Reply { token: FabricToken, outcome: Outcome<'a> },
+    /// An accepted socket the origin cell hands to `to` (ADR-0128): the
+    /// fd is process-global, the adopter registers it as its own accept
+    /// and answers `Reply { Ok }` to return the credit. A data op for
+    /// credit purposes; never nested in a `Batch` (a control op, one
+    /// canonical shape).
+    AdoptConn { token: FabricToken, fd: u32 },
 }
 
 impl Op<'_> {
@@ -316,6 +325,7 @@ impl Op<'_> {
             Op::ApplyNs { .. } => OP_APPLY_NS,
             Op::Batch { .. } => OP_BATCH,
             Op::Reply { .. } => OP_REPLY,
+            Op::AdoptConn { .. } => OP_ADOPT_CONN,
         }
     }
 }
@@ -355,6 +365,8 @@ pub enum CodecError {
     NestedBatch,
     /// `Reply` nested inside `Batch`.
     ReplyInBatch,
+    /// `AdoptConn` nested inside `Batch` (ADR-0128: one canonical shape).
+    AdoptConnInBatch,
 }
 
 impl fmt::Display for CodecError {
@@ -377,6 +389,7 @@ impl fmt::Display for CodecError {
             CodecError::TooManyBatchOps(n) => write!(f, "batch ops {n} > {MAX_BATCH_OPS}"),
             CodecError::NestedBatch => write!(f, "batch nested inside batch"),
             CodecError::ReplyInBatch => write!(f, "reply nested inside batch"),
+            CodecError::AdoptConnInBatch => write!(f, "adopt-conn nested inside batch"),
         }
     }
 }
@@ -387,7 +400,8 @@ impl std::error::Error for CodecError {}
 ///
 /// # Panics
 ///
-/// Panics if a `Batch` nests another `Batch` or a `Reply`, or if an
+/// Panics if a `Batch` nests another `Batch`, a `Reply` or an
+/// `AdoptConn`, or if an
 /// `ApplyNs` names a default namespace (`ns < 16` — defaults ride
 /// `Op::Apply`; ADR-0015 D1); both are rejected before any bytes are
 /// written, mirroring what [`decode`] refuses. Also panics if a payload
@@ -399,6 +413,7 @@ pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
             match nested {
                 Op::Batch { .. } => panic!("Batch must not nest Batch (codec v0)"),
                 Op::Reply { .. } => panic!("Batch must not nest Reply (codec v0)"),
+                Op::AdoptConn { .. } => panic!("Batch must not nest AdoptConn (ADR-0128)"),
                 _ => {}
             }
         }
@@ -483,6 +498,10 @@ fn encode_leaf_payload(op: &Op<'_>, out: &mut Vec<u8>) {
         Op::Reply { token, outcome } => {
             out.extend_from_slice(&token.0.to_le_bytes());
             encode_outcome(outcome, out);
+        }
+        Op::AdoptConn { token, fd } => {
+            out.extend_from_slice(&token.0.to_le_bytes());
+            out.extend_from_slice(&fd.to_le_bytes());
         }
     }
 }
@@ -571,6 +590,9 @@ fn decode_frame(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
         let nested_op = decode_leaf(inner)?;
         if matches!(nested_op, Op::Reply { .. }) {
             return Err(CodecError::ReplyInBatch);
+        }
+        if matches!(nested_op, Op::AdoptConn { .. }) {
+            return Err(CodecError::AdoptConnInBatch);
         }
         reader.buf = &reader.buf[inner.end..];
         ops.push(nested_op);
@@ -663,6 +685,11 @@ fn decode_leaf(header: FrameHeader<'_>) -> Result<Op<'_>, CodecError> {
             let token = reader.token()?;
             let outcome = reader.outcome()?;
             Op::Reply { token, outcome }
+        }
+        OP_ADOPT_CONN => {
+            let token = reader.token()?;
+            let fd = reader.u32_le()?;
+            Op::AdoptConn { token, fd }
         }
         other => return Err(CodecError::UnknownOp(other)),
     };
@@ -892,8 +919,8 @@ mod tests {
         let mut bad_op = good.clone();
         bad_op[1] = 0;
         assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(0)));
-        bad_op[1] = 7; // 6 is OP_APPLY_NS since M2-S08
-        assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(7)));
+        bad_op[1] = 8; // 6 is OP_APPLY_NS (M2-S08), 7 OP_ADOPT_CONN (ADR-0128)
+        assert_eq!(decode(&bad_op), Err(CodecError::UnknownOp(8)));
 
         // Bit 0 is the Apply-only program mark (ADR-0115); on a Read it is
         // not applicable, and every higher bit stays reserved.
@@ -1186,6 +1213,34 @@ mod tests {
             },
             &mut out,
         );
+    }
+
+    /// ADR-0128: the hand-off op round-trips and never rides a batch.
+    #[test]
+    fn adopt_conn_round_trips_and_is_refused_in_a_batch() {
+        round_trip(&Op::AdoptConn { token: token(2, 77), fd: 4_000_000_001 });
+        let mut out = Vec::new();
+        encode(&Op::AdoptConn { token: token(0, 1), fd: 9 }, &mut out);
+        assert_eq!(out[1], OP_ADOPT_CONN);
+        assert_eq!(out.len(), HEADER_LEN + 8 + 4, "token + fd, nothing else");
+        // A batch whose one op is the adopt frame, spliced by hand (the
+        // encoder refuses to build it).
+        let mut spliced = vec![CODEC_VERSION, OP_BATCH, 0, 0, 0, 0, 0, 0, 1];
+        spliced.extend_from_slice(&out);
+        let len = (spliced.len() - HEADER_LEN) as u32;
+        spliced[4..8].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode(&spliced), Err(CodecError::AdoptConnInBatch));
+        // A program mark on the control op is not applicable.
+        let mut flagged = out.clone();
+        flagged[2] = FLAG_PROGRAM as u8;
+        assert_eq!(decode(&flagged), Err(CodecError::FlagNotApplicable(OP_ADOPT_CONN)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Batch must not nest AdoptConn")]
+    fn encode_rejects_adopt_conn_in_batch() {
+        let mut out = Vec::new();
+        encode(&Op::Batch { ops: vec![Op::AdoptConn { token: token(0, 1), fd: 3 }] }, &mut out);
     }
 
     #[test]

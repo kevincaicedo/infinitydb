@@ -8,80 +8,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
             CompletionResult::Accepted { fd } => {
-                // A drain admits nothing (ADR-0124 D2 step 1): closed
-                // unanswered — the `SO_REUSEPORT` group still routes here,
-                // and the `maxclients` frame would be a lie.
-                if self.stop.is_some() {
-                    self.close_unadmitted(cx, fd);
-                    return;
+                // ADR-0128: a tier whose kernel does not spread the
+                // listener group rotates accepts across the fabric.
+                if !self.try_handoff(fd) {
+                    self.admit_accepted(cx, fd);
                 }
-                let knobs = self.shared.knobs.get();
-                // `maxclients` (ADR-0123 D1): this cell's share of the node
-                // bound; past it the socket gets Redis's error and a close.
-                if self.shared.conns.borrow().live >= knobs.maxclients_share {
-                    self.refuse_accept(cx, fd);
-                    return;
-                }
-                let ns = self.conn_default_ns();
-                let inserted = self.shared.conns.borrow_mut().insert(Conn {
-                    fd,
-                    parser: ConnParser::new(self.shared.parser_limits.get()),
-                    cx: ConnCx {
-                        proto: Protocol::Resp2,
-                        id: 0,
-                        db: 0,
-                        program: false,
-                        ns,
-                        sub_channels: Vec::new(),
-                        sub_patterns: Vec::new(),
-                        node: Rc::clone(&self.shared.node),
-                        close_requested: Cell::new(false),
-                    },
-                    out: Vec::new(),
-                    send_inflight: false,
-                    closing: false,
-                    close_after_flush: false,
-                    pump_active: false,
-                    queue: VecDeque::new(),
-                    recv_disarmed: false,
-                    rearm_recv: false,
-                    cob_soft_since_ms: 0,
-                    cob_kill_sent: false,
-                    last_active_ms: cx.now.as_millis(),
-                    publish_seq: 0,
-                    self_push: Vec::new(),
-                });
-                let Some(key) = inserted else {
-                    // Admission bound (batch 12): the slab is full below
-                    // the token slot width — the same refusal as the
-                    // `maxclients` share.
-                    self.refuse_accept(cx, fd);
-                    return;
-                };
-                if self.tcp_transport {
-                    // New connections only (Redis's `tcp-keepalive`
-                    // semantics); failure is ignored like `TCP_NODELAY`'s.
-                    let _ = inf_runtime::net::set_keepalive(fd, knobs.keepalive_secs);
-                }
-                // The client id (ADR-0124 D6): `cell << 48 | seq`, seq from 1
-                // — node-unique and never reused, so a sibling's `CLIENT
-                // KILL ID` can never reach another connection (pre-fix ids
-                // were the slab key: 0 for the first, and equal across cells).
-                let node = &self.shared.node;
-                let seq = node.next_client_id.get() + 1;
-                node.next_client_id.set(seq);
-                let id = (u64::from(self.shared.cell.0) << 48) | seq;
-                self.shared.with_conn(key, |conn| conn.cx.id = id);
-                node.total_connections.set(node.total_connections.get() + 1);
-                // Peer address capture is a recorded deviation (CLIENT LIST
-                // placeholder) until the accept path carries peernames.
-                node.clients.borrow_mut().register(
-                    id,
-                    key.packed(),
-                    "0.0.0.0:0".to_string(),
-                    cx.now.as_millis(),
-                );
-                cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
             }
             CompletionResult::Recv { buf, len } => {
                 let key = Self::key_of(c.token);
@@ -411,6 +342,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 }
                 StagedReply::Int(n) => fabric.reply(to, token, &Outcome::Int(n)),
                 StagedReply::Nil => fabric.reply(to, token, &Outcome::Nil),
+                StagedReply::Ok => fabric.reply(to, token, &Outcome::Ok),
                 StagedReply::Refused => {
                     fabric.reply(to, token, &Outcome::Err(ErrCode::Unknown(0)));
                 }
@@ -427,6 +359,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             }
         }
         drop(fabric);
+        self.admit_adopted(cx);
         // Owner-side `always` applies (M2-S08, ADR-0015 D6): the fabric
         // reply itself is deferred — a future awaits this cell's ack gate,
         // then publishes the reply (flushed by the next FABRIC-OUT). The

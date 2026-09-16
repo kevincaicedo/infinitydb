@@ -265,6 +265,16 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// The codec refuses that shape on the wire, so this counts only an
     /// in-process producer that bypassed it — a tripwire, not a stat.
     nested_batch_ops_dropped: Cell<u64>,
+    /// Accept hand-off (ADR-0128, lane L11 N19): where the kernel does
+    /// not spread a listener group, the accepting cell rotates accepted
+    /// sockets across the node. `handoff_next` is this cell's own cursor;
+    /// `adopted` holds fds peers handed here, admitted after FABRIC-IN;
+    /// `adopt_acks` the tokens whose `Reply { Ok }` returns a credit and
+    /// completes no gate.
+    accept_handoff: Cell<bool>,
+    handoff_next: Cell<u16>,
+    adopted: RefCell<Vec<RawFd>>,
+    adopt_acks: RefCell<Vec<u64>>,
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
     pubsub: RefCell<PubSubCell<ConnKey>>,
@@ -582,6 +592,8 @@ enum StagedReply {
     Bytes(usize, usize),
     Int(i64),
     Nil,
+    /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
+    Ok,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,
 }
@@ -668,6 +680,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 recv_dropped: Cell::new(0),
                 accept_errors: Cell::new(0),
                 nested_batch_ops_dropped: Cell::new(0),
+                accept_handoff: Cell::new(false),
+                handoff_next: Cell::new(0),
+                adopted: RefCell::new(Vec::new()),
+                adopt_acks: RefCell::new(Vec::new()),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
                 pub_queue: RefCell::new(VecDeque::new()),
                 pub_pump_active: Cell::new(false),
@@ -1179,6 +1195,134 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// (ADR-0123 D3). Off by default (the DST's fds are not sockets).
     pub fn set_tcp_transport(&mut self, on: bool) {
         self.tcp_transport = on;
+    }
+
+    /// Rotates accepted sockets across the node's cells over the fabric
+    /// (ADR-0128): the accepting cell keeps every `cells`-th socket and
+    /// hands the rest off round-robin. For a tier whose kernel does not
+    /// spread a `SO_REUSEPORT` group (XNU hands every connection to one
+    /// listener); `infinityd --accept-handoff on|off`, on by default on
+    /// macOS.
+    pub fn set_accept_handoff(&mut self, on: bool) {
+        self.shared.accept_handoff.set(on);
+    }
+
+    /// The hand-off leg of an accept: `true` when the socket left for a
+    /// peer and nothing more happens here. A single cell, a draining
+    /// cell, this cell's own turn, or a peer without credit keep the
+    /// socket local — the hand-off is a spread, never a gate on
+    /// admission.
+    fn try_handoff(&mut self, fd: RawFd) -> bool {
+        let shared = &self.shared;
+        if !shared.accept_handoff.get() || shared.cells < 2 || self.stop.is_some() {
+            return false;
+        }
+        let turn = shared.handoff_next.get();
+        shared.handoff_next.set((turn + 1) % shared.cells);
+        let to = CellId(turn);
+        let Ok(fd) = u32::try_from(fd) else { return false };
+        if to == shared.cell {
+            return false;
+        }
+        let mut fabric = shared.fabric.borrow_mut();
+        let token = fabric.next_token();
+        if fabric.send(to, &Op::AdoptConn { token, fd }).is_err() {
+            return false;
+        }
+        shared.adopt_acks.borrow_mut().push(token.0);
+        true
+    }
+
+    /// Sockets peers handed this cell during FABRIC-IN (ADR-0128): each
+    /// is admitted exactly as this cell's own accept would be — the same
+    /// `maxclients` share, keepalive, client id and recv arm.
+    fn admit_adopted(&mut self, cx: &mut LoopCx<'_>) {
+        if self.shared.adopted.borrow().is_empty() {
+            return;
+        }
+        let adopted: Vec<RawFd> = self.shared.adopted.borrow_mut().drain(..).collect();
+        for fd in adopted {
+            self.admit_accepted(cx, fd);
+        }
+    }
+
+    /// One accepted socket becomes a connection of this cell (or is
+    /// refused: a drain admits nothing, `maxclients`, a full slab).
+    fn admit_accepted(&mut self, cx: &mut LoopCx<'_>, fd: RawFd) {
+        // A drain admits nothing (ADR-0124 D2 step 1): closed
+        // unanswered — the `SO_REUSEPORT` group still routes here,
+        // and the `maxclients` frame would be a lie.
+        if self.stop.is_some() {
+            self.close_unadmitted(cx, fd);
+            return;
+        }
+        let knobs = self.shared.knobs.get();
+        // `maxclients` (ADR-0123 D1): this cell's share of the node
+        // bound; past it the socket gets Redis's error and a close.
+        if self.shared.conns.borrow().live >= knobs.maxclients_share {
+            self.refuse_accept(cx, fd);
+            return;
+        }
+        let ns = self.conn_default_ns();
+        let inserted = self.shared.conns.borrow_mut().insert(Conn {
+            fd,
+            parser: ConnParser::new(self.shared.parser_limits.get()),
+            cx: ConnCx {
+                proto: Protocol::Resp2,
+                id: 0,
+                db: 0,
+                program: false,
+                ns,
+                sub_channels: Vec::new(),
+                sub_patterns: Vec::new(),
+                node: Rc::clone(&self.shared.node),
+                close_requested: Cell::new(false),
+            },
+            out: Vec::new(),
+            send_inflight: false,
+            closing: false,
+            close_after_flush: false,
+            pump_active: false,
+            queue: VecDeque::new(),
+            recv_disarmed: false,
+            rearm_recv: false,
+            cob_soft_since_ms: 0,
+            cob_kill_sent: false,
+            last_active_ms: cx.now.as_millis(),
+            publish_seq: 0,
+            self_push: Vec::new(),
+        });
+        let Some(key) = inserted else {
+            // Admission bound (batch 12): the slab is full below
+            // the token slot width — the same refusal as the
+            // `maxclients` share.
+            self.refuse_accept(cx, fd);
+            return;
+        };
+        if self.tcp_transport {
+            // New connections only (Redis's `tcp-keepalive`
+            // semantics); failure is ignored like `TCP_NODELAY`'s.
+            let _ = inf_runtime::net::set_keepalive(fd, knobs.keepalive_secs);
+        }
+        // The client id (ADR-0124 D6): `cell << 48 | seq`, seq from 1
+        // — node-unique and never reused, so a sibling's `CLIENT
+        // KILL ID` can never reach another connection (pre-fix ids
+        // were the slab key: 0 for the first, and equal across cells).
+        let node = &self.shared.node;
+        let seq = node.next_client_id.get() + 1;
+        node.next_client_id.set(seq);
+        let id = (u64::from(self.shared.cell.0) << 48) | seq;
+        self.shared.with_conn(key, |conn| conn.cx.id = id);
+        node.total_connections.set(node.total_connections.get() + 1);
+        // Peer address capture is a recorded deviation (CLIENT LIST
+        // placeholder) until the accept path carries peernames.
+        node.clients.borrow_mut().register(
+            id,
+            key.packed(),
+            "0.0.0.0:0".to_string(),
+            cx.now.as_millis(),
+        );
+        cx.push(IoOp::RecvArm { fd, token: Self::token(TokenClass::Recv, key) });
     }
 
     pub fn set_early_fabric_flush(&mut self, on: bool) {

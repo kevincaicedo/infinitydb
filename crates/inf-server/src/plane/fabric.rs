@@ -71,6 +71,12 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 ) {
     match op {
         Op::Reply { token, outcome } => {
+            // An adopt ack (ADR-0128): the drain returned its credit; it
+            // completes no gate and records no hop RTT.
+            if shared.retire_adopt_ack(token.0) {
+                shared.credit_waiters.wake_one(from);
+                return;
+            }
             // Delivery-time hop RTT: inline-handled ops reply in send order
             // per cell pair, so the front send-time entry is this reply's
             // (recording at the pump's await would charge head-of-line
@@ -216,6 +222,18 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         // The M0 plane speaks Apply; a typed Write from a future peer gets
         // a typed refusal rather than silence.
         Op::Write { token, .. } => staged.push((from, token, StagedReply::Refused)),
+        Op::AdoptConn { token, fd } => {
+            // ADR-0128: a peer's accepted socket becomes this cell's once
+            // the drain ends (admission needs the loop context); the ack
+            // returns the origin's credit.
+            match RawFd::try_from(fd) {
+                Ok(fd) => {
+                    shared.adopted.borrow_mut().push(fd);
+                    staged.push((from, token, StagedReply::Ok));
+                }
+                Err(_) => staged.push((from, token, StagedReply::Refused)),
+            }
+        }
     }
 }
 

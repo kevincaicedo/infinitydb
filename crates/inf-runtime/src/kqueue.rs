@@ -11,7 +11,13 @@
 //!
 //! Mechanics: level-triggered filters; filter-state changes are queued and
 //! applied by the next `kevent` call (before its wait), so a disable/delete
-//! costs no extra syscall — at worst one spurious wakeup.
+//! costs no extra syscall — at worst one spurious wakeup. A write filter
+//! lives exactly as long as the blocked queue that armed it (F-L11-08), a
+//! refused arm fails its queue whole with every buffer (F-L11-09), and a
+//! closed number takes its queued changes with it. A `Close` discards the
+//! socket's unread input first (`shutdown(SHUT_RD)`): XNU answers a close
+//! over unread bytes with RST, and the consumer that stopped reading owes
+//! its peer a FIN (lane L11 N19, ADR-0124 D2).
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -44,6 +50,15 @@ struct PendingSend {
     written: u32,
 }
 
+/// One fd's blocked sends and whether `EVFILT_WRITE` is registered for
+/// them (or its `EV_ADD` queued). The entry lives exactly as long as the
+/// filter: a drained queue removes both.
+#[derive(Default)]
+struct SendQueue {
+    pending: VecDeque<PendingSend>,
+    armed: bool,
+}
+
 /// One listener's accept arm; `parked` = the read filter is disabled after
 /// an exhaustion/broken failure (the shared table in `driver.rs`,
 /// F-L11-02/F-L11-06) until `AcceptArm` or (exhaustion only) a `Close`.
@@ -61,7 +76,7 @@ pub struct KqueueDriver {
     changes: Vec<libc::kevent>,
     accepts: HashMap<RawFd, AcceptState>,
     recvs: HashMap<RawFd, RecvState>,
-    sends: HashMap<RawFd, VecDeque<PendingSend>>,
+    sends: HashMap<RawFd, SendQueue>,
     events: Vec<libc::kevent>,
     stats: SubmitStats,
 }
@@ -119,57 +134,9 @@ impl KqueueDriver {
                     }
                 }
                 IoOp::Send { fd, buf, len, token } => {
-                    if len as usize > pool.buf_size() {
-                        out.push(Completion {
-                            token,
-                            result: CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) },
-                        });
-                        continue;
-                    }
-                    let queue = self.sends.entry(fd).or_default();
-                    queue.push_back(PendingSend { token, buf, len, written: 0 });
-                    // Try to drain synchronously — the common case on a
-                    // writable socket — and only arm EVFILT_WRITE on EAGAIN.
-                    let drained = drain_sends(fd, queue, pool, out, &mut self.stats);
-                    if drained {
-                        self.sends.remove(&fd);
-                    } else {
-                        self.push_change(fd, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ENABLE);
-                    }
+                    self.queue_send(fd, buf, len, token, pool, out);
                 }
-                IoOp::Close { fd, token } => {
-                    self.accepts.remove(&fd);
-                    self.recvs.remove(&fd);
-                    if let Some(queue) = self.sends.remove(&fd) {
-                        for p in queue {
-                            out.push(Completion {
-                                token: p.token,
-                                result: CompletionResult::Error {
-                                    errno: libc::ECANCELED,
-                                    buf: Some(p.buf),
-                                },
-                            });
-                        }
-                    }
-                    // SAFETY: closing an fd we were handed; kqueue drops its
-                    // filters automatically.
-                    let rc = unsafe { libc::close(fd) };
-                    self.stats.syscalls += 1;
-                    out.push(Completion {
-                        token,
-                        result: if rc == 0 {
-                            CompletionResult::Closed
-                        } else {
-                            CompletionResult::Error {
-                                errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                                buf: None,
-                            }
-                        },
-                    });
-                    // close(2) released the descriptor either way: every
-                    // exhaustion-parked accept arm may try again.
-                    self.resume_exhausted_accepts();
-                }
+                IoOp::Close { fd, token } => self.close_fd(fd, token, out),
                 // File ops (M2-S05, ADR-0013): regular files are always
                 // "ready" — the readiness tier executes them synchronously
                 // at submit, delivering the same completion contract as the
@@ -179,41 +146,7 @@ impl KqueueDriver {
                 // cost: the correctness tier, never a gate artifact
                 // (ADR-0086 D1).
                 IoOp::LogWrite { fd, offset, data, token, barrier } => {
-                    let fsync_token = barrier.fsync_token();
-                    let write_through = matches!(barrier, WriteBarrier::WriteThrough);
-                    match log_pwrite_all(fd, offset, data, &mut self.stats) {
-                        Ok(()) => {
-                            let through = if write_through {
-                                // The write's own token is the durability
-                                // fact: a failed sync is the write's error.
-                                match sync_file(fd, token, &mut self.stats).result {
-                                    CompletionResult::Synced => CompletionResult::LogWritten,
-                                    failed => failed,
-                                }
-                            } else {
-                                CompletionResult::LogWritten
-                            };
-                            out.push(Completion { token, result: through });
-                            if let Some(ft) = fsync_token {
-                                out.push(sync_file(fd, ft, &mut self.stats));
-                            }
-                        }
-                        Err(errno) => {
-                            out.push(Completion {
-                                token,
-                                result: CompletionResult::Error { errno, buf: None },
-                            });
-                            if let Some(ft) = fsync_token {
-                                out.push(Completion {
-                                    token: ft,
-                                    result: CompletionResult::Error {
-                                        errno: libc::ECANCELED,
-                                        buf: None,
-                                    },
-                                });
-                            }
-                        }
-                    }
+                    self.log_write(fd, offset, data, token, barrier, out);
                 }
                 IoOp::Fdatasync { fd, token } => {
                     out.push(sync_file(fd, token, &mut self.stats));
@@ -225,6 +158,135 @@ impl KqueueDriver {
                             Ok(()) => CompletionResult::TierRead,
                             Err(errno) => CompletionResult::Error { errno, buf: None },
                         },
+                    });
+                }
+            }
+        }
+    }
+
+    /// One `Send`: drain synchronously — the common case on a writable
+    /// socket — and arm `EVFILT_WRITE` only on `EAGAIN`.
+    fn queue_send(
+        &mut self,
+        fd: RawFd,
+        buf: BufferId,
+        len: u32,
+        token: CompletionToken,
+        pool: &mut BufferPool,
+        out: &mut Vec<Completion>,
+    ) {
+        if len as usize > pool.buf_size() {
+            out.push(Completion {
+                token,
+                result: CompletionResult::Error { errno: libc::EINVAL, buf: Some(buf) },
+            });
+            return;
+        }
+        let state = self.sends.entry(fd).or_default();
+        state.pending.push_back(PendingSend { token, buf, len, written: 0 });
+        let drained = drain_sends(fd, &mut state.pending, pool, out, &mut self.stats);
+        self.settle_write_filter(fd, drained);
+    }
+
+    /// After a drain attempt on `fd`'s queue. Drained: the entry goes, and
+    /// with it the write filter it armed — level-triggered, an orphan fires
+    /// on every wait (F-L11-08). Blocked: the filter is armed once.
+    fn settle_write_filter(&mut self, fd: RawFd, drained: bool) {
+        let Some(state) = self.sends.get_mut(&fd) else { return };
+        let change = if drained {
+            let armed = state.armed;
+            self.sends.remove(&fd);
+            armed.then_some(libc::EV_DELETE)
+        } else if state.armed {
+            None
+        } else {
+            state.armed = true;
+            Some(libc::EV_ADD | libc::EV_ENABLE)
+        };
+        if let Some(flags) = change {
+            self.push_change(fd, libc::EVFILT_WRITE, flags);
+        }
+    }
+
+    /// Pending sends cancel (buffers returned) before `Closed`. Unread
+    /// input is discarded so the peer sees a FIN (module doc). close(2)
+    /// drops the fd's filters, and its queued changes go too: the number
+    /// may be another thread's fd before the next `kevent` applies them.
+    fn close_fd(&mut self, fd: RawFd, token: CompletionToken, out: &mut Vec<Completion>) {
+        self.accepts.remove(&fd);
+        self.recvs.remove(&fd);
+        if let Some(state) = self.sends.remove(&fd) {
+            fail_queue(state.pending, libc::ECANCELED, out);
+        }
+        self.changes.retain(|change| change.ident != fd as usize);
+        // SAFETY: shutdown on an fd we were handed; a non-socket or an
+        // unconnected socket refuses (ENOTSOCK/ENOTCONN) and nothing else
+        // happens — the close below is the one that matters.
+        unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        // SAFETY: closing an fd we were handed; kqueue drops its filters
+        // automatically.
+        let rc = unsafe { libc::close(fd) };
+        self.stats.syscalls += 1;
+        out.push(Completion {
+            token,
+            result: if rc == 0 {
+                CompletionResult::Closed
+            } else {
+                CompletionResult::Error {
+                    errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    buf: None,
+                }
+            },
+        });
+        // close(2) released the descriptor either way: every
+        // exhaustion-parked accept arm may try again.
+        self.resume_exhausted_accepts();
+    }
+
+    /// One `LogWrite` on the readiness tier (M2-S05, ADR-0013): regular
+    /// files are always "ready", so it executes synchronously at submit
+    /// with the uring tier's completion contract (fsync only after the
+    /// full write; a failed write cancels the chained sync).
+    /// `WriteThrough` is write + fsync here — the same durability promise
+    /// at FLUSH-class cost: the correctness tier, never a gate artifact
+    /// (ADR-0086 D1).
+    fn log_write(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        data: StableBytes,
+        token: CompletionToken,
+        barrier: WriteBarrier,
+        out: &mut Vec<Completion>,
+    ) {
+        let fsync_token = barrier.fsync_token();
+        let write_through = matches!(barrier, WriteBarrier::WriteThrough);
+        match log_pwrite_all(fd, offset, data, &mut self.stats) {
+            Ok(()) => {
+                let through = if write_through {
+                    // The write's own token is the durability fact: a
+                    // failed sync is the write's error.
+                    match sync_file(fd, token, &mut self.stats).result {
+                        CompletionResult::Synced => CompletionResult::LogWritten,
+                        failed => failed,
+                    }
+                } else {
+                    CompletionResult::LogWritten
+                };
+                out.push(Completion { token, result: through });
+                if let Some(ft) = fsync_token {
+                    out.push(sync_file(fd, ft, &mut self.stats));
+                }
+            }
+            Err(errno) => {
+                out.push(Completion {
+                    token,
+                    result: CompletionResult::Error { errno, buf: None },
+                });
+                if let Some(ft) = fsync_token {
+                    out.push(Completion {
+                        token: ft,
+                        result: CompletionResult::Error { errno: libc::ECANCELED, buf: None },
                     });
                 }
             }
@@ -289,26 +351,7 @@ impl KqueueDriver {
     ) {
         let fd = ev.ident as RawFd;
         if ev.flags & libc::EV_ERROR != 0 {
-            // Stale change on an already-closed fd is routine; a real error
-            // on a live fd surfaces on its owner token.
-            let errno = ev.data as i32;
-            if errno == 0 {
-                return;
-            }
-            let token = if ev.filter == libc::EVFILT_WRITE {
-                self.sends.get(&fd).and_then(|q| q.front()).map(|p| p.token)
-            } else {
-                self.accepts
-                    .get(&fd)
-                    .map(|a| a.token)
-                    .or_else(|| self.recvs.get(&fd).map(|s| s.token))
-            };
-            if let Some(token) = token {
-                out.push(Completion {
-                    token,
-                    result: CompletionResult::Error { errno, buf: None },
-                });
-            }
+            self.change_refused(ev, out);
             return;
         }
         match ev.filter {
@@ -316,18 +359,45 @@ impl KqueueDriver {
                 self.accept_slice(fd, out);
             }
             libc::EVFILT_READ => self.recv_one(fd, pool, out),
-            libc::EVFILT_WRITE => {
-                if let Some(mut queue) = self.sends.remove(&fd) {
-                    let drained = drain_sends(fd, &mut queue, pool, out, &mut self.stats);
-                    if drained {
-                        self.push_change(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
-                    } else {
-                        self.sends.insert(fd, queue);
-                    }
-                }
-            }
+            libc::EVFILT_WRITE => self.write_ready(fd, pool, out),
             _ => {}
         }
+    }
+
+    /// A changelist entry the kernel refused. A refused `EV_DELETE` is
+    /// nobody's error — the filter is gone either way (`ENOENT` once the
+    /// fd closed underneath it). A refused arm surfaces on its owner: the
+    /// write queue fails whole, every buffer returned (F-L11-09); a recv
+    /// or accept arm reports on its token.
+    fn change_refused(&mut self, ev: libc::kevent, out: &mut Vec<Completion>) {
+        let fd = ev.ident as RawFd;
+        let errno = ev.data as i32;
+        if errno == 0 || ev.flags & libc::EV_DELETE != 0 {
+            return;
+        }
+        if ev.filter == libc::EVFILT_WRITE {
+            if let Some(state) = self.sends.remove(&fd) {
+                fail_queue(state.pending, errno, out);
+            }
+            return;
+        }
+        let token =
+            self.accepts.get(&fd).map(|a| a.token).or_else(|| self.recvs.get(&fd).map(|s| s.token));
+        if let Some(token) = token {
+            out.push(Completion { token, result: CompletionResult::Error { errno, buf: None } });
+        }
+    }
+
+    /// Writable: drain a bounded slice of the fd's queue. A filter no
+    /// queue owns is deleted here — the one spurious wakeup the module
+    /// doc allows.
+    fn write_ready(&mut self, fd: RawFd, pool: &mut BufferPool, out: &mut Vec<Completion>) {
+        let Some(state) = self.sends.get_mut(&fd) else {
+            self.push_change(fd, libc::EVFILT_WRITE, libc::EV_DELETE);
+            return;
+        };
+        let drained = drain_sends(fd, &mut state.pending, pool, out, &mut self.stats);
+        self.settle_write_filter(fd, drained);
     }
 
     /// Multishot-accept emulation: drain a bounded slice of the backlog.
@@ -490,9 +560,8 @@ impl core::fmt::Debug for KqueueDriver {
 }
 
 /// Write the queue head(s) until drained, blocked, or errored. Returns
-/// whether the queue is now empty. Hard errors fail the head op and cancel
-/// the rest (a broken stream cannot carry later sends), returning every
-/// buffer.
+/// whether the queue is now empty. A hard error fails the queue whole (a
+/// broken stream cannot carry later sends).
 fn drain_sends(
     fd: RawFd,
     queue: &mut VecDeque<PendingSend>,
@@ -526,23 +595,23 @@ fn drain_sends(
         if errno == libc::EAGAIN || errno == libc::EINTR {
             return false;
         }
-        let failed = queue.pop_front().expect("head exists");
-        out.push(Completion {
-            token: failed.token,
-            result: CompletionResult::Error { errno, buf: Some(failed.buf) },
-        });
-        for cancelled in queue.drain(..) {
-            out.push(Completion {
-                token: cancelled.token,
-                result: CompletionResult::Error {
-                    errno: libc::ECANCELED,
-                    buf: Some(cancelled.buf),
-                },
-            });
-        }
+        fail_queue(core::mem::take(queue), errno, out);
         return true;
     }
     true
+}
+
+/// Terminal failure of a whole queue: the head with `errno`, the rest
+/// `ECANCELED` — every buffer returned (the contract's "ALWAYS").
+fn fail_queue(queue: VecDeque<PendingSend>, errno: i32, out: &mut Vec<Completion>) {
+    let mut errno = errno;
+    for p in queue {
+        out.push(Completion {
+            token: p.token,
+            result: CompletionResult::Error { errno, buf: Some(p.buf) },
+        });
+        errno = libc::ECANCELED;
+    }
 }
 
 fn set_nonblocking(fd: RawFd) {
@@ -676,4 +745,153 @@ fn duration_to_timespec(d: Duration) -> libc::timespec {
 
 fn zero_event() -> libc::kevent {
     libc::kevent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: core::ptr::null_mut() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::TokenClass;
+
+    /// A connected non-blocking pair whose driver side has a 4 KiB send
+    /// buffer; the peer never reads, so a few sends block in the driver.
+    fn blocked_pair() -> (RawFd, RawFd) {
+        let mut sv = [0 as RawFd; 2];
+        // SAFETY: socketpair writes two fds into the live array.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair");
+        let size: libc::c_int = 4096;
+        // SAFETY: setsockopt with a valid int pointer on a live socket.
+        unsafe {
+            libc::setsockopt(
+                sv[0],
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const size).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        set_nonblocking(sv[0]);
+        (sv[0], sv[1])
+    }
+
+    fn send_token(slot: u32) -> CompletionToken {
+        CompletionToken::new(TokenClass::Send, slot, 0)
+    }
+
+    /// Pushes full-buffer sends until one blocks, then one more behind it;
+    /// returns the two queued tokens (head, tail).
+    fn block_two_sends(
+        driver: &mut KqueueDriver,
+        pool: &mut BufferPool,
+        fd: RawFd,
+    ) -> [CompletionToken; 2] {
+        let mut out = Vec::new();
+        let mut head = None;
+        for slot in 0..64u32 {
+            let buf = pool.try_lease(LeaseKind::Send).expect("lease");
+            pool.bytes_mut(buf).fill(0xAB);
+            let len = pool.buf_size() as u32;
+            driver.push(IoOp::Send { fd, buf, len, token: send_token(slot) });
+            out.clear();
+            driver.submit_and_reap(pool, Wait::Poll, &mut out).expect("submit");
+            match out.pop().map(|c| c.result) {
+                Some(CompletionResult::Sent { buf }) => pool.release(buf),
+                Some(other) => panic!("unexpected {other:?}"),
+                None => {
+                    head = Some(slot);
+                    break;
+                }
+            }
+        }
+        let head = head.expect("could not block a send");
+        let buf = pool.try_lease(LeaseKind::Send).expect("lease");
+        let len = pool.buf_size() as u32;
+        driver.push(IoOp::Send { fd, buf, len, token: send_token(head + 1) });
+        out.clear();
+        driver.submit_and_reap(pool, Wait::Poll, &mut out).expect("submit");
+        assert!(out.is_empty(), "the second send queued behind the blocked head");
+        [send_token(head), send_token(head + 1)]
+    }
+
+    /// The record kevent returns for a changelist entry it refused.
+    fn refused_change(fd: RawFd, flags: u16, errno: i32) -> libc::kevent {
+        libc::kevent {
+            ident: fd as usize,
+            filter: libc::EVFILT_WRITE,
+            flags: flags | libc::EV_ERROR,
+            fflags: 0,
+            data: errno as isize,
+            udata: core::ptr::null_mut(),
+        }
+    }
+
+    /// F-L11-09: a refused `EV_ADD` on a live write queue is the queue's
+    /// terminal failure — every buffer comes back, and the later `Close`
+    /// names no token twice.
+    #[test]
+    fn a_refused_write_filter_fails_the_queue_with_its_buffers() {
+        let (fd, peer) = blocked_pair();
+        let mut driver = KqueueDriver::new().expect("kqueue");
+        let mut pool = BufferPool::new(8, 4096);
+        let [head, tail] = block_two_sends(&mut driver, &mut pool, fd);
+
+        let mut out = Vec::new();
+        let report = refused_change(fd, libc::EV_ADD | libc::EV_ENABLE, libc::EBADF);
+        driver.dispatch_event(report, &mut pool, &mut out);
+        let mut failed = Vec::new();
+        for c in out.drain(..) {
+            match c.result {
+                CompletionResult::Error { errno, buf: Some(buf) } => {
+                    pool.release(buf);
+                    failed.push((c.token, errno));
+                }
+                other => panic!("a terminal without its buffer: {other:?}"),
+            }
+        }
+        assert_eq!(failed, vec![(head, libc::EBADF), (tail, libc::ECANCELED)]);
+        assert!(!driver.sends.contains_key(&fd), "the failed queue is gone");
+        assert_eq!(pool.reconcile(), Ok(()));
+
+        let close = CompletionToken::new(TokenClass::Close, 7, 0);
+        driver.push(IoOp::Close { fd, token: close });
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("close");
+        let tokens: Vec<CompletionToken> = out.iter().map(|c| c.token).collect();
+        assert_eq!(tokens, vec![close], "exactly one terminal per token");
+        // SAFETY: the peer fd is ours and unused after this.
+        unsafe { libc::close(peer) };
+    }
+
+    /// A refused `EV_DELETE` (`ENOENT` once the fd closed underneath it) is
+    /// never the queue's error: nothing is delivered, the queue stands.
+    #[test]
+    fn a_refused_delete_is_not_the_queues_error() {
+        let (fd, peer) = blocked_pair();
+        let mut driver = KqueueDriver::new().expect("kqueue");
+        let mut pool = BufferPool::new(8, 4096);
+        let [head, tail] = block_two_sends(&mut driver, &mut pool, fd);
+
+        let mut out = Vec::new();
+        driver.dispatch_event(
+            refused_change(fd, libc::EV_DELETE, libc::ENOENT),
+            &mut pool,
+            &mut out,
+        );
+        assert!(out.is_empty(), "a failed delete delivered {out:?}");
+        assert!(driver.sends.contains_key(&fd), "the queue stands");
+
+        let close = CompletionToken::new(TokenClass::Close, 7, 0);
+        driver.push(IoOp::Close { fd, token: close });
+        driver.submit_and_reap(&mut pool, Wait::Poll, &mut out).expect("close");
+        let mut cancelled = Vec::new();
+        for c in out.drain(..) {
+            if let CompletionResult::Error { errno, buf: Some(buf) } = c.result {
+                pool.release(buf);
+                cancelled.push((c.token, errno));
+            }
+        }
+        assert_eq!(cancelled, vec![(head, libc::ECANCELED), (tail, libc::ECANCELED)]);
+        assert_eq!(pool.reconcile(), Ok(()));
+        // SAFETY: the peer fd is ours and unused after this.
+        unsafe { libc::close(peer) };
+    }
 }

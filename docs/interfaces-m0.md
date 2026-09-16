@@ -296,6 +296,10 @@ pub enum Op<'a> {
               args: /* ≤ MAX_APPLY_ARGS slices */, program: bool },
     Batch { ops: /* nested Read/Write/Apply, one destination */ },
     Reply { token: FabricToken, outcome: Outcome<'a> },
+    /// ADR-0128 (batch 70, additive opcode 7): an accepted socket handed to
+    /// another cell of the process; the adopter answers Reply { Ok }. Never
+    /// inside a Batch, no program mark.
+    AdoptConn { token: FabricToken, fd: u32 },
 }
 pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), Int(i64), Nil, Bool(bool), Err(ErrCode) }
 pub fn encode(op: &Op<'_>, out: &mut Vec<u8>);

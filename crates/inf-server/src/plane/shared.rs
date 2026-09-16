@@ -15,6 +15,20 @@ type ArmedDbBracket<'a> = (NsId, Vec<&'a [u8]>, Option<inf_doc::PathProgram>);
 type ArmedNsBracket<'a> = (Vec<&'a [u8]>, Option<inf_doc::PathProgram>);
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
+    /// Retires an adopt ack (ADR-0128): `true` when `token` was one of
+    /// this cell's hand-offs — its credit came back with the drain and
+    /// no gate waits on it.
+    pub(super) fn retire_adopt_ack(&self, token: u64) -> bool {
+        let mut acks = self.adopt_acks.borrow_mut();
+        match acks.iter().position(|t| *t == token) {
+            Some(i) => {
+                acks.swap_remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(super) fn with_conn<R>(&self, key: ConnKey, f: impl FnOnce(&mut Conn) -> R) -> Option<R> {
         self.conns.borrow_mut().get_mut(key).map(f)
     }

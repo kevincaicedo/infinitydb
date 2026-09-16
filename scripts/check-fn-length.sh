@@ -28,10 +28,15 @@
 #
 # INF_FN_LENGTH_INPUT=<file> replaces the cargo run with a captured
 # `--message-format=short` log (the self-test's planted breaches).
+# INF_FN_LENGTH_HOST=<uname -s> names the host (ADR-0125 A7): the baseline
+# is recorded on Linux, where the ratchet-down direction is authoritative;
+# elsewhere a row whose cfg-gated file never compiled is disclosed, not
+# failed. A new breach fails on every host.
 
 set -euo pipefail
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 BASELINE="${INF_FN_LENGTH_BASELINE:-docs/fn-length-baseline.tsv}"
+HOST="${INF_FN_LENGTH_HOST:-$(uname -s)}"
 work=$(mktemp -d)
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
@@ -61,10 +66,12 @@ fi
 # emits a crate's diagnostics once per feature set it compiles, and the
 # simulator's `dst` lane recompiles every crate upstream of it under
 # `collision-oracle` — batch 64's baseline counted those twice (ADR-0125
-# A1). Two functions of the same length in one file are two sites.
+# A1). Two functions of the same length in one file are two sites. The
+# line number is cut by awk: BSD sed reads `[^\t]` as "not backslash, not
+# t", which kept `path:line` as the key on macOS (ADR-0125 A7).
 { grep -E 'warning: this function has too many lines' "$work/clippy.log" || true; } \
     | sed -E 's/^([^:]+:[0-9]+):[0-9]+: .*\(([0-9]+)\/[0-9]+\).*$/\1\t\2/' \
-    | sort -u | sed -E 's/^([^\t]+):[0-9]+\t/\1\t/' \
+    | sort -u | awk -F'\t' 'BEGIN { OFS = "\t" } { sub(/:[0-9]+$/, "", $1); print }' \
     | sort > "$work/breaches"
 # No breach at all is the ratchet's goal, not evidence of a scan: the
 # compiler must have finished (ADR-0125 A3, ADR-0106 D2).
@@ -107,12 +114,19 @@ while IFS=$'\t' read -r count file; do
         fail=1
     fi
 done < "$work/counts"
-# baseline vs tree
+# baseline vs tree (ADR-0125 A7: the baseline's host is Linux — elsewhere
+# a row's file may simply be cfg-gated out of this build)
+skipped=0
 while IFS=$'\t' read -r base file; do
     count=$(awk -F'\t' -v f="$file" '$2 == f { print $1 }' "$work/counts")
     if [ -z "$count" ]; then
-        echo "FN-LENGTH ratchet: $file has no function over the bar, baseline $base — delete the row in $BASELINE"
-        fail=1
+        if [ "$HOST" = Linux ]; then
+            echo "FN-LENGTH ratchet: $file has no function over the bar, baseline $base — delete the row in $BASELINE"
+            fail=1
+        else
+            echo "FN-LENGTH note: $file (baseline $base) not compiled on this host ($HOST) — the ratchet for it runs on Linux"
+            skipped=$((skipped + 1))
+        fi
     fi
 done < "$work/baseline"
 
@@ -226,6 +240,9 @@ allows=$(grep -c '^ok' "$work/optouts" || true)
 total=$(wc -l < "$work/breaches" | tr -d ' ')
 filecount=$(wc -l < "$work/counts" | tr -d ' ')
 scope="$total function(s) over 70 lines in $filecount file(s) (the baseline backlog), $allows reasoned opt-out(s)"
+if [ "$skipped" -ne 0 ]; then
+    scope="$scope; $skipped baseline row(s) not compiled on $HOST"
+fi
 if [ "$fail" -ne 0 ]; then
     echo "fn-length FAILED: $scope"
     exit 1

@@ -2,14 +2,21 @@
 //! graceful stop. Black-box over the real binary — these compile and run
 //! against the pre-fix tree, where the child dies by signal 15 with no
 //! exit code and the next boot replays every frame.
-#![allow(clippy::disallowed_methods)] // test harness process, not cell code
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+/// One spawning test at a time (batch 69): macOS sets `CLOEXEC` after
+/// `socket(2)`, so a sibling test's `posix_spawn` in that window inherits
+/// this test's client socket and its port picker — the client then never
+/// sees the server's FIN, and the picked port is a ghost's.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -119,7 +126,19 @@ struct Client(TcpStream);
 
 impl Client {
     fn connect(port: u16) -> Client {
-        let c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        // macOS answers a connect right behind a closed one on the same
+        // pair with a transient `EADDRNOTAVAIL` (batch 69): retry briefly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let c = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(c) => break c,
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("connect: {e:?}"),
+            }
+        };
         c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
         c.set_nodelay(true).expect("nodelay");
         Client(c)
@@ -181,7 +200,8 @@ impl Client {
 }
 
 /// `INFO` is cell-scoped for `# Persistence`: connect until every cell
-/// of the node has answered, and return `field` per cell.
+/// of the node has answered, and return `field` per cell (every tier
+/// since batch 70: the macOS accept hand-off, ADR-0128).
 fn per_cell_field(port: u16, cells: usize, section: &[u8], field: &str) -> Vec<(u16, String)> {
     let mut seen = std::collections::BTreeMap::new();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -204,6 +224,7 @@ const N: usize = 4_000;
 /// clean EOF, not a reset.
 #[test]
 fn sigterm_drains_and_exits_zero() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = data_root("exit");
     let mut server = Server::spawn(&dir, "2", &[]);
     let mut c = Client::connect(server.port);
@@ -239,6 +260,7 @@ fn sigterm_drains_and_exits_zero() {
 /// replay_frames > 0` on every cell) — there is no stop checkpoint.
 #[test]
 fn sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = data_root("replay");
     let mut server = Server::spawn(&dir, "2", &[]);
     let mut c = Client::connect(server.port);
@@ -266,6 +288,9 @@ fn sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing() {
     assert_eq!(dbsize, format!(":{N}\r\n").as_bytes(), "acked writes lost across the stop");
     // Pre-fix: no checkpoint at all (`recover_ckpt_bytes:0` — 4 000 small
     // SETs never reach the bytes trigger) and the whole tail replays.
+    // Every cell, on every tier (batch 69 had this Linux-only: the macOS
+    // listener group handed every connection to one cell — lane L11 N19,
+    // fixed by the accept hand-off in batch 70).
     let ckpt = per_cell_field(server.port, 2, b"persistence", "recover_ckpt_bytes");
     assert!(ckpt.iter().all(|(_, v)| v != "0"), "no stop checkpoint was loaded: {ckpt:?}");
     let replayed = per_cell_field(server.port, 2, b"persistence", "recover_replay_records");
@@ -276,6 +301,7 @@ fn sigterm_keeps_every_acked_write_and_the_next_boot_replays_nothing() {
 /// write, and the next boot replays the tail (the operator chose it).
 #[test]
 fn shutdown_checkpoint_off_is_a_clean_exit_that_replays() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = data_root("nockpt");
     let mut server = Server::spawn(&dir, "1", &["--shutdown-checkpoint", "off"]);
     let mut c = Client::connect(server.port);

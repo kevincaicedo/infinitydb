@@ -158,12 +158,15 @@ while IFS=$'\t' read -r ptr file kind message; do
     # Resolve from a stripped *file*, never a pipe: the resolver exits at
     # the first definition, and a piped stripper takes SIGPIPE under
     # pipefail once the file outgrows the pipe buffer (ADR-0106 D14).
-    stripped="$work/stripped/$path"
-    if [ ! -f "$stripped" ]; then
-        mkdir -p "$(dirname "$stripped")"
-        awk -f "$STRIP" "$path" > "$stripped"
+    # `stripped_file`, not `stripped`: that name is the scope line's
+    # stripped-line count, and the batch-69 loop overwrote it with this
+    # path (batch 70 — the verdict was right, the disclosure was not).
+    stripped_file="$work/stripped/$path"
+    if [ ! -f "$stripped_file" ]; then
+        mkdir -p "$(dirname "$stripped_file")"
+        awk -f "$STRIP" "$path" > "$stripped_file"
     fi
-    if ! awk -v sym="$sym" -f "$RESOLVE" "$stripped" > /dev/null; then
+    if ! awk -v sym="$sym" -f "$RESOLVE" "$stripped_file" > /dev/null; then
         echo "RELEASE-ASSERT violation: proof pointer '$ptr' does not resolve — $path defines no '$sym' in production code (renamed, moved, or test-only?) (row: $file $kind \"$message\")"
         fail=1
     fi

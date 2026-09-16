@@ -206,14 +206,55 @@ fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
     Some((guard, stream))
 }
 
+/// The Redis the matrix is pinned to (`diff.rs`, matrixgen): every
+/// oracle-measured row was recorded against this version, so any other
+/// oracle measures the oracle, not the node (batch 69: 8.6.2 on the
+/// macOS box produced 11 mismatches that were all Redis's own changes).
+pub const ORACLE_VERSION: &str = "8.0.5";
+
 /// The redis oracle: `INF_COMPAT_ORACLE_ADDR` when pinned (CI), else a
-/// throwaway spawn from PATH. `None` means redis-server is not
-/// installed — the caller prints the loud SKIP marker.
+/// throwaway spawn from PATH. `None` means no *valid* oracle — not
+/// installed, or a version other than [`ORACLE_VERSION`] on PATH (batch
+/// 70) — and this prints why; the caller adds the loud SKIP marker. A
+/// pinned address of the wrong version panics: it was asked for.
+///
+/// # Panics
+/// `INF_COMPAT_ORACLE_ADDR` names a Redis of another version.
 pub fn oracle() -> Option<(Option<ProcessGuard>, TcpStream)> {
     match std::env::var("INF_COMPAT_ORACLE_ADDR") {
-        Ok(addr) => Some((None, connect_external(&addr))),
-        Err(_) => spawn_redis().map(|(guard, stream)| (Some(guard), stream)),
+        Ok(addr) => {
+            let mut stream = connect_external(&addr);
+            let version = redis_version(&mut stream).unwrap_or_default();
+            assert!(
+                version == ORACLE_VERSION,
+                "INF_COMPAT_ORACLE_ADDR={addr} is redis {version:?}; the matrix is pinned to \
+                 {ORACLE_VERSION}"
+            );
+            Some((None, stream))
+        }
+        Err(_) => {
+            let (guard, mut stream) = spawn_redis()?;
+            let version = redis_version(&mut stream).unwrap_or_default();
+            if version != ORACLE_VERSION {
+                eprintln!(
+                    "SKIPPED: redis-server on PATH is {version:?}, not the pinned oracle \
+                     {ORACLE_VERSION} — its rows would measure Redis, not the node; point \
+                     INF_COMPAT_ORACLE_ADDR at a {ORACLE_VERSION} instance"
+                );
+                return None;
+            }
+            Some((Some(guard), stream))
+        }
     }
+}
+
+/// `INFO server:redis_version` over `stream` (`None` when absent).
+fn redis_version(stream: &mut TcpStream) -> Option<String> {
+    stream.write_all(b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n").ok()?;
+    let mut buf = Vec::new();
+    let reply = read_frames(stream, &mut buf, 1);
+    let text = String::from_utf8_lossy(&reply);
+    text.lines().find_map(|l| l.strip_prefix("redis_version:")).map(|v| v.trim().to_string())
 }
 
 /// The real-node candidate (F-L19-09): spawns `$INFINITYD_BIN` with

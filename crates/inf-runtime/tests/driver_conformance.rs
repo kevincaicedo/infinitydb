@@ -382,8 +382,148 @@ fn buffer_lifecycle_storm_reconciles_to_zero() {
     assert!(send_leases > 0, "storm exercised the send lifecycle");
 }
 
+/// F-L11-08: a send blocked on `EAGAIN` arms the write filter; when a
+/// *later* `Send` on the same fd drains the whole queue on the submit
+/// path, the filter must go with it. A level-triggered filter left armed
+/// fires on every wait — the reactor can never park again on that fd.
+#[test]
+fn write_filter_disarms_after_a_late_send_drains_the_queue() {
+    let mut rig = Rig::new(8);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+
+    // Block a send: small send buffer, the client not reading.
+    set_small_sndbuf(conn);
+    let mut blocked = None;
+    for i in 0..64u32 {
+        let buf = rig.pool.try_lease(LeaseKind::Send).expect("lease");
+        let payload = rig.pool.buf_size() as u32;
+        rig.pool.bytes_mut(buf).fill(0xAB);
+        rig.driver.push(IoOp::Send { fd: conn, buf, len: payload, token: send_token(i) });
+        rig.out.clear();
+        rig.driver.submit_and_reap(&mut rig.pool, Wait::Poll, &mut rig.out).expect("submit");
+        let mut done = false;
+        for c in rig.out.drain(..) {
+            if let CompletionResult::Sent { buf } | CompletionResult::Error { buf: Some(buf), .. } =
+                c.result
+            {
+                rig.pool.release(buf);
+                done = true;
+            }
+        }
+        if !done {
+            blocked = Some(i);
+            break;
+        }
+    }
+    let blocked = blocked.expect("could not block a send; the write filter was never armed");
+
+    // The regime: room appears before the driver's next wait — the peer
+    // drains, the kernel buffer grows — and the *next* `Send` on the fd
+    // is what empties the queue, on the submit path.
+    set_sndbuf(conn, 1 << 20);
+    drain_client(&mut client);
+    let late = rig.pool.try_lease(LeaseKind::Send).expect("lease");
+    rig.pool.bytes_mut(late)[..4].copy_from_slice(b"late");
+    rig.driver.push(IoOp::Send { fd: conn, buf: late, len: 4, token: send_token(1000) });
+    rig.out.clear();
+    rig.driver.submit_and_reap(&mut rig.pool, Wait::Poll, &mut rig.out).expect("submit");
+    let mut sent: Vec<u32> = Vec::new();
+    for c in rig.out.drain(..) {
+        if let CompletionResult::Sent { buf } = c.result {
+            rig.pool.release(buf);
+            sent.push(c.token.slot());
+        }
+    }
+    sent.sort_unstable();
+    assert_eq!(sent, vec![blocked, 1000], "regime: the late send drained the queue synchronously");
+    drain_client(&mut client);
+
+    // Nothing is pending on the driver: a park must last its timeout and
+    // produce nothing. Three in a row — an orphaned filter returns at once
+    // every time.
+    let started = Instant::now();
+    for round in 0..3 {
+        rig.out.clear();
+        let produced = rig
+            .driver
+            .submit_and_reap(
+                &mut rig.pool,
+                Wait::Park { timeout: Some(Duration::from_millis(100)) },
+                &mut rig.out,
+            )
+            .expect("park");
+        assert_eq!(produced, 0, "round {round}: a spurious completion {:?}", rig.out);
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(200),
+        "three 100 ms parks returned after {waited:?}: the write filter is still armed"
+    );
+    assert_eq!(rig.pool.reconcile(), Ok(()));
+    drop(client);
+}
+
+/// Lane L11 N19 (batch 70, macOS): a `Close` on a socket whose kernel
+/// receive queue still holds bytes the consumer never read. The stop
+/// path drops post-mark input by design (ADR-0124 D2) and the peer is
+/// owed a FIN, not a reset; XNU sends RST for unread input at close, so
+/// the driver discards it first (`shutdown(SHUT_RD)`). The regime is
+/// input already delivered: bytes a peer keeps sending after the FIN
+/// are reset by TCP itself on every kernel, so the pipeline fits the
+/// receive window (64 KiB) and settles before the close. io_uring's tier
+/// is not measured here: its multishot recv drains the socket into the
+/// pool ahead of any close, and Linux ignores `SHUT_RD` for this.
+#[cfg(target_os = "macos")]
+#[test]
+fn close_with_unread_input_is_a_fin_not_a_reset() {
+    let mut rig = Rig::new(4);
+    let mut client = rig.connect();
+    let conn = rig.accept_one(&client);
+    client.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    client.write_all(&vec![0x2A; 64 << 10]).expect("pipeline");
+    rig.driver.push(IoOp::RecvArm { fd: conn, token: recv_token(0) });
+    let got = rig.pump_until(|c| matches!(c.result, CompletionResult::Recv { .. }));
+    std::thread::sleep(Duration::from_millis(50)); // the pipeline has landed
+    for c in got {
+        if let CompletionResult::Recv { buf, .. } = c.result {
+            rig.pool.release(buf);
+        }
+    }
+    rig.driver.push(IoOp::Close { fd: conn, token: CompletionToken::new(TokenClass::Close, 0, 0) });
+    let closed = rig.pump_until(|c| matches!(c.result, CompletionResult::Closed));
+    assert!(closed.iter().any(|c| matches!(c.result, CompletionResult::Closed)));
+    let mut rest = Vec::new();
+    let read = client.read_to_end(&mut rest);
+    assert!(read.is_ok(), "the close was a reset, not a FIN: {read:?}");
+    assert_eq!(rig.pool.reconcile(), Ok(()));
+}
+
+/// Reads whatever the peer has already delivered and stops at the first
+/// empty poll (the driver is not running, so nothing more can arrive).
+fn drain_client(client: &mut TcpStream) {
+    client.set_nonblocking(true).expect("nonblocking");
+    let mut scratch = [0u8; 1 << 16];
+    let mut idle_polls = 0;
+    while idle_polls < 3 {
+        match client.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(_) => idle_polls = 0,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                idle_polls += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("drain: {e}"),
+        }
+    }
+    client.set_nonblocking(false).expect("blocking");
+}
+
 fn set_small_sndbuf(fd: i32) {
-    let size: libc::c_int = 4096;
+    set_sndbuf(fd, 4096);
+}
+
+fn set_sndbuf(fd: i32, size: libc::c_int) {
     // SAFETY: setsockopt with a valid int pointer on a live socket.
     unsafe {
         libc::setsockopt(
