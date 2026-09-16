@@ -529,20 +529,23 @@ fn destination_maxmemory_admits_renames_and_refuses_copy() {
         for existing in [false, true] {
             for command in [CommandId::Rename, CommandId::Renamenx, CommandId::Copy] {
                 let rig = Rig::new(owner);
-                let dest = 1 - owner;
+                let target_cell = 1 - owner;
                 rig.seed();
                 if existing {
                     assert_eq!(
-                        rig.local(dest, &[b"SET", &rig.target, b"previous", b"PX", b"900000"]),
+                        rig.local(
+                            target_cell,
+                            &[b"SET", &rig.target, b"previous", b"PX", b"900000"]
+                        ),
                         b"+OK\r\n"
                     );
                 }
                 let source_deadline = rig.source(&[b"PEXPIRETIME", &rig.source]);
-                let target_before = rig.local(dest, &[b"GET", &rig.target]);
-                let target_deadline_before = rig.local(dest, &[b"PEXPIRETIME", &rig.target]);
+                let target_before = rig.local(target_cell, &[b"GET", &rig.target]);
+                let target_deadline_before = rig.local(target_cell, &[b"PEXPIRETIME", &rig.target]);
                 assert_eq!(
                     rig.local(
-                        dest,
+                        target_cell,
                         &[
                             b"CONFIG",
                             b"SET",
@@ -555,7 +558,7 @@ fn destination_maxmemory_admits_renames_and_refuses_copy() {
                     b"+OK\r\n"
                 );
                 // The gate is armed: a client SET at the destination refuses.
-                assert!(rig.local(dest, &[b"SET", b"probe", b"v"]).starts_with(b"-OOM "));
+                assert!(rig.local(target_cell, &[b"SET", b"probe", b"v"]).starts_with(b"-OOM "));
                 let reply = rig.run(command, |_, _| None);
                 let label = format!("{command:?} owner={owner} existing={existing}");
                 let lands = match (command, existing) {
@@ -588,12 +591,12 @@ fn destination_maxmemory_admits_renames_and_refuses_copy() {
                 if lands {
                     assert_eq!(rig.source(&[b"GET", &rig.source]), b"$-1\r\n", "{label}");
                     assert_eq!(
-                        rig.local(dest, &[b"GET", &rig.target]),
+                        rig.local(target_cell, &[b"GET", &rig.target]),
                         b"$7\r\npayroll\r\n",
                         "{label}"
                     );
                     assert_eq!(
-                        rig.local(dest, &[b"PEXPIRETIME", &rig.target]),
+                        rig.local(target_cell, &[b"PEXPIRETIME", &rig.target]),
                         source_deadline,
                         "{label}: the absolute deadline travels with the value"
                     );
@@ -604,9 +607,13 @@ fn destination_maxmemory_admits_renames_and_refuses_copy() {
                         source_deadline,
                         "{label}"
                     );
-                    assert_eq!(rig.local(dest, &[b"GET", &rig.target]), target_before, "{label}");
                     assert_eq!(
-                        rig.local(dest, &[b"PEXPIRETIME", &rig.target]),
+                        rig.local(target_cell, &[b"GET", &rig.target]),
+                        target_before,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        rig.local(target_cell, &[b"PEXPIRETIME", &rig.target]),
                         target_deadline_before,
                         "{label}"
                     );

@@ -162,10 +162,10 @@ impl Cancel {
 /// value or condition is a function of more than one owner's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dependent {
-    /// `RENAME src dst` across owners: the destination takes the
+    /// `RENAME source target` across owners: the destination takes the
     /// source's value as the transaction sees it; the source is
     /// deleted. Absent source ⇒ `no such key`.
-    Move { src: Key, dst: Key },
+    Move { source: Key, target: Key },
     /// `MSETNX k…` across owners: every key is set iff none exists.
     SetIfNoneExist { keys: Vec<Key> },
 }
@@ -173,14 +173,14 @@ pub enum Dependent {
 impl Dependent {
     pub fn keys(&self) -> Vec<Key> {
         match self {
-            Dependent::Move { src, dst } => vec![*src, *dst],
+            Dependent::Move { source, target } => vec![*source, *target],
             Dependent::SetIfNoneExist { keys } => keys.clone(),
         }
     }
 
     fn label(&self) -> String {
         match self {
-            Dependent::Move { src, dst } => format!("RENAME {src}→{dst}"),
+            Dependent::Move { source, target } => format!("RENAME {source}→{target}"),
             Dependent::SetIfNoneExist { keys } => format!("MSETNX {keys:?}"),
         }
     }
@@ -482,9 +482,9 @@ enum ExecStage {
     Legs,
     /// Move: the destination's reserve-then-stage put of the shipped
     /// value.
-    ApplyDest,
+    ApplyTarget,
     /// Move: the source's delete, after the destination staged.
-    ApplySrc,
+    ApplySource,
     /// Set-if-none-exist: stage the sets reserved in the gather.
     Apply,
 }
@@ -1236,16 +1236,16 @@ impl Model {
         let (_, dep) = self.stage_dep(txn, si).expect("an apply step has its command");
         let mut probe = Probe::default();
         match (stage, dep) {
-            (ExecStage::ApplyDest, Dependent::Move { dst, .. }) => {
+            (ExecStage::ApplyTarget, Dependent::Move { target, .. }) => {
                 if self.txns[txn].spec.refuses_at == Some(owner) {
                     probe.refused = true;
                 } else {
                     let value = self.txns[txn].probe_value;
-                    self.stage_write(txn, owner, dst, value);
+                    self.stage_write(txn, owner, target, value);
                 }
             }
-            (ExecStage::ApplySrc, Dependent::Move { src, .. }) => {
-                self.stage_write(txn, owner, src, None);
+            (ExecStage::ApplySource, Dependent::Move { source, .. }) => {
+                self.stage_write(txn, owner, source, None);
             }
             (ExecStage::Apply, Dependent::SetIfNoneExist { keys }) => {
                 for key in keys {
@@ -1345,8 +1345,8 @@ impl Model {
     fn gather(&self, txn: usize, owner: Cell, dep: &Dependent) -> Probe {
         let mut probe = Probe::default();
         match dep {
-            Dependent::Move { src, .. } if self.owner_of(*src) == owner => {
-                probe.value = self.view(txn, owner, *src);
+            Dependent::Move { source, .. } if self.owner_of(*source) == owner => {
+                probe.value = self.view(txn, owner, *source);
                 probe.present = probe.value.is_some();
             }
             Dependent::Move { .. } => {}
@@ -1371,22 +1371,22 @@ impl Model {
         dep: &Dependent,
     ) -> (Option<&'static str>, Option<Reply>) {
         match dep {
-            Dependent::Move { src, dst } => {
-                if self.owner_of(*src) == owner {
-                    self.stage_write(txn, owner, *src, None);
+            Dependent::Move { source, target } => {
+                if self.owner_of(*source) == owner {
+                    self.stage_write(txn, owner, *source, None);
                 }
-                if self.owner_of(*dst) != owner {
+                if self.owner_of(*target) != owner {
                     return (None, None);
                 }
                 if self.txns[txn].spec.refuses_at == Some(owner) {
                     return (Some("destination refused"), Some(Reply::Err("destination refused")));
                 }
                 let Some(value) =
-                    self.owners[self.owner_of(*src)].values.get(src).copied().flatten()
+                    self.owners[self.owner_of(*source)].values.get(source).copied().flatten()
                 else {
                     return (Some("no such key"), Some(Reply::Err("no such key")));
                 };
-                self.stage_write(txn, owner, *dst, Some(value));
+                self.stage_write(txn, owner, *target, Some(value));
                 (None, Some(Reply::Ok))
             }
             Dependent::SetIfNoneExist { keys } => {
@@ -1492,21 +1492,21 @@ impl Model {
                     self.next_stage(txn);
                 }
             }
-            ExecStage::ApplyDest => {
+            ExecStage::ApplyTarget => {
                 if self.txns[txn].probe_refused {
                     self.dependent_failed(txn, "destination refused");
                     return;
                 }
-                let Some((_, Dependent::Move { src, .. })) = self.stage_dep(txn, si) else {
-                    unreachable!("ApplyDest is the move family's")
+                let Some((_, Dependent::Move { source, .. })) = self.stage_dep(txn, si) else {
+                    unreachable!("ApplyTarget is the move family's")
                 };
-                let owner = self.owner_of(src);
-                self.txns[txn].stage = ExecStage::ApplySrc;
+                let owner = self.owner_of(source);
+                self.txns[txn].stage = ExecStage::ApplySource;
                 self.txns[txn].cursor = 1;
                 self.txns[txn].fan = 1;
-                self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplySrc });
+                self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplySource });
             }
-            ExecStage::ApplySrc => {
+            ExecStage::ApplySource => {
                 let idx = dep_idx.expect("the move family's stage");
                 self.txns[txn].replies.insert(idx, Reply::Ok);
                 self.next_stage(txn);
@@ -1530,16 +1530,16 @@ impl Model {
         }
         let (_, dep) = self.stage_dep(txn, si).expect("a dependent command");
         match dep {
-            Dependent::Move { dst, .. } => {
+            Dependent::Move { target, .. } => {
                 if !self.txns[txn].probe_any {
                     self.dependent_failed(txn, "no such key");
                     return;
                 }
-                let owner = self.owner_of(dst);
-                self.txns[txn].stage = ExecStage::ApplyDest;
+                let owner = self.owner_of(target);
+                self.txns[txn].stage = ExecStage::ApplyTarget;
                 self.txns[txn].cursor = 1;
                 self.txns[txn].fan = 1;
-                self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplyDest });
+                self.pending.push(Msg::Exec { txn, owner, stage: ExecStage::ApplyTarget });
             }
             Dependent::SetIfNoneExist { keys } => {
                 if self.txns[txn].probe_refused {

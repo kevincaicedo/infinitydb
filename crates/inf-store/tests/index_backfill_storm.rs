@@ -203,10 +203,10 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
             ks.expire_tick(*now, ExpiryBudget::default());
         }
         _ => {
-            let dst = key_of(rng.below(256));
-            if dst != key {
-                bracketed(ks, ns, &[&key, &dst], |s| {
-                    let _ = s.rename(&key, &dst, *now);
+            let target = key_of(rng.below(256));
+            if target != key {
+                bracketed(ks, ns, &[&key, &target], |s| {
+                    let _ = s.rename(&key, &target, *now);
                 });
             }
         }

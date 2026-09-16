@@ -17,6 +17,16 @@ pub enum Malformed {
     Length,
     /// Nested past [`MAX_DEPTH`].
     Nesting,
+    /// The bytes end before one reply does (value parser: the caller
+    /// handed over an incomplete frame).
+    Incomplete,
+    /// Bytes follow the first complete reply (value parser).
+    Trailing,
+    /// A `:` line that is not a decimal `i64`.
+    Integer,
+    /// A tag the RESP2 value parser does not model (the RESP3 set the
+    /// framer accepts: `,` `#` `(` `_` `=` `%` `~` `>`).
+    Unsupported(u8),
 }
 
 impl core::fmt::Display for Malformed {
@@ -25,6 +35,12 @@ impl core::fmt::Display for Malformed {
             Malformed::Tag(tag) => write!(f, "invalid RESP tag {tag:#04x}"),
             Malformed::Length => f.write_str("RESP length is not ASCII digits"),
             Malformed::Nesting => write!(f, "reply nesting exceeds {MAX_DEPTH}"),
+            Malformed::Incomplete => f.write_str("incomplete RESP reply"),
+            Malformed::Trailing => f.write_str("trailing bytes after one reply"),
+            Malformed::Integer => f.write_str("RESP integer is not a decimal i64"),
+            Malformed::Unsupported(tag) => {
+                write!(f, "RESP tag {tag:#04x} is outside the RESP2 value model")
+            }
         }
     }
 }
@@ -147,42 +163,58 @@ pub enum Reply {
 /// under test produced it, which is itself a finding the panic surfaces
 /// with the seed.
 pub fn parse_reply(raw: &[u8]) -> Reply {
-    let end = reply_len(raw).expect("complete frame");
-    assert_eq!(end, raw.len(), "trailing bytes after one reply: {raw:?}");
-    let len = |digits: &[u8]| parse_len(digits).expect("framed length");
+    match try_parse_reply(raw) {
+        Ok(reply) => reply,
+        Err(err) => panic!("sim client saw malformed RESP: {err} in {raw:?}"),
+    }
+}
+
+/// The total value parser behind [`parse_reply`] (review B64-65-R04):
+/// every byte string is `Ok(reply)` or a typed [`Malformed`] — the fuzz
+/// target `sim_resp_value` drives this form on arbitrary bytes and on a
+/// generated RESP2 model at and past the depth cap.
+///
+/// # Errors
+/// [`Malformed`] names the first violation; over-depth input is
+/// `Malformed::Nesting`, never a stack overflow.
+pub fn try_parse_reply(raw: &[u8]) -> Result<Reply, Malformed> {
+    let end = try_reply_len(raw)?.ok_or(Malformed::Incomplete)?;
+    if end != raw.len() {
+        return Err(Malformed::Trailing);
+    }
     let mut stack: Vec<(usize, Vec<Reply>)> = Vec::new();
     let mut at = 0;
     loop {
-        let header = line_end(raw, at).expect("framed line");
+        let header = line_end(raw, at).ok_or(Malformed::Incomplete)?;
+        let line = &raw[at + 1..header - 2];
         let mut value = match raw[at] {
             b'+' => {
-                let line = raw[at + 1..header - 2].to_vec();
                 at = header;
-                Reply::Simple(line)
+                Reply::Simple(line.to_vec())
             }
             b'-' => {
-                let line = raw[at + 1..header - 2].to_vec();
                 at = header;
-                Reply::Error(line)
+                Reply::Error(line.to_vec())
             }
             b':' => {
-                let text = core::str::from_utf8(&raw[at + 1..header - 2]).expect("int ASCII");
                 at = header;
-                Reply::Int(text.parse().expect("int parses"))
+                Reply::Int(parse_int(line)?)
             }
             b'$' => {
-                let n = len(&raw[at + 1..header - 2]);
+                let n = parse_len(line)?;
                 if n < 0 {
                     at = header;
                     Reply::Nil
                 } else {
+                    // The framer accepted this bulk, so `header + n + 2`
+                    // is inside `raw`.
                     let end = header + n as usize + 2;
                     at = end;
                     Reply::Bulk(raw[header..end - 2].to_vec())
                 }
             }
             b'*' => {
-                let n = len(&raw[at + 1..header - 2]);
+                let n = parse_len(line)?;
                 at = header;
                 if n < 0 {
                     Reply::Nil
@@ -193,16 +225,66 @@ pub fn parse_reply(raw: &[u8]) -> Reply {
                     continue;
                 }
             }
-            other => panic!("sim reply parser saw RESP tag {other:#04x}"),
+            other => return Err(Malformed::Unsupported(other)),
         };
         loop {
-            let Some((want, items)) = stack.last_mut() else { return value };
+            let Some((want, items)) = stack.last_mut() else { return Ok(value) };
             items.push(value);
             if items.len() < *want {
                 break;
             }
             let (_, items) = stack.pop().expect("checked non-empty");
             value = Reply::Array(items);
+        }
+    }
+}
+
+fn parse_int(digits: &[u8]) -> Result<i64, Malformed> {
+    core::str::from_utf8(digits).ok().and_then(|t| t.parse().ok()).ok_or(Malformed::Integer)
+}
+
+/// Canonical RESP2 bytes of a reply — the value parser's inverse
+/// (`try_parse_reply(encode_reply(r)) == Ok(r)`), iterative with an
+/// explicit stack of open arrays so a model at the depth cap encodes
+/// without recursion.
+pub fn encode_reply(reply: &Reply, out: &mut Vec<u8>) {
+    let mut stack: Vec<core::slice::Iter<'_, Reply>> = Vec::new();
+    let mut next = Some(reply);
+    loop {
+        let Some(value) = next.take() else {
+            let Some(items) = stack.last_mut() else { return };
+            match items.next() {
+                Some(item) => next = Some(item),
+                None => {
+                    stack.pop();
+                }
+            }
+            continue;
+        };
+        match value {
+            Reply::Simple(line) => {
+                out.push(b'+');
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+            }
+            Reply::Error(line) => {
+                out.push(b'-');
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+            }
+            Reply::Int(n) => {
+                out.extend_from_slice(format!(":{n}\r\n").as_bytes());
+            }
+            Reply::Bulk(bytes) => {
+                out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
+                out.extend_from_slice(bytes);
+                out.extend_from_slice(b"\r\n");
+            }
+            Reply::Nil => out.extend_from_slice(b"$-1\r\n"),
+            Reply::Array(items) => {
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                stack.push(items.iter());
+            }
         }
     }
 }
@@ -356,6 +438,43 @@ mod tests {
         let mut deep = b"*1\r\n".repeat(200_000);
         deep.extend_from_slice(b":1\r\n");
         let _ = parse_reply(&deep);
+    }
+
+    /// B64-65-R04: the value parser is total — every malformed shape is
+    /// a typed error, so the fuzz target can drive it on arbitrary bytes.
+    #[test]
+    fn value_parser_names_every_malformation() {
+        assert_eq!(try_parse_reply(b":x\r\n"), Err(Malformed::Integer));
+        assert_eq!(try_parse_reply(b":99999999999999999999\r\n"), Err(Malformed::Integer));
+        assert_eq!(try_parse_reply(b"_\r\n"), Err(Malformed::Unsupported(b'_')));
+        assert_eq!(try_parse_reply(b"%1\r\n$1\r\na\r\n:1\r\n"), Err(Malformed::Unsupported(b'%')));
+        assert_eq!(try_parse_reply(b"*1\r\n,1.5\r\n"), Err(Malformed::Unsupported(b',')));
+        assert_eq!(try_parse_reply(b"+OK\r\n+OK\r\n"), Err(Malformed::Trailing));
+        assert_eq!(try_parse_reply(b"*2\r\n:1\r\n"), Err(Malformed::Incomplete));
+        assert_eq!(try_parse_reply(b""), Err(Malformed::Incomplete));
+        assert_eq!(try_parse_reply(b"?\r\n"), Err(Malformed::Tag(b'?')));
+        assert_eq!(try_parse_reply(b"$x\r\n"), Err(Malformed::Length));
+        let mut deep = b"*1\r\n".repeat(MAX_DEPTH + 1);
+        deep.extend_from_slice(b":1\r\n");
+        assert_eq!(try_parse_reply(&deep), Err(Malformed::Nesting));
+    }
+
+    #[test]
+    fn encode_is_the_value_parsers_inverse() {
+        let mut chain = Reply::Array(vec![
+            Reply::Simple(b"OK".to_vec()),
+            Reply::Error(b"ERR x".to_vec()),
+            Reply::Int(-7),
+            Reply::Bulk(b"a\r\nb".to_vec()),
+            Reply::Nil,
+            Reply::Array(Vec::new()),
+        ]);
+        for _ in 0..MAX_DEPTH - 1 {
+            chain = Reply::Array(vec![chain]);
+        }
+        let mut bytes = Vec::new();
+        encode_reply(&chain, &mut bytes);
+        assert_eq!(try_parse_reply(&bytes), Ok(chain));
     }
 
     #[test]

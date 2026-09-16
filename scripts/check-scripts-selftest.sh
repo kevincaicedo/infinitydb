@@ -1092,11 +1092,11 @@ style_root() {
     echo "$root"
 }
 root=$(style_root fl-over)
-{ printf 'pub fn f() {\n'; for _ in $(seq 1 1999); do printf '    let _x = 1;\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
-expect red "file-length: 2001 production lines" env INF_CHECK_ROOT="$root" $FILELEN
-{ printf 'pub fn f() {\n'; for _ in $(seq 1 1499); do printf '    let _x = 1;\n'; done; printf '}\n#[cfg(test)]\nmod tests {\n'; for _ in $(seq 1 600); do printf '    fn t() {}\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
-expect green "file-length: 2103 lines of which 602 are a test module" env INF_CHECK_ROOT="$root" $FILELEN
-expect_output "file-length: the OK line discloses the largest file" "largest: 1501 crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" $FILELEN
+{ printf 'pub fn f() {\n'; for _ in $(seq 1 2999); do printf '    let _x = 1;\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
+expect red "file-length: 3001 production lines" env INF_CHECK_ROOT="$root" $FILELEN
+{ printf 'pub fn f() {\n'; for _ in $(seq 1 2499); do printf '    let _x = 1;\n'; done; printf '}\n#[cfg(test)]\nmod tests {\n'; for _ in $(seq 1 600); do printf '    fn t() {}\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
+expect green "file-length: 3103 lines of which 602 are a test module" env INF_CHECK_ROOT="$root" $FILELEN
+expect_output "file-length: the OK line discloses the largest file" "largest: 2501 crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" $FILELEN
 rm -rf "$root/bins"
 expect red "file-length: a missing bins/ is a scope error, not a skip" env INF_CHECK_ROOT="$root" $FILELEN
 root=$(style_root lw)
@@ -1139,6 +1139,52 @@ expect green "fn-length: an opt-out with its reason" env INF_CHECK_ROOT="$root" 
 expect_output "fn-length: every opt-out is listed on the OK line" "opt-out: crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
 rm -f "$root/docs/fn-length-baseline.tsv"
 expect red "fn-length: a missing baseline is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+# ADR-0125 A3 (review B64-65-R01): the opt-out audit is structural — the
+# lint can be silenced from any scope and by any spelling, so every
+# attribute that names it is read whole and classified.
+printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+printf '#![allow(clippy::too_many_lines)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a crate-level #![allow] is a violation, not an invisible opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#![allow(clippy::pedantic)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a lint-group allow (pedantic) is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(warnings)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: allow(warnings) on a function is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(\n    clippy::too_many_lines,\n    reason = "one linear script"\n)]\n#[must_use]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect green "fn-length: a multi-line reasoned allow on a function (through another attribute) is a valid opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+expect_output "fn-length: the multi-line opt-out is disclosed on the OK line" "1 reasoned opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(\n    clippy::too_many_lines\n)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a multi-line allow without a reason is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(clippy::too_many_lines, reason = "x")]\nmod inner { pub fn f() {} }\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a reasoned allow on a mod is a violation (function scope only)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf 'struct S;\n#[allow(clippy::too_many_lines, reason = "x")]\nimpl S { fn f() {} }\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a reasoned allow on an impl is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[cfg_attr(not(test), allow(clippy::too_many_lines, reason = "x"))]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: a cfg_attr suppression is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[expect(clippy::too_many_lines, reason = "x")]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "fn-length: an expect is a violation (unfulfilled under normal builds)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '#[allow(dead_code, reason = "keeps warnings quiet")]\nstruct S;\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect green "fn-length: an unrelated allow whose reason mentions warnings is not a suppression" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+# ADR-0125 A3 (review B64-65-R02): the baseline is validated before it is
+# compared — a malformed row used to skip both integer branches and pass.
+printf 'oops\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a non-integer baseline count is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '2\tcrates/fake/src/lib.rs\n1\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a path listed twice is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '2\tcrates/fake/src/lib.rs\textra\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a surplus baseline field is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '2\t/etc/passwd\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: an out-of-scope baseline path is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+printf '0\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
+expect red "fn-length: a zero baseline count is a scope error (delete the row instead)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+# ADR-0125 A3 (review B64-65-R03): zero breaches with zero rows is the
+# ratchet's final state and passes; a scan with no compiler output is not.
+printf '# no rows\n' >"$root/docs/fn-length-baseline.tsv"
+printf '    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.00s\n' >"$log"
+expect green "fn-length: zero breaches and an empty baseline pass (the ratchet's goal)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+expect_output "fn-length: the zero state is disclosed" "0 function(s) over 70 lines in 0 file(s)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+: >"$log"
+expect red "fn-length: an empty compiler log is a scope error, not a clean tree" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
 
 # ---------------------------------------------------------- doc artifacts
 DOCS=./scripts/check-doc-artifacts.sh

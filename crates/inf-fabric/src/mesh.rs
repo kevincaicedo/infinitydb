@@ -259,14 +259,14 @@ impl Mesh {
                 stats: FabricStats::default(),
             })
             .collect();
-        for src in 0..n {
-            for dst in 0..n {
-                if src == dst {
+        for from in 0..n {
+            for to in 0..n {
+                if from == to {
                     continue;
                 }
                 let (producer, consumer) = ring::<FabricMsg>(config.ring_capacity);
                 let doorbell = Arc::new(Doorbell::default());
-                fabrics[src].out[dst] = Some(Outbound {
+                fabrics[from].out[to] = Some(Outbound {
                     producer,
                     doorbell: Arc::clone(&doorbell),
                     staged: Vec::new(),
@@ -274,7 +274,7 @@ impl Mesh {
                     pack: Vec::with_capacity(PACK_SEAL_BYTES),
                     pack_frames: 0,
                 });
-                fabrics[dst].inn[src] = Some(Inbound { consumer, doorbell, skip_streak: 0 });
+                fabrics[to].inn[from] = Some(Inbound { consumer, doorbell, skip_streak: 0 });
             }
         }
         fabrics
@@ -380,7 +380,7 @@ impl CellFabric {
     pub fn flush(&mut self) -> usize {
         let mut published_total = 0;
         let mut seal_spills = 0;
-        for (dst, slot) in self.out.iter_mut().enumerate() {
+        for (to, slot) in self.out.iter_mut().enumerate() {
             let Some(outbound) = slot.as_mut() else { continue };
             if outbound.seal() {
                 seal_spills += 1;
@@ -404,8 +404,8 @@ impl CellFabric {
                 // never a hang.
                 if let (Some(flags), Some(wake)) = (&self.park_flags, &self.peer_wake) {
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    if flags[dst].load(Ordering::Relaxed) {
-                        wake(CellId(dst as u16));
+                    if flags[to].load(Ordering::Relaxed) {
+                        wake(CellId(to as u16));
                     }
                 }
             }

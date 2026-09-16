@@ -212,9 +212,9 @@ fn flush_block(base: usize, masks: BlockMasks, state: &mut ScanState, out: &mut 
     // SAFETY: `reserve(64)` guarantees capacity for the at-most-64 set
     // bits of `emit`; `set_len(n)` exposes exactly the written prefix.
     unsafe {
-        let dst = out.as_mut_ptr();
+        let target = out.as_mut_ptr();
         while emit != 0 {
-            *dst.add(n) = (base + emit.trailing_zeros() as usize) as u32;
+            *target.add(n) = (base + emit.trailing_zeros() as usize) as u32;
             n += 1;
             emit &= emit - 1;
         }
@@ -532,14 +532,14 @@ unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
 unsafe fn avx2_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
     let n_blocks = input.len().div_ceil(BLOCK);
     out.reserve(n_blocks);
-    let dst = out.as_mut_ptr();
+    let target = out.as_mut_ptr();
     let ptr = input.as_ptr();
     let mut i = 0;
     let mut offset = 0;
     while offset + BLOCK <= input.len() {
         // SAFETY: `offset + 64 <= len` bounds the block inside the slice;
         // `i < n_blocks` entries fit the reservation above.
-        unsafe { dst.add(i).write(avx2_block(ptr.add(offset))) };
+        unsafe { target.add(i).write(avx2_block(ptr.add(offset))) };
         i += 1;
         offset += BLOCK;
     }
@@ -549,7 +549,7 @@ unsafe fn avx2_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
         padded[..tail].copy_from_slice(&input[offset..]);
         // SAFETY: `padded` is a 64-byte stack array; the write is the
         // `n_blocks`-th entry of the reservation.
-        unsafe { dst.add(i).write(avx2_block(padded.as_ptr())) };
+        unsafe { target.add(i).write(avx2_block(padded.as_ptr())) };
         i += 1;
     }
     // SAFETY: exactly `i <= n_blocks` entries were initialized above.
@@ -682,22 +682,22 @@ fn neon_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
 
 // ---- fused string-content copy (ADR-0047 K1) --------------------------------
 
-/// Append `src` to `out` while scanning for JSON string specials — a raw
+/// Append `source` to `out` while scanning for JSON string specials — a raw
 /// backslash or a control byte (< 0x20). One pass replaces the parser's
 /// separate scan (`find_special`) + copy (`append_from_input`) passes on
 /// escape-free string content, which dominates real corpora.
 ///
-/// Returns `None` with `src` fully appended, or `Some(i)` — the index in
-/// `src` of the first special byte — with `out` logically unchanged
+/// Returns `None` with `source` fully appended, or `Some(i)` — the index in
+/// `source` of the first special byte — with `out` logically unchanged
 /// (its length is restored; bytes beyond it are spare capacity). The
 /// caller owns escape decoding and error typing, so accept/reject
 /// behavior stays byte-identical to the two-pass path.
 #[inline]
-pub fn json_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+pub fn json_copy_unescaped(source: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         static SIMD_LEVEL: AtomicU8 = AtomicU8::new(SIMD_LEVEL_UNKNOWN);
-        if src.len() >= 32 {
+        if source.len() >= 32 {
             let mut level = SIMD_LEVEL.load(Ordering::Relaxed);
             if level == SIMD_LEVEL_UNKNOWN {
                 level = if std::arch::is_x86_feature_detected!("avx2") {
@@ -709,23 +709,23 @@ pub fn json_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
             }
             if level == SIMD_LEVEL_AVX2 {
                 // SAFETY: runtime dispatch above guarantees AVX2.
-                return unsafe { avx2_copy_unescaped(src, out) };
+                return unsafe { avx2_copy_unescaped(source, out) };
             }
         }
     }
-    scalar_json_copy_unescaped(src, out)
+    scalar_json_copy_unescaped(source, out)
 }
 
 /// Safe SWAR tier (and the portability path): the same fused
 /// scan-while-copy contract as [`json_copy_unescaped`], word-at-a-time.
 /// No SSE2 tier — the word loop is the measured fallback, and an
 /// unmeasured port would be L4 theater (the `utf8_is_valid` precedent).
-pub fn scalar_json_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+pub fn scalar_json_copy_unescaped(source: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     let base = out.len();
-    let len = src.len();
+    let len = source.len();
     let mut i = 0;
     while i + 8 <= len {
-        let w = u64::from_le_bytes(src[i..i + 8].try_into().expect("8-byte chunk"));
+        let w = u64::from_le_bytes(source[i..i + 8].try_into().expect("8-byte chunk"));
         let hit = word_special(w);
         if hit != 0 {
             out.truncate(base);
@@ -735,7 +735,7 @@ pub fn scalar_json_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize
         i += 8;
     }
     while i < len {
-        let b = src[i];
+        let b = source[i];
         if b < 0x20 || b == b'\\' {
             out.truncate(base);
             return Some(i);
@@ -925,7 +925,7 @@ fn word_special(w: u64) -> u64 {
 }
 
 /// AVX2 tier: 32-byte blocks, classify-and-store straight-line; the final
-/// block overlaps backward (`src.len() >= 32`, dispatcher-guaranteed) —
+/// block overlaps backward (`source.len() >= 32`, dispatcher-guaranteed) —
 /// the re-covered prefix already scanned clean, so any set mask bit is a
 /// genuinely new position.
 /// # Safety
@@ -933,7 +933,7 @@ fn word_special(w: u64) -> u64 {
 /// dispatch of this module.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx2")]
-unsafe fn avx2_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
+unsafe fn avx2_copy_unescaped(source: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     /// # Safety
     /// AVX2 enabled (the tier's dispatch); value-only intrinsics, no memory access.
     #[target_feature(enable = "avx2")]
@@ -946,24 +946,24 @@ unsafe fn avx2_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
         _mm256_movemask_epi8(_mm256_or_si256(backslash, control)) as u32
     }
 
-    let len = src.len();
+    let len = source.len();
     debug_assert!(len >= 32, "dispatcher sends >= 32-byte content only");
     let base = out.len();
     out.reserve(len);
-    let src_ptr = src.as_ptr();
+    let source_ptr = source.as_ptr();
     // SAFETY: `reserve(len)` above guarantees capacity >= base + len; every
     // store below lands inside `[base, base + len)` of that reservation.
-    let dst = unsafe { out.as_mut_ptr().add(base) };
+    let target = unsafe { out.as_mut_ptr().add(base) };
     let mut i = 0;
     while i + 32 <= len {
-        // SAFETY: `i + 32 <= len` bounds the load inside `src`.
-        let v = unsafe { _mm256_loadu_si256(src_ptr.add(i).cast::<__m256i>()) };
+        // SAFETY: `i + 32 <= len` bounds the load inside `source`.
+        let v = unsafe { _mm256_loadu_si256(source_ptr.add(i).cast::<__m256i>()) };
         // SAFETY: pure register arithmetic; the fn is only target_feature-gated.
         let special = unsafe { special_mask(v) };
         // SAFETY: `base + i + 32 <= base + len` — inside the reservation.
         // Store before the branch: the block is copied either way, and a
         // `Some` return leaves it as spare capacity (never exposed).
-        unsafe { _mm256_storeu_si256(dst.add(i).cast::<__m256i>(), v) };
+        unsafe { _mm256_storeu_si256(target.add(i).cast::<__m256i>(), v) };
         if special != 0 {
             return Some(i + special.trailing_zeros() as usize);
         }
@@ -971,14 +971,14 @@ unsafe fn avx2_copy_unescaped(src: &[u8], out: &mut Vec<u8>) -> Option<usize> {
     }
     if i < len {
         let off = len - 32;
-        // SAFETY: `len >= 32`, so `off..off + 32` is inside `src`; the
+        // SAFETY: `len >= 32`, so `off..off + 32` is inside `source`; the
         // matching store is inside the reservation as above.
-        let v = unsafe { _mm256_loadu_si256(src_ptr.add(off).cast::<__m256i>()) };
+        let v = unsafe { _mm256_loadu_si256(source_ptr.add(off).cast::<__m256i>()) };
         // SAFETY: pure register arithmetic; the fn is only target_feature-gated.
         let special = unsafe { special_mask(v) };
         // SAFETY: the store lands at `base + off .. base + len` — inside the
         // reservation; the re-covered prefix rewrites identical bytes.
-        unsafe { _mm256_storeu_si256(dst.add(off).cast::<__m256i>(), v) };
+        unsafe { _mm256_storeu_si256(target.add(off).cast::<__m256i>(), v) };
         if special != 0 {
             let hit = off + special.trailing_zeros() as usize;
             // The overlapped prefix `off..i` was scanned clean by earlier
@@ -1157,19 +1157,19 @@ mod tests {
         use super::*;
 
         /// Independent oracle — a position scan, not the bit tricks.
-        fn oracle(src: &[u8]) -> Option<usize> {
-            src.iter().position(|&b| b < 0x20 || b == b'\\')
+        fn oracle(source: &[u8]) -> Option<usize> {
+            source.iter().position(|&b| b < 0x20 || b == b'\\')
         }
 
-        fn check(src: &[u8]) {
+        fn check(source: &[u8]) {
             for tier in [json_copy_unescaped, scalar_json_copy_unescaped] {
                 let mut out = b"pre".to_vec();
-                let verdict = tier(src, &mut out);
-                assert_eq!(verdict, oracle(src), "verdict for {src:?}");
+                let verdict = tier(source, &mut out);
+                assert_eq!(verdict, oracle(source), "verdict for {source:?}");
                 match verdict {
                     None => {
                         assert_eq!(&out[..3], b"pre");
-                        assert_eq!(&out[3..], src, "appended bytes for {src:?}");
+                        assert_eq!(&out[3..], source, "appended bytes for {source:?}");
                     }
                     Some(_) => assert_eq!(out, b"pre", "out must be untouched"),
                 }
@@ -1185,9 +1185,9 @@ mod tests {
                 check(&clean);
                 for special in [b'\\', 0x1F, 0x00, b'\n'] {
                     for at in 0..len {
-                        let mut src = clean.clone();
-                        src[at] = special;
-                        check(&src);
+                        let mut source = clean.clone();
+                        source[at] = special;
+                        check(&source);
                     }
                 }
             }
@@ -1248,22 +1248,22 @@ mod tests {
 
             proptest! {
                 #[test]
-                fn tiers_agree_on_arbitrary_bytes(src in proptest::collection::vec(
+                fn tiers_agree_on_arbitrary_bytes(source in proptest::collection::vec(
                     any::<u8>(),
                     0..200,
                 )) {
-                    check(&src);
+                    check(&source);
                 }
 
                 #[test]
-                fn tiers_agree_on_stringish_bytes(src in proptest::collection::vec(
+                fn tiers_agree_on_stringish_bytes(source in proptest::collection::vec(
                     prop_oneof![
                         9 => (0x20u8..0x7F).prop_map(|b| b),
                         1 => prop_oneof![Just(b'\\'), Just(0x1Fu8), Just(0xC3u8)],
                     ],
                     0..200,
                 )) {
-                    check(&src);
+                    check(&source);
                 }
             }
         }

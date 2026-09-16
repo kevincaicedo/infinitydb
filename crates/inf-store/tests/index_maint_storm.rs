@@ -303,10 +303,10 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
         // RENAME under the bracket (both keys in the write set — the
         // deliberate free_record bypass, ADR-0072 D6).
         _ => {
-            let dst = key_of(rng.below(256));
-            if dst != key {
-                bracketed(ks, ns, &[&key, &dst], None, |s| {
-                    let _ = s.rename(&key, &dst, *now);
+            let target = key_of(rng.below(256));
+            if target != key {
+                bracketed(ks, ns, &[&key, &target], None, |s| {
+                    let _ = s.rename(&key, &target, *now);
                 });
             }
         }
@@ -461,7 +461,7 @@ fn copy_maintains_destination_entries() {
         s.json_set(b"src", &doc, Default::default(), now).expect("set")
     });
     // Same-db COPY: no plane bracket — the store's own mini-bracket.
-    ks.db_mut(0).copy(b"src", b"dst", false, now).expect("copy");
+    ks.db_mut(0).copy(b"src", b"target", false, now).expect("copy");
     assert_equivalence(&mut ks, ns, now, "same-db copy");
     // Cross-db COPY onto an indexed destination db.
     let ns2 = NsId(1);

@@ -457,9 +457,9 @@ impl BackendDriver for SimDriver {
                         result
                     }
                     PendingKind::Read { offset, buf } => {
-                        let dest = stable_mut_slice(&buf);
-                        match disk.driver_read_at(fd, offset, dest) {
-                            Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                        let target = stable_mut_slice(&buf);
+                        match disk.driver_read_at(fd, offset, target) {
+                            Ok(n) if n == target.len() => CompletionResult::TierRead,
                             Ok(_) | Err(_) => {
                                 CompletionResult::Error { errno: libc::EIO, buf: None }
                             }
@@ -634,11 +634,11 @@ impl BackendDriver for SimDriver {
                         defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
                         continue;
                     }
-                    let dest = stable_mut_slice(&buf);
+                    let target = stable_mut_slice(&buf);
                     // The op contract: `TierRead` means the buffer is
                     // FULL; EOF inside the flushed range is corruption.
-                    let result = match disk.driver_read_at(fd, offset, dest) {
-                        Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                    let result = match disk.driver_read_at(fd, offset, target) {
+                        Ok(n) if n == target.len() => CompletionResult::TierRead,
                         Ok(_) | Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
                     };
                     out.push(Completion { token, result });

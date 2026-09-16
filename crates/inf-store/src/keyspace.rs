@@ -736,7 +736,7 @@ impl Keyspace {
 
     // ---- cross-db ops (M1-S08) ----
 
-    /// `COPY src dst DB n` across databases: value, TTL, and encoding move
+    /// `COPY source destination DB n` across databases: value, TTL, and encoding move
     /// exactly like the single-db copy. Same-db calls delegate.
     pub fn copy_between(
         &mut self,

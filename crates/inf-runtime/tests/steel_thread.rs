@@ -121,11 +121,11 @@ fn plan_first_window(
             let frame_count = window_frames.min(ctx.tier_frames - first_frame) as usize;
             let buf = ctx.pool.try_lease().expect("steel-thread pool is sized");
             let token = ctx.mint_token();
-            let dest = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
+            let target = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
             // SAFETY: the pool buffer's address is stable for the pool's
             // lifetime and the lease is held (untouched) until this op's
             // terminal completion resumes us.
-            let stable = unsafe { StableBytesMut::new(dest) };
+            let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd: ctx.tier_fd,
                 offset: tier_frame_offset(first_frame),

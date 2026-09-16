@@ -47,7 +47,6 @@
 1	crates/inf-doc/src/path/eval.rs
 1	crates/inf-doc/src/ser.rs
 1	crates/inf-doc/src/tape.rs
-1	crates/inf-fabric/src/codec.rs
 1	crates/inf-log/src/ckpt/read.rs
 1	crates/inf-log/src/reader.rs
 2	crates/inf-log/src/record.rs

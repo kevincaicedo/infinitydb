@@ -1277,73 +1277,74 @@ impl CellStore {
     /// destination (ADR-0037 D3) — handles are never duplicated.
     pub fn copy(
         &mut self,
-        src: &[u8],
-        dst: &[u8],
+        source: &[u8],
+        target: &[u8],
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        let Some((src_addr, src_len)) = self.resolve(src, now) else {
+        let Some((source_addr, source_len)) = self.resolve(source, now) else {
             return Ok(CopyResult::SourceMissing);
         };
         // COPY is excluded from the plane brackets (ADR-0076 D3): the
         // destination may live in another database, so the mini-bracket
         // runs here, where the owning store is unambiguous. The peek
-        // mutates nothing — `src_addr` stays valid across it.
+        // mutates nothing — `source_addr` stays valid across it.
         #[cfg(feature = "doc")]
         {
-            self.idx_bracket_begin(&[dst], None).map_err(OpError::IndexMaintenance)?;
-            let result = self.copy_from_resolved(src_addr, src_len, dst, replace, now);
+            self.idx_bracket_begin(&[target], None).map_err(OpError::IndexMaintenance)?;
+            let result = self.copy_from_resolved(source_addr, source_len, target, replace, now);
             match &result {
                 Ok(CopyResult::Copied) => {
-                    self.idx_bracket_commit(&[dst], crate::index_maint::MaintMode::Strict);
+                    self.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
                 }
                 _ => self.idx_bracket_abort(),
             }
             result
         }
         #[cfg(not(feature = "doc"))]
-        self.copy_from_resolved(src_addr, src_len, dst, replace, now)
+        self.copy_from_resolved(source_addr, source_len, target, replace, now)
     }
 
     /// The COPY body past source resolution (split out for the S04
     /// mini-bracket above).
     fn copy_from_resolved(
         &mut self,
-        src_addr: ArenaAddr,
-        src_len: usize,
-        dst: &[u8],
+        source_addr: ArenaAddr,
+        source_len: usize,
+        target: &[u8],
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        let view = RecordView::new(self.arena.bytes(src_addr, src_len));
+        let view = RecordView::new(self.arena.bytes(source_addr, source_len));
         #[cfg(feature = "doc")]
         if view.type_tag() == TypeTag::JsonDoc {
             let deadline = view.expire_at_ms();
             let plain = self.frozen_bytes_of(view)?;
-            return self.copy_doc_to(dst, &plain, deadline, replace, now);
+            return self.copy_doc_to(target, &plain, deadline, replace, now);
         }
         let value = view.value().to_vec();
         let deadline = view.expire_at_ms();
         let raw = view.is_raw();
-        check_bounds(dst, &value)?;
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        check_bounds(target, &value)?;
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
-            key: dst,
+            key: target,
             value: &value,
             version,
             expire_at_ms: deadline,
             kind: RecordKind::String { raw },
         };
-        self.write_record(dst, dst_existing, spec)?;
+        self.write_record(target, target_existing, spec)?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
         if let Some(ms) = deadline {
-            self.arm_wheel(self.hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(target), ms);
         }
         Ok(CopyResult::Copied)
     }
@@ -1353,28 +1354,29 @@ impl CellStore {
     #[cfg(feature = "doc")]
     fn copy_doc_to(
         &mut self,
-        dst: &[u8],
+        target: &[u8],
         plain: &[u8],
         deadline: Option<u64>,
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        if dst.len() > MAX_KEY_LEN {
+        if target.len() > MAX_KEY_LEN {
             return Err(OpError::TooLarge);
         }
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         let lineage = dst_old
             .filter(|view| view.type_tag() == TypeTag::JsonDoc)
             .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
         let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         self.json_write_value(
-            dst,
-            dst_existing,
+            target,
+            target_existing,
             plain,
             doc::DocWriteMeta {
                 lineage,
@@ -1385,7 +1387,7 @@ impl CellStore {
         )?;
         self.note_ttl(dst_had_ttl, deadline.is_some());
         if let Some(ms) = deadline {
-            self.arm_wheel(self.hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(target), ms);
         }
         Ok(CopyResult::Copied)
     }
@@ -1415,35 +1417,36 @@ impl CellStore {
     /// with the source already materialized from another db.
     pub(crate) fn copy_in(
         &mut self,
-        dst: &[u8],
+        target: &[u8],
         rec: &ExportedRecord,
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        check_bounds(dst, &rec.value)?;
+        check_bounds(target, &rec.value)?;
         #[cfg(feature = "doc")]
         if rec.kind == RecordKind::JsonDoc {
             // Exported documents carry canonical tape bytes; re-tier here.
-            return self.copy_doc_to(dst, &rec.value, rec.expire_at_ms, replace, now);
+            return self.copy_doc_to(target, &rec.value, rec.expire_at_ms, replace, now);
         }
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
-            key: dst,
+            key: target,
             value: &rec.value,
             version,
             expire_at_ms: rec.expire_at_ms,
             kind: rec.kind,
         };
-        self.write_record(dst, dst_existing, spec)?;
+        self.write_record(target, target_existing, spec)?;
         self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
         if let Some(ms) = rec.expire_at_ms {
-            self.arm_wheel(self.hash_key(dst), ms);
+            self.arm_wheel(self.hash_key(target), ms);
         }
         Ok(CopyResult::Copied)
     }

@@ -183,15 +183,15 @@ impl Model {
                         Reply::Ok
                     }
                 }
-                Cmd::Dep(Dependent::Move { src, dst }) => {
-                    let value = state.get(src).copied().flatten();
+                Cmd::Dep(Dependent::Move { source, target }) => {
+                    let value = state.get(source).copied().flatten();
                     if value.is_none() {
                         Reply::Err("no such key")
-                    } else if spec.refuses_at == Some(self.owner_of(*dst)) {
+                    } else if spec.refuses_at == Some(self.owner_of(*target)) {
                         Reply::Err("destination refused")
                     } else {
-                        state.insert(*dst, value);
-                        state.insert(*src, None);
+                        state.insert(*target, value);
+                        state.insert(*source, None);
                         Reply::Ok
                     }
                 }

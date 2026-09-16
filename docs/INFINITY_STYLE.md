@@ -76,8 +76,13 @@ resumable commands, and variable-size inputs.
 - **No recursion in decoders or on the data plane.** Every parser (RESP,
   JSON, JSONPath, PartiQL, log frames, cursors, fabric codec) is iterative
   and bounded; nested grammars use an explicit stack with a depth limit.
-  Its fuzz target lands **in the same PR** (L9). Recursion elsewhere needs
-  a proven bound and a reviewer who agrees.
+  A grammar whose nesting the type forbids beyond one level (a fabric
+  batch, a JSONPath descend) is a two-level walk — a leaf function and a
+  caller that loops it — never a self-call, and its encoder and printer
+  take the same shape (ADR-0125 A4). Its fuzz target lands **in the same
+  PR** (L9). Recursion elsewhere needs a proven bound and a reviewer who
+  agrees; the census's remaining rows and their classification are in
+  ADR-0125 A4.
 - **Function limit: 70 code lines.** Split by responsibility, keeping the
   transition visible and the helper contract meaningful. ADR-0125 defines
   the mechanical scope:
@@ -538,14 +543,21 @@ they are recurring sources of database defects, not just readability issues.
   `latency_ms_max`, `budget_bytes_slice`, `expiry_fires_per_slice_cap`.
   Related names line up and sort together.
 - **No abbreviations** in identifiers (loop counters and established domain
-  terms — `lsn`, `crc`, `ttl`, `ns` for namespace — excepted). Long-form
-  flags in scripts and CLIs: `--reference-box`, never `-r`.
+  terms excepted). The allowlist (ADR-0125 A5): `lsn`, `crc`, `ttl`, `ns`
+  for namespace; `buf` and `cfg` (the standard library's and Cargo's own
+  spellings); `ctx`; `ckpt` (the checkpoint format's name); `ptr` inside
+  the unsafe leaves; `idx` and `prev`/`next` as loop-local names. Anything
+  else is renamed when its function is next touched — there is no naming
+  gate. Long-form flags in scripts and CLIs: `--reference-box`, never `-r`.
 - Prefer clear, symmetric pairs such as `source`/`target` and
-  `begin`/`end`. Meaning takes precedence over matching name lengths.
+  `begin`/`end`. `src`/`dst`/`dest` are not used (renamed workspace-wide
+  in batch 68). Meaning takes precedence over matching name lengths.
 - Infuse allocator/handle names with their contract: `arena:`-prefixed
   things do not get freed item-by-item; `pool` things return whence they
   came; a `lease` must be returned before suspension.
 - Don't overload a word with two meanings. A cell is the execution owner;
+  `shard` names only the on-disk per-cell directory family (`shard-N/`,
+  `shard_dir`) and nothing else;
   a partition is a unit of data ownership. Likewise, submitted, written,
   durable, and applied describe distinct progress states. Use the vocabulary
   of the owning contract consistently in code, metrics, and documentation.

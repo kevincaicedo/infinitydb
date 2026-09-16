@@ -81,13 +81,13 @@ fn storm_faults(rng: &mut Rng, spec: &mut TxnSpec, cells: usize, keys: u32) {
             continue;
         }
         let dep = if rng.below(2) == 0 {
-            Dependent::Move { src: a, dst: b }
+            Dependent::Move { source: a, target: b }
         } else {
             Dependent::SetIfNoneExist { keys: vec![a, b] }
         };
         if rng.below(4) == 0 {
             spec.refuses_at = Some(match dep {
-                Dependent::Move { dst, .. } => dst as usize % cells,
+                Dependent::Move { target, .. } => target as usize % cells,
                 Dependent::SetIfNoneExist { .. } => [a, b][rng.below(2)] as usize % cells,
             });
         }
@@ -211,7 +211,7 @@ pub fn rename_history(
     let t = m.submit(TxnSpec {
         coordinator: 0,
         writes: vec![0],
-        dependent: Some(Dependent::Move { src: 0, dst: 1 }),
+        dependent: Some(Dependent::Move { source: 0, target: 1 }),
         native,
         refuses_at: refuses.then_some(1),
         ..Default::default()
@@ -258,7 +258,7 @@ pub fn ordered_rename_history(rules: Rules, native: bool) -> Ordered<2> {
     let mut m = Model::new(rules, 2, 19);
     let t = m.submit(TxnSpec {
         coordinator: 0,
-        program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { src: 0, dst: 1 }), Cmd::Get(1)],
+        program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { source: 0, target: 1 }), Cmd::Get(1)],
         native,
         ..Default::default()
     });
@@ -275,7 +275,7 @@ pub fn consecutive_dependents_history(rules: Rules, native: bool) -> Ordered<3> 
         coordinator: 0,
         program: vec![
             Cmd::Dep(Dependent::SetIfNoneExist { keys: vec![0, 1] }),
-            Cmd::Dep(Dependent::Move { src: 1, dst: 2 }),
+            Cmd::Dep(Dependent::Move { source: 1, target: 2 }),
             Cmd::Get(2),
             Cmd::Get(1),
         ],
@@ -296,7 +296,7 @@ pub fn refused_then_read_history(rules: Rules, native: bool) -> Ordered<2> {
         coordinator: 0,
         program: vec![
             Cmd::Set(0),
-            Cmd::Dep(Dependent::Move { src: 0, dst: 1 }),
+            Cmd::Dep(Dependent::Move { source: 0, target: 1 }),
             Cmd::Get(0),
             Cmd::Get(1),
         ],
@@ -338,7 +338,7 @@ pub fn dependent_cancellation_history(
     let mut m = Model::new(rules, 2, seed);
     let t = m.submit(TxnSpec {
         coordinator: 0,
-        program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { src: 0, dst: 1 }), Cmd::Get(1)],
+        program: vec![Cmd::Set(0), Cmd::Dep(Dependent::Move { source: 0, target: 1 }), Cmd::Get(1)],
         cancel: Some((phase, kind)),
         ..Default::default()
     });

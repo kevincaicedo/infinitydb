@@ -398,10 +398,10 @@ impl KqueueDriver {
             return;
         };
         let capacity = pool.buf_size();
-        let dst = pool.bytes_mut(buf);
-        // SAFETY: dst is a live unique borrow of the leased buffer, valid
+        let target = pool.bytes_mut(buf);
+        // SAFETY: target is a live unique borrow of the leased buffer, valid
         // for `capacity` bytes.
-        let n = unsafe { libc::read(fd, dst.as_mut_ptr().cast(), capacity) };
+        let n = unsafe { libc::read(fd, target.as_mut_ptr().cast(), capacity) };
         self.stats.syscalls += 1;
         if n >= 0 {
             // n == 0 ⇒ EOF, delivered with the buffer per the contract.

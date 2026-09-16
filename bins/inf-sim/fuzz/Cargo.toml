@@ -21,4 +21,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "sim_resp_value"
+path = "fuzz_targets/sim_resp_value.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

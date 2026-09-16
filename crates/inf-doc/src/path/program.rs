@@ -240,7 +240,15 @@ impl<'a> Iterator for PathSteps<'a> {
     }
 }
 
+/// `Descend(inner)` is the one nesting segment and the AST forbids a
+/// descend inside it, so the encoder is a two-level walk (ADR-0125 A4).
 fn encode_segment(out: &mut Vec<u8>, segment: &Segment) {
+    let Segment::Descend(inner) = segment else { return encode_leaf_segment(out, segment) };
+    out.push(OP_DESCEND);
+    encode_leaf_segment(out, inner);
+}
+
+fn encode_leaf_segment(out: &mut Vec<u8>, segment: &Segment) {
     match segment {
         Segment::Child(name) => {
             out.push(OP_CHILD);
@@ -272,10 +280,7 @@ fn encode_segment(out: &mut Vec<u8>, segment: &Segment) {
                 }
             }
         }
-        Segment::Descend(inner) => {
-            out.push(OP_DESCEND);
-            encode_segment(out, inner); // depth exactly one (AST invariant)
-        }
+        Segment::Descend(_) => unreachable!("descend never nests (AST invariant)"),
     }
 }
 
@@ -342,9 +347,26 @@ impl<'a> UnionRef<'a> {
 }
 
 /// Decode the op at `at` on **validated** bytes; returns it plus the
-/// next op's offset (for a union: past the whole member region).
+/// next op's offset (for a union: past the whole member region). A
+/// union's members are validated non-unions, so they are read by
+/// [`read_leaf`] — one level, never a self-call (ADR-0125 A4).
 pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
     debug_assert!(at < bytes.len(), "validated pc in bounds");
+    if bytes[at] != OP_UNION {
+        return read_leaf(bytes, at);
+    }
+    let count = bytes[at + 1];
+    let members_at = at + 2;
+    let mut next = members_at;
+    for _ in 0..count {
+        let (_, after) = read_leaf(bytes, next);
+        next = after;
+    }
+    (Op::Union(UnionRef { count, bytes, members_at }), next)
+}
+
+/// One non-union op on validated bytes.
+fn read_leaf(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
     match bytes[at] {
         OP_ROOT => (Op::Root, at + 1),
         OP_CHILD => {
@@ -362,16 +384,7 @@ pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
             let (slice, next) = read_slice(bytes, at);
             (Op::Slice(slice), next)
         }
-        OP_UNION => {
-            let count = bytes[at + 1];
-            let members_at = at + 2;
-            let mut next = members_at;
-            for _ in 0..count {
-                let (_, after) = read_op(bytes, next);
-                next = after;
-            }
-            (Op::Union(UnionRef { count, bytes, members_at }), next)
-        }
+        OP_UNION => unreachable!("validated union members are never unions"),
         OP_DESCEND => (Op::Descend, at + 1),
         _ => unreachable!("validated tape has no unknown opcodes"),
     }

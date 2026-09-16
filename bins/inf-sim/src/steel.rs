@@ -151,11 +151,11 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
             let fd = tier.fd;
             let buf = ctx.pool.try_lease().expect("scenario pool is sized");
             let token = ctx.mint_token();
-            let dest = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
+            let target = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
             // SAFETY: the pool buffer's address is stable for the pool's
             // lifetime and the lease is held (untouched) until this op's
             // terminal completion resumes us.
-            let stable = unsafe { StableBytesMut::new(dest) };
+            let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd,
                 offset: tier_frame_offset(first_frame),

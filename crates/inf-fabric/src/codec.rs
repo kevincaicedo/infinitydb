@@ -289,6 +289,12 @@ pub enum Op<'a> {
     },
     /// Per-destination coalescing of non-batch data ops (one destination).
     /// `Reply` and nested `Batch` are rejected by [`encode`]/[`decode`].
+    /// The op count is bounded on the **receiver** only: [`decode`]
+    /// refuses more than [`MAX_BATCH_OPS`], while construction and
+    /// [`encode`] accept any `Vec` (review B64-65-R05 — no constructor
+    /// enforces the cap). No shipped sender builds a `Batch` today; the
+    /// story that activates one (M6's lock/unlock hops, L3) owns a
+    /// construction-side bound, ADR-first, before the first send.
     Batch { ops: Vec<Op<'a>> },
     /// Routed back to `token.origin_cell()`; returns one data-op credit.
     Reply { token: FabricToken, outcome: Outcome<'a> },
@@ -400,17 +406,40 @@ pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
     if let Op::ApplyNs { ns, .. } = op {
         assert!(*ns >= APPLY_NS_MIN, "ApplyNs ns {ns} is a default namespace (rides Op::Apply)");
     }
+    let start = begin_frame(op, out);
+    encode_payload(op, out);
+    finish_frame(out, start);
+}
+
+/// Writes the header with a `len` placeholder; returns the frame start.
+fn begin_frame(op: &Op<'_>, out: &mut Vec<u8>) -> usize {
     let start = out.len();
     out.extend_from_slice(&[CODEC_VERSION, op.opcode()]);
     out.extend_from_slice(&op.header_flags().to_le_bytes());
     out.extend_from_slice(&[0; 4]); // len placeholder
-    encode_payload(op, out);
+    start
+}
+
+/// Patches the `len` field once the payload is written.
+fn finish_frame(out: &mut [u8], start: usize) {
     let len = out.len() - start - HEADER_LEN;
     let len = u32::try_from(len).expect("fabric frame payload exceeds u32::MAX");
     out[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
 }
 
+/// A `Batch` payload is a loop of framed leaves — one level, never a
+/// self-call (ADR-0125 A4: encoder and decoder are both two-level walks).
 fn encode_payload(op: &Op<'_>, out: &mut Vec<u8>) {
+    let Op::Batch { ops } = op else { return encode_leaf_payload(op, out) };
+    varint::encode_u64(ops.len() as u64, out);
+    for nested in ops {
+        let start = begin_frame(nested, out);
+        encode_leaf_payload(nested, out);
+        finish_frame(out, start);
+    }
+}
+
+fn encode_leaf_payload(op: &Op<'_>, out: &mut Vec<u8>) {
     match op {
         Op::Read { token, slot, key } => {
             out.extend_from_slice(&token.0.to_le_bytes());
@@ -450,12 +479,7 @@ fn encode_payload(op: &Op<'_>, out: &mut Vec<u8>) {
                 encode_bytes(arg, out);
             }
         }
-        Op::Batch { ops } => {
-            varint::encode_u64(ops.len() as u64, out);
-            for nested in ops {
-                encode(nested, out);
-            }
-        }
+        Op::Batch { .. } => unreachable!("encode refused a nested batch before writing"),
         Op::Reply { token, outcome } => {
             out.extend_from_slice(&token.0.to_le_bytes());
             encode_outcome(outcome, out);
@@ -502,7 +526,7 @@ fn encode_outcome(outcome: &Outcome<'_>, out: &mut Vec<u8>) {
 /// Returns the first [`CodecError`] encountered, including
 /// [`CodecError::TrailingBytes`] when `frame` extends past the encoded frame.
 pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError> {
-    let (op, used) = decode_frame(frame, false)?;
+    let (op, used) = decode_frame(frame)?;
     if used != frame.len() {
         return Err(CodecError::TrailingBytes);
     }
@@ -519,12 +543,55 @@ pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError> {
 /// Same conditions as [`decode`], except trailing bytes are the caller's
 /// remaining frames, not an error.
 pub fn decode_prefix(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
-    decode_frame(buf, false)
+    decode_frame(buf)
 }
 
-/// Decodes one frame from the front of `buf`; returns the op and the bytes
-/// consumed. `nested` is true when decoding inside a `Batch`.
-fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError> {
+/// Decodes one frame from the front of `buf`; returns the op and the
+/// bytes consumed. A `Batch` payload is a loop over [`decode_leaf`] —
+/// one level, never a self-call, so the decoder is iterative as
+/// INFINITY_STYLE requires (ADR-0125 A4); the codec's nesting rule is
+/// enforced where a leaf meets `OP_BATCH`.
+fn decode_frame(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
+    let header = decode_header(buf)?;
+    if header.opcode != OP_BATCH {
+        let op = decode_leaf(header)?;
+        return Ok((op, header.end));
+    }
+    let mut reader = Reader { buf: header.payload };
+    let count = reader.varint()?;
+    if count > MAX_BATCH_OPS as u64 {
+        return Err(CodecError::TooManyBatchOps(count));
+    }
+    let mut ops = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let inner = decode_header(reader.buf)?;
+        if inner.opcode == OP_BATCH {
+            return Err(CodecError::NestedBatch);
+        }
+        let nested_op = decode_leaf(inner)?;
+        if matches!(nested_op, Op::Reply { .. }) {
+            return Err(CodecError::ReplyInBatch);
+        }
+        reader.buf = &reader.buf[inner.end..];
+        ops.push(nested_op);
+    }
+    if !reader.buf.is_empty() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok((Op::Batch { ops }, header.end))
+}
+
+/// One validated frame header: the opcode, the program flag and the
+/// payload it delimits; `end` is the frame's total length in the buffer.
+#[derive(Clone, Copy)]
+struct FrameHeader<'a> {
+    opcode: u8,
+    program: bool,
+    payload: &'a [u8],
+    end: usize,
+}
+
+fn decode_header(buf: &[u8]) -> Result<FrameHeader<'_>, CodecError> {
     if buf.len() < HEADER_LEN {
         return Err(CodecError::Truncated);
     }
@@ -544,7 +611,12 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
     let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     let end = HEADER_LEN.checked_add(len).ok_or(CodecError::Truncated)?;
     let payload = buf.get(HEADER_LEN..end).ok_or(CodecError::Truncated)?;
+    Ok(FrameHeader { opcode, program, payload, end })
+}
 
+/// Decodes a non-batch payload; the caller has already routed `OP_BATCH`.
+fn decode_leaf(header: FrameHeader<'_>) -> Result<Op<'_>, CodecError> {
+    let FrameHeader { opcode, program, payload, .. } = header;
     let mut reader = Reader { buf: payload };
     let op = match opcode {
         OP_READ => {
@@ -586,25 +658,7 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
             let args = reader.apply_args()?;
             Op::ApplyNs { token, slot, cmd, ns, args, program }
         }
-        OP_BATCH => {
-            if nested {
-                return Err(CodecError::NestedBatch);
-            }
-            let count = reader.varint()?;
-            if count > MAX_BATCH_OPS as u64 {
-                return Err(CodecError::TooManyBatchOps(count));
-            }
-            let mut ops = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let (nested_op, used) = decode_frame(reader.buf, true)?;
-                if matches!(nested_op, Op::Reply { .. }) {
-                    return Err(CodecError::ReplyInBatch);
-                }
-                reader.buf = &reader.buf[used..];
-                ops.push(nested_op);
-            }
-            Op::Batch { ops }
-        }
+        OP_BATCH => return Err(CodecError::NestedBatch),
         OP_REPLY => {
             let token = reader.token()?;
             let outcome = reader.outcome()?;
@@ -612,11 +666,10 @@ fn decode_frame(buf: &[u8], nested: bool) -> Result<(Op<'_>, usize), CodecError>
         }
         other => return Err(CodecError::UnknownOp(other)),
     };
-
     if !reader.buf.is_empty() {
         return Err(CodecError::TrailingBytes);
     }
-    Ok((op, end))
+    Ok(op)
 }
 
 /// Cursor over a frame payload; every read is bounds-checked and returns a

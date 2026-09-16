@@ -621,7 +621,7 @@ mod tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             m.submit(acquisition::TxnSpec {
                 coordinator: 0,
-                dependent: Some(Dependent::Move { src: 0, dst: 2 }),
+                dependent: Some(Dependent::Move { source: 0, target: 2 }),
                 ..Default::default()
             })
         }));
@@ -793,7 +793,7 @@ mod tests {
     fn a_stage_compiles_monotonically_in_queue_order() {
         let program = vec![
             Cmd::Get(0),
-            Cmd::Dep(Dependent::Move { src: 0, dst: 1 }),
+            Cmd::Dep(Dependent::Move { source: 0, target: 1 }),
             Cmd::Set(1),
             Cmd::Dep(Dependent::SetIfNoneExist { keys: vec![2, 3] }),
             Cmd::Get(3),

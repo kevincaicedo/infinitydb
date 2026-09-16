@@ -72,7 +72,32 @@ pub fn print(ast: &PathAst) -> String {
     out
 }
 
+/// `Descend(inner)` prints its inner segment through the leaf printer —
+/// the AST forbids a nested descend, so this is a two-level walk, not a
+/// self-call (ADR-0125 A4).
 fn print_segment(out: &mut String, segment: &Segment) {
+    let Segment::Descend(inner) = segment else { return print_leaf_segment(out, segment) };
+    // `..name` / `..*` fuse; bracketed selectors keep their `[`.
+    out.push('.');
+    match inner.as_ref() {
+        Segment::Child(name) if is_shorthand(name) => {
+            out.push('.');
+            out.push_str(str::from_utf8(name).expect("AST keys are validated UTF-8"));
+        }
+        Segment::ChildAny => out.push_str(".*"),
+        other => {
+            out.push('.');
+            // Bracket forms print without the leading dot they never
+            // had; the leaf printer emits `[...]` directly.
+            let mut inner_text = String::new();
+            print_leaf_segment(&mut inner_text, other);
+            debug_assert!(inner_text.starts_with('['), "descend inner is a bracket form");
+            out.push_str(&inner_text);
+        }
+    }
+}
+
+fn print_leaf_segment(out: &mut String, segment: &Segment) {
     match segment {
         Segment::Child(name) if is_shorthand(name) => {
             out.push('.');
@@ -108,27 +133,7 @@ fn print_segment(out: &mut String, segment: &Segment) {
             }
             out.push(']');
         }
-        Segment::Descend(inner) => {
-            // `..name` / `..*` fuse; bracketed selectors keep their `[`.
-            out.push('.');
-            match inner.as_ref() {
-                Segment::Child(name) if is_shorthand(name) => {
-                    out.push('.');
-                    out.push_str(str::from_utf8(name).expect("AST keys are validated UTF-8"));
-                }
-                Segment::ChildAny => out.push_str(".*"),
-                other => {
-                    out.push('.');
-                    // Bracket forms print without the leading dot they
-                    // never had; `print_segment` emits `[...]` directly.
-                    debug_assert!(!matches!(other, Segment::Descend(_)), "descend never nests");
-                    let mut inner_text = String::new();
-                    print_segment(&mut inner_text, other);
-                    debug_assert!(inner_text.starts_with('['), "descend inner is a bracket form");
-                    out.push_str(&inner_text);
-                }
-            }
-        }
+        Segment::Descend(_) => unreachable!("descend never nests (AST invariant)"),
     }
 }
 

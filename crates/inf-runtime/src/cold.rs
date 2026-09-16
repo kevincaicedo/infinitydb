@@ -616,7 +616,7 @@ impl ColdReads {
         }
         counters.issued += 1;
         counters.merged_waiters += waiters.len() as u64 - 1;
-        let dest = &mut pool.bytes_mut(buf)[..window_len];
+        let target = &mut pool.bytes_mut(buf)[..window_len];
         // SAFETY: the pool buffer's address is stable for the pool's
         // lifetime (inf-alloc invariant) and its lease is held by the
         // in-flight table — released only when the last `ColdDone` built
@@ -624,7 +624,7 @@ impl ColdReads {
         // reads, writes, or re-leases these bytes while the driver owns
         // them, regardless of what any issuing future does (including
         // being cancelled).
-        let stable = unsafe { StableBytesMut::new(dest) };
+        let stable = unsafe { StableBytesMut::new(target) };
         inflight.insert(token, DeviceRead { buf, file, len: window_len as u32, waiters });
         qd_hist.record(inflight.len() as u64);
         IoOp::TierRead { fd, offset: lo, buf: stable, token }
