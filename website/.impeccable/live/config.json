@@ -1,7 +1,0 @@
-{
-  "files": ["site/**/*.html"],
-  "exclude": ["site/docs/compat.html"],
-  "insertBefore": "</body>",
-  "commentSyntax": "html",
-  "cspChecked": true
-}

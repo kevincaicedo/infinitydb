@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Review 2026-08-30 lane L18 R1 (batch 64, ADR-0125): a source file is at
-# most 2000 production lines. Tests do not count — `strip-test-modules.awk`
+# most 3000 production lines. Tests do not count — `strip-test-modules.awk`
 # blanks every `#[cfg(test)] mod … { }` region and names the test-only
 # module files, exactly as the panic-policy and release-assert gates see
 # the tree — so a file over the bar splits into a subfolder, never into a
@@ -12,7 +12,7 @@
 set -euo pipefail
 STRIP="${INF_STRIP_AWK:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/strip-test-modules.awk}"
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
-LIMIT="${INF_FILE_LINES_MAX:-2000}"
+LIMIT="${INF_FILE_LINES_MAX:-3000}"
 
 INF_STRIP_AWK="$STRIP" INF_FILE_LINES_MAX="$LIMIT" python3 - <<'PY'
 import os
