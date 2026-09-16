@@ -507,14 +507,15 @@ useful throughput within latency, memory, and durability contracts.
   branch misses, cache/TLB misses, and stalled or off-CPU time. A better
   counter alone does not establish a better database.
 - Record revision and dirty state, build features, toolchain, workload,
-  affinity, SMT, governor/EPP, thermals, device configuration, and raw
-  artifacts. Public claims require the clean-tree reference tier and 3–5
-  replicates under the evidence policy. Never present a noisy or saturated
+  affinity, SMT, governor/EPP, thermals, device configuration, and results
+  with their spread. Keep raw output local and ignored. Public claims require
+  exact reproduction commands, baseline revisions, the clean-tree reference
+  tier and 3–5 replicates under the evidence policy. Never present a noisy or saturated
   generator's result as server capacity.
 - Record `Accepted`, `Rejected`, or `Revised` with evidence. A losing A/B
   is useful evidence; keep the result and do not merge the losing
   optimization. Correctness fixes may be `Correctness-only`; unrun
-  measurements remain `Evidence-pending`, with the missing artifact named.
+  measurements remain `Evidence-pending`, with the missing run named.
 - `inf-bench` proves in-house gates. Disclose a workload the external generator cannot drive; 
   never silently substitute instruments. Only the claim ledger authorizes public numbers (L10).
 
@@ -559,14 +560,14 @@ they are recurring sources of database defects, not just readability issues.
 
 - **Always say why.** Comments carry the reasoning the code cannot:
   constraints, rejected alternatives, the invariant being protected, the
-  artifact that justified the trick (`// A/B: .artifacts/...`). Comments
+  reproducible benchmark and decision that justified the trick. Comments
   that narrate what the next line does are noise; delete them.
 - Keep comments concise: a complete sentence for a rationale or invariant,
   a short phrase for an obvious inline label. Explain a nontrivial test's
   trigger, oracle, and expected failure; do not narrate each assertion.
 - Use a short, one-line commit message stating the concrete change. Keep
-  detailed reasoning and evidence paths in checked-in documentation and the
-  PR description. Do not append model co-author trailers.
+  detailed reasoning, reproduction commands and results in checked-in
+  documentation and the PR description. Do not append model co-author trailers.
 
 ### Cache invalidation
 
@@ -662,6 +663,9 @@ Use distinct names and types for different quantities:
 
 ### Tests and review
 
+- Keep tests, fixtures, seeds and harnesses in source. Generated logs,
+  profiles and reports stay ignored; record commands and results, not output
+  archives. See [validation and reference hardware](validation.md).
 - **Red first for a defect.** Keep the smallest failing reproducer, then
   test the fix at the layer that owns the invariant. If clients can reach
   the bug, retain a client/binary test as well. Show that the intended

@@ -49,7 +49,9 @@ once) used by the RSS gate.
 ### `gate-run m0` / `gate-run m1`
 
 Runs the milestone's whole exit-gate matrix in one command and writes a report
-to `.artifacts/<milestone>/<stamp>-gate-run/report.md`.
+to ignored local output at `.artifacts/<milestone>/<stamp>-gate-run/report.md`.
+Commit harnesses and reproduction instructions, not generated reports. See
+[validation and reference hardware](../../docs/validation.md).
 
 - **`gate-run m0`** — pipelined replicates with windowed tripwire scrapes
   (raw `io_uring` counter deltas via `INFO` across all cells), cross-cell A/B

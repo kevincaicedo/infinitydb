@@ -17,8 +17,9 @@
       `just compat` (reply bytes) · `just sim-smoke` (determinism) ·
       Miri (unsafe leaves) · fuzz smoke (decoders)
 - [ ] **Performance work (L4):** hypothesis + target metric + workload stated
-      *before* the change; A/B artifact attached (3–5 replicates, environment
-      named); a losing A/B is recorded and the code **not merged**
+      *before* the change; A/B commands, baseline revisions and results recorded
+      (3–5 replicates, environment named); a losing A/B is recorded and the code **not merged**
+- [ ] Generated output stays ignored; tests, seeds and harnesses are committed
 - [ ] **Correctness-only** label if shipping without perf acceptance
 - [ ] Frozen seam / dep-DAG edge / format change → the ADR merged **first**
 - [ ] Unsafe touched → `// SAFETY:` on every block, crate `SAFETY.md`
@@ -29,10 +30,10 @@
 - [ ] **INFINITY_STYLE conformance affirmed** (`docs/INFINITY_STYLE.md`):
       invalid states unrepresentable · panics only for violated internal
       invariants · no hot-path allocation/dispatch/locks without an A/B
-      artifact · bounded queues & explicit backpressure · decoders
+      measurement and reproduction recipe · bounded queues & explicit backpressure · decoders
       iterative + depth/size-bounded + fuzzed
 - [ ] Evidence discipline holds (L10): no number or "faster/slower" claim
-      in code, docs, or the PR description without its artifact
+      in code, docs, or the PR description without measured results and reproduction details
 - [ ] Crate fences respected (dep-DAG green is necessary, not sufficient —
       check the *semantic* boundary: e.g. `inf-store` sees no sockets,
       `inf-log` knows no RESP)

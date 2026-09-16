@@ -39,7 +39,7 @@ set -euo pipefail
 
 OUT="${1:-.artifacts/m4/s24/recovery-brackets}"        # in-tree, written LAST
 WORK="${WORK:-$HOME/.cache/inf-campaign/recovery-brackets}"
-BIN="${BIN:-$HOME/.cache/inf-campaign/v0.4.0-bin/infinityd-6bd25b1}"
+BIN="${BIN:-./target/release/infinityd}"
 BENCH="${BENCH:-./target/release/inf-bench}"
 DATA_ROOT="${DATA_ROOT:-$HOME/.cache/inf-tmp}"
 CELLS="${CELLS:-4}"
@@ -51,19 +51,15 @@ NS="${NS:-ycsb}"
 LEGS="${LEGS:-ick-tail,cold-cache}"                    # comma list; run one leg at a time if you like
 
 # ---------------------------------------------------------------------------
-# Phase 0 — every check that can fail runs BEFORE anything is written inside
-# the checkout. `.artifacts/` is TRACKED here, so creating a log file in it
-# dirties the tree and fails the very env-check we are about to run (and the
-# inner `inf-bench ycsb` env-check later). All working output goes to $WORK,
-# outside the checkout — the same rule the S24 runbook already applies to
-# campaign binaries and INF_GATERUN_STDERR_DIR.
+# Phase 0 — verify prerequisites before measurement. Working output goes to
+# $WORK; the final report goes to ignored $OUT. Neither is committed.
 # ---------------------------------------------------------------------------
 [ -x "$BIN" ]   || { echo "no infinityd at $BIN" >&2; exit 1; }
 [ -x "$BENCH" ] || { echo "no inf-bench at $BENCH (cargo build --release -p inf-bench)" >&2; exit 1; }
 command -v redis-cli >/dev/null || { echo "redis-cli not on PATH" >&2; exit 1; }
 
 case "$OUT" in /*) echo "OUT must be a repo-relative path" >&2; exit 1;; esac
-[ -e "$OUT" ] && { echo "$OUT already exists — move or delete it first (a stale dir dirties the tree)" >&2; exit 1; }
+[ -e "$OUT" ] && { echo "$OUT already exists — choose a fresh output path" >&2; exit 1; }
 
 FS=$(df -T "$DATA_ROOT" 2>/dev/null | tail -n 1 | awk '{print $2}')
 [ "$FS" = "tmpfs" ] && { echo "DATA_ROOT ($DATA_ROOT) is tmpfs — a recovery number off a RAM disk is meaningless" >&2; exit 1; }

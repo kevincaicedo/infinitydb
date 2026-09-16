@@ -179,11 +179,18 @@ InfinityDB has a strict claim discipline (L10):
   with tests; label them as correctness work.
 - **Performance changes** are a hypothesis until measured. State the bottleneck
   hypothesis, the target metric, and the workload; after the change, record
-  before/after numbers and the artifact. Dev-laptop numbers are never
+  before/after numbers, baseline revisions and exact reproduction commands. Dev-laptop numbers are never
   citation-grade — only a pinned Linux reference box can back a published
   number.
 - Never add a performance number to docs or comments without reproducible,
   reference-box-grade evidence behind it.
+
+Commit tests, fixtures, DST seeds and harnesses. Keep generated logs,
+profiles, reports and database images local: `.artifacts/` and `artifacts/`
+are ignored, with no gate or claim exceptions. The
+[validation guide](docs/validation.md) lists runnable checks and the reference
+hardware. Record results and reproduction details in the relevant ledger;
+do not create an output archive for a bug fix or a release gate.
 
 ## Commits & pull requests
 

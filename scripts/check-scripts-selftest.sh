@@ -1198,6 +1198,22 @@ cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
 printf '\n65 commands\n' >>"$doc_case/docs/compat-matrix.md"
 expect red "docs: counts added to the pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
 
+cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
+git init -q "$doc_root"
+mkdir -p "$doc_root/tests/fixtures" "$doc_root/bins/inf-sim/seeds"
+printf 'regression input\n' >"$doc_root/tests/fixtures/artifacts.txt"
+printf '0xC0FFEE\n' >"$doc_root/bins/inf-sim/seeds/regression.txt"
+git -C "$doc_root" add tests/fixtures/artifacts.txt bins/inf-sim/seeds/regression.txt
+expect green "docs: regression inputs and seeds belong in source" env INF_CHECK_ROOT="$doc_root" $DOCS
+for output in .artifacts/gate.log artifacts/claim.json tests/fuzz/artifacts/crash; do
+    mkdir -p "$doc_root/$(dirname "$output")"
+    printf 'generated output\n' >"$doc_root/$output"
+    expect green "docs: local output may exist ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
+    git -C "$doc_root" add -f "$output"
+    expect red "docs: tracked output is forbidden ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
+    git -C "$doc_root" rm -q --cached -f "$output"
+done
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"

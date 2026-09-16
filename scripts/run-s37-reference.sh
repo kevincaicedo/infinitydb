@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Q, D9 and DBSIZE on the ADR-0022 reference host. README carries the rules.
+# Q, D9 and DBSIZE on the reference host; rules in docs/validation-s37.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ "$(hostname)" != HomeLab ]]; then
@@ -7,7 +7,7 @@ if [[ "$(hostname)" != HomeLab ]]; then
     exit 1
 fi
 if [[ -n "$(git status --porcelain)" ]]; then
-    echo "Commit the reviewed source and evidence before the reference campaign." >&2
+    echo "Commit the reviewed source and protocol before the reference campaign." >&2
     exit 1
 fi
 if pgrep -x infinityd >/dev/null; then
@@ -54,4 +54,4 @@ for row in Q D9 DBSIZE; do
     printf '%s complete\n' "$row"
 done
 printf 'Measurements complete. Review validity and D9 thresholds before accepting or changing a default.\n'
-printf 'Copy reviewed reports, environment, profiles and logs to .artifacts/m4.5/s37/campaign-R/.\n'
+printf 'Record commands, revisions, environment and results in the ledger; keep output local.\n'

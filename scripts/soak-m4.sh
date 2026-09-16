@@ -25,7 +25,7 @@
 #   SOAK_PIN_START     (4)     server cell pinning start cpu
 #   SOAK_LOADGEN_CPUS  (12-23) taskset set for every generator invocation
 # Run from infinitydb/ on the reference box after `just check` on a clean
-# tree. Full 24 h protocol: .artifacts/m4/s23/RUNBOOK-24h.md.
+# tree. Output policy and maintained harnesses: docs/validation.md.
 set -euo pipefail
 
 HOURS="${1:-24}"

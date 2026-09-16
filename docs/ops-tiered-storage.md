@@ -174,13 +174,14 @@ reads — on 512 MiB of user bytes at 8× the memory budget:
 | inserts only (no dead bytes, no compaction) | **1.999×** | −1.40% |
 | skewed overwrites with compaction running | **1.730×** | −2.27% |
 
-Artifacts:
-[`.artifacts/m4/s13/accounting-vs-block-layer-20260725.md`](../.artifacts/m4/s13/accounting-vs-block-layer-20260725.md)
-and [`.artifacts/m4/s16/README.md`](../.artifacts/m4/s16/README.md).
+Reproduce the accounting comparison with `cargo bench -p inf-store --bench
+write_accounting` on a declared device (`INF_ACCT_DIR`); check write-amplification
+invariants with `cargo test -p inf-store --test tiered_write_amp`. See the
+[validation guide](validation.md) for reference hardware and measurement rules.
 The churn row being *lower* is not a mistake: when writes are skewed,
 many overwrites replace a record that is still in the mutable region, and
 an in-place update costs no tier byte at all. Both are **dev-box**
-measurements with the device deviation disclosed in the artifacts; the
+measurements on the Gen3 DRAM-less reference device; the
 gate-grade figure is the M4-S24 campaign's, and no public claim exists
 until it has a ledger row.
 

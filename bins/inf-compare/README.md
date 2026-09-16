@@ -26,7 +26,11 @@ cargo run --release -p inf-compare -- list-workloads
 cargo run --release -p inf-compare -- help
 ```
 
-Reports land in `.artifacts/compare/<unix>-compare/` (or `--out DIR`):
+Reports land in ignored `.artifacts/compare/<unix>-compare/` (or `--out DIR`).
+Keep them local; commit commands, configurations and result summaries, not
+generated output. See [validation and reference hardware](../../docs/validation.md).
+
+Local output:
 
 ```
 report.md            # tier banner, published configs, result tables, honesty notes

@@ -5,12 +5,20 @@ cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
 python3 - <<'PY'
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import unquote
 
 root = Path.cwd()
 errors = []
+
+# Check the index: a force-add must not bypass the output policy.
+if (root / ".git").exists():
+    tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+    output = [p for p in tracked if {".artifacts", "artifacts"}.intersection(Path(p).parts[:-1])]
+    if output:
+        errors.append(f"DOC OUTPUT: {len(output)} tracked generated-output paths: {output[:8]}")
 
 def read_required(path):
     if not path.is_file():

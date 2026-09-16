@@ -130,11 +130,8 @@ MAX_ALERTS=1000
 
 cargo build --release -p infinityd -p inf-bench
 
-# env-check runs BEFORE `$OUT` exists, into a temp file. `.artifacts/` is
-# tracked, so creating the output directory first makes the tree dirty and
-# the probe fails on this run's *own* artifacts — a self-inflicted FAIL
-# banner that says nothing about binary provenance. Same reason the
-# end-of-run probe is annotated rather than trusted bare.
+# Capture admission before measurement. Generated output under .artifacts/
+# is ignored and cannot explain away a dirty-tree failure.
 ENV_TMP=$(mktemp)
 ./target/release/inf-bench env-check >"$ENV_TMP" 2>&1 || \
   echo "soak-unified: env-check FAILED at start — run is not citation-grade (see env-start.txt)"
@@ -533,9 +530,8 @@ redis-cli -p $PORT INFO memory     >>"$OUT/info-end.txt" 2>/dev/null || true
 redis-cli -p $PORT INFO tiering    >>"$OUT/info-end.txt" 2>/dev/null || true
 redis-cli -p $PORT INFO tripwires  >>"$OUT/info-end.txt" 2>/dev/null || true
 {
-  echo "# NOTE: this run's own artifacts under $OUT are untracked by now,"
-  echo "# so git-dirty-tree is EXPECTED to fail here. env-start.txt is the"
-  echo "# provenance probe; this one only re-checks governor/EPP/thermal."
+  echo "# End-of-run environment check; compare with env-start.txt."
+  echo "# Ignored output does not excuse a dirty-tree failure."
 } >"$OUT/env-end.txt"
 ./target/release/inf-bench env-check >>"$OUT/env-end.txt" 2>&1 || true
 attr_snap end

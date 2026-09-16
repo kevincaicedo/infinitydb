@@ -19,6 +19,8 @@ Public documentation for InfinityDB. Start with the
 
 ## Tools
 
+- **[Validation and reference box](validation.md)** — runnable tests, DST,
+  performance harnesses, baseline requirements and local output policy.
 - **[inf-bench](../bins/inf-bench/README.md)** — the benchmark and exit-gate
   harness (`env-check`, `load`, `gate-run`, `zipfian`).
 - **[inf-sim](../bins/inf-sim/README.md)** — the deterministic simulator
