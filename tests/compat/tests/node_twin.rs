@@ -140,6 +140,9 @@ fn twin_check(argv: &[String], check: Check) -> Twin {
         Check::ByteExact => Twin::Exact,
         Check::Frames(n) => Twin::Frames(n),
         Check::IntWithin(t) => Twin::IntWithin(t),
+        Check::SetEqual => Twin::SetEqual,
+        // Page one of a walk and a random draw carry per-node cursors / draws.
+        Check::ScanWalk | Check::MemberOfKeys => Twin::Shape,
         Check::SkipDiff(why) => {
             if why.contains("InfinityDB extension") || why.contains("arity+keyspec") {
                 Twin::Exact

@@ -10,7 +10,10 @@
 //! clients live in the harness; a shared [`oracle`] observes every apply
 //! point and replays it against a single-store model — replies must match
 //! byte-for-byte (the single-key linearizability oracle: apply points on a
-//! single thread form a real total order).
+//! single thread form a real total order) — and, since ADR-0129, against an
+//! independent model written from Redis's documented semantics
+//! (`harness::shadow`), the check the replay cannot be: the replay runs the
+//! product's own `execute` on the product's own store.
 //!
 //! # Device model per scenario (F-L04-06)
 //!
@@ -73,6 +76,43 @@ pub use recovery::{RecoveryReport, RecoveryScenario, run_recovery_scenario};
 pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
 pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};
+
+/// Every scenario name the `inf-sim` binary accepts (F-L19-03, review
+/// 2026-08-30): the registry `scripts/sim-smoke.sh` runs once per merge
+/// and `tests/lanes.rs` checks against the CLI dispatch, so a scenario
+/// cannot be born unrun. Add a scenario here, in `main.rs`, and in the
+/// smoke script together.
+pub const SCENARIOS: &[&str] = &[
+    "m0-smoke",
+    "m0-adversarial",
+    "m0-surface",
+    "m0-fabric-fairness",
+    "m0-admission",
+    "m1-cache",
+    "m2-durable",
+    "m2-clean-stop",
+    "m2-device-budget",
+    "m2-mode-transition",
+    "m2-reorder-window",
+    "m2-fill-tick",
+    "m2-group-hold",
+    "m2-fua-pending",
+    "m2-ckpt-refused",
+    "m2-recycle",
+    "m2-combined",
+    "m2-ns-create-window",
+    "m2-ns-ddl-race",
+    "m3-document",
+    "boot-storm",
+    "m4-steel",
+    "m4-pressure",
+    "m4-cold",
+    "m4-recovery",
+    "m4-diskfull",
+    "m4-tiered",
+    "m45-backfill",
+    "m45-sidecar",
+];
 
 /// ADR-0107: the simulator's tests arm fault points and build forced
 /// collisions; without the `dst` feature both are compiled to no-ops and

@@ -321,3 +321,38 @@ fn shutdown_checkpoint_off_is_a_clean_exit_that_replays() {
     assert_eq!(c.info_field(b"persistence", "recover_ckpt_bytes"), "0");
     assert_eq!(c.info_field(b"persistence", "recover_replay_records"), "64");
 }
+
+/// Batch 71 (L11, Linux/io_uring): a close over unread input, measured.
+/// One write pipelines `N` SETs, a `QUIT`, then `N` more SETs the server
+/// never reads: every reply up to and including QUIT's `+OK` reaches the
+/// client, whatever the kernel does with the tail (Linux answers a close
+/// over unread receive data with RST, exactly as Redis 8.0.5 does on the
+/// same probe; the driver having drained the pipeline first ends in a
+/// FIN instead). The pool is four 4 KiB buffers, so the pipeline runs
+/// well past it and multishot recv pauses and resumes underneath.
+#[test]
+fn quit_past_the_pool_delivers_every_earlier_reply() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = data_root("quit-pool");
+    let server = Server::spawn(&dir, "1", &["--buffers", "4", "--buf-size", "4096"]);
+    let mut c = Client::connect(server.port);
+    assert_eq!(c.call(&[b"PING"]), b"+PONG\r\n");
+    let mut wire = Vec::new();
+    for i in 0..N {
+        wire.extend_from_slice(&resp(&[b"SET", format!("k{i}").as_bytes(), b"v"]));
+    }
+    wire.extend_from_slice(&resp(&[b"QUIT"]));
+    for i in 0..N {
+        wire.extend_from_slice(&resp(&[b"SET", format!("z{i}").as_bytes(), b"v"]));
+    }
+    c.0.write_all(&wire).expect("pipeline");
+    let mut rest = Vec::new();
+    let tail = c.0.read_to_end(&mut rest);
+    let replies = rest.split(|&b| b == b'\n').filter(|l| *l == b"+OK\r").count();
+    assert_eq!(replies, N + 1, "replies before the close (tail {tail:?})");
+    assert!(
+        tail.is_ok()
+            || tail.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+        "the tail is neither EOF nor a reset: {tail:?}"
+    );
+}

@@ -654,17 +654,51 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
                 && scenario.io_mode == SegmentIoMode::Direct
             {
                 let truncated = stats.segments_truncated;
-                if stats.segment_rotations >= 3 && truncated >= 2 && stats.segments_recycled == 0 {
+                // ADR-0090 A16 (batch 71): the rule's precondition is the
+                // pool's state, not a rotation count — seed 0xc10005 rotated
+                // 3 times in a burst whose checkpoints trailed every
+                // prealloc, so the pool was fed only after the last one.
+                // A prealloc that found the pool non-empty (not a miss, not
+                // a space failure) must have recycled or fallen back.
+                let served = stats
+                    .segment_preallocs
+                    .saturating_sub(stats.recycle_misses + stats.segment_prealloc_failures);
+                if served > 0 && stats.segments_recycled == 0 && stats.recycle_fallbacks == 0 {
                     fail(
                         &mut report,
                         format!(
-                            "RECYCLING NEVER ENGAGED seed {:#x} cell {cell}: {} rotations, {} \
-                             truncations, 0 recycled ({} misses, {} fallbacks)",
+                            "RECYCLING NEVER ENGAGED seed {:#x} cell {cell}: {} preallocs found \
+                             the pool non-empty ({} preallocs, {} misses, {} space failures), \
+                             0 recycled, 0 fallbacks ({} rotations, {} truncations)",
                             scenario.seed,
-                            stats.segment_rotations,
-                            truncated,
+                            served,
+                            stats.segment_preallocs,
                             stats.recycle_misses,
-                            stats.recycle_fallbacks
+                            stats.segment_prealloc_failures,
+                            stats.segment_rotations,
+                            truncated
+                        ),
+                    );
+                }
+                // The feed half: two covered pre-zeroed truncations and the
+                // pool never held a segment (taken, refused full, or held
+                // at the cut) means truncation stopped offering (D1).
+                let pool_saw_a_segment = stats.segments_recycled
+                    + stats.recycle_fallbacks
+                    + stats.recycle_pool_full
+                    + u64::from(stats.recycle_pool_bytes > 0)
+                    > 0;
+                if truncated >= 2
+                    && stats.rotations_unzeroed == 0
+                    && !scenario.recycle_open_fault
+                    && !pool_saw_a_segment
+                {
+                    fail(
+                        &mut report,
+                        format!(
+                            "TRUNCATIONS NEVER FED THE POOL seed {:#x} cell {cell}: {} \
+                             truncations, pool never held a segment ({} rotations, {} misses)",
+                            scenario.seed, truncated, stats.segment_rotations, stats.recycle_misses
                         ),
                     );
                 }

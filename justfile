@@ -85,43 +85,16 @@ compat:
 # net against the wired plane: cut → recover → §8.2 command audit →
 # re-pressure flush liveness → DISKFULL clamp → the S19 drop race).
 sim-smoke:
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
-    # F-L11-05: an accept-path error is a counter, never connection teardown.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE --plant accept-error
-    # Group 0 (review 2026-08-30 §5.5): adversarial key/value lengths at
-    # 4 cells — the two parameters no other gate exercises.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-adversarial --seed 0xC0FFEE --cells 4 --verify-determinism
-    # F-L19-05/06: namespace-bound + SELECTed clients, SCAN/KEYS/DBSIZE/
-    # RANDOMKEY/FLUSH* under audit, values + deadlines reconciled.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-surface --seed 0xC0FFEE --cells 4 --verify-determinism
-    # F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines —
-    # FABRIC-IN must reach every peer within `cells − 2` exhausted drains.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-fabric-fairness --seed 0xC0FFEE --verify-determinism
-    # F-L15-05 (ADR-0123): maxclients refusal at accept + the idle reaper
-    # under an oracle (share bound, refusal frame, counter fold, deadline).
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m0-admission --seed 0xC0FFEE --verify-determinism
-    # ADR-0124 (F-L15-08): a graceful stop before the cut keeps every acked
-    # everysec op, every client sees its close, and the reboot replays nothing.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-clean-stop --seed 0xC0FFEE --verify-determinism
-    # F-L17-14: the M4.5 index crash scenarios ran in no automated lane.
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-backfill --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m45-sidecar --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-steel --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-pressure --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-cold --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-recovery --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-diskfull --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --verify-determinism
-    # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply and
-    # one counter increment — the forced arm must fire (vacuous = red).
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m4-tiered --seed 0xC0FFEE --plant tier-read-eio
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-create-window --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ns-ddl-race --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-device-budget --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-mode-transition --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-reorder-window --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-ckpt-refused --seed 0xC0FFEE --verify-determinism
-    cargo run --release -p inf-sim --features dst --bin inf-sim -- --scenario m2-recycle --seed 0xC0FFEE --verify-determinism
+    # F-L19-03 (review 2026-08-30): one registry — every scenario the
+    # binary accepts, once, determinism-verified; `bins/inf-sim/tests/
+    # lanes.rs` fails when a scenario has no row. PR CI runs the same script.
+    ./scripts/sim-smoke.sh
+
+# Planted-bug canaries (ADR-0129; ADR-0090 D5): each `--cfg inf_canary_*`
+# built into its own target dir must turn its scenario red, and the plain
+# build must stay green on the same row. Nightly runs it too.
+sim-canaries:
+    ./scripts/sim-canaries.sh
 
 # M2-S19 durability sweep (the §6 dst_sweep gate shape). Every *-sweep
 # recipe runs through scripts/run-sweep.sh (ADR-0106 D7): eight shards,

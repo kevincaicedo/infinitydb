@@ -106,17 +106,20 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario \
-                        m0-smoke|m0-adversarial|m0-surface|m0-fabric-fairness|m0-admission\
-                        |m1-cache|m2-durable|m2-clean-stop|m2-device-budget|m2-mode-transition\
-                        |m2-reorder-window|m2-fill-tick|m2-group-hold|m2-fua-pending\
-                        |m2-ckpt-refused|m2-recycle|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--cells N] \
                          [--connections N] [--commands N] [--trace-out FILE] \
-                         [--sweep N [--shard I/K] [--out DIR]]"
+                         [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
+                        inf_sim::SCENARIOS.join("|")
                     );
+                    std::process::exit(0);
+                }
+                "--list-scenarios" => {
+                    for name in inf_sim::SCENARIOS {
+                        println!("{name}");
+                    }
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown flag {other}")),
@@ -1112,10 +1115,8 @@ fn main() {
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m0-adversarial, m0-surface, \
-                m0-fabric-fairness, m0-admission, m1-cache, \
-                 m2-durable, m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, \
-                 m4-cold, m4-recovery, m4-diskfull, m4-tiered)"
+                "inf-sim: unknown scenario {other} (have: {})",
+                inf_sim::SCENARIOS.join(", ")
             );
             std::process::exit(2);
         }
@@ -1145,7 +1146,8 @@ fn main() {
     println!(
         "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
          scan_walks={} replays_skipped={} plant_fired={} accept_resumes={} \
-         fabric_skip_streak_max={} refused_clients={} idle_closed={} idle_survived={}",
+         fabric_skip_streak_max={} refused_clients={} idle_closed={} idle_survived={} \
+         shadow_checked={} shadow_unmodeled={:?}",
         report.sim_seconds,
         report.published,
         report.delivered,
@@ -1158,7 +1160,9 @@ fn main() {
         report.fabric_skip_streak_max,
         report.refused_clients,
         report.idle_closed,
-        report.idle_survived
+        report.idle_survived,
+        report.shadow_checked,
+        report.shadow_unmodeled
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)

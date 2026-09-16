@@ -265,9 +265,12 @@ recovery — runs deterministically on one thread inside the simulator
 (`inf-sim`), FoundationDB/TigerBeetle-style: simulated disks tear writes and
 lie about fsync, power cuts land at chosen LSNs, and every failure is a
 seed that replays byte-identically. Invariant oracles (linearizability per
-key, durability-watermark honesty, index equivalence, accounting
-reconciliation) run continuously inside the sim, and a nightly fleet burns
-millions of simulated seconds. Determinism also gives replicas byte-exact
+key — against the product's own store replayed in apply order **and**
+against an independent model written from Redis's documented semantics
+(ADR-0129) — durability-watermark honesty, index equivalence, accounting
+reconciliation) run continuously inside the sim; every scenario runs once
+on every PR (`scripts/sim-smoke.sh`), and a nightly fleet burns millions
+of simulated seconds. Determinism also gives replicas byte-exact
 log apply and makes `EXPLAIN` truthful — there is no planner and no
 nondeterministic execution to surprise anyone.
 

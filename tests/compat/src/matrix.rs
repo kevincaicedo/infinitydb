@@ -20,10 +20,23 @@ pub enum Check {
     IntWithin(i64),
     /// Replies differ by design; both must frame-parse.
     SkipDiff(&'static str),
+    /// `*N` of bulks compared as sets — element order is engine-defined
+    /// (`KEYS`: home-group order vs dict order), the set is the guarantee
+    /// (review 2026-08-30, F-L19-10).
+    SetEqual,
+    /// A cursor walk: the case is the first page; the harness follows each
+    /// engine's own cursor until `0` and compares the union of every page
+    /// as a set. Cursor bytes are engine-internal; the enumerated set is
+    /// the guarantee (F-L19-10).
+    ScanWalk,
+    /// A random draw: nil on both engines, or the candidate's bulk is a
+    /// member of the oracle's `KEYS *` set and the oracle drew a bulk too
+    /// (`RANDOMKEY` — F-L19-10).
+    MemberOfKeys,
 }
 
 impl Check {
-    /// Whether this case byte-compares against the oracle (feeds the
+    /// Whether this case compares against the oracle (feeds the
     /// declared-`full` enforcement in the generated matrix — M1-S13).
     pub fn compared(self) -> bool {
         !matches!(self, Check::SkipDiff(_))
@@ -46,6 +59,18 @@ const fn frames(argv: &'static [&'static str], n: usize) -> Case {
 
 const fn skip(argv: &'static [&'static str], why: &'static str) -> Case {
     Case { argv, check: Check::SkipDiff(why) }
+}
+
+const fn set_equal(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::SetEqual }
+}
+
+const fn scan_walk(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::ScanWalk }
+}
+
+const fn member_of_keys(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::MemberOfKeys }
 }
 
 /// 130 bytes — two past the oracle's 128-byte argument/name budget, so a
@@ -509,16 +534,17 @@ pub static MATRIX: &[Case] = &[
     c(&["KEYS", "gr"]),
     c(&["KEYS", "rnxfre*"]),
     c(&["KEYS", "no-such-prefix:*"]),
-    skip(
-        &["KEYS", "m*"],
-        "result ordering differs (home-group vs dict order); set equality via DBSIZE",
-    ),
-    skip(&["SCAN", "0"], "cursor values are engine-internal; guarantee proptested in inf-store"),
-    skip(&["SCAN", "0", "MATCH", "m*", "COUNT", "100"], "cursor values engine-internal"),
+    // F-L19-10 (review 2026-08-30): the guarantee is compared, not the
+    // representation — KEYS as a set, SCAN as the set a full walk from
+    // this cursor enumerates (MATCH/COUNT ride along), RANDOMKEY as a
+    // draw from the oracle's live keys.
+    set_equal(&["KEYS", "m*"]),
+    scan_walk(&["SCAN", "0"]),
+    scan_walk(&["SCAN", "0", "MATCH", "m*", "COUNT", "100"]),
     c(&["SCAN", "notacursor"]),
     c(&["SCAN", "0", "COUNT", "0"]),
     c(&["DBSIZE"]),
-    skip(&["RANDOMKEY"], "two-level random (cell, then key) — documented deviation"),
+    member_of_keys(&["RANDOMKEY"]),
     // --- SELECT + database isolation (M1-E4 namespaces v1) ---
     c(&["SELECT", "0"]),
     c(&["SELECT", "17"]),

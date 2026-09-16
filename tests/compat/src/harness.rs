@@ -10,6 +10,7 @@
 //! against one in-process `Keyspace` with no cells, no namespaces and
 //! no tier).
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -451,6 +452,73 @@ pub fn read_frames(stream: &mut TcpStream, buf: &mut Vec<u8>, n: usize) -> Vec<u
     out
 }
 
+/// Parses `*N` of `$len` bulks into the element list.
+pub fn parse_bulk_array(reply: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if reply.first() != Some(&b'*') {
+        return None;
+    }
+    let header_end = reply.windows(2).position(|w| w == b"\r\n")? + 2;
+    let count: usize = std::str::from_utf8(reply.get(1..header_end - 2)?).ok()?.parse().ok()?;
+    let mut at = header_end;
+    let mut items = Vec::with_capacity(count.min(1 << 16));
+    for _ in 0..count {
+        let rest = reply.get(at..)?;
+        if rest.first() != Some(&b'$') {
+            return None;
+        }
+        let len_end = rest.windows(2).position(|w| w == b"\r\n")? + 2;
+        let len: usize = std::str::from_utf8(rest.get(1..len_end - 2)?).ok()?.parse().ok()?;
+        items.push(rest.get(len_end..len_end + len)?.to_vec());
+        at += len_end + len + 2;
+    }
+    (at == reply.len()).then_some(items)
+}
+
+/// Parses a `SCAN` reply — `*2` of (cursor bulk, key array).
+pub fn parse_scan(reply: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let rest = reply.strip_prefix(b"*2\r\n")?;
+    if rest.first() != Some(&b'$') {
+        return None;
+    }
+    let len_end = rest.windows(2).position(|w| w == b"\r\n")? + 2;
+    let len: usize = std::str::from_utf8(rest.get(1..len_end - 2)?).ok()?.parse().ok()?;
+    let cursor = rest.get(len_end..len_end + len)?.to_vec();
+    let keys = parse_bulk_array(rest.get(len_end + len + 2..)?)?;
+    Some((cursor, keys))
+}
+
+/// A bulk reply's payload (`$len\r\n…\r\n`); `None` for nil or any other shape.
+pub fn parse_bulk(reply: &[u8]) -> Option<Vec<u8>> {
+    parse_bulk_array(&[b"*1\r\n", reply].concat())?.into_iter().next()
+}
+
+/// Follows one engine's cursor from `first` (the case's argv, cursor at
+/// position 1) until it answers `0`, unioning every page. `page` runs one
+/// page's argv on that engine and returns the raw reply.
+pub fn scan_walk(
+    first: &[String],
+    mut page: impl FnMut(&[String]) -> Vec<u8>,
+) -> Result<BTreeSet<Vec<u8>>, String> {
+    let mut argv = first.to_vec();
+    let mut keys = BTreeSet::new();
+    for _ in 0..10_000 {
+        let reply = page(&argv);
+        let (next, items) = parse_scan(&reply)
+            .ok_or_else(|| format!("malformed SCAN page: {:?}", String::from_utf8_lossy(&reply)))?;
+        keys.extend(items);
+        if next == b"0" {
+            return Ok(keys);
+        }
+        argv[1] = String::from_utf8(next).map_err(|_| "non-ASCII cursor".to_string())?;
+    }
+    Err("SCAN never terminated (10 000 pages)".into())
+}
+
+fn show_set(set: &BTreeSet<Vec<u8>>) -> String {
+    let items: Vec<String> = set.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+    format!("{{{}}}", items.join(", "))
+}
+
 /// Parses `:N\r\n`.
 pub fn parse_int_reply(reply: &[u8]) -> Option<i64> {
     let text = reply.strip_prefix(b":")?.strip_suffix(b"\r\n")?;
@@ -634,6 +702,82 @@ pub fn run_matrix(
                 if (a - b).abs() > tolerance {
                     failures
                         .push(format!("case {i} {:?}: {a} vs {b} exceeds ±{tolerance}", case.argv));
+                }
+            }
+            Check::SetEqual => {
+                match (parse_bulk_array(&oracle_reply), parse_bulk_array(&candidate_reply)) {
+                    (Some(a), Some(b)) => {
+                        let (a, b): (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>) =
+                            (a.into_iter().collect(), b.into_iter().collect());
+                        if a != b {
+                            failures.push(format!(
+                                "case {i} {:?}: array sets differ:\n  oracle    {}\n  candidate {}",
+                                case.argv,
+                                show_set(&a),
+                                show_set(&b)
+                            ));
+                        }
+                    }
+                    _ => failures.push(format!(
+                        "case {i} {:?}: not two bulk arrays (oracle {:?}, candidate {:?})",
+                        case.argv,
+                        String::from_utf8_lossy(&oracle_reply),
+                        String::from_utf8_lossy(&candidate_reply),
+                    )),
+                }
+            }
+            Check::ScanWalk => {
+                // Page one was read above on both engines; each walk
+                // restarts from the case's cursor and follows its own
+                // (both engines are quiescent, so a walk is repeatable).
+                let oracle_walk = scan_walk(&argv, |page| {
+                    oracle.write_all(&encode_command(page)).expect("oracle write");
+                    read_frames(oracle, &mut oracle_buf, 1)
+                });
+                let candidate_walk = scan_walk(&argv, |page| exec(&encode_command(page), 1));
+                match (oracle_walk, candidate_walk) {
+                    (Ok(a), Ok(b)) if a == b => {}
+                    (Ok(a), Ok(b)) => failures.push(format!(
+                        "case {i} {:?}: SCAN walks enumerate different sets:\n  oracle    {}\n  \
+                         candidate {}",
+                        case.argv,
+                        show_set(&a),
+                        show_set(&b)
+                    )),
+                    (a, b) => failures.push(format!(
+                        "case {i} {:?}: SCAN walk failed (oracle {:?}, candidate {:?})",
+                        case.argv,
+                        a.err(),
+                        b.err()
+                    )),
+                }
+            }
+            Check::MemberOfKeys => {
+                let nil = |r: &[u8]| r == b"$-1\r\n" || r == b"_\r\n";
+                match (parse_bulk(&oracle_reply), parse_bulk(&candidate_reply)) {
+                    (None, None) if nil(&oracle_reply) && nil(&candidate_reply) => {}
+                    (Some(_), Some(key)) => {
+                        let keys_all = encode_command(&["KEYS".to_string(), "*".to_string()]);
+                        oracle.write_all(&keys_all).expect("oracle write");
+                        let keys = read_frames(oracle, &mut oracle_buf, 1);
+                        let live = parse_bulk_array(&keys).unwrap_or_default();
+                        if !live.contains(&key) {
+                            failures.push(format!(
+                                "case {i} {:?}: candidate drew {:?}, not a live key of the oracle \
+                                 ({} keys)",
+                                case.argv,
+                                String::from_utf8_lossy(&key),
+                                live.len()
+                            ));
+                        }
+                    }
+                    _ => failures.push(format!(
+                        "case {i} {:?}: one engine drew a key and the other did not (oracle {:?}, \
+                         candidate {:?})",
+                        case.argv,
+                        String::from_utf8_lossy(&oracle_reply),
+                        String::from_utf8_lossy(&candidate_reply),
+                    )),
                 }
             }
             Check::SkipDiff(why) => {

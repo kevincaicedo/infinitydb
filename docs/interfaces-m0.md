@@ -530,7 +530,11 @@ Reply bytes are oracle-pinned by the compat harness (`tests/compat`):
 132 byte-exact cases vs real Redis 8.0.5; documented deviations:
 `HELLO`/`INFO`/`COMMAND` payloads, `SET … EXAT/PXAT` (wall-clock timebase
 arrives with the node), keys > 255 B / values > 16 MiB − 1 (record v0
-bounds, typed error).
+bounds: a write naming one answers the typed error `ERR key or value
+exceeds InfinityDB M0 record bounds`; a read or delete treats such a key
+as absent — nil, `0`, `none`, `-2` — since no write can have stored it;
+made precise 2026-09-16 when the simulator's independent model,
+F-L19-04, read the sentence as "typed error on every command").
 
 ## 6c. `inf-server` — node assembly (M0 E6/E7 substrate; implemented)
 

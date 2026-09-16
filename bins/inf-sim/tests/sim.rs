@@ -32,6 +32,24 @@ fn same_seed_same_trace() {
 /// AC: scenario `m0-smoke` — 3 cells, 100 sim connections, 10⁵ mixed
 /// commands incl. cross-cell — oracle green. (The full-size run also
 /// executes via the CLI for the artifact; this keeps a CI-sized guard.)
+/// F-L19-04: the independent model answered most apply events, and
+/// every event outside its vocabulary is a command the mix is known to
+/// send that it does not claim (bindings, pub/sub, the surface legs the
+/// audit oracle owns) — a mix it silently never checked cannot pass.
+fn assert_shadow_covered(report: &inf_sim::SimReport, label: &str) {
+    const OUTSIDE: &[&str] =
+        &["SELECT", "INF.NS", "PUBLISH", "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE"];
+    assert!(
+        report.shadow_checked >= report.commands_done / 2,
+        "{label}: the shadow model checked {} of {} commands",
+        report.shadow_checked,
+        report.commands_done
+    );
+    let unknown: Vec<&String> =
+        report.shadow_unmodeled.keys().filter(|k| !OUTSIDE.contains(&k.as_str())).collect();
+    assert!(unknown.is_empty(), "{label}: commands the shadow model does not know: {unknown:?}");
+}
+
 #[test]
 fn m0_smoke_oracle_green() {
     let mut scenario = Scenario::m0_smoke(0xC0FFEE);
@@ -41,6 +59,22 @@ fn m0_smoke_oracle_green() {
     assert_eq!(report.oracle_violations, Vec::<String>::new());
     assert_eq!(report.commands_done, scenario.commands);
     assert!(report.events >= scenario.commands, "apply events cover every command");
+    assert_shadow_covered(&report, "m0-smoke");
+}
+
+/// F-L19-04 at the length edges: the adversarial mix (254/255/256/300 B
+/// keys, values to 64 KiB, over-bound MSET/MSETNX pairs, GETRANGE to
+/// i64::MAX, SETRANGE offsets) agrees with the independent model too.
+#[test]
+fn m0_adversarial_agrees_with_the_independent_model() {
+    let mut scenario = Scenario::m0_adversarial(0xBAD5EED);
+    scenario.cells = 4;
+    scenario.commands = if cfg!(debug_assertions) { 12_000 } else { 60_000 };
+    let report = run_scenario(&scenario);
+    assert!(!report.stalled, "adversarial stalled");
+    assert_eq!(report.oracle_violations, Vec::<String>::new());
+    assert_eq!(report.commands_done, scenario.commands);
+    assert_shadow_covered(&report, "m0-adversarial");
 }
 
 /// AC: a planted lost-wakeup bug is caught by a seed within 1000 runs —
@@ -122,6 +156,7 @@ fn m1_cache_oracle_green() {
     // Every channel has ≥ 2 watchers (subscription plan), so deliveries
     // strictly exceed publishes when anything was published.
     assert!(report.delivered > report.published, "fan-out did not fan");
+    assert_shadow_covered(&report, "m1-cache");
 }
 
 /// M1-S15: determinism holds with the pub/sub plane + subscribers active.
@@ -155,6 +190,7 @@ fn m0_surface_oracle_green() {
     assert!(report.audits >= 3, "audits ran: {}", report.audits);
     assert!(report.scan_walks >= 1, "a concurrent SCAN walk completed");
     assert!(report.replays_skipped >= 1, "scatter legs reached the seam");
+    assert_shadow_covered(&report, "m0-surface");
 }
 
 /// The content oracle has teeth for every damage class it claims to see

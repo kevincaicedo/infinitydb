@@ -74,6 +74,7 @@ use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
 mod audit;
 mod idle;
+pub mod shadow;
 
 use audit::{
     AuditState, fold_model_entries, fold_node_entries, plant_canary, reconcile_entries, run_audit,
@@ -400,6 +401,11 @@ pub struct SimReport {
     pub flushes: u64,
     pub scan_walks: u64,
     pub replays_skipped: u64,
+    /// The independent model's coverage (F-L19-04): apply events it
+    /// answered, and the events outside its vocabulary by command —
+    /// disclosed so a mix it never checked cannot pass as checked.
+    pub shadow_checked: u64,
+    pub shadow_unmodeled: BTreeMap<String, u64>,
     /// The `--plant` canary reached its arming point (engagement check —
     /// a plant that never fired proves nothing).
     pub plant_fired: bool,
@@ -431,6 +437,8 @@ impl SimReport {
 
 struct Oracle {
     model: Keyspace,
+    /// The independent model (F-L19-04): shares no code with the node.
+    shadow: shadow::Shadow,
     trace: Vec<u8>,
     events: u64,
     violations: Vec<String>,
@@ -516,7 +524,14 @@ impl Oracle {
     fn new(keys: usize, namespaces: u16) -> Oracle {
         let mut model = Keyspace::new(StoreConfig { initial_keys: keys, ..Default::default() });
         seed_namespaces(&mut model, namespaces);
-        Oracle { model, trace: Vec::new(), events: 0, violations: Vec::new(), replays_skipped: 0 }
+        Oracle {
+            model,
+            shadow: shadow::Shadow::default(),
+            trace: Vec::new(),
+            events: 0,
+            violations: Vec::new(),
+            replays_skipped: 0,
+        }
     }
 }
 
@@ -567,7 +582,7 @@ impl PlaneObserver for SharedOracle {
         // (the scenario mixes never switch protocols).
         let mut expected = Vec::new();
         let mut cx = model_cx(scope);
-        let Oracle { model, violations, .. } = &mut *oracle;
+        let Oracle { model, shadow, violations, .. } = &mut *oracle;
         execute_slices(argv, model, &mut cx, now, &mut expected);
         if expected != reply {
             let argv_text: Vec<String> =
@@ -577,6 +592,21 @@ impl PlaneObserver for SharedOracle {
                  model {:?}",
                 String::from_utf8_lossy(reply),
                 String::from_utf8_lossy(&expected),
+            ));
+        }
+        // The independent model (F-L19-04): the same argv at the same
+        // instant, computed from Redis's documented semantics, never from
+        // the product. A command it does not know is counted, not passed.
+        if let Some(shadow_reply) = shadow.apply(scope, argv, now)
+            && shadow_reply != reply
+        {
+            let argv_text: Vec<String> =
+                argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            violations.push(format!(
+                "shadow divergence on cell {cell} scope {scope:?} {argv_text:?}: node {:?} vs \
+                 shadow {:?}",
+                String::from_utf8_lossy(reply),
+                String::from_utf8_lossy(&shadow_reply),
             ));
         }
     }
@@ -1361,6 +1391,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         flushes: 0,
         scan_walks: 0,
         replays_skipped: 0,
+        shadow_checked: 0,
+        shadow_unmodeled: BTreeMap::new(),
         plant_fired: false,
         accept_resumes: 0,
         fabric_skip_streak_max: 0,
@@ -1795,6 +1827,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let oracle = oracle.0.borrow();
     report.events = oracle.events;
     report.replays_skipped = oracle.replays_skipped;
+    report.shadow_checked = oracle.shadow.checked;
+    report.shadow_unmodeled = oracle.shadow.unmodeled.clone();
     report.trace = oracle.trace.clone();
     report.trace_hash = hash64(&report.trace, 0x51A1);
     report.oracle_violations = oracle.violations.clone();

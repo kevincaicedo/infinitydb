@@ -309,6 +309,14 @@ pub(super) fn run_audit(
             let mut cx = model_cx(auditor.scope.exec_scope());
             let mut oracle = oracle.0.borrow_mut();
             execute_slices(&slices, &mut oracle.model, &mut cx, now, &mut expected);
+            // The independent model follows an acknowledged flush only.
+            if expected == b"+OK\r\n" {
+                if argv[0] == b"FLUSHALL" {
+                    oracle.shadow.flush_all();
+                } else {
+                    oracle.shadow.flush_db(auditor.scope.exec_scope());
+                }
+            }
         }
         match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
             Ok(reply) if reply == expected => {}

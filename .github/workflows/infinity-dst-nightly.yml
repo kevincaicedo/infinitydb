@@ -64,6 +64,21 @@ jobs:
       - name: crash matrix (expanded seeds)
         run: CRASH_MATRIX_SEEDS=256 cargo test -p crash-matrix -- --nocapture
 
+  # F-L19-03 addendum / F-L19-04 (ADR-0129): every planted-bug canary the
+  # workspace admits is built, run red, and its plain build run green —
+  # a canary nobody plants proves nothing. `bins/inf-sim/tests/lanes.rs`
+  # keeps the driver's rows complete.
+  canaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: planted-bug canaries (scripts/sim-canaries.sh)
+        run: ./scripts/sim-canaries.sh
+
   fleet:
     runs-on: ubuntu-24.04
     timeout-minutes: 120

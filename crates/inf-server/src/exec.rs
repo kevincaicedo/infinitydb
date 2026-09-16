@@ -789,6 +789,12 @@ fn execute_db(
             cx.close_requested.set(true);
         }
         CommandId::Get => match store.get_str(argv.arg(1), now) {
+            // Planted-bug canary (F-L19-04, `scripts/sim-canaries.sh`):
+            // one byte appended to every value. The shared-store replay
+            // cannot see it; the simulator's independent model must.
+            #[cfg(inf_canary_reply_lie)]
+            Ok(Some(value)) => w.bulk(&[value, b"!"].concat()),
+            #[cfg(not(inf_canary_reply_lie))]
             Ok(Some(value)) => w.bulk(value),
             Ok(None) => w.null(),
             Err(e) => op_error(e, &mut w),

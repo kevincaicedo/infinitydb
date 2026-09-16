@@ -23,11 +23,13 @@
 
 use inf_wire::{COMMANDS, CmdFlags};
 
+use crate::candidate::Candidate;
 use crate::json_oracle::{
     DEVIATIONS as JSON_DEVIATIONS, JSON_CASES, Protocol as JsonProtocol, REDIS_STACK_DIGEST,
     REDIS_STACK_IMAGE, REDISJSON_MODULE_VERSION,
 };
 use crate::matrix::{Check, MATRIX};
+use crate::resp::encode_command;
 
 /// Declared compatibility level (see the module-level decision rule).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -75,9 +77,11 @@ pub static DECLARED: &[Declared] = &[
     d("ECHO", Status::Full, "M0", ""),
     d(
         "HELLO",
-        Status::Full,
+        Status::Partial,
         "M0",
-        "identity fields (server/version) are InfinityDB's own, as for any non-Redis server",
+        "the reply's identity fields (server, version, id) are InfinityDB's own, so no \
+         handshake case byte-compares (F-L19-10: its one compared case was the subscriber-mode \
+         refusal); the protocol switch is proven by the RESP3-keyed cases that follow it",
     ),
     d(
         "QUIT",
@@ -225,13 +229,21 @@ pub static DECLARED: &[Declared] = &[
     d("TOUCH", Status::Full, "M1", ""),
     d("UNLINK", Status::Full, "M1", ""),
     d("DBSIZE", Status::Full, "M1", ""),
-    d("KEYS", Status::Full, "M1", "result ordering is engine-defined (set equality holds)"),
-    d("RANDOMKEY", Status::Full, "M1", "two-level random: cell, then key"),
+    d("KEYS", Status::Full, "M1", "result ordering is engine-defined; the corpus compares the set"),
+    d(
+        "RANDOMKEY",
+        Status::Full,
+        "M1",
+        "two-level random (cell, then key); the corpus compares the draw against the oracle's \
+         live keys",
+    ),
     d(
         "SCAN",
         Status::Full,
         "M1",
-        "cursor values are engine-internal; the every-resident-key-≥-once guarantee is proptested",
+        "cursor values are engine-internal; the corpus compares the key set a full cursor \
+         walk enumerates (F-L19-10), the store-tier proptest covers every-resident-key-≥-once \
+         under concurrent mutation",
     ),
     d("FLUSHDB", Status::Full, "M1", ""),
     d(
@@ -550,7 +562,38 @@ pub struct CommandRow {
     pub arity: i8,
     pub flags: String,
     pub compared_cases: usize,
+    /// Compared cases whose reply is neither an error nor a null — the
+    /// cases that exercise the command's guarantee rather than its
+    /// argument validation (review 2026-08-30, F-L19-10). JSON cases
+    /// count as compared and as evidence unclassified (S22 audited every
+    /// `JSON.*` row by hand under both protocols).
+    pub evidence_cases: usize,
     pub deviations: Vec<String>,
+}
+
+/// An error (`-`) or a null (`$-1`, `*-1`, `_`) reply: a compared case
+/// answering one proves the command's validation, not its guarantee.
+fn is_error_or_null(reply: &[u8]) -> bool {
+    reply.first() == Some(&b'-')
+        || reply.starts_with(b"$-1\r\n")
+        || reply.starts_with(b"*-1\r\n")
+        || reply.starts_with(b"_\r\n")
+}
+
+/// The core corpus run once on the in-process candidate, in script
+/// order (state accumulates): each case's reply classified for the
+/// `full` bar. The candidate's own reply is the conservative choice —
+/// a command that wrongly errors loses its evidence and the bar goes red.
+fn classify_corpus() -> Vec<bool> {
+    let mut candidate = Candidate::new();
+    MATRIX
+        .iter()
+        .map(|case| {
+            let argv: Vec<String> = case.argv.iter().map(|s| (*s).to_string()).collect();
+            let reply = candidate.execute_wire(&encode_command(&argv));
+            case.check.compared() && !is_error_or_null(&reply)
+        })
+        .collect()
 }
 
 /// Joins the registry, the declaration, and the corpus — panicking on any
@@ -563,6 +606,8 @@ pub fn rows() -> Vec<CommandRow> {
         DECLARED.len(),
         "every registry command needs a compat declaration (and vice versa)"
     );
+    let evidence = classify_corpus();
+    let mut no_evidence: Vec<String> = Vec::new();
     let mut rows = Vec::with_capacity(COMMANDS.len());
     for meta in &COMMANDS {
         let declared = DECLARED
@@ -570,22 +615,26 @@ pub fn rows() -> Vec<CommandRow> {
             .find(|d| d.name == meta.name)
             .unwrap_or_else(|| panic!("{} has no compat declaration", meta.name));
         let mut compared_cases = 0;
+        let mut evidence_cases = 0;
         let mut deviations: Vec<String> = Vec::new();
-        for case in MATRIX {
+        for (case, evidence) in MATRIX.iter().zip(&evidence) {
             if !case.argv[0].eq_ignore_ascii_case(meta.name) {
                 continue;
             }
             if case.check.compared() {
                 compared_cases += 1;
+                evidence_cases += usize::from(*evidence);
             } else if let Check::SkipDiff(why) = case.check
                 && !deviations.iter().any(|deviation| deviation == why)
             {
                 deviations.push(why.to_string());
             }
         }
-        compared_cases +=
+        let json_cases =
             JSON_CASES.iter().filter(|case| case.argv[0].eq_ignore_ascii_case(meta.name)).count()
                 * JsonProtocol::ALL.len();
+        compared_cases += json_cases;
+        evidence_cases += json_cases;
         deviations.extend(
             JSON_DEVIATIONS
                 .iter()
@@ -605,6 +654,11 @@ pub fn rows() -> Vec<CommandRow> {
                 "{} is declared full but has no byte-compared corpus case",
                 meta.name
             );
+            // F-L19-10: one error-path case made a command `full` (`SCAN`
+            // was full on two argument errors, `RANDOMKEY` on a nil).
+            if evidence_cases == 0 {
+                no_evidence.push(format!("{} ({compared_cases} compared)", meta.name));
+            }
         }
         if matches!(declared.status, Status::Partial | Status::Stub) {
             assert!(
@@ -634,9 +688,16 @@ pub fn rows() -> Vec<CommandRow> {
             arity: meta.arity,
             flags: flags.join(" "),
             compared_cases,
+            evidence_cases,
             deviations,
         });
     }
+    assert!(
+        no_evidence.is_empty(),
+        "declared full, but every compared case answers an error or a null — no case exercises \
+         the guarantee; add one, or declare partial: {}",
+        no_evidence.join(", ")
+    );
     rows
 }
 
@@ -711,20 +772,26 @@ pub fn render() -> String {
     push("`partial` = a documented semantic difference exists; `stub` = accepted but");
     push("inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric");
     push("program primitives — unknown to clients and hidden from COMMAND (ADR-0115).");
+    push("`Cases` = compared corpus executions; `Evidence` = those answering neither an");
+    push("error nor a null — a `full` row needs at least one (review 2026-08-30,");
+    push("F-L19-10: an error-path case alone no longer makes a command `full`). `KEYS`");
+    push("compares as a set, `SCAN` as the set a full cursor walk enumerates, `RANDOMKEY`");
+    push("as membership in the oracle's live keys.");
     push("");
     push("## Commands");
     push("");
-    push("| Command | Status | Since | Flags | Arity | Cases | Notes |");
-    push("|---|---|---|---|---|---|---|");
+    push("| Command | Status | Since | Flags | Arity | Cases | Evidence | Notes |");
+    push("|---|---|---|---|---|---|---|---|");
     for row in &rows {
         push(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
             row.name,
             row.status.name(),
             row.since,
             row.flags,
             row.arity,
             row.compared_cases,
+            row.evidence_cases,
             row.note,
         ));
     }
