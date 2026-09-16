@@ -54,6 +54,17 @@ pub fn anchor() -> WallAnchor {
     WallAnchor { internal_ms: 0, unix_ms: UNIX_BASE }
 }
 
+/// A matrix seed override must execute work, never turn a row vacuous.
+pub fn seed_count(default: u64) -> u64 {
+    let seeds = match std::env::var("CRASH_MATRIX_SEEDS") {
+        Ok(value) => value.parse().expect("CRASH_MATRIX_SEEDS must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("invalid CRASH_MATRIX_SEEDS: {error}"),
+    };
+    assert!(seeds > 0, "CRASH_MATRIX_SEEDS must be positive");
+    seeds
+}
+
 // ---------------------------------------------------------------------
 // Matrix definition (m2.toml): hand-rolled reader for exactly this
 // schema (`[[row]]` tables of scalars + string lists — the house
@@ -67,10 +78,12 @@ pub struct MatrixRow {
     pub workloads: Vec<String>,
     pub expect: String,
     /// "memfs" (default — the runner executes it) or "node" (carried by
-    /// the named test; counted for coverage, skipped by the runner).
+    /// an exact test executed by `run_node_rows.py`).
     pub tier: String,
-    /// Node-tier rows: the test file that carries the row.
+    /// Node-tier rows: `package::target::test_function`.
     pub test: String,
+    /// Empty for portable rows; `linux` for the real io_uring carriers.
+    pub platform: String,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +134,7 @@ pub fn load_matrix(path: &Path) -> MatrixDef {
             "expect" => row.expect = unquote(value),
             "tier" => row.tier = unquote(value),
             "test" => row.test = unquote(value),
+            "platform" => row.platform = unquote(value),
             "policies" => row.policies = string_list(value),
             "workloads" => row.workloads = string_list(value),
             other => panic!("{}:{}: unknown row field {other}", path.display(), lineno + 1),

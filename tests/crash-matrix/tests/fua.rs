@@ -51,10 +51,13 @@
 //! point. Seeds vary the cut's sector coin; the per-key oracle is the
 //! sweep's: acked ⇒ exact, un-acked ⇒ absent or exact.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crash_matrix::{CELL, NS, anchor, config, fresh_keyspace, load_matrix, now};
+use crash_matrix::{CELL, NS, anchor, config, fresh_keyspace, now};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
@@ -356,6 +359,7 @@ fn fua_in_flight_loses_only_the_unacked_frame() {
         disk.power_cut(seed);
         recover_and_audit(&disk, &model, &format!("fua_in_flight seed {seed}"));
     }
+    receipt::verified("torn_frame", "fua-in-flight");
 }
 
 /// `seal_flush_x_fua`: the active segment fills, rotation hands off a
@@ -396,24 +400,7 @@ fn seal_flush_in_flight_keeps_later_fua_frames_unacked() {
         disk.power_cut(seed ^ 0x5EA1);
         recover_and_audit(&disk, &model, &format!("seal_flush_x_fua seed {seed}"));
     }
-}
-
-/// The rows are declared in the matrix (self-policing).
-#[test]
-fn s34_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    for expect in [
-        "fua-in-flight",
-        "seal-flush-x-fua",
-        "seal-flush-x-fua-plain-tail",
-        "pipeline-later-durable-earlier-torn",
-        "flush-to-fua-packed-tail",
-    ] {
-        assert!(
-            def.rows.iter().any(|r| r.test == "fua.rs" && r.expect == expect),
-            "the {expect} row is declared"
-        );
-    }
+    receipt::verified("power_cut_after_seal", "seal-flush-x-fua");
 }
 
 /// `seal_flush_x_fua_plain_tail` (ADR-0087 D6): segment 1 fills with
@@ -476,6 +463,7 @@ fn plain_tail_behind_a_pending_seal_truncates_instead_of_refusing() {
         }
     }
     assert!(holes > 0, "some seed must cut the plain tail, or the row proves nothing");
+    receipt::verified("power_cut_after_seal", "seal-flush-x-fua-plain-tail");
 }
 
 /// `pipeline_later_durable_earlier_torn` (ADR-0087 D7): four write-through
@@ -530,6 +518,7 @@ fn later_frame_durable_earlier_torn_acks_nothing_and_truncates_at_the_first() {
         assert_eq!(stats.torn_truncated_at, Some(first_base), "seed {seed}: resume at frame 1");
         assert_eq!(stats.beyond_frames_discarded, 1, "seed {seed}: the third frame, discarded");
     }
+    receipt::verified("torn_frame", "pipeline-later-durable-earlier-torn");
 }
 
 /// `flush-to-fua-packed-tail` (ADR-0086 D4 as amended): life 1 writes
@@ -626,4 +615,5 @@ fn flush_to_fua_transition_keeps_every_acked_record() {
         let (rotor, _) = recover_in(&disk, &model, SegmentIoMode::Direct, &context);
         assert_eq!(rotor.stats().reopened_packed_tails, 1, "{context}");
     }
+    receipt::verified("torn_frame", "flush-to-fua-packed-tail");
 }

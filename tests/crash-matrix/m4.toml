@@ -3,7 +3,8 @@
 # against the manifested watermark / the surviving MANIFEST. S11 rows
 # are carried by `tests/tier.rs`, S12 rows by `tests/recovery_v2.rs`
 # (the runner vocabulary here is tier flush + manifest v2 + recovery,
-# not the m2 WAL machinery — rows use the carried-by-named-test tier).
+# not the m2 WAL machinery). Each row selects an exact Cargo test whose
+# assertion receipt is checked by run_node_rows.py (ADR-0020 amendment).
 # The m2 coverage test (`every_declared_point_has_a_matrix_row`) reads
 # this file alongside `m2.toml`, so a declared-but-rowless tier point
 # fails the build.
@@ -71,25 +72,25 @@ seeds = 3
 [[row]]
 point = "tier_short_write"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_short_write_append_fails_typed"
 expect = "append-fails-typed"
 
 [[row]]
 point = "tier_torn_frame"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_torn_frame_reseal_at_watermark"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "tier_fsync_err"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_fsync_err_fail_stop"
 expect = "fail-stop"
 
 [[row]]
 point = "tier_footer_torn"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_footer_torn_reseal_at_watermark"
 expect = "reseal-at-watermark"
 
 # ---- F-L04-14 (review 2026-08-30): the same points on a `Direct`-mode
@@ -101,25 +102,25 @@ expect = "reseal-at-watermark"
 [[row]]
 point = "tier_torn_frame"
 tier = "node"
-test = "tier_direct.rs"
+test = "crash-matrix::tier_direct::tier_torn_frame_injects_on_a_direct_tier_file"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "tier_short_write"
 tier = "node"
-test = "tier_direct.rs"
+test = "crash-matrix::tier_direct::tier_short_write_injects_on_a_direct_tier_file"
 expect = "append-fails-typed"
 
 [[row]]
 point = "tier_footer_torn"
 tier = "node"
-test = "tier_direct.rs"
+test = "crash-matrix::tier_direct::tier_footer_torn_injects_on_a_direct_tier_file"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "blob_short_write"
 tier = "node"
-test = "tier_direct.rs"
+test = "crash-matrix::tier_direct::blob_short_write_injects_on_a_direct_extent"
 expect = "blob-write-fails-typed"
 
 # ---- M4-S12 recovery-unit windows (ADR-0057 D8) ----
@@ -127,25 +128,25 @@ expect = "blob-write-fails-typed"
 [[row]]
 point = "manifest_rename_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::manifest_v2_rename_fail_keeps_old_unit"
 expect = "unit-resolves"
 
 [[row]]
 point = "dir_fsync_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::manifest_v2_dir_fsync_crash_resolves_new_unit"
 expect = "unit-resolves"
 
 [[row]]
 point = "tier_torn_frame"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::tier_torn_frame_reseal_from_manifest_v2"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "tier_fsync_err"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::tier_fsync_frozen_watermark_bounds_manifest"
 expect = "fail-stop"
 
 # ---- M4-S15 copy-forward windows (ADR-0057 D8's sixth window +
@@ -154,19 +155,19 @@ expect = "fail-stop"
 [[row]]
 point = "manifest_rename_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_covering_swap_abort_serves_from_prior_unit"
 expect = "serves-from-prior-unit"
 
 [[row]]
 point = "dir_fsync_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims"
 expect = "unit-resolves"
 
 [[row]]
 point = "tier_unlink_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_unlink_failure_is_nonfatal_and_redriven"
 expect = "reclaim-deferred-nonfatal"
 
 # Review 2026-08-30, F-L01-02: a tier-file creation refused at its
@@ -176,7 +177,7 @@ expect = "reclaim-deferred-nonfatal"
 [[row]]
 point = "tier_dir_open_fail"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
 expect = "creation-retried-round-owned"
 
 # ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
@@ -184,13 +185,13 @@ expect = "creation-retried-round-owned"
 [[row]]
 point = "blob_short_write"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_faults_abandon_the_extent_typed"
 expect = "blob-write-fails-typed"
 
 [[row]]
 point = "blob_fsync_err"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_faults_abandon_the_extent_typed"
 expect = "blob-write-fails-typed"
 
 # The AC1 ordering cut rides the fsync-abort point's row pair: the
@@ -200,13 +201,13 @@ expect = "blob-write-fails-typed"
 [[row]]
 point = "blob_fsync_err"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves"
 expect = "orphan-reclaimed-never-served"
 
 [[row]]
 point = "blob_unlink_fail"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims"
 expect = "reclaim-deferred-nonfatal"
 
 # ---- M4-S21 ENOSPC windows (ADR-0063 D4) ----
@@ -214,7 +215,7 @@ expect = "reclaim-deferred-nonfatal"
 [[row]]
 point = "tier_write_nospace"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_write_nospace_diskfull_typed_then_automatic_recovery"
 expect = "diskfull-typed-then-automatic-recovery"
 
 # Kill mid-exhaustion: the file recovers valid exactly to the
@@ -223,13 +224,13 @@ expect = "diskfull-typed-then-automatic-recovery"
 [[row]]
 point = "tier_write_nospace"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_write_nospace_kill_recovers_at_watermark"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "blob_write_nospace"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_nospace_fails_typed_and_next_attempt_recovers"
 expect = "blob-write-fails-typed"
 
 # ---- M4.5-S31 reactor-drive cut windows (ADR-0084 D4) ----
@@ -255,13 +256,13 @@ expect = "blob-write-fails-typed"
 [[row]]
 point = "torn_frame"
 tier = "node"
-test = "fua.rs"
+test = "crash-matrix::fua::fua_in_flight_loses_only_the_unacked_frame"
 expect = "fua-in-flight"
 
 [[row]]
 point = "power_cut_after_seal"
 tier = "node"
-test = "fua.rs"
+test = "crash-matrix::fua::seal_flush_in_flight_keeps_later_fua_frames_unacked"
 expect = "seal-flush-x-fua"
 
 # ---- M4.5-S35 bounded frame pipeline (ADR-0087 D6/D7) — sim-disk
@@ -280,13 +281,13 @@ expect = "seal-flush-x-fua"
 [[row]]
 point = "power_cut_after_seal"
 tier = "node"
-test = "fua.rs"
+test = "crash-matrix::fua::plain_tail_behind_a_pending_seal_truncates_instead_of_refusing"
 expect = "seal-flush-x-fua-plain-tail"
 
 [[row]]
 point = "torn_frame"
 tier = "node"
-test = "fua.rs"
+test = "crash-matrix::fua::later_frame_durable_earlier_torn_acks_nothing_and_truncates_at_the_first"
 expect = "pipeline-later-durable-earlier-torn"
 
 # ---- Review row (ADR-0086 D4 as amended, 2026-08-21) — the FLUSH → FUA
@@ -301,7 +302,7 @@ expect = "pipeline-later-durable-earlier-torn"
 [[row]]
 point = "torn_frame"
 tier = "node"
-test = "fua.rs"
+test = "crash-matrix::fua::flush_to_fua_transition_keeps_every_acked_record"
 expect = "flush-to-fua-packed-tail"
 
 # ---- M4.5-S36 `.ick` container v3 (ADR-0088 D3/D8) — the aligned,
@@ -322,23 +323,23 @@ expect = "flush-to-fua-packed-tail"
 [[row]]
 point = "power_cut_after_seal"
 tier = "node"
-test = "ickv3.rs"
+test = "crash-matrix::ickv3::v3_named_unit_loads_and_the_tail_replays_over_it"
 expect = "v3-named-unit-loads"
 
 [[row]]
 point = "torn_frame"
 tier = "node"
-test = "ickv3.rs"
+test = "crash-matrix::ickv3::v3_mid_section_orphan_is_collected_and_the_old_unit_loads"
 expect = "v3-mid-section-orphan"
 
 [[row]]
 point = "manifest_rename_fail"
 tier = "node"
-test = "ickv3.rs"
+test = "crash-matrix::ickv3::v3_footer_complete_orphan_without_a_manifest_never_loads"
 expect = "v3-footer-before-fdatasync"
 
 [[row]]
 point = "torn_frame"
 tier = "node"
-test = "ickv3.rs"
+test = "crash-matrix::ickv3::v3_named_unit_with_damaged_padding_fail_stops"
 expect = "v3-named-unit-damaged-padding"

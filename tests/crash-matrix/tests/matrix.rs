@@ -1,7 +1,7 @@
 //! M2-S17 crash-matrix runner (ADR-0020): executes every MemFs-tier row
 //! of `m2.toml` — {fault point} × {fsync policy} × {workload} × seed —
 //! as inject → crash (kill) → recover → verify. Node-tier rows are
-//! counted for coverage and carried by their named test (fsyncgate).
+//! executed separately with fresh assertion receipts (ADR-0020 amendment).
 //!
 //! Per run: the point must fire (a vacuous row fails), the injection's
 //! documented semantics must be observed, the recovered digest must
@@ -23,10 +23,6 @@ use inf_store::FsyncClass;
 
 fn matrix_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("m2.toml")
-}
-
-fn seed_count(default: u64) -> u64 {
-    std::env::var("CRASH_MATRIX_SEEDS").ok().and_then(|value| value.parse().ok()).unwrap_or(default)
 }
 
 /// Every declared fault point must appear in the matrix (the §6 "every
@@ -51,33 +47,73 @@ fn every_declared_point_has_a_matrix_row() {
         .chain(inf_store::fault::ALL)
         .copied()
         .collect();
-    for point in declared {
+    for point in &declared {
         assert!(
-            def.rows.iter().any(|row| row.point == point),
+            def.rows.iter().any(|row| row.point == *point),
             "fault point {point:?} has no crash-matrix row (tests/crash-matrix/m2.toml + m4.toml + \
                  m45.toml)"
         );
     }
     for row in &def.rows {
+        assert!(declared.contains(&row.point.as_str()), "undeclared fault point: {row:?}");
         match row.tier.as_str() {
             "memfs" => {
                 assert!(!row.policies.is_empty(), "row {:?}: no policies", row.point);
                 assert!(!row.workloads.is_empty(), "row {:?}: no workloads", row.point);
             }
-            "node" => assert!(
-                !row.test.is_empty(),
-                "node-tier row {:?} must name its carrying test",
-                row.point
-            ),
+            "node" => {
+                assert_eq!(row.test.splitn(3, "::").count(), 3, "exact carrier: {row:?}");
+                assert!(matches!(row.platform.as_str(), "" | "all" | "linux"));
+            }
             other => panic!("row {:?}: unknown tier {other:?}", row.point),
         }
     }
 }
 
 #[test]
+fn node_rows_execute_and_prove_their_verdicts() {
+    let executable = std::env::current_exe().expect("test executable");
+    let profile_dir = executable.parent().expect("deps").parent().expect("profile");
+    let profile = profile_dir.file_name().expect("profile name").to_str().expect("UTF-8");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("run_node_rows.py");
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .args(["--cargo", env!("CARGO"), "--profile"])
+        .arg(if profile == "debug" { "test" } else { profile })
+        .arg("--target-dir")
+        .arg(profile_dir.parent().expect("target directory"))
+        .status()
+        .expect("run node crash matrix (requires Python 3.11+)");
+    assert!(status.success(), "node crash rows were not proved by their carrying tests");
+}
+
+#[test]
+fn node_receipt_gate_rejects_planted_carriers() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_node_rows.py");
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .status()
+        .expect("run receipt gate regressions");
+    assert!(status.success(), "node receipt gate accepted a planted false green");
+}
+
+#[test]
+fn seed_override_cannot_make_a_row_vacuous() {
+    for value in ["0", "", "invalid"] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "matrix_kill_and_recover", "--nocapture"])
+            .env("CRASH_MATRIX_SEEDS", value)
+            .output()
+            .expect("run seed override child");
+        assert!(!output.status.success(), "invalid seed count {value:?} passed");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("CRASH_MATRIX_SEEDS"));
+    }
+}
+
+#[test]
 fn matrix_kill_and_recover() {
     let def = load_matrix(&matrix_path());
-    let seeds = seed_count(def.seeds);
+    let seeds = crash_matrix::seed_count(def.seeds);
     let mut runs = 0u64;
     for (row_idx, row) in def.rows.iter().enumerate() {
         if row.tier != "memfs" {

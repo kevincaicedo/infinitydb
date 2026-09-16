@@ -12,9 +12,11 @@
 //! therefore never land under the watermark; these tests assert the
 //! recovery half of that pair.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::Path;
 
-use crash_matrix::load_matrix;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
@@ -30,10 +32,6 @@ use inf_store::{AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, Store
 
 const NS: NsId = NsId(21);
 const PAGE: u64 = 4 << 10;
-
-fn seed_count(default: u64) -> u64 {
-    std::env::var("CRASH_MATRIX_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 fn identity() -> TierIdentity {
     TierIdentity { cell: 0, ns: NS, base: LogicalAddr::ZERO }
@@ -109,6 +107,7 @@ fn tier_short_write_append_fails_typed() {
     assert_eq!(table.space().flushed(), flushed_before, "watermark unmoved on failure");
     assert!(fault::fired("tier_short_write") >= 1, "the row is not vacuous");
     fault::disarm_all();
+    receipt::verified("tier_short_write", "append-fails-typed");
 }
 
 /// `tier_torn_frame` — a prefix lands and the call SUCCEEDS (lying-disk
@@ -117,7 +116,7 @@ fn tier_short_write_append_fails_typed() {
 /// `Recovered` (`reseal-at-watermark`). Seeds vary which append tears.
 #[test]
 fn tier_torn_frame_reseal_at_watermark() {
-    for seed in 0..seed_count(3) {
+    for seed in 0..crash_matrix::seed_count(3) {
         let fs = MemFs::new();
         let mut w = writer(&fs, 0);
         // Manifested prefix: three full frames, synced — the claim rule
@@ -175,6 +174,7 @@ fn tier_torn_frame_reseal_at_watermark() {
             "torn/un-manifested frames are gone"
         );
     }
+    receipt::verified("tier_torn_frame", "reseal-at-watermark");
 }
 
 /// `tier_fsync_err` — the barrier fails: the fatal typed class surfaces,
@@ -200,6 +200,7 @@ fn tier_fsync_err_fail_stop() {
     assert_eq!(table.space().flushed(), frozen, "watermark frozen at the last good barrier");
     assert!(fault::fired("tier_fsync_err") >= 1, "the row is not vacuous");
     fault::disarm_all();
+    receipt::verified("tier_fsync_err", "fail-stop");
 }
 
 /// `tier_footer_torn` — crash between data durability and footer
@@ -245,6 +246,7 @@ fn tier_footer_torn_reseal_at_watermark() {
     assert_eq!(footer.data_len, manifested);
     assert_eq!(footer.reason, SealReason::Recovered);
     assert_eq!(summary.first_bad_frame, None);
+    receipt::verified("tier_footer_torn", "reseal-at-watermark");
 }
 
 /// `tier_write_nospace` — the M4-S21 ENOSPC row
@@ -292,6 +294,7 @@ fn tier_write_nospace_diskfull_typed_then_automatic_recovery() {
     let ro = table.space().ro_boundary().to_raw();
     table.flush_drain(&mut flush).expect("drain");
     assert_eq!(table.space().flushed().to_raw(), ro, "the whole backlog became durable");
+    receipt::verified("tier_write_nospace", "diskfull-typed-then-automatic-recovery");
 }
 
 /// `tier_write_nospace` — the kill-mid-exhaustion row
@@ -301,7 +304,7 @@ fn tier_write_nospace_diskfull_typed_then_automatic_recovery() {
 /// standing D5 contract.
 #[test]
 fn tier_write_nospace_kill_recovers_at_watermark() {
-    for seed in 0..seed_count(3) {
+    for seed in 0..crash_matrix::seed_count(3) {
         let fs = MemFs::new();
         let mut w = writer(&fs, 0);
         let manifested = 3 * TIER_FRAME_DATA as u64;
@@ -342,6 +345,7 @@ fn tier_write_nospace_kill_recovers_at_watermark() {
         assert_eq!(footer.reason, SealReason::Recovered);
         assert_eq!(summary.first_bad_frame, None, "every retained frame verifies");
     }
+    receipt::verified("tier_write_nospace", "reseal-at-watermark");
 }
 
 // ---- M4.5-S31 reactor-drive cut windows (ADR-0084 D4) ----
@@ -417,7 +421,7 @@ fn sim_image(disk: &SimDisk, path: &Path) -> Vec<u8> {
 /// and `sync_data()`).
 #[test]
 fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
-    for seed in 0..seed_count(3) {
+    for seed in 0..crash_matrix::seed_count(3) {
         let disk = SimDisk::new();
         let mut flush = reactor_pipeline(&disk);
         // Round 1 completes whole: two full frames + a partial tail are
@@ -471,7 +475,7 @@ fn reactor_seal_barrier_lost_reseals_at_the_manifested_watermark() {
 /// retry then creates B.
 #[test]
 fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
-    for seed in 0..seed_count(3) {
+    for seed in 0..crash_matrix::seed_count(3) {
         let disk = SimDisk::new();
         let mut flush = TierFlush::new(
             disk.clone(),
@@ -519,6 +523,7 @@ fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
         assert_eq!(flush.active().map(|(id, ..)| id), Some(1));
         fault::disarm_all();
     }
+    receipt::verified("tier_dir_open_fail", "creation-retried-round-owned");
 }
 
 /// Window 2: the seal **completed** (footer durable, catalog committed)
@@ -591,34 +596,4 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
         manifested,
         "the new life starts at the manifested watermark"
     );
-}
-
-/// The m4.toml definition itself stays well-formed and every row names
-/// a carrying test file (self-policing, the m2 pattern; S12's rows are
-/// carried by `recovery_v2.rs`, M4.5-S34/S35's by `fua.rs`, M4.5-S36's
-/// by `ickv3.rs`, F-L04-14's Direct-mode rows by `tier_direct.rs` —
-/// each polices its own subset).
-#[test]
-fn m4_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    assert!(def.rows.len() >= 11);
-    for row in &def.rows {
-        assert_eq!(row.tier, "node", "tier rows are carried by a named test");
-        assert!(
-            row.test == "tier.rs"
-                || row.test == "recovery_v2.rs"
-                || row.test == "blob.rs"
-                || row.test == "fua.rs"
-                || row.test == "ickv3.rs"
-                || row.test == "tier_direct.rs",
-            "row {:?} names an unknown carrier {:?}",
-            row.point,
-            row.test
-        );
-        assert!(
-            inf_log::fault::ALL.contains(&row.point.as_str()),
-            "row {:?} names a declared point",
-            row.point
-        );
-    }
 }

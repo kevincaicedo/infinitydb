@@ -161,7 +161,7 @@ fn connect_external(addr: &str) -> TcpStream {
     stream
 }
 
-fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
+fn spawn_redis() -> (ProcessGuard, TcpStream) {
     let port = reserve_port();
     // A scratch working directory per oracle (found 2026-09-01 while
     // building the node lane): the matrix's `BGSAVE` case makes the
@@ -170,7 +170,7 @@ fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
     // key (`oomk`) shifted every later DBSIZE by one. An oracle must
     // not be able to leave state for its successor.
     let dir = std::env::temp_dir().join(format!("inf-compat-oracle-{port}"));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir).expect("create Redis oracle scratch directory");
     let child = Command::new("redis-server")
         .args([
             "--port",
@@ -188,10 +188,19 @@ fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let guard = ProcessGuard { child, scratch: Some(dir), log: None };
+        .unwrap_or_else(|error| {
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!(
+                "cannot start redis-server: {error}; compat requires Redis {ORACLE_VERSION} \
+                 on PATH or INF_COMPAT_ORACLE_ADDR pointing to that version"
+            );
+        });
+    let mut guard = ProcessGuard { child, scratch: Some(dir), log: None };
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = loop {
+        if let Some(status) = guard.child.try_wait().expect("poll Redis oracle") {
+            panic!("redis-server exited before readiness: {status}");
+        }
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(s) => break s,
             Err(_) if Instant::now() < deadline => {
@@ -204,7 +213,7 @@ fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
         }
     };
     stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
-    Some((guard, stream))
+    (guard, stream)
 }
 
 /// The Redis the matrix is pinned to (`diff.rs`, matrixgen): every
@@ -214,14 +223,12 @@ fn spawn_redis() -> Option<(ProcessGuard, TcpStream)> {
 pub const ORACLE_VERSION: &str = "8.0.5";
 
 /// The redis oracle: `INF_COMPAT_ORACLE_ADDR` when pinned (CI), else a
-/// throwaway spawn from PATH. `None` means no *valid* oracle — not
-/// installed, or a version other than [`ORACLE_VERSION`] on PATH (batch
-/// 70) — and this prints why; the caller adds the loud SKIP marker. A
-/// pinned address of the wrong version panics: it was asked for.
+/// throwaway spawn from PATH. Every caller requires a valid oracle;
+/// missing or wrong-version Redis must never produce a passing test.
 ///
 /// # Panics
-/// `INF_COMPAT_ORACLE_ADDR` names a Redis of another version.
-pub fn oracle() -> Option<(Option<ProcessGuard>, TcpStream)> {
+/// Redis is unavailable, its version differs, or the address is invalid.
+pub fn oracle() -> (Option<ProcessGuard>, TcpStream) {
     match std::env::var("INF_COMPAT_ORACLE_ADDR") {
         Ok(addr) => {
             let mut stream = connect_external(&addr);
@@ -231,21 +238,19 @@ pub fn oracle() -> Option<(Option<ProcessGuard>, TcpStream)> {
                 "INF_COMPAT_ORACLE_ADDR={addr} is redis {version:?}; the matrix is pinned to \
                  {ORACLE_VERSION}"
             );
-            Some((None, stream))
+            (None, stream)
         }
-        Err(_) => {
-            let (guard, mut stream) = spawn_redis()?;
+        Err(std::env::VarError::NotPresent) => {
+            let (guard, mut stream) = spawn_redis();
             let version = redis_version(&mut stream).unwrap_or_default();
-            if version != ORACLE_VERSION {
-                eprintln!(
-                    "SKIPPED: redis-server on PATH is {version:?}, not the pinned oracle \
-                     {ORACLE_VERSION} — its rows would measure Redis, not the node; point \
-                     INF_COMPAT_ORACLE_ADDR at a {ORACLE_VERSION} instance"
-                );
-                return None;
-            }
-            Some((Some(guard), stream))
+            assert!(
+                version == ORACLE_VERSION,
+                "redis-server on PATH is {version:?}; compat requires Redis {ORACLE_VERSION}; \
+                 point INF_COMPAT_ORACLE_ADDR at that version"
+            );
+            (Some(guard), stream)
         }
+        Err(error) => panic!("invalid INF_COMPAT_ORACLE_ADDR: {error}"),
     }
 }
 

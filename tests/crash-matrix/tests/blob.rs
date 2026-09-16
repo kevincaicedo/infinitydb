@@ -16,6 +16,9 @@
 //!   and re-offered; the file outlives the failure, disk returns on the
 //!   retry, and a crash instead of a retry hands it to the boot sweep.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
@@ -32,7 +35,6 @@ use inf_store::{
     apply_blob_ref_section, apply_live_set_section, apply_ref_section, recover_tiered_ns,
 };
 
-use crash_matrix::load_matrix;
 use inf_store::KeyHasher;
 
 const NS: NsId = NsId(29);
@@ -163,6 +165,8 @@ fn blob_write_faults_abandon_the_extent_typed() {
         inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("listing").is_empty(),
         "debris reclaimed after its second verdict"
     );
+    receipt::verified("blob_short_write", "blob-write-fails-typed");
+    receipt::verified("blob_fsync_err", "blob-write-fails-typed");
 }
 
 /// One boot's disposal drain, dispatched exactly as the plane's reclaim
@@ -264,6 +268,7 @@ fn blob_write_nospace_fails_typed_and_next_attempt_recovers() {
         inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("listing").is_empty(),
         "the refused extent's debris reclaimed"
     );
+    receipt::verified("blob_write_nospace", "blob-write-fails-typed");
 }
 
 /// Row: `blob_fsync_err` → orphan-reclaimed-never-served — the AC1 cut.
@@ -492,6 +497,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("listing").is_empty(),
         "the second verdict reclaimed the orphan's twin"
     );
+    receipt::verified("blob_fsync_err", "orphan-reclaimed-never-served");
 }
 
 /// Row: `blob_unlink_fail` → reclaim-deferred-nonfatal. The failure is
@@ -545,26 +551,5 @@ fn blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims() {
     unlink_extent_file(&fs, Path::new(SHARD), ExtentId(id)).expect("retry succeeds");
     t.extent_reclaim_done(id);
     assert_eq!(list_extent_ids(&fs, Path::new(SHARD)).expect("listing"), Vec::<ExtentId>::new());
-}
-
-/// The S17 + S21 blob rows are well-formed and carried here
-/// (self-policing).
-#[test]
-fn s17_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    let here: Vec<_> = def.rows.iter().filter(|r| r.test == "blob.rs").collect();
-    assert_eq!(here.len(), 5, "the four S17 rows plus the S21 ENOSPC row are declared");
-    for row in &here {
-        assert_eq!(row.tier, "node");
-        assert!(
-            inf_log::fault::ALL.contains(&row.point.as_str()),
-            "row {:?} names a declared point",
-            row.point
-        );
-    }
-    for expect in
-        ["blob-write-fails-typed", "orphan-reclaimed-never-served", "reclaim-deferred-nonfatal"]
-    {
-        assert!(here.iter().any(|r| r.expect == expect), "the {expect} verdict is carried");
-    }
+    receipt::verified("blob_unlink_fail", "reclaim-deferred-nonfatal");
 }

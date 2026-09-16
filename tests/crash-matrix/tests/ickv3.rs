@@ -19,6 +19,9 @@
 //!   every padding byte as zero; anything else is damage the reader must
 //!   not step over.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::{Path, PathBuf};
 
 use inf_foundation::KeyHasher;
@@ -166,6 +169,7 @@ fn v3_named_unit_loads_and_the_tail_replays_over_it() {
         let want = value_of(i, if i < 25 { 2 } else { 1 });
         assert_eq!(get(&mut ks, &key_of(i)), Some(want), "key {i}");
     }
+    receipt::verified("power_cut_after_seal", "v3-named-unit-loads");
 }
 
 #[test]
@@ -191,6 +195,7 @@ fn v3_mid_section_orphan_is_collected_and_the_old_unit_loads() {
     assert!(!names.iter().any(|n| n.ends_with(".ick.new")), "no orphan survives boot");
     assert_eq!(get(&mut ks, &key_of(KEYS - 1)), Some(value_of(KEYS - 1, 1)));
     assert_eq!(get(&mut ks, &key_of(0)), Some(value_of(0, 2)), "the tail replayed");
+    receipt::verified("torn_frame", "v3-mid-section-orphan");
 }
 
 #[test]
@@ -217,6 +222,7 @@ fn v3_footer_complete_orphan_without_a_manifest_never_loads() {
     assert_eq!(get(&mut ks, &key_of(0)), None, "an unnamed unit contributes nothing");
     let names = fs.list_dir(&ckpt_dir).expect("dir");
     assert!(!names.iter().any(|n| n.ends_with(".ick.new")));
+    receipt::verified("manifest_rename_fail", "v3-footer-before-fdatasync");
 }
 
 #[test]
@@ -241,4 +247,5 @@ fn v3_named_unit_with_damaged_padding_fail_stops() {
         .expect_err("a named unit with non-zero padding is corruption");
     let text = err.to_string();
     assert!(text.contains("Padding"), "typed refusal names the padding: {text}");
+    receipt::verified("torn_frame", "v3-named-unit-damaged-padding");
 }

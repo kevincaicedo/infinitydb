@@ -1027,8 +1027,11 @@ per episode). A drained cell always seals — never slower than K = 1.
   declared point must be fired in library code AND exercised by ≥ 1
   test (crate `tests/` trees or workspace test crates under `tests/*`) —
   an unexercised point fails the build. The M2-S17 crash matrix
-  (`tests/crash-matrix/m2.toml`) additionally requires a matrix row per
-  point (runner-enforced). The M2-S18 sim disk consumes the same
+  (`tests/crash-matrix/{m2,m4,m45}.toml`) additionally requires a matrix
+  row per point (runner-enforced). Node rows name an exact
+  `package::target::test_function`; the runner executes it and requires
+  a fresh point/verdict receipt after its assertions (ADR-0020 amendment,
+  F-L19-13). Missing, ignored and empty carriers fail. The M2-S18 sim disk consumes the same
   registry for power-cut scheduling (arm a point → observe the typed
   error → `cut_after_ops`/`power_cut`); reactor-tier write/fsync
   failures are injected by the ScriptedDriver, the sim disk's dead

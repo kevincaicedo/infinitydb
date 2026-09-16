@@ -67,7 +67,7 @@ deny:
 loom:
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-fabric --release loom_
 
-# Compat-diff vs real redis-server (requires redis-server on PATH).
+# Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR.
 compat:
     cargo build -p infinityd
     INF_COMPAT_REQUIRE_BINARY=1 INFINITYD_BIN={{justfile_directory()}}/target/debug/infinityd cargo test -p compat -- --nocapture

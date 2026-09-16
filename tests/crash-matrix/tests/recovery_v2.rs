@@ -24,9 +24,11 @@
 //!   is typed, counted, and re-driven (retry and boot GC alike); the
 //!   one deliberate non-fail-stop posture in the tier pipeline.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::Path;
 
-use crash_matrix::load_matrix;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
@@ -213,6 +215,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
         "exactly the manifested files survive: {survivors:?}"
     );
     assert!(recovered.stats.files_removed > 0, "the window actually created garbage");
+    receipt::verified("manifest_rename_fail", "unit-resolves");
 }
 
 /// `dir_fsync_fail` at the epoch-2 swap's step 6 — the checkpoint ↔
@@ -272,6 +275,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
     }
+    receipt::verified("dir_fsync_fail", "unit-resolves");
 }
 
 /// `tier_torn_frame` driven end-to-end through MANIFEST v2 — the
@@ -357,6 +361,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
     .expect("recovery is idempotent");
     assert_eq!(again.stats.files_resealed, 0, "second boot takes the sealed fast path");
     assert_eq!(again.stats.files_removed, 0);
+    receipt::verified("tier_torn_frame", "reseal-at-watermark");
 }
 
 /// `tier_fsync_err` with a published unit — the fatal class freezes the
@@ -386,6 +391,7 @@ fn tier_fsync_frozen_watermark_bounds_manifest() {
         section.files.iter().all(|f| f.end() <= frozen),
         "no manifested range outruns the frozen watermark"
     );
+    receipt::verified("tier_fsync_err", "fail-stop");
 }
 
 /// Deletes a fraction of file 0's cold records through the live path
@@ -518,6 +524,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
             range.id
         );
     }
+    receipt::verified("manifest_rename_fail", "serves-from-prior-unit");
 }
 
 /// The sixth window, landed half (`dir_fsync_fail` over the covering
@@ -582,6 +589,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
     }
+    receipt::verified("dir_fsync_fail", "unit-resolves");
 }
 
 /// `tier_unlink_fail` (`reclaim-deferred-nonfatal`): the unlink of a
@@ -621,37 +629,5 @@ fn s15_unlink_failure_is_nonfatal_and_redriven() {
     // Re-drive 2: a crash before any retry — boot GC (the manifest no
     // longer names the file, ADR-0057 D6-1) — is proven by
     // `s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims`.
-}
-
-/// The S15 rows are well-formed and carried here (self-policing).
-#[test]
-fn s15_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    let expects = ["serves-from-prior-unit", "reclaim-deferred-nonfatal"];
-    for expect in expects {
-        assert!(
-            def.rows.iter().any(|r| r.test == "recovery_v2.rs" && r.expect == expect),
-            "the {expect} row is declared"
-        );
-    }
-    assert!(
-        def.rows.iter().any(|r| r.point == "tier_unlink_fail"),
-        "the new fault point has its row"
-    );
-}
-
-/// The S12 rows are well-formed and carried here (self-policing).
-#[test]
-fn s12_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    let here: Vec<_> = def.rows.iter().filter(|r| r.test == "recovery_v2.rs").collect();
-    assert!(here.len() >= 3, "the S12 windows have rows");
-    for row in here {
-        assert_eq!(row.tier, "node");
-        assert!(
-            inf_log::fault::ALL.contains(&row.point.as_str()),
-            "row {:?} names a declared point",
-            row.point
-        );
-    }
+    receipt::verified("tier_unlink_fail", "reclaim-deferred-nonfatal");
 }

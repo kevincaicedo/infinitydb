@@ -3,8 +3,8 @@
 //!
 //! Spawns a throwaway `redis-server` (no persistence) as the oracle and the
 //! in-process executor as the candidate, runs the scripted matrix on both,
-//! and diffs raw reply bytes per the case's `Check` mode. Skips (with a loud
-//! marker) when `redis-server` is not installed.
+//! and diffs raw reply bytes per the case's `Check` mode. Missing or invalid
+//! Redis fails the test (F-L19-11).
 //!
 //! Oracle pinning (M1-S14): when `INF_COMPAT_ORACLE_ADDR=host:port` is set,
 //! the harness connects to that server instead of spawning one — CI runs the
@@ -23,10 +23,7 @@ use compat::matrix::MATRIX;
 
 #[test]
 fn matrix_replies_match_redis() {
-    let Some((_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_guard, mut oracle) = oracle();
     let mut candidate = Candidate::new();
     let report = run_matrix(MATRIX, &mut oracle, &[], |wire, _frames| candidate.execute_wire(wire));
 
@@ -52,10 +49,7 @@ fn matrix_replies_match_redis() {
 fn a_lying_enumeration_is_caught_by_the_set_checks() {
     use compat::harness::{parse_bulk_array, parse_scan};
     use compat::matrix::{Case, Check};
-    let Some((_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_guard, mut oracle) = oracle();
     // Seed both engines with the same keys through the honest prefix.
     let matrix = [
         Case { argv: &["SET", "s:1", "v"], check: Check::ByteExact },

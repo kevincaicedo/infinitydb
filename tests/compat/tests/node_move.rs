@@ -16,10 +16,7 @@ fn cross_cell_rename_stats_match_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — H3 INFO counters not run");
         return;
     };
-    let Some((_oracle_guard, mut redis)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — H3 INFO counters not run");
-        return;
-    };
+    let (_oracle_guard, mut redis) = oracle();
     let peer = other_cell_connection(&mut node);
     for node in &mut [node, peer] {
         let owner = connection_cell(node);

@@ -37,11 +37,25 @@ just compat
 just sim-smoke
 ```
 
-`just compat` requires `redis-server` on PATH and requires a real InfinityDB
-binary. Full reference checks may need additional tools or pinned oracle
+`just check`, workspace tests and `just compat` require Redis **8.0.5** on
+PATH or `INF_COMPAT_ORACLE_ADDR` pointing to that version. An absent,
+broken or wrong-version oracle fails; there is no successful skip. The
+compat corpus changes `maxclients` to 20,000, so raise the shell's soft
+file-descriptor limit if necessary (`ulimit -n 65536`). `just compat`
+also requires the real InfinityDB binary it builds. CI's build matrix
+explicitly excludes the compat package; the separate `compat-diff` job
+executes it with pinned oracles. Full reference checks may need additional tools or pinned oracle
 images; see [CONTRIBUTING](../CONTRIBUTING.md). A local prerequisite failure
 is not a passing gate. Workloads and required sweep sizes remain those of the
 owning gate; a smoke run does not discharge a full campaign.
+
+`cargo test -p crash-matrix` requires Python 3.11+ and runs every node row
+in `m2.toml`, `m4.toml` and `m45.toml` by exact package/target/function.
+Each invocation must pass one non-ignored test and emit its point/verdict
+receipt after the assertions. Missing, ignored or empty carriers and
+invented verdicts fail. Cargo resolves current test binaries offline;
+receipts live only in captured child output. Linux reactor rows are
+explicitly unsupported on other hosts and must pass on Linux CI.
 
 Run the smallest relevant check while developing, then the required suite:
 

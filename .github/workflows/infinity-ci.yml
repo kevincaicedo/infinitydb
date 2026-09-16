@@ -92,8 +92,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build
         run: cargo build --workspace
-      - name: test
-        run: cargo test --workspace
+      - name: test (compat runs with its pinned oracles in compat-diff)
+        run: cargo test --workspace --exclude compat
 
   cargo-deny:
     runs-on: ubuntu-24.04

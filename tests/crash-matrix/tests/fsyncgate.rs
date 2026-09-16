@@ -25,6 +25,9 @@
 //! writes; the tier where those bytes vanish is the M2-S18 sim disk.
 #![cfg(target_os = "linux")]
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
@@ -284,4 +287,5 @@ fn fsyncgate_fail_stop() {
         handle.join().expect("cell thread");
     }
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("durable_fsync_eio", "fail-stop");
 }

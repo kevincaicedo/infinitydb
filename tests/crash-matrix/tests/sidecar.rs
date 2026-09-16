@@ -18,6 +18,9 @@
 //!   proceeds (soft class), the damaged index rebuilds, its neighbor
 //!   loads, and the damage is counted (L10).
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -471,4 +474,5 @@ fn a_tail_trip_turns_the_load_into_a_rebuild() {
         assert_eq!(ks.idx_degraded(NS, IndexId(id)), Some(false));
         assert_tree_matches_store(&ks, id, path, key_type);
     }
+    receipt::verified("idx_apply_trip", "degraded-tail-rebuilds");
 }

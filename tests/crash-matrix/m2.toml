@@ -74,7 +74,7 @@ expect = "clean"
 [[row]]
 point = "recycle_open_fail"
 tier = "node"
-test = "segment_recycle"
+test = "inf-log::segment_recycle::a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor"
 expect = "fresh-fallback"
 
 # dir-fsync barrier at the MANIFEST envelope swap (publication site).
@@ -98,7 +98,8 @@ expect = "unit-resolves"
 [[row]]
 point = "durable_fsync_eio"
 tier = "node"
-test = "fsyncgate"
+platform = "linux"
+test = "crash-matrix::fsyncgate::fsyncgate_fail_stop"
 expect = "fail-stop"
 # M4.5-S37 (ADR-0093 D4.3/A3/A8): a shadow twin's cold read fails while
 # a ticket is open. Carried by `tests/shadow_open_tickets.rs` (the
@@ -111,7 +112,7 @@ expect = "fail-stop"
 [[row]]
 point = "shadow_twin_read_fail"
 tier = "node"
-test = "shadow_open_tickets"
+test = "crash-matrix::shadow_open_tickets::open_ticket_rows_hold_every_plane_path_with_tickets_open"
 expect = "dbsize-typed-error"
 # Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): the
 # reconciler's twin reads fail while `DBSIZE`'s and `DEL`'s succeed, so a
@@ -126,7 +127,8 @@ expect = "dbsize-typed-error"
 [[row]]
 point = "shadow_reconcile_read_fail"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket"
 expect = "del-drains-every-ticket"
 # Review of 2026-08-30 (C2′ / F-L06-02, F-L06-04): the ColdReads enqueue
 # refuses QueueFull — the deterministic stand-in for a saturated cold
@@ -143,7 +145,8 @@ expect = "del-drains-every-ticket"
 [[row]]
 point = "cold_enqueue_full"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_cold_read_failure_is_typed_for_every_read_command"
 expect = "read-typed-error"
 # Review of 2026-08-30 (H2 / F-L17-11, ADR-0098): a multi-key write
 # applies a prefix and then fails mid-way (the deterministic stand-in
@@ -160,7 +163,8 @@ expect = "read-typed-error"
 [[row]]
 point = "mset_midway_oom"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::durable_mset_midway_failure_stages_what_it_wrote"
 expect = "staged-prefix"
 # Review of 2026-08-30 (C13 / F-L14-04, ADR-0100): `INF.NS DROP` of a
 # tiered namespace — the two windows a power cut can land in. Both
@@ -181,13 +185,15 @@ expect = "staged-prefix"
 [[row]]
 point = "ns_drop_before_meta"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::dropped_tiered_namespace_survives_a_cut_before_its_swap"
 expect = "namespace-restored-whole"
 
 [[row]]
 point = "ns_drop_after_meta"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::dropped_tiered_namespace_survives_a_cut_after_its_swap"
 expect = "residue-swept"
 
 # ADR-0103 D5 (`created_namespace_survives_a_cut_after_its_swap`): the
@@ -200,7 +206,8 @@ expect = "residue-swept"
 [[row]]
 point = "ns_create_after_meta"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::created_namespace_survives_a_cut_after_its_swap"
 expect = "namespace-seeded-from-meta"
 # ADR-0108 D3 (review 2026-08-30, the batch-8 partial-fan residual): a
 # peer refuses its CREATE leg after the catalog swap — the origin rolls
@@ -209,5 +216,13 @@ expect = "namespace-seeded-from-meta"
 [[row]]
 point = "ns_create_fan_refused"
 tier = "node"
-test = "node_e2e"
+platform = "linux"
+test = "inf-server::node_e2e::create_with_a_refused_fan_leg_rolls_back_on_every_cell"
 expect = "create-rolled-back"
+
+[[row]]
+point = "mset_midway_oom"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::durable_mset_midway_failure_stages_on_the_fabric_path"
+expect = "staged-prefix"

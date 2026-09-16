@@ -20,10 +20,7 @@ fn internal_commands_are_unknown_to_clients_at_the_binary() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — internal-command lane not run");
         return;
     };
-    let Some((_oracle_guard, mut redis)) = oracle() else {
-        eprintln!("SKIPPED: redis-server not installed — internal-command lane not run");
-        return;
-    };
+    let (_oracle_guard, mut redis) = oracle();
     let mut failures = Vec::new();
     let mut compare = |label: &str, argv: &[&[u8]], node: &mut TcpStream, redis: &mut TcpStream| {
         let want = call(redis, argv);

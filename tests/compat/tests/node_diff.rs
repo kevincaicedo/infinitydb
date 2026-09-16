@@ -59,10 +59,7 @@ fn node_matrix_replies_match_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let mut node_buf = Vec::new();
     let report = run_matrix(MATRIX, &mut oracle, NODE_OVERRIDES, |wire, frames| {
         node.write_all(wire).expect("node write");
@@ -308,10 +305,7 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     let mut failures: Vec<String> = Vec::new();
 
@@ -412,10 +406,7 @@ fn large_values_match_redis_up_to_the_bulk_cap() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let mut nb = Vec::new();
     let mut ob = Vec::new();
     let mut failures = Vec::new();
@@ -534,10 +525,7 @@ fn quit_closes_a_namespace_bound_connection_like_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     for preamble in
         [&["INF.NS", "CREATE", "cache", "MODE", "memory"][..], &["INF.NS", "USE", "cache"][..]]
@@ -576,10 +564,7 @@ fn info_unknown_section_is_empty_like_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     let o = cmd(&mut oracle, &mut ob, &["INFO", "nosuchsection"]);
     let n = cmd(&mut node, &mut nb, &["INFO", "nosuchsection"]);
@@ -604,10 +589,7 @@ fn info_keyspace_counts_the_whole_node_like_dbsize() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     for i in 0..400u32 {
         let key = format!("kf:{i}");
@@ -681,10 +663,7 @@ fn maxclients_refusal_matches_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "maxclients", "1"]), b"+OK\r\n");
     let mut o2 = sibling(&oracle);
@@ -836,10 +815,7 @@ fn timeout_closes_an_idle_connection_like_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     assert_eq!(cmd(&mut oracle, &mut ob, &["CONFIG", "SET", "timeout", "1"]), b"+OK\r\n");
     assert_eq!(cmd(&mut node, &mut nb, &["CONFIG", "SET", "timeout", "1"]), b"+OK\r\n");
@@ -879,10 +855,7 @@ fn run_id_is_40_hex_and_stable_like_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     fn field(reply: &[u8], name: &str) -> String {
         let text = String::from_utf8_lossy(reply);
         text.lines()
@@ -924,10 +897,7 @@ fn client_id_is_positive_and_killable_like_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, oracle) = oracle();
     for (who, mut first) in [("oracle", oracle), ("node", node)] {
         let mut buf = Vec::new();
         let reply = cmd(&mut first, &mut buf, &["CLIENT", "ID"]);
@@ -970,10 +940,7 @@ fn tiered_namespace_argument_errors_match_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     let (mut ob, mut nb) = (Vec::new(), Vec::new());
     for preamble in [
         &[
@@ -1058,10 +1025,7 @@ fn deadline_millisecond_read_matches_redis() {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run (F-L19-09)");
         return;
     };
-    let Some((_oracle_guard, mut oracle)) = oracle() else {
-        eprintln!("SKIPPED: no pinned redis oracle (8.0.5) — compat AC stays evidence-pending");
-        return;
-    };
+    let (_oracle_guard, mut oracle) = oracle();
     const KEYS: u64 = 8;
     #[allow(clippy::disallowed_methods)] // wall-clock deadlines on the test thread, not cell code
     fn sample(stream: &mut TcpStream, who: &str) -> (u64, BTreeSet<Vec<u8>>) {

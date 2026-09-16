@@ -8,6 +8,9 @@
 //! ordering, HELLO protocol switching, and protocol-error close.
 #![cfg(target_os = "linux")]
 
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::IntoRawFd;
@@ -1845,6 +1848,7 @@ fn durable_mset_midway_failure_stages_what_it_wrote() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("mset_midway_oom", "staged-prefix");
 }
 
 /// The same staged-prefix contract on the fabric path (`ApplyNs`, the
@@ -1890,6 +1894,7 @@ fn durable_mset_midway_failure_stages_on_the_fabric_path() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("mset_midway_oom", "staged-prefix");
 }
 
 /// Review of 2026-08-30, F-L17-15 (ADR-0120): a named-namespace command
@@ -3389,6 +3394,7 @@ fn tiered_cold_read_failure_is_typed_for_every_read_command() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_full", "read-typed-error");
 }
 
 /// Review of 2026-08-30 (C7 / F-L04-08; ADR-0096) over the wire: a
@@ -5781,6 +5787,7 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_drop_before_meta", "namespace-restored-whole");
 }
 
 /// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
@@ -5819,6 +5826,7 @@ fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_drop_after_meta", "residue-swept");
 }
 
 // ---- review of 2026-08-30: H0 / F-L06-01 / F-L06-03 / C14 falsifiers ----
@@ -6003,6 +6011,7 @@ fn created_namespace_survives_a_cut_after_its_swap() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_create_after_meta", "namespace-seeded-from-meta");
 }
 
 /// F-L06-03 (lane L06, High; L00-21 could not reproduce it by random
@@ -6502,6 +6511,7 @@ fn create_with_a_refused_fan_leg_rolls_back_on_every_cell() {
         read_exactly(&mut c, b"$14\r\nafter-rollback\r\n");
     }
     node.stop();
+    receipt::verified("ns_create_fan_refused", "create-rolled-back");
 }
 
 /// ADR-0108 D1: concurrent namespace DDL from every cell — `CREATE` and
@@ -6738,6 +6748,7 @@ fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("shadow_reconcile_read_fail", "del-drains-every-ticket");
 }
 
 /// Reads a `CONFIG GET <one key>` reply (`*2` of bulks) and returns the value.

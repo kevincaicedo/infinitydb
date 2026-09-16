@@ -151,6 +151,10 @@ cargo build --release -p infinityd
 
 Other developer commands:
 
+The checks require Redis 8.0.5 on PATH (or `INF_COMPAT_ORACLE_ADDR`) and
+Python 3.11+. Missing or wrong-version Redis fails compatibility tests.
+See [validation prerequisites](docs/validation.md).
+
 ```bash
 just compat       # byte-diff vs a local redis-server
 just sim-smoke    # deterministic simulator, trace-identity check

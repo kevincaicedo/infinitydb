@@ -18,6 +18,9 @@
 
 #![cfg(feature = "doc")]
 
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
+
 use std::collections::BTreeSet;
 
 use inf_doc::JsonParser;
@@ -716,6 +719,7 @@ fn reservation_refusal_is_typed_and_mutates_nothing() {
         s.json_set(b"doc:new", &doc2, Default::default(), now).expect("set")
     });
     assert_equivalence(&mut ks, ns, now, "after disarm");
+    receipt::verified("idx_reserve_refuse", "refusal-leaves-no-trace");
 }
 
 /// The degraded-marking backstop proven by a planted trip (ADR-0072
@@ -765,4 +769,5 @@ fn planted_apply_trip_degrades_and_never_lies() {
         s.json_set(b"doc:fresh", &doc3, Default::default(), now).expect("set")
     });
     assert_eq!(tree_entries(&ks, ns, IndexId(1)).len(), 1, "maintenance resumed post-rebuild");
+    receipt::verified("idx_apply_trip", "degrades-never-lies");
 }

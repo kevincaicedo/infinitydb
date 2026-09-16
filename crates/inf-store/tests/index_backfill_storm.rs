@@ -43,6 +43,9 @@
 
 #![cfg(feature = "doc")]
 
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
+
 use std::collections::BTreeSet;
 
 use inf_doc::JsonParser;
@@ -555,6 +558,7 @@ fn planted_backfill_trip_parks_and_rebuild_recovers() {
     assert_eq!(ks.idx_degraded(ns, victim), Some(false));
     run_to_ready(&mut ks, now, BackfillBudget::default(), 64);
     assert_equivalence(&mut ks, ns, now, "after rebuild of the parked index");
+    receipt::verified("idx_backfill_trip", "parks-and-rebuild-recovers");
 }
 
 /// ADR-0077 D7's other class: a pre-declaration document whose wildcard

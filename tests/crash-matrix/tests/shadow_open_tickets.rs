@@ -10,6 +10,9 @@
 //! error. The sweep runs this on every arm seed; this row is the
 //! `cargo test` witness that the paths are exercised, not disclosed.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use inf_sim::tiered::{TieredScenario, run_tiered_scenario};
 
 #[test]
@@ -39,4 +42,5 @@ fn open_ticket_rows_hold_every_plane_path_with_tickets_open() {
     assert_eq!(report.rebuilt_multi_dels, 2, "both DELs drained several tickets");
     assert_eq!(report.rebuilt_same_key_twins, 1, "one same-key twin among the rebuilt");
     assert_eq!(report.rebuilt_reboots, 2, "the 7c cut and the durability reboot");
+    receipt::verified("shadow_twin_read_fail", "dbsize-typed-error");
 }

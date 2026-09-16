@@ -9,6 +9,9 @@
 //! runs on a real `O_DIRECT` fd where the filesystem offers it.
 //! Every test states its goal and method in its first sentence.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
@@ -91,6 +94,7 @@ fn tier_torn_frame_injects_on_a_direct_tier_file() {
     assert_eq!(footer.reason, SealReason::Recovered);
     assert_eq!(summary.first_bad_frame, None, "every retained frame verifies");
     assert_eq!(image.len(), 4096 + 3 * TIER_FRAME_BYTES + TIER_FOOTER_BYTES);
+    receipt::verified("tier_torn_frame", "reseal-at-watermark");
 }
 
 /// Goal: the torn prefix is sector-granular and keeps the block's prior
@@ -149,6 +153,7 @@ fn tier_short_write_injects_on_a_direct_tier_file() {
     w.sync().expect("the retry rewrites the frame whole");
     let image = disk.contents(w.path()).expect("file exists");
     assert_eq!(inspect_tier_bytes(&image).expect("parses").first_bad_frame, None);
+    receipt::verified("tier_short_write", "append-fails-typed");
 }
 
 /// Goal: `tier_footer_torn` injects on a Direct file — the footer block
@@ -185,6 +190,7 @@ fn tier_footer_torn_injects_on_a_direct_tier_file() {
     let footer = inspect_tier_bytes(&image).expect("parses").sealed.expect("resealed");
     assert_eq!(footer.data_len, manifested);
     assert_eq!(footer.reason, SealReason::Recovered);
+    receipt::verified("tier_footer_torn", "reseal-at-watermark");
 }
 
 /// Goal: `blob_short_write` injects on a Direct extent for a one-frame
@@ -206,6 +212,7 @@ fn blob_short_write_injects_on_a_direct_extent() {
     let image = disk.contents(&path).expect("file exists");
     let summary = inspect_extent_bytes(&image).expect("header parses");
     assert!(!summary.complete, "the torn frame never verifies");
+    receipt::verified("blob_short_write", "blob-write-fails-typed");
 }
 
 /// Goal: on a real `O_DIRECT` fd the torn-frame point *lands* (the

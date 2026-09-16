@@ -6,6 +6,9 @@
 //! reads as foreign-segment frames, never as data. Every test states its
 //! goal and method in its first sentence.
 
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
+
 use std::path::PathBuf;
 
 use inf_foundation::fault::{self, FaultSpec};
@@ -353,6 +356,7 @@ fn a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor() {
     let report = lab.maintain();
     assert_eq!(report.preallocated, Some(SegmentId(4)));
     assert_eq!(lab.rotor.stats().segments_recycled, 1, "seg 2's file became seg 4");
+    receipt::verified("recycle_open_fail", "fresh-fallback");
 }
 
 /// Goal: the residue a recycled file carries reads as foreign-segment

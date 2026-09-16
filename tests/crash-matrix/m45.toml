@@ -6,9 +6,10 @@
 # declared point was covered (the F-L20-04 blind-spot class, in the
 # instrument rather than the script).
 #
-# All three are store-tier windows, not power cuts: the injected trip
+# The index points are store-tier windows, not power cuts: the injected trip
 # happens inside one cell's maintenance, and the oracle is what the cell
-# serves afterwards. They carry as named tests, like the node tier.
+# serves afterwards. Exact tests emit assertion receipts, checked by
+# run_node_rows.py alongside the other node rows (ADR-0020 amendment).
 #
 # expect vocabulary (verified by the carrying tests):
 #   refusal-leaves-no-trace  — the reservation refuses before the command
@@ -30,19 +31,19 @@ seeds = 3
 [[row]]
 point = "idx_reserve_refuse"
 tier = "node"
-test = "inf-store/tests/index_maint_storm.rs"
+test = "inf-store::index_maint_storm::reservation_refusal_is_typed_and_mutates_nothing"
 expect = "refusal-leaves-no-trace"
 
 [[row]]
 point = "idx_apply_trip"
 tier = "node"
-test = "inf-store/tests/index_maint_storm.rs"
+test = "inf-store::index_maint_storm::planted_apply_trip_degrades_and_never_lies"
 expect = "degrades-never-lies"
 
 [[row]]
 point = "idx_backfill_trip"
 tier = "node"
-test = "inf-store/tests/index_backfill_storm.rs"
+test = "inf-store::index_backfill_storm::planted_backfill_trip_parks_and_rebuild_recovers"
 expect = "parks-and-rebuild-recovers"
 
 # The sidecar boot's commit gate (ADR-0078 A1; review F-L07-04): a trip
@@ -55,5 +56,5 @@ expect = "parks-and-rebuild-recovers"
 [[row]]
 point = "idx_apply_trip"
 tier = "node"
-test = "tests/crash-matrix/tests/sidecar.rs"
+test = "crash-matrix::sidecar::a_tail_trip_turns_the_load_into_a_rebuild"
 expect = "degraded-tail-rebuilds"
