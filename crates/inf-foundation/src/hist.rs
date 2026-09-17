@@ -20,6 +20,9 @@ pub struct LogHistogram {
 }
 
 impl LogHistogram {
+    /// Schema-1 snapshot width: exact small values and 32 slots per octave.
+    pub const BUCKET_COUNT: usize = BUCKETS;
+
     pub fn new() -> LogHistogram {
         LogHistogram { counts: Box::new([0; BUCKETS]), count: 0, max: 0, sum: 0 }
     }
@@ -60,6 +63,24 @@ impl LogHistogram {
 
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Cumulative counts; subtract matching snapshots before taking a percentile.
+    pub fn bucket_counts(&self) -> &[u64; BUCKETS] {
+        &self.counts
+    }
+
+    /// Conservative sample bound for a schema-1 bucket; invalid indexes are refused.
+    pub fn bucket_upper_bound(index: usize) -> Option<u64> {
+        (index < BUCKETS).then(|| Self::bucket_upper(index))
+    }
+
+    /// Copy into reusable scrape storage without allocating per request.
+    pub fn copy_from(&mut self, source: &Self) {
+        self.counts.copy_from_slice(source.counts.as_slice());
+        self.count = source.count;
+        self.max = source.max;
+        self.sum = source.sum;
     }
 
     /// Exact sum of every recorded value (saturating at `u64::MAX`).
@@ -197,5 +218,26 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.count(), 2);
         assert_eq!(a.max(), 1_000);
+    }
+
+    #[test]
+    fn snapshot_copy_reuses_storage_and_keeps_bucket_bounds_total() {
+        let mut source = LogHistogram::new();
+        let mut snapshot = LogHistogram::new();
+        let storage = snapshot.bucket_counts().as_ptr();
+        for value in [0, 31, 32, 499, 500, 1000, 1 << 63, u64::MAX] {
+            source.record(value);
+            snapshot.copy_from(&source);
+            assert_eq!(snapshot.bucket_counts().as_ptr(), storage);
+            assert_eq!(snapshot.bucket_counts(), source.bucket_counts());
+            assert_eq!(snapshot.count(), source.count());
+            assert_eq!(snapshot.max(), source.max());
+            assert_eq!(snapshot.sum(), source.sum());
+            assert!(
+                LogHistogram::bucket_upper_bound(LogHistogram::index_of(value)).unwrap() >= value
+            );
+        }
+        assert_eq!(LogHistogram::bucket_upper_bound(LogHistogram::BUCKET_COUNT), None);
+        assert_eq!(LogHistogram::bucket_upper_bound(usize::MAX), None);
     }
 }

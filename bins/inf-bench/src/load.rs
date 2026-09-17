@@ -16,6 +16,10 @@ use inf_foundation::rng::{Entropy, SplitMix64};
 use crate::cli::Flags;
 use crate::resp::{connect, encode_command, reply_len};
 
+#[cfg(test)]
+#[path = "load/refusals.rs"]
+mod refusals;
+
 #[derive(Clone, Debug)]
 pub struct LoadSpec {
     pub host: String,
@@ -130,8 +134,14 @@ const ERROR_SAMPLE_CAP: usize = 8;
 #[derive(Clone, Debug, Default)]
 pub struct LoadReport {
     pub mode: LoadMode,
+    /// Successful measured replies; refusals never contribute to throughput.
     pub ops: u64,
     pub errors: u64,
+    pub warmup_errors: u64,
+    pub error_p50_us: u64,
+    pub error_p99_us: u64,
+    pub error_p999_us: u64,
+    pub error_max_us: u64,
     /// The subset of `errors` that are `-BUSY` typed retryable refusals
     /// (admission backpressure). A leg with only BUSY refusals is a
     /// different fact than one with `-ERR`s — the 20260807 soak's 31 M
@@ -204,10 +214,12 @@ fn slots_in_window(first: Instant, interval: Duration, count: u64, window_start:
 struct ConnResult {
     ops: u64,
     errors: u64,
+    warmup_errors: u64,
     busy: u64,
     nils: u64,
     error_samples: Vec<String>,
     hist_us: FineHistogram,
+    error_hist_us: FineHistogram,
     max_us: u64,
     max_intended_at_s: f64,
     max_sent_at_s: f64,
@@ -245,10 +257,12 @@ fn run_conn(
     let mut result = ConnResult {
         ops: 0,
         errors: 0,
+        warmup_errors: 0,
         busy: 0,
         nils: 0,
         error_samples: Vec::new(),
         hist_us: FineHistogram::new(),
+        error_hist_us: FineHistogram::new(),
         max_us: 0,
         max_intended_at_s: 0.0,
         max_sent_at_s: 0.0,
@@ -430,45 +444,8 @@ fn run_conn(
         }
         rx.extend_from_slice(&chunk[..n]);
         while let Some(end) = reply_len(&rx[rx_at..]) {
-            let SentAt { intended, sent } =
-                inflight.pop_front().ok_or("reply without a request")?;
-            if intended >= warmup_end {
-                let done = Instant::now();
-                let micros = done.duration_since(intended).as_micros() as u64;
-                result.hist_us.record(micros);
-                result.ops += 1;
-                // `sent >= intended >= warmup_end`: a slot is sent at or
-                // after its instant, never before.
-                let since = sent.duration_since(warmup_end);
-                if micros > result.max_us {
-                    result.max_us = micros;
-                    result.max_intended_at_s = intended.duration_since(warmup_end).as_secs_f64();
-                    result.max_sent_at_s = since.as_secs_f64();
-                    result.max_done_at_s = done.duration_since(warmup_end).as_secs_f64();
-                }
-                if let Some(slot) = result.max_per_second.get_mut(since.as_secs() as usize) {
-                    *slot = (*slot).max(micros);
-                }
-                if rx[rx_at..].starts_with(b"$-1") {
-                    result.nils += 1;
-                }
-                // Errors count under the same warmup guard as ops, so an
-                // error *rate* is errors/ops over one window (pre-fix the
-                // first leg's rate was inflated by warmup-only errors).
-                if rx[rx_at] == b'-' {
-                    result.errors += 1;
-                    let line = &rx[rx_at..rx_at + end];
-                    if line.starts_with(b"-BUSY") {
-                        result.busy += 1;
-                    }
-                    if result.error_samples.len() < ERROR_SAMPLE_CAP {
-                        let text = String::from_utf8_lossy(line).trim_end().to_string();
-                        if !result.error_samples.contains(&text) {
-                            result.error_samples.push(text);
-                        }
-                    }
-                }
-            }
+            let sent = inflight.pop_front().ok_or("reply without a request")?;
+            result.record_reply(&rx[rx_at..rx_at + end], sent, warmup_end, Instant::now());
             rx_at += end;
             if inflight.is_empty() {
                 break;
@@ -480,6 +457,63 @@ fn run_conn(
         }
     }
     Ok(result)
+}
+
+impl ConnResult {
+    fn record_reply(&mut self, reply: &[u8], at: SentAt, warmup_end: Instant, done: Instant) {
+        let error = reply.first() == Some(&b'-');
+        if error && self.error_samples.len() < ERROR_SAMPLE_CAP {
+            let text = String::from_utf8_lossy(reply).trim_end().to_string();
+            if !self.error_samples.contains(&text) {
+                self.error_samples.push(text);
+            }
+        }
+        if at.intended < warmup_end {
+            self.warmup_errors += u64::from(error);
+            return;
+        }
+        let micros = done.duration_since(at.intended).as_micros() as u64;
+        if error {
+            self.errors += 1;
+            self.busy += u64::from(reply.starts_with(b"-BUSY ") || reply == b"-BUSY\r\n");
+            self.error_hist_us.record(micros);
+            return;
+        }
+        self.ops += 1;
+        self.hist_us.record(micros);
+        self.nils += u64::from(reply == b"$-1\r\n");
+        let since = at.sent.duration_since(warmup_end);
+        if micros > self.max_us {
+            self.max_us = micros;
+            self.max_intended_at_s = at.intended.duration_since(warmup_end).as_secs_f64();
+            self.max_sent_at_s = since.as_secs_f64();
+            self.max_done_at_s = done.duration_since(warmup_end).as_secs_f64();
+        }
+        if let Some(slot) = self.max_per_second.get_mut(since.as_secs() as usize) {
+            *slot = (*slot).max(micros);
+        }
+    }
+}
+
+impl LoadReport {
+    pub(crate) fn require_no_errors(&self) -> Result<(), String> {
+        if self.errors == 0 && self.warmup_errors == 0 {
+            return Ok(());
+        }
+        let first = self.error_samples.first().map(String::as_str).unwrap_or("none sampled");
+        Err(format!(
+            "{} error replies under load ({} BUSY-retryable; {} warmup errors; \
+             first sample: {first})",
+            self.errors, self.busy_retryable, self.warmup_errors
+        ))
+    }
+}
+
+/// Gate legs, including fills, cannot consume refused work (ADR-0137).
+pub(crate) fn run_checked(spec: &LoadSpec) -> Result<LoadReport, String> {
+    let report = run(spec)?;
+    report.require_no_errors()?;
+    Ok(report)
 }
 
 /// Runs the load and merges per-connection results.
@@ -499,10 +533,13 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
     let mut report =
         LoadReport { mode: spec.mode(), elapsed_s: elapsed.as_secs_f64(), ..Default::default() };
     let mut hist = FineHistogram::new();
+    let mut error_hist = FineHistogram::new();
     for result in results {
         let conn = result?;
         report.ops += conn.ops;
         report.errors += conn.errors;
+        report.warmup_errors += conn.warmup_errors;
+        error_hist.merge(&conn.error_hist_us);
         report.busy_retryable += conn.busy;
         report.nils += conn.nils;
         for sample in conn.error_samples {
@@ -530,6 +567,10 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
     }
     report.offered = report.sent + report.skipped_pipeline_full;
     report.ops_per_sec = report.ops as f64 / report.elapsed_s;
+    report.error_p50_us = error_hist.percentile(50.0);
+    report.error_p99_us = error_hist.percentile(99.0);
+    report.error_p999_us = error_hist.percentile(99.9);
+    report.error_max_us = error_hist.max();
     report.p50_us = hist.percentile(50.0);
     report.p99_us = hist.percentile(99.0);
     report.p999_us = hist.percentile(99.9);
@@ -559,6 +600,16 @@ pub fn render(report: &LoadReport) -> String {
         report.p9999_us,
         report.max_us
     );
+    out.push_str(&format!(
+        "replies = {}\nwarmup_errors = {}\nlatency_population = successful-replies\n\
+         error_p50_us = {}\nerror_p99_us = {}\nerror_p999_us = {}\nerror_max_us = {}\n",
+        report.ops + report.errors,
+        report.warmup_errors,
+        report.error_p50_us,
+        report.error_p99_us,
+        report.error_p999_us,
+        report.error_max_us
+    ));
     if let LoadMode::OpenLoop { target_ops_per_sec } = report.mode {
         out.push_str(&format!(
             "target_ops_per_sec = {target_ops_per_sec}\n\
@@ -646,16 +697,7 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
     if let Some(path) = flags.get("out") {
         std::fs::write(path, rendered).map_err(|e| format!("--out {path}: {e}"))?;
     }
-    if report.errors > 0 {
-        // Keep the "error replies under load" prefix stable — soak
-        // tooling greps for it. The classification rides behind it.
-        let first = report.error_samples.first().map(String::as_str).unwrap_or("none sampled");
-        return Err(format!(
-            "{} error replies under load ({} BUSY-retryable; first sample: {})",
-            report.errors, report.busy_retryable, first
-        ));
-    }
-    Ok(())
+    report.require_no_errors()
 }
 
 #[cfg(test)]

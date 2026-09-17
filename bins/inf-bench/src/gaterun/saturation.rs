@@ -51,9 +51,7 @@ fn validate_sample(sample: &LoadReport) -> Result<(), String> {
     if !sample.elapsed_s.is_finite() || sample.elapsed_s <= 0.0 {
         return Err("no finite positive measurement interval".into());
     }
-    if sample.errors != 0 {
-        return Err(format!("{} error replies (including refusals)", sample.errors));
-    }
+    sample.require_no_errors()?;
     if sample.mode != LoadMode::ClosedLoop {
         return Err("sample was not closed-loop".into());
     }

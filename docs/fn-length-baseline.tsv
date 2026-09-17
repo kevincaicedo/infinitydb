@@ -3,7 +3,7 @@
 # count rises, and when it falls (lower the row). Regenerate the numbers with the
 # recipe in ADR-0125; never edit a row upward.
 1	bins/inf-bench/src/bootstorm.rs
-2	bins/inf-bench/src/load.rs
+1	bins/inf-bench/src/load.rs
 3	bins/inf-bench/src/m2rows.rs
 4	bins/inf-bench/src/m45rows.rs
 3	bins/inf-bench/src/m45rows/s37.rs

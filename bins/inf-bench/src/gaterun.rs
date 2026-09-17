@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 use crate::cli::Flags;
 use crate::envcheck;
 use crate::gates;
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, parse_info, request};
 
+mod loop_scrape;
 mod saturation;
 
 pub(crate) struct ServerGuard {
@@ -262,11 +263,6 @@ pub fn max_field(infos: &[BTreeMap<String, String>], field: &str) -> u64 {
         .filter_map(|v| v.parse::<u64>().ok())
         .max()
         .unwrap_or(0)
-}
-
-/// Raw counters summed across cells: (submits, sqes, cqes).
-fn raw_counters(infos: &[BTreeMap<String, String>]) -> (u64, u64, u64) {
-    (sum_field(infos, "raw_submits"), sum_field(infos, "raw_sqes"), sum_field(infos, "raw_cqes"))
 }
 
 /// The filesystem type a path resolves to, from `/proc/self/mounts`
@@ -781,20 +777,38 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         server_extra.push("--no-deasync-dispatch");
     }
     let natural = spawn_infinityd(&infinityd, cells, &server_extra)?;
+    let mut loop_scraper = loop_scrape::LoopScraper::connect(natural.port, cells)?;
     let mut pipelined_ops: Vec<f64> = Vec::new();
     let mut pipelined_p999: Vec<f64> = Vec::new();
     let mut windowed_sqes_per_submit: Vec<f64> = Vec::new();
+    let mut loop_p999_us = 0;
     let mut generator_baseline = None;
     for rep in 0..replicates {
-        let before = raw_counters(&scrape_cells(natural.port, cells)?);
+        let before = loop_scraper.fresh()?;
         let spec = LoadSpec {
             port: natural.port,
             duration: Duration::from_secs(duration),
             ..Default::default()
         };
         let report = run_load(&spec)?;
-        let after = raw_counters(&scrape_cells(natural.port, cells)?);
-        let sqes = (after.1 - before.1) as f64 / (after.0 - before.0).max(1) as f64;
+        let after = loop_scraper.fresh()?;
+        let window = crate::loop_histogram::LoadWindow::between(&before, &after)?;
+        let sqes = window.sqes_per_submit;
+        loop_p999_us = loop_p999_us.max(window.p999_us);
+        for (label, snapshots) in [("before", &before), ("after", &after)] {
+            for snapshot in snapshots {
+                m.raw_section(
+                    &format!("loop histogram rep {rep} cell {} {label}", snapshot.cell),
+                    &snapshot.render(),
+                );
+            }
+        }
+        for cell in &window.cells {
+            m.note(format!(
+                "loop window rep {rep} cell {}: {} samples, p999 {} us (bucket upper bound)",
+                cell.cell, cell.samples, cell.p999_us
+            ));
+        }
         println!(
             "  rep {rep}: {:.0} ops/s, p999 {} us, windowed sqes/submit {sqes:.1}",
             report.ops_per_sec, report.p999_us
@@ -808,8 +822,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     m.set("loadgen:ops_per_sec", median(&mut pipelined_ops));
     m.set("loadgen:p999_us", median(&mut pipelined_p999));
     m.set("tripwire:sqes_per_submit", median(&mut windowed_sqes_per_submit));
+    m.set("tripwire:loop_iter_p999_us", loop_p999_us as f64);
+    m.note(
+        "loop histogram windows bracket pipelined load including warmup/drain and scrape RTTs; \
+            worst cell/window across replicates, lifetime history and generator probes excluded",
+    );
     let infos = scrape_cells(natural.port, cells)?;
-    m.set("tripwire:loop_iter_p999_us", max_field(&infos, "loop_iter_p999_us") as f64);
     m.set(
         "external:fabric_token_histogram",
         max_field(&infos, "fabric_rtt_p50_ns") as f64 / 1000.0,

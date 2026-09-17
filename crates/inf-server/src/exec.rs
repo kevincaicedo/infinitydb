@@ -74,6 +74,8 @@ pub struct NodeInfo {
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
+    /// Requested iteration-boundary snapshots; ordinary INFO does not copy buckets.
+    pub loop_snapshot: crate::LoopSnapshot,
     pub wire_buffers_bytes: Cell<u64>,
     pub conn_state_bytes: Cell<u64>,
     /// Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges,

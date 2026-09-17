@@ -382,6 +382,7 @@ impl Scenario {
 pub struct SimReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub events: u64,
     pub commands_done: u64,
     pub oracle_violations: Vec<String>,
@@ -440,6 +441,7 @@ struct Oracle {
     /// The independent model (F-L19-04): shares no code with the node.
     shadow: shadow::Shadow,
     trace: Vec<u8>,
+    state: crate::state::StateHash,
     events: u64,
     violations: Vec<String>,
     /// Scatter legs the replay oracle left to the audit oracle.
@@ -528,6 +530,7 @@ impl Oracle {
             model,
             shadow: shadow::Shadow::default(),
             trace: Vec::new(),
+            state: crate::state::StateHash::default(),
             events: 0,
             violations: Vec::new(),
             replays_skipped: 0,
@@ -550,6 +553,7 @@ impl PlaneObserver for SharedOracle {
     ) {
         let mut oracle = self.0.borrow_mut();
         oracle.events += 1;
+        oracle.state.number(b"apply-time", now.0);
         // Trace record: cell, origin tag, scope, argv, reply (length-prefixed).
         oracle.trace.extend_from_slice(&cell.0.to_le_bytes());
         match origin {
@@ -1379,6 +1383,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let mut report = SimReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         events: 0,
         commands_done: 0,
         oracle_violations: Vec::new(),
@@ -1409,6 +1414,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
 
     loop {
         report.scheduler_steps += 1;
+        oracle.0.borrow_mut().state.number(b"step", clock.now().0);
 
         // Seeded round-robin with perturbation: rotate, occasionally swap.
         order.rotate_left(1);
@@ -1831,6 +1837,14 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     report.shadow_unmodeled = oracle.shadow.unmodeled.clone();
     report.trace = oracle.trace.clone();
     report.trace_hash = hash64(&report.trace, 0x51A1);
+    let mut state = oracle.state;
+    state.number(b"finish", clock.now().0);
+    state.number(b"steps", report.scheduler_steps);
+    for (index, (_, plane)) in cells.iter().enumerate() {
+        state.number(b"cell", index as u64);
+        state.keyspace(&plane.keyspace(), clock.now());
+    }
+    report.state_hash = state.value();
     report.oracle_violations = oracle.violations.clone();
     report.oracle_violations.extend(violations);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;

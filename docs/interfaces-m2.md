@@ -1097,6 +1097,13 @@ per episode). A drained cell always seals — never slower than K = 1.
   full-replay fallback. `open_cell_log` is generic over `SegmentFs` (DST
   seam); recovery is digest-deterministic (`Keyspace::state_digest`,
   same-files ⇒ same digest + same resume LSN, CI-asserted).
+  ADR-0137 adds the simulator's separate `state_hash`: event/step clocks,
+  boot/ready/end boundaries, recovered keyspace digests and disk-image
+  names/bytes. The apply-trace encoding and release trace baselines stay
+  unchanged; insertion debug assertions no longer inflate cold-read counts.
+  `TieredTable::simulation_digest` is a read-only diagnostic over every
+  index hash/address and resident record; the disk digest covers cold
+  bytes. It starts no checkpoint walk and changes no runtime state.
 - Checkpoint streaming is paced: `CkptConfig::stream_bytes_per_sec`
   (default 64 MiB/s, injected clock; 0 = unpaced) — burst walks trip
   kernel dirty-page throttling and stall the log write's CQE path

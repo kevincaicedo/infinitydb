@@ -10,17 +10,17 @@ use super::*;
 /// audit every ledger key against the §8.2 admissible-state rule.
 #[allow(clippy::too_many_lines, reason = "one linear phase script, like run_scenario")]
 #[must_use]
-pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
+fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, scenario.stall.as_ref());
     if let Some(allowed) = scenario.ckpt_direct_refused_after {
         disk.refuse_direct_writes_after(allowed);
     }
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0xD07A_B1E5);
     let mut report = DurableReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         violations: Vec::new(),
         stalled: false,
         clean_stop_steps: 0,
@@ -242,7 +242,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         }
         let prelude_cut_time = clock.now();
         drop(node);
-        disk.power_cut(scenario.seed ^ 0x0FF5_EED2);
+        observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED2);
         // The residue plant (batch 21): the lift shape on every cell,
         // between the cut and the boot that must lift past it.
         let mut planted = Vec::new();
@@ -848,7 +848,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         );
     }
     drop(node); // the process dies: in-flight state vanishes
-    disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED0);
     if document_workload {
         // M3-S24 (ADR-0045 D4): disclose which record class the surviving
         // image ends on — cut coverage is measured, never assumed.
@@ -941,7 +941,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
         }
         // The second cut: recovery itself was interrupted (idempotence).
         drop(node);
-        disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
+        observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
     // ADR-0124 D4's observable: a boot after a clean stop replays no tail
@@ -1130,6 +1130,15 @@ fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> Ope
     } else {
         OpenFaultVerdict::Ok
     }
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
+    report
 }
 
 #[cfg(test)]

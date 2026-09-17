@@ -534,7 +534,7 @@ fn s27_write_repeat_row(
     // *refusal shape only* — max/decay here are device-writeback physics
     // (SLC state at saturation), not the admission mechanism.
     let mut raw = String::new();
-    let mut ops_total: u64 = 0;
+    let mut replies_total: u64 = 0;
     let mut busy_total: u64 = 0;
     {
         let (server, port) = s27_spawn(flags, infinityd, cells, data_root, Some(1))?;
@@ -542,7 +542,7 @@ fn s27_write_repeat_row(
         for rep in 0..S27_REPEATS {
             let report = s27_leg(port, "s27press", 4, duration)?;
             check_non_busy(&report, &format!("s27 provoked rep{rep}"))?;
-            ops_total += report.ops;
+            replies_total += report.ops + report.errors;
             busy_total += report.busy_retryable;
             raw.push_str(&format!(
                 "provoked rep{rep} everysec ops/s={:<8.0} p99_us={:<7} max_us={:<8} busy={}\n",
@@ -576,7 +576,7 @@ fn s27_write_repeat_row(
             always.ops_per_sec, always.p99_us, always.max_us, always.busy_retryable
         ));
         busy_total += always.busy_retryable;
-        ops_total += always.ops;
+        replies_total += always.ops + always.errors;
         drop(server);
     }
 
@@ -592,7 +592,7 @@ fn s27_write_repeat_row(
         for rep in 0..S27_REPEATS {
             let report = s27_leg(port, "s27press", 1, duration)?;
             check_non_busy(&report, &format!("s27 d5 rep{rep}"))?;
-            ops_total += report.ops;
+            replies_total += report.ops + report.errors;
             busy_total += report.busy_retryable;
             max_us_worst = max_us_worst.max(report.max_us);
             if rep == 0 {
@@ -607,7 +607,7 @@ fn s27_write_repeat_row(
         drop(server);
     }
 
-    m.set("s27:busy_refusals_pct", busy_total as f64 * 100.0 / ops_total.max(1) as f64);
+    m.set("s27:busy_refusals_pct", busy_total as f64 * 100.0 / replies_total.max(1) as f64);
     m.set("s27:write_repeat_decay_x", last_rep_ops_per_sec / first_rep_ops_per_sec.max(1.0));
     m.set("s27:max_ms", max_us_worst as f64 / 1000.0);
     m.note(format!(

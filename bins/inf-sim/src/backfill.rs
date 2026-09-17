@@ -81,6 +81,7 @@ pub struct BackfillReport {
     pub raced_mutations: u64,
     pub scheduler_steps: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
 }
 
 impl BackfillReport {
@@ -317,10 +318,9 @@ fn check_serving_contract(
 /// catalog persist) → one cut per phase, each reboot re-checked for the
 /// regression contract → a final boot driven to fleet-ready and fully
 /// oracle-verified.
-pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
+fn run_observed(scenario: &BackfillScenario, observer: TraceObserver) -> BackfillReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, base(scenario).stall.as_ref());
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0xBACF_1115);
     let mut report = BackfillReport::default();
     let mut trace: Vec<u8> = scenario.seed.to_le_bytes().to_vec();
@@ -536,7 +536,7 @@ pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
         let scanned: u64 = (0..usize::from(scenario.cells))
             .map(|c| node.plane(c).keyspace().idx_backfill_info().docs_scanned_total)
             .sum();
-        disk.power_cut(scenario.seed ^ (0xC0DE_0500 + phase as u64));
+        observer.power_cut(&disk, clock.now(), scenario.seed ^ (0xC0DE_0500 + phase as u64));
         report.cuts.push(format!("{what}(scanned={scanned})"));
         trace.extend_from_slice(what.as_bytes());
         trace.extend_from_slice(&scanned.to_le_bytes());
@@ -588,5 +588,14 @@ pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
     trace.extend_from_slice(&report.ready_checks.to_le_bytes());
     trace.extend_from_slice(&(report.violations.len() as u64).to_le_bytes());
     report.trace_hash = inf_foundation::hash64(&trace, 0x4501_BACF);
+    report
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
     report
 }

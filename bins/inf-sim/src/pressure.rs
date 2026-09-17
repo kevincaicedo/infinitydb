@@ -94,6 +94,8 @@ pub struct PressureReport {
     pub stall_p99_ns: u64,
     pub peak_committed_bytes: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl PressureReport {
@@ -456,6 +458,8 @@ fn run_round(
     report: &mut PressureReport,
     round: u64,
 ) {
+    report.state.number(b"round-time", world.borrow().now.get());
+    report.state.number(b"round", round);
     {
         // Bank this round's credit (bounded: full-speed rounds cover
         // demand outright, so the bank never grows past a few slices).
@@ -623,5 +627,10 @@ pub fn run_pressure_scenario(scenario: &PressureScenario) -> PressureReport {
     }
     drain(&world, &mut fleet);
     audit(&world, &fleet, &mut report);
+    let world = world.borrow();
+    report.state.number(b"finish-time", world.now.get());
+    report.state.keyspace(&world.ks, inf_foundation::time::Nanos(world.now.get()));
+    report.state.disk(&fleet.disk);
+    report.state_hash = report.state.value();
     report
 }

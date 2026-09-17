@@ -16,6 +16,7 @@ const SECTIONS: &[&str] = &[
     "replication",
     "cpu",
     "tripwires",
+    "loophist",
     "keyspace",
 ];
 
@@ -97,6 +98,10 @@ pub(crate) fn info(
     }
     if wants("tripwires") {
         tripwires_section(&mut text, node, &report, &stats);
+    }
+    // Explicit only: ordinary INFO must not request or serialize 1920 buckets.
+    if selected.contains(&"loophist") {
+        node.loop_snapshot.append_info(&mut text);
     }
     if let Some((scope, g)) = fold.filter(|_| wants("keyspace")) {
         keyspace_section(&mut text, scope, &g);
@@ -382,6 +387,7 @@ fn tripwires_section(
     push(text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
     push(text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
     push(text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
+    push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
     text.push_str("\r\n");
 }
 

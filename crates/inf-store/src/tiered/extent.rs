@@ -65,8 +65,13 @@ impl TieredTable {
         hash: u64,
         sealed: &SealedExtent,
     ) -> Result<LogicalAddr, OpError> {
+        debug_assert_eq!(hash, self.hash_key(key));
         debug_assert!(
-            !matches!(self.lookup(key, hash, &[]), TieredLookup::Ram(_)),
+            self.index
+                .find(hash, |addr| {
+                    addr.to_raw() >= self.space.head().to_raw() && self.record(addr).key == key
+                })
+                .is_none(),
             "insert of a RAM-verified present key"
         );
         if self.index.needs_grow() {

@@ -21,7 +21,7 @@ use crate::gaterun::{
     Measurements, env_gate, finish_report, load_gates, scrape_cells, spawn_infinityd, spawn_redis,
     sum_field,
 };
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, encode_command, request};
 
 mod memory;

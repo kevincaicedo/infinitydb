@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+inf-foundation = { path = "../../../crates/inf-foundation" }
 
 
 [[bin]]
@@ -22,3 +23,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "loop_histogram"
+path = "fuzz_targets/loop_histogram.rs"
+test = false
+doc = false
+bench = false

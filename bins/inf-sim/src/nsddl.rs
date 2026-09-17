@@ -50,6 +50,7 @@ const DDL_STEPS: u64 = 20_000;
 pub struct NsDdlRaceReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
     pub commands_done: u64,
@@ -175,15 +176,15 @@ fn served_on(
     reason = "one linear phase script, like \
      run_ns_create_window_scenario"
 )]
-pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
+fn run_observed(seed: u64, observer: TraceObserver) -> NsDdlRaceReport {
     let scenario = DurableScenario { cells: 4, ..DurableScenario::m2_durable(seed) };
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(seed, scenario.stall.as_ref());
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(seed ^ 0x0DD1_0DD1);
     let mut report = NsDdlRaceReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         violations: Vec::new(),
         stalled: false,
         commands_done: 0,
@@ -390,7 +391,7 @@ pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
 
     // ---- phase 3: the cut + reboot audit --------------------------------
     drop(node);
-    disk.power_cut(seed ^ 0x0DD1_0FF5);
+    observer.power_cut(&disk, clock.now(), seed ^ 0x0DD1_0FF5);
     let mut node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
@@ -495,7 +496,7 @@ pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
         );
     }
     drop(node);
-    disk.power_cut(seed ^ 0x0DD1_0FF6);
+    observer.power_cut(&disk, clock.now(), seed ^ 0x0DD1_0FF6);
     let mut node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
@@ -575,7 +576,7 @@ pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
         report.released_keys_found = keys.len() as u64;
         return finish(report, &observer, &clock);
     }
-    disk.power_cut(seed ^ 0x0DD1_0FF7);
+    observer.power_cut(&disk, clock.now(), seed ^ 0x0DD1_0FF7);
     let mut node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
@@ -616,4 +617,13 @@ pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
     drop(reader);
     drop(node);
     finish(report, &observer, &clock)
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_ns_ddl_race_scenario(seed: u64) -> NsDdlRaceReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(seed, observer.clone());
+    report.state_hash = observer.state_hash();
+    report
 }

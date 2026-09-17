@@ -181,6 +181,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_steel_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-steel determinism: second run diverged"
@@ -214,6 +219,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_backfill_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m45-backfill determinism: second run diverged"
@@ -250,6 +260,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_sidecar_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m45-sidecar determinism: second run diverged"
@@ -282,6 +297,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_diskfull_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-diskfull determinism: second run diverged"
@@ -313,6 +333,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_pressure_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-pressure determinism: second run diverged"
@@ -371,6 +396,14 @@ fn main() {
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
                 shadow_held_rows += report.shadow_held_rows;
                 shadow_held_reformed += report.shadow_held_reformed;
@@ -505,6 +538,11 @@ fn main() {
         );
         if verify {
             let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
             assert_eq!(report.trace_hash, twin.trace_hash, "determinism violated (L7)");
             println!("inf-sim: determinism verified (two runs, identical traces)");
         }
@@ -591,6 +629,14 @@ fn main() {
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
                 rebuilt_seeds += u64::from(report.rebuilt_rows);
                 rebuilt_tickets += report.rebuilt_tickets;
@@ -829,6 +875,11 @@ fn main() {
         );
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
@@ -869,6 +920,14 @@ fn main() {
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
                 found += u64::from(report.drop_found);
                 crossings += report.crossings;
@@ -926,6 +985,11 @@ fn main() {
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
@@ -967,6 +1031,14 @@ fn main() {
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
                 attempts += report.use_attempts;
                 refused += report.use_refused;
@@ -1017,6 +1089,11 @@ fn main() {
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
@@ -1063,6 +1140,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_cold_storm_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-cold determinism: second run diverged"
@@ -1088,6 +1170,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_boot_storm_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "boot-storm determinism: second run diverged"
@@ -1182,6 +1269,11 @@ fn main() {
 
     if verify {
         let second = run_scenario(&scenario);
+        verify_hashes(
+            (report.trace_hash, report.state_hash),
+            (second.trace_hash, second.state_hash),
+        );
+        assert!(second.ok(), "second run failed its oracles");
         if second.trace != report.trace {
             eprintln!(
                 "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs {:#x})",
@@ -1289,6 +1381,11 @@ fn run_durable(
         }
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
@@ -1373,6 +1470,14 @@ fn run_durable(
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
+        if verify {
+            let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
+        }
         ran += 1;
         pipelined_seeds += u64::from(report.frames_in_flight_max >= 2);
         depth_max = depth_max.max(report.frames_in_flight_max);
@@ -1553,6 +1658,11 @@ fn run_m2_combined(
         }
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
@@ -1578,6 +1688,14 @@ fn run_m2_combined(
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
+        if verify {
+            let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
+        }
         ran += 1;
         sim_seconds += report.sim_seconds;
         published += report.published;
@@ -1611,5 +1729,39 @@ fn run_m2_combined(
     }
     if violations > 0 {
         std::process::exit(1);
+    }
+}
+
+fn verify_hashes(first: (u64, u64), second: (u64, u64)) {
+    if let Err(reason) = inf_sim::state::verify(first.0, first.1, second.0, second.1) {
+        eprintln!("inf-sim: DETERMINISM VIOLATION — {reason}");
+        std::process::exit(1);
+    }
+    println!("inf-sim: state_hash={:#018x}; state hash identical", first.1);
+}
+
+#[cfg(test)]
+mod determinism_exit {
+    #[test]
+    fn state_only_mismatch_exits_one_with_a_named_reason() {
+        const CHILD: &str = "INF_SIM_STATE_VERIFY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::verify_hashes((7, 1), (7, 2));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "determinism_exit::state_only_mismatch_exits_one_with_a_named_reason",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("state_hash differs"),
+            "{output:?}"
+        );
     }
 }

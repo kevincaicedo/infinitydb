@@ -891,6 +891,7 @@ pub(crate) fn m2_fill_config() -> inf_server::FillConfig {
 pub struct DurableReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
     /// ADR-0124: scheduler steps the clean stop took to drain every cell
@@ -1046,13 +1047,27 @@ impl DurableReport {
 // ---- trace observer (no model replay — the ledger is the oracle) -------
 
 #[derive(Clone, Default)]
-pub(crate) struct TraceObserver(Rc<RefCell<Vec<u8>>>);
+pub(crate) struct TraceObserver(Rc<RefCell<Vec<u8>>>, crate::state::Recorder);
 
 impl TraceObserver {
     /// The accumulated apply-event trace (the determinism artifact). Used
     /// by every scenario's `finish` (durable, combined).
     pub(crate) fn trace_bytes(&self) -> Vec<u8> {
         self.0.borrow().clone()
+    }
+
+    pub(crate) fn state_hash(&self) -> u64 {
+        self.1.value()
+    }
+
+    pub(crate) fn power_cut(&self, disk: &SimDisk, now: Nanos, seed: u64) {
+        self.1.update(|state| {
+            state.number(b"cut-time", now.0);
+            state.number(b"cut-seed", seed);
+            state.disk(disk);
+        });
+        disk.power_cut(seed);
+        self.1.update(|state| state.disk(disk));
     }
 }
 
@@ -1064,8 +1079,9 @@ impl PlaneObserver for TraceObserver {
         scope: ExecScope,
         argv: &[&[u8]],
         reply: &[u8],
-        _now: Nanos,
+        now: Nanos,
     ) {
+        self.1.update(|state| state.number(b"apply-time", now.0));
         let mut trace = self.0.borrow_mut();
         trace.extend_from_slice(&cell.0.to_le_bytes());
         match origin {
@@ -1417,6 +1433,10 @@ pub(crate) type SimPlane = ServerPlane<TraceObserver, SimDisk>;
 type SimLoop = CellLoop<SimDriver, Rc<VirtualClock>>;
 
 pub(crate) struct Node {
+    observer: TraceObserver,
+    clock: Rc<VirtualClock>,
+    disk: SimDisk,
+    observed_ready: bool,
     cells: Vec<(SimLoop, SimPlane)>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
@@ -1441,6 +1461,10 @@ pub(crate) fn boot(
     clock: &Rc<VirtualClock>,
     observer: &TraceObserver,
 ) -> std::io::Result<Node> {
+    observer.1.update(|state| {
+        state.number(b"boot", clock.now().0);
+        state.disk(disk);
+    });
     // F-L04-06: a driver-tier durable boot runs on a device whose plain
     // writes can land after a later-issued fsync (ADR-0087 D7) — the
     // instant device orders everything by submission and proves nothing
@@ -1525,10 +1549,39 @@ pub(crate) fn boot(
         nets.push(net);
         cells.push((cell_loop, plane));
     }
-    Ok(Node { cells, nets, control, inbox, data_dir, hold_inbox: false, frozen: None })
+    Ok(Node {
+        cells,
+        nets,
+        control,
+        inbox,
+        data_dir,
+        hold_inbox: false,
+        frozen: None,
+        observer: observer.clone(),
+        clock: Rc::clone(clock),
+        disk: disk.clone(),
+        observed_ready: false,
+    })
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.observe_state(b"node-end");
+    }
 }
 
 impl Node {
+    fn observe_state(&self, tag: &[u8]) {
+        self.observer.1.update(|state| {
+            state.number(tag, self.clock.now().0);
+            state.disk(&self.disk);
+            for (index, (_, plane)) in self.cells.iter().enumerate() {
+                state.number(b"cell", index as u64);
+                state.keyspace(&plane.keyspace(), self.clock.now());
+            }
+        });
+    }
+
     /// One scheduler step: seeded cell order, one loop iteration each,
     /// one control-inbox drain, one seeded clock advance.
     pub(crate) fn step(
@@ -1540,6 +1593,10 @@ impl Node {
     ) -> std::io::Result<()> {
         let n = self.cells.len();
         let rotate = (rng.next_u64() as usize) % n;
+        self.observer.1.update(|state| {
+            state.number(b"step", clock.now().0);
+            state.number(b"rotate", rotate as u64);
+        });
         let skip = match self.frozen {
             Some((cell, steps)) if steps > 0 => {
                 self.frozen = Some((cell, steps - 1));
@@ -1565,6 +1622,10 @@ impl Node {
             self.inbox.drain(disk, &self.data_dir)?;
         }
         clock.advance(Nanos(1_000 + rng.next_u64() % step_ns_max));
+        if !self.observed_ready && self.ready() {
+            self.observe_state(b"recovered");
+            self.observed_ready = true;
+        }
         Ok(())
     }
 

@@ -81,6 +81,8 @@ pub struct DiskfullReport {
     pub peak_disk_used: u64,
     pub keys_verified: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl DiskfullReport {
@@ -154,6 +156,8 @@ impl World {
 
     fn fold(&mut self, tag: u64, value: u64) {
         self.report.trace_hash = hash64(&value.to_le_bytes(), self.report.trace_hash ^ tag);
+        self.report.state.number(b"event", tag);
+        self.report.state.number(b"value", value);
     }
 
     fn violation(&mut self, text: String) {
@@ -472,5 +476,8 @@ pub fn run_diskfull_scenario(scenario: &DiskfullScenario) -> DiskfullReport {
     w.fold(0xF1, refusals);
     let keys = w.report.keys_verified;
     w.fold(0xF2, keys);
+    w.report.state.keyspace(&w.ks, inf_foundation::time::Nanos(0));
+    w.report.state.disk(&w.disk);
+    w.report.state_hash = w.report.state.value();
     w.report
 }

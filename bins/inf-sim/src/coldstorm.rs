@@ -100,6 +100,8 @@ pub struct ColdStormReport {
     pub unlink_deferrals: u64,
     pub unlinks: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl ColdStormReport {
@@ -852,7 +854,12 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
     while ops < scenario.ops || ex.live_tasks() > 0 {
         round += 1;
         assert!(round < scenario.ops.max(1) * 4, "storm rounds exploded (liveness)");
-        world.borrow_mut().now_us = round * ROUND_US;
+        {
+            let mut world = world.borrow_mut();
+            world.now_us = round * ROUND_US;
+            let now = world.now_us;
+            world.report.state.number(b"round-time-us", now);
+        }
         // Foreground: new GETs (cold-heavy once files exist).
         if ops < scenario.ops {
             for _ in 0..GETS_PER_ROUND {
@@ -946,6 +953,10 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         world.report.violations.push("no unlink deferral observed under flood".into());
     }
     let mut report = std::mem::take(&mut world.report);
+    report.state.number(b"finish-time-us", world.now_us);
+    report.state.keyspace(&world.ks, inf_foundation::time::Nanos(world.now_us * 1000));
+    report.state.disk(&world.disk);
+    report.state_hash = report.state.value();
     report.trace_hash = hash64(
         &counters.issued.to_le_bytes(),
         report.trace_hash ^ counters.completed ^ counters.unclaimed,

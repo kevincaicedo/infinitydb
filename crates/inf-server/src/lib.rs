@@ -23,6 +23,7 @@ mod io_properties;
 mod json;
 mod key_hash;
 mod log_bytes;
+mod loop_snapshot;
 mod plane;
 mod pubsub;
 mod readahead;
@@ -80,6 +81,7 @@ pub use key_hash::{
     directory_has_data, load_key_hash, parse_key_hash, render_key_hash, resolve_key_hash,
     verify_key_hash_binding,
 };
+pub use loop_snapshot::LoopSnapshot;
 pub use plane::{
     ExecOrigin, ExecScope, NoopObserver, OwnedOutcome, PlaneObserver, ServerPlane, StopPhase,
     fold_live_entries,

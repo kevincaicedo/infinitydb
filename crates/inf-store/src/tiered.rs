@@ -324,6 +324,25 @@ impl TieredTable {
         self.index.group_count()
     }
 
+    /// Read-only DST digest of every index entry and resident record (ADR-0137).
+    /// Cold bytes are covered by the simulator's separate disk-image digest.
+    pub fn simulation_digest(&self) -> crate::StateDigest {
+        let mut digest = crate::StateDigest::default();
+        for group in 0..self.index.group_count() {
+            self.index.scan_home_group_ext(group, |addr, hash| {
+                let mut entry = inf_foundation::hash64(&addr.to_raw().to_le_bytes(), hash);
+                if addr.to_raw() >= self.space.head().to_raw() {
+                    let parts = self.record(addr);
+                    entry =
+                        inf_foundation::hash64(self.record_bytes(addr, parts.encoded_len), entry);
+                }
+                digest.entries += 1;
+                digest.digest = digest.digest.wrapping_add(entry);
+            });
+        }
+        digest
+    }
+
     /// Probe-line prefetch (the batch pipeline's phase 1 — L3).
     #[inline]
     pub fn prefetch(&self, hash: u64) {
@@ -437,8 +456,13 @@ impl TieredTable {
         // NOT presence — a 2⁻²² fingerprint collision with a cold slot
         // legally reports a candidate for an absent key, so asserting
         // `Miss` here would panic on legal input.
+        debug_assert_eq!(hash, self.hash_key(key));
         debug_assert!(
-            !matches!(self.lookup(key, hash, &[]), TieredLookup::Ram(_)),
+            self.index
+                .find(hash, |addr| {
+                    addr.to_raw() >= self.space.head().to_raw() && self.record(addr).key == key
+                })
+                .is_none(),
             "insert of a RAM-verified present key"
         );
         if self.index.needs_grow() {
@@ -1231,6 +1255,90 @@ impl core::fmt::Debug for TieredTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulation_digest_observes_resident_changes_and_cold_index_without_mutation() {
+        let mut table = table();
+        let hash = table.hash_key(b"key");
+        let address = table.insert(b"key", b"one", hash).unwrap();
+        let before = table.simulation_digest();
+        assert_eq!(before.entries, 1);
+        assert_eq!(before, table.simulation_digest());
+        assert_eq!(table.walk_ckpt_id(), None);
+        let record = table.record(address);
+        let (len, version) = (record.encoded_len, record.version);
+        table.update(b"key", b"two", hash, address, len, version).unwrap();
+        assert_ne!(before, table.simulation_digest());
+        assert_eq!(table.walk_ckpt_id(), None);
+        let mut cold = cold_table();
+        let empty = cold.simulation_digest();
+        cold.apply_ref(17, LogicalAddr::ZERO);
+        assert_ne!(empty, cold.simulation_digest());
+        assert_eq!(cold.simulation_digest().entries, 1);
+        assert_eq!(cold.walk_ckpt_id(), None);
+    }
+
+    fn cold_table() -> TieredTable {
+        let mut cold = TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: 1 << 12,
+                life_origin: LogicalAddr::from_raw(1 << 12).unwrap(),
+            },
+            DemotionConfig::for_budget(1 << 16, 1 << 12),
+            64,
+            KeyHasher::default(),
+        )
+        .unwrap();
+        cold.seed_recovered_files(
+            &[TierFileMeta {
+                id: 0,
+                base: LogicalAddr::ZERO,
+                data_len: 1 << 12,
+                reason: inf_log::tier::SealReason::Capacity,
+                path: "tier-0.itier".into(),
+            }],
+            0,
+        );
+        cold
+    }
+
+    fn assert_insert_does_not_resolve_cold(blob: bool) {
+        let mut table = cold_table();
+        let hash = table.hash_key(b"absent");
+        table.apply_ref(hash, LogicalAddr::ZERO);
+        let before = table.space.counters().cold_resolves;
+        if blob {
+            use inf_log::blob::{ExtentId, ExtentWriter};
+            let fs = inf_log::fs::mem::MemFs::new();
+            let mut writer = ExtentWriter::create(
+                &fs,
+                std::path::Path::new("shard"),
+                ExtentId(0),
+                0,
+                inf_log::NsId(1),
+                3,
+                inf_log::TierIoMode::Buffered,
+            )
+            .unwrap();
+            writer.append_chunk(b"one").unwrap();
+            let sealed = writer.finish().unwrap();
+            table.insert_extent(b"absent", hash, &sealed).unwrap();
+        } else {
+            table.insert(b"absent", b"one", hash).unwrap();
+        }
+        assert_eq!(table.space.counters().cold_resolves, before);
+    }
+
+    #[test]
+    fn inline_insert_assertion_does_not_count_a_cold_lookup() {
+        assert_insert_does_not_resolve_cold(false);
+    }
+
+    #[test]
+    fn extent_insert_assertion_does_not_count_a_cold_lookup() {
+        assert_insert_does_not_resolve_cold(true);
+    }
 
     fn table() -> TieredTable {
         TieredTable::new(

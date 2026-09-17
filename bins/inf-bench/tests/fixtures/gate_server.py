@@ -19,6 +19,41 @@ pending = deque()
 load_connections = set()
 next_cell = 0
 probe_engaged = False
+loop_reads = [0] * cells
+info_reads = [0] * cells
+loop_mode = os.environ.get("INF_GATE_TEST_LOOP", "healthy")
+
+
+def loop_info(cell):
+    read = loop_reads[cell]
+    loop_reads[cell] += 1
+    buckets = [0] * 1920
+    buckets[0] = 1_000_000 + min(read, 1)
+    slow = loop_mode in ("diluted", "early-slow") and cell == cells - 1
+    if slow:
+        buckets[190] = min(2, max(0, read - 1)) * 100
+        buckets[0] += max(0, read - 3) * 1_000_000
+    else:
+        buckets[0] += max(0, read - 1) * 1_000_000
+    if loop_mode == "stale":
+        buckets[0] = 1_000_000
+    samples = sum(buckets)
+    submits = 100 + read * 10
+    if loop_mode == "rollback" and read >= 2:
+        submits = 1
+    info = (f"loop_histogram_schema:1\r\nloop_histogram_samples:{samples}\r\n"
+            f"loop_histogram_counts:{','.join(map(str, buckets))}\r\n"
+            f"loop_histogram_submits:{submits}\r\nloop_histogram_sqes:{submits * 16}\r\n"
+            f"loop_histogram_iterations:{samples}\r\n")
+    if loop_mode == "missing":
+        return ""
+    if loop_mode == "duplicate":
+        return info + f"loop_histogram_samples:{samples}\r\n"
+    if loop_mode == "malformed":
+        return info.replace("schema:1", "schema:2")
+    if loop_mode == "oversized":
+        return info + "x" * 65537
+    return info
 
 # The first Redis starts; the second attempt fails in Command::spawn.
 if "--appendonly" in args and os.environ.get("INF_GATE_TEST_DISABLE_REDIS"):
@@ -26,6 +61,8 @@ if "--appendonly" in args and os.environ.get("INF_GATE_TEST_DISABLE_REDIS"):
 
 async def serve(reader, writer):
     global next_cell, probe_engaged
+    cell = next_cell % cells
+    next_cell += 1
     try:
         for _ in range(1_000_000):
             header = await reader.readline()
@@ -40,17 +77,30 @@ async def serve(reader, writer):
                 assert header.startswith(b"$") and 0 <= size <= 65536
                 command.append((await reader.readexactly(size + 2))[:-2])
             if command[0] == b"INFO":
-                info = (f"cell:{next_cell % cells}\r\nloop_iter_p999_us:0\r\n"
+                submits = 100 + info_reads[cell] * 10
+                # Feed the original scraper too: its unchecked release subtraction wraps.
+                sqes = 0 if loop_mode == "rollback" and info_reads[cell] else submits * 16
+                info_reads[cell] += 1
+                info = (f"cell:{cell}\r\ncells:{cells}\r\nrun_id:{'0' * 40}\r\n"
+                        "loop_iter_p999_us:0\r\n"
+                        f"raw_submits:{submits}\r\nraw_sqes:{sqes}\r\n"
                         "memory_scope:node\r\nused_memory:4096\r\n"
                         "records_live_bytes:100\r\nindex_bytes:20\r\n"
                         "wheel_bytes:3\r\nevict_bytes:4\r\nevicted_keys:1\r\n"
                         f"acks_gated:{900 if probe_engaged else 100}\r\nfsyncs_completed:10\r\n"
                         "ckpts_completed:100\r\nmanifests_published:100\r\n"
-                        "segments_truncated:100\r\n").encode()
-                next_cell += 1
+                        "segments_truncated:100\r\n")
+                if any(arg.lower() == b"loophist" for arg in command[1:]):
+                    info += loop_info(cell)
+                info = info.encode()
                 writer.write(b"$%d\r\n" % len(info) + info + b"\r\n")
             elif command[0] in (b"GET", b"SET"):
                 reply = b"$-1\r\n" if command[0] == b"GET" else b"+OK\r\n"
+                refusal = os.environ.get("INF_GATE_TEST_REFUSAL")
+                if refusal:
+                    writer.write(f"-{refusal} fixture refused\r\n".encode())
+                    await writer.drain()
+                    continue
                 if mode == "basic":
                     writer.write(reply)
                 else:

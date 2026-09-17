@@ -282,6 +282,7 @@ pub enum DropCutOutcome {
 pub struct TieredNodeReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
     /// The reboot refused with the ADR-0018 taxonomy error — legal
@@ -419,14 +420,13 @@ impl TieredNodeReport {
 /// line is a complete repro via `--seed`.
 #[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
 #[must_use]
-pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
+fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNodeReport {
     let harness = scenario.harness();
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, scenario.stall.as_ref());
     if let Some(allowed) = scenario.ckpt_direct_refused_after {
         disk.refuse_direct_writes_after(allowed);
     }
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0x71E7_ED00);
     let mut report = TieredNodeReport::default();
     let seed = scenario.seed;
@@ -823,7 +823,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     let cut_time = clock.now();
     note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
-    disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED0);
 
     // ---- phase 4: reboot (+ optional second cut mid-recovery) -----------
     let mut boots = 0;
@@ -871,7 +871,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
         note_ckpt_witness(&node, scenario.cells, &mut report);
         drop(node);
-        disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
+        observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
 
@@ -1839,4 +1839,13 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     // Every verdict ends the same way: the report carries the violations.
     let _verdict = late::run(&mut cx, node, audit, total_keys);
     finish(report, &observer, &clock)
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
+    report
 }

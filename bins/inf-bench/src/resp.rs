@@ -101,6 +101,15 @@ fn parse_len(digits: &[u8]) -> Option<i64> {
 
 /// One blocking request/response exchange (cold-path helper: INFO scrapes).
 pub fn request(stream: &mut TcpStream, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
+    request_bounded(stream, argv, usize::MAX)
+}
+
+/// One cold-path exchange with an explicit reply byte budget.
+pub fn request_bounded(
+    stream: &mut TcpStream,
+    argv: &[&[u8]],
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     stream.write_all(&encode_command(argv)).map_err(|e| format!("write: {e}"))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16384];
@@ -112,6 +121,9 @@ pub fn request(stream: &mut TcpStream, argv: &[&[u8]]) -> Result<Vec<u8>, String
         let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("connection closed mid-reply".into());
+        }
+        if n > limit.saturating_sub(buf.len()) {
+            return Err("reply exceeds byte budget".into());
         }
         buf.extend_from_slice(&chunk[..n]);
     }

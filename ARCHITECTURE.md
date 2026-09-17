@@ -213,6 +213,11 @@ benchmark run with red tripwires is invalid for claims by definition,
 because it means the architecture wasn't exercising the thing that makes it
 fast.
 
+Loop-latency gates subtract per-cell histogram buckets around each loaded
+replicate, using fresh `INFO server loophist` snapshots (ADR-0136). The
+worst cell/window p99.9 binds; the ordinary INFO percentile is lifetime
+diagnostic data. Invalid or empty snapshots cannot certify a gate.
+
 ### Every command is a resumable state machine
 
 Commands compile to `!Send` futures on a minimal cell-local executor — no
@@ -278,6 +283,14 @@ on every PR (`scripts/sim-smoke.sh`), and a nightly fleet burns millions
 of simulated seconds. Determinism also gives replicas byte-exact
 log apply and makes `EXPLAIN` truthful — there is no planner and no
 nondeterministic execution to surprise anyone.
+
+`--verify-determinism` compares the preserved apply trace and a separate
+`state_hash` (ADR-0137). The latter records virtual event/step times,
+node boot/ready/end boundaries, recovered keyspace contents and canonical
+disk paths/bytes, including segments, checkpoints and MANIFESTs. Tiered
+index/resident-record digests combine with the disk image for cold data.
+Sweep mode checks both hashes for every selected seed when verification
+is requested. The hashes are diagnostic evidence, not cryptographic proof.
 
 The simulator's authority is guarded mechanically: cell code cannot name
 `tokio`, locks, `thread::sleep`, ambient clocks, or ambient randomness —

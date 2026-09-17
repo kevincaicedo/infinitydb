@@ -263,7 +263,7 @@ pub struct CellLoop<D: BackendDriver, C: Clock>;
 impl CellLoop {
     /// Backend-fatal errors propagate; per-op failures are completions.
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats>;
-    pub fn iteration_histogram(&self) -> &LogHistogram;    // loop_iter p999 gate
+    pub fn iteration_histogram(&self) -> &LogHistogram;    // cumulative loop buckets
     pub fn tripwires(&self) -> [(&'static str, u64); 5];   // frozen names, M0-S19 scrape
 }
 
@@ -588,7 +588,45 @@ pub struct NodeInfo { /* Cells: tripwires, raw_counters, wire_buffers_bytes,
 — tripwire ratios are computed from windowed deltas, lifetime ratios
 include idle parks.
 
+**ADR-0136 (2026-09-17, F-L20-13):** `NodeInfo::loop_snapshot` is a
+cell-owned on-demand snapshot. The assembly calls
+`capture_if_requested(iteration_histogram(), counters())` after each
+iteration. It copies only on request into reusable storage. Explicit
+`INFO server loophist` returns schema 1, cell/cells/run_id and either
+`loop_histogram_pending:1` or `loop_histogram_samples`,
+`loop_histogram_iterations`, `loop_histogram_submits`,
+`loop_histogram_sqes`, `loop_histogram_counts` (1920 comma-separated
+cumulative u64 counts, 32 sub-buckets/octave). It also requests the next
+iteration-boundary snapshot. Ordinary INFO/all does not select this section.
+
+The scraper retains a connection per cell and requires a newer sample
+count after requesting each snapshot. Pairs must share cell/node identity,
+have complete monotone buckets and counters, and contain samples and
+submissions. Gate-run computes integer-rank p99.9 from bucket differences
+around each pipelined load call, including warmup/drain and scrape RTTs;
+the maximum across cells and replicates binds the unchanged <500 µs gate.
+Bucket upper bounds conservatively round the result. Lifetime
+`loop_iter_p999_us` remains diagnostic only; subtracting percentiles is
+invalid. Raw snapshot pairs and per-window sample counts are retained in
+the report; malformed, empty or stale windows are errors in either tier.
+
+`LogHistogram` adds `BUCKET_COUNT`, `bucket_counts()`,
+`bucket_upper_bound(index) -> Option<u64>` and allocation-free
+`copy_from(&LogHistogram)` for this scrape. The schema's decimal list is
+at most 40319 bytes; the benchmark bounds the entire reply at 64 KiB,
+refuses duplicate fields, and fuzzes the decoder with `loop_histogram`.
+`INFO tripwires:loop_snapshot_bytes` attributes the added bucket storage
+(0 before a scrape, 15360 B after); it does not change the data maxmemory
+policy, like the existing render-only pool gauges.
+
 ## 7. Tripwire counter set (`inf-foundation::tripwire`) — names frozen
+
+**ADR-0137 (2026-09-17, F-L20-14):** benchmark `ops` and `ops_per_sec`
+count successful measured replies only; `errors` includes BUSY refusals.
+Success and error latencies have separate histograms. `warmup_errors` is
+separate from measured counts. Every M0/M1/M2 native load leg, fill and
+generator probe refuses errors (including warmup) before accepting a gate
+measurement. This changes instrument semantics, not numeric thresholds.
 
 `sqes_per_submit` · `cqes_per_reap` · `cmds_per_iter` · `fabric_msgs_per_batch`
 · `loop_iter_p999_us` · memory domains: `records_live_bytes`,

@@ -377,8 +377,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
     }
 
-    /// Always-on iteration histogram (µs). `loop_iter_p999_us` =
-    /// `.percentile(99.9)` — the §6 gate reads this.
+    /// Always-on lifetime iteration histogram (µs). The §6 gate subtracts
+    /// fresh bucket snapshots around each loaded window (ADR-0136).
     pub fn iteration_histogram(&self) -> &LogHistogram {
         &self.iter_hist_us
     }

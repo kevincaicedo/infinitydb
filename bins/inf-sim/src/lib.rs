@@ -57,6 +57,7 @@ pub mod pressure;
 pub mod recovery;
 pub mod resp;
 pub mod sidecar;
+pub mod state;
 #[allow(unsafe_code)]
 pub mod steel;
 pub mod tiered;

@@ -22,7 +22,7 @@ use crate::gaterun::{
     Measurements, ServerGuard, env_gate, finish_report, load_gates, max_field, median,
     rss_bytes_of, scrape_cells, spawn_infinityd, sum_field,
 };
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, request};
 
 /// Measurement keys for one A/B row (`Measurements` keys are `'static`).

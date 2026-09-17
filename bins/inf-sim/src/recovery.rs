@@ -164,6 +164,8 @@ pub struct RecoveryReport {
     /// image — disclosed, never a pass on its own.
     pub shadow_held_not_restored: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl RecoveryReport {
@@ -1536,7 +1538,11 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.held_twin.filter(|c| life.table.shadow_tickets().any(|t| t.cold.to_raw() == *c));
         run.held_twin = None;
         // The cut: every un-fsynced byte tears (seeded physics).
+        run.report.state.number(b"cut-life", life_index);
+        run.report.state.digest(life.table.simulation_digest());
+        run.report.state.disk(&disk);
         disk.power_cut(scenario.seed ^ (0xC07_0000 + life_index));
+        run.report.state.disk(&disk);
         drop(life);
 
         // ---- recovery (ADR-0057 D6) ----
@@ -1544,15 +1550,18 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             Ok(Some(manifest)) => manifest,
             Ok(None) => {
                 run.report.violations.push("published manifest lost".into());
+                run.report.state_hash = run.report.state.value();
                 return run.report;
             }
             Err(e) => {
                 run.report.violations.push(format!("manifest unreadable: {e}"));
+                run.report.state_hash = run.report.state.value();
                 return run.report;
             }
         };
         let Some(tier) = manifest.tier_ns(NS.0).cloned() else {
             run.report.violations.push("manifest lost its tier section".into());
+            run.report.state_hash = run.report.state.value();
             return run.report;
         };
         let recovered = match recover_tiered_ns(
@@ -1568,6 +1577,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             Ok(recovered) => recovered,
             Err(e) => {
                 run.report.violations.push(format!("tier recovery failed: {e}"));
+                run.report.state_hash = run.report.state.value();
                 return run.report;
             }
         };
@@ -1613,9 +1623,12 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         );
         if let Err(e) = loaded {
             run.report.violations.push(format!("checkpoint load failed: {e:?}"));
+            run.report.state_hash = run.report.state.value();
             return run.report;
         }
         let mut table = table.into_inner();
+        run.report.state.number(b"checkpoint-loaded", life_index);
+        run.report.state.digest(table.simulation_digest());
         table.set_shadow_enabled(true);
         // D4 tail replay: displacement markers pair with their mutation
         // — a bounded list since ADR-0059 D9 (origin markers stack atop
@@ -1654,6 +1667,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 }
                 other => {
                     run.report.violations.push(format!("modeled tail carries {other:?}"));
+                    run.report.state_hash = run.report.state.value();
                     return run.report;
                 }
             }
@@ -1674,8 +1688,11 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             Ok(image)
         }) {
             run.report.violations.push(format!("life {life_index}: {err}"));
+            run.report.state_hash = run.report.state.value();
             return run.report;
         }
+        run.report.state.number(b"recovered-life", life_index);
+        run.report.state.digest(table.simulation_digest());
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
         // recovered file's slot count equals the index's ground truth,
         // and byte counters never over-count dead — asserted per life,
@@ -1740,6 +1757,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // refcount decrement, happen at the verdict).
         check_blob_refs(&mut run, &mut life, &recovered.extents_listed, life_index);
         run.audit(&life, &format!("life {life_index}"));
+        run.report.state.number(b"audited-life", life_index);
+        run.report.state.digest(life.table.simulation_digest());
+        run.report.state.disk(&disk);
         run.report.trace_hash = hash64(
             &[
                 run.report.refs_emitted.to_le_bytes(),
@@ -1766,5 +1786,6 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.trace_hash,
         );
     }
+    run.report.state_hash = run.report.state.value();
     run.report
 }

@@ -9,6 +9,25 @@ use std::process::{Command, Output};
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn every_gate_flow_refuses_errors_before_consuming_a_measurement() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (milestone, refusal) in [("m0", "ERR"), ("m1", "OOM"), ("m2", "BUSY")] {
+        let fixture = Fixture::new(&format!("refusal-{milestone}"), "external:unmeasured", true);
+        let mut command = fixture.command_for(milestone, "0", "1");
+        command.arg("--skip-fill").env("INF_GATE_TEST_REFUSAL", refusal);
+        if milestone == "m2" {
+            command.arg("--only-always").arg("--data-root").arg(&fixture.0);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("error replies under load"), "{output:?}");
+        assert!(stderr.contains(&format!("-{refusal} fixture refused")), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("generator saturation:"));
+    }
+}
+
+#[test]
 fn zero_replicates_refuse_before_running_any_milestone() {
     for milestone in ["m0", "m1", "m2", "m4", "m4.5"] {
         let output = Command::new(env!("CARGO_BIN_EXE_inf-bench"))
@@ -24,6 +43,8 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new(name: &str, source: &str, informational: bool) -> Self {
+        let (threshold, comparator) =
+            if source == "tripwire:loop_iter_p999_us" { (500, "<") } else { (1, "<=") };
         let root =
             std::env::temp_dir().join(format!("inf-bench-gate-{}-{name}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
@@ -35,8 +56,8 @@ impl Fixture {
         std::fs::write(
             root.join("gates.toml"),
             format!(
-                "[[gate]]\nid = \"probe\"\nname = \"probe\"\nthreshold = 1\n\
-             comparator = \"<=\"\n\
+                "[[gate]]\nid = \"probe\"\nname = \"probe\"\nthreshold = {threshold}\n\
+             comparator = \"{comparator}\"\n\
              tier = \"linux-reference-box\"\nsource = \"{source}\"\n\
              informational = {informational}\n"
             ),
@@ -50,6 +71,16 @@ impl Fixture {
     }
 
     fn command_for(&self, milestone: &str, duration: &str, cells: &str) -> Command {
+        self.command_with_replicates(milestone, duration, cells, "1")
+    }
+
+    fn command_with_replicates(
+        &self,
+        milestone: &str,
+        duration: &str,
+        cells: &str,
+        replicates: &str,
+    ) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_inf-bench"));
         command.args([
             "gate-run",
@@ -61,7 +92,7 @@ impl Fixture {
             "--duration",
             duration,
             "--replicates",
-            "1",
+            replicates,
             "--fill-keys",
             "0",
         ]);
@@ -105,6 +136,71 @@ fn unmeasured_stop_exits_one_with_an_incomplete_report() {
     let fixture = Fixture::new("missing", "external:unmeasured", false);
     let output = fixture.command().arg("--skip-fill").output().unwrap();
     fixture.assert_failed(&output, "unmeasured STOP gate(s): probe (external:unmeasured)");
+}
+
+#[test]
+fn loop_gate_uses_loaded_buckets_instead_of_the_cheap_lifetime_percentile() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("loop-dilution", "tripwire:loop_iter_p999_us", false);
+    let output = fixture
+        .command_for("m0", "0", "2")
+        .arg("--skip-fill")
+        .env("INF_GATE_TEST_LOOP", "diluted")
+        .output()
+        .unwrap();
+    let report = fixture.report();
+    assert!(report.contains("| 1007.00 | FAIL"), "{report}\n{output:?}");
+    assert!(report.contains("loop window rep 0 cell 1"), "{report}");
+}
+
+#[test]
+fn loop_gate_refuses_a_counter_rollback_in_the_release_binary() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("loop-rollback", "tripwire:loop_iter_p999_us", false);
+    let output = fixture
+        .command()
+        .arg("--skip-fill")
+        .env("INF_GATE_TEST_LOOP", "rollback")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("non-monotone raw_submits"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn loop_gate_keeps_the_worst_replicate_and_excludes_inter_replicate_history() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("loop-replicates", "tripwire:loop_iter_p999_us", false);
+    let output = fixture
+        .command_with_replicates("m0", "0", "2", "2")
+        .arg("--skip-fill")
+        .env("INF_GATE_TEST_LOOP", "early-slow")
+        .output()
+        .unwrap();
+    let report = fixture.report();
+    assert!(report.contains("| 1007.00 | FAIL"), "{report}\n{output:?}");
+    assert!(report.contains("loop window rep 1 cell 1: 2000000 samples, p999 0 us"), "{report}");
+}
+
+#[test]
+fn loop_gate_refuses_invalid_and_oversized_snapshots() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (mode, reason) in [
+        ("missing", "missing loop_histogram_schema"),
+        ("malformed", "unsupported loop histogram schema"),
+        ("duplicate", "duplicate loop histogram field"),
+        ("stale", "stale loop histogram snapshot"),
+        ("oversized", "reply exceeds byte budget"),
+    ] {
+        let fixture = Fixture::new(&format!("loop-{mode}"), "tripwire:loop_iter_p999_us", false);
+        let output =
+            fixture.command().arg("--skip-fill").env("INF_GATE_TEST_LOOP", mode).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(reason), "{output:?}");
+    }
 }
 
 #[test]

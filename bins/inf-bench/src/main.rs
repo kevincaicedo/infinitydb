@@ -28,6 +28,7 @@ mod finehist;
 mod gaterun;
 mod gates;
 mod load;
+mod loop_histogram;
 mod m1rows;
 mod m2rows;
 mod m45rows;

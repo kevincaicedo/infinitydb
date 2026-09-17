@@ -114,7 +114,7 @@ comparator = "<"
 unit = "us"
 tier = "linux-reference-box"
 source = "tripwire:loop_iter_p999_us"
-measured_by = "always-on HDR histogram, scraped via INFO tripwires under the M0 reference load"
+measured_by = "maximum cell/window p99.9 from fresh INFO loophist bucket deltas around M0 load replicates (ADR-0136)"
 
 [[gate]]
 id = "syscall_cpu_share"

@@ -96,6 +96,7 @@ impl CombinedScenario {
 pub struct CombinedReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
     pub commands_done: u64,
@@ -216,17 +217,17 @@ fn next_memory_command(
 /// order and oracle inventory.
 #[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
 #[must_use]
-pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
+fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> CombinedReport {
     let dur = &scenario.durable;
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(dur.seed, dur.stall.as_ref());
-    let observer = TraceObserver::default();
     // A scheduler stream distinct from the durable scenario's, so shared
     // seeds don't correlate the two fleets.
     let mut rng = SplitMix64::new(dur.seed ^ 0xC0B1_4ED5);
     let mut report = CombinedReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         violations: Vec::new(),
         stalled: false,
         commands_done: 0,
@@ -579,7 +580,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
     // ---- POWER CUT ------------------------------------------------------
     let cut_time = clock.now();
     drop(node); // the process dies: in-flight state vanishes
-    disk.power_cut(dur.seed ^ 0x0FF5_EED0);
+    observer.power_cut(&disk, clock.now(), dur.seed ^ 0x0FF5_EED0);
 
     // ---- reboot (+ optional second cut mid-recovery, inherited) ---------
     let mut boots = 0;
@@ -635,7 +636,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
         // The second cut: recovery itself was interrupted (idempotence),
         // now with memory + expiry + quiesced pub/sub state present.
         drop(node);
-        disk.power_cut(dur.seed ^ 0x0FF5_EED1 ^ boots);
+        observer.power_cut(&disk, clock.now(), dur.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
 
@@ -825,5 +826,14 @@ fn finish(
     report.trace = observer.trace_bytes();
     report.trace_hash = hash64(&report.trace, 0xC0B1);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
+    report
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
     report
 }

@@ -91,6 +91,7 @@ pub struct SidecarReport {
     pub degraded_rebuilds: u64,
     pub scheduler_steps: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
 }
 
 impl SidecarReport {
@@ -231,10 +232,9 @@ fn check_serving_contract(
 }
 
 /// Runs one seeded scenario (module docs for the structure).
-pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
+fn run_observed(scenario: &SidecarScenario, observer: TraceObserver) -> SidecarReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, base(scenario).stall.as_ref());
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(scenario.seed ^ 0x51DE_CA55);
     let mut report = SidecarReport::default();
     let mut trace: Vec<u8> = scenario.seed.to_le_bytes().to_vec();
@@ -346,7 +346,7 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
     }
     // The declarations reach the live registries only through boot
     // seeding (the DDL fan is S10's) — restart once, then converge.
-    disk.power_cut(scenario.seed ^ 0x51DE_0001);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x51DE_0001);
     node = reboot!("post-ddl");
     if !drive_until!(node, "post-ddl recovery", node.ready()) {
         report.trace_hash = inf_foundation::hash64(&trace, 0x4501_51DE);
@@ -370,7 +370,7 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
         report.scheduler_steps += 1;
     }
     let published_before = manifests_published(&node, scenario.cells);
-    disk.power_cut(scenario.seed ^ 0x51DE_0002);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x51DE_0002);
     report.cuts.push(format!("mid-write(extra={extra},published={published_before})"));
     trace.extend_from_slice(&[b'm', extra as u8, published_before as u8]);
     node = reboot!("mid-write");
@@ -461,7 +461,7 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
             break;
         }
     }
-    disk.power_cut(scenario.seed ^ 0x51DE_0003);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x51DE_0003);
     report.cuts.push(format!("post-publish(storm={})", report.storm_during_stream));
     trace.extend_from_slice(&report.storm_during_stream.to_le_bytes());
     node = reboot!("post-publish");
@@ -566,7 +566,7 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
         }
     }
     inf_foundation::fault::arm(inf_store::fault::IDX_APPLY_TRIP, FaultSpec::Nth(1));
-    disk.power_cut(scenario.seed ^ 0x51DE_0004);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x51DE_0004);
     report.cuts.push("degraded-tail".into());
     node = reboot!("degraded-tail");
     let recovered = drive_until!(node, "degraded-tail recovery", node.ready());
@@ -639,5 +639,14 @@ pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
     trace.extend_from_slice(&report.ready_checks.to_le_bytes());
     trace.extend_from_slice(&(report.violations.len() as u64).to_le_bytes());
     report.trace_hash = inf_foundation::hash64(&trace, 0x4501_51DE);
+    report
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
     report
 }

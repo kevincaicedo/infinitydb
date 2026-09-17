@@ -40,6 +40,7 @@ use crate::durable::{
 pub struct NsCreateWindowReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
     pub commands_done: u64,
@@ -112,15 +113,15 @@ fn scrape_unknown_skips(node: &Node, cells: u16) -> u64 {
 /// Runs one seeded `m2-ns-create-window` scenario.
 #[must_use]
 #[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
-pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
+fn run_observed(seed: u64, observer: TraceObserver) -> NsCreateWindowReport {
     let scenario = DurableScenario::m2_durable(seed);
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(seed, scenario.stall.as_ref());
-    let observer = TraceObserver::default();
     let mut rng = SplitMix64::new(seed ^ 0x0C14_C14A);
     let mut report = NsCreateWindowReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         violations: Vec::new(),
         stalled: false,
         commands_done: 0,
@@ -260,7 +261,7 @@ pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     drop(creator);
     drop(setup);
     drop(node);
-    disk.power_cut(seed ^ 0x0C14_0FF5);
+    observer.power_cut(&disk, clock.now(), seed ^ 0x0C14_0FF5);
 
     // ---- phase 4: reboot + the audit ------------------------------------
     let mut node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
@@ -369,7 +370,7 @@ pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     drop(writers);
     drop(audit);
     drop(node);
-    disk.power_cut(seed ^ 0x0C14_0FF6);
+    observer.power_cut(&disk, clock.now(), seed ^ 0x0C14_0FF6);
     let mut node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
         Ok(node) => node,
         Err(err) => {
@@ -410,4 +411,13 @@ pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     drop(reader);
     drop(node);
     finish(report, &observer, &clock)
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(seed, observer.clone());
+    report.state_hash = observer.state_hash();
+    report
 }

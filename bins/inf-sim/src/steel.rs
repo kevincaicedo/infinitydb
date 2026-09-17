@@ -71,6 +71,8 @@ pub struct SteelReport {
     pub cold_reads: u64,
     pub promotions: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl SteelReport {
@@ -311,6 +313,8 @@ fn run_life(
             model.insert(key.clone(), Expect { value: value.clone(), version: parts.version });
         }
     }
+    report.state.number(b"recovered-life", life_origin.to_raw());
+    report.state.keyspace(&ks, inf_foundation::time::Nanos(0));
     // Seal → flush through the S11 pipeline (rotation, gaps, footer,
     // fdatasync, watermark confirmation — the harness leg retired) →
     // release.
@@ -440,6 +444,8 @@ fn run_life(
     }
 
     let ctx = ctx.borrow();
+    report.state.keyspace(&ctx.ks, inf_foundation::time::Nanos(0));
+    report.state.disk(disk);
     if ctx.pool.reconcile().is_err() {
         report.violations.push("aligned-pool lease leak".into());
     }
@@ -477,7 +483,9 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
 
     // The S06 crash leg: tear un-fsynced state, then a new life replays
     // the ledger at a fresh origin — content survives, addresses don't.
+    report.state.number(b"cut", scenario.seed ^ 0x0FF5_EED0);
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    report.state.disk(&disk);
     let origin = LogicalAddr::from_raw(tail.to_raw().next_multiple_of(PAGE as u64))
         .expect("origin fits 48 bits");
     run_life(
@@ -490,5 +498,6 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
         &mut report,
         KeyHasher::from_seed(scenario.seed),
     );
+    report.state_hash = report.state.value();
     report
 }

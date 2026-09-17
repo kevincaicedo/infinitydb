@@ -1199,6 +1199,28 @@ mod tests {
         assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
     }
 
+    #[test]
+    fn info_loop_histogram_is_explicit_and_does_not_duplicate_tripwire_fields() {
+        let mut cx = ConnCx::default();
+        let mut store = Keyspace::new(StoreConfig::default());
+        let ordinary = run(&mut cx, &mut store, &[b"INFO"]);
+        assert!(!String::from_utf8_lossy(&ordinary).contains("loop_histogram_"));
+        let pending = run(&mut cx, &mut store, &[b"INFO", b"loophist"]);
+        assert!(String::from_utf8_lossy(&pending).contains("loop_histogram_pending:1"));
+        let mut histogram = inf_foundation::LogHistogram::new();
+        histogram.record(1000);
+        cx.node.loop_snapshot.capture_if_requested(&histogram, [1, 16, 0, 1, 0, 0]);
+        let combined = run(&mut cx, &mut store, &[b"INFO", b"all", b"loophist"]);
+        let text = String::from_utf8(combined).unwrap();
+        let mut fields = std::collections::BTreeSet::new();
+        for line in text.lines().skip(1).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let name = line.split_once(':').unwrap().0;
+            assert!(fields.insert(name), "duplicate field {name}");
+        }
+        assert!(text.contains("loop_histogram_samples:1\r\n"));
+        assert!(text.contains("loop_histogram_submits:1\r\n"));
+    }
+
     /// Batch 50 (review 2026-08-30, F-L15-10): a section name this build
     /// does not have yields nothing for that name — `INFO nosuchsection`
     /// is an empty body (Redis 8.0.5: `$0\r\n\r\n`), `INFO server

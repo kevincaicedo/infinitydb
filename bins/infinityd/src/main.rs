@@ -1330,6 +1330,8 @@ fn cell_main(
     let mut counted = false;
     loop {
         cell_loop.run_iteration(&mut plane)?;
+        node.loop_snapshot
+            .capture_if_requested(cell_loop.iteration_histogram(), cell_loop.counters());
         if let Some(err) = plane.take_boot_error() {
             // §8.4 fail-stop: recovery refused — the whole node stops,
             // immediately (a half-recovered node must never serve).

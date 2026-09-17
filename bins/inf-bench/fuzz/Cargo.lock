@@ -47,8 +47,13 @@ dependencies = [
 name = "inf-bench-fuzz"
 version = "0.0.0"
 dependencies = [
+ "inf-foundation",
  "libfuzzer-sys",
 ]
+
+[[package]]
+name = "inf-foundation"
+version = "0.0.0"
 
 [[package]]
 name = "jobserver"
