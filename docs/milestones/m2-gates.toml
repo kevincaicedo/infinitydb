@@ -8,7 +8,8 @@
 # natively by gate-run (the ab:* zero-cost rows need `--baseline-bin`, the
 # pre-M2 infinityd build); external:* rows come from campaign tooling (DST
 # sweep, crash matrix, recovery timing, soak, M0/M1 regression A/B) and
-# report PENDING from gate-run until that artifact is supplied. The S22 gate
+# remain unmeasured until supplied. Missing/non-finite selected STOP measurements
+# fail in every tier (ADR-0132). The S22 gate
 # campaign is the binding run; S09 lands the ab:* + counter rows first.
 # tier = "linux-reference-box" verdicts bind only on the reference box.
 

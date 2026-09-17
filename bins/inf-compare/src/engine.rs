@@ -71,6 +71,16 @@ impl EngineKind {
             EngineKind::RedisStack | EngineKind::Dragonfly | EngineKind::InfinityDb => true,
         }
     }
+
+    pub fn validate_durability(self, durability: Durability) -> Result<(), String> {
+        if self == Self::Dragonfly && durability == Durability::Everysec {
+            return Err("dragonfly does not support --durability everysec in inf-compare: \
+                no verified AOF/every-second fsync launch mode; snapshots are not equivalent. \
+                Use --engines redis,infinitydb or --durability none"
+                .into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,12 +100,12 @@ impl Mode {
     }
 }
 
-/// Durability class every engine in a run is configured for (M4.5-S40):
+/// Requested durability class for launched engines (M4.5-S40):
 /// `None` is the in-memory row (redis `--appendonly no`, infinitydb's
 /// default dbs); `Everysec` is redis `--appendonly yes --appendfsync
 /// everysec` against an infinitydb `FSYNC everysec` namespace every
-/// connection starts in (`--conn-default-ns`) — the same loss window on
-/// both sides, each engine's own mechanism.
+/// connection starts in (`--conn-default-ns`). Dragonfly has no verified
+/// equivalent launch mode and is refused for `Everysec` (L20-19).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Durability {
     None,
@@ -165,6 +175,8 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub mode: Mode,
+    /// Configured by this harness; attached servers remain unverified.
+    pub durability: Option<Durability>,
     pub version: String,
     pub launch_cmd: String,
     pid: Option<u32>,
@@ -180,8 +192,8 @@ impl Target {
 
 /// Spawn `spec` as a host child process, wait until it answers `PING`.
 pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
-    prepare_data_dir(spec)?;
     let (program, argv) = host_argv(spec)?;
+    prepare_data_dir(spec)?;
     let launch_cmd = render_cmd(&program, &argv);
     let child = spawn(&program, &argv, log_dir, spec.kind.label())?;
     let pid = child.id();
@@ -194,6 +206,7 @@ pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
         host: spec.host.clone(),
         port: spec.port,
         mode: Mode::Host,
+        durability: Some(spec.durability),
         version,
         launch_cmd,
         pid: Some(pid),
@@ -277,9 +290,10 @@ fn durable_setup(spec: &Spec) -> Result<(), String> {
 
 /// `docker run -d` `spec` as a container; wait until it answers `PING`.
 pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Target, String> {
+    spec.kind.validate_durability(spec.durability)?;
     if spec.durability != Durability::None {
         return Err("--durability is a host-launch row (the data dir is a host path); drop \
-                    --docker or attach"
+                    --docker and --attach"
             .into());
     }
     let name = format!("inf-compare-{}-{}", spec.kind.label(), spec.port);
@@ -318,6 +332,7 @@ pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Tar
         host: spec.host.clone(),
         port: spec.port,
         mode: Mode::Docker,
+        durability: Some(spec.durability),
         version,
         launch_cmd,
         pid: None,
@@ -336,6 +351,7 @@ pub fn attach(kind: EngineKind, host: &str, port: u16) -> Result<Target, String>
         host: host.to_string(),
         port,
         mode: Mode::Attach,
+        durability: None,
         version: info_version(host, port),
         launch_cmd: format!("(attached at {host}:{port})"),
         pid: None,
@@ -432,6 +448,10 @@ fn wait_ready(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
 // ---- host argv ----------------------------------------------------------
 
 fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
+    spec.kind.validate_durability(spec.durability)?;
+    if spec.durability == Durability::Everysec && spec.data_dir.is_none() {
+        return Err(format!("{} everysec launch requires a data directory", spec.kind.label()));
+    }
     match spec.kind {
         EngineKind::Redis => {
             let (p, a) = redis_argv(spec, false);
@@ -444,7 +464,7 @@ fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
             Err("redis-stack is docker-only (no host binary); pass --docker".into())
         }
         EngineKind::Dragonfly => {
-            let (p, a) = dragonfly_argv(spec, false);
+            let (p, a) = dragonfly_argv(spec, false)?;
             Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
         }
         // infinityd pins its own cells via --pin-start; never taskset-wrapped.
@@ -481,7 +501,8 @@ fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
     ("redis-server".to_string(), argv)
 }
 
-fn dragonfly_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
+fn dragonfly_argv(spec: &Spec, in_docker: bool) -> Result<(String, Vec<String>), String> {
+    EngineKind::Dragonfly.validate_durability(spec.durability)?;
     let port = if in_docker { 6379 } else { spec.port };
     let mut argv = vec![
         "--port".to_string(),
@@ -499,7 +520,7 @@ fn dragonfly_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
         // keep snapshots out of cwd; send logs to stderr so we capture them
         argv.extend(["--logtostderr".to_string(), "--dir".to_string(), "/tmp".to_string()]);
     }
-    ("dragonfly".to_string(), argv)
+    Ok(("dragonfly".to_string(), argv))
 }
 
 /// Wrap a host command in `taskset -c LO-HI` (`width` cores from `pin_start`)
@@ -728,7 +749,7 @@ fn docker_argv(spec: &Spec, images: &Images, name: &str) -> Result<Vec<String>, 
             // dragonfly needs unlimited locked memory for its io_uring rings.
             argv.splice(1..1, ["--ulimit".to_string(), "memlock=-1".to_string()]);
             argv.push(images.dragonfly.clone());
-            let (_, inner) = dragonfly_argv(spec, true);
+            let (_, inner) = dragonfly_argv(spec, true)?;
             argv.extend(inner);
         }
         EngineKind::InfinityDb => {
@@ -926,7 +947,53 @@ fn on_path(program: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineKind, Observation, observation_delta, parse_info};
+    use super::*;
+
+    fn spec(kind: EngineKind, durability: Durability) -> Spec {
+        Spec {
+            kind,
+            host: "127.0.0.1".into(),
+            port: 7000,
+            threads: 1,
+            pin_start: None,
+            maxmemory_mb: None,
+            durability,
+            data_dir: (durability == Durability::Everysec).then(|| PathBuf::from("data")),
+            probe_file: None,
+            redis_no_auto_rewrite: false,
+        }
+    }
+
+    #[test]
+    fn dragonfly_everysec_cannot_produce_a_memory_launch() {
+        let spec = spec(EngineKind::Dragonfly, Durability::Everysec);
+        let result = host_argv(&spec);
+        assert!(result.is_err(), "must refuse an unmatched durability configuration: {result:?}");
+        assert!(dragonfly_argv(&spec, false).is_err());
+        assert!(dragonfly_argv(&spec, true).is_err());
+    }
+
+    #[test]
+    fn durable_host_launch_requires_a_data_directory() {
+        for kind in [EngineKind::Redis, EngineKind::InfinityDb] {
+            let mut spec = spec(kind, Durability::Everysec);
+            spec.data_dir = None;
+            assert!(host_argv(&spec).is_err(), "{kind:?} silently fell back to memory");
+        }
+    }
+
+    #[test]
+    fn supported_launches_keep_their_explicit_durability_configuration() {
+        let (_, argv) = host_argv(&spec(EngineKind::Redis, Durability::Everysec)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--appendonly", "yes"]));
+        assert!(argv.windows(2).any(|w| w == ["--appendfsync", "everysec"]));
+        assert!(argv.windows(2).any(|w| w == ["--dir", "data"]));
+        let (_, argv) = host_argv(&spec(EngineKind::InfinityDb, Durability::Everysec)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--data-dir", "data"]));
+        assert!(argv.windows(2).any(|w| w == ["--conn-default-ns", DURABLE_NS]));
+        let (_, argv) = host_argv(&spec(EngineKind::Dragonfly, Durability::None)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--dbfilename", ""]));
+    }
 
     #[test]
     fn info_parser_and_selected_deltas_are_explicit() {

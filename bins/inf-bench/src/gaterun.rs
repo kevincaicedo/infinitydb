@@ -9,10 +9,9 @@
 //! reference-box runs can bind the milestone verdict.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::cli::Flags;
 use crate::envcheck;
@@ -374,6 +373,7 @@ pub(crate) struct Measurements {
     pub(crate) raw: String,
     rows: Vec<RowWriteAmp>,
     sidecars: Vec<(String, String)>,
+    failures: Vec<String>,
 }
 
 impl Measurements {
@@ -384,6 +384,7 @@ impl Measurements {
             raw: String::new(),
             rows: Vec::new(),
             sidecars: Vec::new(),
+            failures: Vec::new(),
         }
     }
 
@@ -421,6 +422,10 @@ impl Measurements {
 
     pub(crate) fn note(&mut self, text: impl Into<String>) {
         self.notes.push(text.into());
+    }
+
+    pub(crate) fn fail(&mut self, reason: impl Into<String>) {
+        self.failures.push(reason.into());
     }
 
     pub(crate) fn raw_section(&mut self, title: &str, body: &str) {
@@ -465,107 +470,8 @@ pub(crate) fn env_gate(flags: &Flags) -> Result<bool, String> {
     Ok(env_ok)
 }
 
-/// Per-gate verdicts + the report file (shared epilogue). Errs when any
-/// binding gate failed, or when a declared workload row never reported its
-/// write amplification (M4-S16: a row missing WA is an invalid row — the
-/// generator refuses it rather than publishing a report whose silence
-/// reads like a good number).
-pub(crate) fn finish_report(
-    milestone: &str,
-    gates_list: &[gates::Gate],
-    m: &Measurements,
-    env_ok: bool,
-    reference_box: bool,
-    artifacts_root: &str,
-    header_facts: &str,
-) -> Result<(), String> {
-    // The row obligation is checked *before* anything is written: an
-    // invalid run must not leave a report file behind to be cited later.
-    let unreported: Vec<&str> =
-        m.rows.iter().filter(|r| r.disposition.is_none()).map(|r| r.name.as_str()).collect();
-    if !unreported.is_empty() {
-        return Err(format!(
-            "row(s) [{}] finished without a write-amplification disposition — an M4 report row \
-             without WA is an invalid row (M4-S16); measure it or name why there is none",
-            unreported.join(", ")
-        ));
-    }
-
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs();
-    let dir = format!("{artifacts_root}/{stamp}-gate-run");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
-
-    let mut report = String::new();
-    report.push_str(&format!(
-        "# {} gate-run report\n\ndate: {stamp} (unix) · {header_facts}\nenv-check: {}\ntier: \
-             {}\n\nnotes:\n",
-        milestone.to_uppercase(),
-        if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
-        if reference_box { "reference-box (binding)" } else { "dev (non-binding)" },
-    ));
-    for note in &m.notes {
-        report.push_str(&format!("- {note}\n"));
-    }
-    report.push_str("\n| gate | threshold | measured | verdict |\n|---|---|---|---|\n");
-    println!("\n== gate verdicts ==");
-    let mut binding_failures = 0;
-    for gate in gates_list {
-        let measured = m.values.get(gate.source.as_str()).copied();
-        let (measured_text, verdict) = match measured {
-            None => ("—".to_string(), "PENDING (tooling)".to_string()),
-            Some(value) => {
-                let pass = gate.passes(value);
-                let tag = if pass { "PASS" } else { "FAIL" };
-                let verdict = if gate.informational {
-                    format!("{tag} (informational)")
-                } else if gate.tier == "linux-reference-box" && !reference_box {
-                    format!("{tag} (DEV-TIER, non-binding)")
-                } else {
-                    if !pass {
-                        binding_failures += 1;
-                    }
-                    tag.to_string()
-                };
-                (format!("{value:.2}"), verdict)
-            }
-        };
-        println!("  {:<38} {}", gate.name, verdict);
-        report.push_str(&format!(
-            "| {} | {} {} {} | {} | {} |\n",
-            gate.name, gate.comparator, gate.threshold, gate.unit, measured_text, verdict
-        ));
-    }
-    if !m.rows.is_empty() {
-        report.push_str(
-            "\n## write amplification by row\n\n\
-             Per namespace, worst first — never a node-wide blend (M4-S16).\n\n\
-             | row | write amplification |\n|---|---|\n",
-        );
-        for row in &m.rows {
-            let disposition = row.disposition.as_deref().unwrap_or("MISSING");
-            report.push_str(&format!("| {} | {} |\n", row.name, disposition));
-        }
-    }
-    report.push_str(&m.raw);
-
-    let report_path = format!("{dir}/report.md");
-    let mut file =
-        std::fs::File::create(&report_path).map_err(|e| format!("{report_path}: {e}"))?;
-    file.write_all(report.as_bytes()).map_err(|e| format!("{report_path}: {e}"))?;
-    println!("\ngate-run: report written to {report_path}");
-    for (name, body) in &m.sidecars {
-        let path = format!("{dir}/{name}");
-        std::fs::write(&path, body).map_err(|e| format!("{path}: {e}"))?;
-        println!("gate-run: sidecar written to {path}");
-    }
-    if binding_failures > 0 {
-        return Err(format!("{binding_failures} binding gate(s) FAILED"));
-    }
-    Ok(())
-}
+mod report;
+pub(crate) use report::finish_report;
 
 pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
     &[
@@ -796,6 +702,9 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
         return Err("usage: gate-run m0|m1 [flags]".into());
     };
     let flags = Flags::parse(rest, GATE_RUN_FLAGS.0, GATE_RUN_FLAGS.1)?;
+    if flags.usize_or("replicates", 3)? == 0 {
+        return Err("--replicates must be >= 1".into());
+    }
     match milestone.as_str() {
         "m0" => cmd_gate_run_m0(&flags),
         "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
@@ -929,12 +838,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     // without Dragonfly in the same run does not exist). Interleaved ABBA
     // against `dragonfly --proactor_threads=<cells>`, same workload.
     if flags.bool("skip-comparator") {
-        m.note("comparator leg skipped (--skip-comparator): comparator_ab PENDING");
+        m.note("comparator leg skipped (--skip-comparator): comparator_ab UNMEASURED");
     } else {
         println!("\n== comparator anchor (dragonfly --proactor_threads={cells}) ==");
         let dragonfly_bin = flags.str_or("dragonfly-bin", "dragonfly");
         match spawn_dragonfly(&dragonfly_bin, cells) {
-            Err(e) => m.note(format!("comparator leg skipped: {e} — comparator_ab PENDING")),
+            Err(e) => m.fail(format!("Dragonfly comparator startup failed: {e}")),
             Ok(dragonfly) => {
                 let mut ours: Vec<f64> = Vec::new();
                 let mut theirs: Vec<f64> = Vec::new();
@@ -973,7 +882,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     // 4. Unpipelined 512-conn A/B vs Redis (interleaved replicates).
     println!("\n== unpipelined 512-conn A/B vs redis ==");
     match spawn_redis(&redis_bin) {
-        Err(e) => m.note(format!("A/B skipped: {e} — unpipelined ratio PENDING")),
+        Err(e) => m.fail(format!("Redis A/B startup failed: {e}")),
         Ok(redis) => {
             let mut ours: Vec<f64> = Vec::new();
             let mut theirs: Vec<f64> = Vec::new();
@@ -1034,7 +943,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         drop(ours);
 
         match spawn_redis(&redis_bin) {
-            Err(e) => m.note(format!("redis RSS leg skipped: {e}")),
+            Err(e) => m.fail(format!("Redis RSS startup failed: {e}")),
             Ok(redis) => {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 let report = run_load(&fill)?;
@@ -1062,6 +971,28 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmeasured_stop_gates_refuse_in_both_tiers() {
+        let dir = std::env::temp_dir().join(format!("inf-bench-missing-{}", std::process::id()));
+        let root = dir.to_str().unwrap();
+        let mut gates = one_gate();
+        gates[0].tier = "linux-reference-box".into();
+        for reference_box in [false, true] {
+            let result = finish_report(
+                "m0",
+                &gates,
+                &Measurements::new(),
+                true,
+                reference_box,
+                root,
+                "test",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let error = result.expect_err("missing STOP gate must fail");
+            assert!(error.contains("probe"), "{error}");
+        }
+    }
 
     fn one_gate() -> Vec<gates::Gate> {
         vec![gates::Gate {

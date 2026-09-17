@@ -35,7 +35,7 @@ libc.workspace = true
 inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
 # The collision-key builders are behind this crate's own feature (batch
 # 47); the store suite reaches them through the self dev-edge.
-inf-store = { path = ".", features = ["collision-oracle"] }
+inf-store = { path = ".", default-features = false, features = ["collision-oracle"] }
 
 [[bench]]
 name = "store"

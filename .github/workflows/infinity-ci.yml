@@ -7,8 +7,8 @@
 # Split (2026-07-17): only the two slow jobs were the problem — `miri`
 # (45-min timeout) and the 14-target `fuzz-smoke` (~70 min). Those are
 # REDUCED here (a strict-provenance canary on inf-alloc, and a single 60-s
-# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (label `ci-full` /
-# `/ci-full` comment / dispatch), together with the benchmark compile. Every
+# fuzz smoke) and run in FULL in `infinity-ci-full.yml` (main pushes / weekly /
+# label `ci-full` / `/ci-full` comment / dispatch). Benchmark sanity also runs on every PR. Every
 # other job — the full 3-OS build matrix, client-smoke, compat-diff,
 # kernel-matrix, loom, sim-smoke — stays here: each runs in a few minutes and
 # they run in parallel, so they cost little wall-clock but keep PR coverage.
@@ -90,10 +90,78 @@ jobs:
         run: ./scripts/check-waker-atomics.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: build
-        run: cargo build --workspace
+      - name: build shipping packages
+        run: cargo build --workspace --exclude inf-sim
+      - name: build simulator (isolated DST features)
+        run: cargo build -p inf-sim --features dst
       - name: test (compat runs with its pinned oracles in compat-diff)
         run: cargo test --workspace --exclude compat
+
+  slim-build:
+    # L11 / F-L20-09: workspace feature unification hides missing doc guards.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: slim-build
+      - name: slim clippy
+        run: cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
+      - name: slim libraries
+        run: cargo build -p inf-server -p inf-store --no-default-features
+      - name: slim symbols exclude document and query engines
+        shell: bash
+        run: |
+          mkdir -p .artifacts/slim-build
+          nm -C --defined-only target/debug/libinf_server.rlib target/debug/libinf_store.rlib > .artifacts/slim-build/symbols.txt
+          cargo tree -p inf-server -p inf-store --no-default-features -e normal,build > .artifacts/slim-build/dependencies.txt
+          grep -q 'inf_server::' .artifacts/slim-build/symbols.txt
+          grep -q 'inf_store::' .artifacts/slim-build/symbols.txt
+          if grep -E 'inf_(doc|query)::|inf-(doc|query) v' .artifacts/slim-build/{symbols,dependencies}.txt; then
+            echo '::error::slim libraries include a document or query engine'
+            exit 1
+          fi
+      - name: slim tests
+        run: cargo test -p inf-server -p inf-store --no-default-features
+
+  doc-intern-keys:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc-intern-keys
+      - name: interned document clippy
+        run: cargo clippy -p inf-doc -p inf-store --all-targets --features doc-intern-keys -- -D warnings
+      - name: interned document tests
+        run: cargo test -p inf-doc -p inf-store --features doc-intern-keys
+
+  benchmark-sanity:
+    # Correctness and compilation only; hosted runners do not prove perf gates.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmark-sanity
+      - name: benchmark instrument tests (release)
+        run: cargo test --release -p inf-bench -p inf-compare
+      - name: criterion benches compile (no measurements)
+        run: cargo bench --workspace --no-run
 
   cargo-deny:
     runs-on: ubuntu-24.04

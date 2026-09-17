@@ -298,7 +298,7 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
             binary_fingerprint(bin)
         )),
         None => m.note(
-            "--baseline-bin not given: delta rows report PENDING (build the M3 tip commit's \
+            "--baseline-bin not given: delta rows report UNMEASURED (build the M3 tip commit's \
              infinityd and pass its path)"
                 .to_string(),
         ),

@@ -4,6 +4,8 @@
 //! redis-stack corpus byte-diffs both protocols and admits only explicit,
 //! checked deviations (L8).
 
+#![cfg(feature = "doc")]
+
 use inf_foundation::time::Nanos;
 use inf_server::{ConnCx, execute_slices};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig};

@@ -46,6 +46,15 @@ pipeline depth, a seeded SET/GET mix, merged latency histograms, and a
 deterministic `--fill N` mode (partitioned key ranges, each key written exactly
 once) used by the RSS gate.
 
+Every shared load report, including gate-run raw sections, prints
+`mode = closed-loop` or `mode = open-loop`. Open-loop reports also print
+`target_ops_per_sec` and offered/sent/skipped counts, even with no samples.
+The label follows the effective scheduler: fill mode and zero/absent targets
+are closed-loop. The `load` CLI uses closed-loop; offered-rate campaign legs
+select open-loop. Closed-loop percentiles can hide coordinated omission;
+open-loop latencies start at the intended send slot, and skipped slots remain
+visible in the counters rather than appearing as completed requests.
+
 ### `gate-run m0` / `gate-run m1`
 
 Runs the milestone's whole exit-gate matrix in one command and writes a report
@@ -102,6 +111,15 @@ It writes a `.artifacts/m1/<stamp>-zipfian/report.md` artifact and exits
 non-zero if InfinityDB trails Redis by more than the threshold.
 
 ## Tier honesty (L10)
+
+`gate-run` exits nonzero when any selected STOP gate has no finite
+measurement or any attempted competitor startup fails. This applies in
+both tiers, including `--unsafe-env`. Diagnostic reports list the missing
+gate IDs/sources and startup errors under **INCOMPLETE / FAILED — NOT
+citation-grade**. Missing informational rows remain non-fatal. A skipped
+workload (`--skip-fill`, `--skip-comparator`, or `--only-*`) does not waive
+the gates in the selected file; `--gates` can select an explicit smaller
+scope, whose result proves only that scope.
 
 Gates marked `tier = "linux-reference-box"` report measured values everywhere
 but **bind** the milestone verdict only with `--reference-box`. Any run that

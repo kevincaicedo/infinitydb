@@ -47,9 +47,11 @@ check:
     # document/path code and must keep compiling that way — warnings
     # denied since ADR-0125 A2 (a doc-only const warned here for months).
     cargo clippy -p inf-server -p inf-store --no-default-features -- -D warnings
+    cargo test -p inf-server -p inf-store --no-default-features
 
 build:
-    cargo build --workspace
+    cargo build --workspace --exclude inf-sim
+    cargo build -p inf-sim --features dst
 
 test:
     cargo test --workspace

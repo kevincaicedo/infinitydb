@@ -11,7 +11,7 @@
 #
 # Consumed by `inf-bench gate-run m4` and `inf-bench ycsb`. **Coverage
 # (S22/S24): the full §7 table.** Rows whose producer cannot run yet render
-# `PENDING (tooling)` in every report — a visible gap, never a passed gate:
+# `UNMEASURED` in the report and selected STOP omissions fail the run (ADR-0132):
 # the tiered rows (hot-set split, cold p99, endurance) produce values only
 # once command wiring (M4-S26) lifts the ADR-0062 D8 `USE` refusal, and the
 # campaign-carried rows (recovery, M3 regression, DST/crash, foreground,

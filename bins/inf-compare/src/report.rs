@@ -4,6 +4,7 @@
 
 use std::fmt::Write;
 
+use crate::engine::Durability;
 use crate::env::Env;
 use crate::memtier;
 use crate::redisbench;
@@ -13,6 +14,7 @@ pub struct EngineConfig {
     pub label: &'static str,
     pub version: String,
     pub mode: &'static str,
+    pub durability: Option<Durability>,
     pub launch_cmd: String,
     pub peak_rss_mib: Option<f64>,
 }
@@ -60,11 +62,8 @@ pub struct Params {
     pub rb_requests: u64,
     pub crosscheck_pct: f64,
     pub maxmemory_mb: Option<u64>,
-    /// M4.5-S40: the offered rate (`None` = closed loop), the durability
-    /// class every engine ran in, the durable data root, the device
-    /// sampled.
+    /// M4.5-S40: the offered rate (`None` = closed loop).
     pub rate: Option<u64>,
-    pub durability: String,
     pub data_root: Option<String>,
     pub device_stat: Option<String>,
     pub redis_no_auto_rewrite: bool,
@@ -117,13 +116,12 @@ pub fn render(
     );
     let _ = writeln!(
         md,
-        "| Load shape | {} · durability={}{}{} |",
+        "| Load shape | {}{}{} |",
         p.rate.map_or("closed loop".to_string(), |r| format!(
             "offered {r} ops/s (memtier --rate-limiting {} per connection × {} connections)",
             r.div_ceil((u64::from(p.threads) * p.clients as u64).max(1)),
             u64::from(p.threads) * p.clients as u64
         )),
-        p.durability,
         p.data_root.as_deref().map_or(String::new(), |d| format!(" · data root `{d}`")),
         p.device_stat.as_deref().map_or(String::new(), |d| format!(" · device `{d}`"))
     );
@@ -131,15 +129,17 @@ pub fn render(
 
     // ---- published configs ----
     let _ = writeln!(md, "## Engines — published configs\n");
-    let _ = writeln!(md, "| Engine | Mode | Version | Peak RSS (MiB) | Launch command |");
-    let _ = writeln!(md, "|---|---|---|---:|---|");
+    let _ =
+        writeln!(md, "| Engine | Mode | Version | Durability | Peak RSS (MiB) | Launch command |");
+    let _ = writeln!(md, "|---|---|---|---|---:|---|");
     for e in engines {
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | `{}` |",
+            "| {} | {} | {} | {} | {} | `{}` |",
             e.label,
             e.mode,
             e.version,
+            e.durability.map_or("unverified (attached)", Durability::label),
             fmt_opt(e.peak_rss_mib, 1),
             e.launch_cmd
         );
@@ -336,16 +336,16 @@ pub fn render(
                  comparison."
         );
     }
-    if p.durability != "none (in-memory)" {
-        let _ = writeln!(
-            md,
-            "- **Durability {}.** redis ran `--appendonly yes --appendfsync everysec` (its AOF \
-                 under the data root); infinitydb ran `--data-dir` with every connection starting \
-                 in an `FSYNC everysec` namespace (`--conn-default-ns cmp`, proven by a probe key \
-                 before the row) — the same ≤ 1 s power-loss window on both sides, each engine's \
-                 own mechanism, both on the same device.",
-            p.durability
-        );
+    for e in engines.iter().filter(|e| e.durability == Some(Durability::Everysec)) {
+        let mechanism = match e.label {
+            "redis" => "AOF with `--appendonly yes --appendfsync everysec`",
+            "infinitydb" => {
+                "an `FSYNC everysec` namespace via `--conn-default-ns cmp`, \
+                verified with a probe key before the row"
+            }
+            _ => "see published launch configuration",
+        };
+        let _ = writeln!(md, "- **{} durability:** {mechanism}.", e.label);
     }
     let _ =
         writeln!(md, "- Raw memtier JSON + redis-benchmark CSV for every row are under `raw/`.");
@@ -359,3 +359,6 @@ fn fmt_opt(value: Option<f64>, places: usize) -> String {
         None => "n/a".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests;

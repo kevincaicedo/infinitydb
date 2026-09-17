@@ -8,7 +8,8 @@
 //! values with non-binding verdicts; only `--reference-box` runs can bind
 //! the milestone verdict. Rows whose tooling lives elsewhere (zipfian LFU
 //! parity, M0-regression A/B vs the M0 baseline artifact, 24 h soak,
-//! flamegraph attribution) report PENDING from this command by design.
+//! flamegraph attribution) remain UNMEASURED until supplied; selected STOP
+//! omissions make the run incomplete (ADR-0132).
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -458,7 +459,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         let our_rss = ours.rss_bytes();
         drop(ours);
         match spawn_redis(&redis_bin) {
-            Err(e) => m.note(format!("redis RSS leg skipped: {e}")),
+            Err(e) => m.fail(format!("Redis RSS startup failed: {e}")),
             Ok(redis) => {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 run_load(&fill)?;

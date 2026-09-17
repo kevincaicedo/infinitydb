@@ -6,8 +6,9 @@
 # Consumed by `inf-bench gate-run m1`. Field semantics identical to
 # m0-gates.toml: loadgen:* rows are measured natively by gate-run; external:*
 # rows come from campaign tooling (compat suite, soak harness, zipfian trace
-# replay, M0-baseline A/B, release pipeline) and report PENDING from gate-run
-# until that artifact is supplied. tier = "linux-reference-box" verdicts bind
+# replay, M0-baseline A/B, release pipeline) and remain unmeasured until supplied.
+# Missing/non-finite selected STOP measurements fail in every tier (ADR-0132).
+# Measured tier = "linux-reference-box" threshold verdicts bind
 # only on the reference box (M0-R2 standing obligation).
 
 schema = 1

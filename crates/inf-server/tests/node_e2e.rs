@@ -4875,6 +4875,7 @@ fn inf_ckpt_cell_targets_one_cell() {
 /// everything else). Single-key remote JSON commands ride the ordinary
 /// fast arm alongside.
 #[test]
+#[cfg(feature = "doc")]
 fn json_mget_gathers_across_cells() {
     // A durable node shape: namespace DDL needs the control plane. The
     // JSON namespace itself is memory-class (durable JSON writes refuse
@@ -6421,6 +6422,22 @@ fn connection_level_commands_ignore_the_bound_namespace() {
                 ));
             }
             replies.push((binding, reply));
+            // Peer close is asynchronous; retire subscriptions before the next template.
+            let unsubscribe = match *name {
+                "SUBSCRIBE" => Some((
+                    &b"UNSUBSCRIBE"[..],
+                    &b"*3\r\n$11\r\nunsubscribe\r\n$10\r\nconn-level\r\n:0\r\n"[..],
+                )),
+                "PSUBSCRIBE" => Some((
+                    &b"PUNSUBSCRIBE"[..],
+                    &b"*3\r\n$12\r\npunsubscribe\r\n$6\r\nconn-*\r\n:0\r\n"[..],
+                )),
+                _ => None,
+            };
+            if let Some((command, expected)) = unsubscribe {
+                conn.write_all(&cmd(&[command, argv[1]])).expect("unsubscribe");
+                assert_eq!(read_frame(conn), expected);
+            }
         }
         let (_, first) = &replies[0];
         for (binding, reply) in &replies[1..] {

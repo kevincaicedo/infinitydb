@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use crate::finehist::FineHistogram;
@@ -61,7 +62,7 @@ pub struct LoadSpec {
     /// offered rate whose latencies were stamped from slots long past);
     /// the report counts `offered` / `sent` / `skipped_pipeline_full`
     /// and the achieved rate against the target is its disclosure.
-    /// `None` = closed loop (every pre-S36 row byte-identical).
+    /// `None`, zero targets and fill mode select closed-loop pacing.
     pub target_ops_per_sec: Option<u64>,
 }
 
@@ -70,6 +71,27 @@ pub struct LoadSpec {
 pub enum FillOp {
     Set,
     Del,
+}
+
+/// Effective scheduling policy, retained even when a leg has no samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadMode {
+    #[default]
+    ClosedLoop,
+    OpenLoop {
+        target_ops_per_sec: NonZeroU64,
+    },
+}
+
+impl LoadSpec {
+    fn mode(&self) -> LoadMode {
+        match self.target_ops_per_sec.and_then(NonZeroU64::new) {
+            Some(target_ops_per_sec) if self.fill.is_none() => {
+                LoadMode::OpenLoop { target_ops_per_sec }
+            }
+            _ => LoadMode::ClosedLoop,
+        }
+    }
 }
 
 impl Default for LoadSpec {
@@ -107,6 +129,7 @@ const ERROR_SAMPLE_CAP: usize = 8;
 
 #[derive(Clone, Debug, Default)]
 pub struct LoadReport {
+    pub mode: LoadMode,
     pub ops: u64,
     pub errors: u64,
     /// The subset of `errors` that are `-BUSY` typed retryable refusals
@@ -252,10 +275,13 @@ fn run_conn(
     // Offered-rate schedule (ADR-0088 D7): this connection's share of
     // the target, staggered by index so the fleet does not send in
     // lockstep; `None` = closed loop.
-    let pace = spec.target_ops_per_sec.filter(|t| *t > 0 && spec.fill.is_none()).map(|target| {
-        let per_conn = target.max(1) as f64 / spec.conns.max(1) as f64;
-        Duration::from_secs_f64(1.0 / per_conn)
-    });
+    let pace = match spec.mode() {
+        LoadMode::ClosedLoop => None,
+        LoadMode::OpenLoop { target_ops_per_sec } => {
+            let per_conn = target_ops_per_sec.get() as f64 / spec.conns.max(1) as f64;
+            Some(Duration::from_secs_f64(1.0 / per_conn))
+        }
+    };
     let mut next_send_at = pace.map_or(Instant::now(), |interval| {
         Instant::now() + interval.mul_f64(conn_index as f64 / spec.conns.max(1) as f64)
     });
@@ -470,7 +496,8 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
     });
     let elapsed = started.elapsed().saturating_sub(warmup);
 
-    let mut report = LoadReport { elapsed_s: elapsed.as_secs_f64(), ..Default::default() };
+    let mut report =
+        LoadReport { mode: spec.mode(), elapsed_s: elapsed.as_secs_f64(), ..Default::default() };
     let mut hist = FineHistogram::new();
     for result in results {
         let conn = result?;
@@ -513,8 +540,13 @@ pub fn run(spec: &LoadSpec) -> Result<LoadReport, String> {
 }
 
 pub fn render(report: &LoadReport) -> String {
+    let mode = match report.mode {
+        LoadMode::ClosedLoop => "closed-loop",
+        LoadMode::OpenLoop { .. } => "open-loop",
+    };
     let mut out = format!(
-        "ops = {}\nerrors = {}\nbusy_retryable = {}\nelapsed_s = {:.3}\nops_per_sec = {:.0}\n\
+        "mode = {mode}\nops = {}\nerrors = {}\nbusy_retryable = {}\n\
+         elapsed_s = {:.3}\nops_per_sec = {:.0}\n\
          p50_us = {}\np99_us = {}\np999_us = {}\np9999_us = {}\nmax_us = {}\n",
         report.ops,
         report.errors,
@@ -527,9 +559,10 @@ pub fn render(report: &LoadReport) -> String {
         report.p9999_us,
         report.max_us
     );
-    if report.offered > 0 {
+    if let LoadMode::OpenLoop { target_ops_per_sec } = report.mode {
         out.push_str(&format!(
-            "offered = {}\nsent = {}\nskipped_pipeline_full = {}\n",
+            "target_ops_per_sec = {target_ops_per_sec}\n\
+             offered = {}\nsent = {}\nskipped_pipeline_full = {}\n",
             report.offered, report.sent, report.skipped_pipeline_full
         ));
     }
@@ -628,6 +661,69 @@ pub fn cmd_load(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_always_disclose_closed_loop() {
+        let output = render(&LoadReport::default());
+        assert!(output.lines().any(|line| line == "mode = closed-loop"), "{output}");
+        assert!(!output.contains("target_ops_per_sec"));
+    }
+
+    #[test]
+    fn reports_disclose_open_loop_target_and_accounting() {
+        for (sent, skipped) in [(0, 0), (7, 0), (7, 3)] {
+            let report = LoadReport {
+                mode: LoadMode::OpenLoop { target_ops_per_sec: NonZeroU64::new(12_345).unwrap() },
+                offered: sent + skipped,
+                sent,
+                skipped_pipeline_full: skipped,
+                ..Default::default()
+            };
+            let output = render(&report);
+            for expected in [
+                "mode = open-loop".to_owned(),
+                "target_ops_per_sec = 12345".to_owned(),
+                format!("offered = {}", sent + skipped),
+                format!("sent = {sent}"),
+                format!("skipped_pipeline_full = {skipped}"),
+            ] {
+                assert!(
+                    output.lines().any(|line| line == expected),
+                    "missing {expected}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_load_legs_retain_effective_mode() {
+        for (target, fill, expected) in [
+            (None, None, LoadMode::ClosedLoop),
+            (Some(0), None, LoadMode::ClosedLoop),
+            (Some(10), Some(0), LoadMode::ClosedLoop),
+            (
+                Some(10),
+                None,
+                LoadMode::OpenLoop { target_ops_per_sec: NonZeroU64::new(10).unwrap() },
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let spec = LoadSpec {
+                port: listener.local_addr().unwrap().port(),
+                conns: 1,
+                duration: Duration::ZERO,
+                warmup: Duration::ZERO,
+                fill,
+                target_ops_per_sec: target,
+                ..Default::default()
+            };
+            // Empty legs establish their connection but send no requests.
+            let report = run(&spec).unwrap();
+            assert_eq!(report.ops, 0);
+            assert_eq!(report.offered, 0);
+            assert_eq!(report.mode, expected);
+        }
+    }
 
     /// The skip rule's arithmetic: a pipeline freed `now` skips every
     /// slot from the one that was due up to `now` (inclusive of a slot

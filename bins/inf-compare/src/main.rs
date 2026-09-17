@@ -62,7 +62,8 @@ OPTIONS (run):
                                     # clients)); default: closed loop
     --durability    none|everysec   # everysec: redis --appendonly yes --appendfsync everysec,
                                     # infinitydb FSYNC everysec namespace every connection starts in
-                                    # (--conn-default-ns); host launches only; default: none
+                                    # (--conn-default-ns); host launches only; Dragonfly refused
+                                    # (no equivalent mode); default: none
     --data-root     DIR             # durable state root (per-engine subdirs, wiped);
                                     # default: .artifacts/compare-data
     --probe-file    PATH            # io-properties.toml copied into infinitydb's data dir
@@ -218,6 +219,17 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let fill_secs = lp.duration.clamp(2, 5);
     let mem_fill_secs = lp.duration.clamp(3, 10);
 
+    for &kind in &engines {
+        kind.validate_durability(lp.durability)?;
+    }
+    if lp.durability != engine::Durability::None
+        && (docker || engines.iter().any(|kind| attach.contains_key(kind)))
+    {
+        return Err("--durability everysec requires host launches; drop --docker and --attach \
+            (attached persistence is unverified)"
+            .into());
+    }
+
     if workloads.iter().any(|w| w.name == "eviction") && maxmemory_mb.is_none() {
         eprintln!(
             "inf-compare: WARNING — `eviction` without --maxmemory-mb is just a write storm (no \
@@ -308,6 +320,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             label: kind.label(),
             version: target.version.clone(),
             mode: target.mode_label(),
+            durability: target.durability,
             launch_cmd: target.launch_cmd.clone(),
             peak_rss_mib: engine::rss_peak_mib(&target),
         });
@@ -333,7 +346,6 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         crosscheck_pct,
         maxmemory_mb,
         rate: lp.rate,
-        durability: lp.durability.label().to_string(),
         data_root: (lp.durability != engine::Durability::None)
             .then(|| lp.data_root.display().to_string()),
         device_stat: lp.device_stat.clone(),

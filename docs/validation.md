@@ -71,6 +71,15 @@ owning fuzz target. Their commands and prerequisites live in
 [CONTRIBUTING](../CONTRIBUTING.md), crate `SAFETY.md` files and the
 [simulator guide](../bins/inf-sim/README.md). Keep checks in CI where practical.
 
+Full CI runs on every push to `main` and Mondays at 07:23 UTC, as well as
+the `ci-full` PR label, maintainer `/ci-full` comment and manual dispatch.
+It runs strict-provenance Miri on `inf-alloc` and `inf-fabric`, all 14
+existing fuzz smoke targets for 300 seconds each, and benchmark test/build
+sanity. Automatic runs use their event SHA and have separate concurrency
+groups. The PR lane retains its smaller Miri and RESP-fuzz canaries;
+the nightly fuzz campaign remains separate. Benchmark sanity on hosted
+runners validates the instruments, without producing performance evidence.
+
 ## Performance and the reference box
 
 Anyone can run the harness on their own machine. Results describe that

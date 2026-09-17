@@ -2463,7 +2463,8 @@ mod tests {
             .collect();
         assert!(uncovered.is_empty(), "write-class rows without a template: {uncovered:?}");
         eprintln!("{} write rows, {cases} cases, {errors_seen} error replies", covered.len());
-        assert!(cases >= 150 && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
+        let minimum_cases = if cfg!(feature = "doc") { 150 } else { 128 };
+        assert!(cases >= minimum_cases && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
     }
 
     /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
@@ -2725,11 +2726,17 @@ mod tests {
             run_at(&mut cx, &mut store, now, &[b"GETEX", b"nk", b"EX", b"notanint"]),
             b"$-1\r\n"
         );
-        assert_eq!(run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]), b"+OK\r\n");
-        assert_eq!(
-            run_at(&mut cx, &mut store, now, &[b"GETEX", b"d", b"EXAT", b"0"]),
-            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
-        );
+        #[cfg(feature = "doc")]
+        {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"GETEX", b"d", b"EXAT", b"0"]),
+                b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+            );
+        }
     }
 
     /// Review 2026-08-30 follow-up (batch 17, ADR-0111): Redis decides an
@@ -2868,9 +2875,18 @@ mod tests {
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]), b":5100000\r\n");
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$2\r\nv2\r\n");
         // A document at the destination is overwritten, as RENAME does.
-        assert_eq!(run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]), b"+OK\r\n");
-        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"d", b"s", b"-1"]), b"+OK\r\n");
-        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TYPE", b"d"]), b"+string\r\n");
+        #[cfg(feature = "doc")]
+        {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"d", b"s", b"-1"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(run_at(&mut cx, &mut store, now, &[b"TYPE", b"d"]), b"+string\r\n");
+        }
         // Validation precedes any write: the deadline is `-1` or positive.
         for bad in [&b"0"[..], b"-2", b"x", b"9223372036854775808"] {
             assert_eq!(

@@ -55,6 +55,25 @@ logs/<engine>.log    # the engine's stdout+stderr (host) / .container id (docker
 | `--maxmemory-mb` | unset | Cap every engine (`allkeys-lru`); enables the `eviction` workload. |
 | `--rb-requests` | `1000000` | redis-benchmark request count (`-n`). |
 | `--crosscheck-threshold` | `25` | Flag a row when memtier and redis-benchmark throughput disagree by more than this %. |
+| `--durability` | `none` | `none` or `everysec`. Everysec supports host-launched Redis and InfinityDB; Dragonfly is refused because no equivalent durable launch mode is verified. |
+| `--data-root` | `.artifacts/compare-data` | Per-engine durable directories, wiped only after launch configuration validation. |
+
+For an every-second durable comparison, select the supported engines:
+
+```bash
+just benchmark --engines redis,infinitydb --durability everysec --workload set --pipeline 1
+```
+
+Dragonfly's [official AOF documentation](https://www.dragonflydb.io/docs/managing-dragonfly/aof)
+states AOF is unsupported (checked 2026-09-16); the installed 1.39.0 binary
+and source at 1.39.0/1.40.2 provide no matching every-second fsync mode.
+Scheduling snapshots does not establish equivalent
+durability. An explicit or automatically selected Dragonfly causes an
+`everysec` run to fail before any engine launches or data directory is
+prepared; it is never silently omitted. Dragonfly remains available under
+`--durability none`. Docker and attached servers are refused for `everysec`.
+The report lists durability per engine; attached servers are marked
+`unverified (attached)` because the harness does not configure them.
 
 **Placement**
 
@@ -140,9 +159,18 @@ cargo run --release -p inf-compare -- run --reference-box --duration 60 --pipeli
 
 The report leads with a tier banner so a number can never be quoted without its
 context. A run is **DEV-TIER (non-citable)** unless `--reference-box` is given on
-a clean box. `inf-compare` shells out to a built `inf-bench env-check` (the
-authoritative gate: governor=`performance`, EPP=`performance`, no thermal
-throttle, clean tree) and lets it *bind* the verdict; a `--reference-box` run on
+a clean box. `inf-compare` records governor and EPP for every Linux sysfs
+`cpuN`, including sparse CPU IDs. Each reading must exist and equal
+`performance`; missing/empty/unreadable policy files, including on offline
+CPUs, refuse reference admission. CPU enumeration must also succeed and
+find at least one CPU. The report names each CPU and its reading.
+
+A built `target/release/inf-bench` (or `target/debug/inf-bench` when release
+is absent), resolved from the working directory, must also execute
+`env-check` successfully. An absent, unexecutable or failing checker refuses
+reference admission. This authoritative check also covers thermal state
+and the git tree. Run from the workspace root after building `inf-bench`.
+A `--reference-box` run on
 a non-clean box is **refused** unless `--unsafe-env` is passed, which stamps the
 result non-citable. macOS is dev-tier only and cannot run dragonfly (Linux-only).
 

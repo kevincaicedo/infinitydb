@@ -7,7 +7,7 @@
 #   threshold/comparator/unit — the gate inequality, e.g. measured >= 6000000 ops/s.
 #   tier        — "linux-reference-box": a performance gate; its verdict may only
 #                 be decided from runs on the Linux reference box (macOS runs are
-#                 plumbing validation and report PENDING, never PASS/FAIL).
+#                 plumbing validation with non-binding threshold verdicts).
 #                 "any": structural gate; evaluated wherever the measurement
 #                 source actually provides a value.
 #   source      — where gate-run obtains the measurement:
@@ -15,8 +15,9 @@
 #                 "tripwire:<name>"   INFO tripwires scrape (inf_foundation::tripwire names)
 #                 "ab:<metric>"       interleaved A/B replicates (--ab), ratio A/B
 #                 "external:<what>"   gate-campaign tooling (memtier, flamegraph, smem);
-#                                     always PENDING from gate-run until that tooling lands.
+#                                     unmeasured until supplied by the owning tooling.
 #   informational — tripwire row that does not block the verdict (still reported).
+# Missing/non-finite selected STOP measurements fail in every tier (ADR-0132).
 
 schema = 1
 milestone = "m0"

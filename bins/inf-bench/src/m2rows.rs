@@ -63,7 +63,7 @@ pub(crate) fn delta_pct(a: f64, b: f64) -> f64 {
 /// Both legs stay equally fresh within a replicate.
 ///
 /// With no baseline binary the M2 leg still runs (the counter tripwire
-/// needs it) and the delta gates stay PENDING.
+/// needs it) and the delta gates stay UNMEASURED.
 #[allow(clippy::too_many_arguments)] // orchestration row: linear, not branchy
 fn ab_row(
     m: &mut Measurements,
@@ -941,7 +941,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     );
     if baseline_bin.is_none() {
         m.note(
-            "--baseline-bin not given: zero-cost delta rows report PENDING \
+            "--baseline-bin not given: zero-cost delta rows report UNMEASURED \
              (build the pre-M2 commit's infinityd and pass its path)",
         );
     }
@@ -1087,7 +1087,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
 
     // S21: always grouped writes + the grouping-ratio tripwire.
     if flags.bool("skip-pressure") {
-        m.note("S21 always row SKIPPED (--skip-pressure): always_grouped_wps stays PENDING");
+        m.note("S21 always row SKIPPED (--skip-pressure): always_grouped_wps stays UNMEASURED");
     } else {
         always_row(
             &mut m,
@@ -1116,7 +1116,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
 
     // S12: checkpoint under full durable load (anti-BGREWRITEAOF + RSS).
     if flags.bool("skip-pressure") {
-        m.note("S12 pressure rows SKIPPED (--skip-pressure): ckpt gates stay PENDING");
+        m.note("S12 pressure rows SKIPPED (--skip-pressure): ckpt gates stay UNMEASURED");
     } else {
         let pressure_reps = flags.usize_or("pressure-replicates", 3)?;
         pressure_rows(
