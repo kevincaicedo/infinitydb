@@ -16,8 +16,8 @@
 //!
 //! Tooling tier: `std::thread` and blocking sockets are fine here; this
 //! binary never runs on the data plane. It deliberately does not depend on
-//! `inf-wire` — the measurement tool shares no code with the system under
-//! test (client-side RESP lives in [`resp`]).
+//! `inf-wire` (client-side RESP lives in [`resp`]). Internal `inf-foundation`
+//! primitives are shared; there are no external dependencies (ADR-0134).
 #![forbid(unsafe_code)]
 
 mod bootstorm;

@@ -98,6 +98,7 @@ jobs:
         # memtier_benchmark on the runner (the reference-box profile).
         run: |
           ./target/release/inf-compare run --reference-box \
+            --threads 4 --pin-start 0 --load-pin-start 4 --load-cpus 4 \
             --workload set,get,mixed,memory --pipeline 1,16 \
             --duration 15 --out .artifacts/compare
       - uses: actions/upload-artifact@v4

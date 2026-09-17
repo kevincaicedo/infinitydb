@@ -12,7 +12,7 @@ It is the competitor-anchored complement to [`inf-bench`](../inf-bench/README.md
 same workload files, configs published. No comparison ships from a run the
 competitor wasn't in."_
 
-Zero external crates, like `inf-bench`: it only orchestrates external binaries
+Zero dependencies: it only orchestrates external binaries
 and parses their output with a hand-rolled JSON reader (`src/json.rs`), so it
 shares neither code nor a dependency surface with the system under test.
 
@@ -26,17 +26,21 @@ cargo run --release -p inf-compare -- list-workloads
 cargo run --release -p inf-compare -- help
 ```
 
-Reports land in ignored `.artifacts/compare/<unix>-compare/` (or `--out DIR`).
+Reports land in ignored `.artifacts/compare/<unix-nanos>-compare/` (or `--out DIR`).
 Keep them local; commit commands, configurations and result summaries, not
 generated output. See [validation and reference hardware](../../docs/validation.md).
 
 Local output:
 
 ```
-report.md            # tier banner, published configs, result tables, honesty notes
-raw/<engine>-<workload>-p<pipe>.memtier.json   # memtier JSON each row was parsed from
-raw/<engine>-<workload>-p<pipe>.redisbench.csv # redis-benchmark CSV
-logs/<engine>.log    # the engine's stdout+stderr (host) / .container id (docker)
+report.md            # tier, per-leg configs, replicate summaries and individual samples
+placement.txt        # server/generator logical CPU ranges, or unverified isolation
+schedule.tsv         # actual leg order, replicate, scenario, artifact and status
+raw/<leg>/*.memtier.json   # original generator JSON, one file per measured leg
+raw/<leg>/*.redisbench.csv # original redis-benchmark CSV
+raw/<leg>/*.info.*.txt     # INFO before/after; memory legs carry memory.tsv
+logs/<leg>/config.txt     # exact command, version, mode and durability
+logs/<leg>/<engine>.log   # stdout+stderr (host) / .container id (docker)
 ```
 
 ## Options (`inf-compare run`)
@@ -47,6 +51,7 @@ logs/<engine>.log    # the engine's stdout+stderr (host) / .container id (docker
 | `--generator` | `both` | `both` \| `memtier` \| `redis-benchmark`. |
 | `--workload` | `all` | Single name, `all`, or a comma list (e.g. `set,get,memory`). See **Workloads**. |
 | `--duration` | `30` | memtier `--test-time` seconds per row. |
+| `--replicates` | `3` | Independent measurements per engine/workload/pipeline; 1–5 for development, 3–5 with `--reference-box`. |
 | `--threads` | `4` | → infinityd `--cells`, dragonfly `--proactor_threads`, memtier `-t`. redis stays single-threaded. |
 | `--clients` | `50` | Connections per generator thread. |
 | `--pipeline` | `1,16` | Comma list → one row each. |
@@ -56,7 +61,7 @@ logs/<engine>.log    # the engine's stdout+stderr (host) / .container id (docker
 | `--rb-requests` | `1000000` | redis-benchmark request count (`-n`). |
 | `--crosscheck-threshold` | `25` | Flag a row when memtier and redis-benchmark throughput disagree by more than this %. |
 | `--durability` | `none` | `none` or `everysec`. Everysec supports host-launched Redis and InfinityDB; Dragonfly is refused because no equivalent durable launch mode is verified. |
-| `--data-root` | `.artifacts/compare-data` | Per-engine durable directories, wiped only after launch configuration validation. |
+| `--data-root` | `.artifacts/compare-data` | Per-engine durable directories, wiped before each leg after launch configuration validation. |
 
 For an every-second durable comparison, select the supported engines:
 
@@ -75,14 +80,57 @@ prepared; it is never silently omitted. Dragonfly remains available under
 The report lists durability per engine; attached servers are marked
 `unverified (attached)` because the harness does not configure them.
 
+## Replicates and order
+
+For each workload/pipeline, the harness runs every eligible engine in each
+replicate before moving to the next replicate. It rotates the requested order
+one position per round: two engines produce `AB / BA / AB`, three produce
+`ABC / BCA / CAB`. Unsupported engine/workload/generator combinations are
+recorded as skipped and do not change the eligible engines' rotation. Memory
+rows run once per engine/replicate; pipeline is not applicable.
+
+Each leg has a fresh launched process and, for durable runs, a fresh data
+directory. Attached servers receive FLUSHALL and the workload's preload but
+retain process/cache state. Every raw file and log lives under a distinct leg
+directory. A failed leg stops the run with a nonzero exit, preserves earlier
+artifacts and the failed schedule entry, and produces no success report.
+Owned servers are stopped and reaped on setup and measurement errors too.
+Launched legs use distinct ports (`port-base + ordinal - 1`) to avoid
+immediate address reuse during kernel socket cleanup; the full port span is
+validated before launch. Attached endpoints stay unchanged.
+
+Summaries report n, median, minimum, maximum and relative spread
+`(max-min)/median*100` for each metric; zero medians or unrepresentable
+percentages show `n/a`. Latencies are medians of per-run quantiles, never
+pooled request percentiles. Optional observations disclose their own n.
+Individual samples retain their replicate and execution ordinal. Replication
+alone does not establish reference validity or authorize a public claim.
+`--unsafe-env` cannot bypass the 3–5 reference replicate requirement.
+
+For a short development smoke, use `--replicates 1`. Empty selections,
+duplicate workloads/pipelines, zero pipelines and overflowing port ranges
+refuse before artifacts or launches; at most 16 pipeline depths are accepted.
+
 **Placement**
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--docker` | off | Run servers in containers; the generator stays on the host. |
 | `--attach` | — | `redis=host:port,dragonfly=host:port,…` — use running servers, skip launch/teardown. |
-| `--port-base` | `7000` | Launched engines get `N, N+1, …`. |
-| `--pin-start` | — | `taskset` base core for host launches (fairness); infinityd uses its own `--pin-start`. |
+| `--port-base` | `7000` | Launched legs get `N + ordinal - 1`; the entire span must fit in a port. |
+| `--pin-start` | — | First logical CPU of the process-wide server mask, width `--threads`; applies to every host engine. |
+| `--load-pin-start` | — | First logical CPU of a disjoint generator mask; required together with `--pin-start`. |
+| `--load-cpus` | `--threads` | Generator mask width, including memtier preload/memory fills and redis-benchmark. |
+
+CPU pinning requires Linux host launches. Every engine is wrapped in `taskset`;
+InfinityDB also pins its cells within that mask using `--pin-stride 1`; its
+standalone default remains stride two. The harness checks the effective
+mask before creating artifacts or launching servers, rejects overlap, unavailable
+CPUs and trimmed masks (admitted CPU IDs: 0–65535), and fails if `taskset`
+cannot run. Docker and attached
+servers cannot request controlled placement. Unpinned development runs explicitly
+report **CPU isolation unverified**. Logical CPU ranges do not prove physical-core
+or SMT isolation; the reference environment must document those separately.
 
 **Docker images** (with `--docker`)
 
@@ -98,7 +146,7 @@ The report lists durability per engine; attached servers are marked
 | Flag | Meaning |
 |---|---|
 | `--out DIR` | Artifacts root (default `.artifacts/compare`). |
-| `--reference-box` | Bind the numbers — requires a clean box (`inf-bench env-check` must pass). |
+| `--reference-box` | Requires both CPU ranges on Linux host launches and a clean box (`inf-bench env-check` must pass). |
 | `--unsafe-env` | Proceed on a non-clean box; stamps the run non-citable. |
 
 ## Workloads (gated to the M1 string surface)
@@ -152,7 +200,8 @@ cargo run --release -p inf-compare -- run \
   --engines redis,infinitydb --attach redis=127.0.0.1:6379
 
 # Reference-box, citation-grade (refuses unless the box is clean).
-cargo run --release -p inf-compare -- run --reference-box --duration 60 --pipeline 1,16
+cargo run --release -p inf-compare -- run --reference-box --duration 60 --pipeline 1,16 \
+  --threads 4 --pin-start 0 --load-pin-start 4 --load-cpus 4
 ```
 
 ## Tier honesty (L10)
@@ -180,3 +229,28 @@ It does not measure pub/sub fan-out latency: memtier/redis-benchmark do not set
 up subscribers, so that row stays with `inf-bench gate-run m1` (delivery-acked).
 It is not a replacement for `inf-bench` — it is the external cross-check that
 sits beside it.
+
+## Decoder bounds and verification
+
+The independent JSON reader and RESP framer are iterative, with at most 32
+open containers including empty ones. JSON accepts at most 16 MiB and 256 Ki
+value/key nodes. RESP accepts at most 1 MiB per reply, 64 Ki nodes and 4 KiB
+header lines. Explicit errors distinguish malformed input and resource
+limits from incomplete replies. Socket/file reads enforce byte budgets before
+buffering; fragmented RESP is decoded incrementally. Bounds describe this
+instrument's inputs, not InfinityDB's protocol limits.
+
+Regression checks include exact limits, empty-container off-by-one cases,
+malformed inputs, fragmented and pipelined replies, bounded file reads,
+binary schedule/statistics checks, and fresh-process/error cleanup fixtures:
+
+```bash
+cargo test -p inf-compare
+cd bins/inf-compare
+cargo +nightly fuzz run compare_resp_frame -- -max_total_time=300
+cargo +nightly fuzz run memtier_json_parse -- -max_total_time=300
+```
+
+Both fuzz targets are wired into `infinity-fuzz-nightly.yml` with authored
+boundary seeds under `fuzz/seeds/`. The fuzz package alone depends on
+libFuzzer; the shipped instrument remains dependency-free.

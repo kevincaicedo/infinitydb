@@ -36,6 +36,7 @@ struct Args {
     buffers: usize,
     buf_size: usize,
     pin_start: Option<usize>,
+    pin_stride: u16,
     route_local_only: bool,
     park_us: Option<u64>,
     /// Durable-plane root (M2-S08/S11): `--data-dir` enables the catalog,
@@ -178,6 +179,7 @@ impl Default for Args {
             buffers: 4096,
             buf_size: 4096,
             pin_start: None,
+            pin_stride: 2,
             route_local_only: false,
             park_us: None,
             data_dir: None,
@@ -234,6 +236,10 @@ fn parse_args() -> Result<Args, String> {
             "--pin-start" => {
                 args.pin_start =
                     Some(take("--pin-start")?.parse().map_err(|e| format!("--pin-start: {e}"))?);
+            }
+            "--pin-stride" => {
+                args.pin_stride =
+                    take("--pin-stride")?.parse().map_err(|e| format!("--pin-stride: {e}"))?;
             }
             "--route-local-only" => args.route_local_only = true,
             "--early-fabric-flush" => args.early_fabric_flush = true,
@@ -410,7 +416,7 @@ fn parse_args() -> Result<Args, String> {
             "--help" | "-h" => {
                 println!(
                     "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
-                     [--pin-start CORE] [--route-local-only] [--data-dir PATH] \
+                     [--pin-start CORE] [--pin-stride 2] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
                      [--no-segment-recycle] [--recycle-wait off|quarter|eighth] \
                      [--conn-default-ns NAME] [--frames-in-flight auto|K] \
@@ -468,7 +474,23 @@ fn parse_args() -> Result<Args, String> {
             i32::MAX
         ));
     }
+    if args.pin_stride == 0 {
+        return Err("--pin-stride must be >= 1".into());
+    }
+    args.cell_cpu(args.cells - 1)?;
     Ok(args)
+}
+
+impl Args {
+    /// Startup-only placement; the final cell is validated before allocating the node.
+    fn cell_cpu(&self, cell: u16) -> Result<Option<usize>, String> {
+        let Some(start) = self.pin_start else { return Ok(None) };
+        usize::from(cell)
+            .checked_mul(usize::from(self.pin_stride))
+            .and_then(|offset| start.checked_add(offset))
+            .map(Some)
+            .ok_or_else(|| "--pin-start/--pin-stride cell CPU overflow".into())
+    }
 }
 
 /// The device model a boot runs on (M4.5-S42, ADR-0091 D1/D2): the
@@ -1125,8 +1147,8 @@ fn cell_main(
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
-    if let Some(start) = args.pin_start {
-        pin_current_thread(start + cell as usize * 2)?;
+    if let Some(cpu) = args.cell_cpu(cell).map_err(std::io::Error::other)? {
+        pin_current_thread(cpu)?;
     }
     mark(10); // setup:listen
     let listener = listen_reuseport(args.port)?;
@@ -1494,6 +1516,20 @@ fn replay_term_origin(read_qd4: u64, read_qd1: u64, cells: u16) -> String {
 mod tests {
     use super::*;
     use inf_foundation::{DeviceIdentity, IdentityVerdict};
+
+    #[test]
+    fn explicit_pin_stride_preserves_default_and_bounds_cell_placement() {
+        let mut args = Args { pin_start: Some(4), cells: 2, ..Args::default() };
+        assert_eq!(args.pin_stride, 2);
+        assert_eq!(args.cell_cpu(0).unwrap(), Some(4));
+        assert_eq!(args.cell_cpu(1).unwrap(), Some(6));
+        args.pin_stride = 1;
+        assert_eq!(args.cell_cpu(1).unwrap(), Some(5));
+        args.pin_start = Some(usize::MAX);
+        assert!(args.cell_cpu(1).is_err());
+        args.pin_start = None;
+        assert_eq!(args.cell_cpu(1).unwrap(), None);
+    }
 
     fn props(schema: u64, uuid: &str, block: u32) -> inf_server::IoProperties {
         inf_server::IoProperties {

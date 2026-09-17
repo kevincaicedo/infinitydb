@@ -84,7 +84,10 @@ pub(crate) fn finish_report(
         ));
     }
     let verdicts = gate_verdicts(gates, m, reference_box);
-    let error = verdicts.error(&m.failures);
+    let (generator_report, generator_error) = m.generator_verdict(milestone);
+    let mut failures = m.failures.clone();
+    failures.extend(generator_error);
+    let error = verdicts.error(&failures);
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| format!("report timestamp: {e}"))?
@@ -96,6 +99,7 @@ pub(crate) fn finish_report(
         if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
         if reference_box { "reference-box (binding thresholds)" } else { "dev (non-binding)" },
     );
+    report.push_str(&generator_report);
     if let Some(reason) = &error {
         report.push_str(&format!("**INCOMPLETE / FAILED — NOT citation-grade**\n\n{reason}\n\n"));
     } else {

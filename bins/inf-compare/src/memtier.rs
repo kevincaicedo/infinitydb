@@ -6,8 +6,9 @@
 //! milliseconds, as memtier reports them.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
+use crate::affinity::{self, CpuRange};
 use crate::json::Json;
 use crate::workload::{Kind, Workload};
 
@@ -35,6 +36,7 @@ pub struct Metrics {
 #[derive(Clone, Copy, Debug)]
 pub struct Plan<'a> {
     pub host: &'a str,
+    pub cpus: Option<CpuRange>,
     pub port: u16,
     pub threads: u16,
     pub clients: usize,
@@ -85,21 +87,37 @@ pub fn run(plan: &Plan, wl: &Workload, pipeline: u32, json_path: &Path) -> Resul
         "--json-out-file".into(),
         json_path.display().to_string(),
     ]);
-    invoke(&args)?;
+    invoke(&args, plan.cpus)?;
 
-    let text = std::fs::read_to_string(json_path)
+    let file = std::fs::File::open(json_path)
         .map_err(|e| format!("read memtier json {}: {e}", json_path.display()))?;
-    let json = Json::parse(&text)?;
+    let json = Json::read(file).map_err(|error| error.to_string())?;
     let pct = ["ALL STATS", "Totals", "Percentile Latencies"];
-    Ok(Metrics {
+    let metrics = Metrics {
         ops_per_sec: json.num_at(&["ALL STATS", "Totals", "Ops/sec"])?,
         avg_ms: json.num_at(&["ALL STATS", "Totals", "Average Latency"])?,
         p50_ms: json.num_at(&[pct[0], pct[1], pct[2], "p50.00"])?,
         p99_ms: json.num_at(&[pct[0], pct[1], pct[2], "p99.00"])?,
         p999_ms: json.num_at(&[pct[0], pct[1], pct[2], "p99.90"])?,
-        max_ms: json.num_at(&["ALL STATS", "Totals", "Max Latency"]).ok(),
+        max_ms: json
+            .get(&["ALL STATS", "Totals", "Max Latency"])
+            .map(|_| json.num_at(&["ALL STATS", "Totals", "Max Latency"]))
+            .transpose()?,
         offered_ops_per_sec: plan.rate,
-    })
+    };
+    for value in [
+        metrics.ops_per_sec,
+        metrics.avg_ms,
+        metrics.p50_ms,
+        metrics.p99_ms,
+        metrics.p999_ms,
+        metrics.max_ms.unwrap_or(0.0),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err("memtier metrics must be finite and nonnegative".into());
+        }
+    }
+    Ok(metrics)
 }
 
 /// Sequential write pass to populate the keyspace (GET fill, memory fill). No
@@ -111,7 +129,7 @@ pub fn fill(plan: &Plan, secs: u64) -> Result<(), String> {
         args[pos + 1] = secs.to_string();
     }
     args.extend(["--ratio".into(), "1:0".into(), "--key-pattern".into(), "S:S".into()]);
-    invoke(&args)
+    invoke(&args, plan.cpus)
 }
 
 /// Flags every run shares: target, concurrency, time, value size, keyspace.
@@ -142,8 +160,8 @@ fn base_args(plan: &Plan) -> Vec<String> {
     args
 }
 
-fn invoke(args: &[String]) -> Result<(), String> {
-    let status = Command::new("memtier_benchmark")
+fn invoke(args: &[String], cpus: Option<CpuRange>) -> Result<(), String> {
+    let status = affinity::command("memtier_benchmark", cpus)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

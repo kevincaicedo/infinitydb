@@ -720,8 +720,7 @@ effectively free of third-party dependencies; intentional edge dependencies
 have an ADR. The dependency permission map, `docs/dep-dag.toml`, is the
 authority for allowed edges; do not bypass it through a re-export.
 checked for all dependency kinds by `check-dep-dag.sh` (ADR-0025,
-ADR-0106 D16). The in-house gate instrument `inf-bench` deliberately uses
-`inf-foundation` and the tooling TOML parser.
+ADR-0106 D16). Internal dependencies are allowed.
 
 Review a dependency's transitive graph, features, unsafe code, allocation,
 blocking behavior, determinism, portability, build cost, and maintenance.

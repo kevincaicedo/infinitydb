@@ -16,6 +16,8 @@
 //! system under test.
 #![forbid(unsafe_code)]
 
+mod affinity;
+mod campaign;
 mod cli;
 mod engine;
 mod env;
@@ -48,6 +50,7 @@ OPTIONS (run):
     --engines       redis,dragonfly,infinitydb   # default: all present on host/docker
     --generator     both | memtier | redis-benchmark   # default: both
     --workload      set|mixed|get|incr|mset|ttl|memory|eviction|all   # default: all
+    --replicates    N               # default: 3; 1–5 dev, 3–5 reference; rotating order
     --duration      SECS            # memtier test-time per row; default: 30
     --threads       N               # → infinityd --cells, dragonfly --proactor_threads; default: 4
     --clients       N               # connections per generator thread; default: 50
@@ -75,8 +78,10 @@ OPTIONS (run):
   Placement:
     --docker        # run servers in containers; generator stays on host
     --attach        redis=127.0.0.1:6379,dragonfly=...   # use running servers, skip launch
-    --port-base     N               # launched engines get N, N+1, ...; default: 7000
-    --pin-start     CORE            # taskset base core for host launches (fairness)
+    --port-base     N               # launched legs get N, N+1, ...; default: 7000
+    --pin-start     CORE            # server process mask: CORE .. CORE+threads-1 (Linux host)
+    --load-pin-start CORE           # disjoint generator mask; required with --pin-start
+    --load-cpus     N               # generator mask width; default: --threads
 
   Docker images (with --docker):
     --redis-image       (default redis:8.0.5)
@@ -86,7 +91,7 @@ OPTIONS (run):
 
   Evidence:
     --out DIR           # artifacts root; default: .artifacts/compare
-    --reference-box     # bind numbers (needs a clean box: env-check must pass)
+    --reference-box     # needs both CPU ranges and a clean box: env-check must pass
     --unsafe-env        # proceed on a non-clean box (stamps the run non-citable)";
 
 fn main() -> ExitCode {
@@ -122,6 +127,7 @@ const VALUE_FLAGS: &[&str] = &[
     "generator",
     "workload",
     "duration",
+    "replicates",
     "threads",
     "clients",
     "pipeline",
@@ -138,6 +144,8 @@ const VALUE_FLAGS: &[&str] = &[
     "attach",
     "port-base",
     "pin-start",
+    "load-pin-start",
+    "load-cpus",
     "redis-image",
     "redis-stack-image",
     "dragonfly-image",
@@ -154,6 +162,7 @@ struct Generators {
 
 struct LoadParams {
     threads: u16,
+    load_cpus: Option<affinity::CpuRange>,
     clients: usize,
     duration: u64,
     data_size: usize,
@@ -171,6 +180,8 @@ struct LoadParams {
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let known: Vec<&str> = BOOL_FLAGS.iter().chain(VALUE_FLAGS).copied().collect();
     let flags = Flags::parse(args, BOOL_FLAGS, &known)?;
+
+    let replicates = campaign::replicates(&flags)?;
 
     // --- placement + generators ---
     let docker = flags.bool("docker");
@@ -194,8 +205,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let workloads = workload::select(&flags.str_or("workload", "all"))?;
 
     // --- sizing ---
+    let threads = flags.u16_or("threads", 4)?;
     let lp = LoadParams {
-        threads: flags.u16_or("threads", 4)?,
+        threads,
+        load_cpus: None,
         clients: flags.usize_or("clients", 50)?,
         duration: flags.u64_or("duration", 30)?,
         data_size: flags.usize_or("data-size", 64)?,
@@ -210,14 +223,20 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     };
     let pipelines = flags.u32_list_or("pipeline", &[1, 16])?;
     let maxmemory_mb = flags.opt_u64("maxmemory-mb")?;
-    let pin_start = flags.opt_usize("pin-start")?;
     let port_base = flags.u16_or("port-base", 7000)?;
     let crosscheck_pct = flags.f64_or("crosscheck-threshold", 25.0)?;
     let out = flags.str_or("out", ".artifacts/compare");
     let reference_box = flags.bool("reference-box");
     let unsafe_env = flags.bool("unsafe-env");
     let fill_secs = lp.duration.clamp(2, 5);
-    let mem_fill_secs = lp.duration.clamp(3, 10);
+    campaign::validate(&engines, &workloads, &pipelines)?;
+    let legs = campaign::leg_count(engines.len(), &workloads, pipelines.len(), replicates);
+    let last_offset = u16::try_from(legs - 1).map_err(|_| "too many campaign legs")?;
+    if engines.iter().any(|kind| !attach.contains_key(kind))
+        && (port_base == 0 || port_base.checked_add(last_offset).is_none())
+    {
+        return Err("--port-base must give every launched leg a port in 1–65535".into());
+    }
 
     for &kind in &engines {
         kind.validate_durability(lp.durability)?;
@@ -261,15 +280,31 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    let placement = affinity::placement(
+        &flags,
+        threads,
+        docker,
+        engines.iter().any(|kind| attach.contains_key(kind)),
+    )?;
+    let pin_start = placement.map(|placement| placement.server.start());
+    let lp = LoadParams { load_cpus: placement.map(|placement| placement.load), ..lp };
+
     // --- artifact layout ---
     let stamp_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let run_dir = PathBuf::from(&out).join(format!("{stamp_secs}-compare"));
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let run_dir = PathBuf::from(&out).join(format!("{nonce}-compare"));
+    std::fs::create_dir_all(&out).map_err(|error| format!("create output root: {error}"))?;
+    std::fs::create_dir(&run_dir).map_err(|error| format!("create unique run: {error}"))?;
+    let placement_description = affinity::description(placement);
+    std::fs::write(run_dir.join("placement.txt"), &placement_description)
+        .map_err(|error| format!("write CPU placement: {error}"))?;
     let raw_dir = run_dir.join("raw");
     let log_dir = run_dir.join("logs");
     std::fs::create_dir_all(&raw_dir).map_err(|e| format!("create {}: {e}", raw_dir.display()))?;
     std::fs::create_dir_all(&log_dir).map_err(|e| format!("create {}: {e}", log_dir.display()))?;
 
     let mode_label = mode_label(docker, &attach, &engines);
+    eprintln!("inf-compare: {placement_description}");
     eprintln!(
         "inf-compare: {} · {mode_label} · {} · {} engine(s) · {} workload(s) · pipeline \
              {pipelines:?}",
@@ -279,64 +314,32 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         workloads.len()
     );
 
-    // --- run each engine in isolation: launch → bench → teardown ---
-    let mut cells: Vec<Cell> = Vec::new();
-    let mut mems: Vec<MemCell> = Vec::new();
-    let mut configs: Vec<EngineConfig> = Vec::new();
-    for (i, &kind) in engines.iter().enumerate() {
-        let target = bring_up(
-            kind,
-            &attach,
-            docker,
-            port_base + i as u16,
-            &lp,
-            pin_start,
-            maxmemory_mb,
-            &images,
-            &log_dir,
-        )?;
-
-        // infinityd has no maxmemory flag; set it over RESP (redis/dragonfly
-        // took it at launch). Never mutate an attached server's config.
-        if matches!(kind, EngineKind::InfinityDb)
-            && target.mode != Mode::Attach
-            && let Some(mb) = maxmemory_mb
-        {
-            engine::set_maxmemory(&target, mb)?;
-        }
-
-        let result = bench_engine(
-            &target,
-            &workloads,
-            &pipelines,
-            &lp,
-            generators,
-            &raw_dir,
-            fill_secs,
-            mem_fill_secs,
-            crosscheck_pct,
-        );
-        configs.push(EngineConfig {
-            label: kind.label(),
-            version: target.version.clone(),
-            mode: target.mode_label(),
-            durability: target.durability,
-            launch_cmd: target.launch_cmd.clone(),
-            peak_rss_mib: engine::rss_peak_mib(&target),
-        });
-        engine::teardown(target);
-        let (c, m) = result?;
-        cells.extend(c);
-        mems.extend(m);
-    }
+    // --- rotate engines inside each scenario and replicate ---
+    let campaign = campaign::Campaign {
+        engines: &engines,
+        attach: &attach,
+        docker,
+        port_base,
+        load: &lp,
+        pin_start,
+        maxmemory_mb,
+        images: &images,
+        generators,
+        run_dir: &run_dir,
+        replicates,
+    };
+    let campaign::Results { cells, memory: mems, configs } =
+        campaign.run(&workloads, &pipelines)?;
 
     // --- render + persist ---
     let params = Params {
         stamp_secs,
+        replicates,
         mode: mode_label,
         generators: generators_label(generators).to_string(),
         duration: lp.duration,
         threads: lp.threads,
+        placement,
         clients: lp.clients,
         data_size: lp.data_size,
         keyspace: lp.keyspace,
@@ -353,13 +356,16 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     };
     let md = report::render(&environment, &params, &configs, &cells, &mems);
     let report_path = run_dir.join("report.md");
-    std::fs::write(&report_path, md).map_err(|e| format!("write report: {e}"))?;
+    let pending_report = run_dir.join("report.md.tmp");
+    std::fs::write(&pending_report, md)
+        .and_then(|()| std::fs::rename(&pending_report, &report_path))
+        .map_err(|e| format!("publish report: {e}"))?;
 
     println!(
         "\ninf-compare: {} latency/throughput rows + {} memory rows across {} engine(s)",
         cells.len(),
         mems.len(),
-        configs.len()
+        engines.len()
     );
     println!("inf-compare: report → {}", report_path.display());
     Ok(())
@@ -420,6 +426,7 @@ fn bench_engine(
     let label = target.kind.label();
     let mt_plan = memtier::Plan {
         host: &target.host,
+        cpus: lp.load_cpus,
         port: target.port,
         threads: lp.threads,
         clients: lp.clients,
@@ -445,18 +452,9 @@ fn bench_engine(
             continue;
         }
         for &pipeline in pipelines {
-            // A durable run starts every engine on a wiped data dir and
-            // runs one row per engine (the offered-rate row); infinitydb
-            // refuses FLUSHALL on a node with durable namespaces (M2),
-            // and a FLUSHALL under redis's AOF is a rewrite the row did
-            // not ask for — so the durable run skips it and the report
-            // says so (the populate, when a lane needs one, still runs).
+            // Campaigns launch a fresh server/data directory for every durable leg.
             if lp.durability == engine::Durability::None {
                 engine::flushall(target)?;
-            } else if pipelines.len() > 1 || workloads.len() > 1 {
-                return Err("--durability runs one workload at one pipeline depth per invocation \
-                            (no FLUSHALL between durable rows); pass --workload X --pipeline N"
-                    .into());
             }
             if wl.needs_fill && wl.requires_json {
                 // Document preload: every key in the keyspace holds the
@@ -516,6 +514,7 @@ fn bench_engine(
                     );
                     let rb_plan = redisbench::Plan {
                         host: &target.host,
+                        cpus: lp.load_cpus,
                         port: target.port,
                         requests: lp.rb_requests,
                         clients: lp.clients,
@@ -532,6 +531,8 @@ fn bench_engine(
                 continue; // nothing measured for this generator/workload combo
             }
             cells.push(Cell {
+                replicate: 0,
+                ordinal: 0,
                 engine: label,
                 workload: wl.name,
                 pipeline,
@@ -568,6 +569,8 @@ fn measure_memory(
         _ => None,
     };
     Ok(MemCell {
+        replicate: 0,
+        ordinal: 0,
         engine: target.kind.label(),
         keys,
         value_size: data_size,

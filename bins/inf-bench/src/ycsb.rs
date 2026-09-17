@@ -837,6 +837,7 @@ fn render_mem_hit_tsv(mem_hits: &[(String, MemHit)], config: &LegConfig) -> Stri
     let mut out = format!(
         "# inf-bench ycsb — client-derived memory-hit split (ADR-0071 D2)\n\
          # config: {}\n\
+         # latency instrument: LogHistogram (32 sub-buckets/octave, <=3.125% bucket width)\n\
          # row\tops\tcold_frac\tp50_us\tp99_us\tp999_us\teligible\n",
         config.render()
     );
@@ -1077,6 +1078,7 @@ impl MemHit {
             "memory-hit split (client-derived, ADR-0071 D2):\n  \
              cold_frac = {:.4}% (cold_reads {} · cold_resolves {} — re-resolve ratio {:.2}×)\n  \
              mem_hit p50_us = {} · p99_us = {} · p999_us = {}\n  \
+             latency instrument = LogHistogram (32 sub-buckets/octave, <=3.125% bucket width)\n  \
              {separation}{verdict}\n",
             self.cold_frac * 100.0,
             self.cold_reads,
@@ -1171,6 +1173,7 @@ fn render_row(out: &RowOut, w: &Workload, dist: Dist) -> String {
     format!(
         "workload = {} ({dist_name})\nops = {}\nerrors = {}\nnils = {}\nops_per_sec = {:.0}\n\
          combined_client p50_us = {} · p99_us = {} · p999_us = {} · max_us = {}\n\
+         latency instrument = LogHistogram (32 sub-buckets/octave, <=3.125% bucket width)\n\
          (combined = context only; the split section below is the honest read)\n\
          hot_share_top1pct = {:.2}%\nstream_checksum = {:#018x}\n",
         w.id,
@@ -1693,6 +1696,18 @@ pub fn cmd_ycsb(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_rows_disclose_the_coarse_histogram() {
+        let row = bimodal_row(100, 80, 0, 0);
+        let rendered = render_row(&row, &WORKLOADS[0], Dist::Uniform);
+        assert!(rendered.contains("LogHistogram"), "{rendered}");
+        assert!(rendered.contains("3.125%"), "{rendered}");
+        let config = LegConfig { conns: 1, pipeline: 1, value_size: 64 };
+        let sidecar = render_mem_hit_tsv(&[], &config);
+        assert!(sidecar.contains("LogHistogram"), "{sidecar}");
+        assert!(sidecar.contains("3.125%"), "{sidecar}");
+    }
 
     #[test]
     fn workload_percentages_sum_to_100() {

@@ -1,6 +1,6 @@
 //! Client-side RESP for the load generator and INFO scrapes. Deliberately
-//! independent of `inf-wire`: the measurement tool shares no code with the
-//! system under test.
+//! independent of `inf-wire`. Other harness primitives come from `inf-foundation`;
+//! the RESP encoder and parser share no implementation with the server.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

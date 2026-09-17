@@ -19,6 +19,8 @@ use crate::gates;
 use crate::load::{LoadSpec, render, run as run_load};
 use crate::resp::{connect, parse_info, request};
 
+mod saturation;
+
 pub(crate) struct ServerGuard {
     child: Child,
     pub port: u16,
@@ -374,6 +376,7 @@ pub(crate) struct Measurements {
     rows: Vec<RowWriteAmp>,
     sidecars: Vec<(String, String)>,
     failures: Vec<String>,
+    generator_probes: Vec<saturation::GeneratorProbe>,
 }
 
 impl Measurements {
@@ -385,6 +388,7 @@ impl Measurements {
             rows: Vec::new(),
             sidecars: Vec::new(),
             failures: Vec::new(),
+            generator_probes: Vec::new(),
         }
     }
 
@@ -780,6 +784,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let mut pipelined_ops: Vec<f64> = Vec::new();
     let mut pipelined_p999: Vec<f64> = Vec::new();
     let mut windowed_sqes_per_submit: Vec<f64> = Vec::new();
+    let mut generator_baseline = None;
     for rep in 0..replicates {
         let before = raw_counters(&scrape_cells(natural.port, cells)?);
         let spec = LoadSpec {
@@ -798,6 +803,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         pipelined_ops.push(report.ops_per_sec);
         pipelined_p999.push(report.p999_us as f64);
         windowed_sqes_per_submit.push(sqes);
+        generator_baseline = Some((spec, report));
     }
     m.set("loadgen:ops_per_sec", median(&mut pipelined_ops));
     m.set("loadgen:p999_us", median(&mut pipelined_p999));
@@ -809,6 +815,9 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         max_field(&infos, "fabric_rtt_p50_ns") as f64 / 1000.0,
     );
     m.note("fabric RTT measured at loop granularity (shared.now updates once per step)");
+    if let Some((spec, report)) = generator_baseline {
+        m.probe_generator("m0 pipelined", &spec, &report);
+    }
 
     // 3. Cross-cell penalty: same workload, --route-local-only A/B.
     println!("\n== cross-cell penalty (natural vs --route-local-only) ==");
@@ -817,14 +826,19 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let local_only = spawn_infinityd(&infinityd, cells, &local_extra)?;
     let mut natural_ops: Vec<f64> = Vec::new();
     let mut local_ops: Vec<f64> = Vec::new();
-    for _ in 0..replicates {
+    for rep in 0..replicates {
         for (target, bucket) in [(&natural, &mut natural_ops), (&local_only, &mut local_ops)] {
             let spec = LoadSpec {
                 port: target.port,
                 duration: Duration::from_secs(duration.min(5)),
                 ..Default::default()
             };
-            bucket.push(run_load(&spec)?.ops_per_sec);
+            let report = run_load(&spec)?;
+            bucket.push(report.ops_per_sec);
+            if rep + 1 == replicates {
+                let label = if target.port == natural.port { "natural" } else { "all-local" };
+                m.probe_generator(&format!("m0 routing {label}"), &spec, &report);
+            }
         }
     }
     let nat = median(&mut natural_ops);
@@ -860,7 +874,13 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                             duration: Duration::from_secs(duration.min(5)),
                             ..Default::default()
                         };
-                        bucket.push(run_load(&spec)?.ops_per_sec);
+                        let report = run_load(&spec)?;
+                        bucket.push(report.ops_per_sec);
+                        if rep + 1 == replicates {
+                            let label =
+                                if port == natural.port { "infinityd" } else { "Dragonfly" };
+                            m.probe_generator(&format!("m0 comparator {label}"), &spec, &report);
+                        }
                     }
                 }
                 let a = median(&mut ours);
@@ -886,7 +906,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         Ok(redis) => {
             let mut ours: Vec<f64> = Vec::new();
             let mut theirs: Vec<f64> = Vec::new();
-            for _ in 0..replicates {
+            for rep in 0..replicates {
                 for (port, bucket) in [(natural.port, &mut ours), (redis.port, &mut theirs)] {
                     let spec = LoadSpec {
                         port,
@@ -895,7 +915,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                         duration: Duration::from_secs(duration.min(5)),
                         ..Default::default()
                     };
-                    bucket.push(run_load(&spec)?.ops_per_sec);
+                    let report = run_load(&spec)?;
+                    bucket.push(report.ops_per_sec);
+                    if rep + 1 == replicates {
+                        let label = if port == natural.port { "infinityd" } else { "Redis" };
+                        m.probe_generator(&format!("m0 unpipelined {label}"), &spec, &report);
+                    }
                 }
             }
             let a = median(&mut ours);
@@ -957,6 +982,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     }
 
     // 6. Per-gate verdicts + report.
+    m.note("generator scope: RSS fills measure memory; fill speed is not capacity evidence");
     finish_report(
         "m0",
         &gates_list,

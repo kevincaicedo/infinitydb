@@ -98,10 +98,13 @@ class GateFixtures(unittest.TestCase):
 
     def metadata(self, kind=None):
         return {"packages": [
-            {"name": "fake", "id": "fake", "dependencies": [
-                {"name": "other", "kind": kind, "rename": "alias", "target": "cfg(unix)"},
+            {"name": "fake", "id": "fake", "manifest_path": str(self.root / "fake/Cargo.toml"),
+             "dependencies": [
+                {"name": "other", "kind": kind, "rename": "alias", "target": "cfg(unix)",
+                 "path": str(self.root / "other"), "source": None},
             ]},
-            {"name": "other", "id": "other", "dependencies": []},
+            {"name": "other", "id": "other", "dependencies": [],
+             "manifest_path": str(self.root / "other/Cargo.toml")},
         ], "workspace_members": ["fake", "other"]}
 
     def prepare_dag(self, kind=None, allowed=False):
@@ -309,6 +312,46 @@ if overwrite.exists():
         self.remove_actual_edge()
         self.write("docs/dep-dag.toml", 'zero-dependency = ["fake"]\n[edges]\nfake = []\nother = []\n')
         self.assert_green(self.gate("check-dep-dag.sh"))
+
+    def test_dag_internal_only_accepts_workspace_dependencies(self):
+        self.prepare_dag(allowed=True)
+        self.write("docs/dep-dag.toml", 'no-external-dependencies = ["fake"]\n'
+                   '[edges]\nfake = ["other"]\nother = []\n')
+        self.assert_green(self.gate("check-dep-dag.sh"))
+
+    def test_dag_internal_only_rejects_all_external_kinds_and_name_collisions(self):
+        self.prepare_dag(allowed=True)
+        self.write("docs/dep-dag.toml", 'no-external-dependencies = ["fake"]\n'
+                   '[edges]\nfake = ["other"]\nother = []\n')
+        for kind in [None, "build", "dev"]:
+            for external in [dict(name="toml", path=None, source="registry+fixture"),
+                             dict(source="registry+fixture"), dict(path="/outside/other")]:
+                with self.subTest(kind=kind, external=external):
+                    metadata = self.metadata()
+                    dep = dict(metadata["packages"][0]["dependencies"][0], kind=kind, optional=True)
+                    dep.update(external)
+                    metadata["packages"][0]["dependencies"].append(dep)
+                    self.write("metadata.json", json.dumps(metadata))
+                    result = self.gate("check-dep-dag.sh")
+                    self.assert_red(result)
+                    self.assertIn("EXTERNAL-DEPENDENCY VIOLATION", result.stdout)
+
+    def test_dag_internal_only_policy_rejects_malformed_duplicate_and_unknown_scope(self):
+        self.prepare_dag(allowed=True)
+        for policy in ['"fake"', '["fake", "fake"]', '["absent"]']:
+            with self.subTest(policy=policy):
+                self.write("docs/dep-dag.toml", f'no-external-dependencies = {policy}\n'
+                           '[edges]\nfake = ["other"]\nother = []\n')
+                self.assert_red(self.gate("check-dep-dag.sh"))
+
+    def test_dag_internal_only_accepts_empty_package_and_empty_policy(self):
+        self.prepare_dag()
+        self.remove_actual_edge()
+        for policy in ['["fake"]', '[]']:
+            with self.subTest(policy=policy):
+                self.write("docs/dep-dag.toml", f'no-external-dependencies = {policy}\n'
+                           '[edges]\nfake = []\nother = []\n')
+                self.assert_green(self.gate("check-dep-dag.sh"))
 
 
 class DocumentPaths(unittest.TestCase):

@@ -116,6 +116,9 @@ fn ab_row(
             if *is_m2 {
                 assert_zero_log_records(m, server.port, cells, name)?;
             }
+            if rep + 1 == replicates {
+                m.probe_generator(&format!("m2 {name} {label}"), &spec_for(server.port), &report);
+            }
         }
     }
     if baseline_bin.is_some() {
@@ -349,6 +352,19 @@ fn pressure_leg(
     let buf_peak = AtomicU64::new(0);
     let pid = server.pid();
     let port = server.port;
+    let spec = LoadSpec {
+        port: server.port,
+        conns: 64,
+        pipeline: 16,
+        duration: Duration::from_secs(duration),
+        set_weight: 1,
+        get_weight: 1,
+        keys: PRESSURE_KEYS,
+        key_prefix: "p:".into(),
+        value_size: PRESSURE_VALUE,
+        setup: use_press,
+        ..Default::default()
+    };
     let (report, ()) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
@@ -365,19 +381,7 @@ fn pressure_leg(
                 }
             }
         });
-        let report = run_load(&LoadSpec {
-            port: server.port,
-            conns: 64,
-            pipeline: 16,
-            duration: Duration::from_secs(duration),
-            set_weight: 1,
-            get_weight: 1,
-            keys: PRESSURE_KEYS,
-            key_prefix: "p:".into(),
-            value_size: PRESSURE_VALUE,
-            setup: use_press,
-            ..Default::default()
-        });
+        let report = run_load(&spec);
         stop.store(true, Ordering::Relaxed);
         sampler.join().expect("rss sampler");
         (report, ())
@@ -398,6 +402,7 @@ fn pressure_leg(
         fsync_p99_us: max_field(&infos, "fsync_latency_p99_us"),
         fsync_p999_us: max_field(&infos, "fsync_latency_p999_us"),
     };
+    m.probe_generator(&format!("m2 ckpt-pressure {label}"), &spec, &report);
     drop(server);
     drop(guard);
     Ok(leg)
@@ -455,7 +460,7 @@ fn always_row(
     let before = scrape_cells(server.port, cells)?;
     let (frames_0, iters_0) =
         (sum_field(&before, "log_frames_queued"), sum_field(&before, "raw_iterations"));
-    let report = run_load(&LoadSpec {
+    let spec = LoadSpec {
         port: server.port,
         conns,
         pipeline,
@@ -467,7 +472,8 @@ fn always_row(
         value_size: 64,
         setup: use_alw,
         ..Default::default()
-    })?;
+    };
+    let report = run_load(&spec)?;
     m.raw_section(&format!("always grouped writes ({label})"), &render(&report));
 
     let infos = scrape_cells(server.port, cells)?;
@@ -490,6 +496,9 @@ fn always_row(
     let group_p99 = max_field(&infos, "fsync_group_p99");
     let available_per_cell = conns as f64 * pipeline as f64 / f64::from(cells);
     let formation = group_p50 as f64 / available_per_cell;
+    if !canary {
+        m.probe_generator("m2 always grouped writes", &spec, &report);
+    }
     drop(server);
     drop(guard);
 
@@ -625,6 +634,7 @@ fn everysec_row(
     let mut mem_p999: Vec<f64> = Vec::new();
     let mut esec_ops: Vec<f64> = Vec::new();
     let mut esec_p999: Vec<f64> = Vec::new();
+    let mut generator_samples = Vec::new();
     for rep in 0..replicates {
         let mem_first = rep % 2 == 0;
         for leg in 0..2 {
@@ -637,6 +647,9 @@ fn everysec_row(
                 m.raw_section(&format!("everysec row memory-ns rep {rep}"), &render(&report));
                 mem_ops.push(report.ops_per_sec);
                 mem_p999.push(report.p999_us as f64);
+                if rep + 1 == replicates {
+                    generator_samples.push(("m2 everysec memory arm", spec_for(b"memns"), report));
+                }
             } else {
                 let report = run_load(&spec_for(b"esec"))?;
                 println!(
@@ -646,6 +659,9 @@ fn everysec_row(
                 m.raw_section(&format!("everysec row everysec rep {rep}"), &render(&report));
                 esec_ops.push(report.ops_per_sec);
                 esec_p999.push(report.p999_us as f64);
+                if rep + 1 == replicates {
+                    generator_samples.push(("m2 everysec durable arm", spec_for(b"esec"), report));
+                }
             }
         }
     }
@@ -653,6 +669,9 @@ fn everysec_row(
     let p50 = max_field(&infos, "fsync_latency_p50_us");
     let p99 = max_field(&infos, "fsync_latency_p99_us");
     let p999f = max_field(&infos, "fsync_latency_p999_us");
+    for (name, spec, report) in generator_samples {
+        m.probe_generator(name, &spec, &report);
+    }
     drop(server);
     drop(guard);
 
@@ -914,6 +933,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     let root_fstype = crate::gaterun::admit_device_root(flags, &data_root, reference_box)?;
     sweep_stale_row_dirs(&data_root);
     let mut m = Measurements::new();
+    m.note("generator scope: deterministic attribution fills measure memory, not capacity");
     if !env_ok {
         m.note("env-check FAILED and was overridden (--unsafe-env): not citation-grade");
     }

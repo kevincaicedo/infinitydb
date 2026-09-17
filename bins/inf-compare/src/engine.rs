@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::resp;
+use crate::{affinity, resp};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum EngineKind {
@@ -167,8 +167,7 @@ pub struct Images {
     pub seccomp: PathBuf,
 }
 
-/// A launched-or-attached engine. Dropping it does NOT stop it — call
-/// [`teardown`].
+/// An owned engine is stopped and reaped on every exit path, including setup failure.
 #[derive(Debug)]
 pub struct Target {
     pub kind: EngineKind,
@@ -197,22 +196,23 @@ pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
     let launch_cmd = render_cmd(&program, &argv);
     let child = spawn(&program, &argv, log_dir, spec.kind.label())?;
     let pid = child.id();
-    wait_ready(&spec.host, spec.port, Duration::from_secs(20))
-        .map_err(|e| format!("{} (host): {e}", spec.kind.label()))?;
-    durable_setup(spec)?;
-    let version = host_version(&program, &argv);
-    Ok(Target {
+    let mut target = Target {
         kind: spec.kind,
         host: spec.host.clone(),
         port: spec.port,
         mode: Mode::Host,
         durability: Some(spec.durability),
-        version,
+        version: String::new(),
         launch_cmd,
         pid: Some(pid),
         child: Some(child),
         container: None,
-    })
+    };
+    wait_ready(&spec.host, spec.port, Duration::from_secs(20))
+        .map_err(|e| format!("{} (host): {e}", spec.kind.label()))?;
+    durable_setup(spec)?;
+    target.version = host_version(&program, &argv);
+    Ok(target)
 }
 
 /// A fresh durable state directory for the engine (M4.5-S40): wiped and
@@ -320,25 +320,26 @@ pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Tar
     // Persist the container id for debugging next to the host logs.
     let _ = std::fs::write(log_dir.join(format!("{}.container", spec.kind.label())), &out.stdout);
 
+    let mut target = Target {
+        kind: spec.kind,
+        host: spec.host.clone(),
+        port: spec.port,
+        mode: Mode::Docker,
+        durability: Some(spec.durability),
+        version: String::new(),
+        launch_cmd,
+        pid: None,
+        child: None,
+        container: Some(name.clone()),
+    };
     wait_ready(&spec.host, spec.port, Duration::from_secs(30)).map_err(|e| {
         let logs = Command::new("docker").args(["logs", "--tail", "20", &name]).output();
         let tail =
             logs.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_default();
         format!("{} (docker): {e}\n--- docker logs {name} ---\n{tail}", spec.kind.label())
     })?;
-    let version = info_version(&spec.host, spec.port);
-    Ok(Target {
-        kind: spec.kind,
-        host: spec.host.clone(),
-        port: spec.port,
-        mode: Mode::Docker,
-        durability: Some(spec.durability),
-        version,
-        launch_cmd,
-        pid: None,
-        child: None,
-        container: Some(name),
-    })
+    target.version = info_version(&spec.host, spec.port);
+    Ok(target)
 }
 
 /// Verify an already-running engine at `host:port` is reachable; read version
@@ -409,23 +410,22 @@ pub fn rss_peak_mib(target: &Target) -> Option<f64> {
 
 /// Stop the engine: host → SIGKILL + reap; docker → `rm -f`; attach → nothing.
 pub fn teardown(target: Target) {
-    match target.mode {
-        Mode::Host => {
-            if let Some(mut child) = target.child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+    drop(target);
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Mode::Docker => {
-            if let Some(name) = target.container {
-                let _ = Command::new("docker")
-                    .args(["rm", "-f", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
+        if let Some(name) = self.container.take() {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
-        Mode::Attach => {}
     }
 }
 
@@ -452,24 +452,17 @@ fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
     if spec.durability == Durability::Everysec && spec.data_dir.is_none() {
         return Err(format!("{} everysec launch requires a data directory", spec.kind.label()));
     }
-    match spec.kind {
-        EngineKind::Redis => {
-            let (p, a) = redis_argv(spec, false);
-            // Redis executes commands on one thread, but AOF rewrite children
-            // need the same CPU allowance as InfinityDB's cells or they
-            // contend with the parent on a single pinned CPU.
-            Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
-        }
+    let (program, argv) = match spec.kind {
+        EngineKind::Redis => redis_argv(spec, false),
         EngineKind::RedisStack => {
-            Err("redis-stack is docker-only (no host binary); pass --docker".into())
+            return Err("redis-stack is docker-only (no host binary); pass --docker".into());
         }
-        EngineKind::Dragonfly => {
-            let (p, a) = dragonfly_argv(spec, false)?;
-            Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
-        }
-        // infinityd pins its own cells via --pin-start; never taskset-wrapped.
-        EngineKind::InfinityDb => infinity_host_argv(spec),
-    }
+        EngineKind::Dragonfly => dragonfly_argv(spec, false)?,
+        EngineKind::InfinityDb => infinity_host_argv(spec)?,
+    };
+    let cpus =
+        spec.pin_start.map(|start| affinity::CpuRange::new(start, spec.threads)).transpose()?;
+    Ok(affinity::wrap(program, argv, cpus))
 }
 
 fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
@@ -523,26 +516,6 @@ fn dragonfly_argv(spec: &Spec, in_docker: bool) -> Result<(String, Vec<String>),
     Ok(("dragonfly".to_string(), argv))
 }
 
-/// Wrap a host command in `taskset -c LO-HI` (`width` cores from `pin_start`)
-/// when pinning is requested and `taskset` exists; no-op otherwise.
-fn maybe_pin(
-    program: String,
-    argv: Vec<String>,
-    pin: Option<usize>,
-    width: usize,
-) -> (String, Vec<String>) {
-    match pin {
-        Some(base) if taskset_available() => {
-            let hi = base + width.max(1) - 1;
-            let range = if hi > base { format!("{base}-{hi}") } else { base.to_string() };
-            let mut wrapped = vec!["-c".to_string(), range, program];
-            wrapped.extend(argv);
-            ("taskset".to_string(), wrapped)
-        }
-        _ => (program, argv),
-    }
-}
-
 fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
     let bin = resolve_infinityd();
     let mut argv = vec![
@@ -556,7 +529,12 @@ fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
         "off".to_string(),
     ];
     if let Some(core) = spec.pin_start {
-        argv.extend(["--pin-start".to_string(), core.to_string()]);
+        argv.extend([
+            "--pin-start".to_string(),
+            core.to_string(),
+            "--pin-stride".to_string(),
+            "1".to_string(),
+        ]);
     }
     if let (Durability::Everysec, Some(dir)) = (spec.durability, &spec.data_dir) {
         argv.extend([
@@ -778,8 +756,12 @@ fn docker_argv(spec: &Spec, images: &Images, name: &str) -> Result<Vec<String>, 
 // ---- versions -----------------------------------------------------------
 
 /// First line of `<program> --version`, ANSI-stripped (dragonfly colorizes).
-fn host_version(program: &str, _argv: &[String]) -> String {
-    Command::new(program)
+fn host_version(program: &str, argv: &[String]) -> String {
+    let mut command = Command::new(program);
+    if program == "taskset" {
+        command.args(&argv[..3]);
+    }
+    command
         .arg("--version")
         .output()
         .ok()
@@ -925,16 +907,6 @@ fn resolve_infinityd() -> PathBuf {
     PathBuf::from("infinityd")
 }
 
-fn taskset_available() -> bool {
-    Command::new("taskset")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn on_path(program: &str) -> bool {
     Command::new(program)
         .arg("--version")
@@ -961,6 +933,22 @@ mod tests {
             data_dir: (durability == Durability::Everysec).then(|| PathBuf::from("data")),
             probe_file: None,
             redis_no_auto_rewrite: false,
+        }
+    }
+
+    #[test]
+    fn infinity_process_and_competitors_share_the_cpu_allowance() {
+        for kind in [EngineKind::Redis, EngineKind::Dragonfly, EngineKind::InfinityDb] {
+            let mut spec = spec(kind, Durability::None);
+            spec.threads = 2;
+            spec.pin_start = Some(4);
+            let (program, argv) = host_argv(&spec).unwrap();
+            assert_eq!(program, "taskset", "{kind:?} process was not confined");
+            assert_eq!(&argv[..2], ["-c", "4-5"]);
+            if kind == EngineKind::InfinityDb {
+                assert!(argv.windows(2).any(|pair| pair == ["--pin-start", "4"]));
+                assert!(argv.windows(2).any(|pair| pair == ["--pin-stride", "1"]));
+            }
         }
     }
 

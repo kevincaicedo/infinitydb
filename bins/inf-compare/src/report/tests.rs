@@ -17,7 +17,9 @@ fn durability_is_reported_per_engine_and_attached_servers_are_unverified() {
         reasons: vec![],
     };
     let params = Params {
+        placement: None,
         stamp_secs: 0,
+        replicates: 3,
         mode: "host + attach".into(),
         generators: "memtier".into(),
         duration: 1,
@@ -37,6 +39,7 @@ fn durability_is_reported_per_engine_and_attached_servers_are_unverified() {
     };
     let engines = [
         EngineConfig {
+            artifact: "fixture".into(),
             label: "redis",
             version: "test".into(),
             mode: "host",
@@ -45,6 +48,7 @@ fn durability_is_reported_per_engine_and_attached_servers_are_unverified() {
             peak_rss_mib: None,
         },
         EngineConfig {
+            artifact: "fixture".into(),
             label: "dragonfly",
             version: "test".into(),
             mode: "attach",
@@ -59,4 +63,6 @@ fn durability_is_reported_per_engine_and_attached_servers_are_unverified() {
     assert!(report.contains("| dragonfly | attach | test | unverified (attached) |"), "{report}");
     assert!(!report.contains("durability=everysec"), "{report}");
     assert!(!report.contains("infinitydb ran"), "{report}");
+    assert!(report.contains("CPU isolation unverified"), "{report}");
+    assert!(!report.contains("process tree was allowed the same"), "{report}");
 }

@@ -333,9 +333,9 @@ fn server_version(bin: &str) -> String {
     )
 }
 
-fn leg_line(name: &str, r: &LoadReport) -> String {
+fn leg_line(name: &str, r: &LoadReport, histogram: &str) -> String {
     format!(
-        "| {name} | {:.0} | {} | {} | {} | {} | {} |",
+        "| {name} | {:.0} | {} | {} | {} | {} | {} | {histogram} |",
         r.ops_per_sec, r.p50_us, r.p99_us, r.p999_us, r.errors, r.nils
     )
 }
@@ -662,14 +662,16 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push("");
     push("## Legs");
     push("");
-    push("| leg | ops/s | p50 µs | p99 µs | p99.9 µs | errors | nil replies |");
-    push("|---|---|---|---|---|---|---|");
-    push(&leg_line("cache solo", &cache_solo));
-    push(&leg_line("document solo", &doc_solo));
-    push(&leg_line("tiered solo", &tier_solo));
-    push(&leg_line("cache mixed", &cache_mixed));
-    push(&leg_line("document mixed", &doc_mixed));
-    push(&leg_line("tiered mixed", &tier_mixed));
+    push("| leg | ops/s | p50 µs | p99 µs | p99.9 µs | errors | nil replies | histogram |");
+    push("|---|---|---|---|---|---|---|---|");
+    let fine = "FineHistogram (256 sub-buckets/octave, <=0.391%)";
+    let coarse = "LogHistogram (32 sub-buckets/octave, <=3.125%)";
+    push(&leg_line("cache solo", &cache_solo, fine));
+    push(&leg_line("document solo", &doc_solo, fine));
+    push(&leg_line("tiered solo", &tier_solo, coarse));
+    push(&leg_line("cache mixed", &cache_mixed, fine));
+    push(&leg_line("document mixed", &doc_mixed, fine));
+    push(&leg_line("tiered mixed", &tier_mixed, coarse));
     push("");
     push(&format!(
         "Tiered fill: {} keys at {:.0} sets/s, {} error replies (typed durable admission \

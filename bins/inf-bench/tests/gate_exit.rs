@@ -46,16 +46,20 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
+        self.command_for("m0", "0", "1")
+    }
+
+    fn command_for(&self, milestone: &str, duration: &str, cells: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_inf-bench"));
         command.args([
             "gate-run",
-            "m0",
+            milestone,
             "--unsafe-env",
             "--allow-dirty",
             "--cells",
-            "1",
+            cells,
             "--duration",
-            "0",
+            duration,
             "--replicates",
             "1",
             "--fill-keys",
@@ -131,7 +135,7 @@ fn redis_rss_startup_failure_is_fatal_after_successful_ab_startup() {
 }
 
 #[test]
-fn complete_run_and_missing_informational_measurement_exit_zero() {
+fn zero_duration_cannot_certify_a_generator_even_when_numeric_gates_pass() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for (name, source, informational) in [
         ("complete", "tripwire:loop_iter_p999_us", false),
@@ -139,7 +143,132 @@ fn complete_run_and_missing_informational_measurement_exit_zero() {
     ] {
         let fixture = Fixture::new(name, source, informational);
         let output = fixture.command().arg("--skip-fill").output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(fixture.report().contains("status: COMPLETE"));
+        fixture.assert_failed(&output, "generator saturation:");
+        assert!(fixture.report().contains("UNMEASURED"));
+        for row in [
+            "m0 pipelined",
+            "m0 routing natural",
+            "m0 routing all-local",
+            "m0 comparator infinityd",
+            "m0 comparator Dragonfly",
+            "m0 unpipelined infinityd",
+            "m0 unpipelined Redis",
+        ] {
+            assert!(fixture.report().contains(&format!("| {row} | UNMEASURED |")));
+        }
+    }
+}
+
+#[test]
+fn m2_only_always_probes_and_enforces_measured_dispositions() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (mode, expected, valid) in [
+        ("plateau", "PLATEAU", true),
+        ("limited", "GENERATOR-LIMITED", false),
+        ("error", "UNMEASURED", false),
+        ("disconnect", "UNMEASURED", false),
+    ] {
+        let fixture = Fixture::new(mode, "tripwire:spawn_retries", false);
+        let output = fixture
+            .command_for("m2", "3", "1")
+            .arg("--only-always")
+            .arg("--data-root")
+            .arg(&fixture.0)
+            .env("INF_GATE_TEST_PROBE", mode)
+            .output()
+            .unwrap();
+        let report = fixture.report();
+        assert_eq!(output.status.success(), valid, "{report}\n{:?}", output);
+        assert!(report.contains(&format!("| m2 always grouped writes | {expected} |")), "{report}");
+        assert!(report.contains("64 -> 96"));
+        assert!(report.contains("generator m2 always grouped writes baseline"));
+        assert!(report.contains("always row: 100 gated acks / 10 fsyncs"), "{report}");
+        assert_eq!(report.contains("status: COMPLETE"), valid);
+        if !valid {
+            fixture.assert_failed(&output, "generator saturation:");
+        }
+    }
+}
+
+#[test]
+fn m1_binary_counts_a_four_cell_node_total_once() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("m1-memory", "external:unmeasured", true);
+    let output = fixture
+        .command_for("m1", "0", "4")
+        .args([
+            "--storm-keys",
+            "1",
+            "--flushall-keys",
+            "1",
+            "--maxmemory-mb",
+            "16",
+            "--subs",
+            "1",
+            "--sub-channels",
+            "1",
+            "--skip-fill",
+        ])
+        .output()
+        .unwrap();
+    fixture.assert_failed(&output, "generator saturation:");
+    let report = fixture.report();
+    assert!(report.contains("logical 508 B vs limit 16777216 B"), "{report}");
+    assert!(report.contains("resident incl. slack/buffers: 4096 B"), "{report}");
+    for row in ["m1 baseline", "m1 TTL-heavy", "m1 eviction pressure", "m1 KV under pubsub"] {
+        assert!(report.contains(&format!("| {row} |")), "{report}");
+    }
+}
+
+#[test]
+fn m2_only_everysec_requires_both_namespace_probes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("m2-everysec", "external:unmeasured", true);
+    let output = fixture
+        .command_for("m2", "0", "1")
+        .arg("--only-everysec")
+        .arg("--data-root")
+        .arg(&fixture.0)
+        .output()
+        .unwrap();
+    fixture.assert_failed(&output, "generator saturation:");
+    let report = fixture.report();
+    for name in ["m2 everysec memory arm", "m2 everysec durable arm"] {
+        assert!(report.contains(&format!("| {name} | UNMEASURED |")), "{report}");
+    }
+}
+
+#[test]
+fn m2_full_flow_disposes_memory_durable_and_checkpoint_arms() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new("m2-full", "external:unmeasured", true);
+    let output = fixture
+        .command_for("m2", "0", "1")
+        .args(["--pressure-replicates", "1", "--attribution-keys", "1"])
+        .arg("--baseline-bin")
+        .arg(fixture.0.join("server"))
+        .arg("--data-root")
+        .arg(&fixture.0)
+        .output()
+        .unwrap();
+    fixture.assert_failed(&output, "generator saturation:");
+    let report = fixture.report();
+    for row in [
+        "pipelined 1:10 (M0 gate mix)",
+        "unpipelined 512-conn (M0 gate mix)",
+        "ttl-heavy 1:1 writes (M1 gate mix)",
+    ] {
+        for arm in ["m2", "m1-baseline"] {
+            assert!(report.contains(&format!("| m2 {row} {arm} | UNMEASURED |")), "{report}");
+        }
+    }
+    for row in [
+        "m2 always grouped writes",
+        "m2 everysec memory arm",
+        "m2 everysec durable arm",
+        "m2 ckpt-pressure baseline rep 0",
+        "m2 ckpt-pressure pressure rep 0",
+    ] {
+        assert!(report.contains(&format!("| {row} | UNMEASURED |")), "{report}");
     }
 }

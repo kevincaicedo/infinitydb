@@ -477,6 +477,25 @@ fn info_names_every_field_once_on_a_real_node() {
     assert!(body.contains("tripwire_scope:cell\r\n"), "{body}");
     assert!(body.contains("used_memory_doc_resident:"), "{body}");
     assert!(body.contains("\r\ndoc_resident_bytes:"), "{body}");
+
+    let memory = cmd(&mut node, &mut nb, &["INFO", "memory"]);
+    let memory = String::from_utf8_lossy(&memory);
+    let tripwires = cmd(&mut node, &mut nb, &["INFO", "tripwires"]);
+    let tripwires = String::from_utf8_lossy(&tripwires);
+    assert!(memory.contains("memory_scope:node\r\n"));
+    assert!(tripwires.contains("tripwire_scope:cell\r\n"));
+    for (node_name, cell_name) in [
+        ("used_memory_doc_resident", "doc_resident_bytes"),
+        ("used_memory_doc_scratch", "doc_scratch_bytes"),
+        ("used_memory_doc_path_cache", "doc_path_cache_bytes"),
+        ("used_memory_idx_tree", "idx_tree_bytes"),
+        ("used_memory_idx_slack", "idx_slack_bytes"),
+    ] {
+        assert!(memory.contains(&format!("\r\n{node_name}:")), "{memory}");
+        assert!(!memory.contains(&format!("\r\n{cell_name}:")), "{memory}");
+        assert!(tripwires.contains(&format!("\r\n{cell_name}:")), "{tripwires}");
+        assert!(!tripwires.contains(&format!("\r\n{node_name}:")), "{tripwires}");
+    }
 }
 
 /// Batch 49 (review 2026-08-30, F-L15-07) at the binary: a spawned 4-cell

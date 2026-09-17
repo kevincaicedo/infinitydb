@@ -24,6 +24,8 @@ use crate::gaterun::{
 use crate::load::{LoadSpec, render, run as run_load};
 use crate::resp::{connect, encode_command, request};
 
+mod memory;
+
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut conn = connect("127.0.0.1", port)?;
     request(&mut conn, argv)
@@ -140,6 +142,9 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         m.raw_section(&format!("baseline rep {rep}"), &render(&report));
         base_ops.push(report.ops_per_sec);
         base_p999.push(report.p999_us as f64);
+        if rep + 1 == replicates {
+            m.probe_generator("m1 baseline", &spec, &report);
+        }
     }
     m.set("loadgen:baseline_ops_per_sec", crate::gaterun::median(&mut base_ops));
     m.set("loadgen:baseline_p999_us", crate::gaterun::median(&mut base_p999));
@@ -165,6 +170,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         sum_field(&infos, "expired_active"),
         sum_field(&infos, "expired_lazy")
     ));
+    m.probe_generator("m1 TTL-heavy", &spec, &report);
     control(server.port, &[b"FLUSHALL"])?;
 
     // Row 3 — expiry storm: `storm_keys` keys all expire at one absolute
@@ -258,24 +264,8 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     m.raw_section("eviction-pressure", &render(&report));
     m.set("loadgen:eviction_storm_p999_us", report.p999_us as f64);
     let infos = scrape_cells(server.port, cells)?;
-    let evicted = sum_field(&infos, "evicted_keys");
-    // The pressure bound compares LOGICAL used bytes (live records + index +
-    // wheel + CMS — the shape `Keyspace::used_bytes` enforces); INFO's
-    // `used_memory` additionally carries allocator slack + wire buffers +
-    // conn state, whose bound is the RSS/attribution story, not this gate.
-    let logical = sum_field(&infos, "records_live_bytes")
-        + sum_field(&infos, "index_bytes")
-        + sum_field(&infos, "wheel_bytes")
-        + sum_field(&infos, "evict_bytes");
-    let resident = sum_field(&infos, "used_memory");
-    m.set("loadgen:eviction_used_over_limit", logical as f64 / mb as f64);
-    m.note(format!(
-        "eviction pressure: {evicted} evictions; logical {logical} B vs limit {mb} B \
-         (resident incl. slack/buffers: {resident} B)"
-    ));
-    if evicted == 0 {
-        m.note("WARNING: zero evictions — the row did not generate pressure (check sizing)");
-    }
+    memory::record_eviction_memory(&mut m, &infos, mb)?;
+    m.probe_generator("m1 eviction pressure", &spec, &report);
     control(server.port, &[b"CONFIG", b"SET", b"maxmemory", b"0"])?;
     control(server.port, &[b"CONFIG", b"SET", b"maxmemory-policy", b"noeviction"])?;
     control(server.port, &[b"FLUSHALL"])?;
@@ -374,10 +364,12 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             ..Default::default()
         };
         let report = run_load(&spec)?;
+        m.probe_generator("m1 KV under pubsub", &spec, &report);
         stop_pub.store(true, Ordering::Relaxed);
         let published = bg.join().expect("bg publisher")?;
         println!(
-            "  KV under pub/sub background: p999 {} µs ({published} publishes behind it)",
+            "  KV under pub/sub background: p999 {} µs \
+             ({published} publishes across measurement + generator probe)",
             report.p999_us
         );
         m.raw_section("pubsub-background", &render(&report));
@@ -388,7 +380,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             d.join().expect("drainer");
         }
         m.note(format!(
-            "pub/sub deliveries drained by the fleet: {}",
+            "pub/sub deliveries drained by the fleet (including generator probe): {}",
             fleet.delivered.load(Ordering::Relaxed)
         ));
         Ok(())
@@ -500,6 +492,11 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         m.set("external:zipfian_lfu", pp);
     }
 
+    m.note(
+        "generator scope: expiry/FLUSHALL are transient event rows, pub/sub fan-out and \
+         slow-subscriber checks are manually paced; no saturation inference for those rows. \
+         Deterministic fills measure memory and zipfian measures hit-rate, not capacity.",
+    );
     finish_report(
         "m1",
         &gates_list,

@@ -5,9 +5,17 @@ The InfinityDB benchmark and exit-gate harness (milestones M0-E6 / M1-S17).
 `inf-bench` spawns the system under test (`infinityd`) and, where relevant,
 real `redis-server` as a comparator, drives load with its own RESP client, and
 produces per-gate PASS/FAIL reports against the machine-readable gate files in
-`docs/milestones/`. It shares **no code** with the system under test — the
-client-side RESP lives in `src/resp.rs`, so the measurement tool and the server
-can never accidentally agree because they share a bug.
+`docs/milestones/`. It has no external dependencies; internal dependencies
+are allowed (ADR-0134). It shares `inf-foundation` RNG, checksum and histogram
+primitives with the system under test. The client-side RESP in `src/resp.rs`
+is independent of the server parser; shared primitives are not an independent
+correctness oracle. `inf-compare` supplies the separate external generators.
+
+Latency reports disclose their instrument: native load/cache/document rows
+use FineHistogram (256 sub-buckets per octave, about 0.391% bucket width);
+YCSB and mixed-audit tiered rows retain LogHistogram (32, about 3.125%).
+YCSB's memory-hit sidecar carries the same disclosure. Old unlabelled reports
+retain their original resolution; this repair does not remeasure them.
 
 ## Subcommands
 
@@ -72,6 +80,32 @@ Commit harnesses and reproduction instructions, not generated reports. See
   **fan-out** and background rows, the **slow-subscriber kill**, the hardened
   ≤ 1.0× **RSS** leg, and (with `--with-zipfian`) the LFU **hit-rate parity**
   row — against `docs/milestones/m1-gates.toml`.
+
+M0/M1/M2 reports require a generator-saturation disposition (ADR-0135).
+Steady native load rows run once more with 50% more connections, rounded
+up and capped at 1024. Workload, pipeline, duration, warmup, seed and
+namespace stay fixed. The report retains both samples and the connection
+counts; probe samples are excluded from gate values and server-counter
+windows. Positive throughput change of at least 5% is `GENERATOR-LIMITED`;
+negative change of at least 5% is `INCONCLUSIVE`; smaller changes are
+`PLATEAU`. A plateau does not establish CPU headroom or server capacity.
+Errors, missing samples and failed probes are `UNMEASURED`. Every result
+except a plateau makes the diagnostic report non-citable and the exit
+nonzero, even with `--unsafe-env` or a reduced gate file. Zero-duration
+smoke runs therefore cannot return a valid-run status.
+
+Coverage includes M0 routing/comparator arms, M1 baseline/TTL/eviction/KV
+under pub/sub, and M2 memory A/B, everysec arms, always writes and checkpoint
+pressure arms, including `--only-always`/`--only-everysec`. Reports explicitly
+exclude transient expiry/FLUSHALL, manually paced pub/sub/control checks,
+and fill/hit-rate rows from capacity inference. The grouping canary remains
+a correctness witness. Reference campaigns still owe every other §19 check.
+
+The M1 eviction note sums cell-owned logical domains and reads the maximum
+observed node-fold `used_memory` once. Each scrape must declare
+`memory_scope:node`; asynchronous scrapes can differ. This is accounted
+resident memory, not process RSS. INFO uses distinct node and cell names
+under ADR-0122, independent of section selection/order.
 
 Common flags:
 

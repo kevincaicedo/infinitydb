@@ -4,6 +4,8 @@
 
 use std::fmt::Write;
 
+mod summary;
+
 use crate::engine::Durability;
 use crate::env::Env;
 use crate::memtier;
@@ -11,6 +13,7 @@ use crate::redisbench;
 
 /// One engine's published launch config + peak memory.
 pub struct EngineConfig {
+    pub artifact: String,
     pub label: &'static str,
     pub version: String,
     pub mode: &'static str,
@@ -21,6 +24,8 @@ pub struct EngineConfig {
 
 /// One measured (engine × workload × pipeline) cell — either or both generators.
 pub struct Cell {
+    pub replicate: u16,
+    pub ordinal: u32,
     pub engine: &'static str,
     pub workload: &'static str,
     pub pipeline: u32,
@@ -39,6 +44,8 @@ pub struct Cell {
 
 /// One bytes/key attribution row.
 pub struct MemCell {
+    pub replicate: u16,
+    pub ordinal: u32,
     pub engine: &'static str,
     pub keys: u64,
     pub value_size: usize,
@@ -49,6 +56,8 @@ pub struct MemCell {
 
 /// Run-level parameters echoed into the header.
 pub struct Params {
+    pub placement: Option<crate::affinity::Placement>,
+    pub replicates: u16,
     pub stamp_secs: u64,
     pub mode: String,
     pub generators: String,
@@ -83,6 +92,7 @@ pub fn render(
     // ---- banner ----
     let _ = writeln!(md, "# inf-compare — competitive benchmark report\n");
     let _ = writeln!(md, "> **Tier:** {}", env.tier);
+    let _ = writeln!(md, "> **CPU placement:** {}", crate::affinity::description(p.placement));
     if !env.reasons.is_empty() {
         let _ = writeln!(md, ">");
         for reason in &env.reasons {
@@ -102,6 +112,7 @@ pub fn render(
     if let Some(detail) = &env.envcheck {
         let _ = writeln!(md, "| inf-bench env-check | {detail} |");
     }
+    let _ = writeln!(md, "| Replicates | {} |", p.replicates);
     let _ = writeln!(md, "| Mode | {} |", p.mode);
     let _ = writeln!(md, "| Generators | {} |", p.generators);
     let _ = writeln!(md, "| memtier | `{}` |", env.memtier_version);
@@ -129,33 +140,43 @@ pub fn render(
 
     // ---- published configs ----
     let _ = writeln!(md, "## Engines — published configs\n");
-    let _ =
-        writeln!(md, "| Engine | Mode | Version | Durability | Peak RSS (MiB) | Launch command |");
-    let _ = writeln!(md, "|---|---|---|---|---:|---|");
+    let _ = writeln!(
+        md,
+        "| Engine | Mode | Version | Durability | Peak RSS (MiB) | Launch command | Leg artifact |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---:|---|---|");
     for e in engines {
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | {} | `{}` |",
+            "| {} | {} | {} | {} | {} | `{}` | `{}` |",
             e.label,
             e.mode,
             e.version,
             e.durability.map_or("unverified (attached)", Durability::label),
             fmt_opt(e.peak_rss_mib, 1),
-            e.launch_cmd
+            e.launch_cmd,
+            e.artifact
         );
     }
     let _ = writeln!(md);
 
+    summary::render(&mut md, cells, mem);
+
     // ---- memtier results ----
     if cells.iter().any(|c| c.memtier.is_some()) {
-        let _ = writeln!(md, "## Results — memtier_benchmark\n");
+        let _ = writeln!(md, "## Individual samples — memtier_benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (ops/s) | achieved/offered | avg (ms) | p50 \
+            "| Engine | Workload | Pipe | Replicate | Leg | Throughput (ops/s) | \
+                 achieved/offered | avg (ms) | \
+                 p50 \
                  (ms) | p99 (ms) | p99.9 (ms) | max (ms) | server CPU (%) | device MiB written | \
                  RSS (MiB) |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            md,
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        );
         for c in cells {
             let Some(m) = c.memtier else { continue };
             let achieved = m.offered_ops_per_sec.map(|offered| {
@@ -164,10 +185,13 @@ pub fn render(
             });
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {} | {:.3} | {:.3} | {:.3} | {:.3} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {:.0} | {} | {:.3} | {:.3} | {:.3} | \
+                 {:.3} | {} | {} | {} | {} |",
                 c.engine,
                 c.workload,
                 c.pipeline,
+                c.replicate,
+                c.ordinal,
                 m.ops_per_sec,
                 achieved.unwrap_or_else(|| "closed loop".to_string()),
                 m.avg_ms,
@@ -183,15 +207,18 @@ pub fn render(
         let _ = writeln!(md);
 
         let _ = writeln!(md, "### Persistence and stall deltas\n");
-        let _ = writeln!(md, "| Engine | Workload | Pipe | Before/after summary |");
-        let _ = writeln!(md, "|---|---|---:|---|");
+        let _ =
+            writeln!(md, "| Engine | Workload | Pipe | Replicate | Leg | Before/after summary |");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---|");
         for c in cells.iter().filter(|c| c.memtier.is_some()) {
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} |",
                 c.engine,
                 c.workload,
                 c.pipeline,
+                c.replicate,
+                c.ordinal,
                 c.persistence_delta.as_deref().unwrap_or("n/a")
             );
         }
@@ -200,18 +227,27 @@ pub fn render(
 
     // ---- redis-benchmark results ----
     if cells.iter().any(|c| c.redisbench.is_some()) {
-        let _ = writeln!(md, "## Results — redis-benchmark\n");
+        let _ = writeln!(md, "## Individual samples — redis-benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (req/s) | avg (ms) | p50 (ms) | p99 (ms) |"
+            "| Engine | Workload | Pipe | Replicate | Leg | Throughput (req/s) | \
+                 avg (ms) | p50 (ms) | p99 (ms) |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|");
         for c in cells {
             let Some(r) = c.redisbench else { continue };
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} |",
-                c.engine, c.workload, c.pipeline, r.rps, r.avg_ms, r.p50_ms, r.p99_ms
+                "| {} | {} | {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.replicate,
+                c.ordinal,
+                r.rps,
+                r.avg_ms,
+                r.p50_ms,
+                r.p99_ms
             );
         }
         let _ = writeln!(md);
@@ -228,17 +264,26 @@ pub fn render(
         );
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | memtier (ops/s) | redis-bench (req/s) | Δ | |"
+            "| Engine | Workload | Pipe | Replicate | Leg | memtier (ops/s) | \
+                 redis-bench (req/s) | Δ | |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|:--|");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|:--|");
         for c in cells {
             let (Some(m), Some(r)) = (c.memtier, c.redisbench) else { continue };
             let delta = if r.rps > 0.0 { (m.ops_per_sec - r.rps) / r.rps * 100.0 } else { 0.0 };
             let flag = if delta.abs() > p.crosscheck_pct { "⚠ diverges" } else { "ok" };
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.0} | {:+.1}% | {} |",
-                c.engine, c.workload, c.pipeline, m.ops_per_sec, r.rps, delta, flag
+                "| {} | {} | {} | {} | {} | {:.0} | {:.0} | {:+.1}% | {} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.replicate,
+                c.ordinal,
+                m.ops_per_sec,
+                r.rps,
+                delta,
+                flag
             );
         }
         let _ = writeln!(md);
@@ -254,14 +299,17 @@ pub fn render(
         );
         let _ = writeln!(
             md,
-            "| Engine | Keys | Value (B) | RSS baseline (MiB) | RSS after (MiB) | bytes/key |"
+            "| Engine | Replicate | Leg | Keys | Value (B) | RSS baseline (MiB) | \
+                 RSS after (MiB) | bytes/key |"
         );
-        let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|");
+        let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---:|");
         for m in mem {
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
                 m.engine,
+                m.replicate,
+                m.ordinal,
                 m.keys,
                 m.value_size,
                 fmt_opt(m.baseline_mib, 1),
@@ -284,10 +332,9 @@ pub fn render(
     }
     let _ = writeln!(
         md,
-        "- redis command execution is single-threaded, but its process tree was allowed the same \
-             {} CPUs as InfinityDB's cells so AOF rewrite children did not contend with the \
-             command thread on one pinned CPU. Each engine's config is recorded above.",
-        p.threads
+        "- {}. Logical CPU affinity does not establish physical-core/SMT isolation or \
+             load-generator capacity; those need separate reference-run evidence.",
+        crate::affinity::description(p.placement)
     );
     let _ = writeln!(
         md,
@@ -350,6 +397,16 @@ pub fn render(
     let _ =
         writeln!(md, "- Raw memtier JSON + redis-benchmark CSV for every row are under `raw/`.");
 
+    let _ = writeln!(
+        md,
+        "- Schedule: workload/pipeline, then replicate, then rotated engine order. \
+         `schedule.tsv` records each attempted/skipped leg. Raw/log subdirectories name the leg."
+    );
+    let _ = writeln!(
+        md,
+        "- Launched engines restart per leg; durable directories are fresh. Attached engines \
+         receive FLUSHALL/preload but retain process and cache state."
+    );
     md
 }
 

@@ -44,8 +44,8 @@ jobs:
           # JSON reader and RESP framer, the load generator's framer, and
           # the sim clients' framer. Iterative, depth-capped, fuzzed.
           - { dir: bins/inf, target: cli_reply_parse }
-          - { dir: bins/inf-compare, target: memtier_json_parse }
-          - { dir: bins/inf-compare, target: compare_resp_frame }
+          - { dir: bins/inf-compare, target: memtier_json_parse, seeds: fuzz/seeds/memtier_json_parse }
+          - { dir: bins/inf-compare, target: compare_resp_frame, seeds: fuzz/seeds/compare_resp_frame }
           - { dir: bins/inf-bench, target: bench_resp_frame }
           - { dir: bins/inf-sim, target: sim_resp_frame }
           # B64-65-R04 (batch 68): the sim's RESP2 *value* parser, total

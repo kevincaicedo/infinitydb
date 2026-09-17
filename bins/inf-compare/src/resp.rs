@@ -4,9 +4,13 @@
 //! path. Independent of `inf-wire` on purpose: the orchestrator shares no code
 //! with the system under test.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+
+#[path = "resp/frame.rs"]
+mod frame;
+pub use frame::{Decoder, Error, MAX_BYTES};
 
 /// `true` iff `host:port` answers `PING` with `+PONG`.
 pub fn ping(host: &str, port: u16) -> bool {
@@ -29,8 +33,11 @@ pub fn command(host: &str, port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String>
 /// Decode a non-null RESP bulk reply into its payload. INFO uses this form
 /// on both Redis and InfinityDB.
 pub fn bulk_text(reply: &[u8]) -> Result<String, String> {
+    if reply_len(reply).map_err(|error| error.to_string())? != Some(reply.len()) {
+        return Err("expected one complete bulk reply".into());
+    }
     if reply.first() != Some(&b'$') {
-        return Err(format!("expected bulk reply, got {:?}", String::from_utf8_lossy(reply)));
+        return Err("expected bulk reply".into());
     }
     let Some(header_end) = reply.windows(2).position(|w| w == b"\r\n") else {
         return Err("bulk reply has no header terminator".into());
@@ -91,25 +98,12 @@ pub fn json_fill(host: &str, port: u16, keyspace: u64, doc: &str) -> Result<(), 
 
 /// Read exactly `count` simple replies, requiring `+OK` for each.
 fn drain_ok(stream: &mut TcpStream, count: usize) -> Result<(), String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 16384];
-    let mut seen = 0usize;
-    let mut at = 0usize;
-    while seen < count {
-        if let Some(end) = frame(&buf, at) {
-            if !buf[at..].starts_with(b"+OK") {
-                let line = String::from_utf8_lossy(&buf[at..end]);
-                return Err(format!("json fill reply: {}", line.trim()));
-            }
-            at = end;
-            seen += 1;
-            continue;
+    let mut reader = BufReader::new(stream);
+    for _ in 0..count {
+        let reply = read_reply(&mut reader)?;
+        if reply != b"+OK\r\n" {
+            return Err("json fill expected +OK".into());
         }
-        let n = stream.read(&mut chunk).map_err(|e| format!("json fill read: {e}"))?;
-        if n == 0 {
-            return Err("connection closed mid-fill".into());
-        }
-        buf.extend_from_slice(&chunk[..n]);
     }
     Ok(())
 }
@@ -124,18 +118,27 @@ fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
 
 fn request(stream: &mut TcpStream, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     stream.write_all(&encode(argv)).map_err(|e| format!("write: {e}"))?;
+    read_reply(&mut BufReader::new(stream))
+}
+
+/// Keep at most one bounded reply; leave pipelined successors in the reader.
+fn read_reply(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    let mut chunk = [0u8; 16384];
+    let mut decoder = Decoder::default();
     loop {
-        if let Some(n) = reply_len(&buf) {
-            buf.truncate(n);
-            return Ok(buf);
-        }
-        let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
+        let chunk = reader.fill_buf().map_err(|error| format!("read: {error}"))?;
+        if chunk.is_empty() {
             return Err("connection closed mid-reply".into());
         }
-        buf.extend_from_slice(&chunk[..n]);
+        let previous = buf.len();
+        let count = chunk.len().min(MAX_BYTES - previous);
+        buf.extend_from_slice(&chunk[..count]);
+        if let Some(end) = decoder.advance(&buf).map_err(|error| error.to_string())? {
+            reader.consume(end - previous);
+            buf.truncate(end);
+            return Ok(buf);
+        }
+        reader.consume(count);
     }
 }
 
@@ -150,89 +153,50 @@ fn encode(argv: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// The deepest reply nesting the framer accepts (F-L18-07, review of
-/// 2026-08-30): the framer is iterative with an explicit stack and this
-/// explicit depth limit; past it the reply is treated as malformed.
-pub const MAX_DEPTH: usize = 32;
-
-/// `Some(n)` when `buf[..n]` is exactly one complete reply; `None` = need more.
-pub fn reply_len(buf: &[u8]) -> Option<usize> {
-    frame(buf, 0)
-}
-
-fn frame(buf: &[u8], at: usize) -> Option<usize> {
-    // Remaining items per open aggregate — the explicit stack (F-L18-07).
-    let mut pending = [0usize; MAX_DEPTH];
-    let mut depth = 0usize;
-    let mut pos = at;
-    loop {
-        let tag = *buf.get(pos)?;
-        let items = match tag {
-            b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => {
-                pos = line_end(buf, pos)?;
-                0
-            }
-            b'$' | b'=' => {
-                let header_end = line_end(buf, pos)?;
-                let n = parse_len(&buf[pos + 1..header_end - 2])?;
-                pos = if n < 0 {
-                    header_end // RESP2 null bulk
-                } else {
-                    let total = header_end.checked_add(usize::try_from(n).ok()?)?.checked_add(2)?;
-                    if buf.len() < total {
-                        return None;
-                    }
-                    total
-                };
-                0
-            }
-            b'*' | b'%' | b'~' | b'>' => {
-                let header_end = line_end(buf, pos)?;
-                let n = parse_len(&buf[pos + 1..header_end - 2])?;
-                pos = header_end;
-                if n < 0 {
-                    0 // null array
-                } else {
-                    let n = usize::try_from(n).ok()?;
-                    if tag == b'%' { n.checked_mul(2)? } else { n }
-                }
-            }
-            _ => return None, // malformed: caller treats as a protocol error
-        };
-        if items > 0 {
-            if depth == MAX_DEPTH {
-                return None; // nested past the cap: malformed
-            }
-            pending[depth] = items;
-            depth += 1;
-            continue;
-        }
-        // One element is complete: close every aggregate it finishes.
-        while depth > 0 {
-            pending[depth - 1] -= 1;
-            if pending[depth - 1] > 0 {
-                break;
-            }
-            depth -= 1;
-        }
-        if depth == 0 {
-            return Some(pos);
-        }
-    }
-}
-
-fn line_end(buf: &[u8], at: usize) -> Option<usize> {
-    let nl = buf[at..].windows(2).position(|w| w == b"\r\n")?;
-    Some(at + nl + 2)
-}
-
-fn parse_len(digits: &[u8]) -> Option<i64> {
-    core::str::from_utf8(digits).ok()?.parse().ok()
+/// Complete frame end, incomplete input, or a terminal protocol/limit error.
+pub fn reply_len(buf: &[u8]) -> Result<Option<usize>, Error> {
+    Decoder::default().advance(buf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::bulk_text;
+
+    #[test]
+    fn buffered_reader_preserves_pipelined_replies_and_refuses_oversize_headers() {
+        let mut reader = std::io::Cursor::new(b"+OK\r\n:2\r\n");
+        assert_eq!(super::read_reply(&mut reader).unwrap(), b"+OK\r\n");
+        assert_eq!(super::read_reply(&mut reader).unwrap(), b":2\r\n");
+        let mut reader = std::io::Cursor::new(b"$999999999\r\n");
+        assert!(super::read_reply(&mut reader).unwrap_err().contains("byte limit"));
+    }
+
+    #[test]
+    fn empty_containers_count_toward_depth_and_payloads_are_bounded() {
+        let mut reply = b"*1\r\n".repeat(super::frame::MAX_DEPTH);
+        reply.extend_from_slice(b"*0\r\n");
+        assert!(super::reply_len(&reply).is_err());
+        let bytes = 1024 * 1024;
+        let reply = format!("${bytes}\r\n{}\r\n", "x".repeat(bytes));
+        assert!(super::reply_len(reply.as_bytes()).is_err());
+        assert!(super::reply_len(b"$1\r\nx!!").is_err());
+    }
+
+    #[test]
+    fn socket_reports_depth_refusal_instead_of_waiting_for_more_bytes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 64];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(&b"*1\r\n".repeat(super::frame::MAX_DEPTH + 1)).unwrap();
+        });
+        let error = super::command("127.0.0.1", port, &[b"PING"]).unwrap_err();
+        sender.join().unwrap();
+        assert!(error.contains("nesting"), "{error}");
+    }
 
     #[test]
     fn decodes_info_bulk_payload_exactly() {
@@ -242,17 +206,17 @@ mod tests {
     }
 
     /// F-L18-07 (review of 2026-08-30): a reply nested past the depth cap
-    /// is refused (`None`, the framer's malformed answer), never a stack
+    /// is refused with a depth error, never a stack
     /// overflow.
     #[test]
     fn framing_past_the_cap_is_refused() {
         let deep = b"*1\r\n".repeat(200_000);
-        assert_eq!(super::reply_len(&deep), None);
-        let mut at_cap = b"*1\r\n".repeat(super::MAX_DEPTH);
+        assert_eq!(super::reply_len(&deep), Err(super::Error::DepthLimit));
+        let mut at_cap = b"*1\r\n".repeat(super::frame::MAX_DEPTH);
         at_cap.extend_from_slice(b":1\r\n");
-        assert_eq!(super::reply_len(&at_cap), Some(at_cap.len()));
-        let mut past = b"*1\r\n".repeat(super::MAX_DEPTH + 1);
+        assert_eq!(super::reply_len(&at_cap), Ok(Some(at_cap.len())));
+        let mut past = b"*1\r\n".repeat(super::frame::MAX_DEPTH + 1);
         past.extend_from_slice(b":1\r\n");
-        assert_eq!(super::reply_len(&past), None);
+        assert_eq!(super::reply_len(&past), Err(super::Error::DepthLimit));
     }
 }

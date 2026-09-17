@@ -10,6 +10,7 @@
 # Adding an edge here is an architecture decision — it needs an ADR.
 
 zero-dependency = ["inf-compare"] # ADR-0025: independent competitive instrument.
+no-external-dependencies = ["inf-bench"] # ADR-0134: internal workspace crates are allowed.
 
 [edges]
 inf-foundation = []

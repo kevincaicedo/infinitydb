@@ -11,8 +11,8 @@
 //! `lpush/sadd/hset/zadd/lrange`, none of which M1 implements. The caller only
 //! ever passes an explicit, M1-surface `-t` test (set/get/incr).
 
+use crate::affinity::{self, CpuRange};
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
@@ -25,6 +25,7 @@ pub struct Metrics {
 #[derive(Clone, Copy, Debug)]
 pub struct Plan<'a> {
     pub host: &'a str,
+    pub cpus: Option<CpuRange>,
     pub port: u16,
     pub requests: u64,
     pub clients: usize,
@@ -35,7 +36,7 @@ pub struct Plan<'a> {
 /// Run a single `-t test` and parse the matching CSV row. `csv_path` keeps the
 /// raw output as an artifact.
 pub fn run(plan: &Plan, test: &str, pipeline: u32, csv_path: &Path) -> Result<Metrics, String> {
-    let out = Command::new("redis-benchmark")
+    let out = affinity::command("redis-benchmark", plan.cpus)
         .args([
             "-h",
             plan.host,
@@ -77,7 +78,11 @@ fn parse_csv(csv: &str, test: &str) -> Result<Metrics, String> {
             let num = |i: usize| {
                 fields[i]
                     .parse::<f64>()
-                    .map_err(|_| format!("redis-benchmark csv: `{}` is not a number", fields[i]))
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| {
+                        "redis-benchmark csv: expected finite nonnegative metric".to_string()
+                    })
             };
             return Ok(Metrics { rps: num(1)?, avg_ms: num(2)?, p50_ms: num(4)?, p99_ms: num(6)? });
         }
@@ -105,5 +110,13 @@ mod tests {
         let csv = "\"test\",\"rps\",\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"\n\"GET\",\"1\",\"0\",\"0\"\
              ,\"0\",\"0\",\"0\",\"0\"\n";
         assert!(parse_csv(csv, "set").is_err());
+    }
+
+    #[test]
+    fn nonfinite_and_negative_samples_cannot_enter_the_summary() {
+        for metric in ["NaN", "inf", "-1", "1e999"] {
+            let csv = format!("header\nSET,{metric},0,0,0,0,0,0\n");
+            assert!(parse_csv(&csv, "set").is_err());
+        }
     }
 }

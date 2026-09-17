@@ -7,6 +7,7 @@ cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
 python3 - <<'PY'
 import json
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -25,11 +26,14 @@ try:
         policy = tomllib.load(f)
 except (OSError, tomllib.TOMLDecodeError) as err:
     scope_error(f"cannot read docs/dep-dag.toml ({err})")
-if set(policy) - {"edges", "unused", "zero-dependency"}:
+if set(policy) - {"edges", "unused", "zero-dependency", "no-external-dependencies"}:
     scope_error("unknown policy section")
 allowed = policy.get("edges")
 unused = policy.get("unused", {})
 zero = policy.get("zero-dependency", [])
+internal_only = policy.get("no-external-dependencies", [])
+if not names(internal_only):
+    scope_error("no-external-dependencies must be a string array")
 if not isinstance(allowed, dict) or not isinstance(unused, dict) or not names(zero):
     scope_error("edges/unused must be tables; zero-dependency must be a string array")
 if any(not names(targets) or len(targets) != len(set(targets)) for targets in allowed.values()):
@@ -64,6 +68,7 @@ try:
             if (not isinstance(dep["name"], str) or not dep["name"]
                     or dep["kind"] not in (None, "build", "dev")):
                 raise ValueError("invalid dependency name or kind")
+    roots = {p["name"]: str(Path(p["manifest_path"]).parent) for p in packages} if internal_only else {}
 except (ValueError, KeyError, TypeError) as err:
     scope_error(f"invalid cargo metadata ({err})")
 
@@ -76,6 +81,8 @@ for name in sorted(unused.keys() - workspace):
     violations.append(f"UNKNOWN RESERVATION PACKAGE: {name}")
 if len(zero) != len(set(zero)) or set(zero) - workspace:
     violations.append("INVALID ZERO-DEPENDENCY POLICY: duplicate or unknown package")
+if len(internal_only) != len(set(internal_only)) or set(internal_only) - workspace:
+    violations.append("INVALID NO-EXTERNAL-DEPENDENCIES POLICY: duplicate or unknown package")
 permissions = {(source, target) for source, targets in allowed.items() for target in targets}
 reservations = {
     (source, target): reason
@@ -100,6 +107,12 @@ for pkg in packages:
         if source in zero:
             kind = dep["kind"] or "normal"
             violations.append(f"ZERO-DEPENDENCY VIOLATION: {source} -> {target} ({kind})")
+        if source in internal_only and (
+            target not in workspace or dep.get("source") is not None
+            or dep.get("path") != roots.get(target)
+        ):
+            kind = dep["kind"] or "normal"
+            violations.append(f"EXTERNAL-DEPENDENCY VIOLATION: {source} -> {target} ({kind})")
         if dep["name"] not in workspace:
             continue
         if dep["kind"] == "dev":  # tests may cross layers
@@ -123,6 +136,7 @@ scope = (
     f"{len(permissions)} permissions, {len(reservations)} reserved, {exempt} dev edges exempt"
 )
 print(f"dep-dag scope: {scope}; zero-dependency packages: {', '.join(zero) or 'none'}")
+print(f"dep-dag no-external-dependencies packages: {', '.join(internal_only) or 'none'}")
 if violations:
     print("\n".join(violations))
     print("dep-dag FAILED: permissions/reservations must match Cargo; changing an edge needs an ADR.")

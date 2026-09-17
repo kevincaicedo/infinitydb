@@ -1,6 +1,18 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[test]
+fn required_generator_disposition_cannot_be_omitted() {
+    let mut measurements = Measurements::new();
+    measurements.set("probe:value", 0.5);
+    for milestone in ["m0", "m1", "m2"] {
+        let (result, body) = report_for(milestone, &[gate("any", false)], &measurements, true);
+        assert!(result.unwrap_err().contains("generator saturation"));
+        assert!(body.contains("UNMEASURED"));
+        assert!(!body.contains("status: COMPLETE"));
+    }
+}
+
 fn gate(tier: &str, informational: bool) -> gates::Gate {
     gates::Gate {
         id: "probe".into(),
@@ -19,13 +31,24 @@ fn report(
     m: &Measurements,
     reference: bool,
 ) -> (Result<(), String>, String) {
+    // These tests isolate gate thresholds; M0/M1/M2 probe validity has its own fixtures.
+    report_for("m4", gates, m, reference)
+}
+
+fn report_for(
+    milestone: &str,
+    gates: &[gates::Gate],
+    m: &Measurements,
+    reference: bool,
+) -> (Result<(), String>, String) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
         "inf-bench-verdict-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = finish_report("m0", gates, m, true, reference, root.to_str().unwrap(), "test");
+    let result =
+        finish_report(milestone, gates, m, true, reference, root.to_str().unwrap(), "test");
     let dir = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
     let body = std::fs::read_to_string(dir.join("report.md")).unwrap();
     std::fs::remove_dir_all(root).unwrap();

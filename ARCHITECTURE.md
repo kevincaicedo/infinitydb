@@ -347,7 +347,11 @@ competitors in the same run, flamegraph and memory attribution attached,
 tripwires green. Development-box numbers can never back a public claim. The
 comparative instrument is `inf-compare` — a zero-dependency harness driving
 industry-standard load generators against Redis, Dragonfly, and InfinityDB
-on one box with published configs. Optimizations are hypotheses until an
+on one box with published configs. Its reference runs require the same
+process-wide CPU allowance for each host server and a disjoint logical CPU
+range for both generators (ADR-0134). The in-house `inf-bench` permits
+internal `inf-foundation` primitives and has no external dependencies.
+Optimizations are hypotheses until an
 end-to-end A/B settles them, and a losing A/B is recorded and not merged.
 
 ### Rust
