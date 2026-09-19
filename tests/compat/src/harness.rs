@@ -181,6 +181,8 @@ fn spawn_redis() -> (ProcessGuard, TcpStream) {
             "no",
             "--bind",
             "127.0.0.1",
+            "--maxclients",
+            "20000",
             "--enable-debug-command",
             "yes",
         ])

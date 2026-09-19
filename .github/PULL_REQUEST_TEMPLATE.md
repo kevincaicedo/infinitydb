@@ -8,6 +8,13 @@
 
 ## Author checklist
 
+- [ ] **Design Review Record** linked and `Reviewed` by someone who is not
+      the author **before** this code was written (L12); the change matches
+      it, or the record carries a dated revision (third revision = stop)
+- [ ] **Fix? Class question answered:** the type, table or lint that makes
+      the sibling impossible — or why no class exists
+- [ ] One logical change per commit; reachable from the wire at the shipped
+      topology, or the deviation names its owner and expiry
 - [ ] `just check` green locally (fmt, dep-DAG, cell deny-list, fault-point
       + fsync greps, panic policy, safety inventory, clippy `-D warnings`,
       workspace tests)
@@ -31,7 +38,12 @@
       invalid states unrepresentable · panics only for violated internal
       invariants · no hot-path allocation/dispatch/locks without an A/B
       measurement and reproduction recipe · bounded queues & explicit backpressure · decoders
-      iterative + depth/size-bounded + fuzzed
+      iterative + depth/size-bounded + fuzzed · outcomes are enums, never
+      inferred from encoded output · trust-boundary values parsed into a type
+      once · nothing validated before a suspension used after it · every new
+      limit has a crossing behavior · no second copy of a decision (L13)
+- [ ] Every new oracle, gate or claim row names its canary and the canary
+      ran; the oracle shares no code with what it checks
 - [ ] Evidence discipline holds (L10): no number or "faster/slower" claim
       in code, docs, or the PR description without measured results and reproduction details
 - [ ] Crate fences respected (dep-DAG green is necessary, not sufficient —

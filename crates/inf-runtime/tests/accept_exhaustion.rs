@@ -182,8 +182,10 @@ fn emfile_parks_the_arm_and_a_close_resumes_it() {
         .expect("c0 accepted");
     let mut accepted_extras = 0usize;
     let mut first_error = None;
+    let mut connected_extras = 0usize;
     for &fd in &extras {
         raw_connect(fd, port);
+        connected_extras += 1;
         let seen = pump_until(&mut driver, &mut pool, &mut out, |c| {
             matches!(c.result, CompletionResult::Accepted { .. }) || is_accept_error(c).is_some()
         });
@@ -244,17 +246,29 @@ fn emfile_parks_the_arm_and_a_close_resumes_it() {
     assert!(seen.iter().filter(|c| is_accept_error(c).is_some()).count() <= 1, "{seen:?}");
 
     // The limit lifts (descriptors freed outside the driver): the
-    // consumer's re-arm lets every remaining client in, without errors.
+    // consumer's re-arm lets every remaining client in. io_uring may
+    // deliver one stale EMFILE captured under the old limit; re-arming
+    // (the retry wheel) re-prepares under the lifted limit.
     set_nofile(original.rlim_cur);
+    for &fd in &extras[connected_extras..] {
+        raw_connect(fd, port);
+    }
     driver.push(IoOp::AcceptArm {
         listener: listener_fd,
         token: CompletionToken::new(TokenClass::Accept, ACCEPT_TOKEN, 0),
     });
     while accepted_extras < extras.len() {
         let seen = pump_until(&mut driver, &mut pool, &mut out, |c| {
-            matches!(c.result, CompletionResult::Accepted { .. })
+            matches!(c.result, CompletionResult::Accepted { .. }) || is_accept_error(c).is_some()
         });
-        assert!(seen.iter().all(|c| is_accept_error(c).is_none()), "{seen:?}");
+        for c in &seen {
+            if is_accept_error(c).is_some() {
+                driver.push(IoOp::AcceptArm {
+                    listener: listener_fd,
+                    token: CompletionToken::new(TokenClass::Accept, ACCEPT_TOKEN, 0),
+                });
+            }
+        }
         accepted_extras +=
             seen.iter().filter(|c| matches!(c.result, CompletionResult::Accepted { .. })).count();
     }

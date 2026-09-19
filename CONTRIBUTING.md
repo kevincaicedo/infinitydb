@@ -33,17 +33,18 @@ against them. Read in this order before your first substantive PR:
    problem, the shared-nothing cell model, and why the system is shaped
    this way. Then [`docs/architecture.md`](docs/architecture.md), the
    finer-grained single-node walkthrough.
-2. The master plan (design laws L1–L11, gates, and the milestone train —
+2. The master plan (design laws L1–L13, gates, and the milestone train —
    planning repository; ask a maintainer if your change is
    milestone-scoped).
 3. [`docs/INFINITY_STYLE.md`](docs/INFINITY_STYLE.md) — the **normative**
-   engineering style: what a reviewer will hold your PR to. The
+   engineering style for designs and code: what a reviewer will hold your
+   design record and your PR to. The
    [PR checklist](.github/PULL_REQUEST_TEMPLATE.md) is its operational
    form.
-4. For milestone-scoped work: the owning milestone plan and its review
-   ledger (planning repository) — story lifecycle, budgets, and the
-   definition of done live there; a story is claimed in the ledger
-   before code.
+4. For milestone-scoped work: the owning milestone plan (planning
+   repository). A story is claimed only on a **Design Review Record**
+   reviewed by someone who did not write it (law L12; the lifecycle and
+   the nine STOP rules are master plan §17.4).
 
 ## Development setup
 

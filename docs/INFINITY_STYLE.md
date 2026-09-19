@@ -4,8 +4,11 @@
 > [TIGER_STYLE](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
 > adapted to Rust, and InfinityDB's
 >
-> Normative for all code in this workspace. Reviewers affirm conformance
-> (ADR-0025). This document states enduring engineering rules.
+> Normative for every **design and** all code in this workspace. Read it
+> in full before writing a Design Review Record and before writing code;
+> the record's reviewer affirms conformance of the design, the code
+> reviewer of the code (ADR-0025, ADR-0138). This document states
+> enduring engineering rules.
 
 ## Why Have Style?
 
@@ -18,6 +21,13 @@ The unit of correctness and performance is the whole system. An elegant
 component that complicates recovery, hides memory, or stalls another cell
 is an incomplete design. Every rule needs a reason that a reviewer can
 explain and a way to establish conformance.
+
+**A rule is enforced by the strongest mechanism available (L13):** a
+type, then a lint, then a generated table, then a self-tested script,
+then review. What the compiler enforced held through every review; what
+a grep, a comment or a paragraph enforced drifted. A new rule lands with
+its enforcement, or is recorded as review-only with the reason. A rule
+the tree contradicts is an open finding, never precedent.
 
 ## Simplicity and Elegance
 
@@ -41,6 +51,45 @@ worth more than a clever implementation of a complicated design.
   comments, and configuration together. Keep compatibility paths only for
   a defined contract with tests; a second implementation doubles what must
   remain correct.
+- **One decision, one place.** A second implementation of a contract — a
+  second dispatcher, a second table, a second store — needs an ADR, not a
+  test that keeps the two equal. A behavior that varies per command,
+  format or namespace is a **column of one table**, and the default
+  regression is a test that iterates the table. A hand-kept list that
+  "a new X must join" is a defect waiting for the next X.
+
+## Design Before Code
+
+The cheapest defect is the one a page of design removes (L12). A story
+is claimed only on a **Design Review Record** reviewed by someone who
+did not write it (master plan §17.4). The record answers, in tables and
+arithmetic, not prose:
+
+1. **State and transitions** — state × event → state, effect; the
+   invariant inventory, each row marked *type*, *lint*, *assert* or
+   *test only*, with a reason for every row that is not *type*.
+2. **Publication and failure** — the publication point, what is
+   validated and reserved before it, what each failure leaves behind,
+   what is durable before what is served.
+3. **Scale envelope** — cost and memory at 10³, 10⁶, 10⁹ and 10¹² units,
+   for steady state **and** construction, resize, teardown and recovery;
+   every O(N) named with its bound per slice.
+4. **Hardware budget** — per resource, operations and bytes per request,
+   the queue it waits in, Little's-law depth, the resource expected to
+   saturate and the counter that shows it.
+5. **Limits** — every new bound: unit, owner, crossing behavior.
+6. **Adversarial inputs and the oracle** — the hostile values, the
+   oracle that sees a violation, why it is independent, its canary.
+7. **Where the decision lives** — the owning table or type; a second
+   copy needs a reason.
+8. **Falsifier** — the observation that rejects the design, and the
+   control leg that separates a regression from the instrument.
+
+If a state machine cannot be drawn as a table, it is not understood yet.
+The third amendment to an ADR means the design was never drawn: stop,
+redraw it, and write a superseding ADR that states the rule as it is.
+Build the thin vertical path through every seam first; polish substrate
+after the seams have been met.
 
 ## Zero Technical Debt
 
@@ -59,6 +108,17 @@ An intentionally unsupported feature with a defined refusal is a product
 boundary. An unrun benchmark is an evidence gap. Neither licenses a
 violation of the behavior we promise. Existing findings remain open until
 their fixes are verified; changing this policy does not close them.
+
+- **A fix answers its class question.** Before closing a defect, state
+  which table, type or lint makes its sibling impossible — or state that
+  no class exists and why. Fixing one of five commands is an open
+  finding with four instances left.
+- **A recorded deviation carries an owner and an expiry date.** An
+  expired deviation is a defect. "Proven at the store tier" is a
+  substrate status: done means reachable from the wire at the shipped
+  topology.
+- **A plan or document sentence the tree contradicts is a red row**
+  until an ADR withdraws it or a story builds it.
 
 ## Safety
 
@@ -108,7 +168,12 @@ resumable commands, and variable-size inputs.
   time. A single-threaded cell still permits interleaving across a yield.
   Retain only state that the seam explicitly permits, such as owned bytes,
   typed identities, or bounded reservations; reacquire and revalidate
-  mutable facts when execution resumes.
+  mutable facts when execution resumes. A position, ordinal or address
+  validated before a suspension is not valid after it: walkers resume
+  through a typed cursor keyed by identity, never by `skip(n)` or a
+  remembered offset. Prefer a non-`Copy`, non-`'static` handle so that
+  holding it across an `await` is a compile error rather than a review
+  comment.
 - **Don't react to external events directly; run at your own pace.** The
   reactor reaps, drains, parses, executes, and submits in **batches** under
   budgets (L3). Code that does per-event work at a boundary — one syscall
@@ -126,6 +191,20 @@ Every loop has a bound or a documented event-loop lifetime with bounded
 work per iteration. Every queue, ring, cache, page, batch, retry sequence,
 and backlog has a cap and a defined full-state behavior. Configuration
 validates limits and their arithmetic before allocating or serving.
+
+**Every limit is a row of `limits` with a crossing behavior. A limit that
+exists only as a literal is a defect.** A row names the unit, the owner,
+and what a client observes when the bound is crossed: a typed refusal, a
+continuation, pacing, or a documented fail-stop. Width is a limit too: an
+address, counter or pool index whose type can be exhausted (`u32` heap
+addresses, lifetime-cumulative offsets, generation bits) states its
+exhaustion policy where it is declared. One `const` owns each on-disk or
+wire bound and both encoder and decoder consume it — a writer that can
+emit what the reader refuses is a defect at default flags. Until the
+workspace `limits` table exists (its ADR is owed; the scattered
+constants are an open finding), a new bound is a named `const` in its
+crate's `limits` module with the crossing behavior in its doc comment —
+never a literal at the use site.
 
 - Bound **bytes and work as well as item counts**. A batch of a few large
   values can monopolize a core. Bound fan-out, response expansion, nesting,
@@ -191,6 +270,24 @@ capacity for every small value.
   for distinct outcomes. Never collapse corruption, refusal, absence, and
   success into a boolean or sentinel to simplify a call site. Avoid
   wildcard matches that silently accept a new state or error variant.
+  `None` must not mean both "missing" and "wrong type"; a bounded or
+  truncated read is its own variant, never absence. **Never infer an
+  outcome from encoded output** — a reply's first byte, a length, an
+  empty buffer. The operation returns its effect as a type and the
+  consumer matches on it. A phase machine is an enum per phase, not a
+  struct of `Option`s and `bool`s whose legal combinations live in a
+  comment.
+- **Parse, don't validate, at trust boundaries.** A value from a client,
+  a peer or a file is checked once, where it enters, into a type whose
+  only constructor is that check (`BoundedKey`, `Deadline`, a decoded
+  cursor). Inner layers take the type; they do not re-check and they do
+  not assert. A receipt type carries ordering the same way: what may be
+  served only after it is durable is constructed only by the durable
+  write's return value.
+- **Name the population.** Every counter, gauge and fold says whether it
+  is per cell, per node, per namespace or per pool, in its name or its
+  type, and an expression never mixes two populations without an
+  explicit fold.
 - Prevent argument swaps with distinct newtypes or a named options struct
   when parameters share a representation but have different meanings.
   Prefer an enum to positional booleans that select unrelated modes.
@@ -239,6 +336,12 @@ force multiplier for DST and fuzzing.
   where it is established, and how it is enforced) in its interface
   documentation. Identify proof gaps as open findings; the inventory is
   no waiver for a missing safety check. Update it with the transition.
+- **An assertion about a caller is a debt; an assertion about yourself
+  is a proof.** A release `assert!` justified by "the caller checked" is
+  how a single command kills a node. When a function is touched, move
+  each caller-claim to the boundary type that makes it true and delete
+  the assert, or return a typed error. The best assertion is the one a
+  type made unnecessary.
 - Assertions are a safety net, not a substitute for understanding. Build
   the mental model first, encode it in assertions, explain it in comments,
   and let the simulator hunt what both of you missed.
@@ -278,6 +381,13 @@ force multiplier for DST and fuzzing.
   the assertion into a **postcondition on what you emit**. For example, a
   RESP line writer must enforce framing even when a caller interpolates
   client bytes into an error message (ADR-0097).
+- **Every `Err` arm restores custody.** A lease, fd, pin, credit, ticket
+  or flag taken before a fallible step is released by RAII on the error
+  path, not by a paired call the next edit can skip. Each arm names the
+  fault point that reaches it under interleaving; an arm no fault point
+  arms is untested code on the path most likely to wedge a cell.
+  Classify the errno, never the syscall: `EMFILE`, `EDQUOT`, `ENOSPC`
+  and `EINVAL` have different owners and different recoveries.
 - **Preserve the meaning of failure.** Keep the original error category
   and add bounded diagnostic context. Never turn corrupt storage into
   "not found", a failed write into success, or an ambiguous timeout into
@@ -291,7 +401,15 @@ force multiplier for DST and fuzzing.
 - **Name the publication point.** Specify when a mutation becomes visible,
   what an acknowledgment promises, and which failures may still occur.
   Validate and reserve first; publish through the owning seam. A typed
-  error after partial mutation is not atomic failure handling.
+  error after partial mutation is not atomic failure handling. For a
+  multi-key or variadic write, validation is a pure pass over every
+  argument and application is infallible; a loop that validates as it
+  mutates is wrong before it is tested.
+- **Durable before served.** Catalog, topology and configuration that
+  recovery depends on are persisted before any cell serves them, and a
+  move is snapshot → put → conditional delete, never take-then-put. What
+  the data directory means — cell count, key-hash secret, format epoch —
+  lives in the directory, not in a command-line flag.
 - Keep written, durable, and applied progress distinct and scoped to the
   correct owner and incarnation. Advance a prefix only when every required
   predecessor is covered. A later completion or larger sequence number
@@ -361,7 +479,9 @@ release-assert inventory — ADR-0107 D2), `check-unsafe-roots.sh` (every
 crate root governs `unsafe_code`, the deny set is the leaf list,
 allows are module-scoped — ADR-0121) —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
-merge; change the law first (ADR) or fix the code.
+merge; change the law first (ADR) or fix the code. A shell gate is the
+last resort, not the default: when clippy, the type system or a
+generated table can carry a rule, move it there and delete the script.
 
 A check that silently checks nothing gives false confidence. Every
 `check-*.sh` **asserts its scope** (ADR-0106): a missing directory, an empty
@@ -417,6 +537,20 @@ useful throughput within latency, memory, and durability contracts.
 - Include construction, resize, invalidation, cancellation, teardown, and
   recovery in complexity analysis. An amortized O(1) operation can still
   contain an O(N) pause. The worst legal input belongs in the design budget.
+- **State the scale envelope.** Write the cost at 10³, 10⁶, 10⁹ and 10¹²
+  units before choosing a structure. Anything proportional to the
+  dataset — a checkpoint, a rebuild, a whole-file rewrite, a boot audit,
+  a stop-and-copy growth step — is named, bounded per slice, and kept off
+  the foreground path. Probabilistic identity is part of the envelope:
+  write n²/2ᵇ next to the gate size.
+- **The budget names the resource expected to saturate. A run where a
+  different resource saturates is a finding before it is a number.**
+  Model the queue before building it: depth = arrival rate × service
+  time. A cap that never binds and a gate the device arithmetic cannot
+  reach are both design errors found on paper. Know the device's unit of
+  work — its barrier class, flush scope, queue depth, block size — before
+  choosing the write path, and rehearse on the gate's medium: tmpfs
+  fsyncs in zero time and proves nothing about a barrier.
 
 ### CPU predictability
 
@@ -517,6 +651,14 @@ useful throughput within latency, memory, and durability contracts.
   exact reproduction commands, baseline revisions, the clean-tree reference
   tier and 3–5 replicates under the evidence policy. Never present a noisy or saturated
   generator's result as server capacity.
+- **Specify the instrument before it measures:** estimator and scope;
+  resolution; a spread budget with a **same-binary control leg**; a
+  liveness counter with a planted red. Suspect the instrument first:
+  run the same binary against itself before blaming the product or
+  crediting a fix. A gate needs a load-response curve, not a point
+  sampled where the curve is flat. An error counted as a completed
+  operation, a skip that exits 0 and a lifetime histogram are
+  instruments that cannot go red.
 - Record `Accepted`, `Rejected`, or `Revised` with evidence. A losing A/B
   is useful evidence; keep the result and do not merge the losing
   optimization. Correctness fixes may be `Correctness-only`; unrun
@@ -577,9 +719,16 @@ they are recurring sources of database defects, not just readability issues.
 - Keep comments concise: a complete sentence for a rationale or invariant,
   a short phrase for an obvious inline label. Explain a nontrivial test's
   trigger, oracle, and expected failure; do not narrate each assertion.
-- Use a short, one-line commit message stating the concrete change. Keep
-  detailed reasoning, reproduction commands and results in checked-in
-  documentation and the PR description. Do not append model co-author trailers.
+- **Cite the live rule, not its history.** A comment names the current
+  decision (`ADR-0087 D2`) and the invariant it protects. It never
+  narrates amendments, review batches or finding numbers — that is what
+  the ADR and Git are for. If the current rule cannot be stated without
+  its history, the ADR needs superseding (third amendment ⇒ redesign).
+- Use a short, one-line commit message stating the concrete change. **One
+  logical change per commit**, so bisect and the sim A/B diff work at the
+  granularity of a decision. Keep detailed reasoning, reproduction
+  commands and results in the ticket. Do not append model co-author
+  trailers.
 
 ### Cache invalidation
 
@@ -686,6 +835,18 @@ Use distinct names and types for different quantities:
   Use an independent model, byte-exact compatibility oracle, or separately
   derived invariant. Include invalid inputs, refusal, partial I/O,
   cancellation, reordered completion, and crash/restart where relevant.
+- **An oracle is independent when it shares no code with what it checks
+  beyond the wire format and `limits`. Every oracle has a canary** — a
+  planted violation, run in the same lane, that must turn it red. An
+  oracle that performs the server's work, compares a count where
+  contents were promised, or cannot produce the fault it guards against
+  encodes the bug. A model that does not dispatch on every command is
+  blind to the one it skips. Run the oracle at the shipped topology: the
+  multi-cell binary, not only the store tier.
+- Generate the hostile inputs from the limits: 0, 1, limit − 1, limit,
+  limit + 1, the integer maximum, 2³² where a `u32` narrows, negative,
+  non-UTF-8, repeated and contradictory options. A generator capped
+  below the cliff proves the plateau.
 - Keep failing seeds, minimized inputs, exact commands, build features,
   and expected outcomes. A simulator pass proves only the modeled paths;
   distinguish model-only, runtime, and real-reference evidence. A green
@@ -753,8 +914,9 @@ process composition; move complex state and parsing into typed, tested code.
 
 ## The Last Stage
 
-Keep revising until the design is simple enough to explain, the failure
-paths are explicit, and the evidence matches the claim. When a rule needs
+Keep revising until the design is simple enough to draw as a table, the
+failure paths are explicit, the envelope is written down, and the
+evidence matches the claim — and can go red. When a rule needs
 to change, give the reason and update its governing document; change a
 frozen contract by ADR before implementation. Leave the next engineer a
 smaller problem and a stronger proof.

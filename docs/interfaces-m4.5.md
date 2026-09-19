@@ -62,8 +62,11 @@ Status column tracks arrival.
   `hash64(key)` before 2026-08-28) — durable-
   adjacent: S06 sidecars serialize `(typed key bytes, ref)` pairs, so
   changing the ref definition later is an encoding-class break
-  (ADR-0073 D5.2 discipline). Collision odds and consequences are
-  disclosed in the ADR.
+  (ADR-0073 D5.2 discipline). The ref is hash evidence, not identity:
+  ADR-0076 A2 withdrew the accepted-collision disclosure — an entry
+  denotes an alias group, and removal, coverage and resolution are
+  decided by full key. **Not built yet** (DRR ARCH-W0.2): the tree
+  still removes on the pair alone.
 - **The bracket:** `Keyspace::idx_bracket_begin / idx_bracket_commit /
   idx_bracket_abort` — pre-image eval + reservation before the mutation,
   post-image eval + dedup diff + idempotent tree ops after staging.
