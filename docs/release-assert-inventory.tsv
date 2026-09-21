@@ -758,3 +758,5 @@ I	1	crates/inf-server/src/plane/ns_ddl.rs	assert	db rides 4 bits of the Apply cm
 I	1	crates/inf-log/src/frame.rs	assert	MIN_FRAME_LEN_V1 is header + minimal record + trailer	const assertion — evaluated at compile time, never at run time; ties the literal to the lengths it sums
 I	1	crates/inf-log/src/frame.rs	assert	MIN_FRAME_LEN is header + minimal record + trailer	const assertion — evaluated at compile time, never at run time; ties the literal to the lengths it sums
 I	1	crates/inf-foundation/src/lib.rs	assert	InfinityDB targets 64-bit hosts	const assertion — a compile-time refusal of a 32-bit target, never a run-time panic; the `bound:` proofs of ADR-0144 D2/D3 cite it
+I	1	crates/inf-log/src/tier.rs	assert	the window backstop is the round's op bound	const assertion — evaluated at compile time, never at run time; ties the literal to the lengths it sums
+I	1	crates/inf-log/src/ckpt/read.rs	expect	decode audited the sidecar entry shape	an `IckIdxSidecarSection` is built only by `parse_idx_sidecar_body`, which walks every entry of the body through the same `split_sidecar_entry` before delivering it; the iterator re-walks those bytes

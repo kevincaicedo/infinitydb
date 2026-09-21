@@ -24,6 +24,11 @@
 //! drives it — L9). fsync failure anywhere on this path is
 //! fatal-by-default (§8.4; ADR-0056 D4) — surfaced typed via
 //! [`TierWriteFailure::Fsync`], never retried.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -169,6 +174,10 @@ pub fn probe_tier_file<F: SegmentFs>(
 /// `delta`: (first frame index, frame count, skip inside the first
 /// frame's payload).
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: the skip is a remainder of TIER_FRAME_DATA, itself a usize"
+)]
 pub fn tier_frame_span(delta: u64, len: usize) -> (u64, u32, usize) {
     assert!(len > 0, "empty read");
     let data = TIER_FRAME_DATA as u64;
@@ -229,7 +238,8 @@ pub fn tier_extract(
             window[at + TIER_FRAME_DATA..at + TIER_FRAME_BYTES].try_into().expect("4 bytes"),
         );
         if crc32c(payload) != stored {
-            return Err(TierCorruption { window_frame: frame as u32 });
+            // A diagnostic index: a window past u32 frames reports the last.
+            return Err(TierCorruption { window_frame: u32::try_from(frame).unwrap_or(u32::MAX) });
         }
         let take = remaining.min(TIER_FRAME_DATA - skip);
         out.extend_from_slice(&payload[skip..skip + take]);
@@ -497,7 +507,11 @@ pub const ROUND_OPS_MAX: usize = 256;
 /// Backstop on circulating windows — a round staging more than this is
 /// a programmer error (the token op-index bound is [`ROUND_OPS_MAX`];
 /// see ADR-0084 D3).
-const WINDOWS_OUTSTANDING_CAP: u32 = ROUND_OPS_MAX as u32;
+const WINDOWS_OUTSTANDING_CAP: u32 = 256;
+const _: () = assert!(
+    WINDOWS_OUTSTANDING_CAP as usize == ROUND_OPS_MAX,
+    "the window backstop is the round's op bound"
+);
 
 impl WindowPool {
     pub(crate) fn new() -> WindowPool {
@@ -1522,14 +1536,13 @@ pub fn inspect_tier_bytes(bytes: &[u8]) -> Result<TierSummary, TierDecodeError> 
         }
     }
     let mut first_bad_frame = None;
-    for frame_index in 0..frames {
-        let at = frame_index as usize * TIER_FRAME_BYTES;
-        let frame = &body[at..at + TIER_FRAME_BYTES];
+    let checkable = usize::try_from(frames).unwrap_or(usize::MAX);
+    for (frame_index, frame) in body.chunks_exact(TIER_FRAME_BYTES).take(checkable).enumerate() {
         let stored = u32::from_le_bytes(
             frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
         );
         if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
-            first_bad_frame = Some(frame_index);
+            first_bad_frame = Some(frame_index as u64);
             break;
         }
     }

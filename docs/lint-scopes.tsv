@@ -23,11 +23,10 @@ inf-fabric/fabric_codec	crates/inf-fabric/src/codec.rs	cast,arith	ratchet
 inf-log/extent_decode	crates/inf-log/src/blob.rs	cast,arith	deny
 inf-log/frame_decode	crates/inf-log/src/frame.rs	cast,arith	deny
 inf-log/frame_decode	crates/inf-log/src/record.rs	cast,arith	deny
-inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	cast	deny
-inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	arith	ratchet
-inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	cast,arith	ratchet
-inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	cast	deny
-inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	arith	ratchet
+inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	cast,arith	deny
+inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	cast	deny
+inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	arith	ratchet
+inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	cast,arith	deny
 inf-log/manifest_decode	crates/inf-log/src/manifest.rs	cast,arith	deny
 inf-log/manifest_decode	crates/inf-log/src/meta.rs	cast,arith	deny
 inf-log/segment_read	crates/inf-log/src/reader.rs	cast,arith	deny

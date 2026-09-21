@@ -4,7 +4,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use super::*;
@@ -239,17 +244,71 @@ fn read_exact_at<File: SegmentFile>(
 ) -> Result<(), IckReadError> {
     let mut done = 0usize;
     while done < buf.len() {
-        let n = file.read_at(offset + done as u64, &mut buf[done..])?;
+        // Saturating: a position past every file reads as end-of-file.
+        let at = offset.saturating_add(done as u64);
+        let n = file.read_at(at, &mut buf[done..])?;
         if n == 0 {
-            return Err(IckReadError::Truncated { at: offset + done as u64 });
+            return Err(IckReadError::Truncated { at });
         }
-        done += n;
+        // A file reporting more than the slice it was handed fills it.
+        done = done.saturating_add(n).min(buf.len());
     }
     Ok(())
 }
 
+/// `fixed + count × each` bytes, `None` when it cannot be addressed: every
+/// `count` here was read from the file.
+fn span_len(fixed: usize, count: usize, each: usize) -> Option<usize> {
+    count.checked_mul(each)?.checked_add(fixed)
+}
+
+/// Header block: fixed fields, one `u32` per namespace, the CRC.
+fn header_len(ns_count: usize) -> Option<usize> {
+    span_len(HEADER_FIXED_LEN + CRC_LEN, ns_count, 4)
+}
+
+/// Footer block: fixed fields, `(ns, count)` per namespace, digest, CRC.
+fn footer_len(ns_count: usize) -> Option<usize> {
+    span_len(FOOTER_FIXED_LEN + 8 + CRC_LEN, ns_count, 12)
+}
+
+/// Zero bytes between a v3 block's end and its aligned successor.
+fn padding_len(block_len: usize) -> usize {
+    ick_align_up(block_len).abs_diff(block_len)
+}
+
+/// The `(ns, entries)` pairs of a CRC-valid footer block.
+fn footer_entries(block: &[u8], ns_count: usize) -> Vec<(u32, u64)> {
+    block[FOOTER_FIXED_LEN..]
+        .chunks_exact(12)
+        .take(ns_count)
+        .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
+        .collect()
+}
+
 fn le_u16(bytes: &[u8]) -> u16 {
     u16::from_le_bytes(bytes.try_into().expect("2 bytes"))
+}
+
+/// `(typed key bytes, entry_ref)`.
+type SidecarEntry<'a> = (&'a [u8], u64);
+
+/// One sidecar entry off the front of `rest` — `[key_len: u16] key
+/// entry_ref: u64`, the length prefix absent in the fixed-8 shape — and
+/// what follows it. `None`: short, or a key over [`IDXSIDECAR_KEY_MAX`].
+fn split_sidecar_entry(rest: &[u8], fixed8: bool) -> Option<(SidecarEntry<'_>, &[u8])> {
+    let (key_len, rest) = if fixed8 {
+        (8, rest)
+    } else {
+        let (len, rest) = rest.split_first_chunk::<2>()?;
+        (usize::from(u16::from_le_bytes(*len)), rest)
+    };
+    if key_len > IDXSIDECAR_KEY_MAX {
+        return None;
+    }
+    let (key, rest) = rest.split_at_checked(key_len)?;
+    let (entry_ref, rest) = rest.split_first_chunk::<8>()?;
+    Some(((key, u64::from_le_bytes(*entry_ref)), rest))
 }
 
 /// The end-of-file footer probe (ADR-0028 D3 as amended): one read of the
@@ -266,34 +325,36 @@ fn probe_footer<File: SegmentFile>(
     aligned: bool,
 ) -> Result<Option<Vec<(u32, u64)>>, IckReadError> {
     let hop = |len: usize| if aligned { ick_align_up(len) } else { len };
-    let footer_len = |ns: usize| FOOTER_FIXED_LEN + ns * 12 + 8 + CRC_LEN;
-    let max_block = hop(footer_len(header_ns));
-    if file_size < sections_at + max_block as u64 {
+    let Some(max_block) = footer_len(header_ns).map(hop) else {
         return Ok(None);
-    }
-    let tail_at = file_size - max_block as u64;
+    };
+    // The probe needs the whole block to lie after the header.
+    let Some(tail_at) =
+        file_size.checked_sub(max_block as u64).filter(|tail_at| *tail_at >= sections_at)
+    else {
+        return Ok(None);
+    };
     let mut tail = vec![0u8; max_block];
     if read_exact_at(file, tail_at, &mut tail).is_err() {
         return Ok(None);
     }
     for ns in (0..=header_ns).rev() {
-        let len = footer_len(ns);
-        let start = max_block - hop(len);
+        // A shorter footer's block is no longer than the longest one's.
+        let Some(len) = footer_len(ns) else { continue };
+        let Some(start) = max_block.checked_sub(hop(len)) else { continue };
         let block = &tail[start..];
         if block[0] != BLOCK_FOOTER || le_u32(&block[13..17]) as usize != ns {
             continue;
         }
-        let hit = crc32c(&block[..len - CRC_LEN]) == le_u32(&block[len - CRC_LEN..len])
-            && block[len..].iter().all(|b| *b == 0);
+        let (footer, padding) = block.split_at(len);
+        let hit = footer
+            .split_last_chunk::<CRC_LEN>()
+            .is_some_and(|(covered, stored)| crc32c(covered) == u32::from_le_bytes(*stored))
+            && padding.iter().all(|b| *b == 0);
         if !hit {
             return Ok(None);
         }
-        return Ok(Some(
-            block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + ns * 12]
-                .chunks_exact(12)
-                .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
-                .collect(),
-        ));
+        return Ok(Some(footer_entries(footer, ns)));
     }
     Ok(None)
 }
@@ -354,9 +415,9 @@ pub fn read_ick_counts_probed<F: SegmentFs>(
     let file_size = file.file_size()?;
     let aligned = version >= ICK_VERSION_V3;
     let hop = |len: usize| if aligned { ick_align_up(len) } else { len };
-    let header_len = HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN;
+    let header_len = header_len(ns_count).ok_or(IckReadError::Truncated { at: 28 })?;
     if aligned {
-        verify_padding(&file, header_len as u64, hop(header_len) - header_len)?;
+        verify_padding(&file, header_len as u64, padding_len(header_len))?;
     }
     let mut offset = hop(header_len) as u64;
     // Direct footer probe (M2.5-S08): a well-formed `.ick` ends exactly at
@@ -400,32 +461,34 @@ pub fn read_ick_counts_probed<F: SegmentFs>(
                         max: cfg.max_section_bytes,
                     });
                 }
-                offset += hop(SECTION_HEADER_LEN + body_len as usize + CRC_LEN) as u64;
+                offset = (SECTION_HEADER_LEN + CRC_LEN)
+                    .checked_add(body_len as usize)
+                    .and_then(|block_len| offset.checked_add(hop(block_len) as u64))
+                    .ok_or(IckReadError::Truncated { at: offset })?;
             }
             BLOCK_FOOTER => {
                 let mut fixed = [0u8; FOOTER_FIXED_LEN];
                 read_exact_at(&file, offset, &mut fixed)?;
                 let footer_ns = le_u32(&fixed[13..17]) as usize;
+                let bad_count = || IckReadError::Truncated { at: offset.saturating_add(13) };
                 if footer_ns > (1 << 20) {
-                    return Err(IckReadError::Truncated { at: offset + 13 });
+                    return Err(bad_count());
                 }
-                let block_len = FOOTER_FIXED_LEN + footer_ns * 12 + 8 + CRC_LEN;
+                let block_len = footer_len(footer_ns).ok_or_else(bad_count)?;
                 let mut block = vec![0u8; block_len];
                 read_exact_at(&file, offset, &mut block)?;
-                let stored_crc = le_u32(&block[block_len - CRC_LEN..]);
-                if crc32c(&block[..block_len - CRC_LEN]) != stored_crc {
+                let crc_ok =
+                    block.split_last_chunk::<CRC_LEN>().is_some_and(|(covered, stored)| {
+                        crc32c(covered) == u32::from_le_bytes(*stored)
+                    });
+                if !crc_ok {
                     return Err(IckReadError::FooterCrc { at: offset });
                 }
                 if aligned {
-                    verify_padding(&file, offset + block_len as u64, hop(block_len) - block_len)?;
+                    let padding_at = offset.saturating_add(block_len as u64);
+                    verify_padding(&file, padding_at, padding_len(block_len))?;
                 }
-                return Ok((
-                    block[FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
-                        .chunks_exact(12)
-                        .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
-                        .collect(),
-                    false,
-                ));
+                return Ok((footer_entries(&block, footer_ns), false));
             }
             tag => return Err(IckReadError::UnknownBlock { tag, at: offset }),
         }
@@ -519,14 +582,11 @@ impl IckIdxSidecarSection<'_> {
             if rest.is_empty() {
                 return None;
             }
-            // Decode audited the shape; the arithmetic below cannot go
-            // out of bounds on a delivered section.
-            let key_len = if fixed8 { 8 } else { le_u16(&rest[0..2]) as usize };
-            let key_at = if fixed8 { 0 } else { 2 };
-            let key = &rest[key_at..key_at + key_len];
-            let entry_ref = le_u64(&rest[key_at + key_len..key_at + key_len + 8]);
-            rest = &rest[key_at + key_len + 8..];
-            Some((key, entry_ref))
+            // Decode audited the shape of every delivered section.
+            let (entry, tail) =
+                split_sidecar_entry(rest, fixed8).expect("decode audited the sidecar entry shape");
+            rest = tail;
+            Some(entry)
         })
     }
 }
@@ -711,26 +771,13 @@ fn parse_idx_sidecar_body(body: &[u8], record_count: u32) -> Option<IckIdxSideca
     let mut decoded: u32 = 0;
     let mut prev: Option<(&[u8], u64)> = None;
     while !rest.is_empty() {
-        let key_len = if fixed8 {
-            8
-        } else {
-            if rest.len() < 2 {
-                return None;
-            }
-            le_u16(&rest[0..2]) as usize
-        };
-        let key_at = if fixed8 { 0 } else { 2 };
-        if key_len > IDXSIDECAR_KEY_MAX || rest.len() < key_at + key_len + 8 {
-            return None;
-        }
-        let key = &rest[key_at..key_at + key_len];
-        let entry_ref = le_u64(&rest[key_at + key_len..key_at + key_len + 8]);
+        let ((key, entry_ref), tail) = split_sidecar_entry(rest, fixed8)?;
         if prev.is_some_and(|p| (key, entry_ref) <= p) {
             return None;
         }
         prev = Some((key, entry_ref));
         decoded = decoded.checked_add(1)?;
-        rest = &rest[key_at + key_len + 8..];
+        rest = tail;
     }
     if decoded != record_count {
         return None;
@@ -796,22 +843,24 @@ impl<File: SegmentFile> IckReader<File> {
         if ns_count > (1 << 20) {
             return Err(IckReadError::Truncated { at: 28 }); // absurd count: damaged length
         }
-        let mut rest = vec![0u8; ns_count * 4 + CRC_LEN];
+        let header_len = header_len(ns_count).ok_or(IckReadError::Truncated { at: 28 })?;
+        let mut rest = vec![0u8; header_len.abs_diff(HEADER_FIXED_LEN)];
         read_exact_at(&file, HEADER_FIXED_LEN as u64, &mut rest)?;
-        let mut header_crc_input = Vec::with_capacity(HEADER_FIXED_LEN + ns_count * 4);
+        let (ids, stored_header_crc) =
+            rest.split_last_chunk::<CRC_LEN>().ok_or(IckReadError::Truncated { at: 28 })?;
+        let stored_header_crc = u32::from_le_bytes(*stored_header_crc);
+        let mut header_crc_input = Vec::with_capacity(header_len);
         header_crc_input.extend_from_slice(&fixed);
-        header_crc_input.extend_from_slice(&rest[..ns_count * 4]);
-        let stored_header_crc = le_u32(&rest[ns_count * 4..]);
+        header_crc_input.extend_from_slice(ids);
         if crc32c(&header_crc_input) != stored_header_crc {
             return Err(IckReadError::HeaderCrc);
         }
-        let ns_ids: Vec<u32> = rest[..ns_count * 4].chunks_exact(4).map(le_u32).collect();
+        let ns_ids: Vec<u32> = ids.chunks_exact(4).map(le_u32).collect();
         let file_size = file.file_size()?;
-        let header_len = HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN;
         if version >= ICK_VERSION_V3 {
             // The header block's padding is zero like every other block's
             // (ADR-0088 D3).
-            verify_padding(&file, header_len as u64, ick_align_up(header_len) - header_len)?;
+            verify_padding(&file, header_len as u64, padding_len(header_len))?;
         }
         Ok(IckReader {
             file,
@@ -819,9 +868,9 @@ impl<File: SegmentFile> IckReader<File> {
             info: IckInfo { version, cell, ckpt_id, begin_lsn, ns_ids },
             file_size,
             offset: if version >= ICK_VERSION_V3 {
-                ick_align_up(HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64
+                ick_align_up(header_len) as u64
             } else {
-                (HEADER_FIXED_LEN + ns_count * 4 + CRC_LEN) as u64
+                header_len as u64
             },
             sections: 0,
             records_total: 0,
@@ -848,16 +897,17 @@ impl<File: SegmentFile> IckReader<File> {
     fn advise_next_blocks(&self, block_len: usize) {
         let next =
             if self.info.version < ICK_VERSION_V3 { block_len } else { ick_align_up(block_len) };
-        self.file.advise_read_ahead(self.offset + next as u64, 4 * next as u64);
+        let next = next as u64;
+        self.file.advise_read_ahead(self.offset.saturating_add(next), next.saturating_mul(4));
     }
 
     fn hop(&self, block_len: usize) -> Result<u64, IckReadError> {
         if self.info.version < ICK_VERSION_V3 {
             return Ok(block_len as u64);
         }
-        let padded = ick_align_up(block_len);
-        verify_padding(&self.file, self.offset + block_len as u64, padded - block_len)?;
-        Ok(padded as u64)
+        let padding_at = self.offset.saturating_add(block_len as u64);
+        verify_padding(&self.file, padding_at, padding_len(block_len))?;
+        Ok(ick_align_up(block_len) as u64)
     }
 
     /// Total file bytes (the progress denominator).
@@ -971,12 +1021,15 @@ impl<File: SegmentFile> IckReader<File> {
             });
         }
         let record_count = le_u32(&head[5..9]);
-        let block_len = SECTION_HEADER_LEN + body_len as usize + CRC_LEN;
+        let body_len = body_len as usize;
+        let block_len = (SECTION_HEADER_LEN + CRC_LEN)
+            .checked_add(body_len)
+            .ok_or(IckReadError::Truncated { at: self.offset })?;
         self.block.resize(block_len, 0);
         self.block[..SECTION_HEADER_LEN].copy_from_slice(&head);
         read_exact_at(
             &self.file,
-            self.offset + SECTION_HEADER_LEN as u64,
+            self.offset.saturating_add(SECTION_HEADER_LEN as u64),
             &mut self.block[SECTION_HEADER_LEN..],
         )?;
         // Read-ahead the next blocks (M2.5-S08): their device reads
@@ -985,8 +1038,8 @@ impl<File: SegmentFile> IckReader<File> {
         // that one-ahead loses the race against the prefetcher's wakeup
         // latency. Hint-only; EOF-safe.
         self.advise_next_blocks(block_len);
-        let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-        Ok(SectionFrame { record_count, block_len, stored_crc })
+        let stored_crc = le_u32(&self.block[SECTION_HEADER_LEN..][body_len..]);
+        Ok(SectionFrame { record_count, block_len, body_len, stored_crc })
     }
 
     /// The hard CRC audit: a mismatch is fail-stop, a match folds into
@@ -1005,10 +1058,18 @@ impl<File: SegmentFile> IckReader<File> {
         frame: SectionFrame,
         records: u64,
     ) -> Result<IckStep, IckReadError> {
-        self.sections += 1;
-        self.records_total += records;
+        // Counts the footer audits: past their width they cannot match it.
+        self.sections = self
+            .sections
+            .checked_add(1)
+            .ok_or(IckReadError::FooterMismatch { field: "section_count" })?;
+        self.records_total = self
+            .records_total
+            .checked_add(records)
+            .ok_or(IckReadError::FooterMismatch { field: "records_total" })?;
         let hop = self.hop(frame.block_len)?;
-        self.offset += hop;
+        self.offset =
+            self.offset.checked_add(hop).ok_or(IckReadError::Truncated { at: self.offset })?;
         Ok(IckStep::Section { bytes: hop })
     }
 
@@ -1032,7 +1093,9 @@ impl<File: SegmentFile> IckReader<File> {
                 count_entries(&mut self.entries_seen, ns.0, 1);
             }
             apply(view).map_err(|error| IckApplyError::Apply { section, error })?;
-            decoded += 1;
+            decoded = decoded
+                .checked_add(1)
+                .ok_or(IckReadError::FooterMismatch { field: "section record_count" })?;
             body = &body[consumed..];
         }
         if decoded != frame.record_count {
@@ -1140,18 +1203,25 @@ impl<File: SegmentFile> IckReader<File> {
         let footer_sections = le_u32(&fixed[1..5]);
         let footer_records = le_u64(&fixed[5..13]);
         let footer_ns = le_u32(&fixed[13..17]) as usize;
+        let bad_count = || IckReadError::Truncated { at: self.offset.saturating_add(13) };
         if footer_ns > (1 << 20) {
-            return Err(IckReadError::Truncated { at: self.offset + 13 });
+            return Err(bad_count());
         }
-        let tail_len = footer_ns * 12 + 8 + CRC_LEN;
-        let block_len = FOOTER_FIXED_LEN + tail_len;
+        let block_len = footer_len(footer_ns).ok_or_else(bad_count)?;
         self.block.resize(block_len, 0);
         read_exact_at(&self.file, self.offset, &mut self.block)?;
-        let stored_crc = le_u32(&self.block[block_len - CRC_LEN..]);
-        if crc32c(&self.block[..block_len - CRC_LEN]) != stored_crc {
-            return Err(IckReadError::FooterCrc { at: self.offset });
+        // `footer_len` covers the digest and the CRC.
+        let bad_crc = IckReadError::FooterCrc { at: self.offset };
+        let Some((covered, stored_crc)) = self.block.split_last_chunk::<CRC_LEN>() else {
+            return Err(bad_crc);
+        };
+        if crc32c(covered) != u32::from_le_bytes(*stored_crc) {
+            return Err(bad_crc);
         }
-        let stored_digest = le_u64(&self.block[block_len - CRC_LEN - 8..block_len - CRC_LEN]);
+        let Some((_, stored_digest)) = covered.split_last_chunk::<8>() else {
+            return Err(bad_crc);
+        };
+        let stored_digest = u64::from_le_bytes(*stored_digest);
         if footer_sections != self.sections {
             return Err(IckReadError::FooterMismatch { field: "section_count" });
         }
@@ -1161,11 +1231,7 @@ impl<File: SegmentFile> IckReader<File> {
         if stored_digest != self.digest {
             return Err(IckReadError::FooterMismatch { field: "digest" });
         }
-        let footer_entries: Vec<(u32, u64)> = self.block
-            [FOOTER_FIXED_LEN..FOOTER_FIXED_LEN + footer_ns * 12]
-            .chunks_exact(12)
-            .map(|chunk| (le_u32(&chunk[0..4]), le_u64(&chunk[4..12])))
-            .collect();
+        let footer_entries = footer_entries(&self.block, footer_ns);
         let mut seen_sorted = self.entries_seen.clone();
         seen_sorted.sort_unstable();
         let mut footer_sorted = footer_entries.clone();
@@ -1173,7 +1239,7 @@ impl<File: SegmentFile> IckReader<File> {
         if seen_sorted != footer_sorted {
             return Err(IckReadError::FooterMismatch { field: "entries_per_ns" });
         }
-        let end = self.offset + self.hop(block_len)?;
+        let end = self.offset.saturating_add(self.hop(block_len)?);
         if end != self.file_size {
             return Err(IckReadError::TrailingData { at: end });
         }
@@ -1212,21 +1278,30 @@ enum SectionTag {
 #[derive(Copy, Clone, Debug)]
 struct SectionFrame {
     record_count: u32,
+    /// Header + body + CRC.
     block_len: usize,
+    body_len: usize,
     stored_crc: u32,
 }
 
 impl SectionFrame {
     fn body<'a>(&self, block: &'a [u8]) -> &'a [u8] {
-        &block[SECTION_HEADER_LEN..self.block_len - CRC_LEN]
+        &block[SECTION_HEADER_LEN..][..self.body_len]
     }
 
     fn crc_ok(&self, block: &[u8]) -> bool {
-        crc32c(&block[..self.block_len - CRC_LEN]) == self.stored_crc
+        block[..self.block_len]
+            .split_last_chunk::<CRC_LEN>()
+            .is_some_and(|(covered, _)| crc32c(covered) == self.stored_crc)
     }
 }
 
 /// The per-ns presize count fold (the footer audits it).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: a count of records decoded from one file, each at least one byte of a \
+              u64-addressed file — 2^64 of them cannot be read"
+)]
 fn count_entries(seen: &mut Vec<(u32, u64)>, ns: u32, n: u64) {
     match seen.iter_mut().find(|(id, _)| *id == ns) {
         Some((_, count)) => *count += n,
@@ -1253,8 +1328,8 @@ fn fixed_entries(
     let entry_bytes = body.len().checked_sub(meta_len)?;
     (record_count != 0
         && entry_bytes.is_multiple_of(entry_len)
-        && entry_bytes / entry_len == record_count as usize)
-        .then(|| &body[meta_len..])
+        && entry_bytes.checked_div(entry_len) == Some(record_count as usize))
+    .then(|| &body[meta_len..])
 }
 
 /// Addr-ref body (ADR-0057 D3): `{ns, walk_watermark}` + entries; the
@@ -1359,6 +1434,62 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block geometry is checked arithmetic over counts the file
+    /// supplies: 0, 1, the loader's 2^20 namespace bound, and a count no
+    /// address space holds.
+    #[test]
+    fn block_lengths_are_checked_at_their_bounds() {
+        assert_eq!(header_len(0), Some(HEADER_FIXED_LEN + CRC_LEN));
+        assert_eq!(header_len(1), Some(HEADER_FIXED_LEN + 4 + CRC_LEN));
+        assert_eq!(header_len(1 << 20), Some(HEADER_FIXED_LEN + (4 << 20) + CRC_LEN));
+        assert_eq!(footer_len(0), Some(FOOTER_FIXED_LEN + 8 + CRC_LEN));
+        assert_eq!(footer_len(1 << 20), Some(FOOTER_FIXED_LEN + (12 << 20) + 8 + CRC_LEN));
+        assert_eq!(header_len(usize::MAX), None, "count × 4 overflows");
+        assert_eq!(footer_len(usize::MAX / 12), None, "the fixed part overflows");
+        assert_eq!(span_len(usize::MAX, 0, 12), Some(usize::MAX));
+        assert_eq!(span_len(usize::MAX, 1, 1), None);
+    }
+
+    #[test]
+    fn padding_len_is_the_distance_to_the_next_aligned_block() {
+        for (len, want) in [
+            (0, 0),
+            (1, ICK_BLOCK_ALIGN - 1),
+            (ICK_BLOCK_ALIGN - 1, 1),
+            (ICK_BLOCK_ALIGN, 0),
+            (ICK_BLOCK_ALIGN + 1, ICK_BLOCK_ALIGN - 1),
+        ] {
+            assert_eq!(padding_len(len), want, "block of {len} bytes");
+        }
+    }
+
+    /// The one sidecar entry split, at every edge: a short length prefix,
+    /// a key at and over `IDXSIDECAR_KEY_MAX`, a short key, a short
+    /// `entry_ref`, and the fixed-8 shape one byte short.
+    #[test]
+    fn sidecar_entry_split_refuses_every_short_or_oversized_shape() {
+        let entry = |key_len: usize, body: usize| {
+            let mut bytes = (key_len as u16).to_le_bytes().to_vec();
+            bytes.resize(2 + body, 0xAB);
+            bytes
+        };
+        assert!(split_sidecar_entry(&[], false).is_none());
+        assert!(split_sidecar_entry(&[1], false).is_none(), "half a length prefix");
+        let max = entry(IDXSIDECAR_KEY_MAX, IDXSIDECAR_KEY_MAX + 8);
+        let ((key, _), tail) = split_sidecar_entry(&max, false).expect("a key at the bound");
+        assert_eq!((key.len(), tail.len()), (IDXSIDECAR_KEY_MAX, 0));
+        let over = entry(IDXSIDECAR_KEY_MAX + 1, IDXSIDECAR_KEY_MAX + 9);
+        assert!(split_sidecar_entry(&over, false).is_none(), "a key over the bound");
+        assert!(split_sidecar_entry(&entry(4, 3), false).is_none(), "a short key");
+        assert!(split_sidecar_entry(&entry(4, 4 + 7), false).is_none(), "a short entry_ref");
+        let empty_key = entry(0, 8 + 1);
+        let ((key, entry_ref), tail) = split_sidecar_entry(&empty_key, false).expect("empty key");
+        assert_eq!((key.len(), entry_ref, tail), (0, u64::from_le_bytes([0xAB; 8]), &[0xAB][..]));
+        assert!(split_sidecar_entry(&[0u8; 15], true).is_none(), "fixed-8 one byte short");
+        let ((key, _), tail) = split_sidecar_entry(&[0u8; 16], true).expect("fixed-8");
+        assert_eq!((key.len(), tail.len()), (8, 0));
+    }
 
     /// One Fixed8 pair under a FINAL meta whose `flags` byte is `flags`.
     fn final_body(flags: u8) -> Vec<u8> {
