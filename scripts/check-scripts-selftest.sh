@@ -1303,6 +1303,29 @@ ls_commit "$root" "PR1: arith fixed on the base"
 git -C "$root" checkout -q feature
 { rt_msg arithmetic_side_effects $D 4 9; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
 expect red "lint-ratchet: a branch that is green against its merge base is red against the base tip" rt_run "$root"
+# a row counts its own family in its own scope: casts denied where
+# arithmetic ratchets, and an item scope counts the item's lines only
+root=$(rt_root rt-family)
+printf 't/x\t%s\tcast\tdeny\nt/x\t%s\tarith\tratchet\n' $D $D >"$root/docs/lint-scopes.tsv"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
+expect green "lint-ratchet: casts denied, arithmetic ratcheted (the control)" rt_run "$root"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg arithmetic_side_effects $D 8 9; rt_done; } >"$root/clippy.json"
+expect red "lint-ratchet: arithmetic rises in a scope whose casts are denied" rt_run "$root"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\t%s\ncast\t1\t%s\n' $D $D >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a narrowing in a cast-denied scope cannot be bought with a row" rt_run "$root"
+printf 'pub fn a() {\n}\npub fn g() {\n    let _brace = "}";\n}\npub fn z() {}\n' >"$root/$D"
+printf 't/x\t%s::g\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg arithmetic_side_effects $D 1 5; rt_msg cast_sign_loss $D 6 1; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
+expect green "lint-ratchet: an item scope counts the item's lines, not its file's" rt_run "$root"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg arithmetic_side_effects $D 5 1; rt_done; } >"$root/clippy.json"
+expect red "lint-ratchet: a new site inside the item" rt_run "$root"
+printf 't/x\t%s::gone\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
+expect red "lint-ratchet: an item scope naming no function is a scope error" rt_run "$root"
+printf 't/x\t%s\tcast,bogus\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
+expect red "lint-ratchet: an unknown lint family is a scope error" rt_run "$root"
 
 # ---------------------------------------------------------- doc artifacts
 DOCS=./scripts/check-doc-artifacts.sh
@@ -1489,6 +1512,57 @@ printf 'fake/t\tcrates/fake/src/lib.rs\tcast,arith\tsomeday\n' >"$root/docs/lint
 expect red "lint-scopes: an unknown tier" ls_run "$root"
 rm "$root/docs/lint-scopes.tsv"
 expect red "lint-scopes: a missing scope table is a scope error" ls_run "$root"
+# the tier is per (scope, family): casts are denied where arithmetic still
+# ratchets, and the attribute sits on the scope the row names — not elsewhere
+root=$(ls_root ls-family)
+L=crates/fake/src/lib.rs
+LS_CAST='#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )
+)]'
+LS_CAST_ITEM='#[cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]'
+ls_mixed() { printf 'fake/t\t%s\tcast\tdeny\nfake/t\t%s\tarith\tratchet\n' "$1" "$1" >"$root/docs/lint-scopes.tsv"; }
+ls_lib() { printf '%s\n' "$LS_ATTR" "$@" >"$root/$L"; }
+ls_mixed $L
+ls_lib "$LS_CAST" 'pub fn f() {}'
+expect green "lint-scopes: casts denied, arithmetic ratcheted (the control)" ls_run "$root"
+ls_lib "$LS_DENY" 'pub fn f() {}'
+expect red "lint-scopes: the file denies the arithmetic its row still ratchets" ls_run "$root"
+ls_lib 'pub fn f() {}'
+expect red "lint-scopes: a mixed scope without its cast deny" ls_run "$root"
+ls_lib 'pub fn f() {}' "$LS_CAST_ITEM" 'pub fn g() {}'
+expect red "lint-scopes: the file's deny sits on one of its functions" ls_run "$root"
+ls_lib 'pub mod m {' "$LS_CAST" '}' 'pub fn f() {}'
+expect red "lint-scopes: the file's deny sits inside a nested module" ls_run "$root"
+ls_mixed $L::f
+ls_lib "/// doc" "$LS_CAST_ITEM" '#[inline]' 'pub fn f() {}' 'pub fn g() {}'
+expect green "lint-scopes: an item scope carries its deny on the item" ls_run "$root"
+ls_lib 'pub fn f() {}' "$LS_CAST_ITEM" 'pub fn g() {}'
+expect red "lint-scopes: an item scope's deny sits on its neighbour" ls_run "$root"
+ls_lib "$LS_CAST_ITEM" 'pub fn f() {}' 'pub mod m {' '    pub fn f() {}' '}'
+expect red "lint-scopes: an item scope naming two functions is ambiguous" ls_run "$root"
+ls_mixed $L::nope
+ls_lib "$LS_CAST_ITEM" 'pub fn f() {}'
+expect red "lint-scopes: an item scope naming no function" ls_run "$root"
+ls_lib 'pub fn f() {}'
+for bad in "$L\tcast,bogus\tratchet" "$L\tcast,cast\tratchet\nfake/t\t$L\tarith\tratchet" \
+    "$L\tcast\tratchet" "$L\tcast,arith\tratchet\nfake/t\t$L\tcast\tdeny" \
+    "$L\tcast,arith\tratchet\nfake/t\t$L::f\tcast,arith\tratchet" \
+    "$L\tcast,arith\tratchet\nfake/t\t$L\tcast,arith\tratchet" \
+    "none: the fixture target enters no decoder\tcast\t-"; do
+    printf "fake/t\t$bad\n" >"$root/docs/lint-scopes.tsv"
+    expect red "lint-scopes: a malformed or conflicting family row ($bad)" ls_run "$root"
+done
+ls_scopes "$root"
+ls_lib "$LS_CAST" 'pub fn f() {}'
+expect red "lint-scopes: a decoder deny no row names" ls_run "$root"
 # the frozen exemption table
 root=$(ls_root ls-exempt)
 ls_exempt() { printf '%s\n#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]\npub fn %s() {}\n' "$LS_ATTR" "$1" >"$root/crates/fake/src/lib.rs"; }

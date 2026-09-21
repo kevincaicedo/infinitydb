@@ -34,12 +34,16 @@ for dir in crates bins; do
 done
 
 INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
-    INF_SELF="scripts/check-lint-scopes.sh" python3 - <<'PY'
+    INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+import lint_scope_table as scope_table
+from lint_scope_table import FN, attribute_end
 
 EXEMPTIONS = os.environ["INF_EXEMPTIONS"]
 BASE_REF = os.environ["INF_BASE_REF"]
@@ -59,46 +63,14 @@ LINTS = {
     "too_many_lines": ("fn", ("shape:",)),
 }
 SCOPES = os.environ["INF_SCOPES"]
-DENY_ATTR = re.compile(
-    r"#!?\[cfg_attr\(\s*not\(test\),\s*deny\(\s*clippy::cast_possible_truncation,\s*"
-    r"clippy::cast_sign_loss,\s*clippy::cast_possible_wrap,\s*"
-    r"clippy::arithmetic_side_effects,?\s*\)\s*,?\s*\)\]"
-)
 GROUPS = ("clippy::pedantic", "clippy::restriction", "clippy::style", "clippy::all", "warnings")
 ROOT_ATTR = re.compile(
     r"#!\[cfg_attr\(\s*not\(test\),\s*deny\(\s*clippy::wildcard_enum_match_arm,\s*"
     r"clippy::match_wildcard_for_single_variants,?\s*\)\s*,?\s*\)\]"
 )
-FN = re.compile(
-    r"^\s*(pub(\([^)]*\))?\s+)?(default\s+)?(const\s+)?(async\s+)?(unsafe\s+)?"
-    r'(extern\s+("[^"]*"\s+)?)?fn\s+([A-Za-z_][A-Za-z_0-9]*)'
-)
 REASON = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
 
-errors, oks = [], []
-
-
-def attribute_end(lines, start):
-    depth, in_str = 0, False
-    for i in range(start, len(lines)):
-        text, j = lines[i], 0
-        while j < len(text):
-            ch = text[j]
-            if in_str:
-                if ch == "\\":
-                    j += 1
-                elif ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return i + 1
-            j += 1
-    return len(lines)
+errors, oks, deny_sites = [], [], []
 
 
 def next_item(lines, at):
@@ -127,6 +99,10 @@ def audit(path, exempt_sites):
         site = f"{path}:{i + 1}"
         i = end
         head = REASON.sub("", text)  # lint names; never the reason text
+        deny = scope_table.DENY.match(text)
+        if deny and scope_table.denied([text], inner=bool(deny.group(1))):
+            fn = FN.match(next_item(lines, end))
+            deny_sites.append((str(path), int(site.rsplit(":", 1)[1]), bool(deny.group(1)), fn.group(9) if fn else ""))
         if not re.search(r"\b(allow|expect)\s*\(", head):
             continue
         named = [l for l in LINTS if re.search(rf"\b{l}\b", head)]
@@ -210,7 +186,10 @@ for top in ("crates", "bins", "tests"):
                 audit(Path(dirpath) / name, exempt_sites)
 
 # ---- D2/D3: the scope table — every fuzz target is named by a row, every
-# row's target and file exist, and a `deny` row's file carries the attribute
+# row's target and file exist, and the source reflects the table exactly:
+# a scope's `deny` families are denied on that scope (the file's own inner
+# attribute, or the outer attribute on the item), its `ratchet` families are
+# not, and no decoder deny sits where no row names it
 targets = set()
 for crate in sorted(Path("crates").iterdir()):
     fuzz = crate / "fuzz" / "fuzz_targets"
@@ -219,46 +198,46 @@ for crate in sorted(Path("crates").iterdir()):
 if not Path(SCOPES).is_file():
     print(f"LINT-SCOPES SCOPE ERROR: {SCOPES} is missing")
     sys.exit(1)
-named_targets, denied, ratchet_rows = set(), 0, 0
-for n, line in enumerate(Path(SCOPES).read_text().split("\n"), 1):
-    if not line.strip() or line.startswith("#"):
-        continue
-    cols = line.split("\t")
-    if len(cols) != 4:
-        errors.append(f"{SCOPES}:{n}: malformed row (target, file[::item], lints, tier)")
-        continue
-    target, where, _lints, tier = cols
-    named_targets.add(target)
-    if target not in targets:
-        errors.append(f"{SCOPES}:{n}: fuzz target `{target}` does not exist")
-    if where.startswith("none:"):
-        if len(where) < len("none: ") + 8:
-            errors.append(f"{SCOPES}:{n}: a `none:` row states its reason")
-        continue
-    file, _, item = where.partition("::")
-    if not Path(file).is_file():
-        errors.append(f"{SCOPES}:{n}: `{file}` does not exist")
-        continue
-    if tier == "ratchet":
-        ratchet_rows += 1
-    elif tier == "deny":
-        denied += 1
-        text = Path(file).read_text()
-        if item:
-            at = re.search(rf"\bfn\s+{re.escape(item)}\b", text)
-            head = text[: at.start()] if at else ""
-            ok = bool(at) and bool(DENY_ATTR.search(head[-600:]))
-        else:
-            ok = bool(DENY_ATTR.search(text))
-        if not ok:
-            errors.append(f"{SCOPES}:{n}: `{where}` is tier deny and lacks the cast + arithmetic deny attribute")
-    else:
-        errors.append(f"{SCOPES}:{n}: tier `{tier}` is not deny | ratchet")
-for t in sorted(targets - named_targets):
+scopes_tbl = scope_table.load(SCOPES)
+errors += scopes_tbl.errors
+for t in sorted(scopes_tbl.targets - targets):
+    errors.append(f"{SCOPES}: fuzz target `{t}` does not exist")
+for t in sorted(targets - scopes_tbl.targets):
     errors.append(f"fuzz target `{t}` is named by no row of {SCOPES} — a decoder chooses its lint scope")
 if not targets:
     print("LINT-SCOPES SCOPE ERROR: no fuzz target found under crates/*/fuzz/fuzz_targets")
     sys.exit(1)
+reflected = set()  # (file, item) scopes whose source was read
+for (file, item), fams in sorted(scopes_tbl.scopes.items()):
+    where = f"{file}::{item}" if item else file
+    if not Path(file).is_file():
+        errors.append(f"{SCOPES}: `{file}` does not exist")
+        continue
+    lines = Path(file).read_text(encoding="utf-8", errors="replace").split("\n")
+    if item:
+        found = scope_table.locate_item(lines, item)
+        if isinstance(found, str):
+            errors.append(f"{SCOPES}: `{where}`: {found}")
+            continue
+        have = scope_table.denied(found[0], inner=False)
+    else:
+        have = scope_table.denied(scope_table.leading_attributes(lines), inner=True)
+    reflected.add((file, item))
+    want = {l for fam, tier in fams.items() if tier == "deny" for l in scope_table.FAMILIES[fam]}
+    place = f"on `fn {item}`" if item else "among the file's own inner attributes"
+    for lint in sorted(want - have):
+        errors.append(f"{SCOPES}: `{where}` is tier deny for clippy::{lint} and lacks `cfg_attr(not(test), deny(…))` {place}")
+    for lint in sorted(have - want):
+        errors.append(f"{where}: denies clippy::{lint}, which {SCOPES} still ratchets — move the row to deny")
+for file, line, inner, fn_name in deny_sites:
+    scope = (file, "" if inner else fn_name)
+    if scope not in scopes_tbl.scopes:
+        errors.append(f"{file}:{line}: a decoder deny that no row of {SCOPES} names — the table is its one home")
+    elif inner and scope in reflected:
+        lines = Path(file).read_text(encoding="utf-8", errors="replace").split("\n")
+        if line >= scope_table.first_item_line(lines):
+            errors.append(f"{file}:{line}: a decoder deny inside a nested module — the row names the file")
+denied_n, ratchet_n = len(scopes_tbl.families("deny")), len(scopes_tbl.families("ratchet"))
 
 # ---- D1: the frozen exemption table
 if not Path(EXEMPTIONS).is_file():
@@ -315,7 +294,7 @@ if errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
-scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped ({denied} deny row(s), {ratchet_rows} ratchet)"
+scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted"
 if notes:
     scope += "; " + "; ".join(notes)
 print(f"lint-scopes OK: {scope}")

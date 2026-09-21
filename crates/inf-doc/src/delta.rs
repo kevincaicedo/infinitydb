@@ -4,6 +4,16 @@
 //! module is the one semantic registry: live command capture encodes an
 //! [`ApplyOp`], replay decodes the bytes back to the same type, and every
 //! foreign fragment crosses the canonical idoc trust boundary here.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 

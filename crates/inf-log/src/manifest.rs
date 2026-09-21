@@ -58,6 +58,11 @@
 //! address 48-bit. The envelope ([`crate::meta`]) adds magic, length, and
 //! CRC32C around this payload; corruption at either layer is a named
 //! fail-stop error.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use core::fmt;
 use std::io;

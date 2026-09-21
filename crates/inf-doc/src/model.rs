@@ -8,6 +8,11 @@
 //! the durable contract (ADR-0036 D5), and duplicate keys are representable
 //! here on purpose — the model must be able to describe every tape the
 //! decoder accepts, canonical producers or not.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use crate::build::TapeBuilder;
 use crate::cursor::{DocValue, ObjCursor};

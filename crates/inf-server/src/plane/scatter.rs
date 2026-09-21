@@ -785,6 +785,10 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 /// trailing CRLF must exist, so the offset never lands past the buffer
 /// (`&raw[rest_at..]` at the caller). Public for the fuzz target.
 #[doc(hidden)]
+#[cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
     let rest = raw.strip_prefix(b"*2\r\n$")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
@@ -801,6 +805,15 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
 /// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
 /// carries milliseconds (-1 means no expiry). Legacy forms return remaining
 /// TTL; the move program's `INF.PEEK key ABS` returns absolute Unix expiry.
+#[cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 pub fn parse_take_reply(raw: &[u8]) -> Option<Option<(Vec<u8>, i64)>> {
     if raw == b"*-1\r\n" {
         return Some(None);

@@ -54,6 +54,7 @@ INF_BASELINE="${INF_LINT_BASELINE:-docs/lint-baseline.tsv}" \
 INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" \
 INF_BASE_REF="${INF_LINT_BASE_REF:-origin/main}" \
 INF_HOST="${INF_LINT_RATCHET_HOST:-$(uname -s)}" \
+INF_SCRIPT_DIR="$SCRIPT_DIR" \
 python3 - "$work/clippy.json" <<'PY'
 import json
 import os
@@ -61,6 +62,9 @@ import re
 import subprocess
 import sys
 from collections import Counter
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+import lint_scope_table as scope_table
 
 BASELINE, SCOPES = os.environ["INF_BASELINE"], os.environ["INF_SCOPES"]
 BASE_REF, HOST = os.environ["INF_BASE_REF"], os.environ["INF_HOST"]
@@ -108,21 +112,36 @@ def parse_baseline(text, label, strict):
     return rows
 
 
-# ---- which files ratchet cast / arith (docs/lint-scopes.tsv, tier `ratchet`)
+# ---- which (scope, family) ratchets (docs/lint-scopes.tsv — read through
+# the one parser the scope gate uses). An item scope is its function's lines.
 if not os.path.isfile(SCOPES):
     scope_error(f"{SCOPES} is missing")
-ratcheted = set()
-for n, line in enumerate(open(SCOPES, encoding="utf-8").read().split("\n"), 1):
-    if not line.strip() or line.startswith("#"):
-        continue
-    cols = line.split("\t")
-    if len(cols) != 4:
-        scope_error(f"malformed scope row {SCOPES}:{n}: {line}")
-    if cols[3] == "ratchet":
-        ratcheted.add(cols[1].split("::")[0])
+scopes_tbl = scope_table.load(SCOPES)
+if scopes_tbl.errors:
+    scope_error(scopes_tbl.errors[0])
+spans = {}  # file -> [(first line, last line, {family: tier})]; whole file = (1, inf)
+for (file, item), fams in sorted(scopes_tbl.scopes.items()):
+    first, last = 1, float("inf")
+    if item:
+        if not os.path.isfile(file):
+            scope_error(f"{SCOPES}: `{file}` does not exist")
+        lines = open(file, encoding="utf-8", errors="replace").read().split("\n")
+        found = scope_table.locate_item(lines, item)
+        if isinstance(found, str):
+            scope_error(f"{SCOPES}: `{file}::{item}`: {found}")
+        _, first, last = found
+    spans.setdefault(file, []).append((first, last, fams))
+
+
+def tier_of(family, file, line):
+    for first, last, fams in spans.get(file, ()):
+        if first <= line <= last:
+            return fams[family]
+    return None
+
 
 # ---- count, once per span
-sites, finished = set(), False
+sites, denied_sites, finished = set(), set(), False
 for raw in open(sys.argv[1], encoding="utf-8"):
     try:
         msg = json.loads(raw)
@@ -139,11 +158,16 @@ for raw in open(sys.argv[1], encoding="utf-8"):
     for sp in d["spans"]:
         if sp.get("is_primary"):
             f = sp["file_name"]
-            if family == "fn_length" or f in ratcheted:
+            tier = "ratchet" if family == "fn_length" else tier_of(family, f, sp["line_start"])
+            if tier == "ratchet":
                 sites.add((family, f, sp["line_start"], sp["column_start"]))
+            elif tier == "deny":
+                denied_sites.add((family, f, sp["line_start"]))
 if not finished:
     scope_error("clippy reported no completed build — no count is not a clean count")
 counts = Counter((fam, f) for fam, f, _, _ in sites)
+for fam, f, line in sorted(denied_sites):
+    errors.append(f"{f}:{line} has a {fam} site in a scope {SCOPES} denies — a row cannot buy it")
 
 # ---- tree vs the working table, both directions
 if not os.path.isfile(BASELINE):
@@ -216,7 +240,7 @@ if errors:
     print(f"lint-ratchet FAILED: {len(errors)} violation(s)")
     sys.exit(1)
 scope = ", ".join(f"{fam} {totals[fam]} in {sum(1 for k in table if k[0] == fam)} file(s)" for fam in sorted(totals))
-print(f"lint-ratchet OK: {scope or 'no backlog'} (the baseline backlog); {len(ratcheted)} file(s) ratchet cast/arith")
+print(f"lint-ratchet OK: {scope or 'no backlog'} (the baseline backlog); {len(scopes_tbl.families('ratchet'))} (scope, family) ratcheted, {len(scopes_tbl.families('deny'))} denied")
 for m in sorted(moved):
     print(f"    moved: {m}")
 for n in notes:

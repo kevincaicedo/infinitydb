@@ -5,6 +5,8 @@
 //! text. The printer exists for the `parse(print(ast)) == ast` property,
 //! diagnostics, and the S15 matrix. Grammar authority:
 //! `infinitydb/docs/jsonpath-subset.md`.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 /// One parsed path: mode + segments (root is implicit — the encoder
 /// emits `Root` as the first op).

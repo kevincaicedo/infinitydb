@@ -2,6 +2,11 @@
 //! (L9), typed errors with byte offsets. Statements are ≤ 8 KiB and
 //! UTF-8-validated by the entry, so the token vector is a bounded
 //! cold-path allocation.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use super::{QlError, QlErrorKind};
 

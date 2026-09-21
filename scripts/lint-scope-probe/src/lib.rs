@@ -96,6 +96,28 @@ pub mod decoder {
     }
 }
 
+/// The mixed tier: casts denied where arithmetic still ratchets. The
+/// narrowing must draw its lint and the `+` must draw nothing — a cast-only
+/// attribute that also fired on arithmetic would make the tier unusable.
+pub mod casts_only {
+    #![cfg_attr(
+        not(test),
+        deny(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_wrap
+        )
+    )]
+
+    pub fn narrowing(decoded_len: u64) -> u32 {
+        decoded_len as u32 // PLANT clippy::cast_possible_truncation
+    }
+
+    pub fn ratcheted_sum(cursor: usize, decoded_len: usize) -> usize {
+        cursor + decoded_len // CONTROL
+    }
+}
+
 /// The item form: a decoder that is one function inside a larger file.
 #[cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 pub fn item_scope(cursor: usize, decoded_len: usize) -> usize {

@@ -7,6 +7,11 @@
 //! Classic CVE surface in Redis — the M1 test plan fuzzes it from day one;
 //! the unit oracle below pins the Redis edge behaviors (unterminated
 //! classes, reversed ranges, trailing backslash).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 /// Does `pattern` match all of `string`?
 pub fn glob_match(pattern: &[u8], string: &[u8], nocase: bool) -> bool {

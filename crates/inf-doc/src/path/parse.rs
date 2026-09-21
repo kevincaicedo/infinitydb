@@ -4,6 +4,11 @@
 //! exceeds one level and is handled by a flag, not a stack). Grammar
 //! authority: `infinitydb/docs/jsonpath-subset.md`; typed errors carry
 //! the byte offset like `JsonParseError`.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use super::ast::{Member, PathAst, Segment, SliceSpec};
 use super::{PathError, PathErrorKind, SEGMENTS_MAX, UNION_MEMBERS_MAX};

@@ -1,6 +1,11 @@
 //! The `.ick` reader: the footer probe, the bounded section decoder
 //! (`IckReader` — iterative, one block per step, every section class
 //! capped by `IckReaderConfig`), and the audit helpers recovery drives.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use super::*;
 

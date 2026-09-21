@@ -13,6 +13,11 @@
 //! pair, never a tree position (the S01 freeze: cursors re-seek, so
 //! rebalancing cannot break them); mid-key resume matters because a
 //! multi-valued equality range holds many refs under one key.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use inf_store::{IndexKeyType, IndexTree, OrderedCursor, PkRef};
 

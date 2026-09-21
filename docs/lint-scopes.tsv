@@ -1,41 +1,57 @@
 # ADR-0144 D2/D3: which file is under which lint set, by the fuzz target that
 # enters it (the relation is checked, not derived: targets call crate-root
-# re-exports). tier: `deny` = the file (or item) carries the cast + arithmetic
-# deny attribute; `ratchet` = its backlog is rows of docs/lint-baseline.tsv;
+# re-exports). The tier is per (scope, lint family) — a scope whose families
+# differ is split over two rows: `deny` = the scope (the file's own inner
+# attribute, or the outer attribute on the item) denies that family;
+# `ratchet` = its backlog is rows of docs/lint-baseline.tsv;
 # a target that enters no decoder says `none: <reason>` in the file column.
 # fuzz target<TAB>file[::item]<TAB>lints<TAB>tier
-inf-doc/fuzz_delta_apply	crates/inf-doc/src/delta.rs	cast,arith	ratchet
+inf-doc/fuzz_delta_apply	crates/inf-doc/src/delta.rs	cast,arith	deny
 inf-doc/idoc_decode	crates/inf-doc/src/tape.rs	cast,arith	ratchet
-inf-doc/idoc_decode	crates/inf-doc/src/model.rs	cast,arith	ratchet
+inf-doc/idoc_decode	crates/inf-doc/src/model.rs	cast	deny
+inf-doc/idoc_decode	crates/inf-doc/src/model.rs	arith	ratchet
 inf-doc/idoc_decode	crates/inf-doc/src/arena.rs	cast,arith	ratchet
 inf-doc/json_parse	crates/inf-doc/src/json.rs	cast,arith	ratchet
-inf-doc/path_program	crates/inf-doc/src/path/parse.rs	cast,arith	ratchet
+inf-doc/path_program	crates/inf-doc/src/path/parse.rs	cast	deny
+inf-doc/path_program	crates/inf-doc/src/path/parse.rs	arith	ratchet
 inf-doc/path_program	crates/inf-doc/src/path/program.rs	cast,arith	ratchet
 inf-doc/path_program	crates/inf-doc/src/path/eval.rs	cast,arith	ratchet
-inf-doc/path_program	crates/inf-doc/src/path/ast.rs	cast,arith	ratchet
+inf-doc/path_program	crates/inf-doc/src/path/ast.rs	cast	ratchet
+inf-doc/path_program	crates/inf-doc/src/path/ast.rs	arith	deny
 inf-doc/path_program	crates/inf-doc/src/path/cache.rs	cast,arith	ratchet
 inf-fabric/fabric_codec	crates/inf-fabric/src/codec.rs	cast,arith	ratchet
 inf-log/extent_decode	crates/inf-log/src/blob.rs	cast,arith	ratchet
 inf-log/frame_decode	crates/inf-log/src/frame.rs	cast,arith	ratchet
 inf-log/frame_decode	crates/inf-log/src/record.rs	cast,arith	deny
-inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	cast,arith	ratchet
+inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	cast	deny
+inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	arith	ratchet
 inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	cast,arith	ratchet
-inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	cast,arith	ratchet
-inf-log/manifest_decode	crates/inf-log/src/manifest.rs	cast,arith	ratchet
-inf-log/manifest_decode	crates/inf-log/src/meta.rs	cast,arith	ratchet
-inf-log/segment_read	crates/inf-log/src/reader.rs	cast,arith	ratchet
+inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	cast	deny
+inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	arith	ratchet
+inf-log/manifest_decode	crates/inf-log/src/manifest.rs	cast	deny
+inf-log/manifest_decode	crates/inf-log/src/manifest.rs	arith	ratchet
+inf-log/manifest_decode	crates/inf-log/src/meta.rs	cast	deny
+inf-log/manifest_decode	crates/inf-log/src/meta.rs	arith	ratchet
+inf-log/segment_read	crates/inf-log/src/reader.rs	cast	deny
+inf-log/segment_read	crates/inf-log/src/reader.rs	arith	ratchet
 inf-query/fuzz_access_program	crates/inf-query/src/access.rs	cast,arith	ratchet
-inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/lex.rs	cast,arith	ratchet
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/lex.rs	cast	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/lex.rs	arith	ratchet
 inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/parse.rs	cast,arith	ratchet
 inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/compile.rs	cast,arith	ratchet
 inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/cache.rs	cast,arith	ratchet
-inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	cast,arith	ratchet
+inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	cast	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	arith	ratchet
 inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/program.rs	cast,arith	ratchet
 inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/vm.rs	cast,arith	ratchet
-inf-server/glob_match	crates/inf-server/src/glob.rs	cast,arith	ratchet
-inf-server/move_snapshot	crates/inf-server/src/plane/scatter.rs	cast,arith	ratchet
-inf-server/scan_cursor	crates/inf-server/src/exec.rs::parse_cursor	cast,arith	ratchet
-inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs	cast,arith	ratchet
+inf-server/glob_match	crates/inf-server/src/glob.rs	cast	deny
+inf-server/glob_match	crates/inf-server/src/glob.rs	arith	ratchet
+inf-server/move_snapshot	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
+inf-server/scan_cursor	crates/inf-server/src/exec.rs::parse_cursor	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_header	cast,arith	ratchet
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	arith	ratchet
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
 inf-store/fuzz_catalog	crates/inf-store/src/catalog.rs	cast,arith	ratchet
 inf-store/fuzz_index_key	crates/inf-store/src/index_key.rs	cast,arith	ratchet
 inf-wire/resp_parse	crates/inf-wire/src/parser.rs	cast,arith	ratchet

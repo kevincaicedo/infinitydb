@@ -26,6 +26,11 @@
 //! Swap steps, in order (each becomes a named fault point at M2-S16):
 //! remove stale staging → create staging → write envelope → fdatasync →
 //! rename → dir-fsync.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use std::io;
 use std::path::Path;
