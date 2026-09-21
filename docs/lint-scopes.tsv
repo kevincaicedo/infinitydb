@@ -40,13 +40,11 @@ inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	cast	deny
 inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	arith	ratchet
 inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/program.rs	cast,arith	ratchet
 inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/vm.rs	cast,arith	ratchet
-inf-server/glob_match	crates/inf-server/src/glob.rs	cast	deny
-inf-server/glob_match	crates/inf-server/src/glob.rs	arith	ratchet
+inf-server/glob_match	crates/inf-server/src/glob.rs	cast,arith	deny
 inf-server/move_snapshot	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
 inf-server/scan_cursor	crates/inf-server/src/exec.rs::parse_cursor	cast,arith	deny
-inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_header	cast,arith	ratchet
-inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast	deny
-inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	arith	ratchet
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_header	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast,arith	deny
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
 inf-store/fuzz_catalog	crates/inf-store/src/catalog.rs	cast,arith	deny
 inf-store/fuzz_index_key	crates/inf-store/src/index_key.rs	cast,arith	deny

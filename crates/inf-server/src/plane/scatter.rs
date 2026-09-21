@@ -770,14 +770,21 @@ pub(super) fn parse_publisher_tag(conn: &[u8], seq: &[u8]) -> Option<(ConnKey, u
 /// `*N\r\n` array header → `(N, body offset)`. `None` for errors/nulls.
 /// Public for the fuzz target.
 #[doc(hidden)]
+#[cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
     let rest = raw.strip_prefix(b"*")?;
     let nl = rest.windows(2).position(|w| w == b"\r\n")?;
     let n: i64 = core::str::from_utf8(&rest[..nl]).ok()?.parse().ok()?;
-    if n < 0 {
-        return None;
-    }
-    Some((n as usize, 1 + nl + 2))
+    // A negative count is a null array: no header to walk. `*` + CRLF = 3.
+    Some((usize::try_from(n).ok()?, nl.checked_add(3)?))
 }
 
 /// `*2\r\n$N\r\n<cursor>\r\n…` SCAN reply head → `(cursor, keys offset)`.
@@ -787,7 +794,12 @@ pub fn parse_array_header(raw: &[u8]) -> Option<(usize, usize)> {
 #[doc(hidden)]
 #[cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
     let rest = raw.strip_prefix(b"*2\r\n$")?;
@@ -799,7 +811,8 @@ pub fn parse_scan_head(raw: &[u8]) -> Option<(u64, usize)> {
     if rest.get(end..end.checked_add(2)?)? != b"\r\n" {
         return None;
     }
-    Some((cursor, 4 + 1 + end + 2))
+    // `*2\r\n$` (5) before `rest`, the cursor's CRLF (2) after `end`.
+    Some((cursor, end.checked_add(7)?))
 }
 
 /// Two-field snapshot reply: `*-1` means missing; `*2 [$value][:time]`
@@ -939,6 +952,40 @@ mod scatter_reply_parsers {
         let ok = b"*2\r\n$3\r\n123\r\n*0\r\n";
         let (cursor, at) = parse_scan_head(ok).expect("well formed");
         assert_eq!((cursor, &ok[at..]), (123, &b"*0\r\n"[..]));
+    }
+
+    /// The array count at its edges: zero, one, null (negative), the i64
+    /// maximum, and one past it; the offset is always `*` + digits + CRLF.
+    #[test]
+    fn array_header_count_is_narrowed_never_wrapped() {
+        assert_eq!(parse_array_header(b"*0\r\n"), Some((0, 4)));
+        assert_eq!(parse_array_header(b"*1\r\nx"), Some((1, 4)));
+        assert_eq!(parse_array_header(b"*-1\r\n"), None, "a null array has no body");
+        assert_eq!(parse_array_header(b"*-9223372036854775808\r\n"), None);
+        assert_eq!(
+            parse_array_header(b"*9223372036854775807\r\n"),
+            Some((i64::MAX as usize, 22)),
+            "the largest count a peer can state"
+        );
+        assert_eq!(parse_array_header(b"*9223372036854775808\r\n"), None, "past i64");
+        assert_eq!(parse_array_header(b"*\r\n"), None, "no digits");
+    }
+
+    /// The keys offset is the head's exact length, at the smallest cursor
+    /// and at `u64::MAX`.
+    #[test]
+    fn scan_head_offset_is_the_head_length() {
+        for cursor in ["0", "18446744073709551615"] {
+            let head = format!("*2\r\n${}\r\n{cursor}\r\n", cursor.len());
+            let raw = format!("{head}*0\r\n");
+            let parsed = parse_scan_head(raw.as_bytes()).expect("a well-formed head");
+            assert_eq!(parsed, (cursor.parse().expect("u64"), head.len()));
+        }
+        assert_eq!(
+            parse_scan_head(b"*2\r\n$18446744073709551615\r\n0\r\n"),
+            None,
+            "length past the buffer"
+        );
     }
 
     #[test]

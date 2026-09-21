@@ -19,8 +19,6 @@ arith	22	crates/inf-query/src/partiql/lex.rs
 arith	6	crates/inf-query/src/partiql/parse.rs
 arith	32	crates/inf-query/src/predicate/program.rs
 arith	17	crates/inf-query/src/predicate/vm.rs
-arith	21	crates/inf-server/src/glob.rs
-arith	2	crates/inf-server/src/plane/scatter.rs
 arith	19	crates/inf-wire/src/parser.rs
 arith	23	crates/inf-wire/src/writer.rs
 cast	10	crates/inf-doc/src/arena.rs
@@ -36,7 +34,6 @@ cast	1	crates/inf-query/src/partiql/compile.rs
 cast	1	crates/inf-query/src/partiql/parse.rs
 cast	13	crates/inf-query/src/predicate/program.rs
 cast	1	crates/inf-query/src/predicate/vm.rs
-cast	1	crates/inf-server/src/plane/scatter.rs
 cast	5	crates/inf-wire/src/parser.rs
 cast	6	crates/inf-wire/src/writer.rs
 fn_length	1	bins/inf-bench/src/bootstorm.rs
