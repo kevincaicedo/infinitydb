@@ -7,6 +7,16 @@
 //! canonical f64 constants; non-legacy embedded paths — are
 //! validator-enforced, so accepted bytes re-encode identically from
 //! their decoded tree: the fuzz target's standing law.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::rc::Rc;
 
@@ -275,8 +285,9 @@ impl Pools {
         if self.paths.len() == PATHS_MAX {
             return Err(PredicateBuildError::TooManyPaths);
         }
+        let id = self.paths.len() as u64;
         self.paths.push(bytes.to_vec());
-        Ok((self.paths.len() - 1) as u64)
+        Ok(id)
     }
 
     fn constant_id(&mut self, encoded: Vec<u8>) -> Result<u64, PredicateBuildError> {
@@ -286,8 +297,9 @@ impl Pools {
         if self.constants.len() == CONSTANTS_MAX {
             return Err(PredicateBuildError::TooManyConstants);
         }
+        let id = self.constants.len() as u64;
         self.constants.push(encoded);
-        Ok((self.constants.len() - 1) as u64)
+        Ok(id)
     }
 }
 
@@ -327,6 +339,12 @@ fn utf8_constant_bytes(s: &str, out: &mut Vec<u8>) {
 /// serialized form. Iterative prefix walk: children are pushed reversed
 /// so pops run left to right, which is both the evaluation order and
 /// the first-reference pool order the validator enforces (D2.1).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `ops` is refused past OPS_MAX on the line after its increment, and a \
+              `depth` past NESTING_DEPTH_MAX returns before `depth + 1`, so each sum is at \
+              most a small const plus one"
+)]
 pub fn encode(root: &Predicate) -> Result<PredicateProgram, PredicateBuildError> {
     let mut pools = Pools::default();
     let mut expr = Vec::with_capacity(32);
@@ -347,8 +365,10 @@ pub fn encode(root: &Predicate) -> Result<PredicateProgram, PredicateBuildError>
                 if !(2..=BOOL_ARITY_MAX).contains(&children.len()) {
                     return Err(PredicateBuildError::BadArity);
                 }
+                let arity =
+                    u8::try_from(children.len()).map_err(|_| PredicateBuildError::BadArity)?;
                 expr.push(if matches!(node, Predicate::And(_)) { OP_AND } else { OP_OR });
-                expr.push(children.len() as u8);
+                expr.push(arity);
                 for child in children.iter().rev() {
                     work.push((child, depth + 1));
                 }
@@ -390,7 +410,7 @@ fn encode_leaf(
         Predicate::BeginsWith { path, prefix } => {
             expr.push(OP_BEGINS_WITH);
             emit_ref(pools.path_id(path)?, expr);
-            let mut encoded = Vec::with_capacity(prefix.len() + 3);
+            let mut encoded = Vec::with_capacity(prefix.len().saturating_add(3));
             utf8_constant_bytes(prefix, &mut encoded);
             emit_ref(pools.constant_id(encoded)?, expr);
         }
@@ -401,9 +421,10 @@ fn encode_leaf(
             if members.iter().any(|m| m.family() != members[0].family()) {
                 return Err(PredicateBuildError::MixedInFamilies);
             }
+            let count = u8::try_from(members.len()).map_err(|_| PredicateBuildError::BadInCount)?;
             expr.push(OP_IN);
             emit_ref(pools.path_id(path)?, expr);
-            expr.push(members.len() as u8);
+            expr.push(count);
             for member in members {
                 emit_ref(pools.constant_id(constant_bytes(member)?)?, expr);
             }
@@ -425,7 +446,7 @@ fn emit_ref(id: u64, out: &mut Vec<u8>) {
 }
 
 fn assemble(pools: &Pools, expr: &[u8]) -> Result<PredicateProgram, PredicateBuildError> {
-    let mut out = Vec::with_capacity(expr.len() + 64);
+    let mut out = Vec::with_capacity(expr.len().saturating_add(64));
     out.push(PROGRAM_VERSION);
     out.push(0); // flags: must-be-zero in v1
     varint::encode_u64(pools.paths.len() as u64, &mut out);
@@ -448,11 +469,13 @@ fn assemble(pools: &Pools, expr: &[u8]) -> Result<PredicateProgram, PredicateBui
 /// Zigzag i64 → u64 (the tape/path-program convention: small magnitudes
 /// get short varints either sign).
 fn zigzag(v: i64) -> u64 {
-    ((v << 1) ^ (v >> 63)) as u64
+    ((v << 1) ^ (v >> 63)).cast_unsigned()
 }
 
 fn unzigzag(u: u64) -> i64 {
-    ((u >> 1) as i64) ^ -((u & 1) as i64)
+    // The low bit is the sign: all-ones flips the magnitude bits back.
+    let sign: i64 = if u & 1 == 1 { -1 } else { 0 };
+    (u >> 1).cast_signed() ^ sign
 }
 
 // ---------------------------------------------------------------------
@@ -482,6 +505,11 @@ fn validate(bytes: &[u8]) -> Result<(), PredicateError> {
     validate_expr(bytes, at, path_spans.len(), &constants)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `used` counts bytes `decode_u64` read from `bytes[*at..]`, a slice indexed \
+              on the line above, so `*at + used <= bytes.len()`"
+)]
 fn read_varint_at(bytes: &[u8], at: &mut usize) -> Result<u64, PredicateError> {
     let (value, used) = varint::decode_u64(&bytes[*at..])
         .ok_or(PredicateError { offset: *at, kind: PredicateErrorKind::BadVarint })?;
@@ -498,10 +526,10 @@ fn region_end(len: u64, start: usize, total: usize) -> Option<usize> {
 
 fn validate_paths(bytes: &[u8], at: &mut usize) -> Result<Vec<(usize, usize)>, PredicateError> {
     let count = read_varint_at(bytes, at)?;
-    if count > PATHS_MAX as u64 {
+    let Some(capacity) = usize::try_from(count).ok().filter(|&count| count <= PATHS_MAX) else {
         return verr(PredicateErrorKind::BadCount, *at);
-    }
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(count as usize);
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(capacity);
     for _ in 0..count {
         let len = read_varint_at(bytes, at)?;
         let start = *at;
@@ -531,10 +559,10 @@ type ConstantSpans = Vec<((usize, usize), ConstFamily)>;
 
 fn validate_constants(bytes: &[u8], at: &mut usize) -> Result<ConstantSpans, PredicateError> {
     let count = read_varint_at(bytes, at)?;
-    if count > CONSTANTS_MAX as u64 {
+    let Some(capacity) = usize::try_from(count).ok().filter(|&count| count <= CONSTANTS_MAX) else {
         return verr(PredicateErrorKind::BadCount, *at);
-    }
-    let mut constants: ConstantSpans = Vec::with_capacity(count as usize);
+    };
+    let mut constants: ConstantSpans = Vec::with_capacity(capacity);
     for _ in 0..count {
         let start = *at;
         let family = validate_constant(bytes, at)?;
@@ -548,9 +576,15 @@ fn validate_constants(bytes: &[u8], at: &mut usize) -> Result<ConstantSpans, Pre
     Ok(constants)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: each `*at += 1` follows `bytes.get(*at)` returning a byte, so the sum is at \
+              most `bytes.len()`"
+)]
 fn validate_constant(bytes: &[u8], at: &mut usize) -> Result<ConstFamily, PredicateError> {
-    let Some(&tag) = bytes.get(*at) else {
-        return verr(PredicateErrorKind::Truncated, *at);
+    let tag_at = *at;
+    let Some(&tag) = bytes.get(tag_at) else {
+        return verr(PredicateErrorKind::Truncated, tag_at);
     };
     *at += 1;
     match tag {
@@ -594,7 +628,7 @@ fn validate_constant(bytes: &[u8], at: &mut usize) -> Result<ConstFamily, Predic
             *at = end;
             Ok(ConstFamily::Utf8)
         }
-        _ => verr(PredicateErrorKind::BadConstant, *at - 1),
+        _ => verr(PredicateErrorKind::BadConstant, tag_at),
     }
 }
 
@@ -621,6 +655,11 @@ impl ExprCheck<'_> {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*next_new += 1` runs only when `*next_new == id < pool_len`, so the sum \
+              is at most `pool_len`"
+)]
 fn read_pool_ref(
     bytes: &[u8],
     at: &mut usize,
@@ -629,10 +668,9 @@ fn read_pool_ref(
 ) -> Result<usize, PredicateError> {
     let offset = *at;
     let id = read_varint_at(bytes, at)?;
-    if id >= pool_len as u64 {
+    let Some(id) = usize::try_from(id).ok().filter(|&id| id < pool_len) else {
         return verr(PredicateErrorKind::BadPoolRef, offset);
-    }
-    let id = id as usize;
+    };
     if id > *next_new {
         return verr(PredicateErrorKind::NotCanonical, offset);
     }
@@ -642,6 +680,13 @@ fn read_pool_ref(
     Ok(id)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `ops` is refused past OPS_MAX on the line after its increment; each \
+              `at += 1` follows `bytes.get(at)` returning a byte; every frame is pushed >= 1 \
+              (1, or an arity checked >= 2) and popped when it reaches 0, so `*top -= 1` \
+              never runs on 0"
+)]
 fn validate_expr(
     bytes: &[u8],
     mut at: usize,
@@ -663,8 +708,9 @@ fn validate_expr(
         if ops > OPS_MAX {
             return verr(PredicateErrorKind::TooManyOps, at);
         }
-        let Some(&opcode) = bytes.get(at) else {
-            return verr(PredicateErrorKind::Truncated, at);
+        let opcode_at = at;
+        let Some(&opcode) = bytes.get(opcode_at) else {
+            return verr(PredicateErrorKind::Truncated, opcode_at);
         };
         at += 1;
         let leaf = match opcode {
@@ -684,7 +730,7 @@ fn validate_expr(
                 false
             }
             _ => {
-                validate_leaf(opcode, &mut at, &mut check)?;
+                validate_leaf(opcode, opcode_at, &mut at, &mut check)?;
                 true
             }
         };
@@ -710,8 +756,14 @@ fn validate_expr(
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*at += 1` follows `bytes.get(*at)` returning a byte, so the sum is at \
+              most `bytes.len()`"
+)]
 fn validate_leaf(
     opcode: u8,
+    opcode_at: usize,
     at: &mut usize,
     check: &mut ExprCheck<'_>,
 ) -> Result<(), PredicateError> {
@@ -755,7 +807,7 @@ fn validate_leaf(
             }
         }
         OP_EXISTS => check.path_ref(at)?,
-        _ => return verr(PredicateErrorKind::BadOpcode, *at - 1),
+        _ => return verr(PredicateErrorKind::BadOpcode, opcode_at),
     }
     Ok(())
 }
@@ -802,6 +854,10 @@ pub(crate) struct InMembers<'a> {
 impl Iterator for InMembers<'_> {
     type Item = u32;
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `left == 0` returned on the line above the decrement"
+    )]
     fn next(&mut self) -> Option<u32> {
         if self.left == 0 {
             return None;
@@ -811,22 +867,40 @@ impl Iterator for InMembers<'_> {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `used` counts bytes `decode_u64` read from `bytes[*at..]`, a slice indexed \
+              on the line above, so `*at + used <= bytes.len()`"
+)]
 fn trusted_varint(bytes: &[u8], at: &mut usize) -> u64 {
     let (value, used) = varint::decode_u64(&bytes[*at..]).expect("validated varint");
     *at += used;
     value
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: a `PredicateProgram` holds validated bytes by type (`encode` or \
+              `from_bytes`), and `read_pool_ref` refused every reference at or past its \
+              pool's count, itself capped at PATHS_MAX / CONSTANTS_MAX (const-asserted below)"
+)]
 fn trusted_ref(bytes: &[u8], at: &mut usize) -> u32 {
     let id = trusted_varint(bytes, at);
     debug_assert!(id < CONSTANTS_MAX.max(PATHS_MAX) as u64, "validated pool reference");
     id as u32
 }
+const _: () = assert!(PATHS_MAX <= u32::MAX as usize, "a path reference fits its u32");
+const _: () = assert!(CONSTANTS_MAX <= u32::MAX as usize, "a constant reference fits its u32");
 
 /// Decode the op at `at` on **validated** bytes; returns it plus the
 /// next op's offset (for IN: past the whole member region). ~2–4
 /// predictable branches per op — the S08 short-circuit skip walk uses
 /// exactly this (skip-by-decode, no stored offsets — ADR-0079 D3).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `at + 1` follows the index of `bytes[at]` and each `next += 1` the index \
+              of `bytes[next]`, so each sum is at most `bytes.len() <= isize::MAX`"
+)]
 pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
     debug_assert!(at < bytes.len(), "validated pc in bounds");
     let opcode = bytes[at];
@@ -872,29 +946,47 @@ pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
 
 pub(crate) fn decode_paths(bytes: &[u8], at: &mut usize) -> Vec<PathProgram> {
     let count = trusted_varint(bytes, at);
-    let mut paths = Vec::with_capacity(count as usize);
+    let mut paths = Vec::with_capacity(pool_capacity(count, PATHS_MAX));
     for _ in 0..count {
-        let len = trusted_varint(bytes, at) as usize;
-        let end = *at + len;
-        paths.push(PathProgram::from_bytes(&bytes[*at..end]).expect("validated path program"));
-        *at = end;
+        let program = trusted_region(bytes, at).and_then(|span| PathProgram::from_bytes(span).ok());
+        paths.push(program.expect("validated path program"));
     }
     paths
 }
 
+/// A pool's capacity hint: its count, never more than the pool's cap.
+fn pool_capacity(count: u64, cap: usize) -> usize {
+    usize::try_from(count).map_or(cap, |count| count.min(cap))
+}
+
+/// The length-prefixed region at `*at`, the cursor moved past it; `None`
+/// when the span leaves `bytes`, which validated bytes never do.
+fn trusted_region<'a>(bytes: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+    let len = trusted_varint(bytes, at);
+    let end = region_end(len, *at, bytes.len())?;
+    let region = bytes.get(*at..end)?;
+    *at = end;
+    Some(region)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: each `*at += 1` follows the index of `bytes[*at]`, and `*at += 8` follows \
+              `split_first_chunk::<8>` of `bytes[*at..]` succeeding, so each sum is at most \
+              `bytes.len()`"
+)]
 pub(crate) fn decode_constants(bytes: &[u8], at: &mut usize) -> Vec<Constant> {
     let count = trusted_varint(bytes, at);
-    let mut constants = Vec::with_capacity(count as usize);
+    let mut constants = Vec::with_capacity(pool_capacity(count, CONSTANTS_MAX));
     for _ in 0..count {
         let tag = bytes[*at];
         *at += 1;
         constants.push(match tag {
             CONST_I64 => Constant::I64(unzigzag(trusted_varint(bytes, at))),
             CONST_F64 => {
-                let end = *at + 8;
-                let bits = u64::from_be_bytes(bytes[*at..end].try_into().expect("8-byte slice"));
-                *at = end;
-                Constant::F64(f64::from_bits(bits))
+                let (word, _) = bytes[*at..].split_first_chunk::<8>().expect("8-byte slice");
+                *at += 8;
+                Constant::F64(f64::from_bits(u64::from_be_bytes(*word)))
             }
             CONST_BOOL => {
                 let b = bytes[*at];
@@ -902,11 +994,8 @@ pub(crate) fn decode_constants(bytes: &[u8], at: &mut usize) -> Vec<Constant> {
                 Constant::Bool(b == 1)
             }
             CONST_UTF8 => {
-                let len = trusted_varint(bytes, at) as usize;
-                let end = *at + len;
-                let s = str::from_utf8(&bytes[*at..end]).expect("validated utf8").to_owned();
-                *at = end;
-                Constant::Utf8(s)
+                let text = trusted_region(bytes, at).and_then(|span| str::from_utf8(span).ok());
+                Constant::Utf8(text.expect("validated utf8").to_owned())
             }
             _ => unreachable!("validated constant tags"),
         });
@@ -1022,18 +1111,18 @@ pub(crate) fn explain(program: &PredicateProgram, indent: usize, out: &mut Strin
             Predicate::And(children) => {
                 out.push_str(&format!("and n={}\n", children.len()));
                 for child in children.into_iter().rev() {
-                    work.push((child, depth + 2));
+                    work.push((child, depth.saturating_add(2)));
                 }
             }
             Predicate::Or(children) => {
                 out.push_str(&format!("or n={}\n", children.len()));
                 for child in children.into_iter().rev() {
-                    work.push((child, depth + 2));
+                    work.push((child, depth.saturating_add(2)));
                 }
             }
             Predicate::Not(inner) => {
                 out.push_str("not\n");
-                work.push((*inner, depth + 2));
+                work.push((*inner, depth.saturating_add(2)));
             }
             Predicate::Cmp { op, path, constant } => {
                 let op = match op {
@@ -1402,6 +1491,71 @@ mod tests {
         assert!(legacy.is_legacy(), "fixture must be legacy-mode");
         let bytes = raw(&[legacy.as_bytes()], &[], &[OP_EXISTS, 0x00]);
         assert_eq!(kind_of(&bytes), PredicateErrorKind::BadPath);
+    }
+
+    /// Pool counts and references are client varints: the cap, one past
+    /// it, 2^32 and `u64::MAX` each refuse typed — none narrows first.
+    #[test]
+    fn pool_counts_and_references_refuse_past_their_bounds() {
+        let program = |paths: u64, constants: u64| {
+            let mut bytes = vec![PROGRAM_VERSION, 0];
+            varint::encode_u64(paths, &mut bytes);
+            if paths == 0 {
+                varint::encode_u64(constants, &mut bytes);
+            }
+            bytes
+        };
+        for count in [PATHS_MAX as u64 + 1, 1 << 32, u64::MAX] {
+            assert_eq!(kind_of(&program(count, 0)), PredicateErrorKind::BadCount, "{count}");
+        }
+        for count in [CONSTANTS_MAX as u64 + 1, 1 << 32, u64::MAX] {
+            assert_eq!(kind_of(&program(0, count)), PredicateErrorKind::BadCount, "{count}");
+        }
+        // At the cap the count is admitted; the missing entries are what refuses.
+        assert_eq!(kind_of(&program(PATHS_MAX as u64, 0)), PredicateErrorKind::BadVarint);
+
+        let pa = p("$.a");
+        for id in [1u64, 1 << 32, u64::MAX] {
+            let mut expr = vec![OP_EXISTS];
+            varint::encode_u64(id, &mut expr);
+            let bytes = raw(&[pa.as_bytes()], &[], &expr);
+            assert_eq!(kind_of(&bytes), PredicateErrorKind::BadPoolRef, "{id}");
+        }
+    }
+
+    /// A refusal names the offending byte: the opcode, or the constant's
+    /// tag — not the byte after it.
+    #[test]
+    fn bad_opcode_and_bad_tag_point_at_their_byte() {
+        let pa = p("$.a");
+        let bytes = raw(&[pa.as_bytes()], &[], &[0x7F, 0x00]);
+        let e = PredicateProgram::from_bytes(&bytes).expect_err("rejects");
+        assert_eq!((e.kind, e.offset), (PredicateErrorKind::BadOpcode, bytes.len() - 2));
+
+        let bytes = raw(&[], &[vec![0x05]], &[]);
+        let e = PredicateProgram::from_bytes(&bytes).expect_err("rejects");
+        assert_eq!((e.kind, e.offset), (PredicateErrorKind::BadConstant, bytes.len() - 1));
+    }
+
+    #[test]
+    fn zigzag_round_trips_at_the_integer_edges() {
+        for (v, word) in
+            [(0i64, 0u64), (-1, 1), (1, 2), (i64::MAX, u64::MAX - 1), (i64::MIN, u64::MAX)]
+        {
+            assert_eq!(zigzag(v), word, "{v}");
+            assert_eq!(unzigzag(word), v, "{word}");
+        }
+    }
+
+    /// The encoder's arity and member counts at their caps survive the
+    /// trusted decode (the `u8` fields are exact, not truncated).
+    #[test]
+    fn arity_and_member_caps_round_trip() {
+        let wide = Predicate::And(vec![exists("$.a"); BOOL_ARITY_MAX]);
+        assert_eq!(encode(&wide).expect("at the cap").decode(), wide);
+        let members: Vec<Constant> = (0..IN_MEMBERS_MAX as i64).map(Constant::I64).collect();
+        let full = Predicate::In { path: p("$.a"), members };
+        assert_eq!(encode(&full).expect("at the cap").decode(), full);
     }
 
     // -- Encoder rejections (compiler-side bounds) ---------------------

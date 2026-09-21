@@ -10,6 +10,16 @@
 //! miss that recompiles — resolution stays a pure function of
 //! (statement text, catalog) instead of drifting with cache residency
 //! (L7). Rejections are not cached (client errors; the M3 rule).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::rc::Rc;
 
@@ -18,6 +28,9 @@ use super::{
 };
 
 const NIL: u32 = u32::MAX;
+
+/// The entry cap's ceiling: every slot index stays below [`NIL`].
+const ENTRIES_MAX: u32 = NIL - 1;
 
 /// Nominal per-entry byte share: budget = `capacity ×` this. The
 /// statement cap is the honest share — typical statements (tens of
@@ -28,6 +41,11 @@ const ENTRY_SHARE_BYTES: usize = STATEMENT_BYTES_CEILING;
 /// The per-cell entry-cap default (the M3-S10 value; node assembly
 /// re-sizes it).
 pub const STATEMENT_CACHE_DEFAULT_ENTRIES: usize = 1024;
+
+const _: () = assert!(
+    (ENTRIES_MAX as usize).checked_mul(ENTRY_SHARE_BYTES).is_some(),
+    "the byte budget of a full-size cache fits usize"
+);
 
 struct Entry {
     hash: u64,
@@ -45,8 +63,17 @@ impl Entry {
     /// serialized program (the dominant owned allocations; the decoded
     /// `Access`/VM views are proportional to it).
     fn heap_bytes(&self) -> usize {
-        self.key.len() + self.compiled.program.as_bytes().len()
+        heap_bytes_of(&self.key, &self.compiled)
     }
+}
+
+/// An entry's heap bytes, for one not yet built: key text + program.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: two slice lengths, each <= isize::MAX, sum to at most usize::MAX"
+)]
+fn heap_bytes_of(text: &[u8], compiled: &CompiledStatement) -> usize {
+    text.len() + compiled.program.as_bytes().len()
 }
 
 /// Bounded LRU of compiled statements, keyed by raw statement text.
@@ -73,8 +100,14 @@ impl Default for StatementCache {
 impl StatementCache {
     /// `capacity` in entries; 0 disables caching (every lookup
     /// compiles).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `capacity <= ENTRIES_MAX < 2^32`, so `* 2` is below 2^33 on the 64-bit \
+                  usize inf-foundation const-asserts, and `ENTRIES_MAX * ENTRY_SHARE_BYTES` is \
+                  const-asserted above to fit"
+    )]
     pub fn new(capacity: usize) -> StatementCache {
-        let capacity = capacity.min(NIL as usize - 1) as u32;
+        let capacity = u32::try_from(capacity).map_or(ENTRIES_MAX, |c| c.min(ENTRIES_MAX));
         let bucket_count = (capacity as usize * 2).next_power_of_two().max(1);
         StatementCache {
             buckets: vec![NIL; if capacity == 0 { 1 } else { bucket_count }].into_boxed_slice(),
@@ -105,22 +138,22 @@ impl StatementCache {
     ) -> Result<Rc<CompiledStatement>, QlError> {
         let epoch = catalog.catalog_epoch();
         if self.capacity == 0 {
-            self.misses += 1;
+            self.misses = self.misses.saturating_add(1);
             return Ok(Rc::new(compile_with_max_bytes(text, catalog, max_bytes)?));
         }
         let hash = fnv1a(text);
         if let Some(slot) = self.find(hash, text) {
             if self.slab[slot as usize].epoch == epoch {
-                self.hits += 1;
+                self.hits = self.hits.saturating_add(1);
                 self.touch(slot);
                 return Ok(Rc::clone(&self.slab[slot as usize].compiled));
             }
-            self.invalidations += 1;
+            self.invalidations = self.invalidations.saturating_add(1);
             self.remove(slot);
         }
-        self.misses += 1;
+        self.misses = self.misses.saturating_add(1);
         let compiled = Rc::new(compile_with_max_bytes(text, catalog, max_bytes)?);
-        let entry_heap = text.len() + compiled.program.as_bytes().len();
+        let entry_heap = heap_bytes_of(text, &compiled);
         if entry_heap <= self.budget_bytes {
             self.insert(hash, text, Rc::clone(&compiled), epoch, entry_heap);
         }
@@ -128,10 +161,11 @@ impl StatementCache {
     }
 
     /// Exact resident bytes: slab slots + entry heap + bucket table.
+    /// A gauge: it saturates rather than wrap.
     pub fn bytes(&self) -> usize {
-        self.slab.capacity() * size_of::<Entry>()
-            + self.entry_bytes
-            + self.buckets.len() * size_of::<u32>()
+        let slab_bytes = self.slab.capacity().saturating_mul(size_of::<Entry>());
+        let bucket_bytes = self.buckets.len().saturating_mul(size_of::<u32>());
+        slab_bytes.saturating_add(self.entry_bytes).saturating_add(bucket_bytes)
     }
 
     pub fn len(&self) -> usize {
@@ -162,6 +196,13 @@ impl StatementCache {
 
     // ---- internals (the M3-S10 slab/LRU mechanics) ----
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: `new` builds `buckets` with a power-of-two length >= 1 and nothing \
+                  resizes it, so `len - 1` cannot underflow; the masked hash is below that \
+                  length, itself a usize"
+    )]
     fn bucket_of(&self, hash: u64) -> usize {
         (hash & (self.buckets.len() as u64 - 1)) as usize
     }
@@ -189,41 +230,48 @@ impl StatementCache {
     /// Drop `slot` entirely (epoch invalidation, eviction): swap-remove
     /// keeps the slab dense, so the displaced tail entry's links
     /// re-target.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `entry_bytes` is the sum of `heap_bytes()` over resident entries — \
+                  `insert` adds exactly that for the entry it pushes, and this is the only \
+                  subtraction — so it is at least this resident entry's share"
+    )]
     fn remove(&mut self, slot: u32) {
         self.unlink_lru(slot);
         self.unlink_chain(slot);
         self.entry_bytes -= self.slab[slot as usize].heap_bytes();
-        let last = (self.slab.len() - 1) as u32;
         self.slab.swap_remove(slot as usize);
-        if slot != last {
-            self.retarget(last, slot);
+        // The former tail now sits at `slot`; its old index is the new length.
+        let moved_from = self.slab.len();
+        if slot as usize != moved_from {
+            self.retarget(moved_from, slot);
         }
     }
 
-    /// Every link that pointed at `from` now points at `to` (the
-    /// swap-remove fixup).
-    fn retarget(&mut self, from: u32, to: u32) {
+    /// Every link that pointed at slab index `from` now points at `to`
+    /// (the swap-remove fixup).
+    fn retarget(&mut self, from: usize, to: u32) {
         let (hash, prev, next) = {
             let e = &self.slab[to as usize];
             (e.hash, e.prev, e.next)
         };
         if prev != NIL {
             self.slab[prev as usize].next = to;
-        } else if self.lru_head == from {
+        } else if self.lru_head as usize == from {
             self.lru_head = to;
         }
         if next != NIL {
             self.slab[next as usize].prev = to;
-        } else if self.lru_tail == from {
+        } else if self.lru_tail as usize == from {
             self.lru_tail = to;
         }
         let bucket = self.bucket_of(hash);
-        if self.buckets[bucket] == from {
+        if self.buckets[bucket] as usize == from {
             self.buckets[bucket] = to;
         } else {
             let mut cursor = self.buckets[bucket];
             while cursor != NIL {
-                if self.slab[cursor as usize].chain == from {
+                if self.slab[cursor as usize].chain as usize == from {
                     self.slab[cursor as usize].chain = to;
                     break;
                 }
@@ -268,6 +316,12 @@ impl StatementCache {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: the eviction loop exits only once `entry_bytes + entry_heap` was \
+                  computed checked and found <= budget_bytes, or the slab is empty, where \
+                  `entry_bytes` (the residents' sum) is 0"
+    )]
     fn insert(
         &mut self,
         hash: u64,
@@ -279,14 +333,18 @@ impl StatementCache {
         debug_assert!(entry_heap <= self.budget_bytes, "oversize entries stay uncached");
         // Every victim leaves the slab (F-L09-01): unlinking alone kept
         // the slot resident — unreachable, uncounted, with stale links.
-        while self.slab.len() as u32 >= self.capacity
-            || (self.entry_bytes + entry_heap > self.budget_bytes && !self.slab.is_empty())
+        while self.slab.len() >= self.capacity as usize
+            || (self.over_budget_with(entry_heap) && !self.slab.is_empty())
         {
             let victim = self.lru_tail;
             debug_assert_ne!(victim, NIL, "eviction requires a resident entry");
             self.remove(victim);
-            self.evictions += 1;
+            self.evictions = self.evictions.saturating_add(1);
         }
+        // A slot is a u32 below NIL; the entry cap keeps every index there.
+        let Ok(slot) = u32::try_from(self.slab.len()) else {
+            return;
+        };
         self.slab.push(Entry {
             hash,
             key: text.into(),
@@ -296,12 +354,16 @@ impl StatementCache {
             prev: NIL,
             next: NIL,
         });
-        let slot = (self.slab.len() - 1) as u32;
         self.entry_bytes += entry_heap;
         let bucket = self.bucket_of(hash);
         self.slab[slot as usize].chain = self.buckets[bucket];
         self.buckets[bucket] = slot;
         self.link_front(slot);
+    }
+
+    /// Would admitting `entry_heap` more bytes pass the budget?
+    fn over_budget_with(&self, entry_heap: usize) -> bool {
+        self.entry_bytes.checked_add(entry_heap).is_none_or(|total| total > self.budget_bytes)
     }
 
     fn unlink_chain(&mut self, slot: u32) {

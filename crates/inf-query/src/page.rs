@@ -16,7 +16,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use inf_store::{IndexKeyType, IndexTree, OrderedCursor, PkRef};
@@ -128,8 +133,12 @@ impl RangePager {
     /// when the page ends (budget, range end, or LIMIT). The caller
     /// resolves the ref, applies the residual, and reports a match via
     /// [`RangePager::count_match`].
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: the guard at the top returned unless `scanned < scan_budget <= u32::MAX`"
+    )]
     pub fn next(&mut self, tree: &IndexTree) -> Option<(&[u8], PkRef)> {
-        if self.done || self.scanned == self.scan_budget || self.limit_remaining == Some(0) {
+        if self.done || self.scanned >= self.scan_budget || self.limit_remaining == Some(0) {
             return None;
         }
         let Some((key, entry_ref)) = tree.cursor_next(&mut self.cursor) else {
@@ -149,12 +158,21 @@ impl RangePager {
 
     /// The last candidate satisfied the statement (residual verdict
     /// true, document present) — counts toward the page's result and
-    /// the statement LIMIT.
+    /// the statement LIMIT. A page reports at most one match per
+    /// candidate it scanned, so a report beyond that count is dropped:
+    /// `matched <= scanned` holds for every caller.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: the guard at the top returned unless `matched < scanned <= u32::MAX`"
+    )]
     pub fn count_match(&mut self) {
+        if self.matched >= self.scanned {
+            return;
+        }
         self.matched += 1;
         if let Some(remaining) = &mut self.limit_remaining {
-            debug_assert!(*remaining >= 1, "matches beyond LIMIT are a caller bug");
-            *remaining -= 1;
+            // Saturation ends the walk: at 0 the page is done.
+            *remaining = remaining.saturating_sub(1);
             if *remaining == 0 {
                 self.done = true;
             }

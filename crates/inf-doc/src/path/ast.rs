@@ -6,7 +6,15 @@
 //! diagnostics, and the S15 matrix. Grammar authority:
 //! `infinitydb/docs/jsonpath-subset.md`.
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
-#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 /// One parsed path: mode + segments (root is implicit — the encoder
 /// emits `Root` as the first op).
@@ -166,14 +174,15 @@ fn print_quoted(out: &mut String, name: &[u8]) {
         match ch {
             '\\' => out.push_str("\\\\"),
             '\'' => out.push_str("\\'"),
-            c if (c as u32) < 0x20 => {
-                let b = c as u32 as u8;
-                let hex = b"0123456789abcdef";
-                out.push_str("\\u00");
-                out.push(hex[(b >> 4) as usize] as char);
-                out.push(hex[(b & 0xF) as usize] as char);
-            }
-            c => out.push(c),
+            c => match u8::try_from(c) {
+                Ok(b) if b < 0x20 => {
+                    let hex = b"0123456789abcdef";
+                    out.push_str("\\u00");
+                    out.push(hex[(b >> 4) as usize] as char);
+                    out.push(hex[(b & 0xF) as usize] as char);
+                }
+                Ok(_) | Err(_) => out.push(c),
+            },
         }
     }
     out.push('\'');

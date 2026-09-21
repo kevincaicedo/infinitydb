@@ -33,6 +33,16 @@
 //!
 //! Errors carry byte offsets (`unexpected character at offset N` family);
 //! the wire layer maps them to RESP phrasing at S11 against the oracle.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 
@@ -142,13 +152,30 @@ fn err<T>(offset: usize, kind: JsonErrorKind) -> Result<T, JsonParseError> {
 /// observe exactly how much memory the refused parse held (S07).
 struct Tape<'o> {
     out: &'o mut Vec<u8>,
-    max_body: usize,
+    /// Header + body cap: the longest `out` a parse may produce.
+    max_len: usize,
 }
 
-impl Tape<'_> {
+impl<'o> Tape<'o> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: the body cap is clamped to the DOC_BYTES_MAX const (2^24 - 1) on this \
+                  line, so adding the 8-byte header fits usize"
+    )]
+    fn new(out: &'o mut Vec<u8>, max_body: usize) -> Tape<'o> {
+        Tape { out, max_len: max_body.min(DOC_BYTES_MAX) + header::HEADER_LEN }
+    }
+
+    /// An `extra` whose sum is unrepresentable cannot fit: refused, never wrapped.
     #[inline]
     fn fits(&self, extra: usize) -> bool {
-        self.out.len() - header::HEADER_LEN + extra <= self.max_body
+        self.out.len().checked_add(extra).is_some_and(|len| len <= self.max_len)
+    }
+
+    /// The finished body's length as the header's `u32`; `None` past it.
+    fn body_len(&self) -> Option<u32> {
+        let body_len = self.out.len().checked_sub(header::HEADER_LEN)?;
+        u32::try_from(body_len).ok()
     }
 }
 
@@ -170,7 +197,7 @@ struct ObjEntry {
 struct ObjFrame {
     entries: Vec<ObjEntry>,
     /// Output offset where this object's body begins.
-    body_start: u32,
+    body_start: usize,
     dup_found: bool,
     /// 64-bit key-fingerprint filter: one bit per key hash
     /// ([`key_fingerprint`]). A clear bit at insert proves the key is new,
@@ -186,7 +213,7 @@ struct ObjFrame {
 }
 
 impl ObjFrame {
-    fn reset(&mut self, body_start: u32) {
+    fn reset(&mut self, body_start: usize) {
         self.entries.clear();
         self.body_start = body_start;
         self.dup_found = false;
@@ -205,15 +232,21 @@ impl ObjFrame {
 #[inline]
 fn key_fingerprint(key: &[u8]) -> u64 {
     let (first, last) = match key {
-        [] => (0u32, 0u32),
-        [b] => (u32::from(*b), u32::from(*b)),
-        [first, .., last] => (u32::from(*first), u32::from(*last)),
+        [] => (0u64, 0u64),
+        [b] => (u64::from(*b), u64::from(*b)),
+        [first, .., last] => (u64::from(*first), u64::from(*last)),
     };
-    let h = (key.len() as u32)
+    // Only the low six bits are read, so the mix runs at the length's width.
+    let h = (key.len() as u64)
         .wrapping_mul(131)
         .wrapping_add(first.wrapping_mul(31))
         .wrapping_add(last.wrapping_mul(7));
     1u64 << (h & 63)
+}
+
+/// Bytes a `Vec`'s capacity holds (scratch attribution).
+fn vec_bytes<T>(v: &Vec<T>) -> usize {
+    v.capacity().saturating_mul(size_of::<T>())
 }
 
 /// What the grammar machine expects next. `:` and `,` never appear here:
@@ -231,6 +264,14 @@ enum Expect {
 /// offset (≤ header + 16 MiB cap < 2³¹, by the format ceiling).
 const OBJ_BIT: u32 = 1 << 31;
 const LEN_AT_MASK: u32 = OBJ_BIT - 1;
+
+/// The frame word of a container whose placeholder sits at `len_at`;
+/// `None` when the offset does not fit the word's 31 bits.
+#[inline]
+fn frame_word(len_at: usize, kind_bit: u32) -> Option<u32> {
+    let len_at = u32::try_from(len_at).ok()?;
+    (len_at & OBJ_BIT == 0).then_some(len_at | kind_bit)
+}
 
 /// Ingest limits (M3-S07): the per-namespace configuration surface.
 /// Every field is clamped to its format ceiling at parser construction —
@@ -307,18 +348,20 @@ impl TokenSource for inf_simd::JsonTokenCursor<'_> {
 /// Batch-index adapter: feeds a pre-materialized structural index through
 /// the [`TokenSource`] interface.
 struct IndexTokens<'a> {
-    indices: &'a [u32],
-    cursor: usize,
+    /// The tokens not yet consumed.
+    rest: &'a [u32],
 }
 
 impl TokenSource for IndexTokens<'_> {
     #[inline]
     fn peek(&mut self) -> Option<u32> {
-        self.indices.get(self.cursor).copied()
+        self.rest.first().copied()
     }
     #[inline]
     fn bump(&mut self) {
-        self.cursor += 1;
+        if let Some((_, rest)) = self.rest.split_first() {
+            self.rest = rest;
+        }
     }
 }
 
@@ -374,18 +417,19 @@ impl JsonParser {
     /// rejections keep it bounded by the text cap, never by the would-be
     /// document.
     pub fn scratch_bytes(&self) -> usize {
-        self.blocks.capacity() * size_of::<inf_simd::BlockMasks>()
-            + self.indices.capacity() * size_of::<u32>()
-            + self.frames.capacity() * size_of::<u32>()
-            + self.unescape.capacity()
-            + self.rebuild.capacity()
-            + self.obj_frames.capacity() * size_of::<ObjFrame>()
-            + self
-                .obj_frames
-                .iter()
-                .map(|f| f.entries.capacity() * size_of::<ObjEntry>())
-                .sum::<usize>()
-            + (self.dup_order.capacity() + self.dup_target.capacity()) * size_of::<u32>()
+        // An attribution metric: it saturates rather than wraps.
+        let fixed = [
+            vec_bytes(&self.blocks),
+            vec_bytes(&self.indices),
+            vec_bytes(&self.frames),
+            vec_bytes(&self.unescape),
+            vec_bytes(&self.rebuild),
+            vec_bytes(&self.obj_frames),
+            vec_bytes(&self.dup_order),
+            vec_bytes(&self.dup_target),
+        ];
+        let entries = self.obj_frames.iter().map(|f| vec_bytes(&f.entries));
+        fixed.into_iter().chain(entries).fold(0, usize::saturating_add)
     }
 
     /// After a parse: the per-object scratch keeps at most
@@ -467,7 +511,7 @@ impl JsonParser {
         let indices = core::mem::take(&mut self.indices);
         let mut frames = core::mem::take(&mut self.frames);
         let mut out = Vec::new();
-        let mut tokens = IndexTokens { indices: &indices[..n], cursor: 0 };
+        let mut tokens = IndexTokens { rest: &indices[..n] };
         let result = self.parse_tokens(input, &mut tokens, &mut frames, &mut out);
         self.indices = indices;
         self.frames = frames;
@@ -488,7 +532,7 @@ impl JsonParser {
         let capacity = input.len().min(self.limits.max_body).saturating_add(16);
         out.clear();
         out.reserve(capacity);
-        let mut tape = Tape { out, max_body: self.limits.max_body };
+        let mut tape = Tape::new(out, self.limits.max_body);
         tape.out.resize(header::HEADER_LEN, 0);
         frames.clear();
         let mut live_obj_frames = 0usize;
@@ -536,8 +580,11 @@ impl JsonParser {
                         if !tape.fits(emit::CONTAINER_OPEN_LEN) {
                             return err($at, JsonErrorKind::DocumentTooLarge);
                         }
-                        let len_at = emit::begin(tape.out, TAG_OBJ) as u32;
-                        frames.push(len_at | OBJ_BIT);
+                        let len_at = emit::begin(tape.out, TAG_OBJ);
+                        let Some(word) = frame_word(len_at, OBJ_BIT) else {
+                            return err($at, JsonErrorKind::DocumentTooLarge);
+                        };
+                        frames.push(word);
                         self.open_obj_frame(&mut live_obj_frames, tape.out.len());
                         expect = Expect::KeyOrObjClose;
                         tokens.bump();
@@ -550,8 +597,11 @@ impl JsonParser {
                         if !tape.fits(emit::CONTAINER_OPEN_LEN) {
                             return err($at, JsonErrorKind::DocumentTooLarge);
                         }
-                        let len_at = emit::begin(tape.out, TAG_ARR) as u32;
-                        frames.push(len_at);
+                        let len_at = emit::begin(tape.out, TAG_ARR);
+                        let Some(word) = frame_word(len_at, 0) else {
+                            return err($at, JsonErrorKind::DocumentTooLarge);
+                        };
+                        frames.push(word);
                         expect = Expect::ValueOrArrClose;
                         tokens.bump();
                         continue $grammar;
@@ -626,7 +676,7 @@ impl JsonParser {
                     if c == b'}' && expect == Expect::KeyOrObjClose {
                         // Empty object.
                         let frame = frames.pop().expect("KeyOrObjClose implies an open object");
-                        self.close_obj_frame(&mut live_obj_frames, &mut tape);
+                        self.close_obj_frame(&mut live_obj_frames, &mut tape, at)?;
                         emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
                         tokens.bump();
                     } else {
@@ -641,7 +691,9 @@ impl JsonParser {
                             let close = string_close!(at);
                             let entry_at = tape.out.len();
                             let key_len = self.emit_string(&mut tape, input, at, close)?;
-                            self.note_key(live_obj_frames, tape.out, entry_at, key_len);
+                            if !self.note_key(live_obj_frames, tape.out, entry_at, key_len) {
+                                return err(at, JsonErrorKind::DocumentTooLarge);
+                            }
                             tokens.bump();
                             fetch!(at, c);
                             if c != b':' {
@@ -658,7 +710,7 @@ impl JsonParser {
                             }
                             if c == b'}' {
                                 let frame = frames.pop().expect("entry loop owns an open object");
-                                self.close_obj_frame(&mut live_obj_frames, &mut tape);
+                                self.close_obj_frame(&mut live_obj_frames, &mut tape, at)?;
                                 emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
                                 tokens.bump();
                                 break;
@@ -678,7 +730,9 @@ impl JsonParser {
                         return err(trailing as usize, JsonErrorKind::TrailingCharacters);
                     }
                     debug_assert_eq!(live_obj_frames, 0);
-                    let body_len = (tape.out.len() - header::HEADER_LEN) as u32;
+                    let Some(body_len) = tape.body_len() else {
+                        return err(input.len(), JsonErrorKind::DocumentTooLarge);
+                    };
                     header::patch(tape.out, 0, body_len);
                     return Ok(());
                 };
@@ -697,7 +751,7 @@ impl JsonParser {
                     frames.pop();
                     // Splice before backpatch: a duplicate-key rebuild can
                     // shrink the body the u24 must describe.
-                    self.close_obj_frame(&mut live_obj_frames, &mut tape);
+                    self.close_obj_frame(&mut live_obj_frames, &mut tape, at)?;
                     emit::end(tape.out, (frame & LEN_AT_MASK) as usize);
                     tokens.bump();
                     continue;
@@ -716,6 +770,10 @@ impl JsonParser {
     /// Decode the string opening at `at` (content up to `close`) and emit
     /// it onto the tape; returns the decoded byte length (key spans).
     #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `close <= at` returns above the difference, so at + 1 <= close"
+    )]
     fn emit_string(
         &mut self,
         tape: &mut Tape<'_>,
@@ -727,6 +785,10 @@ impl JsonParser {
         // so scan and copy fuse into one word pass (the scan's loads feed
         // the stores). Any special byte, missing word slack, or cap miss
         // falls through — the general path owns escapes and typed errors.
+        if close <= at {
+            // Stage 1 orders its tokens; a close at or before its open is refused.
+            return err(at, JsonErrorKind::UnterminatedString);
+        }
         let len = close - (at + 1);
         if len <= FIXSTR_MAX_LEN && try_fixstr_fast(tape, input, at, len) {
             return Ok(len);
@@ -735,19 +797,25 @@ impl JsonParser {
         // and growing it past the fixstr try regressed the string-light
         // shapes (deep/wide) through sheer code size — the general path
         // costs a call it amortizes over ≥ 32-byte payloads.
-        self.emit_string_general(tape, input, at, close, len)
+        self.emit_string_general(tape, input, at, close)
     }
 
     #[inline(never)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: input[at..close][1..] is sliced first, so at < close <= input.len() <= \
+                  isize::MAX; every len is a slice or Vec length (<= isize::MAX) and a string \
+                  header is at most 4 bytes"
+    )]
     fn emit_string_general(
         &mut self,
         tape: &mut Tape<'_>,
         input: &[u8],
         at: usize,
         close: usize,
-        len: usize,
     ) -> Result<usize, JsonParseError> {
-        let content = &input[at + 1..close];
+        let content = &input[at..close][1..];
+        let len = content.len();
         // Fused general path (ADR-0047 K1): one `inf-simd` pass scans for
         // specials while copying, replacing the separate `find_special` +
         // `append_from_input` passes on escape-free content. A special
@@ -788,28 +856,48 @@ impl JsonParser {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: obj_frames[*live] is indexed on the line above the increment, so \
+                  *live < obj_frames.len() <= isize::MAX"
+    )]
     fn open_obj_frame(&mut self, live: &mut usize, body_start: usize) {
         if *live == self.obj_frames.len() {
             self.obj_frames.push(ObjFrame::default());
         }
-        self.obj_frames[*live].reset(body_start as u32);
+        self.obj_frames[*live].reset(body_start);
         *live += 1;
     }
 
     /// Record an emitted key; small objects detect duplicates on insert
     /// (fingerprint filter, then memcmp on the recorded spans), large
-    /// ones defer to the close-time sort.
+    /// ones defer to the close-time sort. `false` when an offset does not
+    /// fit the entry's `u32` — the document is past its cap.
     #[inline]
-    fn note_key(&mut self, live: usize, out: &[u8], entry_at: usize, key_len: usize) {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `ka` widens a u32 and key_len <= u16::MAX is the guard of the branch \
+                  that adds them, so the sum fits the 64-bit usize inf-foundation const-asserts"
+    )]
+    fn note_key(&mut self, live: usize, out: &[u8], entry_at: usize, key_len: usize) -> bool {
         // The key bytes sit right after their canonical string header.
-        let key_at = (entry_at + emit::str_header_len(key_len)) as u32;
-        let key_len16 = key_len.min(u16::MAX as usize) as u16;
-        let frame = &mut self.obj_frames[live - 1];
+        let Some(key_at) = entry_at.checked_add(emit::str_header_len(key_len)) else {
+            return false;
+        };
+        let (Ok(entry_at32), Ok(key_at32)) = (u32::try_from(entry_at), u32::try_from(key_at))
+        else {
+            return false;
+        };
+        let key_len16 = u16::try_from(key_len).unwrap_or(u16::MAX);
+        let Some(frame) = live.checked_sub(1).and_then(|top| self.obj_frames.get_mut(top)) else {
+            debug_assert!(false, "a key is noted inside an open object");
+            return true;
+        };
         if !frame.dup_found
             && frame.entries.len() <= LINEAR_SCAN_MAX
             && key_len <= u16::MAX as usize
         {
-            let key = &out[key_at as usize..key_at as usize + key_len];
+            let key = &out[key_at..][..key_len];
             // Fingerprint filter first: a clear bit proves no prior entry
             // has this key, so the scan is skipped outright (equal keys
             // always collide in the filter; see `key_fingerprint`).
@@ -835,7 +923,8 @@ impl JsonParser {
             // Keys longer than 64 KiB fall back to close-time detection.
             frame.dup_found = true;
         }
-        frame.entries.push(ObjEntry { entry_at: entry_at as u32, key_at, key_len: key_len16 });
+        frame.entries.push(ObjEntry { entry_at: entry_at32, key_at: key_at32, key_len: key_len16 });
+        true
     }
 
     /// Close the innermost object: if duplicates exist (or the object was
@@ -843,16 +932,30 @@ impl JsonParser {
     /// last-occurrence-wins / first-position-kept semantics and splice it
     /// over the original (ADR-0036 D5). Cold path: it runs only for
     /// objects that contained duplicates or exceeded the linear-scan cap.
-    fn close_obj_frame(&mut self, live: &mut usize, tape: &mut Tape<'_>) {
-        *live -= 1;
-        let frame = &mut self.obj_frames[*live];
+    /// `at` is the closing token's offset, for the typed refusal.
+    fn close_obj_frame(
+        &mut self,
+        live: &mut usize,
+        tape: &mut Tape<'_>,
+        at: usize,
+    ) -> Result<(), JsonParseError> {
+        let Some(top) = live.checked_sub(1) else {
+            debug_assert!(false, "an object close pairs with its open");
+            return Ok(());
+        };
+        *live = top;
+        let frame = &mut self.obj_frames[top];
         let must_scan = frame.entries.len() > LINEAR_SCAN_MAX;
         if !frame.dup_found && !must_scan {
-            return;
+            return Ok(());
         }
-        let body_start = frame.body_start as usize;
+        let body_start = frame.body_start;
         let body_end = tape.out.len();
         let entries = &frame.entries;
+        // Entry ids are u32 (the pooled scan vectors' width).
+        let Ok(entry_count) = u32::try_from(entries.len()) else {
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        };
         // Sort entry ids by key bytes (O(k log k) memcmp compares), then
         // group equal runs: first occurrence keeps the position, last
         // occurrence supplies the entry bytes.
@@ -861,53 +964,32 @@ impl JsonParser {
                 // Possibly-truncated span: decode the full key from its tag.
                 key_bytes_at(tape.out, e.entry_at as usize)
             } else {
-                &tape.out[e.key_at as usize..(e.key_at + u32::from(e.key_len)) as usize]
+                &tape.out[e.key_at as usize..][..usize::from(e.key_len)]
             }
         };
         let by_key = &mut self.dup_order;
         by_key.clear();
-        by_key.extend(0..entries.len() as u32);
+        by_key.extend(0..entry_count);
         by_key.sort_unstable_by(|&a, &b_idx| {
             key_of(&entries[a as usize]).cmp(key_of(&entries[b_idx as usize]))
         });
-        // replace_with[idx]: idx (emit own span), the last dup's idx (emit
-        // that span at this position), or SKIP.
-        const SKIP: u32 = u32::MAX;
         let replace_with = &mut self.dup_target;
         replace_with.clear();
-        replace_with.extend(0..entries.len() as u32);
-        let mut any_dup = false;
-        let mut run = 0usize;
-        while run < by_key.len() {
-            let key = key_of(&entries[by_key[run] as usize]);
-            let mut end = run + 1;
-            while end < by_key.len() && key_of(&entries[by_key[end] as usize]) == key {
-                end += 1;
-            }
-            if end - run > 1 {
-                any_dup = true;
-                let first = by_key[run..end].iter().copied().min().expect("non-empty run");
-                let last = by_key[run..end].iter().copied().max().expect("non-empty run");
-                for &idx in &by_key[run..end] {
-                    replace_with[idx as usize] = if idx == first { last } else { SKIP };
-                }
-            }
-            run = end;
+        replace_with.extend(0..entry_count);
+        let same_key =
+            |a: u32, b: u32| key_of(&entries[a as usize]) == key_of(&entries[b as usize]);
+        if !mark_duplicate_runs(by_key, replace_with, same_key) {
+            return Ok(());
         }
-        if !any_dup {
-            return;
-        }
-        let entry_end = |idx: usize| -> usize {
-            entries.get(idx + 1).map_or(body_end, |e| e.entry_at as usize)
-        };
         self.rebuild.clear();
         for &target in replace_with.iter() {
             if target == SKIP {
                 continue;
             }
             let target = target as usize;
-            let span = entries[target].entry_at as usize..entry_end(target);
-            self.rebuild.extend_from_slice(&tape.out[span]);
+            let begin = entries[target].entry_at as usize;
+            let end = entries[target..].get(1).map_or(body_end, |e| e.entry_at as usize);
+            self.rebuild.extend_from_slice(&tape.out[begin..end]);
         }
         // Splice the rebuilt body over the original. Every open
         // placeholder (this object's and its ancestors') precedes
@@ -916,38 +998,82 @@ impl JsonParser {
         debug_assert_eq!(body_end, tape.out.len());
         tape.out.truncate(body_start);
         tape.out.extend_from_slice(&self.rebuild);
+        Ok(())
     }
+}
+
+/// `replace_with[idx]` for an entry the rebuild drops (an earlier
+/// occurrence of a duplicated key that is not the first).
+const SKIP: u32 = u32::MAX;
+
+/// Group `by_key` (entry ids sorted by key) into equal-key runs and mark
+/// each run of two or more in `replace_with`: the first occurrence takes
+/// the last one's id (emit that span at this position), the others
+/// [`SKIP`]. Returns whether any run had a duplicate.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `run + 1` and `end += 1` sit under their loops' `< by_key.len()` guards \
+              (<= isize::MAX), and end >= run + 1 where the difference is taken"
+)]
+fn mark_duplicate_runs(
+    by_key: &[u32],
+    replace_with: &mut [u32],
+    same_key: impl Fn(u32, u32) -> bool,
+) -> bool {
+    let mut any_dup = false;
+    let mut run = 0usize;
+    while run < by_key.len() {
+        let mut end = run + 1;
+        while end < by_key.len() && same_key(by_key[run], by_key[end]) {
+            end += 1;
+        }
+        if end - run > 1 {
+            any_dup = true;
+            let first = by_key[run..end].iter().copied().min().expect("non-empty run");
+            let last = by_key[run..end].iter().copied().max().expect("non-empty run");
+            for &idx in &by_key[run..end] {
+                replace_with[idx as usize] = if idx == first { last } else { SKIP };
+            }
+        }
+        run = end;
+    }
+    any_dup
 }
 
 /// Decode the key bytes of the entry starting at `at` in the output tape
 /// (the parser wrote it, so the encoding is canonical fixstr/str8/str24).
 fn key_bytes_at(out: &[u8], at: usize) -> &[u8] {
-    let tag = out[at];
+    let entry = &out[at..];
+    let tag = entry[0];
     if (0x80..=0x9F).contains(&tag) {
-        let len = (tag - 0x80) as usize;
-        &out[at + 1..at + 1 + len]
+        // A fixstr tag carries its length in the low five bits.
+        &entry[1..][..usize::from(tag & 0x1F)]
     } else if tag == 0xA5 {
-        let len = out[at + 1] as usize;
-        &out[at + 2..at + 2 + len]
+        &entry[2..][..usize::from(entry[1])]
     } else {
         debug_assert_eq!(tag, 0xA6, "parser keys are canonical string forms");
-        let len = out[at + 1] as usize | (out[at + 2] as usize) << 8 | (out[at + 3] as usize) << 16;
-        &out[at + 4..at + 4 + len]
+        let len = usize::from(entry[1]) | usize::from(entry[2]) << 8 | usize::from(entry[3]) << 16;
+        &entry[4..][..len]
     }
 }
 
 /// `true` / `false` / `null`, with a hard terminator check (`truex` is a
 /// grammar error even though stage 1 emits one token for it).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: input[at..] starts with `text` where the sum is taken, so at + text.len() \
+              <= input.len() <= isize::MAX"
+)]
 fn parse_literal(input: &[u8], at: usize, tape: &mut Tape<'_>) -> Result<(), JsonParseError> {
-    let (text, len): (&[u8], usize) = match input[at] {
-        b't' => (b"true", 4),
-        b'f' => (b"false", 5),
-        _ => (b"null", 4),
+    let text: &[u8] = match input[at] {
+        b't' => b"true",
+        b'f' => b"false",
+        _ => b"null",
     };
-    if input.len() < at + len || &input[at..at + len] != text {
+    if !input[at..].starts_with(text) {
         return err(at, JsonErrorKind::UnexpectedCharacter(input[at]));
     }
-    check_scalar_terminator(input, at + len)?;
+    check_scalar_terminator(input, at + text.len())?;
     if !tape.fits(1) {
         return err(at, JsonErrorKind::DocumentTooLarge);
     }
@@ -971,11 +1097,23 @@ fn check_scalar_terminator(input: &[u8], end: usize) -> Result<(), JsonParseErro
     }
 }
 
-/// Digits-only slice → u64 via 8-digit SWAR chunks (caller guarantees
-/// ASCII digits and length ≤ 19, so no overflow is possible).
-fn parse_digits(bytes: &[u8]) -> u64 {
-    debug_assert!(bytes.len() <= 19);
-    debug_assert!(bytes.iter().all(u8::is_ascii_digit));
+/// The longest digit run [`parse_digits`] accumulates: 10¹⁹ − 1 < 2⁶⁴.
+const DIGITS_U64_MAX: usize = 19;
+
+/// Digits-only slice → u64 via 8-digit SWAR chunks; `None` past
+/// [`DIGITS_U64_MAX`] digits (the caller takes its f64 fallback). Every
+/// byte contributes its low nibble, so the sum is bounded whatever the
+/// bytes are; callers pass ASCII digit runs, for which it is the value.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: bytes.len() <= 19 is checked first and every byte is masked to a nibble \
+              (<= 15): the SWAR lanes hold at most 165, 16 665 and 166 666 665 in their 8, 16 \
+              and 32 bits, and acc <= 15 * (10^19 - 1) / 9 < 1.67e19 < u64::MAX"
+)]
+fn parse_digits(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() > DIGITS_U64_MAX {
+        return None;
+    }
     let mut acc: u64 = 0;
     let mut chunks = bytes.chunks_exact(8);
     for chunk in &mut chunks {
@@ -988,9 +1126,9 @@ fn parse_digits(bytes: &[u8]) -> u64 {
         acc = acc * 100_000_000 + (octet & 0xFFFF_FFFF);
     }
     for &d in chunks.remainder() {
-        acc = acc * 10 + u64::from(d - b'0');
+        acc = acc * 10 + u64::from(d & 0x0F);
     }
-    acc
+    Some(acc)
 }
 
 /// Exact powers of ten as f64 (10²² is the largest exact one) — the
@@ -1039,10 +1177,14 @@ fn digit_run_len(w: u64) -> usize {
 /// End of the ASCII-digit run starting at `i` — word-at-a-time (numbers
 /// are scanned twice nowhere: this is the only classification pass).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: a full word was just read at input[i..], so i + 8 <= input.len() and \
+              digit_run_len returns <= 8; `i += 1` follows input[i] under its `i < len` guard"
+)]
 fn digit_run_end(input: &[u8], mut i: usize) -> usize {
-    while i + 8 <= input.len() {
-        let w = u64::from_le_bytes(input[i..i + 8].try_into().expect("8-byte chunk"));
-        let n = digit_run_len(w);
+    while let Some(word) = input.get(i..).and_then(|tail| tail.first_chunk::<8>()) {
+        let n = digit_run_len(u64::from_le_bytes(*word));
         i += n;
         if n < 8 {
             return i;
@@ -1065,6 +1207,12 @@ fn parse_number(input: &[u8], at: usize, tape: &mut Tape<'_>) -> Result<(), Json
 /// Parse a standalone JSON number token through the ingest parser's one
 /// grammar, without constructing an idoc. Leading/trailing JSON whitespace
 /// is accepted exactly as it is for a scalar document.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: rposition's index is < input.len(); token is input[start..end], and \
+              parse_number_value reports offsets and lengths inside the token it was given, \
+              so each sum is <= end <= input.len() <= isize::MAX"
+)]
 pub fn parse_number_token(input: &[u8]) -> Result<Number, JsonParseError> {
     let start = input
         .iter()
@@ -1086,6 +1234,11 @@ pub fn parse_number_token(input: &[u8]) -> Result<Number, JsonParseError> {
     Ok(number)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: each `i += 1` follows input[i] being indexed or input.get(i) being Some, \
+              so i < input.len() <= isize::MAX"
+)]
 fn parse_number_value(input: &[u8], at: usize) -> Result<(Number, usize), JsonParseError> {
     let mut i = at;
     let neg = input[i] == b'-';
@@ -1113,71 +1266,29 @@ fn parse_number_value(input: &[u8], at: usize) -> Result<(Number, usize), JsonPa
         }
         frac = &input[frac_start..i];
     }
-    // Exponent value, saturated far past the f64 range — the fast path
-    // only reads |exp| ≤ 22, and the std fallback re-parses the text.
     let mut exp10: i32 = 0;
     if matches!(input.get(i), Some(&b'e') | Some(&b'E')) {
         is_float = true;
         i += 1;
-        let exp_neg = match input.get(i) {
-            Some(&b'-') => {
-                i += 1;
-                true
-            }
-            Some(&b'+') => {
-                i += 1;
-                false
-            }
-            _ => false,
-        };
+        let exp_neg = input.get(i) == Some(&b'-');
+        if matches!(input.get(i), Some(&b'-') | Some(&b'+')) {
+            i += 1;
+        }
         let exp_start = i;
         i = digit_run_end(input, i);
         if i == exp_start {
             return err(at, JsonErrorKind::InvalidNumber); // "1e"
         }
-        let mut v: i32 = 0;
-        for &d in &input[exp_start..i.min(exp_start + 9)] {
-            v = v * 10 + i32::from(d - b'0');
-        }
-        if i - exp_start > 9 {
-            v = 100_000; // saturate: the fallback decides overflow/underflow
-        }
-        exp10 = if exp_neg { -v } else { v };
+        exp10 = exponent_value(&input[exp_start..i], exp_neg);
     }
     check_scalar_terminator(input, i)?;
-    if !is_float {
-        // Integral: i64 when it fits; `-0` keeps its sign as f64;
-        // otherwise the ADR-0036 D4 f64 fallback (S21 measures the
-        // oracle's u64-range behavior — candidate deviation).
-        if int_digits.len() <= 19 {
-            let magnitude = parse_digits(int_digits);
-            if neg && magnitude == 0 {
-                return Ok((Number::F64(-0.0), i));
-            }
-            if neg && magnitude <= (i64::MAX as u64) + 1 {
-                return Ok((Number::I64((magnitude as i64).wrapping_neg()), i));
-            }
-            if !neg && magnitude <= i64::MAX as u64 {
-                return Ok((Number::I64(magnitude as i64), i));
-            }
-        }
+    let fast = if is_float {
+        clinger_fast(int_digits, frac, exp10, neg).map(Number::F64)
     } else {
-        // Clinger fast path: a mantissa exact in f64 (≤ 2⁵³) scaled by an
-        // exact power of ten (|10^e| ≤ 10²²) rounds exactly once — bit-
-        // identical to the Eisel–Lemire fallback, minus its full re-parse.
-        let total = int_digits.len() + frac.len();
-        if total <= 19 {
-            let m = parse_digits(int_digits) * U64_POW10[frac.len()] + parse_digits(frac);
-            let e = exp10.saturating_sub(frac.len() as i32);
-            if m <= (1u64 << 53) && (-22..=22).contains(&e) {
-                let scaled = if e < 0 {
-                    m as f64 / F64_POW10[(-e) as usize]
-                } else {
-                    m as f64 * F64_POW10[e as usize]
-                };
-                return Ok((Number::F64(if neg { -scaled } else { scaled }), i));
-            }
-        }
+        integral_fast(int_digits, neg)
+    };
+    if let Some(number) = fast {
+        return Ok((number, i));
     }
     // Fallback (float outside the fast bounds, or integral overflow):
     // std's Eisel–Lemire parse is round-trip-correct; the slice is
@@ -1190,6 +1301,65 @@ fn parse_number_value(input: &[u8], at: usize) -> Result<(Number, usize), JsonPa
         return err(at, JsonErrorKind::NumberOutOfRange);
     }
     Ok((Number::F64(value), i))
+}
+
+/// Exponent digits past this many saturate (10⁹ − 1 < 2³¹).
+const EXPONENT_DIGITS_MAX: usize = 9;
+/// The saturated exponent: far past the f64 range — the fast path only
+/// reads |exp| ≤ 22, and the std fallback re-parses the text.
+const EXPONENT_SATURATED: i32 = 100_000;
+
+/// The signed exponent of a digit run (nibbles, as [`parse_digits`]).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: digits.len() <= 9 is checked first and every byte is masked to a nibble \
+              (<= 15), so v <= 15 * 111 111 111 < 1.67e9 < i32::MAX, and negating a \
+              non-negative i32 cannot overflow"
+)]
+fn exponent_value(digits: &[u8], negative: bool) -> i32 {
+    let mut v: i32 = EXPONENT_SATURATED;
+    if digits.len() <= EXPONENT_DIGITS_MAX {
+        v = 0;
+        for &d in digits {
+            v = v * 10 + i32::from(d & 0x0F);
+        }
+    }
+    if negative { -v } else { v }
+}
+
+/// Integral token: i64 when it fits; `-0` keeps its sign as f64; `None`
+/// is the ADR-0036 D4 f64 fallback (S21 measures the oracle's u64-range
+/// behavior — candidate deviation).
+fn integral_fast(int_digits: &[u8], neg: bool) -> Option<Number> {
+    let magnitude = parse_digits(int_digits)?;
+    if !neg {
+        return i64::try_from(magnitude).ok().map(Number::I64);
+    }
+    if magnitude == 0 {
+        return Some(Number::F64(-0.0));
+    }
+    // `0 - magnitude`: reaches `i64::MIN`, which negating an i64 cannot.
+    0i64.checked_sub_unsigned(magnitude).map(Number::I64)
+}
+
+/// Clinger fast path: a mantissa exact in f64 (≤ 2⁵³) scaled by an exact
+/// power of ten (|10^e| ≤ 10²²) rounds exactly once — bit-identical to
+/// the Eisel–Lemire fallback, minus its full re-parse. `None` is that
+/// fallback; an unrepresentable mantissa takes it too.
+fn clinger_fast(int_digits: &[u8], frac: &[u8], exp10: i32, neg: bool) -> Option<f64> {
+    // The mantissa is the two runs read as one: at most 19 digits in all.
+    if int_digits.len().checked_add(frac.len())? > DIGITS_U64_MAX {
+        return None;
+    }
+    let scale = *U64_POW10.get(frac.len())?;
+    let m = parse_digits(int_digits)?.checked_mul(scale)?.checked_add(parse_digits(frac)?)?;
+    let e = exp10.saturating_sub(i32::try_from(frac.len()).ok()?);
+    if m > (1u64 << 53) || !(-22..=22).contains(&e) {
+        return None;
+    }
+    let power = *F64_POW10.get(usize::try_from(e.unsigned_abs()).ok()?)?;
+    let scaled = if e < 0 { m as f64 / power } else { m as f64 * power };
+    Some(if neg { -scaled } else { scaled })
 }
 
 /// Cap-checked i64 emission (fixints cost 1, the rest the varint worst
@@ -1227,20 +1397,25 @@ fn emit_f64_checked(tape: &mut Tape<'_>, v: f64, at: usize) -> Result<(), JsonPa
 /// slack; cap exceeded) — the general path is the single source of
 /// errors, so rejection behavior stays byte-identical.
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "bound: `len > FIXSTR_MAX_LEN` (31) returns first, so 1 + len <= 32, len fits u8 \
+              and FIXSTR_BASE (0x80) + len <= 0x9F"
+)]
 fn try_fixstr_fast(tape: &mut Tape<'_>, input: &[u8], at: usize, len: usize) -> bool {
-    debug_assert!(len <= FIXSTR_MAX_LEN);
-    if !tape.fits(1 + len) {
+    if len > FIXSTR_MAX_LEN || !tape.fits(1 + len) {
         return false;
     }
-    let s = at + 1;
     if len == 0 {
         tape.out.push(FIXSTR_BASE);
         return true;
     }
-    if s + 32 > input.len() {
+    // The 32-byte window that opens after the quote at `at`.
+    let Some(window) = input.get(at..).and_then(|tail| tail.get(1..33)) else {
         return false;
-    }
-    inf_simd::json_copy_unescaped_fixstr(&input[s..s + 32], len, FIXSTR_BASE + len as u8, tape.out)
+    };
+    inf_simd::json_copy_unescaped_fixstr(window, len, FIXSTR_BASE + len as u8, tape.out)
 }
 
 /// Whole-input validation: UTF-8 once, through the `inf-simd` kernel
@@ -1284,6 +1459,12 @@ fn word_hit(w: u64) -> u64 {
 /// take the predicted byte loop (a masked stack word lost its A/B —
 /// the variable-length copy outweighed ≤ 7 predicted iterations).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: i <= len throughout (it steps by 1 under `i < len`, by 8 only after \
+              `i + 8 <= len`), len <= isize::MAX, `len - 8` runs only past the `len < 8` \
+              return, and a hit's byte index (<= 7) lies inside the word just read"
+)]
 fn find_special(bytes: &[u8]) -> Option<usize> {
     let len = bytes.len();
     if len < 8 {
@@ -1320,6 +1501,14 @@ fn find_special(bytes: &[u8]) -> Option<usize> {
 /// is in `scratch` (valid UTF-8 by construction: validated input runs
 /// plus `char`-encoded escapes). `base` is the input offset of
 /// `content[0]`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: i < bytes.len() under the loop guard; `i += 2` follows bytes.get(i + 1) \
+              being Some, `i += 4` and `i += 6` follow parse_hex4 reading four digits at i and \
+              at i + 2, and find_special's index is inside bytes[i..] — every cursor is <= \
+              bytes.len() <= isize::MAX; hi and lo are range-checked above the surrogate sum \
+              (<= 0x10FFFF)"
+)]
 fn decode_string<'a>(
     content: &'a [u8],
     base: usize,
@@ -1329,8 +1518,10 @@ fn decode_string<'a>(
     let Some(first) = find_special(bytes) else {
         return Ok(Some(content));
     };
+    // Error offsets are diagnostics: they saturate, never wrap.
+    let offset = |i: usize| base.saturating_add(i);
     if bytes[first] < 0x20 {
-        return err(base + first, JsonErrorKind::ControlCharacter);
+        return err(offset(first), JsonErrorKind::ControlCharacter);
     }
     scratch.clear();
     scratch.reserve(content.len());
@@ -1340,8 +1531,9 @@ fn decode_string<'a>(
     while i < bytes.len() {
         match bytes[i] {
             b'\\' => {
+                let at = offset(i);
                 let Some(&esc) = bytes.get(i + 1) else {
-                    return err(base + i, JsonErrorKind::InvalidEscape);
+                    return err(at, JsonErrorKind::InvalidEscape);
                 };
                 i += 2;
                 match esc {
@@ -1354,7 +1546,6 @@ fn decode_string<'a>(
                     b'r' => scratch.push(b'\r'),
                     b't' => scratch.push(b'\t'),
                     b'u' => {
-                        let at = base + i - 2;
                         let hi = parse_hex4(bytes, i).ok_or(JsonParseError {
                             offset: at,
                             kind: JsonErrorKind::InvalidUnicodeEscape,
@@ -1366,7 +1557,7 @@ fn decode_string<'a>(
                                 return err(at, JsonErrorKind::LoneSurrogate);
                             }
                             let lo = parse_hex4(bytes, i + 2).ok_or(JsonParseError {
-                                offset: base + i,
+                                offset: offset(i),
                                 kind: JsonErrorKind::InvalidUnicodeEscape,
                             })?;
                             if !(0xDC00..=0xDFFF).contains(&lo) {
@@ -1384,10 +1575,10 @@ fn decode_string<'a>(
                         let mut utf8 = [0u8; 4];
                         scratch.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
                     }
-                    _ => return err(base + i - 2, JsonErrorKind::InvalidEscape),
+                    _ => return err(at, JsonErrorKind::InvalidEscape),
                 }
             }
-            b if b < 0x20 => return err(base + i, JsonErrorKind::ControlCharacter),
+            b if b < 0x20 => return err(offset(i), JsonErrorKind::ControlCharacter),
             _ => {
                 // Maximal raw run to the next escape/control byte; run
                 // boundaries are ASCII, so &str slicing is boundary-safe.
@@ -1402,13 +1593,101 @@ fn decode_string<'a>(
 
 /// Four hex digits at `content[i..i+4]` → code unit.
 fn parse_hex4(content: &[u8], i: usize) -> Option<u32> {
-    if content.len() < i + 4 {
-        return None;
-    }
     let mut v = 0u32;
-    for &b in &content[i..i + 4] {
+    for &b in content.get(i..)?.first_chunk::<4>()? {
         let d = (b as char).to_digit(16)?;
         v = v << 4 | d;
     }
     Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_digits` owns its bound: 19 digits is the last length it
+    /// accumulates, and no 19 bytes — digits or not — overflow the sum
+    /// (a debug build panics on overflow, so this test is the proof's canary).
+    #[test]
+    fn parse_digits_bound_is_nineteen() {
+        assert_eq!(parse_digits(b""), Some(0));
+        assert_eq!(parse_digits(b"7"), Some(7));
+        assert_eq!(parse_digits(b"12345678"), Some(12_345_678));
+        assert_eq!(parse_digits(b"123456789"), Some(123_456_789));
+        assert_eq!(parse_digits(b"1234567890123456"), Some(1_234_567_890_123_456));
+        assert_eq!(parse_digits(&[b'9'; 18]), Some(999_999_999_999_999_999));
+        assert_eq!(parse_digits(&[b'9'; 19]), Some(9_999_999_999_999_999_999));
+        assert_eq!(parse_digits(&[b'9'; 20]), None);
+        assert_eq!(parse_digits(&[b'0'; 20]), None);
+        for len in 0..=19 {
+            assert!(parse_digits(&vec![0xFF; len]).is_some(), "{len} hostile bytes stay bounded");
+        }
+    }
+
+    #[test]
+    fn exponent_saturates_past_nine_digits() {
+        assert_eq!(exponent_value(b"0", false), 0);
+        assert_eq!(exponent_value(b"22", true), -22);
+        assert_eq!(exponent_value(b"999999999", false), 999_999_999);
+        assert_eq!(exponent_value(b"999999999", true), -999_999_999);
+        assert_eq!(exponent_value(b"0000000001", false), EXPONENT_SATURATED);
+        assert_eq!(exponent_value(b"0000000001", true), -EXPONENT_SATURATED);
+        // Nine hostile bytes stay inside i32 (the bound's canary).
+        assert!(exponent_value(&[0xFF; 9], true) < 0);
+    }
+
+    #[test]
+    fn frame_word_holds_thirty_one_bits() {
+        assert_eq!(frame_word(0, 0), Some(0));
+        assert_eq!(frame_word(9, OBJ_BIT), Some(9 | OBJ_BIT));
+        assert_eq!(frame_word(LEN_AT_MASK as usize, OBJ_BIT), Some(u32::MAX));
+        assert_eq!(frame_word(LEN_AT_MASK as usize + 1, 0), None);
+        assert_eq!(frame_word(u32::MAX as usize + 1, 0), None);
+        assert_eq!(frame_word(usize::MAX, OBJ_BIT), None);
+    }
+
+    #[test]
+    fn tape_cap_refuses_at_the_limit_and_on_overflow() {
+        let mut out = vec![0; header::HEADER_LEN];
+        let tape = Tape::new(&mut out, 4);
+        assert!(tape.fits(0));
+        assert!(tape.fits(3));
+        assert!(tape.fits(4));
+        assert!(!tape.fits(5));
+        assert!(!tape.fits(usize::MAX));
+        assert_eq!(tape.body_len(), Some(0));
+        // A configured cap past the format ceiling is clamped to it.
+        let mut out = vec![0; header::HEADER_LEN];
+        let tape = Tape::new(&mut out, usize::MAX);
+        assert!(tape.fits(DOC_BYTES_MAX));
+        assert!(!tape.fits(DOC_BYTES_MAX + 1));
+        // A buffer shorter than its header has no body length.
+        let mut short = vec![0; header::HEADER_LEN - 1];
+        assert_eq!(Tape::new(&mut short, 4).body_len(), None);
+    }
+
+    #[test]
+    fn index_tokens_bump_past_the_end_stays_empty() {
+        let mut tokens = IndexTokens { rest: &[3, 7] };
+        assert_eq!(tokens.peek(), Some(3));
+        tokens.bump();
+        assert_eq!(tokens.peek(), Some(7));
+        tokens.bump();
+        tokens.bump();
+        assert_eq!(tokens.peek(), None);
+    }
+
+    #[test]
+    fn key_bytes_at_reads_each_string_form() {
+        let mut out = vec![0xEE];
+        emit::str(&mut out, b"k");
+        assert_eq!(key_bytes_at(&out, 1), b"k");
+        for len in [0usize, 31, 32, 255, 256, 70_000] {
+            let key = vec![b'a'; len];
+            let mut out = vec![0xEE, 0xEE];
+            emit::str(&mut out, &key);
+            out.push(0xEE);
+            assert_eq!(key_bytes_at(&out, 2), &key[..], "key of {len} bytes");
+        }
+    }
 }

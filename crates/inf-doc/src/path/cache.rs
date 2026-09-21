@@ -20,10 +20,17 @@
 //! cell denylist's spirit and leaks nondeterminism into eviction order
 //! and metrics under DST. Behavior is a pure function of the lookup
 //! sequence.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use super::{PATH_BYTES_CEILING, PathError, PathErrorKind, PathProgram, compile_with_max_bytes};
 
 const NIL: u32 = u32::MAX;
+/// The most entries a cache holds: every slab index stays below [`NIL`].
+const CAPACITY_MAX: u32 = NIL - 1;
 
 /// Nominal per-entry byte share: budget = `capacity ×` this. 4 KiB is
 /// the default path-text cap — typical entries (a few dozen bytes) fit
@@ -83,7 +90,7 @@ impl Default for ProgramCache {
 impl ProgramCache {
     /// `capacity` in entries; 0 disables caching (every lookup compiles).
     pub fn new(capacity: usize) -> ProgramCache {
-        let capacity = capacity.min(NIL as usize - 1) as u32;
+        let capacity = u32::try_from(capacity).unwrap_or(CAPACITY_MAX).min(CAPACITY_MAX);
         let bucket_count = (capacity as usize * 2).next_power_of_two().max(1);
         ProgramCache {
             buckets: vec![NIL; if capacity == 0 { 1 } else { bucket_count }].into_boxed_slice(),
@@ -169,6 +176,10 @@ impl ProgramCache {
 
     // ---- internals ----
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "bound: the hash is masked by buckets.len() - 1, a usize value, before it narrows"
+    )]
     fn bucket_of(&self, hash: u64) -> usize {
         (hash & (self.buckets.len() as u64 - 1)) as usize
     }
@@ -232,11 +243,16 @@ impl ProgramCache {
 
     /// Insert a fresh entry, evicting from the LRU tail until both the
     /// entry cap and the byte budget hold. Returns the slab slot.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "bound: the eviction loop exits only with slab.len() < capacity, a u32, and the \
+                  slot is read before the push"
+    )]
     fn insert(&mut self, hash: u64, text: &[u8], program: PathProgram, entry_heap: usize) -> u32 {
         debug_assert!(entry_heap <= self.budget_bytes, "oversize entries stay uncached");
         // Every victim leaves the slab (F-L09-01's class): unlinking alone
         // kept the slot resident — unreachable, uncounted, with stale links.
-        while self.slab.len() as u32 >= self.capacity
+        while self.slab.len() >= self.capacity as usize
             || (self.entry_bytes + entry_heap > self.budget_bytes && !self.slab.is_empty())
         {
             let victim = self.lru_tail;
@@ -244,8 +260,8 @@ impl ProgramCache {
             self.remove(victim);
             self.evictions += 1;
         }
+        let slot = self.slab.len() as u32;
         self.slab.push(Entry { hash, key: text.into(), program, chain: NIL, prev: NIL, next: NIL });
-        let slot = (self.slab.len() - 1) as u32;
         self.entry_bytes += entry_heap;
         let bucket = self.bucket_of(hash);
         self.slab[slot as usize].chain = self.buckets[bucket];
@@ -260,10 +276,13 @@ impl ProgramCache {
         self.unlink_lru(slot);
         self.unlink_chain(slot);
         self.entry_bytes -= self.slab[slot as usize].heap_bytes();
-        let last = (self.slab.len() - 1) as u32;
+        let last = self.slab.len() - 1;
         self.slab.swap_remove(slot as usize);
-        if slot != last {
-            self.retarget(last, slot);
+        // Links are u32: a slab index past it is one no link can name.
+        match u32::try_from(last) {
+            Ok(last) if slot != last => self.retarget(last, slot),
+            Ok(_) => {}
+            Err(_) => debug_assert!(false, "insert keeps the slab under its u32 capacity"),
         }
     }
 

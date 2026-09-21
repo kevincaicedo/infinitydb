@@ -11,7 +11,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use crate::build::TapeBuilder;
@@ -53,6 +58,11 @@ enum EmitFrame<'v> {
 /// Iterative emit — the builder's depth cap is the only recursion bound we
 /// rely on anywhere (no call-stack recursion, decoder rule discipline even
 /// off the hot path).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: items[*idx] / entries[*idx] is indexed on the line above each increment, \
+              so *idx < len <= isize::MAX"
+)]
 fn emit(root: &Value, b: &mut TapeBuilder) -> Result<(), DocError> {
     let mut stack: Vec<EmitFrame<'_>> = Vec::new();
     emit_value(root, b, &mut stack)?;

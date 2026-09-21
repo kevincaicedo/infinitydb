@@ -3,36 +3,13 @@
 # equal to the tree and the totals below their approved copies.
 # family<TAB>count<TAB>file
 arith	48	crates/inf-doc/src/arena.rs
-arith	89	crates/inf-doc/src/json.rs
-arith	2	crates/inf-doc/src/model.rs
-arith	17	crates/inf-doc/src/path/cache.rs
+arith	15	crates/inf-doc/src/path/cache.rs
 arith	23	crates/inf-doc/src/path/eval.rs
-arith	36	crates/inf-doc/src/path/parse.rs
-arith	31	crates/inf-doc/src/path/program.rs
-arith	81	crates/inf-doc/src/tape.rs
 arith	67	crates/inf-log/src/tier.rs
-arith	11	crates/inf-query/src/access.rs
-arith	3	crates/inf-query/src/page.rs
-arith	17	crates/inf-query/src/partiql/cache.rs
-arith	8	crates/inf-query/src/partiql/compile.rs
-arith	22	crates/inf-query/src/partiql/lex.rs
-arith	6	crates/inf-query/src/partiql/parse.rs
-arith	32	crates/inf-query/src/predicate/program.rs
 arith	17	crates/inf-query/src/predicate/vm.rs
 arith	19	crates/inf-wire/src/parser.rs
 arith	23	crates/inf-wire/src/writer.rs
-cast	10	crates/inf-doc/src/arena.rs
-cast	16	crates/inf-doc/src/json.rs
-cast	1	crates/inf-doc/src/path/ast.rs
-cast	5	crates/inf-doc/src/path/cache.rs
 cast	15	crates/inf-doc/src/path/eval.rs
-cast	3	crates/inf-doc/src/path/program.rs
-cast	11	crates/inf-doc/src/tape.rs
-cast	5	crates/inf-query/src/access.rs
-cast	5	crates/inf-query/src/partiql/cache.rs
-cast	1	crates/inf-query/src/partiql/compile.rs
-cast	1	crates/inf-query/src/partiql/parse.rs
-cast	13	crates/inf-query/src/predicate/program.rs
 cast	1	crates/inf-query/src/predicate/vm.rs
 cast	5	crates/inf-wire/src/parser.rs
 cast	6	crates/inf-wire/src/writer.rs
@@ -75,7 +52,7 @@ fn_length	1	bins/inf-sim/src/txmodel/durable.rs
 fn_length	1	bins/inf-sim/src/txmodel/watch.rs
 fn_length	1	bins/inf/src/main.rs
 fn_length	1	crates/inf-doc/src/apply.rs
-fn_length	2	crates/inf-doc/src/json.rs
+fn_length	1	crates/inf-doc/src/json.rs
 fn_length	1	crates/inf-doc/src/merge.rs
 fn_length	1	crates/inf-doc/src/path/eval.rs
 fn_length	1	crates/inf-doc/src/ser.rs

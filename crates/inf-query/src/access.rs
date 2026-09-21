@@ -6,6 +6,16 @@
 //! input (S12) are one representation. `from_bytes` is the trust
 //! boundary — fabric arrivals revalidate everything, including the
 //! embedded residual through `PredicateProgram::from_bytes`.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::rc::Rc;
 
@@ -202,26 +212,30 @@ impl AccessProgram {
 
     /// Decode back to the field form (executors, EXPLAIN, the
     /// round-trip law). Cold path — allocates freely.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: each `at += 1` follows the index of `bytes[at]`, so the sum is at most \
+                  `bytes.len()`"
+    )]
     pub fn decode(&self) -> Access {
         let bytes: &[u8] = &self.bytes;
         let mut at = 2; // version, flags
-        let ns = NsId(read_varint(bytes, &mut at) as u32);
+        let ns = NsId(read_varint::<u32>(bytes, &mut at));
         let projection =
             if bytes[at] == PROJECT_COUNT { Projection::Count } else { Projection::Documents };
         at += 1;
-        let limit_raw = read_varint(bytes, &mut at);
-        let limit = (limit_raw != 0).then_some(limit_raw as u32);
+        let limit_raw = read_varint::<u32>(bytes, &mut at);
+        let limit = (limit_raw != 0).then_some(limit_raw);
         let step_tag = bytes[at];
         at += 1;
         let step = match step_tag {
-            STEP_PK_GET => AccessStep::PkGet { key: read_bytes(bytes, &mut at) },
+            STEP_PK_GET => AccessStep::PkGet { key: read_region(bytes, &mut at).to_vec() },
             STEP_INDEX_RANGE => decode_index_range(bytes, &mut at),
             _ => AccessStep::Scan,
         };
-        let residual_len = read_varint(bytes, &mut at) as usize;
-        let residual = (residual_len != 0).then(|| {
-            let end = at + residual_len;
-            PredicateProgram::from_bytes(&bytes[at..end])
+        let residual = read_region(bytes, &mut at);
+        let residual = (!residual.is_empty()).then(|| {
+            PredicateProgram::from_bytes(residual)
                 .expect("validated at the access-program boundary")
         });
         Access { ns, projection, limit, step, residual }
@@ -255,9 +269,14 @@ impl AccessProgram {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*at += 1` follows the index of `bytes[*at]`, so the sum is at most \
+              `bytes.len()`"
+)]
 fn decode_index_range(bytes: &[u8], at: &mut usize) -> AccessStep {
-    let index = IndexId(read_varint(bytes, at) as u32);
-    let generation = read_varint(bytes, at);
+    let index = IndexId(read_varint::<u32>(bytes, at));
+    let generation = read_varint::<u64>(bytes, at);
     let key_type = decode_key_type(bytes[*at]).expect("validated key type");
     *at += 1;
     let lo = decode_edge(bytes, at);
@@ -265,29 +284,49 @@ fn decode_index_range(bytes: &[u8], at: &mut usize) -> AccessStep {
     AccessStep::IndexRange { index, generation, key_type, lo, hi }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*at += 1` follows the index of `bytes[*at]`, so the sum is at most \
+              `bytes.len()`"
+)]
 fn decode_edge(bytes: &[u8], at: &mut usize) -> RangeEdge {
     let tag = bytes[*at];
     *at += 1;
     match tag {
         EDGE_UNBOUNDED => RangeEdge::Unbounded,
-        EDGE_INCLUDED => RangeEdge::Included(read_bytes(bytes, at)),
-        _ => RangeEdge::Excluded(read_bytes(bytes, at)),
+        EDGE_INCLUDED => RangeEdge::Included(read_region(bytes, at).to_vec()),
+        _ => RangeEdge::Excluded(read_region(bytes, at).to_vec()),
     }
 }
 
 // Trusted readers over validated bytes (debug asserts only — the
-// `read_op` posture).
-fn read_varint(bytes: &[u8], at: &mut usize) -> u64 {
-    let (value, used) = varint::decode_u64(&bytes[*at..]).expect("validated varint");
+// `read_op` posture). A field narrower than its varint (`validate`
+// bounds `ns`, `limit` and the index id to u32) narrows under the same
+// invariant, never by truncation.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `used` counts bytes `decode_u64` read from `bytes[*at..]`, a slice indexed \
+              on the line above, so `*at + used <= bytes.len()`"
+)]
+fn read_varint<T: TryFrom<u64>>(bytes: &[u8], at: &mut usize) -> T {
+    let (value, used) = varint::decode_u64(&bytes[*at..])
+        .and_then(|(value, used)| Some((T::try_from(value).ok()?, used)))
+        .expect("validated varint");
     *at += used;
     value
 }
 
-fn read_bytes(bytes: &[u8], at: &mut usize) -> Vec<u8> {
-    let len = read_varint(bytes, at) as usize;
-    let out = bytes[*at..*at + len].to_vec();
+/// The length-prefixed region at `*at`; the cursor moves past it.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*at += len` follows the index `bytes[*at..][..len]`, so the sum is at most \
+              `bytes.len()`"
+)]
+fn read_region<'b>(bytes: &'b [u8], at: &mut usize) -> &'b [u8] {
+    let len: usize = read_varint(bytes, at);
+    let region = &bytes[*at..][..len];
     *at += len;
-    out
+    region
 }
 
 fn decode_key_type(tag: u8) -> Option<IndexKeyType> {
@@ -493,6 +532,11 @@ fn validate_residual(bytes: &[u8], at: &mut usize) -> Result<(), AccessError> {
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `used` counts bytes `decode_u64` read from `bytes[*at..]`, a slice indexed \
+              on the line above, so `*at + used <= bytes.len()`"
+)]
 fn validate_varint(bytes: &[u8], at: &mut usize) -> Result<u64, AccessError> {
     let (value, used) = varint::decode_u64(&bytes[*at..])
         .ok_or(AccessError { offset: *at, kind: AccessErrorKind::BadVarint })?;
@@ -500,6 +544,11 @@ fn validate_varint(bytes: &[u8], at: &mut usize) -> Result<u64, AccessError> {
     Ok(value)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `*at += 1` follows `bytes.get(*at)` returning a byte, so the sum is at most \
+              `bytes.len()`"
+)]
 fn validate_tag(bytes: &[u8], at: &mut usize, allowed: &[u8]) -> Result<u8, AccessError> {
     let Some(&tag) = bytes.get(*at) else {
         return verr(AccessErrorKind::Truncated, *at);
@@ -573,7 +622,7 @@ fn explain_edge(edge: &RangeEdge, key_type: IndexKeyType) -> String {
         Ok(DecodedIndexKey::F64(v)) => format!("{word} f64:{v:?}"),
         Ok(DecodedIndexKey::Bool(v)) => format!("{word} bool:{v}"),
         Err(_) => {
-            let mut hex = String::with_capacity(bytes.len() * 2);
+            let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
             for b in bytes {
                 hex.push_str(&format!("{b:02x}"));
             }
@@ -710,6 +759,68 @@ mod tests {
         bytes[len - 1] = 3; // residual_len 0 → 3, with 3 garbage...
         bytes.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         assert_eq!(kind(&bytes), AccessErrorKind::BadResidual);
+    }
+
+    /// The u32-ranged fields at their width: `u32::MAX` round-trips
+    /// through the trusted decoder un-truncated, and one past it is a
+    /// typed refusal at the boundary.
+    #[test]
+    fn u32_fields_round_trip_at_their_maximum_and_refuse_past_it() {
+        let access = Access {
+            ns: NsId(u32::MAX),
+            projection: Projection::Documents,
+            limit: Some(u32::MAX),
+            step: AccessStep::IndexRange {
+                index: IndexId(u32::MAX),
+                generation: u64::MAX,
+                key_type: IndexKeyType::I64,
+                lo: RangeEdge::Included(vec![0; 8]),
+                hi: RangeEdge::Unbounded,
+            },
+            residual: None,
+        };
+        let program = encode(&access).expect("encodes");
+        assert_eq!(program.decode(), access);
+
+        let kind = |bytes: &[u8]| AccessProgram::from_bytes(bytes).expect_err("rejects").kind;
+        let past_u32 = u64::from(u32::MAX) + 1;
+        for (case, ns, limit, id) in [
+            ("ns", past_u32, 1, 1),
+            ("limit", 1, past_u32, 1),
+            ("index id", 1, 1, past_u32),
+            ("index id 0", 1, 1, 0),
+            ("u64::MAX ns", u64::MAX, 1, 1),
+        ] {
+            let mut bytes = vec![ACCESS_VERSION, 0];
+            varint::encode_u64(ns, &mut bytes);
+            bytes.push(PROJECT_DOCUMENTS);
+            varint::encode_u64(limit, &mut bytes);
+            bytes.push(STEP_INDEX_RANGE);
+            varint::encode_u64(id, &mut bytes);
+            varint::encode_u64(1, &mut bytes); // generation
+            bytes.extend_from_slice(&[KEY_TYPE_I64, EDGE_UNBOUNDED, EDGE_UNBOUNDED, 0]);
+            assert_eq!(kind(&bytes), AccessErrorKind::BadField, "{case}");
+        }
+    }
+
+    /// A region length that overruns or overflows the cursor refuses
+    /// typed; the longest key that fits is accepted.
+    #[test]
+    fn region_lengths_refuse_at_the_overrun() {
+        let program = |key_len: u64, key: &[u8]| {
+            let mut bytes = vec![ACCESS_VERSION, 0, 1, PROJECT_DOCUMENTS, 0, STEP_PK_GET];
+            varint::encode_u64(key_len, &mut bytes);
+            bytes.extend_from_slice(key);
+            bytes.push(0); // no residual
+            bytes
+        };
+        assert!(AccessProgram::from_bytes(&program(1, b"k")).is_ok());
+        let kind = |bytes: &[u8]| AccessProgram::from_bytes(bytes).expect_err("rejects").kind;
+        assert_eq!(kind(&program(0, b"")), AccessErrorKind::BadKey);
+        // One past what remains (the key plus the residual byte), then the maxima.
+        assert_eq!(kind(&program(3, b"k")), AccessErrorKind::Truncated);
+        assert_eq!(kind(&program(u64::from(u32::MAX), b"k")), AccessErrorKind::Truncated);
+        assert_eq!(kind(&program(u64::MAX, b"k")), AccessErrorKind::Truncated);
     }
 
     #[test]

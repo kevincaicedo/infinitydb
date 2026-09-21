@@ -3,6 +3,16 @@
 //! depth bound (L9; the M3-S08 pattern). Grammar authority:
 //! `infinitydb/docs/partiql-subset.md`; every rejection is one of the
 //! spec's documented strings.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use inf_doc::path::PathProgram;
 
@@ -91,11 +101,10 @@ fn err<T>(offset: usize, kind: QlErrorKind) -> Result<T, QlError> {
 /// Offset of a leading INSERT/UPDATE/DELETE keyword, if any.
 fn leading_dml_keyword(text: &[u8]) -> Option<usize> {
     let start = text.iter().position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))?;
-    let end = text[start..]
-        .iter()
-        .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
-        .map_or(text.len(), |i| start + i);
-    let word = &text[start..end];
+    let tail = &text[start..];
+    let word_len =
+        tail.iter().position(|&b| !(b.is_ascii_alphanumeric() || b == b'_')).unwrap_or(tail.len());
+    let word = &tail[..word_len];
     ["INSERT", "UPDATE", "DELETE"]
         .iter()
         .any(|kw| word.eq_ignore_ascii_case(kw.as_bytes()))
@@ -122,8 +131,9 @@ pub(crate) fn parse(text: &[u8]) -> Result<Statement, QlError> {
     p.reject_clause_keywords()?;
     let mut where_at = 0;
     let mut condition = None;
+    let clause_at = p.at();
     if p.take_kw("WHERE") {
-        where_at = p.prev_at();
+        where_at = clause_at;
         condition = Some(p.parse_condition()?);
         p.reject_clause_keywords()?;
     }
@@ -161,13 +171,19 @@ impl Parser<'_> {
         self.tokens[self.i].at
     }
 
-    fn prev_at(&self) -> usize {
-        self.tokens[self.i - 1].at
+    /// The token after the current one; `None` on `End`, the last token.
+    fn next_kind(&self) -> Option<&Tok<'_>> {
+        self.tokens.get(self.i.checked_add(1)?).map(|token| &token.kind)
     }
 
+    /// Advances one token. The cursor never leaves the vector: `End` is
+    /// its last token, and a bump on it stays there.
     fn bump(&mut self) {
-        debug_assert!(self.i + 1 < self.tokens.len(), "End is never consumed");
-        self.i += 1;
+        let next = self.i.checked_add(1).filter(|&next| next < self.tokens.len());
+        debug_assert!(next.is_some(), "End is never consumed");
+        if let Some(next) = next {
+            self.i = next;
+        }
     }
 
     fn is_kw(&self, word: &str) -> bool {
@@ -328,11 +344,11 @@ impl Parser<'_> {
         let Tok::Int(v) = *self.kind() else {
             return err(self.at(), QlErrorKind::Expected("an integer"));
         };
-        if !(1..=i64::from(u32::MAX)).contains(&v) {
+        let Some(limit) = u32::try_from(v).ok().filter(|&limit| limit >= 1) else {
             return err(self.at(), QlErrorKind::LimitRange);
-        }
+        };
         self.bump();
-        Ok(v as u32)
+        Ok(limit)
     }
 
     /// The WHERE expression machine: precedence OR < AND < NOT, with
@@ -411,7 +427,7 @@ impl Parser<'_> {
     fn parse_leaf(&mut self) -> Result<Cond, QlError> {
         match self.kind() {
             Tok::Pseudo(_) => self.parse_key_leaf(),
-            Tok::Ident(s) if matches!(self.tokens[self.i + 1].kind, Tok::LParen) => {
+            Tok::Ident(s) if matches!(self.next_kind(), Some(Tok::LParen)) => {
                 if s.eq_ignore_ascii_case("begins_with") {
                     self.parse_begins_with()
                 } else if s.eq_ignore_ascii_case("exists") {
@@ -671,7 +687,7 @@ impl Parser<'_> {
     fn path_steps(&mut self, text: &mut String) -> Result<(), QlError> {
         loop {
             match self.kind() {
-                Tok::Dot if matches!(self.tokens[self.i + 1].kind, Tok::Dot) => {
+                Tok::Dot if matches!(self.next_kind(), Some(Tok::Dot)) => {
                     return err(self.at(), QlErrorKind::DescendUnsupported);
                 }
                 Tok::Dot => {
@@ -805,4 +821,61 @@ fn push_quoted_member(text: &mut String, name: &str) {
         }
     }
     text.push_str("']");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limit_of(text: &str) -> Result<Option<u32>, QlErrorKind> {
+        parse(text.as_bytes()).map(|statement| statement.limit).map_err(|e| e.kind)
+    }
+
+    #[test]
+    fn limit_bounds_are_exact() {
+        let statement = |limit: &str| format!("SELECT * FROM orders LIMIT {limit}");
+        assert_eq!(limit_of(&statement("1")), Ok(Some(1)));
+        assert_eq!(limit_of(&statement("4294967294")), Ok(Some(u32::MAX - 1)));
+        assert_eq!(limit_of(&statement("4294967295")), Ok(Some(u32::MAX)));
+        for limit in ["0", "-1", "4294967296", "9223372036854775807", "-9223372036854775808"] {
+            assert_eq!(limit_of(&statement(limit)), Err(QlErrorKind::LimitRange), "{limit}");
+        }
+    }
+
+    /// A lookahead from the last real token sees `End`, and the cursor
+    /// never leaves the token vector on a statement that stops short.
+    #[test]
+    fn statements_that_stop_at_a_lookahead_refuse_typed() {
+        for text in [
+            "SELECT * FROM orders WHERE a",
+            "SELECT * FROM orders WHERE a.",
+            "SELECT * FROM orders WHERE a..",
+            "SELECT * FROM orders WHERE exists",
+            "SELECT * FROM orders WHERE exists(",
+            "SELECT",
+            "",
+        ] {
+            assert!(parse(text.as_bytes()).is_err(), "{text:?}");
+        }
+        let e = parse(b"SELECT * FROM orders WHERE a..b = 1").err().expect("refuses");
+        assert_eq!(e.kind, QlErrorKind::DescendUnsupported);
+    }
+
+    #[test]
+    fn where_anchor_is_the_keyword_offset() {
+        let statement = parse(b"SELECT * FROM orders  WHERE a = 1").expect("parses");
+        assert_eq!(statement.where_at, 22);
+        let statement = parse(b"SELECT * FROM orders").expect("parses");
+        assert_eq!(statement.where_at, 0);
+    }
+
+    #[test]
+    fn leading_dml_keyword_is_found_at_any_length() {
+        assert_eq!(leading_dml_keyword(b"  insert"), Some(2));
+        assert_eq!(leading_dml_keyword(b"DELETE FROM x"), Some(0));
+        assert_eq!(leading_dml_keyword(b"update("), Some(0));
+        assert_eq!(leading_dml_keyword(b"inserted"), None);
+        assert_eq!(leading_dml_keyword(b""), None);
+        assert_eq!(leading_dml_keyword(b"   "), None);
+    }
 }

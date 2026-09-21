@@ -4,6 +4,16 @@
 //! every non-compiling statement takes a documented rejection; nothing
 //! here ever compares two candidate plans — ambiguity is a refusal
 //! (the ADR-0024 D2 fence).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::cmp::Ordering;
 
@@ -264,7 +274,7 @@ fn fold_index_bounds(
     let multi_valued = path_is_multi_valued(spec);
     let mut interval = Interval::unbounded();
     let mut used = vec![false; conjuncts.len()];
-    let mut folded = 0usize;
+    let mut folded = false;
     for (i, conjunct) in conjuncts.iter().enumerate() {
         let Some((path, op)) = servable(conjunct) else { continue };
         if path.program.as_bytes() != spec.program {
@@ -272,7 +282,7 @@ fn fold_index_bounds(
         }
         if multi_valued {
             match op {
-                KeyOp::Cmp(CmpOp::Eq, _) if folded == 0 => {}
+                KeyOp::Cmp(CmpOp::Eq, _) if !folded => {}
                 KeyOp::Cmp(CmpOp::Eq, _) => continue, // later equalities re-check as residual
                 _ if named_explicitly => {
                     return err(path.at, QlErrorKind::MultiValueRange(name_string(&spec.name)));
@@ -283,9 +293,9 @@ fn fold_index_bounds(
         }
         interval = interval.intersect(key_op_interval(spec, path.at, &op)?);
         used[i] = true;
-        folded += 1;
+        folded = true;
     }
-    if folded == 0 {
+    if !folded {
         debug_assert!(named_explicitly, "path matching only chooses constrained indexes");
         return err(0, QlErrorKind::UnconstrainedIndex(name_string(&spec.name)));
     }
@@ -434,13 +444,21 @@ fn prefix_interval(prefix: &str) -> Interval {
 fn prefix_successor(image: &[u8]) -> Option<Vec<u8>> {
     let last = image.iter().rposition(|&b| b != 0xFF)?;
     let mut successor = image[..=last].to_vec();
-    successor[last] += 1;
+    // `rposition` chose a byte below 0xFF; `?` keeps the step total.
+    successor[last] = successor[last].checked_add(1)?;
     Some(successor)
 }
 
 /// i64 index, f64 literal: integrality decides (ADR-0080 D3). The
 /// verifying oracle for every branch here is the bound-construction
 /// proptest against the production VM.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::arithmetic_side_effects,
+    reason = "bound: the two returns above leave `c` in [-2^63, 2^63), where the cast of its \
+              integral `trunc()` is exact (a NaN casts to 0); `t + 1` / `t - 1` run only for a \
+              non-integral `c`, and every f64 of magnitude >= 2^52 is integral, so |t| < 2^52"
+)]
 fn i64_cross_interval(cmp: CmpOp, c: f64) -> Interval {
     debug_assert!(!c.is_nan(), "the lexer only produces finite floats");
     const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
@@ -487,6 +505,12 @@ fn i64_cross_interval(cmp: CmpOp, c: f64) -> Interval {
 /// ones bind at the float neighbor, computed as ±1 on the encoded
 /// word — the f64 key encoding is a monotone bijection onto its word
 /// range, so word arithmetic IS float neighbor stepping (ADR-0080 D3).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `g` is finite (every i64 converts to a finite f64), and the key words of \
+              finite floats lie strictly between those of -inf and +inf (the monotone \
+              ADR-0074 D2 encoding), so neither `word - 1` nor `word + 1` leaves u64"
+)]
 fn f64_cross_interval(cmp: CmpOp, c: i64) -> Interval {
     let g = c as f64;
     let lossless = matches!(
@@ -662,6 +686,10 @@ fn constant(lit: &Lit) -> Constant {
 
 /// Flatten to the arity cap, nest beyond it (ADR-0079 D2's "compilers
 /// SHOULD flatten"); a single operand collapses.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: the loop guard holds `v.len() > BOOL_ARITY_MAX` at the subtraction"
+)]
 fn and_of(mut v: Vec<Predicate>) -> Predicate {
     while v.len() > BOOL_ARITY_MAX {
         let tail = v.split_off(v.len() - BOOL_ARITY_MAX);
@@ -670,6 +698,10 @@ fn and_of(mut v: Vec<Predicate>) -> Predicate {
     if v.len() == 1 { v.pop().expect("just checked") } else { Predicate::And(v) }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: the loop guard holds `v.len() > BOOL_ARITY_MAX` at the subtraction"
+)]
 fn or_of(mut v: Vec<Predicate>) -> Predicate {
     while v.len() > BOOL_ARITY_MAX {
         let tail = v.split_off(v.len() - BOOL_ARITY_MAX);

@@ -286,6 +286,62 @@ fn suspension_resumes_without_loss() {
     assert_eq!(emitted, (0..10).collect::<Vec<u64>>());
 }
 
+/// The pager's counters are total (ADR-0144 D3): a page reports at most
+/// one match per candidate it scanned, so an over-reporting caller can
+/// neither push `matched` past `scanned` nor wrap the LIMIT countdown
+/// below zero into an unbounded statement.
+#[test]
+fn match_reports_beyond_the_scanned_count_are_dropped() {
+    let catalog = catalog("$.price", IndexKeyType::I64);
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
+    let mut docs = Docs { docs: HashMap::new() };
+    for pk in 0..4u64 {
+        docs.insert(&mut tree, pk, pk as i64, true);
+    }
+    let compiled = compile(b"SELECT * FROM ns WHERE price >= 0", &catalog).expect("compiles");
+    let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else { unreachable!() };
+
+    // No candidate yet: nothing to report.
+    let mut pager =
+        RangePager::new(lo, hi, None, IndexKeyType::I64, 100, Some(2)).expect("no resume");
+    pager.count_match();
+    let outcome = pager.finish();
+    assert_eq!((outcome.matched, outcome.scanned, outcome.more), (0, 0, true));
+
+    // One candidate, three reports: one match, and LIMIT 2 still has one left.
+    let mut pager =
+        RangePager::new(lo, hi, None, IndexKeyType::I64, 100, Some(2)).expect("no resume");
+    pager.next(&tree).expect("a candidate");
+    for _ in 0..3 {
+        pager.count_match();
+    }
+    pager.next(&tree).expect("LIMIT 2 admits a second candidate");
+    pager.count_match();
+    pager.count_match();
+    assert!(pager.next(&tree).is_none(), "LIMIT reached: the page is done");
+    let outcome = pager.finish();
+    assert_eq!((outcome.matched, outcome.scanned, outcome.more), (2, 2, false));
+}
+
+/// The scan budget at its edges: a page of budget 1 scans exactly one
+/// entry, and the largest budget does not disturb the count.
+#[test]
+fn scan_budget_edges_are_exact() {
+    let catalog = catalog("$.price", IndexKeyType::I64);
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
+    let mut docs = Docs { docs: HashMap::new() };
+    for pk in 0..3u64 {
+        docs.insert(&mut tree, pk, pk as i64, true);
+    }
+    let compiled = compile(b"SELECT * FROM ns WHERE price >= 0", &catalog).expect("compiles");
+    for (budget, scanned, more) in [(1u32, 1u32, true), (2, 2, true), (3, 3, true), (4, 3, false)] {
+        let outcome = run_page(&tree, &docs, &compiled, None, budget, None, &mut Vec::new());
+        assert_eq!((outcome.scanned, outcome.more), (scanned, more), "budget {budget}");
+    }
+    let outcome = run_page(&tree, &docs, &compiled, None, u32::MAX, None, &mut Vec::new());
+    assert_eq!((outcome.scanned, outcome.matched, outcome.more), (3, 3, false));
+}
+
 // ---------------------------------------------------------------------
 // The lower edge on the resume path (review 2026-08-30, F-L09-03). A
 // cursor is client input: S11's binding checks (CRC, version, shape,
