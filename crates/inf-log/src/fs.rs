@@ -69,6 +69,25 @@ pub fn is_storage_exhausted(e: &io::Error) -> bool {
         || matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
 }
 
+/// A read loop's cursor after `read_at` reported `n` bytes into the
+/// `cap - done` bytes it was handed. The one refusal, for every reader, of
+/// a file that reports more than that slice: a broken fs seam must not
+/// pass unwritten buffer bytes off as read.
+///
+/// # Errors
+/// `InvalidData` naming the over-report.
+pub(crate) fn advance_read(done: usize, n: usize, cap: usize) -> io::Result<usize> {
+    done.checked_add(n).filter(|&next| next <= cap).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "read_at reported {n} bytes into the {} it was handed",
+                cap.saturating_sub(done)
+            ),
+        )
+    })
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -871,5 +890,22 @@ pub mod mem {
             state.credit(entry.debited);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod advance_read_tests {
+    use super::advance_read;
+
+    /// The cursor advances up to the slice's end and refuses one past it,
+    /// and at the integer maximum — never a wrapped or clamped cursor.
+    #[test]
+    fn a_read_past_the_slice_is_refused() {
+        assert_eq!(advance_read(0, 0, 0).expect("empty"), 0);
+        assert_eq!(advance_read(0, 8, 8).expect("exactly the slice"), 8);
+        assert_eq!(advance_read(3, 4, 8).expect("inside"), 7);
+        assert!(advance_read(0, 9, 8).is_err(), "one past the slice");
+        assert!(advance_read(8, 1, 8).is_err(), "a byte into a full buffer");
+        assert!(advance_read(usize::MAX, 1, usize::MAX).is_err(), "the sum overflows");
     }
 }

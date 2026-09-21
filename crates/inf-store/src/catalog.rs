@@ -456,8 +456,8 @@ fn decode_entry(r: &mut Cursor<'_>, version: u8) -> Result<NsSpec, CatalogError>
     Ok(NsSpec { id: NsId(id), name, mode, fsync, policy, maxmemory, tier })
 }
 
-/// A validated length as its 16-bit on-disk field. The registries admit
-/// nothing wider (names, programs, permille); past the field is a violated
+/// A validated value as its 16-bit on-disk field. The registries admit
+/// nothing wider (name and program lengths, the permille); past it is a violated
 /// writer invariant — a fail-stop, never a wrapped length in the durable
 /// catalog a boot then mis-frames.
 fn len_u16(len: usize) -> u16 {

@@ -315,9 +315,7 @@ impl FrameBuilder {
     #[must_use]
     pub fn sealed_frame(&self) -> &[u8] {
         assert!(self.sealed, "sealed_frame before finalize");
-        // `finalize` resized the buffer to exactly `at + sealed_len`.
-        debug_assert_eq!(self.buf.len().checked_sub(self.at), Some(self.sealed_len));
-        &self.buf[self.at..]
+        &self.buf[self.at..][..self.sealed_len]
     }
 
     /// The finished frame's length (padding included), 0 before

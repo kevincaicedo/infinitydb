@@ -360,13 +360,16 @@ impl<F: SegmentFs> ExtentWriter<F> {
         Ok(())
     }
 
-    /// Index of the frame holding the last appended byte. Callers hold a
-    /// non-empty tail, so `written >= 1`; saturating keeps a broken
-    /// caller on frame 0 instead of wrapping to the far end of the file.
+    /// Index of the frame holding the last appended byte.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: every caller holds a non-empty tail (`tail_fill > 0`, tested in \
+                  `finish*`, or == TIER_FRAME_DATA in `stage_full_frame`), and `append_chunk` \
+                  adds to `written` whatever it adds to `tail_fill`, so written >= 1"
+    )]
     fn last_frame_index(&self) -> u64 {
-        debug_assert!(self.written > 0, "no byte appended yet");
         const FRAME_DATA: u64 = TIER_FRAME_DATA as u64;
-        self.written.saturating_sub(1) / FRAME_DATA
+        (self.written - 1) / FRAME_DATA
     }
 
     /// Bytes handed to the device, summed. Saturating: the figure is
@@ -671,7 +674,7 @@ impl<File: SegmentFile> ExtentReader<File> {
         clippy::arithmetic_side_effects,
         clippy::cast_possible_truncation,
         reason = "bound: len <= BLOB_CHUNK_BYTES (asserted), so tier_frame_span returns at most \
-                  TIER_BATCH_FRAMES + 1 frames (a u32) and a skip < TIER_FRAME_DATA; taken <= len \
+                  TIER_BATCH_FRAMES + 2 frames (a u32) and a skip < TIER_FRAME_DATA; taken <= len \
                   because each take is capped by len - taken"
     )]
     pub fn read(
@@ -767,8 +770,7 @@ fn read_full<File: SegmentFile>(file: &File, offset: u64, buf: &mut [u8]) -> io:
         if n == 0 {
             break;
         }
-        // A file reporting more than the slice it was handed fills it.
-        read = read.saturating_add(n).min(buf.len());
+        read = crate::fs::advance_read(read, n, buf.len())?;
     }
     Ok(read)
 }

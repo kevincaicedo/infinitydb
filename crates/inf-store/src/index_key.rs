@@ -287,14 +287,15 @@ fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
     out.len = buf_len(len + 1);
 }
 
-/// The buffer length as its `u16` field: every producer writes at most
-/// `ORDERED_KEY_MAX + 1` bytes (the D3 cap plus a terminator), so the
-/// narrowing is exact — stated here once instead of at each cast.
+/// The buffer length as its `u16` field. Every producer has just written
+/// `out.bytes[len - 1]` — a bounds-checked index into the fixed
+/// `ORDERED_KEY_MAX`-byte array — or keeps `len` under that cap by its
+/// loop guard, so the narrowing is exact; stated once, not at each cast.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "bound: each caller passes one past an index it has just written in the fixed \
-              ORDERED_KEY_MAX-byte buffer, or a length its loop guard keeps under that cap; \
-              the cap fits u16 (const-asserted below)"
+    reason = "bound: len <= ORDERED_KEY_MAX — a larger one panicked at the bounds-checked write \
+              of bytes[len - 1] into the fixed buffer before reaching here — and the cap fits \
+              u16 (const-asserted below)"
 )]
 fn buf_len(len: usize) -> u16 {
     debug_assert!(len <= ORDERED_KEY_MAX, "index key buffer past the D3 cap");

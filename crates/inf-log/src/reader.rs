@@ -472,7 +472,7 @@ impl<File: SegmentFile> SegmentReader<File> {
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "bound: start > valid is tested before their difference and start <= valid \
-                  holds after it; read_at fills at most buf[valid..target], so valid <= target; \
+                  holds after it (advance_read keeps valid <= target); \
                   file_pos is a byte position inside one u32-addressed segment file"
     )]
     fn refill(&mut self, needed: usize) -> Result<(), ReadError> {
@@ -503,7 +503,10 @@ impl<File: SegmentFile> SegmentReader<File> {
             if read == 0 {
                 self.hit_eof = true;
             } else {
-                self.valid += read;
+                self.valid =
+                    crate::fs::advance_read(self.valid, read, target).map_err(|source| {
+                        ReadError::Io { segment: self.segment, offset: self.next_offset, source }
+                    })?;
                 self.file_pos += read as u64;
             }
         }

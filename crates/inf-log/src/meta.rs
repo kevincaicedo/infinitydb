@@ -169,12 +169,7 @@ pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec
         if n == 0 {
             return Err(invalid(format!("envelope torn: EOF at {read} of {len} bytes")));
         }
-        // A file that reports more bytes than the slice it was handed is
-        // refused like any other malformed envelope read.
-        read = read
-            .checked_add(n)
-            .filter(|&read| read <= buf.len())
-            .ok_or_else(|| invalid(format!("envelope read_at returned {n} bytes past {read}")))?;
+        read = crate::fs::advance_read(read, n, buf.len())?;
     }
     let payload_len = decode_envelope(&buf)?.len();
     buf.drain(..HEADER_LEN);

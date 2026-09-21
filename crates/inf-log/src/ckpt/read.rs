@@ -250,8 +250,7 @@ fn read_exact_at<File: SegmentFile>(
         if n == 0 {
             return Err(IckReadError::Truncated { at });
         }
-        // A file reporting more than the slice it was handed fills it.
-        done = done.saturating_add(n).min(buf.len());
+        done = crate::fs::advance_read(done, n, buf.len())?;
     }
     Ok(())
 }
@@ -273,8 +272,15 @@ fn footer_len(ns_count: usize) -> Option<usize> {
 }
 
 /// Zero bytes between a v3 block's end and its aligned successor.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: a remainder of ICK_BLOCK_ALIGN is below it"
+)]
 fn padding_len(block_len: usize) -> usize {
-    ick_align_up(block_len).abs_diff(block_len)
+    match block_len % ICK_BLOCK_ALIGN {
+        0 => 0,
+        rem => ICK_BLOCK_ALIGN - rem,
+    }
 }
 
 /// The `(ns, entries)` pairs of a CRC-valid footer block.
@@ -844,7 +850,8 @@ impl<File: SegmentFile> IckReader<File> {
             return Err(IckReadError::Truncated { at: 28 }); // absurd count: damaged length
         }
         let header_len = header_len(ns_count).ok_or(IckReadError::Truncated { at: 28 })?;
-        let mut rest = vec![0u8; header_len.abs_diff(HEADER_FIXED_LEN)];
+        let rest_len = span_len(CRC_LEN, ns_count, 4).ok_or(IckReadError::Truncated { at: 28 })?;
+        let mut rest = vec![0u8; rest_len];
         read_exact_at(&file, HEADER_FIXED_LEN as u64, &mut rest)?;
         let (ids, stored_header_crc) =
             rest.split_last_chunk::<CRC_LEN>().ok_or(IckReadError::Truncated { at: 28 })?;
@@ -1059,17 +1066,19 @@ impl<File: SegmentFile> IckReader<File> {
         records: u64,
     ) -> Result<IckStep, IckReadError> {
         // Counts the footer audits: past their width they cannot match it.
-        self.sections = self
+        // Every refusal comes before the first assignment.
+        let sections = self
             .sections
             .checked_add(1)
             .ok_or(IckReadError::FooterMismatch { field: "section_count" })?;
-        self.records_total = self
+        let records_total = self
             .records_total
             .checked_add(records)
             .ok_or(IckReadError::FooterMismatch { field: "records_total" })?;
         let hop = self.hop(frame.block_len)?;
-        self.offset =
+        let offset =
             self.offset.checked_add(hop).ok_or(IckReadError::Truncated { at: self.offset })?;
+        (self.sections, self.records_total, self.offset) = (sections, records_total, offset);
         Ok(IckStep::Section { bytes: hop })
     }
 
