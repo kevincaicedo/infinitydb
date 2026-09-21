@@ -45,7 +45,8 @@ use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick_hybr
 use inf_log::fs::SegmentFs as _;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, DocLineage, IckIdxSidecarStep, IdxSidecarMeta, Lsn, RecordView, SegmentId,
+    CkptConfig, DocLineage, IckIdxSidecarStep, IdxSidecarMeta, IdxSidecarRules, Lsn, RecordView,
+    SegmentId,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -148,6 +149,18 @@ fn key_of(i: u64) -> Vec<u8> {
     format!("doc:{i:04}").into_bytes()
 }
 
+/// The same universe as forced 64-bit aliases (`collision-oracle`,
+/// ADR-0094 D3): groups of four keys share one `PkRef`, and `random_doc`
+/// draws from few values, so most groups share tree entries.
+fn alias_key_of(i: u64) -> Vec<u8> {
+    let (group, member) = (i / 4, i % 4);
+    let mut key = inf_store::COLLISION_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&group.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    key.extend_from_slice(&group.to_le_bytes());
+    key.extend_from_slice(&[b'a' + member as u8; 16]);
+    key
+}
+
 /// The tail-record model: what phase-B live mutations replay as on the
 /// fresh node (the log vocabulary, applied via `apply_record`).
 enum TailOp {
@@ -159,14 +172,27 @@ enum TailOp {
 /// Drive one live mutation through the bracket exactly as the plane
 /// does, recording its tail-replay record.
 fn live_op(ks: &mut Keyspace, rng: &mut Rng, now: Nanos, tail: &mut Vec<TailOp>) {
+    live_op_over(key_of, ks, rng, now, tail);
+}
+
+fn live_op_over(
+    key_of: fn(u64) -> Vec<u8>,
+    ks: &mut Keyspace,
+    rng: &mut Rng,
+    now: Nanos,
+    tail: &mut Vec<TailOp>,
+) {
     let key = key_of(rng.below(160));
     match rng.below(8) {
         0..=4 => {
             let doc = parse(&random_doc(rng));
-            bracketed(ks, &[&key], |s| {
-                let _ = s.json_set(&key, &doc, Default::default(), now);
-            });
-            tail.push(TailOp::Doc(key, doc));
+            // `WRONGTYPE` over a string key is a refusal: nothing changed,
+            // so nothing is logged — the tail is what the node applied.
+            let applied =
+                bracketed(ks, &[&key], |s| s.json_set(&key, &doc, Default::default(), now).is_ok());
+            if applied {
+                tail.push(TailOp::Doc(key, doc));
+            }
         }
         5..=6 => {
             bracketed(ks, &[&key], |s| s.del(&key, now));
@@ -249,7 +275,7 @@ fn tree_entries(ks: &Keyspace, id: IndexId) -> BTreeSet<(Vec<u8>, u64)> {
     let mut cursor = OrderedCursor::from_start();
     let mut out = BTreeSet::new();
     while let Some((key, entry_ref)) = tree.cursor_next(&mut cursor) {
-        out.insert((key.to_vec(), entry_ref));
+        out.insert((key.to_vec(), entry_ref.to_raw()));
     }
     out
 }
@@ -285,6 +311,7 @@ fn emit_sidecars(
             generation,
             key_encoding_version: INDEX_KEY_ENCODING_VERSION,
             fixed8,
+            maint_rules: inf_store::IDX_MAINT_RULES,
         });
         let mut cursor = OrderedCursor::from_start();
         let mut ordinal = 0u64;
@@ -379,6 +406,15 @@ fn converged_fixture(count: u64, seed: u64) -> (Keyspace, Corpus, Rng, Nanos) {
 }
 
 fn converged_fixture_with(
+    cfg: StoreConfig,
+    count: u64,
+    seed: u64,
+) -> (Keyspace, Corpus, Rng, Nanos) {
+    converged_fixture_over(key_of, cfg, count, seed)
+}
+
+fn converged_fixture_over(
+    key_of: fn(u64) -> Vec<u8>,
     cfg: StoreConfig,
     count: u64,
     seed: u64,
@@ -482,6 +518,102 @@ fn sidecar_load_and_catchup_converge_to_oracle() {
     }
 }
 
+/// ARCH-W0.2 §6, the lifecycle row: one **collision history** through
+/// every way a tree is built or emptied — backfill over alias groups,
+/// sidecar save → load under fuzzy emission, the `CatchUp` replay arm
+/// over the same tail the live node applied, `Strict` live load after
+/// the commit, and `FLUSH` with groups present. Every tree equals the
+/// from-scratch oracle at each stage, rebuild ≡ live, and the alias
+/// counters prove each stage met a group (a run over distinct refs
+/// would pass the equalities vacuously).
+#[test]
+fn a_collision_history_survives_backfill_sidecar_replay_and_flush() {
+    let assert_oracle = |ks: &mut Keyspace, now: Nanos, stage: &str| {
+        for &(id, path_expr, key_type) in INDEXES {
+            assert_eq!(
+                tree_entries(ks, IndexId(id)),
+                oracle_entries(ks, path_expr, key_type, now),
+                "index {id} diverged from the oracle: {stage}"
+            );
+        }
+    };
+    assert_eq!(
+        KeyHasher::default().hash(&alias_key_of(0)),
+        KeyHasher::default().hash(&alias_key_of(3)),
+        "the oracle collides a group"
+    );
+    // Backfill over groups: inserts never enumerate — the tree is a set.
+    let (mut ks1, corpus, mut rng, mut now) =
+        converged_fixture_over(alias_key_of, StoreConfig::default(), 160, 0xA11A5);
+    assert_oracle(&mut ks1, now, "backfill over alias groups");
+    let documents: usize = corpus.len();
+    let qty_entries = tree_entries(&ks1, IndexId(2)).len();
+    assert!(
+        qty_entries < documents,
+        "aliases share `$.name` entries: {qty_entries} of {documents}"
+    );
+
+    let mut tail: Vec<TailOp> = Vec::new();
+    let (fs, path) = emit_sidecars(
+        &mut ks1,
+        7,
+        |ks| {
+            let mut inner_now = now;
+            for _ in 0..2 {
+                live_op_over(alias_key_of, ks, &mut rng, inner_now, &mut tail);
+                inner_now.0 += 1_000_000;
+            }
+        },
+        |meta| meta,
+    );
+    now.0 += 1_000_000_000;
+    assert_oracle(&mut ks1, now, "live, under the fuzzy emission");
+    let live = ks1.idx_counters_total();
+    assert!(live.alias_groups > 0 && live.alias_kept > 0, "the live leg met a group: {live:?}");
+
+    // Save → load → the replay arm over the same history.
+    let mut ks2 = rebooted(&ks1, &corpus, now);
+    let mut loader = SidecarLoader::default();
+    load_sections(&mut loader, &mut ks2, &fs, &path);
+    loader.finish_load(&mut ks2);
+    replay_tail(&mut ks2, &tail, now);
+    let rows = loader.commit_ready(&mut ks2);
+    for row in &rows {
+        assert!(matches!(row.decision, SidecarBootDecision::Loaded { .. }), "{:?}", row.decision);
+    }
+    assert_oracle(&mut ks2, now, "sidecar load + CatchUp replay");
+    for &(id, ..) in INDEXES {
+        assert_eq!(
+            tree_entries(&ks2, IndexId(id)),
+            tree_entries(&ks1, IndexId(id)),
+            "index {id}: rebuild ≡ live"
+        );
+    }
+    let replayed = ks2.idx_counters_total();
+    assert!(
+        replayed.alias_groups > 0 && replayed.alias_kept > 0,
+        "the replay arm met a group: {replayed:?}"
+    );
+
+    // `Strict` live load over the loaded trees, then `FLUSH` with groups
+    // present: every tree empties, and the next history starts clean.
+    let mut tail2 = Vec::new();
+    for _ in 0..128 {
+        live_op_over(alias_key_of, &mut ks2, &mut rng, now, &mut tail2);
+        now.0 += 1_000_000;
+    }
+    assert_oracle(&mut ks2, now, "post-commit live load");
+    ks2.ns_store_mut(NS).expect("registered").flush(now);
+    for &(id, ..) in INDEXES {
+        assert!(tree_entries(&ks2, IndexId(id)).is_empty(), "index {id} after FLUSH");
+    }
+    for _ in 0..128 {
+        live_op_over(alias_key_of, &mut ks2, &mut rng, now, &mut tail2);
+        now.0 += 1_000_000;
+    }
+    assert_oracle(&mut ks2, now, "live load after FLUSH");
+}
+
 #[test]
 fn empty_converged_tree_loads_from_its_final_section() {
     // An index on an unwritten namespace converges instantly (S05) and
@@ -571,6 +703,65 @@ fn key_scheme_mismatch_discards_and_rebuilds() {
     );
 }
 
+/// ADR-0078 A2.5 — the old-version fixture, built in source (entry refs
+/// are bound to the data directory's hash key, so checked-in bytes could
+/// not boot). Index 1's stream is written with `maint_rules = 0` — byte
+/// for byte what a pre-A2 writer emitted, which left those bits zero —
+/// and carries the two defect states those rules could leave behind: one
+/// **stale** pair (no document holds it) and one **missing** pair. A
+/// new-format round trip cannot show this. The loader must refuse the
+/// stream for its rules, never trust its pairs.
+#[test]
+fn a_sidecar_written_under_older_maintenance_rules_is_discarded_and_rebuilt() {
+    let (ks1, corpus, _rng, now) = converged_fixture(60, 44);
+    let (_, path_expr, key_type) = INDEXES[0];
+    let mut pairs: Vec<(Vec<u8>, u64)> = tree_entries(&ks1, IndexId(1)).into_iter().collect();
+    let missing = pairs.remove(pairs.len() / 2);
+    let mut buf = IndexKeyBuf::new();
+    index_key_encode(key_type, IndexScalar::F64(987_654.5), &mut buf).expect("encodes");
+    let stale = (buf.as_bytes().to_vec(), KeyHasher::default().hash(b"doc:never-existed"));
+    pairs.push(stale.clone());
+    pairs.sort();
+
+    let fs = MemFs::new();
+    let dir = Path::new("/ckpt");
+    fs.create_dir_all(dir).unwrap();
+    let cfg = CkptConfig { section_bytes: 256, ..Default::default() };
+    let at = Lsn::new(SegmentId(1), 64);
+    let mut w = SyncIckWriter::create_v2(fs.clone(), dir, &cfg, 0, 1, at, &[NS.0]).expect("v2");
+    let meta = IdxSidecarMeta {
+        ns: NS.0,
+        index_id: 1,
+        generation: 1,
+        key_encoding_version: INDEX_KEY_ENCODING_VERSION,
+        fixed8: true,
+        maint_rules: IdxSidecarRules::PRE_A2,
+    };
+    for (ordinal, (key, entry_ref)) in pairs.iter().enumerate() {
+        w.append_idx_entry(&meta, ordinal as u64, key, *entry_ref).expect("entry");
+    }
+    w.append_idx_final(&meta, pairs.len() as u64).expect("final");
+    w.finish().expect("finish");
+    let path = dir.join(ick_file_name(1));
+
+    let mut ks2 = rebooted(&ks1, &corpus, now);
+    let mut loader = SidecarLoader::default();
+    load_sections(&mut loader, &mut ks2, &fs, &path);
+    loader.finish_load(&mut ks2);
+    let rows = loader.commit_ready(&mut ks2);
+    let row = rows.iter().find(|r| r.id == IndexId(1)).expect("row");
+    assert_eq!(
+        row.decision,
+        SidecarBootDecision::Rebuilt { reason: SidecarRebuildReason::MaintenanceRules },
+        "pairs maintained under older rules are never trusted"
+    );
+    backfill_to_convergence(&mut ks2, now);
+    let rebuilt = tree_entries(&ks2, IndexId(1));
+    assert_eq!(rebuilt, oracle_entries(&mut ks2, path_expr, key_type, now), "tree ≡ the model");
+    assert!(rebuilt.contains(&missing), "the pair the old rules lost is back");
+    assert!(!rebuilt.contains(&stale), "the pair the old rules leaked is gone");
+}
+
 #[test]
 fn ordinal_gap_discards_and_rebuilds() {
     // A hole in the ordinal chain across sections — the shape an
@@ -595,6 +786,7 @@ fn ordinal_gap_discards_and_rebuilds() {
         generation: 3,
         key_encoding_version: INDEX_KEY_ENCODING_VERSION,
         fixed8: true,
+        maint_rules: inf_store::IDX_MAINT_RULES,
     };
     let mut pairs: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut cursor = OrderedCursor::from_start();
@@ -652,6 +844,7 @@ fn cross_section_regression_discards_as_out_of_order() {
         generation: 3,
         key_encoding_version: INDEX_KEY_ENCODING_VERSION,
         fixed8: true,
+        maint_rules: inf_store::IDX_MAINT_RULES,
     };
     let mut pairs: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut cursor = OrderedCursor::from_start();
@@ -710,6 +903,7 @@ fn missing_final_discards_as_incomplete() {
         generation: 3,
         key_encoding_version: INDEX_KEY_ENCODING_VERSION,
         fixed8: true,
+        maint_rules: inf_store::IDX_MAINT_RULES,
     };
     let mut cursor = OrderedCursor::from_start();
     let mut pairs = Vec::new();
@@ -755,6 +949,7 @@ fn sections_after_final_discard_as_after_final() {
         generation: 3,
         key_encoding_version: INDEX_KEY_ENCODING_VERSION,
         fixed8: true,
+        maint_rules: inf_store::IDX_MAINT_RULES,
     };
     let mut cursor = OrderedCursor::from_start();
     let mut pairs = Vec::new();

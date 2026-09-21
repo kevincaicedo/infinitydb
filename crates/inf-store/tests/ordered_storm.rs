@@ -9,7 +9,16 @@
 
 use std::collections::BTreeSet;
 
-use inf_store::{Fixed8, OrderedCursor, OrderedMap, VarKey};
+use inf_store::{AliasView, Fixed8, OrderedCursor, OrderedMap, PkRef, VarKey};
+
+fn pk(raw: u64) -> PkRef {
+    PkRef::from_key_hash(raw)
+}
+
+/// A bare tree has no record table behind it, so no ref has an alias.
+fn unaliased(raw: u64) -> AliasView {
+    AliasView::unaliased_for_tests(pk(raw))
+}
 
 struct XorShift(u64);
 
@@ -37,10 +46,10 @@ fn storm_var(seed: u64, ops: usize, key_space: u64, ref_space: u64) {
         key.resize(len, 0xAB);
         let entry_ref = rng.next() % ref_space;
         if rng.next() % 5 < 3 {
-            let inserted = map.insert(&key, entry_ref).expect("capacity");
+            let inserted = map.insert(&key, pk(entry_ref)).expect("capacity");
             assert_eq!(inserted, model.insert((key, entry_ref)), "insert verdict @op {op}");
         } else {
-            let removed = map.remove(&key, entry_ref);
+            let removed = map.remove(&key, pk(entry_ref), &unaliased(entry_ref));
             assert_eq!(removed, model.remove(&(key, entry_ref)), "remove verdict @op {op}");
         }
         if op % 100_000 == 0 {
@@ -50,7 +59,7 @@ fn storm_var(seed: u64, ops: usize, key_space: u64, ref_space: u64) {
     let mut cursor = OrderedCursor::from_start();
     let mut scanned = Vec::with_capacity(model.len());
     while let Some((key, entry_ref)) = cursor.next(&map) {
-        scanned.push((key.to_vec(), entry_ref));
+        scanned.push((key.to_vec(), entry_ref.to_raw()));
     }
     let want: Vec<(Vec<u8>, u64)> = model.into_iter().collect();
     assert_eq!(scanned, want, "full scan must equal the model in order");
@@ -65,17 +74,17 @@ fn storm_fixed(seed: u64, ops: usize, key_space: u64) {
         let key_val = rng.next() % key_space;
         let entry_ref = rng.next() % 4;
         if rng.next() % 5 < 3 {
-            let inserted = map.insert(&key_val.to_be_bytes(), entry_ref).expect("capacity");
+            let inserted = map.insert(&key_val.to_be_bytes(), pk(entry_ref)).expect("capacity");
             assert_eq!(inserted, model.insert((key_val, entry_ref)), "insert verdict @op {op}");
         } else {
-            let removed = map.remove(&key_val.to_be_bytes(), entry_ref);
+            let removed = map.remove(&key_val.to_be_bytes(), pk(entry_ref), &unaliased(entry_ref));
             assert_eq!(removed, model.remove(&(key_val, entry_ref)), "remove verdict @op {op}");
         }
     }
     let mut cursor = OrderedCursor::from_start();
     let mut scanned = Vec::with_capacity(model.len());
     while let Some((key, entry_ref)) = cursor.next(&map) {
-        scanned.push((u64::from_be_bytes(key.try_into().unwrap()), entry_ref));
+        scanned.push((u64::from_be_bytes(key.try_into().unwrap()), entry_ref.to_raw()));
     }
     let want: Vec<(u64, u64)> = model.into_iter().collect();
     assert_eq!(scanned, want, "full scan must equal the model in order");

@@ -15,8 +15,8 @@ use inf_query::partiql::{CatalogView, CompiledStatement, compile};
 use proptest::prelude::*;
 
 use inf_store::{
-    Fixed8, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState, IndexTree,
-    NsId, OrderedMap, index_key_encode,
+    AliasView, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState, IndexTree,
+    NsId, PkRef, index_key_encode,
 };
 
 struct OneIndex {
@@ -61,6 +61,10 @@ fn i64_key(v: i64) -> Vec<u8> {
     buf.as_bytes().to_vec()
 }
 
+fn pk_ref(pk: u64) -> PkRef {
+    PkRef::from_key_hash(pk)
+}
+
 /// A fixture document store: pk ref → (idoc bytes, live). The S04
 /// maintenance contract keeps tree entries and docs in step; here the
 /// test plays both roles.
@@ -73,12 +77,14 @@ impl Docs {
         let json = format!("{{\"price\": {price}, \"flag\": {flag}}}");
         let bytes = JsonParser::new().parse(json.as_bytes()).expect("doc parses");
         self.docs.insert(pk, bytes);
-        assert!(tree.insert(&i64_key(price), pk).expect("tree capacity"));
+        assert!(tree.insert(&i64_key(price), pk_ref(pk)).expect("tree capacity"));
     }
 
     fn remove(&mut self, tree: &mut IndexTree, pk: u64, price: i64) {
         assert!(self.docs.remove(&pk).is_some());
-        assert!(tree.remove(&i64_key(price), pk));
+        // The fixture has no record table: no ref has an alias.
+        let unaliased = AliasView::unaliased_for_tests(pk_ref(pk));
+        assert!(tree.remove(&i64_key(price), pk_ref(pk), &unaliased));
     }
 }
 
@@ -99,7 +105,8 @@ fn run_page(
     let mut pager =
         RangePager::new(lo, hi, resume, IndexKeyType::I64, scan_budget, limit_remaining)
             .expect("well-formed resume");
-    while let Some((_, pk)) = pager.next(tree) {
+    while let Some((_, entry_ref)) = pager.next(tree) {
+        let pk = entry_ref.to_raw();
         let doc = docs.docs.get(&pk).expect("fixture keeps docs and entries in step");
         let matched = match &compiled.vm {
             None => true,
@@ -124,7 +131,7 @@ fn run_page(
 #[test]
 fn count_pages_sum_to_truth_under_mutation() {
     let catalog = catalog("$.price", IndexKeyType::I64);
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     let mut docs = Docs { docs: HashMap::new() };
     // Stable docs: prices 0..100, flag alternates — the residual keeps
     // the even pks. In-range stable matches: price in [10, 60) & flag.
@@ -186,7 +193,7 @@ fn count_pages_sum_to_truth_under_mutation() {
 #[test]
 fn resume_is_exact_mid_key() {
     let catalog = catalog("$.tags[*]", IndexKeyType::I64);
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     let mut docs = Docs { docs: HashMap::new() };
     // Ten docs share the indexed value 7 (plus neighbors on both sides
     // that the equality range must exclude).
@@ -194,10 +201,10 @@ fn resume_is_exact_mid_key() {
         let json = format!("{{\"tags\": [7], \"pk\": {pk}}}");
         let bytes = JsonParser::new().parse(json.as_bytes()).expect("doc parses");
         docs.docs.insert(pk, bytes);
-        assert!(tree.insert(&i64_key(7), pk).expect("capacity"));
+        assert!(tree.insert(&i64_key(7), pk_ref(pk)).expect("capacity"));
     }
-    assert!(tree.insert(&i64_key(6), 96).expect("capacity"));
-    assert!(tree.insert(&i64_key(8), 98).expect("capacity"));
+    assert!(tree.insert(&i64_key(6), pk_ref(96)).expect("capacity"));
+    assert!(tree.insert(&i64_key(8), pk_ref(98)).expect("capacity"));
     docs.docs.insert(96, JsonParser::new().parse(b"{\"tags\": [6]}").expect("doc"));
     docs.docs.insert(98, JsonParser::new().parse(b"{\"tags\": [8]}").expect("doc"));
 
@@ -224,7 +231,7 @@ fn resume_is_exact_mid_key() {
 #[test]
 fn limit_caps_the_total_across_pages() {
     let catalog = catalog("$.price", IndexKeyType::I64);
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     let mut docs = Docs { docs: HashMap::new() };
     for pk in 0..20u64 {
         docs.insert(&mut tree, pk, pk as i64, true);
@@ -255,7 +262,7 @@ fn limit_caps_the_total_across_pages() {
 #[test]
 fn suspension_resumes_without_loss() {
     let catalog = catalog("$.price", IndexKeyType::I64);
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     let mut docs = Docs { docs: HashMap::new() };
     for pk in 0..10u64 {
         docs.insert(&mut tree, pk, pk as i64, true);
@@ -267,7 +274,7 @@ fn suspension_resumes_without_loss() {
     let mut emitted: Vec<u64> = Vec::new();
     for _ in 0..2 {
         let (_, pk) = pager.next(&tree).expect("candidates remain");
-        emitted.push(pk);
+        emitted.push(pk.to_raw());
         pager.count_match();
     }
     let suspended = pager.finish();
@@ -292,7 +299,7 @@ fn suspension_resumes_without_loss() {
 #[test]
 fn resume_below_the_lower_edge_serves_nothing_out_of_range() {
     let catalog = catalog("$.price", IndexKeyType::I64);
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     let mut docs = Docs { docs: HashMap::new() };
     for pk in 0..1200u64 {
         docs.insert(&mut tree, pk, pk as i64, true);
@@ -300,11 +307,12 @@ fn resume_below_the_lower_edge_serves_nothing_out_of_range() {
     let compiled = compile(b"SELECT * FROM ns WHERE price > 1000", &catalog).expect("compiles");
     let AccessStep::IndexRange { lo, hi, .. } = &compiled.access.step else { unreachable!() };
     assert!(compiled.access.residual.is_none(), "the conjunct folds into the range");
-    let forged = PageResume { key: i64_key(5), entry_ref: 5 };
+    let forged = PageResume { key: i64_key(5), entry_ref: pk_ref(5) };
     let mut pager = RangePager::new(lo, hi, Some(&forged), IndexKeyType::I64, 10_000, None)
         .expect("an 8-byte resume key");
     let mut served: Vec<u64> = Vec::new();
     while let Some((key, pk)) = pager.next(&tree) {
+        let pk = pk.to_raw();
         assert!(lo.admits_from_below(key), "served pk {pk} below the lower edge (price > 1000)");
         served.push(pk);
     }
@@ -332,23 +340,25 @@ proptest! {
         hi in edge_strategy(),
         resume in prop::option::of((-24i64..24, 0u64..6)),
     ) {
-        let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+        let mut tree = IndexTree::for_tests(IndexKeyType::I64);
         for &(v, pk) in &entries {
-            prop_assert!(tree.insert(&i64_key(v), pk).expect("capacity"));
+            prop_assert!(tree.insert(&i64_key(v), pk_ref(pk)).expect("capacity"));
         }
-        let resume = resume.map(|(v, pk)| PageResume { key: i64_key(v), entry_ref: pk });
+        let resume = resume.map(|(v, pk)| PageResume { key: i64_key(v), entry_ref: pk_ref(pk) });
         let expected: Vec<(Vec<u8>, u64)> = entries
             .iter()
             .map(|&(v, pk)| (i64_key(v), pk))
             .filter(|(key, _)| lo.admits_from_below(key) && hi.admits_from_above(key))
-            .filter(|pair| resume.as_ref().is_none_or(|r| *pair > (r.key.clone(), r.entry_ref)))
+            .filter(|pair| {
+                resume.as_ref().is_none_or(|r| *pair > (r.key.clone(), r.entry_ref.to_raw()))
+            })
             .collect();
         let mut pager =
             RangePager::new(&lo, &hi, resume.as_ref(), IndexKeyType::I64, 10_000, None)
                 .expect("8-byte resume keys");
         let mut served: Vec<(Vec<u8>, u64)> = Vec::new();
         while let Some((key, pk)) = pager.next(&tree) {
-            served.push((key.to_vec(), pk));
+            served.push((key.to_vec(), pk.to_raw()));
         }
         prop_assert_eq!(served, expected, "lo={:?} hi={:?} resume={:?}", lo, hi, resume);
     }
@@ -361,30 +371,31 @@ proptest! {
 // program's edges already obey (`Fixed8` = 8 bytes, `Utf8` = 1..=cap).
 #[test]
 fn a_mis_sized_resume_key_is_a_typed_error_not_a_panic() {
-    let mut tree = IndexTree::Fixed8(OrderedMap::<Fixed8>::new());
+    let mut tree = IndexTree::for_tests(IndexKeyType::I64);
     for pk in 0..64u64 {
-        assert!(tree.insert(&i64_key(pk as i64), pk).expect("capacity"));
+        assert!(tree.insert(&i64_key(pk as i64), pk_ref(pk)).expect("capacity"));
     }
     let lo = RangeEdge::Unbounded;
     let hi = RangeEdge::Unbounded;
     for bad in [0usize, 7, 9, 1025] {
-        let forged = PageResume { key: vec![0u8; bad], entry_ref: 0 };
+        let forged = PageResume { key: vec![0u8; bad], entry_ref: pk_ref(0) };
         let refused = RangePager::new(&lo, &hi, Some(&forged), IndexKeyType::I64, 8, None);
         assert!(matches!(refused, Err(PageError::BadResumeKey)), "{bad}-byte key on I64");
     }
     // The Utf8 rule is the edge rule: empty and over-cap refused, the
     // cap itself accepted.
-    let utf8 = IndexTree::Var(OrderedMap::<inf_store::VarKey>::new());
+    let utf8 = IndexTree::for_tests(IndexKeyType::Utf8);
     for (len, ok) in [(0usize, false), (1, true), (1024, true), (1025, false)] {
-        let forged = PageResume { key: vec![b'x'; len], entry_ref: 0 };
+        let forged = PageResume { key: vec![b'x'; len], entry_ref: pk_ref(0) };
         let built = RangePager::new(&lo, &hi, Some(&forged), IndexKeyType::Utf8, 8, None);
         assert_eq!(built.is_ok(), ok, "{len}-byte key on Utf8");
         if let Ok(mut pager) = built {
             assert_eq!(pager.next(&utf8), None, "empty tree serves nothing");
         }
     }
-    let well_formed = PageResume { key: i64_key(3), entry_ref: 3 };
+    let well_formed = PageResume { key: i64_key(3), entry_ref: pk_ref(3) };
     let mut pager = RangePager::new(&lo, &hi, Some(&well_formed), IndexKeyType::I64, 8, None)
         .expect("8 bytes on I64");
-    assert_eq!(pager.next(&tree).map(|(_, pk)| pk), Some(4), "resumes strictly after the pair");
+    let next = pager.next(&tree).map(|(_, pk)| pk.to_raw());
+    assert_eq!(next, Some(4), "resumes strictly after the pair");
 }

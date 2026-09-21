@@ -23,7 +23,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_store::{Fixed8, OrderedMap, VarKey};
+use inf_store::{Fixed8, OrderedMap, PkRef, VarKey};
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -42,7 +42,7 @@ fn bench_fixed(entries: u64, reps: u64) {
         let t = Instant::now();
         for i in 0..entries {
             let (key, entry_ref) = fixed_pair(i);
-            map.append(&key, entry_ref).expect("ascending");
+            map.append(&key, PkRef::from_raw(entry_ref)).expect("ascending");
         }
         let append_ns = t.elapsed().as_nanos() as f64 / entries as f64;
         let append_mem = map.memory();
@@ -53,7 +53,7 @@ fn bench_fixed(entries: u64, reps: u64) {
         let t = Instant::now();
         for i in 0..entries {
             let (key, entry_ref) = fixed_pair(i);
-            assert!(map.insert(&key, entry_ref).expect("capacity"));
+            assert!(map.insert(&key, PkRef::from_raw(entry_ref)).expect("capacity"));
         }
         let insert_ns = t.elapsed().as_nanos() as f64 / entries as f64;
         let insert_mem = map.memory();
@@ -78,7 +78,7 @@ fn bench_var(entries: u64, reps: u64) {
         let mut map: OrderedMap<VarKey> = OrderedMap::new();
         let t = Instant::now();
         for (i, key) in keys.iter().enumerate() {
-            map.append(key, i as u64).expect("ascending");
+            map.append(key, PkRef::from_raw(i as u64)).expect("ascending");
         }
         let append_ns = t.elapsed().as_nanos() as f64 / entries as f64;
         let append_mem = map.memory();
@@ -88,7 +88,7 @@ fn bench_var(entries: u64, reps: u64) {
         let mut map: OrderedMap<VarKey> = OrderedMap::new();
         let t = Instant::now();
         for (i, key) in keys.iter().enumerate() {
-            assert!(map.insert(key, i as u64).expect("capacity"));
+            assert!(map.insert(key, PkRef::from_raw(i as u64)).expect("capacity"));
         }
         let insert_ns = t.elapsed().as_nanos() as f64 / entries as f64;
         let insert_mem = map.memory();

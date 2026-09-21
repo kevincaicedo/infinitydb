@@ -17,12 +17,14 @@ mod extents;
 /// `scripts/check-fault-points.sh` and armed by tests.
 pub mod fault;
 mod index;
+mod index_alias;
 mod index_backfill;
 mod index_key;
 mod index_maint;
 mod index_registry;
 mod index_sidecar;
 mod keyspace;
+pub mod limits;
 mod live_set;
 mod ns;
 mod ordered;
@@ -48,7 +50,10 @@ pub use extents::{
     BLOB_MAX_BYTES_DEFAULT, BLOB_RECLAIM_PER_SLICE_DEFAULT, BLOB_THRESHOLD_DEFAULT, BlobConfig,
     ExtentRefs, ExtentStats, ReclaimCandidate, ReclaimOrigin,
 };
-pub use index::{ChainPos, HomeGroupCursor, Index, MemoryMode, SlotMode, TieredMode, WalkCursor};
+pub use index::{
+    ChainPos, HomeGroupCursor, Index, MemoryMode, ProbeEnd, SlotMode, TieredMode, WalkCursor,
+};
+pub use index_alias::{AliasLimit, AliasTally, AliasView, AliasWalk};
 pub use index_backfill::{
     BackfillBudget, BackfillInfo, BackfillPhase, BackfillProgress, BackfillTickStats,
 };
@@ -58,8 +63,8 @@ pub use index_key::{
     index_key_escape_prefix, index_scalar_coerce,
 };
 pub use index_maint::{
-    BRACKET_ENTRY_CAP, IdxCounters, IdxMaintRefusal, MaintMode, SCRATCH_RETAIN_BYTES,
-    SCRATCH_RETAIN_ENTRIES,
+    BRACKET_ENTRY_CAP, IDX_MAINT_RULES, IDX_MAINT_RULES_VERSION, IdxCounters, IdxMaintRefusal,
+    MaintMode, SCRATCH_RETAIN_BYTES, SCRATCH_RETAIN_ENTRIES,
 };
 #[cfg(feature = "doc")]
 pub use index_registry::validate_index_program;
@@ -84,7 +89,7 @@ pub use live_set::{FileLiveSet, LiveSet};
 pub use ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsSpec, TierSpec, valid_ns_name};
 pub use ordered::{
     AppendError, Fixed8, KeyScheme, ORDERED_KEY_MAX, OrderedCursor, OrderedMap, OrderedMapError,
-    OrderedMapMemory, VarKey,
+    OrderedMapMemory, PkRef, VarKey,
 };
 pub use record::{
     EXTENT_REF_LEN, ExtentRef, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag,

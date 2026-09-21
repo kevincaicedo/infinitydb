@@ -659,10 +659,11 @@ fn ckpt_gauge_lines(text: &mut String, node: &NodeInfo) {
 
 /// `INFO` — the index stat lines.
 fn index_stat_lines(text: &mut String, ks: &Keyspace) {
-    // M4.5-S04 (ADR-0076 D8): index-maintenance counters, cell-scope
-    // fold (per-index detail rides `INF.IDX LIST` at S10). Nothing
-    // skips, prunes, or degrades silently (L10). Cumulative per boot
-    // — CONFIG RESETSTAT does not reset them (recorded deviation).
+    // ADR-0139 D8: index-maintenance counters, cell-scope fold
+    // (per-index detail rides `INF.IDX LIST` at S10). Nothing skips,
+    // prunes, degrades or suppresses a removal silently (L10).
+    // Cumulative per boot — CONFIG RESETSTAT does not reset them
+    // (recorded deviation). `idx_alias_walk_groups_max` is a maximum.
     {
         let idx = ks.idx_counters_total();
         push(text, &format!("idx_maint_inserts:{}", idx.maint_inserts));
@@ -673,6 +674,14 @@ fn index_stat_lines(text: &mut String, ks: &Keyspace) {
         push(text, &format!("idx_skipped_nan:{}", idx.skipped_nan));
         push(text, &format!("idx_skipped_toolong:{}", idx.skipped_toolong));
         push(text, &format!("idx_degraded_trips:{}", idx.degraded_trips));
+        push(text, &format!("idx_alias_groups:{}", idx.alias_groups));
+        push(text, &format!("idx_alias_kept:{}", idx.alias_kept));
+        push(text, &format!("idx_alias_held_marks:{}", idx.alias_held_marks));
+        push(text, &format!("idx_cover_alias:{}", idx.cover_alias));
+        push(text, &format!("idx_alias_walk_over:{}", idx.alias_walk_over));
+        push(text, &format!("idx_alias_walk_groups_max:{}", idx.alias_walk_groups_max));
+        push(text, &format!("idx_gate_forget:{}", idx.gate_forget));
+        push(text, &format!("idx_prune_void:{}", idx.prune_void));
     }
     // M4.5-S05 (ADR-0077 D8): backfill progress, cell-scope fold —
     // phase counts plus cumulative walk totals (same per-boot

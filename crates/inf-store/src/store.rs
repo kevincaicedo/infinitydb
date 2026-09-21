@@ -1285,20 +1285,23 @@ impl CellStore {
         let Some((source_addr, source_len)) = self.resolve(source, now) else {
             return Ok(CopyResult::SourceMissing);
         };
-        // COPY is excluded from the plane brackets (ADR-0076 D3): the
+        // COPY is excluded from the plane brackets (ADR-0139 D3): the
         // destination may live in another database, so the mini-bracket
         // runs here, where the owning store is unambiguous. The peek
-        // mutates nothing — `source_addr` stays valid across it.
+        // mutates nothing — `source_addr` stays valid across it. The
+        // bracket commits on **every** outcome: the body resolves its
+        // target inside it and may reap an expired indexed target, whose
+        // entries leave through the diff; an unchanged target evaluates
+        // to `new = old`, a no-op.
         #[cfg(feature = "doc")]
         {
             self.idx_bracket_begin(&[target], None).map_err(OpError::IndexMaintenance)?;
             let result = self.copy_from_resolved(source_addr, source_len, target, replace, now);
-            match &result {
-                Ok(CopyResult::Copied) => {
-                    self.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
-                }
-                _ => self.idx_bracket_abort(),
+            #[cfg(inf_canary_copy_abort_after_death)]
+            if !matches!(result, Ok(CopyResult::Copied)) {
+                self.idx_bracket_abort_canary();
             }
+            self.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
             result
         }
         #[cfg(not(feature = "doc"))]

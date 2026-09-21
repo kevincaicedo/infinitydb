@@ -276,7 +276,7 @@ fn tree_entries(ks: &Keyspace, ns: NsId, id: IndexId) -> BTreeSet<(Vec<u8>, u64)
     let Some(tree) = ks.idx_tree(ns, id) else { return out };
     let mut cursor = OrderedCursor::from_start();
     while let Some((key, entry_ref)) = tree.cursor_next(&mut cursor) {
-        out.insert((key.to_vec(), entry_ref));
+        out.insert((key.to_vec(), entry_ref.to_raw()));
     }
     out
 }

@@ -149,9 +149,54 @@ const IDXSIDECAR_META_LEN: usize = 4 + 4 + 8 + 2 + 1 + 1 + 8 + 8;
 pub const IDXSIDECAR_KEY_MAX: usize = 1024;
 /// Fixed8 sidecar entry: key 8 B · entry_ref u64.
 const IDXSIDECAR_FIXED_ENTRY_LEN: usize = 8 + 8;
+/// Offset of the `flags` byte inside the sidecar body meta — one
+/// definition for the writer's two patch sites and the reader.
+const IDXSIDECAR_FLAGS_AT: usize = 4 + 4 + 8 + 2 + 1;
 /// `flags` bit 0: this is the index's last section; `total_entries` is
-/// meaningful. Any other bit is a body-class failure within v1.
+/// meaningful.
 const IDXSIDECAR_FLAG_FINAL: u8 = 0x01;
+/// `flags` bits 1–3: the maintenance-rules version the pairs were
+/// maintained under (ADR-0078 A2). One definition for writer and reader;
+/// bits 4–7 stay a body-class failure within v1.
+pub const IDXSIDECAR_RULES_SHIFT: u8 = 1;
+pub const IDXSIDECAR_RULES_MASK: u8 = 0b0000_1110;
+
+/// A maintenance-rules version as the sidecar can carry it: three bits.
+/// This crate never learns what the rules are — the store passes its
+/// current value to the writer and judges the value the reader surfaces.
+/// Exhaustion policy: at [`IdxSidecarRules::MAX`] the next rules change
+/// takes a body schema v2, by a superseding ADR.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IdxSidecarRules(u8);
+
+impl IdxSidecarRules {
+    /// The largest representable version.
+    pub const MAX: u8 = IDXSIDECAR_RULES_MASK >> IDXSIDECAR_RULES_SHIFT;
+    /// What every writer before ADR-0078 A2 emitted: it left the bits
+    /// zero.
+    pub const PRE_A2: IdxSidecarRules = IdxSidecarRules(0);
+
+    /// `None` when `version` does not fit the field.
+    #[must_use]
+    pub const fn new(version: u8) -> Option<IdxSidecarRules> {
+        if version <= Self::MAX { Some(IdxSidecarRules(version)) } else { None }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// The field's position inside the meta's `flags` byte.
+    pub(crate) const fn to_flag_bits(self) -> u8 {
+        self.0 << IDXSIDECAR_RULES_SHIFT
+    }
+
+    /// Total: any `flags` byte yields the three bits it carries.
+    pub(crate) const fn from_flags(flags: u8) -> IdxSidecarRules {
+        IdxSidecarRules((flags & IDXSIDECAR_RULES_MASK) >> IDXSIDECAR_RULES_SHIFT)
+    }
+}
 /// `key_scheme` values (ADR-0078 D2).
 const IDXSIDECAR_SCHEME_FIXED8: u8 = 0;
 const IDXSIDECAR_SCHEME_VAR: u8 = 1;
@@ -518,6 +563,9 @@ pub struct IdxSidecarMeta {
     /// True: `Fixed8` (keys exactly 8 bytes); false: `VarKey`
     /// (length-prefixed, ≤ [`IDXSIDECAR_KEY_MAX`]).
     pub fixed8: bool,
+    /// The maintenance rules the pairs were maintained under (ADR-0078
+    /// A2) — the store's current value; a loader discards any other.
+    pub maint_rules: IdxSidecarRules,
 }
 
 /// The checkpoint-buffer domain of one cell: a double-buffered section
@@ -888,11 +936,8 @@ impl IckStream {
             self.staged_idx_entries_before + u64::from(self.staged_records),
             "sidecar ordinals are contiguous within a section"
         );
-        assert_eq!(
-            self.bufs[self.staging][SECTION_HEADER_LEN + 19],
-            0,
-            "no entries after a FINAL marker"
-        );
+        let flags = self.bufs[self.staging][SECTION_HEADER_LEN + IDXSIDECAR_FLAGS_AT];
+        assert_eq!(flags & IDXSIDECAR_FLAG_FINAL, 0, "no entries after a FINAL marker");
         assert!(
             self.staged_records == 0
                 || (key, entry_ref)
@@ -967,7 +1012,8 @@ impl IckStream {
         buf.extend_from_slice(&meta.generation.to_le_bytes());
         buf.extend_from_slice(&meta.key_encoding_version.to_le_bytes());
         buf.push(if meta.fixed8 { IDXSIDECAR_SCHEME_FIXED8 } else { IDXSIDECAR_SCHEME_VAR });
-        buf.push(0); // flags — patched by `stage_idx_final`.
+        // flags: the rules bits now, FINAL patched by `stage_idx_final`.
+        buf.push(meta.maint_rules.to_flag_bits());
         buf.extend_from_slice(&entries_before.to_le_bytes());
         buf.extend_from_slice(&total.to_le_bytes());
         debug_assert_eq!(buf.len(), SECTION_HEADER_LEN + IDXSIDECAR_META_LEN);
@@ -976,9 +1022,9 @@ impl IckStream {
     /// Patches FINAL + `total_entries` into the pending section's meta.
     fn patch_idx_final(&mut self, total_entries: u64) {
         let buf = &mut self.bufs[self.staging];
-        let flags_at = SECTION_HEADER_LEN + 19;
-        assert_eq!(buf[flags_at], 0, "an index finalizes once");
-        buf[flags_at] = IDXSIDECAR_FLAG_FINAL;
+        let flags_at = SECTION_HEADER_LEN + IDXSIDECAR_FLAGS_AT;
+        assert_eq!(buf[flags_at] & IDXSIDECAR_FLAG_FINAL, 0, "an index finalizes once");
+        buf[flags_at] |= IDXSIDECAR_FLAG_FINAL;
         let total_at = SECTION_HEADER_LEN + 28;
         buf[total_at..total_at + 8].copy_from_slice(&total_entries.to_le_bytes());
     }
@@ -1463,6 +1509,9 @@ impl<F: SegmentFs> SyncIckWriter<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any in-range value: this crate never learns what the rules mean.
+    const TEST_RULES: IdxSidecarRules = IdxSidecarRules(5);
     use crate::fs::mem::MemFs;
     use crate::record::NsId;
 
@@ -1712,6 +1761,7 @@ mod tests {
             generation: 1,
             key_encoding_version: 1,
             fixed8: true,
+            maint_rules: TEST_RULES,
         };
         w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
         w.append_idx_final(&meta, 1).expect("idx final");
@@ -1754,6 +1804,7 @@ mod tests {
             generation: 1,
             key_encoding_version: 1,
             fixed8: true,
+            maint_rules: TEST_RULES,
         };
         w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
         w.append_idx_final(&meta, 1).expect("idx final");
@@ -1999,6 +2050,7 @@ mod tests {
             generation: 1,
             key_encoding_version: 1,
             fixed8: true,
+            maint_rules: TEST_RULES,
         };
         w.append_idx_entry(&meta, 0, &7u64.to_be_bytes(), 42).expect("idx entry");
         w.append_idx_final(&meta, 1).expect("idx final");
@@ -2555,6 +2607,7 @@ mod tests {
             generation: 3,
             key_encoding_version: 1,
             fixed8: true,
+            maint_rules: TEST_RULES,
         };
         let want_a: Vec<(Vec<u8>, u64)> =
             (0..5u64).map(|i| ((i * 3).to_be_bytes().to_vec(), 100 + i)).collect();
@@ -2570,6 +2623,7 @@ mod tests {
             generation: 7,
             key_encoding_version: 1,
             fixed8: false,
+            maint_rules: TEST_RULES,
         };
         let want_b: Vec<(Vec<u8>, u64)> = vec![
             (b"alpha".to_vec(), 1),
@@ -2589,6 +2643,7 @@ mod tests {
             generation: 1,
             key_encoding_version: 1,
             fixed8: true,
+            maint_rules: TEST_RULES,
         };
         w.append_idx_final(&idx_c, 0).expect("empty final");
         let summary = w.finish().expect("finish");
@@ -2752,6 +2807,7 @@ mod tests {
                     generation: 1,
                     key_encoding_version: 1,
                     fixed8: true,
+                    maint_rules: TEST_RULES,
                 };
                 stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
             }) as fn(),
@@ -2765,6 +2821,7 @@ mod tests {
                     generation: 1,
                     key_encoding_version: 1,
                     fixed8: true,
+                    maint_rules: TEST_RULES,
                 };
                 stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
                 stream.stage_idx_entry(&meta, 2, &2u64.to_be_bytes(), 1); // ordinal gap
@@ -2779,6 +2836,7 @@ mod tests {
                     generation: 1,
                     key_encoding_version: 1,
                     fixed8: true,
+                    maint_rules: TEST_RULES,
                 };
                 stream.stage_idx_entry(&meta, 0, &2u64.to_be_bytes(), 1);
                 stream.stage_idx_entry(&meta, 1, &1u64.to_be_bytes(), 1); // regression
@@ -2793,6 +2851,7 @@ mod tests {
                     generation: 1,
                     key_encoding_version: 1,
                     fixed8: true,
+                    maint_rules: TEST_RULES,
                 };
                 stream.stage_idx_entry(&meta, 0, &1u64.to_be_bytes(), 1);
                 stream.stage_idx_final(&meta, 1);

@@ -234,6 +234,7 @@ fn sidecar_walk_step(
                     generation,
                     key_encoding_version: inf_store::INDEX_KEY_ENCODING_VERSION,
                     fixed8,
+                    maint_rules: inf_store::IDX_MAINT_RULES,
                 });
             }
         }

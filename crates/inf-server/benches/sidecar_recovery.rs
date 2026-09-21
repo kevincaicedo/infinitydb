@@ -217,6 +217,7 @@ fn build_shard(data_dir: &Path, docs: u64, sidecars: bool) -> u64 {
                 generation: u64::from(id),
                 key_encoding_version: INDEX_KEY_ENCODING_VERSION,
                 fixed8: key_type.fixed8(),
+                maint_rules: inf_store::IDX_MAINT_RULES,
             };
             for (ordinal, (key, entry_ref)) in entries.iter().enumerate() {
                 w.append_idx_entry(&meta, ordinal as u64, key, *entry_ref).expect("entry");

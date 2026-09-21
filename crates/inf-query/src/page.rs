@@ -14,7 +14,7 @@
 //! rebalancing cannot break them); mid-key resume matters because a
 //! multi-valued equality range holds many refs under one key.
 
-use inf_store::{IndexKeyType, IndexTree, OrderedCursor};
+use inf_store::{IndexKeyType, IndexTree, OrderedCursor, PkRef};
 
 use crate::access::{RangeEdge, edge_len_ok};
 
@@ -35,7 +35,7 @@ pub enum PageError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageResume {
     pub key: Vec<u8>,
-    pub entry_ref: u64,
+    pub entry_ref: PkRef,
 }
 
 /// What one page did. `more == false` means the statement is complete
@@ -66,7 +66,8 @@ pub struct RangePager {
     /// Range end or LIMIT reached — the statement is complete.
     done: bool,
     last_key: Vec<u8>,
-    last_ref: u64,
+    /// `Some` once the page consumed a pair.
+    last_ref: Option<PkRef>,
 }
 
 impl RangePager {
@@ -114,7 +115,7 @@ impl RangePager {
             limit_remaining,
             done: false,
             last_key: Vec::new(),
-            last_ref: 0,
+            last_ref: None,
         })
     }
 
@@ -122,7 +123,7 @@ impl RangePager {
     /// when the page ends (budget, range end, or LIMIT). The caller
     /// resolves the ref, applies the residual, and reports a match via
     /// [`RangePager::count_match`].
-    pub fn next(&mut self, tree: &IndexTree) -> Option<(&[u8], u64)> {
+    pub fn next(&mut self, tree: &IndexTree) -> Option<(&[u8], PkRef)> {
         if self.done || self.scanned == self.scan_budget || self.limit_remaining == Some(0) {
             return None;
         }
@@ -137,8 +138,8 @@ impl RangePager {
         self.scanned += 1;
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
-        self.last_ref = entry_ref;
-        Some((self.last_key.as_slice(), self.last_ref))
+        self.last_ref = Some(entry_ref);
+        Some((self.last_key.as_slice(), entry_ref))
     }
 
     /// The last candidate satisfied the statement (residual verdict
@@ -159,8 +160,10 @@ impl RangePager {
     /// byte budgets stop driving and take the resume the same way).
     pub fn finish(self) -> PageOutcome {
         let more = !self.done;
-        let resume = (more && self.scanned > 0)
-            .then_some(PageResume { key: self.last_key, entry_ref: self.last_ref });
+        let resume = self
+            .last_ref
+            .filter(|_| more)
+            .map(|entry_ref| PageResume { key: self.last_key, entry_ref });
         PageOutcome { matched: self.matched, scanned: self.scanned, more, resume }
     }
 }

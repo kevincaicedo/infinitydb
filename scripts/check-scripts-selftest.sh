@@ -414,6 +414,70 @@ root=$(printf '%s' "$body" | manifest ship-forwarder)
 expect green "shipping: a non-default forwarder feature (inf-sim's dst shape)" env INF_CHECK_ROOT="$root" $SHIP
 expect_output "shipping: forwarders are counted" "1 forwarder feature(s)" env INF_CHECK_ROOT="$root" $SHIP
 
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
+[dependencies]
+inf-store = { workspace = true, features = ["test-support"] }
+EOF
+root=$(printf '%s' "$body" | manifest ship-test-support)
+expect red "shipping: a normal edge requests inf-store's test-support (ADR-0139 D2)" env INF_CHECK_ROOT="$root" $SHIP
+
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
+[features]
+test-support = []
+
+[dev-dependencies]
+inf-store = { workspace = true, features = ["test-support"] }
+EOF
+root=$(printf '%s' "$body" | manifest ship-test-support-dev)
+expect green "shipping: test-support declared, and requested on a dev edge only" env INF_CHECK_ROOT="$root" $SHIP
+
+# ------------------------------------------------ planted-bug canary driver
+# ADR-0139: `sim-canaries.sh` judges a crate-test row by the named test's
+# own verdict line. A stub cargo prints a canned test log: with RUSTFLAGS
+# set it is the planted build, without it the plain one.
+CANARY=./scripts/sim-canaries.sh
+canary_fixture() {
+    local name=$1 planted=$2 plain=$3 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "canary_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir"
+    echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+        echo "$planted"
+        echo 'else'
+        echo "$plain"
+        echo 'fi'
+    } >"$dir/cargo"
+    chmod +x "$dir/cargo"
+    echo "$dir"
+}
+ok_line='echo "test the_row ... ok"; exit 0'
+failed_line='echo "test the_row ... FAILED"; exit 101'
+dir=$(canary_fixture canary-caught "$failed_line" "$ok_line")
+expect green "canaries: the named test FAILED on the planted build, ok on the plain one" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-toothless "$ok_line" "$ok_line")
+expect red "canaries: a planted build that stays green is NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the toothless oracle is named" "NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-other-red 'echo "error[E0425]: cannot find value"; echo "test another_row ... FAILED"; exit 101' "$ok_line")
+expect red "canaries: red for another reason (compile error, another test) is not a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the wrong-reason red is named" "red for another reason" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-no-control "$failed_line" "$failed_line")
+expect red "canaries: a plain build that is red too is no control leg" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-filtered-out "$failed_line" 'echo "running 0 tests"; exit 0')
+expect red "canaries: a plain run that never ran the named test is not green" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+: >"$work/canary-empty-rows"
+expect red "canaries: an empty row table is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-empty-rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture crate-test fake test:suite" >"$work/canary-short-row"
+expect red "canaries: a malformed crate-test row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+
 # --------------------------------------------------- release-assert inventory
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and
 # the inventory that names them; each planted drift is red.
@@ -1312,4 +1376,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts each red on a planted violation)"

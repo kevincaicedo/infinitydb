@@ -18,7 +18,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_store::{Fixed8, KeyScheme, OrderedCursor, OrderedMap, VarKey};
+use inf_store::{Fixed8, KeyScheme, OrderedCursor, OrderedMap, PkRef, VarKey};
 
 const ROUNDS: usize = 15;
 const HOT_SET: usize = 100_000;
@@ -62,7 +62,7 @@ fn build_fixed<const F: usize>(n: usize, sequential: bool) -> (OrderedMap<Fixed8
     // (contains() is pair-exact) and every probe below is a hit.
     for i in 0..n {
         let key = if sequential { i as u64 } else { rng.next() };
-        if map.insert(&key.to_be_bytes(), key).expect("capacity") {
+        if map.insert(&key.to_be_bytes(), PkRef::from_key_hash(key)).expect("capacity") {
             keys.push(key);
         }
     }
@@ -87,10 +87,11 @@ fn bench_probe<const F: usize>(
         let mut found = 0u64;
         for &key in &hot {
             let bytes = key.to_be_bytes();
+            let pk_ref = PkRef::from_key_hash(black_box(key));
             let hit = if scalar {
-                map.contains_scalar_search(black_box(&bytes), black_box(key))
+                map.contains_scalar_search(black_box(&bytes), pk_ref)
             } else {
-                map.contains(black_box(&bytes), black_box(key))
+                map.contains(black_box(&bytes), pk_ref)
             };
             found += u64::from(hit);
         }
@@ -164,7 +165,7 @@ fn var_rows(n: usize) {
         let mut key = [0u8; 16];
         key[..8].copy_from_slice(&rng.next().to_be_bytes());
         key[8..].copy_from_slice(&(i as u64).to_be_bytes());
-        map.insert(&key, i as u64).expect("capacity");
+        map.insert(&key, PkRef::from_key_hash(i as u64)).expect("capacity");
     }
     report_memory(&map, "var16", "random");
 }

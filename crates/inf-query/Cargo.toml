@@ -22,6 +22,9 @@ serde_json = { workspace = true }
 criterion = { workspace = true }
 # Thread-local allocation counter for the S08 zero-allocation gate.
 inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
+# Bare-tree constructors for the paging suite (`IndexTree::for_tests`,
+# `AliasView::unaliased_for_tests`) — a dev edge only.
+inf-store = { workspace = true, features = ["test-support"] }
 
 [[bench]]
 name = "predicate_eval"

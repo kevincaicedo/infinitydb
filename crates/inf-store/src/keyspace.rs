@@ -753,19 +753,19 @@ impl Keyspace {
         let Some(rec) = self.db_mut(source_db).copy_out(source, now) else {
             return Ok(crate::store::CopyResult::SourceMissing);
         };
-        // Cross-db COPY is excluded from the plane brackets (ADR-0076
-        // D3): the destination store is only unambiguous here.
+        // Cross-db COPY is excluded from the plane brackets (ADR-0139
+        // D3): the destination store is only unambiguous here. The
+        // bracket commits on every outcome — see `CellStore::copy`.
         let dst_store = self.db_mut(target_db);
         #[cfg(feature = "doc")]
         {
             dst_store.idx_bracket_begin(&[target], None).map_err(OpError::IndexMaintenance)?;
             let result = dst_store.copy_in(target, &rec, replace, now);
-            match &result {
-                Ok(crate::store::CopyResult::Copied) => {
-                    dst_store.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
-                }
-                _ => dst_store.idx_bracket_abort(),
+            #[cfg(inf_canary_copy_abort_after_death)]
+            if !matches!(result, Ok(crate::store::CopyResult::Copied)) {
+                dst_store.idx_bracket_abort_canary();
             }
+            dst_store.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
             result
         }
         #[cfg(not(feature = "doc"))]
@@ -1976,7 +1976,8 @@ mod tests {
         // combined comparison and the report must attribute the bytes.
         let tree = ks.idx_tree_mut(NsId(16), IndexId(1)).expect("tree");
         for i in 0..4096u64 {
-            tree.insert(&i.to_be_bytes(), i).expect("insert");
+            let pk_ref = crate::ordered::PkRef::from_key_hash(i);
+            tree.insert(&i.to_be_bytes(), pk_ref).expect("insert");
         }
         ks.refresh_pressure();
         assert!(ks.ns_over_limit(NsId(16)), "index growth tightens the namespace budget");

@@ -24,6 +24,16 @@
 #                              build and never reports ready; the others
 #                              converge; rebuild resets and it converges
 
+#   scratch-refusal-leaves-no-trace — a bracket-scratch `try_reserve`
+#                              fails at the pre-half (ADR-0139 D10): typed
+#                              `Reserve`, nothing degraded, no bracket
+#                              left open, the next bracket opens
+#   scratch-owned-before-publish — with every scratch growth refused
+#                              after the pre-half, a key that reaches no
+#                              funnel (`EXPIRE`) commits exact trees and
+#                              degrades nothing; the control leg (a
+#                              growing post-image) proves the plant live
+
 # No memfs-tier rows here, so the runner executes none; the key is
 # required by the schema.
 seeds = 3
@@ -45,6 +55,18 @@ point = "idx_backfill_trip"
 tier = "node"
 test = "inf-store::index_backfill_storm::planted_backfill_trip_parks_and_rebuild_recovers"
 expect = "parks-and-rebuild-recovers"
+
+[[row]]
+point = "idx_scratch_refuse"
+tier = "node"
+test = "inf-store::index_alias::scratch_growth_failure_at_the_pre_half_is_a_typed_refusal"
+expect = "scratch-refusal-leaves-no-trace"
+
+[[row]]
+point = "idx_scratch_refuse"
+tier = "node"
+test = "inf-store::index_alias::a_key_that_reaches_no_funnel_needs_no_scratch_after_the_pre_half"
+expect = "scratch-owned-before-publish"
 
 # The sidecar boot's commit gate (ADR-0078 A1; review F-L07-04): a trip
 # in the CatchUp tail turns a loaded index into a rebuild — never a

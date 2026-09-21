@@ -16,10 +16,12 @@
 
 use inf_log::NsId;
 
+use crate::index_alias::AliasView;
 use crate::index_key::{INDEX_KEY_ENCODING_VERSION, IndexKeyType};
 use crate::ns::valid_ns_name;
 use crate::ordered::{
-    AppendError, Fixed8, OrderedCursor, OrderedMap, OrderedMapError, OrderedMapMemory, VarKey,
+    AppendError, Fixed8, OrderedCursor, OrderedMap, OrderedMapError, OrderedMapMemory, PkRef,
+    VarKey,
 };
 
 /// First allocatable index id; `IndexId(0)` is reserved (the board's
@@ -162,6 +164,11 @@ pub enum SidecarRebuildReason {
     EncodingVersion,
     /// The section's key scheme disagrees with the declared key type.
     SchemeMismatch,
+    /// The pairs were maintained under other rules than this binary's
+    /// (ADR-0078 A2): a tree built before ADR-0139's identity rules can
+    /// hold a stale pair or lack one, and the `|G| = 1` resolve path
+    /// would serve it without re-evaluating.
+    MaintenanceRules,
     /// A section's `entries_before` broke the ordinal chain (writer
     /// abandonment or unattributed damage resolving here — ADR-0078
     /// D4/D6).
@@ -191,6 +198,7 @@ impl SidecarRebuildReason {
             SidecarRebuildReason::GenerationMismatch => "generation-mismatch",
             SidecarRebuildReason::EncodingVersion => "encoding-version",
             SidecarRebuildReason::SchemeMismatch => "scheme-mismatch",
+            SidecarRebuildReason::MaintenanceRules => "maintenance-rules",
             SidecarRebuildReason::NonContiguous => "non-contiguous",
             SidecarRebuildReason::OutOfOrder => "out-of-order",
             SidecarRebuildReason::Capacity => "capacity",
@@ -215,10 +223,19 @@ pub enum SidecarBootDecision {
 /// One index's tree: the projection contents, scheme-monomorphized per
 /// the declared key type (ADR-0074 D1 — i64/f64/bool keys are exactly
 /// 8 bytes and ride `Fixed8`; utf8 rides `VarKey`). Custody: trees live
-/// in the owning store's attach block (`index_maint`, ADR-0076 D1 —
-/// amending the D1 wording here); the registry stays the catalog
-/// authority.
-pub enum IndexTree {
+/// in the owning store's attach block (`index_maint`, ADR-0139 D1); the
+/// registry stays the catalog authority. The scheme is private: a tree
+/// is built by the attach block, and nothing outside matches it apart.
+pub struct IndexTree(TreeScheme);
+
+#[cfg_attr(
+    not(any(test, feature = "doc", feature = "test-support")),
+    allow(
+        dead_code,
+        reason = "a slim build refuses index-bearing catalogs: no tree is ever built"
+    )
+)]
+enum TreeScheme {
     Fixed8(OrderedMap<Fixed8>),
     Var(OrderedMap<VarKey>),
 }
@@ -226,17 +243,30 @@ pub enum IndexTree {
 impl IndexTree {
     #[cfg(feature = "doc")]
     pub(crate) fn new(key_type: IndexKeyType) -> IndexTree {
-        if key_type.fixed8() {
-            IndexTree::Fixed8(OrderedMap::new())
+        IndexTree::with_scheme(key_type.fixed8())
+    }
+
+    /// A bare tree for suites that page or load one with no store behind
+    /// it. Absent from shipping builds (`check-shipping-features.sh`).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_tests(key_type: IndexKeyType) -> IndexTree {
+        IndexTree::with_scheme(key_type.fixed8())
+    }
+
+    #[cfg(any(test, feature = "doc", feature = "test-support"))]
+    fn with_scheme(fixed8: bool) -> IndexTree {
+        IndexTree(if fixed8 {
+            TreeScheme::Fixed8(OrderedMap::new())
         } else {
-            IndexTree::Var(OrderedMap::new())
-        }
+            TreeScheme::Var(OrderedMap::new())
+        })
     }
 
     pub fn len(&self) -> u64 {
-        match self {
-            IndexTree::Fixed8(map) => map.len(),
-            IndexTree::Var(map) => map.len(),
+        match &self.0 {
+            TreeScheme::Fixed8(map) => map.len(),
+            TreeScheme::Var(map) => map.len(),
         }
     }
 
@@ -246,9 +276,9 @@ impl IndexTree {
 
     /// L5 snapshot (O(1) — the tree maintains its own attribution).
     pub fn memory(&self) -> OrderedMapMemory {
-        match self {
-            IndexTree::Fixed8(map) => map.memory(),
-            IndexTree::Var(map) => map.memory(),
+        match &self.0 {
+            TreeScheme::Fixed8(map) => map.memory(),
+            TreeScheme::Var(map) => map.memory(),
         }
     }
 
@@ -258,20 +288,20 @@ impl IndexTree {
     /// # Errors
     /// Capacity refusals ([`OrderedMapError`]) — the tree is unchanged;
     /// S04's plan-then-commit reservation turns them into typed refusals.
-    pub fn insert(&mut self, key: &[u8], entry_ref: u64) -> Result<bool, OrderedMapError> {
-        match self {
-            IndexTree::Fixed8(map) => map.insert(key, entry_ref),
-            IndexTree::Var(map) => map.insert(key, entry_ref),
+    pub fn insert(&mut self, key: &[u8], entry_ref: PkRef) -> Result<bool, OrderedMapError> {
+        match &mut self.0 {
+            TreeScheme::Fixed8(map) => map.insert(key, entry_ref),
+            TreeScheme::Var(map) => map.insert(key, entry_ref),
         }
     }
 
     /// Whether `additional` inserts are guaranteed inside the tree's
     /// structural limits — the S04 reservation's arithmetic headroom
-    /// check (ADR-0076 D5): no allocation, conservative.
+    /// check (ADR-0139 D5's limits row): no allocation, conservative.
     pub fn insert_headroom(&self, additional: u64) -> bool {
-        match self {
-            IndexTree::Fixed8(map) => map.insert_headroom(additional),
-            IndexTree::Var(map) => map.insert_headroom(additional),
+        match &self.0 {
+            TreeScheme::Fixed8(map) => map.insert_headroom(additional),
+            TreeScheme::Var(map) => map.insert_headroom(additional),
         }
     }
 
@@ -282,40 +312,42 @@ impl IndexTree {
     ///
     /// # Errors
     /// [`AppendError`] — the tree is unchanged.
-    pub fn append(&mut self, key: &[u8], entry_ref: u64) -> Result<(), AppendError> {
-        match self {
-            IndexTree::Fixed8(map) => map.append(key, entry_ref),
-            IndexTree::Var(map) => map.append(key, entry_ref),
+    pub fn append(&mut self, key: &[u8], entry_ref: PkRef) -> Result<(), AppendError> {
+        match &mut self.0 {
+            TreeScheme::Fixed8(map) => map.append(key, entry_ref),
+            TreeScheme::Var(map) => map.append(key, entry_ref),
         }
     }
 
     /// True when the tree keys ride the `Fixed8` scheme (the sidecar
     /// meta's `key_scheme` byte — ADR-0078 D2).
     pub fn fixed8(&self) -> bool {
-        matches!(self, IndexTree::Fixed8(_))
+        matches!(self.0, TreeScheme::Fixed8(_))
     }
 
     /// Remove-if-present on the exact pair; `true` when it was present.
-    pub fn remove(&mut self, key: &[u8], entry_ref: u64) -> bool {
-        match self {
-            IndexTree::Fixed8(map) => map.remove(key, entry_ref),
-            IndexTree::Var(map) => map.remove(key, entry_ref),
+    /// `aliases` witnesses the ref's alias-group enumeration (ADR-0139
+    /// D2 rule 2) — see [`OrderedMap::remove`].
+    pub fn remove(&mut self, key: &[u8], entry_ref: PkRef, aliases: &AliasView) -> bool {
+        match &mut self.0 {
+            TreeScheme::Fixed8(map) => map.remove(key, entry_ref, aliases),
+            TreeScheme::Var(map) => map.remove(key, entry_ref, aliases),
         }
     }
 
-    pub fn contains(&self, key: &[u8], entry_ref: u64) -> bool {
-        match self {
-            IndexTree::Fixed8(map) => map.contains(key, entry_ref),
-            IndexTree::Var(map) => map.contains(key, entry_ref),
+    pub fn contains(&self, key: &[u8], entry_ref: PkRef) -> bool {
+        match &self.0 {
+            TreeScheme::Fixed8(map) => map.contains(key, entry_ref),
+            TreeScheme::Var(map) => map.contains(key, entry_ref),
         }
     }
 
     /// One cursor step (re-seek semantics — the S01 freeze); `None`
     /// past the end.
-    pub fn cursor_next<'c>(&self, cursor: &'c mut OrderedCursor) -> Option<(&'c [u8], u64)> {
-        match self {
-            IndexTree::Fixed8(map) => cursor.next(map),
-            IndexTree::Var(map) => cursor.next(map),
+    pub fn cursor_next<'c>(&self, cursor: &'c mut OrderedCursor) -> Option<(&'c [u8], PkRef)> {
+        match &self.0 {
+            TreeScheme::Fixed8(map) => cursor.next(map),
+            TreeScheme::Var(map) => cursor.next(map),
         }
     }
 }

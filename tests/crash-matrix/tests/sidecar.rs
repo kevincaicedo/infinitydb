@@ -215,6 +215,7 @@ fn build_shard(fs: &MemFs, tail_ops: u64) -> Vec<u8> {
             generation: u64::from(id),
             key_encoding_version: INDEX_KEY_ENCODING_VERSION,
             fixed8: key_type.fixed8(),
+            maint_rules: inf_store::IDX_MAINT_RULES,
         };
         let mut entries: BTreeSet<(Vec<u8>, u64)> = BTreeSet::new();
         for (key, idoc) in &corpus {
@@ -264,7 +265,7 @@ fn assert_tree_matches_store(ks: &Keyspace, id: u32, path: &str, key_type: Index
     let mut walk = OrderedCursor::from_start();
     let mut got: BTreeSet<(Vec<u8>, u64)> = BTreeSet::new();
     while let Some((key, entry_ref)) = tree.cursor_next(&mut walk) {
-        got.insert((key.to_vec(), entry_ref));
+        got.insert((key.to_vec(), entry_ref.to_raw()));
     }
     assert_eq!(got, truth, "index {id}: loaded+caught-up tree ≠ store derivation");
 }

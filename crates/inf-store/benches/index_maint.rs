@@ -35,7 +35,7 @@ use std::time::Instant;
 use inf_doc::JsonParser;
 use inf_doc::path::compile;
 use inf_foundation::time::Nanos;
-use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig};
+use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, PkRef, StoreConfig};
 
 const ROUNDS: usize = 15;
 const OPS_PER_ROUND: usize = 20_000;
@@ -137,7 +137,7 @@ fn main() {
             // tree shape matches a random corpus, not an append run.
             let v = (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11) as f64;
             let word = v.to_bits() | 0x8000_0000_0000_0000;
-            tree.insert(&word.to_be_bytes(), i).expect("fill");
+            tree.insert(&word.to_be_bytes(), PkRef::from_key_hash(i)).expect("fill");
         }
         eprintln!(
             "# fill: {TREE_FILL} entries in {:.1}s (len {})",

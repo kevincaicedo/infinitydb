@@ -42,6 +42,8 @@ use core::marker::PhantomData;
 
 use inf_simd::lower_bound_u64;
 
+use crate::index_alias::AliasView;
+
 /// Structural cap on a tree key (u16-safe; the DynamoDB key-cap
 /// precedent). S02's encoding ADR owns the semantic cap and the
 /// too-long ⇒ no-entry (counted) rule — the tree only refuses.
@@ -53,6 +55,37 @@ const MAX_HEIGHT: usize = 16;
 
 /// Null node id (pools never reach `u32::MAX` nodes — checked on alloc).
 const NONE: u32 = u32::MAX;
+
+/// An index entry's primary-key reference: the store's keyed hash of the
+/// document's full key (ADR-0139 D2). **Hash evidence, not identity** —
+/// two keys can share one, so no record, removal or resume position is
+/// derived from a ref except through the alias enumeration
+/// (`index_alias`), and no client-visible token carries one (a keyed-hash
+/// output, ADR-0094). The raw value crosses only the sidecar's
+/// serialization boundary.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PkRef(u64);
+
+impl PkRef {
+    /// The ref of the document whose full key hashes to `hash`.
+    #[must_use]
+    pub const fn from_key_hash(hash: u64) -> PkRef {
+        PkRef(hash)
+    }
+
+    /// The serialized form (index sidecar entries, ADR-0078 D2).
+    #[must_use]
+    pub const fn to_raw(self) -> u64 {
+        self.0
+    }
+
+    /// The inverse of [`to_raw`](Self::to_raw): a sidecar entry read
+    /// back under the same data directory's hash key (ADR-0094).
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> PkRef {
+        PkRef(raw)
+    }
+}
 
 /// Capacity failures are operating conditions, not invariants: the caller
 /// (S04's plan-then-commit reservation) turns them into typed refusals.
@@ -629,7 +662,8 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     /// Insert the pair; `Ok(false)` when it is already present (the
     /// ADR-0072 D5 insert-if-absent semantics). On `Err` (capacity) the
     /// tree is unchanged — allocations happen before structure moves.
-    pub fn insert(&mut self, key: &[u8], entry_ref: u64) -> Result<bool, OrderedMapError> {
+    pub fn insert(&mut self, key: &[u8], entry_ref: PkRef) -> Result<bool, OrderedMapError> {
+        let entry_ref = entry_ref.0;
         let probe = make_probe::<S>(key);
         if self.root == NONE {
             return self.insert_first(&probe, entry_ref);
@@ -678,7 +712,8 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     /// [`AppendError::OutOfOrder`] when the pair is not strictly greater
     /// than the tree's maximum; [`AppendError::Map`] for capacity
     /// refusals (the tree is unchanged either way).
-    pub fn append(&mut self, key: &[u8], entry_ref: u64) -> Result<(), AppendError> {
+    pub fn append(&mut self, key: &[u8], entry_ref: PkRef) -> Result<(), AppendError> {
+        let entry_ref = entry_ref.0;
         let probe = make_probe::<S>(key);
         if self.root == NONE {
             self.insert_first(&probe, entry_ref).map_err(AppendError::Map)?;
@@ -960,7 +995,8 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     // -- point lookup ---------------------------------------------------------
 
     /// Exact-pair membership (ADR-0072 D5's remove-if-present twin).
-    pub fn contains(&self, key: &[u8], entry_ref: u64) -> bool {
+    pub fn contains(&self, key: &[u8], entry_ref: PkRef) -> bool {
+        let entry_ref = entry_ref.0;
         if self.root == NONE {
             return false;
         }
@@ -979,7 +1015,8 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     /// of exiting early — the other arm of the S01 leaf-search A/B
     /// (L4). Hidden, not frozen API.
     #[doc(hidden)]
-    pub fn contains_scalar_search(&self, key: &[u8], entry_ref: u64) -> bool {
+    pub fn contains_scalar_search(&self, key: &[u8], entry_ref: PkRef) -> bool {
+        let entry_ref = entry_ref.0;
         if self.root == NONE {
             return false;
         }
@@ -1024,7 +1061,15 @@ impl<S: KeyScheme, const F: usize> OrderedMap<S, F> {
     /// (a borrow's fence copy) falls back to a merge, which only frees,
     /// and when the heap refuses the copy and no merge fits the leaf is
     /// left underfull and counted (`rebalance_deferred`, F-L08-02).
-    pub fn remove(&mut self, key: &[u8], entry_ref: u64) -> bool {
+    ///
+    /// `aliases` is the witness that the ref's alias group was enumerated
+    /// (ADR-0139 D2 rule 2): an entry is a fact about every document that
+    /// shares the ref, so a removal decided on the hash alone does not
+    /// compile. Whether a member still holds `key` is the caller's
+    /// evaluation — the tree cannot read documents.
+    pub fn remove(&mut self, key: &[u8], entry_ref: PkRef, aliases: &AliasView) -> bool {
+        debug_assert_eq!(aliases.pk_ref(), entry_ref, "the view enumerated another ref");
+        let entry_ref = entry_ref.0;
         if self.root == NONE {
             return false;
         }
@@ -1523,7 +1568,8 @@ impl OrderedCursor {
     /// which skips *every* ref of `key`, this resumes mid-key: a
     /// multi-valued index holds many refs under one key and a page
     /// boundary must not skip the rest of them.
-    pub fn resume_after(key: &[u8], entry_ref: u64) -> OrderedCursor {
+    pub fn resume_after(key: &[u8], entry_ref: PkRef) -> OrderedCursor {
+        let entry_ref = entry_ref.0;
         let mut cursor = OrderedCursor::from_start();
         cursor.key_buf.extend_from_slice(key);
         cursor.pos = CursorPos::After;
@@ -1537,7 +1583,7 @@ impl OrderedCursor {
     pub fn next<'c, S: KeyScheme, const F: usize>(
         &'c mut self,
         map: &OrderedMap<S, F>,
-    ) -> Option<(&'c [u8], u64)> {
+    ) -> Option<(&'c [u8], PkRef)> {
         let hint_ok =
             self.pos == CursorPos::After && self.hint_leaf != NONE && self.hint_epoch == map.epoch;
         let (leaf, slot) = if hint_ok { self.advance_hint(map) } else { self.seek_position(map) }?;
@@ -1546,7 +1592,7 @@ impl OrderedCursor {
         self.hint_leaf = leaf;
         self.hint_slot = slot as u32;
         self.hint_epoch = map.epoch;
-        Some((self.key_buf.as_slice(), self.entry_ref))
+        Some((self.key_buf.as_slice(), PkRef(self.entry_ref)))
     }
 
     /// Fast path: the tree is unmutated since the last return, so the
@@ -1594,6 +1640,15 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
+    fn pk(raw: u64) -> PkRef {
+        PkRef::from_key_hash(raw)
+    }
+
+    /// These suites drive a bare tree: no record table, so no aliases.
+    fn view(raw: u64) -> AliasView {
+        AliasView::unaliased_for_tests(pk(raw))
+    }
+
     // Moved into the test module (ADR-0106 D3 / ADR-0107 D2): an inline
     // `#[cfg(test)]` item is scanned as production by the release-assert
     // census; a test-only checker lives where the census strips it.
@@ -1640,13 +1695,13 @@ mod tests {
     #[test]
     fn fixed8_basics() {
         let mut map = FixedMap::new();
-        assert!(map.insert(&key8(5), 1).unwrap());
-        assert!(map.insert(&key8(5), 2).unwrap(), "same key, new ref is a new pair");
-        assert!(!map.insert(&key8(5), 1).unwrap(), "exact pair is idempotent");
-        assert!(map.contains(&key8(5), 1));
-        assert!(!map.contains(&key8(5), 3));
-        assert!(map.remove(&key8(5), 1));
-        assert!(!map.remove(&key8(5), 1), "remove-if-present");
+        assert!(map.insert(&key8(5), pk(1)).unwrap());
+        assert!(map.insert(&key8(5), pk(2)).unwrap(), "same key, new ref is a new pair");
+        assert!(!map.insert(&key8(5), pk(1)).unwrap(), "exact pair is idempotent");
+        assert!(map.contains(&key8(5), pk(1)));
+        assert!(!map.contains(&key8(5), pk(3)));
+        assert!(map.remove(&key8(5), pk(1), &view(1)));
+        assert!(!map.remove(&key8(5), pk(1), &view(1)), "remove-if-present");
         assert_eq!(map.len(), 1);
         map.check_invariants();
     }
@@ -1659,12 +1714,12 @@ mod tests {
             vec![b"a", b"a\0", b"a\0\0", b"a\x01", b"ab", b"abcdefgh", b"abcdefgh\0", b"abcdefghi"];
         let mut map = VarMap::new();
         for (i, key) in keys.iter().enumerate() {
-            assert!(map.insert(key, i as u64).unwrap());
+            assert!(map.insert(key, pk(i as u64)).unwrap());
         }
         let mut cursor = OrderedCursor::from_start();
         let mut got = Vec::new();
         while let Some((key, entry_ref)) = cursor.next(&map) {
-            got.push((key.to_vec(), entry_ref));
+            got.push((key.to_vec(), entry_ref.to_raw()));
         }
         let mut want: Vec<(Vec<u8>, u64)> =
             keys.iter().enumerate().map(|(i, key)| (key.to_vec(), i as u64)).collect();
@@ -1678,12 +1733,12 @@ mod tests {
         let mut map = FixedMap::new();
         let n = 10_000u64;
         for v in 0..n {
-            assert!(map.insert(&key8(v.wrapping_mul(0x9E37_79B9_7F4A_7C15)), v).unwrap());
+            assert!(map.insert(&key8(v.wrapping_mul(0x9E37_79B9_7F4A_7C15)), pk(v)).unwrap());
         }
         assert_eq!(map.len(), n);
         map.check_invariants();
         for v in 0..n {
-            assert!(map.remove(&key8(v.wrapping_mul(0x9E37_79B9_7F4A_7C15)), v));
+            assert!(map.remove(&key8(v.wrapping_mul(0x9E37_79B9_7F4A_7C15)), pk(v), &view(v)));
         }
         assert_eq!(map.len(), 0);
         assert!(map.is_empty());
@@ -1695,7 +1750,7 @@ mod tests {
     fn sequential_fill_uses_rightmost_split() {
         let mut map = FixedMap::new();
         for v in 0..2_000u64 {
-            map.insert(&key8(v), v).unwrap();
+            map.insert(&key8(v), pk(v)).unwrap();
         }
         map.check_invariants();
         // Ascending inserts with the rightmost heuristic leave interior
@@ -1709,7 +1764,7 @@ mod tests {
     fn cursor_resumes_across_mutations() {
         let mut map = FixedMap::new();
         for v in 0..500u64 {
-            map.insert(&key8(v * 2), v).unwrap();
+            map.insert(&key8(v * 2), pk(v)).unwrap();
         }
         let mut cursor = OrderedCursor::from_start();
         let mut seen = Vec::new();
@@ -1719,10 +1774,10 @@ mod tests {
         }
         // Mutate mid-scan: delete everything already seen, insert odds.
         for v in seen.clone() {
-            assert!(map.remove(&key8(v), v / 2));
+            assert!(map.remove(&key8(v), pk(v / 2), &view(v / 2)));
         }
         for v in 0..100u64 {
-            map.insert(&key8(v * 2 + 1), 1_000 + v).unwrap();
+            map.insert(&key8(v * 2 + 1), pk(1_000 + v)).unwrap();
         }
         while let Some((key, _)) = cursor.next(&map) {
             seen.push(u64::from_be_bytes(key.try_into().unwrap()));
@@ -1740,7 +1795,7 @@ mod tests {
         let mut map = FixedMap::new();
         for v in [10u64, 20, 20, 30] {
             let next_ref = map.len();
-            map.insert(&key8(v), next_ref).unwrap();
+            map.insert(&key8(v), pk(next_ref)).unwrap();
         }
         let mut cursor = OrderedCursor::from_key(&key8(20), true);
         let (key, _) = cursor.next(&map).unwrap();
@@ -1758,21 +1813,21 @@ mod tests {
     fn resume_after_resumes_mid_key() {
         let mut map = FixedMap::new();
         for (v, r) in [(10u64, 0u64), (20, 1), (20, 2), (20, 3), (30, 4)] {
-            map.insert(&key8(v), r).unwrap();
+            map.insert(&key8(v), pk(r)).unwrap();
         }
-        let mut cursor = OrderedCursor::resume_after(&key8(20), 1);
+        let mut cursor = OrderedCursor::resume_after(&key8(20), pk(1));
         let (key, entry_ref) = cursor.next(&map).unwrap();
-        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 2));
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref.to_raw()), (20, 2));
         // Mutation between calls: a pair inserted behind the resume
         // point stays invisible; one at the resume key's tail shows.
-        map.insert(&key8(15), 9).unwrap();
-        map.insert(&key8(20), 7).unwrap();
+        map.insert(&key8(15), pk(9)).unwrap();
+        map.insert(&key8(20), pk(7)).unwrap();
         let (key, entry_ref) = cursor.next(&map).unwrap();
-        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 3));
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref.to_raw()), (20, 3));
         let (key, entry_ref) = cursor.next(&map).unwrap();
-        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (20, 7));
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref.to_raw()), (20, 7));
         let (key, entry_ref) = cursor.next(&map).unwrap();
-        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref), (30, 4));
+        assert_eq!((u64::from_be_bytes(key.try_into().unwrap()), entry_ref.to_raw()), (30, 4));
         assert!(cursor.next(&map).is_none());
     }
 
@@ -1796,11 +1851,11 @@ mod tests {
     fn apply_op(map: &mut VarMap, model: &mut BTreeSet<(Vec<u8>, u64)>, op: &Op) {
         match op {
             Op::Insert(key, entry_ref) => {
-                let inserted = map.insert(key, *entry_ref).unwrap();
+                let inserted = map.insert(key, pk(*entry_ref)).unwrap();
                 assert_eq!(inserted, model.insert((key.clone(), *entry_ref)));
             }
             Op::Remove(key, entry_ref) => {
-                let removed = map.remove(key, *entry_ref);
+                let removed = map.remove(key, pk(*entry_ref), &view(*entry_ref));
                 assert_eq!(removed, model.remove(&(key.clone(), *entry_ref)));
             }
         }
@@ -1810,7 +1865,7 @@ mod tests {
         let mut cursor = OrderedCursor::from_start();
         let mut out = Vec::new();
         while let Some((key, entry_ref)) = cursor.next(map) {
-            out.push((key.to_vec(), entry_ref));
+            out.push((key.to_vec(), entry_ref.to_raw()));
         }
         out
     }
@@ -1824,15 +1879,15 @@ mod tests {
         let mut inserted = FixedMap::new();
         let n = 5_000u64;
         for v in 0..n {
-            appended.append(&key8(v / 3), v).expect("ascending");
-            assert!(inserted.insert(&key8(v / 3), v).unwrap());
+            appended.append(&key8(v / 3), pk(v)).expect("ascending");
+            assert!(inserted.insert(&key8(v / 3), pk(v)).unwrap());
         }
         appended.check_invariants();
         assert_eq!(appended.len(), inserted.len());
         assert_eq!(full_scan_fixed(&appended), full_scan_fixed(&inserted));
         // Duplicates and regressions refuse typed — the tree unchanged.
-        assert_eq!(appended.append(&key8((n - 1) / 3), n - 1), Err(AppendError::OutOfOrder));
-        assert_eq!(appended.append(&key8(0), 0), Err(AppendError::OutOfOrder));
+        assert_eq!(appended.append(&key8((n - 1) / 3), pk(n - 1)), Err(AppendError::OutOfOrder));
+        assert_eq!(appended.append(&key8(0), pk(0)), Err(AppendError::OutOfOrder));
         assert_eq!(appended.len(), n);
         appended.check_invariants();
     }
@@ -1844,12 +1899,12 @@ mod tests {
         let mut map = VarMap::new();
         for i in 0..600u64 {
             let key = format!("k{i:05}");
-            map.append(key.as_bytes(), i).expect("ascending");
+            map.append(key.as_bytes(), pk(i)).expect("ascending");
         }
-        assert!(map.remove(b"k00007", 7));
-        assert!(map.insert(b"a-before-everything", 1).unwrap());
-        map.append(b"z-after-everything", 9).expect("still the maximum edge");
-        assert_eq!(map.append(b"k99999", 1), Err(AppendError::OutOfOrder));
+        assert!(map.remove(b"k00007", pk(7), &view(7)));
+        assert!(map.insert(b"a-before-everything", pk(1)).unwrap());
+        map.append(b"z-after-everything", pk(9)).expect("still the maximum edge");
+        assert_eq!(map.append(b"k99999", pk(1)), Err(AppendError::OutOfOrder));
         map.check_invariants();
     }
 
@@ -1883,30 +1938,30 @@ mod tests {
         let mut map = VarMap8::new();
         // Sequential fill: leaves 8, 8, 8, 4 (rightmost splits fill full).
         for i in 0..28u64 {
-            map.append(&key_with_suffix(i, 8), i).expect("ascending");
+            map.append(&key_with_suffix(i, 8), pk(i)).expect("ascending");
         }
         assert_eq!(leaf_counts(&map), vec![8, 8, 8, 4], "fill shape");
         // The left sibling's tail entry takes a 16-byte suffix (class 2),
         // a class no removal in the last leaf (class 1) frees.
-        assert!(map.remove(&key_with_suffix(23, 8), 23));
-        assert!(map.insert(&key_with_suffix(23, 16), 23).unwrap());
+        assert!(map.remove(&key_with_suffix(23, 8), pk(23), &view(23)));
+        assert!(map.insert(&key_with_suffix(23, 16), pk(23)).unwrap());
         assert_eq!(leaf_counts(&map), vec![8, 8, 8, 4], "same shape, richer tail");
         map.heap.free = vec![Vec::new(); HEAP_CLASSES + 1];
         map.heap.ceiling = map.heap.bytes.len();
         // Last leaf 4 -> 3: the borrow from the left needs a class-2
         // fence copy the ceiling refuses; no right sibling; 8 + 3 > 8.
-        assert!(map.remove(&key_with_suffix(27, 8), 27));
+        assert!(map.remove(&key_with_suffix(27, 8), pk(27), &view(27)));
         assert_eq!(map.len(), 27);
         assert_eq!(map.rebalance_deferred(), 1, "the underfull leaf was left in place");
         assert_eq!(leaf_counts(&map), vec![8, 8, 8, 3]);
         map.check_invariants();
         for i in 0..27u64 {
             let suffix = if i == 23 { 16 } else { 8 };
-            assert!(map.contains(&key_with_suffix(i, suffix), i), "pair {i} survives");
+            assert!(map.contains(&key_with_suffix(i, suffix), pk(i)), "pair {i} survives");
         }
         // Heap room again: the next removal borrows until the minimum.
         map.heap.ceiling = NONE as usize;
-        assert!(map.remove(&key_with_suffix(26, 8), 26));
+        assert!(map.remove(&key_with_suffix(26, 8), pk(26), &view(26)));
         assert_eq!(leaf_counts(&map), vec![8, 8, 6, 4], "borrowed twice, back at LEAF_MIN");
         assert_eq!(map.rebalance_deferred(), 1, "no new deferral");
         map.check_invariants();
@@ -1917,7 +1972,7 @@ mod tests {
         let mut cursor = OrderedCursor::from_start();
         let mut out = Vec::new();
         while let Some((key, entry_ref)) = cursor.next(map) {
-            out.push((key.to_vec(), entry_ref));
+            out.push((key.to_vec(), entry_ref.to_raw()));
         }
         out
     }
@@ -1934,8 +1989,8 @@ mod tests {
             let mut appended = VarMap::new();
             let mut inserted = VarMap::new();
             for (key, entry_ref) in &pairs {
-                appended.append(key, *entry_ref).expect("btree_set iterates ascending");
-                prop_assert!(inserted.insert(key, *entry_ref).unwrap());
+                appended.append(key, pk(*entry_ref)).expect("btree_set iterates ascending");
+                prop_assert!(inserted.insert(key, pk(*entry_ref)).unwrap());
             }
             appended.check_invariants();
             prop_assert_eq!(full_scan(&appended), full_scan(&inserted));
@@ -1972,7 +2027,7 @@ mod tests {
             let mut heap_full = 0u32;
             for op in &ops {
                 match op {
-                    Op::Insert(key, entry_ref) => match map.insert(key, *entry_ref) {
+                    Op::Insert(key, entry_ref) => match map.insert(key, pk(*entry_ref)) {
                         Ok(inserted) => {
                             prop_assert_eq!(inserted, model.insert((key.clone(), *entry_ref)));
                         }
@@ -1985,7 +2040,7 @@ mod tests {
                     },
                     Op::Remove(key, entry_ref) => {
                         prop_assert_eq!(
-                            map.remove(key, *entry_ref),
+                            map.remove(key, pk(*entry_ref), &view(*entry_ref)),
                             model.remove(&(key.clone(), *entry_ref))
                         );
                     }
@@ -2013,7 +2068,7 @@ mod tests {
             let mut map = VarMap::new();
             let mut model: BTreeSet<(Vec<u8>, u64)> = initial.iter().cloned().collect();
             for (key, entry_ref) in &initial {
-                map.insert(key, *entry_ref).unwrap();
+                map.insert(key, pk(*entry_ref)).unwrap();
             }
             let mut cursor = OrderedCursor::from_start();
             let mut returned = Vec::new();
@@ -2022,7 +2077,7 @@ mod tests {
                 let mut progressed = false;
                 for _ in 0..stride {
                     if let Some((key, entry_ref)) = cursor.next(&map) {
-                        returned.push((key.to_vec(), entry_ref));
+                        returned.push((key.to_vec(), entry_ref.to_raw()));
                         progressed = true;
                     }
                 }

@@ -10,7 +10,8 @@ use std::cmp::Ordering;
 
 use inf_store::{
     DecodedIndexKey, Fixed8, IndexKeyBuf, IndexKeyType, IndexScalar, KeySkip, OrderedCursor,
-    OrderedMap, VarKey, compare_i64_f64, index_key_decode, index_key_encode, index_scalar_coerce,
+    OrderedMap, PkRef, VarKey, compare_i64_f64, index_key_decode, index_key_encode,
+    index_scalar_coerce,
 };
 
 const PAIRS: usize = 1_000_000;
@@ -222,7 +223,7 @@ fn storm_tree_iteration_matches_typed_order() {
     for i in 0..10_000u64 {
         let value = gen_f64(&mut rng);
         if let Ok(bytes) = encode(IndexKeyType::F64, IndexScalar::F64(value))
-            && fixed.insert(&bytes, i).expect("capacity")
+            && fixed.insert(&bytes, PkRef::from_key_hash(i)).expect("capacity")
         {
             admitted_f64.push(value);
         }
@@ -255,7 +256,7 @@ fn storm_tree_iteration_matches_typed_order() {
     for i in 0..10_000u64 {
         let value = gen_string(&mut rng);
         if let Ok(bytes) = encode(IndexKeyType::Utf8, IndexScalar::Utf8(&value))
-            && var.insert(&bytes, i).expect("capacity")
+            && var.insert(&bytes, PkRef::from_key_hash(i)).expect("capacity")
         {
             admitted_strings.push(value);
         }

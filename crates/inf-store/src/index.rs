@@ -31,6 +31,8 @@
 //! never taken up; it stays a design item, not a plan in flight (review
 //! 2026-08-30, lane L05).
 
+use core::ops::ControlFlow;
+
 use inf_alloc::ArenaAddr;
 use inf_foundation::LogicalAddr;
 use inf_simd::{eq_mask16, high_bit_mask16, prefetch_read};
@@ -249,6 +251,20 @@ impl WalkCursor {
     }
 }
 
+/// How one [`Index::probe_exact_bounded`] walk ended. Three outcomes, so
+/// an enum: only `ChainEnd` proves the whole chain was seen — negative
+/// evidence ("no other record has this hash") is valid on nothing else.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProbeEnd {
+    /// An `EMPTY` (or the full cycle) ended the chain after `groups`
+    /// control groups were loaded: every candidate was visited.
+    ChainEnd { groups: u32 },
+    /// `groups_max` groups were loaded and the chain had not ended.
+    GroupBudget,
+    /// `visit` returned `Break` after `groups` groups were loaded.
+    Stopped { groups: u32 },
+}
+
 /// The position of a resumable home-group walk
 /// ([`Index::home_group_cursor`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -363,41 +379,85 @@ impl<M: SlotMode> Index<M> {
         }
     }
 
-    /// Visits every slotted address whose **full** hash equals `hash`
-    /// (the tiered sidecar — `ext_matches`; on memory tables every
-    /// tag-matching slot, which is the same filter `find` applies), in
-    /// probe order, until the chain ends. The M4.5-S37 shadow probe
-    /// (ADR-0093 D2): a cold candidate is a *shadow* only when its
-    /// 64-bit hash equals the key's — a fingerprint-only match is another
-    /// key and is left alone. Diagnostics-class cost (one chain walk);
-    /// the eligible write pays it once, after `lookup` reported a cold
-    /// candidate.
-    pub fn each_exact(&self, hash: u64, mut visit: impl FnMut(M::Addr)) {
+    /// The **one** probe-chain walk over fragment matches (ADR-0139 D9):
+    /// visits, in probe order, every slotted address that passes the
+    /// 22-bit fragment (control tag **and** `fp15`) and — on tiered
+    /// tables — the full sidecar hash (`ext_matches`). On memory tables
+    /// a visited slot is therefore only a *candidate*: the caller
+    /// re-hashes the record's key to confirm 64 bits.
+    ///
+    /// The group budget lives here because only the traversal can keep
+    /// it: a group is charged when its control bytes are loaded, match
+    /// or not, so a chain of match-free full groups is bounded too. A
+    /// chain that ends **in** its `groups_max`-th group is
+    /// [`ProbeEnd::ChainEnd`]; one that needs another is
+    /// [`ProbeEnd::GroupBudget`]. The full-cycle exit (every group seen,
+    /// a table saturated with tombstones) is `ChainEnd`. `visit`
+    /// returning `Break` stops the walk at once.
+    pub fn probe_exact_bounded(
+        &self,
+        hash: u64,
+        groups_max: usize,
+        mut visit: impl FnMut(M::Addr) -> ControlFlow<()>,
+    ) -> ProbeEnd {
         let (tag, fp) = (h2(hash), fp15(hash));
         let mask = self.group_mask();
         let mut group = (hash as usize) & mask;
         let mut stride = 0;
+        let mut groups: u32 = 0;
         loop {
+            #[cfg(not(inf_canary_walk_callback_cap))]
+            if groups as usize >= groups_max {
+                return ProbeEnd::GroupBudget;
+            }
+            #[cfg(inf_canary_walk_callback_cap)]
+            let _ = groups_max;
             let ctrl = self.ctrl_group(group);
+            groups += 1;
             let mut candidates = eq_mask16(ctrl, tag);
             while candidates != 0 {
                 let i = candidates.trailing_zeros() as usize;
                 candidates &= candidates - 1;
                 let pos = group * GROUP + i;
                 let slot = self.slots[pos];
-                if slot.fp15() == fp && M::ext_matches(&self.ext, pos, hash) {
-                    visit(M::addr_from_raw(slot.addr_raw()));
+                if slot.fp15() == fp
+                    && M::ext_matches(&self.ext, pos, hash)
+                    && visit(M::addr_from_raw(slot.addr_raw())).is_break()
+                {
+                    return ProbeEnd::Stopped { groups };
                 }
             }
+            // An EMPTY anywhere in the group terminates the probe chain
+            // (tombstones do not — deleted slots were once links).
             if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
-                return;
+                return ProbeEnd::ChainEnd { groups };
             }
             stride += 1;
             if stride > mask {
-                return;
+                return ProbeEnd::ChainEnd { groups }; // every group was seen
             }
             group = (group + stride) & mask;
         }
+    }
+
+    /// Visits every slotted address that passes the control tag, `fp15`
+    /// and — on tiered tables — the **full** sidecar hash, in probe
+    /// order, until the chain ends. The M4.5-S37 shadow probe (ADR-0093
+    /// D2): a cold candidate is a *shadow* only when its 64-bit hash
+    /// equals the key's — a fingerprint-only match is another key and is
+    /// left alone. Diagnostics-class cost (one chain walk); the eligible
+    /// write pays it once, after `lookup` reported a cold candidate.
+    /// A call of [`probe_exact_bounded`](Self::probe_exact_bounded) with
+    /// the whole table as its budget — there is no second traversal.
+    pub fn each_exact(&self, hash: u64, mut visit: impl FnMut(M::Addr)) {
+        let end = self.probe_exact_bounded(hash, self.group_count(), |addr| {
+            visit(addr);
+            ControlFlow::Continue(())
+        });
+        debug_assert!(
+            matches!(end, ProbeEnd::ChainEnd { .. }),
+            "a whole-table budget always reaches the chain's end: {end:?}"
+        );
     }
 
     /// Diagnostics: groups visited until the probe for `hash` terminates
@@ -1087,6 +1147,100 @@ mod tests {
         }
         // Load factor honored after growth churn.
         assert!(rig.index.len() * 100 <= rig.index.capacity() * 85);
+    }
+
+    /// A hostile but **admitted** table state (ADR-0139 D9): `full`
+    /// consecutive groups of `target`'s probe chain, each filled with 16
+    /// entries homed there. 410 of 512 groups is 80 % occupancy — under
+    /// the 85 % load rule, which bounds the expected chain only. With
+    /// `same_fragment` every entry passes `target`'s 22-bit filter; with
+    /// it off none does, so only the traversal can bound the walk.
+    fn chained_table(target: u64, full: usize, same_fragment: bool) -> Index {
+        let mut index: Index = Index::with_capacity(6_900);
+        assert_eq!(index.group_count(), 512);
+        let mask = index.group_mask();
+        let fragment = if same_fragment { target } else { !target } & !(mask as u64);
+        let mut group = (target as usize) & mask;
+        let mut next_addr = 0u64;
+        for stride in 1..=full {
+            for _ in 0..GROUP {
+                assert!(!index.needs_grow(), "the state is admitted by the load rule");
+                let addr = ArenaAddr::from_raw(next_addr).expect("small");
+                index.insert(fragment | group as u64, addr);
+                next_addr += 1;
+            }
+            group = (group + stride) & mask;
+        }
+        index
+    }
+
+    const CHAIN_TARGET: u64 = 0xA5A5_5A5A_DEAD_0000;
+
+    #[test]
+    fn bounded_walk_charges_every_loaded_group_match_or_not() {
+        // No slot passes the fragment, so `visit` never runs: a budget
+        // kept in the callback would walk all 411 groups.
+        let index = chained_table(CHAIN_TARGET, 410, false);
+        let mut visits = 0usize;
+        let mut count = |_| {
+            visits += 1;
+            ControlFlow::Continue(())
+        };
+        assert_eq!(index.probe_exact_bounded(CHAIN_TARGET, 32, &mut count), ProbeEnd::GroupBudget);
+        assert_eq!(
+            index.probe_exact_bounded(CHAIN_TARGET, 410, &mut count),
+            ProbeEnd::GroupBudget,
+            "the chain needs a 411th group"
+        );
+        assert_eq!(
+            index.probe_exact_bounded(CHAIN_TARGET, 411, &mut count),
+            ProbeEnd::ChainEnd { groups: 411 },
+            "a chain that ends in its last budgeted group is complete"
+        );
+        assert_eq!(visits, 0);
+    }
+
+    #[test]
+    fn bounded_walk_stops_on_break_and_each_exact_sees_the_same_slots() {
+        let index = chained_table(CHAIN_TARGET, 410, true);
+        let mut all = Vec::new();
+        index.each_exact(CHAIN_TARGET, |addr| all.push(addr));
+        assert_eq!(all.len(), 410 * GROUP, "every fragment match on the chain");
+        let mut seen = Vec::new();
+        let end = index.probe_exact_bounded(CHAIN_TARGET, 32, |addr| {
+            seen.push(addr);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(end, ProbeEnd::GroupBudget);
+        assert_eq!(seen, all[..32 * GROUP], "32 groups loaded, in probe order");
+        let mut taken = 0usize;
+        let end = index.probe_exact_bounded(CHAIN_TARGET, 32, |_| {
+            taken += 1;
+            if taken == 17 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+        assert_eq!(end, ProbeEnd::Stopped { groups: 2 }, "the 17th match sits in group 2");
+    }
+
+    /// The smallest budget: a chain that ends in its first group is
+    /// complete under `groups_max = 1`, and a budget of zero loads
+    /// nothing. (The full-cycle exit is not constructible here: the load
+    /// rule always leaves an `EMPTY` somewhere on a cycle.)
+    #[test]
+    fn bounded_walk_budget_of_one_and_zero() {
+        let mut index: Index = Index::with_capacity(8);
+        assert_eq!(index.group_count(), 1);
+        for i in 0..13u64 {
+            index.insert(i * 16, ArenaAddr::from_raw(i).expect("small"));
+        }
+        let visits = core::cell::Cell::new(0usize);
+        let count = |_| {
+            visits.set(visits.get() + 1);
+            ControlFlow::Continue(())
+        };
+        assert_eq!(index.probe_exact_bounded(0, 1, count), ProbeEnd::ChainEnd { groups: 1 });
+        assert_eq!(visits.get(), 13, "small hashes all carry the zero fragment");
+        assert_eq!(index.probe_exact_bounded(0, 0, count), ProbeEnd::GroupBudget);
+        assert_eq!(visits.get(), 13, "a zero budget loads no group");
     }
 
     #[test]

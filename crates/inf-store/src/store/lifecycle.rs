@@ -3,6 +3,8 @@
 //! mutation funnels through.
 
 use super::*;
+#[cfg(feature = "doc")]
+use crate::index_maint::{AliasCtx, DeathHook};
 
 impl CellStore {
     // ---- active expiry (M1-E2) ----
@@ -40,10 +42,13 @@ impl CellStore {
                     // exception). MAINTAIN slices never run inside a
                     // command, so no bracket can cover this death.
                     #[cfg(feature = "doc")]
-                    if idx.death_hook_wanted(hash)
-                        && let Some(root) = doc::doc_root_at(arena, docs, addr, len)
-                    {
-                        idx.remove_doc_entries(hash, root, max_matches);
+                    if idx.is_active() {
+                        debug_assert!(
+                            !idx.bracket_open(),
+                            "the wheel never ticks inside a bracket"
+                        );
+                        let ctx = AliasCtx { arena, index, docs, hasher };
+                        idx.remove_doc_entries(&ctx, hash, addr, u64::MAX, max_matches);
                     }
                     let payload = doc::payload_of(arena, addr, len);
                     index.remove(hash, addr);
@@ -133,15 +138,17 @@ impl CellStore {
         head[0] = flags_ref_decrement(head[0]);
     }
 
-    /// Reaps a record the eviction sweep found already expired.
+    /// Reaps a record the eviction sweep found already expired. An
+    /// eviction entry point: never bracket-covered (ADR-0139 D4).
     pub(crate) fn reap_expired_at(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
-        self.free_record(hash, addr, len);
+        self.free_record_uncovered(hash, addr, len);
         self.note_reap_lazy();
     }
 
     /// Removes an eviction victim (counted separately from expirations).
+    /// An eviction entry point: never bracket-covered (ADR-0139 D4).
     pub(crate) fn evict_record(&mut self, hash: u64, addr: ArenaAddr, len: usize, had_ttl: bool) {
-        self.free_record(hash, addr, len);
+        self.free_record_uncovered(hash, addr, len);
         self.note_ttl(had_ttl, false);
         self.stats.evicted_keys += 1;
     }
@@ -150,23 +157,58 @@ impl CellStore {
 
     /// Free one record completely: index entry, record bytes, and any
     /// document payload behind it (the ADR-0037 D3 choke point). Every
-    /// reap/delete/evict site funnels here; the only deliberate bypass is
-    /// RENAME's source removal (the handle transferred to the destination).
+    /// delete and lazy reap funnels here; eviction funnels through
+    /// [`free_record_uncovered`](Self::free_record_uncovered); the only
+    /// deliberate bypass is RENAME's source removal (the handle
+    /// transferred to the destination).
     ///
-    /// Record-death hook (M4.5-S04, ADR-0072 D6): a dying document's
-    /// index entries are removed here — the last moment its values are
-    /// readable — unless this death is bracket-covered (a write-set key
-    /// dying inside its own command; the bracket's diff owns it,
-    /// ADR-0076 D4). Zero-index stores pay one cached branch.
+    /// Record-death hook (ADR-0072 D6): a dying document's index entries
+    /// are removed here — the last moment its values are readable —
+    /// unless this death is bracket-covered: a write-set key, by **full
+    /// key**, dying inside its own command with no index pruned
+    /// (ADR-0139 D4). Zero-index stores pay one cached branch.
     pub(crate) fn free_record(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
         #[cfg(feature = "doc")]
-        if self.idx.death_hook_wanted(hash) {
-            let max_matches = self.cfg.doc_max_path_matches;
-            let CellStore { arena, docs, idx, .. } = self;
-            if let Some(root) = doc::doc_root_at(arena, docs, addr, len) {
-                idx.remove_doc_entries(hash, root, max_matches);
-            }
+        if self.idx.is_active() {
+            let CellStore { arena, idx, .. } = self;
+            let hook = idx.death_hook_wanted(hash, record_at(arena, addr).key());
+            self.run_death_hook(hook, hash, addr);
         }
+        self.release_record(hash, addr, len);
+    }
+
+    /// [`free_record`](Self::free_record) for the eviction entry points
+    /// (`evict_record`, `reap_expired_at`). Eviction is reachable only
+    /// from the OOM gate and the MAINTAIN pass — never from a command
+    /// body — so a death here precedes the mutation: the hook always
+    /// runs, and an open bracket forgets what `old` claimed for the
+    /// victim (ADR-0139 D4). There is no coverage question to ask, so
+    /// this path never consults the prune mask for it.
+    pub(crate) fn free_record_uncovered(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
+        #[cfg(feature = "doc")]
+        if self.idx.is_active() {
+            let CellStore { arena, idx, .. } = self;
+            let hook = idx.note_uncovered_death(hash, record_at(arena, addr).key());
+            self.run_death_hook(hook, hash, addr);
+        }
+        self.release_record(hash, addr, len);
+    }
+
+    #[cfg(feature = "doc")]
+    fn run_death_hook(&mut self, hook: DeathHook, hash: u64, addr: ArenaAddr) {
+        let mask = match hook {
+            DeathHook::Covered => return,
+            DeathHook::All => u64::MAX,
+            DeathHook::Masked(mask) => mask,
+        };
+        let max_matches = self.cfg.doc_max_path_matches;
+        let hasher = self.cfg.hasher;
+        let CellStore { arena, index, docs, idx, .. } = self;
+        let ctx = AliasCtx { arena, index, docs, hasher };
+        idx.remove_doc_entries(&ctx, hash, addr, mask, max_matches);
+    }
+
+    fn release_record(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
         let payload = doc::payload_of(&self.arena, addr, len);
         self.index.remove(hash, addr);
         self.arena.free(addr, len);

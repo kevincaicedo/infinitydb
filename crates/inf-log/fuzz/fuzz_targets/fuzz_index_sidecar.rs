@@ -21,7 +21,9 @@ use std::path::Path;
 use inf_log::ckpt::{IckReaderConfig, ick_file_name, read_ick_counts, read_ick_hybrid};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
-use inf_log::{CkptConfig, IckIdxSidecarStep, IdxSidecarMeta, Lsn, SegmentId, SyncIckWriter};
+use inf_log::{
+    CkptConfig, IckIdxSidecarStep, IdxSidecarMeta, IdxSidecarRules, Lsn, SegmentId, SyncIckWriter,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -37,6 +39,10 @@ fuzz_target!(|data: &[u8]| {
         SyncIckWriter::create_v2(fs.clone(), dir, &cfg, 0, 1, Lsn::new(SegmentId(1), 64), &[16])
             .expect("create v2");
 
+    // The maintenance-rules bits (ADR-0078 A2): every value the three-bit
+    // field can carry. The writer can emit nothing else (writer bound ≤
+    // reader bound), and an uncorrupted image must surface it unchanged.
+    let rules = IdxSidecarRules::new(data[1] % (IdxSidecarRules::MAX + 1)).expect("three bits");
     // Interpret the input as an op stream over four index streams; the
     // per-index counters keep the writer's own canon (ascending pairs,
     // contiguous ordinals) satisfied — writer asserts must never fire
@@ -58,6 +64,7 @@ fuzz_target!(|data: &[u8]| {
             generation: u64::from(slot as u32) + 1,
             key_encoding_version: 1,
             fixed8,
+            maint_rules: rules,
         };
         if finaled[slot] {
             continue;
@@ -90,6 +97,7 @@ fuzz_target!(|data: &[u8]| {
                 generation: u64::from(slot as u32) + 1,
                 key_encoding_version: 1,
                 fixed8: true,
+                maint_rules: rules,
             };
             w.append_idx_final(&meta, ordinals[slot]).expect("mem write");
         }
@@ -128,6 +136,10 @@ fuzz_target!(|data: &[u8]| {
             match step {
                 IckIdxSidecarStep::Section(section) => {
                     assert!(!section.is_empty() || section.final_section, "empty ⇒ FINAL");
+                    assert!(section.maint_rules.get() <= IdxSidecarRules::MAX);
+                    if !corrupted {
+                        assert_eq!(section.maint_rules, rules, "the rules bits round-trip");
+                    }
                     assert!(section.final_section || section.total_entries == 0);
                     let mut prev: Option<(Vec<u8>, u64)> = None;
                     let mut n = 0usize;

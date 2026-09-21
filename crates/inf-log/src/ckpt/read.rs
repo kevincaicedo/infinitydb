@@ -478,6 +478,9 @@ pub struct IckIdxSidecarSection<'a> {
     pub fixed8: bool,
     /// This is the index's last section; `total_entries` is meaningful.
     pub final_section: bool,
+    /// The maintenance rules the writer stated (ADR-0078 A2): decoded
+    /// and surfaced, never judged here — the loader owns the compare.
+    pub maint_rules: IdxSidecarRules,
     /// Ordinal of this section's first pair within the index's whole
     /// emission (the loader's contiguity check).
     pub entries_before: u64,
@@ -688,8 +691,8 @@ fn parse_idx_sidecar_body(body: &[u8], record_count: u32) -> Option<IckIdxSideca
         IDXSIDECAR_SCHEME_VAR => false,
         _ => return None,
     };
-    let flags = body[19];
-    if flags & !IDXSIDECAR_FLAG_FINAL != 0 {
+    let flags = body[IDXSIDECAR_FLAGS_AT];
+    if flags & !(IDXSIDECAR_FLAG_FINAL | IDXSIDECAR_RULES_MASK) != 0 {
         return None;
     }
     let final_section = flags & IDXSIDECAR_FLAG_FINAL != 0;
@@ -734,6 +737,7 @@ fn parse_idx_sidecar_body(body: &[u8], record_count: u32) -> Option<IckIdxSideca
         key_encoding_version: le_u16(&body[16..18]),
         fixed8,
         final_section,
+        maint_rules: IdxSidecarRules::from_flags(flags),
         entries_before: le_u64(&body[20..28]),
         total_entries,
         entries,
@@ -1343,6 +1347,53 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
         )? {
             IckStep::Section { .. } => {}
             IckStep::Done(summary) => return Ok((reader.info, summary)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One Fixed8 pair under a FINAL meta whose `flags` byte is `flags`.
+    fn final_body(flags: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&16u32.to_le_bytes()); // ns
+        body.extend_from_slice(&1u32.to_le_bytes()); // index id
+        body.extend_from_slice(&1u64.to_le_bytes()); // generation
+        body.extend_from_slice(&1u16.to_le_bytes()); // key-encoding version
+        body.push(IDXSIDECAR_SCHEME_FIXED8);
+        assert_eq!(body.len(), IDXSIDECAR_FLAGS_AT);
+        body.push(flags);
+        body.extend_from_slice(&0u64.to_le_bytes()); // entries_before
+        body.extend_from_slice(&1u64.to_le_bytes()); // total_entries
+        assert_eq!(body.len(), IDXSIDECAR_META_LEN);
+        body.extend_from_slice(&7u64.to_be_bytes());
+        body.extend_from_slice(&9u64.to_le_bytes());
+        body
+    }
+
+    /// ADR-0078 A2: the reader decodes the rules bits at every value the
+    /// field can carry and judges none of them — a pre-A2 body (`flags`
+    /// 0 or 1) surfaces rules 0 — while bits 4–7 stay a body-class
+    /// failure. Writer bound ≤ reader bound: `IdxSidecarRules` cannot
+    /// hold a value past three bits.
+    #[test]
+    fn sidecar_rules_bits_are_surfaced_never_judged() {
+        for version in 0..=IdxSidecarRules::MAX {
+            let rules = IdxSidecarRules::new(version).expect("three bits");
+            let body = final_body(IDXSIDECAR_FLAG_FINAL | rules.to_flag_bits());
+            let section = parse_idx_sidecar_body(&body, 1).expect("a canonical body");
+            assert_eq!(section.maint_rules, rules);
+            assert!(section.final_section);
+        }
+        assert_eq!(IdxSidecarRules::new(IdxSidecarRules::MAX + 1), None);
+        let body = final_body(IDXSIDECAR_FLAG_FINAL);
+        let pre_a2 = parse_idx_sidecar_body(&body, 1).expect("a pre-A2 body");
+        assert_eq!(pre_a2.maint_rules, IdxSidecarRules::PRE_A2);
+        for reserved in [0x10u8, 0x20, 0x40, 0x80] {
+            let body = final_body(IDXSIDECAR_FLAG_FINAL | reserved);
+            assert!(parse_idx_sidecar_body(&body, 1).is_none(), "bit {reserved:#04x} is reserved");
         }
     }
 }

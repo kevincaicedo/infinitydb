@@ -27,7 +27,7 @@ use inf_doc::path::{EvalLimits, compile, eval, resolve};
 use inf_doc::{DocValue, PathProgram, TapeDoc};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_log::fs::sim::StallConfig;
+use inf_log::fs::sim::{SimDisk, StallConfig};
 use inf_store::{
     CheckpointImage, IndexId, IndexKeyBuf, IndexKeyType, IndexScalar, IndexSpec, IndexState,
     Keyspace, NsId, OrderedCursor, index_key_encode,
@@ -197,7 +197,7 @@ pub(crate) fn cell_tree(ks: &Keyspace, ns: NsId, id: IndexId) -> BTreeSet<(Vec<u
     let Some(tree) = ks.idx_tree(ns, id) else { return out };
     let mut cursor = OrderedCursor::from_start();
     while let Some((key, entry_ref)) = tree.cursor_next(&mut cursor) {
-        out.insert((key.to_vec(), entry_ref));
+        out.insert((key.to_vec(), entry_ref.to_raw()));
     }
     out
 }
@@ -568,6 +568,7 @@ fn run_observed(scenario: &BackfillScenario, observer: TraceObserver) -> Backfil
                 verify_cell_index(&node, cell, ns, spec, now, "final", &mut report);
             }
         }
+        alias_leg(scenario, &mut node, &mut rng, &clock, &disk, ns, &mut report);
         for cell in 0..usize::from(scenario.cells) {
             let ks = node.plane(cell).keyspace();
             for &(id, ..) in INDEXES {
@@ -589,6 +590,56 @@ fn run_observed(scenario: &BackfillScenario, observer: TraceObserver) -> Backfil
     trace.extend_from_slice(&(report.violations.len() as u64).to_le_bytes());
     report.trace_hash = inf_foundation::hash64(&trace, 0x4501_BACF);
     report
+}
+
+/// The alias leg (ADR-0139 D2), through the wire on the converged
+/// fleet: two keys that share one pk ref (the collision oracle's
+/// `{shadow-collide}` shape — one hashtag, so one cell) are written with
+/// the same document, then one is deleted. The survivor's entries must
+/// stay: every cell's trees still equal their from-scratch truth. The
+/// leg asserts its own engagement — a suppressed removal must have been
+/// counted, or the rule was never reached.
+fn alias_leg(
+    scenario: &BackfillScenario,
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    ns: NsId,
+    report: &mut BackfillReport,
+) {
+    let (first, second) = inf_store::forced_collision_pair(scenario.seed ^ 0xA11A_5ED0);
+    let doc = doc_of(7);
+    let mut client = MiniClient::connect(node, 0);
+    let script: [&[&[u8]]; 4] = [
+        &[b"INF.NS", b"USE", b"bf"],
+        &[b"JSON.SET", &first, b"$", &doc],
+        &[b"JSON.SET", &second, b"$", &doc],
+        &[b"DEL", &first],
+    ];
+    for argv in script {
+        match client.call(node, rng, clock, disk, scenario.step_ns_max, argv) {
+            Ok(Some(reply)) if reply.first() != Some(&b'-') => {}
+            other => {
+                report.violations.push(format!("alias leg: {argv:?} answered {other:?}"));
+                return;
+            }
+        }
+    }
+    let now = clock.now();
+    let mut kept = 0u64;
+    for cell in 0..usize::from(scenario.cells) {
+        for &spec in INDEXES {
+            verify_cell_index(node, cell, ns, spec, now, "alias leg", report);
+        }
+        kept += node.plane(cell).keyspace().idx_counters_total().alias_kept;
+    }
+    if kept != INDEXES.len() as u64 {
+        report.violations.push(format!(
+            "alias leg VACUOUS: {kept} suppressed removals, expected one per index ({})",
+            INDEXES.len()
+        ));
+    }
 }
 
 /// Runs the scenario and seals state evidence after every node has been dropped.

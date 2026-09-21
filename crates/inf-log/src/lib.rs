@@ -45,9 +45,10 @@ pub use blob::{
     unlink_quarantined_file,
 };
 pub use ckpt::{
-    BlobRefEntry, CkptConfig, IckBlobRefSection, IckIdxSidecarSection, IckIdxSidecarStep,
-    IckLiveSetSection, IckRefSection, IckStream, IckSummary, IdxSidecarMeta, LiveSetFileEntry,
-    SectionLease, SyncIckWriter, read_ick, read_ick_hybrid,
+    BlobRefEntry, CkptConfig, IDXSIDECAR_RULES_MASK, IDXSIDECAR_RULES_SHIFT, IckBlobRefSection,
+    IckIdxSidecarSection, IckIdxSidecarStep, IckLiveSetSection, IckRefSection, IckStream,
+    IckSummary, IdxSidecarMeta, IdxSidecarRules, LiveSetFileEntry, SectionLease, SyncIckWriter,
+    read_ick, read_ick_hybrid,
 };
 pub use commit::{
     CommitStats, FrameId, FramePlan, FsyncClass, FsyncTicket, GroupCommit, REORDER_WINDOW_FRAMES,

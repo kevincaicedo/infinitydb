@@ -30,7 +30,7 @@ use inf_log::NsId;
 #[cfg(feature = "doc")]
 use crate::index_key::INDEX_KEY_ENCODING_VERSION;
 #[cfg(feature = "doc")]
-use crate::index_maint::MaintMode;
+use crate::index_maint::{IDX_MAINT_RULES, MaintMode};
 use crate::index_registry::{IndexId, SidecarBootDecision};
 #[cfg(feature = "doc")]
 use crate::index_registry::{IndexState, SidecarRebuildReason};
@@ -166,6 +166,9 @@ impl SidecarLoader {
         if spec.key_type.fixed8() != section.fixed8 {
             return Some(SidecarRebuildReason::SchemeMismatch);
         }
+        if section.maint_rules != IDX_MAINT_RULES && !cfg!(inf_canary_sidecar_rules_ignored) {
+            return Some(SidecarRebuildReason::MaintenanceRules);
+        }
         if section.entries_before != loaded {
             return Some(SidecarRebuildReason::NonContiguous);
         }
@@ -187,7 +190,7 @@ impl SidecarLoader {
         };
         let mut appended = 0u64;
         for (key, entry_ref) in section.iter() {
-            match tree.append(key, entry_ref) {
+            match tree.append(key, crate::ordered::PkRef::from_raw(entry_ref)) {
                 Ok(()) => appended += 1,
                 Err(AppendError::OutOfOrder) => return Err(SidecarRebuildReason::OutOfOrder),
                 Err(AppendError::Map(_)) => return Err(SidecarRebuildReason::Capacity),

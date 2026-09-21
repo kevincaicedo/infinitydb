@@ -62,7 +62,7 @@ worth more than a clever implementation of a complicated design.
 
 The cheapest defect is the one a page of design removes (L12). A story
 is claimed only on a **Design Review Record** reviewed by someone who
-did not write it (master plan §17.4). The record answers, in tables and
+did not write it. The record answers, in tables and
 arithmetic, not prose:
 
 1. **State and transitions** — state × event → state, effect; the

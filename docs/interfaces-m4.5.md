@@ -14,7 +14,7 @@ Status column tracks arrival.
 | Index catalog persistence (namespace-catalog payload **v3**; v2 byte-identical while pristine) | `inf-store` (encoding) / `inf-server` (swap) | implemented (M4.5-S03, ADR-0075 D2 — index records + never-regressing id/generation counters ride the `META` swap; `fuzz_catalog` in the same PR) |
 | Declaration lifecycle {declared → backfilling → ready → dropping} + fleet-readiness aggregation | `inf-store` / `inf-server::control` | implemented (M4.5-S03, ADR-0075 D3–D5 — explicit invalid-transition rejection; `IndexBoard` per-cell × per-slot ready generations; catalog `ready` ⟺ every cell reports the exact generation) |
 | Cursor/compile binding gate `{ns, index id, generation}` | `inf-store` | implemented (M4.5-S03, ADR-0075 D7 — `IndexRegistry::validate_binding`, typed `{UnknownIndex, StaleGeneration, NotReady}`; S09/S11 consult it) |
-| At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04, ADR-0076 — attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
+| At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04; mechanics ADR-0139 since ARCH-W0.2 — alias-group identity, coverage by entry point and full key, bounded enumeration; attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
 | Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
 | Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078 under the ADR-0073 constraints — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
 | Access-program form v1 | `inf-query` | implemented (M4.5-S09, ADR-0080 — `access::AccessProgram`: one access step + residual + page spec, serialized/versioned, `from_bytes` trust boundary; EXPLAIN rendering golden-pinned) |
@@ -50,48 +50,103 @@ Status column tracks arrival.
   L5 domains folded into `MemoryReport`, `INFO memory`, and the
   namespace budget comparison (`MAXMEMORY` counts index bytes).
 
-## Maintenance surface (M4.5-S04, ADR-0076 — the ADR-0072 D3–D7 contract as-built)
+## Maintenance surface (M4.5-S04; mechanics ADR-0139, which supersedes ADR-0076)
 
-- **Tree custody (ADR-0076 D1, amending ADR-0075 D1's wording):** each
-  `CellStore` owns its namespace's trees in an attach block
-  (`index_maint::CellIndexes`) — the maintenance-facing cache of the
-  registry, resynced at DDL transitions, seed, and lazy materialization;
-  every S03 accounting shape keeps its value with the fold source moved.
-- **The primary-key ref is the key hash** (ADR-0076 D2; since ADR-0094
-  the keyed SipHash-1-3 under the data directory's secret — it was
-  `hash64(key)` before 2026-08-28) — durable-
-  adjacent: S06 sidecars serialize `(typed key bytes, ref)` pairs, so
-  changing the ref definition later is an encoding-class break
-  (ADR-0073 D5.2 discipline). The ref is hash evidence, not identity:
-  ADR-0076 A2 withdrew the accepted-collision disclosure — an entry
-  denotes an alias group, and removal, coverage and resolution are
-  decided by full key. **Not built yet** (DRR ARCH-W0.2): the tree
-  still removes on the pair alone.
-- **The bracket:** `Keyspace::idx_bracket_begin / idx_bracket_commit /
-  idx_bracket_abort` — pre-image eval + reservation before the mutation,
-  post-image eval + dedup diff + idempotent tree ops after staging.
-  Attachment rows (ADR-0076 D3): the two ADR-0072 named-ns plane sites
-  plus the numbered-db funnel inside `execute_owned_into`; COPY runs
-  store-level mini-brackets; `FLUSH*` runs the whole-namespace truncate;
+- **Tree custody (ADR-0139 D1):** each `CellStore` owns its namespace's
+  trees in an attach block (`index_maint::CellIndexes`) — the
+  maintenance-facing cache of the registry, resynced at DDL transitions,
+  seed, and lazy materialization. `IndexTree`'s key scheme is private.
+- **The ref is hash evidence; identity is the full key (ADR-0139 D2).**
+  An entry is `(typed key bytes, PkRef)`, `PkRef` = the keyed hash of the
+  document's key (`KeyHasher`, ADR-0094). Two keys can share a ref, and
+  two such documents with an equal indexed value share **one** entry, so
+  an entry is a fact about the ref's *alias group* `G(h)` — every
+  physically present record whose full key hashes to `h`:
+  - *Removal* happens only after a complete enumeration of the group
+    found no other member that holds the key; otherwise the entry stays
+    (`idx_alias_kept`). `OrderedMap::remove` / `IndexTree::remove` take
+    the enumeration's `&AliasView` as a witness — its only constructor is
+    private to `index_alias` — so a removal decided on the hash alone
+    does not compile.
+  - *Insertion* finding the pair present is legal iff an alias holds it.
+  - **Resolution (rule 5 — the contract S11, S12, S14 consume; not built
+    here):** a ref is resolved by enumerating `G(h)` through
+    `index_alias`, never by first match. `|G| = 1`: that document.
+    `|G| > 1`: a member is served iff it holds the key, re-evaluated;
+    `COUNT(*)` counts members that hold it. `|G| = 0` is a violated
+    invariant: typed error, the index degrades on that cell.
+  - **Position (rule 6):** inside a group, order and resume position are
+    decided by the full primary key. No client-visible token carries a
+    ref (a keyed-hash output). `PageResume` still embeds one — M4.5-S11's
+    cursor format (ADR-0142) replaces it.
+  - `PkRef::to_raw` / `from_raw` exist for the sidecar's serialization
+    boundary only.
+- **The enumeration and its bounds (ADR-0139 D9):**
+  `Index::probe_exact_bounded(hash, groups_max, visit) → ProbeEnd` is the
+  one probe-chain walk over fragment matches (`each_exact` is a call of
+  it); a group is charged when its control bytes are loaded, match or
+  not. `index_alias::alias_view` builds on it under three limits
+  (`inf_store::limits`): `IDX_ALIAS_WALK_GROUPS_MAX` = 32 groups,
+  `IDX_ALIAS_REHASH_MAX` = 16 fragment matches **fetched** — every
+  record the walk reads is charged before it is read, a write-set key
+  excluded by full key included; only the death sites' by-address skip
+  of the dying record is free — and `IDX_ALIAS_GROUP_MAX` = 8 members
+  **of the view**, i.e. after exclusion. A bracket enumerates once per
+  distinct removing ref (≤ one walk per write-set key), a death hook
+  once. Crossing any is
+  `AliasWalk::Over(AliasLimit)`, which carries no view: nothing is
+  decided, `idx_alias_walk_over` + 1, and the indexes the question
+  touches degrade on that cell — the participating set from a bracket
+  commit, **every** non-degraded index from a death hook. `REBUILD`
+  clears the veto.
+- **The bracket (ADR-0139 step table):** `Keyspace::idx_bracket_begin /
+  idx_bracket_commit`. The pre-half notes the write set (hash **and** key
+  bytes), sets the participating set whole before evaluating anything
+  (D12), evaluates each key's physical pre-image, reserves the `new`
+  side of scratch at `|old|` and checks tree headroom. The commit-half
+  evaluates the post-image, diffs and applies. **A bracket ends only in
+  its commit-half — there is no abort**; the `COPY` mini-brackets commit
+  on every outcome. Attachment rows (D3): the two ADR-0072 named-ns plane
+  sites plus the numbered-db funnel; `FLUSH*` truncates whole trees;
   fabric `DEL`/`UNLINK` (`apply_counted`) is death-hook-covered.
-- **Record deaths** outside a bracket (lazy expiry, the wheel reap,
-  eviction) remove the dying document's entries at the death site; the
-  responsibility split keys on the bracket's write-set hashes.
+- **Coverage of a record death (ADR-0139 D4)** is decided once, from the
+  entry point and the full key:
+  - the eviction entry points (`evict_record`, `reap_expired_at` →
+    `free_record_uncovered`) are **never covered** — the hook runs; if
+    the victim's full key is in the open bracket's write set, the bracket
+    forgets that key's `old` ranges (compacted out before the diff sorts)
+    and the prune is void (`idx_gate_forget`);
+  - any other `free_record` is covered iff its full key is in the write
+    set and no index is pruned; with a prune engaged the hook runs for
+    the pruned indexes and the mask clears (`idx_prune_void`);
+  - a hash in the write set whose key is not is an alias: hooked, and
+    counted (`idx_cover_alias`).
 - **Failure contract:** typed pre-half refusals
-  (`IdxMaintRefusal::{Reserve, EntryFlood}`, fault point
-  `idx_reserve_refuse`); post-half failures set the cell-local
-  `degraded` serving veto (`Keyspace::idx_degraded` — S09/S11 must
-  consult it beside `validate_binding`; fault point `idx_apply_trip`);
-  rebuild clears the veto.
+  (`IdxMaintRefusal::{Reserve, EntryFlood}`; fault points
+  `idx_reserve_refuse`, `idx_scratch_refuse`). `EntryFlood` covers the
+  entry cap, the match cap and `BRACKET_KEY_BYTES_MAX` (32 MiB of encoded
+  keys per phase). Every bracket and death-hook scratch growth is
+  `try_reserve`. Post-half failures — a flooding or growing post-image,
+  `AliasWalk::Over`, the planted `idx_apply_trip` — set the cell-local
+  `degraded` serving veto on **every** participating index
+  (`Keyspace::idx_degraded` — S09/S11 must consult it beside
+  `validate_binding`); a death hook that cannot evaluate or grow degrades
+  the index. Rebuild clears the veto. The pre-apply refusal of a
+  post-image is ADR-0139 D5 (ARCH-W1.6), not built.
 - **Replay arm:** `Keyspace::idx_set_replay_maintenance(ns,
   Option<MaintMode>)` — `None` at boot (the no-sidecar path rebuilds via
   S05); S06's sidecar load arms `CatchUp`. Same code path as live,
   assertion strictness only (`Strict` scoped to converged indexes via
   `idx_set_converged`).
-- **Counters (ADR-0076 D8):** per-index `IdxCounters` (sparse/inexact/
-  nan/toolong skips, inserts/removes/prunes, degraded trips) via
-  `Keyspace::idx_counters[_total]`; `INFO stats` renders the cell-scope
-  fold; `INF.IDX LIST` (S10) renders per-index detail.
+- **Counters (ADR-0139 D8; population: cell, fold: node):** per-index
+  `IdxCounters` (sparse/inexact/nan/toolong skips, inserts/removes/
+  prunes, degraded trips, `alias_kept`, `alias_held_marks` — the held
+  marking's work, ≤ the entries the removals evaluated) plus the
+  store-scoped
+  `alias_groups`, `cover_alias`, `alias_walk_over`,
+  `alias_walk_groups_max` (a maximum), `gate_forget`, `prune_void`, via
+  `Keyspace::idx_counters[_total]`; `INFO stats` renders the fold as
+  `idx_*`; `INF.IDX LIST` (S10) renders per-index detail.
 
 ## Backfill surface (M4.5-S05, ADR-0077 — the plan's backfill machine as-built)
 
@@ -147,9 +202,19 @@ Status column tracks arrival.
   loaders refuse typed (`IdxSidecarSectionUnsupported` — the ADR-0073
   D7 downgrade boundary). Fuzz: `fuzz_index_sidecar` + the `ick_decode`
   sidecar oracles.
+- **Maintenance-rules bits (ADR-0078 A2):** the meta's `flags` byte is
+  bit 0 `FINAL`, bits 1–3 `maint_rules` (`IdxSidecarRules`, three bits;
+  `IDXSIDECAR_RULES_SHIFT` / `_MASK`, one definition for writer and
+  reader), bits 4–7 zero. The store passes `IDX_MAINT_RULES` (= version
+  `IDX_MAINT_RULES_VERSION` = 1) to the writer; the reader decodes and
+  surfaces the value and never judges it. A writer before A2 left the
+  bits zero, so its sidecars read as rules 0; a reader before A2 refuses
+  the new bits as a body-class failure — both directions discard and
+  rebuild, neither can fail a boot.
 - **Loader (D6):** `inf-store::SidecarLoader` — per-`(ns, id)` state
   machine (`Accepting → Loaded | Discarded{reason}`); binding checks
-  {generation, `INDEX_KEY_ENCODING_VERSION`, key scheme}, ordinal
+  {generation, `INDEX_KEY_ENCODING_VERSION`, key scheme, **maintenance
+  rules** (`SidecarRebuildReason::MaintenanceRules`)}, ordinal
   contiguity, and the ascending canon via `IndexTree::append`'s own
   refusal (`OrderedMap::append` — the rightmost-spine bulk path, the
   < 15 s gate's mechanism). `finish_load` at checkpoint end discards

@@ -174,15 +174,6 @@ impl Keyspace {
         }
     }
 
-    /// Aborts an open bracket without applying (the plane's refusal
-    /// paths between the halves).
-    #[cfg(feature = "doc")]
-    pub fn idx_bracket_abort(&mut self, ns: NsId) {
-        if let Some(store) = self.existing_store_mut(ns) {
-            store.idx_bracket_abort();
-        }
-    }
-
     /// Mutable tree access for `(ns, id)` — S05's backfill walk inserts
     /// through this; tests grow trees without a document corpus.
     #[cfg(feature = "doc")]
@@ -306,7 +297,7 @@ impl Keyspace {
         let mut emitted = 0u32;
         while emitted < max_entries {
             let Some((key, entry_ref)) = tree.cursor_next(cursor) else { break };
-            emit(key, entry_ref);
+            emit(key, entry_ref.to_raw());
             emitted += 1;
         }
         emitted
