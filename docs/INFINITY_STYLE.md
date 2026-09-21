@@ -146,12 +146,15 @@ resumable commands, and variable-size inputs.
 - **Function limit: 70 code lines.** Split by responsibility, keeping the
   transition visible and the helper contract meaningful. ADR-0125 defines
   the mechanical scope:
-  `scripts/check-fn-length.sh` runs clippy's `too_many_lines` at 70 code
-  lines on every production target and ratchets
-  `docs/fn-length-baseline.tsv` — a file's count never goes up, and the
-  row comes down with the code. A function opts out only with
-  `#[allow(clippy::too_many_lines, reason = "…")]`, and every opt-out is
-  printed on the gate's OK line. The baseline records existing violations
+  `scripts/check-lint-ratchet.sh` (ADR-0144 D3 — the one ratchet) runs
+  clippy's `too_many_lines` at 70 code lines on every production target
+  and ratchets the `fn_length` rows of `docs/lint-baseline.tsv` — a
+  file's count never goes up, the row comes down with the code, and the
+  total never exceeds the table's approved copies (`HEAD`, the base
+  branch tip, its introducing commit), so a violation cannot arrive with
+  its own raised row. A function opts out only with
+  `#[allow(clippy::too_many_lines, reason = "shape: …")]`, and every
+  opt-out is printed on `check-lint-scopes.sh`'s OK line. The baseline records existing violations
   to remove; it is no budget for new ones. Never trade one oversized
   function for another merely because the per-file count stays level.
 - **Hard limit: 3000 production lines per file.** Tests do not count

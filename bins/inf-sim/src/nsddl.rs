@@ -173,7 +173,7 @@ fn served_on(
 #[must_use]
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear phase script, like \
+    reason = "shape: one linear phase script, like \
      run_ns_create_window_scenario"
 )]
 fn run_observed(seed: u64, observer: TraceObserver) -> NsDdlRaceReport {

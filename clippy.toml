@@ -35,7 +35,7 @@ disallowed-methods = [
 
 # INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch
 # 64, ADR-0125): clippy counts code lines (comments and blanks excluded).
-# The lint is not in the workspace lint table — scripts/check-fn-length.sh
-# enables it on production targets only and ratchets
-# docs/fn-length-baseline.tsv.
+# The lint is not in the workspace lint table — scripts/check-lint-ratchet.sh
+# (ADR-0144 D3) enables it on production targets only and ratchets the
+# `fn_length` rows of docs/lint-baseline.tsv.
 too-many-lines-threshold = 70

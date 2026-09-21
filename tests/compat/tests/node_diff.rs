@@ -175,7 +175,7 @@ fn scan_all(stream: &mut TcpStream, buf: &mut Vec<u8>, label: &str) -> BTreeSet<
 /// (refused on tiered namespaces — the declared M4 string-family cut).
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear phase script; splitting would scatter the \
+    reason = "shape: one linear phase script; splitting would scatter the \
      invariants"
 )]
 fn run_ns_phase(

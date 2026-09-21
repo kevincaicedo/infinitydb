@@ -1172,7 +1172,6 @@ expect red "safety-inventory: a path that only contains the file name is not nam
 # --------------------------------------------- style limits (ADR-0125, batch 64)
 FILELEN=./scripts/check-file-length.sh
 LINEW=./scripts/check-line-width.sh
-FNLEN=./scripts/check-fn-length.sh
 # Batch 69 (ADR-0106 D2, macOS tier): a heredoc inside `$( )` whose body
 # holds an unbalanced parenthesis is a parse error under bash 3.2 — this
 # script aborted at its first such fixture and `just check` still saw exit
@@ -1213,89 +1212,97 @@ printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
 expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
 rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
-root=$(style_root fn)
-printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-log="$root/clippy.log"
-printf 'crates/fake/src/lib.rs:3:1: warning: this function has too many lines (90/70)\ncrates/fake/src/lib.rs:9:1: warning: this function has too many lines (80/70)\n' >"$log"
-printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect green "fn-length: two breaches, baseline 2" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-# ADR-0125 A1: cargo re-emits a crate's warnings once per feature set it
-# compiles; a site counts once however often it is printed, while two
-# same-length functions at different lines are two sites.
-dup="$root/clippy-dup.log"
-cat "$log" "$log" >"$dup"
-expect green "fn-length: the same two sites emitted twice count 2, not 4" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$dup" $FNLEN
-printf 'crates/fake/src/lib.rs:3:1: warning: this function has too many lines (90/70)\ncrates/fake/src/lib.rs:9:1: warning: this function has too many lines (90/70)\n' >"$dup"
-expect green "fn-length: two same-length sites are two breaches" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$dup" $FNLEN
-printf '1\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a new breach above the baseline" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '3\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a stale baseline above the tree (the ratchet)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '# empty\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a breach with no baseline row" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-# ADR-0125 A7 (batch 69): the baseline's host is Linux. A row whose file
-# shows no breach is the ratchet there and a disclosed note elsewhere (a
-# cfg-gated file this host never compiled); a new breach fails everywhere.
-printf '2\tcrates/fake/src/lib.rs\n1\tcrates/fake/src/linux_only.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a baseline row with no breach is the ratchet on Linux" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Linux $FNLEN
-expect green "fn-length: a baseline row with no breach is a note on another host" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
-expect_output "fn-length: the row skipped on another host is disclosed" "not compiled on this host (Darwin)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
-printf '# empty\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a new breach fails on another host too" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" INF_FN_LENGTH_HOST=Darwin $FNLEN
-printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-printf '#[allow(clippy::too_many_lines)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: an opt-out without a reason" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(clippy::too_many_lines, reason = "one linear script")]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect green "fn-length: an opt-out with its reason" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-expect_output "fn-length: every opt-out is listed on the OK line" "opt-out: crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-rm -f "$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a missing baseline is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-# ADR-0125 A3 (review B64-65-R01): the opt-out audit is structural — the
-# lint can be silenced from any scope and by any spelling, so every
-# attribute that names it is read whole and classified.
-printf '2\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-printf '#![allow(clippy::too_many_lines)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a crate-level #![allow] is a violation, not an invisible opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#![allow(clippy::pedantic)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a lint-group allow (pedantic) is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(warnings)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: allow(warnings) on a function is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(\n    clippy::too_many_lines,\n    reason = "one linear script"\n)]\n#[must_use]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect green "fn-length: a multi-line reasoned allow on a function (through another attribute) is a valid opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-expect_output "fn-length: the multi-line opt-out is disclosed on the OK line" "1 reasoned opt-out" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(\n    clippy::too_many_lines\n)]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a multi-line allow without a reason is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(clippy::too_many_lines, reason = "x")]\nmod inner { pub fn f() {} }\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a reasoned allow on a mod is a violation (function scope only)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf 'struct S;\n#[allow(clippy::too_many_lines, reason = "x")]\nimpl S { fn f() {} }\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a reasoned allow on an impl is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[cfg_attr(not(test), allow(clippy::too_many_lines, reason = "x"))]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: a cfg_attr suppression is a violation" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[expect(clippy::too_many_lines, reason = "x")]\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect red "fn-length: an expect is a violation (unfulfilled under normal builds)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '#[allow(dead_code, reason = "keeps warnings quiet")]\nstruct S;\npub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-expect green "fn-length: an unrelated allow whose reason mentions warnings is not a suppression" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
-# ADR-0125 A3 (review B64-65-R02): the baseline is validated before it is
-# compared — a malformed row used to skip both integer branches and pass.
-printf 'oops\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a non-integer baseline count is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '2\tcrates/fake/src/lib.rs\n1\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a path listed twice is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '2\tcrates/fake/src/lib.rs\textra\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a surplus baseline field is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '2\t/etc/passwd\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: an out-of-scope baseline path is a scope error" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-printf '0\tcrates/fake/src/lib.rs\n' >"$root/docs/fn-length-baseline.tsv"
-expect red "fn-length: a zero baseline count is a scope error (delete the row instead)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-# ADR-0125 A3 (review B64-65-R03): zero breaches with zero rows is the
-# ratchet's final state and passes; a scan with no compiler output is not.
-printf '# no rows\n' >"$root/docs/fn-length-baseline.tsv"
-printf '    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.00s\n' >"$log"
-expect green "fn-length: zero breaches and an empty baseline pass (the ratchet's goal)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-expect_output "fn-length: the zero state is disclosed" "0 function(s) over 70 lines in 0 file(s)" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
-: >"$log"
-expect red "fn-length: an empty compiler log is a scope error, not a clean tree" env INF_CHECK_ROOT="$root" INF_FN_LENGTH_INPUT="$log" $FNLEN
+# ------------------------------------------------------------ lint-ratchet
+# ADR-0144 D3 (absorbs ADR-0125's fn-length ratchet). Fixtures are captured
+# clippy JSON; the approved copies are real commits in a fixture repository.
+RATCHET="$SCRIPT_DIR/check-lint-ratchet.sh"
+ls_commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+rt_msg() { # rt_msg <lint> <file> <line> <col>
+    printf '{"reason":"compiler-message","message":{"code":{"code":"clippy::%s"},"level":"warning","message":"m","children":[],"spans":[{"file_name":"%s","line_start":%s,"column_start":%s,"is_primary":true}]}}\n' "$1" "$2" "$3" "$4"
+}
+rt_done() { printf '{"reason":"build-finished","success":true}\n'; }
+rt_root() {
+    local root="$work/$1"
+    [ -n "$1" ] && [ -n "$work" ] || { echo "rt_root: empty name" >&2; exit 2; }
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/fake/src" "$root/docs" "$root/scripts"
+    printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+    printf 'pub fn g() {}\n' >"$root/crates/fake/src/dec.rs"
+    printf 't/x\tcrates/fake/src/dec.rs\tcast,arith\tratchet\n' >"$root/docs/lint-scopes.tsv"
+    git -C "$root" init -q
+    ls_commit "$root" "before the gate"
+    git -C "$root" branch -q base-tip
+    printf '# gate\n' >"$root/scripts/check-lint-ratchet.sh"
+    echo "$root"
+}
+rt_run() { env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_INPUT="$1/clippy.json" INF_LINT_RATCHET_HOST="${2:-Linux}" "$RATCHET"; }
+root=$(rt_root rt)
+F=crates/fake/src/lib.rs
+D=crates/fake/src/dec.rs
+{ rt_msg too_many_lines $F 3 1; rt_msg too_many_lines $F 9 1; rt_done; } >"$root/clippy.json"
+printf 'fn_length\t2\t%s\n' $F >"$root/docs/lint-baseline.tsv"
+expect green "lint-ratchet: two breaches, baseline 2 (the introducing change)" rt_run "$root"
+{ rt_msg too_many_lines $F 3 1; rt_msg too_many_lines $F 9 1; rt_msg too_many_lines $F 3 1; rt_msg too_many_lines $F 9 1; rt_done; } >"$root/clippy.json"
+expect green "lint-ratchet: the same two spans emitted twice count 2, not 4" rt_run "$root"
+printf 'fn_length\t1\t%s\n' $F >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a new breach above the row" rt_run "$root"
+printf 'fn_length\t3\t%s\n' $F >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a stale row above the tree" rt_run "$root"
+printf '# empty\n' >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a breach with no row" rt_run "$root"
+printf 'fn_length\t2\t%s\nfn_length\t1\tcrates/fake/src/linux_only.rs\n' $F >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a row with no breach is the ratchet on Linux" rt_run "$root"
+expect green "lint-ratchet: a row with no breach is a note on another host" rt_run "$root" Darwin
+expect_output "lint-ratchet: the skipped row is disclosed" "not compiled on Darwin" rt_run "$root" Darwin
+for bad in 'fn_length\toops\t'$F 'fn_length\t0\t'$F 'fn_length\t2\t/etc/passwd' 'nonsense\t2\t'$F 'fn_length\t2\t'$F'\textra' 'fn_length\t2\t'$F'\nfn_length\t1\t'$F; do
+    printf "$bad\n" >"$root/docs/lint-baseline.tsv"
+    expect red "lint-ratchet: a malformed table is a scope error ($bad)" rt_run "$root"
+done
+printf '# no rows\n' >"$root/docs/lint-baseline.tsv"
+rt_done >"$root/clippy.json"
+expect green "lint-ratchet: zero breaches and an empty table pass (the goal)" rt_run "$root"
+: >"$root/clippy.json"
+expect red "lint-ratchet: no completed build is a scope error, not a clean tree" rt_run "$root"
+rm -f "$root/docs/lint-baseline.tsv"
+rt_done >"$root/clippy.json"
+expect red "lint-ratchet: a missing table is a scope error" rt_run "$root"
+# cast / arith count only on the files the scope table ratchets
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg cast_possible_truncation $D 5 9; rt_msg cast_sign_loss $D 5 9; rt_msg arithmetic_side_effects $F 2 1; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\t%s\ncast\t1\t%s\n' $D $D >"$root/docs/lint-baseline.tsv"
+expect green "lint-ratchet: cast/arith count on scoped files only; two cast lints on one span are one site" rt_run "$root"
+# the approved copies
+ls_commit "$root" "introduce the table: arith 1, cast 1"
+expect green "lint-ratchet: the committed table" rt_run "$root"
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg arithmetic_side_effects $D 8 9; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
+printf 'arith\t2\t%s\ncast\t1\t%s\n' $D $D >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: a violation with its row raised to match, uncommitted (HEAD leg)" rt_run "$root"
+ls_commit "$root" "combined change"
+expect red "lint-ratchet: the combined change committed is still red (introducing-commit leg)" rt_run "$root"
+git -C "$root" reset -q --hard HEAD~1
+# a fix does not buy a violation: -1 in dec.rs, +1 in an existing file
+printf 't/x\t%s\tcast,arith\tratchet\nt/x\t%s\tcast,arith\tratchet\n' $D $F >"$root/docs/lint-scopes.tsv"
+{ rt_msg arithmetic_side_effects $F 2 1; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\t%s\ncast\t1\t%s\n' $F $D >"$root/docs/lint-baseline.tsv"
+expect red "lint-ratchet: sites fixed in one file do not pay for new ones in an existing file" rt_run "$root"
+# a split carries its counts to an added file
+git -C "$root" reset -q --hard HEAD
+printf 'pub fn h() {}\n' >"$root/crates/fake/src/split.rs"
+printf 't/x\t%s\tcast,arith\tratchet\nt/x\tcrates/fake/src/split.rs\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
+{ rt_msg arithmetic_side_effects crates/fake/src/split.rs 1 1; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
+printf 'arith\t1\tcrates/fake/src/split.rs\ncast\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
+git -C "$root" add -A
+expect green "lint-ratchet: a split carries its count to an added file" rt_run "$root"
+expect_output "lint-ratchet: the moved row is printed" "moved: arith crates/fake/src/split.rs" rt_run "$root"
+git -C "$root" reset -q --hard HEAD
+expect red "lint-ratchet: an unresolvable base ref is a scope error" env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=no-such-ref INF_LINT_RATCHET_INPUT="$root/clippy.json" "$RATCHET"
+# two changes that each pass: the base tip moved down, this branch did not
+git -C "$root" checkout -q -b feature
+git -C "$root" checkout -q -B base-tip
+printf 'cast\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
+ls_commit "$root" "PR1: arith fixed on the base"
+git -C "$root" checkout -q feature
+{ rt_msg arithmetic_side_effects $D 4 9; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
+expect red "lint-ratchet: a branch that is green against its merge base is red against the base tip" rt_run "$root"
 
 # ---------------------------------------------------------- doc artifacts
 DOCS=./scripts/check-doc-artifacts.sh
@@ -1382,6 +1389,20 @@ LS_ATTR='#![cfg_attr(
     not(test),
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]'
+LS_DENY='#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]'
+ls_scopes() {
+    mkdir -p "$1/crates/fake/fuzz/fuzz_targets" "$1/docs"
+    printf '// fuzz\n' >"$1/crates/fake/fuzz/fuzz_targets/t.rs"
+    printf 'fake/t\tnone: the fixture target enters no decoder\t-\t-\n' >"$1/docs/lint-scopes.tsv"
+}
 ls_root() {
     local root="$work/$1"
     [ -n "$1" ] && [ -n "$work" ] || { echo "ls_root: empty name" >&2; exit 2; }
@@ -1393,6 +1414,7 @@ ls_root() {
     printf '%s\nfn main() {}\n' "$LS_ATTR" >"$root/bins/fake/src/main.rs"
     printf '# file\tfn\tcolumn\n' >"$root/docs/lint-exemptions.tsv"
     printf '# gate\n' >"$root/scripts/check-lint-scopes.sh"
+    ls_scopes "$root"
     git -C "$root" init -q
     git -C "$root" add -A
     git -C "$root" -c user.name=t -c user.email=t@t commit -q -m base
@@ -1411,24 +1433,25 @@ ls_case() {
     printf '%s\n%s\n' "$LS_ATTR" "$body" >"$root/crates/fake/src/lib.rs"
     expect "$want" "lint-scopes: $label" ls_run "$root"
 }
-for lint in wildcard_enum_match_arm match_wildcard_for_single_variants; do
+for lint in wildcard_enum_match_arm match_wildcard_for_single_variants cast_possible_truncation arithmetic_side_effects too_many_lines; do
+    case "$lint" in too_many_lines) cls=shape ;; cast_*|arith*) cls=bound ;; *) cls=foreign ;; esac
     ls_case red "$lint — allow without a reason" "#[allow(clippy::$lint)]
 pub fn f() {}"
-    ls_case red "$lint — expect hides it" "#[expect(clippy::$lint, reason = \"foreign: x\")]
+    ls_case red "$lint — expect hides it" "#[expect(clippy::$lint, reason = \"$cls: x\")]
 pub fn f() {}"
-    ls_case red "$lint — cfg_attr-wrapped allow" "#[cfg_attr(not(test), allow(clippy::$lint, reason = \"foreign: x\"))]
+    ls_case red "$lint — cfg_attr-wrapped allow" "#[cfg_attr(not(test), allow(clippy::$lint, reason = \"$cls: x\"))]
 pub fn f() {}"
     ls_case red "$lint — inner allow in a module" "pub mod m {
-    #![allow(clippy::$lint, reason = \"foreign: x\")]
+    #![allow(clippy::$lint, reason = \"$cls: x\")]
 }"
     ls_case red "$lint — allow on an impl" "pub struct S;
-#[allow(clippy::$lint, reason = \"foreign: x\")]
+#[allow(clippy::$lint, reason = \"$cls: x\")]
 impl S {}"
     ls_case red "$lint — a reason of no class" "#[allow(clippy::$lint, reason = \"it is fine\")]
 pub fn f() {}"
     ls_case green "$lint — a reasoned function-level allow (multi-line)" "#[allow(
     clippy::$lint,
-    reason = \"foreign: io::ErrorKind is non_exhaustive; the rest is fail-stop\"
+    reason = \"$cls: stated over two lines, through another attribute\"
 )]
 pub fn f() {}"
 done
@@ -1436,11 +1459,36 @@ for group in clippy::pedantic clippy::restriction clippy::style clippy::all warn
     ls_case red "group suppression $group" "#[allow($group)]
 pub fn f() {}"
 done
+cls=foreign
 expect_output "lint-scopes: every allow is listed on the OK line" "allow: crates/fake/src/lib.rs" ls_run "$(
-    ls_case green "listed allow" "#[allow(clippy::wildcard_enum_match_arm, reason = \"foreign: x\")]
+    ls_case green "listed allow" "#[allow(clippy::wildcard_enum_match_arm, reason = \"$cls: x\")]
 pub fn f() {}" >/dev/null
     echo "$root"
 )"
+# the scope table (ADR-0144 D2): targets and rows name each other, and a
+# `deny` row's file carries the attribute
+root=$(ls_root ls-table)
+printf '// fuzz\n' >"$root/crates/fake/fuzz/fuzz_targets/new_decoder.rs"
+expect red "lint-scopes: a fuzz target no row names" ls_run "$root"
+rm "$root/crates/fake/fuzz/fuzz_targets/new_decoder.rs"
+printf 'fake/gone\tcrates/fake/src/lib.rs\tcast,arith\tratchet\n' >>"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: a row naming a target that is gone" ls_run "$root"
+ls_scopes "$root"
+printf 'fake/t\tcrates/fake/src/nope.rs\tcast,arith\tratchet\n' >"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: a row naming a file that does not exist" ls_run "$root"
+printf 'fake/t\tcrates/fake/src/lib.rs\tcast,arith\tdeny\n' >"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: a deny row whose file lacks the attribute" ls_run "$root"
+printf '%s\n%s\npub fn f() {}\n' "$LS_ATTR" "$LS_DENY" >"$root/crates/fake/src/lib.rs"
+expect green "lint-scopes: a deny row whose file carries it" ls_run "$root"
+printf '%s\npub fn f() {}\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
+printf 'fake/t\tcrates/fake/src/lib.rs::f\tcast,arith\tdeny\n' >"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: an item-scoped deny row without the attribute on the item" ls_run "$root"
+printf 'fake/t\tnone: x\t-\t-\n' >"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: a none row states its reason" ls_run "$root"
+printf 'fake/t\tcrates/fake/src/lib.rs\tcast,arith\tsomeday\n' >"$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: an unknown tier" ls_run "$root"
+rm "$root/docs/lint-scopes.tsv"
+expect red "lint-scopes: a missing scope table is a scope error" ls_run "$root"
 # the frozen exemption table
 root=$(ls_root ls-exempt)
 ls_exempt() { printf '%s\n#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]\npub fn %s() {}\n' "$LS_ATTR" "$1" >"$root/crates/fake/src/lib.rs"; }
@@ -1456,6 +1504,7 @@ ls_commit "$root" "before the gate"
 git -C "$root" branch -q base-tip
 mkdir -p "$root/scripts" "$root/docs"
 printf "# gate\n" >"$root/scripts/check-lint-scopes.sh"
+ls_scopes "$root"
 printf '# file\tfn\tcolumn\n' >"$root/docs/lint-exemptions.tsv"
 printf '%s\n' '#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]' 'pub fn f() {}' >"$root/crates/fake/src/a.rs"
 printf 'crates/fake/src/a.rs\tf\tk\n' >>"$root/docs/lint-exemptions.tsv"
@@ -1507,4 +1556,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts, lint-scopes each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, lint-scopes each red on a planted violation)"

@@ -11,7 +11,7 @@ import json
 import re
 import sys
 
-PLANTS_MIN = 4
+PLANTS_MIN = 8
 
 src, diag = sys.argv[1], sys.argv[2]
 plants, controls = {}, set()

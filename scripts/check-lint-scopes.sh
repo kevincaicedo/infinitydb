@@ -33,7 +33,7 @@ for dir in crates bins; do
     [ -d "$dir" ] || { echo "LINT-SCOPES SCOPE ERROR: $dir/ is missing"; exit 1; }
 done
 
-INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
+INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
     INF_SELF="scripts/check-lint-scopes.sh" python3 - <<'PY'
 import os
 import re
@@ -51,7 +51,19 @@ SELF = os.environ["INF_SELF"]
 LINTS = {
     "wildcard_enum_match_arm": ("fn", ("ADR-0143:", "foreign:")),
     "match_wildcard_for_single_variants": ("fn", ("ADR-0143:", "foreign:")),
+    "cast_possible_truncation": ("fn", ("bound:",)),
+    "cast_sign_loss": ("fn", ("bound:",)),
+    "cast_possible_wrap": ("fn", ("bound:",)),
+    "arithmetic_side_effects": ("fn", ("bound:",)),
+    # ADR-0125 D2's opt-out, audited here since the ratchet absorbed it.
+    "too_many_lines": ("fn", ("shape:",)),
 }
+SCOPES = os.environ["INF_SCOPES"]
+DENY_ATTR = re.compile(
+    r"#!?\[cfg_attr\(\s*not\(test\),\s*deny\(\s*clippy::cast_possible_truncation,\s*"
+    r"clippy::cast_sign_loss,\s*clippy::cast_possible_wrap,\s*"
+    r"clippy::arithmetic_side_effects,?\s*\)\s*,?\s*\)\]"
+)
 GROUPS = ("clippy::pedantic", "clippy::restriction", "clippy::style", "clippy::all", "warnings")
 ROOT_ATTR = re.compile(
     r"#!\[cfg_attr\(\s*not\(test\),\s*deny\(\s*clippy::wildcard_enum_match_arm,\s*"
@@ -187,13 +199,66 @@ if roots == 0:
 
 # ---- D2: the suppression audit
 files, exempt_sites = 0, []
-for top in ("crates", "bins"):
+for top in ("crates", "bins", "tests"):
+    if not os.path.isdir(top):
+        continue
     for dirpath, dirnames, names in os.walk(top):
         dirnames[:] = sorted(d for d in dirnames if d not in ("target", "fuzz"))
         for name in sorted(names):
             if name.endswith(".rs"):
                 files += 1
                 audit(Path(dirpath) / name, exempt_sites)
+
+# ---- D2/D3: the scope table — every fuzz target is named by a row, every
+# row's target and file exist, and a `deny` row's file carries the attribute
+targets = set()
+for crate in sorted(Path("crates").iterdir()):
+    fuzz = crate / "fuzz" / "fuzz_targets"
+    if fuzz.is_dir():
+        targets |= {f"{crate.name}/{t.stem}" for t in fuzz.glob("*.rs")}
+if not Path(SCOPES).is_file():
+    print(f"LINT-SCOPES SCOPE ERROR: {SCOPES} is missing")
+    sys.exit(1)
+named_targets, denied, ratchet_rows = set(), 0, 0
+for n, line in enumerate(Path(SCOPES).read_text().split("\n"), 1):
+    if not line.strip() or line.startswith("#"):
+        continue
+    cols = line.split("\t")
+    if len(cols) != 4:
+        errors.append(f"{SCOPES}:{n}: malformed row (target, file[::item], lints, tier)")
+        continue
+    target, where, _lints, tier = cols
+    named_targets.add(target)
+    if target not in targets:
+        errors.append(f"{SCOPES}:{n}: fuzz target `{target}` does not exist")
+    if where.startswith("none:"):
+        if len(where) < len("none: ") + 8:
+            errors.append(f"{SCOPES}:{n}: a `none:` row states its reason")
+        continue
+    file, _, item = where.partition("::")
+    if not Path(file).is_file():
+        errors.append(f"{SCOPES}:{n}: `{file}` does not exist")
+        continue
+    if tier == "ratchet":
+        ratchet_rows += 1
+    elif tier == "deny":
+        denied += 1
+        text = Path(file).read_text()
+        if item:
+            at = re.search(rf"\bfn\s+{re.escape(item)}\b", text)
+            head = text[: at.start()] if at else ""
+            ok = bool(at) and bool(DENY_ATTR.search(head[-600:]))
+        else:
+            ok = bool(DENY_ATTR.search(text))
+        if not ok:
+            errors.append(f"{SCOPES}:{n}: `{where}` is tier deny and lacks the cast + arithmetic deny attribute")
+    else:
+        errors.append(f"{SCOPES}:{n}: tier `{tier}` is not deny | ratchet")
+for t in sorted(targets - named_targets):
+    errors.append(f"fuzz target `{t}` is named by no row of {SCOPES} — a decoder chooses its lint scope")
+if not targets:
+    print("LINT-SCOPES SCOPE ERROR: no fuzz target found under crates/*/fuzz/fuzz_targets")
+    sys.exit(1)
 
 # ---- D1: the frozen exemption table
 if not Path(EXEMPTIONS).is_file():
@@ -250,7 +315,7 @@ if errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
-scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions"
+scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped ({denied} deny row(s), {ratchet_rows} ratchet)"
 if notes:
     scope += "; " + "; ".join(notes)
 print(f"lint-scopes OK: {scope}")

@@ -8,7 +8,7 @@ use super::*;
 /// Runs one seeded durable scenario: boot → DDL → seeded traffic → power
 /// cut mid-run → reboot (optionally cut again mid-recovery) → recover →
 /// audit every ledger key against the §8.2 admissible-state rule.
-#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_scenario")]
+#[allow(clippy::too_many_lines, reason = "shape: one linear phase script, like run_scenario")]
 #[must_use]
 fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableReport {
     let clock = Rc::new(VirtualClock::new(Nanos(1)));

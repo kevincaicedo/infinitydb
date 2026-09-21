@@ -418,7 +418,10 @@ impl TieredNodeReport {
 /// Runs one seeded tiered-node scenario (the phase list in the module
 /// docs). Violations carry the seed and the exact key/reply — a sweep
 /// line is a complete repro via `--seed`.
-#[allow(clippy::too_many_lines, reason = "one linear phase script, like run_durable_scenario")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: one linear phase script, like run_durable_scenario"
+)]
 #[must_use]
 fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNodeReport {
     let harness = scenario.harness();

@@ -99,6 +99,10 @@ jobs:
       # ADR-0143 exemptions, and the probe whose plants must draw their lint.
       - name: lint scopes (ADR-0144)
         run: ./scripts/check-lint-scopes.sh
+      # Linux only: the baseline is recorded there (cfg-gated files).
+      - name: lint ratchet (ADR-0144 D3; absorbs the fn-length ratchet)
+        if: runner.os == 'Linux'
+        run: ./scripts/check-lint-ratchet.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build shipping packages

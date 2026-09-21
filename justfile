@@ -19,7 +19,10 @@ check:
     # on every line, and the 70-line function ratchet.
     ./scripts/check-file-length.sh
     ./scripts/check-line-width.sh
-    ./scripts/check-fn-length.sh
+    # ADR-0144 D3: one ratchet — fn-length, and the cast / arithmetic
+    # backlog of the decoder files docs/lint-scopes.tsv lists — judged
+    # against the table's approved copies in history.
+    ./scripts/check-lint-ratchet.sh
     # ADR-0144 (architecture review 2026-09-17, W5): every crate root is
     # under the wildcard deny, no attribute hides a lint of the ADR, the
     # ADR-0143 exemptions are frozen, and the probe's plants draw their lint.

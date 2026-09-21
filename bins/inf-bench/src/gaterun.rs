@@ -696,7 +696,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
     ],
 );
 
-#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
+#[allow(clippy::too_many_lines, reason = "shape: orchestration script: linear, not branchy")]
 pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     let Some((milestone, rest)) = args.split_first() else {
         return Err("usage: gate-run m0|m1 [flags]".into());
@@ -715,7 +715,7 @@ pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "orchestration script: linear, not branchy")]
+#[allow(clippy::too_many_lines, reason = "shape: orchestration script: linear, not branchy")]
 fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m0")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m0");

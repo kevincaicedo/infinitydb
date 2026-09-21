@@ -1257,7 +1257,7 @@ const STALL_STEPS: u64 = 20_000;
 /// down) or to a stall verdict.
 #[allow(
     clippy::too_many_lines,
-    reason = "one linear phase script; splitting would scatter the \
+    reason = "shape: one linear phase script; splitting would scatter the \
      invariants"
 )]
 pub fn run_scenario(scenario: &Scenario) -> SimReport {
