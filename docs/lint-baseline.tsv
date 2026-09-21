@@ -12,7 +12,6 @@ arith	23	crates/inf-wire/src/writer.rs
 cast	15	crates/inf-doc/src/path/eval.rs
 cast	1	crates/inf-query/src/predicate/vm.rs
 cast	5	crates/inf-wire/src/parser.rs
-cast	6	crates/inf-wire/src/writer.rs
 fn_length	1	bins/inf-bench/src/bootstorm.rs
 fn_length	1	bins/inf-bench/src/load.rs
 fn_length	3	bins/inf-bench/src/m2rows.rs

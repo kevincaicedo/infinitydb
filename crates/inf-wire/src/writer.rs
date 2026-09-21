@@ -2,6 +2,11 @@
 //! `Vec<u8>` (a wire send buffer) — no internal allocation; integers format
 //! through a stack buffer (no `format!`). The protocol version is chosen per
 //! connection at `HELLO` and threaded through [`RespWriter::new`].
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 /// Negotiated protocol for one connection.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -77,7 +82,7 @@ impl<'b> RespWriter<'b> {
     /// `$len\r\n<bytes>\r\n`.
     pub fn bulk(&mut self, bytes: &[u8]) {
         self.out.push(b'$');
-        self.raw_int(bytes.len() as i64);
+        self.raw_len(bytes.len());
         self.out.extend_from_slice(b"\r\n");
         self.out.extend_from_slice(bytes);
         self.out.extend_from_slice(b"\r\n");
@@ -126,7 +131,7 @@ impl<'b> RespWriter<'b> {
         }
         let len = self.out.len() - payload_at;
         let mut buf = [0u8; 20];
-        let text = itoa(len as i64, &mut buf);
+        let text = utoa(len as u64, false, &mut buf);
         if text.len() <= PATCHED_DIGITS {
             let gap = PATCHED_DIGITS - text.len();
             self.out[digits_at..digits_at + text.len()].copy_from_slice(text);
@@ -161,7 +166,7 @@ impl<'b> RespWriter<'b> {
     /// `*N\r\n` — N replies follow.
     pub fn array_header(&mut self, n: usize) {
         self.out.push(b'*');
-        self.raw_int(n as i64);
+        self.raw_len(n);
         self.out.extend_from_slice(b"\r\n");
     }
 
@@ -172,7 +177,7 @@ impl<'b> RespWriter<'b> {
             Protocol::Resp2 => self.array_header(n),
             Protocol::Resp3 => {
                 self.out.push(b'>');
-                self.raw_int(n as i64);
+                self.raw_len(n);
                 self.out.extend_from_slice(b"\r\n");
             }
         }
@@ -185,7 +190,7 @@ impl<'b> RespWriter<'b> {
             Protocol::Resp2 => self.array_header(pairs * 2),
             Protocol::Resp3 => {
                 self.out.push(b'%');
-                self.raw_int(pairs as i64);
+                self.raw_len(pairs);
                 self.out.extend_from_slice(b"\r\n");
             }
         }
@@ -222,7 +227,7 @@ impl<'b> RespWriter<'b> {
             Protocol::Resp2 => self.bulk(text),
             Protocol::Resp3 => {
                 self.out.push(b'=');
-                self.raw_int((text.len() + 4) as i64);
+                self.raw_len(text.len() + 4);
                 self.out.extend_from_slice(b"\r\n");
                 self.out.extend_from_slice(kind);
                 self.out.push(b':');
@@ -291,6 +296,14 @@ impl<'b> RespWriter<'b> {
         let text = itoa(value, &mut buf);
         self.out.extend_from_slice(text);
     }
+
+    /// A length or element count → ASCII. Formatted unsigned: `usize`
+    /// widens to `u64` losslessly, so no reply header is ever narrowed.
+    fn raw_len(&mut self, len: usize) {
+        let mut buf = [0u8; 20];
+        let text = utoa(len as u64, false, &mut buf);
+        self.out.extend_from_slice(text);
+    }
 }
 
 /// Reserved length-header width of a patched bulk: 8 digits cover every
@@ -345,9 +358,14 @@ fn contains_line_break(text: &[u8]) -> bool {
 
 /// Minimal signed-integer formatter into a caller stack buffer.
 fn itoa(value: i64, buf: &mut [u8; 20]) -> &[u8] {
-    let negative = value < 0;
     // Two's-complement-safe magnitude (handles i64::MIN).
-    let mut magnitude = value.unsigned_abs();
+    utoa(value.unsigned_abs(), value < 0, buf)
+}
+
+/// Decimal digits of `magnitude`, signed by `negative`: 20 bytes hold the
+/// 20 digits of `u64::MAX`, or a sign and the 19 digits of `i64::MIN`.
+fn utoa(mut magnitude: u64, negative: bool, buf: &mut [u8; 20]) -> &[u8] {
+    debug_assert!(!negative || magnitude <= i64::MIN.unsigned_abs(), "a sign needs a byte");
     let mut at = buf.len();
     loop {
         at -= 1;
@@ -734,5 +752,9 @@ mod tests {
         assert_eq!(itoa(-1, &mut buf), b"-1");
         assert_eq!(itoa(i64::MAX, &mut buf), b"9223372036854775807");
         assert_eq!(itoa(i64::MIN, &mut buf), b"-9223372036854775808");
+        // Lengths format unsigned: the widest one fills the buffer exactly.
+        assert_eq!(utoa(0, false, &mut buf), b"0");
+        assert_eq!(utoa(i64::MAX as u64 + 1, false, &mut buf), b"9223372036854775808");
+        assert_eq!(utoa(u64::MAX, false, &mut buf), b"18446744073709551615");
     }
 }
