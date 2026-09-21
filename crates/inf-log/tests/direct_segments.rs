@@ -903,3 +903,28 @@ fn each_open_is_its_own_file_description() {
     disk.driver_write_at(b, 0, &[2u8; 8]).expect("the live handle's fd serves");
     assert_eq!(&disk.contents(&path).expect("exists")[..8], &[2u8; 8]);
 }
+
+/// A v3 frame's padding may run past the bytes read (`start` ahead of
+/// `valid`), and the reader's `Debug` must still print: the window
+/// subtraction underflowed there — a debug-build panic, a wrapped figure
+/// in release (ADR-0144 D3's audit of `reader.rs`).
+#[test]
+fn reader_debug_survives_padding_past_the_window() {
+    let fs = MemFs::new();
+    let dir = Path::new("log");
+    fs.create_dir_all(dir).expect("dir");
+    let mut b = FrameBuilder::new();
+    b.append(&record(1));
+    let first = Lsn::new(SegmentId(4), FRAME_HEADER_LEN as u32);
+    let frame_len = b.frame_len();
+    // The file ends right after the frame's own bytes, inside its padding.
+    let mut file =
+        fs.create_segment(&dir.join("seg-000004.ilog"), u64::from(frame_len)).expect("seg");
+    let sealed = b.finalize(first, stamp(1), FrameLayout::Aligned);
+    file.write_at(0, &sealed[..frame_len as usize]).expect("write");
+    let mut reader =
+        SegmentReader::open(&fs, dir, SegmentId(4), ReaderConfig::default()).expect("open");
+    assert!(reader.next_frame().expect("frame").is_some());
+    let shown = format!("{reader:?}");
+    assert!(shown.contains("window: 0"), "an empty window, not a wrapped one: {shown}");
+}

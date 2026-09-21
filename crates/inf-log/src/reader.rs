@@ -26,7 +26,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use core::fmt;
@@ -255,7 +260,8 @@ impl<File: SegmentFile> fmt::Debug for SegmentReader<File> {
         f.debug_struct("SegmentReader")
             .field("segment", &self.segment)
             .field("next_offset", &self.next_offset)
-            .field("window", &(self.valid - self.start))
+            // `start` may run ahead of `valid` (a v3 frame's padding).
+            .field("window", &self.valid.saturating_sub(self.start))
             .field("end", &self.end)
             .finish()
     }
@@ -411,7 +417,7 @@ impl<File: SegmentFile> SegmentReader<File> {
                 // ahead of `valid`; the next peek's refill compacts from
                 // the boundary (a file ending inside the padding is a
                 // clean `FileEnd`, like any other short tail).
-                self.start += frame.padded_len() as usize;
+                self.start = self.start.saturating_add(frame.padded_len() as usize);
                 self.next_offset = next_offset;
                 Ok(ReadStep::Frame(frame))
             }
@@ -463,6 +469,12 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// boundary (or end at EOF), compacting and reading ahead in
     /// `chunk_bytes` strides. The buffer grows only when one frame
     /// exceeds it — bounded by `max_frame_len`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: start > valid is tested before their difference and start <= valid \
+                  holds after it; read_at fills at most buf[valid..target], so valid <= target; \
+                  file_pos is a byte position inside one u32-addressed segment file"
+    )]
     fn refill(&mut self, needed: usize) -> Result<(), ReadError> {
         if self.start > self.valid {
             // A v3 frame's padding ran past the bytes read so far: the
@@ -503,7 +515,8 @@ impl<File: SegmentFile> SegmentReader<File> {
         // path. Hint-only (no-op on in-memory tiers): bytes and digests
         // unchanged.
         if !self.hit_eof {
-            self.file.advise_read_ahead(self.file_pos, 2 * self.cfg.chunk_bytes as u64);
+            let hint_len = (self.cfg.chunk_bytes as u64).saturating_mul(2);
+            self.file.advise_read_ahead(self.file_pos, hint_len);
         }
         Ok(())
     }

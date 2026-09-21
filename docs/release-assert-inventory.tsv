@@ -268,7 +268,6 @@ C	1	crates/inf-log/src/frame.rs	assert	frame epoch 0 is reserved (ADR-0031 D1)	`
 C	1	crates/inf-log/src/frame.rs	assert	frame seq 0 is reserved (ADR-0031 D1)	`crates/inf-server/src/durable.rs:DurableCell::new` stamps the recovery-derived life (≥ 1, `crates/inf-server/src/recover.rs:Recovery::step_finish`) through `crates/inf-log/src/staging.rs:StagingRing::set_frame_epoch`, which asserts it; seq starts at 1 and only increments
 I	1	crates/inf-log/src/frame.rs	assert	sealed_frame before finalize	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 I	6	crates/inf-log/src/frame.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	1	crates/inf-log/src/frame.rs	expect	4-byte trailer	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	2	crates/inf-log/src/frame.rs	expect	8-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/frame.rs	expect	frame exceeds u32	the builder's buffer is one staging slot ≤ 64 MiB (`staging.rs:StagingRing::new`)
 I	1	crates/inf-log/src/fs.rs	expect	length fits usize	u64 → usize is lossless on every supported (64-bit) target
@@ -298,7 +297,6 @@ I	1	crates/inf-log/src/manifest.rs	expect	segment count	bounded by the decode ca
 I	1	crates/inf-log/src/manifest.rs	expect	tier file count	bounded by the decode caps (MAX_TIER_NS, MAX_TIER_FILES) and segment retention — far below u32 in any real catalog
 I	1	crates/inf-log/src/manifest.rs	expect	tier ns count	bounded by the decode caps (MAX_TIER_NS, MAX_TIER_FILES) and segment retention — far below u32 in any real catalog
 I	1	crates/inf-log/src/meta.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
-I	1	crates/inf-log/src/meta.rs	expect	4-byte trailer	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	2	crates/inf-log/src/reader.rs	expect	4-byte slice	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-log/src/record.rs	expect	8-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
@@ -757,3 +755,6 @@ I	1	crates/inf-doc/src/path/program.rs	unreachable	descend never nests (AST inva
 I	1	crates/inf-doc/src/path/program.rs	unreachable	validated union members are never unions	`PathProgram` holds validated bytes by type: built only by `crates/inf-doc/src/path/mod.rs:compile_with_max_bytes` (this crate's compiler) or `PathProgram::from_bytes` (`validate` runs first); fields are private; `validate_selector(union_member = true)` admits `Child`/`Index`/`Slice` members only, so `read_op` loops `read_leaf` over them (ADR-0125 A4)
 C	1	crates/inf-fabric/src/codec.rs	unreachable	encode refused a nested batch before writing	`encode_leaf_payload` is reached for a batch member only from `encode_payload`'s batch loop, after `crates/inf-fabric/src/codec.rs:encode` walked the ops and panicked on any nested `Batch` before writing a byte; no production code constructs `Op::Batch` — the plane sends point ops only (`crates/inf-server/src/plane/ns_ddl.rs:send_apply`)
 I	1	crates/inf-server/src/plane/ns_ddl.rs	assert	db rides 4 bits of the Apply cmd byte	compile-time (`const _: () = assert!(DATABASES <= 16)`, review 2026-08-30 L17 E6b): the one owner of the database count must fit the fabric cmd byte's db nibble; a wider `DATABASES` fails the build, so no release path can reach a mis-route
+I	1	crates/inf-log/src/frame.rs	assert	MIN_FRAME_LEN_V1 is header + minimal record + trailer	const assertion — evaluated at compile time, never at run time; ties the literal to the lengths it sums
+I	1	crates/inf-log/src/frame.rs	assert	MIN_FRAME_LEN is header + minimal record + trailer	const assertion — evaluated at compile time, never at run time; ties the literal to the lengths it sums
+I	1	crates/inf-foundation/src/lib.rs	assert	InfinityDB targets 64-bit hosts	const assertion — a compile-time refusal of a 32-bit target, never a run-time panic; the `bound:` proofs of ADR-0144 D2/D3 cite it

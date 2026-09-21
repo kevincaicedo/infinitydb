@@ -29,7 +29,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use std::io;
@@ -164,11 +169,16 @@ pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec
         if n == 0 {
             return Err(invalid(format!("envelope torn: EOF at {read} of {len} bytes")));
         }
-        read += n;
+        // A file that reports more bytes than the slice it was handed is
+        // refused like any other malformed envelope read.
+        read = read
+            .checked_add(n)
+            .filter(|&read| read <= buf.len())
+            .ok_or_else(|| invalid(format!("envelope read_at returned {n} bytes past {read}")))?;
     }
-    decode_envelope(&buf)?;
-    buf.truncate(len - TRAILER_LEN);
+    let payload_len = decode_envelope(&buf)?.len();
     buf.drain(..HEADER_LEN);
+    buf.truncate(payload_len);
     Ok(Some(buf))
 }
 
@@ -192,15 +202,22 @@ pub fn decode_envelope(buf: &[u8]) -> io::Result<&[u8]> {
     let payload_len =
         u32::from_le_bytes(buf[META_MAGIC.len()..HEADER_LEN].try_into().expect("4-byte slice"))
             as usize;
-    let expected = MIN_ENVELOPE_LEN + payload_len;
+    let Some(expected) = MIN_ENVELOPE_LEN.checked_add(payload_len) else {
+        return Err(invalid(format!(
+            "envelope declares an unaddressable {payload_len}-byte payload"
+        )));
+    };
     if len != expected {
         return Err(invalid(format!(
             "envelope length mismatch: envelope declares a {payload_len}-byte payload \
              ({expected} bytes total), file holds {len}"
         )));
     }
-    let (covered, trailer) = buf.split_at(len - TRAILER_LEN);
-    let stored = u32::from_le_bytes(trailer.try_into().expect("4-byte trailer"));
+    // `len >= MIN_ENVELOPE_LEN` (checked above) covers the trailer.
+    let Some((covered, trailer)) = buf.split_last_chunk::<TRAILER_LEN>() else {
+        return Err(invalid(format!("envelope too short for its trailer: {len} bytes")));
+    };
+    let stored = u32::from_le_bytes(*trailer);
     let computed = crc32c(covered);
     if stored != computed {
         return Err(invalid(format!(
@@ -214,7 +231,7 @@ pub(crate) fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "envelope payload exceeds the u32 length field")
     })?;
-    let mut envelope = Vec::with_capacity(MIN_ENVELOPE_LEN + payload.len());
+    let mut envelope = Vec::with_capacity(MIN_ENVELOPE_LEN.saturating_add(payload.len()));
     envelope.extend_from_slice(&META_MAGIC);
     envelope.extend_from_slice(&payload_len.to_le_bytes());
     envelope.extend_from_slice(payload);

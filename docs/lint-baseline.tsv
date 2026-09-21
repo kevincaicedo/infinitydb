@@ -11,12 +11,7 @@ arith	36	crates/inf-doc/src/path/parse.rs
 arith	31	crates/inf-doc/src/path/program.rs
 arith	81	crates/inf-doc/src/tape.rs
 arith	3	crates/inf-fabric/src/codec.rs
-arith	29	crates/inf-log/src/blob.rs
 arith	62	crates/inf-log/src/ckpt/read.rs
-arith	17	crates/inf-log/src/frame.rs
-arith	6	crates/inf-log/src/manifest.rs
-arith	5	crates/inf-log/src/meta.rs
-arith	7	crates/inf-log/src/reader.rs
 arith	69	crates/inf-log/src/tier.rs
 arith	11	crates/inf-query/src/access.rs
 arith	3	crates/inf-query/src/page.rs
@@ -40,8 +35,6 @@ cast	15	crates/inf-doc/src/path/eval.rs
 cast	3	crates/inf-doc/src/path/program.rs
 cast	11	crates/inf-doc/src/tape.rs
 cast	5	crates/inf-fabric/src/codec.rs
-cast	2	crates/inf-log/src/blob.rs
-cast	4	crates/inf-log/src/frame.rs
 cast	4	crates/inf-log/src/tier.rs
 cast	5	crates/inf-query/src/access.rs
 cast	5	crates/inf-query/src/partiql/cache.rs

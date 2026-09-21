@@ -10,6 +10,11 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+// The supported targets are 64-bit (io_uring / kqueue hosts). `bound:`
+// proofs across the workspace (ADR-0144 D2/D3) rest on it: a sum of a
+// `Vec` length (<= isize::MAX) and u32-ranged on-disk lengths fits `usize`.
+const _: () = assert!(usize::BITS >= 64, "InfinityDB targets 64-bit hosts");
+
 mod addr;
 mod crc;
 mod device;

@@ -61,7 +61,12 @@
 // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
 #![cfg_attr(
     not(test),
-    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
 )]
 
 use core::fmt;
@@ -131,8 +136,13 @@ pub struct TierFileRange {
 impl TierFileRange {
     /// One past the last manifested address of this range.
     #[must_use]
+    ///
+    /// Saturating: `decode` admits only ranges whose end fits, and a
+    /// hand-built range past the address space must order after every
+    /// valid address so `encode`'s tiling assert refuses it — a wrapped
+    /// end would pass that assert and stage a manifest no boot can decode.
     pub fn end(&self) -> u64 {
-        self.base + self.durable_len
+        self.base.saturating_add(self.durable_len)
     }
 }
 
@@ -204,9 +214,15 @@ impl Manifest {
     /// cannot decode canonically must never be staged).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let tier_len: usize =
-            self.tiers.iter().map(|t| TIER_NS_FIXED_LEN + t.files.len() * TIER_FILE_LEN).sum();
-        let mut out = Vec::with_capacity(FIXED_LEN + self.segments.len() * 4 + 4 + tier_len);
+        // A capacity hint only: saturating, never a wrapped (small) one.
+        let tier_len = self.tiers.iter().fold(0usize, |sum, t| {
+            let files_len = t.files.len().saturating_mul(TIER_FILE_LEN);
+            sum.saturating_add(TIER_NS_FIXED_LEN).saturating_add(files_len)
+        });
+        let segments_len = self.segments.len().saturating_mul(4);
+        let mut out = Vec::with_capacity(
+            FIXED_LEN.saturating_add(segments_len).saturating_add(4).saturating_add(tier_len),
+        );
         out.extend_from_slice(&MANIFEST_MAGIC);
         out.extend_from_slice(&MANIFEST_EPOCH_V3.to_le_bytes());
         out.extend_from_slice(&self.ckpt_id.to_le_bytes());
@@ -289,7 +305,9 @@ impl Manifest {
         if count > MAX_SEGMENTS {
             return Err(ManifestDecodeError::TooManySegments { count });
         }
-        let segments_end = FIXED_LEN + count * 4;
+        let Some(segments_end) = count.checked_mul(4).and_then(|n| n.checked_add(FIXED_LEN)) else {
+            return Err(ManifestDecodeError::TooManySegments { count });
+        };
         if payload.len() < segments_end {
             return Err(ManifestDecodeError::Truncated { at: payload.len() });
         }
@@ -299,7 +317,9 @@ impl Manifest {
             .collect();
         for (i, pair) in segments.windows(2).enumerate() {
             if pair[1] <= pair[0] {
-                return Err(ManifestDecodeError::SegmentsNotAscending { index: i + 1 });
+                return Err(ManifestDecodeError::SegmentsNotAscending {
+                    index: i.saturating_add(1),
+                });
             }
         }
         if segments[0] != begin_lsn.segment {
@@ -374,7 +394,9 @@ impl Manifest {
             tiers.push(TierNsManifest { ns, flushed, files });
         }
         if at != payload.len() {
-            return Err(ManifestDecodeError::TrailingBytes { extra: payload.len() - at });
+            return Err(ManifestDecodeError::TrailingBytes {
+                extra: payload.len().saturating_sub(at),
+            });
         }
         Ok(tiers)
     }
@@ -571,6 +593,22 @@ mod tests {
             ],
             ..sample()
         }
+    }
+
+    /// A tier range whose end wraps u64 must not pass `encode`'s tiling
+    /// assert: with a plain `base + durable_len` the wrapped end (1) sat
+    /// inside `[0, flushed)` and the writer staged a manifest every boot
+    /// refuses (`TierAddrOutOfRange`). `end` saturates, so the assert fires.
+    #[test]
+    #[should_panic(expected = "ranges tile inside [0, flushed)")]
+    fn a_tier_range_that_wraps_is_refused_at_encode() {
+        let wrapped = TierFileRange { id: 0, base: u64::MAX - 1, durable_len: 3 };
+        assert_eq!(wrapped.end(), u64::MAX, "saturates, never wraps to 1");
+        let m = Manifest {
+            tiers: vec![TierNsManifest { ns: 16, flushed: 9000, files: vec![wrapped] }],
+            ..sample()
+        };
+        let _ = m.encode();
     }
 
     /// Epoch 3 (ADR-0094 D6): the key-hash identity sits after the

@@ -44,6 +44,17 @@
 //! separates log lives so discarded residue can never re-enter a replay
 //! prefix, and `seq` pins writer continuity (ADR-0031 D3–D5).
 
+// ADR-0144 D2/D3: bytes from a log file enter here first.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use core::fmt;
 
 use inf_simd::crc32c;
@@ -69,9 +80,19 @@ pub const FRAME_HEADER_LEN_V1: usize = 20;
 pub const FRAME_HEADER_LEN: usize = 40;
 pub const FRAME_TRAILER_LEN: usize = 4;
 /// Smallest well-formed v1 frame: header + one minimal record + CRC.
-pub const MIN_FRAME_LEN_V1: u32 = (FRAME_HEADER_LEN_V1 + 4 + FRAME_TRAILER_LEN) as u32;
+pub const MIN_FRAME_LEN_V1: u32 = 28;
+const _: () = assert!(
+    MIN_FRAME_LEN_V1 as usize == FRAME_HEADER_LEN_V1 + 4 + FRAME_TRAILER_LEN,
+    "MIN_FRAME_LEN_V1 is header + minimal record + trailer"
+);
 /// Smallest well-formed frame of the current format.
-pub const MIN_FRAME_LEN: u32 = (FRAME_HEADER_LEN + 4 + FRAME_TRAILER_LEN) as u32;
+pub const MIN_FRAME_LEN: u32 = 48;
+const _: () = assert!(
+    MIN_FRAME_LEN as usize == FRAME_HEADER_LEN + 4 + FRAME_TRAILER_LEN,
+    "MIN_FRAME_LEN is header + minimal record + trailer"
+);
+/// Leading + trailing alignment slack of a [`FrameBuilder`] buffer.
+const BUILDER_SLACK_LEN: usize = 2 * FRAME_ALIGN as usize;
 /// Default decoder bound on a single frame. Real frames are bounded by the
 /// staging ring capacity (M2-S03); the decoder cap exists so a corrupt
 /// length field cannot command absurd skips.
@@ -170,12 +191,15 @@ impl FrameBuilder {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> FrameBuilder {
         let align = FRAME_ALIGN as usize;
-        let mut buf = Vec::with_capacity(capacity.max(FRAME_HEADER_LEN) + 2 * align);
+        // Saturating: a capacity no allocation can serve is the allocator's
+        // capacity fail-stop, never a wrapped (small) buffer.
+        let mut buf =
+            Vec::with_capacity(capacity.max(FRAME_HEADER_LEN).saturating_add(BUILDER_SLACK_LEN));
         buf.resize(align, 0);
         let at = buf.as_ptr().align_offset(align);
         debug_assert!(at < align, "an aligned base fits the leading slack");
         buf.truncate(at);
-        buf.resize(at + FRAME_HEADER_LEN, 0);
+        buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
         FrameBuilder { buf, at, record_count: 0, sealed: false, sealed_len: 0 }
     }
 
@@ -193,6 +217,11 @@ impl FrameBuilder {
     /// excluded**) — what `SegmentRotor::begin_frame` reserves under
     /// [`FrameLayout::Packed`]; the rotor pads it for `Aligned`.
     #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: buf holds at + FRAME_HEADER_LEN bytes since new/reset, and a Vec's \
+                  length (<= isize::MAX) plus the 4-byte trailer fits usize; try_from owns u32"
+    )]
     pub fn frame_len(&self) -> u32 {
         u32::try_from(self.buf.len() - self.at + FRAME_TRAILER_LEN).expect("frame exceeds u32")
     }
@@ -202,6 +231,11 @@ impl FrameBuilder {
     /// # Panics
     /// If called after `finalize` without `reset` — an internal invariant
     /// of the LOG step, not a runtime condition.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: a record is >= 1 byte, so a count past u32::MAX is a frame past \
+                  u32::MAX bytes, which finalize's frame_len refuses before it reads the count"
+    )]
     pub fn append(&mut self, record: &RecordView<'_>) {
         assert!(!self.sealed, "append on a sealed frame (missing reset)");
         record.encode_into(&mut self.buf);
@@ -222,6 +256,12 @@ impl FrameBuilder {
     /// malformed (`epoch == 0` or `seq == 0` — reserved by ADR-0031 D1) or
     /// the covered watermark leads the frame's own records (it can never
     /// lead the append cursor).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: buf.len() >= at (new/reset), at <= buf.len() <= isize::MAX and the \
+                  padded length is a u32, so each sum fits the 64-bit usize inf-foundation asserts; \
+                  FRAME_ALIGN is a non-zero const"
+    )]
     pub fn finalize(
         &mut self,
         first_record_lsn: Lsn,
@@ -275,7 +315,9 @@ impl FrameBuilder {
     #[must_use]
     pub fn sealed_frame(&self) -> &[u8] {
         assert!(self.sealed, "sealed_frame before finalize");
-        &self.buf[self.at..self.at + self.sealed_len]
+        // `finalize` resized the buffer to exactly `at + sealed_len`.
+        debug_assert_eq!(self.buf.len().checked_sub(self.at), Some(self.sealed_len));
+        &self.buf[self.at..]
     }
 
     /// The finished frame's length (padding included), 0 before
@@ -290,7 +332,7 @@ impl FrameBuilder {
     /// emits (padding included).
     pub fn reset(&mut self) {
         self.buf.truncate(self.at);
-        self.buf.resize(self.at + FRAME_HEADER_LEN, 0);
+        self.buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
         self.record_count = 0;
         self.sealed = false;
         self.sealed_len = 0;
@@ -480,6 +522,13 @@ pub struct RecordIter<'a> {
 impl<'a> Iterator for RecordIter<'a> {
     type Item = Result<(Lsn, RecordView<'a>), FrameRecordError>;
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: remaining starts at declared and only falls, and is non-zero where it \
+                  is decremented; decode_record consumes <= the slice it was given, so offset \
+                  stays <= body.len(), and the body is part of a frame whose length is a u32"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
@@ -598,8 +647,11 @@ pub fn decode_frame(
         return Err(FrameDecodeError::Truncated { needed: frame_len_usize, available: buf.len() });
     }
     let frame = &buf[..frame_len_usize];
-    let (covered, trailer) = frame.split_at(frame_len_usize - FRAME_TRAILER_LEN);
-    let stored = u32::from_le_bytes(trailer.try_into().expect("4-byte trailer"));
+    // `frame_len >= min_frame_len` (checked above) covers the trailer.
+    let Some((covered, trailer)) = frame.split_last_chunk::<FRAME_TRAILER_LEN>() else {
+        return Err(FrameDecodeError::BadLength { len: frame_len });
+    };
+    let stored = u32::from_le_bytes(*trailer);
     let computed = crc32c(covered);
     if stored != computed {
         return Err(FrameDecodeError::CrcMismatch { stored, computed });
@@ -623,10 +675,11 @@ pub fn decode_frame(
     // past the ceiling and panic in `Lsn::advance`, makes `Phase::Replay`'s
     // `first_lsn.offset - header_len` frame-base subtraction underflow,
     // and (v3) lets the successor address wrap past the ceiling.
-    let header_len_u32 = shape.header_len as u32;
-    if first_lsn.offset < header_len_u32
-        || (first_lsn.offset - header_len_u32).checked_add(extent).is_none()
-    {
+    let fits_segment = u64::from(first_lsn.offset)
+        .checked_sub(shape.header_len as u64)
+        .and_then(|base| base.checked_add(u64::from(extent)))
+        .is_some_and(|end| end <= u64::from(u32::MAX));
+    if !fits_segment {
         return Err(FrameDecodeError::BadFirstLsn { offset: first_lsn.offset });
     }
     let stamp = if shape.has_stamp {
@@ -645,7 +698,7 @@ pub fn decode_frame(
     } else {
         None
     };
-    let body = &frame[shape.header_len..frame_len_usize - FRAME_TRAILER_LEN];
+    let body = &covered[shape.header_len..];
     let frame = FrameRef { first_lsn, record_count, stamp, layout: shape.layout, frame_len, body };
     Ok((frame, frame_len_usize))
 }
@@ -688,7 +741,8 @@ impl<'a> Iterator for FrameIter<'a> {
                 let at = self.offset;
                 // v3: the successor sits at the aligned boundary (ADR-0086
                 // D3); an image ending inside the padding ends the walk.
-                self.offset += frame.padded_len() as usize;
+                // Saturating: a cursor at or past the image's end ends the walk.
+                self.offset = self.offset.saturating_add(frame.padded_len() as usize);
                 Some(Ok((at, frame)))
             }
             Err(FrameDecodeError::ZeroMagic) => {

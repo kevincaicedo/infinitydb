@@ -17,6 +17,16 @@
 //! the fsyncgate poison — retrying the fsync and trusting a later
 //! success — is structurally absent. WAL and tier-file fsync fatality
 //! are untouched.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -293,9 +303,15 @@ impl<F: SegmentFs> ExtentWriter<F> {
     ///
     /// # Panics
     /// Panics when the chunk would exceed the declared length.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: tail_fill < TIER_FRAME_DATA on entry to each pass (reset when it \
+                  reaches it), take <= the room left in the tail, and written + take <= \
+                  data_len by the assert above the loop"
+    )]
     pub fn append_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
         assert!(
-            self.written + bytes.len() as u64 <= self.data_len,
+            self.data_len.checked_sub(self.written).is_some_and(|room| bytes.len() as u64 <= room),
             "chunks must not exceed the declared extent length"
         );
         let mut bytes = bytes;
@@ -317,9 +333,14 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// Stages the (full) tail frame into the append batch; the batch
     /// reaches the device as one multi-frame write when the window fills
     /// (L3 — never one syscall per frame).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: batch_frames < TIER_BATCH_FRAMES here — flush_batch zeroes it the \
+                  moment it reaches the window — and the frame index is a u64 quotient"
+    )]
     fn stage_full_frame(&mut self) -> io::Result<()> {
         debug_assert_eq!(self.tail_fill, TIER_FRAME_DATA, "staging a full frame");
-        let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
+        let frame_index = self.last_frame_index();
         if self.batch_frames == 0 {
             self.batch_first_frame = frame_index;
         }
@@ -339,6 +360,21 @@ impl<F: SegmentFs> ExtentWriter<F> {
         Ok(())
     }
 
+    /// Index of the frame holding the last appended byte. Callers hold a
+    /// non-empty tail, so `written >= 1`; saturating keeps a broken
+    /// caller on frame 0 instead of wrapping to the far end of the file.
+    fn last_frame_index(&self) -> u64 {
+        debug_assert!(self.written > 0, "no byte appended yet");
+        const FRAME_DATA: u64 = TIER_FRAME_DATA as u64;
+        self.written.saturating_sub(1) / FRAME_DATA
+    }
+
+    /// Bytes handed to the device, summed. Saturating: the figure is
+    /// bounded by `extent_device_bytes(data_len)`, which saturates too.
+    fn account_device_bytes(&mut self, len: u64) {
+        self.device_bytes = self.device_bytes.saturating_add(len);
+    }
+
     /// One device write for the staged batch (aligned offset, aligned
     /// length, aligned memory — legal in both I/O modes).
     fn flush_batch(&mut self) -> io::Result<()> {
@@ -351,7 +387,7 @@ impl<F: SegmentFs> ExtentWriter<F> {
         let bytes = self.batch.filled(count);
         let len = bytes.len() as u64;
         device_write(&mut self.file, offset, bytes)?;
-        self.device_bytes += len;
+        self.account_device_bytes(len);
         Ok(())
     }
 
@@ -371,15 +407,14 @@ impl<F: SegmentFs> ExtentWriter<F> {
         assert_eq!(self.written, self.data_len, "an extent finishes at its declared length");
         self.flush_batch().map_err(ExtentWriteFailure::Write)?;
         if self.tail_fill > 0 {
-            let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
-            let offset = extent_frame_offset(frame_index);
+            let offset = extent_frame_offset(self.last_frame_index());
             let frame = self.staging.frame_mut();
             frame.fill(0);
             frame[..self.tail_fill].copy_from_slice(&self.tail[..self.tail_fill]);
             let crc = crc32c(&frame[..TIER_FRAME_DATA]);
             frame[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
             device_write(&mut self.file, offset, frame).map_err(ExtentWriteFailure::Write)?;
-            self.device_bytes += TIER_FRAME_BYTES as u64;
+            self.account_device_bytes(TIER_FRAME_BYTES as u64);
         }
         // ADR-0061 D3/D9 `blob_fsync_err`: the barrier fails — typed
         // abort; the extent is abandoned, nothing durable references it.
@@ -416,15 +451,14 @@ impl<F: SegmentFs> ExtentWriter<F> {
         assert_eq!(self.written, self.data_len, "an extent finishes at its declared length");
         self.flush_batch().map_err(ExtentWriteFailure::Write)?;
         if self.tail_fill > 0 {
-            let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
-            let offset = extent_frame_offset(frame_index);
+            let offset = extent_frame_offset(self.last_frame_index());
             let frame = self.staging.frame_mut();
             frame.fill(0);
             frame[..self.tail_fill].copy_from_slice(&self.tail[..self.tail_fill]);
             let crc = crc32c(&frame[..TIER_FRAME_DATA]);
             frame[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
             device_write(&mut self.file, offset, frame).map_err(ExtentWriteFailure::Write)?;
-            self.device_bytes += TIER_FRAME_BYTES as u64;
+            self.account_device_bytes(TIER_FRAME_BYTES as u64);
         }
         let sealed = SealedExtent {
             ns: self.ns,
@@ -446,7 +480,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// the L5 term the S17 staging-bound assert reads.
     #[must_use]
     pub fn staging_bytes(&self) -> usize {
-        BLOB_CHUNK_BYTES + TIER_FRAME_BYTES + self.tail.len()
+        const FIXED_BYTES: usize = BLOB_CHUNK_BYTES + TIER_FRAME_BYTES;
+        FIXED_BYTES.saturating_add(self.tail.len())
     }
 
     /// The extent file's path (tests and the plane's pin bookkeeping).
@@ -476,19 +511,27 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
 
 /// Device offset of extent frame `frame` (header block first — the tier
 /// arithmetic with the blob header).
+///
+/// Saturating: a frame index no file can hold addresses `u64::MAX`, where
+/// the read or write fails typed, instead of wrapping onto a real frame.
 #[must_use]
 pub fn extent_frame_offset(frame: u64) -> u64 {
-    BLOB_HEADER_BYTES as u64 + frame * TIER_FRAME_BYTES as u64
+    frame.saturating_mul(TIER_FRAME_BYTES as u64).saturating_add(BLOB_HEADER_BYTES as u64)
 }
 
 /// On-disk size of a complete extent holding `data_len` value bytes:
 /// the header block plus whole CRC frames. The disk-budget accounting's
 /// per-extent term (M4-S19, ADR-0062 D5) — one formula, shared with the
 /// writer's cumulative figure so the two can never drift.
+///
+/// Saturating: `data_len` also arrives from an on-disk header, and a
+/// budget term that wrapped small would admit what the disk cannot hold.
 #[must_use]
 pub fn extent_device_bytes(data_len: u64) -> u64 {
-    let payload = TIER_FRAME_BYTES as u64 - 4; // 4092 payload + 4 CRC
-    BLOB_HEADER_BYTES as u64 + data_len.div_ceil(payload) * TIER_FRAME_BYTES as u64
+    data_len
+        .div_ceil(TIER_FRAME_DATA as u64)
+        .saturating_mul(TIER_FRAME_BYTES as u64)
+        .saturating_add(BLOB_HEADER_BYTES as u64)
 }
 
 /// Parses a v1 extent header block from untrusted bytes (ADR-0061 D9,
@@ -573,13 +616,11 @@ pub fn inspect_extent_bytes(bytes: &[u8]) -> Result<ExtentSummary, TierDecodeErr
     let frames = (body.len() / TIER_FRAME_BYTES) as u64;
     let expected_frames = header.data_len.div_ceil(TIER_FRAME_DATA as u64);
     let mut first_bad_frame = None;
-    let checkable = frames.min(expected_frames);
-    for frame in 0..checkable {
-        let from = (frame as usize) * TIER_FRAME_BYTES;
-        let block = &body[from..from + TIER_FRAME_BYTES];
+    let checkable = usize::try_from(frames.min(expected_frames)).unwrap_or(usize::MAX);
+    for (frame, block) in body.chunks_exact(TIER_FRAME_BYTES).take(checkable).enumerate() {
         let stored = u32::from_le_bytes(block[TIER_FRAME_DATA..].try_into().expect("4 bytes"));
         if crc32c(&block[..TIER_FRAME_DATA]) != stored {
-            first_bad_frame = Some(frame);
+            first_bad_frame = Some(frame as u64);
             break;
         }
     }
@@ -626,6 +667,13 @@ impl<File: SegmentFile> ExtentReader<File> {
     /// Panics when the requested range exceeds the extent's `data_len`
     /// or the chunk budget — caller arithmetic, not operating
     /// conditions.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: len <= BLOB_CHUNK_BYTES (asserted), so tier_frame_span returns at most \
+                  TIER_BATCH_FRAMES + 1 frames (a u32) and a skip < TIER_FRAME_DATA; taken <= len \
+                  because each take is capped by len - taken"
+    )]
     pub fn read(
         &mut self,
         offset: u64,
@@ -634,7 +682,7 @@ impl<File: SegmentFile> ExtentReader<File> {
     ) -> io::Result<Result<(), TierCorruption>> {
         assert!(len <= BLOB_CHUNK_BYTES, "extent reads are chunk-bounded (stream larger ranges)");
         assert!(
-            offset + len as u64 <= self.data_len,
+            self.data_len.checked_sub(offset).is_some_and(|room| len as u64 <= room),
             "extent read inside the value range (offset {offset} + len {len} > {})",
             self.data_len
         );
@@ -668,8 +716,7 @@ impl<File: SegmentFile> ExtentReader<File> {
         // here).
         let mut taken = 0usize;
         let mut in_frame = skip;
-        for frame in 0..frame_count as usize {
-            let block = &self.window[frame * TIER_FRAME_BYTES..(frame + 1) * TIER_FRAME_BYTES];
+        for (frame, block) in self.window.chunks_exact(TIER_FRAME_BYTES).enumerate() {
             let stored = u32::from_le_bytes(block[TIER_FRAME_DATA..].try_into().expect("4 bytes"));
             if crc32c(&block[..TIER_FRAME_DATA]) != stored {
                 return Ok(Err(TierCorruption { window_frame: frame as u32 }));
@@ -716,11 +763,12 @@ pub fn list_extent_ids<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Vec
 fn read_full<File: SegmentFile>(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     let mut read = 0usize;
     while read < buf.len() {
-        let n = file.read_at(offset + read as u64, &mut buf[read..])?;
+        let n = file.read_at(offset.saturating_add(read as u64), &mut buf[read..])?;
         if n == 0 {
             break;
         }
-        read += n;
+        // A file reporting more than the slice it was handed fills it.
+        read = read.saturating_add(n).min(buf.len());
     }
     Ok(read)
 }
