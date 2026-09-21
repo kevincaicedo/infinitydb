@@ -321,6 +321,18 @@ fn match_reports_beyond_the_scanned_count_are_dropped() {
     assert!(pager.next(&tree).is_none(), "LIMIT reached: the page is done");
     let outcome = pager.finish();
     assert_eq!((outcome.matched, outcome.scanned, outcome.more), (2, 2, false));
+
+    // LIMIT 1, two candidates scanned before either is reported: the second
+    // report has no LIMIT left to spend and is dropped — `matched` never
+    // passes the LIMIT (a saturating countdown let it reach 2).
+    let mut pager =
+        RangePager::new(lo, hi, None, IndexKeyType::I64, 100, Some(1)).expect("no resume");
+    pager.next(&tree).expect("first candidate");
+    pager.next(&tree).expect("second candidate");
+    pager.count_match();
+    pager.count_match();
+    let outcome = pager.finish();
+    assert_eq!((outcome.matched, outcome.scanned, outcome.more), (1, 2, false));
 }
 
 /// The scan budget at its edges: a page of budget 1 scans exactly one

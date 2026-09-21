@@ -158,21 +158,22 @@ impl RangePager {
 
     /// The last candidate satisfied the statement (residual verdict
     /// true, document present) — counts toward the page's result and
-    /// the statement LIMIT. A page reports at most one match per
-    /// candidate it scanned, so a report beyond that count is dropped:
-    /// `matched <= scanned` holds for every caller.
+    /// the statement LIMIT. A report the page cannot owe is dropped, so
+    /// `matched <= scanned` and `matched <=` the LIMIT hold for every
+    /// caller: one match per scanned candidate, none once the LIMIT is
+    /// spent.
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "bound: the guard at the top returned unless `matched < scanned <= u32::MAX`"
+        reason = "bound: the guards above returned unless `matched < scanned <= u32::MAX` and \
+                  the LIMIT countdown is non-zero"
     )]
     pub fn count_match(&mut self) {
-        if self.matched >= self.scanned {
+        if self.matched >= self.scanned || self.limit_remaining == Some(0) {
             return;
         }
         self.matched += 1;
         if let Some(remaining) = &mut self.limit_remaining {
-            // Saturation ends the walk: at 0 the page is done.
-            *remaining = remaining.saturating_sub(1);
+            *remaining -= 1;
             if *remaining == 0 {
                 self.done = true;
             }
