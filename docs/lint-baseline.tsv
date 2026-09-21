@@ -10,7 +10,6 @@ arith	23	crates/inf-doc/src/path/eval.rs
 arith	36	crates/inf-doc/src/path/parse.rs
 arith	31	crates/inf-doc/src/path/program.rs
 arith	81	crates/inf-doc/src/tape.rs
-arith	3	crates/inf-fabric/src/codec.rs
 arith	67	crates/inf-log/src/tier.rs
 arith	11	crates/inf-query/src/access.rs
 arith	3	crates/inf-query/src/page.rs
@@ -22,8 +21,6 @@ arith	32	crates/inf-query/src/predicate/program.rs
 arith	17	crates/inf-query/src/predicate/vm.rs
 arith	21	crates/inf-server/src/glob.rs
 arith	2	crates/inf-server/src/plane/scatter.rs
-arith	3	crates/inf-store/src/catalog.rs
-arith	14	crates/inf-store/src/index_key.rs
 arith	19	crates/inf-wire/src/parser.rs
 arith	23	crates/inf-wire/src/writer.rs
 cast	10	crates/inf-doc/src/arena.rs
@@ -33,7 +30,6 @@ cast	5	crates/inf-doc/src/path/cache.rs
 cast	15	crates/inf-doc/src/path/eval.rs
 cast	3	crates/inf-doc/src/path/program.rs
 cast	11	crates/inf-doc/src/tape.rs
-cast	5	crates/inf-fabric/src/codec.rs
 cast	5	crates/inf-query/src/access.rs
 cast	5	crates/inf-query/src/partiql/cache.rs
 cast	1	crates/inf-query/src/partiql/compile.rs
@@ -41,8 +37,6 @@ cast	1	crates/inf-query/src/partiql/parse.rs
 cast	13	crates/inf-query/src/predicate/program.rs
 cast	1	crates/inf-query/src/predicate/vm.rs
 cast	1	crates/inf-server/src/plane/scatter.rs
-cast	7	crates/inf-store/src/catalog.rs
-cast	6	crates/inf-store/src/index_key.rs
 cast	5	crates/inf-wire/src/parser.rs
 cast	6	crates/inf-wire/src/writer.rs
 fn_length	1	bins/inf-bench/src/bootstorm.rs

@@ -78,6 +78,16 @@
 //! the command parser does. `maxmemory = u64::MAX` is the reserved
 //! inherit sentinel — a literal budget of `u64::MAX` is not
 //! representable (it would be meaningless).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 
@@ -279,12 +289,13 @@ impl NsCatalog {
     /// live) — the writer builds it, so that is a violated invariant.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let payload: usize = self
-            .entries
-            .iter()
-            .map(|e| 17 + if e.tier.is_some() { TIER_BLOCK_BYTES } else { 0 } + e.name.len())
-            .sum();
-        let mut out = Vec::with_capacity(9 + payload + 4 * self.dropped.len());
+        // A capacity hint only: saturating, never a wrapped (small) one.
+        let payload = self.entries.iter().fold(0usize, |sum, e| {
+            let tier_len = if e.tier.is_some() { TIER_BLOCK_BYTES } else { 0 };
+            sum.saturating_add(17).saturating_add(tier_len).saturating_add(e.name.len())
+        });
+        let dropped_len = self.dropped.len().saturating_mul(4);
+        let mut out = Vec::with_capacity(payload.saturating_add(9).saturating_add(dropped_len));
         let pristine = self.index.is_pristine();
         let version = if !self.dropped.is_empty() {
             CATALOG_VERSION_V4
@@ -295,7 +306,7 @@ impl NsCatalog {
         };
         out.push(version);
         out.extend_from_slice(&self.next_id.to_le_bytes());
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&len_u32(self.entries.len()).to_le_bytes());
         for e in &self.entries {
             debug_assert!(valid_ns_name(&e.name), "catalog entries carry validated names");
             out.extend_from_slice(&e.id.0.to_le_bytes());
@@ -311,7 +322,7 @@ impl NsCatalog {
                     encode_tier_block(tier, &mut out);
                 }
             }
-            out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&len_u16(e.name.len()).to_le_bytes());
             out.extend_from_slice(&e.name);
         }
         if version >= CATALOG_VERSION_V3 {
@@ -322,7 +333,7 @@ impl NsCatalog {
                 validate_dropped(&self.dropped, self.next_id, &self.entries).is_ok(),
                 "the writer builds a rule-abiding tombstone set"
             );
-            out.extend_from_slice(&(self.dropped.len() as u32).to_le_bytes());
+            out.extend_from_slice(&len_u32(self.dropped.len()).to_le_bytes());
             for id in &self.dropped {
                 out.extend_from_slice(&id.to_le_bytes());
             }
@@ -445,10 +456,23 @@ fn decode_entry(r: &mut Cursor<'_>, version: u8) -> Result<NsSpec, CatalogError>
     Ok(NsSpec { id: NsId(id), name, mode, fsync, policy, maxmemory, tier })
 }
 
+/// A validated length as its 16-bit on-disk field. The registries admit
+/// nothing wider (names, programs, permille); past the field is a violated
+/// writer invariant — a fail-stop, never a wrapped length in the durable
+/// catalog a boot then mis-frames.
+fn len_u16(len: usize) -> u16 {
+    u16::try_from(len).expect("catalog field exceeds its u16 width")
+}
+
+/// A registry entry count as its 32-bit on-disk field (see [`len_u16`]).
+fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).expect("catalog count exceeds its u32 width")
+}
+
 fn encode_index_section(index: &IndexCatalog, out: &mut Vec<u8>) {
     out.extend_from_slice(&index.next_id.to_le_bytes());
     out.extend_from_slice(&index.next_generation.to_le_bytes());
-    out.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len_u32(index.entries.len()).to_le_bytes());
     for e in &index.entries {
         debug_assert!(valid_ns_name(&e.name), "registered index names are validated");
         debug_assert!(!e.program.is_empty(), "registered programs are non-empty");
@@ -458,9 +482,9 @@ fn encode_index_section(index: &IndexCatalog, out: &mut Vec<u8>) {
         out.push(index_state_to_byte(e.state));
         out.push(index_key_type_to_byte(e.key_type));
         out.extend_from_slice(&INDEX_KEY_ENCODING_VERSION.to_le_bytes());
-        out.extend_from_slice(&(e.program.len() as u16).to_le_bytes());
+        out.extend_from_slice(&len_u16(e.program.len()).to_le_bytes());
         out.extend_from_slice(&e.program);
-        out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&len_u16(e.name.len()).to_le_bytes());
         out.extend_from_slice(&e.name);
     }
 }
@@ -593,8 +617,8 @@ fn encode_tier_block(tier: &TierSpec, out: &mut Vec<u8>) {
     let start = out.len();
     out.extend_from_slice(&tier.mem_budget_bytes.to_le_bytes());
     out.extend_from_slice(&tier.disk_budget_bytes.to_le_bytes());
-    // Permille ≤ 999 by validation — the u16 narrowing is exact.
-    out.extend_from_slice(&(tier.mutable_permille as u16).to_le_bytes());
+    // Permille ≤ 999 by `TierSpec::validate`.
+    out.extend_from_slice(&len_u16(tier.mutable_permille as usize).to_le_bytes());
     out.extend_from_slice(&tier.maintain_slice_bytes.to_le_bytes());
     out.extend_from_slice(&tier.cold_read_qd.to_le_bytes());
     out.push(tier.compaction_dead_ratio_pct);
@@ -605,7 +629,7 @@ fn encode_tier_block(tier: &TierSpec, out: &mut Vec<u8>) {
         TierIoMode::Direct => 1,
     });
     out.extend_from_slice(&tier.tail_stall_timeout_ms.to_le_bytes());
-    debug_assert_eq!(out.len() - start, TIER_BLOCK_BYTES, "the D6 block size is the contract");
+    debug_assert_eq!(out[start..].len(), TIER_BLOCK_BYTES, "the D6 block size is the contract");
 }
 
 fn decode_tier_block(r: &mut Cursor<'_>, mode: NsMode) -> Result<TierSpec, CatalogError> {

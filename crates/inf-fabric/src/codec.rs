@@ -22,6 +22,16 @@
 //! the `Vec` of nested ops in `Batch`, flagged as an M1 optimization, and
 //! the slice table of an `Apply`/`ApplyNs` wider than
 //! [`MAX_INLINE_APPLY_ARGS`] — ADR-0120 D2, sized by the frame).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 
@@ -214,8 +224,7 @@ impl<'a> ApplyArgs<'a> {
         } else {
             args.to_vec()
         };
-        // Length fits in u16 because MAX_APPLY_ARGS < 65536.
-        Some(ApplyArgs { inline, len: args.len() as u16, spill })
+        Some(ApplyArgs { inline, len: u16::try_from(args.len()).ok()?, spill })
     }
 
     /// The argument slices.
@@ -443,9 +452,10 @@ fn begin_frame(op: &Op<'_>, out: &mut Vec<u8>) -> usize {
 
 /// Patches the `len` field once the payload is written.
 fn finish_frame(out: &mut [u8], start: usize) {
-    let len = out.len() - start - HEADER_LEN;
-    let len = u32::try_from(len).expect("fabric frame payload exceeds u32::MAX");
-    out[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+    // `begin_frame` wrote the header at `start`; the payload follows it.
+    let (header, payload) = out[start..].split_at_mut(HEADER_LEN);
+    let len = u32::try_from(payload.len()).expect("fabric frame payload exceeds u32::MAX");
+    header[4..8].copy_from_slice(&len.to_le_bytes());
 }
 
 /// A `Batch` payload is a loop of framed leaves — one level, never a
@@ -587,7 +597,8 @@ fn decode_frame(buf: &[u8]) -> Result<(Op<'_>, usize), CodecError> {
     if count > MAX_BATCH_OPS as u64 {
         return Err(CodecError::TooManyBatchOps(count));
     }
-    let mut ops = Vec::with_capacity(count as usize);
+    let capacity = usize::try_from(count).map_err(|_| CodecError::TooManyBatchOps(count))?;
+    let mut ops = Vec::with_capacity(capacity);
     for _ in 0..count {
         let inner = decode_header(reader.buf)?;
         if inner.opcode == OP_BATCH {
@@ -741,7 +752,7 @@ impl<'a> Reader<'a> {
     }
 
     fn i64_le(&mut self) -> Result<i64, CodecError> {
-        Ok(self.u64_le()? as i64)
+        Ok(self.u64_le()?.cast_signed())
     }
 
     fn varint(&mut self) -> Result<u64, CodecError> {
@@ -765,7 +776,8 @@ impl<'a> Reader<'a> {
         if argc > MAX_APPLY_ARGS as u64 {
             return Err(CodecError::TooManyArgs(argc));
         }
-        let argc = argc as usize;
+        let len = u16::try_from(argc).map_err(|_| CodecError::TooManyArgs(argc))?;
+        let argc = usize::from(len);
         if argc > self.buf.len() {
             return Err(CodecError::Truncated);
         }
@@ -782,8 +794,7 @@ impl<'a> Reader<'a> {
             }
             spill
         };
-        // argc <= MAX_APPLY_ARGS < 65536, so the cast is lossless.
-        Ok(ApplyArgs { inline, len: argc as u16, spill })
+        Ok(ApplyArgs { inline, len, spill })
     }
 
     fn token(&mut self) -> Result<FabricToken, CodecError> {

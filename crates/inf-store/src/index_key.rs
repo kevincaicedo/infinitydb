@@ -21,6 +21,16 @@
 //! The hot path never decodes: [`index_key_decode`] serves `EXPLAIN` and
 //! debug rendering only, and is canonical-strict (accepts exactly what
 //! the encoder can produce) so the fuzz target's round-trip laws hold.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::cmp::Ordering;
 
@@ -163,6 +173,11 @@ pub fn index_scalar_coerce(
 
 /// i64 → a declared f64 index: admit iff the conversion is lossless
 /// (ADR-0074 D4.1 — the rule is exactness, not the `|v| ≤ 2⁵³` band).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: the float is range-checked into [-2^63, 2^63) on the line that casts it, \
+              where a float-to-int `as` of an integral value is exact"
+)]
 fn coerce_i64_to_f64(v: i64) -> Result<IndexScalar<'static>, KeySkip> {
     let f = v as f64;
     // Range guard before the round-trip check: `i64::MAX as f64` rounds
@@ -176,6 +191,11 @@ fn coerce_i64_to_f64(v: i64) -> Result<IndexScalar<'static>, KeySkip> {
 
 /// f64 → a declared i64 index: admit iff finite, integral, in range —
 /// then `as i64` is exact by construction.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: the float is range-checked into [-2^63, 2^63) on the line that casts it, \
+              where a float-to-int `as` of an integral value is exact"
+)]
 fn coerce_f64_to_i64(f: f64) -> Result<IndexScalar<'static>, KeySkip> {
     if f.is_nan() {
         return Err(KeySkip::NotANumber);
@@ -191,6 +211,10 @@ fn coerce_f64_to_i64(f: f64) -> Result<IndexScalar<'static>, KeySkip> {
 
 /// Encoded length of a utf8 key: raw + one escape byte per NUL + the
 /// terminator (ADR-0074 D3 — the cap is on *encoded* length).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: nuls <= s.len() <= isize::MAX, so the sum is at most usize::MAX"
+)]
 fn utf8_encoded_len(s: &str) -> usize {
     let nuls = s.as_bytes().iter().filter(|&&b| b == 0).count();
     s.len() + nuls + 1
@@ -207,7 +231,7 @@ pub fn index_key_encode(
 ) -> Result<(), KeySkip> {
     let admitted = index_scalar_coerce(key_type, value)?;
     match admitted {
-        IndexScalar::I64(v) => out.put_word((v as u64) ^ SIGN_BIT),
+        IndexScalar::I64(v) => out.put_word(v.cast_unsigned() ^ SIGN_BIT),
         IndexScalar::F64(f) => out.put_word(f64_key_word(f)),
         IndexScalar::Bool(b) => out.put_word(u64::from(b)),
         IndexScalar::Utf8(s) => encode_utf8(s, out),
@@ -235,6 +259,11 @@ fn f64_key_word(f: f64) -> u64 {
 /// order-preserving: memcmp ≡ raw byte order ≡ code-point order, and
 /// `s` starts_with `p` ⟺ `enc(s)` starts_with `escape(p)` — the S09
 /// `begins_with` bound construction (ADR-0074 D2).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: every `+ 1` follows a bounds-checked write at that index of the fixed \
+              ORDERED_KEY_MAX-byte buffer, so the sum is at most its length"
+)]
 fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
     let bytes = s.as_bytes();
     // Fast path: no NUL — one copy + terminator. The scan is bounded by
@@ -261,10 +290,17 @@ fn encode_utf8(s: &str, out: &mut IndexKeyBuf) {
 /// The buffer length as its `u16` field: every producer writes at most
 /// `ORDERED_KEY_MAX + 1` bytes (the D3 cap plus a terminator), so the
 /// narrowing is exact — stated here once instead of at each cast.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: each caller passes one past an index it has just written in the fixed \
+              ORDERED_KEY_MAX-byte buffer, or a length its loop guard keeps under that cap; \
+              the cap fits u16 (const-asserted below)"
+)]
 fn buf_len(len: usize) -> u16 {
-    debug_assert!(len <= ORDERED_KEY_MAX + 1, "index key buffer past the D3 cap");
+    debug_assert!(len <= ORDERED_KEY_MAX, "index key buffer past the D3 cap");
     len as u16
 }
+const _: () = assert!(ORDERED_KEY_MAX <= u16::MAX as usize, "an index key length fits its u16");
 
 /// The terminator-less escape image of `s`, truncated to
 /// [`ORDERED_KEY_MAX`] bytes; returns the **untruncated** escaped
@@ -274,6 +310,11 @@ fn buf_len(len: usize) -> u16 {
 /// comparison literals bind at the truncated image — the escape rule
 /// stays in this module (the §3.1 one-implementation discipline), it
 /// is never re-derived by a consumer.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: full counts at most two per input byte (<= 2 * isize::MAX), and len is \
+              incremented only under its `< ORDERED_KEY_MAX` guard"
+)]
 pub fn index_key_escape_prefix(s: &str, out: &mut IndexKeyBuf) -> usize {
     let mut len: usize = 0;
     let mut full: usize = 0;
@@ -300,6 +341,11 @@ pub fn index_key_escape_prefix(s: &str, out: &mut IndexKeyBuf) -> usize {
 /// (ADR-0074 D5). No lossy casts: range-classify, then compare integer
 /// parts via exact truncation, then the fractional sign. NaN is a
 /// precondition violation — the VM rejects NaN before comparing (D4.4).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: b is range-classified into [-2^63, 2^63) above the cast, and trunc() of \
+              it is an integral f64 in that range — exactly convertible"
+)]
 pub fn compare_i64_f64(a: i64, b: f64) -> Ordering {
     debug_assert!(!b.is_nan(), "NaN is rejected before comparison (ADR-0074 D4)");
     if b >= TWO_POW_63 {
@@ -370,7 +416,7 @@ pub fn index_key_decode(
         let word_bytes: [u8; 8] = bytes.try_into().map_err(|_| IndexKeyDecodeError::Length)?;
         let word = u64::from_be_bytes(word_bytes);
         return match key_type {
-            IndexKeyType::I64 => Ok(DecodedIndexKey::I64((word ^ SIGN_BIT) as i64)),
+            IndexKeyType::I64 => Ok(DecodedIndexKey::I64((word ^ SIGN_BIT).cast_signed())),
             IndexKeyType::F64 => decode_f64_word(word),
             IndexKeyType::Bool => match word {
                 0 => Ok(DecodedIndexKey::Bool(false)),
@@ -403,29 +449,24 @@ fn decode_f64_word(word: u64) -> Result<DecodedIndexKey, IndexKeyDecodeError> {
 
 /// Iterative unescape with explicit bounds (a decoder in the L9 sense).
 fn decode_utf8_key(bytes: &[u8]) -> Result<DecodedIndexKey, IndexKeyDecodeError> {
-    if bytes.is_empty() || bytes.len() > ORDERED_KEY_MAX {
+    if bytes.len() > ORDERED_KEY_MAX {
         return Err(IndexKeyDecodeError::Length);
     }
-    if *bytes.last().expect("nonempty checked above") != 0x00 {
+    let Some((&terminator, body)) = bytes.split_last() else {
+        return Err(IndexKeyDecodeError::Length);
+    };
+    if terminator != 0x00 {
         return Err(IndexKeyDecodeError::Terminator);
     }
-    let body = &bytes[..bytes.len() - 1];
     let mut raw = Vec::with_capacity(body.len());
-    let mut at: usize = 0;
-    while at < body.len() {
-        let b = body[at];
-        if b == 0x00 {
-            // Inside the body a NUL is always the 2-byte escape; a lone
-            // 0x00 here would be an early terminator.
-            if at + 1 >= body.len() || body[at + 1] != 0xFF {
-                return Err(IndexKeyDecodeError::Escape);
-            }
-            raw.push(0x00);
-            at += 2;
-        } else {
-            raw.push(b);
-            at += 1;
+    let mut rest = body.iter();
+    while let Some(&b) = rest.next() {
+        // Inside the body a NUL is always the 2-byte escape; a lone 0x00
+        // here would be an early terminator.
+        if b == 0x00 && rest.next() != Some(&0xFF) {
+            return Err(IndexKeyDecodeError::Escape);
         }
+        raw.push(b);
     }
     let s = String::from_utf8(raw).map_err(|_| IndexKeyDecodeError::Utf8)?;
     debug_assert!(utf8_encoded_len(&s) == bytes.len(), "decode/encode length agree");
