@@ -12,6 +12,11 @@
 //! inventoried in `SAFETY.md`; the rest of the crate is `#![deny(unsafe_code)]`.
 
 #![deny(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod codec;
 #[cfg(not(loom))]

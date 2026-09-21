@@ -734,14 +734,20 @@ pub(super) fn budget_oracles(
                 IoClass::LogFrame => u64::from(scenario.segment_bytes),
                 IoClass::ZeroFill => 256 << 10,
                 IoClass::Checkpoint => ckpt_slice as u64,
-                _ => 0,
+                IoClass::BlobWrite
+                | IoClass::ColdReadForeground
+                | IoClass::TierFlush
+                | IoClass::ColdReadMaintain => 0,
             }
         };
         for class in IoClass::ALL {
             let counted = stats.io_budget[class.index()];
             match class {
                 IoClass::BlobWrite | IoClass::ColdReadForeground | IoClass::ColdReadMaintain => {}
-                _ => {
+                IoClass::LogFrame
+                | IoClass::ZeroFill
+                | IoClass::TierFlush
+                | IoClass::Checkpoint => {
                     let seen = observed.bytes[class.index()];
                     let seen_ops = observed.ops[class.index()];
                     let ops_slack = counted.spent_ops.wrapping_sub(seen_ops);

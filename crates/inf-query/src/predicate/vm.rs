@@ -189,7 +189,11 @@ impl PredicateVm {
                     depth += 1;
                     continue;
                 }
-                leaf => self.eval_leaf(leaf, root, &mut fuel, &mut flags)?,
+                leaf @ (Op::Cmp { .. }
+                | Op::Between { .. }
+                | Op::BeginsWith { .. }
+                | Op::In { .. }
+                | Op::Exists { .. }) => self.eval_leaf(leaf, root, &mut fuel, &mut flags)?,
             };
             if let Some(verdict) =
                 fold(leaf_verdict, bytes, &mut pc, &mut stack, &mut depth, &mut fuel)?
@@ -249,7 +253,12 @@ impl PredicateVm {
                     // empty prefix matches every string.
                     Ok(match value {
                         DocValue::Str(s) => s.as_bytes().starts_with(prefix.as_bytes()),
-                        _ => {
+                        DocValue::Null
+                        | DocValue::Bool(_)
+                        | DocValue::I64(_)
+                        | DocValue::F64(_)
+                        | DocValue::Obj(_)
+                        | DocValue::Arr(_) => {
                             flags.type_mismatch = true;
                             false
                         }
@@ -435,7 +444,11 @@ fn skip_operands(
         match op {
             Op::And { arity } | Op::Or { arity } => open_operands += u32::from(arity),
             Op::Not => open_operands += 1,
-            _ => {}
+            Op::Cmp { .. }
+            | Op::Between { .. }
+            | Op::BeginsWith { .. }
+            | Op::In { .. }
+            | Op::Exists { .. } => {}
         }
     }
     Ok(())

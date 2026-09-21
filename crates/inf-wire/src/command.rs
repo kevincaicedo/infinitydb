@@ -528,6 +528,7 @@ impl<'a> Iterator for KeyIter<'_, 'a> {
 /// review of 2026-08-30, L12-01 was two notions of a command's keys
 /// disagreeing about one argv shape (the last member of C1's class).
 #[inline]
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column key_spec")]
 pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec {
     match meta.id {
         CommandId::Debug => match subcommand {

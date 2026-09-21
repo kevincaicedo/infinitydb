@@ -6,6 +6,11 @@
 //! Boundary law (§3.3): this crate never sees a socket or a record — it
 //! transforms byte slices. Fully safe; the SIMD lives in `inf-simd`.
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod command;
 mod parser;

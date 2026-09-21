@@ -40,7 +40,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
+      # ADR-0144 D3: the lint gates compare their tables with approved
+      # copies in history (HEAD, the base branch tip, the introducing
+      # commit) — a shallow clone makes the base tip unresolvable, which
+      # the gate reports as a scope error, never a skip.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -88,6 +94,11 @@ jobs:
       - name: waker-atomics (vtable-resolved, planted-bypass probe)
         if: runner.os == 'Linux'
         run: ./scripts/check-waker-atomics.sh
+      # ADR-0144 (architecture review 2026-09-17, W5): crate roots under the
+      # wildcard deny, the structural suppression audit, the frozen
+      # ADR-0143 exemptions, and the probe whose plants must draw their lint.
+      - name: lint scopes (ADR-0144)
+        run: ./scripts/check-lint-scopes.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build shipping packages

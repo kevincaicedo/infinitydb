@@ -943,7 +943,11 @@ impl SimClient {
                             Reply::Bulk(digits) => core::str::from_utf8(digits)
                                 .ok()
                                 .and_then(|text| text.parse::<u64>().ok()),
-                            _ => None,
+                            Reply::Simple(_)
+                            | Reply::Error(_)
+                            | Reply::Int(_)
+                            | Reply::Nil
+                            | Reply::Array(_) => None,
                         };
                         let Some(cursor) = cursor else {
                             violations.push(format!("{who}: SCAN cursor not numeric: {items:?}"));
@@ -958,7 +962,12 @@ impl SimClient {
                         for key in keys {
                             match key {
                                 Reply::Bulk(key) if self.scope.owns(key) => {}
-                                other => violations.push(format!(
+                                other @ (Reply::Simple(_)
+                                | Reply::Error(_)
+                                | Reply::Int(_)
+                                | Reply::Bulk(_)
+                                | Reply::Nil
+                                | Reply::Array(_)) => violations.push(format!(
                                     "{who}: SCAN returned a key outside its scope: {other:?}"
                                 )),
                             }
@@ -976,7 +985,12 @@ impl SimClient {
                             self.scan = Some((cursor, pages));
                         }
                     }
-                    other => {
+                    other @ (Reply::Simple(_)
+                    | Reply::Error(_)
+                    | Reply::Int(_)
+                    | Reply::Bulk(_)
+                    | Reply::Nil
+                    | Reply::Array(_)) => {
                         violations.push(format!("{who}: SCAN answered {other:?}"));
                         self.scan = None;
                     }
@@ -985,26 +999,41 @@ impl SimClient {
             Check::Keys(glob) => match parse_reply(raw) {
                 Reply::Array(keys) => {
                     for key in keys {
-                        match key {
-                            Reply::Bulk(key)
-                                if self.scope.owns(&key) && glob_match(&glob, &key, false) => {}
-                            other => violations.push(format!(
-                                "{who}: KEYS {:?} returned {other:?} (out of scope or off-glob)",
+                        let in_scope = matches!(&key, Reply::Bulk(key)
+                                if self.scope.owns(key) && glob_match(&glob, key, false));
+                        if !in_scope {
+                            violations.push(format!(
+                                "{who}: KEYS {:?} returned {key:?} (out of scope or off-glob)",
                                 String::from_utf8_lossy(&glob)
-                            )),
+                            ));
                         }
                     }
                 }
-                other => violations.push(format!("{who}: KEYS answered {other:?}")),
+                other @ (Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Nil) => violations.push(format!("{who}: KEYS answered {other:?}")),
             },
             Check::RandomKey => match parse_reply(raw) {
                 Reply::Nil => {}
                 Reply::Bulk(key) if self.scope.owns(&key) => {}
-                other => violations.push(format!("{who}: RANDOMKEY answered {other:?}")),
+                other @ (Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Array(_)) => {
+                    violations.push(format!("{who}: RANDOMKEY answered {other:?}"))
+                }
             },
             Check::Dbsize => match parse_reply(raw) {
                 Reply::Int(n) if n >= 0 => {}
-                other => violations.push(format!("{who}: DBSIZE answered {other:?}")),
+                other @ (Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Nil
+                | Reply::Array(_)) => violations.push(format!("{who}: DBSIZE answered {other:?}")),
             },
         }
     }
@@ -1564,7 +1593,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                     next_audit_at += scenario.audit_every;
                     audit_state = AuditState::Idle;
                 }
-                _ => {}
+                AuditState::Idle | AuditState::Draining => {}
             }
             if clients_done && drained && !final_audit_done {
                 if canary_armed {

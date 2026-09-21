@@ -305,7 +305,11 @@ fn compact<const BOUNDED: bool>(
                     out.push(b'[');
                     stack.push(Frame::Arr { it: a.iter(), first: true });
                 }
-                scalar => write_scalar::<BOUNDED>(scalar, out, limit)?,
+                scalar @ (DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)) => write_scalar::<BOUNDED>(scalar, out, limit)?,
             }
             continue;
         }
@@ -367,7 +371,11 @@ fn formatted<const BOUNDED: bool>(
                     out.push(b'[');
                     stack.push(Frame::Arr { it: a.iter(), first: true });
                 }
-                scalar => write_scalar::<BOUNDED>(scalar, out, limit)?,
+                scalar @ (DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)) => write_scalar::<BOUNDED>(scalar, out, limit)?,
             }
             continue;
         }

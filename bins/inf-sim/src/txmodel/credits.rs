@@ -100,7 +100,12 @@ impl Msg {
             Msg::Exec(_) => "ExecOp",
             Msg::Unlock { .. } => "UnlockOp",
             Msg::Notify(_) => "the decision-durable notification",
-            _ => "a reply",
+            Msg::Queued(_)
+            | Msg::Granted(_)
+            | Msg::Aborted(_)
+            | Msg::SubResult(_)
+            | Msg::UnlockAck(_)
+            | Msg::NotifyAck(_) => "a reply",
         }
     }
 }
@@ -405,7 +410,14 @@ impl Model {
                 }
             }
             Msg::Notify(t) => self.reply(Msg::NotifyAck(t)),
-            reply => return Err(format!("MISROUTED: {reply:?} reached the owner")),
+            reply @ (Msg::Queued(_)
+            | Msg::Granted(_)
+            | Msg::Aborted(_)
+            | Msg::SubResult(_)
+            | Msg::UnlockAck(_)
+            | Msg::NotifyAck(_)) => {
+                return Err(format!("MISROUTED: {reply:?} reached the owner"));
+            }
         }
         Ok(())
     }
@@ -419,7 +431,13 @@ impl Model {
             Msg::Granted(t) => match self.txns[t].state {
                 State::Locking { .. } => (t, Some((State::Executing, Msg::Exec(t)))),
                 // A grant that overtook the abort: the abort removes it.
-                _ => (t, None),
+                State::Executing
+                | State::Unlocking
+                | State::Notifying
+                | State::Aborting
+                | State::Committed
+                | State::Aborted
+                | State::Refused => (t, None),
             },
             Msg::SubResult(t) => {
                 (t, Some((State::Unlocking, Msg::Unlock { txn: t, commit: true })))
@@ -429,14 +447,22 @@ impl Model {
                     self.finish_txn(t, State::Aborted);
                     (t, None)
                 }
-                _ => (t, Some((State::Notifying, Msg::Notify(t)))),
+                State::Locking { .. }
+                | State::Executing
+                | State::Unlocking
+                | State::Notifying
+                | State::Committed
+                | State::Aborted
+                | State::Refused => (t, Some((State::Notifying, Msg::Notify(t)))),
             },
             Msg::NotifyAck(t) => {
                 self.finish_txn(t, State::Committed);
                 (t, None)
             }
             Msg::Aborted(t) => (t, None),
-            request => return Err(format!("MISROUTED: {request:?} reached the coordinator")),
+            request @ (Msg::Lock(_) | Msg::Exec(_) | Msg::Unlock { .. } | Msg::Notify(_)) => {
+                return Err(format!("MISROUTED: {request:?} reached the coordinator"));
+            }
         };
         if let Some((state, request)) = next {
             self.txns[t].state = state;
@@ -455,7 +481,12 @@ impl Model {
         match state {
             State::Committed => self.stats.committed += 1,
             State::Aborted => self.stats.aborted += 1,
-            _ => {}
+            State::Locking { .. }
+            | State::Executing
+            | State::Unlocking
+            | State::Notifying
+            | State::Aborting
+            | State::Refused => {}
         }
     }
 

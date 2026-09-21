@@ -212,14 +212,23 @@ fn number(bytes: &[u8]) -> Result<Number, DeltaDecodeError> {
     match canonical_fragment(bytes).map_err(DeltaDecodeError::BadFragment)? {
         ValueRef::I64(value) => Ok(Number::I64(value)),
         ValueRef::F64(value) => Ok(Number::F64(value)),
-        _ => Err(DeltaDecodeError::WrongOperandKind),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_)
+        | ValueRef::Arr(_) => Err(DeltaDecodeError::WrongOperandKind),
     }
 }
 
 fn require_array(bytes: &[u8]) -> Result<(), DeltaDecodeError> {
     match canonical_fragment(bytes).map_err(DeltaDecodeError::BadFragment)? {
         ValueRef::Arr(_) => Ok(()),
-        _ => Err(DeltaDecodeError::WrongOperandKind),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::I64(_)
+        | ValueRef::F64(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_) => Err(DeltaDecodeError::WrongOperandKind),
     }
 }
 

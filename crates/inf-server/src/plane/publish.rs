@@ -11,6 +11,7 @@ use super::*;
 /// are emitted**, so once a client sees its confirmation, a PUBLISH from
 /// anywhere reaches it. PUBLISH routes to the channel's owner; PUBSUB is an
 /// introspection program over the owner views.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column pubsub")]
 pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
@@ -334,7 +335,13 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                     total += n;
                     bodies.push((bytes, off));
                 }
-                _ => return error_reply(shared, proto, "ERR cross-cell execution failed"),
+                OwnedOutcome::Ok
+                | OwnedOutcome::Int(_)
+                | OwnedOutcome::Nil
+                | OwnedOutcome::Bool(_)
+                | OwnedOutcome::Err(_) => {
+                    return error_reply(shared, proto, "ERR cross-cell execution failed");
+                }
             }
         }
         let mut reply = shared.take_reply_buf();
@@ -381,7 +388,11 @@ async fn program_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
                 Count::Local(n) => n,
                 Count::Wait(waiter) => match waiter.await {
                     OwnedOutcome::Int(n) => n,
-                    _ => 0,
+                    OwnedOutcome::Ok
+                    | OwnedOutcome::Bytes(_)
+                    | OwnedOutcome::Nil
+                    | OwnedOutcome::Bool(_)
+                    | OwnedOutcome::Err(_) => 0,
                 },
             };
             let mut w = RespWriter::new(&mut reply, proto);

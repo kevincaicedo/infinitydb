@@ -227,6 +227,23 @@ pub struct Keyspace {
     seed_normalized_thresholds: u32,
 }
 
+/// Whether `rec` may follow an armed displacement marker of `pending_ns`:
+/// only further markers or the paired mutation, in the marker's namespace
+/// (ADR-0057 D4).
+fn follows_displace_marker(rec: &LogRecordView<'_>, pending_ns: NsId) -> bool {
+    match *rec {
+        LogRecordView::ColdDisplace { ns, .. }
+        | LogRecordView::StringPostImage { ns, .. }
+        | LogRecordView::Delete { ns, .. }
+        | LogRecordView::StringExtentRef { ns, .. } => ns == pending_ns,
+        LogRecordView::ExpireAt { .. }
+        | LogRecordView::NsOp { .. }
+        | LogRecordView::CkptBegin { .. }
+        | LogRecordView::DocDelta { .. }
+        | LogRecordView::DocFull { .. } => false,
+    }
+}
+
 impl Keyspace {
     /// `cfg.evict_seed` seeds the per-db eviction streams (vary it per cell
     /// — L7: all randomness is injected).
@@ -964,7 +981,7 @@ impl Keyspace {
                 spec.policy.unwrap_or(self.pressure.policy),
                 ns_budget_share(spec.maxmemory, self.budget_shares),
             ),
-            _ => (EvictionPolicy::NoEviction, 0),
+            NsMode::Durable | NsMode::Topic => (EvictionPolicy::NoEviction, 0),
         };
         let mut cfg = self.cfg;
         cfg.evict_seed = self.cfg.evict_seed ^ u64::from(id.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -1301,19 +1318,12 @@ impl Keyspace {
         // frame immediately before their mutation): while the register is
         // armed, only further markers or the paired mutation — all in the
         // marker's namespace — are legal.
-        if let Some(&(pending_ns, _)) = self.pending_displace.first() {
-            let legal = match *rec {
-                LogRecordView::ColdDisplace { ns, .. }
-                | LogRecordView::StringPostImage { ns, .. }
-                | LogRecordView::Delete { ns, .. }
-                | LogRecordView::StringExtentRef { ns, .. } => ns == pending_ns,
-                _ => false,
-            };
-            if !legal {
-                return Err(ReplayError::Displacement(
-                    "displacement marker not followed by its paired mutation",
-                ));
-            }
+        if let Some(&(pending_ns, _)) = self.pending_displace.first()
+            && !follows_displace_marker(rec, pending_ns)
+        {
+            return Err(ReplayError::Displacement(
+                "displacement marker not followed by its paired mutation",
+            ));
         }
         match *rec {
             LogRecordView::ColdDisplace { ns, old_addr } => {
@@ -1365,7 +1375,14 @@ impl Keyspace {
             {
                 Ok(Some(ReplayOutcome::SkippedReserved))
             }
-            _ => Ok(None),
+            LogRecordView::StringPostImage { .. }
+            | LogRecordView::Delete { .. }
+            | LogRecordView::ExpireAt { .. }
+            | LogRecordView::NsOp { .. }
+            | LogRecordView::CkptBegin { .. }
+            | LogRecordView::DocDelta { .. }
+            | LogRecordView::DocFull { .. }
+            | LogRecordView::StringExtentRef { .. } => Ok(None),
         }
     }
 

@@ -73,7 +73,7 @@ mod imp {
     pub fn arm(point: &'static str, spec: FaultSpec) {
         let seed = match spec {
             FaultSpec::Probability { seed, .. } => seed,
-            _ => 0,
+            FaultSpec::Always | FaultSpec::Nth(_) | FaultSpec::FromNth(_) => 0,
         };
         ARMED.with(|armed| {
             let mut armed = armed.borrow_mut();

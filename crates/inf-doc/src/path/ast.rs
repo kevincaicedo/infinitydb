@@ -85,7 +85,11 @@ fn print_segment(out: &mut String, segment: &Segment) {
             out.push_str(str::from_utf8(name).expect("AST keys are validated UTF-8"));
         }
         Segment::ChildAny => out.push_str(".*"),
-        other => {
+        other @ (Segment::Child(_)
+        | Segment::Index(_)
+        | Segment::Slice(_)
+        | Segment::Union(_)
+        | Segment::Descend(_)) => {
             out.push('.');
             // Bracket forms print without the leading dot they never
             // had; the leaf printer emits `[...]` directly.

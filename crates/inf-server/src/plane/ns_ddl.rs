@@ -7,6 +7,7 @@ use super::*;
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column ns_program")]
 pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
@@ -646,7 +647,13 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
         let leg = match send_apply(shared, cell, ApplyOrigin::Program, proto, 0, fan).await {
             Ok(waiter) => match waiter.await {
                 OwnedOutcome::Bytes(bytes) => bytes,
-                _ => error_reply(shared, proto, "ERR cross-cell DDL leg answered no reply bytes"),
+                OwnedOutcome::Ok
+                | OwnedOutcome::Int(_)
+                | OwnedOutcome::Nil
+                | OwnedOutcome::Bool(_)
+                | OwnedOutcome::Err(_) => {
+                    error_reply(shared, proto, "ERR cross-cell DDL leg answered no reply bytes")
+                }
             },
             Err(refusal) => refusal,
         };

@@ -346,7 +346,7 @@ impl Item {
     fn bulk(&self) -> Option<&[u8]> {
         match self {
             Item::Bulk(b) => Some(b),
-            _ => None,
+            Item::Nil | Item::Int(_) => None,
         }
     }
 }

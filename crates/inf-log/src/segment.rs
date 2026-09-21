@@ -309,7 +309,9 @@ impl std::error::Error for LogError {
             // fsync-fail-stop-allow: Error::source arm: hands out the io::Error, never handles it
             LogError::Fsync(err) => Some(err),
             LogError::Io { source, .. } => Some(source),
-            _ => None,
+            LogError::NoSpace { .. }
+            | LogError::FrameTooLarge { .. }
+            | LogError::NextNotReady { .. } => None,
         }
     }
 }

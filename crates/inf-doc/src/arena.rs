@@ -463,7 +463,12 @@ impl ArenaDoc {
                     RefTag::IntInline => Number::I64(current.as_inline_int()),
                     RefTag::IntHeap => Number::I64(num_bits(arena, current) as i64),
                     RefTag::F64 => Number::F64(f64::from_bits(num_bits(arena, current))),
-                    _ => return Ok(ScalarPatch::Skipped),
+                    RefTag::Null
+                    | RefTag::False
+                    | RefTag::True
+                    | RefTag::Str
+                    | RefTag::Obj
+                    | RefTag::Arr => return Ok(ScalarPatch::Skipped),
                 };
                 let result =
                     number_op(current_number, operand, matches!(op, ApplyOp::NumMultBy(_)))?;
@@ -478,12 +483,27 @@ impl ArenaDoc {
                 let toggled = match current.tag() {
                     RefTag::False => true,
                     RefTag::True => false,
-                    _ => return Ok(ScalarPatch::Skipped),
+                    RefTag::Null
+                    | RefTag::IntInline
+                    | RefTag::IntHeap
+                    | RefTag::F64
+                    | RefTag::Str
+                    | RefTag::Obj
+                    | RefTag::Arr => return Ok(ScalarPatch::Skipped),
                 };
                 write_slot(arena, &mut self.root, slot, DocRef::bool_ref(toggled));
                 Ok(ScalarPatch::Toggled(toggled))
             }
-            _ => Ok(ScalarPatch::Unsupported),
+            ApplyOp::SetReplace { .. }
+            | ApplyOp::SetMember { .. }
+            | ApplyOp::Del
+            | ApplyOp::StrAppend(_)
+            | ApplyOp::Clear
+            | ApplyOp::ArrAppend { .. }
+            | ApplyOp::ArrInsert { .. }
+            | ApplyOp::ArrPop { .. }
+            | ApplyOp::ArrTrim { .. }
+            | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported),
         }
     }
 

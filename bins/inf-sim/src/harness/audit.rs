@@ -144,7 +144,9 @@ fn bulk_set(items: &[Reply]) -> Option<BTreeSet<Vec<u8>>> {
         .iter()
         .map(|item| match item {
             Reply::Bulk(key) => Some(key.clone()),
-            _ => None,
+            Reply::Simple(_) | Reply::Error(_) | Reply::Int(_) | Reply::Nil | Reply::Array(_) => {
+                None
+            }
         })
         .collect()
 }
@@ -237,7 +239,12 @@ pub(super) fn run_audit(
                         .zip(bulk_set(keys)),
                     _ => None,
                 },
-                _ => None,
+                Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Nil
+                | Reply::Array(_) => None,
             };
             let Some((next, keys)) = page else {
                 violations.push(format!("{who}: SCAN answered {reply:?}"));
@@ -271,7 +278,12 @@ pub(super) fn run_audit(
         match audit_roundtrip(cells, nets, auditor, &encode(&[b"KEYS".to_vec(), glob.clone()])) {
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Array(items) if bulk_set(&items).is_some_and(|got| got == want) => {}
-                other => violations.push(format!(
+                other @ (Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Nil
+                | Reply::Array(_)) => violations.push(format!(
                     "{who}: KEYS {:?} answered {other:?}, model set has {} keys",
                     String::from_utf8_lossy(&glob),
                     want.len()
@@ -284,7 +296,12 @@ pub(super) fn run_audit(
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Nil if expected.is_empty() => {}
                 Reply::Bulk(key) if expected.contains(&key) => {}
-                other => violations.push(format!(
+                other @ (Reply::Simple(_)
+                | Reply::Error(_)
+                | Reply::Int(_)
+                | Reply::Bulk(_)
+                | Reply::Nil
+                | Reply::Array(_)) => violations.push(format!(
                     "{who}: RANDOMKEY answered {other:?} against a {}-key scope",
                     expected.len()
                 )),

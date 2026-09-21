@@ -652,7 +652,15 @@ impl ColdReads {
                 debug_assert!(buf.is_none(), "tier reads never carry recv-pool buffers");
                 Err(errno)
             }
-            other => panic!("non-tier completion routed to ColdReads: {other:?}"),
+            other @ (CompletionResult::Accepted { .. }
+            | CompletionResult::Recv { .. }
+            | CompletionResult::RecvDropped
+            | CompletionResult::Sent { .. }
+            | CompletionResult::LogWritten
+            | CompletionResult::Synced
+            | CompletionResult::Closed) => {
+                panic!("non-tier completion routed to ColdReads: {other:?}")
+            }
         };
         let (file, mut waiters) = {
             let mut state = self.state.borrow_mut();

@@ -232,6 +232,7 @@ fn cold_issued<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         .unwrap_or(0)
 }
 
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column tiered_handler")]
 async fn run_command<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -553,7 +554,8 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
                         Probe::Fail(message) if message != "__replan" => {
                             return Resolved::Fail(message);
                         }
-                        _ => continue 'attempt, // state moved: re-resolve whole
+                        // state moved: re-resolve whole
+                        Probe::Ram(_) | Probe::Miss | Probe::Fail(_) => continue 'attempt,
                     };
                     let done = plan.wait.await;
                     if done.outcome().is_err() {
@@ -868,7 +870,9 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 };
                 match table.space().resolve(addr) {
                     inf_store::AddrClass::Cold => None,
-                    _ => Some(table.record(addr).key.to_vec()),
+                    inf_store::AddrClass::Mutable | inf_store::AddrClass::ReadOnly => {
+                        Some(table.record(addr).key.to_vec())
+                    }
                 }
             };
             match ram_key {

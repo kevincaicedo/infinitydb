@@ -440,7 +440,10 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
                             report.always_ack_latency_ms_max =
                                 report.always_ack_latency_ms_max.max(latency.as_millis());
                         }
-                        _ => {}
+                        NsClass::Everysec
+                        | NsClass::Memory
+                        | NsClass::Tiered
+                        | NsClass::Indexed => {}
                     }
                 }
                 writer.replied += 1;

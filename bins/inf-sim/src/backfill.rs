@@ -179,7 +179,7 @@ pub(crate) fn cell_truth(
                     DocValue::I64(v) => IndexScalar::I64(v),
                     DocValue::F64(f) => IndexScalar::F64(f),
                     DocValue::Str(s) => IndexScalar::Utf8(s.to_str()),
-                    _ => continue,
+                    DocValue::Obj(_) | DocValue::Arr(_) => continue,
                 };
                 if index_key_encode(key_type, scalar, &mut buf).is_ok() {
                     out.insert((buf.as_bytes().to_vec(), hash));

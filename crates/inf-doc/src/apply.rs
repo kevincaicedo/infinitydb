@@ -222,7 +222,16 @@ pub fn patch_scalar_in_place(
             }
             _ => Ok(ScalarPatch::Skipped),
         },
-        _ => Ok(ScalarPatch::Unsupported),
+        ApplyOp::SetReplace { .. }
+        | ApplyOp::SetMember { .. }
+        | ApplyOp::Del
+        | ApplyOp::StrAppend(_)
+        | ApplyOp::Clear
+        | ApplyOp::ArrAppend { .. }
+        | ApplyOp::ArrInsert { .. }
+        | ApplyOp::ArrPop { .. }
+        | ApplyOp::ArrTrim { .. }
+        | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported),
     }
 }
 
@@ -489,7 +498,13 @@ fn plan_site(body: &[u8], site: &Site, op: &ApplyOp<'_>) -> Result<Verdict, Appl
                 // versions or (S17) log records (ADR-0041 D8).
                 ValueRef::I64(v) if v != 0 => vec![0x00],
                 ValueRef::F64(f) if f != 0.0 => vec![0x00],
-                _ => return Ok(Verdict::Skip),
+                ValueRef::Null
+                | ValueRef::Bool(_)
+                | ValueRef::I64(_)
+                | ValueRef::F64(_)
+                | ValueRef::Str(_)
+                | ValueRef::Obj(_)
+                | ValueRef::Arr(_) => return Ok(Verdict::Skip),
             };
             replace(repl, MatchResult::Cleared)
         }
@@ -704,7 +719,11 @@ fn num_op(value: ValueRef<'_>, operand: Number, mul: bool) -> Result<Number, App
     let current = match value {
         ValueRef::I64(v) => Number::I64(v),
         ValueRef::F64(v) => Number::F64(v),
-        _ => unreachable!("caller checked the numeric arms"),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_)
+        | ValueRef::Arr(_) => unreachable!("caller checked the numeric arms"),
     };
     number_op(current, operand, mul)
 }

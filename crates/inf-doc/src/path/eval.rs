@@ -140,7 +140,11 @@ pub fn resolve<'a>(root: DocValue<'a>, steps: &[u32]) -> Option<DocValue<'a>> {
         node = match node {
             DocValue::Obj(o) => o.iter().nth(step as usize)?.1,
             DocValue::Arr(a) => a.index(step as usize)?,
-            _ => return None,
+            DocValue::Null
+            | DocValue::Bool(_)
+            | DocValue::I64(_)
+            | DocValue::F64(_)
+            | DocValue::Str(_) => return None,
         };
     }
     Some(node)
@@ -516,12 +520,22 @@ where
                 DocValue::Obj(entries) => {
                     entries.iter().find(|(k, _)| k.as_bytes() == key).map(|(_, value)| value)
                 }
-                _ => None,
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)
+                | DocValue::Arr(_) => None,
             },
             super::program::SimpleStep::Index(index) => match node {
                 DocValue::Arr(items) => resolve_index(index, || items.len() as i64)
                     .and_then(|ordinal| items.index(ordinal as usize)),
-                _ => None,
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)
+                | DocValue::Obj(_) => None,
             },
         };
         // A failed hop is an empty match set — no item was produced, so
@@ -606,7 +620,11 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                 frame.progress = match frame.node {
                     DocValue::Obj(o) => Progress::Obj { it: o.iter(), next_ord: 0 },
                     DocValue::Arr(a) => Progress::Arr { it: a.iter(), next_ord: 0 },
-                    _ => Progress::Done,
+                    DocValue::Null
+                    | DocValue::Bool(_)
+                    | DocValue::I64(_)
+                    | DocValue::F64(_)
+                    | DocValue::Str(_) => Progress::Done,
                 };
             }
             match &mut frame.progress {
@@ -622,7 +640,12 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     *next_ord += 1;
                     Some(child_item(frame, bytes, end, value, ord))
                 }
-                _ => None,
+                Progress::Fresh
+                | Progress::Done
+                | Progress::Slice { .. }
+                | Progress::Union { .. }
+                | Progress::DescendObj { .. }
+                | Progress::DescendArr { .. } => None,
             }
         }
         Op::Slice(spec) => {
@@ -661,7 +684,12 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     0
                 }
                 Progress::Union { member } => *member,
-                _ => return None,
+                Progress::Done
+                | Progress::Obj { .. }
+                | Progress::Arr { .. }
+                | Progress::Slice { .. }
+                | Progress::DescendObj { .. }
+                | Progress::DescendArr { .. } => return None,
             };
             if member == u.count {
                 return None;
@@ -684,7 +712,11 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     frame.progress = match frame.node {
                         DocValue::Obj(o) => Progress::DescendObj { it: o.iter(), next_ord: 0 },
                         DocValue::Arr(a) => Progress::DescendArr { it: a.iter(), next_ord: 0 },
-                        _ => Progress::Done,
+                        DocValue::Null
+                        | DocValue::Bool(_)
+                        | DocValue::I64(_)
+                        | DocValue::F64(_)
+                        | DocValue::Str(_) => Progress::Done,
                     };
                     Some(Item {
                         node: frame.node,
@@ -706,7 +738,11 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     *next_ord += 1;
                     Some(Item { node: value, pc: frame.op_at, cont: sel_at, step: Some(ord) })
                 }
-                _ => None,
+                Progress::Done
+                | Progress::Obj { .. }
+                | Progress::Arr { .. }
+                | Progress::Slice { .. }
+                | Progress::Union { .. } => None,
             }
         }
         Op::Root => unreachable!("Root never becomes a frame"),
@@ -815,7 +851,11 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
                     }
                     Progress::Arr { it, next_ord }
                 }
-                _ => unreachable!("iterating frame on a container"),
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_) => unreachable!("iterating frame on a container"),
             },
             SavedProgress::Slice { next, stop, step } => Progress::Slice { next, stop, step },
             SavedProgress::Union { member } => Progress::Union { member },
@@ -834,7 +874,11 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
                     }
                     Progress::DescendArr { it, next_ord }
                 }
-                _ => unreachable!("descend-iterating frame on a container"),
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_) => unreachable!("descend-iterating frame on a container"),
             },
         };
         frames.push(Frame {

@@ -181,7 +181,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     // ADR-0086 D4: a zero slice landed on the next
                     // segment — the rotor's cursor, never the frame lease.
                     TokenClass::ZeroFillWrite => cell.on_zero_fill_written(),
-                    _ => cell.on_log_written(cx, c.token),
+                    TokenClass::Accept
+                    | TokenClass::Recv
+                    | TokenClass::Send
+                    | TokenClass::Close
+                    | TokenClass::Wake
+                    | TokenClass::LogWrite
+                    | TokenClass::Fsync
+                    | TokenClass::CkptSync
+                    | TokenClass::ManifestSync
+                    | TokenClass::TierRead
+                    | TokenClass::TierFlushWrite
+                    | TokenClass::TierFlushSync => cell.on_log_written(cx, c.token),
                 }
             }
             CompletionResult::Synced => {

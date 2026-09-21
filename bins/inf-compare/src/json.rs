@@ -92,7 +92,7 @@ impl Json {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Num(n) => Some(*n),
-            _ => None,
+            Json::Null | Json::Bool(_) | Json::Str(_) | Json::Arr(_) | Json::Obj(_) => None,
         }
     }
 

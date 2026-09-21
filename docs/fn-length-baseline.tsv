@@ -50,7 +50,6 @@
 1	crates/inf-log/src/reader.rs
 2	crates/inf-log/src/record.rs
 1	crates/inf-query/src/partiql/mod.rs
-1	crates/inf-query/src/partiql/parse.rs
 1	crates/inf-query/src/predicate/program.rs
 1	crates/inf-runtime/src/reactor.rs
 2	crates/inf-runtime/src/uring.rs

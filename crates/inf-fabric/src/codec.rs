@@ -313,7 +313,13 @@ impl Op<'_> {
     fn header_flags(&self) -> u16 {
         match self {
             Op::Apply { program: true, .. } | Op::ApplyNs { program: true, .. } => FLAG_PROGRAM,
-            _ => 0,
+            Op::Read { .. }
+            | Op::Write { .. }
+            | Op::Apply { .. }
+            | Op::ApplyNs { .. }
+            | Op::Batch { .. }
+            | Op::Reply { .. }
+            | Op::AdoptConn { .. } => 0,
         }
     }
 
@@ -414,7 +420,7 @@ pub fn encode(op: &Op<'_>, out: &mut Vec<u8>) {
                 Op::Batch { .. } => panic!("Batch must not nest Batch (codec v0)"),
                 Op::Reply { .. } => panic!("Batch must not nest Reply (codec v0)"),
                 Op::AdoptConn { .. } => panic!("Batch must not nest AdoptConn (ADR-0128)"),
-                _ => {}
+                Op::Read { .. } | Op::Write { .. } | Op::Apply { .. } | Op::ApplyNs { .. } => {}
             }
         }
     }

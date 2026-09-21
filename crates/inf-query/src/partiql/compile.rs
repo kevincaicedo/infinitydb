@@ -244,7 +244,10 @@ fn servable(cond: &Cond) -> Option<(&StmtPath, KeyOp<'_>)> {
         LeafKind::Cmp { path, op, lit } if *op != CmpOp::Ne => Some((path, KeyOp::Cmp(*op, lit))),
         LeafKind::Between { path, lo, hi } => Some((path, KeyOp::Between(lo, hi))),
         LeafKind::BeginsWith { path, prefix } => Some((path, KeyOp::BeginsWith(prefix))),
-        _ => None,
+        LeafKind::Cmp { .. }
+        | LeafKind::In { .. }
+        | LeafKind::Exists { .. }
+        | LeafKind::KeyEq { .. } => None,
     }
 }
 
@@ -274,7 +277,8 @@ fn fold_index_bounds(
                 _ if named_explicitly => {
                     return err(path.at, QlErrorKind::MultiValueRange(name_string(&spec.name)));
                 }
-                _ => continue, // never a candidate under path matching
+                // never a candidate under path matching
+                KeyOp::Cmp(..) | KeyOp::Between(..) | KeyOp::BeginsWith(_) => continue,
             }
         }
         interval = interval.intersect(key_op_interval(spec, path.at, &op)?);
@@ -443,13 +447,17 @@ fn i64_cross_interval(cmp: CmpOp, c: f64) -> Interval {
     if c >= TWO_POW_63 {
         return match cmp {
             CmpOp::Lt | CmpOp::Le => Interval::unbounded(),
-            _ => Interval::empty_fixed(&0i64.to_be_bytes()),
+            CmpOp::Eq | CmpOp::Ne | CmpOp::Gt | CmpOp::Ge => {
+                Interval::empty_fixed(&0i64.to_be_bytes())
+            }
         };
     }
     if c < -TWO_POW_63 {
         return match cmp {
             CmpOp::Gt | CmpOp::Ge => Interval::unbounded(),
-            _ => Interval::empty_fixed(&0i64.to_be_bytes()),
+            CmpOp::Eq | CmpOp::Ne | CmpOp::Lt | CmpOp::Le => {
+                Interval::empty_fixed(&0i64.to_be_bytes())
+            }
         };
     }
     let truncated = c.trunc();

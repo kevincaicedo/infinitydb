@@ -465,7 +465,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             let think = match writer.class {
                 NsClass::Everysec => scenario.esec_think_ns_max,
                 NsClass::Always => scenario.always_think_ns_max,
-                _ => 0,
+                NsClass::Memory | NsClass::Tiered | NsClass::Indexed => 0,
             };
             if think > 0 {
                 writer.idle_until = clock.now() + Nanos(writer.rng.next_below(think));
@@ -1017,7 +1017,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             match writer.class {
                 NsClass::Tiered => report.lift_tiered_ops += acked,
                 NsClass::Indexed => report.lift_indexed_ops += acked,
-                _ => {}
+                NsClass::Always | NsClass::Everysec | NsClass::Memory => {}
             }
         }
         for cell in 0..usize::from(scenario.cells) {

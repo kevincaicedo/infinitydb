@@ -82,6 +82,7 @@ fn pop_or_quiesce<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// observed by — their exact pipeline position (HELLO switches the protocol
 /// every later reply serializes under; SELECT switches the database every
 /// later command routes to — M1-S08).
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column conn_state")]
 fn is_conn_state(owned: &OwnedCmd) -> bool {
     lookup(owned.arg(0)).is_some_and(|m| match m.id {
         CommandId::Hello | CommandId::Select => true,
@@ -368,7 +369,11 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
                                     reply.extend_from_slice(element);
                                     shared.recycle_reply_buf(bytes);
                                 }
-                                _ => RespWriter::new(&mut reply, proto).null(),
+                                OwnedOutcome::Ok
+                                | OwnedOutcome::Int(_)
+                                | OwnedOutcome::Nil
+                                | OwnedOutcome::Bool(_)
+                                | OwnedOutcome::Err(_) => RespWriter::new(&mut reply, proto).null(),
                             }
                         }
                     }
@@ -416,6 +421,7 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
 /// RESETSTAT and INF.NS CREATE / DROP mutate per-cell state (typed config,
 /// namespace registries — M1-E3/E4) and fan out AllOk; their read forms
 /// stay local.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column scatter")]
 pub(super) fn is_scatter(id: CommandId, sub: Option<&[u8]>) -> bool {
     match id {
         CommandId::Dbsize
@@ -734,6 +740,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 /// a counted `DBSIZE`, the all-or-nothing per-cell mutators, and the
 /// `KEYS`/`SCAN`/`RANDOMKEY` folds. Returns the reply slot to stage.
 #[allow(clippy::too_many_arguments, reason = "the dispatch context, not an API surface")]
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column scatter")]
 async fn dispatch_scatter<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     cmd: CommandId,
@@ -1107,7 +1114,10 @@ pub(super) fn render_outcome<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
             RespWriter::new(&mut reply, proto).error("ERR cross-cell execution failed");
             reply
         }
-        other => {
+        other @ (OwnedOutcome::Ok
+        | OwnedOutcome::Int(_)
+        | OwnedOutcome::Nil
+        | OwnedOutcome::Bool(_)) => {
             // Defensive: typed outcomes from a future peer.
             let mut reply = shared.take_reply_buf();
             let mut w = RespWriter::new(&mut reply, proto);

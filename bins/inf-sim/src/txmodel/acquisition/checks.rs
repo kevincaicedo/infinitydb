@@ -59,7 +59,7 @@ impl Model {
                         published[0]
                     ))
                 }
-                _ => None,
+                Outcome::Committed | Outcome::Aborted(_) | Outcome::Stuck => None,
             };
             if let Some(msg) = msg {
                 self.report.violations.push(msg);
@@ -127,7 +127,7 @@ impl Model {
                 .expect("a written key has a writing command");
             let kind = match t.program[writer] {
                 Cmd::Dep(_) => "DEPENDENT COMMAND",
-                _ => "PLAIN COMMAND",
+                Cmd::Set(_) | Cmd::Get(_) => "PLAIN COMMAND",
             };
             out.push(format!(
                 "{kind}: T{}'s {} left key {key}@cell{} = {} where the serial history gives {}",

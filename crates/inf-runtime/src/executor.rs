@@ -383,7 +383,9 @@ impl CellExecutor {
                 self.ready.borrow_mut().push_back(slot);
             }
             TaskState::Running => header.state.set(TaskState::Idle),
-            other => unreachable!("inserting task in state {other:?}"),
+            other @ (TaskState::Idle | TaskState::Queued | TaskState::Dead) => {
+                unreachable!("inserting task in state {other:?}")
+            }
         }
         self.next_generation += 1;
         let generation = self.next_generation;
@@ -418,7 +420,9 @@ impl CellExecutor {
                         self.ready.borrow_mut().push_back(slot);
                     }
                     TaskState::Running => header.state.set(TaskState::Idle),
-                    other => unreachable!("post-poll task state {other:?}"),
+                    other @ (TaskState::Idle | TaskState::Queued | TaskState::Dead) => {
+                        unreachable!("post-poll task state {other:?}")
+                    }
                 },
             }
         }

@@ -4,6 +4,11 @@
 //! slot math, varints, the always-on latency histogram, and the frozen
 //! tripwire counter names. This crate is dependency-free and fully safe.
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod addr;
 mod crc;

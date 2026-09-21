@@ -309,7 +309,9 @@ fn try_upsert(world: &mut World, key: &[u8], value: &[u8]) -> Result<(), ()> {
     result.map_err(|_| ())?;
     let placed = match world.table().lookup(key, hash, &[]) {
         TieredLookup::Ram(addr) => addr,
-        other => panic!("fresh write must be RAM-resident: {other:?}"),
+        other @ (TieredLookup::Cold(_) | TieredLookup::Miss) => {
+            panic!("fresh write must be RAM-resident: {other:?}")
+        }
     };
     world.model.insert(key.to_vec(), value.to_vec());
     world.trace_hash = hash64(value, world.trace_hash ^ placed.to_raw());

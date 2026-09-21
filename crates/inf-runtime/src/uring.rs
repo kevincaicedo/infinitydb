@@ -685,7 +685,18 @@ impl UringDriver {
                             {
                                 cancel_ids.push(*id);
                             }
-                            _ => {}
+                            OpState::Accept { .. }
+                            | OpState::RecvMulti { .. }
+                            | OpState::RecvOneshot { .. }
+                            | OpState::Send { .. }
+                            | OpState::Close
+                            | OpState::Cancel
+                            | OpState::Provide { .. }
+                            | OpState::PollDry { .. }
+                            | OpState::WakeWatch
+                            | OpState::LogWrite { .. }
+                            | OpState::LogFsync { .. }
+                            | OpState::TierRead { .. } => {}
                         }
                     }
                     for op_id in cancel_ids {
@@ -1189,7 +1200,7 @@ impl BackendDriver for UringDriver {
             Wait::Park { timeout: None } if !already_satisfied => {
                 self.ring.submitter().submit_and_wait(1)
             }
-            _ => {
+            Wait::Poll | Wait::Park { .. } => {
                 let args = types::SubmitArgs::new().timespec(&zero_ts);
                 self.ring.submitter().submit_with_args(1, &args)
             }

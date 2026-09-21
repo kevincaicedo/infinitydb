@@ -63,7 +63,7 @@ fn storm_faults(rng: &mut Rng, spec: &mut TxnSpec, cells: usize, keys: u32) {
     if rng.below(4) == 0 {
         spec.fails_at = spec.program.iter().find_map(|c| match c {
             Cmd::Set(k) => Some(*k as usize % cells),
-            _ => None,
+            Cmd::Get(_) | Cmd::Dep(_) => None,
         });
     }
     let deps = match (rng.below(4), rng.below(4)) {

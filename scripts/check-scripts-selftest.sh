@@ -1371,9 +1371,140 @@ for output in .artifacts/gate.log artifacts/claim.json tests/fuzz/artifacts/cras
     git -C "$doc_root" rm -q --cached -f "$output"
 done
 
+# ------------------------------------------------------------- lint-scopes
+# ADR-0144 D1/D2: the crate-root wildcard deny, the structural suppression
+# audit (one planted case per spelling that compiles clean under the deny)
+# and the frozen ADR-0143 exemption table against its approved copies —
+# fixture repositories with real commits, because the approved copies are
+# history (HEAD, the base tip, the table's introducing commit).
+LINTSCOPES="$SCRIPT_DIR/check-lint-scopes.sh"
+LS_ATTR='#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]'
+ls_root() {
+    local root="$work/$1"
+    [ -n "$1" ] && [ -n "$work" ] || { echo "ls_root: empty name" >&2; exit 2; }
+    [ -e "$root" ] && rm -rf "$root"
+    mkdir -p "$root/crates/fake/src" "$root/bins/fake/src" "$root/docs" "$root/scripts"
+    printf 'name = "fake"\n' >"$root/crates/fake/Cargo.toml"
+    printf 'name = "fakebin"\n' >"$root/bins/fake/Cargo.toml"
+    printf '%s\npub fn f() {}\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
+    printf '%s\nfn main() {}\n' "$LS_ATTR" >"$root/bins/fake/src/main.rs"
+    printf '# file\tfn\tcolumn\n' >"$root/docs/lint-exemptions.tsv"
+    printf '# gate\n' >"$root/scripts/check-lint-scopes.sh"
+    git -C "$root" init -q
+    git -C "$root" add -A
+    git -C "$root" -c user.name=t -c user.email=t@t commit -q -m base
+    git -C "$root" branch -q base-tip
+    echo "$root"
+}
+ls_run() { env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip "$LINTSCOPES"; }
+ls_commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+root=$(ls_root ls-clean)
+expect green "lint-scopes: clean roots, empty table" ls_run "$root"
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+expect red "lint-scopes: a crate root without the D1 attribute" ls_run "$root"
+root=$(ls_root ls-audit)
+ls_case() {
+    local want=$1 label=$2 body=$3
+    printf '%s\n%s\n' "$LS_ATTR" "$body" >"$root/crates/fake/src/lib.rs"
+    expect "$want" "lint-scopes: $label" ls_run "$root"
+}
+for lint in wildcard_enum_match_arm match_wildcard_for_single_variants; do
+    ls_case red "$lint — allow without a reason" "#[allow(clippy::$lint)]
+pub fn f() {}"
+    ls_case red "$lint — expect hides it" "#[expect(clippy::$lint, reason = \"foreign: x\")]
+pub fn f() {}"
+    ls_case red "$lint — cfg_attr-wrapped allow" "#[cfg_attr(not(test), allow(clippy::$lint, reason = \"foreign: x\"))]
+pub fn f() {}"
+    ls_case red "$lint — inner allow in a module" "pub mod m {
+    #![allow(clippy::$lint, reason = \"foreign: x\")]
+}"
+    ls_case red "$lint — allow on an impl" "pub struct S;
+#[allow(clippy::$lint, reason = \"foreign: x\")]
+impl S {}"
+    ls_case red "$lint — a reason of no class" "#[allow(clippy::$lint, reason = \"it is fine\")]
+pub fn f() {}"
+    ls_case green "$lint — a reasoned function-level allow (multi-line)" "#[allow(
+    clippy::$lint,
+    reason = \"foreign: io::ErrorKind is non_exhaustive; the rest is fail-stop\"
+)]
+pub fn f() {}"
+done
+for group in clippy::pedantic clippy::restriction clippy::style clippy::all warnings; do
+    ls_case red "group suppression $group" "#[allow($group)]
+pub fn f() {}"
+done
+expect_output "lint-scopes: every allow is listed on the OK line" "allow: crates/fake/src/lib.rs" ls_run "$(
+    ls_case green "listed allow" "#[allow(clippy::wildcard_enum_match_arm, reason = \"foreign: x\")]
+pub fn f() {}" >/dev/null
+    echo "$root"
+)"
+# the frozen exemption table
+root=$(ls_root ls-exempt)
+ls_exempt() { printf '%s\n#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]\npub fn %s() {}\n' "$LS_ATTR" "$1" >"$root/crates/fake/src/lib.rs"; }
+ls_exempt f
+expect red "lint-scopes: an ADR-0143 allow with no row" ls_run "$root"
+printf 'crates/fake/src/lib.rs\tf\tk\n' >>"$root/docs/lint-exemptions.tsv"
+expect red "lint-scopes: the row arrives with its allow — the table grew against HEAD" ls_run "$root"
+# a repository whose history starts before the gate and its table
+root=$(ls_root ls-exempt2)
+rm -rf "$root/.git" "$root/scripts" "$root/docs"
+git -C "$root" init -q
+ls_commit "$root" "before the gate"
+git -C "$root" branch -q base-tip
+mkdir -p "$root/scripts" "$root/docs"
+printf "# gate\n" >"$root/scripts/check-lint-scopes.sh"
+printf '# file\tfn\tcolumn\n' >"$root/docs/lint-exemptions.tsv"
+printf '%s\n' '#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]' 'pub fn f() {}' >"$root/crates/fake/src/a.rs"
+printf 'crates/fake/src/a.rs\tf\tk\n' >>"$root/docs/lint-exemptions.tsv"
+expect green "lint-scopes: the introducing change (no gate at any copy) is the bootstrap" ls_run "$root"
+printf '# gate\n' >"$root/scripts/check-lint-scopes.sh"
+ls_commit "$root" intro
+expect green "lint-scopes: committed table, one allow per row" ls_run "$root"
+printf '%s\n' '#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]' 'pub fn g() {}' >>"$root/crates/fake/src/a.rs"
+printf 'crates/fake/src/a.rs\tg\tk\n' >>"$root/docs/lint-exemptions.tsv"
+expect red "lint-scopes: a new exemption with its row, uncommitted (HEAD leg)" ls_run "$root"
+ls_commit "$root" combined
+expect red "lint-scopes: the same change committed is still red (introducing-commit leg)" ls_run "$root"
+git -C "$root" reset -q --hard HEAD~1
+git -C "$root" mv crates/fake/src/a.rs crates/fake/src/moved.rs
+printf 'crates/fake/src/moved.rs\tf\tk\n' >"$root/docs/lint-exemptions.tsv"
+git -C "$root" add -A
+expect green "lint-scopes: a renamed file keeps its row" ls_run "$root"
+git -C "$root" reset -q --hard HEAD
+printf '%s\n' '#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]' 'pub fn f2() {}' >"$root/crates/fake/src/extra.rs"
+sed -i.bak 's/pub fn f2/pub fn f/' "$root/crates/fake/src/extra.rs" && rm "$root/crates/fake/src/extra.rs.bak"
+expect red "lint-scopes: a second ADR-0143 allow with no row of its own" ls_run "$root"
+git -C "$root" rm -q -f docs/lint-exemptions.tsv
+expect red "lint-scopes: a missing table is a scope error" ls_run "$root"
+git -C "$root" reset -q --hard HEAD
+rm -f "$root/crates/fake/src/extra.rs"
+expect red "lint-scopes: an unresolvable base ref is a scope error" env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=no-such-ref "$LINTSCOPES"
+git -C "$root" checkout -q -b feature
+git -C "$root" branch -q -f base-tip HEAD
+git -C "$root" rm -q -f docs/lint-exemptions.tsv
+expect red "lint-scopes: a table deleted from under the gate is not a bootstrap" ls_run "$root"
+
+# the probe's judge: a plant that compiles clean, and a plant that fails
+# for an unrelated reason, are both red (ADR-0144 D5's probe rule).
+root=$(ls_root ls-probe)
+ls_probe() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_PROBE=on INF_LINT_PROBE_SRC="$1" "$LINTSCOPES"; }
+expect green "lint-scopes: the shipped probe draws every planted lint" ls_probe "$SCRIPT_DIR/lint-scope-probe"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-inert"
+sed -i.bak 's|Three::B \| Three::C => 0, // CONTROL|Three::B \| Three::C => 0, // PLANT clippy::wildcard_enum_match_arm|' "$work/probe-inert/src/lib.rs"
+expect red "lint-scopes: a plant that compiles clean" ls_probe "$work/probe-inert"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-broken"
+printf 'pub fn broken() -> u8 {\n    "not a u8"\n}\n' >>"$work/probe-broken/src/lib.rs"
+expect red "lint-scopes: a probe that fails for an unrelated reason" ls_probe "$work/probe-broken"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unmarked"
+sed -i.bak 's|_ => 0, // PLANT clippy::match_wildcard_for_single_variants|_ => 0,|' "$work/probe-unmarked/src/lib.rs"
+expect red "lint-scopes: a diagnostic on a line with no marker" ls_probe "$work/probe-unmarked"
+
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, fn-length, doc-artifacts, lint-scopes each red on a planted violation)"

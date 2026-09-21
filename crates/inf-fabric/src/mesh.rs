@@ -314,7 +314,11 @@ impl CellFabric {
         match op {
             Op::Batch { ops } => ops.len() as u32,
             Op::Reply { .. } => 0,
-            _ => 1,
+            Op::Read { .. }
+            | Op::Write { .. }
+            | Op::Apply { .. }
+            | Op::ApplyNs { .. }
+            | Op::AdoptConn { .. } => 1,
         }
     }
 

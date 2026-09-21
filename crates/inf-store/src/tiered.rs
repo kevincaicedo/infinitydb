@@ -92,7 +92,7 @@ impl<'a> RecordParts<'a> {
     pub fn extent_ref(&self) -> Option<ExtentRef> {
         match self.type_tag {
             crate::record::TypeTag::StringExtent => Some(ExtentRef::decode(self.value)),
-            _ => None,
+            crate::record::TypeTag::String | crate::record::TypeTag::JsonDoc => None,
         }
     }
 }

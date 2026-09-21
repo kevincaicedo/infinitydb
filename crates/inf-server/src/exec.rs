@@ -580,6 +580,7 @@ pub(crate) fn unavailable_default_allows(id: CommandId) -> bool {
 /// live on. Keyspace-level commands (SELECT, FLUSHALL, cross-db COPY,
 /// INF.NS, INFO, CONFIG) dispatch here; everything else runs against the
 /// connection's selected database.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 pub fn execute(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
@@ -1714,6 +1715,7 @@ fn inf_take_peek(
 
 /// ADR-0110: the move snapshot and cleanup compare bytes plus an absolute
 /// deadline. No store borrow or record identity survives a fabric hop.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 fn inf_move_snapshot(
     argv: &(impl Argv + ?Sized),
     store: &mut CellStore,

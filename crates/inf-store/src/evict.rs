@@ -95,7 +95,10 @@ impl EvictionPolicy {
         match self {
             EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => Tracking::Clock,
             EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => Tracking::Lfu,
-            _ => Tracking::None,
+            EvictionPolicy::NoEviction
+            | EvictionPolicy::AllKeysRandom
+            | EvictionPolicy::VolatileRandom
+            | EvictionPolicy::VolatileTtl => Tracking::None,
         }
     }
 }
@@ -382,7 +385,9 @@ fn score_of(
         // volatile-ttl: nearest deadline first.
         EvictionPolicy::VolatileTtl => view.expire_at_ms().unwrap_or(u64::MAX),
         // Random: every sample scores equally; the first wins.
-        _ => 0,
+        EvictionPolicy::NoEviction
+        | EvictionPolicy::AllKeysRandom
+        | EvictionPolicy::VolatileRandom => 0,
     }
 }
 

@@ -497,7 +497,7 @@ impl<F: SegmentFs> CkptCell<F> {
     pub fn stats(&self, records_total: u64) -> CkptStats {
         let buffer_bytes = match &self.phase {
             CkptPhase::Stream(st) => st.stream.resident_bytes() as u64,
-            _ => 0,
+            CkptPhase::Idle | CkptPhase::AwaitBeginLsn { .. } | CkptPhase::Begun { .. } => 0,
         };
         let base = if matches!(self.phase, CkptPhase::Idle) {
             self.records_at_last
@@ -775,7 +775,13 @@ impl<F: SegmentFs> ManifestCell<F> {
             SwapPhase::IckDirQueued { pending, .. } => SwapPhase::WatermarkWait { pending },
             SwapPhase::StageQueued { manifest, .. } => SwapPhase::StageSynced { manifest },
             SwapPhase::DirQueued { manifest, .. } => SwapPhase::DirSynced { manifest },
-            other => {
+            other @ (SwapPhase::Backoff { .. }
+            | SwapPhase::Idle
+            | SwapPhase::IckDirPending { .. }
+            | SwapPhase::WatermarkWait { .. }
+            | SwapPhase::StageSynced { .. }
+            | SwapPhase::DirSynced { .. }
+            | SwapPhase::Failed) => {
                 let _ = other;
                 panic!("ManifestSync completion with no barrier in flight")
             }
@@ -796,7 +802,13 @@ impl<F: SegmentFs> ManifestCell<F> {
             SwapPhase::StageQueued { manifest, .. } | SwapPhase::DirQueued { manifest, .. } => {
                 PendingManifest { ckpt_id: manifest.ckpt_id, begin_lsn: manifest.begin_lsn }
             }
-            other => {
+            other @ (SwapPhase::Backoff { .. }
+            | SwapPhase::Idle
+            | SwapPhase::IckDirPending { .. }
+            | SwapPhase::WatermarkWait { .. }
+            | SwapPhase::StageSynced { .. }
+            | SwapPhase::DirSynced { .. }
+            | SwapPhase::Failed) => {
                 let _ = other;
                 panic!("ManifestSync error with no barrier in flight")
             }

@@ -159,6 +159,7 @@ fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_
     true
 }
 
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 pub(crate) fn execute_json(
     id: CommandId,
     argv: &(impl Argv + ?Sized),
@@ -255,7 +256,17 @@ fn parse_value(
             match e.kind {
                 JsonErrorKind::DocumentTooLarge => w.error("ERR document too large"),
                 JsonErrorKind::DepthExceeded => w.error("ERR document nesting too deep"),
-                _ => w.error(&format!("ERR invalid JSON: {e}")),
+                JsonErrorKind::UnexpectedCharacter(_)
+                | JsonErrorKind::UnexpectedEnd
+                | JsonErrorKind::TrailingCharacters
+                | JsonErrorKind::InvalidNumber
+                | JsonErrorKind::NumberOutOfRange
+                | JsonErrorKind::InvalidEscape
+                | JsonErrorKind::InvalidUnicodeEscape
+                | JsonErrorKind::LoneSurrogate
+                | JsonErrorKind::InvalidUtf8
+                | JsonErrorKind::ControlCharacter
+                | JsonErrorKind::UnterminatedString => w.error(&format!("ERR invalid JSON: {e}")),
             }
             false
         }
@@ -266,7 +277,10 @@ fn apply_error(e: ApplyError, w: &mut RespWriter<'_>) {
     match e {
         ApplyError::TooLarge => w.error("ERR document too large"),
         ApplyError::Eval(inner) => w.error(&format!("ERR {inner}")),
-        other => w.error(&format!("ERR {other}")),
+        other @ (ApplyError::Overflow
+        | ApplyError::NotANumber
+        | ApplyError::OutOfBounds
+        | ApplyError::RootDelete) => w.error(&format!("ERR {other}")),
     }
 }
 
@@ -472,7 +486,7 @@ fn set_parsed(
     match cond {
         SetCond::IfAbsent if !matches.is_empty() => return Some(false),
         SetCond::IfPresent if matches.is_empty() => return Some(false),
-        _ => {}
+        SetCond::Always | SetCond::IfAbsent | SetCond::IfPresent => {}
     }
     let fragment = &idoc[inf_doc::HEADER_LEN..];
     let op = if matches.is_empty() {
@@ -783,6 +797,7 @@ fn type_name(value: DocValue<'_>) -> &'static str {
 
 // ---- scalar mutations (M3-S12) ----------------------------------------------
 
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 fn num_op(
     id: CommandId,
     argv: &(impl Argv + ?Sized),
@@ -942,7 +957,14 @@ fn str_append(
     }
     int_per_match(path, program.is_legacy(), &outcome, w, "a string", |r| match r {
         MatchResult::Len(n) => Some(*n as i64),
-        _ => None,
+        MatchResult::Skipped
+        | MatchResult::Num(_)
+        | MatchResult::Toggled(_)
+        | MatchResult::Cleared
+        | MatchResult::Removed
+        | MatchResult::Set
+        | MatchResult::Popped(_)
+        | MatchResult::PoppedEmpty => None,
     });
 }
 
@@ -955,7 +977,12 @@ fn str_len(
 ) {
     int_read(argv, store, cx, now, w, "a string", |v| match v {
         DocValue::Str(s) => Some(s.as_bytes().len() as i64),
-        _ => None,
+        DocValue::Null
+        | DocValue::Bool(_)
+        | DocValue::I64(_)
+        | DocValue::F64(_)
+        | DocValue::Obj(_)
+        | DocValue::Arr(_) => None,
     });
 }
 
@@ -1073,7 +1100,14 @@ fn toggle(
     for r in &outcome.results {
         match r {
             MatchResult::Toggled(b) => w.int(i64::from(*b)),
-            _ => w.null(),
+            MatchResult::Skipped
+            | MatchResult::Num(_)
+            | MatchResult::Len(_)
+            | MatchResult::Cleared
+            | MatchResult::Removed
+            | MatchResult::Set
+            | MatchResult::Popped(_)
+            | MatchResult::PoppedEmpty => w.null(),
         }
     }
 }
@@ -1161,7 +1195,14 @@ fn arr_trim(
 fn array_len_result(r: &MatchResult) -> Option<i64> {
     match r {
         MatchResult::Len(n) => Some(*n as i64),
-        _ => None,
+        MatchResult::Skipped
+        | MatchResult::Num(_)
+        | MatchResult::Toggled(_)
+        | MatchResult::Cleared
+        | MatchResult::Removed
+        | MatchResult::Set
+        | MatchResult::Popped(_)
+        | MatchResult::PoppedEmpty => None,
     }
 }
 
@@ -1237,7 +1278,14 @@ fn arr_pop(
     for r in &outcome.results {
         match r {
             MatchResult::Popped(at) => popped_bulk(*at, w),
-            _ => w.null(),
+            MatchResult::Skipped
+            | MatchResult::Num(_)
+            | MatchResult::Len(_)
+            | MatchResult::Toggled(_)
+            | MatchResult::Cleared
+            | MatchResult::Removed
+            | MatchResult::Set
+            | MatchResult::PoppedEmpty => w.null(),
         }
     }
 }
@@ -1251,7 +1299,12 @@ fn arr_len(
 ) {
     int_read(argv, store, cx, now, w, "an array", |v| match v {
         DocValue::Arr(a) => Some(a.len() as i64),
-        _ => None,
+        DocValue::Null
+        | DocValue::Bool(_)
+        | DocValue::I64(_)
+        | DocValue::F64(_)
+        | DocValue::Str(_)
+        | DocValue::Obj(_) => None,
     });
 }
 
@@ -1384,7 +1437,12 @@ fn obj_len(
 ) {
     int_read(argv, store, cx, now, w, "an object", |v| match v {
         DocValue::Obj(o) => Some(o.len() as i64),
-        _ => None,
+        DocValue::Null
+        | DocValue::Bool(_)
+        | DocValue::I64(_)
+        | DocValue::F64(_)
+        | DocValue::Str(_)
+        | DocValue::Arr(_) => None,
     });
 }
 

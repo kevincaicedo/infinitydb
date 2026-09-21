@@ -461,7 +461,12 @@ fn write_block_of<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             proto,
             "ERR value exceeds the tiered record bound",
         )),
-        other => {
+        other @ (inf_store::OpError::NotInt
+        | inf_store::OpError::Overflow
+        | inf_store::OpError::NotFloat
+        | inf_store::OpError::NanOrInf
+        | inf_store::OpError::WrongType
+        | inf_store::OpError::IndexMaintenance(_)) => {
             debug_assert!(false, "unexpected tiered apply failure: {other:?}");
             WriteBlock::Reply(error_bytes(shared, proto, "ERR internal tiered apply failure"))
         }
@@ -905,6 +910,7 @@ pub(super) async fn setrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 
     int_write_reply(shared, proto, class, outcome, |old| old.map_or(0, |v| v.len()).max(end) as i64)
 }
 
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 pub(super) async fn incr<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -1278,7 +1284,9 @@ fn note_winner_ticket<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         (None, Some(image)) => match table.verify_shadow(ticket.hash, ticket.cold, image) {
             inf_store::ShadowVerdict::SameKey => image.len(),
             inf_store::ShadowVerdict::Collision => return TicketStep::Next,
-            _ => return TicketStep::Stale,
+            inf_store::ShadowVerdict::Stale | inf_store::ShadowVerdict::Deferred => {
+                return TicketStep::Stale;
+            }
         },
         (None, None) => return TicketStep::Stale,
     };
@@ -1334,7 +1342,9 @@ fn stage_delete<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // (delete is index + accounting only).
     match table.lookup(key, hash, &[]) {
         TieredLookup::Ram(now) | TieredLookup::Cold(now) if now == target.addr => {}
-        _ => return Ok(Staged::Moved),
+        TieredLookup::Ram(_) | TieredLookup::Cold(_) | TieredLookup::Miss => {
+            return Ok(Staged::Moved);
+        }
     }
     // Twins still slotted: one a MAINTAIN settle chained into the
     // winner's origins meanwhile is covered by the winner's list.

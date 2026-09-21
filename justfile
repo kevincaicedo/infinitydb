@@ -20,6 +20,10 @@ check:
     ./scripts/check-file-length.sh
     ./scripts/check-line-width.sh
     ./scripts/check-fn-length.sh
+    # ADR-0144 (architecture review 2026-09-17, W5): every crate root is
+    # under the wildcard deny, no attribute hides a lint of the ADR, the
+    # ADR-0143 exemptions are frozen, and the probe's plants draw their lint.
+    ./scripts/check-lint-scopes.sh
     # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
     # denies unsafe_code, the deny set is the audited-leaf list, and every
     # allow is module-scoped — the §17.3 posture, mechanical.

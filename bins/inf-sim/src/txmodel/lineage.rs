@@ -275,7 +275,7 @@ fn durable_decisions(cells: &[CellLog]) -> BTreeSet<Txid> {
         .flat_map(|c| c.records.iter().take(c.durable))
         .filter_map(|r| match r {
             Rec::Decision { txid } => Some(*txid),
-            _ => None,
+            Rec::Prepare { .. } | Rec::Plain { .. } => None,
         })
         .collect()
 }
@@ -453,7 +453,7 @@ impl<'a> Model<'a> {
                 .enumerate()
                 .find_map(|(i, r)| match r {
                     Rec::Prepare { txid, deps, .. } if *txid == t => Some((i, deps.clone())),
-                    _ => None,
+                    Rec::Prepare { .. } | Rec::Plain { .. } | Rec::Decision { .. } => None,
                 })
                 .expect("prepared leg");
             let old = std::mem::replace(&mut cell.ram, tx_value(t));
@@ -570,7 +570,7 @@ impl<'a> Model<'a> {
                     {
                         *value
                     }
-                    _ => state,
+                    Rec::Prepare { .. } | Rec::Plain { .. } | Rec::Decision { .. } => state,
                 })
             })
             .collect()
@@ -584,7 +584,7 @@ impl<'a> Model<'a> {
             .flat_map(|cell| cell.records.iter())
             .filter_map(|r| match r {
                 Rec::Prepare { txid, deps, .. } if *txid == t => Some(deps.clone()),
-                _ => None,
+                Rec::Prepare { .. } | Rec::Plain { .. } | Rec::Decision { .. } => None,
             })
             .flatten()
             .collect()

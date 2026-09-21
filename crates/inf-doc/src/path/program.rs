@@ -80,7 +80,12 @@ impl PathProgram {
                     at = inner_next;
                     Segment::Descend(Box::new(op_to_segment(inner)))
                 }
-                other => {
+                other @ (Op::Root
+                | Op::Child(_)
+                | Op::ChildAny
+                | Op::Index(_)
+                | Op::Slice(_)
+                | Op::Union(_)) => {
                     at = next;
                     op_to_segment(other)
                 }
@@ -193,7 +198,9 @@ impl<'a> Iterator for SimpleSteps<'a> {
         Some(match op {
             Op::Child(key) => SimpleStep::Child(key),
             Op::Index(index) => SimpleStep::Index(index),
-            _ => unreachable!("simple_steps prevalidated the whole program"),
+            Op::Root | Op::ChildAny | Op::Slice(_) | Op::Union(_) | Op::Descend => {
+                unreachable!("simple_steps prevalidated the whole program")
+            }
         })
     }
 }
@@ -338,7 +345,9 @@ impl<'a> UnionRef<'a> {
                 Op::Child(key) => Member::Name(key.to_vec()),
                 Op::Index(i) => Member::Index(i),
                 Op::Slice(s) => Member::Slice(s),
-                _ => unreachable!("validated member kinds"),
+                Op::Root | Op::ChildAny | Op::Union(_) | Op::Descend => {
+                    unreachable!("validated member kinds")
+                }
             });
             at = next;
         }

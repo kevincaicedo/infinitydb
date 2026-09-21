@@ -324,7 +324,7 @@ pub fn compare_i64_f64(a: i64, b: f64) -> Ordering {
                 Ordering::Equal
             }
         }
-        unequal => unequal,
+        unequal @ (Ordering::Less | Ordering::Greater) => unequal,
     }
 }
 

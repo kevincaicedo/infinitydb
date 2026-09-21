@@ -146,6 +146,12 @@ struct Parser<'s> {
     i: usize,
 }
 
+/// `v` with `cond` appended — closing an `AND` / `OR` frame.
+fn pushed(mut v: Vec<Cond>, cond: Cond) -> Vec<Cond> {
+    v.push(cond);
+    v
+}
+
 impl Parser<'_> {
     fn kind(&self) -> &Tok<'_> {
         &self.tokens[self.i].kind
@@ -223,7 +229,22 @@ impl Parser<'_> {
             Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_) | Tok::Int(_) | Tok::Float(_) => {
                 return err(self.at(), QlErrorKind::ColumnProjection);
             }
-            _ => return err(self.at(), QlErrorKind::Expected("* or COUNT(*)")),
+            Tok::Pseudo(_)
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => return err(self.at(), QlErrorKind::Expected("* or COUNT(*)")),
         };
         if matches!(self.kind(), Tok::Comma) {
             return err(self.at(), QlErrorKind::ColumnProjection);
@@ -246,7 +267,28 @@ impl Parser<'_> {
                 self.bump();
                 Ok(Target::Scan { ns })
             }
-            _ => match self.take_name() {
+            Tok::Ident(_)
+            | Tok::Quoted(_)
+            | Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => match self.take_name() {
                 Some(index) => Ok(Target::Index { ns, index }),
                 None => err(self.at(), QlErrorKind::Expected("an index name or SCAN")),
             },
@@ -257,7 +299,26 @@ impl Parser<'_> {
         let name = match self.kind() {
             Tok::Ident(s) => s.as_bytes().to_vec(),
             Tok::Quoted(s) => s.clone().into_bytes(),
-            _ => return None,
+            Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => return None,
         };
         self.bump();
         Some(name)
@@ -323,14 +384,8 @@ impl Parser<'_> {
             {
                 loop {
                     match stack.pop() {
-                        Some(Frame::And(mut v)) => {
-                            v.push(cond);
-                            cond = Cond::And(v);
-                        }
-                        Some(Frame::Or(mut v)) => {
-                            v.push(cond);
-                            cond = Cond::Or(v);
-                        }
+                        Some(Frame::And(v)) => cond = Cond::And(pushed(v, cond)),
+                        Some(Frame::Or(v)) => cond = Cond::Or(pushed(v, cond)),
                         Some(Frame::Paren) => break,
                         Some(Frame::Not) | None => unreachable!("folded above; Paren was found"),
                     }
@@ -342,14 +397,8 @@ impl Parser<'_> {
                 // the statement loop reports it as trailing input).
                 loop {
                     match stack.pop() {
-                        Some(Frame::And(mut v)) => {
-                            v.push(cond);
-                            cond = Cond::And(v);
-                        }
-                        Some(Frame::Or(mut v)) => {
-                            v.push(cond);
-                            cond = Cond::Or(v);
-                        }
+                        Some(Frame::And(v)) => cond = Cond::And(pushed(v, cond)),
+                        Some(Frame::Or(v)) => cond = Cond::Or(pushed(v, cond)),
                         Some(Frame::Paren) => return err(self.at(), QlErrorKind::Expected("')'")),
                         Some(Frame::Not) => unreachable!("folded above"),
                         None => return Ok(cond),
@@ -372,7 +421,25 @@ impl Parser<'_> {
                 }
             }
             Tok::Ident(_) | Tok::LBracket => self.parse_path_leaf(),
-            _ => err(self.at(), QlErrorKind::Expected("a condition")),
+            Tok::Quoted(_)
+            | Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => err(self.at(), QlErrorKind::Expected("a condition")),
         }
     }
 
@@ -391,7 +458,7 @@ impl Parser<'_> {
         self.bump();
         match self.parse_literal()? {
             Lit::Str(key) => Ok(Cond::Leaf(Leaf { at, kind: LeafKind::KeyEq { key } })),
-            _ => err(at, QlErrorKind::PkType),
+            Lit::I64(_) | Lit::F64(_) | Lit::Bool(_) => err(at, QlErrorKind::PkType),
         }
     }
 
@@ -501,7 +568,22 @@ impl Parser<'_> {
             Tok::Le => CmpOp::Le,
             Tok::Gt => CmpOp::Gt,
             Tok::Ge => CmpOp::Ge,
-            _ => return None,
+            Tok::Ident(_)
+            | Tok::Quoted(_)
+            | Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::End => return None,
         };
         self.bump();
         Some(op)
@@ -517,7 +599,25 @@ impl Parser<'_> {
             Tok::Ident(s) if s.eq_ignore_ascii_case("NULL") => {
                 return err(self.at(), QlErrorKind::NullComparison);
             }
-            _ => return err(self.at(), QlErrorKind::Expected("a literal")),
+            Tok::Ident(_)
+            | Tok::Quoted(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => return err(self.at(), QlErrorKind::Expected("a literal")),
         };
         self.bump();
         Ok(lit)
@@ -536,8 +636,39 @@ impl Parser<'_> {
                 self.bump();
             }
             Tok::LBracket => self.path_bracket(&mut text)?,
-            _ => return err(self.at(), QlErrorKind::Expected("a document path")),
+            Tok::Quoted(_)
+            | Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::Colon
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => return err(self.at(), QlErrorKind::Expected("a document path")),
         }
+        self.path_steps(&mut text)?;
+        match inf_doc::path::compile(text.as_bytes()) {
+            Ok(program) => {
+                debug_assert!(!program.is_legacy(), "assembled text is rooted at $");
+                Ok(StmtPath { program, at: start })
+            }
+            Err(_) => err(start, QlErrorKind::BadPath),
+        }
+    }
+
+    /// The `.name` and `[…]` steps after a path's first segment.
+    fn path_steps(&mut self, text: &mut String) -> Result<(), QlError> {
         loop {
             match self.kind() {
                 Tok::Dot if matches!(self.tokens[self.i + 1].kind, Tok::Dot) => {
@@ -552,16 +683,28 @@ impl Parser<'_> {
                     text.push_str(s);
                     self.bump();
                 }
-                Tok::LBracket => self.path_bracket(&mut text)?,
-                _ => break,
+                Tok::LBracket => self.path_bracket(text)?,
+                Tok::Ident(_)
+                | Tok::Quoted(_)
+                | Tok::Str(_)
+                | Tok::Int(_)
+                | Tok::Float(_)
+                | Tok::Pseudo(_)
+                | Tok::Star
+                | Tok::Comma
+                | Tok::Colon
+                | Tok::LParen
+                | Tok::RParen
+                | Tok::RBracket
+                | Tok::Semi
+                | Tok::Eq
+                | Tok::Ne
+                | Tok::Lt
+                | Tok::Le
+                | Tok::Gt
+                | Tok::Ge
+                | Tok::End => return Ok(()),
             }
-        }
-        match inf_doc::path::compile(text.as_bytes()) {
-            Ok(program) => {
-                debug_assert!(!program.is_legacy(), "assembled text is rooted at $");
-                Ok(StmtPath { program, at: start })
-            }
-            Err(_) => err(start, QlErrorKind::BadPath),
         }
     }
 
@@ -583,7 +726,23 @@ impl Parser<'_> {
                 self.bump();
             }
             Tok::Colon => return err(self.at(), QlErrorKind::SliceUnionUnsupported),
-            _ => return err(self.at(), QlErrorKind::Expected("a document path")),
+            Tok::Ident(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Dot
+            | Tok::Comma
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => return err(self.at(), QlErrorKind::Expected("a document path")),
         }
         match self.kind() {
             Tok::RBracket => {
@@ -591,7 +750,25 @@ impl Parser<'_> {
                 Ok(())
             }
             Tok::Comma | Tok::Colon => err(self.at(), QlErrorKind::SliceUnionUnsupported),
-            _ => err(self.at(), QlErrorKind::Expected("']'")),
+            Tok::Ident(_)
+            | Tok::Quoted(_)
+            | Tok::Str(_)
+            | Tok::Int(_)
+            | Tok::Float(_)
+            | Tok::Pseudo(_)
+            | Tok::Star
+            | Tok::Dot
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::Semi
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge
+            | Tok::End => err(self.at(), QlErrorKind::Expected("']'")),
         }
     }
 }

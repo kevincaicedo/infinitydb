@@ -175,7 +175,7 @@ pub(super) fn drive_idle_phase(
                         c.state = IdleState::Closed { at: now };
                         report.idle_survived += 1;
                     }
-                    _ => {}
+                    IdleKind::Plain | IdleKind::Subscriber => {}
                 }
             }
             IdleState::Refused | IdleState::Closed { .. } => {}

@@ -146,6 +146,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// one — everything else evaluates in full. A path that fails to
     /// compile never prunes (the command will fail with its own error).
     #[cfg(feature = "doc")]
+    #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column json_path")]
     pub(super) fn json_mutation_path(
         &self,
         id: CommandId,
@@ -278,6 +279,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     /// per write key, the key + the current post-image + record overhead,
     /// plus every argument byte (covers APPEND/SETRANGE growth). Checked
     /// *before* execution so a mutation is never applied unlogged.
+    #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column effect_bytes")]
     fn estimate_effect_bytes(
         &self,
         ns: NsId,

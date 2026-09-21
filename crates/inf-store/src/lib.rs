@@ -6,6 +6,11 @@
 //! effect/record vocabulary (ADR-0012 D1 / ADR-0015 D7) — it still never
 //! opens a file.
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod address_space;
 mod catalog;

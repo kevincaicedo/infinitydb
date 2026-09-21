@@ -248,7 +248,7 @@ impl Reply {
         match self {
             Reply::Err(e) => Some(e),
             Reply::Int(0) => Some("condition failed"),
-            _ => None,
+            Reply::Ok | Reply::Value(_) | Reply::Int(_) => None,
         }
     }
 
@@ -1014,7 +1014,9 @@ impl Model {
                     }
                     q.insert(pos, entry);
                 }
-                _ => q.push_back(entry),
+                Acquisition::WithdrawnTxidSorted
+                | Acquisition::Canonical
+                | Acquisition::Reschedule { .. } => q.push_back(entry),
             }
         }
         self.try_grant(owner, txn);
@@ -1090,7 +1092,9 @@ impl Model {
                     self.exec_fan(txn);
                 }
             }
-            _ => self.parallel_reply(txn),
+            Acquisition::WithdrawnTxidSorted | Acquisition::Reschedule { .. } => {
+                self.parallel_reply(txn)
+            }
         }
     }
 
@@ -1183,7 +1187,9 @@ impl Model {
         let t = &self.txns[txn];
         t.stages[si].dep.map(|i| match &t.program[i] {
             Cmd::Dep(dep) => (i, dep.clone()),
-            cmd => unreachable!("a stage closes with a dependent command, not {cmd:?}"),
+            cmd @ (Cmd::Set(_) | Cmd::Get(_)) => {
+                unreachable!("a stage closes with a dependent command, not {cmd:?}")
+            }
         })
     }
 
@@ -1299,7 +1305,7 @@ impl Model {
                         replies.push((i, Reply::Ok));
                     }
                 }
-                _ => {}
+                Cmd::Set(_) | Cmd::Get(_) | Cmd::Dep(_) => {}
             }
         }
         if !self.rules.stage_privately && !failed {
@@ -1735,7 +1741,7 @@ impl Model {
     pub fn outcome(&self, txn: usize) -> Outcome {
         match &self.txns[txn].phase {
             Phase::Terminal(o) => o.clone(),
-            _ => Outcome::Stuck,
+            Phase::Acquiring | Phase::Cancelling | Phase::Executing => Outcome::Stuck,
         }
     }
 

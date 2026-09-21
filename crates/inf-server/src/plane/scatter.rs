@@ -40,7 +40,10 @@ impl CountedFold {
                     .error(&format!("ERR cross-cell execution failed ({code:?})"));
                 bytes
             }
-            other => {
+            other @ (OwnedOutcome::Ok
+            | OwnedOutcome::Bytes(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)) => {
                 let mut bytes = Vec::new();
                 RespWriter::new(&mut bytes, proto).error(&format!(
                     "ERR internal: a counted leg returned {} instead of a count (fail-closed)",
@@ -196,7 +199,11 @@ async fn run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     match send_apply(shared, cell, ApplyOrigin::Program, proto, db, argv).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Bytes(bytes) => bytes,
-            outcome => render_outcome(shared, outcome, proto),
+            outcome @ (OwnedOutcome::Ok
+            | OwnedOutcome::Int(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)
+            | OwnedOutcome::Err(_)) => render_outcome(shared, outcome, proto),
         },
         Err(refusal) => refusal,
     }
@@ -337,7 +344,11 @@ async fn scatter_run_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
             match send_apply_ns(shared, cell, ApplyOrigin::Program, proto, ns, argv).await {
                 Ok(waiter) => match waiter.await {
                     OwnedOutcome::Bytes(bytes) => bytes,
-                    outcome => render_outcome(shared, outcome, proto),
+                    outcome @ (OwnedOutcome::Ok
+                    | OwnedOutcome::Int(_)
+                    | OwnedOutcome::Nil
+                    | OwnedOutcome::Bool(_)
+                    | OwnedOutcome::Err(_)) => render_outcome(shared, outcome, proto),
                 },
                 Err(refusal) => refusal,
             }
@@ -361,7 +372,13 @@ async fn count_on<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     match send_apply(shared, cell, ApplyOrigin::Program, Protocol::Resp2, db, &[name, key]).await {
         Ok(waiter) => match waiter.await {
             OwnedOutcome::Int(n) => Ok(n),
-            _ => Err(error_reply(shared, proto, "ERR cross-cell execution failed")),
+            OwnedOutcome::Ok
+            | OwnedOutcome::Bytes(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)
+            | OwnedOutcome::Err(_) => {
+                Err(error_reply(shared, proto, "ERR cross-cell execution failed"))
+            }
         },
         Err(refusal) => Err(refusal),
     }
@@ -409,6 +426,7 @@ pub(super) async fn program_msetnx<O: PlaneObserver + 'static, F: SegmentFs + Cl
 /// Cross-owner moves snapshot first, put second, and conditionally remove
 /// the source last (ADR-0110). A refused put cannot destroy the source;
 /// failed cleanup may retain a copy. Full cross-cell atomicity belongs to M6.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column scatter")]
 pub(super) async fn program_move<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -631,7 +649,13 @@ pub(super) async fn program_keys<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 total += n;
                 bodies.push((bytes, off));
             }
-            _ => return error_reply(shared, proto, "ERR cross-cell execution failed"),
+            OwnedOutcome::Ok
+            | OwnedOutcome::Int(_)
+            | OwnedOutcome::Nil
+            | OwnedOutcome::Bool(_)
+            | OwnedOutcome::Err(_) => {
+                return error_reply(shared, proto, "ERR cross-cell execution failed");
+            }
         }
     }
     let mut reply = shared.take_reply_buf();

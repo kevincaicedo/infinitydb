@@ -548,7 +548,7 @@ impl Run {
                         .push(format!("{when}: collision verdict on a same-key twin"));
                 }
             }
-            _ => {}
+            inf_store::ShadowVerdict::Stale | inf_store::ShadowVerdict::Deferred => {}
         }
     }
 
@@ -650,7 +650,9 @@ impl Run {
                     .violations
                     .push(format!("{when}: drain — collision verdict on a same-key twin")),
                 inf_store::ShadowVerdict::Collision => self.report.shadow_collision += 1,
-                _ => {}
+                inf_store::ShadowVerdict::SameKey
+                | inf_store::ShadowVerdict::Stale
+                | inf_store::ShadowVerdict::Deferred => {}
             }
         }
         self.report.shadow_drain_checks += 1;
@@ -807,10 +809,15 @@ impl Run {
                         self.model.insert(key.to_vec(), Expect { value, extent: None });
                         return;
                     }
-                    _ => Op::Set(value),
+                    inf_store::ShadowProbe::RamHit(_)
+                    | inf_store::ShadowProbe::Miss
+                    | inf_store::ShadowProbe::NoCandidate
+                    | inf_store::ShadowProbe::One(_)
+                    | inf_store::ShadowProbe::Ticketed(_)
+                    | inf_store::ShadowProbe::Many => Op::Set(value),
                 }
             }
-            other => other,
+            other @ (Op::Set(_) | Op::SetBlob(_) | Op::Del) => other,
         };
         // The plane's resolve: RAM verifies in place; a cold candidate is
         // read and its full key compared, a mismatch (a fingerprint false
@@ -1602,7 +1609,13 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                             )
                             .expect("fits");
                     }
-                    _ => {}
+                    RecordView::Delete { .. }
+                    | RecordView::ExpireAt { .. }
+                    | RecordView::NsOp { .. }
+                    | RecordView::CkptBegin { .. }
+                    | RecordView::DocDelta { .. }
+                    | RecordView::DocFull { .. }
+                    | RecordView::ColdDisplace { .. } => {}
                 }
                 Ok::<(), std::convert::Infallible>(())
             },
@@ -1665,7 +1678,11 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                     }
                     table.apply_delete(key, hash);
                 }
-                other => {
+                other @ (RecordView::ExpireAt { .. }
+                | RecordView::NsOp { .. }
+                | RecordView::CkptBegin { .. }
+                | RecordView::DocDelta { .. }
+                | RecordView::DocFull { .. }) => {
                     run.report.violations.push(format!("modeled tail carries {other:?}"));
                     run.report.state_hash = run.report.state.value();
                     return run.report;

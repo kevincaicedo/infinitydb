@@ -32,7 +32,14 @@ pub(super) fn handle_fabric_op<O: PlaneObserver + 'static, F: SegmentFs + Clone 
                 handle_fabric_leaf(shared, now, from, leaf, scratch, staged, pubs, gated, orphans);
             }
         }
-        leaf => handle_fabric_leaf(shared, now, from, leaf, scratch, staged, pubs, gated, orphans),
+        leaf @ (Op::Read { .. }
+        | Op::Write { .. }
+        | Op::Apply { .. }
+        | Op::ApplyNs { .. }
+        | Op::Reply { .. }
+        | Op::AdoptConn { .. }) => {
+            handle_fabric_leaf(shared, now, from, leaf, scratch, staged, pubs, gated, orphans)
+        }
     }
 }
 
@@ -50,7 +57,12 @@ fn drop_nested_batch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     while let Some(op) = pending.pop() {
         match op {
             Op::Batch { ops } => pending.extend(ops),
-            _ => dropped += 1,
+            Op::Read { .. }
+            | Op::Write { .. }
+            | Op::Apply { .. }
+            | Op::ApplyNs { .. }
+            | Op::Reply { .. }
+            | Op::AdoptConn { .. } => dropped += 1,
         }
     }
     shared.nested_batch_ops_dropped.set(shared.nested_batch_ops_dropped.get() + dropped);
@@ -103,7 +115,11 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     buf.extend_from_slice(bytes);
                     OwnedOutcome::Bytes(buf)
                 }
-                other => OwnedOutcome::own(other),
+                other @ (Outcome::Ok
+                | Outcome::Int(_)
+                | Outcome::Nil
+                | Outcome::Bool(_)
+                | Outcome::Err(_)) => OwnedOutcome::own(other),
             };
             if !shared.gate.complete(token.0, owned) {
                 *orphans += 1;
@@ -517,7 +533,12 @@ pub(super) fn stage_or_handle<O: PlaneObserver + 'static, F: SegmentFs + Clone +
                 );
             }
         }
-        leaf => stage_or_handle_leaf(
+        leaf @ (Op::Read { .. }
+        | Op::Write { .. }
+        | Op::Apply { .. }
+        | Op::ApplyNs { .. }
+        | Op::Reply { .. }
+        | Op::AdoptConn { .. }) => stage_or_handle_leaf(
             shared,
             now,
             from,
@@ -573,7 +594,12 @@ fn stage_or_handle_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stat
         // A batch inside a batch: nothing executes, so no order barrier —
         // dropped whole and counted (F-L18-06).
         Op::Batch { ops } => drop_nested_batch(shared, ops),
-        other => {
+        other @ (Op::Read { .. }
+        | Op::Write { .. }
+        | Op::Apply { .. }
+        | Op::ApplyNs { .. }
+        | Op::Reply { .. }
+        | Op::AdoptConn { .. }) => {
             flush_apply_stage(shared, stage, stage_bytes, scratch, staged, pubs);
             handle_fabric_leaf(shared, now, from, other, scratch, staged, pubs, gated, orphans);
         }

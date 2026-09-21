@@ -52,14 +52,14 @@ impl Image {
     fn hot(self) -> u64 {
         match self {
             Image::Hot(b) => b,
-            _ => 0,
+            Image::Absent | Image::Cold(_) => 0,
         }
     }
 
     fn extent(self) -> u64 {
         match self {
             Image::Cold(b) => b,
-            _ => 0,
+            Image::Absent | Image::Hot(_) => 0,
         }
     }
 }

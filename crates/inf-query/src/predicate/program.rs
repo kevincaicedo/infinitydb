@@ -357,7 +357,11 @@ pub fn encode(root: &Predicate) -> Result<PredicateProgram, PredicateBuildError>
                 expr.push(OP_NOT);
                 work.push((inner, depth + 1));
             }
-            leaf => encode_leaf(leaf, &mut pools, &mut expr)?,
+            leaf @ (Predicate::Cmp { .. }
+            | Predicate::Between { .. }
+            | Predicate::BeginsWith { .. }
+            | Predicate::In { .. }
+            | Predicate::Exists { .. }) => encode_leaf(leaf, &mut pools, &mut expr)?,
         }
     }
     assemble(&pools, &expr)

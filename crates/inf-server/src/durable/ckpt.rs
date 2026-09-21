@@ -97,7 +97,7 @@ fn tier_walk_step<F: SegmentFs>(
                         }
                         // Documents are not command-reachable on tiered
                         // namespaces in M4 — a doc image here is a bug.
-                        other => {
+                        other @ inf_store::TypeTag::JsonDoc => {
                             debug_assert!(false, "tiered walk met a {other:?} record");
                             return true;
                         }

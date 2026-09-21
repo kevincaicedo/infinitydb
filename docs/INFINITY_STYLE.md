@@ -268,8 +268,15 @@ capacity for every small value.
 - **Use the smallest type that preserves the contract.** Return `Result`
   when an operation can fail, `Option` for legitimate absence, and an enum
   for distinct outcomes. Never collapse corruption, refusal, absence, and
-  success into a boolean or sentinel to simplify a call site. Avoid
-  wildcard matches that silently accept a new state or error variant.
+  success into a boolean or sentinel to simplify a call site. A
+  production `match` names every variant of its enum: a wildcard arm
+  silently accepts a new state or error variant, so
+  `clippy::wildcard_enum_match_arm` and
+  `clippy::match_wildcard_for_single_variants` are denied at every crate
+  root (ADR-0144 D1; `scripts/check-lint-scopes.sh`). The two reasoned
+  exceptions are a foreign `#[non_exhaustive]` enum (`foreign:` — say
+  what the rest means) and the frozen `CommandId` list that ADR-0143's
+  table deletes.
   `None` must not mean both "missing" and "wrong type"; a bounded or
   truncated read is its own variant, never absence. **Never infer an
   outcome from encoded output** — a reply's first byte, a length, an

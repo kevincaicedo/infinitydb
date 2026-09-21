@@ -14,6 +14,11 @@
 //! Allowed edges: `inf-foundation`, `inf-doc`, `inf-store` — never RESP,
 //! sockets, raw record memory, or log files (L11).
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 pub mod access;
 pub mod page;

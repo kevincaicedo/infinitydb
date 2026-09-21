@@ -1328,7 +1328,17 @@ fn op_from_doc(e: DocError) -> OpError {
     match e {
         DocError::ArenaExhausted => OpError::OutOfMemory,
         DocError::TooLarge { .. } => OpError::TooLarge,
-        other => {
+        other @ (DocError::Truncated
+        | DocError::BadMagic
+        | DocError::UnsupportedVersion(_)
+        | DocError::UnsupportedFlags(_)
+        | DocError::DepthExceeded
+        | DocError::BadTag(_)
+        | DocError::BadLength
+        | DocError::NonCanonical(_)
+        | DocError::BadUtf8
+        | DocError::BadKey
+        | DocError::NonFiniteNumber) => {
             debug_assert!(false, "unexpected DocError from validated document: {other}");
             OpError::TooLarge
         }
