@@ -103,12 +103,30 @@ fn write_log(root: &Path, frames: usize, per_frame: usize) {
     drop(rotor);
 }
 
-/// Names of every thread in this process, from `/proc/self/task`.
+/// The kernel's `PF_EXITING` task flag (`include/linux/sched.h`).
+const PF_EXITING: u64 = 0x4;
+
+/// Names of every thread of this process still running user code, from
+/// `/proc/self/task`. A task with `PF_EXITING` set is excluded: `join`
+/// returns when the kernel clears the thread's tid — inside `do_exit`,
+/// before the task is unhashed from `/proc` — so a joined worker can be
+/// listed for a few more microseconds (measured under load: state `R`,
+/// flags `0x40004c`, gone after 94 µs; 2 of 300 runs counted it). A
+/// worker that was never stopped carries no such flag and is still
+/// counted, which is what `assert_a_live_prefetch_thread_is_counted` pins.
 fn thread_names() -> Vec<String> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir("/proc/self/task").expect("procfs") {
-        let comm = entry.expect("task").path().join("comm");
-        if let Ok(name) = std::fs::read_to_string(comm) {
+        let task = entry.expect("task").path();
+        let Ok(name) = std::fs::read_to_string(task.join("comm")) else { continue };
+        let Ok(stat) = std::fs::read_to_string(task.join("stat")) else { continue };
+        // Fields after the parenthesised comm: state is 0, flags is 6.
+        let exiting = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(6))
+            .and_then(|flags| flags.parse::<u64>().ok())
+            .is_some_and(|flags| flags & PF_EXITING != 0);
+        if !exiting {
             names.push(name.trim().to_string());
         }
     }
@@ -117,6 +135,35 @@ fn thread_names() -> Vec<String> {
 
 fn live_prefetch_threads() -> usize {
     thread_names().iter().filter(|n| n.as_str() == "inf-readahead").count()
+}
+
+/// The oracle's canary: a worker that is alive is counted — excluding
+/// exiting tasks must not blind the scan to a leaked one. Called from the
+/// scoping test itself (one scanner per process: a second test's live
+/// worker would be this one's false positive).
+fn assert_a_live_prefetch_thread_is_counted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let started = std::sync::Arc::new(AtomicBool::new(false));
+    let (seen, running) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&started));
+    let worker = std::thread::Builder::new()
+        .name("inf-readahead".into())
+        .spawn(move || {
+            // The name is set by the thread itself, before this closure runs.
+            running.store(true, Ordering::Release);
+            while !seen.load(Ordering::Acquire) {
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
+            }
+        })
+        .expect("spawn");
+    while !started.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    assert_eq!(live_prefetch_threads(), 1, "a parked worker is a live thread");
+    stop.store(true, Ordering::Release);
+    worker.thread().unpark();
+    worker.join().expect("join");
+    assert_eq!(live_prefetch_threads(), 0, "a joined worker is not");
 }
 
 /// Recovers the log at `root` with the given arm; returns the digest and
@@ -134,6 +181,7 @@ fn recover(root: &Path, boot_prefetch: bool) -> (StateDigest, u64) {
 
 #[test]
 fn boot_prefetch_is_scoped_to_recovery_and_changes_no_byte() {
+    assert_a_live_prefetch_thread_is_counted();
     let root = scratch("scoped");
     write_log(&root, 24, 16);
     assert_eq!(live_prefetch_threads(), 0, "clean start");
