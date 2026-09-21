@@ -259,8 +259,8 @@ impl FrameBuilder {
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "bound: buf.len() >= at (new/reset), at <= buf.len() <= isize::MAX and the \
-                  padded length is a u32, so each sum fits the 64-bit usize inf-foundation asserts; \
-                  FRAME_ALIGN is a non-zero const"
+                  padded length is a u32, so each sum fits the 64-bit usize inf-foundation \
+                  asserts; FRAME_ALIGN is a non-zero const"
     )]
     pub fn finalize(
         &mut self,
