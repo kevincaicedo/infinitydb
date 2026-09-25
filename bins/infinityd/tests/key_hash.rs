@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
+#![allow(
     clippy::disallowed_methods,
     reason = "test target: harness deadlines and stamps, not cell code"
 )]

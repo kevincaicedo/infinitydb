@@ -4,6 +4,30 @@
 
 use super::*;
 
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
+    fn arm_initial_listener(&mut self, cx: &mut LoopCx<'_>) -> bool {
+        use crate::cache_boot::CacheBootStatus;
+
+        match self.shared.node.cache_boot.status() {
+            CacheBootStatus::Pending => return false,
+            CacheBootStatus::Failed => {
+                self.boot_error.get_or_insert_with(|| {
+                    std::io::Error::other("a peer failed cache construction before admission")
+                });
+                return false;
+            }
+            CacheBootStatus::Ready => {}
+        }
+        self.started = true;
+        // The listener owns the reserved slot, outside the connection slab.
+        cx.push(IoOp::AcceptArm {
+            listener: self.listener,
+            token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
+        });
+        true
+    }
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for ServerPlane<O, F> {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match c.result {
@@ -234,7 +258,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         {
             cell.on_everysec_tick(cx);
         }
-        if key == ACCEPT_RETRY_TIMER_KEY {
+        if key == ACCEPT_RETRY_TIMER_KEY && self.started {
             // Idempotent on an armed listener; resumes a parked one. A
             // still-exhausted accept fails again → one more count and one
             // more window (bounded by wall time, F-L11-02).
@@ -418,15 +442,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     }
 
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
-        if !self.started {
-            self.started = true;
-            // The listener rides the reserved top slot no connection ever
-            // holds (F-L11-05): an accept-class completion can never share
-            // `{slot, generation}` with a live connection.
-            cx.push(IoOp::AcceptArm {
-                listener: self.listener,
-                token: CompletionToken::new(TokenClass::Accept, CONN_SLOT_CAP, 0),
-            });
+        if !self.started && !self.arm_initial_listener(cx) {
+            return;
         }
         if !self.everysec_armed && self.shared.durable.borrow().is_some() {
             self.everysec_armed = true;

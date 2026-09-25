@@ -31,6 +31,7 @@
 //! ```
 
 use std::fmt;
+#[allow(clippy::disallowed_types, reason = "boot: persisted key hash before serving")]
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -164,6 +165,7 @@ pub enum KeyHashSource {
 /// # Errors
 /// A present-but-malformed file, or one readable beyond its owner
 /// (never a silent default).
+#[allow(clippy::disallowed_types, reason = "boot: persisted key hash before serving")]
 pub fn load_key_hash(data_dir: &Path) -> Result<Option<KeyHasher>, KeyHashError> {
     let mut file = match File::open(data_dir.join(KEY_HASH_FILE)) {
         Ok(file) => file,
@@ -179,6 +181,7 @@ pub fn load_key_hash(data_dir: &Path) -> Result<Option<KeyHasher>, KeyHashError>
 /// ADR-0094 D9: no group/other permission bit on the secret. Unix only —
 /// the product's targets (Linux, the macOS dev tier); elsewhere the mode
 /// model does not exist and the check is vacuous.
+#[allow(clippy::disallowed_types, reason = "boot: persisted key hash before serving")]
 fn require_private(file: &File) -> Result<(), KeyHashError> {
     #[cfg(unix)]
     {
@@ -276,9 +279,11 @@ pub fn render_key_hash(hasher: KeyHasher) -> String {
 /// # Errors
 /// The directory cannot be listed (a missing directory is `false`).
 pub fn directory_has_data(data_dir: &Path) -> io::Result<bool> {
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     if data_dir.join(CATALOG_FILE).exists() {
         return Ok(true);
     }
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -307,10 +312,13 @@ pub fn directory_has_data(data_dir: &Path) -> io::Result<bool> {
 /// owner lock was not held); [`KeyHashError::Permissions`] when the
 /// created file is not private; any I/O failure (the boot refuses; a
 /// half-written secret must never be read back as one).
+#[allow(clippy::disallowed_types, reason = "boot: persisted key hash before serving")]
 pub fn create_key_hash(data_dir: &Path, hasher: KeyHasher) -> Result<(), KeyHashError> {
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     std::fs::create_dir_all(data_dir)?;
     let tmp = data_dir.join(format!("{KEY_HASH_FILE}.tmp"));
     let target = data_dir.join(KEY_HASH_FILE);
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -330,9 +338,11 @@ pub fn create_key_hash(data_dir: &Path, hasher: KeyHasher) -> Result<(), KeyHash
         file.sync_all()?;
     }
     // Publication: `link` never replaces — a present secret is EEXIST.
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     match std::fs::hard_link(&tmp, &target) {
         Ok(()) => {}
         Err(err) => {
+            #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
             let _ = std::fs::remove_file(&tmp);
             return Err(if err.kind() == io::ErrorKind::AlreadyExists {
                 KeyHashError::Contended
@@ -341,6 +351,7 @@ pub fn create_key_hash(data_dir: &Path, hasher: KeyHasher) -> Result<(), KeyHash
             });
         }
     }
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     std::fs::remove_file(&tmp)?;
     File::open(data_dir)?.sync_all()?;
     Ok(())
@@ -373,6 +384,7 @@ pub fn verify_key_hash_binding(
     let secret = hasher.identity();
     let mut report = KeyHashBinding::default();
     let mut shards: Vec<PathBuf> = Vec::new();
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted key hash before serving")]
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(report),
@@ -430,6 +442,7 @@ pub fn resolve_key_hash(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
 

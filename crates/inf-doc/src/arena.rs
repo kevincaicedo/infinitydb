@@ -1056,3 +1056,25 @@ impl<'a> Iterator for ArrIter<'a> {
         Some(v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_alloc::ArenaConfig;
+
+    #[test]
+    fn array_ref_lookup_checks_both_signed_edges() {
+        let bytes = crate::JsonParser::new().parse(b"[10,20,30]").unwrap();
+        let tape = TapeDoc::from_bytes(&bytes).unwrap();
+        let mut arena = Arena::new(ArenaConfig::default());
+        let doc = ArenaDoc::from_tape(&tape, &mut arena).unwrap();
+        for index in [2, -1] {
+            let (_, value) = locate_arr_ref(&arena, doc.root_ref(), index).unwrap();
+            assert_eq!(value.as_inline_int(), 30);
+        }
+        for index in [3, -4, i64::MIN, i64::MAX] {
+            assert!(locate_arr_ref(&arena, doc.root_ref(), index).is_none());
+        }
+        doc.free(&mut arena);
+    }
+}

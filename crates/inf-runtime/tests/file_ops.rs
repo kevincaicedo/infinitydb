@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! File-op conformance (M2-S05, ADR-0013 D1): `LogWrite` + linked/standalone
 //! fdatasync against real files, on every real backend — io_uring exercises
 //! `IOSQE_IO_LINK` + cancellation, kqueue exercises the synchronous fallback

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4.5-S34 (ADR-0086): frame format v3, `Direct` segments, the
 //! zero-fill state machine, the class-upgrade / not-ready rotations, the
 //! `SimDisk` write-through model, and the std tier's pre-zeroing fact.

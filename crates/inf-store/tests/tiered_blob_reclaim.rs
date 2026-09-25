@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4-S18 — extent reclaim + compaction interplay (plan AC 1/AC 2's
 //! store half; ADR-0061 D5/D8 — the decisions were made in S17, this
 //! suite proves them **complete under churn**):

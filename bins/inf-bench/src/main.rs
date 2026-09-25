@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_types,
+    reason = "tool: corpus and campaign files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
     clippy::disallowed_methods,
     reason = "inf-bench is the load generator: the wall clock is its instrument; it drives \
          infinityd over the wire and runs no cell"

@@ -529,7 +529,7 @@ mod tests {
     use super::*;
 
     fn cx(proto: Protocol) -> ConnCx {
-        ConnCx { proto, ..ConnCx::default() }
+        ConnCx { proto, ..ConnCx::try_default().expect("fixture cache allocation") }
     }
 
     #[test]

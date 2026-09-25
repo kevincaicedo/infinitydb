@@ -73,6 +73,13 @@ pub enum RangeEdge {
 }
 
 impl RangeEdge {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Unbounded => 0,
+            Self::Included(bytes) | Self::Excluded(bytes) => bytes.capacity(),
+        }
+    }
+
     /// True when `key` is inside this edge taken as a **lower** bound.
     pub fn admits_from_below(&self, key: &[u8]) -> bool {
         match self {
@@ -124,6 +131,16 @@ pub enum AccessStep {
     Scan,
 }
 
+impl AccessStep {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::PkGet { key } => key.capacity(),
+            Self::IndexRange { lo, hi, .. } => lo.heap_bytes().saturating_add(hi.heap_bytes()),
+            Self::Scan => 0,
+        }
+    }
+}
+
 /// The decoded access program — the compiler's build target and
 /// `decode`'s output. `encode` is the only writer of program bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +154,15 @@ pub struct Access {
     pub limit: Option<u32>,
     pub step: AccessStep,
     pub residual: Option<PredicateProgram>,
+}
+
+impl Access {
+    /// Owned decoded buffers; inline fields are charged by their containing value.
+    pub fn heap_bytes(&self) -> usize {
+        self.step
+            .heap_bytes()
+            .saturating_add(self.residual.as_ref().map_or(0, PredicateProgram::heap_bytes))
+    }
 }
 
 /// `encode` rejection — compiler-side operating conditions. The S09
@@ -202,6 +228,10 @@ impl AccessProgram {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        inf_foundation::rc_allocation_bytes(self.bytes.as_ref())
     }
 
     /// Validate foreign bytes (fabric arrival, fuzz) into a program.

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Durability crash-matrix harness. M2 fault-point coverage lives in
 //! `m2.toml`; M3 document record/checkpoint cuts live in `m3.toml`.
 //! Both are reviewable data, while this crate supplies the shared schema

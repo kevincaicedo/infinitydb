@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! The S09 table-driven suite (plan AC 1): every case compiles one
 //! statement against the fixture catalog and pins either the golden
 //! EXPLAIN rendering or the exact documented rejection string —

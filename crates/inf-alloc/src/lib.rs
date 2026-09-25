@@ -30,5 +30,5 @@ pub use aligned::{AlignedBox, AlignedBufId, AlignedLeak, AlignedPool, TIER_READ_
 pub use arena::{Arena, ArenaAddr, ArenaConfig, ArenaReport};
 pub use buffer_pool::{BufferId, BufferPool, LeaseKind, LeaseLeak};
 #[cfg(any(test, feature = "test-counting-allocator"))]
-pub use counting_allocator::CountingAllocator;
+pub use counting_allocator::{AllocationRefusal, CountingAllocator, RefusalActive};
 pub use region::{REGION_PAGE_BYTES, Region, RegionConfig, RegionReport};

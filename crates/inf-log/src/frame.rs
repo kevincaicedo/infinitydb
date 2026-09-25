@@ -807,6 +807,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn first_lsn_at_the_header_boundary_decodes_v1_and_v2() {
+        let v2 = frame_with_first_offset(FRAME_HEADER_LEN as u32);
+        let mut v1 = v2[..FRAME_HEADER_LEN_V1].to_vec();
+        v1.extend_from_slice(&v2[FRAME_HEADER_LEN..v2.len() - FRAME_TRAILER_LEN]);
+        v1[..4].copy_from_slice(&FRAME_MAGIC_V1);
+        let frame_len = v1.len() as u32 + FRAME_TRAILER_LEN as u32;
+        v1[4..8].copy_from_slice(&frame_len.to_le_bytes());
+        v1[16..20].copy_from_slice(&(FRAME_HEADER_LEN_V1 as u32).to_le_bytes());
+        let crc = crc32c(&v1);
+        v1.extend_from_slice(&crc.to_le_bytes());
+        for (image, header_len) in [(&v1, FRAME_HEADER_LEN_V1), (&v2, FRAME_HEADER_LEN)] {
+            let (frame, consumed) = decode_frame(image, DEFAULT_MAX_FRAME_LEN).unwrap();
+            assert_eq!(consumed, image.len());
+            assert_eq!(frame.first_lsn().offset, header_len as u32);
+            assert_eq!(frame.records().filter(|r| r.is_ok()).count(), 1);
+        }
+    }
+
     /// The bound admits the whole legal range: a frame ending exactly at the
     /// ceiling decodes, and every record walks without panicking.
     #[test]

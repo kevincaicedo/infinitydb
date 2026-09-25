@@ -40,8 +40,8 @@ check:
     ./scripts/check-scripts-selftest.sh
     # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the ambient-
     # clock ban is clippy's type-resolved disallowed-methods; this gate
-    # proves the config is in force on planted bypass spellings and lists
-    # every sanctioned site in cell code.
+    # proves the config is in force on planted bypass spellings; the
+    # common lint-scopes audit lists and checks the sanctioned sites.
     ./scripts/check-clock-ban.sh
     # ADR-0106 second amendment (review 2026-08-30, F-L20-03): the M0-S06
     # AC's own gate ran nowhere and scanned zero instructions per waker.

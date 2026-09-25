@@ -8,7 +8,7 @@ use inf_store::{Keyspace, StoreConfig};
 #[test]
 fn slim_serves_strings_and_refuses_documents() {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    let mut cx = ConnCx::try_default().expect("fixture cache allocation");
     let mut run = |argv: &[&[u8]]| {
         let mut reply = Vec::new();
         execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut reply);

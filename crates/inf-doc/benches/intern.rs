@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M3-S04 interning A/B rows (ADR-0038 D6/D7; dev-tier on this box — the
 //! RSS half of the decision rule re-runs on the reference box at S25).
 //!

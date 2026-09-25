@@ -669,7 +669,7 @@ pub fn ok() -> u64 { 1 }
 EOF
 root=$(printf '%s' "$body" | clock_fixture clock-clean)
 expect green "clock-ban: clean crate under the real config" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-expect_output "clock-ban: scope line discloses config, scan and the skipped probe" "config 9/9 entries, 0 shadow configs, 1 cell crates / 1 files scanned, 0 allowed sites in cell code; probe: skipped (fixture mode)" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+expect_output "clock-ban: scope line discloses config, scan and the skipped probe" "config 9/9 entries, 0 shadow configs, 1 cell-source files; allows audited by check-lint-scopes.sh; probe: skipped (fixture mode)" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 [ -n "$root" ] && rm -f "$root/clippy.toml"
 expect red "clock-ban: no clippy.toml is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 cp clippy.toml "$root/clippy.toml"
@@ -680,57 +680,8 @@ printf 'disallowed-methods = []\n' >"$root/crates/fake/clippy.toml"
 expect red "clock-ban: a shadow clippy.toml in a crate directory is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 [ -n "$root" ] && rm -f "$root/crates/fake/clippy.toml"
 
-for snippet in \
-    '#![allow(clippy::disallowed_methods)] pub fn t() {}' \
-    '#![allow(clippy::style)] pub fn t() {}' \
-    '#![allow(clippy::all)] pub fn t() {}' \
-    '#![allow(warnings)] pub fn t() {}' \
-    '#![expect(clippy::disallowed_methods)] pub fn t() {}' \
-    '#[allow(clippy::all)] pub fn t() {}' \
-    '#[allow(clippy::style)] pub fn t() {}' \
-    '#[allow(clippy::disallowed_methods)] pub fn t() {}' \
-    '#[expect(clippy::disallowed_methods)] pub fn t() {}'
-do
-    root=$(clock_fixture clock-planted <<<"$snippet")
-    expect red "clock-ban: planted '$snippet'" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-done
-# The multi-line shape rustfmt produces, without a reason.
-IFS= read -r -d '' body <<'EOF' || true
-#[allow(
-    clippy::disallowed_methods
-)]
-pub fn t() {}
-EOF
-root=$(printf '%s' "$body" | clock_fixture clock-multiline-bare)
-expect red "clock-ban: a multi-line allow without a reason is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-# Sanctioned shapes: a per-site allow with a reason, one-line and rustfmt's.
-IFS= read -r -d '' body <<'EOF' || true
-#[allow(clippy::disallowed_methods, reason = "control thread: boot narration")]
-pub fn t() {}
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the injected clock's origin"
-)]
-pub fn u() {}
-EOF
-root=$(printf '%s' "$body" | clock_fixture clock-sanctioned)
-expect green "clock-ban: per-site allows with reasons are green" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-expect_output "clock-ban: the one-line site is listed with its reason" "allowed crates/fake/src/lib.rs:1: control thread: boot narration" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-expect_output "clock-ban: the multi-line site is listed with its reason" "allowed crates/fake/src/lib.rs:3: the injected clock's origin" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-expect_output "clock-ban: the scope line counts both" "2 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-# An allow inside a test-only module is not cell code.
-IFS= read -r -d '' body <<'EOF' || true
-pub fn ok() {}
-
-#[cfg(test)]
-mod tests {
-    #[allow(clippy::disallowed_methods)]
-    fn scratch() -> u128 { 0 }
-}
-EOF
-root=$(printf '%s' "$body" | clock_fixture clock-testmod)
-expect green "clock-ban: a bare allow inside a test-only module is stripped" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
-expect_output "clock-ban: the stripped module counts no site" "0 allowed sites in cell code" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
+# Suppression plants moved to the generated lint-scopes matrix below, the
+# single owner of all classes and scopes (ADR-0144 I8).
 
 # ------------------------------------------------------- waker atomics (D8)
 # ADR-0106 second amendment (review 2026-08-30 F-L20-03). The gate's three
@@ -1431,6 +1382,9 @@ ls_root() {
     [ -n "$1" ] && [ -n "$work" ] || { echo "ls_root: empty name" >&2; exit 2; }
     [ -e "$root" ] && rm -rf "$root"
     mkdir -p "$root/crates/fake/src" "$root/bins/fake/src" "$root/docs" "$root/scripts"
+    for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
+        mkdir -p "$root/${entry%%|*}"
+    done
     printf 'name = "fake"\n' >"$root/crates/fake/Cargo.toml"
     printf 'name = "fakebin"\n' >"$root/bins/fake/Cargo.toml"
     printf '%s\npub fn f() {}\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
@@ -1456,8 +1410,8 @@ ls_case() {
     printf '%s\n%s\n' "$LS_ATTR" "$body" >"$root/crates/fake/src/lib.rs"
     expect "$want" "lint-scopes: $label" ls_run "$root"
 }
-for lint in wildcard_enum_match_arm match_wildcard_for_single_variants cast_possible_truncation arithmetic_side_effects too_many_lines; do
-    case "$lint" in too_many_lines) cls=shape ;; cast_*|arith*) cls=bound ;; *) cls=foreign ;; esac
+while IFS=$'\t' read -r lint scope cls; do
+    cls=${cls%:}
     ls_case red "$lint — allow without a reason" "#[allow(clippy::$lint)]
 pub fn f() {}"
     ls_case red "$lint — expect hides it" "#[expect(clippy::$lint, reason = \"$cls: x\")]
@@ -1477,7 +1431,79 @@ pub fn f() {}"
     reason = \"$cls: stated over two lines, through another attribute\"
 )]
 pub fn f() {}"
-done
+done < <(env INF_LINT_RULES=1 "$LINTSCOPES")
+ls_case red "filesystem methods cannot be allowed on a whole function" '#[allow(clippy::disallowed_methods, reason = "boot: filesystem setup")]
+pub fn f() {}'
+ls_case green "filesystem method allow is on its statement" 'pub fn f() {
+    #[allow(clippy::disallowed_methods, reason = "boot: filesystem setup")]
+    let _ = std::fs::read("config");
+}'
+ls_case red "a combined allow must satisfy every lint class" '#[allow(clippy::disallowed_types, clippy::arithmetic_side_effects, reason = "boot: file handle")]
+pub fn f() {}'
+ls_case red "type aliases cannot launder disallowed types" '#[allow(clippy::disallowed_types, reason = "boot: alias")]
+type F = std::fs::File;'
+ls_case green "test-only module remains outside the API audit" '#[allow(clippy::disallowed_methods, clippy::disallowed_types, reason = "test-only: scratch files")]
+#[cfg(test)]
+mod tests {
+    fn f() { let _ = std::fs::read("scratch"); }
+}'
+ls_case green "bare test-only API allow is outside production" '#[cfg(test)]
+mod tests {
+    #[allow(clippy::disallowed_methods)]
+    fn f() {}
+}'
+ls_case red "a group cannot hide behind an allowed lint" '#[allow(clippy::all, clippy::arithmetic_side_effects, reason = "bound: fixture")]
+pub fn f() {}'
+# Resolved diagnostics use the same structural audit. These fixtures exercise
+# class laundering and missing carriers; the real probe supplies compiler rows.
+ls_api_diag() {
+    python3 - "$root" "$1" "$2" <<'PY'
+import json, sys
+from pathlib import Path
+root, api, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+source = root / "crates/fake/src/lib.rs"
+line = next(n for n, text in enumerate(source.read_text().splitlines(), 1) if "let _ =" in text)
+rows = []
+for _ in range(count):
+    if api != "none":
+        rows.append({"reason": "compiler-message", "message": {
+            "code": {"code": "clippy::disallowed_methods"},
+            "message": f"use of a disallowed method `{api}`",
+            "spans": [{"is_primary": True, "file_name": "crates/fake/src/lib.rs", "line_start": line}]
+        }})
+    rows.append({"reason": "build-finished", "success": True})
+(root / "api.json").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+PY
+}
+ls_api_run() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$root/api.json" "$LINTSCOPES"; }
+ls_case green "filesystem statement fixture" 'pub fn f() {
+    #[allow(clippy::disallowed_methods, reason = "boot: fixture")]
+    let _ = std::fs::read("config");
+}'
+ls_api_diag std::fs::read 2
+expect green "lint-scopes: resolved filesystem call under boot" ls_api_run
+ls_api_diag std::time::Instant::now 2
+expect red "lint-scopes: boot allow cannot hide a clock read" ls_api_run
+ls_api_diag std::fs::read 1
+expect red "lint-scopes: missing feature-set carrier" ls_api_run
+ls_api_diag none 2
+expect red "lint-scopes: force-warn carrier produced no calls" ls_api_run
+ls_api_diag std::fs::read 2
+sed -i.bak '1d' "$root/api.json"
+expect red "lint-scopes: one feature-set carrier emitted no calls" ls_api_run
+ls_api_diag std::fs::read 2
+printf '\n#[allow(clippy::disallowed_types, reason = "boot: fixture handle")]\npub struct Handle { pub file: std::fs::File }\n' >>"$root/crates/fake/src/lib.rs"
+expect red "lint-scopes: method warnings cannot stand in for the type carrier" ls_api_run
+ls_case green "clock function fixture" '#[allow(clippy::disallowed_methods, reason = "clock: injected origin")]
+pub fn f() {
+    let _ = std::time::Instant::now();
+}'
+ls_api_diag std::time::Instant::now 2
+expect green "lint-scopes: resolved clock call under clock" ls_api_run
+ls_api_diag std::fs::read 2
+expect red "lint-scopes: clock function cannot hide a filesystem call" ls_api_run
+ls_api_diag std::thread::sleep 2
+expect red "lint-scopes: clock function cannot hide a blocking sleep" ls_api_run
 for group in clippy::pedantic clippy::restriction clippy::style clippy::all warnings; do
     ls_case red "group suppression $group" "#[allow($group)]
 pub fn f() {}"
@@ -1614,7 +1640,7 @@ expect red "lint-scopes: a table deleted from under the gate is not a bootstrap"
 # for an unrelated reason, are both red (ADR-0144 D5's probe rule).
 root=$(ls_root ls-probe)
 ls_probe() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_PROBE=on INF_LINT_PROBE_SRC="$1" "$LINTSCOPES"; }
-expect green "lint-scopes: the shipped probe draws every planted lint" ls_probe "$SCRIPT_DIR/lint-scope-probe"
+expect green "lint-scopes: stable plants draw their lints and the unstable call is refused" ls_probe "$SCRIPT_DIR/lint-scope-probe"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-inert"
 sed -i.bak 's|Three::B \| Three::C => 0, // CONTROL|Three::B \| Three::C => 0, // PLANT clippy::wildcard_enum_match_arm|' "$work/probe-inert/src/lib.rs"
 expect red "lint-scopes: a plant that compiles clean" ls_probe "$work/probe-inert"
@@ -1624,6 +1650,38 @@ expect red "lint-scopes: a probe that fails for an unrelated reason" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unmarked"
 sed -i.bak 's|_ => 0, // PLANT clippy::match_wildcard_for_single_variants|_ => 0,|' "$work/probe-unmarked/src/lib.rs"
 expect red "lint-scopes: a diagnostic on a line with no marker" ls_probe "$work/probe-unmarked"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-wrong-path"
+sed -i.bak 's|PLANT clippy::disallowed_methods std::fs::read$|PLANT clippy::disallowed_methods std::fs::write|' "$work/probe-wrong-path/src/filesystem.rs"
+expect red "lint-scopes: the right lint naming the wrong API is red" ls_probe "$work/probe-wrong-path"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-missing-api"
+sed -i.bak '/pub fn write/,/^    }/d' "$work/probe-missing-api/src/filesystem.rs"
+expect red "lint-scopes: a config entry without a plant is red" ls_probe "$work/probe-missing-api"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
+sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
+expect red "lint-scopes: an unreachable config entry is red" ls_probe "$work/probe-unreachable-api"
+
+# ADR-0144 A1: keep the unstable refusal distinct from Clippy witnesses.
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-stable"
+sed -i.bak 's|std::fs::set_times(path, std::fs::FileTimes::new())|std::fs::metadata(path)|' "$work/probe-unstable-stable/unstable/set_times.rs"
+expect red "lint-scopes: replacing the unstable call with a stable operation is red" ls_probe "$work/probe-unstable-stable"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-type"
+printf 'pub fn unrelated() -> u8 { "not a u8" }\n' >>"$work/probe-unstable-type/unstable/set_times.rs"
+expect red "lint-scopes: an unrelated error alongside the unstable refusal is red" ls_probe "$work/probe-unstable-type"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-missing"
+sed -i.bak '/let _ =/d' "$work/probe-unstable-missing/unstable/set_times.rs"
+expect red "lint-scopes: removing the unstable call is red" ls_probe "$work/probe-unstable-missing"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-config"
+sed 's|std::fs::set_times|std::fs::File::set_times|' clippy.toml >"$work/probe-unstable-config/clippy.toml"
+expect red "lint-scopes: changing the configured unstable path is red" ls_probe "$work/probe-unstable-config"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-feature"
+sed -i.bak 's|E0658 fs_set_times |E0658 wrong_feature |' "$work/probe-unstable-feature/unstable/set_times.rs"
+expect red "lint-scopes: the unstable feature must match its census" ls_probe "$work/probe-unstable-feature"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
+cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
+expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
+
+expect green "cache-capacity canary judge rejects stale, missing and false-red receipts" \
+    python3 "$SCRIPT_DIR/check-cache-capacity-canaries.py" --self-test
 
 # ----------------------------------------------------------------- verdict
 if [ "$fail" -ne 0 ]; then

@@ -8,6 +8,8 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+pub mod filesystem;
+
 pub enum Three {
     A,
     B,
@@ -75,7 +77,7 @@ pub mod decoder {
 
     // C10: a client `i64` index narrowed with `as`.
     pub fn c10(client_index: i64) -> u32 {
-        client_index as u32 // PLANT clippy::cast_possible_truncation
+        client_index as u32 // PLANT clippy::cast_possible_truncation,clippy::cast_sign_loss
     }
 
     // C11: a slice cursor advanced with `+` by a decoded length.
@@ -102,11 +104,7 @@ pub mod decoder {
 pub mod casts_only {
     #![cfg_attr(
         not(test),
-        deny(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_possible_wrap
-        )
+        deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
     )]
 
     pub fn narrowing(decoded_len: u64) -> u32 {

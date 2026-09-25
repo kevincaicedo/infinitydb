@@ -14,9 +14,14 @@
 //! cursors never cross a suspension boundary; resume re-derives them);
 //! the match set is capped with a typed error.
 
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
+
 use core::ops::ControlFlow;
 
-use crate::cursor::{ArrEntries, DocValue, ObjEntries};
+use crate::cursor::{ArrCursor, ArrEntries, DocValue, ObjEntries};
 
 use super::PathProgram;
 use super::program::{Op, read_op};
@@ -92,6 +97,10 @@ impl Matches {
     /// mutation planner branches on. Overlap detection is an adjacent
     /// prefix check: in lexicographic order every strict ancestor sorts
     /// immediately into its descendant run.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "bound: record refuses growth when spans.len() >= its u32 cap; spans is private"
+    )]
     pub fn canonical(&self) -> CanonicalMatches {
         let mut ids: Vec<u32> = (0..self.spans.len() as u32).collect();
         ids.sort_by(|&a, &b| self.get(a as usize).cmp(self.get(b as usize)));
@@ -109,17 +118,18 @@ impl Matches {
     }
 
     fn record(&mut self, path: &[u32], step: Option<u32>, cap: u32) -> Result<(), EvalError> {
-        let len = path.len() + usize::from(step.is_some());
-        if self.spans.len() as u32 == cap {
+        if self.spans.len() >= cap as usize {
             return Err(EvalError::TooManyMatches);
         }
-        debug_assert!(len <= u16::MAX as usize, "path depth is bounded far below u16");
-        let at = self.steps.len() as u32;
+        let len = path.len().checked_add(usize::from(step.is_some()));
+        let len = len.and_then(|len| u16::try_from(len).ok()).ok_or(EvalError::TooManyMatches)?;
+        let at = u32::try_from(self.steps.len()).map_err(|_| EvalError::TooManyMatches)?;
+        at.checked_add(u32::from(len)).ok_or(EvalError::TooManyMatches)?;
         self.steps.extend_from_slice(path);
         if let Some(s) = step {
             self.steps.push(s);
         }
-        self.spans.push(Span { at, len: len as u16 });
+        self.spans.push(Span { at, len });
         Ok(())
     }
 }
@@ -201,6 +211,19 @@ struct Item<'a> {
     step: Option<u32>,
 }
 
+/// Immutable bytes borrowed only from a validated, size-bounded program.
+/// Carry the slice into the walker without reloading its Vec on each node.
+#[derive(Clone, Copy)]
+struct ProgramView<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ProgramView<'a> {
+    fn new(program: &'a PathProgram) -> Self {
+        Self { bytes: program.as_bytes() }
+    }
+}
+
 pub enum EvalStep {
     Done(Matches),
     /// Budget exhausted: owned state, **no document borrows** (the
@@ -280,8 +303,8 @@ fn run<'a>(
     mut budget: u64,
     resume: Option<Box<EvalState>>,
 ) -> Result<EvalStep, EvalError> {
-    let bytes = program.as_bytes();
-    let end = bytes.len() as u32;
+    let program = ProgramView::new(program);
+    let end = program_end(program);
     let mut path: Vec<u32>;
     let mut matches: Matches;
     let mut stack: Vec<Frame<'a>>;
@@ -297,7 +320,7 @@ fn run<'a>(
             matches = Matches::default();
             stack = Vec::new();
             // The Root op (offset 2) selects the root node once.
-            let item = Item { node: root, pc: 3, cont: cont_of(bytes, 3), step: None };
+            let item = Item { node: root, pc: 3, cont: cont_of(program, 3), step: None };
             consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
         }
     }
@@ -305,7 +328,7 @@ fn run<'a>(
         let Some(top) = stack.last_mut() else {
             return Ok(EvalStep::Done(matches));
         };
-        let Some(item) = advance(top, bytes, end) else {
+        let Some(item) = advance(top, program) else {
             let frame = stack.pop().expect("stack top exists");
             if frame.stepped {
                 path.pop();
@@ -464,15 +487,15 @@ where
     if let Some(steps) = program.simple_steps() {
         return visit_simple(steps, root, budget_nodes, on_match);
     }
-    let bytes = program.as_bytes();
-    let end = bytes.len() as u32;
+    let program = ProgramView::new(program);
+    let end = program_end(program);
     let mut frames = VisitFrames::new();
     let mut budget = budget_nodes;
     let mut nodes_visited: u64 = 0;
     // The Root op (offset 2) selects the root node once, unbudgeted —
     // the run() convention, so a completing walk consumes exactly the
     // nodes eval_budgeted would (the congruence tests pin it).
-    let staged = Item { node: root, pc: 3, cont: cont_of(bytes, 3), step: None };
+    let staged = Item { node: root, pc: 3, cont: cont_of(program, 3), step: None };
     if stage_visit(staged, &mut frames, end, &mut on_match).is_break() {
         return VisitOutcome { end: VisitEnd::Stopped, nodes_visited };
     }
@@ -480,7 +503,7 @@ where
         let Some(top) = frames.last_mut() else {
             return VisitOutcome { end: VisitEnd::Complete, nodes_visited };
         };
-        let Some(item) = advance(top, bytes, end) else {
+        let Some(item) = advance(top, program) else {
             frames.pop_discard();
             continue;
         };
@@ -528,7 +551,7 @@ where
                 | DocValue::Arr(_) => None,
             },
             super::program::SimpleStep::Index(index) => match node {
-                DocValue::Arr(items) => resolve_index(index, || items.len() as i64)
+                DocValue::Arr(items) => resolve_index(index, || array_len(items))
                     .and_then(|ordinal| items.index(ordinal as usize)),
                 DocValue::Null
                 | DocValue::Bool(_)
@@ -581,16 +604,46 @@ where
 }
 
 /// Continuation of the op at `pc` (== `end` when `pc` is the last op).
-fn cont_of(bytes: &[u8], pc: u32) -> u32 {
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: ProgramView borrows PathProgram's validated u16::MAX-bounded bytes; \
+              read_op returns at or before its end, including the complete union member region"
+)]
+fn cont_of(program: ProgramView<'_>, pc: u32) -> u32 {
+    let bytes = program.bytes;
     if pc as usize >= bytes.len() {
         return bytes.len() as u32;
     }
     read_op(bytes, pc as usize).1 as u32
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: ProgramView borrows only PathProgram's validated u16::MAX-bounded bytes"
+)]
+fn program_end(program: ProgramView<'_>) -> u32 {
+    program.bytes.len() as u32
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "bound: ArrCursor's tape body length is u24 (each entry uses a byte); its arena \
+              form has a u32 count. Either element count fits i64"
+)]
+fn array_len(array: ArrCursor<'_>) -> i64 {
+    array.len() as i64
+}
+
 /// Advance one frame by one selection. `None` ⇒ the frame is exhausted.
-fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>> {
-    let (op, _) = read_op(bytes, frame.op_at as usize);
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bound: object ordinals are below the tape u24 body or arena u32 count; \
+              the slice guard and resolve_slice keep next in [0, the array's u32 count); \
+              union offsets lie in ProgramView's validated u16::MAX-bounded bytes"
+)]
+fn advance<'a>(frame: &mut Frame<'a>, program: ProgramView<'_>) -> Option<Item<'a>> {
+    let (op, _) = read_op(program.bytes, frame.op_at as usize);
     match op {
         Op::Child(key) => {
             if !matches!(frame.progress, Progress::Fresh) {
@@ -598,12 +651,9 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
             }
             frame.progress = Progress::Done;
             let DocValue::Obj(o) = frame.node else { return None };
-            let (ord, value) = o
-                .iter()
-                .enumerate()
-                .find(|(_, (k, _))| k.as_bytes() == key)
-                .map(|(ord, (_, v))| (ord as u32, v))?;
-            Some(child_item(frame, bytes, end, value, ord))
+            let (ord, (_, value)) = o.iter().enumerate().find(|(_, (k, _))| k.as_bytes() == key)?;
+            let ord = ord as u32;
+            Some(child_item(frame, program, value, ord))
         }
         Op::Index(i) => {
             if !matches!(frame.progress, Progress::Fresh) {
@@ -611,9 +661,9 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
             }
             frame.progress = Progress::Done;
             let DocValue::Arr(a) = frame.node else { return None };
-            let ord = resolve_index(i, || a.len() as i64)?;
+            let ord = resolve_index(i, || array_len(a))?;
             let value = a.index(ord as usize)?;
-            Some(child_item(frame, bytes, end, value, ord))
+            Some(child_item(frame, program, value, ord))
         }
         Op::ChildAny => {
             if let Progress::Fresh = frame.progress {
@@ -632,13 +682,13 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     let (_, value) = it.next()?;
                     let ord = *next_ord;
                     *next_ord += 1;
-                    Some(child_item(frame, bytes, end, value, ord))
+                    Some(child_item(frame, program, value, ord))
                 }
                 Progress::Arr { it, next_ord } => {
                     let value = it.next()?;
                     let ord = *next_ord;
                     *next_ord += 1;
-                    Some(child_item(frame, bytes, end, value, ord))
+                    Some(child_item(frame, program, value, ord))
                 }
                 Progress::Fresh
                 | Progress::Done
@@ -654,7 +704,7 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     frame.progress = Progress::Done;
                     return None;
                 };
-                let (next, stop, step) = resolve_slice(&spec, a.len() as i64);
+                let (next, stop, step) = resolve_slice(&spec, array_len(a));
                 frame.progress = Progress::Slice { next, stop, step };
             }
             let Progress::Slice { next, stop, step } = &mut frame.progress else {
@@ -672,10 +722,9 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
             // cell). With `start`/`stop` clamped by `resolve_slice`, that
             // guard keeps `ord` inside `[0, len)` in both directions.
             *next = next.saturating_add(*step);
-            debug_assert!(ord >= 0, "resolved slice indices are in range");
             let DocValue::Arr(a) = frame.node else { unreachable!("slice progress on array") };
             let value = a.index(ord as usize).expect("resolved slice indices are in range");
-            Some(child_item(frame, bytes, end, value, ord as u32))
+            Some(child_item(frame, program, value, ord as u32))
         }
         Op::Union(u) => {
             let member = match &mut frame.progress {
@@ -721,7 +770,7 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     Some(Item {
                         node: frame.node,
                         pc: sel_at,
-                        cont: cont_of(bytes, sel_at),
+                        cont: cont_of(program, sel_at),
                         step: None,
                     })
                 }
@@ -751,12 +800,11 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
 
 fn child_item<'a>(
     frame: &Frame<'a>,
-    bytes: &[u8],
-    _end: u32,
+    program: ProgramView<'_>,
     value: DocValue<'a>,
     ord: u32,
 ) -> Item<'a> {
-    Item { node: value, pc: frame.next_pc, cont: cont_of(bytes, frame.next_pc), step: Some(ord) }
+    Item { node: value, pc: frame.next_pc, cont: cont_of(program, frame.next_pc), step: Some(ord) }
 }
 
 /// Index resolution: negatives add `len` (the RedisJSON rule), and the
@@ -891,4 +939,32 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
     }
     debug_assert_eq!(step_idx, path.len(), "every path step belongs to a frame");
     frames
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::{EvalError, Matches};
+
+    #[test]
+    fn match_refusal_keeps_both_arenas_unchanged() {
+        let mut matches = Matches::default();
+        matches.record(&[1, 2], Some(3), 1).unwrap();
+        let before = matches.clone();
+        for cap in [0, 1] {
+            assert_eq!(matches.record(&[4], None, cap), Err(EvalError::TooManyMatches));
+            assert_eq!(matches, before);
+        }
+        let too_deep = vec![0; usize::from(u16::MAX)];
+        assert_eq!(matches.record(&too_deep, Some(0), u32::MAX), Err(EvalError::TooManyMatches));
+        assert_eq!(matches, before);
+    }
+
+    #[test]
+    fn match_depth_width_accepts_equality() {
+        let path = vec![7; usize::from(u16::MAX)];
+        let mut matches = Matches::default();
+        matches.record(&path, None, 1).unwrap();
+        assert_eq!(matches.get(0), path);
+        assert_eq!(matches.canonical().ids, [0]);
+    }
 }

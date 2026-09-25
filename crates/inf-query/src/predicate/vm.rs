@@ -26,6 +26,11 @@
 //!   one fuel unit, the flag once, false. Comparable values test
 //!   members left to right, one fuel unit each, stopping at `Equal`.
 
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
+
 use std::cmp::Ordering;
 use std::ops::ControlFlow;
 
@@ -130,6 +135,34 @@ enum Pending {
 }
 
 impl PredicateVm {
+    /// Owned decoded pools and program storage, including backing capacities.
+    pub fn heap_bytes(&self) -> usize {
+        self.heap_bytes_except_program(None)
+    }
+
+    /// The access object and VM normally share their residual program's Rc.
+    /// Only pointer identity permits a retaining statement to charge it once.
+    pub(crate) fn heap_bytes_except_program(&self, shared: Option<&PredicateProgram>) -> usize {
+        let mut bytes = match shared {
+            Some(program) if self.program.shares_allocation(program) => 0,
+            Some(_) | None => self.program.heap_bytes(),
+        };
+        bytes =
+            bytes.saturating_add(self.paths.capacity().saturating_mul(size_of::<PathProgram>()));
+        for path in &self.paths {
+            bytes = bytes.saturating_add(path.heap_bytes());
+        }
+        bytes =
+            bytes.saturating_add(self.constants.capacity().saturating_mul(size_of::<Constant>()));
+        for constant in &self.constants {
+            match constant {
+                Constant::Utf8(text) => bytes = bytes.saturating_add(text.capacity()),
+                Constant::I64(_) | Constant::F64(_) | Constant::Bool(_) => {}
+            }
+        }
+        bytes
+    }
+
     /// Decode the pools of a validated program (cold path — allocates;
     /// the per-statement cache holds the result). Path programs inside
     /// predicates are compiled once here, never re-parsed per eval.
@@ -139,7 +172,8 @@ impl PredicateVm {
         let paths = decode_paths(bytes, &mut at);
         let constants = decode_constants(bytes, &mut at);
         debug_assert!(at < bytes.len(), "validated program ends with an expression");
-        PredicateVm { program: program.clone(), paths, constants, expr_at: at as u32 }
+        let expr_at = u32::try_from(at).expect("validated predicate program fits u32 offsets");
+        PredicateVm { program: program.clone(), paths, constants, expr_at }
     }
 
     /// The bytes this VM evaluates (the S07 canonical form).
@@ -168,7 +202,7 @@ impl PredicateVm {
         loop {
             // Every op decode charges one unit, evaluated or skipped (D6).
             fuel.charge(1)?;
-            let (op, next) = read_op(bytes, pc);
+            let (op, next) = read_op(&self.program, pc);
             pc = next;
             let leaf_verdict = match op {
                 Op::And { arity } => {
@@ -196,7 +230,7 @@ impl PredicateVm {
                 | Op::Exists { .. }) => self.eval_leaf(leaf, root, &mut fuel, &mut flags)?,
             };
             if let Some(verdict) =
-                fold(leaf_verdict, bytes, &mut pc, &mut stack, &mut depth, &mut fuel)?
+                fold(leaf_verdict, &self.program, &mut pc, &mut stack, &mut depth, &mut fuel)?
             {
                 debug_assert_eq!(pc, bytes.len(), "the expression ends exactly at end-of-program");
                 return Ok(EvalOutcome { verdict, flags, fuel_used: fuel.used });
@@ -382,7 +416,7 @@ impl PredicateVm {
 /// unevaluated siblings, `pc` strictly increases, no jump exists.
 fn fold(
     mut verdict: bool,
-    bytes: &[u8],
+    program: &PredicateProgram,
     pc: &mut usize,
     stack: &mut [Pending; NESTING_DEPTH_MAX],
     depth: &mut usize,
@@ -400,7 +434,7 @@ fn fold(
             }
             Pending::And { remaining } => {
                 if !verdict {
-                    skip_operands(bytes, pc, *remaining - 1, fuel)?;
+                    skip_operands(program, pc, *remaining - 1, fuel)?;
                     *depth -= 1; // settled false
                 } else if *remaining == 1 {
                     *depth -= 1; // last operand: settled true
@@ -411,7 +445,7 @@ fn fold(
             }
             Pending::Or { remaining } => {
                 if verdict {
-                    skip_operands(bytes, pc, *remaining - 1, fuel)?;
+                    skip_operands(program, pc, *remaining - 1, fuel)?;
                     *depth -= 1; // settled true
                 } else if *remaining == 1 {
                     *depth -= 1; // settled false
@@ -430,7 +464,7 @@ fn fold(
 /// iteration decodes one op forward and the validated tape holds at
 /// most `OPS_MAX` ops (the fuel charge is the second bound).
 fn skip_operands(
-    bytes: &[u8],
+    program: &PredicateProgram,
     pc: &mut usize,
     count: u8,
     fuel: &mut Fuel,
@@ -438,7 +472,7 @@ fn skip_operands(
     let mut open_operands = u32::from(count);
     while open_operands > 0 {
         fuel.charge(1)?;
-        let (op, next) = read_op(bytes, *pc);
+        let (op, next) = read_op(program, *pc);
         *pc = next;
         open_operands -= 1;
         match op {

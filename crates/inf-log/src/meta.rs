@@ -238,3 +238,36 @@ pub(crate) fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_reader_refuses_an_overreporting_file() {
+        let fs = crate::fs::mem::MemFs::new();
+        let dir = Path::new("shard");
+        fs.create_dir_all(dir).unwrap();
+        write_envelope(&fs, dir, "META.new", "META", b"value").unwrap();
+        fs.overreport_reads();
+        let error = read_envelope(&fs, &dir.join("META")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read_at reported"));
+    }
+
+    #[test]
+    fn declared_payload_length_must_equal_the_envelope_extent() {
+        let good = encode_envelope(b"data").unwrap();
+        assert_eq!(decode_envelope(&good).unwrap(), b"data");
+        for declared in [3u32, 5, u32::MAX] {
+            let mut bad = good.clone();
+            bad[META_MAGIC.len()..HEADER_LEN].copy_from_slice(&declared.to_le_bytes());
+            let covered = bad.len() - TRAILER_LEN;
+            let crc = crc32c(&bad[..covered]);
+            bad[covered..].copy_from_slice(&crc.to_le_bytes());
+            let error = decode_envelope(&bad).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("length mismatch"));
+        }
+    }
+}

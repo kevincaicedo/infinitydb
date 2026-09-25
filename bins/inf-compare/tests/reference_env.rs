@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! L20-21: reference admission requires the authoritative checker.
 #![cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

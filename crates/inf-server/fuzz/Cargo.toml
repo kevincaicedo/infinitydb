@@ -53,3 +53,10 @@ path = "fuzz_targets/scatter_replies.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "process_stat"
+path = "fuzz_targets/process_stat.rs"
+test = false
+doc = false
+bench = false

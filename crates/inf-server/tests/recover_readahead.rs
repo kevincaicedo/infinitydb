@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Boot-read prefetch scoping (ADR-0109; L17-02 of the 2026-08-30 review).
 //!
 //! The M2.5-S08 prefetch wrapper used to be the plane's filesystem for the

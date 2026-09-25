@@ -64,6 +64,9 @@ use inf_wire::{
     extract_keys, lookup,
 };
 
+#[cfg(test)]
+#[path = "cache_boot_tests.rs"]
+mod cache_boot_tests;
 mod cell_loop;
 mod conn;
 mod dispatch;
@@ -640,19 +643,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     ) -> ServerPlane<O, F> {
         node.cell.set(cell.0);
         node.cells.set(cells);
-        // M3-S10: size the per-cell program cache from the boot config
-        // (`doc-path-cache-size` is BootOnly — assembly time IS its
-        // application point).
-        #[cfg(feature = "doc")]
-        {
-            let size = node
-                .config
-                .borrow()
-                .get("doc-path-cache-size")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(inf_doc::path::PROGRAM_CACHE_DEFAULT_ENTRIES);
-            node.path_cache.replace(inf_doc::ProgramCache::new(size));
-        }
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
         ServerPlane {

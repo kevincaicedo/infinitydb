@@ -84,13 +84,17 @@ fn bench_partiql_compile(c: &mut Criterion) {
     });
 
     c.bench_function("cache_hit", |b| {
-        let mut cache = StatementCache::default();
+        let mut cache =
+            StatementCache::try_new(inf_query::limits::StatementCacheCapacity::default())
+                .expect("benchmark cache allocation");
         cache.get_or_compile(TYPICAL, &catalog, 8192).expect("warm");
         b.iter(|| cache.get_or_compile(black_box(TYPICAL), &catalog, 8192).expect("hit"))
     });
 
     c.bench_function("cache_hot_mix", |b| {
-        let mut cache = StatementCache::default();
+        let mut cache =
+            StatementCache::try_new(inf_query::limits::StatementCacheCapacity::default())
+                .expect("benchmark cache allocation");
         let mix: Vec<Vec<u8>> = (0..20)
             .map(|i| {
                 format!("SELECT * FROM orders WHERE price > {i} AND status = 'open' LIMIT 100")

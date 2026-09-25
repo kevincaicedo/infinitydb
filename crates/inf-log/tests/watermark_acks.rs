@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S06 integration: `always` acks gate on the durability watermark.
 //! The oracle — **no response leaves the cell before the watermark covers
 //! its LSN** — is asserted inside every ack future (support harness) and

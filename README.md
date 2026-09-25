@@ -149,6 +149,11 @@ cargo build --release -p infinityd
 ./target/release/infinityd --port 6379
 ```
 
+`--doc-path-cache-size` sets the compiled JSONPath cache's entries per cell:
+0 disables caching, the default is 1,024, and the maximum is 4,096.
+Larger values fail boot. `CONFIG GET doc-path-cache-size` reports the boot
+setting; it cannot be changed with `CONFIG SET`.
+
 Other developer commands:
 
 The checks require Redis 8.0.5 on PATH (or `INF_COMPAT_ORACLE_ADDR`) and

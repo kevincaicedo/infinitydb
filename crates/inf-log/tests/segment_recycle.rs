@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4.5-S39b (ADR-0090): segment recycling at the rotor — a covered,
 //! pre-zeroed `Direct` segment is pooled at truncation and becomes the
 //! next segment by rename; the pool is bounded; a pooled file is re-read

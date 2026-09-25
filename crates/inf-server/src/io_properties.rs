@@ -210,6 +210,7 @@ impl IoProperties {
     /// A present-but-malformed file (never a silent default).
     pub fn load(data_dir: &Path) -> Result<Option<IoProperties>, IoPropertiesError> {
         let path = data_dir.join(IO_PROPERTIES_FILE);
+        #[allow(clippy::disallowed_methods, reason = "boot: device configuration before serving")]
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -371,6 +372,7 @@ fn parse_u64(key: &'static str, value: &str) -> Result<u64, IoPropertiesError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
 

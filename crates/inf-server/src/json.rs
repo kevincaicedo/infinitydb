@@ -1928,7 +1928,7 @@ mod tests {
     fn durable_cx(budget: usize, record_max: usize) -> ConnCx {
         let cx = ConnCx {
             ns: crate::exec::ConnNamespace::Named(inf_store::NsId(16)),
-            ..ConnCx::default()
+            ..ConnCx::try_default().expect("fixture cache allocation")
         };
         cx.node.doc_log_admission.set(Some(crate::exec::DocLogAdmission { budget, record_max }));
         cx

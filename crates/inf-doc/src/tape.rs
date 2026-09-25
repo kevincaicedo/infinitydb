@@ -825,6 +825,27 @@ mod tests {
     use crate::model::{self, Value};
 
     #[test]
+    fn u24_reader_checks_the_last_full_word() {
+        let bytes = [0xEE, 0x56, 0x34, 0x12];
+        assert_eq!(read_u24(&bytes, bytes.len() - 3), 0x12_3456);
+        assert!(std::panic::catch_unwind(|| read_u24(&bytes, bytes.len() - 2)).is_err());
+    }
+
+    #[test]
+    fn value_extents_accept_equality_and_refuse_one_byte_short() {
+        let mut body = vec![0xEE, TAG_F64];
+        body.extend_from_slice(&1.25f64.to_bits().to_le_bytes());
+        for (limit, expected) in [(9, Err(DocError::Truncated)), (10, Ok(10))] {
+            assert_eq!(
+                validate_one(&body, 1, limit, false, &mut Vec::new(), &mut DictCheck::new(&[])),
+                expected
+            );
+        }
+        assert_eq!(validate_body(&[TAG_ARR, 1, 0, 0, TAG_NULL], &[]), Ok(()));
+        assert_eq!(validate_body(&[TAG_ARR, 2, 0, 0, TAG_NULL], &[]), Err(DocError::BadLength));
+    }
+
+    #[test]
     fn zigzag_covers_the_i64_extremes() {
         for (v, u) in [(0, 0), (-1, 1), (1, 2), (-2, 3), (i64::MAX, u64::MAX - 1)] {
             assert_eq!(zigzag(v), u, "zigzag({v})");

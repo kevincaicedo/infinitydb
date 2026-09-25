@@ -42,14 +42,14 @@ pub(crate) struct DocLogAdmission {
     pub record_max: usize,
 }
 
-/// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
+/// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
 /// can't see, and the M1 cell-local registries (clients, config), the
 /// injected wall-clock anchor, and the injected RNG state. The node assembly
-/// (or sim harness) wires these; a default-constructed `ConnCx` carries an
-/// all-zero instance, so tests and the compat candidate need no wiring.
+/// (or sim harness) wires these. [`NodeInfo`] owns this state together
+/// with the cache whose reservation makes node construction fallible.
 #[derive(Default, Debug)]
-pub struct NodeInfo {
+pub struct NodeState {
     /// Frozen order: sqes_per_submit, cqes_per_reap, cmds_per_iter,
     /// fabric_msgs_per_batch (each ×1000), loop_iter_p999_us.
     pub tripwires: Cell<[u64; 5]>,
@@ -334,15 +334,13 @@ pub struct NodeInfo {
     /// assembly when a control plane exists. `None` in bare harnesses,
     /// where `INFO` renders cell scope and labels it.
     pub memory_board: RefCell<Option<std::sync::Arc<crate::control::MemoryBoard>>>,
+    /// Read-only process gauges; the process supervisor alone samples the OS.
+    /// Bare deterministic harnesses render zeros until they attach a board.
+    pub process_board: RefCell<Option<std::sync::Arc<crate::ProcessBoard>>>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
-    /// Per-cell compiled-path-program cache (M3-S10; ADR-0041 D1) —
-    /// shared by every connection and namespace the cell serves, sized
-    /// by `doc-path-cache-size` at node assembly (default 1024).
-    #[cfg(feature = "doc")]
-    pub path_cache: RefCell<inf_doc::ProgramCache>,
     /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
     /// across commands (the S05 lever-G seam); limits re-point per
     /// target namespace via `set_limits`.
@@ -361,6 +359,32 @@ pub struct NodeInfo {
     /// the durable staging hook after command execution (ADR-0043 D2/D5).
     #[cfg(feature = "doc")]
     pub(crate) doc_log: RefCell<json::DocLogScratch>,
+}
+
+/// Cell-owned command state, built only after cache reservation succeeds.
+/// The default-initializable state stays inline; field access through
+/// Deref adds no allocation or shared ownership (ADR-0146 D2).
+#[derive(Debug)]
+pub struct NodeInfo {
+    state: NodeState,
+    pub(crate) cache_boot: crate::cache_boot::CacheBootReadiness,
+    /// One compiled-path cache shared by this cell's connections and namespaces.
+    #[cfg(feature = "doc")]
+    pub path_cache: RefCell<inf_doc::ProgramCache>,
+}
+
+impl core::ops::Deref for NodeInfo {
+    type Target = NodeState;
+
+    fn deref(&self) -> &NodeState {
+        &self.state
+    }
+}
+
+impl core::ops::DerefMut for NodeInfo {
+    fn deref_mut(&mut self) -> &mut NodeState {
+        &mut self.state
+    }
 }
 
 /// Fold a keyspace report plus this cell's node-side bytes into the
@@ -403,6 +427,32 @@ pub(crate) fn memory_gauges_of(
 }
 
 impl NodeInfo {
+    /// Assemble this cell's state from validated boot configuration before accepting
+    /// connections. A refused cache reservation publishes no node or config.
+    pub fn try_new(config: ConfigStore) -> Result<Self, std::collections::TryReserveError> {
+        #[cfg(feature = "doc")]
+        let path_cache = inf_doc::ProgramCache::try_new(config.path_cache_capacity())?;
+        Ok(Self {
+            state: NodeState { config: RefCell::new(config), ..NodeState::default() },
+            cache_boot: crate::cache_boot::CacheBootReadiness::Standalone,
+            #[cfg(feature = "doc")]
+            path_cache: RefCell::new(path_cache),
+        })
+    }
+
+    pub fn try_default() -> Result<Self, std::collections::TryReserveError> {
+        Self::try_new(ConfigStore::default())
+    }
+
+    /// Install the boot reader before publishing this cell's arrival. The
+    /// non-cloneable permit makes the cache reservation precede readiness.
+    pub fn into_boot_group(mut self, permit: crate::CacheBootPermit) -> Rc<Self> {
+        self.cache_boot = permit.reader();
+        let node = Rc::new(self);
+        permit.complete();
+        node
+    }
+
     /// Publish this cell's memory gauges to the node board and return the
     /// node-wide fold — `None` without a board (bare harness): the caller
     /// renders cell scope and labels it (M3-S25 fix).
@@ -503,19 +553,22 @@ impl ConnCx {
     }
 }
 
-impl Default for ConnCx {
-    fn default() -> ConnCx {
-        ConnCx {
+impl ConnCx {
+    /// Standalone connection state for embedded command harnesses. Production
+    /// connections share their plane's already constructed NodeInfo.
+    pub fn try_default() -> Result<ConnCx, std::collections::TryReserveError> {
+        let node = Rc::new(NodeInfo::try_default()?);
+        Ok(ConnCx {
             proto: Protocol::Resp2,
             id: 1,
             db: 0,
             ns: ConnNamespace::Default,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
-            node: Rc::new(NodeInfo::default()),
+            node,
             close_requested: Cell::new(false),
             program: false,
-        }
+        })
     }
 }
 
@@ -2087,7 +2140,8 @@ mod tests {
     fn an_error_reply_never_leaves_a_mutation_for_any_write_command() {
         use inf_wire::COMMANDS;
 
-        let mut cx = ConnCx { program: true, ..ConnCx::default() };
+        let mut cx =
+            ConnCx { program: true, ..ConnCx::try_default().expect("fixture cache allocation") };
         let mut store = Keyspace::new(StoreConfig::default());
         let big_key = vec![b'k'; MAX_KEY_LEN + 1];
         let big_val = vec![b'v'; MAX_VAL_LEN + 1];
@@ -2487,7 +2541,7 @@ mod tests {
     /// pair applied before the second pair's bounds check fired.
     #[test]
     fn mset_bounds_failure_applies_nothing() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"a", b"old"]), b"+OK\r\n");
         let long_key = vec![b'k'; 256];
@@ -2513,7 +2567,7 @@ mod tests {
     /// (like arity), so they precede the NX existence gate.
     #[test]
     fn msetnx_bounds_failure_applies_nothing() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"MSETNX", b"fresh", b"v", &long_key, b"w"]);
@@ -2545,7 +2599,7 @@ mod tests {
     ///    per bogus command.
     #[test]
     fn unknown_command_reply_is_bounded_and_framed_like_the_oracle() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // One frame: a terminating CRLF and no other CR or LF anywhere.
         let framed = |reply: &[u8]| -> bool {
@@ -2620,7 +2674,7 @@ mod tests {
 
     #[test]
     fn hello_switches_protocol_and_rejects_unknown_versions() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // RESP2 null is the bulk form.
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"missing"]), b"$-1\r\n");
@@ -2644,7 +2698,7 @@ mod tests {
 
     #[test]
     fn quit_replies_ok_and_requests_close() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"QUIT"]), b"+OK\r\n");
         assert!(cx.close_requested.get(), "QUIT must request a connection close");
@@ -2661,7 +2715,7 @@ mod tests {
     /// the store — `:0` for RENAMENX, `+OK` for RENAME.
     #[test]
     fn renamenx_onto_itself_answers_zero_like_redis() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         assert_eq!(run(&mut cx, &mut store, &[b"RENAMENX", b"k", b"k"]), b":0\r\n");
@@ -2675,7 +2729,7 @@ mod tests {
 
     #[test]
     fn record_bound_deviation_is_a_typed_error() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"SET", &long_key, b"v"]);
@@ -2684,7 +2738,7 @@ mod tests {
 
     #[test]
     fn mget_mset_roundtrip() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"MSET", b"a", b"1", b"b", b"2"]), b"+OK\r\n");
         assert_eq!(
@@ -2710,7 +2764,7 @@ mod tests {
     /// whatever the value says.
     #[test]
     fn set_and_getex_refuse_non_positive_absolute_deadlines_before_the_write() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.wall_anchor.set((1_000, 5_000_000));
         let now = Nanos::from_millis(1_000);
@@ -2761,7 +2815,7 @@ mod tests {
     /// into the store's u40-ms bound — the recorded clamp deviation.
     #[test]
     fn far_future_deadlines_follow_redis_arithmetic_and_saturate() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Anchor: internal 1000 ms == unix 1_757_000_000_000 ms (2025-09).
         cx.node.wall_anchor.set((1_000, 1_757_000_000_000));
@@ -2867,7 +2921,8 @@ mod tests {
     #[test]
     fn inf_put_is_a_bounded_put_admitted_like_rename() {
         // ADR-0115: the leg runs under the program context.
-        let mut cx = ConnCx { program: true, ..ConnCx::default() };
+        let mut cx =
+            ConnCx { program: true, ..ConnCx::try_default().expect("fixture cache allocation") };
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.wall_anchor.set((1_000, 5_000_000));
         let now = Nanos::from_millis(1_000);
@@ -2946,7 +3001,7 @@ mod tests {
     /// only a program-composed execution runs them.
     #[test]
     fn internal_commands_are_unknown_to_clients() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let unknown = |argv: &[&[u8]]| {
             let mut text = b"-ERR unknown command '".to_vec();
@@ -2992,7 +3047,7 @@ mod tests {
 
     #[test]
     fn expireat_family_uses_the_wall_anchor() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Anchor: internal 1000 ms == unix 5_000_000 ms.
         cx.node.wall_anchor.set((1_000, 5_000_000));
@@ -3016,7 +3071,7 @@ mod tests {
 
     #[test]
     fn object_encoding_tracks_int_embstr_raw() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"n", b"123"]);
         assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"n"]), b"$3\r\nint\r\n");
@@ -3035,7 +3090,7 @@ mod tests {
 
     #[test]
     fn scan_walks_the_whole_keyspace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..500 {
             let key = format!("k:{i}");
@@ -3076,7 +3131,7 @@ mod tests {
 
     #[test]
     fn select_isolates_databases_and_flushdb_scopes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"zero"]), b"+OK\r\n");
         assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"1"]), b"+OK\r\n");
@@ -3105,7 +3160,7 @@ mod tests {
 
     #[test]
     fn copy_crosses_databases_with_ttl_and_encoding() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos::from_millis(1_000);
         run_at(&mut cx, &mut ks, now, &[b"SET", b"src", b"v", b"PX", b"5000"]);
@@ -3136,7 +3191,7 @@ mod tests {
 
     #[test]
     fn inf_ns_registry_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(
@@ -3192,7 +3247,10 @@ mod tests {
 
     #[test]
     fn unavailable_configured_default_refuses_data_until_explicit_selection() {
-        let mut cx = ConnCx { ns: ConnNamespace::RequiredUnavailable, ..ConnCx::default() };
+        let mut cx = ConnCx {
+            ns: ConnNamespace::RequiredUnavailable,
+            ..ConnCx::try_default().expect("fixture cache allocation")
+        };
         let mut ks = Keyspace::new(StoreConfig::default());
         let refusal =
             b"-ERR configured default namespace is unavailable; use SELECT or INF.NS USE\r\n";
@@ -3207,7 +3265,7 @@ mod tests {
 
     #[test]
     fn resp2_subscriber_mode_restricts_and_reshapes_ping() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
         assert_eq!(
@@ -3239,7 +3297,7 @@ mod tests {
 
     #[test]
     fn resp3_lifts_the_restriction_and_self_delivers() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"HELLO", b"3"]);
         assert_eq!(
@@ -3280,7 +3338,7 @@ mod tests {
 
     #[test]
     fn oom_gate_denies_writes_allows_reads_and_recovers() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
         // maxmemory 1 byte: below the fixed floor, unfreeable — every
@@ -3332,7 +3390,7 @@ mod tests {
     /// its own keys inline instead of refusing.
     #[test]
     fn per_ns_budget_gate_scopes_oom_to_the_namespace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache", b"MAXMEMORY", b"1"]),
@@ -3395,7 +3453,7 @@ mod tests {
         // the exec-layer push applies it to this cell immediately, and the
         // eviction MAINTAIN slice (driven here directly) frees to the
         // watermark.
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         for i in 0..500 {
             let key = format!("fill:{i}");

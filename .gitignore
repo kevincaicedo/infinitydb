@@ -3,6 +3,8 @@ target/
 # Generated output is local; commit tests, seeds and harnesses instead.
 .artifacts/
 artifacts/
+__pycache__/
+*.pyc
 crates/inf-server/fuzz/corpus/
 crates/inf-wire/fuzz/corpus/
 crates/inf-fabric/fuzz/corpus/

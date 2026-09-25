@@ -15,7 +15,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut store = Keyspace::new(StoreConfig::default());
-    let mut cx = ConnCx::default();
+    let mut cx = ConnCx::try_default().expect("fixture cache allocation");
     // ADR-0110: explicitly reach the optional snapshot forms. Random argv
     // almost never spells IF/ABS and otherwise leaves their bodies untouched.
     let value = &data[..data.len().min(4096)];

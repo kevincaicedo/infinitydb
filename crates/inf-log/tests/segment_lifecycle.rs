@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S02 ACs: rotation is a pointer swap onto a preallocated next segment,
 //! disk-full is surfaced loudly before writes need the space, fsync failure
 //! is fatal, and the whole lifecycle behaves identically over the real

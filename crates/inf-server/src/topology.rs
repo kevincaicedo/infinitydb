@@ -26,6 +26,7 @@
 //! ```
 
 use std::fmt;
+#[allow(clippy::disallowed_types, reason = "boot: persisted topology before serving")]
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -146,6 +147,7 @@ pub enum TopologySource {
 ///
 /// # Errors
 /// A present-but-malformed file (never a silent default).
+#[allow(clippy::disallowed_types, reason = "boot: persisted topology before serving")]
 pub fn load_topology(data_dir: &Path) -> Result<Option<u16>, TopologyError> {
     let mut file = match File::open(data_dir.join(TOPOLOGY_FILE)) {
         Ok(file) => file,
@@ -226,10 +228,13 @@ pub fn render_topology(cells: u16) -> String {
 /// # Errors
 /// [`TopologyError::Contended`] when a topology is already in place
 /// (the owner lock was not held); any I/O failure.
+#[allow(clippy::disallowed_types, reason = "boot: persisted topology before serving")]
 pub fn create_topology(data_dir: &Path, cells: u16) -> Result<(), TopologyError> {
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
     std::fs::create_dir_all(data_dir)?;
     let tmp = data_dir.join(format!("{TOPOLOGY_FILE}.tmp"));
     let target = data_dir.join(TOPOLOGY_FILE);
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
     match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -241,9 +246,11 @@ pub fn create_topology(data_dir: &Path, cells: u16) -> Result<(), TopologyError>
         file.sync_all()?;
     }
     // Publication: `link` never replaces — a present topology is EEXIST.
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
     match std::fs::hard_link(&tmp, &target) {
         Ok(()) => {}
         Err(err) => {
+            #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
             let _ = std::fs::remove_file(&tmp);
             return Err(if err.kind() == io::ErrorKind::AlreadyExists {
                 TopologyError::Contended
@@ -252,6 +259,7 @@ pub fn create_topology(data_dir: &Path, cells: u16) -> Result<(), TopologyError>
             });
         }
     }
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
     std::fs::remove_file(&tmp)?;
     File::open(data_dir)?.sync_all()?;
     Ok(())
@@ -263,6 +271,7 @@ pub fn create_topology(data_dir: &Path, cells: u16) -> Result<(), TopologyError>
 /// exactly `{0..k-1}`.
 fn derive_cells(data_dir: &Path) -> Result<Option<u16>, TopologyError> {
     let mut indices: Vec<u64> = Vec::new();
+    #[allow(clippy::disallowed_methods, reason = "boot: persisted topology before serving")]
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -327,6 +336,7 @@ pub fn resolve_topology(data_dir: &Path, cells: u16) -> Result<TopologySource, T
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
 

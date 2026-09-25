@@ -1,29 +1,57 @@
-"""Judge the lint-scope probe (scripts/check-lint-scopes.sh, ADR-0144).
+"""Judge exact lint/code/path witnesses in the compiler probe (ADR-0144).
 
-usage: judge.py <probe lib.rs> <clippy --message-format=json output>
+usage: judge.py <probe lib.rs> <clippy JSON> <clippy.toml> <rustc JSON> <rustc exit>
 
-A `// PLANT <lint>` line must draw that lint, by code, on that line; a
-`// CONTROL` line must draw nothing; any other diagnostic — an unmarked
-line, an error with no lint code — is red: a plant that fails to build
-for an unrelated reason is not a pass.
+Every plant must report its own lint and, for disallowed APIs, its resolved
+path. Unrelated errors, unmarked diagnostics and missing config plants fail.
 """
 import json
+from pathlib import Path
 import re
 import sys
+import tomllib
 
-PLANTS_MIN = 9
+src, diag = Path(sys.argv[1]), Path(sys.argv[2])
+config, unstable_diag = Path(sys.argv[3]), Path(sys.argv[4])
+unstable_exit = int(sys.argv[5])
+# This is an exact census, not a fallback for missing Clippy witnesses.
+UNSTABLE = {"std::fs::set_times": ("set_times.rs", "fs_set_times")}
+plants, controls, errors = {}, set(), []
+probe_root = src.parent.parent
+for file in sorted(src.parent.glob("*.rs")):
+    relative = file.relative_to(probe_root).as_posix()
+    for n, line in enumerate(file.read_text().splitlines(), 1):
+        at = (relative, n)
+        marker = re.search(r"// PLANT (\S+)(?: (\S+))?\s*$", line)
+        if marker:
+            plants[at] = marker.groups()
+        elif re.search(r"// CONTROL\s*$", line):
+            controls.add(at)
 
-src, diag = sys.argv[1], sys.argv[2]
-plants, controls = {}, set()
-for n, line in enumerate(open(src, encoding="utf-8"), 1):
-    m = re.search(r"// PLANT (\S+)\s*$", line)
-    if m:
-        plants[n] = m.group(1)
-    elif re.search(r"// CONTROL\s*$", line):
-        controls.add(n)
 
-seen, stray, messages = {}, [], 0
-for raw in open(diag, encoding="utf-8"):
+def filesystem(path):
+    return path.startswith(("std::fs::", "std::path::Path::", "std::os::unix::fs::"))
+
+
+cfg = tomllib.loads(config.read_text())
+for key, lint, count in (("disallowed-methods", "disallowed_methods", 37),
+                         ("disallowed-types", "disallowed_types", 5)):
+    paths = [row["path"] for row in cfg[key] if filesystem(row["path"])]
+    if len(paths) != count or len(set(paths)) != len(paths):
+        errors.append(f"config needs {count} distinct filesystem {key}, found {len(paths)}")
+    witnesses = {path for code, path in plants.values() if code == f"clippy::{lint}"}
+    unstable = set(UNSTABLE) if lint == "disallowed_methods" else set()
+    for path in sorted(unstable - set(paths)):
+        errors.append(f"unstable path {path} has no config entry")
+    for path in sorted(set(paths) - witnesses - unstable):
+        errors.append(f"config path {path} has no exact-path plant")
+    for path in sorted(witnesses - set(paths)):
+        errors.append(f"plant path {path} has no config entry")
+    if witnesses & unstable:
+        errors.append("an unstable call must not be counted as a Clippy plant")
+
+seen, messages = {}, 0
+for raw in diag.read_text().splitlines():
     try:
         msg = json.loads(raw)
     except ValueError:
@@ -33,39 +61,106 @@ for raw in open(diag, encoding="utf-8"):
     messages += 1
     d = msg["message"]
     code = (d.get("code") or {}).get("code")
+    text = d["message"]
+    if "does not refer to a reachable" in text:
+        errors.append(f"unresolved config entry: {text}")
     if code is None:
-        text = d["message"]
         if d["level"] == "error" and not text.startswith(("aborting due to", "could not compile")):
-            stray.append(text)
+            errors.append(f"unrelated compiler error: {text}")
         continue
+    path = re.search(r"use of a disallowed (?:method|type) `([^`]+)`", text)
     for sp in d["spans"]:
-        if sp.get("is_primary"):
-            seen.setdefault(sp["line_start"], set()).add(code)
+        if not sp.get("is_primary"):
+            continue
+        file = Path(sp["file_name"])
+        if file.is_absolute() and file.is_relative_to(probe_root):
+            file = file.relative_to(probe_root)
+        at = (file.as_posix(), sp["line_start"])
+        seen.setdefault(at, set()).add((code, path.group(1) if path else None))
 
-fail = 0
-for ln, lint in sorted(plants.items()):
-    if lint not in seen.get(ln, set()):
-        drew = sorted(seen.get(ln, []))
-        print(f"LINT-SCOPES violation: probe line {ln} did NOT draw {lint} (drew: {drew})")
-        fail = 1
-for ln in sorted(controls):
-    if seen.get(ln):
-        print(f"LINT-SCOPES violation: probe control line {ln} drew {sorted(seen[ln])}")
-        fail = 1
-for ln, codes in sorted(seen.items()):
-    if ln not in plants and ln not in controls:
-        print(f"LINT-SCOPES violation: probe line {ln} drew {sorted(codes)} with no PLANT marker")
-        fail = 1
-for text in stray:
-    print(f"LINT-SCOPES violation: the probe failed for an unrelated reason: {text}")
-    fail = 1
-if len(plants) < PLANTS_MIN:
-    print(f"LINT-SCOPES SCOPE ERROR: {len(plants)} plants (expected ≥ {PLANTS_MIN}) — edited down")
-    fail = 1
+for at, (lint_spec, path) in sorted(plants.items()):
+    lints = set(lint_spec.split(","))
+    drew = seen.get(at, set())
+    for lint in sorted(lints):
+        if not any(code == lint and (path is None or actual == path) for code, actual in drew):
+            errors.append(f"{at}: did NOT draw {lint} {path or ''}; drew {sorted(drew)}")
+    if any(code not in lints or (path is not None and actual != path) for code, actual in drew):
+        errors.append(f"{at}: plant drew an unrelated diagnostic: {sorted(drew)}")
+for at in sorted(controls):
+    if seen.get(at):
+        errors.append(f"{at}: control drew {sorted(seen[at])}")
+for at, codes in sorted(seen.items()):
+    if at not in plants and at not in controls:
+        errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
+if len(plants) < 52:  # nine decoder/enum plants, 41 stable APIs, two alias/UFCS bypasses
+    errors.append(f"{len(plants)} plants; expected at least 52")
 if messages == 0:
-    print("LINT-SCOPES SCOPE ERROR: clippy produced no diagnostic at all — the probe did not run")
-    fail = 1
-if fail:
+    errors.append("clippy produced no diagnostics; the probe did not run")
+
+# The separate rustc call must reject exactly the configured API at its call
+# span for its own unstable feature. Other compiler failures are not evidence.
+unstable_root = probe_root / "unstable"
+expected_files = {name for name, _ in UNSTABLE.values()}
+if {p.name for p in unstable_root.glob("*.rs")} != expected_files:
+    errors.append("unstable source census must contain only set_times.rs")
+unstable_plants, unstable_seen = {}, set()
+for path, (name, feature) in UNSTABLE.items():
+    file = unstable_root / name
+    if not file.is_file():
+        errors.append(f"missing unstable probe: {name}")
+        continue
+    lines = file.read_text().splitlines()
+    markers = [(n, line) for n, line in enumerate(lines, 1) if "// UNSTABLE" in line]
+    if len(markers) != 1:
+        errors.append(f"{name}: expected exactly one unstable-call marker")
+        continue
+    n, line = markers[0]
+    if not line.endswith(f"// UNSTABLE E0658 {feature} {path}") or not re.search(
+        rf"\b{re.escape(path)}\s*\(", line.split("//", 1)[0]
+    ):
+        errors.append(f"{name}:{n}: marker and source must name the configured unstable call")
+        continue
+    unstable_plants[(file.resolve(), n)] = (path, feature, line)
+
+for raw in unstable_diag.read_text().splitlines():
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        errors.append(f"non-JSON unstable compiler output: {raw}")
+        continue
+    code = (d.get("code") or {}).get("code")
+    message, level = d.get("message", ""), d.get("level")
+    # rustc's two terminal summaries contain no source diagnostic.
+    if code is None and not d.get("spans") and (
+        (level == "error" and message == "aborting due to 1 previous error")
+        or (level == "failure-note" and message ==
+            "For more information about this error, try `rustc --explain E0658`.")
+    ):
+        continue
+    spans = [sp for sp in d.get("spans", []) if sp.get("is_primary")]
+    if code != "E0658" or level != "error" or len(spans) != 1:
+        errors.append(f"unrelated unstable-probe diagnostic: {code} {message}")
+        continue
+    sp = spans[0]
+    at = (Path(sp["file_name"]).resolve(), sp["line_start"])
+    expected = unstable_plants.get(at)
+    if expected is None or at in unstable_seen:
+        errors.append("unstable diagnostic is outside its call or was reported twice")
+        continue
+    path, feature, line = expected
+    spelled = line[sp["column_start"] - 1:sp["column_end"] - 1]
+    if (sp["line_end"] != at[1] or spelled != path
+            or message != f"use of unstable library feature `{feature}`"):
+        errors.append(f"unstable diagnostic does not identify {path} and {feature}")
+        continue
+    unstable_seen.add(at)
+if unstable_exit != 1 or len(unstable_seen) != len(UNSTABLE):
+    errors.append(f"unstable probe: exit {unstable_exit}, {len(unstable_seen)}/1 exact refusals")
+if errors:
+    for error in errors:
+        print(f"LINT-SCOPES violation: {error}")
     sys.exit(1)
-print(f"lint-scopes probe OK: {len(plants)} plants each drew its lint by name, "
-      f"{len(controls)} controls clean")
+print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
+      f"{len(controls)} clean controls; 36 stable filesystem methods and five types covered")
+print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
+      "all 37 filesystem method bans retained")

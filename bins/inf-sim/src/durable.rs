@@ -1490,7 +1490,7 @@ pub(crate) fn boot(
         // with no stall model armed this is exactly `with_disk`.
         let driver = SimDriver::with_disk_stall(Rc::clone(&net), disk.clone(), Rc::clone(clock));
         let pool = BufferPool::new(128, 1024);
-        let node_info = Rc::new(NodeInfo::default());
+        let node_info = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         let mut ks =
             Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });

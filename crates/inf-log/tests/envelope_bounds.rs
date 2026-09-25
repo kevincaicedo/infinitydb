@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Review 2026-08-30 F-L02-05: the META/MANIFEST envelope read is bounded
 //! **before** it allocates. `read_envelope` sized its buffer from the
 //! inode length and looked at magic, length field and CRC only after the

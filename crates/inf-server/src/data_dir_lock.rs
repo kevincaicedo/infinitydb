@@ -12,6 +12,7 @@
 //! construction; their seam is the injected filesystem).
 
 use std::fmt;
+#[allow(clippy::disallowed_types, reason = "boot: data-directory lock before serving")]
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,7 @@ impl std::error::Error for DataDirLockError {}
 /// The held lock. Dropping it (or the process ending) releases the
 /// directory; a node keeps it for its whole life.
 #[derive(Debug)]
+#[allow(clippy::disallowed_types, reason = "boot: data-directory lock before serving")]
 pub struct DataDirLock {
     /// The open, locked file — the lock lives exactly as long as it.
     _file: File,
@@ -60,9 +62,11 @@ impl DataDirLock {
     /// # Errors
     /// [`DataDirLockError::Held`] when another process owns it;
     /// [`DataDirLockError::Io`] for any other failure.
+    #[allow(clippy::disallowed_types, reason = "boot: data-directory lock before serving")]
     pub fn acquire(data_dir: &Path) -> Result<DataDirLock, DataDirLockError> {
         let path = data_dir.join(LOCK_FILE);
         let io_err = |err: io::Error| DataDirLockError::Io { path: path.clone(), err };
+        #[allow(clippy::disallowed_methods, reason = "boot: data-directory lock before serving")]
         std::fs::create_dir_all(data_dir).map_err(io_err)?;
         let file = OpenOptions::new()
             .read(true)
@@ -86,6 +90,7 @@ impl DataDirLock {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
 

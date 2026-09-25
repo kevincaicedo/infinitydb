@@ -1582,6 +1582,7 @@ impl<F: SegmentFs> core::fmt::Debug for TierWriter<F> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
     use crate::fs::mem::MemFs;

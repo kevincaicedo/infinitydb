@@ -14,6 +14,7 @@
 )]
 
 mod admin;
+mod cache_boot;
 mod ckpt;
 mod clients;
 mod config;
@@ -27,9 +28,12 @@ mod io_properties;
 #[cfg(feature = "doc")]
 mod json;
 mod key_hash;
+#[cfg(any(target_os = "linux", test))]
+mod limits;
 mod log_bytes;
 mod loop_snapshot;
 mod plane;
+mod process_info;
 mod pubsub;
 mod readahead;
 mod recover;
@@ -43,6 +47,7 @@ mod topology;
 /// (`infinityd`'s `take_boot_error` path).
 pub const EXIT_DURABLE_FAILSTOP: i32 = 3;
 
+pub use cache_boot::{CacheBootGroup, CacheBootPermit};
 pub use ckpt::{CkptStats, ManifestStats};
 pub use clients::{ClientInfo, ClientRegistry};
 pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
@@ -61,14 +66,21 @@ pub use durable::{
 // types — an assembly cannot fill one without naming them.
 #[doc(hidden)]
 pub use exec::parse_cursor;
-pub use exec::{ConnCx, ConnNamespace, NodeInfo, execute, execute_slices, stall_request};
+pub use exec::{
+    ConnCx, ConnNamespace, NodeInfo, NodeState, execute, execute_slices, stall_request,
+};
 pub use glob::glob_match;
+#[cfg(feature = "doc")]
+pub use inf_doc::limits::{
+    PROGRAM_CACHE_ENTRIES_MAX, ProgramCacheCapacity, ProgramCacheCapacityError,
+};
 pub use inf_log::ckpt::{DEFAULT_CKPT_INTERVAL_BYTES, DEFAULT_REPLAY_BYTES_PER_S};
 pub use inf_log::fs::StdSegmentFs;
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
 pub use plane::{parse_array_header, parse_scan_head, parse_take_reply};
+pub use process_info::{ProcessBoard, ProcessSample, ProcessSampler};
 // M2-S18 (ADR-0020 D6/D7): the sim tier's disk, re-exported for the
 // assembly/simulator tier exactly like `StdSegmentFs` above — bins name
 // `inf-server` only (dep-DAG).

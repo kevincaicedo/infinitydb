@@ -56,6 +56,11 @@ impl PathProgram {
         &self.bytes
     }
 
+    /// This program's Rc allocation, charged once by its retaining cache.
+    pub fn heap_bytes(&self) -> usize {
+        inf_foundation::rc_allocation_bytes(self.bytes.as_ref())
+    }
+
     #[inline]
     pub fn is_legacy(&self) -> bool {
         self.bytes[1] & FLAG_LEGACY != 0

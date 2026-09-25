@@ -7,6 +7,12 @@ disallowed-types = [
     # Review 2026-08-30 F-L18-05: the grep in check-cell-denylist.sh cannot see
     # through `use std::sync::{Condvar}`; this entry is type-resolved and can.
     { path = "std::sync::Condvar", reason = "no blocking waits on the data plane (L1/L6); cells park via the backend idle strategy" },
+    # ADR-0144 D5: acquisition is allowed only at audited seam/boot/control sites.
+    { path = "std::fs::File", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::OpenOptions", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::ReadDir", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::DirEntry", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
 ]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },
@@ -31,6 +37,44 @@ disallowed-methods = [
     # "does not refer to a reachable function" on every crate and the ban on
     # this spelling was inert (batch 34, ADR-0106 D7.5).
     { path = "core::arch::x86_64::__rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+    # Every entry has an exact-path plant in lint-scope-probe (ADR-0144 D5).
+    { path = "std::fs::read", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_to_string", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::write", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::metadata", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::symlink_metadata", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::rename", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_file", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_dir_all", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::create_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::create_dir_all", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::copy", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::hard_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::soft_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::canonicalize", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::exists", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::set_permissions", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::set_times", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::exists", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::try_exists", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::is_dir", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::is_file", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::metadata", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::symlink_metadata", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::read_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::read_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::canonicalize", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::is_symlink", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder::new", reason = "blocking filesystem acquisition (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder::create", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::symlink", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::chown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::lchown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::fchown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::chroot", reason = "blocking filesystem call (ADR-0144 D5)" },
 ]
 
 # INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch

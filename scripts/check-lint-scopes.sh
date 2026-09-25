@@ -28,14 +28,18 @@ EXEMPTIONS="${INF_LINT_EXEMPTIONS:-docs/lint-exemptions.tsv}"
 BASE_REF="${INF_LINT_BASE_REF:-origin/main}"
 # Only a lower number may replace this one (ADR-0144 D1).
 ADR0143_EXEMPTIONS_MAX=15
+# Cell membership has one owner, shared with the runtime safety gates.
+. "$SCRIPT_DIR/cell-crates.sh"
+CELL_DIRS=$(cell_crate_dirs)
 
 for dir in crates bins; do
     [ -d "$dir" ] || { echo "LINT-SCOPES SCOPE ERROR: $dir/ is missing"; exit 1; }
 done
 
-INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
-    INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'
+INF_CELL_DIRS="$CELL_DIRS" INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
+    INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
 import os
+import json
 import re
 import subprocess
 import sys
@@ -61,7 +65,17 @@ LINTS = {
     "arithmetic_side_effects": ("fn", ("bound:",)),
     # ADR-0125 D2's opt-out, audited here since the ratchet absorbed it.
     "too_many_lines": ("fn", ("shape:",)),
+    "disallowed_methods": ("statement", ("clock:", "fs-seam:", "boot:", "control-thread:")),
+    "disallowed_types": ("item", ("fs-seam:", "boot:", "control-thread:")),
 }
+if os.environ.get("INF_LINT_RULES") == "1":
+    for lint, (scope, classes) in LINTS.items():
+        example = next(cls for cls in classes if cls != "ADR-0143:")
+        print(f"{lint}\t{scope}\t{example}")
+    sys.exit(0)
+API_LINTS = {lint for lint in LINTS if lint.startswith("disallowed_")}
+CELL_DIRS = [Path(p) for p in os.environ["INF_CELL_DIRS"].splitlines()]
+ITEM = re.compile(r"^\s*(pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|mod|trait|struct|enum|type|use|const|static|fn)\b")
 SCOPES = os.environ["INF_SCOPES"]
 GROUPS = ("clippy::pedantic", "clippy::restriction", "clippy::style", "clippy::all", "warnings")
 ROOT_ATTR = re.compile(
@@ -70,10 +84,10 @@ ROOT_ATTR = re.compile(
 )
 REASON = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
 
-errors, oks, deny_sites = [], [], []
+errors, oks, deny_sites, api_sites = [], [], [], []
 
 
-def next_item(lines, at):
+def next_item_at(lines, at):
     i = at
     while i < len(lines):
         s = lines[i].strip()
@@ -82,12 +96,24 @@ def next_item(lines, at):
         elif s.startswith("#[") or s.startswith("#!["):
             i = attribute_end(lines, i)
         else:
-            return lines[i]
-    return ""
+            return i
+    return len(lines) - 1
+
+
+def next_item(lines, at):
+    return lines[next_item_at(lines, at)]
 
 
 def audit(path, exempt_sites):
     lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+    cell = any(path.is_relative_to(root) for root in CELL_DIRS)
+    production = []
+    if cell:
+        stripper = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
+        report = subprocess.check_output(["awk", "-v", "mode=report", "-f", stripper, str(path)], text=True)
+        if "unterminated" in report:
+            errors.append(f"{path}: test-only module never closed; API audit cannot establish scope")
+        production = subprocess.check_output(["awk", "-f", stripper, str(path)], text=True).split("\n")
     i = 0
     while i < len(lines):
         s = lines[i].strip()
@@ -105,11 +131,12 @@ def audit(path, exempt_sites):
             deny_sites.append((str(path), int(site.rsplit(":", 1)[1]), bool(deny.group(1)), fn.group(9) if fn else ""))
         if not re.search(r"\b(allow|expect)\s*\(", head):
             continue
-        named = [l for l in LINTS if re.search(rf"\b{l}\b", head)]
+        named = [l for l in LINTS if re.search(rf"\b{l}\b", head)
+                 and (l not in API_LINTS or (cell and production[next_item_at(lines, end)].strip()))]
         group = [g for g in GROUPS if re.search(rf"(^|[(,\s]){re.escape(g)}([),\s]|$)", head)]
         if not named and not group:
             continue
-        if group and not named:
+        if group:
             # A group that contains a lint of the table hides it.
             errors.append(f"{site}: group suppression `{group[0]}` hides the ADR-0144 lints")
             continue
@@ -123,20 +150,37 @@ def audit(path, exempt_sites):
             reason = REASON.search(text)
             item = next_item(lines, end)
             fn = FN.match(item)
-            classes = LINTS[named[0]][1]
             if not reason:
                 errors.append(f"{site}: allow of {named[0]} without a reason")
-            elif not reason.group(1).startswith(classes):
-                errors.append(
-                    f"{site}: reason class of {named[0]} must be one of {', '.join(classes)}"
-                )
-            elif not fn:
-                errors.append(f"{site}: allow of {named[0]} is not on a function")
             else:
                 why = reason.group(1)
-                oks.append(f"{site} — {why}")
-                if why.startswith("ADR-0143:"):
-                    exempt_sites.append((str(path), fn.group(9), why.split("column", 1)[-1].strip()))
+                valid = True
+                for lint in named:
+                    scope, classes = LINTS[lint]
+                    if not why.startswith(classes) or not why.partition(":")[2].strip():
+                        errors.append(f"{site}: reason class of {lint} must be one of {', '.join(classes)}")
+                        valid = False
+                    if scope == "fn" and not fn:
+                        errors.append(f"{site}: allow of {lint} is not on a function")
+                        valid = False
+                    if scope == "statement" and (fn or ITEM.match(item)) and not (fn and why.startswith("clock:")):
+                        errors.append(f"{site}: {lint} needs a statement; only clock: permits a function")
+                        valid = False
+                    if scope == "item" and (not ITEM.match(item) or re.search(r"\b(impl|mod|trait|type)\b", item)):
+                        errors.append(f"{site}: {lint} needs a narrow item, never a module, impl, trait or alias")
+                        valid = False
+                if valid:
+                    oks.append(f"{site} — {why}")
+                    api = set(named) & API_LINTS
+                    if api:
+                        first = next_item_at(lines, end)
+                        last = scope_table._body_end(lines, first, statement=not bool(fn))
+                        if last is None or last < first:
+                            errors.append(f"{site}: API allow has no narrow scope the audit can close")
+                        else:
+                            api_sites.append((str(path), first + 1, last + 1, api, why.split(":", 1)[0]))
+                    if why.startswith("ADR-0143:") and fn:
+                        exempt_sites.append((str(path), fn.group(9), why.split("column", 1)[-1].strip()))
 
 
 def git(*args):
@@ -239,6 +283,61 @@ for file, line, inner, fn_name in deny_sites:
             errors.append(f"{file}:{line}: a decoder deny inside a nested module — the row names the file")
 denied_n, ratchet_n = len(scopes_tbl.families("deny")), len(scopes_tbl.families("ratchet"))
 
+# ---- D5: the same audit checks resolved API paths from the ratchet's two
+# existing JSON passes. --force-warn exposes even allowed calls, so a clock:
+# allow cannot hide a file acquisition, nor a boot: allow an ambient clock.
+diagnostics = os.environ.get("INF_LINT_API_DIAGNOSTICS")
+if diagnostics:
+    completed, resolved, in_build = 0, set(), set()
+    expected = {lint for _, _, _, lints, _ in api_sites for lint in lints}
+    for raw in Path(diagnostics).read_text().splitlines():
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            continue
+        if message.get("reason") == "build-finished":
+            completed += 1
+            if message.get("success") is not True:
+                errors.append(f"API audit build {completed} failed")
+            missing = expected - in_build
+            if missing:
+                errors.append(f"API audit build {completed} lacks force-warn witnesses for {sorted(missing)}")
+            in_build.clear()
+        if message.get("reason") != "compiler-message":
+            continue
+        d = message["message"]
+        code = (d.get("code") or {}).get("code", "").removeprefix("clippy::")
+        if code not in API_LINTS:
+            continue
+        match = re.search(r"use of a disallowed (?:method|type) `([^`]+)`", d["message"])
+        if not match:
+            errors.append(f"resolved API diagnostic has no path: {d['message']}")
+            continue
+        path = match.group(1)
+        fs = path.startswith(("std::fs::", "std::path::Path::", "std::os::unix::fs::"))
+        clock = path.startswith(("std::time::", "core::arch::")) or path in {
+            "libc::clock_gettime", "libc::gettimeofday", "libc::time"
+        }
+        classes = {"fs-seam", "boot", "control-thread"} if fs else ({"clock"} if clock else set())
+        for span in d["spans"]:
+            file, line = span["file_name"], span["line_start"]
+            if Path(file).is_absolute() and Path(file).is_relative_to(Path.cwd()):
+                file = str(Path(file).relative_to(Path.cwd()))
+            if not span.get("is_primary") or not any(Path(file).is_relative_to(root) for root in CELL_DIRS):
+                continue
+            resolved.add((file, line, code, path))
+            in_build.add(code)
+            if not any(file == f and first <= line <= last and code in lints and cls in classes
+                       for f, first, last, lints, cls in api_sites):
+                errors.append(f"{file}:{line}: {path} lacks a narrow allow of its own API class")
+    if completed != 2:
+        errors.append(f"API audit needs two completed feature-set builds, got {completed}")
+    if in_build:
+        errors.append("API audit has diagnostics after its last completed build")
+    if not resolved:
+        errors.append("API audit saw no resolved call; a missing force-warn carrier is not a clean audit")
+    print(f"API call-class audit: {len(resolved)} resolved production sites, {completed} completed builds")
+
 # ---- D1: the frozen exemption table
 if not Path(EXEMPTIONS).is_file():
     print(f"LINT-SCOPES SCOPE ERROR: {EXEMPTIONS} is missing")
@@ -302,6 +401,10 @@ for ok in oks:
     print(f"    allow: {ok}")
 PY
 
+if [ "${INF_LINT_RULES:-0}" = 1 ] || [ -n "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
+    exit 0
+fi
+
 # ---- the probe: every planted line draws its lint, by name, on its line
 # (ADR-0144 D2/D5: a plant that fails to build for another reason is red).
 PROBE_SRC="${INF_LINT_PROBE_SRC:-$SCRIPT_DIR/lint-scope-probe}"
@@ -318,6 +421,24 @@ pwork=$(mktemp -d "$WS_ROOT/target/lint-scope-probe.XXXXXX")
 [ -n "$pwork" ] && [ -d "$pwork" ] || { echo "LINT-SCOPES SCOPE ERROR: mktemp failed"; exit 2; }
 trap '[ -n "$pwork" ] && [ -d "$pwork" ] && rm -rf "$pwork"' EXIT
 cp -R "$PROBE_SRC/." "$pwork/probe"
-(cd "$pwork/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --target-dir "$pwork/target" \
+# Fixture mutations may supply their own config; both judges read the exact
+# config Clippy uses. The shipped probe inherits the production config.
+if [ ! -f "$pwork/probe/clippy.toml" ]; then
+    cp "$WS_ROOT/clippy.toml" "$pwork/probe/clippy.toml"
+fi
+pin=$(python3 -B - "$WS_ROOT/rust-toolchain.toml" <<'PY'
+import re, sys, tomllib
+pin = tomllib.loads(open(sys.argv[1]).read())["toolchain"]["channel"]
+if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pin):
+    sys.exit("LINT-SCOPES SCOPE ERROR: filesystem probes need a pinned stable compiler")
+print(pin)
+PY
+)
+(cd "$pwork/probe" && env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target-dir "$pwork/target" \
     --message-format=json >"$pwork/diag.json" 2>"$pwork/stderr") || true
-python3 "$SCRIPT_DIR/lint-scope-probe/judge.py" "$pwork/probe/src/lib.rs" "$pwork/diag.json"
+unstable_exit=0
+env -u RUSTC_BOOTSTRAP rustc +"$pin" --edition=2021 --crate-type=lib --emit=metadata \
+    --error-format=json --out-dir "$pwork" "$pwork/probe/unstable/set_times.rs" \
+    >"$pwork/unstable.stdout" 2>"$pwork/unstable.json" || unstable_exit=$?
+python3 -B "$SCRIPT_DIR/lint-scope-probe/judge.py" "$pwork/probe/src/lib.rs" \
+    "$pwork/diag.json" "$pwork/probe/clippy.toml" "$pwork/unstable.json" "$unstable_exit"

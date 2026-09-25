@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Exercise the shipping snapshot producer through the benchmark's real scraper.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 #![allow(dead_code)]

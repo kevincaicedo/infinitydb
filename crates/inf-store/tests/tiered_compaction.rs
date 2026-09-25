@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4-S15 — copy-forward compaction at the seam tier (ADR-0059): the
 //! scan/relocate/repoint slice, the trigger arms, refusal-aware
 //! admission, the retirement pipeline (stamp → manifest exclusion →

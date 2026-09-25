@@ -157,19 +157,28 @@ struct Tape<'o> {
 }
 
 impl<'o> Tape<'o> {
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "bound: the body cap is clamped to the DOC_BYTES_MAX const (2^24 - 1) on this \
-                  line, so adding the 8-byte header fits usize"
-    )]
     fn new(out: &'o mut Vec<u8>, max_body: usize) -> Tape<'o> {
-        Tape { out, max_len: max_body.min(DOC_BYTES_MAX) + header::HEADER_LEN }
+        Tape { out, max_len: max_body.min(DOC_BYTES_MAX).saturating_add(header::HEADER_LEN) }
     }
 
     /// An `extra` whose sum is unrepresentable cannot fit: refused, never wrapped.
     #[inline]
     fn fits(&self, extra: usize) -> bool {
         self.out.len().checked_add(extra).is_some_and(|len| len <= self.max_len)
+    }
+
+    /// Check the frame word and byte budget before emitting its placeholder.
+    #[inline]
+    fn open_container(&mut self, tag: u8, kind_bit: u32, at: usize) -> Result<u32, JsonParseError> {
+        if !self.fits(emit::CONTAINER_OPEN_LEN) {
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        }
+        let Some(word) = self.out.len().checked_add(1).and_then(|len| frame_word(len, kind_bit))
+        else {
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        };
+        emit::begin(self.out, tag);
+        Ok(word)
     }
 
     /// The finished body's length as the header's `u32`; `None` past it.
@@ -577,14 +586,7 @@ impl JsonParser {
                         if frames.len() == max_depth {
                             return err($at, JsonErrorKind::DepthExceeded);
                         }
-                        if !tape.fits(emit::CONTAINER_OPEN_LEN) {
-                            return err($at, JsonErrorKind::DocumentTooLarge);
-                        }
-                        let len_at = emit::begin(tape.out, TAG_OBJ);
-                        let Some(word) = frame_word(len_at, OBJ_BIT) else {
-                            return err($at, JsonErrorKind::DocumentTooLarge);
-                        };
-                        frames.push(word);
+                        frames.push(tape.open_container(TAG_OBJ, OBJ_BIT, $at)?);
                         self.open_obj_frame(&mut live_obj_frames, tape.out.len());
                         expect = Expect::KeyOrObjClose;
                         tokens.bump();
@@ -594,14 +596,7 @@ impl JsonParser {
                         if frames.len() == max_depth {
                             return err($at, JsonErrorKind::DepthExceeded);
                         }
-                        if !tape.fits(emit::CONTAINER_OPEN_LEN) {
-                            return err($at, JsonErrorKind::DocumentTooLarge);
-                        }
-                        let len_at = emit::begin(tape.out, TAG_ARR);
-                        let Some(word) = frame_word(len_at, 0) else {
-                            return err($at, JsonErrorKind::DocumentTooLarge);
-                        };
-                        frames.push(word);
+                        frames.push(tape.open_container(TAG_ARR, 0, $at)?);
                         expect = Expect::ValueOrArrClose;
                         tokens.bump();
                         continue $grammar;
@@ -890,8 +885,7 @@ impl JsonParser {
         };
         let key_len16 = u16::try_from(key_len).unwrap_or(u16::MAX);
         let Some(frame) = live.checked_sub(1).and_then(|top| self.obj_frames.get_mut(top)) else {
-            debug_assert!(false, "a key is noted inside an open object");
-            return true;
+            return false;
         };
         if !frame.dup_found
             && frame.entries.len() <= LINEAR_SCAN_MAX
@@ -940,11 +934,16 @@ impl JsonParser {
         at: usize,
     ) -> Result<(), JsonParseError> {
         let Some(top) = live.checked_sub(1) else {
-            debug_assert!(false, "an object close pairs with its open");
-            return Ok(());
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        };
+        let Some(frame) = self.obj_frames.get_mut(top) else {
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        };
+        // Refusal leaves the frame stack and tape unchanged.
+        let Ok(entry_count) = u32::try_from(frame.entries.len()) else {
+            return err(at, JsonErrorKind::DocumentTooLarge);
         };
         *live = top;
-        let frame = &mut self.obj_frames[top];
         let must_scan = frame.entries.len() > LINEAR_SCAN_MAX;
         if !frame.dup_found && !must_scan {
             return Ok(());
@@ -952,10 +951,6 @@ impl JsonParser {
         let body_start = frame.body_start;
         let body_end = tape.out.len();
         let entries = &frame.entries;
-        // Entry ids are u32 (the pooled scan vectors' width).
-        let Ok(entry_count) = u32::try_from(entries.len()) else {
-            return err(at, JsonErrorKind::DocumentTooLarge);
-        };
         // Sort entry ids by key bytes (O(k log k) memcmp compares), then
         // group equal runs: first occurrence keeps the position, last
         // occurrence supplies the entry bytes.
@@ -1207,12 +1202,6 @@ fn parse_number(input: &[u8], at: usize, tape: &mut Tape<'_>) -> Result<(), Json
 /// Parse a standalone JSON number token through the ingest parser's one
 /// grammar, without constructing an idoc. Leading/trailing JSON whitespace
 /// is accepted exactly as it is for a scalar document.
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "bound: rposition's index is < input.len(); token is input[start..end], and \
-              parse_number_value reports offsets and lengths inside the token it was given, \
-              so each sum is <= end <= input.len() <= isize::MAX"
-)]
 pub fn parse_number_token(input: &[u8]) -> Result<Number, JsonParseError> {
     let start = input
         .iter()
@@ -1221,15 +1210,18 @@ pub fn parse_number_token(input: &[u8]) -> Result<Number, JsonParseError> {
     let end = input
         .iter()
         .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-        .map_or(start, |at| at + 1);
+        .and_then(|at| at.checked_add(1))
+        .unwrap_or(start);
     if start == end {
         return err(start, JsonErrorKind::InvalidNumber);
     }
     let token = &input[start..end];
-    let (number, used) = parse_number_value(token, 0)
-        .map_err(|error| JsonParseError { offset: error.offset + start, kind: error.kind })?;
+    let (number, used) = parse_number_value(token, 0).map_err(|error| JsonParseError {
+        offset: error.offset.saturating_add(start),
+        kind: error.kind,
+    })?;
     if used != token.len() {
-        return err(start + used, JsonErrorKind::UnexpectedCharacter(token[used]));
+        return err(start.saturating_add(used), JsonErrorKind::UnexpectedCharacter(token[used]));
     }
     Ok(number)
 }
@@ -1605,6 +1597,66 @@ fn parse_hex4(content: &[u8], i: usize) -> Option<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_object_frame_refuses_without_changing_the_tape() {
+        let mut parser = JsonParser::new();
+        let mut out = vec![0; header::HEADER_LEN];
+        emit::str(&mut out, b"k");
+        let before = out.clone();
+        assert!(!parser.note_key(0, &out, header::HEADER_LEN, 1));
+        assert_eq!(out, before);
+        let mut live = 0;
+        let mut tape = Tape::new(&mut out, DOC_BYTES_MAX);
+        let error = parser.close_obj_frame(&mut live, &mut tape, 7).unwrap_err();
+        assert_eq!(error.kind, JsonErrorKind::DocumentTooLarge);
+        assert_eq!(error.offset, 7);
+        assert_eq!(live, 0);
+        assert_eq!(out, before);
+    }
+
+    #[test]
+    fn key_offsets_refuse_before_bookkeeping_changes() {
+        let mut parser = JsonParser::new();
+        let mut live = 0;
+        parser.open_obj_frame(&mut live, header::HEADER_LEN);
+        for entry_at in [u32::MAX as usize, u32::MAX as usize + 1, usize::MAX] {
+            assert!(!parser.note_key(live, &[], entry_at, 1));
+            assert!(parser.obj_frames[0].entries.is_empty());
+            assert_eq!(parser.obj_frames[0].fp, 0);
+        }
+    }
+
+    #[test]
+    fn reversed_string_tokens_refuse() {
+        let mut parser = JsonParser::new();
+        for close in [2, 1] {
+            let mut out = vec![0; header::HEADER_LEN];
+            let before = out.clone();
+            let mut tape = Tape::new(&mut out, DOC_BYTES_MAX);
+            let error = parser.emit_string(&mut tape, b"  \"\"", 2, close).unwrap_err();
+            assert_eq!(error.kind, JsonErrorKind::UnterminatedString);
+            assert_eq!(error.offset, 2);
+            assert_eq!(out, before);
+        }
+    }
+
+    #[test]
+    fn string_diagnostics_keep_the_input_offset() {
+        let cases: &[(&[u8], usize, JsonErrorKind)] = &[
+            (br"ab\uD800\uZZZZ", 9, JsonErrorKind::InvalidUnicodeEscape),
+            (br"\uD800\u", 7, JsonErrorKind::InvalidUnicodeEscape),
+            (br"\uD800\uDC0", 7, JsonErrorKind::InvalidUnicodeEscape),
+            (br"\q", 1, JsonErrorKind::InvalidEscape),
+            (br"x\u12", 2, JsonErrorKind::InvalidUnicodeEscape),
+        ];
+        for &(content, offset, kind) in cases {
+            let error = decode_string(content, 1, &mut Vec::new()).unwrap_err();
+            assert_eq!((error.offset, error.kind), (offset, kind), "{content:?}");
+        }
+        let error = decode_string(br"x\q", usize::MAX, &mut Vec::new()).unwrap_err();
+        assert_eq!(error.offset, usize::MAX);
+    }
+
     /// `parse_digits` owns its bound: 19 digits is the last length it
     /// accumulates, and no 19 bytes — digits or not — overflow the sum
     /// (a debug build panics on overflow, so this test is the proof's canary).
@@ -1664,6 +1716,24 @@ mod tests {
         // A buffer shorter than its header has no body length.
         let mut short = vec![0; header::HEADER_LEN - 1];
         assert_eq!(Tape::new(&mut short, 4).body_len(), None);
+    }
+
+    #[test]
+    fn container_open_reserves_before_writing() {
+        for (tag, kind) in [(TAG_OBJ, OBJ_BIT), (TAG_ARR, 0)] {
+            let mut out = vec![0; header::HEADER_LEN];
+            let before = out.clone();
+            let mut tape = Tape::new(&mut out, emit::CONTAINER_OPEN_LEN - 1);
+            let error = tape.open_container(tag, kind, 11).unwrap_err();
+            assert_eq!((error.offset, error.kind), (11, JsonErrorKind::DocumentTooLarge));
+            assert_eq!(out, before);
+            let mut tape = Tape::new(&mut out, emit::CONTAINER_OPEN_LEN);
+            let word = tape.open_container(tag, kind, 11).unwrap();
+            assert_eq!(word & OBJ_BIT, kind);
+            assert_eq!(word & LEN_AT_MASK, header::HEADER_LEN as u32 + 1);
+            assert_eq!(out.len(), header::HEADER_LEN + emit::CONTAINER_OPEN_LEN);
+            assert_eq!(out[header::HEADER_LEN], tag);
+        }
     }
 
     #[test]

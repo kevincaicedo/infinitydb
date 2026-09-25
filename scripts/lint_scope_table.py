@@ -164,9 +164,15 @@ def denied(attributes, inner):
     return out
 
 
-def _body_end(lines, fn_line):
-    """Index of the line closing the body of the fn at `fn_line`, or None."""
+def _body_end(lines, fn_line, statement=False):
+    """Last line of a function body, or a narrow API-allow statement/item.
+
+    Statement mode also stops at a top-level semicolon or the containing
+    block's close. A nested braced expression may shorten a statement's
+    audited range; that fails closed when the compiler reports a later call.
+    """
     depth, opened, block = 0, False, 0
+    parens, brackets = 0, 0
     i, j = fn_line, 0
     raw_close = None
     in_str = False
@@ -214,11 +220,21 @@ def _body_end(lines, fn_line):
             elif ch == "{":
                 depth, opened = depth + 1, True
             elif ch == "}":
+                if statement and not opened:
+                    return i - 1
                 depth -= 1
                 if opened and depth == 0:
                     return i
-            elif ch == ";" and not opened:
-                return None  # a declaration, no body
+            elif ch == "(":
+                parens += 1
+            elif ch == ")":
+                parens -= 1
+            elif ch == "[":
+                brackets += 1
+            elif ch == "]":
+                brackets -= 1
+            elif ch == ";" and not opened and parens == brackets == 0:
+                return i if statement else None
             j += 1
         i, j = i + 1, 0
     return None

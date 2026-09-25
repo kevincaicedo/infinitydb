@@ -27,15 +27,12 @@
 )]
 
 use super::{PATH_BYTES_CEILING, PathError, PathErrorKind, PathProgram, compile_with_max_bytes};
+use crate::limits::{PROGRAM_CACHE_ENTRIES_MAX, ProgramCacheCapacity};
+use std::collections::TryReserveError;
+
+pub use crate::limits::PROGRAM_CACHE_DEFAULT_ENTRIES;
 
 const NIL: u32 = u32::MAX;
-/// The most entries a cache holds: every slab index stays below [`NIL`].
-const CAPACITY_MAX: u32 = NIL - 1;
-
-/// Nominal per-entry byte share: budget = `capacity ×` this. 4 KiB is
-/// the default path-text cap — typical entries (a few dozen bytes) fit
-/// thousands of times over; the budget only binds adversarial mixes.
-const ENTRY_SHARE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 struct Entry {
@@ -52,17 +49,16 @@ struct Entry {
 impl Entry {
     /// Exact heap bytes this entry pins beyond its slab slot.
     fn heap_bytes(&self) -> usize {
-        self.key.len() + self.program.as_bytes().len()
+        self.key.len().saturating_add(self.program.heap_bytes())
     }
 }
 
 /// Bounded LRU of compiled path programs, keyed by raw path text.
 ///
-/// `Default` is the plan's per-cell default: 1024 entries (M3 §5 S10;
-/// `doc-path-cache-size` re-sizes it at node assembly).
+/// A default-sized cache is built fallibly with [`ProgramCacheCapacity::default`].
 #[derive(Debug)]
 pub struct ProgramCache {
-    buckets: Box<[u32]>,
+    buckets: Vec<u32>,
     slab: Vec<Entry>,
     lru_head: u32,
     lru_tail: u32,
@@ -78,33 +74,31 @@ pub struct ProgramCache {
     uncached: Option<PathProgram>,
 }
 
-/// The plan's per-cell entry-cap default (M3 §5 S10).
-pub const PROGRAM_CACHE_DEFAULT_ENTRIES: usize = 1024;
-
-impl Default for ProgramCache {
-    fn default() -> ProgramCache {
-        ProgramCache::new(PROGRAM_CACHE_DEFAULT_ENTRIES)
-    }
-}
+const _: () =
+    assert!((PROGRAM_CACHE_ENTRIES_MAX as usize).checked_mul(size_of::<Entry>()).is_some());
 
 impl ProgramCache {
-    /// `capacity` in entries; 0 disables caching (every lookup compiles).
-    pub fn new(capacity: usize) -> ProgramCache {
-        let capacity = u32::try_from(capacity).unwrap_or(CAPACITY_MAX).min(CAPACITY_MAX);
-        let bucket_count = (capacity as usize * 2).next_power_of_two().max(1);
-        ProgramCache {
-            buckets: vec![NIL; if capacity == 0 { 1 } else { bucket_count }].into_boxed_slice(),
-            slab: Vec::new(),
+    /// Reserve all metadata before installation (ADR-0146 D2).
+    /// Zero capacity allocates nothing and compiles each lookup uncached.
+    pub fn try_new(capacity: ProgramCacheCapacity) -> Result<ProgramCache, TryReserveError> {
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(capacity.buckets())?;
+        buckets.resize(capacity.buckets(), NIL);
+        let mut slab = Vec::new();
+        slab.try_reserve_exact(capacity.entries())?;
+        Ok(ProgramCache {
+            buckets,
+            slab,
             lru_head: NIL,
             lru_tail: NIL,
-            capacity,
-            budget_bytes: capacity as usize * ENTRY_SHARE_BYTES,
+            capacity: capacity.slots(),
+            budget_bytes: capacity.budget_bytes(),
             entry_bytes: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
             uncached: None,
-        }
+        })
     }
 
     /// Look up `text`, compiling and inserting on miss. `max_bytes` is
@@ -137,7 +131,7 @@ impl ProgramCache {
         }
         self.misses += 1;
         let program = compile_with_max_bytes(text, max_bytes)?;
-        let entry_heap = text.len() + program.as_bytes().len();
+        let entry_heap = text.len().saturating_add(program.heap_bytes());
         if entry_heap > self.budget_bytes {
             return Ok(self.uncached.insert(program));
         }
@@ -150,8 +144,8 @@ impl ProgramCache {
     pub fn bytes(&self) -> usize {
         self.slab.capacity() * size_of::<Entry>()
             + self.entry_bytes
-            + self.buckets.len() * size_of::<u32>()
-            + self.uncached.as_ref().map_or(0, |program| program.as_bytes().len())
+            + self.buckets.capacity() * size_of::<u32>()
+            + self.uncached.as_ref().map_or(0, PathProgram::heap_bytes)
     }
 
     pub fn len(&self) -> usize {
@@ -273,16 +267,13 @@ impl ProgramCache {
     /// Drop `slot` entirely: swap-remove keeps the slab dense, so the
     /// displaced tail entry's links re-target.
     fn remove(&mut self, slot: u32) {
+        let last = u32::try_from(self.slab.len() - 1).expect("slab indices fit u32 capacity");
         self.unlink_lru(slot);
         self.unlink_chain(slot);
         self.entry_bytes -= self.slab[slot as usize].heap_bytes();
-        let last = self.slab.len() - 1;
         self.slab.swap_remove(slot as usize);
-        // Links are u32: a slab index past it is one no link can name.
-        match u32::try_from(last) {
-            Ok(last) if slot != last => self.retarget(last, slot),
-            Ok(_) => {}
-            Err(_) => debug_assert!(false, "insert keeps the slab under its u32 capacity"),
+        if slot != last {
+            self.retarget(last, slot);
         }
     }
 
@@ -354,11 +345,40 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    fn cache_with_capacity(entries: usize) -> ProgramCache {
+        ProgramCache::try_new(ProgramCacheCapacity::try_from(entries).expect("test capacity"))
+            .expect("test cache allocation")
+    }
     use super::*;
 
     #[test]
+    fn metadata_backing_stays_fixed_through_eviction() {
+        let mut cache = cache_with_capacity(3);
+        let before = (
+            cache.slab.capacity(),
+            cache.buckets.capacity(),
+            cache.slab.as_ptr(),
+            cache.buckets.as_ptr(),
+        );
+        for i in 0..64 {
+            cache.get_or_compile(format!("$.key{i}").as_bytes(), 4096).unwrap();
+            assert_eq!(
+                (
+                    cache.slab.capacity(),
+                    cache.buckets.capacity(),
+                    cache.slab.as_ptr(),
+                    cache.buckets.as_ptr()
+                ),
+                before
+            );
+        }
+        assert!(cache.evictions() > 0);
+    }
+
+    #[test]
     fn hit_returns_the_cached_program_and_counts() {
-        let mut cache = ProgramCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let a = cache.get_or_compile(b"$.a.b", 4096).expect("compiles").clone();
         assert_eq!((cache.hits(), cache.misses()), (0, 1));
         let b = cache.get_or_compile(b"$.a.b", 4096).expect("hits").clone();
@@ -371,7 +391,7 @@ mod tests {
     fn distinct_texts_are_distinct_keys_even_when_programs_agree() {
         // `['a']` and `.a` compile to identical programs (escape
         // insensitivity, ADR-0040 D2) but cache under their own texts.
-        let mut cache = ProgramCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let bracket = cache.get_or_compile(b"$['a']", 4096).expect("compiles").clone();
         let dot = cache.get_or_compile(b"$.a", 4096).expect("compiles").clone();
         assert_eq!(bracket, dot);
@@ -380,7 +400,7 @@ mod tests {
 
     #[test]
     fn legacy_and_dollar_mode_share_the_key_space() {
-        let mut cache = ProgramCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let legacy = cache.get_or_compile(b".a", 4096).expect("compiles").clone();
         let dollar = cache.get_or_compile(b"$.a", 4096).expect("compiles").clone();
         assert!(legacy.is_legacy());
@@ -390,7 +410,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_coldest_entry() {
-        let mut cache = ProgramCache::new(2);
+        let mut cache = cache_with_capacity(2);
         cache.get_or_compile(b"$.a", 4096).expect("compiles");
         cache.get_or_compile(b"$.b", 4096).expect("compiles");
         // Touch $.a so $.b is the tail.
@@ -413,7 +433,7 @@ mod tests {
 
     #[test]
     fn compile_failures_are_not_cached() {
-        let mut cache = ProgramCache::new(8);
+        let mut cache = cache_with_capacity(8);
         assert!(cache.get_or_compile(b"$..", 4096).is_err());
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.misses(), 1);
@@ -421,7 +441,7 @@ mod tests {
 
     #[test]
     fn namespace_cap_binds_before_the_lookup() {
-        let mut cache = ProgramCache::new(8);
+        let mut cache = cache_with_capacity(8);
         cache.get_or_compile(b"$.abcdef", 4096).expect("compiles under the wide cap");
         let err = cache.get_or_compile(b"$.abcdef", 4).expect_err("lower cap refuses");
         assert_eq!(err.kind, PathErrorKind::PathTooLong);
@@ -430,7 +450,7 @@ mod tests {
 
     #[test]
     fn capacity_zero_disables_but_still_serves() {
-        let mut cache = ProgramCache::new(0);
+        let mut cache = cache_with_capacity(0);
         let p = cache.get_or_compile(b"$.a", 4096).expect("compiles").clone();
         assert!(!p.is_legacy());
         assert_eq!(cache.len(), 0);
@@ -441,14 +461,14 @@ mod tests {
 
     #[test]
     fn byte_accounting_is_exact_across_churn() {
-        let mut cache = ProgramCache::new(4);
+        let mut cache = cache_with_capacity(4);
         for i in 0..64u32 {
             let text = format!("$.key{i}");
             cache.get_or_compile(text.as_bytes(), 4096).expect("compiles");
             let expected: usize =
                 (0..cache.len()).map(|s| cache.slab[s].heap_bytes()).sum::<usize>()
                     + cache.slab.capacity() * size_of::<Entry>()
-                    + cache.buckets.len() * size_of::<u32>();
+                    + cache.buckets.capacity() * size_of::<u32>();
             assert_eq!(cache.bytes(), expected);
         }
         assert_eq!(cache.len(), 4);
@@ -485,8 +505,8 @@ mod tests {
         assert_eq!(seen, n, "the LRU list threads {seen} of {n} slots");
         let expected = heap
             + cache.slab.capacity() * size_of::<Entry>()
-            + cache.buckets.len() * size_of::<u32>()
-            + cache.uncached.as_ref().map_or(0, |program| program.as_bytes().len());
+            + cache.buckets.capacity() * size_of::<u32>()
+            + cache.uncached.as_ref().map_or(0, PathProgram::heap_bytes);
         assert_eq!(cache.bytes(), expected, "bytes() is not exact");
     }
 
@@ -508,7 +528,7 @@ mod tests {
     /// unreachable, uncounted, with stale LRU links.
     #[test]
     fn multi_victim_eviction_does_not_leak_slots() {
-        let mut cache = ProgramCache::new(4); // budget = 4 × 4096
+        let mut cache = cache_with_capacity(4); // budget = 4 × 4096
         cache.get_or_compile(&padded(0, 0), NS_CAP).expect("ok");
         // A 2 560 B path compiles to a program of about its own size:
         // three such entries and the tiny one fit, a fourth does not.
@@ -525,6 +545,26 @@ mod tests {
         check_invariants(&cache);
     }
 
+    #[test]
+    fn payload_equality_is_resident_and_one_byte_over_is_uncached() {
+        let text = b"$.value";
+        let program = compile_with_max_bytes(text, NS_CAP).unwrap();
+        let charge = text.len() + program.heap_bytes();
+        for (short_by, expected_entries) in [(0, 1), (1, 0)] {
+            let mut cache = cache_with_capacity(1);
+            cache.budget_bytes = charge - short_by;
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.get_or_compile(text, NS_CAP).unwrap().as_bytes(),
+                    program.as_bytes(),
+                );
+            }
+            assert_eq!(cache.len(), expected_entries);
+            assert_eq!(cache.misses(), if short_by == 0 { 1 } else { 2 });
+            check_invariants(&cache);
+        }
+    }
+
     /// The same shape driven by a generator: mixed sizes and hits —
     /// every step keeps the structure.
     #[test]
@@ -538,7 +578,7 @@ mod tests {
         proptest!(
             ProptestConfig::with_cases(512),
             |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
-            let mut cache = ProgramCache::new(capacity);
+            let mut cache = cache_with_capacity(capacity);
             for (idx, pad) in ops {
                 let before = cache.evictions();
                 cache.get_or_compile(&padded(idx, pad), NS_CAP).expect("ok");

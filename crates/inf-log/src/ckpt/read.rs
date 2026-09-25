@@ -1444,6 +1444,70 @@ pub fn read_ick_hybrid<F: SegmentFs, E>(
 mod tests {
     use super::*;
 
+    fn checkpoint_file(bytes: &[u8]) -> (crate::fs::mem::MemFs, crate::fs::mem::MemFile) {
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(Path::new("ckpt")).unwrap();
+        let mut file = fs.create_meta(Path::new("ckpt/test.ick")).unwrap();
+        file.write_at(0, bytes).unwrap();
+        (fs, file)
+    }
+
+    #[test]
+    fn checkpoint_reader_refuses_an_overreporting_file() {
+        let (fs, file) = checkpoint_file(&[0; 16]);
+        fs.overreport_reads();
+        let error = read_exact_at(&file, 0, &mut [0; 8]).unwrap_err();
+        assert!(matches!(error, IckReadError::Io(ref e)
+                        if e.kind() == std::io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn section_counter_overflow_refuses_before_accounting() {
+        let (_, file) = checkpoint_file(&[]);
+        let mut reader = IckReader {
+            file,
+            cfg: IckReaderConfig::default(),
+            info: IckInfo {
+                version: ICK_VERSION,
+                cell: 0,
+                ckpt_id: 1,
+                begin_lsn: Lsn::from_u64(0),
+                ns_ids: Vec::new(),
+            },
+            file_size: 100,
+            offset: 40,
+            sections: u32::MAX,
+            records_total: 7,
+            entries_seen: Vec::new(),
+            digest: 0,
+            block: Vec::new(),
+            done: false,
+        };
+        let frame = SectionFrame { record_count: 1, block_len: 8, body_len: 0, stored_crc: 0 };
+        assert!(matches!(
+            reader.finish_section(frame, 1),
+            Err(IckReadError::FooterMismatch { field: "section_count" })
+        ));
+        assert_eq!((reader.sections, reader.records_total, reader.offset), (u32::MAX, 7, 40));
+    }
+
+    #[test]
+    fn footer_probe_start_cannot_cross_the_header_boundary() {
+        let len = footer_len(0).unwrap();
+        let mut footer = vec![0u8; len];
+        footer[0] = BLOCK_FOOTER;
+        let crc = crc32c(&footer[..len - CRC_LEN]);
+        footer[len - CRC_LEN..].copy_from_slice(&crc.to_le_bytes());
+        let sections_at = 36;
+        for prefix in [35usize, 36, 37] {
+            let mut bytes = vec![0; prefix];
+            bytes.extend_from_slice(&footer);
+            let (_, file) = checkpoint_file(&bytes);
+            let result = probe_footer(&file, bytes.len() as u64, sections_at, 0, false).unwrap();
+            assert_eq!(result, (prefix >= sections_at as usize).then(Vec::new));
+        }
+    }
+
     /// The block geometry is checked arithmetic over counts the file
     /// supplies: 0, 1, the loader's 2^20 namespace bound, and a count no
     /// address space holds.

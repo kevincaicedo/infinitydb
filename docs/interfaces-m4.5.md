@@ -52,6 +52,11 @@ Status column tracks arrival.
 
 ## Maintenance surface (M4.5-S04; mechanics ADR-0139, which supersedes ADR-0076)
 
+- **Accepted, unbuilt construction extension:**
+  [ADR-0160](../../docs/adr/0160-borrowed-path-program-views-and-fallible-index-ownership.md)
+  specifies borrowed program views, fallible attachment ownership and
+  preparation before local registry/attachment publication. Complete
+  [ARCH-W0.3b](../../docs/drr/ARCH-W0.3b.md) review still gates the build.
 - **Tree custody (ADR-0139 D1):** each `CellStore` owns its namespace's
   trees in an attach block (`index_maint::CellIndexes`) — the
   maintenance-facing cache of the registry, resynced at DDL transitions,

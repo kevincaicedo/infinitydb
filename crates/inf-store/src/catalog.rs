@@ -618,7 +618,9 @@ fn encode_tier_block(tier: &TierSpec, out: &mut Vec<u8>) {
     out.extend_from_slice(&tier.mem_budget_bytes.to_le_bytes());
     out.extend_from_slice(&tier.disk_budget_bytes.to_le_bytes());
     // Permille ≤ 999 by `TierSpec::validate`.
-    out.extend_from_slice(&len_u16(tier.mutable_permille as usize).to_le_bytes());
+    let permille =
+        u16::try_from(tier.mutable_permille).expect("permille <= 999 by TierSpec::validate");
+    out.extend_from_slice(&permille.to_le_bytes());
     out.extend_from_slice(&tier.maintain_slice_bytes.to_le_bytes());
     out.extend_from_slice(&tier.cold_read_qd.to_le_bytes());
     out.push(tier.compaction_dead_ratio_pct);
@@ -824,6 +826,24 @@ mod tests {
             dropped: Vec::new(),
         };
         assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat));
+    }
+
+    #[test]
+    fn namespace_name_limits_precede_the_u16_field_ceiling() {
+        let cat = NsCatalog {
+            next_id: 17,
+            entries: vec![entry(16, &[b'a'; 128], NsMode::Memory)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat.clone()));
+        for length in [129, u16::MAX as usize] {
+            let mut foreign = cat.clone();
+            foreign.entries[0].name = vec![b'a'; length];
+            assert_eq!(NsCatalog::decode(&encode_v1(&foreign)), Err(CatalogError::InvalidName));
+        }
+        assert_eq!(len_u16(u16::MAX as usize), u16::MAX);
+        assert!(std::panic::catch_unwind(|| len_u16(u16::MAX as usize + 1)).is_err());
     }
 
     #[test]
@@ -1170,6 +1190,27 @@ mod tests {
                 key_type,
                 state,
             }
+        }
+
+        #[test]
+        fn index_program_limit_round_trips_at_equality_and_refuses_above() {
+            let mut spec = idx(1, 0, &[b'n'; 128], IndexState::Ready, IndexKeyType::Utf8);
+            spec.program = program(&format!("$.{}", "a".repeat(INDEX_PROGRAM_MAX - 6)));
+            assert_eq!(spec.program.len(), INDEX_PROGRAM_MAX);
+            let mut cat = NsCatalog {
+                next_id: 16,
+                entries: Vec::new(),
+                dropped: Vec::new(),
+                index: IndexCatalog { next_id: 2, next_generation: 4, entries: vec![spec] },
+            };
+            assert_eq!(NsCatalog::decode(&cat.encode()), Ok(cat.clone()));
+            cat.index.entries[0].program =
+                program(&format!("$.{}", "a".repeat(INDEX_PROGRAM_MAX - 5)));
+            assert_eq!(cat.index.entries[0].program.len(), INDEX_PROGRAM_MAX + 1);
+            assert_eq!(
+                NsCatalog::decode(&cat.encode()),
+                Err(CatalogError::InvalidIndexRecord("path program length out of range"))
+            );
         }
 
         /// Every state × key-type combination round-trips, targets on a

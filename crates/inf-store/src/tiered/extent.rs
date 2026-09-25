@@ -140,7 +140,9 @@ impl TieredTable {
         // the wiring-time gate consults [`disk_full`](Self::disk_full)
         // *before* `ExtentWriter::create` so a full device is not
         // probed with a doomed file per attempt.
-        let cost = len as u64 + inf_log::blob::extent_device_bytes(ext.len);
+        let cost = inf_log::blob::extent_device_bytes(ext.len)
+            .checked_add(len as u64)
+            .ok_or(OpError::TooLarge)?;
         self.disk_admit_check(cost)?;
         let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
         self.shadow_note_alloc();
@@ -389,5 +391,57 @@ impl TieredTable {
         // per-life aggregates above but must still release its extent
         // reference — the map, not the record bytes, is the identity.
         self.extents.note_death(addr.to_raw());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> TieredTable {
+        TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: 1 << 12,
+                life_origin: LogicalAddr::ZERO,
+            },
+            DemotionConfig::for_budget(1 << 16, 1 << 12),
+            64,
+            KeyHasher::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn extent_cost_overflow_refuses_before_publication() {
+        let mut table = table();
+        table.set_blob_config(crate::extents::BlobConfig {
+            threshold_bytes: 4096,
+            max_bytes: u64::MAX,
+        });
+        let before = table.space.tail();
+        let ext = ExtentRef { extent_id: 1, offset: 0, len: u64::MAX };
+        assert_eq!(table.append_extent(b"key", ext, 1), Err(OpError::TooLarge));
+        assert_eq!(table.space.tail(), before);
+        assert_eq!(table.extents.reference_count(), 0);
+        assert_eq!(table.live_bytes, 0);
+    }
+
+    #[test]
+    fn saturated_extent_accounting_closes_disk_admission() {
+        let mut table = table();
+        table.extents.register(1, 1, u64::MAX);
+        table.extents.register(2, 2, 4096);
+        table.set_disk_budget(u64::MAX);
+        table.refresh_disk_admission(0);
+        assert_eq!(table.disk_admission_used(), u64::MAX);
+        assert!(matches!(table.disk_full(), Some(DiskFullCause::Budget { .. })));
+        let before = table.space.tail();
+        let hash = table.hash_key(b"key");
+        assert!(matches!(
+            table.insert(b"key", b"value", hash),
+            Err(OpError::DiskFull(DiskFullCause::Budget { .. }))
+        ));
+        assert_eq!(table.space.tail(), before);
     }
 }

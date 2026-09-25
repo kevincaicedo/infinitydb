@@ -38,5 +38,9 @@ required-features = ["doc-intern-keys"]
 name = "parse"
 harness = false
 
+[[bench]]
+name = "path_eval"
+harness = false
+
 [lints]
 workspace = true

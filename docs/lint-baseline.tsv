@@ -3,15 +3,11 @@
 # equal to the tree and the totals below their approved copies.
 # family<TAB>count<TAB>file
 arith	48	crates/inf-doc/src/arena.rs
-arith	15	crates/inf-doc/src/path/cache.rs
-arith	23	crates/inf-doc/src/path/eval.rs
+arith	11	crates/inf-doc/src/path/cache.rs
+arith	22	crates/inf-doc/src/path/eval.rs
 arith	67	crates/inf-log/src/tier.rs
 arith	17	crates/inf-query/src/predicate/vm.rs
-arith	19	crates/inf-wire/src/parser.rs
 arith	23	crates/inf-wire/src/writer.rs
-cast	15	crates/inf-doc/src/path/eval.rs
-cast	1	crates/inf-query/src/predicate/vm.rs
-cast	5	crates/inf-wire/src/parser.rs
 fn_length	1	bins/inf-bench/src/bootstorm.rs
 fn_length	1	bins/inf-bench/src/load.rs
 fn_length	3	bins/inf-bench/src/m2rows.rs
@@ -65,7 +61,6 @@ fn_length	1	crates/inf-runtime/src/reactor.rs
 fn_length	2	crates/inf-runtime/src/uring.rs
 fn_length	2	crates/inf-server/src/admin.rs
 fn_length	1	crates/inf-server/src/ckpt.rs
-fn_length	1	crates/inf-server/src/config.rs
 fn_length	1	crates/inf-server/src/control.rs
 fn_length	2	crates/inf-server/src/durable/ckpt.rs
 fn_length	3	crates/inf-server/src/durable.rs

@@ -21,31 +21,15 @@
     )
 )]
 
+use std::collections::TryReserveError;
 use std::rc::Rc;
 
-use super::{
-    CatalogView, CompiledStatement, QlError, STATEMENT_BYTES_CEILING, compile_with_max_bytes,
-};
+pub use crate::limits::STATEMENT_CACHE_DEFAULT_ENTRIES;
+use crate::limits::{STATEMENT_CACHE_ENTRIES_MAX, StatementCacheCapacity};
+
+use super::{CatalogView, CompiledStatement, QlError, compile_with_max_bytes};
 
 const NIL: u32 = u32::MAX;
-
-/// The entry cap's ceiling: every slot index stays below [`NIL`].
-const ENTRIES_MAX: u32 = NIL - 1;
-
-/// Nominal per-entry byte share: budget = `capacity ×` this. The
-/// statement cap is the honest share — typical statements (tens of
-/// bytes) fit thousands of times over; the budget binds adversarial
-/// mixes only.
-const ENTRY_SHARE_BYTES: usize = STATEMENT_BYTES_CEILING;
-
-/// The per-cell entry-cap default (the M3-S10 value; node assembly
-/// re-sizes it).
-pub const STATEMENT_CACHE_DEFAULT_ENTRIES: usize = 1024;
-
-const _: () = assert!(
-    (ENTRIES_MAX as usize).checked_mul(ENTRY_SHARE_BYTES).is_some(),
-    "the byte budget of a full-size cache fits usize"
-);
 
 struct Entry {
     hash: u64,
@@ -59,26 +43,20 @@ struct Entry {
 }
 
 impl Entry {
-    /// Heap bytes this entry pins beyond its slab slot: key text +
-    /// serialized program (the dominant owned allocations; the decoded
-    /// `Access`/VM views are proportional to it).
+    /// Key text and every allocation the retained compiled value owns.
     fn heap_bytes(&self) -> usize {
         heap_bytes_of(&self.key, &self.compiled)
     }
 }
 
-/// An entry's heap bytes, for one not yet built: key text + program.
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "bound: two slice lengths, each <= isize::MAX, sum to at most usize::MAX"
-)]
+/// A prospective entry's complete resident charge, before admission.
 fn heap_bytes_of(text: &[u8], compiled: &CompiledStatement) -> usize {
-    text.len() + compiled.program.as_bytes().len()
+    text.len().saturating_add(compiled.heap_bytes())
 }
 
 /// Bounded LRU of compiled statements, keyed by raw statement text.
 pub struct StatementCache {
-    buckets: Box<[u32]>,
+    buckets: Vec<u32>,
     slab: Vec<Entry>,
     lru_head: u32,
     lru_tail: u32,
@@ -91,37 +69,31 @@ pub struct StatementCache {
     invalidations: u64,
 }
 
-impl Default for StatementCache {
-    fn default() -> StatementCache {
-        StatementCache::new(STATEMENT_CACHE_DEFAULT_ENTRIES)
-    }
-}
+const _: () =
+    assert!((STATEMENT_CACHE_ENTRIES_MAX as usize).checked_mul(size_of::<Entry>()).is_some());
 
 impl StatementCache {
-    /// `capacity` in entries; 0 disables caching (every lookup
-    /// compiles).
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "bound: `capacity <= ENTRIES_MAX < 2^32`, so `* 2` is below 2^33 on the 64-bit \
-                  usize inf-foundation const-asserts, and `ENTRIES_MAX * ENTRY_SHARE_BYTES` is \
-                  const-asserted above to fit"
-    )]
-    pub fn new(capacity: usize) -> StatementCache {
-        let capacity = u32::try_from(capacity).map_or(ENTRIES_MAX, |c| c.min(ENTRIES_MAX));
-        let bucket_count = (capacity as usize * 2).next_power_of_two().max(1);
-        StatementCache {
-            buckets: vec![NIL; if capacity == 0 { 1 } else { bucket_count }].into_boxed_slice(),
-            slab: Vec::new(),
+    /// Reserve all metadata before installation (ADR-0146 D2).
+    /// Zero capacity allocates nothing and compiles every lookup uncached.
+    pub fn try_new(capacity: StatementCacheCapacity) -> Result<StatementCache, TryReserveError> {
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(capacity.buckets())?;
+        buckets.resize(capacity.buckets(), NIL);
+        let mut slab = Vec::new();
+        slab.try_reserve_exact(capacity.entries())?;
+        Ok(StatementCache {
+            buckets,
+            slab,
             lru_head: NIL,
             lru_tail: NIL,
-            capacity,
-            budget_bytes: capacity as usize * ENTRY_SHARE_BYTES,
+            capacity: capacity.slots(),
+            budget_bytes: capacity.budget_bytes(),
             entry_bytes: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
             invalidations: 0,
-        }
+        })
     }
 
     /// Look up `text`, compiling and inserting on miss. A resident
@@ -164,7 +136,7 @@ impl StatementCache {
     /// A gauge: it saturates rather than wrap.
     pub fn bytes(&self) -> usize {
         let slab_bytes = self.slab.capacity().saturating_mul(size_of::<Entry>());
-        let bucket_bytes = self.buckets.len().saturating_mul(size_of::<u32>());
+        let bucket_bytes = self.buckets.capacity().saturating_mul(size_of::<u32>());
         slab_bytes.saturating_add(self.entry_bytes).saturating_add(bucket_bytes)
     }
 
@@ -199,7 +171,7 @@ impl StatementCache {
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::cast_possible_truncation,
-        reason = "bound: `new` builds `buckets` with a power-of-two length >= 1 and nothing \
+        reason = "bound: a nonzero cache has a power-of-two bucket length >= 1 and nothing \
                   resizes it, so `len - 1` cannot underflow; the masked hash is below that \
                   length, itself a usize"
     )]
@@ -402,6 +374,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::partiql::STATEMENT_BYTES_CEILING;
+
+    fn cache_with_capacity(entries: usize) -> StatementCache {
+        StatementCache::try_new(StatementCacheCapacity::try_from(entries).expect("test capacity"))
+            .expect("test cache allocation")
+    }
     use std::cell::Cell;
 
     use inf_doc::path;
@@ -463,9 +441,36 @@ mod tests {
     const CAP: usize = STATEMENT_BYTES_CEILING;
 
     #[test]
+    fn metadata_backing_stays_fixed_through_eviction() {
+        let mut cache = cache_with_capacity(3);
+        let before = (
+            cache.slab.capacity(),
+            cache.buckets.capacity(),
+            cache.slab.as_ptr(),
+            cache.buckets.as_ptr(),
+        );
+        let catalog = TestCatalog::new();
+        for i in 0..64 {
+            cache
+                .get_or_compile(format!("SELECT * FROM ns WHERE v = {i}").as_bytes(), &catalog, CAP)
+                .unwrap();
+            assert_eq!(
+                (
+                    cache.slab.capacity(),
+                    cache.buckets.capacity(),
+                    cache.slab.as_ptr(),
+                    cache.buckets.as_ptr()
+                ),
+                before
+            );
+        }
+        assert!(cache.evictions() > 0);
+    }
+
+    #[test]
     fn hit_returns_the_cached_statement_and_counts() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let a = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         assert_eq!((cache.hits(), cache.misses()), (0, 1));
         let b = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
@@ -477,7 +482,7 @@ mod tests {
     #[test]
     fn spelling_variants_are_distinct_keys() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let a = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         let b = cache.get_or_compile(b"select * from ns where v = 1", &catalog, CAP).expect("ok");
         assert_eq!(a.program.as_bytes(), b.program.as_bytes(), "same compilation");
@@ -490,7 +495,7 @@ mod tests {
     #[test]
     fn epoch_invalidation_recompiles_and_can_reject() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let compiled =
             cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         assert!(matches!(compiled.access.step, AccessStep::IndexRange { .. }));
@@ -507,7 +512,7 @@ mod tests {
     #[test]
     fn rejections_are_never_cached() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(8);
+        let mut cache = cache_with_capacity(8);
         for _ in 0..2 {
             cache
                 .get_or_compile(b"SELECT * FROM ns ORDER BY v", &catalog, CAP)
@@ -520,7 +525,7 @@ mod tests {
     #[test]
     fn lru_evicts_the_coldest_entry() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(2);
+        let mut cache = cache_with_capacity(2);
         let s1 = b"SELECT * FROM ns WHERE v = 1".as_slice();
         let s2 = b"SELECT * FROM ns WHERE v = 2".as_slice();
         let s3 = b"SELECT * FROM ns WHERE v = 3".as_slice();
@@ -539,7 +544,7 @@ mod tests {
     #[test]
     fn invalidation_keeps_the_table_consistent() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(8);
+        let mut cache = cache_with_capacity(8);
         let statements: Vec<Vec<u8>> =
             (0..5).map(|i| format!("SELECT * FROM ns WHERE v = {i}").into_bytes()).collect();
         for s in &statements {
@@ -576,7 +581,7 @@ mod tests {
     #[test]
     fn cache_hot_mix_hits_over_99_percent() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::default();
+        let mut cache = cache_with_capacity(STATEMENT_CACHE_DEFAULT_ENTRIES);
         let mix: Vec<Vec<u8>> = (0..20)
             .map(|i| format!("SELECT * FROM ns WHERE v > {i} LIMIT 100").into_bytes())
             .collect();
@@ -594,7 +599,7 @@ mod tests {
     #[test]
     fn capacity_zero_disables_but_still_serves() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(0);
+        let mut cache = cache_with_capacity(0);
         cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
         assert_eq!(cache.len(), 0);
@@ -649,7 +654,7 @@ mod tests {
     #[test]
     fn multi_victim_eviction_does_not_leak_slots() {
         let catalog = TestCatalog::new();
-        let mut cache = StatementCache::new(4); // budget = 4 × 8192
+        let mut cache = cache_with_capacity(4); // budget = 4 × 8192
         let tiny = padded(0, 0);
         cache.get_or_compile(&tiny, &catalog, CAP).expect("ok");
         let big: Vec<Vec<u8>> = (1..=4).map(|i| padded(i, CAP)).collect();
@@ -663,6 +668,43 @@ mod tests {
         assert_eq!(cache.evictions(), 2);
         assert_eq!(cache.len(), 3, "two victims out, one entry in");
         check_invariants(&cache);
+    }
+
+    #[test]
+    fn resident_heap_budget_accepts_equality_and_evicts_one_byte_over() {
+        let catalog = TestCatalog::new();
+        let first = b"SELECT * FROM ns WHERE v = 1";
+        let second = b"SELECT * FROM ns WHERE v = 2";
+        let compiled_first = compile_with_max_bytes(first, &catalog, CAP).unwrap();
+        let compiled_second = compile_with_max_bytes(second, &catalog, CAP).unwrap();
+        let exact = heap_bytes_of(first, &compiled_first) + heap_bytes_of(second, &compiled_second);
+        for (short_by, resident, evictions) in [(0, 2, 0), (1, 1, 1)] {
+            let mut cache = cache_with_capacity(2);
+            cache.budget_bytes = exact - short_by;
+            cache.get_or_compile(first, &catalog, CAP).unwrap();
+            cache.get_or_compile(second, &catalog, CAP).unwrap();
+            assert_eq!((cache.len(), cache.evictions()), (resident, evictions));
+            check_invariants(&cache);
+        }
+    }
+
+    #[test]
+    fn oversized_decoded_value_still_compiles_without_becoming_resident() {
+        let catalog = TestCatalog::new();
+        let text = b"SELECT * FROM ns WHERE v BETWEEN 1 AND 9 AND label = 'open'";
+        let compiled = compile_with_max_bytes(text, &catalog, CAP).unwrap();
+        let charge = heap_bytes_of(text, &compiled);
+        for (short_by, expected_entries) in [(0, 1), (1, 0)] {
+            let mut cache = cache_with_capacity(1);
+            cache.budget_bytes = charge - short_by;
+            for _ in 0..2 {
+                let returned = cache.get_or_compile(text, &catalog, CAP).unwrap();
+                assert_eq!(returned.program.as_bytes(), compiled.program.as_bytes());
+            }
+            assert_eq!(cache.len(), expected_entries);
+            assert_eq!(cache.misses(), if short_by == 0 { 1 } else { 2 });
+            check_invariants(&cache);
+        }
     }
 
     /// The same shape driven by a generator: mixed sizes, hits, epoch
@@ -680,7 +722,7 @@ mod tests {
             ProptestConfig::with_cases(512),
             |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
             let catalog = TestCatalog::new();
-            let mut cache = StatementCache::new(capacity);
+            let mut cache = cache_with_capacity(capacity);
             for (kind, idx, pad) in ops {
                 if kind == 7 {
                     catalog.epoch.set(catalog.epoch.get() + 1);
@@ -710,7 +752,7 @@ mod tests {
             ProptestConfig::with_cases(4096),
             |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..96))| {
             let catalog = TestCatalog::new();
-            let mut cache = StatementCache::new(capacity);
+            let mut cache = cache_with_capacity(capacity);
             for (kind, idx, pad) in ops {
                 if kind == 7 {
                     catalog.epoch.set(catalog.epoch.get() + 1);

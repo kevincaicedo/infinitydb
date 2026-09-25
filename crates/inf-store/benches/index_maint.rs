@@ -29,6 +29,9 @@
 //! Run: `taskset -c 4 cargo bench -p inf-store --bench index_maint`
 //! Artifact: 3 replicates recorded under `.artifacts/m4.5/s04/`.
 
+#[path = "../../../scripts/overflow-profile-canary.rs"]
+mod overflow_profile_canary;
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -38,7 +41,7 @@ use inf_foundation::time::Nanos;
 use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, PkRef, StoreConfig};
 
 const ROUNDS: usize = 15;
-const OPS_PER_ROUND: usize = 20_000;
+const OPS_PER_ROUND: usize = 200_000;
 const TREE_FILL: u64 = 10_000_000;
 
 fn median(mut xs: Vec<f64>) -> f64 {
@@ -72,8 +75,8 @@ fn sweep_set(label: &str, ks: &mut Keyspace, ns: NsId, indexed: bool) -> f64 {
     let now = Nanos(1_000_000_000);
     let mut rounds = Vec::with_capacity(ROUNDS);
     let mut checksum = 0u64;
-    for _ in 0..ROUNDS {
-        let started = Instant::now();
+    for round in 0..=ROUNDS {
+        let started = (round != 0).then(Instant::now);
         for i in 0..OPS_PER_ROUND {
             let doc = if i % 2 == 0 { &doc_a } else { &doc_b };
             if indexed {
@@ -87,9 +90,12 @@ fn sweep_set(label: &str, ks: &mut Keyspace, ns: NsId, indexed: bool) -> f64 {
             }
             checksum = checksum.wrapping_add(i as u64);
         }
-        rounds.push(started.elapsed().as_nanos() as f64 / OPS_PER_ROUND as f64);
+        if let Some(started) = started {
+            rounds.push(started.elapsed().as_nanos() as f64 / OPS_PER_ROUND as f64);
+        }
     }
     black_box(checksum);
+    report_samples(label, &rounds);
     let ns_op = median(rounds);
     println!("row={label} ops={OPS_PER_ROUND} ns_per_op={ns_op:.1}");
     ns_op
@@ -100,20 +106,31 @@ fn sweep_bracket(label: &str, ks: &mut Keyspace, ns: NsId, path: Option<&str>) -
     let key = b"bench:hot";
     let program = path.map(|p| compile(p.as_bytes()).expect("valid path"));
     let mut rounds = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let started = Instant::now();
+    for round in 0..=ROUNDS {
+        let started = (round != 0).then(Instant::now);
         for _ in 0..OPS_PER_ROUND {
             ks.idx_bracket_begin(ns, &[key], black_box(program.as_ref())).expect("headroom");
             ks.idx_bracket_commit(ns, &[key]);
         }
-        rounds.push(started.elapsed().as_nanos() as f64 / OPS_PER_ROUND as f64);
+        if let Some(started) = started {
+            rounds.push(started.elapsed().as_nanos() as f64 / OPS_PER_ROUND as f64);
+        }
     }
+    report_samples(label, &rounds);
     let ns_op = median(rounds);
     println!("row={label} ops={OPS_PER_ROUND} ns_per_op={ns_op:.1}");
     ns_op
 }
 
+fn report_samples(label: &str, samples: &[f64]) {
+    for (round, ns_per_op) in samples.iter().enumerate() {
+        println!("sample={label} round={round} ops={OPS_PER_ROUND} ns_per_op={ns_per_op:.6}");
+    }
+}
+
 fn main() {
+    overflow_profile_canary::run_if_requested();
+    println!("# index_maint rounds={ROUNDS} ops={OPS_PER_ROUND} warmup_rounds=1");
     let ns = NsId(0);
     let now = Nanos(1_000_000_000);
 

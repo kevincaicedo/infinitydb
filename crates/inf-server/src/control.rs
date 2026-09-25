@@ -1285,6 +1285,7 @@ fn control_main(
             ControlMsg::Unlink(path) => {
                 // Never fatal: the file is outside every recovery
                 // unit; a survivor is re-collected at boot.
+                #[allow(clippy::disallowed_methods, reason = "control-thread: retired file unlink")]
                 if let Err(err) = std::fs::remove_file(&path)
                     && err.kind() != std::io::ErrorKind::NotFound
                 {
@@ -1301,7 +1302,7 @@ fn control_main(
         let mut announced = vec![false; usize::from(cells)];
         #[allow(
             clippy::disallowed_methods,
-            reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
         )]
         // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
         let boot_started = std::time::Instant::now();
@@ -1359,7 +1360,7 @@ fn control_main(
             }
             #[allow(
                 clippy::disallowed_methods,
-                reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+                reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
             )]
             // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
             let now = std::time::Instant::now();
@@ -1368,7 +1369,7 @@ fn control_main(
                 let (done, total) = board.bytes();
                 #[allow(
                     clippy::disallowed_methods,
-                    reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+                    reason = "clock: boot narration, never oracle input (ADR-0015 D3)"
                 )]
                 let elapsed = boot_started.elapsed().as_secs_f64();
                 let eta = if done > 0 {
@@ -1404,7 +1405,7 @@ fn control_main(
         }
         #[allow(
             clippy::disallowed_methods,
-            reason = "control thread (ADR-0015 D3): boot narration, never oracle input"
+            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
         )]
         let boot_ms = boot_started.elapsed().as_millis();
         eprintln!(

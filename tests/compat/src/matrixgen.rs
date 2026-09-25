@@ -294,7 +294,10 @@ pub static DECLARED: &[Declared] = &[
              unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
              connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
              enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \
-             replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF)",
+             replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); \
+             `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; \
+             0 disables caching), set by `--doc-path-cache-size`; larger boot requests \
+             are refused and slim builds omit the key (ADR-0146)",
     ),
     d(
         "CLIENT",

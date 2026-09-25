@@ -101,7 +101,7 @@ fn start_node(
             listener.into_raw_fd(),
             ks,
             fabric,
-            Rc::new(NodeInfo::default()),
+            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,
             false,
         );

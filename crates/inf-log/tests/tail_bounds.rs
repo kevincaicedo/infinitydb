@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Sparse-file boundary tests for the tail scanner's u32 segment cursor.
 
 use std::path::{Path, PathBuf};

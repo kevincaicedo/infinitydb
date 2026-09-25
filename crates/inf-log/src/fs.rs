@@ -256,6 +256,7 @@ pub struct StdSegmentFs;
 
 /// A real file. Uses positional I/O (`pread`/`pwrite`) — no seek state.
 #[derive(Debug)]
+#[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
 pub struct StdSegmentFile(std::fs::File);
 
 impl SegmentFile for StdSegmentFile {
@@ -299,21 +300,25 @@ impl SegmentFs for StdSegmentFs {
     type File = StdSegmentFile;
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::create_dir_all(dir)
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         std::fs::File::open(dir)?.sync_all()
     }
 
     fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         for entry in std::fs::read_dir(dir)? {
             names.push(entry?.file_name().to_string_lossy().into_owned());
         }
         Ok(names)
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
@@ -322,6 +327,7 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         // No sync_all: an fsync here commits the whole ext4 journal and
         // blocks the reactor behind any entangled foreign writeback for
@@ -333,6 +339,7 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         #[cfg(target_os = "linux")]
         {
@@ -361,6 +368,7 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
         match mode {
             SegmentIoMode::Buffered => self.open_write(path),
@@ -383,6 +391,7 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         match mode {
             TierIoMode::Buffered => self.create_segment(path, 0),
@@ -407,6 +416,7 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         match mode {
             TierIoMode::Buffered => self.open_write(path),
@@ -429,12 +439,14 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
         #[cfg(target_os = "linux")]
         {
@@ -462,23 +474,28 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::File::open(dir)?))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::OpenOptions::new().read(true).write(true).open(path)?))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::File::open(path)?))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::rename(from, to)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::remove_file(path)
     }
 }
@@ -490,8 +507,10 @@ impl SegmentFs for StdSegmentFs {
 /// procfs read; this crate forbids unsafe, so no `fcntl` — and absence
 /// of the flag is a typed `Unsupported` refusal, never a downgrade.
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
 fn verify_o_direct(file: &std::fs::File, path: &Path) -> io::Result<()> {
     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
     let flags = info
         .lines()
@@ -554,6 +573,8 @@ pub mod mem {
         /// Cap on bytes one `read_at` returns (`None` = unlimited): the
         /// partial-read model every reader must loop over (F-L04-10).
         read_cap: Option<usize>,
+        #[cfg(test)]
+        overreport_reads: bool,
         fail_next_sync_data: bool,
         /// `read_at` calls across every file — the dependent-read oracle
         /// for the `.ick` loader (review L03, batch 34).
@@ -623,6 +644,12 @@ pub mod mem {
         /// Every `read_at` returns at most `cap` bytes (partial reads).
         pub fn set_read_cap(&self, cap: Option<usize>) {
             self.state.borrow_mut().read_cap = cap;
+        }
+
+        /// Plant a broken file seam: report one byte past the supplied slice.
+        #[cfg(test)]
+        pub(crate) fn overreport_reads(&self) {
+            self.state.borrow_mut().overreport_reads = true;
         }
 
         pub fn set_capacity(&self, bytes: Option<u64>) {
@@ -701,6 +728,10 @@ pub mod mem {
             }
             let n = buf.len().min(bytes.len() - offset).min(read_cap.unwrap_or(usize::MAX));
             buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+            #[cfg(test)]
+            if self.fs.borrow().overreport_reads {
+                return Ok(buf.len() + 1);
+            }
             Ok(n)
         }
 

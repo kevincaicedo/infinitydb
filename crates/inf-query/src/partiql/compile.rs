@@ -505,12 +505,6 @@ fn i64_cross_interval(cmp: CmpOp, c: f64) -> Interval {
 /// ones bind at the float neighbor, computed as ±1 on the encoded
 /// word — the f64 key encoding is a monotone bijection onto its word
 /// range, so word arithmetic IS float neighbor stepping (ADR-0080 D3).
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "bound: `g` is finite (every i64 converts to a finite f64), and the key words of \
-              finite floats lie strictly between those of -inf and +inf (the monotone \
-              ADR-0074 D2 encoding), so neither `word - 1` nor `word + 1` leaves u64"
-)]
 fn f64_cross_interval(cmp: CmpOp, c: i64) -> Interval {
     let g = c as f64;
     let lossless = matches!(
@@ -527,8 +521,8 @@ fn f64_cross_interval(cmp: CmpOp, c: i64) -> Interval {
     // one side; its word-neighbor is on the other (no float lies
     // strictly between a value and its nearest — half-ulp bound).
     let (above, below) = match side {
-        Ordering::Less => (word, word - 1),    // c < g
-        Ordering::Greater => (word + 1, word), // c > g
+        Ordering::Less => (word, word.checked_sub(1).expect("finite float has a lower word")),
+        Ordering::Greater => (word.checked_add(1).expect("finite float has an upper word"), word),
         Ordering::Equal => unreachable!("lossy coercion is never equal"),
     };
     match cmp {

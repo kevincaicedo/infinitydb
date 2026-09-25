@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M4.5-S08 §4.1 row (dev-tier on this box; campaign re-runs are
 //! gate-grade): **≥ 5M predicate evals/s/core on the 1 KiB corpus shape
 //! ⇒ ≤ 200 ns/eval**, allocation-free (the profile artifact and the
@@ -12,6 +17,9 @@
 //! - `residual_in_list`: membership, hit on the last of three members.
 //! - `residual_multi_match`: `items[*]` existential over 12 array
 //!   elements on the 2 KiB shape — the multi-match cost row.
+
+#[path = "../../../scripts/overflow-profile-canary.rs"]
+mod overflow_profile_canary;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -32,6 +40,7 @@ fn vm(predicate: &Predicate) -> PredicateVm {
 }
 
 fn bench_predicate_eval(c: &mut Criterion) {
+    overflow_profile_canary::run_if_requested();
     let gate_text = doc_corpus::shape(doc_corpus::CANONICAL_SEED, "gate-1KiB").json;
     let gate_bytes = JsonParser::new().parse(gate_text.as_bytes()).expect("corpus parses");
     let gate = TapeDoc::from_bytes(&gate_bytes).expect("validates");

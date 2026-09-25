@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4-S19 — per-namespace memory + disk budgets (ADR-0062): the
 //! spec-driven materialization path, the aggregate reserved-VA admission
 //! bound (D4 — the ADR-0051 accepted debt, retired), the disk-budget

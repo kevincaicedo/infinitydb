@@ -847,6 +847,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_argument_counts_check_the_cap_before_reading_or_allocating() {
+        for argc in [MAX_APPLY_ARGS - 1, MAX_APPLY_ARGS] {
+            let slices = vec![b"".as_slice(); argc];
+            let args = ApplyArgs::new(&slices).unwrap();
+            round_trip(&Op::Apply {
+                token: token(0, 1),
+                slot: slot(0),
+                cmd: 0,
+                args,
+                program: false,
+            });
+        }
+        assert!(ApplyArgs::new(&vec![b"".as_slice(); MAX_APPLY_ARGS + 1]).is_none());
+        for argc in [MAX_APPLY_ARGS as u64 + 1, u64::MAX] {
+            let mut bytes = Vec::new();
+            varint::encode_u64(argc, &mut bytes);
+            let mut reader = Reader { buf: &bytes };
+            assert_eq!(reader.apply_args(), Err(CodecError::TooManyArgs(argc)));
+        }
+    }
+
+    #[test]
+    fn batch_counts_check_the_cap_before_reading_or_allocating() {
+        let ops = (0..MAX_BATCH_OPS)
+            .map(|seq| Op::Read { token: token(0, seq as u64), slot: slot(0), key: b"k" })
+            .collect();
+        round_trip(&Op::Batch { ops });
+        for count in [MAX_BATCH_OPS as u64 + 1, u64::MAX] {
+            let mut payload = Vec::new();
+            varint::encode_u64(count, &mut payload);
+            assert_eq!(
+                decode(&frame_with(OP_BATCH, &payload)),
+                Err(CodecError::TooManyBatchOps(count))
+            );
+        }
+    }
+
+    #[test]
     fn round_trip_every_variant() {
         round_trip(&Op::Read { token: token(3, 9), slot: slot(42), key: b"user:1" });
         round_trip(&Op::Write {

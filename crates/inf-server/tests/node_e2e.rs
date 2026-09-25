@@ -97,6 +97,8 @@ struct Node {
     /// "the META swap has not completed yet", which no fault point can
     /// express (the registry is thread-local to the cells).
     catalog_pump: Option<CatalogPump>,
+    /// Harness/control owner. No OS sampling runs in the cell test threads.
+    process_sampler: std::cell::RefCell<inf_server::ProcessSampler>,
 }
 
 struct CatalogPump {
@@ -433,6 +435,8 @@ impl Node {
         held_catalog: Option<Arc<AtomicBool>>,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
+        let mut process_sampler = inf_server::ProcessSampler::default();
+        process_sampler.sample();
         let graceful = Arc::new(AtomicBool::new(false));
         let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
@@ -497,6 +501,7 @@ impl Node {
         });
         let mut handles = Vec::new();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
+            let process_board = process_sampler.board();
             let stop = Arc::clone(&stop);
             let graceful = Arc::clone(&graceful);
             let quiet = Arc::clone(&quiet);
@@ -513,7 +518,8 @@ impl Node {
                 let mut pool = BufferPool::new(256, 4096);
                 let mut driver = UringDriver::new(256).expect("uring");
                 driver.register_pool(&mut pool).expect("register");
-                let node = Rc::new(NodeInfo::default());
+                let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+                node.process_board.replace(Some(process_board));
                 node.run_id.set(run_id);
                 *node.conn_default_ns.borrow_mut() = default_ns;
                 // Real wall anchor (the infinityd boot pattern): LASTSAVE/
@@ -610,7 +616,17 @@ impl Node {
             }));
         }
         let control = boot.map(|(_, _, control)| control);
-        let node = Node { port, cells, stop, graceful, drained, handles, control, catalog_pump };
+        let node = Node {
+            port,
+            cells,
+            stop,
+            graceful,
+            drained,
+            handles,
+            control,
+            catalog_pump,
+            process_sampler: std::cell::RefCell::new(process_sampler),
+        };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
         // observe it (the throttle IS the -LOADING test's subject).
@@ -6925,6 +6941,7 @@ fn info_tripwires_folds_across_cells_without_a_process_wide_gauge() {
         );
     }
     let mut c = conn_on_cell(&node, 0);
+    node.process_sampler.borrow_mut().sample();
     let memory = info_text(&mut c, b"memory");
     let field = |name: &str| -> u64 {
         memory
@@ -6935,6 +6952,7 @@ fn info_tripwires_folds_across_cells_without_a_process_wide_gauge() {
             .expect("u64")
     };
     assert_eq!(field("process_rss"), field("used_memory_rss"), "{memory}");
+    assert!(field("process_rss") > 0, "the control-owner sample must reach INFO");
     assert_eq!(memory.matches("process_rss:").count(), 1, "{memory}");
     node.stop();
 }

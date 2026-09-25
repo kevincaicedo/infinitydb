@@ -239,6 +239,21 @@ mod tests {
     }
 
     #[test]
+    fn final_pattern_bytes_do_not_advance_past_the_slice() {
+        for (pattern, text, expected) in [
+            (br"\".as_slice(), br"\".as_slice(), true),
+            (br"\", b"", false),
+            (b"[", b"a", false),
+            (b"[a-", b"a", true),
+            (b"[a-", b"-", true),
+            (b"[a-", b"b", false),
+            (b"[^", b"a", true),
+        ] {
+            assert_eq!(glob_match(pattern, text, false), expected, "{pattern:?} {text:?}");
+        }
+    }
+
+    #[test]
     fn nocase_mode() {
         assert!(glob_match(b"MaxMemory*", b"maxmemory-policy", true));
         assert!(glob_match(b"h[A-C]llo", b"hbllo", true));

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use inf_foundation::time::Nanos;
-use inf_server::{ConnCx, execute_slices};
+use inf_server::{ConnCx, ProcessSampler, execute_slices};
 use inf_store::{ArenaConfig, Keyspace, StoreConfig};
 
 const DOCUMENTS: usize = 65_536;
@@ -22,7 +22,14 @@ fn key_of(mut value: usize) -> [u8; 12] {
     key
 }
 
-fn snapshot(ks: &mut Keyspace, cx: &mut ConnCx, clock: &mut u64) -> BTreeMap<String, u64> {
+fn snapshot(
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    clock: &mut u64,
+    sampler: &mut ProcessSampler,
+) -> BTreeMap<String, u64> {
+    // The harness owns OS sampling; INFO must only format the published board.
+    sampler.sample();
     *clock += 1;
     let mut out = Vec::new();
     // The domains are `# Tripwires`, `process_rss` is `# Memory` (ADR-0122
@@ -48,12 +55,14 @@ fn document_heavy_domains_track_incremental_rss_within_ten_percent() {
     let cfg =
         StoreConfig { arena, doc_arena: arena, initial_keys: DOCUMENTS, ..StoreConfig::default() };
     let mut ks = Keyspace::new(cfg);
-    let mut cx = ConnCx::default();
+    let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+    let mut sampler = ProcessSampler::default();
+    cx.node.process_board.replace(Some(sampler.board()));
     let mut clock = 0u64;
     // One baseline INFO also warms its formatter before the measured
     // interval; the fixed input stays live on both sides.
     let json = format!(r#"{{"pad":"{}"}}"#, "x".repeat(1_000));
-    let before = snapshot(&mut ks, &mut cx, &mut clock);
+    let before = snapshot(&mut ks, &mut cx, &mut clock, &mut sampler);
 
     let mut out = Vec::with_capacity(8);
     for index in 0..DOCUMENTS {
@@ -69,7 +78,7 @@ fn document_heavy_domains_track_incremental_rss_within_ten_percent() {
         );
         assert_eq!(out, b"+OK\r\n");
     }
-    let after = snapshot(&mut ks, &mut cx, &mut clock);
+    let after = snapshot(&mut ks, &mut cx, &mut clock, &mut sampler);
 
     const DOMAINS: &[&str] = &[
         "records_resident_bytes",

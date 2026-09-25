@@ -28,7 +28,7 @@ impl Default for Candidate {
 
 impl Candidate {
     pub fn new() -> Candidate {
-        let cx = ConnCx::default();
+        let cx = ConnCx::try_default().expect("fixture cache allocation");
         // Wall anchor at the candidate's epoch: EXPIREAT/EXAT/EXPIRETIME
         // convert through the same Unix instants the redis-server oracle
         // sees, so absolute-time cases diff within `IntWithin` tolerances.

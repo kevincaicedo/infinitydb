@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S01 AC: arbitrary record sequences round-trip frame encode/decode
 //! byte-exact, including frame-boundary edge cases; corruption and
 //! truncation are always detected, never silently absorbed.

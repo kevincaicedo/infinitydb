@@ -266,7 +266,7 @@ impl Rig {
                     -1,
                     Keyspace::new(StoreConfig::default()),
                     fabric,
-                    Rc::new(NodeInfo::default()),
+                    Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
                     false,
                 )

@@ -23,7 +23,11 @@ impl Db {
     }
 
     fn with_config(cfg: StoreConfig) -> Db {
-        Db { ks: Keyspace::new(cfg), cx: ConnCx::default(), clock: 0 }
+        Db {
+            ks: Keyspace::new(cfg),
+            cx: ConnCx::try_default().expect("fixture cache allocation"),
+            clock: 0,
+        }
     }
 
     fn run(&mut self, argv: &[&[u8]]) -> Vec<u8> {

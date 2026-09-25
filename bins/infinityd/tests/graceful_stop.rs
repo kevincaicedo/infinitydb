@@ -49,6 +49,10 @@ impl Server {
     /// cell 0's is announced, so a multi-cell node takes a probed free
     /// port (the compat harness's pattern).
     fn spawn(dir: &Path, cells: &str, extra: &[&str]) -> Server {
+        Self::spawn_mode(dir, cells, extra, true)
+    }
+
+    fn spawn_mode(dir: &Path, cells: &str, extra: &[&str], durable: bool) -> Server {
         std::fs::create_dir_all(dir).expect("data dir");
         let stderr = dir.join(format!("stderr-{}-{}", std::process::id(), unique()));
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -57,10 +61,12 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
-            .args(["--port", &port, "--cells", cells, "--data-dir"])
-            .arg(dir)
-            .args(["--device-probe", "off"])
+        let mut command = Command::new(env!("CARGO_BIN_EXE_infinityd"));
+        command.args(["--port", &port, "--cells", cells]);
+        if durable {
+            command.arg("--data-dir").arg(dir).args(["--device-probe", "off"]);
+        }
+        let child = command
             .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
@@ -216,6 +222,91 @@ fn per_cell_field(port: u16, cells: usize, section: &[u8], field: &str) -> Vec<(
 }
 
 const N: usize = 4_000;
+
+#[test]
+fn cache_boot_setting_is_reported_by_every_cell_and_stays_immutable() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (tag, flags, value) in [
+        ("cache-default", vec![], "1024"),
+        ("cache-off", vec!["--doc-path-cache-size", "0"], "0"),
+        ("cache-limit", vec!["--doc-path-cache-size", "4096"], "4096"),
+    ] {
+        let dir = data_root(tag);
+        let mut server = Server::spawn_mode(&dir, "2", &flags, false);
+        let mut seen = std::collections::BTreeSet::new();
+        let expected = resp(&[b"doc-path-cache-size", value.as_bytes()]);
+        for _ in 0..128 {
+            let mut client = Client::connect(server.port);
+            let cell = client.info_field(b"server", "cell");
+            client.0.write_all(&resp(&[b"CONFIG", b"GET", b"doc-path-cache-size"])).unwrap();
+            let mut reply = vec![0; expected.len()];
+            client.0.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, expected, "cache config differs on cell {cell}");
+            let refused = client.call(&[b"CONFIG", b"SET", b"doc-path-cache-size", b"1"]);
+            assert!(refused.starts_with(b"-ERR"));
+            assert!(String::from_utf8_lossy(&refused).contains("immutable config"));
+            seen.insert(cell);
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 2, "cache setting did not reach every cell");
+        assert!(server.sigterm_and_wait(Duration::from_secs(10)).unwrap().success());
+        drop(server);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// The process supervisor must sample memory-only boots as well as durable
+/// boots, refresh after a real allocation, and still leave on graceful stop.
+/// Omitting its sample call makes the positive-RSS deadline below go red.
+#[cfg(target_os = "linux")]
+#[test]
+fn process_samples_refresh_in_memory_and_durable_nodes() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for durable in [false, true] {
+        let dir = data_root(if durable { "samples-durable" } else { "samples-memory" });
+        let mut server = Server::spawn_mode(&dir, "2", &[], durable);
+        let mut client = Client::connect(server.port);
+        let before = wait_rss(&mut client, 0);
+        let value = vec![b'x'; 32 * 1024];
+        for key in 0..512 {
+            client.ok(&[b"SET", format!("sample:{key}").as_bytes(), &value]);
+        }
+        let after = wait_rss(&mut client, before + (8 << 20));
+        assert!(after > before, "durable={durable}: RSS did not refresh");
+        for name in ["used_cpu_sys", "used_cpu_user"] {
+            let seconds: f64 = client.info_field(b"cpu", name).parse().expect("CPU seconds");
+            assert!(seconds.is_finite() && seconds >= 0.0, "{name}={seconds}");
+        }
+        let status = server.sigterm_and_wait(Duration::from_secs(10)).expect("supervisor exits");
+        assert!(status.success(), "{}", server.text());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_rss(client: &mut Client, floor: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let bytes = client.call(&[b"INFO", b"memory"]);
+        let text = std::str::from_utf8(&bytes).expect("INFO is UTF-8");
+        let field = |key: &str| -> u64 {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .expect("RSS field")
+                .trim()
+                .parse()
+                .expect("RSS bytes")
+        };
+        let rss = field("process_rss:");
+        assert_eq!(rss, field("used_memory_rss:"), "one board sample per reply");
+        if rss > floor {
+            return rss;
+        }
+        assert!(Instant::now() < deadline, "process sample failed to exceed {floor}: {text}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// Pre-fix: the child dies by signal 15 — no exit code, no `clean stop`
 /// line. Post-fix a client with a pipeline still arriving is answered up

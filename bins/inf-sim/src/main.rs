@@ -5,6 +5,10 @@
 //! inf-sim --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
 //! ```
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "sim-harness: scenario files and reports outside simulated cells (ADR-0144 D5)"
+)]
 // ADR-0144 D1: a production `match` names every variant of its enum.
 #![cfg_attr(
     not(test),

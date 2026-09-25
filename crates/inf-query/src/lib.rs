@@ -21,6 +21,7 @@
 )]
 
 pub mod access;
+pub mod limits;
 pub mod page;
 pub mod partiql;
 pub mod predicate;

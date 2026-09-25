@@ -18,6 +18,7 @@ inf-server.workspace = true
 inf-probe.workspace = true
 
 [dev-dependencies]
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # Review F-L14-01 (batch 19): the boot test hand-places frames the
 # shipping writer never emits (a discarded life's residue behind a gap).
 inf-log.workspace = true

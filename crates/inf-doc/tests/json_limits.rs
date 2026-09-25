@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M3-S07 ACs: bounded everything at document ingest.
 //!
 //! - Oversize / overdeep inputs reject with the documented errors, and

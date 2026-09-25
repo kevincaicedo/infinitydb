@@ -209,7 +209,7 @@ fn drive_cell(
     let mut pool = BufferPool::new(256, 4096);
     let mut driver = UringDriver::new(256).expect("uring");
     driver.register_pool(&mut pool).expect("register");
-    let node = Rc::new(NodeInfo::default());
+    let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

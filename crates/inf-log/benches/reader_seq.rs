@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! Sequential log read throughput (M2-S04 AC, L4): a full CRC-validating
 //! `SegmentReader` pass over a segment written by the staging ring + rotor.
 //! Criterion reports bytes/s; the gate value (≥ 2 GB/s sequential read,

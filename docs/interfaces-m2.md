@@ -1254,6 +1254,18 @@ per episode). A drained cell always seals — never slower than K = 1.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
+- **Accepted 2026-09-22, implementation open — ADR-0148:**
+  [bounded tiered namespace lifetimes](../../docs/adr/0148-bounded-tiered-namespace-lifetimes.md)
+  amends the namespace DDL contract below. The catalog writer reserves a
+  tiered lifetime grant before publication; `CreateApplied` does not
+  return it. Durable removal plus every cell's terminal-cleanup receipt
+  permits reuse. The ADR owns the capacity/refusal, namespace-ID exhaustion,
+  startup admission and origin-failure/cancellation contracts. The existing
+  nine-argument fan and durable formats remain. These changes are not yet
+  implemented; [ARCH-W0.3b](../../docs/drr/ARCH-W0.3b.md) revision 2 must
+  complete its resource/producer proofs and receive independent review
+  before code. The historical implementation descriptions below do not
+  establish those new obligations.
 - **ADR-0103 amendment (2026-09-01, full-codebase review C14 /
   F-L14-05) — the `CREATE` choreography: persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
@@ -1654,6 +1666,17 @@ glue). Deliberate unchecked gaps: **2**. Promotions proposed: **5** (6
 call sites after the split).
 
 ### A.7 — Tier-flush round machine (M4.5-S31, ADR-0084)
+
+**Open conformance finding (2026-09-22):** one in-flight round does not
+bound its staged bytes/operations. The production-API coarse-cut witness
+in [ARCH-W0.3b P5](../../docs/drr/ARCH-W0.3b.md#p5-seal-count-proof-and-round-admission-boundary)
+reaches the operation assertion with validated geometry. The existing
+token/custody/durability contracts remain binding; complete pre-effect
+admission and full-host reachability proof remain open.
+[Accepted ADR-0155](../../docs/adr/0155-bounded-tier-round-preparation-and-issue.md)
+supersedes the affected round/preparation/issue contract (owner review,
+2026-09-22). Its replacement is unbuilt. The full container mechanism
+remains Draft and needs independent review before production changes.
 
 The reactor-drive flush state machine (`TierFlush` round state in
 `inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell.rs`):

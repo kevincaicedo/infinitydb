@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4.5-S03 (ADR-0075): the index declaration lifecycle across the
 //! control plane — the 8-cell propagation race (no planning before the
 //! last owning cell reports ready), drop-during-query typed binding

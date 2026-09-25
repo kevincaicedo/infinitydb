@@ -220,6 +220,13 @@ diagnostic data. Invalid or empty snapshots cannot certify a gate.
 
 ### Every command is a resumable state machine
 
+**Accepted contract, implementation open (2026-09-22):**
+[ADR-0149](../docs/adr/0149-reserved-executor-and-gate-capacity.md)
+requires task storage reserved before polling/dequeue and accounting
+through waker retirement and gate-result ownership. The no-allocation
+and 5 ns executor fast-path gate remains; ARCH-W0.3b's full bounds,
+independent review and implementation are still owed.
+
 Commands compile to `!Send` futures on a minimal cell-local executor — no
 work stealing, no atomic wakers, no global runtime. The local fast path
 completes synchronously inside `poll` and pays essentially nothing for the

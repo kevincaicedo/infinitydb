@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M3-S19 document-domain attribution: resident partitions reconcile,
 //! diagnostic overlays are not double-counted, and keyspace aggregation is
 //! the exact field-wise sum of per-namespace reports.

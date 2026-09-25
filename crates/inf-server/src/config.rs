@@ -100,6 +100,8 @@ const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
 #[derive(Debug)]
 pub struct ConfigStore {
     entries: Vec<Entry>,
+    #[cfg(feature = "doc")]
+    path_cache_capacity: inf_doc::limits::ProgramCacheCapacity,
     /// Bumped on every successful SET — the plane's MAINTAIN sweep compares
     /// it to push `hot-per-cell` keys (eviction pressure) without re-parsing
     /// the table each iteration (M1-E3).
@@ -109,124 +111,120 @@ pub struct ConfigStore {
 impl Default for ConfigStore {
     fn default() -> ConfigStore {
         let e = |key, class, kind, value: &str| Entry { key, class, kind, value: value.into() };
+        let mut entries = vec![
+            e("appendonly", ReloadClass::BootOnly, Kind::Enum(&["no", "yes"]), "no"),
+            e(
+                "client-output-buffer-limit",
+                ReloadClass::HotPerCell,
+                Kind::OutputBufferLimit,
+                "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+            ),
+            // Exactly `DATABASES`: the fabric db field's capacity (L17 E6b).
+            e(
+                "databases",
+                ReloadClass::BootOnly,
+                Kind::Int(i64::from(DATABASES), i64::from(DATABASES)),
+                "16",
+            ),
+            // ADR-0123 D1: the node bound, divided per cell like
+            // `maxmemory`; the accept path refuses past the share.
+            e("maxclients", ReloadClass::HotPerCell, Kind::Int(1, i64::from(u32::MAX)), "10000"),
+            e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
+            e(
+                "maxmemory-policy",
+                ReloadClass::HotPerCell,
+                Kind::Enum(MAXMEMORY_POLICIES),
+                "noeviction",
+            ),
+            e("maxmemory-samples", ReloadClass::HotPerCell, Kind::Int(ANY_INT.0, ANY_INT.1), "5"),
+            // ADR-0122: the parser's bulk cap — the record bound by
+            // default (16 MiB; Redis 512 MiB), floored at Redis's
+            // 1 MiB, pushed to every live parser on the MAINTAIN sweep.
+            e("proto-max-bulk-len", ReloadClass::HotPerCell, Kind::Memory, "16777216"),
+            e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
+            // ADR-0123 D3: set on sockets accepted after the change.
+            e(
+                "tcp-keepalive",
+                ReloadClass::HotPerCell,
+                Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                "300",
+            ),
+            // M4.5-S30 (ADR-0085 D6): read-driven promotion
+            // admission. `no` is fully inert (the pre-S30 read
+            // path) — the same-binary A/B arm and the escape hatch
+            // for scan-heavy namespaces until the reserved per-ns
+            // `TIER-PROMOTE` key earns its catalog bump.
+            e("tiered-promote-on-read", ReloadClass::HotPerCell, Kind::Enum(&["no", "yes"]), "yes"),
+            // M4.5-S37 (ADR-0093 D8): shadow-slot reconciliation for
+            // cold overwrites — the same-binary A/B arm, default off
+            // until the reference-box campaign decides; `no` is inert
+            // for new writes and open tickets keep reconciling.
+            e("tiered-shadow-overwrite", ReloadClass::HotPerCell, Kind::Enum(&["no", "yes"]), "no"),
+            // M4.5-S37 (ADR-0093 A8, review of 2026-08-28): pauses
+            // the shadow reconciler (no MAINTAIN reads, no settles)
+            // so open tickets stay open — the DST's lever for the
+            // open-ticket rows (`DBSIZE`'s drain, `SCAN`'s twin, the
+            // `Ticketed` refusal, `DEL`'s forced resolution) and an
+            // operator's pause; the pin cap and the ticket cap bound
+            // what a paused reconciler can hold. `DBSIZE` and `DEL`
+            // keep their own reads.
+            e(
+                "tiered-shadow-reconcile",
+                ReloadClass::HotPerCell,
+                Kind::Enum(&["yes", "no"]),
+                "yes",
+            ),
+            // M4-S19 (ADR-0062 D4): the node bound on aggregate
+            // reserved tiered-Region VA — an explicit bounded
+            // default, never an inferred host maximum. Divided per
+            // cell like `maxmemory`; admission-only (lowering it
+            // never evicts standing reservations).
+            e("tiered-reserved-va-limit", ReloadClass::HotPerCell, Kind::Memory, "274877906944"),
+            // ADR-0123 D2: idle unsubscribed connections close in
+            // the MAINTAIN sweep; 0 = off.
+            e(
+                "timeout",
+                ReloadClass::HotPerCell,
+                Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                "0",
+            ),
+        ];
+        #[cfg(feature = "doc")]
+        entries.push(e(
+            "doc-path-cache-size",
+            ReloadClass::BootOnly,
+            Kind::Int(0, i64::from(inf_doc::limits::PROGRAM_CACHE_ENTRIES_MAX)),
+            &inf_doc::limits::PROGRAM_CACHE_DEFAULT_ENTRIES.to_string(),
+        ));
+        entries.sort_unstable_by_key(|entry| entry.key);
         ConfigStore {
+            entries,
             version: 0,
-            entries: vec![
-                e("appendonly", ReloadClass::BootOnly, Kind::Enum(&["no", "yes"]), "no"),
-                e(
-                    "client-output-buffer-limit",
-                    ReloadClass::HotPerCell,
-                    Kind::OutputBufferLimit,
-                    "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
-                ),
-                // Exactly `DATABASES`: the fabric db field's capacity (L17 E6b).
-                e(
-                    "databases",
-                    ReloadClass::BootOnly,
-                    Kind::Int(i64::from(DATABASES), i64::from(DATABASES)),
-                    "16",
-                ),
-                // M3-S10 (ADR-0041 D2): per-cell compiled-path-program
-                // cache entries; 0 disables. Applied at plane assembly.
-                e(
-                    "doc-path-cache-size",
-                    ReloadClass::BootOnly,
-                    Kind::Int(ANY_INT.0, ANY_INT.1),
-                    "1024",
-                ),
-                // ADR-0123 D1: the node bound, divided per cell like
-                // `maxmemory`; the accept path refuses past the share.
-                e(
-                    "maxclients",
-                    ReloadClass::HotPerCell,
-                    Kind::Int(1, i64::from(u32::MAX)),
-                    "10000",
-                ),
-                e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
-                e(
-                    "maxmemory-policy",
-                    ReloadClass::HotPerCell,
-                    Kind::Enum(MAXMEMORY_POLICIES),
-                    "noeviction",
-                ),
-                e(
-                    "maxmemory-samples",
-                    ReloadClass::HotPerCell,
-                    Kind::Int(ANY_INT.0, ANY_INT.1),
-                    "5",
-                ),
-                // ADR-0122: the parser's bulk cap — the record bound by
-                // default (16 MiB; Redis 512 MiB), floored at Redis's
-                // 1 MiB, pushed to every live parser on the MAINTAIN sweep.
-                e("proto-max-bulk-len", ReloadClass::HotPerCell, Kind::Memory, "16777216"),
-                e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
-                // ADR-0123 D3: set on sockets accepted after the change.
-                e(
-                    "tcp-keepalive",
-                    ReloadClass::HotPerCell,
-                    Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
-                    "300",
-                ),
-                // M4.5-S30 (ADR-0085 D6): read-driven promotion
-                // admission. `no` is fully inert (the pre-S30 read
-                // path) — the same-binary A/B arm and the escape hatch
-                // for scan-heavy namespaces until the reserved per-ns
-                // `TIER-PROMOTE` key earns its catalog bump.
-                e(
-                    "tiered-promote-on-read",
-                    ReloadClass::HotPerCell,
-                    Kind::Enum(&["no", "yes"]),
-                    "yes",
-                ),
-                // M4.5-S37 (ADR-0093 D8): shadow-slot reconciliation for
-                // cold overwrites — the same-binary A/B arm, default off
-                // until the reference-box campaign decides; `no` is inert
-                // for new writes and open tickets keep reconciling.
-                e(
-                    "tiered-shadow-overwrite",
-                    ReloadClass::HotPerCell,
-                    Kind::Enum(&["no", "yes"]),
-                    "no",
-                ),
-                // M4.5-S37 (ADR-0093 A8, review of 2026-08-28): pauses
-                // the shadow reconciler (no MAINTAIN reads, no settles)
-                // so open tickets stay open — the DST's lever for the
-                // open-ticket rows (`DBSIZE`'s drain, `SCAN`'s twin, the
-                // `Ticketed` refusal, `DEL`'s forced resolution) and an
-                // operator's pause; the pin cap and the ticket cap bound
-                // what a paused reconciler can hold. `DBSIZE` and `DEL`
-                // keep their own reads.
-                e(
-                    "tiered-shadow-reconcile",
-                    ReloadClass::HotPerCell,
-                    Kind::Enum(&["yes", "no"]),
-                    "yes",
-                ),
-                // M4-S19 (ADR-0062 D4): the node bound on aggregate
-                // reserved tiered-Region VA — an explicit bounded
-                // default, never an inferred host maximum. Divided per
-                // cell like `maxmemory`; admission-only (lowering it
-                // never evicts standing reservations).
-                e(
-                    "tiered-reserved-va-limit",
-                    ReloadClass::HotPerCell,
-                    Kind::Memory,
-                    "274877906944",
-                ),
-                // ADR-0123 D2: idle unsubscribed connections close in
-                // the MAINTAIN sweep; 0 = off.
-                e(
-                    "timeout",
-                    ReloadClass::HotPerCell,
-                    Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
-                    "0",
-                ),
-            ],
+            #[cfg(feature = "doc")]
+            path_cache_capacity: inf_doc::limits::ProgramCacheCapacity::default(),
         }
     }
 }
 
 impl ConfigStore {
+    /// Assemble boot configuration from the owning cache's checked capacity.
+    /// The CONFIG SET entry remains immutable after assembly (ADR-0146 D2).
+    #[cfg(feature = "doc")]
+    pub fn with_path_cache_capacity(capacity: inf_doc::limits::ProgramCacheCapacity) -> Self {
+        let mut config = Self { path_cache_capacity: capacity, ..Self::default() };
+        for entry in &mut config.entries {
+            if entry.key == "doc-path-cache-size" {
+                entry.value = capacity.entries().to_string();
+            }
+        }
+        config
+    }
+
+    #[cfg(feature = "doc")]
+    pub(crate) fn path_cache_capacity(&self) -> inf_doc::limits::ProgramCacheCapacity {
+        self.path_cache_capacity
+    }
+
     /// Keys matching any of `patterns` (nocase glob, Redis CONFIG GET),
     /// deduplicated, in table (alphabetical) order.
     pub fn get_matching(&self, patterns: &[&[u8]]) -> Vec<(&'static str, &str)> {
@@ -435,6 +433,24 @@ pub(crate) fn parse_memory(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "doc")]
+    #[test]
+    fn boot_cache_capacity_and_config_text_share_one_checked_value() {
+        for requested in [0, 1024, usize::from(inf_doc::limits::PROGRAM_CACHE_ENTRIES_MAX)] {
+            let capacity = inf_doc::limits::ProgramCacheCapacity::try_from(requested).unwrap();
+            let mut config = ConfigStore::with_path_cache_capacity(capacity);
+            assert_eq!(config.path_cache_capacity(), capacity);
+            assert_eq!(config.get("doc-path-cache-size"), Some(requested.to_string().as_str()));
+            assert_eq!(config.version(), 0);
+            assert!(matches!(
+                config.set(b"doc-path-cache-size", b"0"),
+                Err(ConfigSetError::Immutable(_))
+            ));
+            assert_eq!(config.path_cache_capacity(), capacity);
+            assert_eq!(config.version(), 0);
+        }
+    }
 
     #[test]
     fn defaults_match_redis_shapes() {

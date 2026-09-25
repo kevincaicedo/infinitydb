@@ -94,7 +94,7 @@ pub(crate) fn info(
         replication_section(&mut text, node);
     }
     if wants("cpu") {
-        cpu_section(&mut text);
+        cpu_section(&mut text, node);
     }
     if wants("tripwires") {
         tripwires_section(&mut text, node, &report, &stats);
@@ -164,7 +164,7 @@ fn memory_section(
     g: &crate::control::MemoryGauges,
 ) {
     let used = g.used_bytes;
-    let rss = process_rss_bytes();
+    let rss = process_sample(node).rss_bytes;
     push(text, "# Memory");
     push(text, &format!("used_memory:{used}"));
     push(text, &format!("used_memory_human:{}", human_bytes(used)));
@@ -322,8 +322,10 @@ fn replication_section(text: &mut String, node: &NodeInfo) {
 }
 
 /// `INFO` — the cpu lines.
-fn cpu_section(text: &mut String) {
-    let (sys, user) = process_cpu_secs();
+fn cpu_section(text: &mut String, node: &NodeInfo) {
+    let sample = process_sample(node);
+    let sys = sample.cpu_sys_us as f64 / 1_000_000.0;
+    let user = sample.cpu_user_us as f64 / 1_000_000.0;
     push(text, "# CPU");
     push(text, &format!("used_cpu_sys:{sys:.6}"));
     push(text, &format!("used_cpu_user:{user:.6}"));
@@ -1053,25 +1055,8 @@ fn render_run_id(node: &NodeInfo) -> String {
     format!("{a:016x}{b:016x}{:08x}", c as u32)
 }
 
-/// The process RSS via the runtime's reader (Linux `/proc`, macOS
-/// `proc_pidinfo`); 0 only where no reader exists (lane L11 N19).
-fn process_rss_bytes() -> u64 {
-    inf_runtime::net::process_rss_bytes().unwrap_or(0)
-}
-
-/// (sys, user) CPU seconds from `/proc/self/stat` (USER_HZ=100 assumption,
-/// dev-tier; zeros where unavailable).
-fn process_cpu_secs() -> (f64, f64) {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return (0.0, 0.0);
-    };
-    // Split after the parenthesised comm; utime/stime are overall fields
-    // 14/15 → indices 11/12 of the remainder (state is index 0).
-    let Some((_, after)) = stat.rsplit_once(')') else { return (0.0, 0.0) };
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    let utime: f64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let stime: f64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    (stime / 100.0, utime / 100.0)
+fn process_sample(node: &NodeInfo) -> crate::ProcessSample {
+    node.process_board.borrow().as_ref().map_or_else(crate::ProcessSample::default, |b| b.read())
 }
 
 fn human_bytes(bytes: u64) -> String {

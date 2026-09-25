@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M3-S13 §4.1 AC: arena slack for arrays stays ≤ 25% of array bytes on
 //! corpus-shaped documents under array-op storms — the L5 attribution
 //! assert, exercised on both execution shapes:

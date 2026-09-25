@@ -56,6 +56,22 @@ pub struct CompiledStatement {
     pub vm: Option<PredicateVm>,
 }
 
+impl CompiledStatement {
+    /// Complete resident cache charge: this Rc-owned value, the encoded
+    /// program, decoded access buffers and prepared VM pools (ADR-0146 D1).
+    /// Active command references after eviction are a separate population.
+    pub fn heap_bytes(&self) -> usize {
+        let bytes = inf_foundation::rc_allocation_bytes(self)
+            .saturating_add(self.program.heap_bytes())
+            .saturating_add(self.access.heap_bytes());
+        bytes.saturating_add(
+            self.vm
+                .as_ref()
+                .map_or(0, |vm| vm.heap_bytes_except_program(self.access.residual.as_ref())),
+        )
+    }
+}
+
 /// Compile a statement under the default size cap.
 ///
 /// # Errors

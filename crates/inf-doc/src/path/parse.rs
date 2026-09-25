@@ -356,3 +356,33 @@ fn take_shorthand(text: &[u8], at: usize) -> (Vec<u8>, usize) {
     }
     (text[at..i].to_vec(), i)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surrogate_escape_cuts_refuse_without_appending_a_name() {
+        let cuts: &[&[u8]] = &[br"\ud83d", br"\ud83d\", br"\ud83d\u", br"\ud83d\ude0"];
+        for cut in cuts {
+            let mut name = b"prefix".to_vec();
+            assert_eq!(push_unicode_escape(cut, &mut name), None);
+            assert_eq!(name, b"prefix");
+            let mut text = b"$['".to_vec();
+            text.extend_from_slice(cut);
+            let error = parse(&text).unwrap_err();
+            assert_eq!((error.offset, error.kind), (3, PathErrorKind::BadEscape));
+        }
+        let mut name = Vec::new();
+        assert_eq!(push_unicode_escape(br"\ud83d\ude00", &mut name), Some(12));
+        assert_eq!(name, "😀".as_bytes());
+    }
+
+    #[test]
+    fn bracket_parser_checks_its_open_before_advancing() {
+        for text in [b"x".as_slice(), b"".as_slice()] {
+            let error = parse_bracket(text, 0).unwrap_err();
+            assert_eq!((error.offset, error.kind), (0, PathErrorKind::UnexpectedChar));
+        }
+    }
+}

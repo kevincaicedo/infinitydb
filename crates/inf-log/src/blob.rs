@@ -240,11 +240,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// I/O failures from the fs seam — including the typed `Unsupported`
     /// refusal when `Direct` does not take effect (ADR-0054 D3) and
     /// ENOSPC surfaced typed (the S21 blob taxonomy: refusal, never
-    /// corruption).
-    ///
-    /// # Panics
-    /// Panics when `data_len` is zero — an inline-able value out of line
-    /// is a caller routing bug, not an operating condition.
+    /// corruption). `InvalidInput` for zero bytes or a length whose
+    /// framed device size is unrepresentable; no file is created.
     pub fn create(
         fs: &F,
         shard_dir: &Path,
@@ -254,7 +251,9 @@ impl<F: SegmentFs> ExtentWriter<F> {
         data_len: u64,
         mode: TierIoMode,
     ) -> io::Result<ExtentWriter<F>> {
-        assert!(data_len > 0, "an extent holds at least one value byte");
+        if data_len == 0 || checked_extent_device_bytes(data_len).is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid extent geometry"));
+        }
         let cold_dir = shard_dir.join("cold");
         fs.create_dir_all(&cold_dir)?;
         fs.sync_dir(shard_dir)?;
@@ -527,14 +526,19 @@ pub fn extent_frame_offset(frame: u64) -> u64 {
 /// per-extent term (M4-S19, ADR-0062 D5) — one formula, shared with the
 /// writer's cumulative figure so the two can never drift.
 ///
-/// Saturating: `data_len` also arrives from an on-disk header, and a
-/// budget term that wrapped small would admit what the disk cannot hold.
+/// Saturating accounting: header parsing and writer creation refuse
+/// unrepresentable geometry. Callers folding these terms must saturate
+/// too, so a full device cannot wrap into available admission headroom.
 #[must_use]
 pub fn extent_device_bytes(data_len: u64) -> u64 {
+    checked_extent_device_bytes(data_len).unwrap_or(u64::MAX)
+}
+
+fn checked_extent_device_bytes(data_len: u64) -> Option<u64> {
     data_len
         .div_ceil(TIER_FRAME_DATA as u64)
-        .saturating_mul(TIER_FRAME_BYTES as u64)
-        .saturating_add(BLOB_HEADER_BYTES as u64)
+        .checked_mul(TIER_FRAME_BYTES as u64)?
+        .checked_add(BLOB_HEADER_BYTES as u64)
 }
 
 /// Parses a v1 extent header block from untrusted bytes (ADR-0061 D9,
@@ -542,7 +546,7 @@ pub fn extent_device_bytes(data_len: u64) -> u64 {
 ///
 /// # Errors
 /// [`TierDecodeError`] naming the first check that failed (`Geometry`
-/// for a zero `data_len` — no extent holds zero value bytes).
+/// for a zero `data_len` or an unrepresentable framed device size).
 pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeError> {
     if block.len() < BLOB_HEADER_CRC_COVER + 4 {
         return Err(TierDecodeError::TooShort);
@@ -562,7 +566,7 @@ pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeErr
     let ns = NsId(u32::from_le_bytes(block[12..16].try_into().expect("4 bytes")));
     let extent_id = ExtentId(u64::from_le_bytes(block[16..24].try_into().expect("8 bytes")));
     let data_len = u64::from_le_bytes(block[24..32].try_into().expect("8 bytes"));
-    if data_len == 0 {
+    if data_len == 0 || checked_extent_device_bytes(data_len).is_none() {
         return Err(TierDecodeError::Geometry);
     }
     Ok(ExtentHeaderV1 { cell, ns, extent_id, data_len })
@@ -915,6 +919,48 @@ mod tests {
 
     const SHARD: &str = "/shard-0";
 
+    #[test]
+    fn extent_geometry_refuses_unrepresentable_device_lengths() {
+        let max_frames =
+            (u128::from(u64::MAX) - BLOB_HEADER_BYTES as u128) / TIER_FRAME_BYTES as u128;
+        let max_data = (max_frames * TIER_FRAME_DATA as u128) as u64;
+        for (data_len, valid) in
+            [(1, true), (max_data, true), (max_data + 1, false), (u64::MAX, false), (0, false)]
+        {
+            let mut block = [0u8; BLOB_HEADER_BYTES];
+            block[..4].copy_from_slice(BLOB_MAGIC);
+            block[4..8].copy_from_slice(&1u32.to_le_bytes());
+            block[24..32].copy_from_slice(&data_len.to_le_bytes());
+            let crc = crc32c(&block[..BLOB_HEADER_CRC_COVER]);
+            block[32..36].copy_from_slice(&crc.to_le_bytes());
+            let result = parse_extent_header(&block);
+            if valid {
+                assert_eq!(result.unwrap().data_len, data_len);
+            } else {
+                assert!(matches!(result, Err(TierDecodeError::Geometry)), "{data_len}");
+            }
+        }
+        assert_eq!(extent_device_bytes(u64::MAX), u64::MAX);
+        assert_eq!(extent_frame_offset(u64::MAX / TIER_FRAME_BYTES as u64 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn extent_geometry_refusal_precedes_file_creation() {
+        let fs = MemFs::new();
+        let result = ExtentWriter::create(
+            &fs,
+            Path::new(SHARD),
+            ExtentId(1),
+            0,
+            NsId(7),
+            u64::MAX,
+            TierIoMode::Buffered,
+        );
+        let error = result.err().expect("unrepresentable geometry refuses");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs.list_dir(Path::new(SHARD)).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
     fn value(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
     }
@@ -935,6 +981,17 @@ mod tests {
             w.append_chunk(chunk).expect("append");
         }
         w.finish().expect("finish")
+    }
+
+    #[test]
+    fn extent_reader_refuses_an_overreporting_file() {
+        let fs = MemFs::new();
+        write_extent(&fs, 1, b"value");
+        fs.overreport_reads();
+        let path = Path::new(SHARD).join("cold").join(extent_file_name(ExtentId(1)));
+        let error = probe_extent_file(&fs, &path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read_at reported"));
     }
 
     /// F-L04-10: a filesystem that returns short reads (every `pread`

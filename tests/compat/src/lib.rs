@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Byte-level compat-diff harness for InfinityDB M0 (story M0-S15).
 //!
 //! Diffs raw RESP reply bytes between real Redis (the oracle, spawned per

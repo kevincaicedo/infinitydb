@@ -242,6 +242,14 @@ impl PredicateProgram {
         &self.bytes
     }
 
+    pub fn heap_bytes(&self) -> usize {
+        inf_foundation::rc_allocation_bytes(self.bytes.as_ref())
+    }
+
+    pub(crate) fn shares_allocation(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.bytes, &other.bytes)
+    }
+
     /// Validate foreign bytes (fabric arrival, fuzz) into a program.
     pub fn from_bytes(bytes: &[u8]) -> Result<PredicateProgram, PredicateError> {
         validate(bytes)?;
@@ -255,7 +263,7 @@ impl PredicateProgram {
         let mut at = 2; // version, flags
         let paths = decode_paths(bytes, &mut at);
         let constants = decode_constants(bytes, &mut at);
-        decode_expr(bytes, at, &paths, &constants)
+        decode_expr(self, at, &paths, &constants)
     }
 }
 
@@ -834,19 +842,19 @@ pub(crate) enum Op<'a> {
 /// An IN op's member region: `count` constant references back-to-back.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InMembersRef<'a> {
-    bytes: &'a [u8],
+    program: &'a PredicateProgram,
     at: usize,
     count: u8,
 }
 
 impl<'a> InMembersRef<'a> {
     pub(crate) fn iter(&self) -> InMembers<'a> {
-        InMembers { bytes: self.bytes, at: self.at, left: self.count }
+        InMembers { program: self.program, at: self.at, left: self.count }
     }
 }
 
 pub(crate) struct InMembers<'a> {
-    bytes: &'a [u8],
+    program: &'a PredicateProgram,
     at: usize,
     left: u8,
 }
@@ -863,7 +871,7 @@ impl Iterator for InMembers<'_> {
             return None;
         }
         self.left -= 1;
-        Some(trusted_ref(self.bytes, &mut self.at))
+        Some(trusted_ref(self.program, &mut self.at))
     }
 }
 
@@ -884,8 +892,8 @@ fn trusted_varint(bytes: &[u8], at: &mut usize) -> u64 {
               `from_bytes`), and `read_pool_ref` refused every reference at or past its \
               pool's count, itself capped at PATHS_MAX / CONSTANTS_MAX (const-asserted below)"
 )]
-fn trusted_ref(bytes: &[u8], at: &mut usize) -> u32 {
-    let id = trusted_varint(bytes, at);
+fn trusted_ref(program: &PredicateProgram, at: &mut usize) -> u32 {
+    let id = trusted_varint(program.as_bytes(), at);
     debug_assert!(id < CONSTANTS_MAX.max(PATHS_MAX) as u64, "validated pool reference");
     id as u32
 }
@@ -901,7 +909,8 @@ const _: () = assert!(CONSTANTS_MAX <= u32::MAX as usize, "a constant reference 
     reason = "bound: `at + 1` follows the index of `bytes[at]` and each `next += 1` the index \
               of `bytes[next]`, so each sum is at most `bytes.len() <= isize::MAX`"
 )]
-pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
+pub(crate) fn read_op(program: &PredicateProgram, at: usize) -> (Op<'_>, usize) {
+    let bytes = program.as_bytes();
     debug_assert!(at < bytes.len(), "validated pc in bounds");
     let opcode = bytes[at];
     let mut next = at + 1;
@@ -913,31 +922,31 @@ pub(crate) fn read_op(bytes: &[u8], at: usize) -> (Op<'_>, usize) {
         }
         OP_NOT => Op::Not,
         OP_BETWEEN => {
-            let path = trusted_ref(bytes, &mut next);
-            let lo = trusted_ref(bytes, &mut next);
-            let hi = trusted_ref(bytes, &mut next);
+            let path = trusted_ref(program, &mut next);
+            let lo = trusted_ref(program, &mut next);
+            let hi = trusted_ref(program, &mut next);
             Op::Between { path, lo, hi }
         }
         OP_BEGINS_WITH => {
-            let path = trusted_ref(bytes, &mut next);
-            let prefix = trusted_ref(bytes, &mut next);
+            let path = trusted_ref(program, &mut next);
+            let prefix = trusted_ref(program, &mut next);
             Op::BeginsWith { path, prefix }
         }
         OP_IN => {
-            let path = trusted_ref(bytes, &mut next);
+            let path = trusted_ref(program, &mut next);
             let count = bytes[next];
             next += 1;
             let members_at = next;
             for _ in 0..count {
-                trusted_ref(bytes, &mut next);
+                trusted_ref(program, &mut next);
             }
-            Op::In { path, members: InMembersRef { bytes, at: members_at, count } }
+            Op::In { path, members: InMembersRef { program, at: members_at, count } }
         }
-        OP_EXISTS => Op::Exists { path: trusted_ref(bytes, &mut next) },
+        OP_EXISTS => Op::Exists { path: trusted_ref(program, &mut next) },
         _ => {
             let op = CmpOp::from_opcode(opcode).expect("validated tape has no unknown opcodes");
-            let path = trusted_ref(bytes, &mut next);
-            let constant = trusted_ref(bytes, &mut next);
+            let path = trusted_ref(program, &mut next);
+            let constant = trusted_ref(program, &mut next);
             Op::Cmp { op, path, constant }
         }
     };
@@ -1006,7 +1015,7 @@ pub(crate) fn decode_constants(bytes: &[u8], at: &mut usize) -> Vec<Constant> {
 /// Iterative tree rebuild — a build-frame stack mirrors the prefix
 /// walk; no recursion (L9 applies to every decoder, even cold ones).
 fn decode_expr(
-    bytes: &[u8],
+    program: &PredicateProgram,
     mut at: usize,
     paths: &[PathProgram],
     constants: &[Constant],
@@ -1018,7 +1027,7 @@ fn decode_expr(
     }
     let mut frames: Vec<Frame> = Vec::new();
     'ops: loop {
-        let (op, next) = read_op(bytes, at);
+        let (op, next) = read_op(program, at);
         at = next;
         let mut completed = match op {
             Op::And { arity } => {
@@ -1059,7 +1068,11 @@ fn decode_expr(
         loop {
             match frames.last_mut() {
                 None => {
-                    debug_assert_eq!(at, bytes.len(), "validated program ends with its expression");
+                    debug_assert_eq!(
+                        at,
+                        program.as_bytes().len(),
+                        "validated program ends with its expression"
+                    );
                     return completed;
                 }
                 Some(Frame::Not) => {
@@ -1520,6 +1533,51 @@ mod tests {
             varint::encode_u64(id, &mut expr);
             let bytes = raw(&[pa.as_bytes()], &[], &expr);
             assert_eq!(kind_of(&bytes), PredicateErrorKind::BadPoolRef, "{id}");
+        }
+    }
+
+    #[test]
+    fn length_prefixed_regions_refuse_overrun_without_narrowing() {
+        for length in [2u64, 1 << 32, u64::MAX] {
+            let mut region = Vec::new();
+            varint::encode_u64(length, &mut region);
+            region.push(b'x');
+            assert_eq!(trusted_region(&region, &mut 0), None, "length {length}");
+
+            let mut paths = vec![PROGRAM_VERSION, 0, 1];
+            paths.extend_from_slice(&region);
+            assert_eq!(kind_of(&paths), PredicateErrorKind::Truncated);
+
+            let mut constants = vec![PROGRAM_VERSION, 0, 0, 1, CONST_UTF8];
+            constants.extend_from_slice(&region);
+            assert_eq!(kind_of(&constants), PredicateErrorKind::Truncated);
+        }
+        let mut exact = vec![1, b'x'];
+        assert_eq!(trusted_region(&exact, &mut 0), Some(b"x".as_slice()));
+        exact.pop();
+        assert_eq!(trusted_region(&exact, &mut 0), None);
+    }
+
+    #[test]
+    fn full_path_and_constant_pools_validate_and_decode() {
+        let paths = Predicate::And((0..PATHS_MAX).map(|i| exists(&format!("$.p{i}"))).collect());
+        let values: Vec<_> = (0..CONSTANTS_MAX).map(|i| Constant::I64(i as i64)).collect();
+        let constants = Predicate::And(
+            values
+                .chunks(IN_MEMBERS_MAX)
+                .map(|members| Predicate::In { path: p("$.v"), members: members.to_vec() })
+                .collect(),
+        );
+        for (predicate, path_count, constant_count) in
+            [(paths, PATHS_MAX, 0), (constants, 1, CONSTANTS_MAX)]
+        {
+            let encoded = encode(&predicate).expect("exact cap encodes");
+            let program =
+                PredicateProgram::from_bytes(encoded.as_bytes()).expect("exact cap validates");
+            let mut at = 2;
+            assert_eq!(decode_paths(program.as_bytes(), &mut at).len(), path_count);
+            assert_eq!(decode_constants(program.as_bytes(), &mut at).len(), constant_count);
+            assert_eq!(program.decode(), predicate);
         }
     }
 

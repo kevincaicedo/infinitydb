@@ -524,3 +524,22 @@ impl<File: SegmentFile> SegmentReader<File> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refill_refuses_an_overreport_before_advancing_its_cursor() {
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("shard")).unwrap();
+        let mut file = fs.create_meta(std::path::Path::new("shard/test.ilog")).unwrap();
+        file.write_at(0, &[0; 16]).unwrap();
+        fs.overreport_reads();
+        let mut reader = SegmentReader::new(file, SegmentId(0), ReaderConfig::default());
+        assert!(matches!(reader.refill(1), Err(ReadError::Io { ref source, .. })
+                         if source.kind() == std::io::ErrorKind::InvalidData));
+        assert_eq!(reader.valid, 0);
+        assert_eq!(reader.file_pos, 0);
+    }
+}

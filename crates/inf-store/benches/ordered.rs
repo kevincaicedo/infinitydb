@@ -15,6 +15,9 @@
 //! Size override: `ORDERED_BENCH_N=1000000` (default 10M — the AC shape).
 //! Artifact: 3–5 replicates recorded under `.artifacts/m4.5/s01/`.
 
+#[path = "../../../scripts/overflow-profile-canary.rs"]
+mod overflow_profile_canary;
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -22,6 +25,8 @@ use inf_store::{Fixed8, KeyScheme, OrderedCursor, OrderedMap, PkRef, VarKey};
 
 const ROUNDS: usize = 15;
 const HOT_SET: usize = 100_000;
+// A 1k-key sweep alone lasts too little time for a stable comparison.
+const PROBE_OPS_PER_ROUND_MIN: usize = 1_000_000;
 
 struct XorShift(u64);
 
@@ -81,23 +86,37 @@ fn bench_probe<const F: usize>(
 ) -> f64 {
     let mut hot: Vec<u64> = keys.iter().copied().take(hot_set.min(keys.len())).collect();
     shuffle(&mut hot, 0xBEEF_0002);
+    let sweeps = PROBE_OPS_PER_ROUND_MIN.div_ceil(hot.len());
+    let ops = sweeps * hot.len();
     let mut rounds = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let started = Instant::now();
+    // The first sweep group warms precisely the measured working set.
+    for round in 0..=ROUNDS {
+        let started = (round != 0).then(Instant::now);
         let mut found = 0u64;
-        for &key in &hot {
-            let bytes = key.to_be_bytes();
-            let pk_ref = PkRef::from_key_hash(black_box(key));
-            let hit = if scalar {
-                map.contains_scalar_search(black_box(&bytes), pk_ref)
-            } else {
-                map.contains(black_box(&bytes), pk_ref)
-            };
-            found += u64::from(hit);
+        for _ in 0..sweeps {
+            for &key in &hot {
+                let bytes = key.to_be_bytes();
+                let pk_ref = PkRef::from_key_hash(black_box(key));
+                let hit = if scalar {
+                    map.contains_scalar_search(black_box(&bytes), pk_ref)
+                } else {
+                    map.contains(black_box(&bytes), pk_ref)
+                };
+                found += u64::from(hit);
+            }
         }
         // Guard: a miss path is a different measurement — refuse it.
-        assert_eq!(found, hot.len() as u64, "every probe must hit");
-        rounds.push(started.elapsed().as_nanos() as f64 / hot.len() as f64);
+        assert_eq!(found, ops as u64, "every probe must hit");
+        if let Some(started) = started {
+            rounds.push(started.elapsed().as_nanos() as f64 / ops as f64);
+        }
+    }
+    let search = if scalar { "count" } else { "early" };
+    for (round, ns_per_op) in rounds.iter().enumerate() {
+        println!(
+            "sample=probe fanout={F} hot_set={hot_set} search={search} round={round} \
+             ops={ops} ns_per_op={ns_per_op:.6}"
+        );
     }
     median(rounds)
 }
@@ -171,8 +190,10 @@ fn var_rows(n: usize) {
 }
 
 fn main() {
+    overflow_profile_canary::run_if_requested();
     let n = entry_count();
     println!("# ordered bench: n={n} rounds={ROUNDS} hot_set={HOT_SET}");
+    println!("# probe_ops_per_round_min={PROBE_OPS_PER_ROUND_MIN} warmup_rounds=1");
     fixed_rows::<64>(n);
     fixed_rows::<32>(n);
     var_rows(n);

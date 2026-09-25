@@ -488,7 +488,11 @@ pub(crate) fn trace_scope(trace: &mut Vec<u8>, scope: ExecScope) {
 
 /// The model connection for one apply scope: the same store the node used.
 fn model_cx(scope: ExecScope) -> ConnCx {
-    let mut cx = ConnCx { proto: Protocol::Resp2, id: 0, ..Default::default() };
+    let mut cx = ConnCx {
+        proto: Protocol::Resp2,
+        id: 0,
+        ..ConnCx::try_default().expect("simulation cache allocation")
+    };
     match scope {
         ExecScope::Db(db) => cx.db = db,
         ExecScope::Ns(ns) => cx.ns = ConnNamespace::Named(ns),
@@ -1279,7 +1283,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let pool = BufferPool::new(128, 1024);
         // Sim wall anchor stays (0, 0): wall time == virtual time, fully
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
-        let node = Rc::new(NodeInfo::default());
+        let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
         node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         // ADR-0123: the admission and idle knobs are boot config here
         // (the plane reads them at assembly — D5).

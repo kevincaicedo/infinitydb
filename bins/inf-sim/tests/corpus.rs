@@ -18,8 +18,7 @@ fn parse_seed(text: &str) -> u64 {
 
 #[test]
 fn corpus_seeds_replay_green() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/seeds/corpus.txt");
-    let text = std::fs::read_to_string(path).expect("seed corpus exists");
+    let text = include_str!("../seeds/corpus.txt");
     let mut ran = 0;
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 #![allow(clippy::disallowed_methods, reason = "test target: process deadline, not cell code")]
 #![cfg(target_os = "linux")]
 //! Real startup refusal for a sparse segment outside the log address range.

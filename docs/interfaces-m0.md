@@ -73,6 +73,9 @@ impl BufferPool {
     pub fn staged(&self) -> usize;  pub fn available(&self) -> usize;
 }
 
+// ADR-0161 supersedes allocating Arena::new with checked, fallible
+// preparation. The signature below is the existing implementation;
+// the replacement mechanism remains subject to ARCH-W0.3b review.
 // Record arena (M0-S13): size-class slabs over anonymous-mmap chunks.
 // Classes: 16..=256 in 8 B steps, then ×1.25 geometric to chunk_size/4;
 // larger allocations get dedicated page-rounded mappings (unmap on free).
@@ -93,7 +96,61 @@ impl Arena {
 }
 ```
 
-## 3. `inf-runtime` — backend driver + executor + loop (implemented — the code is the spec)
+## 3. `inf-runtime` — backend driver + executor + loop (implemented core; pending changes marked)
+
+> **Accepted 2026-09-22, implementation open — ADR-0149:**
+> [reserved executor and gate capacity](../../docs/adr/0149-reserved-executor-and-gate-capacity.md)
+> replaces the executor/gate part of the implemented sketch below.
+> Fallible boot construction yields fixed task classes; `reserve(class)`
+> returns an exclusive permit whose `poll_immediate`/`spawn_local` methods
+> accept a factory only after admission. Ready publishes no runnable task;
+> retained waker headers still own capacity. `run_ready` returns
+> `ExecutorProgress { tasks_polled, slots_reclaimed }`, charging both
+> against the slice budget. `live_tasks` alone is not a leak proof.
+> `KeyedGate<K, V, Cleanup>` reserves routing and holder capacity before
+> request publication; completed values retain their payload ownership.
+> `IoGate<Cleanup>` keeps its name with an explicit terminal-cleanup
+> policy. The ADR owns the new admissions, transitions and failure rules.
+> ARCH-W0.3b revision 2 and independent review remain owed; the old
+> signatures below do not establish that the replacement is built.
+
+> **Accepted 2026-09-22, implementation open — ADR-0151:**
+> [fixed storage and bounded cell maps](../../docs/adr/0151-fixed-storage-bounded-maps.md)
+> narrows `KeyedGate` keys to the runtime's sealed, exact fixed-width
+> adapter and `WaitList` keys to the foundation's sealed key domain.
+> Fabric and I/O gates retain their current key types and every identity
+> bit. Admission, terminal cleanup and the 5 ns executor gate are unchanged.
+> The ADR owns the representation contract; ARCH-W0.3b's complete backing
+> and owner proofs and independent review still precede implementation.
+
+> **Accepted 2026-09-22, implementation open — ADR-0154:**
+> [fixed timer ownership and bounded callback delivery](../../docs/adr/0154-fixed-timer-ownership-and-bounded-callback-delivery.md)
+> replaces TimerWheel/TimerId and the raw-key on_timer contract below.
+> Fallible boot construction admits fixed TimerSet owner positions and
+> an indexed minimum heap. Cancel/replace physically removes the prior
+> entry; owner/arm identities are checked and do not wrap. Delivery keeps
+> the position through synchronous callback consumption, with at most
+> 64 callbacks per native turn and one successor after consumption.
+> LoopCx exposes admitted owner/arm operations, not unbounded advance or
+> allowance reset. The runtime retains the terminal receipt; a raw route
+> key cannot authorize callback delivery to a replacement owner. The ADR
+> owns this replacement contract; ARCH-W0.3b still owes the complete Rust
+> surface/resource/host proof and independent mechanism review. The old
+> implemented sketch is not evidence that the accepted replacement exists.
+> The ten phases, one backend entry and existing gates remain unchanged.
+
+> **Accepted 2026-09-22, implementation open — ADR-0147:**
+> [bounded accept admission and terminal parking](../../docs/adr/0147-bounded-accept-admission-and-terminal-parking.md)
+> replaces native multishot accept with bounded batches. It adds
+> `IoOp::AcceptPark { listener: RawFd, token: CompletionToken }`,
+> `CompletionResult::AcceptParked`, and the routing classes
+> `TokenClass::RefusalSend` / `TokenClass::RefusalClose`; the token layout
+> is unchanged. The ADR owns generation checks, terminal custody, limits
+> and error/explicit-park precedence. `AcceptParked` settles both original
+> accept and cancellation completions, not just the cancel request.
+> ARCH-W0.3b revision 2 review, implementation and churn evidence are still
+> owed. The implemented sketch below remains the earlier shape until
+> that build; it is not evidence that these accepted additions exist.
 
 > (edition-2024 keyword), the Pin-sound `PollImmediate` shape,
 > `FabricGate<V>`, `submit_stats()`/`performance_tier`, fallible
@@ -148,6 +205,52 @@ impl Arena {
 > `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
 
+> **Accepted 2026-09-22, implementation open — ADR-0152:**
+> [bounded cold-read result delivery](../../docs/adr/0152-bounded-cold-read-delivery.md)
+> replaces the implemented full `on_completion -> delivered_count`
+> fan-out above with `record_completion(token, result, now_us) -> ()`,
+> `deliver_ready(&mut ColdDeliveryBudget, now_us) -> ColdDeliveryProgress`
+> and `has_ready_delivery() -> bool`. One host-turn allowance covers at
+> most 64 logical deliveries, including orphan cleanup. The cell's
+> execute prelude specified by A1 below services it; pending delivery
+> prevents parking.
+> Device receipt returns QD, while file/buffer custody remains through
+> final value drop. Routing and holder storage cover deferred delivery;
+> latency includes that delay. The ADR owns the exact transitions and
+> observables. Complete ARCH-W0.3b review still precedes implementation;
+> the old source is not evidence that this accepted replacement is built.
+
+> **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional early executor
+> pass precedes `parse_execute`. The
+> [A1 correction](../../docs/adr/0152-bounded-cold-read-delivery.md#amendment-a1--delivery-precedes-both-executor-passes)
+> adds a default-no-op `CellPlane::before_execute` hook after FABRIC-IN
+> and before both scheduled executor passes, borrowing one native-turn
+> cold budget from `LoopCx`. The owner independently accepted the seam;
+> complete ARCH-W0.3b review still precedes its implementation.
+
+> **Accepted 2026-09-22, implementation open — ADR-0152 A2:**
+> [bounded preparation](../../docs/adr/0152-bounded-cold-read-delivery.md#amendment-a2--preparation-has-its-own-turn-budget)
+> adds a separate host-turn preparation budget to both cold drain calls
+> and lends it through LoopCx. It forms complete bounded cohorts, keeps
+> unexamined requests queued, reserves identity pairs at enqueue and
+> adds typed progress/cancellation notification with one retry timer.
+> Both `drain` and `drain_budgeted` receive `&mut ColdPreparationBudget`
+> and return `ColdPreparationProgress`; `has_ready_preparation() -> bool`
+> reads stored readiness. The ADR owns the exact work/member bounds,
+> progress reasons, permanent identity refusal and ColdWait notification
+> contract. The owner independently accepted them; complete ARCH-W0.3b
+> review still precedes implementation.
+
+> **Accepted 2026-09-22, implementation open — ADR-0153:**
+> [cold-pool construction and native registration](../../docs/adr/0153-bounded-cold-pool-construction-and-native-registration.md)
+> establishes a fallible chunked pool and owned driver binding/release
+> lifecycle. Registration remains on the issuer, with a ring-owned sparse
+> table and bounded native batches/terminal tags. It replaces the borrowed
+> register_tier_pool method with owned ColdPoolBind/ColdPoolClose operations
+> and ColdPoolReady/ColdPoolReleased receipts under the ADR's identity,
+> admission and cleanup rules. The owner independently accepted the seam;
+> complete ARCH-W0.3b review remains required before implementation.
+
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}
 pub enum TokenClass { Accept, Recv, Send, Close, Wake }
@@ -159,7 +262,8 @@ impl CompletionToken {
 }
 
 pub enum IoOp {
-    /// Multishot accept: one arm yields Accepted completions until disarmed/error.
+    /// Implemented accept: one arm yields Accepted until disarmed/error.
+    /// Accepted ADR-0147's bounded batches and AcceptPark are not yet built.
     /// ADR-0118 (batch 37): an accept failure is classified by ONE table on
     /// every backend — `classify_accept_errno(errno) -> AcceptFailure::
     /// {Transient, Exhausted, Broken}`. Transient ⇒ nothing delivered, the arm
@@ -247,6 +351,7 @@ pub trait CellPlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion);   // 1 REAP dispatch
     fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {}           // timer fired
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {}                    // 2
+    fn before_execute(&mut self, cx: &mut LoopCx<'_>) {}               // execute prelude, ADR-0152 A1
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>);                  // 3+4
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {}                     // 5 (stats flush at M0)
     fn seal_log(&mut self, cx: &mut LoopCx<'_>) {}                     // 6 (no-op at M0)
@@ -258,6 +363,13 @@ pub struct LoopCx<'a> {            // ops pushed here ride the NEXT single submi
     pub pool: &'a mut BufferPool, pub executor: &'a mut CellExecutor,
     pub timers: &'a mut TimerWheel,
     // push(IoOp) · budget(GroupClass) · charge(GroupClass, units) · note_fabric(msgs)
+    // Private delivery and preparation budgets initialized once per native iteration.
+}
+pub struct ColdDeliveryBudget { remaining: u32 } // private, non-Copy; no public reset/constructor
+pub struct ColdPreparationBudget { remaining: u32 } // same restrictions, separate allowance
+impl LoopCx<'_> {
+    pub fn cold_delivery_budget(&mut self) -> &mut ColdDeliveryBudget;
+    pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget;
 }
 pub struct CellLoop<D: BackendDriver, C: Clock>;
 impl CellLoop {
@@ -275,6 +387,17 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 ```
 
 ## 4. `inf-fabric` — ring, mesh, credits, codec v0
+
+> **Accepted 2026-09-22, implementation open — ADR-0150:**
+> [bounded, resumable reply emission](../../docs/adr/0150-bounded-resumable-reply-emission.md)
+> adds `Outcome::StreamReady`, `Op::StreamStep` and `Op::StreamResult`.
+> Separate progress credits carry chunk pulls and terminal cancellation;
+> returning the opening request's data credit does not release its stream
+> resources. The ADR owns the encodings, identity lifetimes, chunk limits
+> and revised ring/headroom equation. ARCH-W0.3b still owes the complete
+> source/resource proof and independent review. The implemented codec and
+> data-credit sketch below do not establish these additions or a complete
+> retained-reply byte bound.
 
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
@@ -298,7 +421,9 @@ pub enum Op<'a> {
     Reply { token: FabricToken, outcome: Outcome<'a> },
     /// ADR-0128 (batch 70, additive opcode 7): an accepted socket handed to
     /// another cell of the process; the adopter answers Reply { Ok }. Never
-    /// inside a Batch, no program mark.
+    /// inside a Batch, no program mark. Accepted ADR-0147 changes that reply's
+    /// publication point to connection admission or terminal refusal close;
+    /// incoming credit backs custody until then. This lifetime is unbuilt.
     AdoptConn { token: FabricToken, fd: u32 },
 }
 pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), Int(i64), Nil, Bool(bool), Err(ErrCode) }
@@ -451,6 +576,18 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest orac
 
 ## 6. `inf-store` — records, index, ops, router (implemented — the code is the spec)
 
+> **Accepted 2026-09-24, implementation open — ADR-0161:**
+> [fallible store construction and prepared materialization](../../docs/adr/0161-fallible-store-construction-and-prepared-materialization.md)
+> replaces the allocating Arena/CellStore constructors and implicit
+> Keyspace materializers shown in this historical sketch. Checked plans
+> and private owners prepare children, destination and cleanup capacity
+> before one allocation-free publication; installed lookup cannot allocate.
+> The ADR owns replacement/clear capacity, LFU policy preparation, recovery
+> life selection and the store-resource error. SELECT publishes its binding
+> only after preparation succeeds. Concrete factories and complete resource
+> proofs remain open in ARCH-W0.3b; independent mechanism review precedes
+> production implementation. The signatures below do not claim otherwise.
+
 > Deviations from the original sketch (recorded in
 > `reviews/milestones/2026-06-11/m0-skeleton.md`): the "8 B fixed" header is honored by
 > narrowing `version` to **u24** (the sketch's field list summed to 72
@@ -516,7 +653,19 @@ impl SlotRouter {
 }
 ```
 
-## 6b. `inf-server` — command execution (M0-S15; implemented)
+## 6b. `inf-server` — command execution (M0-S15; implemented core; pending changes marked)
+
+> **Accepted 2026-09-22, implementation open — ADR-0150:**
+> [bounded, resumable reply emission](../../docs/adr/0150-bounded-resumable-reply-emission.md)
+> replaces complete-buffer production replies with an admitted `ReplyPlan`:
+> a proven bounded inline result or a continuation. It also replaces
+> §6c's whole-reply observer input with bounded begin/chunk/end or abort
+> events. Existing buffered writer rollback remains for bounded callers;
+> streaming JSON measures its immutable source before publishing headers.
+> The ADR owns admission, framing, ordering and terminal cleanup. These
+> replacements are unbuilt, and ARCH-W0.3b's source/resource mechanisms
+> and independent review remain owed; the sketches below show the earlier
+> execution and observer interfaces.
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
@@ -650,8 +799,10 @@ extensions; internal decision record).
 changed shape — `execute(...)` and `ServerPlane::new(...)` now take
 `inf_store::Keyspace` (one cell's slice of every namespace: 16 lazily
 materialized default dbs + named-ns registry + pressure driver) instead of
-`CellStore`, whose own frozen method set is unchanged behind
-`Keyspace::db_mut(n)`. `ConnCx` gains `db: u16`. Additive deltas: registry
+`CellStore`, whose own frozen method set was unchanged behind
+`Keyspace::db_mut(n)` at M1. Accepted ADR-0161 now supersedes that
+implicit construction crossing as recorded in §6; implementation remains
+open. `ConnCx` gains `db: u16`. Additive deltas: registry
 57 → 58 (`INF.NS`); `CmdFlags::DENYOOM` (the M1-S07 OOM gate enters through
 metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
 `StoreConfig` + `evict_seed`; new `inf-store` types `Keyspace` /

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Review 2026-08-30, F-L04-14: the tier and blob write fault points on a
 //! **`Direct`-mode** file. `O_DIRECT` takes whole aligned blocks only
 //! (ADR-0054 D2); a point that tears a write to a sub-block length is

@@ -4,6 +4,9 @@
 //! are dev-tier sanity numbers. Also measures the full suspend→resume cycle
 //! so the slow path has a tracked baseline from day one.
 
+#[path = "../../../scripts/overflow-profile-canary.rs"]
+mod overflow_profile_canary;
+
 use std::cell::Cell;
 use std::hint::black_box;
 use std::rc::Rc;
@@ -19,6 +22,7 @@ fn command_direct(counter: &Cell<u64>) {
 }
 
 fn bench_fast_path(c: &mut Criterion) {
+    overflow_profile_canary::run_if_requested();
     let mut group = c.benchmark_group("executor_fast_path");
 
     let counter = Cell::new(0u64);

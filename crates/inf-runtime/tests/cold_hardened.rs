@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M4-S08 hardened cold reads on real io_uring: the `ColdReads` custody
 //! path (registered aligned pool, per-file pins, chunked staging,
 //! cancellation) over actual tier files — the production-shaped

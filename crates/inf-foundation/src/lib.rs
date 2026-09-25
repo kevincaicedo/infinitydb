@@ -19,6 +19,7 @@ mod addr;
 mod crc;
 mod device;
 pub mod fault;
+mod footprint;
 mod hash;
 mod hist;
 mod ids;
@@ -31,6 +32,7 @@ pub mod varint;
 pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};
 pub use device::{DeviceIdentity, IdentityVerdict};
+pub use footprint::rc_allocation_bytes;
 pub use hash::{
     BuildIntHasher, COLLISION_KEY_PREFIX, COLLISION_ORACLE, IntHasher, KeyHashId, KeyHasher,
     hash64, siphash13,

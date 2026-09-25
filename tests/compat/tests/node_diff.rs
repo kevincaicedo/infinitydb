@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! The real-node compat lanes (review 2026-08-30, F-L19-09 — Group 0
 //! item 2): the candidate is a spawned multi-cell `infinityd` behind a
 //! TCP socket, not the in-process single-cell `Keyspace`. Before this

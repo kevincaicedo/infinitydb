@@ -108,6 +108,7 @@ pub fn set_keepalive(fd: std::os::fd::RawFd, secs: u32) -> io::Result<()> {
 pub fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
+        #[allow(clippy::disallowed_methods, reason = "control-thread: process RSS sample")]
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
         line.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb * 1024)

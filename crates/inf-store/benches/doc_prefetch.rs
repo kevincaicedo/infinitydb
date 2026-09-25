@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
     clippy::disallowed_methods,
     reason = "bench target: the wall clock is the instrument, not cell code"
 )]

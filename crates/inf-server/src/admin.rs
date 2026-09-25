@@ -1,7 +1,7 @@
 //! Server-introspection surface (M1-S03): `HELLO`, `INFO` real sections,
 //! `COMMAND` full output, `CONFIG GET/SET`, `CLIENT *`, `DEBUG` subset.
-//! Cold admin paths — `format!`/procfs reads are acceptable here (the M0
-//! precedent: INFO already read `/proc/self/status`).
+//! Formatting runs on the cell; process gauges come from the supervisor's
+//! read-only board. INFO never opens procfs files (ADR-0144 D5).
 //!
 //! Payloads are documented deviations in the compat matrix (identity
 //! fields, registry size, address placeholders); the *shape* — section
@@ -1073,7 +1073,7 @@ mod tests {
     /// redis oracle) refused writes with -OOM. Red pre-fix.
     #[test]
     fn nonzero_maxmemory_never_fans_to_the_unlimited_sentinel() {
-        let node = NodeInfo::default();
+        let node = NodeInfo::try_default().expect("fixture cache allocation");
         node.cells.set(4);
         let mut ks = Keyspace::new(StoreConfig::default());
         for (configured, per_cell) in [(1u64, 1u64), (2, 1), (5, 1), (100, 25), (0, 0)] {
@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn config_get_set_roundtrip() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut store, &[b"CONFIG", b"GET", b"maxmemory"]),
@@ -1113,7 +1113,7 @@ mod tests {
     /// so `maxmemory` here stuck at 104857600 while the reply was `-ERR`.
     #[test]
     fn config_set_error_applies_nothing() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Valid pair, then an immutable pair.
         let reply = run(
@@ -1180,7 +1180,7 @@ mod tests {
     /// kept whichever section came last.
     #[test]
     fn info_all_names_every_field_once() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn info_loop_histogram_is_explicit_and_does_not_duplicate_tripwire_fields() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ordinary = run(&mut cx, &mut store, &[b"INFO"]);
         assert!(!String::from_utf8_lossy(&ordinary).contains("loop_histogram_"));
@@ -1229,7 +1229,7 @@ mod tests {
     /// an argv of only unknown names rendered the whole body.
     #[test]
     fn info_unknown_section_renders_an_empty_body() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let raw = run(&mut cx, &mut store, &[b"INFO", b"nosuchsection"]);
         assert_eq!(raw, b"$0\r\n\r\n", "{:?}", String::from_utf8_lossy(&raw));
@@ -1253,7 +1253,7 @@ mod tests {
     /// `DBSIZE` folded the node.
     #[test]
     fn info_keyspace_discloses_its_scope() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         let keyspace =
@@ -1267,7 +1267,7 @@ mod tests {
     /// publication — under `keyspace_scope:node`.
     #[test]
     fn info_keyspace_folds_the_board() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         assert_eq!(run(&mut cx, &mut store, &[b"SETEX", b"t", b"100", b"v"]), b"+OK\r\n");
@@ -1290,12 +1290,16 @@ mod tests {
     /// Batch 49 (review 2026-08-30, F-L15-07): `# Tripwires` is wholly cell
     /// scope. `process_rss` — the one process-wide number — renders in
     /// `# Memory` beside `used_memory_rss`, under `memory_scope`, from the
-    /// same procfs read. Pre-fix it sat inside the cell section, so the
+    /// same board sample. Pre-fix it sat inside the cell section, so the
     /// section's own L5 gate (`sum(domains)` vs RSS) read one cell's
     /// domains over the whole process.
     #[test]
     fn info_tripwires_carries_no_process_wide_gauge() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        cx.node.process_board.replace(Some(crate::ProcessBoard::fixture(crate::ProcessSample {
+            rss_bytes: 123_456,
+            ..crate::ProcessSample::default()
+        })));
         let mut store = Keyspace::new(StoreConfig::default());
         let tripwires =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
@@ -1314,10 +1318,43 @@ mod tests {
                 .parse()
                 .expect("u64")
         };
-        // Linux reads `/proc/self/status`, macOS `proc_pidinfo` (batch 70,
-        // lane L11 N19): a gauge that cannot read abstains, never 0 here.
-        assert!(field("process_rss") > 0, "{memory}");
-        assert_eq!(field("process_rss"), field("used_memory_rss"), "one read, two names: {memory}");
+        assert_eq!(field("process_rss"), 123_456, "{memory}");
+        assert_eq!(
+            field("process_rss"),
+            field("used_memory_rss"),
+            "one sample, two names: {memory}"
+        );
+    }
+
+    #[test]
+    fn info_process_gauges_are_zero_before_the_board_and_render_its_values() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let startup =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"cpu", b"memory"])).unwrap();
+        for field in [
+            "used_cpu_sys:0.000000\r\n",
+            "used_cpu_user:0.000000\r\n",
+            "used_memory_rss:0\r\n",
+            "process_rss:0\r\n",
+        ] {
+            assert!(startup.contains(field), "{startup}");
+        }
+        cx.node.process_board.replace(Some(crate::ProcessBoard::fixture(crate::ProcessSample {
+            rss_bytes: 987_654,
+            cpu_sys_us: 1_250_000,
+            cpu_user_us: 2_500_000,
+        })));
+        let sampled =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"cpu", b"memory"])).unwrap();
+        for field in [
+            "used_cpu_sys:1.250000\r\n",
+            "used_cpu_user:2.500000\r\n",
+            "used_memory_rss:987654\r\n",
+            "process_rss:987654\r\n",
+        ] {
+            assert!(sampled.contains(field), "{sampled}");
+        }
     }
 
     /// Batch 45 (review 2026-08-30, F-L15-09): `db`, `sub` and `psub` are
@@ -1325,7 +1362,7 @@ mod tests {
     /// subscribed connection may still be inspected (Redis shape).
     #[test]
     fn client_info_reports_the_selected_db_and_subscription_counts() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let info = |cx: &mut ConnCx, store: &mut Keyspace| -> String {
             let reply = run(cx, store, &[b"CLIENT", b"INFO"]);
@@ -1354,7 +1391,7 @@ mod tests {
 
     #[test]
     fn client_name_and_kill_flow() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"CLIENT", b"ID"]), b":1\r\n");
         // No name yet: null (Redis 8, oracle-pinned), not an empty bulk.
@@ -1376,7 +1413,7 @@ mod tests {
 
     #[test]
     fn info_sections_filter() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
@@ -1395,7 +1432,7 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn info_exposes_every_document_and_tripwire_domain() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut store, &[b"JSON.SET", b"doc", b"$", br#"{"pad":"xxxxxxxx"}"#],),
@@ -1432,7 +1469,7 @@ mod tests {
     /// (bare harness), it renders and labels cell scope.
     #[test]
     fn info_memory_aggregates_across_cells_via_the_board() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         let bare =
@@ -1463,7 +1500,7 @@ mod tests {
     /// `used_memory` and out of the pool; a peer's publication adds in.
     #[test]
     fn info_memory_renders_the_maxmemory_comparable() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..8u32 {
             let key = format!("db0:{i}");
@@ -1521,7 +1558,7 @@ mod tests {
     /// folded only the stores the slice ran).
     #[test]
     fn info_stats_renders_the_expiry_debt() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let idle =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"stats"])).expect("ascii");
@@ -1546,7 +1583,7 @@ mod tests {
     /// release blocker; breaking it here breaks the gate there.
     #[test]
     fn info_tiering_is_all_zero_without_a_tiered_namespace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
         let text =
@@ -1631,7 +1668,7 @@ mod tests {
     fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(17);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -1681,7 +1718,7 @@ mod tests {
     fn info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered() {
         use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(23);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -1722,7 +1759,7 @@ mod tests {
     /// 24 h soak took 31 M with no server-side trace).
     #[test]
     fn info_persistence_renders_admission_busy_refusals() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.log_admission_busy.set(31_260_000);
         let text =
@@ -1735,7 +1772,7 @@ mod tests {
     /// byte-attribution observables.
     #[test]
     fn info_tripwires_renders_recycle_pool_bytes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.reply_pool_bytes.set(4096 * 100);
         cx.node.cmd_pool_bytes.set(4096 * 7);
@@ -1757,7 +1794,7 @@ mod tests {
         use inf_log::{MutationEffect, StagingConfig, StagingRing};
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let mut ring = StagingRing::new(StagingConfig::default());
         for id in [7u32, 9u32] {
@@ -1898,7 +1935,7 @@ mod tests {
     /// tier block read back through `INF.NS INFO`.
     #[test]
     fn inf_ns_tiering_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Tier keys without MEM-BUDGET refuse typed (the discriminator).
         let r = run(
@@ -1986,7 +2023,7 @@ mod tests {
     /// refusals on durable namespaces and for tier keys on memory ones.
     #[test]
     fn inf_ns_memory_pressure_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let r = run(
             &mut cx,
@@ -2052,7 +2089,7 @@ mod tests {
         use inf_log::fs::mem::MemFs;
         use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(21);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -2113,7 +2150,7 @@ mod tests {
 
     #[test]
     fn command_introspection_shapes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let count = run(&mut cx, &mut store, &[b"COMMAND", b"COUNT"]);
         // ADR-0115: the three INTERNAL rows are not a client surface.
@@ -2149,7 +2186,7 @@ mod tests {
     /// same port answers `PING` just as well).
     #[test]
     fn process_id_renders_the_assembled_pid() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.process_id.set(424_242);
         let reply = run(&mut cx, &mut store, &[b"INFO", b"server"]);
@@ -2160,7 +2197,7 @@ mod tests {
     /// and `master_replid` renders the same identity.
     #[test]
     fn run_id_survives_randomkey() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let field = |cx: &mut ConnCx, store: &mut Keyspace, section: &[u8], name: &str| {
             let reply = run(cx, store, &[b"INFO", section]);

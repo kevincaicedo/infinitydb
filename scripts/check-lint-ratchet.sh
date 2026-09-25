@@ -30,7 +30,7 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 work=$(mktemp -d)
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
-LINTS="-W clippy::too_many_lines -W clippy::cast_possible_truncation -W clippy::cast_sign_loss -W clippy::cast_possible_wrap -W clippy::arithmetic_side_effects"
+LINTS="-W clippy::too_many_lines -W clippy::cast_possible_truncation -W clippy::cast_sign_loss -W clippy::cast_possible_wrap -W clippy::arithmetic_side_effects --force-warn clippy::disallowed_methods --force-warn clippy::disallowed_types"
 if [ -n "${INF_LINT_RATCHET_INPUT:-}" ]; then
     cp "$INF_LINT_RATCHET_INPUT" "$work/clippy.json"
 else
@@ -55,7 +55,7 @@ INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" \
 INF_BASE_REF="${INF_LINT_BASE_REF:-origin/main}" \
 INF_HOST="${INF_LINT_RATCHET_HOST:-$(uname -s)}" \
 INF_SCRIPT_DIR="$SCRIPT_DIR" \
-python3 - "$work/clippy.json" <<'PY'
+python3 -B - "$work/clippy.json" <<'PY'
 import json
 import os
 import re
@@ -246,3 +246,9 @@ for m in sorted(moved):
 for n in notes:
     print(f"    note: {n}")
 PY
+
+# The compiler exposes suppressed API calls in these same two passes. Their
+# exact classes/scopes have one audit, shared with the ordinary scope gate.
+if [ -z "${INF_LINT_RATCHET_INPUT:-}" ]; then
+    INF_LINT_API_DIAGNOSTICS="$work/clippy.json" "$SCRIPT_DIR/check-lint-scopes.sh"
+fi

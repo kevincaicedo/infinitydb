@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M1-S13: the published compat matrix is generated, never hand-edited.
 //!
 //! `generated_matrix_is_current` fails whenever `docs/compat-matrix.md`

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M3-S05 gate-shape projection row (§4.1 arithmetic): the 1 KiB parse
 //! cost against same-run plain-SET cost, plus the parse+store e2e —
 //! the early warning for `JSON.SET ≥ 70% SET`. Store-level SET excludes

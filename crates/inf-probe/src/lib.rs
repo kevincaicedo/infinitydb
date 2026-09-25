@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "probe: device files before cells start (ADR-0144 D5)"
+)]
 //! The device probe behind `io-properties.toml` (M4.5-S34, ADR-0086 D7 —
 //! the ScyllaDB `iotune` precedent; M4.5-S36, ADR-0088 D6 — the device
 //! model; M4.5-S42, ADR-0091 — the lifecycle): measure the two log

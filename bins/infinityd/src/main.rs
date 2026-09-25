@@ -56,6 +56,8 @@ struct Args {
     /// namespace (as if it had sent `INF.NS USE`) — the opt-in for
     /// clients without a per-connection prelude. `None` = default dbs.
     conn_default_ns: Option<String>,
+    /// Checked per-cell cache capacity; reservation happens before listen (ADR-0146).
+    doc_path_cache_capacity: inf_server::ProgramCacheCapacity,
     /// Segment recycling (M4.5-S39b, ADR-0090 D1): covered pre-zeroed
     /// `Direct` segments kept for reuse by rename instead of unlinked —
     /// the zero-fill paid once per generation. `0` = off
@@ -191,6 +193,7 @@ impl Default for Args {
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
             conn_default_ns: None,
+            doc_path_cache_capacity: inf_server::ProgramCacheCapacity::default(),
             segment_recycle_slots: inf_server::DEFAULT_RECYCLE_SLOTS,
             recycle_wait: inf_server::PreallocPolicy::DEFAULT,
             #[cfg(feature = "bench-diagnostics")]
@@ -294,6 +297,13 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--conn-default-ns needs a namespace name".into());
                 }
                 args.conn_default_ns = Some(name);
+            }
+            "--doc-path-cache-size" => {
+                let raw = take("--doc-path-cache-size")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("--doc-path-cache-size: {error}"))?;
+                args.doc_path_cache_capacity = inf_server::ProgramCacheCapacity::try_from(raw)
+                    .map_err(|error| format!("--doc-path-cache-size: {error}"))?;
             }
             "--frames-in-flight" => {
                 let raw = take("--frames-in-flight")?;
@@ -424,7 +434,8 @@ fn parse_args() -> Result<Args, String> {
                      [--pin-start CORE] [--pin-stride 2] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
                      [--no-segment-recycle] [--recycle-wait off|quarter|eighth] \
-                     [--conn-default-ns NAME] [--frames-in-flight auto|K] \
+                     [--conn-default-ns NAME] [--doc-path-cache-size N] \
+                     [--frames-in-flight auto|K] \
                      [--barrier-class flush|fua] [--device-write-mbps N] [--seal-pace probe|N] \
                      [--fill-window-us 1000] [--fill-target-kib 16] \
                      [--flush-group-window-us 250] [--device-probe auto|off] \
@@ -563,6 +574,7 @@ fn resolve_io_properties(
         )),
         FileDecision::Reprobe(reason) => {
             let stale = dir.join("io-properties.toml.stale");
+            #[allow(clippy::disallowed_methods, reason = "boot: retain stale device-probe input")]
             std::fs::rename(dir.join(inf_server::IO_PROPERTIES_FILE), &stale)
                 .map_err(|e| format!("rename stale io-properties.toml: {e}"))?;
             probe_now(
@@ -770,8 +782,10 @@ fn main() {
     let park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new(
         (0..args.cells).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
     );
+    let mut process_sampler = inf_server::ProcessSampler::default();
     let wiring = std::sync::Arc::new(NodeWiring {
         stop,
+        process_board: process_sampler.board(),
         quiet_cells: std::sync::atomic::AtomicU16::new(0),
         drained_cells: std::sync::atomic::AtomicU16::new(0),
         #[cfg(target_os = "linux")]
@@ -1039,8 +1053,17 @@ fn main() {
         (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)
     });
 
+    let Some(cell_count) = core::num::NonZeroU16::new(args.cells) else {
+        eprintln!("infinityd: a boot topology must contain at least one cell");
+        std::process::exit(2);
+    };
+    let mut cache_boot = inf_server::CacheBootGroup::new(cell_count);
     let mut handles = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
+        let Some(cache_permit) = cache_boot.next() else {
+            eprintln!("infinityd: fabric exceeds the validated boot topology");
+            std::process::exit(1);
+        };
         let args = args.clone();
         let boot = boot.clone();
         let wiring = std::sync::Arc::clone(&wiring);
@@ -1060,7 +1083,13 @@ fn main() {
                     // an io_uring_setup failure nobody printed. A cell that
                     // cannot run takes the node down loudly, here and now.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell_main(i as u16, &args, boot, hasher, fabric, wake_fd, &wiring)
+                        cell_main(
+                            CellLaunch { cell: i as u16, fabric, wake_fd, cache_permit },
+                            &args,
+                            boot,
+                            hasher,
+                            &wiring,
+                        )
                     }));
                     match outcome {
                         Ok(Ok(())) => Ok::<(), std::io::Error>(()),
@@ -1078,6 +1107,8 @@ fn main() {
                 .expect("spawn cell thread"),
         );
     }
+    // Unissued permits fail the group before supervision can wait on a cell.
+    drop(cache_boot);
     eprintln!("{}", version_line());
     eprintln!(
         "infinityd: {} cells, port {}, backend {}, route {}, accept-handoff {}",
@@ -1087,6 +1118,7 @@ fn main() {
         if args.route_local_only { "local-only" } else { "natural" },
         if args.accept_handoff { "on" } else { "off" }
     );
+    sample_until_cells_exit(&mut process_sampler, &handles);
     for handle in handles {
         if let Err(e) = handle.join().expect("cell thread panicked") {
             eprintln!("infinityd: cell failed: {e}");
@@ -1102,10 +1134,32 @@ fn main() {
 /// and the count of cells that reached `Drained`.
 struct NodeWiring {
     stop: &'static std::sync::atomic::AtomicBool,
+    process_board: std::sync::Arc<inf_server::ProcessBoard>,
     quiet_cells: std::sync::atomic::AtomicU16,
     drained_cells: std::sync::atomic::AtomicU16,
     #[cfg(target_os = "linux")]
     park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
+}
+
+/// The existing main thread is the process-gauge owner, including memory-only
+/// boots. Sampling runs at most once a second; shutdown polls stay at 100 ms.
+fn sample_until_cells_exit(
+    sampler: &mut inf_server::ProcessSampler,
+    handles: &[std::thread::JoinHandle<std::io::Result<()>>],
+) {
+    while handles.iter().any(|h| !h.is_finished()) {
+        sampler.sample();
+        for _ in 0..10 {
+            if handles.iter().all(std::thread::JoinHandle::is_finished) {
+                return;
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "control-thread: process supervisor wait"
+            )]
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 /// Three SplitMix64 outputs — the 40-hex identity's digits.
@@ -1134,15 +1188,32 @@ type Boot = Option<(
     inf_server::IoProvenance,
 )>;
 
-fn cell_main(
+/// Cache refusal crosses the same boot Result before a listener can be created.
+fn boot_node_info(
+    config: inf_server::ConfigStore,
+    permit: inf_server::CacheBootPermit,
+) -> std::io::Result<Rc<NodeInfo>> {
+    let node = NodeInfo::try_new(config)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    Ok(node.into_boot_group(permit))
+}
+
+/// The resources transferred once to their owning cell at thread launch.
+struct CellLaunch {
     cell: u16,
+    fabric: CellFabric,
+    wake_fd: Option<std::os::fd::OwnedFd>,
+    cache_permit: inf_server::CacheBootPermit,
+}
+
+fn cell_main(
+    launch: CellLaunch,
     args: &Args,
     boot: Boot,
     hasher: KeyHasher,
-    fabric: CellFabric,
-    wake_fd: Option<std::os::fd::OwnedFd>,
     wiring: &NodeWiring,
 ) -> std::io::Result<()> {
+    let CellLaunch { cell, fabric, wake_fd, cache_permit } = launch;
     // Setup-phase narration (M2.5-S01): the 500-cycle storm caught cells
     // stalling BEFORE the first loop iteration ("spawned" forever) — every
     // setup step below publishes its phase so a kernel-side stall names
@@ -1155,6 +1226,8 @@ fn cell_main(
     if let Some(cpu) = args.cell_cpu(cell).map_err(std::io::Error::other)? {
         pin_current_thread(cpu)?;
     }
+    let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity);
+    let node = boot_node_info(config, cache_permit)?;
     mark(10); // setup:listen
     let listener = listen_reuseport(args.port)?;
     if cell == 0 {
@@ -1177,7 +1250,7 @@ fn cell_main(
         eprintln!("infinityd: capabilities {:?}", driver.capabilities());
     }
 
-    let node = Rc::new(NodeInfo::default());
+    node.process_board.replace(Some(std::sync::Arc::clone(&wiring.process_board)));
     // Wall-clock anchor (M1-S03): the system clock is read ONCE here, at the
     // cell clock's origin (internal ms 0); everything downstream converts
     // through the anchor (L7 — EXPIREAT/EXAT stay deterministic under DST,
@@ -1340,7 +1413,7 @@ fn cell_main(
         if let Some(err) = plane.take_boot_error() {
             // §8.4 fail-stop: recovery refused — the whole node stops,
             // immediately (a half-recovered node must never serve).
-            eprintln!("infinityd: cell {cell} recovery failed (fail-stop, §8.4): {err}");
+            eprintln!("infinityd: cell {cell} boot failed (fail-stop, §8.4): {err}");
             std::process::exit(1);
         }
         if deadline.is_none() && wiring.stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -1448,6 +1521,7 @@ mod never {
 
 /// Sixteen bytes of OS randomness for a key-hash secret (ADR-0094 D2):
 /// boot code, blocking, never a fixed fallback.
+#[allow(clippy::disallowed_types, reason = "boot: key-hash entropy before cells start")]
 fn os_entropy() -> std::io::Result<[u8; 16]> {
     use std::io::Read;
     let mut bytes = [0u8; 16];
@@ -1684,5 +1758,39 @@ mod tests {
         assert!(replay_term_origin(QD4, QD1, 2).contains("four-reader share at 2 cells"));
         assert!(replay_term_origin(QD4, QD1, 8).contains("÷ 8 cells, assumption A2"));
         assert!(replay_term_origin(QD4, QD1, 1).contains("(one cell)"));
+    }
+}
+
+#[cfg(test)]
+mod cache_boot_tests {
+    use super::*;
+
+    #[global_allocator]
+    static ALLOC: inf_alloc::CountingAllocator = inf_alloc::CountingAllocator::new();
+
+    #[test]
+    fn cache_refusal_propagates_through_production_boot_before_listen() {
+        for skip in 0..2 {
+            let config = inf_server::ConfigStore::with_path_cache_capacity(
+                inf_server::ProgramCacheCapacity::try_from(4).unwrap(),
+            );
+            let mut group = inf_server::CacheBootGroup::new(core::num::NonZeroU16::MIN);
+            let permit = group.next().unwrap();
+            let guard = ALLOC.refuse_after(skip).unwrap();
+            let result = boot_node_info(config, permit);
+            let triggered = guard.was_triggered();
+            drop(guard);
+            assert!(triggered, "cache reservation was not reached");
+            let error = result.expect_err("boot must propagate cache allocation refusal");
+            assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+            assert!(
+                error
+                    .get_ref()
+                    .and_then(|source| {
+                        source.downcast_ref::<std::collections::TryReserveError>()
+                    })
+                    .is_some()
+            );
+        }
     }
 }

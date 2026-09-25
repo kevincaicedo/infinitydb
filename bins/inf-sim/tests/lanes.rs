@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test: inspect source and CI files outside simulated cells (ADR-0144 D5)"
+)]
 //! F-L19-03 (review 2026-08-30): every scenario the `inf-sim` binary
 //! accepts runs in an automated lane, and every planted-bug canary has a
 //! driver. `inf_sim::SCENARIOS` is the registry; this test binds it to

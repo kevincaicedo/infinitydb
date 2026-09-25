@@ -501,13 +501,20 @@ impl ExtentRefs {
         use inf_log::blob::extent_device_bytes;
         let mut stats = self.stats;
         stats.live = self.extents.len() as u64;
-        stats.live_bytes = self.extents.values().map(|e| e.len).sum();
+        stats.live_bytes = self.extents.values().map(|e| e.len).fold(0, u64::saturating_add);
         stats.reclaimable =
             (self.parked.len() + self.reclaimable.len() + self.in_reclaim.len()) as u64;
-        stats.disk_bytes = self.extents.values().map(|e| extent_device_bytes(e.len)).sum::<u64>()
-            + self.parked.iter().map(|&(_, len)| extent_device_bytes(len)).sum::<u64>()
-            + self.reclaimable.values().map(|r| extent_device_bytes(r.len)).sum::<u64>()
-            + self.in_reclaim.iter().map(|&(_, len, _)| extent_device_bytes(len)).sum::<u64>();
+        // This accounting feeds admission: overflow must report a full
+        // device, never wrap small and manufacture budget headroom.
+        stats.disk_bytes = self
+            .extents
+            .values()
+            .map(|e| e.len)
+            .chain(self.parked.iter().map(|&(_, len)| len))
+            .chain(self.reclaimable.values().map(|r| r.len))
+            .chain(self.in_reclaim.iter().map(|&(_, len, _)| len))
+            .map(extent_device_bytes)
+            .fold(0, u64::saturating_add);
         stats
     }
 
@@ -522,6 +529,32 @@ impl ExtentRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_accounting_never_wraps_across_reclaim_states() {
+        let max_frames = (u128::from(u64::MAX) - inf_log::blob::BLOB_HEADER_BYTES as u128)
+            / inf_log::tier::TIER_FRAME_BYTES as u128;
+        let max_data = (max_frames * inf_log::tier::TIER_FRAME_DATA as u128) as u64;
+        for state in 0..4 {
+            let mut refs = ExtentRefs::new();
+            refs.register(1, 1, max_data);
+            refs.register(2, 2, 1);
+            if state >= 1 {
+                refs.note_death(1);
+            }
+            if state >= 2 {
+                refs.stamp(1);
+            }
+            if state >= 3 {
+                assert_eq!(refs.reclaim_work(1, 1).len(), 1);
+            }
+            assert_eq!(refs.stats().disk_bytes, u64::MAX, "state {state}");
+        }
+        let mut refs = ExtentRefs::new();
+        refs.register(1, 1, max_data);
+        refs.register(2, 2, max_data);
+        assert_eq!(refs.stats().live_bytes, u64::MAX);
+    }
 
     #[test]
     fn refcount_follows_the_reference_map_exactly() {

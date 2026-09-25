@@ -68,6 +68,7 @@ struct Prefetcher {
 }
 
 impl Prefetcher {
+    #[allow(clippy::disallowed_types, reason = "boot: recovery-only prefetch owner (ADR-0109)")]
     fn spawn(file: std::fs::File) -> io::Result<Prefetcher> {
         let target = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -268,6 +269,7 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
         self.inner.open_write(path).map(ReadAheadFile::plain)
     }
 
+    #[allow(clippy::disallowed_types, reason = "boot: recovery-only prefetch owner (ADR-0109)")]
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         let inner = self.inner.open_read(path)?;
         // Second handle by path, best-effort: absent (e.g. a non-std tier

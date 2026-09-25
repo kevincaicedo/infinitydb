@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S05 integration: the reactor LOG step end-to-end — one `LogWrite` per
 //! iteration, linked/seal/standalone fsync policy, deferred seal, everysec
 //! virtual-time behavior (L7), and the linked-fsync fault contract — driven

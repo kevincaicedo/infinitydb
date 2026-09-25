@@ -34,6 +34,7 @@ bench-diagnostics = []
 workspace = true
 
 [dev-dependencies]
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # M2-S16: recovery/fault tests arm named points (dev-only unification).
 inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
 inf-store = { workspace = true, features = ["collision-oracle"] }

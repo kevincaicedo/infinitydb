@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Boot-flag gauntlet at the binary level (ADR-0107 D2, Theme 4 of the
 //! full-codebase review of 2026-08-30): an operator value that reaches a
 //! cell-crate constructor is validated where it can be — the flag parser —
@@ -69,6 +73,17 @@ fn out_of_range_boot_flags_are_usage_errors_not_panics() {
             "--buf-size must be <= 2147483647",
         ),
         ("cells-over", &["--cells", "16385"], "--cells must be <= 16384"),
+        ("cache-over", &["--doc-path-cache-size", "4097"], "path cache capacity 4097 exceeds 4096"),
+        (
+            "cache-u32-max",
+            &["--doc-path-cache-size", "4294967295"],
+            "path cache capacity 4294967295 exceeds 4096",
+        ),
+        (
+            "cache-usize-max",
+            &["--doc-path-cache-size", "18446744073709551615"],
+            "path cache capacity 18446744073709551615 exceeds 4096",
+        ),
     ];
     let mut failures = Vec::new();
     for (tag, flags, expect) in cases {
