@@ -168,7 +168,9 @@ impl<'o> Tape<'o> {
     }
 
     /// Check the frame word and byte budget before emitting its placeholder.
-    #[inline]
+    /// Always inlined: as a call it cost the fused parse of nested shapes
+    /// ~3% of its instructions (L4; measured in the ARCH-W0.3 ticket).
+    #[inline(always)]
     fn open_container(&mut self, tag: u8, kind_bit: u32, at: usize) -> Result<u32, JsonParseError> {
         if !self.fits(emit::CONTAINER_OPEN_LEN) {
             return err(at, JsonErrorKind::DocumentTooLarge);
@@ -866,25 +868,29 @@ impl JsonParser {
 
     /// Record an emitted key; small objects detect duplicates on insert
     /// (fingerprint filter, then memcmp on the recorded spans), large
-    /// ones defer to the close-time sort. `false` when an offset does not
-    /// fit the entry's `u32` — the document is past its cap.
+    /// ones defer to the close-time sort. `false` when an offset is past
+    /// the frame word's 31 bits — far beyond the tape cap.
     #[inline]
     #[allow(
         clippy::arithmetic_side_effects,
-        reason = "bound: `ka` widens a u32 and key_len <= u16::MAX is the guard of the branch \
-                  that adds them, so the sum fits the 64-bit usize inf-foundation const-asserts"
+        clippy::cast_possible_truncation,
+        reason = "bound: key_at <= LEN_AT_MASK (2^31 - 1) is checked first and entry_at <= \
+                  key_at (a saturating sum), so both fit u32; `ka` widens a u32 and key_len <= \
+                  u16::MAX is the guard of the branch that adds them, so that sum fits the \
+                  64-bit usize inf-foundation const-asserts"
     )]
     fn note_key(&mut self, live: usize, out: &[u8], entry_at: usize, key_len: usize) -> bool {
-        // The key bytes sit right after their canonical string header.
-        let Some(key_at) = entry_at.checked_add(emit::str_header_len(key_len)) else {
+        // The key bytes sit right after their canonical string header. One
+        // compare bounds both offsets, at the frame word's 31 bits (far above
+        // the 2^24 + 7 tape cap); a conversion each cost the fused parse ~3%
+        // on key-heavy shapes.
+        let key_at = entry_at.saturating_add(emit::str_header_len(key_len));
+        if key_at > LEN_AT_MASK as usize {
             return false;
-        };
-        let (Ok(entry_at32), Ok(key_at32)) = (u32::try_from(entry_at), u32::try_from(key_at))
-        else {
-            return false;
-        };
+        }
         let key_len16 = u16::try_from(key_len).unwrap_or(u16::MAX);
-        let Some(frame) = live.checked_sub(1).and_then(|top| self.obj_frames.get_mut(top)) else {
+        // `live == 0` wraps to an index no frame has: refused, like a missing frame.
+        let Some(frame) = self.obj_frames.get_mut(live.wrapping_sub(1)) else {
             return false;
         };
         if !frame.dup_found
@@ -917,16 +923,21 @@ impl JsonParser {
             // Keys longer than 64 KiB fall back to close-time detection.
             frame.dup_found = true;
         }
-        frame.entries.push(ObjEntry { entry_at: entry_at32, key_at: key_at32, key_len: key_len16 });
+        frame.entries.push(ObjEntry {
+            entry_at: entry_at as u32,
+            key_at: key_at as u32,
+            key_len: key_len16,
+        });
         true
     }
 
     /// Close the innermost object: if duplicates exist (or the object was
-    /// too large for insert-time detection), rebuild the body with
-    /// last-occurrence-wins / first-position-kept semantics and splice it
-    /// over the original (ADR-0036 D5). Cold path: it runs only for
-    /// objects that contained duplicates or exceeded the linear-scan cap.
-    /// `at` is the closing token's offset, for the typed refusal.
+    /// too large for insert-time detection), rebuild it
+    /// ([`rebuild_obj_frame`](Self::rebuild_obj_frame)). `at` is the
+    /// closing token's offset, for the typed refusal. Kept small and marked
+    /// `#[inline]` for the grammar's three object closes (a whole-function
+    /// call cost nested shapes ~3% of the parse).
+    #[inline]
     fn close_obj_frame(
         &mut self,
         live: &mut usize,
@@ -936,6 +947,28 @@ impl JsonParser {
         let Some(top) = live.checked_sub(1) else {
             return err(at, JsonErrorKind::DocumentTooLarge);
         };
+        let Some(frame) = self.obj_frames.get(top) else {
+            return err(at, JsonErrorKind::DocumentTooLarge);
+        };
+        if !frame.dup_found && frame.entries.len() <= LINEAR_SCAN_MAX {
+            *live = top;
+            return Ok(());
+        }
+        self.rebuild_obj_frame(live, top, tape, at)
+    }
+
+    /// Rebuild the closing object's body with last-occurrence-wins /
+    /// first-position-kept semantics and splice it over the original
+    /// (ADR-0036 D5). Cold path: it runs only for objects that contained
+    /// duplicates or exceeded the linear-scan cap.
+    #[inline(never)]
+    fn rebuild_obj_frame(
+        &mut self,
+        live: &mut usize,
+        top: usize,
+        tape: &mut Tape<'_>,
+        at: usize,
+    ) -> Result<(), JsonParseError> {
         let Some(frame) = self.obj_frames.get_mut(top) else {
             return err(at, JsonErrorKind::DocumentTooLarge);
         };
@@ -944,10 +977,6 @@ impl JsonParser {
             return err(at, JsonErrorKind::DocumentTooLarge);
         };
         *live = top;
-        let must_scan = frame.entries.len() > LINEAR_SCAN_MAX;
-        if !frame.dup_found && !must_scan {
-            return Ok(());
-        }
         let body_start = frame.body_start;
         let body_end = tape.out.len();
         let entries = &frame.entries;
@@ -1403,10 +1432,13 @@ fn try_fixstr_fast(tape: &mut Tape<'_>, input: &[u8], at: usize, len: usize) -> 
         tape.out.push(FIXSTR_BASE);
         return true;
     }
-    // The 32-byte window that opens after the quote at `at`.
-    let Some(window) = input.get(at..).and_then(|tail| tail.get(1..33)) else {
+    // The 32-byte window that opens after the quote at `at`: one bounds
+    // check (two chained `get`s cost the fused parse ~1–2%); a wrapped end is
+    // an empty range, refused like a short input.
+    let Some(quoted) = input.get(at..at.wrapping_add(33)) else {
         return false;
     };
+    let window = &quoted[1..];
     inf_simd::json_copy_unescaped_fixstr(window, len, FIXSTR_BASE + len as u8, tape.out)
 }
 
@@ -1619,11 +1651,18 @@ mod tests {
         let mut parser = JsonParser::new();
         let mut live = 0;
         parser.open_obj_frame(&mut live, header::HEADER_LEN);
-        for entry_at in [u32::MAX as usize, u32::MAX as usize + 1, usize::MAX] {
+        for entry_at in [LEN_AT_MASK as usize, u32::MAX as usize, u32::MAX as usize + 1, usize::MAX]
+        {
             assert!(!parser.note_key(live, &[], entry_at, 1));
             assert!(parser.obj_frames[0].entries.is_empty());
             assert_eq!(parser.obj_frames[0].fp, 0);
         }
+        // The last offset the bound accepts (a key past u16::MAX takes the
+        // 4-byte header and skips the span read): key_at == LEN_AT_MASK.
+        let long = 1 << 16;
+        assert!(!parser.note_key(live, &[], LEN_AT_MASK as usize - 3, long));
+        assert!(parser.note_key(live, &[], LEN_AT_MASK as usize - 4, long));
+        assert_eq!(parser.obj_frames[0].entries[0].key_at, LEN_AT_MASK);
     }
 
     #[test]
