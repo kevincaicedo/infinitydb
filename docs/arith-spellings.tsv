@@ -1,0 +1,22 @@
+# ADR-0165 D2: every `saturating_*` / `wrapping_*` call in a scope that
+# docs/lint-scopes.tsv denies `arith`, counted exactly. A change that adds or
+# removes a site edits its row here, and review checks the site against
+# ADR-0165 D1's rows. scripts/check-arith-spellings.sh keeps it equal to the tree.
+# family<TAB>count<TAB>scope
+saturating	9	crates/inf-doc/src/json.rs
+wrapping	13	crates/inf-doc/src/json.rs
+saturating	1	crates/inf-doc/src/tape.rs
+wrapping	1	crates/inf-doc/src/tape.rs
+saturating	5	crates/inf-log/src/blob.rs
+saturating	9	crates/inf-log/src/ckpt/read.rs
+saturating	2	crates/inf-log/src/frame.rs
+saturating	10	crates/inf-log/src/manifest.rs
+saturating	1	crates/inf-log/src/meta.rs
+saturating	3	crates/inf-log/src/reader.rs
+saturating	3	crates/inf-query/src/access.rs
+saturating	10	crates/inf-query/src/partiql/cache.rs
+wrapping	1	crates/inf-query/src/partiql/cache.rs
+saturating	5	crates/inf-query/src/predicate/program.rs
+saturating	2	crates/inf-server/src/process_info/stat.rs
+saturating	6	crates/inf-store/src/catalog.rs
+saturating	1	crates/inf-wire/src/parser.rs

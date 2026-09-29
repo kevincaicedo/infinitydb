@@ -164,18 +164,17 @@ def denied(attributes, inner):
     return out
 
 
-def _body_end(lines, fn_line, statement=False):
-    """Last line of a function body, or a narrow API-allow statement/item.
+def code_chars(lines, start=0):
+    """Yield (line, column, char) for every code character from line `start`.
 
-    Statement mode also stops at a top-level semicolon or the containing
-    block's close. A nested braced expression may shorten a statement's
-    audited range; that fails closed when the compiler reports a later call.
+    The one Rust lexer of the gates: string, raw-string and char-literal
+    text and comments are skipped, so a brace, a call or a name inside
+    them is never code. Its state carries across lines.
     """
-    depth, opened, block = 0, False, 0
-    parens, brackets = 0, 0
-    i, j = fn_line, 0
+    i, j = start, 0
     raw_close = None
     in_str = False
+    block = 0
     while i < len(lines):
         text = lines[i]
         while j < len(text):
@@ -212,31 +211,43 @@ def _body_end(lines, fn_line, statement=False):
             ch = text[j]
             if ch == '"':
                 in_str = True
-            elif ch == "'":
-                lit = CHAR.match(text, j)
-                if lit:
-                    j = lit.end()
-                    continue
-            elif ch == "{":
-                depth, opened = depth + 1, True
-            elif ch == "}":
-                if statement and not opened:
-                    return i - 1
-                depth -= 1
-                if opened and depth == 0:
-                    return i
-            elif ch == "(":
-                parens += 1
-            elif ch == ")":
-                parens -= 1
-            elif ch == "[":
-                brackets += 1
-            elif ch == "]":
-                brackets -= 1
-            elif ch == ";" and not opened and parens == brackets == 0:
-                return i if statement else None
+            elif ch == "'" and (lit := CHAR.match(text, j)):
+                j = lit.end()
+                continue
+            else:
+                yield i, j, ch
             j += 1
         i, j = i + 1, 0
+
+
+def _body_end(lines, fn_line, statement=False):
+    """Last line of a function body, or a narrow API-allow statement/item.
+
+    Statement mode also stops at a top-level semicolon or the containing
+    block's close. A nested braced expression may shorten a statement's
+    audited range; that fails closed when the compiler reports a later call.
+    """
+    depth, opened = 0, False
+    parens, brackets = 0, 0
+    for i, _, ch in code_chars(lines, fn_line):
+        if ch == "{":
+            depth, opened = depth + 1, True
+        elif ch == "}":
+            if statement and not opened:
+                return i - 1
+            depth -= 1
+            if opened and depth == 0:
+                return i
+        elif ch == "(":
+            parens += 1
+        elif ch == ")":
+            parens -= 1
+        elif ch == "[":
+            brackets += 1
+        elif ch == "]":
+            brackets -= 1
+        elif ch == ";" and not opened and parens == brackets == 0:
+            return i if statement else None
     return None
 
 

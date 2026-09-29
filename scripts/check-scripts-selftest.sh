@@ -1692,6 +1692,79 @@ expect green "parent-doc-gates: a standalone checkout is green" \
 expect red "parent-doc-gates: a parent without its gates is red" \
     env INF_CHECK_ROOT="$work/parent-bare/eng" "$PARENT"
 
+# ADR-0165 D2: the spelling table equals the tree, both ways; comments, test
+# modules and code outside an item scope are not sites.
+SPELL=$SCRIPT_DIR/check-arith-spellings.sh
+as_root() { # <name> <scope-row> <table rows…>
+    local root="$work/as-$1" row=$2
+    shift 2
+    mkdir -p "$root/docs" "$root/crates/fake/src"
+    cat >"$root/crates/fake/src/dec.rs" <<'RS'
+pub fn f(a: usize, b: u64) -> u64 {
+    let q = b'"'; // a.saturating_add(9) after a char literal is a comment
+    // usize::saturating_add in a comment is not a site
+    let _s = "\\"; // x.saturating_add(1) after an escaped backslash is a comment
+    let _t = "a.wrapping_add(1) and Wrapping in a string are text";
+    /* b.saturating_mul(2) in a block comment */
+    b.wrapping_mul(3).wrapping_add(q as u64 + a.saturating_add(1) as u64)
+}
+
+pub fn g(a: usize) -> usize {
+    a.saturating_sub(1)
+}
+
+#[cfg(test)]
+mod tests {
+    fn t() -> usize {
+        1usize.saturating_add(1)
+    }
+}
+RS
+    printf 't/x\t%s\tcast,arith\tdeny\n' "$row" >"$root/docs/lint-scopes.tsv"
+    printf '%s\n' "$@" >"$root/docs/arith-spellings.tsv"
+}
+D=crates/fake/src/dec.rs
+# as_red <case> <pattern>: red, and the message names the cause.
+as_red() {
+    expect red "arith-spellings: $1" env INF_CHECK_ROOT="$work/as-$1" "$SPELL"
+    expect_output "arith-spellings: $1 names its cause" "$2" \
+        env INF_CHECK_ROOT="$work/as-$1" "$SPELL"
+}
+as_root clean "$D" "saturating	2	$D" "wrapping	2	$D"
+expect green "arith-spellings: table equals the tree" env INF_CHECK_ROOT="$work/as-clean" "$SPELL"
+expect_output "arith-spellings: strings, comments and test modules are not sites" \
+    "2 saturating, 2 wrapping, 0 overflowing" \
+    env INF_CHECK_ROOT="$work/as-clean" "$SPELL"
+as_root added "$D" "saturating	2	$D" "wrapping	2	$D"
+sed -i.bak 's/a.saturating_sub(1)/a.saturating_sub(1).saturating_add(2)/' "$work/as-added/$D"
+as_red added "3 .saturating_.. call(s), docs/arith-spellings.tsv says 2"
+as_root removed "$D" "saturating	3	$D" "wrapping	2	$D"
+as_red removed "2 .saturating_.. call(s), docs/arith-spellings.tsv says 3"
+# The two plants below add a site and keep every other count, so only the
+# new family can turn them red.
+as_root overflowing "$D" "saturating	2	$D" "wrapping	2	$D"
+sed -i.bak 's/a.saturating_sub(1)/a.saturating_sub(1).overflowing_add(1).0/' \
+    "$work/as-overflowing/$D"
+as_red overflowing "1 .overflowing_.. call(s), docs/arith-spellings.tsv says 0"
+as_root wrapping-type "$D" "saturating	2	$D" "wrapping	2	$D"
+wrap='(core::num::Wrapping(a.saturating_sub(1)) - core::num::Wrapping(1)).0'
+sed -i.bak "s/a.saturating_sub(1)/$wrap/" "$work/as-wrapping-type/$D"
+as_red wrapping-type "4 .wrapping_.. call(s), docs/arith-spellings.tsv says 2"
+as_root stale "$D" "saturating	2	$D" "wrapping	2	$D" "wrapping	1	crates/fake/src/gone.rs"
+as_red stale "gone.rs. is not a deny-arith scope"
+as_root twice "$D" "saturating	2	$D" "wrapping	2	$D" "wrapping	2	$D"
+as_red twice "wrapping is listed twice"
+as_root zero "$D" "saturating	2	$D" "wrapping	2	$D" "saturating	0	$D"
+as_red zero "malformed row"
+as_root missing "$D" "saturating	2	$D"
+rm "$work/as-missing/docs/arith-spellings.tsv"
+as_red missing "arith-spellings.tsv is missing"
+as_root item "$D::g" "saturating	1	$D::g"
+expect green "arith-spellings: an item scope counts inside its fn" \
+    env INF_CHECK_ROOT="$work/as-item" "$SPELL"
+as_root item-wide "$D::g" "saturating	2	$D::g"
+as_red item-wide "g: 1 .saturating_.. call(s), docs/arith-spellings.tsv says 2"
+
 expect green "cache-capacity canary judge rejects stale, missing and false-red receipts" \
     python3 "$SCRIPT_DIR/check-cache-capacity-canaries.py" --self-test
 
@@ -1700,4 +1773,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, lint-scopes each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each red on a planted violation)"

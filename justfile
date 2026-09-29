@@ -29,6 +29,9 @@ check:
     # under the wildcard deny, no attribute hides a lint of the ADR, the
     # ADR-0143 exemptions are frozen, and the probe's plants draw their lint.
     ./scripts/check-lint-scopes.sh
+    # ADR-0165 D2: every saturating_/wrapping_ call in a deny-arith scope is a
+    # counted row of docs/arith-spellings.tsv, reviewed against D1's rows.
+    ./scripts/check-arith-spellings.sh
     # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
     # denies unsafe_code, the deny set is the audited-leaf list, and every
     # allow is module-scoped — the §17.3 posture, mechanical.
