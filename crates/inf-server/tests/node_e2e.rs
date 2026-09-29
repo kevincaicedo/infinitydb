@@ -86,6 +86,9 @@ struct Node {
     /// The graceful stop (ADR-0124): cells drain and exit once every
     /// cell is `Drained`.
     graceful: Arc<AtomicBool>,
+    /// Whether that stop takes its checkpoint (`--shutdown-checkpoint`);
+    /// cleared by [`Node::stop_synced`].
+    stop_checkpoint: Arc<AtomicBool>,
     drained: Arc<std::sync::atomic::AtomicU16>,
     handles: Vec<std::thread::JoinHandle<()>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
@@ -438,6 +441,7 @@ impl Node {
         let mut process_sampler = inf_server::ProcessSampler::default();
         process_sampler.sample();
         let graceful = Arc::new(AtomicBool::new(false));
+        let stop_checkpoint = Arc::new(AtomicBool::new(true));
         let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
         let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
         // The node identity (ADR-0124 D5): one value per node, every cell.
@@ -504,6 +508,7 @@ impl Node {
             let process_board = process_sampler.board();
             let stop = Arc::clone(&stop);
             let graceful = Arc::clone(&graceful);
+            let stop_checkpoint = Arc::clone(&stop_checkpoint);
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
             let boot = boot.clone();
@@ -590,6 +595,7 @@ impl Node {
                         panic!("cell {i} recovery failed (fail-stop, §8.4): {err}");
                     }
                     if graceful.load(Ordering::Relaxed) {
+                        plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
                         plane.request_stop();
                         let phase = plane.stop_phase();
                         if !counted_quiet
@@ -621,6 +627,7 @@ impl Node {
             cells,
             stop,
             graceful,
+            stop_checkpoint,
             drained,
             handles,
             control,
@@ -679,6 +686,19 @@ impl Node {
         self.stop();
     }
 
+    /// The durable stop without a checkpoint (`--shutdown-checkpoint
+    /// off`): the ADR-0124 drain and final sync, so every acknowledged
+    /// write is in the log and the next boot replays it. [`Node::stop`] is
+    /// crash-equivalent — an everysec ack promises nothing there — so a
+    /// test that reads acknowledged everysec writes after a restart stops
+    /// with this, or writes through an `always` namespace.
+    fn stop_synced(self) {
+        self.stop_checkpoint.store(false, Ordering::Relaxed);
+        self.stop_gracefully();
+    }
+
+    /// Crash-equivalent: the cells stop where they are (no drain, no final
+    /// sync; queued frame writes die with the ring). See [`Node::stop_synced`].
     fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for handle in self.handles.drain(..) {
@@ -2589,13 +2609,15 @@ fn tiered_data_plane_serves_and_survives_restart() {
         // RAM images above, live-set sections, manifest v2 tier ranges.
         c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
-        // Post-checkpoint tail: these records replay from the WAL.
+        // Post-checkpoint tail: these records replay from the WAL. The
+        // synced stop lands them without a second checkpoint (a crash
+        // stop lost the everysec tail under a parallel suite).
         for i in 60..80 {
             c.write_all(&cmd(&[b"SET", &key_of(i), &value_of(i, 2)])).expect("write");
             read_exactly(&mut c, b"+OK\r\n");
         }
         drop(c);
-        node.stop();
+        node.stop_synced();
     }
 
     // Restart: MANIFEST v2 → tier files → checkpoint (refs idempotent,
@@ -4283,7 +4305,8 @@ fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
         );
     }
     drop(c);
-    node.stop();
+    // Synced: the GET of the last trickle key below reads an everysec ack.
+    node.stop_synced();
 
     // On-disk truth matches the gauges: ≤ 3 segment files — polled
     // briefly, because unlinks are *delegated* to the control thread
@@ -4486,18 +4509,15 @@ fn loading_gate_byte_matches_redis_and_lifts() {
     let dir = temp_data_dir("loading");
     let val = vec![b'v'; 4096];
 
-    // Phase 1: build ~1 MiB of durable log to replay.
+    // Phase 1: build ~1 MiB of durable log to replay. FSYNC always: the
+    // harness `stop()` is crash-equivalent, so only an ack gated on the
+    // fsync watermark proves the frame is in the segment (an everysec ack
+    // lost 255 of 256 frames under a parallel suite).
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -4614,17 +4634,14 @@ fn loading_lifts_only_when_every_cell_recovered() {
     let val = vec![b'v'; 4096];
     let k0 = key_for_cell(2, 0);
 
+    // FSYNC always: the harness `stop()` is crash-equivalent, so only an
+    // ack gated on the fsync watermark proves the ~1 MiB is in cell 0's
+    // log (under a parallel suite an everysec run replayed 1 of 256).
     {
         let node = Node::start_durable(2, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
