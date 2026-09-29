@@ -5,6 +5,8 @@ default: check
 check:
     cargo fmt --all --check
     ./scripts/check-doc-artifacts.sh
+    # ADR-0164: the parent repository's ADR-link and record gates.
+    ./scripts/check-parent-doc-gates.sh
     ./scripts/check-dep-dag.sh
     ./scripts/check-cell-denylist.sh
     ./scripts/check-fault-points.sh

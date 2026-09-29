@@ -1680,6 +1680,18 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
 
+# ADR-0164: the parent doc gates state their scope — a standalone checkout
+# skips out loud; a parent whose gates are missing is red, not a skip.
+PARENT=$SCRIPT_DIR/check-parent-doc-gates.sh
+mkdir -p "$work/parent-none/eng" "$work/parent-bare/eng" "$work/parent-bare/docs"
+: >"$work/parent-bare/docs/infinity-master-plan.md"
+expect_output "parent-doc-gates: no parent governance prints the skip" "SKIPPED" \
+    env INF_CHECK_ROOT="$work/parent-none/eng" "$PARENT"
+expect green "parent-doc-gates: a standalone checkout is green" \
+    env INF_CHECK_ROOT="$work/parent-none/eng" "$PARENT"
+expect red "parent-doc-gates: a parent without its gates is red" \
+    env INF_CHECK_ROOT="$work/parent-bare/eng" "$PARENT"
+
 expect green "cache-capacity canary judge rejects stale, missing and false-red receipts" \
     python3 "$SCRIPT_DIR/check-cache-capacity-canaries.py" --self-test
 
@@ -1688,4 +1700,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, lint-scopes each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, doc-read-profile, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, lint-scopes each red on a planted violation)"
