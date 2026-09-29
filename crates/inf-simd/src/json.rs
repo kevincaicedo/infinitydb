@@ -22,11 +22,13 @@
 //! correctness oracle. Runtime dispatch follows the cached-`AtomicU8`
 //! pattern from `crlf.rs`.
 
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+use core::arch::x86_64::_mm256_storeu_si256;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
     __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
     _mm_set1_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256,
-    _mm256_set1_epi8, _mm256_storeu_si256,
+    _mm256_set1_epi8,
 };
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -527,7 +529,7 @@ unsafe fn avx2_scan(input: &[u8], out: &mut Vec<u32>) -> usize {
 /// # Safety
 /// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
 /// dispatch of this module.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_classify_blocks(input: &[u8], out: &mut Vec<BlockMasks>) {
     let n_blocks = input.len().div_ceil(BLOCK);
