@@ -432,6 +432,11 @@ pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError>;
 
 // SPSC ring: fixed power-of-two capacity, cache-padded indices,
 // acquire/release only, batch publish/consume. Loom-modeled.
+// Accepted ADR-0157 adds an owned-backing variant beside these types: a
+// retained backing owner and two non-cloneable endpoints, fallible
+// construction, eight slots for ADR-0156's cleanup jobs, capacity-first
+// reservation and explicit budgeted retirement. Existing ring/mesh
+// signatures are unchanged. The variant is unbuilt.
 pub struct Producer<T>; pub struct Consumer<T>;
 pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>);
 impl Producer<T> { pub fn try_push(&mut self, v: T) -> Result<(), T>;

@@ -875,6 +875,16 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   persisted-epoch pattern). One checkpoint in flight per cell; triggers
   latch, never stack. `INF.CKPT`/`BGSAVE` ride this at S20.
 
+  > **Accepted 2026-09-21/23, implementation open — ADR-0145, ADR-0159:**
+  > [ADR-0145](../../docs/adr/0145-bounded-relocation-pressure-checkpoints.md)
+  > adds a typed `RelocationPressure` cause beside Manual and Interval;
+  > `interval_bytes = 0` now disables only the Interval cause.
+  > [ADR-0159](../../docs/adr/0159-reserved-checkpoint-issuance-and-bounded-observation.md)
+  > replaces the infallible `request_ckpt_all()` with reserved issuance
+  > credits (typed `CheckpointExhausted` before effects), late epoch
+  > assignment, per-cell protected final credits and an overflow-free
+  > bounded observer that no longer sums epochs into `u64`. Neither is built.
+
 ### `.ick` container v3 (M4.5-S36 — ADR-0088 D3) — aligned blocks, direct writes
 
 `ICK_VERSION_V3 = 3`: the v2 tag vocabulary (0x01–0x06) with **every
@@ -1044,7 +1054,16 @@ per episode). A drained cell always seals — never slower than K = 1.
   `inf-log::meta` envelope (magic `INFMETA1` + length + CRC32C — one swap
   protocol shared with the catalog; the reader refuses any envelope file
   over `MAX_ENVELOPE_LEN` = 64 MiB **by inode length, before allocating**
-  — review F-L02-05). Payload: magic `INFMAN1\0`,
+  — review F-L02-05).
+
+  > **Accepted 2026-09-23, implementation open — ADR-0158:**
+  > [reserved catalog publication and recovery headroom](../../docs/adr/0158-reserved-catalog-publication-and-recovery-headroom.md)
+  > gives META its own envelope bound, `CATALOG_ENVELOPE_BYTES_MAX` =
+  > 70,837,137 B, owned by one byte-limit table in `inf-log::meta` and
+  > selected by envelope kind, not by caller or filename. MANIFEST keeps
+  > the 64 MiB bound above. Ordinary growth still ends at or below 64 MiB;
+  > the extra band holds legacy normalization and required cleanup. A
+  > META above 64 MiB is refused by binaries built before ADR-0158. Payload: magic `INFMAN1\0`,
   `epoch: u32 = 1`, `ckpt_id: u64`, packed `begin: u64`, count + u32
   segment ids (strictly ascending; `segments[0] == begin.segment` = the
   truncation floor). Canonical decode: trailing bytes / empty or
@@ -1141,6 +1160,13 @@ per episode). A drained cell always seals — never slower than K = 1.
   (catalog clamped to `flushed`; zero-confirmed files not named).
   `TierFlush::with_catalog` seeds a recovered pipeline. Fuzz:
   `manifest_decode` extended over epoch 2 with the tiling invariants.
+- > **Accepted 2026-09-23, implementation open — ADR-0156:**
+  > [bounded, acknowledged tier-file retirement](../../docs/adr/0156-bounded-acknowledged-tier-file-retirement.md)
+  > replaces the plane-layer unlink below with an owned cell→control job:
+  > eight positions per cell cover request, worker and unconsumed result;
+  > the worker closes the final handle then unlinks; `Unlinked` and
+  > `AlreadyAbsent` are terminal, `Retry` returns the owner for paced
+  > retry; one 64-visit allowance per turn. Eligibility is unchanged.
 - **M4-S15 amendment (ADR-0059) — retirement + unlink lifecycle.** The
   §3.1 deletion conjunction made mechanical, staged around the MANIFEST
   swap: `TieredTable::begin_ckpt_walk(ckpt_id: u64)` (signature grew
