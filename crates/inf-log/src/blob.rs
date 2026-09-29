@@ -514,8 +514,10 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
 /// Device offset of extent frame `frame` (header block first — the tier
 /// arithmetic with the blob header).
 ///
-/// Saturating: a frame index no file can hold addresses `u64::MAX`, where
-/// the read or write fails typed, instead of wrapping onto a real frame.
+/// Saturating: a frame index no file can hold addresses `u64::MAX`, never a
+/// wrapped real frame. A synchronous read or write there fails typed; the
+/// io_uring cold path would take it as offset -1 (the file position), so
+/// its callers' frames lie inside extents whose bytes they hold (ADR-0165).
 #[must_use]
 pub fn extent_frame_offset(frame: u64) -> u64 {
     frame.saturating_mul(TIER_FRAME_BYTES as u64).saturating_add(BLOB_HEADER_BYTES as u64)

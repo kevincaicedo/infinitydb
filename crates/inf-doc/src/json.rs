@@ -1434,7 +1434,7 @@ fn try_fixstr_fast(tape: &mut Tape<'_>, input: &[u8], at: usize, len: usize) -> 
     }
     // The 32-byte window that opens after the quote at `at`: one bounds
     // check (two chained `get`s cost the fused parse ~1–2%); a wrapped end is
-    // an empty range, refused like a short input.
+    // a reversed range, refused like a short input.
     let Some(quoted) = input.get(at..at.wrapping_add(33)) else {
         return false;
     };
