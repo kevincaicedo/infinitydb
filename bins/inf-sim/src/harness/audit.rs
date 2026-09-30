@@ -99,6 +99,9 @@ pub(super) fn reconcile_entries(node: &Entries, model: &Entries, label: &str) ->
 /// fold reaps expired records (as reads and `SCAN` do), so a record the
 /// drain left past its deadline shows up as the difference. Independent
 /// of the schedule: it reads arena counts and the checkpoint walk only.
+/// The fold does not walk tiered namespaces, whose arena count it could
+/// then not match, so a cell with one cannot be checked: that is
+/// `VACUOUS`, never a pass (no scenario of this harness registers one).
 pub(super) fn expired_retained(
     cell: usize,
     live: u64,
@@ -107,7 +110,13 @@ pub(super) fn expired_retained(
 ) -> Option<String> {
     let mut emitted = 0u64;
     let skipped = plane.fold_live_entries(now, |_, _, _, _| emitted += 1);
-    (skipped == 0 && live != emitted).then(|| {
+    if skipped > 0 {
+        return Some(format!(
+            "VACUOUS: cell {cell}: the expired-retained check cannot run: the fold skipped \
+             {skipped} tiered namespaces"
+        ));
+    }
+    (live != emitted).then(|| {
         format!(
             "EXPIRED RETAINED: cell {cell}: {live} live records vs {emitted} live entries \
              after the expiry drain (a record outlived its deadline without a reap)"

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use inf_foundation::time::Nanos;
-use inf_store::limits::{EXPIRY_SWEEP_SLOTS_PER_SLICE, WHEEL_TOMBSTONES_MAX};
+use inf_store::limits::{EXPIRY_SWEEP_SLOTS_PER_SLICE, IDX_ALIAS_GROUP_MAX};
 use inf_store::{
     COLLISION_KEY_PREFIX, CellStore, EvictionPolicy, ExpireCond, ExpiryAudit, ExpiryBudget,
     Keyspace, MAX_EXPIRE_MS, NsId, NsMode, NsSpec, SetExpire, SetOptions, StoreConfig, TtlUpdate,
@@ -272,7 +272,7 @@ fn same_second_storm_drains_in_bounded_slices() {
     loop {
         let stats = store.expire_tick(after, budget);
         assert!(
-            stats.reaped + stats.stale + stats.refiled + stats.swept <= u64::from(budget.max_fires),
+            stats.fired + stats.swept <= u64::from(budget.max_fires),
             "slice exceeded its fire budget"
         );
         total += stats.reaped;
@@ -548,8 +548,26 @@ fn persist(store: &mut CellStore, key: &[u8], now: Nanos) {
 /// The legs' drain instant: past the largest deadline a record can carry.
 const LEGS_DRAIN_MS: u64 = MAX_EXPIRE_MS + 1;
 
-fn hostile_legs() -> [HostileLeg; 12] {
+/// Before every leg's earliest remaining deadline (10 000 ms): a drain here
+/// cascades the key's node toward tier 0 but fires nothing.
+const LEGS_MID_DRAIN_MS: u64 = 9_999;
+
+fn hostile_legs() -> [HostileLeg; 13] {
     [
+        // A death with no rewrite after it: a node the death left behind
+        // fires with no member (`wheel_stale`). `b` keeps a deadline live
+        // for the engagement checks.
+        HostileLeg {
+            name: "SET EX then DEL",
+            keys: 2,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_with_ttl(s, b"b", 20_000, now);
+                }
+                set_with_ttl(s, b"a", 10_000 + i, now);
+                assert!(s.del(b"a", now), "DEL applied");
+            },
+        },
         HostileLeg {
             name: "EXPIRE extend",
             keys: 1,
@@ -678,44 +696,71 @@ fn hostile_legs() -> [HostileLeg; 12] {
     ]
 }
 
-/// O1 on every hostile leg: however a key's deadline is rewritten, the
-/// wheel holds one live node per key (`armed ≤ keys`, `armed ≤
-/// ttl_live`), tombstones stay within `WHEEL_TOMBSTONES_MAX`, no
-/// membership entry is orphaned, the idle sweep leaves no record with a
-/// deadline unscheduled (I7) and no node late (I4), every fire finds a
-/// member (`wheel_stale == 0`), and once the wheel passes the largest
-/// deadline no node or tombstone is left.
+/// O1 after every touch: one live node per key (`armed ≤ keys`, `armed ≤
+/// ttl_live`), and no wheel list holding more than one tombstone. Rule 4
+/// keeps a list's tombstone at its tail, so a list holds at most one per
+/// list epoch; no tick runs during a leg, so every list is in one epoch.
+/// That per-list premise is what `WHEEL_TOMBSTONES_MAX` is derived from,
+/// and unlike the total it is a bound one leg can cross.
+fn assert_one_node_per_key(store: &CellStore, leg: &HostileLeg, touch: u64) {
+    let audit = store.expiry_audit();
+    let name = leg.name;
+    assert!(
+        audit.armed <= audit.ttl_live,
+        "{name}: touch {touch}: armed {} > ttl_live {}",
+        audit.armed,
+        audit.ttl_live
+    );
+    assert!(
+        audit.armed <= leg.keys,
+        "{name}: touch {touch}: armed {} for {} keys",
+        audit.armed,
+        leg.keys
+    );
+    assert!(
+        audit.list_tombstones_max <= 1,
+        "{name}: touch {touch}: {} tombstones in one wheel list",
+        audit.list_tombstones_max
+    );
+}
+
+/// The idle sweep leaves no record with a deadline unscheduled (I7) and
+/// no node late (I4), and no membership entry is orphaned; `at` must see
+/// a deadline live (engagement).
+fn assert_schedule_sound(audit: &ExpiryAudit, name: &str, at: &str) {
+    assert_eq!(audit.orphans, 0, "{name}: {at}: orphaned membership entries");
+    assert!(
+        assert_scheduled_when_idle(audit, &format!("{name}: {at}")),
+        "{name}: {at}: engagement: the sweep owes nothing with a deadline live"
+    );
+    assert_eq!(audit.late, 0, "{name}: {at}: a node filed after its group's deadline");
+}
+
+/// O1 on every hostile leg: however a key's deadline is rewritten, every
+/// touch keeps one node per key and one tombstone per list at most; the
+/// schedule is sound after the touches and again after a drain that
+/// cascades the key's node but fires nothing; and once the wheel passes
+/// the largest deadline, every fire found a member (`wheel_stale == 0`),
+/// no node or tombstone is left and the census is empty.
 #[test]
 fn one_key_keeps_one_wheel_node_under_every_ttl_rewrite() {
     for leg in hostile_legs() {
         let mut store = CellStore::new(StoreConfig::default());
-        let now = ms(1);
-        for i in 0..LEG_TOUCHES {
-            (leg.step)(&mut store, i, now);
-            let tombstones = store.expiry_audit().tombstones;
-            assert!(tombstones <= WHEEL_TOMBSTONES_MAX, "{}: {tombstones} tombstones", leg.name);
-        }
-        let audit = store.expiry_audit();
         let name = leg.name;
-        assert!(
-            audit.armed <= audit.ttl_live,
-            "{name}: armed {} > ttl_live {}",
-            audit.armed,
-            audit.ttl_live
-        );
-        assert!(audit.armed <= leg.keys, "{name}: armed {} for {} keys", audit.armed, leg.keys);
-        assert_eq!(audit.orphans, 0, "{name}: orphaned membership entries");
-        assert!(
-            assert_scheduled_when_idle(&audit, name),
-            "{name}: engagement: the sweep owes nothing with a deadline live"
-        );
-        assert_eq!(audit.late, 0, "{name}: a node filed after its group's deadline");
+        for i in 0..LEG_TOUCHES {
+            (leg.step)(&mut store, i, ms(1));
+            assert_one_node_per_key(&store, &leg, i);
+        }
+        assert_schedule_sound(&store.expiry_audit(), name, "after the touches");
+        drain_settled(&mut store, ms(LEGS_MID_DRAIN_MS));
+        assert_schedule_sound(&store.expiry_audit(), name, "after a drain");
         drain_settled(&mut store, ms(LEGS_DRAIN_MS));
         let audit = store.expiry_audit();
         assert_eq!(store.len(), 0, "{name}: a key outlived its deadline");
         assert_eq!(audit.armed, 0, "{name}: nodes left after every deadline passed");
         assert_eq!(audit.tombstones, 0, "{name}: tombstones left past the leg's last instant");
         assert_eq!(store.stats().wheel_stale, 0, "{name}: a fire found no member");
+        assert_eq!(audit.ttl_live, 0, "{name}: the census kept a record that died");
     }
 }
 
@@ -856,6 +901,63 @@ fn a_write_refused_behind_the_sweep_cursor_is_reaped() {
     drain_settled(&mut store, ms(20));
     assert_scheduled_when_idle(&store.expiry_audit(), "after the drain");
     assert_eq!(store.len(), 16, "{} expired writes outlived the drain", store.len() - 16);
+}
+
+/// Rule 6 and O3's drain: an index rebuild moves records across the sweep
+/// cursor, so a pass it voided vouches for nothing — it must not settle a
+/// drain frozen at the instant it began. Setup: one record swept (the node
+/// budget is 1), a pass begun at `now`, and plain writes at the same
+/// instant that grow the index under it.
+#[test]
+fn a_voided_sweep_pass_does_not_settle_the_drain() {
+    let mut store = CellStore::new(small_cap(1));
+    let now = ms(10);
+    set_with_ttl(&mut store, b"scheduled", 1_000_000, now);
+    set_with_ttl(&mut store, b"swept", 1_000_000, now);
+    let capacity = store.index_capacity();
+    let slice = ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX, max_sweep_slots: 16 };
+    store.expire_tick(now, slice);
+    assert!(store.sweep_pass_slots().is_some(), "a pass began at the frozen instant");
+    for i in 0..capacity {
+        if store.index_capacity() != capacity {
+            break;
+        }
+        set_plain(&mut store, format!("grow:{i}").as_bytes(), now);
+    }
+    assert!(store.index_capacity() > capacity, "engagement: the index grew under the pass");
+    for _ in 0..capacity {
+        if store.sweep_pass_slots().is_none() {
+            break;
+        }
+        store.expire_tick(now, slice);
+    }
+    assert_eq!(store.stats().sweep_passes_voided, 1, "engagement: the rebuild voided the pass");
+    assert!(!store.expiry_settled(now), "a voided pass settled the drain at the instant it began");
+    drain_settled(&mut store, now);
+}
+
+/// M1-S05's shared fire budget, in the unit each store's wheel budgets: a
+/// fire. A fire whose group walk crosses ADR-0139 D9's member bound reaps
+/// nothing, yet it is the most expensive fire (rule 5), so it must spend
+/// the keyspace slice's budget — or every store holding such groups gets
+/// the full budget again and one slice runs stores × `max_fires` walks.
+#[test]
+fn over_fires_spend_the_shared_keyspace_fire_budget() {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    for db in 0..2u64 {
+        for group in 0..3u64 {
+            for member in 0..=IDX_ALIAS_GROUP_MAX as u8 {
+                let key = alias_key(100 + db * 10 + group, member);
+                set_with_ttl(ks.db_mut(db as usize), &key, 50, ms(1));
+            }
+        }
+    }
+    let budget = ExpiryBudget { max_fires: 2, max_steps: 4096, max_sweep_slots: 0 };
+    ks.expire_tick(ms(1_000), budget);
+    let fires: u64 =
+        (0..2).map(|db| ks.db(db).expect("materialized").stats().expiry_alias_over).sum();
+    assert!(fires > 0, "engagement: no fire crossed the group bound");
+    assert!(fires <= u64::from(budget.max_fires), "{fires} fires in a slice budgeted 2");
 }
 
 /// A deadline behind an advanced wheel cursor (a writer whose clock reads

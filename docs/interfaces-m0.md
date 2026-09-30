@@ -836,8 +836,10 @@ never left to lazy expiry. All deltas additive. `StoreConfig` +
 `wheel_nodes_max` (`WheelNodesMax`, checked against `WHEEL_NODES_MAX`;
 tests and the simulator lower it). `ExpiryBudget` + `max_sweep_slots` (one
 keyspace-wide sweep budget per slice) and `ExpiryBudget::UNBOUNDED`.
-`ExpiryStats` + `refiled`, `swept`, `sweep_slots`, `sweep` (`SweepState`),
-`sweep_stop` (`SweepStop`) and `tombstones`. `StoreStats` + `expired_swept`,
+`ExpiryStats` + `fired` (the unit of `max_fires`), `refiled`, `swept`,
+`sweep_slots`, `sweep` (`SweepState`), `sweep_stop` (`SweepStop`),
+`tombstones` and `fires_charged()` (fires plus sweep reaps: what a slice
+spends of its fire budget). `StoreStats` + `expired_swept`,
 `wheel_refiled`, `sweep_passes_voided`, `expiry_alias_over` and the
 `wheel_tombstones` gauge. `MemoryReport` + `wheel_live_bytes` (nodes in use,
 the pressure comparable's wheel term; `wheel_bytes` stays the resident

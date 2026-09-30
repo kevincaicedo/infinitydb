@@ -34,13 +34,13 @@ pub const IDX_ALIAS_GROUP_MAX: usize = 8;
 pub const BRACKET_KEY_BYTES_MAX: usize = 32 << 20;
 
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
-/// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so this is the
-/// width bound, not a byte budget — each node's 16 B is charged with its
-/// record to the namespace budget that admitted the record. Crossing ⇒
-/// the placement is `Refused`: the record is swept instead of scheduled
-/// (`wheel_fallback` + 1), never left to lazy expiry alone and never a
-/// client error.
-pub const WHEEL_NODES_MAX: usize = (1 << 24) - 2;
+/// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
+/// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte
+/// budget: each node's 16 B is charged with its record to the namespace
+/// budget that admitted the record. Crossing ⇒ the placement is
+/// `Refused`: the record is swept instead of scheduled (`wheel_fallback`
+/// + 1), never left to lazy expiry alone and never a client error.
+pub const WHEEL_NODES_MAX: usize = (1 << 24) - 1;
 
 /// Shards of the wheel's membership table (key hash → node), selected
 /// by the hash's top byte (ADR-0008 A1 rule 7). Each shard doubles at

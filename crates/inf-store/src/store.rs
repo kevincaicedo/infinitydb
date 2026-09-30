@@ -348,6 +348,11 @@ pub enum CopyResult {
 /// it while foreground latency stays protected.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct ExpiryStats {
+    /// Nodes the wheel fired this slice — the unit of `max_fires`. A fire
+    /// is one group walk (ADR-0139 D9's bounds) and at most
+    /// `IDX_ALIAS_GROUP_MAX` reaps, whatever its answer (ADR-0008 A1 rule
+    /// 5). [`fires_charged`](Self::fires_charged) is what a slice spends.
+    pub fired: u64,
     /// Records the wheel's fires reaped this slice.
     pub reaped: u64,
     /// Fires that found no member of their key hash (ADR-0008 A1 O1: 0).
@@ -375,6 +380,17 @@ pub struct ExpiryStats {
     pub tombstones: u64,
 }
 
+impl ExpiryStats {
+    /// What the slice spent of its fire budget, in the unit the store's
+    /// own wheel and sweep budget: its fires, whatever each reaped, and
+    /// its sweep reaps (ADR-0008 A1 rule 5). The one charge the keyspace
+    /// rotation and the cell's Maintenance class both read.
+    #[must_use]
+    pub fn fires_charged(&self) -> u64 {
+        self.fired + self.swept
+    }
+}
+
 /// The expiry sweep's standing (ADR-0008 A1 rule 6). `Idle` means no
 /// event owes a pass, so every record with a deadline has a wheel node.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -382,15 +398,17 @@ pub enum SweepState {
     #[default]
     Idle,
     /// A pass is owed: under way since `pass_began_ms`, or (`None`) begins
-    /// at the next slice. `completed_pass_began_ms` is when the last pass
-    /// completed since the sweep left `Idle` began.
+    /// at the next slice. `completed_pass_began_ms` is when the last clean
+    /// or dirty pass since the sweep left `Idle` began; a pass an index
+    /// rebuild voided completes nothing.
     Walking { pass_began_ms: Option<u64>, completed_pass_began_ms: Option<u64> },
 }
 
 impl SweepState {
     /// The sweep owes nothing a drain frozen at `t_ms` must wait for:
     /// idle, or its last completed pass began at or after `t_ms` (a pass
-    /// that began then visited every record present at `t_ms`).
+    /// that began then and saw no rebuild visited every record present at
+    /// `t_ms`).
     #[must_use]
     pub fn settled_since(self, t_ms: u64) -> bool {
         match self {
@@ -422,6 +440,9 @@ pub struct ExpiryAudit {
     pub armed: u64,
     /// Tombstone nodes still linked.
     pub tombstones: u64,
+    /// The most tombstones linked in one wheel list: at most 1 until a
+    /// tick drains or cascades a list (rule 4's per-list-epoch premise).
+    pub list_tombstones_max: u64,
     /// Records with a deadline (the census).
     pub ttl_live: u64,
     /// Membership entries whose node no slot list reaches (O1).

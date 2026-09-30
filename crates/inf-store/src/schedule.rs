@@ -119,7 +119,8 @@ pub(crate) struct ExpirySchedule {
     /// The next index slot the sweep walks. A new pass begins here, never
     /// at slot 0, so no slot range starves under voided passes.
     sweep_cursor: usize,
-    /// When the last pass completed since the sweep left idle began.
+    /// When the last clean or dirty pass since the sweep left idle began
+    /// (a voided pass completes nothing).
     completed_began_ms: Option<u64>,
     /// Events that owe the sweep a pass: every `Refused` placement (a
     /// write, a `Moved`, the sweep's own) and every `Over`. u64 cannot
@@ -387,7 +388,13 @@ impl ExpirySchedule {
         } else {
             PassEnd::Clean
         };
-        self.completed_began_ms = Some(pass.began_ms);
+        // A clean or dirty pass visited every record present between
+        // rebuilds; a voided one proves nothing (a rebuild moved records
+        // across the cursor), so it completes no pass the drain reads.
+        match end {
+            PassEnd::Clean | PassEnd::Dirty => self.completed_began_ms = Some(pass.began_ms),
+            PassEnd::Voided => {}
+        }
         self.phase =
             if end == PassEnd::Clean { SweepPhase::Idle } else { SweepPhase::Walking(None) };
         end
@@ -433,6 +440,12 @@ impl ExpirySchedule {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn audit_links(&self) -> (u64, u64) {
         self.wheel.audit_links()
+    }
+
+    /// The most tombstones in one wheel list (test-support).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn list_tombstones_max(&self) -> u64 {
+        self.wheel.list_tombstones_max()
     }
 }
 

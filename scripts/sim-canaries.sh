@@ -99,6 +99,11 @@ rows=(
   # Rule 3 (I1): every changed deadline allocates a node; the old one lingers.
   "inf_canary_wheel_arm_per_change crate-test inf-store test:expiry one_key_keeps_one_wheel_node_under_every_ttl_rewrite"
   "inf_canary_wheel_arm_per_change crate-test inf-store test:expiry wheel_matches_reference_model_under_churn"
+  # Rule 4: every removal leaves a tombstone (no successor copy) — O1's
+  # one-tombstone-per-list bound.
+  "inf_canary_wheel_tombstone_every_removal crate-test inf-store test:expiry one_key_keeps_one_wheel_node_under_every_ttl_rewrite"
+  # Rule 2: a death path skips the schedule transition — O1's stale fire.
+  "inf_canary_wheel_death_skips_transition crate-test inf-store test:expiry one_key_keeps_one_wheel_node_under_every_ttl_rewrite"
   # Rule 3's crossing: a refused placement does not owe the sweep (lazy-only).
   "inf_canary_wheel_refused_lazy crate-test inf-store test:expiry refused_keys_expire_actively_at_the_node_cap"
   "inf_canary_wheel_refused_lazy crate-test inf-store test:expiry a_small_node_budget_matches_the_reference_model_under_churn"

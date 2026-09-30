@@ -178,6 +178,7 @@ impl CellStore {
         self.stats.wheel_stale += tally.stale;
         self.stats.expiry_alias_over += tally.over;
         self.stats.wheel_refiled += u64::from(tick.refiled);
+        out.fired = u64::from(tick.fired);
         out.reaped = tally.reaped;
         out.stale = tally.stale;
         out.refiled = u64::from(tick.refiled);
@@ -297,6 +298,7 @@ impl CellStore {
         let mut audit = ExpiryAudit {
             armed: schedule.armed(),
             tombstones,
+            list_tombstones_max: schedule.list_tombstones_max(),
             ttl_live: schedule.ttl_live(),
             orphans,
             sweep_idle,
@@ -476,7 +478,11 @@ impl CellStore {
         let deadline = record_at(&self.arena, addr).expire_at_ms();
         self.arena.free(addr, len);
         self.docs.release(payload);
-        self.record_died(hash, deadline);
+        // The plant: a death path that skips the transition, as one that
+        // bypassed this choke point would (the canary of O1's stale fire).
+        if !cfg!(inf_canary_wheel_death_skips_transition) {
+            self.record_died(hash, deadline);
+        }
     }
 
     /// RENAME's source removal: the value's handle moved to the target,

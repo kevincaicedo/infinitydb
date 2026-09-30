@@ -451,7 +451,7 @@ impl Keyspace {
             if withheld && s.sweep_stop == SweepStop::Budget {
                 unserved.get_or_insert(at);
             }
-            let consumed = s.reaped + s.stale + s.refiled + s.swept;
+            let consumed = s.fires_charged();
             left.max_fires =
                 left.max_fires.saturating_sub(consumed.min(u64::from(u32::MAX)) as u32);
             left.max_steps = left.max_steps.saturating_sub(s.steps);
@@ -1534,6 +1534,7 @@ impl Keyspace {
 /// state folds to the least-settled store, and the stop to the most
 /// constrained one.
 fn fold_expiry(total: &mut ExpiryStats, s: &ExpiryStats) {
+    total.fired += s.fired;
     total.reaped += s.reaped;
     total.stale += s.stale;
     total.steps += s.steps;

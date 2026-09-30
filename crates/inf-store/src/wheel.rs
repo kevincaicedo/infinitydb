@@ -206,7 +206,8 @@ impl Default for WheelNodesMax {
     }
 }
 
-const _: () = assert!(crate::limits::WHEEL_NODES_MAX < NIL as usize);
+const _: () =
+    assert!(crate::limits::WHEEL_NODES_MAX <= NIL as usize, "every node index is below NIL");
 
 /// What one [`TtlWheel::tick`] did (feeds `expiry_debt` + tripwires).
 #[derive(Copy, Clone, Default, Debug)]
@@ -342,7 +343,9 @@ impl TtlWheel {
         let Some(at) = self.members.lookup(hash, &self.pool) else { return false };
         self.members.remove(hash, at, &self.pool);
         let successor = self.pool[at as usize].next();
-        if successor == NIL {
+        // The plant: every removal leaves a tombstone, successor or not
+        // (the canary of O1's one-tombstone-per-list bound).
+        if successor == NIL || cfg!(inf_canary_wheel_tombstone_every_removal) {
             self.tombstones += 1;
             debug_assert!(self.tombstones <= WHEEL_TOMBSTONES_MAX, "tombstone bound (I6)");
             return true;
@@ -544,7 +547,7 @@ impl TtlWheel {
         if self.pool.len() >= self.nodes_max || self.pool.try_reserve(1).is_err() {
             return None;
         }
-        // Exact: `len < nodes_max ≤ WHEEL_NODES_MAX < NIL` (const-asserted).
+        // Exact: `len < nodes_max ≤ WHEEL_NODES_MAX ≤ NIL` (const-asserted).
         let at = self.pool.len() as u32;
         self.pool.push(Node::new(hash, deadline_ms, NIL));
         self.nodes_in_use += 1;
@@ -634,6 +637,26 @@ impl TtlWheel {
         }
         let unpointed = linked.iter().filter(|l| **l).count() as u64;
         (orphans, unpointed)
+    }
+
+    /// The most tombstones linked in any one list (test-support audit of
+    /// rule 4's premise: a list keeps its tombstone at its tail, so it
+    /// holds at most one per list epoch). A tombstone is a linked node its
+    /// hash's entry does not point at, as the drain tells them apart.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn list_tombstones_max(&self) -> u64 {
+        let lists = self.heads.iter().flatten().copied().chain(core::iter::once(self.overflow));
+        let mut most = 0;
+        for head in lists {
+            let (mut at, mut in_list) = (head, 0u64);
+            while at != NIL {
+                let node = self.pool[at as usize];
+                in_list += u64::from(self.members.lookup(node.hash, &self.pool) != Some(at));
+                at = node.next();
+            }
+            most = most.max(in_list);
+        }
+        most
     }
 }
 
@@ -866,5 +889,13 @@ mod tests {
         assert_eq!(wheel.place(3, 10), Placement::Refused);
         assert_eq!(wheel.armed(), 2);
         assert!(WheelNodesMax::new(crate::limits::WHEEL_NODES_MAX + 1).is_err());
+    }
+
+    /// The width bound is a count: u24 links with `NIL` reserved leave
+    /// indices `0..NIL`, which is `NIL` nodes.
+    #[test]
+    fn the_node_budget_is_every_index_below_nil() {
+        assert!(WheelNodesMax::new(NIL as usize).is_ok(), "index NIL − 1 is a node");
+        assert!(WheelNodesMax::new(NIL as usize + 1).is_err());
     }
 }
