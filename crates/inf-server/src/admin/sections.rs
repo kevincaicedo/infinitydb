@@ -1044,10 +1044,6 @@ fn tiering_namespace_lines(ks: &Keyspace, text: &mut String) {
 /// number hides a runaway tiered namespace behind a quiet one, which is
 /// why the ratio is per namespace and the only aggregate of it is a
 /// maximum.
-///
-/// The operator's reading of every field is
-/// `infinitydb/docs/ops-tiered-storage.md` — that chapter and this
-/// function are edited together.
 fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     // M4-S03: tiering code-path counters (this cell's slice), one group
     // of lines per story; each helper reads the counters it renders.

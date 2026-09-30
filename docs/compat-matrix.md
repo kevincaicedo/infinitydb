@@ -115,7 +115,7 @@ as membership in the oracle's live keys.
 | `JSON.TOGGLE` | full | M3 | write fast | -2 | 4 | 4 | S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split matches the pinned oracle (S22 probe) |
 | `JSON.CLEAR` | full | M3 | write | -2 | 2 | 2 | already-empty containers and zero numbers skip (uncounted), matching the pinned oracle (S21 corpus + S22 probe) |
 | `JSON.ARRAPPEND` | partial | M3 | write denyoom | -3 | 4 | 4 | S21 corpus exact; three-argument form appends one value at the legacy root, a form the pinned RedisJSON rejects with an arity error (S22 probe) |
-| `JSON.ARRINSERT` | partial | M3 | write denyoom | -5 | 6 | 6 | resolved index outside 0..=len aborts the whole command atomically (§3.4 R4); RedisJSON can mutate an earlier match before a later index error |
+| `JSON.ARRINSERT` | partial | M3 | write denyoom | -5 | 6 | 6 | resolved index outside 0..=len aborts the whole command atomically; RedisJSON can mutate an earlier match before a later index error |
 | `JSON.ARRINDEX` | partial | M3 | readonly | -4 | 6 | 6 | scalar needles only (container needles rejected — ADR-0042 D3); mixed-width numbers compare numerically; S21 corpus exact |
 | `JSON.ARRLEN` | partial | M3 | readonly fast | -2 | 8 | 8 | S21 corpus exact except module-specific WRONGTYPE error text |
 | `JSON.ARRPOP` | partial | M3 | write | -2 | 6 | 6 | out-of-range clamps and empty-array null match the pinned oracle (S22 probes); the popped-value text shares JSON.GET's large-exponent f64 deviation (the oracle echoes a 3e72 literal as 2.9999999999999996e72); S21 corpus exact |
@@ -328,11 +328,11 @@ absent (below).
 | MULTI / EXEC / WATCH / DISCARD, EVAL / Lua, FUNCTION, WAIT | M6 — transactions |
 | Streams (X*), AUTH / TLS / ACL, CLIENT TRACKING | M7 |
 | JSONPath filter expressions `?(@…)`, secondary indexes, query engine | M4.5 — ADR-0024 |
-| `JSON.RESP` | Never — deprecated upstream; declared absent per the M3 plan anti-goals |
+| `JSON.RESP` | Never — deprecated upstream; declared absent |
 | Vector sets | M8 |
 | Replication / cluster admin | M9+ |
 
 ---
 
-Master plan §14 owns the staging policy; milestone plans own acceptance
-criteria. Performance claims live in the claim ledger, never here (L10).
+Performance claims live in the claim ledger, published as
+`website/site/_ledger-snapshot.md`, never here (L10).

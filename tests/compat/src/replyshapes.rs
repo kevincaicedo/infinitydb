@@ -94,6 +94,7 @@ pub fn render() -> String {
     push("Compatibility status per command lives in `docs/compat-matrix.md`; this");
     push("artifact pins the *shapes* the corpus executes under both protocols");
     push("(`inf-server/tests/json_commands.rs`). Performance claims live in the");
-    push("claim ledger, never here (L10).");
+    push("claim ledger, published as `website/site/_ledger-snapshot.md`, never here");
+    push("(L10).");
     out
 }

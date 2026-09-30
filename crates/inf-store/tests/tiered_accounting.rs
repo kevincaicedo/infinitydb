@@ -5,8 +5,8 @@
 //! accepted, flush bytes against the bytes that actually reached the
 //! (simulated) device.
 //!
-//! The counters are what M4-S16 divides and what the ops guide teaches
-//! operators to alarm on, so "close enough" is not a passing grade here:
+//! The counters are what M4-S16 divides and what operators alarm on, so
+//! "close enough" is not a passing grade here:
 //! every assertion below is an equality except the two that are
 //! deliberately inequalities (framing overhead, tail-frame rewrites), and
 //! those state their exact structure.
@@ -388,17 +388,17 @@ fn amplification_run(rig: &mut Rig) -> inf_store::WriteAccounting {
 /// is written twice by design (WAL record + tier flush), so at a
 /// production-shaped slice budget the numerator sits near 2× the
 /// denominator — above it, because record framing, frame CRCs, and
-/// per-file blocks are real bytes. The band is wide on purpose; the
-/// guide states the shape, and this test stops it drifting into a
-/// different order of magnitude unnoticed.
+/// per-file blocks are real bytes. The band is wide on purpose: it pins
+/// the shape, and stops it drifting into a different order of magnitude
+/// unnoticed.
 #[test]
 fn write_amplification_shape_is_write_twice_plus_framing() {
     let mut rig = Rig::new(WIDE_SLICE, WIDE_FILE_CAPACITY);
     let acct = amplification_run(&mut rig);
     assert!(acct.user_bytes > 0 && acct.wal_bytes > 0 && acct.flush_bytes > 0);
     let amp = acct.written_bytes() as f64 / acct.user_bytes as f64;
-    // Printed (visible under `--nocapture`) so the guide's stated shape
-    // can be re-read from a test run, not only from a campaign artifact.
+    // Printed (visible under `--nocapture`) so the shape can be re-read
+    // from a test run, not only from a campaign artifact.
     println!(
         "write amp {amp:.3} = (wal {} + flush {}) / user {} (relocation volume {}; \
          ADR-0060 D2 keeps it out of the numerator)",
@@ -435,7 +435,7 @@ fn write_amplification_shape_is_write_twice_plus_framing() {
 /// framing overhead. Neither run is wrong — the counters report what the
 /// device was handed — and an operator who sees `tiering_flush_bytes`
 /// running near 2× the data has a slice budget to raise, not a bug to
-/// file. The guide says so because this test measures it.
+/// file. This test measures it so the tuning advice rests on a number.
 #[test]
 fn flush_amplification_follows_the_slice_budget() {
     let narrow = amplification_run(&mut Rig::narrow());

@@ -145,8 +145,8 @@ struct Run {
     /// shared envelope the counters deliberately do not pro-rate.
     wal_frame_bytes: u64,
     /// The namespace's `INFO tiering` per-namespace fields at the end of
-    /// the run, in `INFO`'s own order — printed so the operator guide's
-    /// worked example carries measured values, never invented ones.
+    /// the run, in `INFO`'s own order — printed so a worked example quotes
+    /// measured values, never invented ones.
     ns_line: String,
     records: u64,
     seconds: f64,

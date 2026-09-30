@@ -29,7 +29,7 @@ M3-S17's `DocDelta`/`DocFull` path (ADR-0043).
 | `JSON.DEL` | write | integer: matches removed | integer: matches removed | identical | root path deletes the key (kernel-owned lifecycle) |
 | `JSON.FORGET` | write | integer: matches removed | integer: matches removed | identical | alias of JSON.DEL |
 | `JSON.TYPE` | read | array of type-name bulk strings | bulk string: first match's type; null when the path misses | `$` mode: array of one-element bulk-string arrays; legacy: one-element array containing the bulk string or null | `integer` and `number` are distinct names (RedisJSON parity) |
-| `JSON.NUMINCRBY` | write | bulk JSON text array: new value per match, null for non-numbers | bulk JSON text: last applied match's new value | native integer/double/null array in both modes; legacy has one element | i64 overflow / non-finite results abort the whole command (§3.4 R4) |
+| `JSON.NUMINCRBY` | write | bulk JSON text array: new value per match, null for non-numbers | bulk JSON text: last applied match's new value | native integer/double/null array in both modes; legacy has one element | i64 overflow / non-finite results abort the whole command |
 | `JSON.NUMMULTBY` | write | bulk JSON text array: new value per match, null for non-numbers | bulk JSON text: last applied match's new value | native integer/double/null array in both modes; legacy has one element | same numeric model as NUMINCRBY |
 | `JSON.STRAPPEND` | write | array: new byte length per match, null for non-strings | integer: last applied match's new length | nulls are `_` instead of `$-1` | operand must be a JSON string; the no-path form appends at the legacy root |
 | `JSON.STRLEN` | read | array: byte length per match, null for non-strings | integer: first match's length | nulls are `_` instead of `$-1` | missing key is null |
@@ -51,4 +51,5 @@ M3-S17's `DocDelta`/`DocFull` path (ADR-0043).
 Compatibility status per command lives in `docs/compat-matrix.md`; this
 artifact pins the *shapes* the corpus executes under both protocols
 (`inf-server/tests/json_commands.rs`). Performance claims live in the
-claim ledger, never here (L10).
+claim ledger, published as `website/site/_ledger-snapshot.md`, never here
+(L10).

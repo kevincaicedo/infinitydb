@@ -79,7 +79,7 @@ enum Payload {
 
 const _: () = assert!(
     core::mem::size_of::<FabricMsg>() == 64,
-    "FabricMsg must stay in the 64-byte slot class (master plan §6.1)"
+    "FabricMsg must stay in the 64-byte slot class the mesh rings are built from"
 );
 
 impl FabricMsg {

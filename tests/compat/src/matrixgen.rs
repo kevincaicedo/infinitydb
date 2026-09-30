@@ -507,7 +507,7 @@ pub static DECLARED: &[Declared] = &[
         "JSON.ARRINSERT",
         Status::Partial,
         "M3",
-        "resolved index outside 0..=len aborts the whole command atomically (§3.4 R4); \
+        "resolved index outside 0..=len aborts the whole command atomically; \
          RedisJSON can mutate an earlier match before a later index error",
     ),
     d(
@@ -726,7 +726,7 @@ pub static ABSENT: &[(&str, &str)] = &[
     ("MULTI / EXEC / WATCH / DISCARD, EVAL / Lua, FUNCTION, WAIT", "M6 — transactions"),
     ("Streams (X*), AUTH / TLS / ACL, CLIENT TRACKING", "M7"),
     ("JSONPath filter expressions `?(@…)`, secondary indexes, query engine", "M4.5 — ADR-0024"),
-    ("`JSON.RESP`", "Never — deprecated upstream; declared absent per the M3 plan anti-goals"),
+    ("`JSON.RESP`", "Never — deprecated upstream; declared absent"),
     ("Vector sets", "M8"),
     ("Replication / cluster admin", "M9+"),
 ];
@@ -900,7 +900,7 @@ pub fn render() -> String {
     push("");
     push("---");
     push("");
-    push("Master plan §14 owns the staging policy; milestone plans own acceptance");
-    push("criteria. Performance claims live in the claim ledger, never here (L10).");
+    push("Performance claims live in the claim ledger, published as");
+    push("`website/site/_ledger-snapshot.md`, never here (L10).");
     out
 }

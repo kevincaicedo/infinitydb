@@ -11,7 +11,7 @@
 //! S21 redis-stack corpus byte-diffs both protocols, and every accepted
 //! divergence lives in its checked allowlist.
 //!
-//! Mutations run the §3.4 R4 discipline end-to-end: `inf_doc::apply`
+//! Mutations validate before they apply, end-to-end: `inf_doc::apply`
 //! validates the whole match set before producing bytes, and the store
 //! rewrite (`json_replace` — one version bump) happens only when an edit
 //! actually applied. A failed command leaves value, version, and
@@ -1864,7 +1864,7 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "bulk JSON text array: new value per match, null for non-numbers",
         legacy: "bulk JSON text: last applied match's new value",
         resp3: "native integer/double/null array in both modes; legacy has one element",
-        notes: "i64 overflow / non-finite results abort the whole command (§3.4 R4)",
+        notes: "i64 overflow / non-finite results abort the whole command",
     },
     ReplyShape {
         name: "JSON.NUMMULTBY",

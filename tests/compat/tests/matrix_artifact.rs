@@ -64,7 +64,7 @@ fn declared_statuses_are_mechanically_enforced() {
 
 /// M3-S22: the rendered artifact carries the whole JSON section — the
 /// RedisJSON oracle pin, per-command RedisJSON deviation entries, and the
-/// `JSON.RESP` absent row (deprecated upstream — M3 plan anti-goals). Byte
+/// `JSON.RESP` absent row (deprecated upstream, declared absent). Byte
 /// equality in `generated_matrix_is_current` then extends the release
 /// pipeline's staleness refusal to the JSON section as a whole.
 #[test]
@@ -75,7 +75,7 @@ fn rendered_matrix_covers_the_json_section() {
         "| `JSON.SET` |",
         "RedisJSON RESP2 `",
         "RedisJSON RESP3 `",
-        "| `JSON.RESP` | Never — deprecated upstream; declared absent per the M3 plan anti-goals |",
+        "| `JSON.RESP` | Never — deprecated upstream; declared absent |",
     ] {
         assert!(rendered.contains(needle), "rendered matrix lost the JSON section: {needle:?}");
     }

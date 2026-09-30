@@ -5,9 +5,8 @@
 //! With tiering a user byte is written **twice by design**: once as a WAL
 //! record (the durability mechanism — L2, unchanged from M2) and once as
 //! tier-file bytes when the record's range flushes (the storage
-//! mechanism). Compaction adds more later. That is the honest baseline
-//! the operator guide states plainly
-//! (`infinitydb/docs/ops-tiered-storage.md`); these counters exist so it
+//! mechanism). Compaction adds more later. That is the honest baseline an
+//! operator sizes the disk against; these counters exist so it
 //! is *measured*, never estimated, and so a runaway namespace is visible
 //! before the disk fills (L10 — no silent anything).
 //!
@@ -37,7 +36,7 @@
 //! - **Deletes contribute no user bytes and do contribute WAL bytes.** A
 //!   tombstone-heavy workload therefore reports write amplification above
 //!   the write-twice baseline. That is a true statement about the
-//!   workload, not an accounting artifact — the guide says so.
+//!   workload, not an accounting artifact, and is reported as such.
 //! - **Frame header/trailer bytes are not pro-rated across namespaces.**
 //!   One WAL frame carries records from every namespace the cell wrote
 //!   that iteration; splitting its 20-odd envelope bytes per namespace
@@ -221,8 +220,8 @@ impl WriteAmplification {
 }
 
 impl core::fmt::Display for WriteAmplification {
-    /// The one spelling of the field value, so `INFO`, the operator guide,
-    /// and the harness cannot drift on the undefined token.
+    /// The one spelling of the field value, so `INFO` and the harness
+    /// cannot drift on the undefined token.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             WriteAmplification::Measured { milli } => write!(f, "{milli}"),
