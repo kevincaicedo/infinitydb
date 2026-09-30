@@ -169,13 +169,32 @@ pub enum ApplyError {
 /// the canonical two-phase engine must run; every other arm is a complete
 /// command verdict and the probe has either committed exactly once or
 /// left the document untouched.
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// Neither `Copy` nor `Clone`: `Unsupported` carries the one [`Unapplied`]
+/// proof its probe made (ADR-0099 A1).
+#[derive(Debug, PartialEq)]
 pub enum ScalarPatch {
-    Unsupported,
+    Unsupported(Unapplied),
     Missing,
     Skipped,
     Number(Number),
     Toggled(bool),
+}
+
+/// Proof that an in-place scalar probe changed no byte (ADR-0043 D1's
+/// fall-through). Only this crate's two in-place patch functions make one,
+/// and only on the arms that return before a byte changes. It is neither
+/// `Copy` nor `Clone`, so one proof reopens one reply reservation that was
+/// taken before the probe ran (ADR-0099 A1).
+#[derive(Debug, PartialEq)]
+pub struct Unapplied {
+    _probe_wrote_nothing: (),
+}
+
+impl Unapplied {
+    pub(crate) fn new() -> Unapplied {
+        Unapplied { _probe_wrote_nothing: () }
+    }
 }
 
 /// Allocation-free same-width scalar patch over a plain stored tape.
@@ -187,10 +206,10 @@ pub fn patch_scalar_in_place(
     op: &ApplyOp<'_>,
 ) -> Result<ScalarPatch, ApplyError> {
     if idoc.get(3).copied().unwrap_or(0) != 0 {
-        return Ok(ScalarPatch::Unsupported);
+        return Ok(ScalarPatch::Unsupported(Unapplied::new()));
     }
     let Some(steps) = program.simple_steps() else {
-        return Ok(ScalarPatch::Unsupported);
+        return Ok(ScalarPatch::Unsupported(Unapplied::new()));
     };
     let body = &idoc[HEADER_LEN..];
     let Some(at) = locate_simple(body, steps) else {
@@ -206,7 +225,7 @@ pub fn patch_scalar_in_place(
             let mut encoded = [0u8; emit::I64_MAX_LEN];
             let len = encode_number(result, &mut encoded);
             if len != end - at {
-                return Ok(ScalarPatch::Unsupported);
+                return Ok(ScalarPatch::Unsupported(Unapplied::new()));
             }
             idoc[HEADER_LEN + at..HEADER_LEN + end].copy_from_slice(&encoded[..len]);
             Ok(ScalarPatch::Number(result))
@@ -231,7 +250,7 @@ pub fn patch_scalar_in_place(
         | ApplyOp::ArrInsert { .. }
         | ApplyOp::ArrPop { .. }
         | ApplyOp::ArrTrim { .. }
-        | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported),
+        | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported(Unapplied::new())),
     }
 }
 

@@ -81,6 +81,16 @@ rows=(
   "inf_canary_lazy_participation crate-test inf-store test:index_alias a_create_that_floods_one_index_degrades_every_participating_index"
   # ADR-0078 A2: the loader skips the maintenance-rules compare.
   "inf_canary_sidecar_rules_ignored crate-test inf-store test:index_sidecar a_sidecar_written_under_older_maintenance_rules_is_discarded_and_rebuilt"
+  # ADR-0099 A1 — the JSON reply account, one plant per rule the types
+  # cannot carry; the registry-iterating reply oracle owns all four.
+  # R2: `commit_delta` runs the effect before the builder.
+  "inf_canary_json_reply_after_effect crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
+  # R4: a bulk reply charges nothing.
+  "inf_canary_json_reply_uncharged crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
+  # R4: a bulk reply charges its payload but not its header and CRLF.
+  "inf_canary_json_reply_framing_uncharged crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
+  # R5: root `JSON.DEL` deletes before it reserves its reply.
+  "inf_canary_json_fixed_unreserved crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

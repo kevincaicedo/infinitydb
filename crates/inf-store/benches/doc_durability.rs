@@ -82,7 +82,7 @@ fn keyspace(documents: usize) -> Keyspace {
 fn apply_mutation(store: &mut CellStore, program: &PathProgram, op: &ApplyOp<'_>) {
     match store.json_patch_scalar(b"doc", program, op, NOW).expect("scalar probe") {
         Some(JsonScalarPatch::Number(_) | JsonScalarPatch::Toggled(_)) => return,
-        Some(JsonScalarPatch::Unsupported) => {}
+        Some(JsonScalarPatch::Unsupported(_)) => {}
         Some(JsonScalarPatch::Missing | JsonScalarPatch::Skipped) | None => {
             panic!("the fixed volume-mix mutation must apply")
         }

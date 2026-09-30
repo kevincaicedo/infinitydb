@@ -88,13 +88,14 @@ pub struct StoreConfig {
     /// key ADR-0040 D6 named): a declared product limit — the
     /// pathological `$..*` mutation otherwise plans unboundedly.
     pub doc_max_path_matches: u32,
-    /// Maximum serialized reply bytes per document-serializing command
-    /// (ADR-0099, review 2026-08-30 C9): a reply is not bounded by
-    /// `doc_max_bytes` — path repetition, `$..*` amplification and
+    /// Maximum RESP bytes of one `JSON.*` command's whole reply, framing
+    /// included (ADR-0099 A1): a reply is not bounded by `doc_max_bytes` —
+    /// path repetition, duplicate union members, `$..*` amplification and
     /// client-supplied `INDENT`/`NEWLINE`/`SPACE` multiply it. The
     /// default provably admits every single-document reply (worst
     /// escape amplification is 6 × (16 MiB − 1) + 2 ≈ 100.7 MB) and cuts
-    /// off only amplified shapes; breach answers `ERR reply too large`.
+    /// off only amplified shapes; a crossing answers `ERR reply too large`
+    /// before the command's effect.
     pub doc_max_reply_bytes: usize,
 }
 
@@ -375,6 +376,11 @@ pub struct StoreStats {
     /// re-places every live key on the foreground path — a deterministic
     /// latency step at every capacity doubling (`INFO index_grows`).
     pub index_grows: u64,
+    /// Scalar patches the ADR-0043 in-place lane applied (a changed number
+    /// or boolean; replay included). The JSON reply oracle's fast-versus-
+    /// general witness (ADR-0099 A1): it moves by one on a fast command and
+    /// not at all on a general-path one.
+    pub json_scalar_patches_in_place: u64,
 }
 
 /// Frozen memory attribution domains (tripwire names, M0 §3.2; document

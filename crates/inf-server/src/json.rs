@@ -17,16 +17,32 @@
 //! actually applied. A failed command leaves value, version, and
 //! accounting untouched; a no-op command (all matches skipped) never
 //! rewrites.
+//!
+//! Every reply is written through one [`JsonReply`] and charged to one
+//! `doc-max-reply-bytes` account (ADR-0099 A1). A path mutation builds its
+//! whole reply inside [`commit_delta`] before its commit, so a reply over
+//! the account refuses before anything changed; a reply known only after
+//! its effect reserves its fixed shape's maximum before that effect.
+
+mod reply;
 
 use inf_doc::apply::{ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, apply};
 use inf_doc::path::{EvalLimits, Matches, PathProgram, Segment, eval, resolve};
-use inf_doc::ser::{Reply, SerializeOpts, serialize_into_bounded, serialize_reply_into_bounded};
-use inf_doc::{DeltaOpcode, DocValue, JsonErrorKind, ObjCursor, TapeDoc, encode_apply_op};
+use inf_doc::ser::{Reply, ReplyTooLarge, SerializeOpts};
+use inf_doc::{DeltaOpcode, DocValue, ObjCursor, TapeDoc, encode_apply_op};
 use inf_foundation::time::Nanos;
-use inf_store::{CellStore, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, SetCond, SetExpire};
+use inf_store::{
+    CellStore, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, OpError, SetCond,
+    SetExpire,
+};
 use inf_wire::{CommandId, Protocol, RespWriter};
 
-use crate::exec::{Argv, ConnCx, op_error, parse_i64};
+use crate::exec::{Argv, ConnCx, parse_i64};
+use crate::limits::FixedShape;
+use reply::{
+    FixedReservation, FixedValue, JsonReply, ReplyBuild, ReplyError, ReplyStop, ReplyVerdict,
+    Settled,
+};
 
 /// Mutating members of the family. The durable plane uses this metadata
 /// classification for full-image admission before the command runs.
@@ -127,14 +143,15 @@ fn capture_delta(cx: &ConnCx, program: &PathProgram, op: &ApplyOp<'_>, match_cou
 /// the semantic planner first: one operand replicated over many matches.
 /// It runs before store commit, so refusal leaves state/version/cadence
 /// untouched. The expiry record is reserved conservatively even when the
-/// current document has no TTL.
-fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_>) -> bool {
+/// current document has no TTL. A refusal is returned, not written: the
+/// caller's reply rolls back before the line is answered (ADR-0099 A1).
+fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8]) -> Result<(), ReplyError<'static>> {
     let Some(admission) = cx.node.doc_log_admission.get() else {
-        return true;
+        return Ok(());
     };
     // Cleared for non-JSON writes and numbered dbs across two files; a
     // miss here means nothing to fit, never a cell panic.
-    let Some(ns) = cx.ns.named() else { return true };
+    let Some(ns) = cx.ns.named() else { return Ok(()) };
     let full = inf_log::RecordView::DocFull {
         ns,
         key,
@@ -145,18 +162,16 @@ fn durable_full_fits(cx: &ConnCx, key: &[u8], idoc: &[u8], w: &mut RespWriter<'_
     .encoded_len();
     let expiry = inf_log::RecordView::ExpireAt { ns, at_unix_ms: u64::MAX, key }.encoded_len();
     if full > admission.record_max {
-        w.error("ERR document too large for durable log staging");
-        return false;
+        return Err(ReplyError::Line("ERR document too large for durable log staging"));
     }
     if full.saturating_add(expiry) > admission.budget {
         // Counted with the owner-side `would_fit` refusals
         // (`log_admission_busy`): same typed reply, same
         // invisible-to-staging pre-check shape.
         cx.node.log_admission_busy.set(cx.node.log_admission_busy.get() + 1);
-        w.error(crate::durable::STAGING_BUSY_ERROR);
-        return false;
+        return Err(ReplyError::Line(crate::durable::STAGING_BUSY_ERROR));
     }
-    true
+    Ok(())
 }
 
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
@@ -168,49 +183,75 @@ pub(crate) fn execute_json(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
-    match id {
-        CommandId::JsonSet => set(argv, store, cx, now, w),
-        CommandId::JsonGet => get(argv, store, cx, now, w),
-        CommandId::JsonMget => mget(argv, store, cx, now, w),
-        CommandId::JsonDel | CommandId::JsonForget => del(argv, store, cx, now, w),
-        CommandId::JsonType => type_of(argv, store, cx, now, w),
+    let reply = JsonReply::open(w, store.doc_max_reply_bytes());
+    let settled = match id {
+        CommandId::JsonSet => set(argv, store, cx, now, reply),
+        CommandId::JsonGet => get(argv, store, cx, now, reply),
+        CommandId::JsonMget => mget(argv, store, cx, now, reply),
+        CommandId::JsonDel | CommandId::JsonForget => del(argv, store, cx, now, reply),
+        CommandId::JsonType => type_of(argv, store, cx, now, reply),
         CommandId::JsonNumIncrBy | CommandId::JsonNumMultBy => {
-            num_op(id, argv, store, cx, now, w);
+            num_op(id, argv, store, cx, now, reply)
         }
-        CommandId::JsonStrAppend => str_append(argv, store, cx, now, w),
-        CommandId::JsonStrLen => str_len(argv, store, cx, now, w),
-        CommandId::JsonToggle => toggle(argv, store, cx, now, w),
-        CommandId::JsonClear => clear(argv, store, cx, now, w),
-        CommandId::JsonArrAppend => arr_append(argv, store, cx, now, w),
-        CommandId::JsonArrInsert => arr_insert(argv, store, cx, now, w),
-        CommandId::JsonArrIndex => arr_index(argv, store, cx, now, w),
-        CommandId::JsonArrLen => arr_len(argv, store, cx, now, w),
-        CommandId::JsonArrPop => arr_pop(argv, store, cx, now, w),
-        CommandId::JsonArrTrim => arr_trim(argv, store, cx, now, w),
-        CommandId::JsonObjKeys => obj_keys(argv, store, cx, now, w),
-        CommandId::JsonObjLen => obj_len(argv, store, cx, now, w),
-        CommandId::JsonMerge => merge(argv, store, cx, now, w),
-        CommandId::JsonDebug => debug(argv, store, now, w),
+        CommandId::JsonStrAppend => str_append(argv, store, cx, now, reply),
+        CommandId::JsonStrLen => str_len(argv, store, cx, now, reply),
+        CommandId::JsonToggle => toggle(argv, store, cx, now, reply),
+        CommandId::JsonClear => clear(argv, store, cx, now, reply),
+        CommandId::JsonArrAppend => arr_append(argv, store, cx, now, reply),
+        CommandId::JsonArrInsert => arr_insert(argv, store, cx, now, reply),
+        CommandId::JsonArrIndex => arr_index(argv, store, cx, now, reply),
+        CommandId::JsonArrLen => arr_len(argv, store, cx, now, reply),
+        CommandId::JsonArrPop => arr_pop(argv, store, cx, now, reply),
+        CommandId::JsonArrTrim => arr_trim(argv, store, cx, now, reply),
+        CommandId::JsonObjKeys => obj_keys(argv, store, cx, now, reply),
+        CommandId::JsonObjLen => obj_len(argv, store, cx, now, reply),
+        CommandId::JsonMerge => merge(argv, store, cx, now, reply),
+        CommandId::JsonDebug => debug(argv, store, now, reply),
         _ => unreachable!("execute_db routes exactly the JSON family here"),
-    }
+    };
+    debug_assert!(
+        settled.refusals() == 0 || settled.verdict() != ReplyVerdict::Declined,
+        "a declined reply refused nothing"
+    );
+    // The one site that folds a reply's refusal figures into this cell's
+    // counters (ADR-0099 A1).
+    let node = &cx.node;
+    node.json_reply_refusals_cell.set(node.json_reply_refusals_cell.get() + settled.refusals());
+    let refused_bytes = node.json_reply_refused_bytes_cell.get();
+    node.json_reply_refused_bytes_cell.set(refused_bytes.saturating_add(settled.refused_bytes()));
 }
 
 // ---- JSON.DEBUG -------------------------------------------------------------
 
-fn debug(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
+fn debug(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    now: Nanos,
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     if !argv.arg(1).eq_ignore_ascii_case(b"MEMORY") {
-        return w.error("ERR unknown JSON.DEBUG subcommand");
+        return reply.decline(ReplyError::Line("ERR unknown JSON.DEBUG subcommand"));
     }
     match store.json_memory_usage(argv.arg(2), now) {
         Ok(Some(bytes)) => {
-            w.int(i64::try_from(bytes).expect("one document is bounded far below i64::MAX"));
+            let bytes = i64::try_from(bytes).expect("one document is bounded far below i64::MAX");
+            answer(reply, |reply| reply.int(bytes))
         }
-        Ok(None) => w.null(),
-        Err(error) => op_error(error, w),
+        Ok(None) => answer(reply, JsonReply::null),
+        Err(error) => reply.decline(ReplyError::Op(error)),
     }
 }
 
 // ---- shared plumbing --------------------------------------------------------
+
+/// A reply that is one charged write and no effect.
+fn answer<'w, 'b>(
+    mut reply: JsonReply<'w, 'b>,
+    write: impl FnOnce(&mut JsonReply<'w, 'b>) -> Result<(), ReplyTooLarge>,
+) -> Settled {
+    let built = write(&mut reply).map_err(ReplyStop::from);
+    reply.settle(built)
+}
 
 /// Compile through the per-cell cache (S10), cloning the program out of
 /// the cache borrow. `PathProgram` owns cell-local `Rc` bytes, so a cache
@@ -220,15 +261,11 @@ fn compile(
     store: &CellStore,
     cx: &ConnCx,
     text: &[u8],
-    w: &mut RespWriter<'_>,
-) -> Option<PathProgram> {
+) -> Result<PathProgram, ReplyError<'static>> {
     let mut cache = cx.node.path_cache.borrow_mut();
     match cache.get_or_compile(text, store.doc_max_path_bytes()) {
-        Ok(program) => Some(program.clone()),
-        Err(e) => {
-            w.error(&format!("ERR {e}"));
-            None
-        }
+        Ok(program) => Ok(program.clone()),
+        Err(error) => Err(ReplyError::Path(error)),
     }
 }
 
@@ -238,176 +275,116 @@ fn eval_limits(store: &CellStore) -> EvalLimits {
 
 /// Parse a JSON value argument with the target store's resolved limits
 /// (ADR-0039 D5's per-namespace resolution) into the recycled per-cell
-/// ingest buffer (the S05 lever-G seam). `None` ⇒ the error is written.
+/// ingest buffer (the S05 lever-G seam).
 fn parse_value(
     store: &CellStore,
     cx: &ConnCx,
     text: &[u8],
     out: &mut Vec<u8>,
-    w: &mut RespWriter<'_>,
-) -> bool {
+) -> Result<(), ReplyError<'static>> {
     let mut parser = cx.node.json_parser.borrow_mut();
     parser.set_limits(store.doc_parse_limits());
-    match parser.parse_into(text, out) {
-        Ok(()) => true,
-        Err(e) => {
-            // The two limit rejections carry their ADR-0039 D5 pinned
-            // phrasing; everything else reports the typed offset line.
-            match e.kind {
-                JsonErrorKind::DocumentTooLarge => w.error("ERR document too large"),
-                JsonErrorKind::DepthExceeded => w.error("ERR document nesting too deep"),
-                JsonErrorKind::UnexpectedCharacter(_)
-                | JsonErrorKind::UnexpectedEnd
-                | JsonErrorKind::TrailingCharacters
-                | JsonErrorKind::InvalidNumber
-                | JsonErrorKind::NumberOutOfRange
-                | JsonErrorKind::InvalidEscape
-                | JsonErrorKind::InvalidUnicodeEscape
-                | JsonErrorKind::LoneSurrogate
-                | JsonErrorKind::InvalidUtf8
-                | JsonErrorKind::ControlCharacter
-                | JsonErrorKind::UnterminatedString => w.error(&format!("ERR invalid JSON: {e}")),
-            }
-            false
-        }
-    }
-}
-
-fn apply_error(e: ApplyError, w: &mut RespWriter<'_>) {
-    match e {
-        ApplyError::TooLarge => w.error("ERR document too large"),
-        ApplyError::Eval(inner) => w.error(&format!("ERR {inner}")),
-        other @ (ApplyError::Overflow
-        | ApplyError::NotANumber
-        | ApplyError::OutOfBounds
-        | ApplyError::RootDelete) => w.error(&format!("ERR {other}")),
-    }
-}
-
-fn path_missing(path: &[u8], w: &mut RespWriter<'_>) {
-    let path = String::from_utf8_lossy(path);
-    w.error(&format!("ERR Path '{path}' does not exist"));
+    parser.parse_into(text, out).map_err(ReplyError::Json)
 }
 
 const MISSING_KEY: &str = "ERR could not perform this operation on a key that doesn't exist";
+const CREATE_AT_ROOT: &str = "ERR new objects must be created at the root";
 
-/// Pinned phrasing for a serialized reply over the namespace's
-/// `doc-max-reply-bytes` budget (ADR-0099 D3, beside ADR-0039 D5's
-/// `ERR document too large`).
-const REPLY_TOO_LARGE: &str = "ERR reply too large";
-
-/// One patched bulk under the reply budget (ADR-0099 D4 — the rule for
-/// the whole document-serializing class, not per command): a breach
-/// rolls the frame back and answers the pinned error in its place.
-fn bulk_reply_bounded(
-    w: &mut RespWriter<'_>,
-    reply: &Reply<'_>,
-    opts: &SerializeOpts<'_>,
-    budget: usize,
-) {
-    let result = w.try_bulk_patched(|out| {
-        let limit = out.len().saturating_add(budget);
-        serialize_reply_into_bounded(reply, opts, out, limit)
-    });
-    if result.is_err() {
-        w.error(REPLY_TOO_LARGE);
-    }
+/// A document read for a read command: `None` when the key is missing.
+fn read_doc<'s>(
+    store: &'s mut CellStore,
+    key: &[u8],
+    now: Nanos,
+) -> Result<Option<JsonRead<'s>>, ReplyError<'static>> {
+    store.json_get(key, now).map_err(ReplyError::Op)
 }
 
-/// Freeze a document's plain canonical bytes for a path mutation, or
-/// write the command's missing-key/WRONGTYPE reply. The freeze copy is
-/// the interim ADR-0041 D5 backend (S16 owns the in-place fast path).
+/// Freeze a document's plain canonical bytes for a path mutation; a
+/// missing key answers `missing`. The freeze copy is the interim ADR-0041
+/// D5 backend (S16 owns the in-place fast path).
 fn frozen_doc(
     store: &mut CellStore,
     key: &[u8],
     now: Nanos,
-    missing: impl FnOnce(&mut RespWriter<'_>),
-    w: &mut RespWriter<'_>,
-) -> Option<Vec<u8>> {
+    missing: &'static str,
+) -> Result<Vec<u8>, ReplyError<'static>> {
     match store.json_freeze(key, now) {
-        Ok(Some(bytes)) => Some(bytes),
-        Ok(None) => {
-            missing(w);
-            None
-        }
-        Err(e) => {
-            op_error(e, w);
-            None
-        }
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(ReplyError::Line(missing)),
+        Err(error) => Err(ReplyError::Op(error)),
     }
 }
 
-/// Commit a mutation outcome: rewrite + one version bump when an edit
-/// applied; a no-op leaves the record untouched (ADR-0041 D8).
-fn commit(
-    store: &mut CellStore,
-    key: &[u8],
-    outcome: &ApplyOutcome,
-    now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> bool {
-    let Some(bytes) = &outcome.bytes else { return true };
-    match store.json_replace(key, bytes, now) {
+/// One planned path edit, ready to commit.
+struct PathEdit<'e> {
+    key: &'e [u8],
+    program: &'e PathProgram,
+    op: &'e ApplyOp<'e>,
+    outcome: &'e ApplyOutcome,
+}
+
+/// A path edit's commit step (ADR-0099 A1). The refusal is returned, not
+/// written: the built reply rolls back before the line is answered.
+enum CommitOutcome {
+    Committed,
+    /// No match applied: no bytes, no version bump, no record.
+    NoEdit,
+    Refused(ReplyError<'static>),
+}
+
+/// Commit a mutation outcome: the staging admission, then the rewrite and
+/// one version bump when an edit applied (ADR-0041 D8).
+fn commit(store: &mut CellStore, edit: &PathEdit<'_>, cx: &ConnCx, now: Nanos) -> CommitOutcome {
+    let Some(bytes) = &edit.outcome.bytes else { return CommitOutcome::NoEdit };
+    if let Err(error) = durable_full_fits(cx, edit.key, bytes) {
+        return CommitOutcome::Refused(error);
+    }
+    match store.json_replace(edit.key, bytes, now) {
         Ok(replaced) => {
             debug_assert!(replaced, "the key was resolved by the freeze above");
-            true
+            let match_count = edit.outcome.results.len();
+            let match_count = u32::try_from(match_count).expect("match set is capped at u32");
+            capture_delta(cx, edit.program, edit.op, match_count);
+            CommitOutcome::Committed
         }
-        Err(e) => {
-            op_error(e, w);
-            false
-        }
+        Err(error) => CommitOutcome::Refused(ReplyError::Op(error)),
     }
 }
 
-/// Commit and capture one logical path edit. No-op outcomes remain absent
-/// from the log, matching the version rule: no bytes, no bump, no record.
-#[allow(clippy::too_many_arguments)]
-fn commit_delta(
+/// Build a path mutation's whole reply, then commit its edit (ADR-0099 A1's
+/// transition table): a builder that refuses or declines leaves no effect,
+/// and a commit refusal rolls the built reply back and answers its own
+/// line. No-op outcomes remain absent from the log, matching the version
+/// rule: no bytes, no bump, no record.
+fn commit_delta<'w, 'b, 'a>(
+    mut reply: JsonReply<'w, 'b>,
+    edit: &PathEdit<'_>,
     store: &mut CellStore,
-    key: &[u8],
-    program: &PathProgram,
-    op: &ApplyOp<'_>,
-    outcome: &ApplyOutcome,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> bool {
-    let changed = outcome.bytes.is_some();
-    if let Some(bytes) = &outcome.bytes
-        && !durable_full_fits(cx, key, bytes, w)
-    {
-        return false;
+    build: impl FnOnce(&mut JsonReply<'w, 'b>) -> ReplyBuild<'a>,
+) -> Settled {
+    // The planted canary runs the effect before the builder; the reply
+    // oracle must see a refusal that changed the document.
+    let effect_first = cfg!(inf_canary_json_reply_after_effect);
+    let early = effect_first.then(|| commit(store, edit, cx, now));
+    if let Err(stop) = build(&mut reply) {
+        return reply.settle(Err(stop));
     }
-    if !commit(store, key, outcome, now, w) {
-        return false;
+    let outcome = match early {
+        Some(outcome) => outcome,
+        None => commit(store, edit, cx, now),
+    };
+    match outcome {
+        CommitOutcome::Committed | CommitOutcome::NoEdit => reply.finish(),
+        CommitOutcome::Refused(error) => reply.decline(error),
     }
-    if changed {
-        capture_delta(
-            cx,
-            program,
-            op,
-            u32::try_from(outcome.results.len()).expect("match set is capped at u32"),
-        );
-    }
-    true
 }
 
 /// The last applied (non-skipped) match in raw order — the legacy
 /// single-value mutation reply (ADR-0041 D7; S21 oracle-verified).
 fn last_applied(results: &[MatchResult]) -> Option<MatchResult> {
     results.iter().rev().find(|r| !matches!(r, MatchResult::Skipped)).copied()
-}
-
-fn write_number_value(n: Number, w: &mut RespWriter<'_>) {
-    if w.protocol() == Protocol::Resp3 {
-        return match n {
-            Number::I64(value) => w.int(value),
-            Number::F64(value) => w.double(value),
-        };
-    }
-    let mut text = [0u8; 32];
-    let len = inf_doc::serialize_number_text(n, &mut text);
-    w.bulk(&text[..len]);
 }
 
 // ---- JSON.SET ---------------------------------------------------------------
@@ -417,137 +394,139 @@ fn set(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let cond = match argv.len() {
         4 => SetCond::Always,
         5 if argv.arg(4).eq_ignore_ascii_case(b"NX") => SetCond::IfAbsent,
         5 if argv.arg(4).eq_ignore_ascii_case(b"XX") => SetCond::IfPresent,
-        _ => return w.error("ERR syntax error"),
+        _ => return reply.decline(ReplyError::Line("ERR syntax error")),
     };
     let (key, path) = (argv.arg(1), argv.arg(2));
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
     let mut idoc = cx.node.json_ingest_buf.take();
-    let parsed = parse_value(store, cx, argv.arg(3), &mut idoc, w);
-    let outcome = parsed.then(|| set_parsed(store, key, path, &program, cond, &idoc, cx, now, w));
-    cx.node.json_ingest_buf.replace(idoc);
-    let Some(Some(applied)) = outcome else { return };
-    if applied {
-        if program.is_root() {
-            capture_full(cx);
+    let settled = match parse_value(store, cx, argv.arg(3), &mut idoc) {
+        Ok(()) if program.is_root() => set_root(reply, store, key, cond, &idoc, cx, now),
+        Ok(()) => {
+            let target = SetTarget { key, path, program: &program, cond, idoc: &idoc };
+            set_path(reply, store, &target, cx, now)
         }
-        w.simple("OK");
-    } else {
-        w.null();
-    }
+        Err(error) => reply.decline(error),
+    };
+    cx.node.json_ingest_buf.replace(idoc);
+    settled
 }
 
-/// The post-parse half of `JSON.SET`: root sets are post-images
-/// (`json_set`); path sets run replace-or-create per ADR-0041 D6.
-/// `None` ⇒ the error reply is written; `Some(applied)` maps to OK/null.
-#[allow(clippy::too_many_arguments)]
-fn set_parsed(
+/// A root set is a post-image (`json_set`) whose reply is known only after
+/// it: the `Status` shape is reserved before the store call. Root TTL
+/// semantics: preserved (the key is replaced, not recreated).
+fn set_root(
+    reply: JsonReply<'_, '_>,
     store: &mut CellStore,
     key: &[u8],
-    path: &[u8],
-    program: &PathProgram,
     cond: SetCond,
     idoc: &[u8],
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<bool> {
-    if program.is_root() {
-        if !durable_full_fits(cx, key, idoc, w) {
-            return None;
-        }
-        // Root TTL semantics: preserved (the key is replaced, not recreated).
-        let opts = JsonSetOptions { cond, expire: SetExpire::Keep };
-        return match store.json_set(key, idoc, opts, now) {
-            Ok(JsonSetOutcome::Applied) => Some(true),
-            Ok(JsonSetOutcome::Skipped) => Some(false),
-            Err(e) => {
-                op_error(e, w);
-                None
-            }
-        };
+) -> Settled {
+    let fixed = match reply.reserve_fixed(FixedShape::Status) {
+        FixedReservation::Reserved(fixed) => fixed,
+        FixedReservation::Refused(settled) => return settled,
+    };
+    if let Err(error) = durable_full_fits(cx, key, idoc) {
+        return fixed.decline(error);
     }
-    let frozen =
-        frozen_doc(store, key, now, |w| w.error("ERR new objects must be created at the root"), w)?;
+    let opts = JsonSetOptions { cond, expire: SetExpire::Keep };
+    match store.json_set(key, idoc, opts, now) {
+        Ok(JsonSetOutcome::Applied) => {
+            capture_full(cx);
+            fixed.write(FixedValue::Ok)
+        }
+        Ok(JsonSetOutcome::Skipped) => fixed.write(FixedValue::Null),
+        Err(error) => fixed.decline(ReplyError::Op(error)),
+    }
+}
+
+/// A path `JSON.SET` after parsing: its key, path text, program, condition
+/// and parsed value.
+struct SetTarget<'t> {
+    key: &'t [u8],
+    path: &'t [u8],
+    program: &'t PathProgram,
+    cond: SetCond,
+    idoc: &'t [u8],
+}
+
+/// Path sets run replace-or-create per ADR-0041 D6.
+fn set_path(
+    reply: JsonReply<'_, '_>,
+    store: &mut CellStore,
+    target: &SetTarget<'_>,
+    cx: &ConnCx,
+    now: Nanos,
+) -> Settled {
+    let frozen = match frozen_doc(store, target.key, now, CREATE_AT_ROOT) {
+        Ok(frozen) => frozen,
+        Err(error) => return reply.decline(error),
+    };
     let doc = TapeDoc::from_validated_bytes(&frozen);
     let limits = eval_limits(store);
-    let matches = match eval(program, DocValue::from(doc.root()), &limits) {
-        Ok(m) => m,
-        Err(e) => {
-            w.error(&format!("ERR {e}"));
-            return None;
-        }
+    let matches = match eval(target.program, DocValue::from(doc.root()), &limits) {
+        Ok(matches) => matches,
+        Err(error) => return reply.decline(ReplyError::Eval(error)),
     };
-    match cond {
-        SetCond::IfAbsent if !matches.is_empty() => return Some(false),
-        SetCond::IfPresent if matches.is_empty() => return Some(false),
-        SetCond::Always | SetCond::IfAbsent | SetCond::IfPresent => {}
+    let skipped = match target.cond {
+        SetCond::IfAbsent => !matches.is_empty(),
+        SetCond::IfPresent => matches.is_empty(),
+        SetCond::Always => false,
+    };
+    if skipped {
+        return answer(reply, JsonReply::null);
     }
-    let fragment = &idoc[inf_doc::HEADER_LEN..];
-    let op = if matches.is_empty() {
-        // Creation: only a plain final child name creates, on every
-        // matched parent object (ADR-0041 D6).
-        let ast = inf_doc::path::parse_ast(path).expect("compile above accepted this text");
-        let Some(Segment::Child(name)) = ast.segments.last() else {
-            path_missing(path, w);
-            return None;
-        };
-        let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
-            legacy: ast.legacy,
-            segments: ast.segments[..ast.segments.len() - 1].to_vec(),
-        })
-        .expect("a prefix of an accepted program encodes under the ceiling");
-        let name = name.clone();
-        return set_apply(
-            store,
-            key,
-            path,
-            &doc,
-            &parent,
-            &ApplyOp::SetMember { key: &name, fragment },
-            &limits,
-            cx,
-            now,
-            w,
-        );
-    } else {
-        ApplyOp::SetReplace { fragment }
+    let fragment = &target.idoc[inf_doc::HEADER_LEN..];
+    if !matches.is_empty() {
+        let op = ApplyOp::SetReplace { fragment };
+        return set_apply(reply, store, target, &doc, target.program, &op, cx, now);
+    }
+    // Creation: only a plain final child name creates, on every matched
+    // parent object (ADR-0041 D6).
+    let ast = inf_doc::path::parse_ast(target.path).expect("compile above accepted this text");
+    let Some(Segment::Child(name)) = ast.segments.last() else {
+        return reply.decline(ReplyError::PathMissing(target.path));
     };
-    set_apply(store, key, path, &doc, program, &op, &limits, cx, now, w)
+    let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
+        legacy: ast.legacy,
+        segments: ast.segments[..ast.segments.len() - 1].to_vec(),
+    })
+    .expect("a prefix of an accepted program encodes under the ceiling");
+    let name = name.clone();
+    let op = ApplyOp::SetMember { key: &name, fragment };
+    set_apply(reply, store, target, &doc, &parent, &op, cx, now)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn set_apply(
+    reply: JsonReply<'_, '_>,
     store: &mut CellStore,
-    key: &[u8],
-    path: &[u8],
+    target: &SetTarget<'_>,
     doc: &TapeDoc<'_>,
     program: &PathProgram,
     op: &ApplyOp<'_>,
-    limits: &EvalLimits,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<bool> {
-    match apply(doc, program, op, limits, store.doc_max_bytes()) {
+) -> Settled {
+    match apply(doc, program, op, &eval_limits(store), store.doc_max_bytes()) {
         Ok(outcome) if outcome.bytes.is_some() => {
-            commit_delta(store, key, program, op, &outcome, cx, now, w).then_some(true)
+            let edit = PathEdit { key: target.key, program, op, outcome: &outcome };
+            commit_delta(reply, &edit, store, cx, now, |reply| Ok(reply.ok()?))
         }
-        Ok(_) => {
-            // No eligible site (every parent skipped): the frozen
-            // path-does-not-exist arm.
-            path_missing(path, w);
-            None
-        }
-        Err(e) => {
-            apply_error(e, w);
-            None
-        }
+        // No eligible site (every parent skipped): the frozen
+        // path-does-not-exist arm.
+        Ok(_) => reply.decline(ReplyError::PathMissing(target.path)),
+        Err(error) => reply.decline(ReplyError::Apply(error)),
     }
 }
 
@@ -559,10 +538,7 @@ struct GetArgs<'a> {
     paths: Vec<&'a [u8]>,
 }
 
-fn parse_get_args<'a>(
-    argv: &'a (impl Argv + ?Sized),
-    w: &mut RespWriter<'_>,
-) -> Option<GetArgs<'a>> {
+fn parse_get_args<'a>(argv: &'a (impl Argv + ?Sized)) -> Result<GetArgs<'a>, ReplyError<'a>> {
     let mut opts = SerializeOpts::default();
     let mut paths: Vec<&[u8]> = Vec::new();
     let mut i = 2;
@@ -573,8 +549,7 @@ fn parse_get_args<'a>(
             || arg.eq_ignore_ascii_case(b"SPACE");
         if takes_value {
             let Some(value) = (i + 1 < argv.len()).then(|| argv.arg(i + 1)) else {
-                w.error("ERR syntax error");
-                return None;
+                return Err(ReplyError::Line("ERR syntax error"));
             };
             if arg.eq_ignore_ascii_case(b"INDENT") {
                 opts.indent = value;
@@ -594,7 +569,7 @@ fn parse_get_args<'a>(
     if paths.is_empty() {
         paths.push(b".");
     }
-    Some(GetArgs { opts, paths })
+    Ok(GetArgs { opts, paths })
 }
 
 fn get(
@@ -602,36 +577,39 @@ fn get(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    let Some(args) = parse_get_args(argv, w) else { return };
+    mut reply: JsonReply<'_, '_>,
+) -> Settled {
+    let built = get_build(argv, store, cx, now, &mut reply);
+    reply.settle(built)
+}
+
+fn get_build<'a>(
+    argv: &'a (impl Argv + ?Sized),
+    store: &mut CellStore,
+    cx: &ConnCx,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+) -> ReplyBuild<'a> {
+    let args = parse_get_args(argv)?;
     // Compile every path before touching the store (cheap misses beat a
     // half-evaluated command), collecting owned programs.
     let mut programs = Vec::with_capacity(args.paths.len());
     for path in &args.paths {
-        let Some(program) = compile(store, cx, path, w) else { return };
-        programs.push(program);
+        programs.push(compile(store, cx, path)?);
     }
     let limits = eval_limits(store);
-    let reply_budget = store.doc_max_reply_bytes();
-    let read = match store.json_get(argv.arg(1), now) {
-        Ok(Some(read)) => read,
-        Ok(None) => return w.null(),
-        Err(e) => return op_error(e, w),
+    let Some(read) = read_doc(store, argv.arg(1), now)? else {
+        return Ok(reply.null()?);
     };
     let mut match_sets: Vec<Matches> = Vec::with_capacity(programs.len());
     for (program, path) in programs.iter().zip(&args.paths) {
-        match eval(program, read.root, &limits) {
-            Ok(m) => {
-                if program.is_legacy() && m.is_empty() {
-                    return path_missing(path, w);
-                }
-                match_sets.push(m);
-            }
-            Err(e) => return w.error(&format!("ERR {e}")),
+        let matches = eval(program, read.root, &limits).map_err(ReplyError::Eval)?;
+        if program.is_legacy() && matches.is_empty() {
+            return Err(ReplyError::PathMissing(path).into());
         }
+        match_sets.push(matches);
     }
-    let reply = if programs.len() == 1 {
+    let tree = if programs.len() == 1 {
         path_reply(read.root, &programs[0], &match_sets[0])
     } else {
         let members = args
@@ -642,7 +620,7 @@ fn get(
             .collect();
         Reply::Object(members)
     };
-    bulk_reply_bounded(w, &reply, &args.opts, reply_budget);
+    Ok(reply.reply_tree(&tree, &args.opts)?)
 }
 
 /// One path's reply subtree: `$` mode wraps every match in an array;
@@ -663,13 +641,15 @@ fn mget(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let path = argv.arg(argv.len() - 1);
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
     let limits = eval_limits(store);
-    let reply_budget = store.doc_max_reply_bytes();
-    w.array_header(argv.len() - 2);
+    let mut elements = reply.per_element_array(argv.len() - 2);
     for i in 1..argv.len() - 1 {
         // Per-key element: missing and non-document keys answer nil
         // (RedisJSON MGET semantics); legacy paths answer the first
@@ -683,15 +663,11 @@ fn mget(
             Ok(None) | Err(_) => None,
         };
         match element {
-            // The array header is already committed, so an over-budget
-            // element answers the pinned error *as its element* (the
-            // EXEC error-in-array precedent) — other keys unaffected.
-            Some(reply) => {
-                bulk_reply_bounded(w, &reply, &SerializeOpts::default(), reply_budget);
-            }
-            None => w.null(),
+            Some(tree) => elements.document(&tree),
+            None => elements.null(),
         }
     }
+    elements.finish()
 }
 
 // ---- JSON.DEL / JSON.FORGET / JSON.TYPE --------------------------------------
@@ -701,36 +677,64 @@ fn del(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
     if program.is_root() {
-        // Root deletion is key-level lifecycle (kernel-owned Delete
-        // record at S17), never a path edit — after the type gate.
-        return match store.type_of(key, now) {
-            Some(inf_store::TypeTag::JsonDoc) => {
-                let deleted = store.del(key, now);
-                if deleted {
-                    capture_delete(cx);
-                }
-                w.int(i64::from(deleted));
-            }
-            Some(_) => op_error(inf_store::OpError::WrongType, w),
-            None => w.int(0),
-        };
+        return del_root(reply, store, key, cx, now);
     }
-    let Some(frozen) = frozen_doc(store, key, now, |w| w.int(0), w) else { return };
+    let frozen = match store.json_freeze(key, now) {
+        Ok(Some(frozen)) => frozen,
+        Ok(None) => return answer(reply, |reply| reply.int(0)),
+        Err(error) => return reply.decline(ReplyError::Op(error)),
+    };
     let doc = TapeDoc::from_validated_bytes(&frozen);
-    match apply(&doc, &program, &ApplyOp::Del, &eval_limits(store), store.doc_max_bytes()) {
+    let op = ApplyOp::Del;
+    match apply(&doc, &program, &op, &eval_limits(store), store.doc_max_bytes()) {
         Ok(outcome) => {
-            if commit_delta(store, key, &program, &ApplyOp::Del, &outcome, cx, now, w) {
-                w.int(i64::from(outcome.applied));
-            }
+            let applied = i64::from(outcome.applied);
+            let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
+            commit_delta(reply, &edit, store, cx, now, |reply| Ok(reply.int(applied)?))
         }
-        Err(e) => apply_error(e, w),
+        Err(error) => reply.decline(ReplyError::Apply(error)),
     }
+}
+
+/// Root deletion is key-level lifecycle (kernel-owned Delete record at
+/// S17), never a path edit — after the type gate. Its count is known only
+/// after the delete, so the `Count` shape is reserved first.
+fn del_root(
+    reply: JsonReply<'_, '_>,
+    store: &mut CellStore,
+    key: &[u8],
+    cx: &ConnCx,
+    now: Nanos,
+) -> Settled {
+    match store.type_of(key, now) {
+        Some(inf_store::TypeTag::JsonDoc) => {}
+        Some(_) => return reply.decline(ReplyError::Op(OpError::WrongType)),
+        None => return answer(reply, |reply| reply.int(0)),
+    }
+    // The planted canary deletes before it reserves; the reply oracle must
+    // see a refused root delete whose key is gone.
+    let early = cfg!(inf_canary_json_fixed_unreserved).then(|| store.del(key, now));
+    let fixed = match reply.reserve_fixed(FixedShape::Count) {
+        FixedReservation::Reserved(fixed) => fixed,
+        FixedReservation::Refused(settled) => return settled,
+    };
+    let deleted = match early {
+        Some(deleted) => deleted,
+        None => store.del(key, now),
+    };
+    if deleted {
+        capture_delete(cx);
+    }
+    fixed.write(FixedValue::Deleted(deleted))
 }
 
 fn type_of(
@@ -738,49 +742,56 @@ fn type_of(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    mut reply: JsonReply<'_, '_>,
+) -> Settled {
+    let built = type_of_build(argv, store, cx, now, &mut reply);
+    reply.settle(built)
+}
+
+fn type_of_build<'a>(
+    argv: &'a (impl Argv + ?Sized),
+    store: &mut CellStore,
+    cx: &ConnCx,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+) -> ReplyBuild<'a> {
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = compile(store, cx, path)?;
     let limits = eval_limits(store);
-    let read = match store.json_get(argv.arg(1), now) {
-        Ok(Some(read)) => read,
-        Ok(None) => return w.null(),
-        Err(e) => return op_error(e, w),
+    let Some(read) = read_doc(store, argv.arg(1), now)? else {
+        return Ok(reply.null()?);
     };
-    let matches = match eval(&program, read.root, &limits) {
-        Ok(m) => m,
-        Err(e) => return w.error(&format!("ERR {e}")),
-    };
+    let matches = eval(&program, read.root, &limits).map_err(ReplyError::Eval)?;
     let name = |i: usize| {
         type_name(resolve(read.root, matches.get(i)).expect("matches resolve on their document"))
     };
-    match (w.protocol(), program.is_legacy()) {
+    match (reply.protocol(), program.is_legacy()) {
         (Protocol::Resp2, true) => match matches.is_empty() {
-            true => w.null(),
-            false => w.bulk(name(0).as_bytes()),
+            true => reply.null()?,
+            false => reply.bulk(name(0).as_bytes())?,
         },
         (Protocol::Resp2, false) => {
-            w.array_header(matches.len());
+            reply.array_header(matches.len())?;
             for i in 0..matches.len() {
-                w.bulk(name(i).as_bytes());
+                reply.bulk(name(i).as_bytes())?;
             }
         }
         (Protocol::Resp3, true) => {
-            w.array_header(1);
+            reply.array_header(1)?;
             match matches.is_empty() {
-                true => w.null(),
-                false => w.bulk(name(0).as_bytes()),
+                true => reply.null()?,
+                false => reply.bulk(name(0).as_bytes())?,
             }
         }
         (Protocol::Resp3, false) => {
-            w.array_header(matches.len());
+            reply.array_header(matches.len())?;
             for i in 0..matches.len() {
-                w.array_header(1);
-                w.bulk(name(i).as_bytes());
+                reply.array_header(1)?;
+                reply.bulk(name(i).as_bytes())?;
             }
         }
     }
+    Ok(())
 }
 
 fn type_name(value: DocValue<'_>) -> &'static str {
@@ -797,6 +808,10 @@ fn type_name(value: DocValue<'_>) -> &'static str {
 
 // ---- scalar mutations (M3-S12) ----------------------------------------------
 
+/// `NUMINCRBY`/`NUMMULTBY`: the `Number` shape is reserved before the
+/// in-place probe, which is the effect; `Unsupported` hands the account
+/// back with the probe's proof, and the general path then carries the
+/// fixed floor (ADR-0099 A1, "Fixed, then charged").
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 fn num_op(
     id: CommandId,
@@ -804,75 +819,110 @@ fn num_op(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let (key, path) = (argv.arg(1), argv.arg(2));
     let Some(operand) = parse_number_operand(argv.arg(3)) else {
-        return w.error("ERR value is not a number");
+        return reply.decline(ReplyError::Line("ERR value is not a number"));
     };
     let op = match id {
         CommandId::JsonNumIncrBy => ApplyOp::NumIncrBy(operand),
         _ => ApplyOp::NumMultBy(operand),
     };
-    let Some(program) = compile(store, cx, path, w) else { return };
-    match store.json_patch_scalar(key, &program, &op, now) {
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
+    let fixed = match reply.reserve_fixed(FixedShape::Number) {
+        FixedReservation::Reserved(fixed) => fixed,
+        FixedReservation::Refused(settled) => return settled,
+    };
+    let legacy = program.is_legacy();
+    let unapplied = match store.json_patch_scalar(key, &program, &op, now) {
         Ok(Some(JsonScalarPatch::Number(number))) => {
             capture_delta(cx, &program, &op, 1);
-            return write_fast_number(path, program.is_legacy(), Some(number), w);
+            return fixed.write(FixedValue::Number { legacy, number });
         }
-        Ok(Some(JsonScalarPatch::Missing)) => {
-            return write_fast_number(path, program.is_legacy(), None, w);
+        Ok(Some(JsonScalarPatch::Missing)) if legacy => {
+            return fixed.decline(ReplyError::PathMissing(path));
         }
-        Ok(Some(JsonScalarPatch::Skipped)) => {
-            return write_fast_number_skipped(path, program.is_legacy(), w);
+        Ok(Some(JsonScalarPatch::Missing)) => return fixed.write(FixedValue::NumberMissing),
+        Ok(Some(JsonScalarPatch::Skipped)) if legacy => {
+            return fixed.decline(ReplyError::NotContaining { path, noun: "a number" });
         }
-        Ok(Some(JsonScalarPatch::Unsupported)) => {}
+        Ok(Some(JsonScalarPatch::Skipped)) => return fixed.write(FixedValue::NumberSkipped),
+        Ok(Some(JsonScalarPatch::Unsupported(unapplied))) => unapplied,
         Ok(Some(JsonScalarPatch::Toggled(_))) => unreachable!("numeric probe returns a number"),
-        Ok(None) => return w.error(MISSING_KEY),
-        Err(inf_store::OpError::Overflow) => return apply_error(ApplyError::Overflow, w),
-        Err(inf_store::OpError::NanOrInf) => return apply_error(ApplyError::NotANumber, w),
-        Err(e) => return op_error(e, w),
-    }
-    let Some(outcome) = mutate_with(store, key, &program, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    if program.is_legacy() {
-        return match last_applied(&outcome.results) {
-            Some(MatchResult::Num(n)) => {
-                if w.protocol() == Protocol::Resp3 {
-                    w.array_header(1);
+        Ok(None) => return fixed.decline(ReplyError::Line(MISSING_KEY)),
+        Err(OpError::Overflow) => return fixed.decline(ReplyError::Apply(ApplyError::Overflow)),
+        Err(OpError::NanOrInf) => return fixed.decline(ReplyError::Apply(ApplyError::NotANumber)),
+        Err(error) => return fixed.decline(ReplyError::Op(error)),
+    };
+    let reply = fixed.reopen(unapplied);
+    let outcome = match mutate_with(store, key, &program, &op, now) {
+        Ok(outcome) => outcome,
+        Err(error) => return reply.decline(error),
+    };
+    let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
+    commit_delta(reply, &edit, store, cx, now, |reply| {
+        number_reply(reply, path, legacy, &outcome.results)
+    })
+}
+
+/// The general path's numeric reply: legacy answers the last applied
+/// match (RESP3 wraps it in a one-element array); `$` mode answers every
+/// match — RESP3 a native array, RESP2 one bulk of JSON text.
+fn number_reply<'a>(
+    reply: &mut JsonReply<'_, '_>,
+    path: &'a [u8],
+    legacy: bool,
+    results: &[MatchResult],
+) -> ReplyBuild<'a> {
+    if legacy {
+        return match last_applied(results) {
+            Some(MatchResult::Num(number)) => {
+                if reply.protocol() == Protocol::Resp3 {
+                    reply.array_header(1)?;
                 }
-                write_number_value(n, w);
+                Ok(reply.number(number)?)
             }
             Some(_) => unreachable!("numeric ops apply numbers"),
-            None if outcome.results.is_empty() => path_missing(path, w),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain a number"));
-            }
+            None if results.is_empty() => Err(ReplyError::PathMissing(path).into()),
+            None => Err(ReplyError::NotContaining { path, noun: "a number" }.into()),
         };
     }
-    if w.protocol() == Protocol::Resp3 {
-        w.array_header(outcome.results.len());
-        for result in &outcome.results {
-            match result {
-                MatchResult::Num(number) => write_number_value(*number, w),
-                _ => w.null(),
+    if reply.protocol() == Protocol::Resp3 {
+        reply.array_header(results.len())?;
+        for result in results {
+            match number_of(result) {
+                Some(number) => reply.number(number)?,
+                None => reply.null()?,
             }
         }
-    } else {
-        let members = outcome
-            .results
-            .iter()
-            .map(|r| match r {
-                MatchResult::Num(Number::I64(v)) => Reply::Value(DocValue::I64(*v)),
-                MatchResult::Num(Number::F64(v)) => Reply::Value(DocValue::F64(*v)),
-                _ => Reply::Value(DocValue::Null),
-            })
-            .collect();
-        let reply = Reply::Array(members);
-        bulk_reply_bounded(w, &reply, &SerializeOpts::default(), store.doc_max_reply_bytes());
+        return Ok(());
+    }
+    let members = results
+        .iter()
+        .map(|result| match number_of(result) {
+            Some(Number::I64(value)) => Reply::Value(DocValue::I64(value)),
+            Some(Number::F64(value)) => Reply::Value(DocValue::F64(value)),
+            None => Reply::Value(DocValue::Null),
+        })
+        .collect();
+    Ok(reply.reply_tree(&Reply::Array(members), &SerializeOpts::default())?)
+}
+
+fn number_of(result: &MatchResult) -> Option<Number> {
+    match result {
+        MatchResult::Num(number) => Some(*number),
+        MatchResult::Skipped
+        | MatchResult::Len(_)
+        | MatchResult::Toggled(_)
+        | MatchResult::Cleared
+        | MatchResult::Removed
+        | MatchResult::Set
+        | MatchResult::Popped(_)
+        | MatchResult::PoppedEmpty => None,
     }
 }
 
@@ -882,80 +932,38 @@ fn parse_number_operand(text: &[u8]) -> Option<Number> {
     inf_doc::parse_number_token(text).ok()
 }
 
-fn write_fast_number(path: &[u8], legacy: bool, number: Option<Number>, w: &mut RespWriter<'_>) {
-    if legacy && number.is_none() {
-        return path_missing(path, w);
-    }
-    if w.protocol() == Protocol::Resp3 {
-        w.array_header(usize::from(legacy || number.is_some()));
-        if let Some(number) = number {
-            write_number_value(number, w);
-        }
-        return;
-    }
-    if legacy {
-        return match number {
-            Some(number) => write_number_value(number, w),
-            None => path_missing(path, w),
-        };
-    }
-    let mut payload = [0u8; 34];
-    payload[0] = b'[';
-    let mut len = 1;
-    if let Some(number) = number {
-        let mut text = [0u8; 32];
-        let text_len = inf_doc::serialize_number_text(number, &mut text);
-        payload[len..len + text_len].copy_from_slice(&text[..text_len]);
-        len += text_len;
-    }
-    payload[len] = b']';
-    w.bulk(&payload[..=len]);
-}
-
-fn write_fast_number_skipped(path: &[u8], legacy: bool, w: &mut RespWriter<'_>) {
-    if legacy {
-        let path = String::from_utf8_lossy(path);
-        return w.error(&format!("ERR Path '{path}' does not contain a number"));
-    }
-    if w.protocol() == Protocol::Resp3 {
-        w.array_header(1);
-        w.null();
-    } else {
-        w.bulk(b"[null]");
-    }
-}
-
 fn str_append(
     argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     let (path, value): (&[u8], &[u8]) = if argv.len() == 3 {
         (b".", argv.arg(2)) // The RedisJSON-compatible implicit-root quirk.
     } else {
         (argv.arg(2), argv.arg(3))
     };
-    // Default limits on purpose (L15 style note, batch 51): the operand is
-    // one wire-bounded scalar; the namespace's size limit binds the
-    // *result* below (`document too large`), and parsing the operand under
-    // it would turn that refusal into `value is not a string`.
+    // Default limits on purpose: the operand is one wire-bounded scalar;
+    // the namespace's size limit binds the *result* below (`document too
+    // large`), and parsing the operand under it would turn that refusal
+    // into `value is not a string`.
     let mut parser = inf_doc::JsonParser::new();
     let Ok(operand_doc) = parser.parse(value) else {
-        return w.error("ERR value is not a string");
+        return reply.decline(ReplyError::Line("ERR value is not a string"));
     };
     let operand = TapeDoc::from_validated_bytes(&operand_doc);
     let DocValue::Str(payload) = DocValue::from(operand.root()) else {
-        return w.error("ERR value is not a string");
+        return reply.decline(ReplyError::Line("ERR value is not a string"));
     };
     let op = ApplyOp::StrAppend(payload.as_bytes());
-    let Some((program, outcome)) = mutate(store, cx, key, path, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    int_per_match(path, program.is_legacy(), &outcome, w, "a string", |r| match r {
+    let count = PerMatchCount { noun: "a string", project: string_len_result };
+    mutate_counting(reply, store, cx, key, path, &op, now, count)
+}
+
+fn string_len_result(result: &MatchResult) -> Option<i64> {
+    match result {
         MatchResult::Len(n) => Some(*n as i64),
         MatchResult::Skipped
         | MatchResult::Num(_)
@@ -965,7 +973,7 @@ fn str_append(
         | MatchResult::Set
         | MatchResult::Popped(_)
         | MatchResult::PoppedEmpty => None,
-    });
+    }
 }
 
 fn str_len(
@@ -973,9 +981,9 @@ fn str_len(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    int_read(argv, store, cx, now, w, "a string", |v| match v {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
+    int_read(argv, store, cx, now, reply, "a string", |v| match v {
         DocValue::Str(s) => Some(s.as_bytes().len() as i64),
         DocValue::Null
         | DocValue::Bool(_)
@@ -983,7 +991,7 @@ fn str_len(
         | DocValue::F64(_)
         | DocValue::Obj(_)
         | DocValue::Arr(_) => None,
-    });
+    })
 }
 
 /// The shared read-only per-match integer skeleton (`STRLEN`/`ARRLEN`/
@@ -998,108 +1006,121 @@ fn int_read(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-    noun: &str,
+    mut reply: JsonReply<'_, '_>,
+    noun: &'static str,
     project: impl Fn(DocValue<'_>) -> Option<i64>,
-) {
+) -> Settled {
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let built = int_read_build(argv, store, cx, now, &mut reply, (path, noun), project);
+    reply.settle(built)
+}
+
+fn int_read_build<'a>(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    cx: &ConnCx,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+    (path, noun): (&'a [u8], &'static str),
+    project: impl Fn(DocValue<'_>) -> Option<i64>,
+) -> ReplyBuild<'a> {
+    let program = compile(store, cx, path)?;
     let limits = eval_limits(store);
-    let read = match store.json_get(argv.arg(1), now) {
-        Ok(Some(read)) => read,
-        Ok(None) => return w.null(),
-        Err(e) => return op_error(e, w),
+    let Some(read) = read_doc(store, argv.arg(1), now)? else {
+        return Ok(reply.null()?);
     };
-    let matches = match eval(&program, read.root, &limits) {
-        Ok(m) => m,
-        Err(e) => return w.error(&format!("ERR {e}")),
-    };
+    let matches = eval(&program, read.root, &limits).map_err(ReplyError::Eval)?;
     let value_of = |i: usize| resolve(read.root, matches.get(i)).and_then(&project);
     if program.is_legacy() {
         if matches.is_empty() {
-            return path_missing(path, w);
+            return Err(ReplyError::PathMissing(path).into());
         }
         return match value_of(0) {
-            Some(n) => w.int(n),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain {noun}"));
-            }
+            Some(n) => Ok(reply.int(n)?),
+            None => Err(ReplyError::NotContaining { path, noun }.into()),
         };
     }
-    w.array_header(matches.len());
+    reply.array_header(matches.len())?;
     for i in 0..matches.len() {
         match value_of(i) {
-            Some(n) => w.int(n),
-            None => w.null(),
+            Some(n) => reply.int(n)?,
+            None => reply.null()?,
         }
     }
+    Ok(())
 }
 
+/// `TOGGLE`: the `Toggle` shape is reserved before the in-place probe;
+/// `Unsupported` reopens the account for the general path, which then
+/// carries the fixed floor (ADR-0099 A1, "Fixed, then charged").
 fn toggle(
     argv: &(impl Argv + ?Sized),
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
     let op = ApplyOp::Toggle;
-    let Some(program) = compile(store, cx, path, w) else { return };
-    match store.json_patch_scalar(key, &program, &op, now) {
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
+    let fixed = match reply.reserve_fixed(FixedShape::Toggle) {
+        FixedReservation::Reserved(fixed) => fixed,
+        FixedReservation::Refused(settled) => return settled,
+    };
+    let legacy = program.is_legacy();
+    let unapplied = match store.json_patch_scalar(key, &program, &op, now) {
         Ok(Some(JsonScalarPatch::Toggled(value))) => {
             capture_delta(cx, &program, &op, 1);
-            if program.is_legacy() {
-                w.bulk(if value { b"true" } else { b"false" });
-            } else {
-                w.array_header(1);
-                w.int(i64::from(value));
-            }
-            return;
+            return fixed.write(FixedValue::Toggled { legacy, value });
         }
-        Ok(Some(JsonScalarPatch::Missing)) => {
-            if program.is_legacy() {
-                path_missing(path, w);
-            } else {
-                w.array_header(0);
-            }
-            return;
+        Ok(Some(JsonScalarPatch::Missing)) if legacy => {
+            return fixed.decline(ReplyError::PathMissing(path));
         }
-        Ok(Some(JsonScalarPatch::Skipped)) => {
-            if program.is_legacy() {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain a boolean"));
-            } else {
-                w.array_header(1);
-                w.null();
-            }
-            return;
+        Ok(Some(JsonScalarPatch::Missing)) => return fixed.write(FixedValue::ToggleMissing),
+        Ok(Some(JsonScalarPatch::Skipped)) if legacy => {
+            return fixed.decline(ReplyError::NotContaining { path, noun: "a boolean" });
         }
-        Ok(Some(JsonScalarPatch::Unsupported)) => {}
+        Ok(Some(JsonScalarPatch::Skipped)) => return fixed.write(FixedValue::ToggleSkipped),
+        Ok(Some(JsonScalarPatch::Unsupported(unapplied))) => unapplied,
         Ok(Some(JsonScalarPatch::Number(_))) => unreachable!("toggle probe returns a boolean"),
-        Ok(None) => return w.error(MISSING_KEY),
-        Err(e) => return op_error(e, w),
-    }
-    let Some(outcome) = mutate_with(store, key, &program, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    if program.is_legacy() {
-        return match last_applied(&outcome.results) {
-            Some(MatchResult::Toggled(b)) => w.bulk(if b { b"true" } else { b"false" }),
-            Some(_) => unreachable!("toggle applies booleans"),
-            None if outcome.results.is_empty() => path_missing(path, w),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain a boolean"));
+        Ok(None) => return fixed.decline(ReplyError::Line(MISSING_KEY)),
+        Err(error) => return fixed.decline(ReplyError::Op(error)),
+    };
+    let reply = fixed.reopen(unapplied);
+    let outcome = match mutate_with(store, key, &program, &op, now) {
+        Ok(outcome) => outcome,
+        Err(error) => return reply.decline(error),
+    };
+    let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
+    commit_delta(reply, &edit, store, cx, now, |reply| {
+        toggle_reply(reply, path, legacy, &outcome.results)
+    })
+}
+
+fn toggle_reply<'a>(
+    reply: &mut JsonReply<'_, '_>,
+    path: &'a [u8],
+    legacy: bool,
+    results: &[MatchResult],
+) -> ReplyBuild<'a> {
+    if legacy {
+        return match last_applied(results) {
+            Some(MatchResult::Toggled(value)) => {
+                Ok(reply.bulk(if value { b"true" } else { b"false" })?)
             }
+            Some(_) => unreachable!("toggle applies booleans"),
+            None if results.is_empty() => Err(ReplyError::PathMissing(path).into()),
+            None => Err(ReplyError::NotContaining { path, noun: "a boolean" }.into()),
         };
     }
-    w.array_header(outcome.results.len());
-    for r in &outcome.results {
-        match r {
-            MatchResult::Toggled(b) => w.int(i64::from(*b)),
+    reply.array_header(results.len())?;
+    for result in results {
+        match result {
+            MatchResult::Toggled(value) => reply.int(i64::from(*value))?,
             MatchResult::Skipped
             | MatchResult::Num(_)
             | MatchResult::Len(_)
@@ -1107,9 +1128,10 @@ fn toggle(
             | MatchResult::Removed
             | MatchResult::Set
             | MatchResult::Popped(_)
-            | MatchResult::PoppedEmpty => w.null(),
+            | MatchResult::PoppedEmpty => reply.null()?,
         }
     }
+    Ok(())
 }
 
 fn clear(
@@ -1117,17 +1139,18 @@ fn clear(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
     let op = ApplyOp::Clear;
-    let Some((program, outcome)) = mutate(store, cx, key, path, &op, now, w) else {
-        return;
+    let (program, outcome) = match mutate(store, cx, key, path, &op, now) {
+        Ok(planned) => planned,
+        Err(error) => return reply.decline(error),
     };
-    if commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        w.int(i64::from(outcome.applied));
-    }
+    let applied = i64::from(outcome.applied);
+    let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
+    commit_delta(reply, &edit, store, cx, now, |reply| Ok(reply.int(applied)?))
 }
 
 // ---- array ops (M3-S13, ADR-0042 D1–D4) ---------------------------------------
@@ -1137,20 +1160,19 @@ fn arr_append(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     // The optional-path quirk (ADR-0042 D7): three arguments mean a
     // legacy root path and a single value — the STRAPPEND precedent.
     let (path, first_value): (&[u8], usize) =
         if argv.len() == 3 { (b".", 2) } else { (argv.arg(2), 3) };
-    let Some(operand) = parse_array_operand(store, cx, argv, first_value, w) else { return };
+    let operand = match parse_array_operand(store, cx, argv, first_value) {
+        Ok(operand) => operand,
+        Err(error) => return reply.decline(error),
+    };
     let op = ApplyOp::ArrAppend { elements: &operand };
-    let Some((program, outcome)) = mutate(store, cx, key, path, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    int_per_match(path, program.is_legacy(), &outcome, w, "an array", array_len_result);
+    mutate_counting(reply, store, cx, key, path, &op, now, ARRAY_LEN)
 }
 
 fn arr_insert(
@@ -1158,19 +1180,18 @@ fn arr_insert(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let (key, path) = (argv.arg(1), argv.arg(2));
     let Ok(index) = parse_i64(argv.arg(3)) else {
-        return w.error("ERR value is not an integer or out of range");
+        return reply.decline(ReplyError::Line("ERR value is not an integer or out of range"));
     };
-    let Some(operand) = parse_array_operand(store, cx, argv, 4, w) else { return };
+    let operand = match parse_array_operand(store, cx, argv, 4) {
+        Ok(operand) => operand,
+        Err(error) => return reply.decline(error),
+    };
     let op = ApplyOp::ArrInsert { index, elements: &operand };
-    let Some((program, outcome)) = mutate(store, cx, key, path, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    int_per_match(path, program.is_legacy(), &outcome, w, "an array", array_len_result);
+    mutate_counting(reply, store, cx, key, path, &op, now, ARRAY_LEN)
 }
 
 fn arr_trim(
@@ -1178,19 +1199,17 @@ fn arr_trim(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let (key, path) = (argv.arg(1), argv.arg(2));
     let (Ok(start), Ok(stop)) = (parse_i64(argv.arg(3)), parse_i64(argv.arg(4))) else {
-        return w.error("ERR value is not an integer or out of range");
+        return reply.decline(ReplyError::Line("ERR value is not an integer or out of range"));
     };
     let op = ApplyOp::ArrTrim { start, stop };
-    let Some((program, outcome)) = mutate(store, cx, key, path, &op, now, w) else { return };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    int_per_match(path, program.is_legacy(), &outcome, w, "an array", array_len_result);
+    mutate_counting(reply, store, cx, key, path, &op, now, ARRAY_LEN)
 }
+
+const ARRAY_LEN: PerMatchCount = PerMatchCount { noun: "an array", project: array_len_result };
 
 fn array_len_result(r: &MatchResult) -> Option<i64> {
     match r {
@@ -1211,73 +1230,68 @@ fn arr_pop(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let key = argv.arg(1);
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
     let mut index = -1i64;
     if argv.len() > 3 {
         let Ok(parsed) = parse_i64(argv.arg(3)) else {
-            return w.error("ERR value is not an integer or out of range");
+            return reply.decline(ReplyError::Line("ERR value is not an integer or out of range"));
         };
         index = parsed;
     }
-    // Inlined mutation prologue: the reply serializes popped elements
-    // from the frozen pre-image (`MatchResult::Popped` offsets are only
-    // meaningful against it — ADR-0042 D4), so `frozen` must outlive the
-    // commit instead of dying inside `mutate`.
-    let Some(program) = compile(store, cx, path, w) else { return };
-    let Some(frozen) = frozen_doc(store, key, now, |w| w.error(MISSING_KEY), w) else { return };
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
+    let frozen = match frozen_doc(store, key, now, MISSING_KEY) {
+        Ok(frozen) => frozen,
+        Err(error) => return reply.decline(error),
+    };
     let doc = TapeDoc::from_validated_bytes(&frozen);
     let op = ApplyOp::ArrPop { index };
     let outcome = match apply(&doc, &program, &op, &eval_limits(store), store.doc_max_bytes()) {
         Ok(outcome) => outcome,
-        Err(e) => return apply_error(e, w),
+        Err(error) => return reply.decline(ReplyError::Apply(error)),
     };
-    if !commit_delta(store, key, &program, &op, &outcome, cx, now, w) {
-        return;
-    }
-    // A popped element serializes under the reply budget like every
-    // document-serializing reply (ADR-0099 D4) — escape amplification
-    // alone can sextuple a string element's stored bytes.
-    let reply_budget = store.doc_max_reply_bytes();
-    // One buffer for the whole reply loop, not one per popped element.
-    let mut text = Vec::new();
-    let mut popped_bulk = |at: u32, w: &mut RespWriter<'_>| {
-        text.clear();
-        let ok = serialize_into_bounded(
-            DocValue::from(doc.value_at(at as usize)),
-            &SerializeOpts::default(),
-            &mut text,
-            reply_budget,
-        );
-        match ok {
-            Ok(()) => w.bulk(&text),
-            Err(_) => w.error(REPLY_TOO_LARGE),
-        }
-    };
-    if program.is_legacy() {
+    let legacy = program.is_legacy();
+    let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
+    // The popped elements serialize from the frozen pre-image (`Popped`
+    // offsets are meaningful only against it — ADR-0042 D4), inside
+    // `commit_delta` and so before the pop commits (ADR-0099 A1).
+    commit_delta(reply, &edit, store, cx, now, |reply| {
+        pop_reply(reply, &doc, path, legacy, &outcome.results)
+    })
+}
+
+fn pop_reply<'a>(
+    reply: &mut JsonReply<'_, '_>,
+    doc: &TapeDoc<'_>,
+    path: &'a [u8],
+    legacy: bool,
+    results: &[MatchResult],
+) -> ReplyBuild<'a> {
+    let opts = SerializeOpts::default();
+    let popped = |at: u32| DocValue::from(doc.value_at(at as usize));
+    if legacy {
         // Last array match wins: its popped value, or null when it was
         // empty; no array match at all takes the type/path error arms.
-        let last_array = outcome
-            .results
+        let last_array = results
             .iter()
             .rev()
             .find(|r| matches!(r, MatchResult::Popped(_) | MatchResult::PoppedEmpty));
         return match last_array {
-            Some(MatchResult::Popped(at)) => popped_bulk(*at, w),
-            Some(_) => w.null(),
-            None if outcome.results.is_empty() => path_missing(path, w),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain an array"));
-            }
+            Some(MatchResult::Popped(at)) => Ok(reply.document(popped(*at), &opts)?),
+            Some(_) => Ok(reply.null()?),
+            None if results.is_empty() => Err(ReplyError::PathMissing(path).into()),
+            None => Err(ReplyError::NotContaining { path, noun: "an array" }.into()),
         };
     }
-    w.array_header(outcome.results.len());
-    for r in &outcome.results {
-        match r {
-            MatchResult::Popped(at) => popped_bulk(*at, w),
+    reply.array_header(results.len())?;
+    for result in results {
+        match result {
+            MatchResult::Popped(at) => reply.document(popped(*at), &opts)?,
             MatchResult::Skipped
             | MatchResult::Num(_)
             | MatchResult::Len(_)
@@ -1285,9 +1299,10 @@ fn arr_pop(
             | MatchResult::Cleared
             | MatchResult::Removed
             | MatchResult::Set
-            | MatchResult::PoppedEmpty => w.null(),
+            | MatchResult::PoppedEmpty => reply.null()?,
         }
     }
+    Ok(())
 }
 
 fn arr_len(
@@ -1295,9 +1310,9 @@ fn arr_len(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    int_read(argv, store, cx, now, w, "an array", |v| match v {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
+    int_read(argv, store, cx, now, reply, "an array", |v| match v {
         DocValue::Arr(a) => Some(a.len() as i64),
         DocValue::Null
         | DocValue::Bool(_)
@@ -1305,7 +1320,7 @@ fn arr_len(
         | DocValue::F64(_)
         | DocValue::Str(_)
         | DocValue::Obj(_) => None,
-    });
+    })
 }
 
 /// The `ARRINDEX` needle: a scalar JSON value (ADR-0042 D3 — container
@@ -1319,7 +1334,7 @@ enum Needle {
 }
 
 /// Default limits on purpose: a scalar needle is wire-bounded and never
-/// stored (L15 style note, batch 51).
+/// stored.
 fn parse_scalar_needle(text: &[u8]) -> Option<Needle> {
     let mut parser = inf_doc::JsonParser::new();
     let idoc = parser.parse(text).ok()?;
@@ -1354,53 +1369,66 @@ fn arr_index(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    let (key, path) = (argv.arg(1), argv.arg(2));
+    mut reply: JsonReply<'_, '_>,
+) -> Settled {
     let Some(needle) = parse_scalar_needle(argv.arg(3)) else {
-        return w.error("ERR value is not a scalar");
+        return reply.decline(ReplyError::Line("ERR value is not a scalar"));
     };
     let mut range = [0i64, 0i64];
     for (slot, i) in range.iter_mut().zip(4..argv.len()) {
         let Ok(parsed) = parse_i64(argv.arg(i)) else {
-            return w.error("ERR value is not an integer or out of range");
+            return reply.decline(ReplyError::Line("ERR value is not an integer or out of range"));
         };
         *slot = parsed;
     }
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let search = ArraySearch { needle: &needle, start: range[0], stop: range[1] };
+    let built = arr_index_build(argv, store, cx, now, &mut reply, &search);
+    reply.settle(built)
+}
+
+/// One `ARRINDEX` query: the needle and its `[start, stop)` window.
+struct ArraySearch<'n> {
+    needle: &'n Needle,
+    start: i64,
+    stop: i64,
+}
+
+fn arr_index_build<'a>(
+    argv: &'a (impl Argv + ?Sized),
+    store: &mut CellStore,
+    cx: &ConnCx,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+    search: &ArraySearch<'_>,
+) -> ReplyBuild<'a> {
+    let (key, path) = (argv.arg(1), argv.arg(2));
+    let program = compile(store, cx, path)?;
     let limits = eval_limits(store);
-    let read = match store.json_get(key, now) {
-        Ok(Some(read)) => read,
-        Ok(None) => return w.null(),
-        Err(e) => return op_error(e, w),
+    let Some(read) = read_doc(store, key, now)? else {
+        return Ok(reply.null()?);
     };
-    let matches = match eval(&program, read.root, &limits) {
-        Ok(m) => m,
-        Err(e) => return w.error(&format!("ERR {e}")),
-    };
+    let matches = eval(&program, read.root, &limits).map_err(ReplyError::Eval)?;
     let index_of = |i: usize| match resolve(read.root, matches.get(i)) {
-        Some(DocValue::Arr(a)) => Some(array_search(&a, &needle, range[0], range[1])),
+        Some(DocValue::Arr(a)) => Some(array_search(&a, search.needle, search.start, search.stop)),
         _ => None,
     };
     if program.is_legacy() {
         if matches.is_empty() {
-            return path_missing(path, w);
+            return Err(ReplyError::PathMissing(path).into());
         }
         return match index_of(0) {
-            Some(n) => w.int(n),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain an array"));
-            }
+            Some(n) => Ok(reply.int(n)?),
+            None => Err(ReplyError::NotContaining { path, noun: "an array" }.into()),
         };
     }
-    w.array_header(matches.len());
+    reply.array_header(matches.len())?;
     for i in 0..matches.len() {
         match index_of(i) {
-            Some(n) => w.int(n),
-            None => w.null(),
+            Some(n) => reply.int(n)?,
+            None => reply.null()?,
         }
     }
+    Ok(())
 }
 
 /// First element in `[start, stop)` equal to the needle, or −1. `stop ==
@@ -1433,9 +1461,9 @@ fn obj_len(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    int_read(argv, store, cx, now, w, "an object", |v| match v {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
+    int_read(argv, store, cx, now, reply, "an object", |v| match v {
         DocValue::Obj(o) => Some(o.len() as i64),
         DocValue::Null
         | DocValue::Bool(_)
@@ -1443,7 +1471,7 @@ fn obj_len(
         | DocValue::F64(_)
         | DocValue::Str(_)
         | DocValue::Arr(_) => None,
-    });
+    })
 }
 
 fn obj_keys(
@@ -1451,50 +1479,59 @@ fn obj_keys(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    mut reply: JsonReply<'_, '_>,
+) -> Settled {
+    let built = obj_keys_build(argv, store, cx, now, &mut reply);
+    reply.settle(built)
+}
+
+/// Every key of every match, each charged as it is written (ADR-0099 A1):
+/// duplicate union members repeat a match up to `max_matches` times.
+fn obj_keys_build<'a>(
+    argv: &'a (impl Argv + ?Sized),
+    store: &mut CellStore,
+    cx: &ConnCx,
+    now: Nanos,
+    reply: &mut JsonReply<'_, '_>,
+) -> ReplyBuild<'a> {
     let path: &[u8] = if argv.len() > 2 { argv.arg(2) } else { b"." };
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = compile(store, cx, path)?;
     let limits = eval_limits(store);
-    let read = match store.json_get(argv.arg(1), now) {
-        Ok(Some(read)) => read,
-        Ok(None) => return w.null(),
-        Err(e) => return op_error(e, w),
+    let Some(read) = read_doc(store, argv.arg(1), now)? else {
+        return Ok(reply.null()?);
     };
-    let matches = match eval(&program, read.root, &limits) {
-        Ok(m) => m,
-        Err(e) => return w.error(&format!("ERR {e}")),
-    };
+    let matches = eval(&program, read.root, &limits).map_err(ReplyError::Eval)?;
     let object_of = |i: usize| match resolve(read.root, matches.get(i)) {
         Some(DocValue::Obj(o)) => Some(o),
         _ => None,
     };
-    let write_keys = |o: &ObjCursor<'_>, w: &mut RespWriter<'_>| {
-        // Insertion order — the only order the format has (ADR-0036).
-        w.array_header(o.len());
-        for (key, _) in o.iter() {
-            w.bulk(key.as_bytes());
-        }
-    };
     if program.is_legacy() {
         if matches.is_empty() {
-            return path_missing(path, w);
+            return Err(ReplyError::PathMissing(path).into());
         }
         return match object_of(0) {
-            Some(o) => write_keys(&o, w),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain an object"));
-            }
+            Some(o) => Ok(write_keys(&o, reply)?),
+            None => Err(ReplyError::NotContaining { path, noun: "an object" }.into()),
         };
     }
-    w.array_header(matches.len());
+    reply.array_header(matches.len())?;
     for i in 0..matches.len() {
         match object_of(i) {
-            Some(o) => write_keys(&o, w),
-            None => w.null(),
+            Some(o) => write_keys(&o, reply)?,
+            None => reply.null()?,
         }
     }
+    Ok(())
+}
+
+/// One object's keys, in insertion order — the only order the format has
+/// (ADR-0036).
+fn write_keys(object: &ObjCursor<'_>, reply: &mut JsonReply<'_, '_>) -> Result<(), ReplyTooLarge> {
+    reply.array_header(object.len())?;
+    for (key, _) in object.iter() {
+        reply.bulk(key.as_bytes())?;
+    }
+    Ok(())
 }
 
 fn merge(
@@ -1502,25 +1539,29 @@ fn merge(
     store: &mut CellStore,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+    reply: JsonReply<'_, '_>,
+) -> Settled {
     let (key, path) = (argv.arg(1), argv.arg(2));
-    let Some(program) = compile(store, cx, path, w) else { return };
+    let program = match compile(store, cx, path) {
+        Ok(program) => program,
+        Err(error) => return reply.decline(error),
+    };
     let mut idoc = cx.node.json_ingest_buf.take();
-    let parsed = parse_value(store, cx, argv.arg(3), &mut idoc, w);
-    let outcome = parsed.then(|| merge_parsed(store, key, path, &program, &idoc, cx, now, w));
+    let settled = match parse_value(store, cx, argv.arg(3), &mut idoc) {
+        Ok(()) => merge_parsed(reply, store, key, path, &program, &idoc, cx, now),
+        Err(error) => reply.decline(error),
+    };
     cx.node.json_ingest_buf.replace(idoc);
-    if let Some(Some(())) = outcome {
-        w.simple("OK");
-    }
+    settled
 }
 
 /// The post-parse half of `JSON.MERGE` (ADR-0042 D6): existing matches
 /// merge in place; a missing key creates at the root only; an existing
 /// key with no matches follows the SET parent-creation rule with the
-/// null-stripped patch. `None` ⇒ the error reply is written.
+/// null-stripped patch.
 #[allow(clippy::too_many_arguments)]
 fn merge_parsed(
+    reply: JsonReply<'_, '_>,
     store: &mut CellStore,
     key: &[u8],
     path: &[u8],
@@ -1528,123 +1569,132 @@ fn merge_parsed(
     idoc: &[u8],
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<()> {
+) -> Settled {
     let fragment = &idoc[inf_doc::HEADER_LEN..];
     if program.is_root() && store.json_get(key, now).ok().flatten().is_none() {
         // Missing key, root path: create with MergePatch(absent, patch).
-        // Wrong types surface through json_set's guard below.
-        let created = inf_doc::merge_absent_document(fragment);
-        if !durable_full_fits(cx, key, &created, w) {
-            return None;
-        }
-        let opts = JsonSetOptions { cond: SetCond::Always, expire: SetExpire::Keep };
-        return match store.json_set(key, &created, opts, now) {
-            Ok(JsonSetOutcome::Applied) => {
-                capture_full(cx);
-                Some(())
-            }
-            Ok(JsonSetOutcome::Skipped) => unreachable!("unconditional set applies"),
-            Err(e) => {
-                op_error(e, w);
-                None
-            }
-        };
+        // Wrong types surface through json_set's guard.
+        return merge_create(reply, store, key, fragment, cx, now);
     }
-    let frozen =
-        frozen_doc(store, key, now, |w| w.error("ERR new objects must be created at the root"), w)?;
-    let doc = TapeDoc::from_validated_bytes(&frozen);
-    let limits = eval_limits(store);
-    let matches = match eval(program, DocValue::from(doc.root()), &limits) {
-        Ok(m) => m,
-        Err(e) => {
-            w.error(&format!("ERR {e}"));
-            return None;
-        }
+    let frozen = match frozen_doc(store, key, now, CREATE_AT_ROOT) {
+        Ok(frozen) => frozen,
+        Err(error) => return reply.decline(error),
     };
-    if matches.is_empty() {
-        // The SET parent-creation rule (ADR-0041 D6), with the merged-
-        // against-absent value (nulls stripped through object chains).
-        let ast = inf_doc::path::parse_ast(path).expect("compile above accepted this text");
-        let Some(Segment::Child(name)) = ast.segments.last() else {
-            path_missing(path, w);
-            return None;
-        };
-        let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
-            legacy: ast.legacy,
-            segments: ast.segments[..ast.segments.len() - 1].to_vec(),
-        })
-        .expect("a prefix of an accepted program encodes under the ceiling");
-        let name = name.clone();
-        let created = inf_doc::merge_absent_document(fragment);
-        let op = ApplyOp::SetMember { key: &name, fragment: &created[inf_doc::HEADER_LEN..] };
-        return merge_apply(store, key, path, &doc, &parent, &op, &limits, cx, now, w);
+    let doc = TapeDoc::from_validated_bytes(&frozen);
+    let target = MergeTarget { key, path, doc: &doc };
+    let matches = match eval(program, DocValue::from(doc.root()), &eval_limits(store)) {
+        Ok(matches) => matches,
+        Err(error) => return reply.decline(ReplyError::Eval(error)),
+    };
+    if !matches.is_empty() {
+        return merge_apply(
+            reply,
+            store,
+            &target,
+            program,
+            &ApplyOp::Merge { patch: fragment },
+            cx,
+            now,
+        );
     }
-    let op = ApplyOp::Merge { patch: fragment };
-    merge_apply(store, key, path, &doc, program, &op, &limits, cx, now, w)
+    // The SET parent-creation rule (ADR-0041 D6), with the merged-against-
+    // absent value (nulls stripped through object chains).
+    let ast = inf_doc::path::parse_ast(path).expect("compile above accepted this text");
+    let Some(Segment::Child(name)) = ast.segments.last() else {
+        return reply.decline(ReplyError::PathMissing(path));
+    };
+    let parent = inf_doc::path::encode_ast(&inf_doc::path::PathAst {
+        legacy: ast.legacy,
+        segments: ast.segments[..ast.segments.len() - 1].to_vec(),
+    })
+    .expect("a prefix of an accepted program encodes under the ceiling");
+    let name = name.clone();
+    let created = inf_doc::merge_absent_document(fragment);
+    let op = ApplyOp::SetMember { key: &name, fragment: &created[inf_doc::HEADER_LEN..] };
+    merge_apply(reply, store, &target, &parent, &op, cx, now)
+}
+
+/// `MERGE`'s root create is a post-image whose reply is known only after
+/// the store call: the `Status` shape is reserved first.
+fn merge_create(
+    reply: JsonReply<'_, '_>,
+    store: &mut CellStore,
+    key: &[u8],
+    fragment: &[u8],
+    cx: &ConnCx,
+    now: Nanos,
+) -> Settled {
+    let created = inf_doc::merge_absent_document(fragment);
+    let fixed = match reply.reserve_fixed(FixedShape::Status) {
+        FixedReservation::Reserved(fixed) => fixed,
+        FixedReservation::Refused(settled) => return settled,
+    };
+    if let Err(error) = durable_full_fits(cx, key, &created) {
+        return fixed.decline(error);
+    }
+    let opts = JsonSetOptions { cond: SetCond::Always, expire: SetExpire::Keep };
+    match store.json_set(key, &created, opts, now) {
+        Ok(JsonSetOutcome::Applied) => {
+            capture_full(cx);
+            fixed.write(FixedValue::Ok)
+        }
+        Ok(JsonSetOutcome::Skipped) => unreachable!("unconditional set applies"),
+        Err(error) => fixed.decline(ReplyError::Op(error)),
+    }
+}
+
+/// A path `JSON.MERGE` over an existing document.
+struct MergeTarget<'t> {
+    key: &'t [u8],
+    path: &'t [u8],
+    doc: &'t TapeDoc<'t>,
 }
 
 /// Run one merge-family apply + commit; a no-op merge (byte-equal
 /// output, ADR-0041 D8) is still `+OK`.
-#[allow(clippy::too_many_arguments)]
 fn merge_apply(
+    reply: JsonReply<'_, '_>,
     store: &mut CellStore,
-    key: &[u8],
-    path: &[u8],
-    doc: &TapeDoc<'_>,
+    target: &MergeTarget<'_>,
     program: &PathProgram,
     op: &ApplyOp<'_>,
-    limits: &EvalLimits,
     cx: &ConnCx,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<()> {
-    match apply(doc, program, op, limits, store.doc_max_bytes()) {
+) -> Settled {
+    match apply(target.doc, program, op, &eval_limits(store), store.doc_max_bytes()) {
         Ok(outcome) => {
             if matches!(op, ApplyOp::SetMember { .. }) && outcome.bytes.is_none() {
                 // Zero eligible parents: the oracle's path error arm.
-                path_missing(path, w);
-                return None;
+                return reply.decline(ReplyError::PathMissing(target.path));
             }
-            commit_delta(store, key, program, op, &outcome, cx, now, w).then_some(())
+            let edit = PathEdit { key: target.key, program, op, outcome: &outcome };
+            commit_delta(reply, &edit, store, cx, now, |reply| Ok(reply.ok()?))
         }
-        Err(e) => {
-            apply_error(e, w);
-            None
-        }
+        Err(error) => reply.decline(ReplyError::Apply(error)),
     }
 }
 
 /// Parse the trailing value arguments and wrap them as the single
-/// ADR-0042 D2 canonical array operand. `None` ⇒ the error is written.
+/// ADR-0042 D2 canonical array operand.
 fn parse_array_operand(
     store: &CellStore,
     cx: &ConnCx,
     argv: &(impl Argv + ?Sized),
     first_value: usize,
-    w: &mut RespWriter<'_>,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, ReplyError<'static>> {
     let mut docs: Vec<Vec<u8>> = Vec::with_capacity(argv.len() - first_value);
     for i in first_value..argv.len() {
         let mut out = Vec::new();
-        if !parse_value(store, cx, argv.arg(i), &mut out, w) {
-            return None;
-        }
+        parse_value(store, cx, argv.arg(i), &mut out)?;
         docs.push(out);
     }
     let fragments: Vec<&[u8]> = docs.iter().map(|d| &d[inf_doc::HEADER_LEN..]).collect();
-    let operand = inf_doc::array_operand(&fragments);
-    if operand.is_none() {
-        w.error("ERR document too large");
-    }
-    operand
+    inf_doc::array_operand(&fragments).ok_or(ReplyError::Line("ERR document too large"))
 }
 
-/// The shared mutation prologue: compile, freeze, apply. `None` ⇒ the
-/// reply (missing key, WRONGTYPE, path/eval/apply error) is written.
-/// Returns the compiled program too — reply shaping branches on its
-/// recorded mode (ADR-0040: mode lives on the program, never re-derived
-/// from text).
+/// The shared mutation prologue: compile, freeze, apply. Returns the
+/// compiled program too — reply shaping branches on its recorded mode
+/// (ADR-0040: mode lives on the program, never re-derived from text).
 fn mutate(
     store: &mut CellStore,
     cx: &ConnCx,
@@ -1652,11 +1702,10 @@ fn mutate(
     path: &[u8],
     op: &ApplyOp<'_>,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<(PathProgram, ApplyOutcome)> {
-    let program = compile(store, cx, path, w)?;
-    let outcome = mutate_with(store, key, &program, op, now, w)?;
-    Some((program, outcome))
+) -> Result<(PathProgram, ApplyOutcome), ReplyError<'static>> {
+    let program = compile(store, cx, path)?;
+    let outcome = mutate_with(store, key, &program, op, now)?;
+    Ok((program, outcome))
 }
 
 /// Canonical fallback for callers that already compiled the program (the
@@ -1668,47 +1717,68 @@ fn mutate_with(
     program: &PathProgram,
     op: &ApplyOp<'_>,
     now: Nanos,
-    w: &mut RespWriter<'_>,
-) -> Option<ApplyOutcome> {
-    let frozen = frozen_doc(store, key, now, |w| w.error(MISSING_KEY), w)?;
+) -> Result<ApplyOutcome, ReplyError<'static>> {
+    let frozen = frozen_doc(store, key, now, MISSING_KEY)?;
     let doc = TapeDoc::from_validated_bytes(&frozen);
-    match apply(&doc, program, op, &eval_limits(store), store.doc_max_bytes()) {
-        Ok(outcome) => Some(outcome),
-        Err(e) => {
-            apply_error(e, w);
-            None
-        }
-    }
+    apply(&doc, program, op, &eval_limits(store), store.doc_max_bytes()).map_err(ReplyError::Apply)
 }
 
-/// `$`-mode per-match integer array (STRAPPEND/ARR* mutations) or the
-/// legacy last-match integer; skipped matches answer nulls / the pinned
-/// `does not contain a {noun}` type error.
-fn int_per_match(
+/// How a counting mutation (`STRAPPEND`, `ARRAPPEND`, `ARRINSERT`,
+/// `ARRTRIM`) reads one match's result, and the noun of its type error.
+#[derive(Copy, Clone)]
+struct PerMatchCount {
+    noun: &'static str,
+    project: fn(&MatchResult) -> Option<i64>,
+}
+
+/// Plan a counting mutation and commit it with its per-match reply.
+#[allow(clippy::too_many_arguments)]
+fn mutate_counting(
+    reply: JsonReply<'_, '_>,
+    store: &mut CellStore,
+    cx: &ConnCx,
+    key: &[u8],
     path: &[u8],
+    op: &ApplyOp<'_>,
+    now: Nanos,
+    count: PerMatchCount,
+) -> Settled {
+    let (program, outcome) = match mutate(store, cx, key, path, op, now) {
+        Ok(planned) => planned,
+        Err(error) => return reply.decline(error),
+    };
+    let legacy = program.is_legacy();
+    let edit = PathEdit { key, program: &program, op, outcome: &outcome };
+    commit_delta(reply, &edit, store, cx, now, |reply| {
+        int_per_match(reply, path, legacy, &outcome.results, count)
+    })
+}
+
+/// `$`-mode per-match integer array or the legacy last-match integer;
+/// skipped matches answer nulls / the pinned `does not contain a {noun}`
+/// type error.
+fn int_per_match<'a>(
+    reply: &mut JsonReply<'_, '_>,
+    path: &'a [u8],
     legacy: bool,
-    outcome: &ApplyOutcome,
-    w: &mut RespWriter<'_>,
-    noun: &str,
-    project: impl Fn(&MatchResult) -> Option<i64>,
-) {
+    results: &[MatchResult],
+    count: PerMatchCount,
+) -> ReplyBuild<'a> {
     if legacy {
-        return match last_applied(&outcome.results).as_ref().and_then(&project) {
-            Some(n) => w.int(n),
-            None if outcome.results.is_empty() => path_missing(path, w),
-            None => {
-                let path = String::from_utf8_lossy(path);
-                w.error(&format!("ERR Path '{path}' does not contain {noun}"));
-            }
+        return match last_applied(results).as_ref().and_then(count.project) {
+            Some(n) => Ok(reply.int(n)?),
+            None if results.is_empty() => Err(ReplyError::PathMissing(path).into()),
+            None => Err(ReplyError::NotContaining { path, noun: count.noun }.into()),
         };
     }
-    w.array_header(outcome.results.len());
-    for r in &outcome.results {
-        match project(r) {
-            Some(n) => w.int(n),
-            None => w.null(),
+    reply.array_header(results.len())?;
+    for result in results {
+        match (count.project)(result) {
+            Some(n) => reply.int(n)?,
+            None => reply.null()?,
         }
     }
+    Ok(())
 }
 
 // ---- reply-shape matrix source (M3-S15, ADR-0042 D8) ---------------------------
@@ -1875,7 +1945,9 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
                  and empty arrays",
         legacy: "bulk JSON text: last array match's popped element; null when it was empty",
         resp3: NULLS,
-        notes: "index defaults to -1; out-of-range clamps to the nearest end (ADR-0042 D3)",
+        notes: "index defaults to -1; out-of-range clamps to the nearest end (ADR-0042 D3); a \
+                reply over `doc-max-reply-bytes` answers `ERR reply too large` and nothing is \
+                popped",
     },
     ReplyShape {
         name: "JSON.ARRTRIM",
@@ -1891,7 +1963,8 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "array: per match, array of key bulk strings or null for non-objects",
         legacy: "array of key bulk strings: first match",
         resp3: NULLS,
-        notes: "keys in insertion order (ADR-0036)",
+        notes: "keys in insertion order (ADR-0036); a reply over `doc-max-reply-bytes` \
+                answers `ERR reply too large`",
     },
     ReplyShape {
         name: "JSON.OBJLEN",
@@ -1957,5 +2030,61 @@ mod tests {
             let busy = u64::from(prefix.starts_with(b"-BUSY"));
             assert_eq!(cx.node.log_admission_busy.get(), busy, "refusal counter");
         }
+    }
+
+    fn run(argv: &[&[u8]], store: &mut CellStore, cx: &ConnCx, now: Nanos) -> Vec<u8> {
+        let meta = inf_wire::lookup(argv[0]).expect("a registered JSON command");
+        let mut out = Vec::new();
+        {
+            let mut writer = RespWriter::new(&mut out, Protocol::Resp2);
+            execute_json(meta.id, argv, store, cx, now, &mut writer);
+        }
+        out
+    }
+
+    /// `[[["y"×40000]]]`, written through the handler under an unbounded
+    /// staging admission, with the doc-log scratch cleared afterwards.
+    fn pop_store(budget: usize) -> (CellStore, Vec<u8>) {
+        let config = inf_store::StoreConfig { doc_max_reply_bytes: budget, ..Default::default() };
+        let mut store = CellStore::new(config);
+        let cx = durable_cx(usize::MAX, usize::MAX);
+        let element = format!("\"{}\"", "y".repeat(40_000));
+        let doc = format!("[[[{element}]]]");
+        let now = Nanos::from_millis(1);
+        let reply = run(&[b"JSON.SET", b"p", b"$", doc.as_bytes()], &mut store, &cx, now);
+        assert_eq!(reply, b"+OK\r\n");
+        (store, element.into_bytes())
+    }
+
+    /// ADR-0099 A1 (R2, R5): a refused path mutation leaves no reply byte,
+    /// no store write and no doc-log capture. Four raw matches of one
+    /// 40 KB element are 160,052 reply bytes against a 64 KiB budget.
+    #[test]
+    fn refused_reply_leaves_the_document_and_the_doc_log_untouched() {
+        let (mut store, _) = pop_store(64 << 10);
+        let cx = durable_cx(usize::MAX, usize::MAX);
+        let now = Nanos::from_millis(2);
+        let before = store.json_freeze(b"p", now).unwrap().expect("fixture document");
+        let reply = run(&[b"JSON.ARRPOP", b"p", b"$[0,0][0,0]"], &mut store, &cx, now);
+        let shown = String::from_utf8_lossy(&reply[..reply.len().min(48)]).into_owned();
+        assert!(reply == b"-ERR reply too large\r\n", "reply {} B: {shown:?}", reply.len());
+        let after = store.json_freeze(b"p", now).unwrap().expect("fixture document");
+        assert!(after == before, "the refused pop changed the document");
+        let intent = &cx.node.doc_log.borrow().intent;
+        assert!(matches!(intent, DocLogIntent::None), "doc-log intent {intent:?}");
+    }
+
+    /// ADR-0099 A1's transition table, row `Built` × `Refused(err)`: the
+    /// reply is built before the commit, so a staging refusal rolls the
+    /// built frame back and answers exactly its own error line.
+    #[test]
+    fn commit_refusal_replaces_the_built_reply() {
+        let (mut store, _) = pop_store(inf_store::StoreConfig::default().doc_max_reply_bytes);
+        let cx = durable_cx(1, usize::MAX);
+        let now = Nanos::from_millis(2);
+        let reply = run(&[b"JSON.ARRPOP", b"p", b"$[0][0]"], &mut store, &cx, now);
+        let want = format!("-{}\r\n", crate::durable::STAGING_BUSY_ERROR);
+        assert_eq!(String::from_utf8_lossy(&reply), want);
+        assert_eq!(cx.node.log_admission_busy.get(), 1, "the refusal is the staging one");
     }
 }

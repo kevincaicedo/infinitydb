@@ -371,6 +371,7 @@ impl Keyspace {
             total.wheel_fallback += s.wheel_fallback;
             total.evicted_keys += s.evicted_keys;
             total.index_grows += s.index_grows;
+            total.json_scalar_patches_in_place += s.json_scalar_patches_in_place;
         }
         total
     }

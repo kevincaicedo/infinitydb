@@ -473,7 +473,7 @@ I	1	crates/inf-server/src/durable.rs	unreachable	a waiting frame is never sealed
 I	1	crates/inf-server/src/durable/ckpt.rs	unreachable	just opened	`open_stream` set `phase = Stream` on the line above
 I	1	crates/inf-server/src/durable/ckpt.rs	unreachable	matched above	the `matches!` on the line above saw `CkptPhase::Stream`
 C	1	crates/inf-server/src/exec.rs	unreachable	keyspace-level and pub/sub commands dispatch in execute()	`crates/inf-server/src/exec.rs:execute` routes those `CommandId`s before `execute_db`; a table-iterating compat test covers every registry row
-I	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	`delta` is called from `commit_delta` only when `changed`, which requires a non-skipped result
+I	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	`delta` is called from `commit` only after an applied edit (`outcome.bytes` present, which requires a non-skipped result) and from the in-place scalar arms with a count of 1
 I	2	crates/inf-server/src/json.rs	expect	a prefix of an accepted program encodes under the ceiling	the same function compiled `path` a few lines above (the ceiling check is the encoder's, F-L10-04); the parent AST is that program's segments minus the last, so its encoding is a strict byte prefix of bytes the ceiling admitted
 I	2	crates/inf-server/src/json.rs	expect	compile above accepted this text	the same function compiled `path` a few lines above; `parse_ast` accepts what the compiler accepted
 I	1	crates/inf-server/src/json.rs	expect	matches resolve on their document	`matches` was just evaluated on `read.root`; `resolve` walks the same tape
@@ -487,6 +487,8 @@ I	1	crates/inf-server/src/json.rs	unreachable	toggle applies booleans	`mutate_wi
 I	1	crates/inf-server/src/json.rs	unreachable	toggle probe returns a boolean	the scalar-patch probe for a toggle returns `Toggled`/`Missing`/`Skipped`/`Unsupported`, never `Number`
 I	1	crates/inf-server/src/json.rs	unreachable	unconditional set applies	`SetCond::Always` never yields `Skipped` (the store's own `json_set` contract)
 I	2	crates/inf-server/src/key_hash.rs	expect	8 bytes	`bytes` is a `[u8; 16]`; `[..8]`/`[8..]` are 8-byte slices
+I	1	crates/inf-server/src/limits.rs	assert	every fixed shape fits the column's maximum	compile-time const assertion over `FixedShape::ALL` — never executes
+I	1	crates/inf-server/src/limits.rs	assert	the fixed column's maximum is 348 bytes	compile-time const assertion — never executes
 C	1	crates/inf-server/src/plane/conn.rs	expect	argc fits u32	argv is a parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds `argc` to `ParserLimits::max_args` (1024) and the frame to `max_frame_bytes`
 C	2	crates/inf-server/src/plane/fabric.rs	expect	argc fits u32	argv is a parsed frame: `crates/inf-wire/src/parser.rs:parse_multibulk` bounds `argc` to `ParserLimits::max_args` (1024) and the frame to `max_frame_bytes`
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	Backfilling → Ready is an ADR-0075 D3 edge	`idx_fleet_candidates` yields only Backfilling indexes (the registry's own state), and the flip is the ADR-0075 D3 edge from that state

@@ -284,7 +284,7 @@ fn scalar_lane_falls_back_before_width_change_or_error() {
             .json_patch_scalar(b"doc", &path, &ApplyOp::NumIncrBy(Number::I64(1)), now())
             .expect("probe")
             .expect("present");
-        assert_eq!(verdict, JsonScalarPatch::Unsupported);
+        assert!(matches!(verdict, JsonScalarPatch::Unsupported(_)), "{verdict:?}");
         assert_eq!(store.json_freeze(b"doc", now()).unwrap().unwrap(), idoc);
         assert_eq!(store.json_get(b"doc", now()).unwrap().unwrap().version, 1);
         assert_eq!(store.doc_domain(), before_domain);

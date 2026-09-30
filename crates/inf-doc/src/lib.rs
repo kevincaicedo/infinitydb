@@ -61,7 +61,7 @@ pub mod ser;
 pub mod tape;
 
 pub use apply::{
-    ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, ScalarPatch, array_operand,
+    ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, ScalarPatch, Unapplied, array_operand,
     merge_absent_document, patch_scalar_in_place,
 };
 pub use arena::{ArenaDoc, DocMemReport, DocRef, FreezeScratch};

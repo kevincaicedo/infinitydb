@@ -28,8 +28,7 @@ mod io_properties;
 #[cfg(feature = "doc")]
 mod json;
 mod key_hash;
-#[cfg(any(target_os = "linux", test))]
-mod limits;
+pub mod limits;
 mod log_bytes;
 mod loop_snapshot;
 mod plane;

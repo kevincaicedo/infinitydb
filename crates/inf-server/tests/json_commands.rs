@@ -514,12 +514,111 @@ fn reply_budget_refuses_every_amplification_reach() {
     let text = String::from_utf8_lossy(&reply);
     assert!(text.starts_with("*2\r\n$"), "healthy element first: {text:?}");
     assert!(text.ends_with("-ERR reply too large\r\n"), "refused element: {text:?}");
-    // ARRPOP: a popped element over the budget refuses; the mutation
-    // itself has committed (RedisJSON pop-then-reply order).
+    // ARRPOP: a popped element over the budget refuses the whole reply,
+    // which is built before the pop commits, so nothing is popped
+    // (ADR-0099 A1).
     let big_elem = format!(r#"["{}"]"#, "y".repeat(70_000));
     db.run_str(&["JSON.SET", "p", "$", &big_elem]);
-    assert_reply(&mut db, &["JSON.ARRPOP", "p", "$"], "*1\r\n-ERR reply too large\r\n");
-    assert_reply(&mut db, &["JSON.ARRLEN", "p", "$"], "*1\r\n:0\r\n");
+    assert_reply(&mut db, &["JSON.ARRPOP", "p", "$"], "-ERR reply too large\r\n");
+    assert_reply(&mut db, &["JSON.ARRLEN", "p", "$"], "*1\r\n:1\r\n");
+}
+
+const REFUSED: &str = "-ERR reply too large\r\n";
+
+/// A printable head of a reply or argument: the amplified replies below are
+/// hundreds of kilobytes, and a mismatch message needs only their shape.
+fn head(bytes: &[u8]) -> String {
+    let shown = &bytes[..bytes.len().min(48)];
+    format!("{} B {:?}", bytes.len(), String::from_utf8_lossy(shown))
+}
+
+/// `assert_reply` for large replies: a mismatch prints lengths and heads.
+fn assert_reply_head(db: &mut Db, argv: &[&str], expected: &str) {
+    let got = db.run_str(argv);
+    let args: Vec<String> = argv.iter().map(|a| head(a.as_bytes())).collect();
+    assert!(
+        got == expected.as_bytes(),
+        "reply mismatch for {args:?}: got {}, want {}",
+        head(&got),
+        head(expected.as_bytes())
+    );
+}
+
+fn db_with_reply_budget(budget: usize) -> Db {
+    Db::with_config(StoreConfig { doc_max_reply_bytes: budget, ..StoreConfig::default() })
+}
+
+/// `[[["y"×40000]]]`: `$[0][0]` is one array holding one 40,002-byte
+/// serialized string. Its `ARRPOP` reply is 4 + (1 + 5 + 2 + 40,002 + 2)
+/// = 40,016 B.
+fn pop_fixture(db: &mut Db) -> String {
+    let element = format!("\"{}\"", "y".repeat(40_000));
+    assert_reply_head(db, &["JSON.SET", "p", "$", &format!("[[[{element}]]]")], "+OK\r\n");
+    element
+}
+
+/// `[{k0000…k4999}]`: one key array is `*5000\r\n` + 5,000 × `$5\r\nkNNNN\r\n`
+/// = 55,007 B.
+fn keys_fixture(db: &mut Db) {
+    let members: Vec<String> = (0..5_000).map(|i| format!("\"k{i:04}\":0")).collect();
+    let doc = format!("[{{{}}}]", members.join(","));
+    assert_reply_head(db, &["JSON.SET", "o", "$", &doc], "+OK\r\n");
+}
+
+/// ADR-0099 A1: `JSON.ARRPOP` builds its whole reply from the frozen
+/// pre-image before the pop commits, under one account. Duplicate union
+/// members give four raw matches of one 40 KB element: 4 + 4 × 40,012 =
+/// 160,052 B against a 64 KiB budget. The command answers the error and
+/// pops nothing; one raw match (40,016 B) is served and pops.
+#[test]
+fn arrpop_over_the_reply_budget_refuses_before_the_pop() {
+    let mut db = db_with_reply_budget(64 << 10);
+    let element = pop_fixture(&mut db);
+    assert_reply_head(&mut db, &["JSON.ARRPOP", "p", "$[0,0][0,0]"], REFUSED);
+    assert_reply_head(&mut db, &["JSON.ARRLEN", "p", "$[0][0]"], "*1\r\n:1\r\n");
+    let served = format!("*1\r\n{}", bulk(&element));
+    assert_reply_head(&mut db, &["JSON.ARRPOP", "p", "$[0][0]"], &served);
+    assert_reply_head(&mut db, &["JSON.ARRLEN", "p", "$[0][0]"], "*1\r\n:0\r\n");
+}
+
+/// ADR-0099 A1: `JSON.OBJKEYS` writes every key of every raw match under
+/// the reply account. Eight raw matches of 5,000 keys are 4 + 8 × 55,007 =
+/// 440,060 B against a 64 KiB budget; one match (55,011 B) is served.
+#[test]
+fn objkeys_over_the_reply_budget_refuses() {
+    let mut db = db_with_reply_budget(64 << 10);
+    keys_fixture(&mut db);
+    assert_reply_head(&mut db, &["JSON.OBJKEYS", "o", "$[0,0,0,0,0,0,0,0]"], REFUSED);
+    let reply = db.run_str(&["JSON.OBJKEYS", "o", "$[0]"]);
+    assert_eq!(reply.len(), 55_011, "one key array: {}", head(&reply));
+    assert!(reply.starts_with(b"*1\r\n*5000\r\n$5\r\nk0000\r\n"), "{}", head(&reply));
+}
+
+/// ADR-0099 A1's charged predicate is exact on whole-reply wire bytes: a
+/// reply is served at budget = its length and refused one byte below, for
+/// keys (`*2` of two 55,007 B key arrays = 110,018 B) and for a document
+/// bulk (`ARRPOP`'s 40,016 B), whose refusal leaves `ARRLEN` unchanged.
+#[test]
+fn reply_budget_boundary_is_exact_for_keys_and_documents() {
+    for (budget, served) in [(110_018, true), (110_017, false)] {
+        let mut db = db_with_reply_budget(budget);
+        keys_fixture(&mut db);
+        let reply = db.run_str(&["JSON.OBJKEYS", "o", "$[0,0]"]);
+        if served {
+            assert_eq!(reply.len(), 110_018, "served at {budget}: {}", head(&reply));
+            assert!(reply.starts_with(b"*2\r\n*5000\r\n"), "{}", head(&reply));
+        } else {
+            assert!(reply == REFUSED.as_bytes(), "refused at {budget}: {}", head(&reply));
+        }
+    }
+    for (budget, served) in [(40_016, true), (40_015, false)] {
+        let mut db = db_with_reply_budget(budget);
+        let element = pop_fixture(&mut db);
+        let want = if served { format!("*1\r\n{}", bulk(&element)) } else { REFUSED.to_owned() };
+        assert_reply_head(&mut db, &["JSON.ARRPOP", "p", "$[0][0]"], &want);
+        let len = if served { "*1\r\n:0\r\n" } else { "*1\r\n:1\r\n" };
+        assert_reply_head(&mut db, &["JSON.ARRLEN", "p", "$[0][0]"], len);
+    }
 }
 
 #[test]
@@ -1049,4 +1148,711 @@ fn resp3_numeric_replies_survive_extreme_doubles() {
     // exponent form with Redis's sign).
     db.cx.proto = Protocol::Resp2;
     assert_reply(&mut db, &["JSON.NUMINCRBY", "d", "$.big", "0"], "$8\r\n[1e+300]\r\n");
+}
+
+// ---- ADR-0099 A1: every JSON reply is charged, refused before its effect -------
+
+use inf_server::limits::FixedShape;
+
+/// How a fixture's reply settles (ADR-0099 A1's settlement table).
+#[derive(Copy, Clone, Debug)]
+enum Settlement {
+    /// Exact: the final reply's bytes > budget.
+    Charged,
+    /// budget < M(shape): the reservation precedes the effect.
+    Fixed(FixedShape),
+    /// The general path behind a fixed reservation: budget < M(shape) or
+    /// the final reply's bytes > budget.
+    FixedThenCharged(FixedShape),
+    /// `JSON.MGET`: each element against its own account.
+    PerElement,
+}
+
+/// The fixture's arm, and the witness that proves the arm ran.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Arm {
+    /// No arm choice beyond the path mode.
+    Plain,
+    /// The in-place scalar lane: `json_scalar_patches_in_place` moves by
+    /// one on a served leg.
+    Fast,
+    /// The general path of a scalar command: the witness does not move.
+    General,
+    /// A root `SET`/`MERGE`/`DEL`/`FORGET`: the key's existence flips.
+    Root,
+    /// A path `SET`/`MERGE`/`DEL`/`FORGET`: the key stays present.
+    Path,
+}
+
+struct Fixture {
+    row: &'static str,
+    arm: Arm,
+    settlement: Settlement,
+    /// `Some(true)` for a `$` path, `Some(false)` for a legacy one; the
+    /// compiler selects `$` mode by a leading `$`, so the path text at
+    /// `path_at` must agree.
+    dollar: Option<bool>,
+    path_at: usize,
+    /// Documents written through the store API, never the reply path.
+    docs: &'static [(&'static str, &'static str)],
+    argv: &'static [&'static str],
+    resp2: &'static str,
+    resp3: &'static str,
+}
+
+const D: &str = r#"{"a":1,"s":"x","f":true,"arr":[1,2],"o":{"x":0}}"#;
+
+const fn fx(
+    row: &'static str,
+    arm: Arm,
+    settlement: Settlement,
+    docs: &'static [(&'static str, &'static str)],
+    argv: &'static [&'static str],
+    resp2: &'static str,
+    resp3: &'static str,
+) -> Fixture {
+    Fixture { row, arm, settlement, dollar: None, path_at: 2, docs, argv, resp2, resp3 }
+}
+
+const fn dollar(mut f: Fixture, at: usize, dollar: bool) -> Fixture {
+    f.dollar = Some(dollar);
+    f.path_at = at;
+    f
+}
+
+/// One or more fixtures per registry row. The pinned bytes are written by
+/// hand from the reply-shape contract, not produced by the server.
+fn reply_fixtures() -> Vec<Fixture> {
+    use Arm::{Fast, General, Path, Plain, Root};
+    use FixedShape::{Count, Number, Status, Toggle};
+    use Settlement::{Charged, Fixed, FixedThenCharged, PerElement};
+    let ok = "+OK\r\n";
+    vec![
+        dollar(
+            fx("JSON.SET", Root, Fixed(Status), &[], &["JSON.SET", "k", "$", "[1]"], ok, ok),
+            2,
+            true,
+        ),
+        dollar(
+            fx("JSON.SET", Path, Charged, &[("k", D)], &["JSON.SET", "k", "$.a", "2"], ok, ok),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.GET",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.GET", "k", "$.a"],
+                "$3\r\n[1]\r\n",
+                "$3\r\n[1]\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.GET",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.GET", "k", ".s"],
+                "$3\r\n\"x\"\r\n",
+                "$3\r\n\"x\"\r\n",
+            ),
+            2,
+            false,
+        ),
+        dollar(
+            fx(
+                "JSON.GET",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.GET", "k", "$.a", ".s"],
+                "$20\r\n{\"$.a\":[1],\".s\":\"x\"}\r\n",
+                "$20\r\n{\"$.a\":[1],\".s\":\"x\"}\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.MGET",
+                Plain,
+                PerElement,
+                &[("k1", r#"{"a":1}"#), ("k2", r#"{"a":22}"#)],
+                &["JSON.MGET", "k1", "k2", "$.a"],
+                "*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+                "*2\r\n$3\r\n[1]\r\n$4\r\n[22]\r\n",
+            ),
+            3,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.DEL",
+                Root,
+                Fixed(Count),
+                &[("k", D)],
+                &["JSON.DEL", "k", "$"],
+                ":1\r\n",
+                ":1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.DEL",
+                Path,
+                Charged,
+                &[("k", D)],
+                &["JSON.DEL", "k", "$.a"],
+                ":1\r\n",
+                ":1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.FORGET",
+                Root,
+                Fixed(Count),
+                &[("k", D)],
+                &["JSON.FORGET", "k", "."],
+                ":1\r\n",
+                ":1\r\n",
+            ),
+            2,
+            false,
+        ),
+        dollar(
+            fx(
+                "JSON.FORGET",
+                Path,
+                Charged,
+                &[("k", D)],
+                &["JSON.FORGET", "k", ".a"],
+                ":1\r\n",
+                ":1\r\n",
+            ),
+            2,
+            false,
+        ),
+        // The uncharged-bulk canary's red: this whole RESP2 reply is one bulk.
+        dollar(
+            fx(
+                "JSON.TYPE",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.TYPE", "k", ".a"],
+                "$7\r\ninteger\r\n",
+                "*1\r\n$7\r\ninteger\r\n",
+            ),
+            2,
+            false,
+        ),
+        dollar(
+            fx(
+                "JSON.TYPE",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.TYPE", "k", "$.s"],
+                "*1\r\n$6\r\nstring\r\n",
+                "*1\r\n*1\r\n$6\r\nstring\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.NUMINCRBY",
+                Fast,
+                Fixed(Number),
+                &[("k", D)],
+                &["JSON.NUMINCRBY", "k", "$.a", "1"],
+                "$3\r\n[2]\r\n",
+                "*1\r\n:2\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.NUMINCRBY",
+                Fast,
+                Fixed(Number),
+                &[("k", D)],
+                &["JSON.NUMINCRBY", "k", ".a", "2"],
+                "$1\r\n3\r\n",
+                "*1\r\n:3\r\n",
+            ),
+            2,
+            false,
+        ),
+        // The tape stores -32..=127 as a one-byte fixint and 128 as a tag
+        // and a two-byte varint, so 127 + 1 changes the encoded width: the
+        // in-place probe answers `Unsupported` and the general path serves
+        // 11 B under the 348 B floor.
+        dollar(
+            fx(
+                "JSON.NUMINCRBY",
+                General,
+                FixedThenCharged(Number),
+                &[("g", r#"{"a":127}"#)],
+                &["JSON.NUMINCRBY", "g", "$.a", "1"],
+                "$5\r\n[128]\r\n",
+                "*1\r\n:128\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.NUMMULTBY",
+                Fast,
+                Fixed(Number),
+                &[("k", D)],
+                &["JSON.NUMMULTBY", "k", "$.a", "3"],
+                "$3\r\n[3]\r\n",
+                "*1\r\n:3\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.NUMMULTBY",
+                General,
+                FixedThenCharged(Number),
+                &[("g", r#"{"a":127}"#)],
+                &["JSON.NUMMULTBY", "g", "$.a", "2"],
+                "$5\r\n[254]\r\n",
+                "*1\r\n:254\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.STRAPPEND",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.STRAPPEND", "k", "$.s", "\"b\""],
+                "*1\r\n:2\r\n",
+                "*1\r\n:2\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.STRLEN",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.STRLEN", "k", "$.s"],
+                "*1\r\n:1\r\n",
+                "*1\r\n:1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.TOGGLE",
+                Fast,
+                Fixed(Toggle),
+                &[("k", D)],
+                &["JSON.TOGGLE", "k", "$.f"],
+                "*1\r\n:0\r\n",
+                "*1\r\n:0\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.TOGGLE",
+                Fast,
+                Fixed(Toggle),
+                &[("k", D)],
+                &["JSON.TOGGLE", "k", ".f"],
+                "$5\r\nfalse\r\n",
+                "$5\r\nfalse\r\n",
+            ),
+            2,
+            false,
+        ),
+        // A descendant path is not a simple path: the general path serves
+        // 8 B under an 11 B floor.
+        dollar(
+            fx(
+                "JSON.TOGGLE",
+                General,
+                FixedThenCharged(Toggle),
+                &[("k", D)],
+                &["JSON.TOGGLE", "k", "$..f"],
+                "*1\r\n:0\r\n",
+                "*1\r\n:0\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.CLEAR",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.CLEAR", "k", "$.arr"],
+                ":1\r\n",
+                ":1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRAPPEND",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRAPPEND", "k", "$.arr", "3"],
+                "*1\r\n:3\r\n",
+                "*1\r\n:3\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRINSERT",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRINSERT", "k", "$.arr", "0", "0"],
+                "*1\r\n:3\r\n",
+                "*1\r\n:3\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRINDEX",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRINDEX", "k", "$.arr", "2"],
+                "*1\r\n:1\r\n",
+                "*1\r\n:1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRLEN",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRLEN", "k", "$.arr"],
+                "*1\r\n:2\r\n",
+                "*1\r\n:2\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRPOP",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRPOP", "k", "$.arr"],
+                "*1\r\n$1\r\n2\r\n",
+                "*1\r\n$1\r\n2\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRPOP",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRPOP", "k", ".arr"],
+                "$1\r\n2\r\n",
+                "$1\r\n2\r\n",
+            ),
+            2,
+            false,
+        ),
+        dollar(
+            fx(
+                "JSON.ARRTRIM",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRTRIM", "k", "$.arr", "0", "0"],
+                "*1\r\n:1\r\n",
+                "*1\r\n:1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.OBJKEYS",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.OBJKEYS", "k", "$.o"],
+                "*1\r\n*1\r\n$1\r\nx\r\n",
+                "*1\r\n*1\r\n$1\r\nx\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.OBJKEYS",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.OBJKEYS", "k", ".o"],
+                "*1\r\n$1\r\nx\r\n",
+                "*1\r\n$1\r\nx\r\n",
+            ),
+            2,
+            false,
+        ),
+        dollar(
+            fx(
+                "JSON.OBJLEN",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.OBJLEN", "k", "$.o"],
+                "*1\r\n:1\r\n",
+                "*1\r\n:1\r\n",
+            ),
+            2,
+            true,
+        ),
+        dollar(
+            fx("JSON.MERGE", Path, Charged, &[("k", D)], &["JSON.MERGE", "k", "$.a", "5"], ok, ok),
+            2,
+            true,
+        ),
+        dollar(
+            fx(
+                "JSON.MERGE",
+                Root,
+                Fixed(Status),
+                &[],
+                &["JSON.MERGE", "k", "$", r#"{"a":1}"#],
+                ok,
+                ok,
+            ),
+            2,
+            true,
+        ),
+        fx("JSON.DEBUG", Plain, Charged, &[], &["JSON.DEBUG", "MEMORY", "k"], "$-1\r\n", "_\r\n"),
+    ]
+}
+
+/// What one leg observed: the reply, the watched keys' canonical bytes
+/// (`None` = absent) before and after, and the in-place witness's move.
+struct Leg {
+    reply: Vec<u8>,
+    before: Vec<Option<Vec<u8>>>,
+    after: Vec<Option<Vec<u8>>>,
+    in_place: u64,
+}
+
+fn store_doc(db: &mut Db, key: &str, json: &str) {
+    let idoc = inf_doc::JsonParser::new().parse(json.as_bytes()).expect("fixture JSON");
+    let opts = inf_store::JsonSetOptions {
+        cond: inf_store::SetCond::Always,
+        expire: inf_store::SetExpire::Keep,
+    };
+    let outcome = db.ks.db_mut(0).json_set(key.as_bytes(), &idoc, opts, Nanos(db.clock));
+    assert_eq!(outcome, Ok(inf_store::JsonSetOutcome::Applied), "fixture write {key}");
+}
+
+/// The keys a leg watches: every fixture document and the command's key.
+fn watched(f: &Fixture) -> Vec<&'static str> {
+    let mut keys: Vec<&str> = f.docs.iter().map(|(key, _)| *key).collect();
+    keys.push(f.argv[1]);
+    keys
+}
+
+fn state(db: &mut Db, f: &Fixture) -> Vec<Option<Vec<u8>>> {
+    let now = Nanos(db.clock);
+    let store = db.ks.db_mut(0);
+    watched(f)
+        .iter()
+        .map(|key| store.json_freeze(key.as_bytes(), now).expect("watched keys hold documents"))
+        .collect()
+}
+
+/// One leg on a fresh keyspace at `budget` reply bytes.
+fn leg(f: &Fixture, proto: Protocol, budget: usize) -> Leg {
+    let mut db = db_with_reply_budget(budget);
+    db.cx.proto = proto;
+    for (key, json) in f.docs {
+        store_doc(&mut db, key, json);
+    }
+    let before = state(&mut db, f);
+    let in_place_before = db.ks.stats().json_scalar_patches_in_place;
+    let reply = db.run_str(f.argv);
+    let in_place = db.ks.stats().json_scalar_patches_in_place - in_place_before;
+    let after = state(&mut db, f);
+    Leg { reply, before, after, in_place }
+}
+
+/// The RESP elements of an `*N` reply (bulk, null or error lines): the
+/// per-element oracle compares element by element.
+fn elements(reply: &[u8]) -> Vec<&[u8]> {
+    let line_end =
+        |from: usize| from + reply[from..].windows(2).position(|w| w == b"\r\n").expect("CRLF") + 2;
+    let mut at = line_end(0);
+    let mut out = Vec::new();
+    while at < reply.len() {
+        let header_end = line_end(at);
+        let end = match reply[at] {
+            b'$' if reply[at + 1] != b'-' => {
+                let digits = std::str::from_utf8(&reply[at + 1..header_end - 2]).expect("digits");
+                header_end + digits.parse::<usize>().expect("length") + 2
+            }
+            _ => header_end,
+        };
+        out.push(&reply[at..end]);
+        at = end;
+    }
+    out
+}
+
+fn per_element_refusal(served: &[u8], budget: usize) -> Vec<u8> {
+    let count = elements(served).len();
+    let mut want = format!("*{count}\r\n").into_bytes();
+    for element in elements(served) {
+        let refused = element.len() > budget;
+        want.extend_from_slice(if refused { REFUSED.as_bytes() } else { element });
+    }
+    want
+}
+
+/// The fixture's declared arm, checked on a served leg — an arm whose
+/// witness did not move is VACUOUS, and VACUOUS is red.
+fn assert_engaged(f: &Fixture, leg: &Leg, what: &str) {
+    let expected_in_place = u64::from(f.arm == Arm::Fast);
+    assert_eq!(leg.in_place, expected_in_place, "VACUOUS {what}: {:?} lane witness", f.arm);
+    let key_at = leg.before.len() - 1;
+    let (present_before, present_after) =
+        (leg.before[key_at].is_some(), leg.after[key_at].is_some());
+    match f.arm {
+        Arm::Root => {
+            assert_ne!(present_before, present_after, "VACUOUS {what}: EXISTS did not flip")
+        }
+        Arm::Path => assert!(present_before && present_after, "VACUOUS {what}: key not kept"),
+        Arm::Plain | Arm::Fast | Arm::General => {}
+    }
+    let write =
+        inf_wire::lookup(f.row.as_bytes()).expect("row").flags.contains(inf_wire::CmdFlags::WRITE);
+    assert_eq!(
+        leg.after != leg.before,
+        write,
+        "{what}: a write row changes state, a read row does not"
+    );
+}
+
+fn assert_refused(leg: &Leg, want: &[u8], what: &str) {
+    assert!(leg.reply == want, "{what}: got {}, want {}", head(&leg.reply), head(want));
+    assert!(leg.after == leg.before, "{what}: state changed under a refusal");
+    assert_eq!(leg.in_place, 0, "{what}: an effect ran before its reservation");
+}
+
+fn check_fixture(f: &Fixture, proto: Protocol) {
+    let pinned = match proto {
+        Protocol::Resp2 => f.resp2,
+        Protocol::Resp3 => f.resp3,
+    };
+    let what = |arm: &str| format!("{} {:?} {:?} {:?}: {arm}", f.row, f.argv, proto, f.arm);
+    // (a) the default budget: the pinned reply, and the fixture's arm ran.
+    let served = leg(f, proto, StoreConfig::default().doc_max_reply_bytes);
+    assert!(served.reply == pinned.as_bytes(), "{}: got {}", what("(a)"), head(&served.reply));
+    assert_engaged(f, &served, &what("(a)"));
+    let length = served.reply.len();
+    // (b) a zero budget refuses before any effect.
+    let zero = match f.settlement {
+        Settlement::PerElement => per_element_refusal(&served.reply, 0),
+        Settlement::Charged | Settlement::Fixed(_) | Settlement::FixedThenCharged(_) => {
+            REFUSED.as_bytes().to_vec()
+        }
+    };
+    assert_refused(&leg(f, proto, 0), &zero, &what("(b) budget 0"));
+    // (c) the boundary pair B, B − 1.
+    let boundary = match f.settlement {
+        Settlement::Charged => length,
+        Settlement::Fixed(shape) => {
+            assert!(length <= shape.reply_bytes_max(), "{}: L over M", what("(c)"));
+            shape.reply_bytes_max()
+        }
+        Settlement::FixedThenCharged(shape) => length.max(shape.reply_bytes_max()),
+        Settlement::PerElement => elements(&served.reply).iter().map(|e| e.len()).max().unwrap(),
+    };
+    let at = leg(f, proto, boundary);
+    let at_what = what(&format!("(c) served at B = {boundary}"));
+    assert!(at.reply == served.reply, "{at_what}: got {}", head(&at.reply));
+    assert!(at.after == served.after, "{at_what}: post-state differs from (a)");
+    assert_engaged(f, &at, &at_what);
+    let below = leg(f, proto, boundary - 1);
+    let below_want = match f.settlement {
+        Settlement::PerElement => per_element_refusal(&served.reply, boundary - 1),
+        Settlement::Charged | Settlement::Fixed(_) | Settlement::FixedThenCharged(_) => {
+            REFUSED.as_bytes().to_vec()
+        }
+    };
+    assert_refused(&below, &below_want, &what(&format!("(c) refused at B - 1 = {}", boundary - 1)));
+}
+
+/// ADR-0099 A1's oracle: every `JSON.*` registry row has a fixture, and
+/// each fixture, under RESP2 and RESP3 on a fresh keyspace per leg, is
+/// (a) served its pinned bytes at the default budget with its arm's
+/// witness moving, (b) refused at budget 0 with no state change and no
+/// in-place effect, and (c) served at its class's boundary B and refused
+/// at B − 1. It judges by pinned wire bytes, canonical document bytes,
+/// key existence and `inf_server::limits` only.
+#[test]
+fn every_json_reply_is_charged_and_refused_before_its_effect() {
+    let fixtures = reply_fixtures();
+    let rows: Vec<&str> =
+        inf_wire::COMMANDS.iter().map(|m| m.name).filter(|n| n.starts_with("JSON.")).collect();
+    for fixture in &fixtures {
+        assert!(rows.contains(&fixture.row), "{} is not a registry row", fixture.row);
+        assert_eq!(fixture.argv[0], fixture.row, "a fixture runs its own row");
+        if let Some(dollar) = fixture.dollar {
+            let text = fixture.argv[fixture.path_at];
+            assert_eq!(text.starts_with('$'), dollar, "{} {text}: declared mode", fixture.row);
+        }
+    }
+    for row in &rows {
+        let own: Vec<&Fixture> = fixtures.iter().filter(|f| f.row == *row).collect();
+        assert!(!own.is_empty(), "registry row {row} has no fixture");
+        for fixture in own {
+            for proto in [Protocol::Resp2, Protocol::Resp3] {
+                check_fixture(fixture, proto);
+            }
+        }
+    }
 }

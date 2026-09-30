@@ -17,7 +17,7 @@
 
 use inf_alloc::arena::{Arena, ArenaAddr};
 
-use crate::apply::{ApplyError, ApplyOp, Number, ScalarPatch, number_op};
+use crate::apply::{ApplyError, ApplyOp, Number, ScalarPatch, Unapplied, number_op};
 use crate::build::{BFrame, TapeBuilder};
 use crate::error::DocError;
 use crate::path::{PathProgram, SimpleStep};
@@ -464,7 +464,7 @@ impl ArenaDoc {
         op: &ApplyOp<'_>,
     ) -> Result<ScalarPatch, ApplyError> {
         let Some(steps) = program.simple_steps() else {
-            return Ok(ScalarPatch::Unsupported);
+            return Ok(ScalarPatch::Unsupported(Unapplied::new()));
         };
         let Some((slot, current)) = locate_simple_ref(arena, self.root, steps) else {
             return Ok(ScalarPatch::Missing);
@@ -487,7 +487,7 @@ impl ArenaDoc {
                 if canonical_number_len(current_number) != canonical_number_len(result)
                     || !patch_number_ref(arena, &mut self.root, slot, current, result)
                 {
-                    return Ok(ScalarPatch::Unsupported);
+                    return Ok(ScalarPatch::Unsupported(Unapplied::new()));
                 }
                 Ok(ScalarPatch::Number(result))
             }
@@ -515,7 +515,7 @@ impl ArenaDoc {
             | ApplyOp::ArrInsert { .. }
             | ApplyOp::ArrPop { .. }
             | ApplyOp::ArrTrim { .. }
-            | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported),
+            | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported(Unapplied::new())),
         }
     }
 

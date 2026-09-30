@@ -307,6 +307,13 @@ fn stats_section(
     // ADR-0123 D2: idle closes under `timeout` (cell scope, like the
     // output-cap kills above).
     push(text, &format!("idle_disconnections:{}", node.idle_disconnections.get()));
+    // ADR-0099 A1: JSON replies refused over the reply budget (cell scope).
+    #[cfg(feature = "doc")]
+    {
+        push(text, &format!("json_reply_refusals_cell:{}", node.json_reply_refusals_cell.get()));
+        let refused_bytes = node.json_reply_refused_bytes_cell.get();
+        push(text, &format!("json_reply_refused_bytes_cell:{refused_bytes}"));
+    }
     push(text, "latest_fork_usec:0");
 }
 

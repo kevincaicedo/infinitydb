@@ -706,6 +706,7 @@ impl CellStore {
         .map_err(op_from_apply)?;
         if matches!(verdict, ScalarPatch::Number(_) | ScalarPatch::Toggled(_)) {
             bump_version_in_place(self.arena.bytes_mut(addr, len));
+            self.stats.json_scalar_patches_in_place += 1;
         }
         Ok(Some(verdict))
     }
@@ -876,7 +877,7 @@ impl CellStore {
                         "document delta produced no live mutation",
                     ));
                 }
-                ScalarPatch::Unsupported => {}
+                ScalarPatch::Unsupported(_) => {}
             }
         }
         let view = RecordView::new(self.arena.bytes(addr, len));
@@ -1083,9 +1084,9 @@ impl CellStore {
         self.cfg.doc_max_bytes
     }
 
-    /// Namespace-resolved serialized-reply budget (ADR-0099): the byte
-    /// cap every document-serializing reply is built under; breach
-    /// answers the pinned `ERR reply too large`.
+    /// Namespace-resolved reply budget (ADR-0099 A1): one account for the
+    /// whole RESP reply of a `JSON.*` command; a reply that would cross it
+    /// answers the pinned `ERR reply too large` before the command's effect.
     #[inline]
     pub fn doc_max_reply_bytes(&self) -> usize {
         self.cfg.doc_max_reply_bytes

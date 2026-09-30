@@ -5134,6 +5134,49 @@ fn json_mget_gathers_across_cells() {
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
 }
 
+/// ADR-0099 A1 at the shipped topology and the default budget (128 MiB):
+/// a 133-byte path of four 16-member duplicate unions selects 65,536 raw
+/// matches of one node. Over a 4 KiB string element `ARRPOP` would answer
+/// 65,536 × 4,107 ≈ 269 MB, and over a 400-key object `OBJKEYS` would
+/// answer 65,536 × 4,006 ≈ 262 MB. Both answer the error instead, the pop
+/// does not happen, and the connection keeps serving. The element key is
+/// owned by the accepting cell and the object key by the other one, so
+/// both the local and the forwarded reply paths refuse.
+#[test]
+#[cfg(feature = "doc")]
+fn json_amplified_replies_refuse_at_the_wire() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let (local, remote) = (key_for_cell(2, 0), key_for_cell(2, 1));
+    let union = format!("[{}]", ["0"; 16].join(","));
+    let path = format!("${}", union.repeat(4));
+    assert_eq!(path.len(), 133, "four unions of 16 members");
+    let element = format!("[[[[[\"{}\"]]]]]", "x".repeat(4_096));
+    let keys: Vec<String> = (0..400).map(|i| format!("\"k{i:03}\":0")).collect();
+    let object = format!("[[[[{{{}}}]]]]", keys.join(","));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"JSON.SET", &local, b"$", element.as_bytes()]));
+    pipeline.extend(cmd(&[b"JSON.SET", &remote, b"$", object.as_bytes()]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    let refused = b"-ERR reply too large\r\n";
+    for (key, command) in [(&local, b"JSON.ARRPOP".as_slice()), (&remote, b"JSON.OBJKEYS")] {
+        client.write_all(&cmd(&[command, key, path.as_bytes()])).expect("write");
+        let line = read_line(&mut client);
+        assert!(
+            line == refused,
+            "{} answered {:?}",
+            String::from_utf8_lossy(command),
+            String::from_utf8_lossy(&line[..line.len().min(48)])
+        );
+    }
+    client.write_all(&cmd(&[b"JSON.ARRLEN", &local, b"$[0][0][0][0]"])).expect("write");
+    read_exactly(&mut client, b"*1\r\n:1\r\n");
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    node.stop();
+}
+
 // ---- M4.5-S34: FUA-class frames on pre-zeroed O_DIRECT segments (ADR-0086) ----
 
 /// On a `Direct` node (real `O_DIRECT` + `RWF_DSYNC` through io_uring) a
