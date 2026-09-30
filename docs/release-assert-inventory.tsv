@@ -742,6 +742,7 @@ I	3	crates/inf-store/src/tiered/shadow.rs	expect	slot addresses are 48-bit	shado
 I	1	crates/inf-wire/src/command.rs	assert	command name exceeds MAX_NAME_LEN	evaluated inside `const fn build_table` for `static TABLE`: a violation fails compilation, never runs
 I	1	crates/inf-wire/src/command.rs	assert	perfect-hash collision — re-search the multipliers	evaluated inside `const fn build_table` for `static TABLE`: a violation fails compilation, never runs
 I	2	crates/inf-wire/src/command.rs	expect	8 bytes	`padded` is a fixed `[u8; 16]`; `[..8]`/`[8..]` are 8-byte slices
+I	1	crates/inf-wire/src/limits.rs	assert	the widest double frame is 344 bytes	compile-time const assertion — never executes
 I	2	crates/inf-wire/src/parser.rs	unreachable	mode checked above	`Mode::Done` returned `None` at the top of the same loop iteration, and the mode does not change in between
 I	1	crates/inf-wire/src/writer.rs	expect	chunks_exact(8) yields 8 bytes	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
 I	1	crates/inf-wire/src/writer.rs	expect	Display output is UTF-8	`Display for f64` writes ASCII only

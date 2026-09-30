@@ -567,6 +567,15 @@ pub struct RespWriter<'b>;                  // over &mut Vec<u8> (a wire buffer)
   // (no partial frame can escape), for reply-byte budgets that refuse
   // mid-serialization (`inf-doc`'s `serialize_*_bounded`,
   // `doc-max-reply-bytes`).
+  // `mark` / `rollback` / `buffered_bytes` (ADR-0099 A1): `mark()` returns
+  // a `ReplyMark` (not `Copy`) where one command's reply starts;
+  // `rollback(&mark)` truncates everything written since and keeps earlier
+  // pipelined replies; `buffered_bytes()` is the whole buffer's length. A
+  // whole-reply byte account charges against the mark and rolls back to it
+  // on refusal. `inf_wire::limits` owns the two frame bounds such an
+  // account needs: `PATCHED_HEADER_SLACK_BYTES` (7, how far a patched
+  // bulk's reserved header can shrink) and `DOUBLE_REPLY_BYTES_MAX` (344,
+  // the widest `double` frame).
 
 // Command metadata (frozen schema): name, arity, flags, key spec.
 // EXPIREAT is not in the M0 surface (matches the S15 list); registry is the

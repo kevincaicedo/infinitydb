@@ -25,4 +25,4 @@ pub use parser::{
     ArgvRef, ConnParser, DEFAULT_MAX_BULK_BYTES, FRAME_HEADROOM_BYTES, FrameIter, INLINE_ARGS,
     Parsed, ParserLimits, WireError,
 };
-pub use writer::{Protocol, RespWriter};
+pub use writer::{Protocol, ReplyMark, RespWriter};

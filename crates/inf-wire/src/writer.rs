@@ -23,6 +23,23 @@ pub struct RespWriter<'b> {
     proto: Protocol,
 }
 
+/// Where one command's reply starts in the send buffer (ADR-0099 A1): the
+/// point [`RespWriter::rollback`] truncates back to, so a reply refused
+/// part-way leaves no byte behind while earlier pipelined replies stay.
+/// Only [`RespWriter::mark`] makes one; not `Copy`, so a reply holds its
+/// own mark rather than a loose offset.
+#[derive(Debug)]
+pub struct ReplyMark {
+    offset_bytes: usize,
+}
+
+impl ReplyMark {
+    /// The buffer offset the reply starts at.
+    pub fn offset_bytes(&self) -> usize {
+        self.offset_bytes
+    }
+}
+
 impl<'b> RespWriter<'b> {
     pub fn new(out: &'b mut Vec<u8>, proto: Protocol) -> RespWriter<'b> {
         RespWriter { out, proto }
@@ -30,6 +47,23 @@ impl<'b> RespWriter<'b> {
 
     pub fn protocol(&self) -> Protocol {
         self.proto
+    }
+
+    /// Marks the current end of the buffer as the start of a reply.
+    pub fn mark(&self) -> ReplyMark {
+        ReplyMark { offset_bytes: self.out.len() }
+    }
+
+    /// Discards every byte written since `mark`; bytes before it (earlier
+    /// pipelined replies) are untouched.
+    pub fn rollback(&mut self, mark: &ReplyMark) {
+        debug_assert!(mark.offset_bytes <= self.out.len(), "a mark lies inside its buffer");
+        self.out.truncate(mark.offset_bytes);
+    }
+
+    /// Bytes buffered for the connection, every pending reply included.
+    pub fn buffered_bytes(&self) -> usize {
+        self.out.len()
     }
 
     /// `+OK\r\n`. The text is written as one protocol line — see
@@ -309,7 +343,7 @@ impl<'b> RespWriter<'b> {
 /// Reserved length-header width of a patched bulk: 8 digits cover every
 /// payload under 100 MB — all of them but the near-boundary amplified
 /// replies that take [`widen_patched_header`].
-const PATCHED_DIGITS: usize = 8;
+pub(crate) const PATCHED_DIGITS: usize = 8;
 
 /// The ≥ 100 MB half of the total header patch (ADR-0099 D1): extend by
 /// the extra digit count, shift the payload right once, write the digits
@@ -393,7 +427,7 @@ fn utoa(mut magnitude: u64, negative: bool, buf: &mut [u8; 20]) -> &[u8] {
 /// `1e300` (301 digits) killed the cell — Theme 4's shape: a release
 /// `expect("f64 display fits 40 bytes")` justified by a claim about the
 /// caller that client-supplied numbers falsified.
-const F64_DISPLAY_MAX: usize = 336;
+pub(crate) const F64_DISPLAY_MAX: usize = 336;
 
 /// `fmt::Write` sink for double formatting: a stack buffer sized to the
 /// worst case above, so `format` is total for every `f64`.
@@ -705,6 +739,69 @@ mod tests {
             .expect("infallible builder");
         });
         assert_eq!(out, b"$3\r\nabc\r\n");
+    }
+
+    /// ADR-0099 A1: a mark taken after an earlier pipelined reply rolls a
+    /// whole multi-frame reply back — array header, patched bulk and all —
+    /// and keeps the earlier reply byte-exact; `buffered_bytes` counts the
+    /// whole buffer, earlier replies included.
+    #[test]
+    fn rollback_to_a_mid_buffer_mark_keeps_the_earlier_reply() {
+        let out = render(Protocol::Resp2, |w| {
+            w.simple("OK");
+            let mark = w.mark();
+            assert_eq!(mark.offset_bytes(), 5);
+            w.array_header(2);
+            w.bulk_patched(|out| out.extend_from_slice(b"[1,2]"));
+            w.int(3);
+            assert_eq!(w.buffered_bytes(), 5 + 4 + 11 + 4);
+            w.rollback(&mark);
+            assert_eq!(w.buffered_bytes(), 5);
+            w.error("ERR reply too large");
+        });
+        assert_eq!(out, b"+OK\r\n-ERR reply too large\r\n");
+        // Rolling back to a mark taken at the end removes nothing.
+        let out = render(Protocol::Resp3, |w| {
+            w.null();
+            let mark = w.mark();
+            w.rollback(&mark);
+        });
+        assert_eq!(out, b"_\r\n");
+    }
+
+    /// The rollback covers a patched bulk whose header was patched in
+    /// place (the gap closed) and one whose header was widened past the
+    /// reserve (≥ 10⁸ bytes, the cold path).
+    #[test]
+    fn rollback_removes_a_patched_and_a_widened_bulk() {
+        for payload_len in [3usize, 100_000_000] {
+            let out = render(Protocol::Resp2, |w| {
+                w.int(9);
+                let mark = w.mark();
+                w.bulk_patched(|out| {
+                    let at = out.len();
+                    out.resize(at + payload_len, b'z');
+                });
+                assert!(w.buffered_bytes() > 4 + payload_len, "the frame was written");
+                w.rollback(&mark);
+            });
+            assert_eq!(out, b":9\r\n", "payload {payload_len}");
+        }
+    }
+
+    #[test]
+    fn reply_frame_limits_match_the_writer() {
+        use crate::limits::{DOUBLE_REPLY_BYTES_MAX, PATCHED_HEADER_SLACK_BYTES};
+        let shrunk = render(Protocol::Resp2, |w| w.bulk_patched(|out| out.push(b'x')));
+        let reserved = 1 + PATCHED_DIGITS + 2 + 1 + 2;
+        assert_eq!(reserved - shrunk.len(), PATCHED_HEADER_SLACK_BYTES);
+        let widest = -1.1125369292536007e-308_f64;
+        for proto in [Protocol::Resp2, Protocol::Resp3] {
+            let frame = render(proto, |w| w.double(widest));
+            assert!(frame.len() <= DOUBLE_REPLY_BYTES_MAX, "{proto:?}: {}", frame.len());
+        }
+        assert_eq!(format!("{widest}").len(), 327, "the longest display the sweep found");
+        assert_eq!(render(Protocol::Resp2, |w| w.double(widest)).len(), 1 + 3 + 2 + 327 + 2);
     }
 
     /// SWAR kernel against a scalar oracle, every length across the
