@@ -91,6 +91,24 @@ rows=(
   "inf_canary_json_reply_framing_uncharged crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
   # R5: root `JSON.DEL` deletes before it reserves its reply.
   "inf_canary_json_fixed_unreserved crate-test inf-server test:json_commands every_json_reply_is_charged_and_refused_before_its_effect"
+  # ADR-0008 A1 — one wheel node per key hash; a refused key is swept.
+  # Rule 3 (I1): every changed deadline allocates a node; the old one lingers.
+  "inf_canary_wheel_arm_per_change crate-test inf-store test:expiry one_key_keeps_one_wheel_node_under_every_ttl_rewrite"
+  "inf_canary_wheel_arm_per_change crate-test inf-store test:expiry wheel_matches_reference_model_under_churn"
+  # Rule 3's crossing: a refused placement does not owe the sweep (lazy-only).
+  "inf_canary_wheel_refused_lazy crate-test inf-store test:expiry refused_keys_expire_actively_at_the_node_cap"
+  "inf_canary_wheel_refused_lazy crate-test inf-store test:expiry a_small_node_budget_matches_the_reference_model_under_churn"
+  "inf_canary_wheel_refused_lazy m1-cache RETAINED --wheel-nodes-max 64"
+  # Rule 4: removal skips the group enumeration (a hash taken for a key).
+  "inf_canary_wheel_release_by_hash crate-test inf-store test:expiry a_colliding_hash_keeps_its_node_when_its_twin_dies"
+  # Rule 5 and I10: a fire reaps only its first expired member and files
+  # its answer unclamped — into the slot being drained.
+  "inf_canary_wheel_refile_at_or_before_now crate-test inf-store test:expiry colliding_keys_with_one_deadline_both_expire_actively"
+  # Rule 6 (I11): only the sweep's own refusals keep a pass from idling.
+  "inf_canary_sweep_owed_by_own_refusals crate-test inf-store test:expiry a_write_refused_behind_the_sweep_cursor_is_reaped"
+  # ADR-0139 D9 through the schedule: a walk that never reports `Over`
+  # leaves a ninth alias unscheduled and unswept.
+  "inf_canary_walk_unbounded crate-test inf-store test:expiry a_ttl_alias_group_of_nine_owes_the_sweep"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

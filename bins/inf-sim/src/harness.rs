@@ -65,7 +65,7 @@ use inf_server::{
 };
 use inf_store::{
     ExpireCond, ExpiryBudget, FIRST_NAMED_NS_ID, KeyHasher, Keyspace, NsId, NsMode, NsSpec,
-    SetOptions, StoreConfig,
+    SetOptions, StoreConfig, WheelNodesMax,
 };
 use inf_wire::{CommandId, Protocol, lookup};
 
@@ -167,6 +167,11 @@ pub struct Scenario {
     /// silent. Under `timeout_secs` every plain one must be closed by the
     /// server at its deadline and every subscriber must survive it.
     pub idle_clients: usize,
+    /// Wheel nodes each store may hold (`--wheel-nodes-max`; `None` = the
+    /// width bound). A small budget refuses placements, so records are
+    /// swept instead of scheduled (ADR-0008 A1): the run must see both a
+    /// refusal and a sweep reap, or it is `VACUOUS`.
+    pub wheel_nodes_max: Option<WheelNodesMax>,
 }
 
 /// Model-side plants for the content oracle's canary tests (F-L19-06's
@@ -212,6 +217,7 @@ impl Scenario {
             maxclients: 0,
             timeout_secs: 0,
             idle_clients: 0,
+            wheel_nodes_max: None,
         }
     }
 
@@ -246,6 +252,7 @@ impl Scenario {
             maxclients: 0,
             timeout_secs: 0,
             idle_clients: 0,
+            wheel_nodes_max: None,
         }
     }
 
@@ -280,6 +287,7 @@ impl Scenario {
             maxclients: 0,
             timeout_secs: 0,
             idle_clients: 0,
+            wheel_nodes_max: None,
         }
     }
 
@@ -315,6 +323,7 @@ impl Scenario {
             maxclients: 0,
             timeout_secs: 0,
             idle_clients: 0,
+            wheel_nodes_max: None,
         }
     }
 
@@ -347,6 +356,7 @@ impl Scenario {
             maxclients: 45,
             timeout_secs: 1,
             idle_clients: 4,
+            wheel_nodes_max: None,
         }
     }
 
@@ -373,6 +383,7 @@ impl Scenario {
             maxclients: 0,
             timeout_secs: 0,
             idle_clients: 0,
+            wheel_nodes_max: None,
         }
     }
 }
@@ -1304,8 +1315,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         // defaulted filesystem parameter (M2-S19).
         // Surface scenarios seed their memory namespaces into every cell
         // before it serves — the catalog seed a durable node's boot performs.
-        let mut keyspace =
-            Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
+        let mut keyspace = Keyspace::new(StoreConfig {
+            hasher: node_hasher(scenario.seed),
+            wheel_nodes_max: scenario.wheel_nodes_max.unwrap_or_default(),
+            ..Default::default()
+        });
         seed_namespaces(&mut keyspace, scenario.namespaces);
         let plane = ServerPlane::<_, inf_server::StdSegmentFs>::new(
             CellId(i as u16),
@@ -1805,7 +1819,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let mut node_live = 0u64;
         for (i, (_, plane)) in cells.iter().enumerate() {
             plane.drain_expiry(final_now);
-            node_live += plane.keyspace_report().live_records;
+            let live = plane.keyspace_report().live_records;
+            node_live += live;
+            violations.extend(audit::expired_retained(i, live, plane, final_now));
             let (channels, patterns, bytes) = plane.pubsub_gauges();
             if channels != 0 || patterns != 0 || bytes != 0 {
                 violations.push(format!(
@@ -1820,17 +1836,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                 ));
             }
         }
+        violations.extend(audit::small_cap_engagement(scenario, &cells));
         {
             let mut oracle = oracle.0.borrow_mut();
-            loop {
-                let stats = oracle.model.expire_tick(
-                    final_now,
-                    ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX },
-                );
-                if stats.reaped == 0 && stats.stale == 0 {
-                    break;
-                }
-            }
+            audit::drain_model_expiry(&mut oracle.model, final_now);
             let model_live = oracle.model.report().live_records;
             if node_live != model_live {
                 violations.push(format!(

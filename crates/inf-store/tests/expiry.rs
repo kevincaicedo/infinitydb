@@ -17,9 +17,11 @@
 use std::collections::HashMap;
 
 use inf_foundation::time::Nanos;
+use inf_store::limits::{EXPIRY_SWEEP_SLOTS_PER_SLICE, WHEEL_TOMBSTONES_MAX};
 use inf_store::{
-    CellStore, EvictionPolicy, ExpireCond, ExpiryBudget, Keyspace, NsId, NsMode, NsSpec, SetExpire,
-    SetOptions, StoreConfig,
+    COLLISION_KEY_PREFIX, CellStore, EvictionPolicy, ExpireCond, ExpiryAudit, ExpiryBudget,
+    Keyspace, MAX_EXPIRE_MS, NsId, NsMode, NsSpec, SetExpire, SetOptions, StoreConfig, TtlUpdate,
+    WheelNodesMax,
 };
 
 fn ms(v: u64) -> Nanos {
@@ -50,15 +52,46 @@ impl VirtualClock {
     }
 }
 
-/// Tick until the wheel catches up to `now`; returns total reaped.
+/// Tick until the wheel catches up to `now` and the sweep settles;
+/// returns total reaped (wheel fires and sweep visits).
 fn drain(store: &mut CellStore, now: Nanos) -> u64 {
     let mut reaped = 0;
     loop {
-        let stats = store.expire_tick(now, ExpiryBudget { max_fires: 1024, max_steps: 1 << 20 });
-        reaped += stats.reaped;
-        if stats.lag_ms == 0 {
+        let stats = store.expire_tick(
+            now,
+            ExpiryBudget { max_fires: 1024, max_steps: 1 << 20, max_sweep_slots: 1 << 20 },
+        );
+        reaped += stats.reaped + stats.swept;
+        if stats.lag_ms == 0 && store.expiry_settled(now) {
             return reaped;
         }
+    }
+}
+
+/// Slices one frozen-time drain may take before it counts as stuck: an
+/// unbounded slice catches the wheel up and ends at most one sweep pass,
+/// and settling needs at most three.
+const DRAIN_SLICES_MAX: usize = 64;
+
+/// ADR-0008 A1 O3's drain at the store tier: time frozen at `now`, every
+/// budget unbounded, until the wheel has caught up and the sweep is idle
+/// or completed a pass that began at `now`. Returns the records reaped.
+fn drain_settled(store: &mut CellStore, now: Nanos) -> u64 {
+    let mut reaped = 0;
+    for _ in 0..DRAIN_SLICES_MAX {
+        let stats = store.expire_tick(now, ExpiryBudget::UNBOUNDED);
+        reaped += stats.reaped + stats.swept;
+        if store.expiry_settled(now) {
+            return reaped;
+        }
+    }
+    panic!("the expiry drain never settled at {now:?}");
+}
+
+fn small_cap(nodes: usize) -> StoreConfig {
+    StoreConfig {
+        wheel_nodes_max: WheelNodesMax::new(nodes).expect("under the width bound"),
+        ..StoreConfig::default()
     }
 }
 
@@ -93,13 +126,27 @@ fn active_wheel_reaps_without_any_reads() {
     assert_eq!(stats.ttl_live, 0);
 }
 
-#[test]
-fn wheel_matches_reference_model_under_churn() {
-    let ops: usize = if cfg!(miri) { 2_000 } else { 60_000 };
-    let mut store = CellStore::new(StoreConfig::default());
+/// I7 at one quiescent point: when the sweep owes nothing, every record
+/// with a deadline has a node. Returns whether the check ran (the sweep
+/// was idle) over at least one record with a deadline — the engagement
+/// a caller counts.
+fn assert_scheduled_when_idle(audit: &ExpiryAudit, at: &str) -> bool {
+    assert_eq!(audit.unscheduled, 0, "{at}: records with a deadline and no node, sweep idle");
+    audit.sweep_idle && audit.ttl_live > 0
+}
+
+/// The reference model under churn (ADR-0008 A1 O2): a `HashMap` key →
+/// deadline, independent of the store, driven through every deadline
+/// transition — set, clear, extend, shorten, persist, delete-then-set —
+/// with budgeted slices between. After every op the wheel holds no more
+/// live nodes than records with a deadline, and I7 holds whenever the
+/// sweep is idle; after a drain with no reads, the store's `len()` (the
+/// index's live count — it reads no record, so it reaps nothing) equals
+/// the model's live count.
+fn churn_against_model(cfg: StoreConfig, ops: usize, mut x: u64) {
+    let mut store = CellStore::new(cfg);
     // key → deadline_ms (None = no TTL)
     let mut model: HashMap<Vec<u8>, Option<u64>> = HashMap::new();
-    let mut x: u64 = 0xD15E_A5ED_C0FF_EE00;
     let mut rand = move || {
         x ^= x << 13;
         x ^= x >> 7;
@@ -107,52 +154,103 @@ fn wheel_matches_reference_model_under_churn() {
         x
     };
     let mut now_ms: u64 = 10;
+    let mut idle_checks = 0u64;
     for op in 0..ops {
         now_ms += rand() % 20;
         let now = ms(now_ms);
         // Purge the model of expired entries before mutating against it
-        // (alive through the deadline millisecond — F-L05-05).
+        // (alive through the deadline millisecond).
         model.retain(|_, deadline| deadline.is_none_or(|d| d >= now_ms));
         let key = format!("key:{}", rand() % 256).into_bytes();
-        match rand() % 5 {
-            0 => {
-                store.set(&key, b"v", SetOptions::default(), now).expect("set");
-                model.insert(key, None);
-            }
-            1 => {
-                let deadline = now_ms + 1 + rand() % 5_000;
-                set_with_ttl(&mut store, &key, deadline, now);
-                model.insert(key, Some(deadline));
-            }
-            2 => {
-                let got = store.del(&key, now);
-                let want = model.remove(&key).is_some();
-                assert_eq!(got, want, "op {op}: DEL disagreed");
-            }
-            3 => {
-                let deadline = now_ms + 1 + rand() % 2_000;
-                let got = store.expire(&key, Some(ms(deadline)), ExpireCond::Always, now);
-                let want = model.contains_key(&key);
-                assert_eq!(got, want, "op {op}: EXPIRE disagreed");
-                if want {
-                    model.insert(key, Some(deadline));
-                }
-            }
-            _ => {
-                // A budget-bounded slice at a random moment.
-                store.expire_tick(now, ExpiryBudget { max_fires: 32, max_steps: 512 });
-            }
-        }
+        churn_op(&mut store, &mut model, &key, rand(), rand(), now, op);
+        let (armed, ttl_live) = (store.wheel_armed(), store.stats().ttl_live);
+        assert!(armed <= ttl_live, "op {op}: armed {armed} > ttl_live {ttl_live}");
+        let audit = store.expiry_audit();
+        idle_checks += u64::from(assert_scheduled_when_idle(&audit, &format!("op {op}")));
     }
+    assert!(idle_checks > 0, "engagement: I7 never checked with the sweep idle");
     // Catch up fully: visible state must equal the model exactly.
     now_ms += 1;
-    drain(&mut store, ms(now_ms));
+    drain_settled(&mut store, ms(now_ms));
+    assert_scheduled_when_idle(&store.expiry_audit(), "after the drain");
     model.retain(|_, deadline| deadline.is_none_or(|d| d >= now_ms));
-    assert_eq!(store.len(), model.len(), "live census after catch-up");
+    assert_eq!(store.len(), model.len(), "live census after the drain, before any read");
     let final_now = ms(now_ms);
     for (key, _) in model {
         assert!(store.get(&key, final_now).is_some(), "model key missing: {key:?}");
     }
+}
+
+fn churn_op(
+    store: &mut CellStore,
+    model: &mut HashMap<Vec<u8>, Option<u64>>,
+    key: &[u8],
+    pick: u64,
+    roll: u64,
+    now: Nanos,
+    op: usize,
+) {
+    let now_ms = now.0 / 1_000_000;
+    match pick % 9 {
+        0 => {
+            store.set(key, b"v", SetOptions::default(), now).expect("set");
+            model.insert(key.to_vec(), None);
+        }
+        1 => {
+            let deadline = now_ms + 1 + roll % 5_000;
+            set_with_ttl(store, key, deadline, now);
+            model.insert(key.to_vec(), Some(deadline));
+        }
+        2 => {
+            let got = store.del(key, now);
+            assert_eq!(got, model.remove(key).is_some(), "op {op}: DEL disagreed");
+        }
+        3 | 7 => {
+            // 3 extends or moves a deadline; 7 shortens it hard.
+            let span = if pick % 9 == 3 { 2_000 } else { 50 };
+            let deadline = now_ms + 1 + roll % span;
+            let got = store.expire(key, Some(ms(deadline)), ExpireCond::Always, now);
+            let want = model.contains_key(key);
+            assert_eq!(got, want, "op {op}: EXPIRE disagreed");
+            if want {
+                model.insert(key.to_vec(), Some(deadline));
+            }
+        }
+        5 => {
+            let got = store.expire(key, None, ExpireCond::Always, now);
+            let want = matches!(model.get(key), Some(Some(_)));
+            assert_eq!(got, want, "op {op}: PERSIST disagreed");
+            if want {
+                model.insert(key.to_vec(), None);
+            }
+        }
+        6 => {
+            store.del(key, now);
+            let deadline = now_ms + 1 + roll % 3_000;
+            set_with_ttl(store, key, deadline, now);
+            model.insert(key.to_vec(), Some(deadline));
+        }
+        _ => {
+            // A budget-bounded slice at a random moment.
+            let budget = ExpiryBudget { max_fires: 32, max_steps: 512, max_sweep_slots: 64 };
+            store.expire_tick(now, budget);
+        }
+    }
+}
+
+#[test]
+fn wheel_matches_reference_model_under_churn() {
+    let ops: usize = if cfg!(miri) { 2_000 } else { 60_000 };
+    churn_against_model(StoreConfig::default(), ops, 0xD15E_A5ED_C0FF_EE00);
+}
+
+/// O2's small-cap run: at 16 nodes most placements are refused, so most
+/// records with a deadline are swept rather than scheduled — the drain
+/// must still leave none past its deadline.
+#[test]
+fn a_small_node_budget_matches_the_reference_model_under_churn() {
+    let ops: usize = if cfg!(miri) { 2_000 } else { 30_000 };
+    churn_against_model(small_cap(16), ops, 0x5EED_0CA9_0016);
 }
 
 #[test]
@@ -174,7 +272,7 @@ fn same_second_storm_drains_in_bounded_slices() {
     loop {
         let stats = store.expire_tick(after, budget);
         assert!(
-            stats.reaped + stats.stale <= u64::from(budget.max_fires),
+            stats.reaped + stats.stale + stats.refiled + stats.swept <= u64::from(budget.max_fires),
             "slice exceeded its fire budget"
         );
         total += stats.reaped;
@@ -275,27 +373,41 @@ fn dst_virtual_time_48h_campaign() {
     );
 }
 
+/// M1-S04 AC 1 as ADR-0008 A1 restates it: one 16 B node per key hash
+/// with a deadline plus one 4 B membership entry at a load in
+/// (7/16, 7/8] — at most 26 B per scheduled key — with the node pool's
+/// capacity within 2× its peak under growth. Attribution-verified: the
+/// resident (`wheel_bytes`) and in-use (`wheel_live_bytes`) domains are
+/// read back and split into nodes, pool slack and membership.
 #[test]
-fn wheel_memory_stays_within_sixteen_bytes_per_ttl_key() {
+fn wheel_memory_is_one_node_and_one_membership_entry_per_ttl_key() {
     let keys: u64 = if cfg!(miri) { 500 } else { 100_000 };
     let mut store = CellStore::new(StoreConfig::default());
     let t0 = ms(1);
-    let baseline = store.report().wheel_bytes;
+    let empty = store.report();
+    assert_eq!(empty.wheel_bytes, empty.wheel_live_bytes, "no pool before the first node");
     for i in 0..keys {
         let key = format!("ttl:{i}");
         set_with_ttl(&mut store, key.as_bytes(), 1_000_000 + i, t0);
     }
     let report = store.report();
-    // 16 B/entry exactly, plus Vec growth slack (< 2×) and the fixed slot
-    // table — the M1-S04 attribution AC shape at dev tier.
-    let pool = report.wheel_bytes - baseline;
-    assert!(pool >= keys * 16, "pool under-reports: {pool}");
-    assert!(pool <= keys * 16 * 2, "wheel pool exceeds 16 B/key + growth slack: {pool}");
+    let audit = store.expiry_audit();
+    assert_eq!(audit.armed, keys, "one live node per key");
+    let nodes = keys * 16;
+    let membership = report.wheel_live_bytes - empty.wheel_live_bytes - nodes;
+    let pool_slack = report.wheel_bytes - report.wheel_live_bytes;
+    assert!(membership <= keys * 10, "membership {membership} B for {keys} keys");
+    assert!(report.wheel_live_bytes - empty.wheel_live_bytes <= keys * 26, "over 26 B per key");
+    assert!(
+        nodes + pool_slack <= 2 * nodes,
+        "pool capacity over 2× its peak: {pool_slack} B slack"
+    );
 }
 
 // ---- F-L05-03 (review 2026-08-30, batch 57): the expiry slice rotates ----
 
-const SLICE: ExpiryBudget = ExpiryBudget { max_fires: 64, max_steps: 4096 };
+const SLICE: ExpiryBudget =
+    ExpiryBudget { max_fires: 64, max_steps: 4096, max_sweep_slots: EXPIRY_SWEEP_SLOTS_PER_SLICE };
 
 fn set_ttl_in(store: &mut CellStore, prefix: &str, n: u32, deadline_ms: u64) {
     for i in 0..n {
@@ -397,7 +509,7 @@ fn the_deadline_millisecond_still_serves_the_key() {
 fn active_expiry_fires_at_the_first_expired_millisecond() {
     let mut store = CellStore::new(StoreConfig::default());
     set_with_ttl(&mut store, b"k", 100, ms(1));
-    let budget = ExpiryBudget { max_fires: 1024, max_steps: 1 << 20 };
+    let budget = ExpiryBudget { max_fires: 1024, max_steps: 1 << 20, max_sweep_slots: 1 << 20 };
     let at_deadline = store.expire_tick(ms(100), budget);
     assert_eq!(at_deadline.reaped, 0, "not reaped at the deadline ms");
     assert_eq!(at_deadline.stale, 0, "and not dropped as stale either");
@@ -407,4 +519,360 @@ fn active_expiry_fires_at_the_first_expired_millisecond() {
     assert_eq!(after.stale, 0);
     assert_eq!(store.len(), 0);
     assert_eq!(store.stats().expired_active, 1, "active, not lazy");
+}
+
+// ---- ADR-0008 A1: one wheel node per key hash; a refused key is swept ----
+
+/// One hostile sequence on one or two keys (ADR-0008 A1's adversarial
+/// list): `step(store, i, now)` runs the sequence's `i`-th touch.
+struct HostileLeg {
+    name: &'static str,
+    keys: u64,
+    step: fn(&mut CellStore, u64, Nanos),
+}
+
+const LEG_TOUCHES: u64 = 1_000;
+
+fn set_plain(store: &mut CellStore, key: &[u8], now: Nanos) {
+    store.set(key, b"v", SetOptions::default(), now).expect("set");
+}
+
+fn expire_at(store: &mut CellStore, key: &[u8], deadline_ms: u64, now: Nanos) {
+    assert!(store.expire(key, Some(ms(deadline_ms)), ExpireCond::Always, now), "expire applied");
+}
+
+fn persist(store: &mut CellStore, key: &[u8], now: Nanos) {
+    assert!(store.expire(key, None, ExpireCond::Always, now), "persist applied");
+}
+
+/// The legs' drain instant: past the largest deadline a record can carry.
+const LEGS_DRAIN_MS: u64 = MAX_EXPIRE_MS + 1;
+
+fn hostile_legs() -> [HostileLeg; 12] {
+    [
+        HostileLeg {
+            name: "EXPIRE extend",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"k", now);
+                }
+                expire_at(s, b"k", 10_000 + i, now);
+            },
+        },
+        HostileLeg {
+            name: "SET EX extend",
+            keys: 1,
+            step: |s, i, now| set_with_ttl(s, b"k", 10_000 + i, now),
+        },
+        HostileLeg {
+            name: "GETEX EX extend",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"k", now);
+                }
+                assert!(s.get_ex(b"k", TtlUpdate::At(ms(10_000 + i)), now).is_some());
+            },
+        },
+        HostileLeg {
+            name: "SET then EXPIRE",
+            keys: 1,
+            step: |s, i, now| {
+                set_plain(s, b"k", now);
+                expire_at(s, b"k", 10_000 + i, now);
+            },
+        },
+        HostileLeg {
+            name: "PERSIST then EXPIRE",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_with_ttl(s, b"k", 10_000, now);
+                }
+                assert!(s.expire(b"k", None, ExpireCond::Always, now), "persist applied");
+                expire_at(s, b"k", 10_000 + i, now);
+            },
+        },
+        HostileLeg {
+            name: "DEL then SET EX",
+            keys: 1,
+            step: |s, i, now| {
+                s.del(b"k", now);
+                set_with_ttl(s, b"k", 10_000 + i, now);
+            },
+        },
+        HostileLeg {
+            name: "RENAME ping-pong",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_with_ttl(s, b"a", 10_000, now);
+                }
+                assert!(s.rename(b"a", b"b", now).expect("rename"));
+                assert!(s.rename(b"b", b"a", now).expect("rename"));
+            },
+        },
+        HostileLeg {
+            name: "COPY REPLACE",
+            keys: 2,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"a", now);
+                }
+                expire_at(s, b"a", 10_000 + i, now);
+                s.copy(b"a", b"b", true, now).expect("copy");
+            },
+        },
+        HostileLeg {
+            name: "replay SET then EXPIREAT",
+            keys: 1,
+            step: |s, i, now| {
+                s.replay_set(b"k", b"v", now).expect("replay set");
+                s.replay_expire_at(b"k", ms(10_000 + i), now);
+            },
+        },
+        HostileLeg {
+            name: "strictly decreasing PEXPIREAT",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"k", now);
+                }
+                expire_at(s, b"k", 10_000_000 - i * 1_000, now);
+            },
+        },
+        // The integer maximum files on the overflow list: each touch clears
+        // the previous near deadline from its tier slot, files there, and
+        // moves out to a near deadline (a successor copy or an overflow
+        // tombstone).
+        HostileLeg {
+            name: "PERSIST, then PEXPIREAT max, then near",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"k", now);
+                } else {
+                    persist(s, b"k", now);
+                }
+                expire_at(s, b"k", MAX_EXPIRE_MS, now);
+                expire_at(s, b"k", 10_000 + i, now);
+            },
+        },
+        // Filed on the overflow list and cleared there: an overflow
+        // tombstone each touch, kept at the list's tail.
+        HostileLeg {
+            name: "PEXPIREAT max, then PERSIST",
+            keys: 1,
+            step: |s, i, now| {
+                if i == 0 {
+                    set_plain(s, b"k", now);
+                }
+                expire_at(s, b"k", MAX_EXPIRE_MS, now);
+                persist(s, b"k", now);
+                if i + 1 == LEG_TOUCHES {
+                    expire_at(s, b"k", MAX_EXPIRE_MS, now);
+                }
+            },
+        },
+    ]
+}
+
+/// O1 on every hostile leg: however a key's deadline is rewritten, the
+/// wheel holds one live node per key (`armed ≤ keys`, `armed ≤
+/// ttl_live`), tombstones stay within `WHEEL_TOMBSTONES_MAX`, no
+/// membership entry is orphaned, the idle sweep leaves no record with a
+/// deadline unscheduled (I7) and no node late (I4), every fire finds a
+/// member (`wheel_stale == 0`), and once the wheel passes the largest
+/// deadline no node or tombstone is left.
+#[test]
+fn one_key_keeps_one_wheel_node_under_every_ttl_rewrite() {
+    for leg in hostile_legs() {
+        let mut store = CellStore::new(StoreConfig::default());
+        let now = ms(1);
+        for i in 0..LEG_TOUCHES {
+            (leg.step)(&mut store, i, now);
+            let tombstones = store.expiry_audit().tombstones;
+            assert!(tombstones <= WHEEL_TOMBSTONES_MAX, "{}: {tombstones} tombstones", leg.name);
+        }
+        let audit = store.expiry_audit();
+        let name = leg.name;
+        assert!(
+            audit.armed <= audit.ttl_live,
+            "{name}: armed {} > ttl_live {}",
+            audit.armed,
+            audit.ttl_live
+        );
+        assert!(audit.armed <= leg.keys, "{name}: armed {} for {} keys", audit.armed, leg.keys);
+        assert_eq!(audit.orphans, 0, "{name}: orphaned membership entries");
+        assert!(
+            assert_scheduled_when_idle(&audit, name),
+            "{name}: engagement: the sweep owes nothing with a deadline live"
+        );
+        assert_eq!(audit.late, 0, "{name}: a node filed after its group's deadline");
+        drain_settled(&mut store, ms(LEGS_DRAIN_MS));
+        let audit = store.expiry_audit();
+        assert_eq!(store.len(), 0, "{name}: a key outlived its deadline");
+        assert_eq!(audit.armed, 0, "{name}: nodes left after every deadline passed");
+        assert_eq!(audit.tombstones, 0, "{name}: tombstones left past the leg's last instant");
+        assert_eq!(store.stats().wheel_stale, 0, "{name}: a fire found no member");
+    }
+}
+
+/// Rule 3's crossing at the node budget: a refused placement is swept,
+/// never left to lazy expiry. `wheel_nodes_max` 64 with 0, 1, cap − 1,
+/// cap, cap + 1 and 200 keys, drained with `expire_tick` alone (no read).
+#[test]
+fn refused_keys_expire_actively_at_the_node_cap() {
+    for keys in [0u64, 1, 63, 64, 65, 200] {
+        let mut store = CellStore::new(small_cap(64));
+        for i in 0..keys {
+            set_with_ttl(&mut store, format!("cap:{i}").as_bytes(), 2 + i % 100, ms(1));
+        }
+        let refused = keys.saturating_sub(64);
+        assert_eq!(store.stats().wheel_fallback, refused, "{keys} keys: refusals");
+        // I7's crossing: a refusal leaves the sweep owed, never idle.
+        let audit = store.expiry_audit();
+        assert_eq!(
+            audit.sweep_idle,
+            refused == 0,
+            "{keys} keys: the sweep owed exactly on refusal"
+        );
+        assert_scheduled_when_idle(&audit, &format!("{keys} keys"));
+        drain_settled(&mut store, ms(200));
+        let stats = store.stats();
+        assert_eq!(store.len(), 0, "{keys} keys: {} refused keys retained", store.len());
+        assert_eq!(stats.expired_active, keys, "{keys} keys: reaped actively");
+        assert_eq!(stats.expired_lazy, 0, "{keys} keys: no read ever ran");
+        assert_eq!(stats.expired_swept > 0, refused > 0, "{keys} keys: the sweep reaped");
+    }
+}
+
+/// One member of the alias group `tag` under the suite's collision-oracle
+/// hasher: the 32-byte hashed head is a function of `tag` alone.
+fn alias_key(tag: u64, member: u8) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out[..16].copy_from_slice(COLLISION_KEY_PREFIX);
+    out[16..24].copy_from_slice(&tag.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    out[24..32].copy_from_slice(&tag.to_le_bytes());
+    out[32..].copy_from_slice(&[member; 16]);
+    out
+}
+
+/// Rule 4: a node is a fact about its key *hash*, so a colliding twin's
+/// death must ask the group before removing it. `b` keeps the node, which
+/// fires early at `a`'s instant, re-files at `b`'s, and reaps `b` there.
+#[test]
+fn a_colliding_hash_keeps_its_node_when_its_twin_dies() {
+    let (a, b) = (alias_key(7, 0), alias_key(7, 1));
+    let mut store = CellStore::new(StoreConfig::default());
+    set_with_ttl(&mut store, &a, 100, ms(1));
+    set_with_ttl(&mut store, &b, 200, ms(1));
+    assert!(store.del(&a, ms(1)));
+    let audit = store.expiry_audit();
+    assert!(assert_scheduled_when_idle(&audit, "after a's DEL"), "b keeps the node, sweep idle");
+    drain_settled(&mut store, ms(150));
+    assert_eq!(store.len(), 1, "b is live until its own deadline");
+    drain_settled(&mut store, ms(250));
+    assert_eq!(store.len(), 0, "b expired without a read");
+    let audit = store.expiry_audit();
+    assert_eq!(audit.armed, 0);
+    assert_eq!(audit.orphans, 0);
+    assert_eq!(store.stats().expired_lazy, 0);
+}
+
+/// Rule 5 and I10: one node schedules two colliding keys with the same
+/// `PXAT`; its fire must reap both and must never file anything into the
+/// tier-0 slot it is draining (a node filed there is lost, and the second
+/// key is left to lazy expiry).
+#[test]
+fn colliding_keys_with_one_deadline_both_expire_actively() {
+    let (a, b) = (alias_key(9, 0), alias_key(9, 1));
+    let mut store = CellStore::new(StoreConfig::default());
+    set_with_ttl(&mut store, &a, 300, ms(1));
+    set_with_ttl(&mut store, &b, 300, ms(1));
+    drain_settled(&mut store, ms(305));
+    let audit = store.expiry_audit();
+    assert_eq!(store.len(), 0, "both colliding keys expired without a read");
+    assert_eq!(audit.armed, 0);
+    assert_eq!(audit.tombstones, 0);
+    assert_eq!(audit.orphans, 0, "no membership entry outlived its node");
+}
+
+/// Rule 4's `Over` crossing: a group of nine with deadlines exceeds
+/// `IDX_ALIAS_GROUP_MAX`, so the death of a tenth cannot answer "does
+/// another member keep the node" — the node is removed and the sweep
+/// owed, never left to lazy expiry.
+#[test]
+fn a_ttl_alias_group_of_nine_owes_the_sweep() {
+    let mut store = CellStore::new(StoreConfig::default());
+    for member in 0..10u8 {
+        set_with_ttl(&mut store, &alias_key(11, member), 400, ms(1));
+    }
+    assert!(store.del(&alias_key(11, 0), ms(1)));
+    assert!(store.stats().expiry_alias_over >= 1, "the walk over nine members is Over");
+    drain_settled(&mut store, ms(500));
+    let stats = store.stats();
+    assert_eq!(store.len(), 0, "every member expired without a read");
+    assert!(stats.expired_swept > 0, "the sweep reaped the group");
+    assert_eq!(stats.expired_lazy, 0);
+}
+
+/// Rule 6's pass-scoped idle rule (I11): a write refused while a pass is
+/// under way may land behind the cursor, so it must keep that pass from
+/// going idle — not only the sweep's own refusals. Setup: 16 far keys
+/// fill the pool, 32 refused keys expire before the pass visits them (so
+/// the sweep refuses nothing of its own), the pass stops mid-table, and
+/// 64 refused writes follow.
+#[test]
+fn a_write_refused_behind_the_sweep_cursor_is_reaped() {
+    let cfg = StoreConfig { initial_keys: 1_024, ..small_cap(16) };
+    let mut store = CellStore::new(cfg);
+    for i in 0..16 {
+        set_with_ttl(&mut store, format!("far:{i}").as_bytes(), 1_000_000, ms(0));
+    }
+    for i in 0..32 {
+        set_with_ttl(&mut store, format!("wave:{i}").as_bytes(), 1, ms(0));
+    }
+    let capacity = store.index_capacity();
+    let slice = ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX, max_sweep_slots: 16 };
+    let (begin, cursor) = (0..capacity)
+        .find_map(|_| {
+            store.expire_tick(ms(2), slice);
+            let (begin, cursor) = store.sweep_pass_slots()?;
+            let walked = cursor.wrapping_sub(begin) % capacity;
+            (walked >= capacity / 2).then_some((begin, cursor))
+        })
+        .expect("a sweep pass is under way and reaches mid-table");
+    let walked = cursor.wrapping_sub(begin) % capacity;
+    let mut behind = 0;
+    for i in 0..64 {
+        let key = format!("late:{i}");
+        set_with_ttl(&mut store, key.as_bytes(), 10, ms(2));
+        let slot = store.key_index_slot(key.as_bytes()).expect("slotted");
+        behind += u32::from(slot.wrapping_sub(begin) % capacity < walked);
+    }
+    assert!(behind > 0, "engagement: no refused write landed behind the cursor");
+    drain_settled(&mut store, ms(20));
+    assert_scheduled_when_idle(&store.expiry_audit(), "after the drain");
+    assert_eq!(store.len(), 16, "{} expired writes outlived the drain", store.len() - 16);
+}
+
+/// A deadline behind an advanced wheel cursor (a writer whose clock reads
+/// earlier than the last slice's) files at the cursor, so the next slice
+/// reaps it — not a wheel revolution later, and never lazy-only.
+#[test]
+fn a_deadline_behind_the_wheel_cursor_is_reaped_by_the_next_slice() {
+    let mut store = CellStore::new(StoreConfig::default());
+    store.set(b"anchor", b"v", SetOptions::default(), ms(1)).expect("set");
+    drain_settled(&mut store, ms(5_000));
+    for (key, deadline_ms) in [(&b"a"[..], 4_900u64), (b"b", 5_000), (b"c", 4_999)] {
+        set_with_ttl(&mut store, key, deadline_ms, ms(4_800));
+    }
+    let audit = store.expiry_audit();
+    assert!(assert_scheduled_when_idle(&audit, "behind the cursor"), "placed, not swept");
+    let next = store.expire_tick(ms(5_001), ExpiryBudget::UNBOUNDED);
+    assert_eq!(next.reaped, 3, "reaped by the next slice");
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.stats().expired_lazy, 0);
 }

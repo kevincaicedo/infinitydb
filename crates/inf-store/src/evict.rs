@@ -289,8 +289,8 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
     // bounds the work). Sampled policies (LFU/TTL/random) examine
     // `samples` candidates per Redis `maxmemory-samples`.
     let sample_cap = if clock { usize::MAX } else { samples.max(1) as usize };
-    // Best victim so far: (score, addr, key_hash, encoded_len, had_ttl).
-    let mut best: Option<(u64, inf_alloc::ArenaAddr, Option<u64>, usize, bool)> = None;
+    // Best victim so far: (score, addr, key_hash, encoded_len).
+    let mut best: Option<(u64, inf_alloc::ArenaAddr, Option<u64>, usize)> = None;
     let mut seen = 0usize;
     let mut found_zero = false;
     let mut expired: Vec<(u64, inf_alloc::ArenaAddr, usize)> = Vec::new();
@@ -334,9 +334,8 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
                     }
                 }
                 let len = view.encoded_len();
-                let had_ttl = deadline.is_some();
                 if best.is_none_or(|(s, ..)| score < s) {
-                    best = Some((score, addr, hash, len, had_ttl));
+                    best = Some((score, addr, hash, len));
                 }
             });
         }
@@ -357,10 +356,10 @@ pub(crate) fn evict_one(store: &mut CellStore, samples: u32, now: Nanos) -> Evic
         store.reap_expired_at(hash, addr, len);
         stats.freed_bytes += len as u64;
     }
-    if let Some((_, addr, hash, len, had_ttl)) = best {
+    if let Some((_, addr, hash, len)) = best {
         let hash = hash
             .unwrap_or_else(|| store.hash_key(crate::store::record_at(&store.arena, addr).key()));
-        store.evict_record(hash, addr, len, had_ttl);
+        store.evict_record(hash, addr, len);
         stats.evicted = 1;
         stats.freed_bytes += len as u64;
     }

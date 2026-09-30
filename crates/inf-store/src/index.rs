@@ -317,6 +317,15 @@ impl<M: SlotMode> Index<M> {
         self.capacity
     }
 
+    /// Stop-and-copy rebuilds so far (doublings and same-size tombstone
+    /// recycles). Between two rebuilds no entry changes slot, so a walk
+    /// stamped with this count and still matching it saw every entry
+    /// present throughout exactly once (ADR-0117 D2; ADR-0008 A1 rule 6).
+    #[inline]
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
     /// Exact table footprint in bytes (feeds `index_bytes`, L5) — the
     /// tiered sidecar is attributed here, not hidden.
     #[inline]
@@ -758,6 +767,15 @@ impl<M: SlotMode> Index<M> {
             }
             group = (group + stride) & mask;
         }
+    }
+
+    /// The slot holding `(hash, addr)`, if slotted — test-support only
+    /// (the mid-pass leg of ADR-0008 A1 rule 6 places keys relative to
+    /// the sweep's cursor).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn slot_of(&self, hash: u64, addr: M::Addr) -> Option<usize> {
+        self.position_of(hash, addr)
     }
 
     /// Probe groups in the table (the SCAN cursor space — one cursor value

@@ -410,6 +410,14 @@ const ARGV_INLINE: usize = 16;
 /// Hard cap on wheel fires per expiry MAINTAIN slice — the debt-aware
 /// escalation (M1-S05) may multiply the deficit budget, never exceed this.
 const MAX_EXPIRY_FIRES_PER_SLICE: u32 = 4096;
+
+/// Unbounded expiry slices one frozen-time drain may take (ADR-0008 A1
+/// O3). An unbounded slice catches every wheel up and ends at most one
+/// sweep pass per store; settling needs at most three (the pass under
+/// way, a dirty one, and one begun at the frozen instant). Crossing: the
+/// drain returns unsettled and the oracle reading the records reports it.
+const EXPIRY_DRAIN_SLICES_MAX: usize = 64;
+
 /// Hard caps on one backfill MAINTAIN tick (M4.5-S05, ADR-0077 D3): the
 /// deficit budget scales the slice, these bound its worst case — the
 /// docs cap keeps one tick well under the 2 ms foreground co-gate at
@@ -1494,23 +1502,25 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         (ps.live_owned_channel_count(), ps.live_pattern_count(), ps.state_bytes())
     }
 
-    /// Reaps every wheel entry already expired at `now`, ignoring slice
-    /// budgets. Sim accounting oracle only: equalizes active-vs-lazy expiry
-    /// between the node (wheel slices ran) and the replay model (none did)
-    /// before live-record counts are compared.
+    /// Drains active expiry at a frozen `now`, ignoring slice budgets,
+    /// until the drain predicate holds (ADR-0008 A1 O3): every wheel has
+    /// caught up and every sweep is idle or completed a pass that began at
+    /// `now`. Sim accounting oracle only: equalizes active-vs-lazy expiry
+    /// between the node (wheel slices ran) and the replay model (none
+    /// did) before live-record counts are compared. Bounded by
+    /// [`EXPIRY_DRAIN_SLICES_MAX`]; a drain that never settles leaves the
+    /// retained records to the oracle that reads them.
     pub fn drain_expiry(&self, now: Nanos) -> u64 {
+        let mut ks = self.shared.store.borrow_mut();
         let mut reaped = 0;
-        loop {
-            let stats = self
-                .shared
-                .store
-                .borrow_mut()
-                .expire_tick(now, ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX });
-            reaped += stats.reaped;
-            if stats.reaped == 0 && stats.stale == 0 {
-                return reaped;
+        for _ in 0..EXPIRY_DRAIN_SLICES_MAX {
+            let stats = ks.expire_tick(now, ExpiryBudget::UNBOUNDED);
+            reaped += stats.reaped + stats.swept;
+            if ks.expiry_settled(now) {
+                break;
             }
         }
+        reaped
     }
 
     fn token(class: TokenClass, key: ConnKey) -> CompletionToken {

@@ -35,6 +35,7 @@ mod ns;
 mod ordered;
 mod record;
 mod router;
+mod schedule;
 mod store;
 mod tiered;
 mod tiered_recover;
@@ -101,10 +102,13 @@ pub use record::{
     saturating_deadline,
 };
 pub use router::SlotRouter;
+#[cfg(feature = "test-support")]
+pub use store::ExpiryAudit;
 pub use store::{
     CellStore, CheckpointImage, CopyResult, DiskFullCause, Encoding, ExpireCond, ExpiryBudget,
     ExpiryStats, LogFullImage, MemoryReport, OpError, PostImage, SetCond, SetExpire, SetOptions,
-    SetOutcome, StoreConfig, StoreStats, Ttl, TtlUpdate,
+    SetOutcome, StoreConfig, StoreStats, SweepState, SweepStop, Ttl, TtlUpdate, WheelNodesMax,
+    WheelNodesMaxError,
 };
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;

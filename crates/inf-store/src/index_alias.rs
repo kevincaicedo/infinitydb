@@ -10,16 +10,12 @@
 //! traversal; an unfinished walk yields [`AliasWalk::Over`], which
 //! carries no view — an unanswered question decides nothing.
 
-#[cfg(any(test, feature = "doc"))]
 use core::ops::ControlFlow;
 
 use inf_alloc::ArenaAddr;
 
-#[cfg(any(test, feature = "doc"))]
 use crate::index::{Index, ProbeEnd};
-use crate::limits::IDX_ALIAS_GROUP_MAX;
-#[cfg(any(test, feature = "doc"))]
-use crate::limits::{IDX_ALIAS_REHASH_MAX, IDX_ALIAS_WALK_GROUPS_MAX};
+use crate::limits::{IDX_ALIAS_GROUP_MAX, IDX_ALIAS_REHASH_MAX, IDX_ALIAS_WALK_GROUPS_MAX};
 use crate::ordered::PkRef;
 
 /// Which budget an enumeration crossed (one crossing behavior for all
@@ -38,13 +34,6 @@ pub enum AliasLimit {
 /// (the dying record, or the bracket's write set). Holding one proves a
 /// **complete** enumeration ran for [`pk_ref`](Self::pk_ref).
 #[derive(Debug)]
-#[cfg_attr(
-    not(any(test, feature = "doc")),
-    allow(
-        dead_code,
-        reason = "a slim build has no index trees: nothing enumerates or reads a view"
-    )
-)]
 pub struct AliasView {
     pk_ref: PkRef,
     /// `Some` for the first `count` slots — a fixed array, so the common
@@ -61,7 +50,6 @@ impl AliasView {
     }
 
     /// The confirmed members, in probe order.
-    #[cfg(any(test, feature = "doc"))]
     pub(crate) fn members(&self) -> impl Iterator<Item = ArenaAddr> + '_ {
         self.members[..self.count].iter().flatten().copied()
     }
@@ -81,7 +69,6 @@ impl AliasView {
         AliasView::empty(pk_ref)
     }
 
-    #[cfg(any(test, feature = "doc", feature = "test-support"))]
     fn empty(pk_ref: PkRef) -> AliasView {
         AliasView { pk_ref, members: [None; IDX_ALIAS_GROUP_MAX], count: 0 }
     }
@@ -110,10 +97,13 @@ pub struct AliasTally {
 /// place an enumeration reads a record, so it is what the fetch budget
 /// charges — an excluded record costs a fetch like any other.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg(any(test, feature = "doc"))]
 pub(crate) enum Candidate {
     /// The caller's own record (a write-set key, by full key): not a
     /// view member.
+    #[cfg_attr(
+        not(any(test, feature = "doc")),
+        allow(dead_code, reason = "only the index bracket excludes by full key; slim has none")
+    )]
     Excluded,
     /// The full keyed hash equals the enumerated one.
     Alias,
@@ -127,7 +117,8 @@ pub(crate) enum Candidate {
 /// **before** it runs, so the budget bounds record fetches, not just
 /// keyed hashes (ADR-0139 D9). `skip(addr)` is for an exclusion that
 /// needs no record — the death sites' dying address — and is free.
-#[cfg(any(test, feature = "doc"))]
+/// The expiry schedule's removal and fire questions are its callers too,
+/// in every build (ADR-0008 A1 rules 4 and 5).
 pub(crate) fn alias_view(
     index: &Index,
     hash: u64,

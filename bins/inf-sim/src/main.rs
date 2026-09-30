@@ -87,7 +87,8 @@ fn main() {
                         other => return Err(format!("unknown plant {other}")),
                     }
                 }
-                "--cells" | "--connections" | "--commands" | "--key-space" => {
+                "--cells" | "--connections" | "--commands" | "--key-space"
+                | "--wheel-nodes-max" => {
                     let value = take(&flag)?.parse().map_err(|e| format!("{flag}: {e}"))?;
                     overrides.push((flag.clone(), value));
                 }
@@ -119,7 +120,8 @@ fn main() {
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--cells N] \
-                         [--connections N] [--commands N] [--trace-out FILE] \
+                         [--connections N] [--commands N] [--wheel-nodes-max N] \
+                         [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
                         inf_sim::SCENARIOS.join("|")
                     );
@@ -1224,6 +1226,16 @@ fn main() {
             "--connections" => scenario.connections = value as usize,
             "--commands" => scenario.commands = value,
             "--key-space" => scenario.key_space = value,
+            "--wheel-nodes-max" => {
+                let nodes = usize::try_from(value).unwrap_or(usize::MAX);
+                match inf_store::WheelNodesMax::new(nodes) {
+                    Ok(max) => scenario.wheel_nodes_max = Some(max),
+                    Err(e) => {
+                        eprintln!("inf-sim: --wheel-nodes-max {} is over the width bound", e.nodes);
+                        std::process::exit(2);
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }

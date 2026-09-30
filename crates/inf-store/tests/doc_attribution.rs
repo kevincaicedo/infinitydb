@@ -26,6 +26,8 @@ fn constructed_report_sums_only_disjoint_resident_domains() {
         records_resident_bytes: 3,
         index_bytes: 5,
         wheel_bytes: 7,
+        // A logical overlay of `wheel_bytes`: never summed against RSS.
+        wheel_live_bytes: 59,
         evict_bytes: 11,
         doc_tape_bytes: 13,
         doc_arena_bytes: 17,

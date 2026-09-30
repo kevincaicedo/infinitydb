@@ -1,9 +1,10 @@
 //! `CellStore` (M0-S15 substrate, extended by M1-E1/E2): the
 //! single-threaded, cell-local string engine — records in the
 //! [`Arena`](inf_alloc::Arena), addresses in the
-//! [`Index`](crate::index::Index), expiry lazy on read **plus** the M1
-//! hierarchical [`TtlWheel`](crate::wheel) driven by budgeted
-//! [`expire_tick`](CellStore::expire_tick) MAINTAIN slices.
+//! [`Index`](crate::index::Index), expiry lazy on read **plus** the
+//! expiry schedule (the hierarchical wheel and the sweep, ADR-0008 A1)
+//! driven by budgeted [`expire_tick`](CellStore::expire_tick) MAINTAIN
+//! slices.
 //!
 //! Every operation takes `now: Nanos` from the caller — time is injected
 //! (L7), so the store is deterministic and DST-able. Memory accounting is
@@ -28,9 +29,9 @@ use crate::record::{
     HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView,
     TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
 };
-use crate::wheel::{ArmOutcome, TtlWheel};
+use lifecycle::RecordIndex;
 
-pub use crate::wheel::ExpiryBudget;
+pub use crate::wheel::{ExpiryBudget, WheelNodesMax, WheelNodesMaxError};
 
 mod lifecycle;
 mod scan;
@@ -97,6 +98,9 @@ pub struct StoreConfig {
     /// off only amplified shapes; a crossing answers `ERR reply too large`
     /// before the command's effect.
     pub doc_max_reply_bytes: usize,
+    /// Wheel nodes this store may hold (ADR-0008 A1 rule 7). Past it a
+    /// record with a deadline is swept instead of scheduled.
+    pub wheel_nodes_max: WheelNodesMax,
 }
 
 impl Default for StoreConfig {
@@ -115,6 +119,7 @@ impl Default for StoreConfig {
             doc_max_path_bytes: DOC_MAX_PATH_BYTES_DEFAULT,
             doc_max_path_matches: DOC_MAX_PATH_MATCHES_DEFAULT,
             doc_max_reply_bytes: DOC_MAX_REPLY_BYTES_DEFAULT,
+            wheel_nodes_max: WheelNodesMax::MAX,
         }
     }
 }
@@ -342,16 +347,105 @@ pub enum CopyResult {
 /// it while foreground latency stays protected.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct ExpiryStats {
-    /// Records actually reaped by this slice.
+    /// Records the wheel's fires reaped this slice.
     pub reaped: u64,
-    /// Wheel entries that no longer matched a live expired record.
+    /// Fires that found no member of their key hash (ADR-0008 A1 O1: 0).
     pub stale: u64,
     /// Cursor work performed (ms steps + fast-forward jumps).
     pub steps: u32,
     /// Backlog: milliseconds the wheel still trails `now` (0 = caught up).
     pub lag_ms: u64,
-    /// Live wheel entries after the slice.
+    /// Live wheel nodes after the slice — one per scheduled key hash,
+    /// tombstones excluded (per store; summed by the keyspace fold).
     pub armed: u64,
+    /// Fires that re-filed their node at a later deadline (rule 5).
+    pub refiled: u64,
+    /// Records the expiry sweep reaped this slice (rule 6).
+    pub swept: u64,
+    /// Index slots the expiry sweep walked this slice.
+    pub sweep_slots: u32,
+    /// Where the sweep stands after the slice.
+    pub sweep: SweepState,
+    /// Why the sweep stopped this slice (the keyspace rotation parks its
+    /// hand at the first store whose sweep an earlier store's slots
+    /// withheld).
+    pub sweep_stop: SweepStop,
+    /// Tombstone nodes still linked after the slice (rule 4).
+    pub tombstones: u64,
+}
+
+/// The expiry sweep's standing (ADR-0008 A1 rule 6). `Idle` means no
+/// event owes a pass, so every record with a deadline has a wheel node.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SweepState {
+    #[default]
+    Idle,
+    /// A pass is owed: under way since `pass_began_ms`, or (`None`) begins
+    /// at the next slice. `completed_pass_began_ms` is when the last pass
+    /// completed since the sweep left `Idle` began.
+    Walking { pass_began_ms: Option<u64>, completed_pass_began_ms: Option<u64> },
+}
+
+impl SweepState {
+    /// The sweep owes nothing a drain frozen at `t_ms` must wait for:
+    /// idle, or its last completed pass began at or after `t_ms` (a pass
+    /// that began then visited every record present at `t_ms`).
+    #[must_use]
+    pub fn settled_since(self, t_ms: u64) -> bool {
+        match self {
+            SweepState::Idle => true,
+            SweepState::Walking { completed_pass_began_ms, .. } => {
+                completed_pass_began_ms.is_some_and(|began| began >= t_ms)
+            }
+        }
+    }
+
+    /// The keyspace fold: the least-settled store decides.
+    #[must_use]
+    pub fn fold(self, other: SweepState) -> SweepState {
+        match (self, other) {
+            (SweepState::Idle, other) | (other, SweepState::Idle) => other,
+            (
+                SweepState::Walking { pass_began_ms: a, completed_pass_began_ms: x },
+                SweepState::Walking { pass_began_ms: b, completed_pass_began_ms: y },
+            ) => SweepState::Walking { pass_began_ms: a.min(b), completed_pass_began_ms: x.min(y) },
+        }
+    }
+}
+
+/// What the O(N) schedule audit found (test-support; ADR-0008 A1).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryAudit {
+    /// Live wheel nodes (membership entries).
+    pub armed: u64,
+    /// Tombstone nodes still linked.
+    pub tombstones: u64,
+    /// Records with a deadline (the census).
+    pub ttl_live: u64,
+    /// Membership entries whose node no slot list reaches (O1).
+    pub orphans: u64,
+    /// The sweep owed nothing when the audit ran: the two record checks
+    /// below ran (a walking sweep owes its records a visit, so they are
+    /// idle-scoped and read 0 otherwise).
+    pub sweep_idle: bool,
+    /// Records with a deadline whose hash has no node (I7).
+    pub unscheduled: u64,
+    /// Records with a deadline whose hash's node files after it + 1 (I4).
+    pub late: u64,
+}
+
+/// Why one slice's sweep stopped.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SweepStop {
+    /// Nothing was owed.
+    #[default]
+    NotOwed,
+    /// A pass ended: a slice stops at a pass boundary.
+    PassEnd,
+    /// The sweep-slot or fire budget ran out mid-pass (or before it
+    /// began); the pass resumes at its next slot on a later slice.
+    Budget,
 }
 
 /// Always-on store counters (feeds `INFO stats`/`keyspace` and the M1
@@ -364,12 +458,26 @@ pub struct StoreStats {
     pub expired_lazy: u64,
     /// Reaped by wheel slices.
     pub expired_active: u64,
-    /// Live records currently carrying a TTL (`INFO keyspace` `expires=`).
+    /// Live records currently carrying a TTL (`INFO keyspace` `expires=`) —
+    /// a gauge the expiry schedule owns, filled in by `CellStore::stats`.
     pub ttl_live: u64,
-    /// Wheel entries that fired without a matching expired record.
+    /// Fires whose key hash had no member left (ADR-0008 A1 O1: a node is
+    /// removed with its group's last deadline, so this stays 0).
     pub wheel_stale: u64,
-    /// TTL writes that could not arm the wheel (pool cap) — lazy-only keys.
+    /// Placements refused at the node budget or a refused growth — the
+    /// record is swept (ADR-0008 A1 rule 3).
     pub wheel_fallback: u64,
+    /// Reaped by the expiry sweep (also counted in `expired_active`).
+    pub expired_swept: u64,
+    /// Fires that re-filed their node at a later deadline.
+    pub wheel_refiled: u64,
+    /// Sweep passes an index rebuild voided (ADR-0008 A1 rule 6).
+    pub sweep_passes_voided: u64,
+    /// Alias enumerations the schedule could not finish (ADR-0139 D9
+    /// `Over`): the node was released and the sweep owed.
+    pub expiry_alias_over: u64,
+    /// Tombstone wheel nodes currently linked (a gauge, like `ttl_live`).
+    pub wheel_tombstones: u64,
     /// Records evicted under memory pressure (M1-S06; `INFO evicted_keys`).
     pub evicted_keys: u64,
     /// Stop-and-copy index grows (M4.5-S40 stall attribution): each one
@@ -394,7 +502,13 @@ pub struct MemoryReport {
     pub records_slack_bytes: u64,
     pub records_resident_bytes: u64,
     pub index_bytes: u64,
+    /// Wheel resident bytes: pool capacity at 16 B per node, membership
+    /// capacity and the fixed tables (the RSS-side attribution).
     pub wheel_bytes: u64,
+    /// Wheel bytes in use: nodes in use (live + tombstones) at 16 B,
+    /// membership capacity and the fixed tables — the pressure
+    /// comparable's wheel term (ADR-0008 A1 rule 7). ≤ `wheel_bytes`.
+    pub wheel_live_bytes: u64,
     /// Eviction-engine footprint: the 8 KiB CMS while an LFU policy is
     /// selected, 0 otherwise (M1-S06 L5 domain).
     pub evict_bytes: u64,
@@ -447,8 +561,9 @@ impl MemoryReport {
 /// `!Send` arena); all time is injected.
 pub struct CellStore {
     pub(crate) arena: Arena,
-    pub(crate) index: Index,
-    wheel: TtlWheel,
+    /// The record table and its expiry schedule, mutated only through the
+    /// `lifecycle` choke points (ADR-0008 A1 I2, I9).
+    pub(crate) index: RecordIndex,
     pub(crate) stats: StoreStats,
     pub(crate) evict: EvictState,
     /// Document arena + domain counters (ADR-0037; no-op without `doc`).
@@ -462,21 +577,6 @@ pub struct CellStore {
 }
 
 impl CellStore {
-    pub fn new(cfg: StoreConfig) -> CellStore {
-        let evict = EvictState { rng: cfg.evict_seed, ..EvictState::default() };
-        CellStore {
-            arena: Arena::new(cfg.arena),
-            index: Index::with_capacity(cfg.initial_keys.max(64)),
-            // Cursor 0: the first tick fast-forwards to `now` (empty wheel).
-            wheel: TtlWheel::new(0),
-            stats: StoreStats::default(),
-            evict,
-            docs: DocStore::new(&cfg),
-            idx: crate::index_maint::CellIndexes::new(),
-            cfg,
-        }
-    }
-
     /// The key hash under this store's secret (ADR-0094) — also what the
     /// batch pipeline computes up front, from the same [`KeyHasher`] the
     /// plane carries. An instance method: a hash is meaningful only to
@@ -539,17 +639,22 @@ impl CellStore {
         self.index.len() == 0
     }
 
-    /// Always-on counters snapshot.
+    /// Always-on counters snapshot. The gauges (`ttl_live`,
+    /// `wheel_tombstones`) are read from the expiry schedule, which owns
+    /// them; the counters are this store's lifetime tallies.
     #[inline]
     pub fn stats(&self) -> StoreStats {
-        self.stats
+        StoreStats {
+            ttl_live: self.index.schedule().ttl_live(),
+            wheel_tombstones: self.index.schedule().tombstones(),
+            ..self.stats
+        }
     }
 
-    /// `CONFIG RESETSTAT`: zero the lifetime counters; the live-state census
-    /// (`ttl_live`) is structural and survives.
+    /// `CONFIG RESETSTAT`: zero the lifetime counters; the gauges are
+    /// structural and survive (the schedule owns them).
     pub fn reset_stats(&mut self) {
-        let ttl_live = self.stats.ttl_live;
-        self.stats = StoreStats { ttl_live, ..StoreStats::default() };
+        self.stats = StoreStats::default();
     }
 
     /// Byte-exact attribution snapshot (L5).
@@ -562,7 +667,8 @@ impl CellStore {
             records_slack_bytes: arena.slack_bytes,
             records_resident_bytes: arena.resident_bytes,
             index_bytes: self.index.memory_bytes() as u64,
-            wheel_bytes: (self.wheel.pool_bytes() + self.wheel.table_bytes()) as u64,
+            wheel_bytes: self.index.schedule().resident_bytes(),
+            wheel_live_bytes: self.index.schedule().live_bytes(),
             evict_bytes: self.evict.bytes() as u64,
             doc_tape_bytes: docs.domain.tape_bytes,
             doc_arena_bytes: docs.domain.arena_bytes,
@@ -901,12 +1007,6 @@ impl CellStore {
             kind: RecordKind::String { raw: false },
         };
         self.write_record(key, existing, spec)?;
-        self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
-        if let Some(ms) = expire_at_ms
-            && old_deadline != Some(ms)
-        {
-            self.arm_wheel(self.hash_key(key), ms);
-        }
         Ok(SetOutcome::Applied { old: old_value })
     }
 
@@ -914,9 +1014,7 @@ impl CellStore {
     pub fn del(&mut self, key: &[u8], now: Nanos) -> bool {
         match self.resolve(key, now) {
             Some((addr, len)) => {
-                let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
                 self.free_record(self.hash_key(key), addr, len);
-                self.note_ttl(had_ttl, false);
                 true
             }
             None => false,
@@ -933,9 +1031,7 @@ impl CellStore {
             return None;
         }
         let value = view.value().to_vec();
-        let had_ttl = view.expire_at_ms().is_some();
         self.free_record(self.hash_key(key), addr, len);
-        self.note_ttl(had_ttl, false);
         Some(value)
     }
 
@@ -1260,21 +1356,13 @@ impl CellStore {
                 .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
             doc::write_lineage(&mut value, lineage);
         }
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec { key: target, value: &value, version, expire_at_ms: deadline, kind };
         // Releasing: the DESTINATION's old payload dies; the carried source
         // handle inside `value` is untouched by the release.
         self.write_record_releasing(target, target_existing, spec)?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
         // Source removal: the target write never moves the source record, and the
         // payload now belongs to target — no release.
-        let src_had_ttl = deadline.is_some();
-        self.index.remove(self.hash_key(source), source_addr);
-        self.arena.free(source_addr, source_len);
-        self.note_ttl(src_had_ttl, false);
-        if let Some(ms) = deadline {
-            self.arm_wheel(self.hash_key(target), ms);
-        }
+        self.remove_renamed_source(self.hash_key(source), source_addr, source_len);
         Ok(true)
     }
 
@@ -1342,7 +1430,6 @@ impl CellStore {
         let dst_old =
             target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
             key: target,
             value: &value,
@@ -1351,10 +1438,6 @@ impl CellStore {
             kind: RecordKind::String { raw },
         };
         self.write_record(target, target_existing, spec)?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
-        if let Some(ms) = deadline {
-            self.arm_wheel(self.hash_key(target), ms);
-        }
         Ok(CopyResult::Copied)
     }
 
@@ -1382,7 +1465,6 @@ impl CellStore {
         let lineage = dst_old
             .filter(|view| view.type_tag() == TypeTag::JsonDoc)
             .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         self.json_write_value(
             target,
             target_existing,
@@ -1394,10 +1476,6 @@ impl CellStore {
                 cadence: doc::DocCadence::default(),
             },
         )?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
-        if let Some(ms) = deadline {
-            self.arm_wheel(self.hash_key(target), ms);
-        }
         Ok(CopyResult::Copied)
     }
 
@@ -1444,7 +1522,6 @@ impl CellStore {
         let dst_old =
             target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
             key: target,
             value: &rec.value,
@@ -1453,10 +1530,6 @@ impl CellStore {
             kind: rec.kind,
         };
         self.write_record(target, target_existing, spec)?;
-        self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
-        if let Some(ms) = rec.expire_at_ms {
-            self.arm_wheel(self.hash_key(target), ms);
-        }
         Ok(CopyResult::Copied)
     }
 
@@ -1493,7 +1566,6 @@ impl CellStore {
             && ms <= now.0 / 1_000_000
         {
             self.free_record(self.hash_key(key), addr, len);
-            self.note_ttl(current.is_some(), false);
             return true;
         }
         // Rewrite with the new TTL-extension state. The ±5-byte extension
@@ -1513,16 +1585,7 @@ impl CellStore {
         };
         // Carrying, not releasing: the value bytes (a document handle
         // included) move verbatim into the rewritten record (ADR-0037 D3).
-        if self.write_record_carrying(key, Some((addr, len)), spec).is_err() {
-            return false;
-        }
-        self.note_ttl(current.is_some(), new_ms.is_some());
-        if let Some(ms) = new_ms
-            && current != new_ms
-        {
-            self.arm_wheel(self.hash_key(key), ms);
-        }
-        true
+        self.write_record_carrying(key, Some((addr, len)), spec).is_ok()
     }
 
     /// `RANDOMKEY` probe: first live key at/after a caller-rolled slot
@@ -1542,25 +1605,18 @@ impl CellStore {
     }
 
     /// `FLUSHDB`/`FLUSHALL` (this cell's slice): drop every record, reset
-    /// the wheel, keep lifetime counters (Redis flush does not reset stats).
+    /// the schedule with the table, keep lifetime counters (Redis flush
+    /// does not reset stats).
     pub fn flush(&mut self, now: Nanos) {
         self.arena = Arena::new(self.cfg.arena);
-        self.index = Index::with_capacity(self.cfg.initial_keys.max(64));
-        self.wheel = TtlWheel::new(now.0 / 1_000_000);
+        self.reset_records(self.cfg.initial_keys.max(64), now.0 / 1_000_000);
         self.docs.reset(&self.cfg);
         // FLUSH* is a removal class (ADR-0072 D6): a bulk replace runs
         // the whole-namespace index truncate, never N removals.
         // Declarations survive; an empty namespace projects empty trees.
         self.idx.truncate_all();
-        self.stats.ttl_live = 0;
         self.evict.hand = 0;
     }
-}
-
-/// The wheel cursor in ms (private peek for the lag metric).
-#[inline]
-fn wheel_cursor(wheel: &TtlWheel) -> u64 {
-    wheel.cursor_ms()
 }
 
 /// Reverse-binary cursor increment (the Redis `dictScan` order) over a

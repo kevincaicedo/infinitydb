@@ -602,12 +602,6 @@ impl CellStore {
             idoc,
             DocWriteMeta { lineage, version, expire_at_ms, cadence: DocCadence::default() },
         )?;
-        self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
-        if let Some(ms) = expire_at_ms
-            && old_deadline != Some(ms)
-        {
-            self.arm_wheel(self.hash_key(key), ms);
-        }
         Ok(JsonSetOutcome::Applied)
     }
 

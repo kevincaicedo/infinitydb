@@ -700,11 +700,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             let max_fires = budget.saturating_mul(escalation).min(MAX_EXPIRY_FIRES_PER_SLICE);
             let stats = self.shared.store.borrow_mut().expire_tick(
                 cx.now,
-                ExpiryBudget { max_fires, max_steps: max_fires.saturating_mul(8).max(4096) },
+                ExpiryBudget {
+                    max_fires,
+                    max_steps: max_fires.saturating_mul(8).max(4096),
+                    max_sweep_slots: inf_store::limits::EXPIRY_SWEEP_SLOTS_PER_SLICE,
+                },
             );
             self.expiry_lag = stats.lag_ms;
+            // Fires, re-files and sweep reaps are foreground-visible work;
+            // cursor steps and sweep slots are cheap walking (ADR-0008 A1
+            // rule 6), charged at 1/64.
+            let fired = stats.reaped + stats.stale + stats.refiled + stats.swept;
             let units =
-                (stats.reaped + stats.stale).min(u64::from(u32::MAX)) as u32 + stats.steps / 64;
+                fired.min(u64::from(u32::MAX)) as u32 + stats.steps / 64 + stats.sweep_slots / 64;
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }

@@ -384,6 +384,14 @@ fn tripwires_section(
     push(text, &format!("idx_slack_bytes:{}", report.idx_slack_bytes));
     push(text, &format!("wheel_fallback:{}", stats.wheel_fallback));
     push(text, &format!("wheel_stale:{}", stats.wheel_stale));
+    // The expiry schedule's cell-scope tripwires (ADR-0008 A1): tombstone
+    // nodes still linked, sweep reaps, early fires that re-filed, alias
+    // walks the schedule could not finish, sweep passes a rebuild voided.
+    push(text, &format!("wheel_tombstones:{}", stats.wheel_tombstones));
+    push(text, &format!("expired_swept:{}", stats.expired_swept));
+    push(text, &format!("wheel_refiled:{}", stats.wheel_refiled));
+    push(text, &format!("expiry_alias_over:{}", stats.expiry_alias_over));
+    push(text, &format!("sweep_passes_voided:{}", stats.sweep_passes_voided));
     push(text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));

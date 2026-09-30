@@ -830,6 +830,23 @@ M1-E1 ops and `expire_tick` (M1-E2). Deadlines past the u40-ms record bound
 now clamp (previously a latent panic). See ADR-0008 (M1-E1 interface
 extensions; internal decision record).
 
+**M1-S04 expiry schedule note (2026-09-30, ADR-0008 A1):** one wheel node
+per key hash with a deadline, and a key the node budget refuses is swept,
+never left to lazy expiry. All deltas additive. `StoreConfig` +
+`wheel_nodes_max` (`WheelNodesMax`, checked against `WHEEL_NODES_MAX`;
+tests and the simulator lower it). `ExpiryBudget` + `max_sweep_slots` (one
+keyspace-wide sweep budget per slice) and `ExpiryBudget::UNBOUNDED`.
+`ExpiryStats` + `refiled`, `swept`, `sweep_slots`, `sweep` (`SweepState`),
+`sweep_stop` (`SweepStop`) and `tombstones`. `StoreStats` + `expired_swept`,
+`wheel_refiled`, `sweep_passes_voided`, `expiry_alias_over` and the
+`wheel_tombstones` gauge. `MemoryReport` + `wheel_live_bytes` (nodes in use,
+the pressure comparable's wheel term; `wheel_bytes` stays the resident
+attribution). `Index::rebuilds`; `CellStore::expiry_settled` and
+`Keyspace::expiry_settled` (the frozen-time drain predicate). New `limits`
+rows: `WHEEL_NODES_MAX`, `WHEEL_MEMBER_SHARDS`,
+`EXPIRY_SWEEP_SLOTS_PER_SLICE`, `EXPIRY_SWEEP_CHUNK_SLOTS`,
+`WHEEL_TOMBSTONES_MAX`.
+
 **M1-E3/E4 extension note (2026-06-12, ADR-0009):** two frozen signatures
 changed shape — `execute(...)` and `ServerPlane::new(...)` now take
 `inf_store::Keyspace` (one cell's slice of every namespace: 16 lazily

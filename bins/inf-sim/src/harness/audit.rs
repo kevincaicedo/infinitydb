@@ -16,10 +16,9 @@ pub(super) enum AuditState {
 /// both sides are compared on.
 type Entries = BTreeMap<(ExecScope, Vec<u8>), (Vec<u8>, Option<u64>)>;
 
-type Cells = Vec<(
-    CellLoop<SimDriver, Rc<VirtualClock>>,
-    ServerPlane<SharedOracle, inf_server::StdSegmentFs>,
-)>;
+type Plane = ServerPlane<SharedOracle, inf_server::StdSegmentFs>;
+
+type Cells = Vec<(CellLoop<SimDriver, Rc<VirtualClock>>, Plane)>;
 
 /// Every cell's live entries at `now`. A key present on two cells breaks
 /// slot ownership and is reported as such rather than folded away.
@@ -94,17 +93,67 @@ pub(super) fn reconcile_entries(node: &Entries, model: &Entries, label: &str) ->
     ))
 }
 
+/// ADR-0008 A1 O3 at the shipped topology: after the drain, a cell's
+/// arena live allocations — read first, a count that reaps nothing — must
+/// equal the entries the fold then emits at the same frozen instant. The
+/// fold reaps expired records (as reads and `SCAN` do), so a record the
+/// drain left past its deadline shows up as the difference. Independent
+/// of the schedule: it reads arena counts and the checkpoint walk only.
+pub(super) fn expired_retained(
+    cell: usize,
+    live: u64,
+    plane: &Plane,
+    now: Nanos,
+) -> Option<String> {
+    let mut emitted = 0u64;
+    let skipped = plane.fold_live_entries(now, |_, _, _, _| emitted += 1);
+    (skipped == 0 && live != emitted).then(|| {
+        format!(
+            "EXPIRED RETAINED: cell {cell}: {live} live records vs {emitted} live entries \
+             after the expiry drain (a record outlived its deadline without a reap)"
+        )
+    })
+}
+
+/// The small-cap run's engagement (ADR-0008 A1 O3): a run under
+/// `--wheel-nodes-max` must have refused a placement and reaped through
+/// the sweep node-wide, or it proved nothing — `VACUOUS`, never green.
+pub(super) fn small_cap_engagement(scenario: &Scenario, cells: &Cells) -> Option<String> {
+    scenario.wheel_nodes_max?;
+    let (mut refused, mut swept) = (0u64, 0u64);
+    for (_, plane) in cells {
+        let stats = plane.keyspace().stats();
+        refused += stats.wheel_fallback;
+        swept += stats.expired_swept;
+    }
+    (refused == 0 || swept == 0).then(|| {
+        format!(
+            "VACUOUS: the small-cap expiry run refused {refused} placements and swept \
+             {swept} records node-wide (both must be > 0)"
+        )
+    })
+}
+
 /// Reaps every already-expired entry on both sides at `now` (active vs lazy
 /// expiry equalized) so served counts are comparable.
 fn equalize_expiry(cells: &Cells, model: &mut Keyspace, now: Nanos) {
     for (_, plane) in cells {
         plane.drain_expiry(now);
     }
-    loop {
-        let stats =
-            model.expire_tick(now, ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX });
-        if stats.reaped == 0 && stats.stale == 0 {
-            break;
+    drain_model_expiry(model, now);
+}
+
+/// Unbounded model slices one drain may take — the node drain's bound.
+const MODEL_DRAIN_SLICES_MAX: usize = 64;
+
+/// The model's side of ADR-0008 A1 O3's drain: time frozen at `now`,
+/// every budget unbounded, until every wheel has caught up and every sweep
+/// is idle or completed a pass that began at `now`.
+pub(super) fn drain_model_expiry(model: &mut Keyspace, now: Nanos) {
+    for _ in 0..MODEL_DRAIN_SLICES_MAX {
+        model.expire_tick(now, ExpiryBudget::UNBOUNDED);
+        if model.expiry_settled(now) {
+            return;
         }
     }
 }

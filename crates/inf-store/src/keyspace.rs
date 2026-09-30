@@ -49,6 +49,7 @@ use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
 use crate::record::ExtentRef;
 use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
+    SweepStop,
 };
 use crate::tiered::TieredTable;
 use crate::tiered::promote::PromotionCounters;
@@ -319,6 +320,7 @@ impl Keyspace {
             records_resident_bytes: 0,
             index_bytes: 0,
             wheel_bytes: 0,
+            wheel_live_bytes: 0,
             evict_bytes: 0,
             doc_tape_bytes: 0,
             doc_arena_bytes: 0,
@@ -339,6 +341,7 @@ impl Keyspace {
             total.records_resident_bytes += r.records_resident_bytes;
             total.index_bytes += r.index_bytes;
             total.wheel_bytes += r.wheel_bytes;
+            total.wheel_live_bytes += r.wheel_live_bytes;
             total.evict_bytes += r.evict_bytes;
             total.doc_tape_bytes += r.doc_tape_bytes;
             total.doc_arena_bytes += r.doc_arena_bytes;
@@ -369,6 +372,11 @@ impl Keyspace {
             total.ttl_live += s.ttl_live;
             total.wheel_stale += s.wheel_stale;
             total.wheel_fallback += s.wheel_fallback;
+            total.expired_swept += s.expired_swept;
+            total.wheel_refiled += s.wheel_refiled;
+            total.sweep_passes_voided += s.sweep_passes_voided;
+            total.expiry_alias_over += s.expiry_alias_over;
+            total.wheel_tombstones += s.wheel_tombstones;
             total.evicted_keys += s.evicted_keys;
             total.index_grows += s.index_grows;
             total.json_scalar_patches_in_place += s.json_scalar_patches_in_place;
@@ -404,22 +412,24 @@ impl Keyspace {
     }
 
     /// One budgeted expiry MAINTAIN slice across every materialized store
-    /// (M1-S05 over M1-S08): the fire/step budget is shared — later stores
-    /// see what earlier ones left, so a storm in one db cannot multiply
-    /// the slice by the store count. The walk rotates (F-L05-03): each
-    /// slice starts at the first store the previous one left unserved
+    /// (M1-S05 over M1-S08): the fire, step and sweep-slot budgets are
+    /// shared — later stores see what earlier ones left, so a storm in one
+    /// db cannot multiply the slice by the store count (ADR-0008 A1 rule
+    /// 6 for the sweep: a spent slot budget withholds only the sweep; the
+    /// wheels still tick). The walk rotates: each slice starts at the
+    /// first store the previous one left unserved on any budget
     /// (`expire_hand`, the Redis `current_db` shape), so a db whose storm
-    /// exhausts every slice cannot starve the other wheels — it yields one
-    /// slice per rotation. `lag_ms` is the worst wheel debt across every
-    /// store, served or not (it drives the plane's debt escalation and
-    /// renders as `expiry_debt_ms`); a store the slice never reached
-    /// reports its standing debt, never 0.
+    /// exhausts every slice cannot starve the others — it yields one slice
+    /// per rotation. `lag_ms` is the worst wheel debt across every store,
+    /// served or not (it drives the plane's debt escalation and renders as
+    /// `expiry_debt_ms`); a store the slice never reached reports its
+    /// standing debt, never 0.
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let mut total = ExpiryStats::default();
         let mut left = budget;
         let rotation = DEFAULT_DBS + self.named_stores.len();
         let start = self.expire_hand % rotation;
-        self.expire_hand = start;
+        let mut unserved: Option<usize> = None;
         for k in 0..rotation {
             let at = (start + k) % rotation;
             let store = if at < DEFAULT_DBS {
@@ -431,23 +441,37 @@ impl Keyspace {
                 self.named_stores[at - DEFAULT_DBS].store.as_mut()
             };
             if left.max_fires == 0 || left.max_steps == 0 {
-                self.expire_hand = at;
+                unserved.get_or_insert(at);
                 break;
             }
+            // A store whose sweep an earlier store's slots left no budget
+            // is unserved; one that spent the budget itself had its turn.
+            let withheld = left.max_sweep_slots == 0;
             let s = store.expire_tick(now, left);
-            let consumed = (s.reaped + s.stale).min(u64::from(u32::MAX)) as u32;
-            left.max_fires = left.max_fires.saturating_sub(consumed);
+            if withheld && s.sweep_stop == SweepStop::Budget {
+                unserved.get_or_insert(at);
+            }
+            let consumed = s.reaped + s.stale + s.refiled + s.swept;
+            left.max_fires =
+                left.max_fires.saturating_sub(consumed.min(u64::from(u32::MAX)) as u32);
             left.max_steps = left.max_steps.saturating_sub(s.steps);
-            total.reaped += s.reaped;
-            total.stale += s.stale;
-            total.steps += s.steps;
-            total.armed += s.armed;
+            left.max_sweep_slots = left.max_sweep_slots.saturating_sub(s.sweep_slots);
+            fold_expiry(&mut total, &s);
         }
+        self.expire_hand = unserved.unwrap_or(start);
         total.lag_ms = self.expiry_lag_ms(now);
-        if total.reaped > 0 {
+        if total.reaped + total.swept > 0 {
             self.refresh_pressure();
         }
         total
+    }
+
+    /// The drain predicate over every store (ADR-0008 A1 O3): each wheel
+    /// has caught up to `now` and each sweep owes nothing a drain frozen at
+    /// `now` must wait for. A pure read; the drain ticks until it holds.
+    #[must_use]
+    pub fn expiry_settled(&self, now: Nanos) -> bool {
+        self.all_stores().all(|store| store.expiry_settled(now))
     }
 
     // ---- pressure (M1-S07) ----
@@ -1504,6 +1528,26 @@ impl Keyspace {
             .filter_map(|s| s.as_deref())
             .chain(self.named_stores.iter().map(|e| e.store.as_ref()))
     }
+}
+
+/// Adds one store's slice to the keyspace total: counts sum, the sweep
+/// state folds to the least-settled store, and the stop to the most
+/// constrained one.
+fn fold_expiry(total: &mut ExpiryStats, s: &ExpiryStats) {
+    total.reaped += s.reaped;
+    total.stale += s.stale;
+    total.steps += s.steps;
+    total.armed += s.armed;
+    total.refiled += s.refiled;
+    total.swept += s.swept;
+    total.sweep_slots += s.sweep_slots;
+    total.tombstones += s.tombstones;
+    total.sweep = total.sweep.fold(s.sweep);
+    total.sweep_stop = match (total.sweep_stop, s.sweep_stop) {
+        (SweepStop::Budget, _) | (_, SweepStop::Budget) => SweepStop::Budget,
+        (SweepStop::PassEnd, _) | (_, SweepStop::PassEnd) => SweepStop::PassEnd,
+        (SweepStop::NotOwed, SweepStop::NotOwed) => SweepStop::NotOwed,
+    };
 }
 
 /// This cell's share of a per-namespace `MAXMEMORY` (ADR-0068 D2): the

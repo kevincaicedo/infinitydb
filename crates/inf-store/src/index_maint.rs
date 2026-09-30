@@ -2036,7 +2036,7 @@ mod tests {
         store.idx_bracket_begin(&[BIG], None).expect("the pre-half reserves |old| for `new`");
         let hash = store.hash_key(victim);
         let (addr, len) = store.resolve(victim, NOW).expect("the victim is live");
-        store.evict_record(hash, addr, len, false);
+        store.evict_record(hash, addr, len);
         fault::arm(crate::fault::IDX_SCRATCH_REFUSE, FaultSpec::Always);
         store.idx_bracket_commit(&[BIG], MaintMode::Strict);
         let fired = fault::fired(crate::fault::IDX_SCRATCH_REFUSE);

@@ -194,11 +194,13 @@ impl CellStore {
     /// store is empty; a populated index keeps its geometry (growth on
     /// insert remains correct either way). The hint is clamped defensively
     /// — it may come from a damaged file, and a wrong hint may only cost
-    /// memory geometry, never correctness.
+    /// memory geometry, never correctness. The table is replaced through
+    /// the lifecycle's reset, which resets the expiry schedule with it
+    /// (ADR-0008 A1 rule 2).
     pub fn reserve_keys(&mut self, keys: usize) {
         const MAX_RESERVE: usize = 1 << 28;
         if self.is_empty() && keys > 64 {
-            self.index = Index::with_capacity(keys.min(MAX_RESERVE));
+            self.reset_records(keys.min(MAX_RESERVE), self.index.schedule().cursor_ms());
         }
     }
 
