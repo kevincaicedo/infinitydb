@@ -14,11 +14,11 @@
 
 use std::time::Instant;
 
-use inf_doc::TapeDoc;
 use inf_doc::apply::{ApplyOp, Number, apply};
 use inf_doc::encode_apply_op;
 use inf_doc::model::{self, Value};
 use inf_doc::path::{EvalLimits, PathProgram, compile};
+use inf_doc::{CanonicalDoc, TapeDoc};
 use inf_foundation::time::Nanos;
 use inf_log::{DocLineage, FsyncClass, NsId, RecordView};
 use inf_store::{
@@ -89,10 +89,10 @@ fn apply_mutation(store: &mut CellStore, program: &PathProgram, op: &ApplyOp<'_>
     }
     let frozen = store.json_freeze(b"doc", NOW).expect("freeze").expect("document");
     let doc = TapeDoc::from_validated_bytes(&frozen);
-    let outcome = apply(&doc, program, op, &EvalLimits::default(), store.doc_max_bytes())
+    let outcome = apply(&doc, program, op, &EvalLimits::default(), store.doc_limits())
         .expect("valid mutation");
-    let bytes = outcome.bytes.expect("the fixed volume-mix mutation changes bytes");
-    assert!(store.json_replace(b"doc", &bytes, NOW).expect("commit"));
+    let document = outcome.document.expect("the fixed volume-mix mutation changes bytes");
+    assert!(store.json_replace(b"doc", &document, NOW).expect("commit"));
 }
 
 fn volume_ratio(idoc: &[u8], histories: usize) -> (u64, u64, f64) {
@@ -105,7 +105,8 @@ fn volume_ratio(idoc: &[u8], histories: usize) -> (u64, u64, f64) {
     ];
     let array = model::encode_fragment(&Value::Arr(vec![Value::I64(1)])).expect("fragment");
     let mut store = CellStore::new(StoreConfig::default());
-    store.json_set(b"doc", idoc, JsonSetOptions::default(), NOW).expect("initial document");
+    let initial = CanonicalDoc::validate(idoc).expect("the fixture is canonical");
+    store.json_set(b"doc", &initial, JsonSetOptions::default(), NOW).expect("initial document");
     let mut actual = 0u64;
     let mut all_full = 0u64;
     for mutation in 0..histories {

@@ -30,9 +30,12 @@
     )
 )]
 
+use std::borrow::Cow;
+
 use inf_foundation::varint;
 
 use crate::error::DocError;
+use crate::header::{FLAG_INTERNED, HEADER_LEN};
 use crate::limits::DEPTH_MAX;
 
 pub(crate) const TAG_NULL: u8 = 0xA0;
@@ -289,6 +292,109 @@ impl<'a> TapeDoc<'a> {
         debug_assert!(offset < self.body.len(), "offsets come from this document's own plan");
         read_value(self.body, self.dict, offset).0
     }
+}
+
+/// A document a store may hold (ADR-0169 D4): plain canonical v1 bytes,
+/// header and body, never interned, nesting at most [`DEPTH_MAX`], with a
+/// body of at most [`DOC_BYTES_MAX`](crate::limits::DOC_BYTES_MAX). Every
+/// store sink takes one. Its one field is private, so outside this crate a
+/// receipt comes only from [`CanonicalDoc::validate`] (a check), from the
+/// parser (a check under its limits), or from `apply` and
+/// `merge_absent_document`, which mint it from a canonical pre-image and
+/// canonical operands — trusted inputs, held by review, the agreement
+/// property and their debug postconditions.
+///
+/// ```compile_fail,E0451
+/// let _ = inf_doc::CanonicalDoc { bytes: std::borrow::Cow::Borrowed(&[0u8][..]) };
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalDoc<'a> {
+    bytes: Cow<'a, [u8]>,
+}
+
+impl<'a> CanonicalDoc<'a> {
+    /// The trust boundary for bytes from anywhere but this crate's writers:
+    /// a `DocFull`, a checkpoint image, a COPY source. The
+    /// [`TapeDoc::from_bytes`] walk, plus a refusal of the interned form —
+    /// stores hold plain bytes and intern only inside the sink (ADR-0038
+    /// D3).
+    pub fn validate(bytes: &'a [u8]) -> Result<CanonicalDoc<'a>, DocError> {
+        TapeDoc::from_bytes(bytes)?;
+        if bytes[3] & FLAG_INTERNED != 0 {
+            return Err(DocError::NonCanonical("interned form"));
+        }
+        Ok(CanonicalDoc { bytes: Cow::Borrowed(bytes) })
+    }
+
+    /// The parser's accepted output: its limits are the check.
+    pub(crate) fn parsed(bytes: &'a [u8]) -> CanonicalDoc<'a> {
+        debug_assert!(
+            CanonicalDoc::validate(bytes).is_ok(),
+            "the parser emits canonical documents"
+        );
+        CanonicalDoc { bytes: Cow::Borrowed(bytes) }
+    }
+
+    /// Header and body.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The root value's bytes: the header stripped.
+    #[inline]
+    pub fn body(&self) -> &[u8] {
+        &self.bytes[HEADER_LEN..]
+    }
+
+    /// The document as a validated tape.
+    #[inline]
+    pub fn tape(&self) -> TapeDoc<'_> {
+        TapeDoc::from_validated_bytes(&self.bytes)
+    }
+}
+
+impl CanonicalDoc<'static> {
+    /// A document this crate's mutation engine emitted from a canonical
+    /// pre-image and canonical operands (ADR-0169 D4's trusted inputs).
+    pub(crate) fn emitted(bytes: Vec<u8>) -> CanonicalDoc<'static> {
+        CanonicalDoc { bytes: Cow::Owned(bytes) }
+    }
+}
+
+/// Containers on the deepest path of one validated value — 0 for a
+/// scalar — saturating at `DEPTH_MAX + 1`: the composed-depth check's
+/// operand walk (ADR-0169 D3). Iterative over a fixed stack of container
+/// ends, so it allocates nothing; O(value bytes).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `open` indexes a DEPTH_MAX array — checked below it before each push and \
+              above 0 before each pop; `off + 4` is under a container tag indexed at \
+              `off < value.len() <= isize::MAX`; `DEPTH_MAX + 1` is a const"
+)]
+pub(crate) fn nesting_depth(value: &[u8]) -> usize {
+    let mut ends = [0usize; DEPTH_MAX];
+    let mut open = 0usize;
+    let mut deepest = 0usize;
+    let mut off = 0usize;
+    while off < value.len() {
+        // A child's extent never crosses its parent's: scopes close exactly here.
+        while open > 0 && ends[open - 1] == off {
+            open -= 1;
+        }
+        if !matches!(value[off], TAG_OBJ | TAG_ARR) {
+            off = skip_value(value, off);
+            continue;
+        }
+        if open == DEPTH_MAX {
+            return DEPTH_MAX + 1;
+        }
+        ends[open] = skip_value(value, off);
+        open += 1;
+        deepest = deepest.max(open);
+        off += 4;
+    }
+    deepest
 }
 
 /// One open container scope during validation.
@@ -935,23 +1041,75 @@ mod tests {
         assert_eq!(validate_body(&[TAG_OBJ, 2, 0, 0, 0x81, b'k'], &[]), Err(DocError::BadKey));
     }
 
+    /// Raw bytes: `depth` arrays around a null. The builder refuses depth
+    /// 129 itself (typed — tested in build.rs), so the validator's cap
+    /// needs hand-rolled nesting.
+    fn raw_nested(depth: usize) -> Vec<u8> {
+        let mut body = vec![TAG_NULL];
+        for _ in 0..depth {
+            let len = body.len();
+            let mut outer =
+                vec![TAG_ARR, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len >> 16) as u8];
+            outer.append(&mut body);
+            body = outer;
+        }
+        body
+    }
+
     #[test]
     fn depth_cap_binds_at_129() {
-        // Raw bytes: the builder refuses depth 129 itself (typed — tested
-        // in build.rs), so the validator's cap needs hand-rolled nesting.
-        fn raw_nested(depth: usize) -> Vec<u8> {
-            let mut body = vec![TAG_NULL];
-            for _ in 0..depth {
-                let len = body.len();
-                let mut outer =
-                    vec![TAG_ARR, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len >> 16) as u8];
-                outer.append(&mut body);
-                body = outer;
-            }
-            body
-        }
         assert!(validate_body(&raw_nested(DEPTH_MAX), &[]).is_ok());
         assert_eq!(validate_body(&raw_nested(DEPTH_MAX + 1), &[]), Err(DocError::DepthExceeded));
+    }
+
+    /// ADR-0169 D3's operand walk: the deepest path, siblings and objects
+    /// included, saturating one past the bound.
+    #[test]
+    fn nesting_depth_counts_the_deepest_container_path() {
+        let fragment = |v: &Value| model::encode_fragment(v).expect("fragment");
+        assert_eq!(nesting_depth(&fragment(&Value::I64(0))), 0);
+        assert_eq!(nesting_depth(&fragment(&Value::Arr(vec![]))), 1);
+        let siblings = Value::Arr(vec![
+            Value::Arr(vec![Value::I64(1)]),
+            Value::Arr(vec![Value::Arr(vec![Value::I64(2)])]),
+            Value::I64(3),
+        ]);
+        assert_eq!(nesting_depth(&fragment(&siblings)), 3);
+        let objects = Value::Obj(vec![
+            ("a".into(), Value::Obj(vec![("b".into(), Value::Arr(vec![]))])),
+            ("c".into(), Value::Str("x".repeat(300))),
+        ]);
+        assert_eq!(nesting_depth(&fragment(&objects)), 3);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX)), DEPTH_MAX);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX + 1)), DEPTH_MAX + 1);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX + 5)), DEPTH_MAX + 1);
+    }
+
+    /// ADR-0169 D4: the receipt's checked constructor accepts what the
+    /// parser emits and refuses a 129th container and the interned form.
+    #[test]
+    fn canonical_doc_validates_what_a_store_may_hold() {
+        let parsed = crate::JsonParser::new().parse(br#"{"a":[1,2]}"#).expect("parses");
+        let doc = CanonicalDoc::validate(&parsed).expect("parser output is canonical");
+        assert_eq!(doc.as_bytes(), &parsed[..]);
+        assert_eq!(doc.body(), &parsed[HEADER_LEN..]);
+        let mut deep = parsed[..HEADER_LEN].to_vec();
+        let body = raw_nested(DEPTH_MAX + 1);
+        deep[4..8].copy_from_slice(&u32::try_from(body.len()).expect("small").to_le_bytes());
+        deep.extend_from_slice(&body);
+        assert_eq!(CanonicalDoc::validate(&deep), Err(DocError::DepthExceeded));
+        #[cfg(feature = "doc-intern-keys")]
+        {
+            let entry = |n: u8| format!(r#"{{"a-repeated-long-key":{n}}}"#);
+            let repeated = format!("[{}]", (0..8).map(entry).collect::<Vec<_>>().join(","));
+            let plain = crate::JsonParser::new().parse(repeated.as_bytes()).expect("parses");
+            let interned = crate::intern::intern(&plain).expect("repeated keys intern");
+            assert!(TapeDoc::from_bytes(&interned).is_ok(), "an interned tape validates");
+            assert_eq!(
+                CanonicalDoc::validate(&interned),
+                Err(DocError::NonCanonical("interned form"))
+            );
+        }
     }
 
     #[test]

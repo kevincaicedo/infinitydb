@@ -1887,7 +1887,14 @@ mod tests {
         let idoc = inf_doc::JsonParser::new().parse(json.as_bytes()).expect("valid doc");
         let key: &[u8] = b"doc:big";
         store.idx_bracket_begin(&[key], None).expect("headroom");
-        store.json_set(key, &idoc, Default::default(), now).expect("set");
+        store
+            .json_set(
+                key,
+                &inf_doc::CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set");
         store.idx_bracket_commit(&[key], MaintMode::Strict);
         assert_eq!(store.idx.tree(IndexId(1)).map(|t| t.len()), Some(20_000));
         let retained = store.idx.scratch_bytes();
@@ -1946,7 +1953,14 @@ mod tests {
         if indexed {
             store.idx_bracket_begin(&[BIG], None).expect("headroom");
         }
-        store.json_set(BIG, &idoc, Default::default(), NOW).expect("set");
+        store
+            .json_set(
+                BIG,
+                &inf_doc::CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                Default::default(),
+                NOW,
+            )
+            .expect("set");
         if indexed {
             store.idx_bracket_commit(&[BIG], MaintMode::Strict);
         }
@@ -2030,7 +2044,14 @@ mod tests {
         let victim: &[u8] = b"doc:victim";
         let idoc = inf_doc::JsonParser::new().parse(br#"{"tags":["v"]}"#).expect("valid doc");
         store.idx_bracket_begin(&[victim], None).expect("headroom");
-        store.json_set(victim, &idoc, Default::default(), NOW).expect("set");
+        store
+            .json_set(
+                victim,
+                &inf_doc::CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                Default::default(),
+                NOW,
+            )
+            .expect("set");
         store.idx_bracket_commit(&[victim], MaintMode::Strict);
 
         store.idx_bracket_begin(&[BIG], None).expect("the pre-half reserves |old| for `new`");

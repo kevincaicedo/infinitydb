@@ -5,6 +5,7 @@
 //! with interning off.
 #![cfg(all(feature = "doc", feature = "doc-intern-keys"))]
 
+use inf_doc::CanonicalDoc;
 use inf_doc::model::{self, Value};
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, CopyResult, DocDomain, JsonLogDecision, JsonSetOptions, StoreConfig};
@@ -30,7 +31,14 @@ fn interning_on_and_off_are_observationally_identical() {
     let mut off = CellStore::new(StoreConfig::default());
     let mut on = CellStore::new(StoreConfig { doc_intern_keys: true, ..StoreConfig::default() });
     for store in [&mut off, &mut on] {
-        store.json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+        store
+            .json_set(
+                b"k",
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                JsonSetOptions::default(),
+                now(),
+            )
+            .expect("set");
     }
     // The knob changes stored bytes (attributed), never observable state.
     assert_eq!(off.doc_domain().intern_bytes, 0);
@@ -79,7 +87,13 @@ fn documents_without_winning_keys_stay_plain_under_the_knob() {
         Value::Str("x".repeat(700)), // blob tier, single-use key
     )]))
     .expect("encodes");
-    s.json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+    s.json_set(
+        b"k",
+        &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+        JsonSetOptions::default(),
+        now(),
+    )
+    .expect("set");
     let d = s.doc_domain();
     assert_eq!(d.intern_bytes, 0, "no winner ⇒ stored plain");
     assert_eq!(d.tape_bytes, doc.len() as u64);
@@ -99,7 +113,13 @@ fn oversized_intern_table_stays_readable() {
     let obj = || Value::Obj((0..distinct).map(|i| (format!("{i:04x}"), Value::I64(0))).collect());
     let doc = model::encode(&Value::Arr(vec![obj(), obj(), obj(), obj()])).expect("encodes");
     let mut on = CellStore::new(StoreConfig { doc_intern_keys: true, ..StoreConfig::default() });
-    on.json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+    on.json_set(
+        b"k",
+        &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+        JsonSetOptions::default(),
+        now(),
+    )
+    .expect("set");
     assert_eq!(on.doc_domain().intern_bytes, 0, "no table representable — stored plain");
     let read = on.json_get(b"k", now()).expect("doc").expect("present");
     let inf_doc::DocValue::Arr(arr) = read.root else { panic!("array root") };

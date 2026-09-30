@@ -68,3 +68,29 @@ pub const EXPIRY_SWEEP_CHUNK_SLOTS: usize = 16;
 /// range (2⁴⁰ / 2²⁷). ≤ 197 KiB of nodes. Crossing: unreachable — a debug
 /// assertion at creation and the `wheel_tombstones` gauge.
 pub const WHEEL_TOMBSTONES_MAX: u64 = 4 * 2 * 512 + (1 << 40) / (1 << 27);
+
+/// Idoc bytes, header and body, one stored document may hold (ADR-0169
+/// D2): the record value cap less the document value prefix, so every
+/// document a sink writes fits one `DocFull` and one inline record. Owner:
+/// inf-store, which alone knows the record layout. Crossing: a live
+/// mutation refuses in the parser or at the head of the apply plan, both
+/// clamped through `record_doc_limits` (`ERR document too large`); at the
+/// sink (COPY, a replayed `DocFull`) it is `OpError::TooLarge`. Nothing
+/// changes.
+#[cfg(feature = "doc")]
+pub const DOC_IDOC_BYTES_MAX: usize = crate::record::MAX_VAL_LEN - crate::doc::VALUE_PREFIX_LEN;
+
+/// Body bytes one stored document may hold: [`DOC_IDOC_BYTES_MAX`] less
+/// the idoc header, named by the crate that owns it (ADR-0169 D2). The
+/// body axis `DocLimits` carries; same owner and crossing.
+#[cfg(feature = "doc")]
+pub const DOC_BODY_BYTES_MAX: usize = DOC_IDOC_BYTES_MAX - inf_doc::HEADER_LEN;
+
+// A `DocDelta` carries the stored idoc length in its 3-byte `post_len`
+// field. That field has no owner const of its own: the encoder's width
+// check reuses the version mask, so the relation rides it (ADR-0169 I4).
+#[cfg(feature = "doc")]
+const _: () = assert!(DOC_IDOC_BYTES_MAX <= inf_log::DOC_VERSION_MASK as usize);
+// The record clamp only ever lowers the format ceiling.
+#[cfg(feature = "doc")]
+const _: () = assert!(DOC_BODY_BYTES_MAX <= inf_doc::limits::DOC_BYTES_MAX);

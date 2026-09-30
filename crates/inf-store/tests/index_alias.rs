@@ -18,8 +18,8 @@ mod receipt;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use inf_doc::JsonParser;
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::fault::{self, FaultSpec};
 use inf_foundation::time::Nanos;
 use inf_store::limits::{BRACKET_KEY_BYTES_MAX, IDX_ALIAS_GROUP_MAX, IDX_ALIAS_REHASH_MAX};
@@ -104,7 +104,9 @@ fn put(ks: &mut Keyspace, key: &[u8], json: &str, expire: SetExpire) {
     let idoc = parse(json);
     bracketed(ks, &[key], None, no_gate, |store| {
         let opts = JsonSetOptions { expire, ..JsonSetOptions::default() };
-        store.json_set(key, &idoc, opts, T0).expect("json_set");
+        store
+            .json_set(key, &CanonicalDoc::validate(&idoc).expect("canonical fixture"), opts, T0)
+            .expect("json_set");
     });
 }
 
@@ -261,7 +263,14 @@ fn gate_deaths_inside_a_bracket_converge_in_both_orders() {
             bracketed(&mut ks, &[&a], None, gate_evict_all_volatile, |store| {
                 if let Some(v) = next {
                     let idoc = parse(&format!(r#"{{"v":{v},"w":1}}"#));
-                    store.json_set(&a, &idoc, JsonSetOptions::default(), T0).expect("json_set");
+                    store
+                        .json_set(
+                            &a,
+                            &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                            JsonSetOptions::default(),
+                            T0,
+                        )
+                        .expect("json_set");
                 }
             });
             let model = next.map_or_else(BTreeMap::new, |v| model_of(&[(&a, v)]));
@@ -284,7 +293,13 @@ type PrunedBody = fn(&mut CellStore, &[u8], Nanos) -> bool;
 /// one of these funnels; each returns whether it found the document.
 const PRUNED_FUNNELS: [(&str, PrunedBody); 5] = [
     ("json_replace", |store, key, now| {
-        store.json_replace(key, &parse(r#"{"v":7,"w":2}"#), now).expect("replace")
+        store
+            .json_replace(
+                key,
+                &CanonicalDoc::validate(&parse(r#"{"v":7,"w":2}"#)).expect("canonical fixture"),
+                now,
+            )
+            .expect("replace")
     }),
     ("json_patch_scalar", |store, key, now| {
         let path = compile(b"$.w").expect("valid path");
@@ -386,7 +401,9 @@ fn cross_db_copy_refused_after_reaping_its_expired_target_removes_the_targets_en
         let idoc = parse(json);
         ks.idx_bracket_begin(DB1, &[key], None).expect("pre-half admits");
         let opts = JsonSetOptions { expire, ..JsonSetOptions::default() };
-        ks.db_mut(1).json_set(key, &idoc, opts, T0).expect("json_set");
+        ks.db_mut(1)
+            .json_set(key, &CanonicalDoc::validate(&idoc).expect("canonical fixture"), opts, T0)
+            .expect("json_set");
         ks.idx_bracket_commit(DB1, &[key]);
     };
     let filler = "x".repeat(40 << 10);
@@ -426,7 +443,14 @@ fn a_create_that_floods_one_index_degrades_every_participating_index() {
     let key = b"doc:flood";
     let idoc = parse(r#"{"a":[1],"b":[1,2,3,4,5,6,7,8,9,10],"c":[1]}"#);
     bracketed(&mut ks, &[key], None, no_gate, |store| {
-        store.json_set(key, &idoc, JsonSetOptions::default(), T0).expect("json_set");
+        store
+            .json_set(
+                key,
+                &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                JsonSetOptions::default(),
+                T0,
+            )
+            .expect("json_set");
     });
     for id in ids {
         assert_eq!(ks.idx_degraded(NS, id), Some(true), "index {} degraded", id.0);
@@ -720,7 +744,14 @@ fn a_write_set_of_aliases_is_charged_per_record_fetch() {
         let idoc = parse(r#"{"v":9,"w":1}"#);
         bracketed(&mut ks, &write_set, None, no_gate, |store| {
             for key in &keys {
-                store.json_set(key, &idoc, JsonSetOptions::default(), T0).expect("json_set");
+                store
+                    .json_set(
+                        key,
+                        &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                        JsonSetOptions::default(),
+                        T0,
+                    )
+                    .expect("json_set");
             }
         });
         let counters = ks.idx_counters_total();
@@ -770,7 +801,14 @@ fn scratch_growth_failure_at_the_pre_half_is_a_typed_refusal() {
         {
             let store = ks.db_mut(0);
             let idoc = parse(r#"{"v":7,"w":1}"#);
-            store.json_set(key, &idoc, JsonSetOptions::default(), T0).expect("unbracketed seed");
+            store
+                .json_set(
+                    key,
+                    &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                    JsonSetOptions::default(),
+                    T0,
+                )
+                .expect("unbracketed seed");
         }
         fault::arm(inf_store::fault::IDX_SCRATCH_REFUSE, FaultSpec::Nth(nth));
         let outcome = ks.idx_bracket_begin(NS, &[key], None);
@@ -821,7 +859,15 @@ fn a_key_that_reaches_no_funnel_needs_no_scratch_after_the_pre_half() {
         let published = match refused {
             "nx" => {
                 let opts = JsonSetOptions { cond: SetCond::IfAbsent, ..JsonSetOptions::default() };
-                let outcome = ks.db_mut(0).json_set(key, &bigger, opts, T0).expect("json_set");
+                let outcome = ks
+                    .db_mut(0)
+                    .json_set(
+                        key,
+                        &CanonicalDoc::validate(&bigger).expect("canonical fixture"),
+                        opts,
+                        T0,
+                    )
+                    .expect("json_set");
                 outcome == inf_store::JsonSetOutcome::Applied
             }
             _ => {
@@ -844,7 +890,14 @@ fn a_key_that_reaches_no_funnel_needs_no_scratch_after_the_pre_half() {
     ks.idx_bracket_begin(NS, &[key], None).expect("pre-half");
     let grown: Vec<String> = (0..4096).map(|i| i.to_string()).collect();
     let idoc = parse(&format!(r#"{{"tags":[{}]}}"#, grown.join(",")));
-    ks.db_mut(0).json_set(key, &idoc, JsonSetOptions::default(), T0).expect("json_set");
+    ks.db_mut(0)
+        .json_set(
+            key,
+            &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            T0,
+        )
+        .expect("json_set");
     ks.idx_bracket_commit(NS, &[key]);
     assert!(fault::fired(inf_store::fault::IDX_SCRATCH_REFUSE) > 0, "the plant is live");
     fault::disarm_all();
@@ -864,7 +917,14 @@ fn scratch_growth_failure_in_a_death_hook_degrades_the_index() {
     let mut ks = fixture();
     {
         let idoc = parse(r#"{"v":7,"w":1}"#);
-        ks.db_mut(0).json_set(key, &idoc, JsonSetOptions::default(), T0).expect("seed");
+        ks.db_mut(0)
+            .json_set(
+                key,
+                &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                JsonSetOptions::default(),
+                T0,
+            )
+            .expect("seed");
     }
     fault::arm(inf_store::fault::IDX_SCRATCH_REFUSE, FaultSpec::Always);
     assert!(ks.db_mut(0).del(key, T0), "an unbracketed death runs the hook");
@@ -915,7 +975,14 @@ fn the_key_bytes_cap_bounds_a_phase() {
     // Un-degraded indexes meet the same document as a pre-image.
     let mut ks = build();
     let idoc = parse(&over_cap);
-    ks.db_mut(0).json_set(key, &idoc, JsonSetOptions::default(), T0).expect("unbracketed seed");
+    ks.db_mut(0)
+        .json_set(
+            key,
+            &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            T0,
+        )
+        .expect("unbracketed seed");
     assert_eq!(ks.idx_bracket_begin(NS, &[key], None), Err(IdxMaintRefusal::EntryFlood));
 }
 

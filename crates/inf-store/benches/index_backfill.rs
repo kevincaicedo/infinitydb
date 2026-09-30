@@ -26,8 +26,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_doc::JsonParser;
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{
     BackfillBudget, IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig,
@@ -63,8 +63,11 @@ fn main() {
 
     // ---- corpus (no index exists yet — the population the walk covers)
     let build_started = Instant::now();
-    let doc_a = parse(r#"{"price":1234.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
-    let doc_b = parse(r#"{"price":77.5,"pad":"yyyyyyyyyyyyyyyy"}"#);
+    let bytes_a = parse(r#"{"price":1234.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
+    let bytes_b = parse(r#"{"price":77.5,"pad":"yyyyyyyyyyyyyyyy"}"#);
+    // Receipts built once, outside every timed section.
+    let doc_a = CanonicalDoc::validate(&bytes_a).expect("canonical fixture");
+    let doc_b = CanonicalDoc::validate(&bytes_b).expect("canonical fixture");
     for i in 0..DOCS {
         let key = key_of(i);
         let doc = if i % 2 == 0 { &doc_a } else { &doc_b };

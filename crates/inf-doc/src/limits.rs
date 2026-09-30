@@ -2,8 +2,13 @@
 //! (ADR-0146). Namespace configuration may lower the format ceilings;
 //! cache capacity has its own checked construction boundary.
 
-/// Maximum nesting depth (containers on the validation/build stack).
-/// RedisJSON parity; a 129th nested container is a typed reject.
+/// Maximum nesting depth, in containers: the reader bound of every stored
+/// document and every delta operand, and the bound a path mutation's
+/// composed output meets (ADR-0169 D2/D3). Crossing ⇒ `DepthExceeded`,
+/// `ERR document nesting too deep`, nothing changed. Not RedisJSON's
+/// bound: it refuses a parsed value's 128th container and never bounds a
+/// composed document — both differences are recorded deviations (ADR-0042
+/// A1).
 pub const DEPTH_MAX: usize = 128;
 
 /// Document byte cap: 16 MiB − 1. This is a *ceiling built into field
@@ -15,6 +20,42 @@ pub const DOC_BYTES_MAX: usize = 0xFF_FFFF;
 // The cap must fit the u24 skip-length fields — if this ever fails to
 // compile, the format changed without its ADR.
 const _: () = assert!(DOC_BYTES_MAX <= 0xFF_FFFF);
+
+/// The document bounds one writer applies: nesting depth in containers and
+/// body bytes (the header excluded). The fields are private and `new`
+/// clamps each to [`DocLimits::FORMAT`], so configuration lowers a bound
+/// and never raises it (ADR-0039 D5's clamp law; ADR-0169 D2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DocLimits {
+    depth_max: usize,
+    body_bytes_max: usize,
+}
+
+impl DocLimits {
+    /// The format ceilings: [`DEPTH_MAX`] and [`DOC_BYTES_MAX`].
+    pub const FORMAT: DocLimits = DocLimits { depth_max: DEPTH_MAX, body_bytes_max: DOC_BYTES_MAX };
+
+    pub const fn new(depth_max: usize, body_bytes_max: usize) -> DocLimits {
+        DocLimits {
+            depth_max: if depth_max < DEPTH_MAX { depth_max } else { DEPTH_MAX },
+            body_bytes_max: if body_bytes_max < DOC_BYTES_MAX {
+                body_bytes_max
+            } else {
+                DOC_BYTES_MAX
+            },
+        }
+    }
+
+    /// Containers a document may nest.
+    pub const fn depth_max(self) -> usize {
+        self.depth_max
+    }
+
+    /// Body bytes a document may hold, its header excluded.
+    pub const fn body_bytes_max(self) -> usize {
+        self.body_bytes_max
+    }
+}
 
 /// Path cache entries per cell. Larger requests are refused before
 /// allocation; zero disables caching (ADR-0146 D1).

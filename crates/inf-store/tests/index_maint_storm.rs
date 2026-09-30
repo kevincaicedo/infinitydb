@@ -23,8 +23,8 @@ mod receipt;
 
 use std::collections::BTreeSet;
 
-use inf_doc::JsonParser;
 use inf_doc::path::{EvalLimits, compile, eval, resolve};
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::KeyHasher;
 use inf_store::{
@@ -269,7 +269,12 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
             bracketed(ks, ns, &[&key], None, |s| {
                 // WrongType over a string-typed key is the ADR-0037 D6
                 // contract — a refused mutation leaves post ≡ pre.
-                let _ = s.json_set(&key, &doc, Default::default(), *now);
+                let _ = s.json_set(
+                    &key,
+                    &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                    Default::default(),
+                    *now,
+                );
             });
         }
         // Delete inside the bracket (the D6 write-set responsibility).
@@ -291,7 +296,12 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
                 expire: inf_store::SetExpire::At(at),
             };
             bracketed(ks, ns, &[&key], None, |s| {
-                let _ = s.json_set(&key, &doc, opts, *now);
+                let _ = s.json_set(
+                    &key,
+                    &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                    opts,
+                    *now,
+                );
             });
         }
         // Lazy-expiry probe: a plain read reaps dead records (the death
@@ -407,7 +417,10 @@ fn expiry_wheel_churn_holds_equivalence() {
             cond: inf_store::SetCond::Always,
             expire: inf_store::SetExpire::At(at),
         };
-        bracketed(&mut ks, ns, &[&key], None, |s| s.json_set(&key, &doc, opts, now).expect("set"));
+        bracketed(&mut ks, ns, &[&key], None, |s| {
+            s.json_set(&key, &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now)
+                .expect("set")
+        });
     }
     for round in 0..60 {
         now.0 += 1_000_000;
@@ -446,7 +459,13 @@ fn flush_truncates_trees_but_keeps_declarations() {
     let key = b"doc:after-flush";
     let doc = parse(r#"{"price":9.5,"name":"post","qty":1,"tags":["z"]}"#);
     bracketed(&mut ks, ns, &[key.as_slice()], None, |s| {
-        s.json_set(key, &doc, Default::default(), now).expect("set")
+        s.json_set(
+            key,
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     assert_equivalence(&mut ks, ns, now, "after flush + reinsert");
 }
@@ -461,7 +480,13 @@ fn copy_maintains_destination_entries() {
     let now = Nanos(1_000_000_000);
     let doc = parse(r#"{"price":4.5,"name":"src","qty":7,"tags":["a","a"]}"#);
     bracketed(&mut ks, ns, &[b"src".as_slice()], None, |s| {
-        s.json_set(b"src", &doc, Default::default(), now).expect("set")
+        s.json_set(
+            b"src",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     // Same-db COPY: no plane bracket — the store's own mini-bracket.
     ks.db_mut(0).copy(b"src", b"target", false, now).expect("copy");
@@ -500,14 +525,26 @@ fn multi_match_duplicates_dedupe_per_document() {
     let key = b"doc:dup";
     let doc = parse(r#"{"price":1,"name":"d","qty":1,"tags":["a","a","b","a"]}"#);
     bracketed(&mut ks, ns, &[key.as_slice()], None, |s| {
-        s.json_set(key, &doc, Default::default(), now).expect("set")
+        s.json_set(
+            key,
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     let tags = tree_entries(&ks, ns, IndexId(4));
     assert_eq!(tags.len(), 2, "duplicates collapse to one pair per value");
     // Shrink to a subset — the remove side must remove exactly "b".
     let doc2 = parse(r#"{"price":1,"name":"d","qty":1,"tags":["a","a"]}"#);
     bracketed(&mut ks, ns, &[key.as_slice()], None, |s| {
-        s.json_set(key, &doc2, Default::default(), now).expect("set")
+        s.json_set(
+            key,
+            &CanonicalDoc::validate(&doc2).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     assert_equivalence(&mut ks, ns, now, "after duplicate shrink");
     assert_eq!(tree_entries(&ks, ns, IndexId(4)).len(), 1);
@@ -525,12 +562,24 @@ fn skip_taxonomy_is_counted() {
     let now = Nanos(1_000_000_000);
     let normal = parse(r#"{"price":1.5,"name":"n","qty":2,"tags":["t"]}"#);
     bracketed(&mut ks, ns, &[b"doc:normal".as_slice()], None, |s| {
-        s.json_set(b"doc:normal", &normal, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:normal",
+            &CanonicalDoc::validate(&normal).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     let doc =
         parse(&format!(r#"{{"price":{},"name":null,"qty":3.5,"tags":[]}}"#, (1u64 << 60) + 1));
     bracketed(&mut ks, ns, &[b"doc:skips".as_slice()], None, |s| {
-        s.json_set(b"doc:skips", &doc, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:skips",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     let price = ks.idx_counters(ns, IndexId(1)).expect("counters");
     assert_eq!(price.skipped_inexact, 1, "2^60+1 does not admit into f64");
@@ -554,7 +603,13 @@ fn static_prune_skips_disjoint_path_mutations() {
     let key = b"doc:prune";
     let doc = parse(r#"{"price":10.5,"name":"p","qty":2,"tags":["a"],"other":1}"#);
     bracketed(&mut ks, ns, &[key.as_slice()], None, |s| {
-        s.json_set(key, &doc, Default::default(), now).expect("set")
+        s.json_set(
+            key,
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     let before = ks.idx_counters(ns, IndexId(1)).expect("counters");
     // A mutation scoped to `$.other` is disjoint from every declared
@@ -594,7 +649,13 @@ fn attach_blocks_sync_at_materialization_and_seed() {
     let now = Nanos(1_000_000_000);
     let doc = parse(r#"{"price":3.5}"#);
     bracketed(&mut ks, ns, &[b"k".as_slice()], None, |s| {
-        s.json_set(b"k", &doc, Default::default(), now).expect("set")
+        s.json_set(
+            b"k",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     assert_eq!(tree_entries(&ks, ns, IndexId(1)).len(), 1, "attach installed + maintained");
     // Rebuild resets the attach tree with the bumped generation.
@@ -627,12 +688,24 @@ fn replay_maintenance_matches_live() {
     for (key, json) in docs {
         let idoc = parse(json);
         bracketed(&mut live, ns, &[key], None, |s| {
-            s.json_set(key, &idoc, Default::default(), now).expect("set")
+            s.json_set(
+                key,
+                &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set")
         });
     }
     let overwrite = parse(r#"{"price":9.0,"name":"a2","qty":9,"tags":["v"]}"#);
     bracketed(&mut live, ns, &[b"k1".as_slice()], None, |s| {
-        s.json_set(b"k1", &overwrite, Default::default(), now).expect("set")
+        s.json_set(
+            b"k1",
+            &CanonicalDoc::validate(&overwrite).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     bracketed(&mut live, ns, &[b"k2".as_slice()], None, |s| s.del(b"k2", now));
     // Replay side: the same history as DocFull/Delete records, dial
@@ -689,7 +762,13 @@ fn reservation_refusal_is_typed_and_mutates_nothing() {
     let now = Nanos(1_000_000_000);
     let doc = parse(r#"{"price":5.5,"name":"pre","qty":1,"tags":["a"]}"#);
     bracketed(&mut ks, ns, &[b"doc:pre".as_slice()], None, |s| {
-        s.json_set(b"doc:pre", &doc, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:pre",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     let trees_before: Vec<_> =
         INDEXES.iter().map(|&(id, ..)| tree_entries(&ks, ns, IndexId(id))).collect();
@@ -716,7 +795,13 @@ fn reservation_refusal_is_typed_and_mutates_nothing() {
     // The bracket closed cleanly — the next mutation maintains normally.
     let doc2 = parse(r#"{"price":6.5,"name":"post","qty":2,"tags":["b"]}"#);
     bracketed(&mut ks, ns, &[b"doc:new".as_slice()], None, |s| {
-        s.json_set(b"doc:new", &doc2, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:new",
+            &CanonicalDoc::validate(&doc2).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     assert_equivalence(&mut ks, ns, now, "after disarm");
     receipt::verified("idx_reserve_refuse", "refusal-leaves-no-trace");
@@ -736,7 +821,13 @@ fn planted_apply_trip_degrades_and_never_lies() {
     fault::arm(inf_store::fault::IDX_APPLY_TRIP, FaultSpec::Nth(1));
     let doc = parse(r#"{"price":7.5,"name":"trip","qty":3,"tags":["c"]}"#);
     bracketed(&mut ks, ns, &[b"doc:trip".as_slice()], None, |s| {
-        s.json_set(b"doc:trip", &doc, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:trip",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     fault::disarm(inf_store::fault::IDX_APPLY_TRIP);
 
@@ -752,7 +843,13 @@ fn planted_apply_trip_degrades_and_never_lies() {
     // trip, no entries appear.
     let doc2 = parse(r#"{"price":8.5,"name":"after","qty":4,"tags":["d"]}"#);
     bracketed(&mut ks, ns, &[b"doc:after".as_slice()], None, |s| {
-        s.json_set(b"doc:after", &doc2, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:after",
+            &CanonicalDoc::validate(&doc2).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     for &(id, ..) in INDEXES {
         assert!(tree_entries(&ks, ns, IndexId(id)).is_empty(), "degraded {id} unmaintained");
@@ -766,7 +863,13 @@ fn planted_apply_trip_degrades_and_never_lies() {
     assert_eq!(ks.idx_degraded(ns, IndexId(1)), Some(false), "rebuild clears the veto");
     let doc3 = parse(r#"{"price":9.5,"name":"fresh","qty":5,"tags":["e"]}"#);
     bracketed(&mut ks, ns, &[b"doc:fresh".as_slice()], None, |s| {
-        s.json_set(b"doc:fresh", &doc3, Default::default(), now).expect("set")
+        s.json_set(
+            b"doc:fresh",
+            &CanonicalDoc::validate(&doc3).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set")
     });
     assert_eq!(tree_entries(&ks, ns, IndexId(1)).len(), 1, "maintenance resumed post-rebuild");
     receipt::verified("idx_apply_trip", "degrades-never-lies");

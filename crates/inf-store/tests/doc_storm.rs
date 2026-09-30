@@ -13,6 +13,7 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 
+use inf_doc::CanonicalDoc;
 use inf_doc::model::{self, Value};
 use inf_foundation::time::Nanos;
 use inf_store::{
@@ -121,6 +122,7 @@ proptest! {
                 Op::Set { key, size } => {
                     let doc = doc_for(size, key as i64);
                     let name = key_name(key);
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     let outcome = store
                         .json_set(name.as_bytes(), &doc, JsonSetOptions::default(), now)
                         .expect("set");
@@ -133,6 +135,7 @@ proptest! {
                 Op::Replace { key, size } => {
                     let doc = doc_for(size, -(key as i64) - 1);
                     let name = key_name(key);
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     let replaced = store.json_replace(name.as_bytes(), &doc, now).expect("ok");
                     let e = &mut expect[key];
                     prop_assert_eq!(replaced, e.version.is_some());
@@ -238,6 +241,7 @@ proptest! {
                 1 => {
                     let doc = doc_for(SizeClass::Blob, key as i64);
                     // WrongType when a string sits there; overwrite via DEL.
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     match store.json_set(name.as_bytes(), &doc, JsonSetOptions::default(), now) {
                         Ok(_) => {}
                         Err(OpError::WrongType) => {

@@ -48,8 +48,8 @@ mod receipt;
 
 use std::collections::BTreeSet;
 
-use inf_doc::JsonParser;
 use inf_doc::path::{EvalLimits, compile, eval, resolve};
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::KeyHasher;
 use inf_store::{
@@ -147,7 +147,14 @@ fn populated_fixture(ns: NsId, count: u64, seed: u64) -> (Keyspace, Rng, Nanos) 
     for i in 0..count {
         let key = key_of(i);
         let doc = parse(&random_doc(&mut rng));
-        ks.db_mut(ns.0 as usize).json_set(&key, &doc, Default::default(), now).expect("set");
+        ks.db_mut(ns.0 as usize)
+            .json_set(
+                &key,
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set");
     }
     (ks, rng, now)
 }
@@ -177,7 +184,12 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
         0..=3 => {
             let doc = parse(&random_doc(rng));
             bracketed(ks, ns, &[&key], |s| {
-                let _ = s.json_set(&key, &doc, Default::default(), *now);
+                let _ = s.json_set(
+                    &key,
+                    &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                    Default::default(),
+                    *now,
+                );
             });
         }
         4 => {
@@ -196,7 +208,12 @@ fn storm_step(ks: &mut Keyspace, ns: NsId, rng: &mut Rng, now: &mut Nanos) {
                 expire: inf_store::SetExpire::At(at),
             };
             bracketed(ks, ns, &[&key], |s| {
-                let _ = s.json_set(&key, &doc, opts, *now);
+                let _ = s.json_set(
+                    &key,
+                    &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                    opts,
+                    *now,
+                );
             });
         }
         7 => {
@@ -383,7 +400,13 @@ fn rehash_mid_walk_converges() {
         let key = key_of(i);
         let doc = parse(&random_doc(&mut rng));
         bracketed(&mut ks, ns, &[&key], |s| {
-            s.json_set(&key, &doc, Default::default(), now).expect("set");
+            s.json_set(
+                &key,
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set");
         });
         now.0 += 10_000;
     }
@@ -409,7 +432,9 @@ fn expiry_across_the_walk_converges() {
             cond: inf_store::SetCond::Always,
             expire: inf_store::SetExpire::At(at),
         };
-        ks.db_mut(0).json_set(&key, &doc, opts, now).expect("set");
+        ks.db_mut(0)
+            .json_set(&key, &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now)
+            .expect("set");
     }
     declare_indexes(&mut ks, ns);
     // Advance the clock while walking so deadlines fire mid-walk: some
@@ -572,7 +597,14 @@ fn eval_overflow_doc_degrades_the_build() {
     let now = Nanos(1_000_000_000);
     // Six tags > the 4-match cap; written before any index exists.
     let flood = parse(r#"{"price":1.5,"name":"f","qty":1,"tags":["a","b","c","d","e","f"]}"#);
-    ks.db_mut(0).json_set(b"doc:flood", &flood, Default::default(), now).expect("set");
+    ks.db_mut(0)
+        .json_set(
+            b"doc:flood",
+            &CanonicalDoc::validate(&flood).expect("canonical fixture"),
+            Default::default(),
+            now,
+        )
+        .expect("set");
     declare_indexes(&mut ks, ns);
     for _ in 0..32 {
         ks.idx_backfill_tick(now, BackfillBudget::default());
@@ -645,7 +677,14 @@ fn empty_and_flushed_namespaces_converge() {
     for i in 0..128u64 {
         let key = key_of(i);
         let doc = parse(r#"{"price":1.5,"name":"x","qty":1,"tags":["a"]}"#);
-        ks.db_mut(5).json_set(&key, &doc, Default::default(), now).expect("set");
+        ks.db_mut(5)
+            .json_set(
+                &key,
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set");
     }
     for &(id, path, key_type) in INDEXES {
         let program = compile(path.as_bytes()).expect("valid path").as_bytes().to_vec();

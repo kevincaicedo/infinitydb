@@ -6,6 +6,7 @@
 
 #![cfg(feature = "doc")]
 
+use inf_doc::CanonicalDoc;
 use inf_foundation::time::Nanos;
 use inf_server::{ConnCx, execute_slices};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig};
@@ -716,6 +717,37 @@ fn arrappend_shapes_and_the_three_argument_quirk() {
         &["JSON.ARRAPPEND", "k", "$.a", "{bad"],
         "-ERR invalid JSON: unexpected character 'b' at offset 1\r\n",
     );
+}
+
+/// ADR-0169 D3: a 128-level `ARRAPPEND` element would nest its operand's
+/// wrapper 129, which the delta decoder refuses, so the command answers the
+/// nesting error while its operands parse — ahead of the missing-key error,
+/// as RedisJSON orders its own parse refusal (ADR-0042 A1).
+#[test]
+fn arrappend_element_past_the_depth_bound_refuses_before_lookup() {
+    let mut db = Db::new();
+    let element = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+    assert_reply(
+        &mut db,
+        &["JSON.ARRAPPEND", "missing", "$", &element],
+        "-ERR document nesting too deep\r\n",
+    );
+}
+
+/// ADR-0169 D2/D5: a `STRAPPEND` that grows a body one byte past the
+/// stored-document bound (16,777,192 body bytes) refuses in the apply plan
+/// with the size text, and the document is unchanged.
+#[test]
+fn strappend_past_the_stored_document_bound_refuses() {
+    const STORED_BODY_MAX: usize = (1 << 24) - 1 - 15 - 8;
+    let mut db = Db::new();
+    // `{"s":…}`: object header 4, key 2, str24 header 4.
+    let big = format!(r#"{{"s":"{}"}}"#, "x".repeat(STORED_BODY_MAX - 10 - 99));
+    assert_reply(&mut db, &["JSON.SET", "k", "$", &big], "+OK\r\n");
+    let before = db.run_str(&["JSON.STRLEN", "k", "$.s"]);
+    let tail = format!("\"{}\"", "y".repeat(100));
+    assert_reply(&mut db, &["JSON.STRAPPEND", "k", "$.s", &tail], "-ERR document too large\r\n");
+    assert_eq!(db.run_str(&["JSON.STRLEN", "k", "$.s"]), before, "the refusal changed nothing");
 }
 
 #[test]
@@ -1685,7 +1717,12 @@ fn store_doc(db: &mut Db, key: &str, json: &str) {
         cond: inf_store::SetCond::Always,
         expire: inf_store::SetExpire::Keep,
     };
-    let outcome = db.ks.db_mut(0).json_set(key.as_bytes(), &idoc, opts, Nanos(db.clock));
+    let outcome = db.ks.db_mut(0).json_set(
+        key.as_bytes(),
+        &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+        opts,
+        Nanos(db.clock),
+    );
     assert_eq!(outcome, Ok(inf_store::JsonSetOutcome::Applied), "fixture write {key}");
 }
 

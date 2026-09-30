@@ -20,7 +20,8 @@
 //! the oracle; what is pinned here is the typed kind and the library
 //! Display line.
 
-use inf_doc::{JsonErrorKind, JsonParser, ParseLimits};
+use inf_doc::limits::{DEPTH_MAX, DOC_BYTES_MAX};
+use inf_doc::{DocLimits, JsonErrorKind, JsonParser, ParseLimits};
 
 /// `[1e1,1e1,…]`: ~4 text bytes but 9 idoc bytes per element.
 fn small_token_array(elements: usize) -> Vec<u8> {
@@ -52,7 +53,7 @@ fn text_cap_rejects_before_any_allocation() {
 #[test]
 fn pathological_small_token_corpus_hits_the_idoc_bound() {
     const CAP: usize = 64 << 10;
-    let limits = ParseLimits { max_depth: 128, max_text: CAP, max_body: CAP };
+    let limits = ParseLimits { doc: DocLimits::new(DEPTH_MAX, CAP), max_text: CAP };
     let mut p = JsonParser::with_limits(limits);
     // ~48 KiB of text (passes the text cap) that would encode to
     // ~108 KiB of tape (fails the idoc cap): the text-cap-passes /
@@ -86,7 +87,8 @@ fn pathological_small_token_corpus_hits_the_idoc_bound() {
 
 #[test]
 fn configured_depth_rejects_downward() {
-    let mut p = JsonParser::with_limits(ParseLimits { max_depth: 4, ..ParseLimits::default() });
+    let doc = DocLimits::new(4, DOC_BYTES_MAX);
+    let mut p = JsonParser::with_limits(ParseLimits { doc, ..ParseLimits::default() });
     assert!(p.parse(b"[[[[1]]]]").is_ok(), "depth 4 fits a depth-4 limit");
     let e = p.parse(b"[[[[[1]]]]]").unwrap_err();
     assert_eq!(e.kind, JsonErrorKind::DepthExceeded);
@@ -97,11 +99,9 @@ fn configured_depth_rejects_downward() {
 fn limits_clamp_to_format_ceilings() {
     // Raising past the ceilings is silently clamped: a 129-deep document
     // still rejects, and the body cap stays the u24 ceiling.
-    let mut p = JsonParser::with_limits(ParseLimits {
-        max_depth: 100_000,
-        max_text: usize::MAX,
-        max_body: usize::MAX,
-    });
+    let doc = DocLimits::new(100_000, usize::MAX);
+    assert_eq!(doc, DocLimits::FORMAT);
+    let mut p = JsonParser::with_limits(ParseLimits { doc, max_text: usize::MAX });
     let too_deep = format!("{}1{}", "[".repeat(129), "]".repeat(129));
     let e = p.parse(too_deep.as_bytes()).unwrap_err();
     assert_eq!(e.kind, JsonErrorKind::DepthExceeded);
@@ -113,7 +113,8 @@ fn rejection_error_lines_are_documented() {
     let e = p.parse(b"[1,2,3,4,5]").unwrap_err();
     assert_eq!(e.to_string(), "document too large at offset 0");
 
-    let mut p = JsonParser::with_limits(ParseLimits { max_depth: 2, ..ParseLimits::default() });
+    let doc = DocLimits::new(2, DOC_BYTES_MAX);
+    let mut p = JsonParser::with_limits(ParseLimits { doc, ..ParseLimits::default() });
     let e = p.parse(b"[[[1]]]").unwrap_err();
     assert_eq!(e.to_string(), "document nesting too deep at offset 2");
 }
@@ -124,11 +125,8 @@ fn rejection_error_lines_are_documented() {
 #[test]
 fn buffer_reuse_survives_rejection() {
     const CAP: usize = 4 << 10;
-    let mut p = JsonParser::with_limits(ParseLimits {
-        max_text: CAP,
-        max_body: CAP,
-        ..ParseLimits::default()
-    });
+    let mut p =
+        JsonParser::with_limits(ParseLimits { doc: DocLimits::new(DEPTH_MAX, CAP), max_text: CAP });
     let mut out = Vec::new();
     let reject = small_token_array(1000); // ~3.9 KiB text → ~9 KiB idoc
     assert!(reject.len() <= CAP);

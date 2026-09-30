@@ -18,10 +18,9 @@
 
 use inf_alloc::arena::{Arena, ArenaConfig};
 use inf_doc::apply::{ApplyOp, apply};
-use inf_doc::limits::DOC_BYTES_MAX;
 use inf_doc::model::{self, Value};
 use inf_doc::path::{EvalLimits, compile};
-use inf_doc::{ArenaDoc, JsonParser, TapeDoc};
+use inf_doc::{ArenaDoc, DocLimits, JsonParser, TapeDoc};
 
 #[allow(dead_code, unused_imports)] // shared generator also contains its CLI and witness tests
 #[path = "../../../bins/inf-bench/src/doc_corpus.rs"]
@@ -50,10 +49,10 @@ fn splice_storm_keeps_arena_slack_at_zero() {
     for round in 0..12 {
         let doc = TapeDoc::from_bytes(&bytes).expect("storm output revalidates");
         let limits = EvalLimits::default();
-        let outcome = apply(&doc, &program, &ops[round % ops.len()], &limits, DOC_BYTES_MAX)
+        let outcome = apply(&doc, &program, &ops[round % ops.len()], &limits, DocLimits::FORMAT)
             .expect("storm ops stay in range");
-        if let Some(new_bytes) = outcome.bytes {
-            bytes = new_bytes;
+        if let Some(document) = outcome.document {
+            bytes = document.as_bytes().to_vec();
         }
         let doc = TapeDoc::from_bytes(&bytes).expect("revalidates");
         let baseline = arena.report().live_bytes as usize;

@@ -21,8 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use inf_doc::JsonParser;
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{
     COLLISION_KEY_PREFIX, CellStore, EvictionPolicy, ExpiryBudget, IndexId, IndexKeyBuf,
@@ -317,7 +317,14 @@ fn step(h: &mut Harness, rng: &mut Rng) -> &'static str {
             // `WRONGTYPE` over a live string: a refusal, nothing changed.
             let applied = h.bracketed(&[&key], None, gate, |store, now| {
                 let opts = JsonSetOptions { expire: expire_of(deadline_ms), ..Default::default() };
-                store.json_set(&key, &idoc, opts, now).is_ok()
+                store
+                    .json_set(
+                        &key,
+                        &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                        opts,
+                        now,
+                    )
+                    .is_ok()
             });
             if applied {
                 h.set_model(&key, Some(Shadow::Doc { v, tags, deadline_ms }));
@@ -376,7 +383,11 @@ fn step(h: &mut Harness, rng: &mut Rng) -> &'static str {
             let is_doc = replacement.is_some();
             h.bracketed(&[&key], Some("$.w"), gate, |store, now| {
                 if is_doc {
-                    let _ = store.json_replace(&key, &idoc, now);
+                    let _ = store.json_replace(
+                        &key,
+                        &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                        now,
+                    );
                 } else {
                     // The body's own lookup: it reaps an expired record.
                     let _ = store.json_get(&key, now);

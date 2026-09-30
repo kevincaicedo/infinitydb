@@ -67,18 +67,19 @@ pub struct StoreConfig {
     /// Repeated-key interning experiment (ADR-0038) — default off, and off
     /// for the M3 release regardless of the A/B (plan §2 cut line).
     pub doc_intern_keys: bool,
-    /// Maximum JSON nesting depth accepted at document ingest (M3-S07;
-    /// RedisJSON-parity default 128). Configurable downward only — the
-    /// format ceiling (`inf_doc::limits::DEPTH_MAX`) clamps it. Per-
-    /// namespace override rides the S11 command surface (the parser is
-    /// constructed with the namespace's resolved limits there).
+    /// Maximum JSON nesting depth of a stored document, at ingest and after
+    /// every path mutation (M3-S07; ADR-0169 D3). Default and ceiling: the
+    /// format's `inf_doc::limits::DEPTH_MAX`, which clamps it — configurable
+    /// downward only. Per-namespace override rides the S11 command surface
+    /// (the parser is constructed with the namespace's resolved limits).
     pub doc_max_depth: usize,
-    /// Maximum document size at ingest (M3-S07), applied to **both** axes
-    /// of the dual bound: input text bytes (reject before the structural
-    /// index allocates) and encoded idoc bytes (incremental during stage 2
-    /// — small-token documents can encode larger than their text). Default
-    /// = the 16 MiB − 1 format ceiling (record `vlen`, u24 skip lengths);
-    /// configurable downward only.
+    /// Maximum document size (M3-S07), applied to both axes of the dual
+    /// bound: input text bytes (reject before the structural index
+    /// allocates) and encoded body bytes (incremental during stage 2 —
+    /// small-token documents can encode larger than their text). The text
+    /// axis defaults to the 16 MiB − 1 format ceiling; the body axis is
+    /// clamped to `limits::DOC_BODY_BYTES_MAX`, what one `DocFull` carries
+    /// (ADR-0169 D2). Configurable downward only.
     pub doc_max_bytes: usize,
     /// Maximum JSONPath text bytes per command (M3-S11; ADR-0040 D6's
     /// `doc_max_path_bytes`). The S10 program cache enforces it before
@@ -1455,6 +1456,9 @@ impl CellStore {
         if target.len() > MAX_KEY_LEN {
             return Err(OpError::TooLarge);
         }
+        // The frozen source is store-owned, yet the sink takes only a
+        // receipt: one more O(document) walk per document COPY (ADR-0169 D5).
+        let plain = inf_doc::CanonicalDoc::validate(plain).map_err(doc::op_from_doc)?;
         let target_existing = self.resolve(target, now);
         if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
@@ -1468,7 +1472,7 @@ impl CellStore {
         self.json_write_value(
             target,
             target_existing,
-            plain,
+            &plain,
             doc::DocWriteMeta {
                 lineage,
                 version,

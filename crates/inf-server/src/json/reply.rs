@@ -143,6 +143,11 @@ impl ReplyError<'_> {
             ReplyError::Json(error) => json_error(&error, w),
             ReplyError::Op(error) => op_error(error, w),
             ReplyError::Apply(ApplyError::TooLarge) => w.error("ERR document too large"),
+            // The parser's nesting text (ADR-0041 D11), for a composed depth
+            // or an array operand past `DEPTH_MAX` (ADR-0169 D3).
+            ReplyError::Apply(ApplyError::DepthExceeded) => {
+                w.error("ERR document nesting too deep");
+            }
             ReplyError::Apply(ApplyError::Eval(inner)) => w.error(&format!("ERR {inner}")),
             ReplyError::Apply(
                 other @ (ApplyError::Overflow

@@ -18,7 +18,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_doc::JsonParser;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::KeyHasher;
 use inf_store::{CellStore, ExpireCond, JsonSetOptions, StoreConfig};
@@ -175,9 +175,13 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
             doc_inline_bytes_max: threshold,
             ..StoreConfig::default()
         });
+        let receipts: Vec<CanonicalDoc<'_>> = corpus
+            .iter()
+            .map(|(_, idoc)| CanonicalDoc::validate(idoc).expect("corpus is canonical"))
+            .collect();
         let started = Instant::now();
         for index in 0..documents {
-            let idoc = &corpus[index % corpus.len()].1;
+            let idoc = &receipts[index % receipts.len()];
             store
                 .json_set(&key_of(index), idoc, JsonSetOptions::default(), NOW)
                 .expect("threshold load");
@@ -225,10 +229,11 @@ fn prefetch_rows(gate: &[u8]) {
         gate.len(),
         doc_corpus::CANONICAL_SEED
     );
+    let gate_doc = CanonicalDoc::validate(gate).expect("the gate document is canonical");
     let started = Instant::now();
     for index in 0..documents {
         store
-            .json_set(&key_of(index), gate, JsonSetOptions::default(), NOW)
+            .json_set(&key_of(index), &gate_doc, JsonSetOptions::default(), NOW)
             .expect("prefetch load");
     }
     let elapsed = started.elapsed().as_secs_f64();

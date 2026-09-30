@@ -8,7 +8,7 @@
 //! the exact field-wise sum of per-namespace reports.
 #![cfg(feature = "doc")]
 
-use inf_doc::JsonParser;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_log::FsyncClass;
 use inf_store::{
@@ -67,10 +67,31 @@ fn keyspace_report_is_the_per_namespace_field_sum() {
         .parse(format!(r#"{{"pad":"{}"}}"#, "x".repeat(5_000)).as_bytes())
         .expect("tree fixture");
 
-    ks.db_mut(0).json_set(b"inline", &inline, JsonSetOptions::default(), NOW).unwrap();
+    ks.db_mut(0)
+        .json_set(
+            b"inline",
+            &CanonicalDoc::validate(&inline).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
     let named = ks.ns_store_mut(NS).expect("namespace store");
-    named.json_set(b"tape", &tape, JsonSetOptions::default(), NOW).unwrap();
-    named.json_set(b"tree", &tree, JsonSetOptions::default(), NOW).unwrap();
+    named
+        .json_set(
+            b"tape",
+            &CanonicalDoc::validate(&tape).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
+    named
+        .json_set(
+            b"tree",
+            &CanonicalDoc::validate(&tree).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
     let _ = named.json_freeze(b"tree", NOW).expect("freeze").expect("document");
 
     let db = ks.db(0).expect("db0").report();
@@ -142,7 +163,12 @@ fn corpus_shape_bytes_per_document_table() {
             CellStore::new(StoreConfig { initial_keys: documents, ..StoreConfig::default() });
         for index in 0..documents {
             store
-                .json_set(&key_of(index), &idoc, JsonSetOptions::default(), NOW)
+                .json_set(
+                    &key_of(index),
+                    &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                    JsonSetOptions::default(),
+                    NOW,
+                )
                 .expect("corpus document stores");
         }
         let report = store.report();

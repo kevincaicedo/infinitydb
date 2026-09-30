@@ -38,8 +38,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use inf_alloc::ArenaAddr;
-use inf_doc::JsonParser;
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{Index, IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, StoreConfig};
 
@@ -78,7 +78,7 @@ fn doc_of(v: u64) -> Vec<u8> {
     JsonParser::new().parse(format!(r#"{{"v":{v}}}"#).as_bytes()).expect("valid bench JSON")
 }
 
-fn bracketed_set(ks: &mut Keyspace, key: &[u8], idoc: &[u8]) {
+fn bracketed_set(ks: &mut Keyspace, key: &[u8], idoc: &CanonicalDoc<'_>) {
     ks.idx_bracket_begin(NsId(0), &[key], None).expect("headroom");
     ks.db_mut(0).json_set(key, black_box(idoc), Default::default(), NOW).expect("set");
     ks.idx_bracket_commit(NsId(0), &[key]);
@@ -105,7 +105,8 @@ fn removing_updates(n: u64) {
     .expect("declare");
     let started = Instant::now();
     for i in 0..n {
-        bracketed_set(&mut ks, &key_of(i), &doc_of(i));
+        let idoc = doc_of(i);
+        bracketed_set(&mut ks, &key_of(i), &CanonicalDoc::validate(&idoc).expect("canonical"));
     }
     eprintln!("# fill: {n} real records in {:.1}s", started.elapsed().as_secs_f64());
 
@@ -121,8 +122,12 @@ fn removing_updates(n: u64) {
                 (key_of(rng.next() % n), doc_of(next_value))
             })
             .collect();
+        let receipts: Vec<CanonicalDoc<'_>> = batch
+            .iter()
+            .map(|(_, idoc)| CanonicalDoc::validate(idoc).expect("canonical fixture"))
+            .collect();
         let started = Instant::now();
-        for (key, idoc) in &batch {
+        for ((key, _), idoc) in batch.iter().zip(&receipts) {
             bracketed_set(&mut ks, key, idoc);
         }
         rounds.push(started.elapsed().as_nanos() as f64 / OPS_PER_ROUND as f64);

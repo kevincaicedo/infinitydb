@@ -6,10 +6,10 @@
 #![cfg(feature = "doc")]
 
 use inf_alloc::ArenaConfig;
-use inf_doc::JsonParser;
 use inf_doc::apply::{ApplyOp, Number};
 use inf_doc::model::{self, Value};
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_store::{
     CellStore, CopyResult, EvictionPolicy, ExpireCond, ExpiryBudget, JsonScalarPatch,
     JsonSetOptions, JsonSetOutcome, Keyspace, OpError, SetCond, SetExpire, SetOptions, StoreConfig,
@@ -59,7 +59,14 @@ fn tree_doc() -> Vec<u8> {
 }
 
 fn set(store: &mut CellStore, key: &[u8], idoc: &[u8]) {
-    let outcome = store.json_set(key, idoc, JsonSetOptions::default(), now()).expect("set");
+    let outcome = store
+        .json_set(
+            key,
+            &CanonicalDoc::validate(idoc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now(),
+        )
+        .expect("set");
     assert_eq!(outcome, JsonSetOutcome::Applied);
 }
 
@@ -150,7 +157,11 @@ fn json_set_version_chains_and_conditions() {
     assert_eq!(s.json_get(b"k", now()).unwrap().unwrap().version, 1);
     // NX on existing: skipped, version untouched.
     let opts = JsonSetOptions { cond: SetCond::IfAbsent, ..JsonSetOptions::default() };
-    assert_eq!(s.json_set(b"k", &doc, opts, now()).expect("nx"), JsonSetOutcome::Skipped);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now())
+            .expect("nx"),
+        JsonSetOutcome::Skipped
+    );
     assert_eq!(s.json_get(b"k", now()).unwrap().unwrap().version, 1);
     // Plain set over existing: exactly one bump — including across tiers.
     set(&mut s, b"k", &doc_of_size(1024));
@@ -160,7 +171,16 @@ fn json_set_version_chains_and_conditions() {
     reconcile(&s);
     // XX on missing: skipped, nothing created.
     let opts = JsonSetOptions { cond: SetCond::IfPresent, ..JsonSetOptions::default() };
-    assert_eq!(s.json_set(b"missing", &doc, opts, now()).expect("xx"), JsonSetOutcome::Skipped);
+    assert_eq!(
+        s.json_set(
+            b"missing",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            opts,
+            now()
+        )
+        .expect("xx"),
+        JsonSetOutcome::Skipped
+    );
     assert!(s.json_get(b"missing", now()).expect("ok").is_none());
 }
 
@@ -168,12 +188,27 @@ fn json_set_version_chains_and_conditions() {
 fn replace_bumps_once_and_retiers() {
     let mut s = store();
     set(&mut s, b"k", &doc_of_size(100));
-    assert!(s.json_replace(b"k", &doc_of_size(2000), now()).expect("replace"));
+    assert!(
+        s.json_replace(
+            b"k",
+            &CanonicalDoc::validate(&doc_of_size(2000)).expect("canonical fixture"),
+            now()
+        )
+        .expect("replace")
+    );
     assert_eq!(s.json_get(b"k", now()).unwrap().unwrap().version, 2);
     let d = s.doc_domain();
     assert_eq!((d.inline_docs, d.docs_live), (0, 1), "re-tiered inline → blob");
     reconcile(&s);
-    assert!(!s.json_replace(b"gone", &doc_of_size(100), now()).expect("missing"), "no-op");
+    assert!(
+        !s.json_replace(
+            b"gone",
+            &CanonicalDoc::validate(&doc_of_size(100)).expect("canonical fixture"),
+            now()
+        )
+        .expect("missing"),
+        "no-op"
+    );
 }
 
 #[test]
@@ -310,9 +345,20 @@ fn wrong_type_is_refused_in_both_directions() {
     let mut s = store();
     s.set(b"str", b"v", SetOptions::default(), now()).expect("set");
     let doc = doc_of_size(100);
-    assert_eq!(s.json_set(b"str", &doc, JsonSetOptions::default(), now()), Err(OpError::WrongType));
+    assert_eq!(
+        s.json_set(
+            b"str",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now()
+        ),
+        Err(OpError::WrongType)
+    );
     assert!(matches!(s.json_get(b"str", now()), Err(OpError::WrongType)));
-    assert_eq!(s.json_replace(b"str", &doc, now()), Err(OpError::WrongType));
+    assert_eq!(
+        s.json_replace(b"str", &CanonicalDoc::validate(&doc).expect("canonical fixture"), now()),
+        Err(OpError::WrongType)
+    );
     assert_eq!(s.json_morph(b"str", now()), Err(OpError::WrongType));
     assert_eq!(s.json_freeze(b"str", now()), Err(OpError::WrongType));
 
@@ -447,7 +493,14 @@ fn rename_transfers_and_copy_deep_copies() {
     assert_eq!(d.tape_bytes, 2 * doc.len() as u64, "two independent blobs");
     assert_eq!(s.json_freeze(b"copy", now()).expect("doc").expect("present"), doc);
     // Mutating the copy leaves the source untouched.
-    assert!(s.json_replace(b"copy", &doc_of_size(100), now()).expect("replace"));
+    assert!(
+        s.json_replace(
+            b"copy",
+            &CanonicalDoc::validate(&doc_of_size(100)).expect("canonical fixture"),
+            now()
+        )
+        .expect("replace")
+    );
     assert_eq!(s.json_freeze(b"src", now()).expect("doc").expect("present"), doc);
     // Deleting both drains everything (no double-free, no leak).
     assert!(s.del(b"src", now()));
@@ -459,7 +512,14 @@ fn rename_transfers_and_copy_deep_copies() {
 fn cross_db_copy_re_tiers_in_the_destination_store() {
     let mut ks = Keyspace::new(tree_config());
     let doc = tree_doc();
-    ks.db_mut(0).json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+    ks.db_mut(0)
+        .json_set(
+            b"k",
+            &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now(),
+        )
+        .expect("set");
     assert_eq!(ks.copy_between(0, b"k", 3, b"k", false, now()).expect("copy"), CopyResult::Copied);
     let frozen = ks.db_mut(3).json_freeze(b"k", now()).expect("doc").expect("present");
     assert_eq!(frozen, doc, "destination holds an independent, identical document");
@@ -486,7 +546,12 @@ fn ingest_failure_aborts_leak_free_and_keeps_the_old_record() {
     let mut stored = 0u32;
     let refused = loop {
         let key = format!("fill:{stored}");
-        match s.json_set(key.as_bytes(), &filler, JsonSetOptions::default(), now()) {
+        match s.json_set(
+            key.as_bytes(),
+            &CanonicalDoc::validate(&filler).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now(),
+        ) {
             Ok(JsonSetOutcome::Applied) => stored += 1,
             Err(e) => break e,
             other => panic!("unexpected outcome {other:?}"),
@@ -503,7 +568,12 @@ fn ingest_failure_aborts_leak_free_and_keeps_the_old_record() {
     let huge_tree =
         model::encode(&Value::Arr((0..40_000i64).map(Value::I64).collect())).expect("encodes");
     assert_eq!(
-        s.json_set(b"tree", &huge_tree, JsonSetOptions::default(), now()),
+        s.json_set(
+            b"tree",
+            &CanonicalDoc::validate(&huge_tree).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now()
+        ),
         Err(OpError::OutOfMemory)
     );
     assert_eq!(s.doc_domain(), before, "aborted morph released everything");
@@ -518,18 +588,38 @@ fn ttl_semantics_ride_json_set_options() {
         expire: SetExpire::At(Nanos::from_millis(500)),
         ..JsonSetOptions::default()
     };
-    assert_eq!(s.json_set(b"k", &doc, opts, now()).expect("set"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now())
+            .expect("set"),
+        JsonSetOutcome::Applied
+    );
     assert!(s.json_get(b"k", Nanos::from_millis(400)).expect("ok").is_some());
     assert!(s.json_get(b"k", Nanos::from_millis(600)).expect("ok").is_none(), "deadline fires");
     assert_eq!(s.doc_domain(), inf_store::DocDomain::default());
     // Keep preserves, Clear drops.
-    assert_eq!(s.json_set(b"k", &doc, opts, now()).expect("set"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now())
+            .expect("set"),
+        JsonSetOutcome::Applied
+    );
     let keep = JsonSetOptions { expire: SetExpire::Keep, ..JsonSetOptions::default() };
-    assert_eq!(s.json_set(b"k", &doc, keep, now()).expect("keep"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), keep, now())
+            .expect("keep"),
+        JsonSetOutcome::Applied
+    );
     assert!(s.json_get(b"k", Nanos::from_millis(600)).expect("ok").is_none(), "TTL kept");
-    assert_eq!(s.json_set(b"k", &doc, opts, now()).expect("set"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), opts, now())
+            .expect("set"),
+        JsonSetOutcome::Applied
+    );
     let clear = JsonSetOptions::default();
-    assert_eq!(s.json_set(b"k", &doc, clear, now()).expect("clear"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(b"k", &CanonicalDoc::validate(&doc).expect("canonical fixture"), clear, now())
+            .expect("clear"),
+        JsonSetOutcome::Applied
+    );
     assert!(s.json_get(b"k", Nanos::from_millis(600)).expect("ok").is_some(), "TTL cleared");
 }
 
@@ -550,7 +640,16 @@ fn same_class_blob_overwrite_rewrites_in_place() {
     // Same size class: slightly different length, same content family.
     let second = doc_of_size(1000);
     let keep = JsonSetOptions { expire: SetExpire::Keep, ..JsonSetOptions::default() };
-    assert_eq!(s.json_set(b"doc", &second, keep, now()).expect("set"), JsonSetOutcome::Applied);
+    assert_eq!(
+        s.json_set(
+            b"doc",
+            &CanonicalDoc::validate(&second).expect("canonical fixture"),
+            keep,
+            now()
+        )
+        .expect("set"),
+        JsonSetOutcome::Applied
+    );
     let after = s.doc_domain();
     assert_eq!(after.docs_live, 1, "overwrite is not a create");
     assert_eq!(after.tape_bytes, second.len() as u64, "blob bytes shift by the length delta");
@@ -564,7 +663,13 @@ fn same_class_blob_overwrite_rewrites_in_place() {
     set(&mut s, b"doc", &doc_of_size(1024));
     let huge = doc_of_size(64 * 1024);
     assert_eq!(
-        s.json_set(b"doc", &huge, JsonSetOptions::default(), now()).expect("set"),
+        s.json_set(
+            b"doc",
+            &CanonicalDoc::validate(&huge).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            now()
+        )
+        .expect("set"),
         JsonSetOutcome::Applied
     );
     let after = s.doc_domain();

@@ -28,8 +28,8 @@
 use inf_alloc::{Arena, ArenaAddr};
 #[cfg(feature = "doc")]
 use inf_doc::{
-    ApplyError, ApplyOp, ArenaDoc, DocError, DocMemReport, DocRef, DocValue, FreezeScratch,
-    ScalarPatch, TapeDoc, patch_scalar_in_place,
+    ApplyError, ApplyOp, ArenaDoc, CanonicalDoc, DocError, DocLimits, DocMemReport, DocRef,
+    DocValue, FreezeScratch, ScalarPatch, TapeDoc, patch_scalar_in_place,
 };
 #[cfg(feature = "doc")]
 use inf_foundation::time::Nanos;
@@ -39,9 +39,10 @@ use inf_log::DocLineage;
 #[cfg(feature = "doc")]
 use crate::keyspace::ReplayError;
 #[cfg(feature = "doc")]
+use crate::limits::{DOC_BODY_BYTES_MAX, DOC_IDOC_BYTES_MAX};
+#[cfg(feature = "doc")]
 use crate::record::{
-    MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView, TypeTag,
-    bump_version_in_place,
+    MAX_EXPIRE_MS, MAX_KEY_LEN, RecordKind, RecordSpec, RecordView, TypeTag, bump_version_in_place,
 };
 #[cfg(not(feature = "doc"))]
 use crate::record::{RecordView, TypeTag};
@@ -56,7 +57,7 @@ pub(crate) const FORM_TAPE: u8 = 1;
 #[cfg(feature = "doc")]
 pub(crate) const FORM_TREE: u8 = 2;
 #[cfg(feature = "doc")]
-const VALUE_PREFIX_LEN: usize = 15;
+pub(crate) const VALUE_PREFIX_LEN: usize = 15;
 
 #[cfg(feature = "doc")]
 #[derive(Copy, Clone, Default, Debug)]
@@ -557,19 +558,18 @@ pub struct JsonRead<'a> {
 
 #[cfg(feature = "doc")]
 impl CellStore {
-    /// `JSON.SET key $ value` (root set). `idoc` MUST be canonical plain
-    /// v1 bytes that crossed a trust boundary (builder output or
-    /// `TapeDoc::from_bytes` — debug-asserted). Version chains like `SET`;
-    /// setting over a non-document key is `WrongType` (ADR-0037 D6).
+    /// `JSON.SET key $ value` (root set). `idoc` is the receipt of a
+    /// canonical plain document (ADR-0169 D4). Version chains like `SET`;
+    /// setting over a non-document key is `WrongType` (ADR-0037 D6); a
+    /// document no `DocFull` can carry answers `TooLarge` first.
     pub fn json_set(
         &mut self,
         key: &[u8],
-        idoc: &[u8],
+        idoc: &CanonicalDoc<'_>,
         opts: JsonSetOptions,
         now: Nanos,
     ) -> Result<JsonSetOutcome, OpError> {
-        debug_assert!(TapeDoc::from_bytes(idoc).is_ok(), "json_set requires validated idoc bytes");
-        if key.len() > MAX_KEY_LEN || idoc.len() + VALUE_PREFIX_LEN > MAX_VAL_LEN {
+        if key.len() > MAX_KEY_LEN || !doc_fits_record(idoc) {
             return Err(OpError::TooLarge);
         }
         let existing = self.resolve(key, now);
@@ -807,15 +807,15 @@ impl CellStore {
         idoc: &[u8],
         now: Nanos,
     ) -> Result<(), ReplayError> {
-        TapeDoc::from_bytes(idoc).map_err(ReplayError::InvalidDocument)?;
-        if key.len() > MAX_KEY_LEN || idoc.len() + VALUE_PREFIX_LEN > MAX_VAL_LEN {
+        let idoc = CanonicalDoc::validate(idoc).map_err(ReplayError::InvalidDocument)?;
+        if key.len() > MAX_KEY_LEN || !doc_fits_record(&idoc) {
             return Err(ReplayError::Store(OpError::TooLarge));
         }
         let existing = self.resolve(key, now);
         self.json_write_value(
             key,
             existing,
-            idoc,
+            &idoc,
             DocWriteMeta { lineage, version, expire_at_ms: None, cadence: DocCadence::default() },
         )
         .map_err(ReplayError::Store)?;
@@ -874,23 +874,30 @@ impl CellStore {
                 ScalarPatch::Unsupported(_) => {}
             }
         }
+        // The recorded idoc length bounds the output's body, clamped to the
+        // record; replay never reads boot configuration (ADR-0169 D2,
+        // ADR-0043 D6).
+        let Some(body_bytes) = (witness.post_len as usize).checked_sub(inf_doc::HEADER_LEN) else {
+            return Err(ReplayError::CorruptDocument("document delta length is below the header"));
+        };
+        let doc_limits = record_doc_limits(inf_doc::limits::DEPTH_MAX, body_bytes);
         let view = RecordView::new(self.arena.bytes(addr, len));
         let frozen = self.frozen_bytes_of(view).map_err(ReplayError::Store)?;
         let doc = TapeDoc::from_validated_bytes(&frozen);
         let limits = inf_doc::path::EvalLimits { max_matches: witness.match_count };
-        let outcome = inf_doc::apply::apply(&doc, program, op, &limits, witness.post_len as usize)
+        let outcome = inf_doc::apply::apply(&doc, program, op, &limits, doc_limits)
             .map_err(ReplayError::InvalidMutation)?;
-        let Some(bytes) = outcome.bytes else {
+        let Some(document) = outcome.document else {
             return Err(ReplayError::CorruptDocument("document delta produced no canonical edit"));
         };
         if outcome.results.len() != witness.match_count as usize
-            || bytes.len() != witness.post_len as usize
+            || document.as_bytes().len() != witness.post_len as usize
         {
             return Err(ReplayError::CorruptDocument(
                 "document delta replay output disagrees with recorded bounds",
             ));
         }
-        let replaced = self.json_replace(key, &bytes, now).map_err(ReplayError::Store)?;
+        let replaced = self.json_replace(key, &document, now).map_err(ReplayError::Store)?;
         debug_assert!(replaced, "record resolved above");
         Ok(DocReplayOutcome::Applied)
     }
@@ -898,11 +905,12 @@ impl CellStore {
     /// Replace a document's content — the path-mutation shape (S16's
     /// subtree-replace fallback): TTL preserved, version bumps exactly
     /// once, placement re-tiered. `Ok(false)` = key missing.
-    pub fn json_replace(&mut self, key: &[u8], idoc: &[u8], now: Nanos) -> Result<bool, OpError> {
-        debug_assert!(
-            TapeDoc::from_bytes(idoc).is_ok(),
-            "json_replace requires validated idoc bytes"
-        );
+    pub fn json_replace(
+        &mut self,
+        key: &[u8],
+        idoc: &CanonicalDoc<'_>,
+        now: Nanos,
+    ) -> Result<bool, OpError> {
         let Some((addr, len)) = self.resolve(key, now) else {
             return Ok(false);
         };
@@ -973,20 +981,21 @@ impl CellStore {
 
     /// Edit a tree-form document in place. `edit` runs against the
     /// rehydrated [`ArenaDoc`] and the doc arena; on `Ok` the record's
-    /// handle fields refresh and the version bumps **exactly once** — the
-    /// L6 mutation seam S16's engine composes. On `Err` the version and
-    /// record stay untouched (physical accounting still reconciles; the
-    /// plan/apply atomicity discipline is S16's — §3.4 R4). `Ok(None)` =
-    /// key missing. Non-tree forms are `WrongType`: morph first. This seam
-    /// has no production caller after ADR-0043 rejected generic surgery;
-    /// it refreshes exact frozen length through recycled scratch in O(doc).
-    /// Any future hot structural engine must pass its planner's exact size
-    /// through a revised API and an A/B artifact instead of inheriting that
-    /// walk silently. Its accounting stays continuously pinned meanwhile:
-    /// `tests/doc_storm.rs` drives it inside the reconciliation storm and
-    /// `tests/doc_records.rs` pins the `Err`/wrong-form/missing arms — the
-    /// visible-debt loop for a caller-less seam (S18/S19 review,
-    /// 2026-07-16).
+    /// handle fields refresh and the version bumps **exactly once**. On
+    /// `Err` the version and record stay untouched (physical accounting
+    /// still reconciles). `Ok(None)` = key missing. Non-tree forms are
+    /// `WrongType`: morph first. It refreshes exact frozen length through
+    /// recycled scratch in O(doc).
+    ///
+    /// Test support only (ADR-0169 D4): it is the one writer of new tree
+    /// content that reaches no sink — no receipt, no depth check, no record
+    /// bound — so no shipping build may call it (the shipping-feature
+    /// fence, ADR-0107 D1). A future in-place engine re-types it by ADR
+    /// first, so that it ends in the receipt and the record check. Its
+    /// accounting stays pinned meanwhile: `tests/doc_storm.rs` drives it
+    /// inside the reconciliation storm and `tests/doc_records.rs` pins the
+    /// `Err`/wrong-form/missing arms.
+    #[cfg(feature = "test-support")]
     pub fn json_edit_tree<T>(
         &mut self,
         key: &[u8],
@@ -1044,17 +1053,21 @@ impl CellStore {
         self.frozen_bytes_of(view).map(Some)
     }
 
+    /// The namespace's document bounds under the record clamp: what every
+    /// live parse and path mutation of this store may produce (ADR-0169
+    /// D2). The one answer to "how large and how deep may a document be".
+    #[inline]
+    pub fn doc_limits(&self) -> DocLimits {
+        record_doc_limits(self.cfg.doc_max_depth, self.cfg.doc_max_bytes)
+    }
+
     /// Namespace-resolved ingest limits (M3-S11: the command layer
     /// constructs parsers from the target store's config — that IS the
-    /// per-namespace resolution ADR-0039 D5 named; construction clamps
-    /// to the format ceilings).
+    /// per-namespace resolution ADR-0039 D5 named). The text axis is the
+    /// configured size; the document axes are [`Self::doc_limits`].
     #[inline]
     pub fn doc_parse_limits(&self) -> inf_doc::ParseLimits {
-        inf_doc::ParseLimits {
-            max_depth: self.cfg.doc_max_depth,
-            max_text: self.cfg.doc_max_bytes,
-            max_body: self.cfg.doc_max_bytes,
-        }
+        inf_doc::ParseLimits { doc: self.doc_limits(), max_text: self.cfg.doc_max_bytes }
     }
 
     /// Namespace-resolved path-text cap (ADR-0040 D6; the S10 cache
@@ -1069,13 +1082,6 @@ impl CellStore {
     #[inline]
     pub fn doc_max_path_matches(&self) -> u32 {
         self.cfg.doc_max_path_matches
-    }
-
-    /// Namespace-resolved idoc-byte cap for path mutations (the apply
-    /// engine's post-edit bound — same axis the ingest dual bound uses).
-    #[inline]
-    pub fn doc_max_bytes(&self) -> usize {
-        self.cfg.doc_max_bytes
     }
 
     /// Namespace-resolved reply budget (ADR-0099 A1): one account for the
@@ -1167,17 +1173,23 @@ impl CellStore {
         stored.to_vec()
     }
 
-    /// Store `idoc` (canonical plain bytes) at `key`, tiering placement
-    /// per ADR-0037 D2 and interning per ADR-0038 when enabled. Releases
+    /// Store `idoc` at `key`, tiering placement per ADR-0037 D2 and
+    /// interning per ADR-0038 when enabled. Every piece of new document
+    /// content passes here, so its first step refuses a document no
+    /// `DocFull` can carry, before it allocates (ADR-0169 D5). Releases
     /// any replaced payload only after the write succeeds; frees this
     /// attempt's allocations on failure (leak-free abort).
     pub(crate) fn json_write_value(
         &mut self,
         key: &[u8],
         existing: Option<(ArenaAddr, usize)>,
-        idoc: &[u8],
+        idoc: &CanonicalDoc<'_>,
         meta: DocWriteMeta,
     ) -> Result<(), OpError> {
+        if !doc_fits_record(idoc) {
+            return Err(OpError::TooLarge);
+        }
+        let idoc = idoc.as_bytes();
         let DocWriteMeta { lineage, version, expire_at_ms, cadence } = meta;
         if idoc.len() >= self.cfg.doc_morph_bytes_min {
             // Node tree, built from the plain form (trees never intern).
@@ -1315,11 +1327,25 @@ impl CellStore {
     }
 }
 
+/// The record clamp, spelled once (ADR-0169 D2): a body axis never past
+/// what one `DocFull` carries, both axes within the format.
+#[cfg(feature = "doc")]
+fn record_doc_limits(depth_max: usize, body_bytes_max: usize) -> DocLimits {
+    DocLimits::new(depth_max, body_bytes_max.min(DOC_BODY_BYTES_MAX))
+}
+
+/// Whether one `DocFull` can carry `idoc` (ADR-0169 D5): the sink's first
+/// check and the `json_set` / `replay_json_full` entry checks.
+#[cfg(feature = "doc")]
+fn doc_fits_record(idoc: &CanonicalDoc<'_>) -> bool {
+    idoc.as_bytes().len() <= DOC_IDOC_BYTES_MAX
+}
+
 /// Map format-layer errors onto the store's vocabulary: arena pressure is
 /// backpressure, size is the record bound; anything else out of a
 /// validated document is an internal invariant.
 #[cfg(feature = "doc")]
-fn op_from_doc(e: DocError) -> OpError {
+pub(crate) fn op_from_doc(e: DocError) -> OpError {
     match e {
         DocError::ArenaExhausted => OpError::OutOfMemory,
         DocError::TooLarge { .. } => OpError::TooLarge,
@@ -1346,9 +1372,46 @@ fn op_from_apply(e: ApplyError) -> OpError {
         ApplyError::Overflow => OpError::Overflow,
         ApplyError::NotANumber => OpError::NanOrInf,
         ApplyError::TooLarge => OpError::TooLarge,
-        ApplyError::OutOfBounds | ApplyError::RootDelete | ApplyError::Eval(_) => {
+        ApplyError::DepthExceeded
+        | ApplyError::OutOfBounds
+        | ApplyError::RootDelete
+        | ApplyError::Eval(_) => {
             debug_assert!(false, "scalar fast path returned an unsupported error: {e}");
             OpError::TooLarge
         }
+    }
+}
+
+#[cfg(all(test, feature = "doc"))]
+mod tests {
+    use super::*;
+
+    const NOW: Nanos = Nanos::from_millis(1);
+
+    /// ADR-0169 D5: the one sink every writer reaches refuses an idoc no
+    /// `DocFull` can carry — 16,777,201 bytes, one over the record value cap
+    /// less the document value prefix — and the store is unchanged.
+    #[test]
+    fn json_write_value_refuses_an_idoc_no_doc_full_holds() {
+        let over = crate::record::MAX_VAL_LEN - VALUE_PREFIX_LEN + 1;
+        // `{"s":…}`: header 8, object header 4, key 2, str24 header 4.
+        let text = "x".repeat(over - 18);
+        let value =
+            inf_doc::model::Value::Obj(vec![("s".into(), inf_doc::model::Value::Str(text))]);
+        let idoc = inf_doc::model::encode(&value).expect("under the format ceiling");
+        assert_eq!(idoc.len(), over);
+        let mut store = CellStore::new(StoreConfig::default());
+        let meta = DocWriteMeta {
+            lineage: DocLineage::FIRST,
+            version: 1,
+            expire_at_ms: None,
+            cadence: DocCadence::default(),
+        };
+        let idoc = CanonicalDoc::validate(&idoc).expect("within the format ceiling");
+        let written = store.json_write_value(b"doc", None, &idoc, meta);
+        assert_eq!(written, Err(OpError::TooLarge));
+        assert!(store.json_freeze(b"doc", NOW).unwrap().is_none(), "nothing stored");
+        assert_eq!(store.doc_domain().docs_live, 0, "no document accounted");
+        assert_eq!(store.doc_live_bytes(), 0, "no doc-arena bytes held");
     }
 }

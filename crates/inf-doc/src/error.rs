@@ -24,7 +24,8 @@ pub enum DocError {
     /// Document exceeds the byte cap (16 MiB − 1; M3-S07 threads the
     /// per-namespace knob through the builder's `max_body`).
     TooLarge { bytes: usize },
-    /// Nesting exceeds the depth cap (default 128, RedisJSON parity).
+    /// Nesting exceeds [`DEPTH_MAX`](crate::limits::DEPTH_MAX) or a lower
+    /// namespace cap.
     DepthExceeded,
     /// Unknown or reserved tag byte.
     BadTag(u8),

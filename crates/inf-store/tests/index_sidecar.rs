@@ -38,8 +38,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use inf_doc::JsonParser;
 use inf_doc::path::{EvalLimits, compile, eval, resolve};
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick_hybrid};
 use inf_log::fs::SegmentFs as _;
@@ -188,8 +188,15 @@ fn live_op_over(
             let doc = parse(&random_doc(rng));
             // `WRONGTYPE` over a string key is a refusal: nothing changed,
             // so nothing is logged — the tail is what the node applied.
-            let applied =
-                bracketed(ks, &[&key], |s| s.json_set(&key, &doc, Default::default(), now).is_ok());
+            let applied = bracketed(ks, &[&key], |s| {
+                s.json_set(
+                    &key,
+                    &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                    Default::default(),
+                    now,
+                )
+                .is_ok()
+            });
             if applied {
                 tail.push(TailOp::Doc(key, doc));
             }
@@ -426,7 +433,15 @@ fn converged_fixture_over(
     for i in 0..count {
         let key = key_of(i);
         let doc = parse(&random_doc(&mut rng));
-        ks.ns_store_mut(NS).unwrap().json_set(&key, &doc, Default::default(), now).expect("set");
+        ks.ns_store_mut(NS)
+            .unwrap()
+            .json_set(
+                &key,
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                Default::default(),
+                now,
+            )
+            .expect("set");
         corpus.push((key, doc));
     }
     declare_indexes(&mut ks);
@@ -1045,7 +1060,12 @@ fn a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready() {
     let key = key_of(3);
     let flood = parse(r#"{"price":1,"name":"flood","qty":1,"tags":["a","b","c","d","e"]}"#);
     bracketed(&mut ks1, &[&key], |s| {
-        let _ = s.json_set(&key, &flood, Default::default(), now);
+        let _ = s.json_set(
+            &key,
+            &CanonicalDoc::validate(&flood).expect("canonical fixture"),
+            Default::default(),
+            now,
+        );
     });
     tail.push(TailOp::Doc(key.clone(), flood));
     for &(id, ..) in INDEXES {
@@ -1053,7 +1073,12 @@ fn a_tail_trip_after_the_load_commits_as_a_rebuild_not_ready() {
     }
     let small = parse(r#"{"price":2,"name":"small","qty":2,"tags":["a"]}"#);
     bracketed(&mut ks1, &[&key], |s| {
-        let _ = s.json_set(&key, &small, Default::default(), now);
+        let _ = s.json_set(
+            &key,
+            &CanonicalDoc::validate(&small).expect("canonical fixture"),
+            Default::default(),
+            now,
+        );
     });
     tail.push(TailOp::Doc(key, small));
     for _ in 0..40 {

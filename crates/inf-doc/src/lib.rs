@@ -18,7 +18,9 @@
 //!   (comparator) mode.
 //! - **Path mutation** ([`apply`] — M3-S11/S12): two-phase plan/apply
 //!   over plain canonical tape bytes (§3.4 R4/R5); the shape S16's fast
-//!   path optimizes under and S17's `DocDelta` replay reuses.
+//!   path optimizes under and S17's `DocDelta` replay reuses. Its output,
+//!   like the parser's, is a [`CanonicalDoc`]: the receipt every store
+//!   sink takes (ADR-0169 D4).
 //! - **Program cache** ([`path::ProgramCache`] — M3-S10): one bounded,
 //!   counted, deterministic LRU per cell.
 //! - **Reference model** ([`model`]): an owned tree for tests,
@@ -61,8 +63,8 @@ pub mod ser;
 pub mod tape;
 
 pub use apply::{
-    ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, ScalarPatch, Unapplied, array_operand,
-    merge_absent_document, patch_scalar_in_place,
+    ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, ScalarPatch, Unapplied, Written,
+    array_operand, merge_absent_document, patch_scalar_in_place,
 };
 pub use arena::{ArenaDoc, DocMemReport, DocRef, FreezeScratch};
 pub use build::TapeBuilder;
@@ -71,10 +73,11 @@ pub use delta::{DeltaDecodeError, DeltaOpcode, decode_apply_op, encode_apply_op}
 pub use error::DocError;
 pub use header::{FLAG_INTERNED, HEADER_LEN, MAGIC, VERSION};
 pub use json::{JsonErrorKind, JsonParseError, JsonParser, ParseLimits, parse_number_token};
+pub use limits::DocLimits;
 pub use path::{Matches, PathError, PathErrorKind, PathProgram, PathStep, PathSteps, ProgramCache};
 pub use ser::{
     Reply, ReplyTooLarge, SerializeOpts, serialize_canonical_into, serialize_into,
     serialize_into_bounded, serialize_number_text, serialize_reply_into,
     serialize_reply_into_bounded,
 };
-pub use tape::{DocStr, TapeDoc};
+pub use tape::{CanonicalDoc, DocStr, TapeDoc};

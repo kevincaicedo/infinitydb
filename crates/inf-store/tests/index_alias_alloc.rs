@@ -15,8 +15,8 @@
 #![cfg(feature = "doc")]
 
 use inf_alloc::CountingAllocator;
-use inf_doc::JsonParser;
 use inf_doc::path::{EvalLimits, compile, eval};
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{
     COLLISION_KEY_PREFIX, ExpireCond, IndexId, IndexKeyType, IndexSpec, IndexState, JsonSetOptions,
@@ -59,7 +59,14 @@ fn fixture() -> Keyspace {
 fn put(ks: &mut Keyspace, key: &[u8], json: &str) {
     let idoc = JsonParser::new().parse(json.as_bytes()).expect("valid doc");
     ks.idx_bracket_begin(NS, &[key], None).expect("pre-half");
-    ks.db_mut(0).json_set(key, &idoc, JsonSetOptions::default(), T0).expect("json_set");
+    ks.db_mut(0)
+        .json_set(
+            key,
+            &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            T0,
+        )
+        .expect("json_set");
     ks.idx_bracket_commit(NS, &[key]);
 }
 

@@ -49,7 +49,8 @@ use core::fmt;
 use crate::apply::Number;
 use crate::emit;
 use crate::header;
-use crate::limits::{DEPTH_MAX, DOC_BYTES_MAX};
+use crate::limits::{DOC_BYTES_MAX, DocLimits};
+use crate::tape::CanonicalDoc;
 use crate::tape::{FIXINT_MAX, FIXINT_MIN, FIXSTR_BASE, FIXSTR_MAX_LEN, TAG_ARR, TAG_OBJ};
 
 /// Objects up to this many entries detect duplicates by per-insert byte
@@ -96,7 +97,8 @@ pub enum JsonErrorKind {
     ControlCharacter,
     /// String never closed.
     UnterminatedString,
-    /// Nesting beyond the depth cap (default 128, RedisJSON parity).
+    /// Nesting beyond the namespace's depth cap, at most
+    /// [`DEPTH_MAX`](crate::limits::DEPTH_MAX).
     DepthExceeded,
     /// Encoded document exceeds the idoc byte cap (the S07 seam).
     DocumentTooLarge,
@@ -284,31 +286,31 @@ fn frame_word(len_at: usize, kind_bit: u32) -> Option<u32> {
     (len_at & OBJ_BIT == 0).then_some(len_at | kind_bit)
 }
 
-/// Ingest limits (M3-S07): the per-namespace configuration surface.
-/// Every field is clamped to its format ceiling at parser construction —
-/// configuration lowers bounds, never raises them (`limits` module law).
+/// Ingest limits (M3-S07): the per-namespace configuration surface. The
+/// document bounds are a [`DocLimits`], which clamps them to the format
+/// ceilings when it is built — configuration lowers bounds, never raises
+/// them (ADR-0169 D2).
 #[derive(Copy, Clone, Debug)]
 pub struct ParseLimits {
-    /// Maximum container nesting depth (ceiling [`DEPTH_MAX`]; RedisJSON
-    /// parity default 128).
-    pub max_depth: usize,
+    /// Container nesting depth (at most
+    /// [`DEPTH_MAX`](crate::limits::DEPTH_MAX)) and encoded idoc
+    /// **body** bytes (at most [`DOC_BYTES_MAX`]), the latter enforced
+    /// incrementally during stage 2. The body axis is independent of
+    /// `max_text` by design: small-token documents encode larger than their
+    /// text (`1e1,` is 4 text bytes and 9 tape bytes), so the text bound
+    /// alone does not bound memory.
+    pub doc: DocLimits,
     /// Maximum input **text** bytes — enforced before UTF-8 validation
     /// and before the structural index allocates (reject-before-allocate:
     /// scratch growth is proportional to input, so the text bound is what
     /// bounds scratch). Note a pretty-printed text of a cap-passing
     /// document can exceed this; the wire frame is bounded regardless.
     pub max_text: usize,
-    /// Maximum encoded idoc **body** bytes — enforced incrementally
-    /// during stage 2 (ceiling [`DOC_BYTES_MAX`]). Independent of
-    /// `max_text` by design: small-token documents encode larger than
-    /// their text (`1e1,` is 4 text bytes and 9 tape bytes), so the text
-    /// bound alone does not bound memory.
-    pub max_body: usize,
 }
 
 impl Default for ParseLimits {
     fn default() -> ParseLimits {
-        ParseLimits { max_depth: DEPTH_MAX, max_text: DOC_BYTES_MAX, max_body: DOC_BYTES_MAX }
+        ParseLimits { doc: DocLimits::FORMAT, max_text: DOC_BYTES_MAX }
     }
 }
 
@@ -388,14 +390,9 @@ impl JsonParser {
         JsonParser::with_limits(ParseLimits::default())
     }
 
-    /// Namespace-configured limits (M3-S07), clamped to the format
-    /// ceilings — a config value can only lower a bound.
+    /// Namespace-configured limits (M3-S07); their [`DocLimits`] already
+    /// sits within the format ceilings.
     pub fn with_limits(limits: ParseLimits) -> JsonParser {
-        let limits = ParseLimits {
-            max_depth: limits.max_depth.min(DEPTH_MAX),
-            max_text: limits.max_text,
-            max_body: limits.max_body.min(DOC_BYTES_MAX),
-        };
         JsonParser {
             blocks: Vec::new(),
             indices: Vec::new(),
@@ -410,15 +407,10 @@ impl JsonParser {
     }
 
     /// Re-point a recycled parser at another namespace's resolved limits
-    /// (M3-S11: one per-cell parser serves every store; two stores and a
-    /// clamp per command beat rebuilding the scratch). Same ceiling
-    /// clamps as [`with_limits`](Self::with_limits).
+    /// (M3-S11: one per-cell parser serves every store; one store per
+    /// command beats rebuilding the scratch).
     pub fn set_limits(&mut self, limits: ParseLimits) {
-        self.limits = ParseLimits {
-            max_depth: limits.max_depth.min(DEPTH_MAX),
-            max_text: limits.max_text,
-            max_body: limits.max_body.min(DOC_BYTES_MAX),
-        };
+        self.limits = limits;
     }
 
     /// Bytes of retained scratch (block masks, structural index, frame
@@ -489,7 +481,14 @@ impl JsonParser {
     /// itself valid UTF-8, so per-string re-validation vanishes — profiled
     /// at 13% of the gate row). Consequence: invalid UTF-8 anywhere
     /// reports `InvalidUtf8` before any grammar error.
-    pub fn parse_into(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), JsonParseError> {
+    ///
+    /// The accepted document comes back as a [`CanonicalDoc`] receipt that
+    /// borrows `out`: the parser's limits made it true (ADR-0169 D4).
+    pub fn parse_into<'o>(
+        &mut self,
+        input: &[u8],
+        out: &'o mut Vec<u8>,
+    ) -> Result<CanonicalDoc<'o>, JsonParseError> {
         // Text bound first (M3-S07 reject-before-allocate): nothing below
         // — not UTF-8 validation, not the block classification, not the
         // output reserve — runs on an over-cap input.
@@ -506,7 +505,9 @@ impl JsonParser {
         self.blocks = blocks;
         self.frames = frames;
         self.trim_scratch();
-        result
+        result?;
+        let out: &'o Vec<u8> = out;
+        Ok(CanonicalDoc::parsed(out))
     }
 
     /// Full parse over the scalar stage-1 tier (the portability fallback)
@@ -539,11 +540,12 @@ impl JsonParser {
         frames: &mut Vec<u32>,
         out: &mut Vec<u8>,
     ) -> Result<(), JsonParseError> {
-        let max_depth = self.limits.max_depth;
-        let capacity = input.len().min(self.limits.max_body).saturating_add(16);
+        let max_depth = self.limits.doc.depth_max();
+        let max_body = self.limits.doc.body_bytes_max();
+        let capacity = input.len().min(max_body).saturating_add(16);
         out.clear();
         out.reserve(capacity);
-        let mut tape = Tape::new(out, self.limits.max_body);
+        let mut tape = Tape::new(out, max_body);
         tape.out.resize(header::HEADER_LEN, 0);
         frames.clear();
         let mut live_obj_frames = 0usize;

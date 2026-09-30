@@ -29,7 +29,7 @@ mod reply;
 use inf_doc::apply::{ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, apply};
 use inf_doc::path::{EvalLimits, Matches, PathProgram, Segment, eval, resolve};
 use inf_doc::ser::{Reply, ReplyTooLarge, SerializeOpts};
-use inf_doc::{DeltaOpcode, DocValue, ObjCursor, TapeDoc, encode_apply_op};
+use inf_doc::{CanonicalDoc, DeltaOpcode, DocValue, ObjCursor, TapeDoc, encode_apply_op};
 use inf_foundation::time::Nanos;
 use inf_store::{
     CellStore, JsonRead, JsonScalarPatch, JsonSetOptions, JsonSetOutcome, OpError, SetCond,
@@ -275,13 +275,14 @@ fn eval_limits(store: &CellStore) -> EvalLimits {
 
 /// Parse a JSON value argument with the target store's resolved limits
 /// (ADR-0039 D5's per-namespace resolution) into the recycled per-cell
-/// ingest buffer (the S05 lever-G seam).
-fn parse_value(
+/// ingest buffer (the S05 lever-G seam). The receipt borrows `out` and is
+/// what a store sink takes (ADR-0169 D4).
+fn parse_value<'o>(
     store: &CellStore,
     cx: &ConnCx,
     text: &[u8],
-    out: &mut Vec<u8>,
-) -> Result<(), ReplyError<'static>> {
+    out: &'o mut Vec<u8>,
+) -> Result<CanonicalDoc<'o>, ReplyError<'static>> {
     let mut parser = cx.node.json_parser.borrow_mut();
     parser.set_limits(store.doc_parse_limits());
     parser.parse_into(text, out).map_err(ReplyError::Json)
@@ -335,11 +336,11 @@ enum CommitOutcome {
 /// Commit a mutation outcome: the staging admission, then the rewrite and
 /// one version bump when an edit applied (ADR-0041 D8).
 fn commit(store: &mut CellStore, edit: &PathEdit<'_>, cx: &ConnCx, now: Nanos) -> CommitOutcome {
-    let Some(bytes) = &edit.outcome.bytes else { return CommitOutcome::NoEdit };
-    if let Err(error) = durable_full_fits(cx, edit.key, bytes) {
+    let Some(document) = &edit.outcome.document else { return CommitOutcome::NoEdit };
+    if let Err(error) = durable_full_fits(cx, edit.key, document.as_bytes()) {
         return CommitOutcome::Refused(error);
     }
-    match store.json_replace(edit.key, bytes, now) {
+    match store.json_replace(edit.key, document, now) {
         Ok(replaced) => {
             debug_assert!(replaced, "the key was resolved by the freeze above");
             let match_count = edit.outcome.results.len();
@@ -407,16 +408,16 @@ fn set(
         Ok(program) => program,
         Err(error) => return reply.decline(error),
     };
-    let mut idoc = cx.node.json_ingest_buf.take();
-    let settled = match parse_value(store, cx, argv.arg(3), &mut idoc) {
-        Ok(()) if program.is_root() => set_root(reply, store, key, cond, &idoc, cx, now),
-        Ok(()) => {
+    let mut buf = cx.node.json_ingest_buf.take();
+    let settled = match parse_value(store, cx, argv.arg(3), &mut buf) {
+        Ok(idoc) if program.is_root() => set_root(reply, store, key, cond, &idoc, cx, now),
+        Ok(idoc) => {
             let target = SetTarget { key, path, program: &program, cond, idoc: &idoc };
             set_path(reply, store, &target, cx, now)
         }
         Err(error) => reply.decline(error),
     };
-    cx.node.json_ingest_buf.replace(idoc);
+    cx.node.json_ingest_buf.replace(buf);
     settled
 }
 
@@ -428,7 +429,7 @@ fn set_root(
     store: &mut CellStore,
     key: &[u8],
     cond: SetCond,
-    idoc: &[u8],
+    idoc: &CanonicalDoc<'_>,
     cx: &ConnCx,
     now: Nanos,
 ) -> Settled {
@@ -436,7 +437,7 @@ fn set_root(
         FixedReservation::Reserved(fixed) => fixed,
         FixedReservation::Refused(settled) => return settled,
     };
-    if let Err(error) = durable_full_fits(cx, key, idoc) {
+    if let Err(error) = durable_full_fits(cx, key, idoc.as_bytes()) {
         return fixed.decline(error);
     }
     let opts = JsonSetOptions { cond, expire: SetExpire::Keep };
@@ -457,7 +458,7 @@ struct SetTarget<'t> {
     path: &'t [u8],
     program: &'t PathProgram,
     cond: SetCond,
-    idoc: &'t [u8],
+    idoc: &'t CanonicalDoc<'t>,
 }
 
 /// Path sets run replace-or-create per ADR-0041 D6.
@@ -486,7 +487,7 @@ fn set_path(
     if skipped {
         return answer(reply, JsonReply::null);
     }
-    let fragment = &target.idoc[inf_doc::HEADER_LEN..];
+    let fragment = target.idoc.body();
     if !matches.is_empty() {
         let op = ApplyOp::SetReplace { fragment };
         return set_apply(reply, store, target, &doc, target.program, &op, cx, now);
@@ -518,8 +519,8 @@ fn set_apply(
     cx: &ConnCx,
     now: Nanos,
 ) -> Settled {
-    match apply(doc, program, op, &eval_limits(store), store.doc_max_bytes()) {
-        Ok(outcome) if outcome.bytes.is_some() => {
+    match apply(doc, program, op, &eval_limits(store), store.doc_limits()) {
+        Ok(outcome) if outcome.document.is_some() => {
             let edit = PathEdit { key: target.key, program, op, outcome: &outcome };
             commit_delta(reply, &edit, store, cx, now, |reply| Ok(reply.ok()?))
         }
@@ -695,7 +696,7 @@ fn del(
     };
     let doc = TapeDoc::from_validated_bytes(&frozen);
     let op = ApplyOp::Del;
-    match apply(&doc, &program, &op, &eval_limits(store), store.doc_max_bytes()) {
+    match apply(&doc, &program, &op, &eval_limits(store), store.doc_limits()) {
         Ok(outcome) => {
             let applied = i64::from(outcome.applied);
             let edit = PathEdit { key, program: &program, op: &op, outcome: &outcome };
@@ -1251,7 +1252,7 @@ fn arr_pop(
     };
     let doc = TapeDoc::from_validated_bytes(&frozen);
     let op = ApplyOp::ArrPop { index };
-    let outcome = match apply(&doc, &program, &op, &eval_limits(store), store.doc_max_bytes()) {
+    let outcome = match apply(&doc, &program, &op, &eval_limits(store), store.doc_limits()) {
         Ok(outcome) => outcome,
         Err(error) => return reply.decline(ReplyError::Apply(error)),
     };
@@ -1546,12 +1547,12 @@ fn merge(
         Ok(program) => program,
         Err(error) => return reply.decline(error),
     };
-    let mut idoc = cx.node.json_ingest_buf.take();
-    let settled = match parse_value(store, cx, argv.arg(3), &mut idoc) {
-        Ok(()) => merge_parsed(reply, store, key, path, &program, &idoc, cx, now),
+    let mut buf = cx.node.json_ingest_buf.take();
+    let settled = match parse_value(store, cx, argv.arg(3), &mut buf) {
+        Ok(idoc) => merge_parsed(reply, store, key, path, &program, &idoc, cx, now),
         Err(error) => reply.decline(error),
     };
-    cx.node.json_ingest_buf.replace(idoc);
+    cx.node.json_ingest_buf.replace(buf);
     settled
 }
 
@@ -1566,11 +1567,11 @@ fn merge_parsed(
     key: &[u8],
     path: &[u8],
     program: &PathProgram,
-    idoc: &[u8],
+    idoc: &CanonicalDoc<'_>,
     cx: &ConnCx,
     now: Nanos,
 ) -> Settled {
-    let fragment = &idoc[inf_doc::HEADER_LEN..];
+    let fragment = idoc.body();
     if program.is_root() && store.json_get(key, now).ok().flatten().is_none() {
         // Missing key, root path: create with MergePatch(absent, patch).
         // Wrong types surface through json_set's guard.
@@ -1610,7 +1611,7 @@ fn merge_parsed(
     .expect("a prefix of an accepted program encodes under the ceiling");
     let name = name.clone();
     let created = inf_doc::merge_absent_document(fragment);
-    let op = ApplyOp::SetMember { key: &name, fragment: &created[inf_doc::HEADER_LEN..] };
+    let op = ApplyOp::SetMember { key: &name, fragment: created.body() };
     merge_apply(reply, store, &target, &parent, &op, cx, now)
 }
 
@@ -1629,7 +1630,7 @@ fn merge_create(
         FixedReservation::Reserved(fixed) => fixed,
         FixedReservation::Refused(settled) => return settled,
     };
-    if let Err(error) = durable_full_fits(cx, key, &created) {
+    if let Err(error) = durable_full_fits(cx, key, created.as_bytes()) {
         return fixed.decline(error);
     }
     let opts = JsonSetOptions { cond: SetCond::Always, expire: SetExpire::Keep };
@@ -1661,9 +1662,9 @@ fn merge_apply(
     cx: &ConnCx,
     now: Nanos,
 ) -> Settled {
-    match apply(target.doc, program, op, &eval_limits(store), store.doc_max_bytes()) {
+    match apply(target.doc, program, op, &eval_limits(store), store.doc_limits()) {
         Ok(outcome) => {
-            if matches!(op, ApplyOp::SetMember { .. }) && outcome.bytes.is_none() {
+            if matches!(op, ApplyOp::SetMember { .. }) && outcome.document.is_none() {
                 // Zero eligible parents: the oracle's path error arm.
                 return reply.decline(ReplyError::PathMissing(target.path));
             }
@@ -1675,7 +1676,9 @@ fn merge_apply(
 }
 
 /// Parse the trailing value arguments and wrap them as the single
-/// ADR-0042 D2 canonical array operand.
+/// ADR-0042 D2 canonical array operand. Its refusals — an element that
+/// nests `DEPTH_MAX`, an operand past the size ceiling — answer through the
+/// apply error texts, ahead of path compile and key lookup (ADR-0169 D3).
 fn parse_array_operand(
     store: &CellStore,
     cx: &ConnCx,
@@ -1689,7 +1692,7 @@ fn parse_array_operand(
         docs.push(out);
     }
     let fragments: Vec<&[u8]> = docs.iter().map(|d| &d[inf_doc::HEADER_LEN..]).collect();
-    inf_doc::array_operand(&fragments).ok_or(ReplyError::Line("ERR document too large"))
+    inf_doc::array_operand(&fragments).map_err(ReplyError::Apply)
 }
 
 /// The shared mutation prologue: compile, freeze, apply. Returns the
@@ -1720,7 +1723,7 @@ fn mutate_with(
 ) -> Result<ApplyOutcome, ReplyError<'static>> {
     let frozen = frozen_doc(store, key, now, MISSING_KEY)?;
     let doc = TapeDoc::from_validated_bytes(&frozen);
-    apply(&doc, program, op, &eval_limits(store), store.doc_max_bytes()).map_err(ReplyError::Apply)
+    apply(&doc, program, op, &eval_limits(store), store.doc_limits()).map_err(ReplyError::Apply)
 }
 
 /// How a counting mutation (`STRAPPEND`, `ARRAPPEND`, `ARRINSERT`,
@@ -2087,4 +2090,81 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&reply), want);
         assert_eq!(cx.node.log_admission_busy.get(), 1, "the refusal is the staging one");
     }
+
+    /// JSON text: `levels` nested arrays around `0`.
+    fn nested_arrays(levels: usize) -> String {
+        format!("{}0{}", "[".repeat(levels), "]".repeat(levels))
+    }
+
+    /// JSON text: `levels` nested objects `{"a":…}` around `0`.
+    fn nested_objects(levels: usize) -> String {
+        format!("{}0{}", r#"{"a":"#.repeat(levels), "}".repeat(levels))
+    }
+
+    /// The canonical bytes and version of `key`.
+    fn state_of(store: &mut CellStore, key: &[u8], now: Nanos) -> (Vec<u8>, u32) {
+        let version = store.json_get(key, now).unwrap().expect("fixture document").version;
+        (store.json_freeze(key, now).unwrap().expect("fixture document"), version)
+    }
+
+    /// ADR-0169 I5(a): a refused path mutation leaves the document's bytes
+    /// and version and the doc-log intent untouched. Each deepening command
+    /// composes depth 129 from an operand of at most 128 levels, and a
+    /// `STRAPPEND` grows a body one byte past the stored-document bound.
+    /// The executor, not `execute_json`, clears the doc-log scratch, so the
+    /// test clears it after setup and before each refused command.
+    #[test]
+    fn path_refusals_change_nothing() {
+        let mut store = CellStore::new(Default::default());
+        let cx = durable_cx(usize::MAX, usize::MAX);
+        let now = Nanos::from_millis(1);
+        let (arrays, objects) = (nested_arrays(DEPTH_FIXTURE), nested_objects(DEPTH_FIXTURE));
+        let finding = nested_arrays(DEPTH_FIXTURE + 1);
+        let string_len = STORED_BODY_MAX - 10 - 99;
+        let big = format!(r#"{{"s":"{}"}}"#, "x".repeat(string_len));
+        let fixtures: [(&[u8], &[u8]); 5] = [
+            (b"replace", br#"{"d":[0]}"#),
+            (b"member", br#"{"d":{}}"#),
+            (b"array", br#"{"d":[]}"#),
+            (b"root", b"[]"),
+            (b"size", big.as_bytes()),
+        ];
+        for (key, json) in fixtures {
+            assert_eq!(run(&[b"JSON.SET", key, b"$", json], &mut store, &cx, now), b"+OK\r\n");
+        }
+        let payload = format!(r#""{}""#, "y".repeat(100));
+        let nesting = b"-ERR document nesting too deep\r\n".as_slice();
+        let refused: [(&[&[u8]], &[u8]); 7] = [
+            (&[b"JSON.SET", b"replace", b"$.d[0]", arrays.as_bytes()], nesting),
+            (&[b"JSON.SET", b"member", b"$.d.x", arrays.as_bytes()], nesting),
+            (&[b"JSON.MERGE", b"replace", b"$.d[0]", objects.as_bytes()], nesting),
+            (&[b"JSON.ARRAPPEND", b"array", b"$.d", arrays.as_bytes()], nesting),
+            (&[b"JSON.ARRINSERT", b"array", b"$.d", b"0", arrays.as_bytes()], nesting),
+            (&[b"JSON.ARRAPPEND", b"root", b"$", finding.as_bytes()], nesting),
+            (
+                &[b"JSON.STRAPPEND", b"size", b"$.s", payload.as_bytes()],
+                b"-ERR document too large\r\n",
+            ),
+        ];
+        for (argv, want) in refused {
+            let before = state_of(&mut store, argv[1], now);
+            cx.node.doc_log.borrow_mut().clear();
+            let reply = run(argv, &mut store, &cx, now);
+            let shown = String::from_utf8_lossy(&argv[..2].join(&b' ')).into_owned();
+            assert_eq!(String::from_utf8_lossy(&reply), String::from_utf8_lossy(want), "{shown}");
+            assert!(
+                state_of(&mut store, argv[1], now) == before,
+                "{shown}: the refusal changed it"
+            );
+            let intent = &cx.node.doc_log.borrow().intent;
+            assert!(matches!(intent, DocLogIntent::None), "{shown}: doc-log intent {intent:?}");
+        }
+    }
+
+    /// The operand nesting that composes depth 129 at every fixture site
+    /// above: two enclosing containers (`$.d[0]`, `$.d.x`, `$.d`'s elements).
+    const DEPTH_FIXTURE: usize = 127;
+    /// The largest stored body: the record value cap less the document value
+    /// prefix (15) and the idoc header (8).
+    const STORED_BODY_MAX: usize = (1 << 24) - 1 - 15 - 8;
 }

@@ -13,7 +13,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use inf_doc::JsonParser;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, JsonSetOptions, SetOptions, StoreConfig};
 
@@ -25,7 +25,9 @@ fn bench_doc_ingest(c: &mut Criterion) {
     let text = doc_corpus::shape(doc_corpus::CANONICAL_SEED, "gate-1KiB").json;
     let now = Nanos::from_millis(1);
     let mut parser = JsonParser::new();
-    let idoc = parser.parse(text.as_bytes()).expect("gate shape parses");
+    let idoc_bytes = parser.parse(text.as_bytes()).expect("gate shape parses");
+    // The prebuilt receipt is made once, outside the timed rows.
+    let idoc = CanonicalDoc::validate(&idoc_bytes).expect("parser output is canonical");
     let value_1kib = vec![0xABu8; text.len()]; // equal-size plain value
 
     let mut group = c.benchmark_group("doc_ingest_1kib");
@@ -57,10 +59,12 @@ fn bench_doc_ingest(c: &mut Criterion) {
         let mut store = CellStore::new(StoreConfig::default());
         let mut i = 0u64;
         b.iter(|| {
-            let bytes = parser.parse(black_box(text.as_bytes())).expect("parses");
+            // A fresh output buffer per parse, as `parse` allocates one.
+            let mut bytes = Vec::new();
+            let doc = parser.parse_into(black_box(text.as_bytes()), &mut bytes).expect("parses");
             let key = [b'e', (i % 251) as u8];
             i += 1;
-            store.json_set(&key, &bytes, JsonSetOptions::default(), now).expect("json_set")
+            store.json_set(&key, &doc, JsonSetOptions::default(), now).expect("json_set")
         })
     });
     // The S05-slice-2 reuse arm: one recycled parse buffer per cell — the
@@ -70,10 +74,10 @@ fn bench_doc_ingest(c: &mut Criterion) {
         let mut buf = Vec::new();
         let mut i = 0u64;
         b.iter(|| {
-            parser.parse_into(black_box(text.as_bytes()), &mut buf).expect("parses");
+            let doc = parser.parse_into(black_box(text.as_bytes()), &mut buf).expect("parses");
             let key = [b'e', (i % 251) as u8];
             i += 1;
-            store.json_set(&key, &buf, JsonSetOptions::default(), now).expect("json_set")
+            store.json_set(&key, &doc, JsonSetOptions::default(), now).expect("json_set")
         })
     });
     group.finish();

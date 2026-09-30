@@ -827,9 +827,15 @@ fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
 
 /// A key owned by `cell` under an N-cell contiguous router.
 fn key_for_cell(cells: u16, cell: u16) -> Vec<u8> {
+    key_for_cell_prefixed(cells, cell, "k")
+}
+
+/// A key named `{prefix}:{i}` owned by `cell` under an N-cell contiguous
+/// router: one key per cell for each prefix a test names.
+fn key_for_cell_prefixed(cells: u16, cell: u16, prefix: &str) -> Vec<u8> {
     let router = SlotRouter::new_contiguous(cells);
     for i in 0..100_000u32 {
-        let key = format!("k:{i}");
+        let key = format!("{prefix}:{i}");
         if router.cell_of(SlotRouter::slot_of(key.as_bytes())) == CellId(cell) {
             return key.into_bytes();
         }
@@ -5473,6 +5479,375 @@ fn json_amplified_replies_refuse_at_the_wire() {
     client.write_all(&cmd(&[b"PING"])).expect("write");
     read_exactly(&mut client, b"+PONG\r\n");
     node.stop();
+}
+
+// ---- ADR-0169 Falsifier 3: the depth cliff through checkpoint and restart ----
+
+/// The deepest nesting a stored document may reach (`inf_doc::limits`).
+#[cfg(feature = "doc")]
+const CLIFF_DEPTH_MAX: usize = 128;
+
+/// JSON text: `levels` nested arrays around `0`.
+#[cfg(feature = "doc")]
+fn cliff_arrays(levels: usize) -> String {
+    format!("{}0{}", "[".repeat(levels), "]".repeat(levels))
+}
+
+/// JSON text: `levels` nested objects `{"a":…}` around `0`.
+#[cfg(feature = "doc")]
+fn cliff_objects(levels: usize) -> String {
+    format!("{}0{}", r#"{"a":"#.repeat(levels), "}".repeat(levels))
+}
+
+/// One shape that composes a site's depth with an operand's nesting
+/// (ADR-0169 D3). `Finding` is the review's script, unpadded; the others
+/// are padded objects `{"n":0,"pad":…,"d":…}` whose operand nests at most
+/// 127 levels under two enclosing containers.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Cliff {
+    Finding,
+    Replace,
+    Member,
+    Merge,
+    Append,
+    Insert,
+}
+
+#[cfg(feature = "doc")]
+const CLIFF_SHAPES: [Cliff; 6] =
+    [Cliff::Finding, Cliff::Replace, Cliff::Member, Cliff::Merge, Cliff::Append, Cliff::Insert];
+
+#[cfg(feature = "doc")]
+impl Cliff {
+    fn padded(site: &str, n: u8) -> String {
+        format!(r#"{{"n":{n},"pad":"{}","d":{site}}}"#, "x".repeat(1024))
+    }
+
+    /// The `d` site a padded shape starts with.
+    fn site(self) -> &'static str {
+        match self {
+            Cliff::Finding => "",
+            Cliff::Replace | Cliff::Merge => "[0]",
+            Cliff::Member => "{}",
+            Cliff::Append | Cliff::Insert => "[]",
+        }
+    }
+
+    fn initial(self) -> String {
+        match self {
+            Cliff::Finding => "[]".into(),
+            _ => Cliff::padded(self.site(), 0),
+        }
+    }
+
+    /// The command that composes depth `depth` on `key`.
+    fn command(self, key: &[u8], depth: usize) -> Vec<Vec<u8>> {
+        let finding = cliff_arrays(depth - 1).into_bytes();
+        let arrays = cliff_arrays(depth - 2).into_bytes();
+        let objects = cliff_objects(depth - 2).into_bytes();
+        let parts: &[&[u8]] = match self {
+            Cliff::Finding => &[b"JSON.ARRAPPEND", key, b"$", &finding],
+            Cliff::Replace => &[b"JSON.SET", key, b"$.d[0]", &arrays],
+            Cliff::Member => &[b"JSON.SET", key, b"$.d.x", &arrays],
+            Cliff::Merge => &[b"JSON.MERGE", key, b"$.d[0]", &objects],
+            Cliff::Append => &[b"JSON.ARRAPPEND", key, b"$.d", &arrays],
+            Cliff::Insert => &[b"JSON.ARRINSERT", key, b"$.d", b"0", &arrays],
+        };
+        parts.iter().map(|part| part.to_vec()).collect()
+    }
+
+    fn accepted_reply(self) -> &'static [u8] {
+        match self {
+            Cliff::Replace | Cliff::Member | Cliff::Merge => b"+OK\r\n",
+            Cliff::Finding | Cliff::Append | Cliff::Insert => b"*1\r\n:1\r\n",
+        }
+    }
+
+    /// The document after the command at `depth`: the edit at 128, or the
+    /// initial document with only the probe applied at 129.
+    fn expected(self, depth: usize) -> String {
+        if depth > CLIFF_DEPTH_MAX {
+            return match self {
+                Cliff::Finding => "[]".into(),
+                _ => Cliff::padded(self.site(), 1),
+            };
+        }
+        let inner = cliff_arrays(depth - 2);
+        match self {
+            Cliff::Finding => format!("[{}]", cliff_arrays(depth - 1)),
+            Cliff::Replace | Cliff::Append | Cliff::Insert => {
+                Cliff::padded(&format!("[{inner}]"), 0)
+            }
+            Cliff::Member => Cliff::padded(&format!(r#"{{"x":{inner}}}"#), 0),
+            Cliff::Merge => Cliff::padded(&format!("[{}]", cliff_objects(depth - 2)), 0),
+        }
+    }
+}
+
+/// One key the test wrote, and the reply its command answered.
+#[cfg(feature = "doc")]
+struct CliffKey {
+    phase: u8,
+    cell: u16,
+    shape: Option<Cliff>,
+    depth: usize,
+    key: Vec<u8>,
+    reply: Vec<u8>,
+}
+
+/// One complete RESP reply, or a named liveness failure when the client's
+/// 5 s read timeout elapses first.
+#[cfg(feature = "doc")]
+fn cliff_reply(stream: &mut TcpStream, what: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(len) = reply_len(&buf, 0).expect("valid RESP") {
+            buf.truncate(len);
+            return buf;
+        }
+        match stream.read(&mut chunk) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            Ok(_) => panic!("liveness: the connection closed before {what} answered"),
+            Err(error) => panic!("liveness: no reply to {what} within 5 s ({error})"),
+        }
+    }
+}
+
+#[cfg(feature = "doc")]
+fn cliff_send(c: &mut TcpStream, argv: &[Vec<u8>]) -> Vec<u8> {
+    let parts: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    c.write_all(&cmd(&parts)).expect("write");
+    let what = parts.iter().take(2).map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>();
+    cliff_reply(c, &what.join(" "))
+}
+
+/// Phase 1 or 2: every shape at composed depth 129, then its twin at 128,
+/// on one key per cell; a probe `NUMINCRBY` after each padded 129 command;
+/// and a 128-level `ARRAPPEND` element on a missing key per cell. Replies
+/// are recorded; the only assertion is liveness.
+#[cfg(feature = "doc")]
+fn cliff_phase(c: &mut TcpStream, phase: u8) -> Vec<CliffKey> {
+    let mut keys = Vec::new();
+    for depth in [CLIFF_DEPTH_MAX + 1, CLIFF_DEPTH_MAX] {
+        for cell in 0..2 {
+            for shape in CLIFF_SHAPES {
+                let prefix = format!("cliff{phase}-{shape:?}-{depth}");
+                let key = key_for_cell_prefixed(2, cell, &prefix);
+                let init = shape.initial().into_bytes();
+                let set = [b"JSON.SET".to_vec(), key.clone(), b"$".to_vec(), init];
+                assert_eq!(cliff_send(c, &set), b"+OK\r\n", "setup {prefix}");
+                let reply = cliff_send(c, &shape.command(&key, depth));
+                if depth > CLIFF_DEPTH_MAX && shape != Cliff::Finding {
+                    let probe = [b"JSON.NUMINCRBY".to_vec(), key.clone(), b"$.n".to_vec()];
+                    cliff_send(c, &[&probe[..], &[b"1".to_vec()]].concat());
+                }
+                keys.push(CliffKey { phase, cell, shape: Some(shape), depth, key, reply });
+            }
+        }
+    }
+    for cell in 0..2 {
+        let key = key_for_cell_prefixed(2, cell, &format!("cliff{phase}-missing"));
+        let element = cliff_arrays(CLIFF_DEPTH_MAX).into_bytes();
+        let argv = [b"JSON.ARRAPPEND".to_vec(), key.clone(), b"$".to_vec(), element];
+        let reply = cliff_send(c, &argv);
+        let depth = CLIFF_DEPTH_MAX + 1;
+        keys.push(CliffKey { phase, cell, shape: None, depth, key, reply });
+    }
+    keys
+}
+
+/// A document record the scan saw, in log order, for one key.
+#[cfg(feature = "doc")]
+#[derive(Clone, Debug, PartialEq)]
+enum CliffRecord {
+    Full { version: u32, idoc: Vec<u8> },
+    Delta { base_version: u32 },
+}
+
+/// Containers on the deepest path of a JSON value: the test's own
+/// recursive walk, independent of the engine's.
+#[cfg(feature = "doc")]
+fn cliff_nesting(value: &inf_doc::model::Value) -> usize {
+    use inf_doc::model::Value;
+    match value {
+        Value::Obj(entries) => 1 + entries.iter().map(|(_, v)| cliff_nesting(v)).max().unwrap_or(0),
+        Value::Arr(items) => 1 + items.iter().map(cliff_nesting).max().unwrap_or(0),
+        Value::Null | Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Str(_) => 0,
+    }
+}
+
+#[cfg(feature = "doc")]
+fn idoc_nesting(idoc: &[u8]) -> usize {
+    let doc = inf_doc::TapeDoc::from_bytes(idoc).expect("a logged image validates");
+    cliff_nesting(&inf_doc::model::from_tape(&doc))
+}
+
+/// Every document record in `cell`'s log, keyed by its key, in log order.
+/// It decodes records, not documents, and asserts nothing.
+#[cfg(feature = "doc")]
+fn cliff_log(dir: &std::path::Path, cell: u16) -> Vec<(Vec<u8>, CliffRecord)> {
+    let log_dir = dir.join(format!("shard-{cell}")).join("log");
+    let fs = inf_log::fs::StdSegmentFs;
+    let scan = inf_log::scan_log_dir(&fs, &log_dir).expect("scan log");
+    let mut records = Vec::new();
+    for &segment in scan.segments() {
+        let config = inf_log::ReaderConfig::default();
+        let mut reader =
+            inf_log::SegmentReader::open(&fs, &log_dir, segment, config).expect("open segment");
+        while let Some(frame) = reader.next_frame().expect("valid frame") {
+            for record in frame.records() {
+                match record.expect("valid record").1 {
+                    inf_log::RecordView::DocFull { key, version, idoc, .. } => {
+                        let full = CliffRecord::Full { version, idoc: idoc.to_vec() };
+                        records.push((key.to_vec(), full));
+                    }
+                    inf_log::RecordView::DocDelta { key, base_version, .. } => {
+                        records.push((key.to_vec(), CliffRecord::Delta { base_version }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    records
+}
+
+/// The keys of the `DocFull` images in `cell`'s published checkpoint.
+#[cfg(feature = "doc")]
+fn cliff_ick(dir: &std::path::Path, cell: u16) -> Vec<Vec<u8>> {
+    let ckpt = dir.join(format!("shard-{cell}")).join("ckpt");
+    let published: Vec<std::path::PathBuf> = std::fs::read_dir(&ckpt)
+        .expect("checkpoint dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ick"))
+        .collect();
+    assert_eq!(published.len(), 1, "cell {cell} published one checkpoint: {published:?}");
+    let mut keys = Vec::new();
+    inf_log::ckpt::read_ick(
+        &inf_log::fs::StdSegmentFs,
+        &published[0],
+        inf_log::ckpt::IckReaderConfig::default(),
+        |view| {
+            if let inf_log::RecordView::DocFull { key, .. } = view {
+                keys.push(key.to_vec());
+            }
+            Ok::<(), ()>(())
+        },
+    )
+    .expect("the published checkpoint validates");
+    keys
+}
+
+#[cfg(feature = "doc")]
+fn cliff_wait_ckpt(node: &Node) {
+    let mut cells = [conn_on_cell(node, 0), conn_on_cell(node, 1)];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for (cell, c) in cells.iter_mut().enumerate() {
+        while scrape_u64(c, b"persistence", "ckpts_completed:") == 0 {
+            assert!(Instant::now() < deadline, "cell {cell} never completed its checkpoint");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// ADR-0169 Falsifier 3 on the shipped multi-cell shape: two cells, a
+/// durable `FSYNC always` namespace, every deepening shape at composed
+/// depth 129 and its 128 twin on one key per cell — so one copy of each is
+/// remote whichever cell accepted the connection — then a checkpoint, the
+/// same shapes on fresh keys, a crash-equivalent stop and a restart. The
+/// pre-fix build stored the 129-level documents, and its restart
+/// fail-stopped on its own checkpoint image; the phases run in this order
+/// so that build reaches the restart.
+#[test]
+#[cfg(feature = "doc")]
+fn json_depth_cliff_survives_checkpoint_and_restart() {
+    let dir = temp_data_dir("json-depth-cliff");
+    let node = Node::start_durable(2, &dir);
+    let mut admin = node.connect();
+    let create: [&[u8]; 7] =
+        [b"INF.NS", b"CREATE", b"cliff", b"MODE", b"durable", b"FSYNC", b"always"];
+    admin.write_all(&cmd(&create)).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    drop(admin);
+    let mut c = connect_use(&node, b"cliff");
+    // Phase 1: write and record.
+    let mut keys = cliff_phase(&mut c, 1);
+    // Phase 2: a completed checkpoint, then the shapes again on fresh keys.
+    node.request_ckpt_all();
+    cliff_wait_ckpt(&node);
+    keys.extend(cliff_phase(&mut c, 2));
+    drop(c);
+    node.stop();
+    // Phase 3: scan, then restart; the boot check is the first assertion.
+    let logs = [cliff_log(&dir, 0), cliff_log(&dir, 1)];
+    let icks = [cliff_ick(&dir, 0), cliff_ick(&dir, 1)];
+    let node = Node::start_durable(2, &dir);
+    // Phase 4: every key reads back over the wire.
+    let mut c = connect_use(&node, b"cliff");
+    for k in &keys {
+        let argv = [b"JSON.GET".to_vec(), k.key.clone()];
+        let got = cliff_send(&mut c, &argv);
+        let want = match k.shape {
+            Some(shape) => {
+                let text = shape.expected(k.depth);
+                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+            }
+            None => b"$-1\r\n".to_vec(),
+        };
+        let name = String::from_utf8_lossy(&k.key);
+        assert!(got == want, "{name}: read back {:.120}", String::from_utf8_lossy(&got));
+    }
+    drop(c);
+    node.stop();
+    // Phase 5: engagement, or the verdict is VACUOUS.
+    let twin = |k: &&CliffKey| k.depth == CLIFF_DEPTH_MAX;
+    for cell in 0..2u16 {
+        let log = &logs[usize::from(cell)];
+        let owned: Vec<&CliffKey> =
+            keys.iter().filter(|k| k.phase == 2 && k.cell == cell).filter(twin).collect();
+        let delta = log.iter().any(|(key, record)| {
+            matches!(record, CliffRecord::Delta { .. }) && owned.iter().any(|k| k.key == *key)
+        });
+        assert!(delta, "VACUOUS: cell {cell}'s tail holds no DocDelta for a 128 key");
+        let ick = &icks[usize::from(cell)];
+        let imaged = keys.iter().filter(|k| k.phase == 1 && k.cell == cell).filter(twin);
+        let imaged = imaged.filter(|k| ick.contains(&k.key)).count();
+        assert!(imaged > 0, "VACUOUS: cell {cell}'s checkpoint holds no DocFull for a 128 key");
+    }
+    let deepest = logs.iter().flatten().any(|(key, record)| {
+        let tail = keys.iter().any(|k| k.phase == 2 && k.key == *key);
+        matches!(record, CliffRecord::Full { idoc, .. } if tail && idoc_nesting(idoc) == 128)
+    });
+    assert!(deepest, "VACUOUS: the tail holds no DocFull whose image nests 128");
+    // Phase 6: the recorded replies.
+    for k in &keys {
+        let name = String::from_utf8_lossy(&k.key);
+        let want = match k.shape {
+            Some(shape) if k.depth <= CLIFF_DEPTH_MAX => shape.accepted_reply(),
+            Some(_) | None => b"-ERR document nesting too deep\r\n".as_slice(),
+        };
+        assert_eq!(String::from_utf8_lossy(&k.reply), String::from_utf8_lossy(want), "{name}");
+    }
+    // Phase 7 (ADR-0169 I5(b)): a refused padded key written after the
+    // checkpoint logs its creation and its probe, nothing from the refusal.
+    for k in keys.iter().filter(|k| k.phase == 2 && k.depth > CLIFF_DEPTH_MAX) {
+        if matches!(k.shape, None | Some(Cliff::Finding)) {
+            continue;
+        }
+        let log = &logs[usize::from(k.cell)];
+        let own: Vec<&CliffRecord> =
+            log.iter().filter(|(key, _)| *key == k.key).map(|(_, record)| record).collect();
+        let name = String::from_utf8_lossy(&k.key);
+        let [CliffRecord::Full { version, .. }, CliffRecord::Delta { base_version }] = own[..]
+        else {
+            panic!("{name}: records {own:?}");
+        };
+        assert_eq!(version, base_version, "{name}: the refusal moved the version");
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---- M4.5-S34: FUA-class frames on pre-zeroed O_DIRECT segments (ADR-0086) ----

@@ -8,10 +8,13 @@
 //! the realization faithful.
 
 use inf_doc::apply::{ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, apply};
-use inf_doc::limits::DOC_BYTES_MAX;
+use inf_doc::limits::DEPTH_MAX;
 use inf_doc::model::{self, Value};
 use inf_doc::path::{EvalLimits, compile, eval};
-use inf_doc::{DocValue, JsonParser, TapeDoc, serialize_canonical_into};
+use inf_doc::{
+    CanonicalDoc, DeltaDecodeError, DeltaOpcode, DocLimits, DocValue, JsonParser, TapeDoc, Written,
+    decode_apply_op, encode_apply_op, serialize_canonical_into,
+};
 use proptest::prelude::*;
 
 fn tape_of(json: &str) -> Vec<u8> {
@@ -29,13 +32,13 @@ fn run(json: &str, path: &str, op: &ApplyOp<'_>) -> Result<ApplyOutcome, ApplyEr
     let bytes = tape_of(json);
     let doc = TapeDoc::from_bytes(&bytes).expect("validates");
     let program = compile(path.as_bytes()).expect("test path compiles");
-    apply(&doc, &program, op, &EvalLimits::default(), DOC_BYTES_MAX)
+    apply(&doc, &program, op, &EvalLimits::default(), DocLimits::FORMAT)
 }
 
 fn applied_json(json: &str, path: &str, op: &ApplyOp<'_>) -> (String, ApplyOutcome) {
     let outcome = run(json, path, op).expect("apply succeeds");
-    let bytes = outcome.bytes.as_ref().expect("an edit applied");
-    (json_of(bytes), outcome.clone())
+    let document = outcome.document.as_ref().expect("an edit applied");
+    (json_of(document.as_bytes()), outcome.clone())
 }
 
 fn fragment(v: &Value) -> Vec<u8> {
@@ -207,7 +210,7 @@ fn del_overlapping_matches_counts_the_pre_state_set() {
 #[test]
 fn del_with_no_matches_changes_nothing() {
     let outcome = run(r#"{"a":1}"#, "$.missing", &ApplyOp::Del).expect("no-op succeeds");
-    assert!(outcome.bytes.is_none());
+    assert!(outcome.document.is_none());
     assert_eq!(outcome.applied, 0);
 }
 
@@ -220,17 +223,17 @@ fn indices_beyond_the_u32_width_mutate_nothing() {
     let frag = fragment(&Value::I64(999));
     for path in ["$[4294967296]", "$[4294967297]", "$[8589934592]", "$[9223372036854775807]"] {
         let outcome = run(r#"[10,20,30]"#, path, &ApplyOp::Del).expect("no-op succeeds");
-        assert!(outcome.bytes.is_none(), "DEL {path} must not edit");
+        assert!(outcome.document.is_none(), "DEL {path} must not edit");
         assert_eq!(outcome.applied, 0);
         let outcome = run(r#"[10,20,30]"#, path, &ApplyOp::SetReplace { fragment: &frag })
             .expect("no-op succeeds");
-        assert!(outcome.bytes.is_none(), "SET {path} must not edit");
+        assert!(outcome.document.is_none(), "SET {path} must not edit");
         assert_eq!(outcome.applied, 0);
     }
     let union = "$[4294967296,4294967296]";
     let outcome =
         run(r#"[10,20,30]"#, union, &ApplyOp::NumIncrBy(Number::I64(1000))).expect("no-op");
-    assert!(outcome.bytes.is_none(), "NUMINCRBY {union} must not edit");
+    assert!(outcome.document.is_none(), "NUMINCRBY {union} must not edit");
     assert_eq!(outcome.applied, 0);
     // The slice cursor at i64::MAX: exactly one element, then the walk ends.
     let (json, outcome) = applied_json(
@@ -271,7 +274,7 @@ fn set_member_skips_non_object_parents() {
     let frag = fragment(&Value::I64(1));
     let outcome = run(r#"{"a":[1]}"#, "$.a", &ApplyOp::SetMember { key: b"k", fragment: &frag })
         .expect("skip succeeds");
-    assert!(outcome.bytes.is_none());
+    assert!(outcome.document.is_none());
     assert_eq!(outcome.results, vec![MatchResult::Skipped]);
 }
 
@@ -316,7 +319,7 @@ fn post_edit_size_cap_aborts_before_output_exists() {
         &program,
         &ApplyOp::StrAppend(&payload),
         &EvalLimits::default(),
-        bytes.len(), // a cap the grown document must exceed
+        DocLimits::new(DEPTH_MAX, bytes.len()), // a cap the grown document must exceed
     )
     .expect_err("cap binds");
     assert_eq!(err, ApplyError::TooLarge);
@@ -325,7 +328,7 @@ fn post_edit_size_cap_aborts_before_output_exists() {
 #[test]
 fn all_skipped_is_a_no_op_with_no_bytes() {
     let outcome = run(r#"{"a":"s"}"#, "$.a", &ApplyOp::Toggle).expect("skip succeeds");
-    assert!(outcome.bytes.is_none(), "no edit ⇒ no rewrite ⇒ no version bump (ADR-0041 D8)");
+    assert!(outcome.document.is_none(), "no edit ⇒ no rewrite ⇒ no version bump (ADR-0041 D8)");
     assert_eq!(outcome.applied, 0);
 }
 
@@ -396,6 +399,8 @@ enum OwnedOp {
     Clear,
     Del,
     SetReplace(Value, Vec<u8>),
+    /// A member write at the matched object: its key, value and fragment.
+    SetMember(String, Value, Vec<u8>),
     ArrAppend(Vec<Value>, Vec<u8>),
     ArrInsert(i64, Vec<Value>, Vec<u8>),
     ArrPop(i64),
@@ -413,6 +418,9 @@ impl OwnedOp {
             OwnedOp::Clear => ApplyOp::Clear,
             OwnedOp::Del => ApplyOp::Del,
             OwnedOp::SetReplace(_, frag) => ApplyOp::SetReplace { fragment: frag },
+            OwnedOp::SetMember(key, _, frag) => {
+                ApplyOp::SetMember { key: key.as_bytes(), fragment: frag }
+            }
             OwnedOp::ArrAppend(_, operand) => ApplyOp::ArrAppend { elements: operand },
             OwnedOp::ArrInsert(index, _, operand) => {
                 ApplyOp::ArrInsert { index: *index, elements: operand }
@@ -502,6 +510,13 @@ fn model_apply_at(root: &mut Value, steps: &[u32], op: &OwnedOp) -> bool {
             _ => return false,
         },
         OwnedOp::SetReplace(value, _) => *node = value.clone(),
+        OwnedOp::SetMember(key, value, _) => {
+            let Value::Obj(entries) = node else { return false };
+            match entries.iter_mut().find(|(k, _)| k == key) {
+                Some((_, slot)) => *slot = value.clone(),
+                None => entries.push((key.clone(), value.clone())),
+            }
+        }
         OwnedOp::ArrAppend(values, _) => {
             let Value::Arr(items) = node else { return false };
             items.extend(values.iter().cloned());
@@ -619,7 +634,8 @@ proptest! {
         prop_assume!(!(matches!(op, OwnedOp::Del)
             && canon.ids.iter().any(|&id| matches.get(id as usize).is_empty())));
 
-        let applied = apply(&doc, &program, &op.borrow(), &EvalLimits::default(), DOC_BYTES_MAX);
+        let applied =
+            apply(&doc, &program, &op.borrow(), &EvalLimits::default(), DocLimits::FORMAT);
         let outcome = match applied {
             Ok(outcome) => outcome,
             Err(ApplyError::OutOfBounds) => {
@@ -691,8 +707,10 @@ proptest! {
             }
         }
         let expected = model::encode(&reference).expect("reference encodes");
-        match &outcome.bytes {
-            Some(bytes) => prop_assert_eq!(bytes, &expected, "engine ≡ reference bytes"),
+        match &outcome.document {
+            Some(document) => {
+                prop_assert_eq!(document.as_bytes(), &expected[..], "engine ≡ reference bytes")
+            }
             None => prop_assert_eq!(&bytes, &expected, "no-op leaves the document unchanged"),
         }
         // Result census agrees (duplicates collapse onto one site).
@@ -767,7 +785,7 @@ fn arrpop_defaults_clamps_and_reports_pre_image_offsets() {
     assert_eq!(outcome.results, vec![MatchResult::Popped(4)]);
     // Empty arrays pop nothing and mutate nothing.
     let outcome = run(r#"[]"#, "$", &ApplyOp::ArrPop { index: -1 }).expect("empty pop succeeds");
-    assert!(outcome.bytes.is_none());
+    assert!(outcome.document.is_none());
     assert_eq!(outcome.results, vec![MatchResult::PoppedEmpty]);
 }
 
@@ -776,9 +794,14 @@ fn arrpop_resolves_popped_values_via_value_at() {
     let bytes = tape_of(r#"{"a":[1,{"k":"v"},3]}"#);
     let doc = TapeDoc::from_bytes(&bytes).expect("validates");
     let program = compile(b"$.a").expect("compiles");
-    let outcome =
-        apply(&doc, &program, &ApplyOp::ArrPop { index: 1 }, &EvalLimits::default(), DOC_BYTES_MAX)
-            .expect("pop succeeds");
+    let outcome = apply(
+        &doc,
+        &program,
+        &ApplyOp::ArrPop { index: 1 },
+        &EvalLimits::default(),
+        DocLimits::FORMAT,
+    )
+    .expect("pop succeeds");
     let MatchResult::Popped(at) = outcome.results[0] else { panic!("array match pops") };
     let mut text = Vec::new();
     inf_doc::serialize_into(
@@ -787,7 +810,10 @@ fn arrpop_resolves_popped_values_via_value_at() {
         &mut text,
     );
     assert_eq!(text, br#"{"k":"v"}"#);
-    assert_eq!(json_of(outcome.bytes.as_ref().expect("edit applied")), r#"{"a":[1,3]}"#);
+    assert_eq!(
+        json_of(outcome.document.as_ref().expect("edit applied").as_bytes()),
+        r#"{"a":[1,3]}"#
+    );
 }
 
 #[test]
@@ -806,7 +832,7 @@ fn arrtrim_clamps_empties_and_skips_full_windows() {
     assert_eq!(json, r#"[]"#);
     // A window covering everything is a no-op (ADR-0041 D8).
     let outcome = run(r#"[0,1,2]"#, "$", &trim(0, -1)).expect("full window succeeds");
-    assert!(outcome.bytes.is_none());
+    assert!(outcome.document.is_none());
     assert_eq!(outcome.results, vec![MatchResult::Len(3)]);
 }
 
@@ -820,7 +846,7 @@ fn array_ops_skip_non_arrays() {
         ApplyOp::ArrTrim { start: 0, stop: 0 },
     ] {
         let outcome = run(r#"{"a":1,"s":"x"}"#, "$.*", &op).expect("skips succeed");
-        assert!(outcome.bytes.is_none(), "non-arrays skip for {op:?}");
+        assert!(outcome.document.is_none(), "non-arrays skip for {op:?}");
         assert_eq!(outcome.results, vec![MatchResult::Skipped, MatchResult::Skipped]);
     }
 }
@@ -831,8 +857,8 @@ fn merge_json(target: &str, path: &str, patch_json: &str) -> String {
     let patch_doc = tape_of(patch_json);
     let patch = &patch_doc[inf_doc::HEADER_LEN..];
     let outcome = run(target, path, &ApplyOp::Merge { patch }).expect("merge succeeds");
-    match outcome.bytes {
-        Some(bytes) => json_of(&bytes),
+    match outcome.document {
+        Some(document) => json_of(document.as_bytes()),
         None => json_of(&tape_of(target)),
     }
 }
@@ -923,7 +949,7 @@ fn merge_of_empty_patch_is_a_no_op() {
     let patch_doc = tape_of("{}");
     let patch = &patch_doc[inf_doc::HEADER_LEN..];
     let outcome = run(r#"{"a":1}"#, "$", &ApplyOp::Merge { patch }).expect("no-op succeeds");
-    assert!(outcome.bytes.is_none(), "byte-equal merge must not rewrite (ADR-0041 D8)");
+    assert!(outcome.document.is_none(), "byte-equal merge must not rewrite (ADR-0041 D8)");
     assert_eq!(outcome.applied, 0);
 }
 
@@ -931,7 +957,7 @@ fn merge_of_empty_patch_is_a_no_op() {
 fn merge_absent_document_strips_nulls_through_object_chains_only() {
     let strip = |patch_json: &str| {
         let doc = tape_of(patch_json);
-        json_of(&inf_doc::merge_absent_document(&doc[inf_doc::HEADER_LEN..]))
+        json_of(inf_doc::merge_absent_document(&doc[inf_doc::HEADER_LEN..]).as_bytes())
     };
     assert_eq!(strip(r#"{"a":1,"b":null,"c":{"d":null,"e":2}}"#), r#"{"a":1,"c":{"e":2}}"#);
     // Arrays and scalars are literal — nulls inside arrays survive.
@@ -939,4 +965,597 @@ fn merge_absent_document_strips_nulls_through_object_chains_only() {
     assert_eq!(strip(r#"[null]"#), r#"[null]"#);
     assert_eq!(strip("null"), "null");
     assert_eq!(strip("3"), "3");
+}
+
+// ---- the depth cliff (ADR-0169 D3, Falsifier 1) --------------------------------
+
+/// JSON text: `levels` nested arrays around `inner`.
+fn nested_arrays(levels: usize, inner: &str) -> String {
+    format!("{}{inner}{}", "[".repeat(levels), "]".repeat(levels))
+}
+
+/// JSON text: `levels` nested objects `{"a":…}` around `inner`.
+fn nested_objects(levels: usize, inner: &str) -> String {
+    format!("{}{inner}{}", r#"{"a":"#.repeat(levels), "}".repeat(levels))
+}
+
+/// The header-less canonical fragment of `json`.
+fn fragment_of(json: &str) -> Vec<u8> {
+    tape_of(json)[inf_doc::HEADER_LEN..].to_vec()
+}
+
+/// A replay reader refuses nothing `apply` returns: the check the replay
+/// validator makes of every `DocFull` and checkpoint image.
+fn assert_replays(result: &Result<ApplyOutcome, ApplyError>, what: &str) {
+    if let Ok(ApplyOutcome { document: Some(document), .. }) = result {
+        let reread = TapeDoc::from_bytes(document.as_bytes()).map(|_| ());
+        assert_eq!(reread, Ok(()), "{what}: apply returned a document replay refuses");
+    }
+}
+
+/// The five ops that compose a site's depth with an operand's nesting.
+#[derive(Copy, Clone, Debug)]
+enum Deepening {
+    SetReplace,
+    SetMember,
+    Merge,
+    ArrAppend,
+    ArrInsert,
+}
+
+/// Where a row's sites sit. ADR-0169 D3 counts only kept edits and the
+/// deepest one decides, so the spread layouts keep two sites at different
+/// depths, the deeper one first and then last in document order.
+#[derive(Copy, Clone, Debug)]
+enum Layout {
+    /// `$.d` over `{"d":S}`: one site, enclosed by the root.
+    Single,
+    /// `$..d` over `[{"c":{"d":S}},{"d":S}]`: sites enclosed by 3 and 2.
+    SpreadDeepFirst,
+    /// `$..d` over `[{"d":S},{"c":{"d":S}}]`: sites enclosed by 2 and 3.
+    SpreadDeepLast,
+}
+
+impl Layout {
+    const ALL: [Layout; 3] = [Layout::Single, Layout::SpreadDeepFirst, Layout::SpreadDeepLast];
+
+    /// The pre-image around `site` (the site value's JSON text) and the
+    /// path that matches every site.
+    fn doc(self, site: &str) -> (String, &'static str) {
+        let shallow = format!(r#"{{"d":{site}}}"#);
+        let deep = format!(r#"{{"c":{shallow}}}"#);
+        match self {
+            Layout::Single => (shallow, "$.d"),
+            Layout::SpreadDeepFirst => (format!("[{deep},{shallow}]"), "$..d"),
+            Layout::SpreadDeepLast => (format!("[{shallow},{deep}]"), "$..d"),
+        }
+    }
+
+    /// The containers enclosing the deepest site.
+    fn deepest_enclosing(self) -> usize {
+        match self {
+            Layout::Single => 1,
+            Layout::SpreadDeepFirst | Layout::SpreadDeepLast => 3,
+        }
+    }
+
+    fn sites(self) -> u32 {
+        match self {
+            Layout::Single => 1,
+            Layout::SpreadDeepFirst | Layout::SpreadDeepLast => 2,
+        }
+    }
+}
+
+/// One deepening op at composed depth `composed` at its layout's deepest
+/// site, per ADR-0169 D3's table: the containers enclosing the written
+/// bytes plus what the op writes.
+struct CliffRow {
+    kind: Deepening,
+    doc: String,
+    path: &'static str,
+    operand: Vec<u8>,
+}
+
+impl CliffRow {
+    fn new(kind: Deepening, layout: Layout, composed: usize) -> CliffRow {
+        let below = composed - layout.deepest_enclosing();
+        let (site, operand) = match kind {
+            // The fragment replaces the site: its own nesting.
+            Deepening::SetReplace => ("0", fragment_of(&nested_arrays(below, "0"))),
+            // The member lands inside the site: one more.
+            Deepening::SetMember => ("{}", fragment_of(&nested_arrays(below - 1, "0"))),
+            // An object patch merged into a scalar keeps every container.
+            Deepening::Merge => ("0", fragment_of(&nested_objects(below, "0"))),
+            // Elements land inside the site: one more.
+            Deepening::ArrAppend | Deepening::ArrInsert => {
+                let element = fragment_of(&nested_arrays(below - 1, "0"));
+                let operand =
+                    inf_doc::array_operand(&[&element]).expect("a 127-level element wraps");
+                ("[]", operand)
+            }
+        };
+        let (doc, path) = layout.doc(site);
+        CliffRow { kind, doc, path, operand }
+    }
+
+    fn op(&self) -> ApplyOp<'_> {
+        match self.kind {
+            Deepening::SetReplace => ApplyOp::SetReplace { fragment: &self.operand },
+            Deepening::SetMember => ApplyOp::SetMember { key: b"x", fragment: &self.operand },
+            Deepening::Merge => ApplyOp::Merge { patch: &self.operand },
+            Deepening::ArrAppend => ApplyOp::ArrAppend { elements: &self.operand },
+            Deepening::ArrInsert => ApplyOp::ArrInsert { index: 0, elements: &self.operand },
+        }
+    }
+}
+
+/// One cliff row: accepted with every site kept at composed depth 127 and
+/// 128, refused at 129, and never a document the replay validator refuses.
+fn assert_cliff_row(kind: Deepening, layout: Layout, composed: usize) {
+    let row = CliffRow::new(kind, layout, composed);
+    let result = run(&row.doc, row.path, &row.op());
+    let what = format!("{kind:?} {layout:?} at composed depth {composed}");
+    assert_replays(&result, &what);
+    if composed <= DEPTH_MAX {
+        let outcome = result.expect(&what);
+        assert!(outcome.document.is_some(), "{what}: an edit applied");
+        assert_eq!(outcome.applied, layout.sites(), "{what}: every site applied");
+    } else {
+        assert_eq!(result.err(), Some(ApplyError::DepthExceeded), "{what}: refused");
+    }
+}
+
+/// ADR-0169 Falsifier 1: the five deepening ops accept at composed depth
+/// 127 and 128 and refuse 129, measured at the deepest kept site whether it
+/// comes first or last; the other eight never refuse at a container site
+/// enclosed by `DEPTH_MAX − 1` containers or a scalar site enclosed by
+/// `DEPTH_MAX`. Every document `apply` returns passes the replay validator
+/// — the pre-fix engine returned a 129-level one.
+#[test]
+fn apply_output_replays_at_the_depth_cliff() {
+    let kinds = [
+        Deepening::SetReplace,
+        Deepening::SetMember,
+        Deepening::Merge,
+        Deepening::ArrAppend,
+        Deepening::ArrInsert,
+    ];
+    for composed in [DEPTH_MAX - 1, DEPTH_MAX, DEPTH_MAX + 1] {
+        for layout in Layout::ALL {
+            for kind in kinds {
+                assert_cliff_row(kind, layout, composed);
+            }
+        }
+    }
+    let site = nested_arrays(DEPTH_MAX - 1, r#"[1,"s",true]"#);
+    let container = format!("${}", "[0]".repeat(DEPTH_MAX - 1));
+    let scalar = |index: usize| format!("{container}[{index}]");
+    let unchecked: [(String, ApplyOp<'_>); 10] = [
+        (container.clone(), ApplyOp::Del),
+        (container.clone(), ApplyOp::Clear),
+        (container.clone(), ApplyOp::ArrPop { index: -1 }),
+        (container.clone(), ApplyOp::ArrTrim { start: 0, stop: 0 }),
+        (scalar(0), ApplyOp::NumIncrBy(Number::I64(1))),
+        (scalar(0), ApplyOp::NumMultBy(Number::I64(3))),
+        (scalar(1), ApplyOp::StrAppend(b"+t")),
+        (scalar(2), ApplyOp::Toggle),
+        (scalar(0), ApplyOp::Del),
+        (scalar(0), ApplyOp::Clear),
+    ];
+    for (path, op) in &unchecked {
+        let result = run(&site, path, op);
+        let what = format!("{op:?} at the deepest site");
+        assert_replays(&result, &what);
+        let outcome = result.expect(&what);
+        assert!(outcome.document.is_some(), "{what}: an edit applied");
+    }
+}
+
+/// ADR-0169 D3 exactness: a match superseded by a kept ancestor edit is
+/// absent from the output, so it cannot refuse it. `$..a` over
+/// `{"a":{"a":{"a":0}}}` keeps only `$.a`'s replacement: a 127-level
+/// fragment composes 128 there while the dropped inner matches would
+/// compose 129 and 130; one level more composes 129 at the kept edit.
+#[test]
+fn superseded_matches_do_not_count_toward_the_depth() {
+    let doc = r#"{"a":{"a":{"a":0}}}"#;
+    let kept = wrap(&[false; DEPTH_MAX - 1], Value::I64(0));
+    let result = run(doc, "$..a", &ApplyOp::SetReplace { fragment: &fragment(&kept) });
+    assert_replays(&result, "the kept edit at composed depth 128");
+    let outcome = result.expect("the kept edit composes 128");
+    let document = outcome.document.expect("an edit applied");
+    let model = model::encode(&Value::Obj(vec![("a".into(), kept)])).expect("128 levels encode");
+    assert_eq!(document.as_bytes(), &model[..], "the output is the kept edit alone");
+    let past = wrap(&[false; DEPTH_MAX], Value::I64(0));
+    let result = run(doc, "$..a", &ApplyOp::SetReplace { fragment: &fragment(&past) });
+    assert_eq!(result.err(), Some(ApplyError::DepthExceeded), "the kept edit composes 129");
+}
+
+/// ADR-0169 D3: `array_operand` refuses an element the operand decoder
+/// would refuse inside its wrapper — a 128-level element nests the wrapper
+/// 129 — and wraps a 127-level one into an operand `decode_apply_op` takes.
+#[test]
+fn array_operand_refuses_what_decode_refuses() {
+    for levels in [DEPTH_MAX - 2, DEPTH_MAX - 1, DEPTH_MAX] {
+        let element = fragment_of(&nested_arrays(levels, "0"));
+        match inf_doc::array_operand(&[&element]) {
+            Ok(operand) => assert_wrapped_operand_decodes(levels, &operand),
+            Err(error) => assert_eq!((levels, error), (DEPTH_MAX, ApplyError::DepthExceeded)),
+        }
+    }
+}
+
+fn assert_wrapped_operand_decodes(levels: usize, operand: &[u8]) {
+    let decoded = decode_apply_op(DeltaOpcode::ArrAppend as u8, operand);
+    assert!(
+        decoded.is_ok(),
+        "array_operand wrapped a {levels}-level element the decoder refuses: {decoded:?}"
+    );
+    assert!(levels < DEPTH_MAX, "a {levels}-level element was wrapped");
+}
+
+// ---- writer/reader agreement over the opcode table (ADR-0169 Falsifier 2) -------
+
+/// One generated case: a pre-image whose single match sits under
+/// `site_enclosing` containers, the path to it, and the op.
+#[derive(Clone, Debug)]
+struct AgreementCase {
+    doc: Value,
+    steps: Vec<u32>,
+    path: String,
+    op: OwnedOp,
+    site_enclosing: usize,
+}
+
+/// What `apply` did with a case, in bytes a planted canary can forge.
+#[derive(Debug)]
+enum Observed {
+    Document(Vec<u8>),
+    NoEdit,
+    Refused(ApplyError),
+}
+
+/// The checker's verdict on one agreeing case.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Judgement {
+    Accepted { model_depth: usize },
+    Refused { model_depth: usize },
+    NoEdit,
+}
+
+/// A disagreement between the writer and a reader, or the model.
+#[derive(Debug, PartialEq)]
+enum Violation {
+    /// The replay validator refuses a returned document (canary a).
+    OutputRefused(inf_doc::DocError),
+    /// The durable operand does not decode (canary b).
+    OperandRefused(DeltaDecodeError),
+    /// Re-executing the decoded operand does not reproduce the bytes.
+    ReplayDiffers,
+    /// The engine's bytes differ from the model's output.
+    ModelDiffers,
+    /// A document the independent model nests past `DEPTH_MAX`.
+    AcceptedPastBound { model_depth: usize },
+    /// A depth refusal the independent model nests within `DEPTH_MAX`
+    /// (canary c).
+    RefusedWithinBound { model_depth: usize },
+    /// Any other refusal: the generator keeps every op in range.
+    Unexpected(ApplyError),
+}
+
+/// Containers on the deepest path: 0 for a scalar. Recursive: test code
+/// over at most `DEPTH_MAX + 2` levels, independent of the engine's walk.
+fn model_nesting(value: &Value) -> usize {
+    match value {
+        Value::Obj(entries) => 1 + entries.iter().map(|(_, v)| model_nesting(v)).max().unwrap_or(0),
+        Value::Arr(items) => 1 + items.iter().map(model_nesting).max().unwrap_or(0),
+        Value::Null | Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Str(_) => 0,
+    }
+}
+
+fn observe(case: &AgreementCase) -> Observed {
+    let bytes = model::encode(&case.doc).expect("the generator stays within the format");
+    let doc = TapeDoc::from_bytes(&bytes).expect("validates");
+    let program = compile(case.path.as_bytes()).expect("generated path compiles");
+    match apply(&doc, &program, &case.op.borrow(), &EvalLimits::default(), DocLimits::FORMAT) {
+        Ok(ApplyOutcome { document: Some(document), .. }) => {
+            Observed::Document(document.as_bytes().to_vec())
+        }
+        Ok(ApplyOutcome { document: None, .. }) => Observed::NoEdit,
+        Err(error) => Observed::Refused(error),
+    }
+}
+
+/// ADR-0169 Falsifier 2's checker. A returned document must pass the
+/// replay validator, its operand must decode, and re-executing the decoded
+/// operand under replay's recorded bound must reproduce it; a depth
+/// refusal must coincide with the model's output nesting past `DEPTH_MAX`.
+fn judge(case: &AgreementCase, observed: Observed) -> Result<Judgement, Violation> {
+    let mut model_out = case.doc.clone();
+    model_apply_at(&mut model_out, &case.steps, &case.op);
+    let model_depth = model_nesting(&model_out);
+    let bytes = match observed {
+        Observed::NoEdit => return Ok(Judgement::NoEdit),
+        Observed::Refused(ApplyError::DepthExceeded) => {
+            return match model_depth > DEPTH_MAX {
+                true => Ok(Judgement::Refused { model_depth }),
+                false => Err(Violation::RefusedWithinBound { model_depth }),
+            };
+        }
+        Observed::Refused(error) => return Err(Violation::Unexpected(error)),
+        Observed::Document(bytes) => bytes,
+    };
+    TapeDoc::from_bytes(&bytes).map_err(Violation::OutputRefused)?;
+    let op = case.op.borrow();
+    let mut operand = Vec::new();
+    let opcode = encode_apply_op(&op, &mut operand);
+    let decoded = decode_apply_op(opcode as u8, &operand).map_err(Violation::OperandRefused)?;
+    let pre = model::encode(&case.doc).expect("the generator stays within the format");
+    let pre = TapeDoc::from_bytes(&pre).expect("validates");
+    let program = compile(case.path.as_bytes()).expect("generated path compiles");
+    // Replay's bound: the recorded idoc length less the header (ADR-0169 D2).
+    let recorded = DocLimits::new(DEPTH_MAX, bytes.len() - inf_doc::HEADER_LEN);
+    let replayed = apply(&pre, &program, &decoded, &EvalLimits { max_matches: 1 }, recorded);
+    let again = replayed.ok().and_then(|outcome| outcome.document);
+    if again.as_ref().map(CanonicalDoc::as_bytes) != Some(&bytes[..]) {
+        return Err(Violation::ReplayDiffers);
+    }
+    if model_depth > DEPTH_MAX {
+        return Err(Violation::AcceptedPastBound { model_depth });
+    }
+    if model::encode(&model_out).ok().as_deref() != Some(&bytes[..]) {
+        return Err(Violation::ModelDiffers);
+    }
+    Ok(Judgement::Accepted { model_depth })
+}
+
+/// `leaf` under `kinds.len()` containers, outermost first: `true` is an
+/// object `{"a":…}`, `false` an array `[…]`.
+fn wrap(kinds: &[bool], leaf: Value) -> Value {
+    kinds.iter().rev().fold(leaf, |inner, &object| match object {
+        true => Value::Obj(vec![("a".into(), inner)]),
+        false => Value::Arr(vec![inner]),
+    })
+}
+
+fn case_at(kinds: &[bool], site: Value, op: OwnedOp) -> AgreementCase {
+    let mut path = String::from("$");
+    for &object in kinds {
+        path.push_str(if object { ".a" } else { "[0]" });
+    }
+    AgreementCase {
+        doc: wrap(kinds, site),
+        steps: vec![0; kinds.len()],
+        path,
+        op,
+        site_enclosing: kinds.len(),
+    }
+}
+
+fn arb_kinds(levels: usize) -> impl Strategy<Value = Vec<bool>> {
+    proptest::collection::vec(any::<bool>(), levels)
+}
+
+/// Composed-depth targets: both sides of the cliff, weighted, and around.
+fn arb_composed() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        2 => Just(DEPTH_MAX),
+        2 => Just(DEPTH_MAX + 1),
+        1 => (DEPTH_MAX - 3)..=(DEPTH_MAX + 2),
+    ]
+}
+
+/// A deepening case: the site under `enclosing` containers and an operand
+/// nesting `composed − enclosing − inside`, where `inside` is 1 when the op
+/// writes inside the matched container (ADR-0169 D3).
+fn arb_deepening(
+    inside: usize,
+    site_max: usize,
+    build: fn(Vec<bool>, Value) -> AgreementCase,
+) -> BoxedStrategy<AgreementCase> {
+    arb_composed()
+        .prop_flat_map(move |composed| {
+            let low = composed.saturating_sub(DEPTH_MAX + inside);
+            let high = site_max.min(composed - inside);
+            (Just(composed), low..=high)
+        })
+        .prop_flat_map(move |(composed, enclosing)| {
+            (arb_kinds(enclosing), arb_kinds(composed - enclosing - inside))
+        })
+        .prop_map(move |(site, operand)| build(site, wrap(&operand, Value::I64(7))))
+        .boxed()
+}
+
+/// A site under `DEPTH_MAX − 1` or `DEPTH_MAX` containers (weighted), or
+/// shallower: the unchecked ops' deepest reach.
+fn arb_deep_site(site_max: usize) -> impl Strategy<Value = Vec<bool>> {
+    prop_oneof![3 => Just(site_max), 1 => (site_max - 4)..=site_max].prop_flat_map(arb_kinds)
+}
+
+fn arb_op_for(opcode: DeltaOpcode) -> BoxedStrategy<AgreementCase> {
+    let number = Value::I64(5);
+    let array = Value::Arr(vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
+    match opcode {
+        DeltaOpcode::SetReplace => arb_deepening(0, DEPTH_MAX, |site, value| {
+            let frag = fragment(&value);
+            case_at(&site, Value::I64(1), OwnedOp::SetReplace(value, frag))
+        }),
+        DeltaOpcode::SetMember => arb_deepening(1, DEPTH_MAX - 1, |site, value| {
+            let frag = fragment(&value);
+            let op = OwnedOp::SetMember("m".into(), value, frag);
+            case_at(&site, Value::Obj(vec![("b".into(), Value::I64(1))]), op)
+        }),
+        DeltaOpcode::Merge => arb_deepening(0, DEPTH_MAX, |site, value| {
+            let patch = match value {
+                Value::Arr(items) => Value::Obj(vec![("p".into(), Value::Arr(items))]),
+                other => other,
+            };
+            let frag = fragment(&patch);
+            case_at(&site, Value::I64(1), OwnedOp::Merge(patch, frag))
+        })
+        .prop_filter("an object patch keeps the target's nesting", |case| {
+            let OwnedOp::Merge(patch, _) = &case.op else { return true };
+            case.site_enclosing + model_nesting(patch) <= DEPTH_MAX + 2
+        })
+        .boxed(),
+        DeltaOpcode::ArrAppend => arb_deepening(1, DEPTH_MAX - 1, |site, value| {
+            let values = vec![Value::I64(0), value];
+            let operand = arr_operand(&values);
+            case_at(&site, Value::Arr(vec![Value::I64(1)]), OwnedOp::ArrAppend(values, operand))
+        }),
+        DeltaOpcode::ArrInsert => arb_deepening(1, DEPTH_MAX - 1, |site, value| {
+            let values = vec![value];
+            let operand = arr_operand(&values);
+            let op = OwnedOp::ArrInsert(-1, values, operand);
+            case_at(&site, Value::Arr(vec![Value::I64(1)]), op)
+        }),
+        DeltaOpcode::Del => arb_deep_site(DEPTH_MAX)
+            .prop_map(move |site| case_at(&site, number.clone(), OwnedOp::Del))
+            .boxed(),
+        DeltaOpcode::NumIncrBy => arb_deep_site(DEPTH_MAX)
+            .prop_map(move |site| {
+                case_at(&site, number.clone(), OwnedOp::NumIncrBy(Number::I64(3)))
+            })
+            .boxed(),
+        DeltaOpcode::NumMultBy => arb_deep_site(DEPTH_MAX)
+            .prop_map(move |site| {
+                case_at(&site, number.clone(), OwnedOp::NumMultBy(Number::F64(1.5)))
+            })
+            .boxed(),
+        DeltaOpcode::StrAppend => arb_deep_site(DEPTH_MAX)
+            .prop_map(|site| {
+                case_at(&site, Value::Str("s".into()), OwnedOp::StrAppend(b"+t".to_vec()))
+            })
+            .boxed(),
+        DeltaOpcode::Toggle => arb_deep_site(DEPTH_MAX)
+            .prop_map(|site| case_at(&site, Value::Bool(true), OwnedOp::Toggle))
+            .boxed(),
+        DeltaOpcode::Clear => arb_deep_site(DEPTH_MAX - 1)
+            .prop_map(move |site| case_at(&site, array.clone(), OwnedOp::Clear))
+            .boxed(),
+        DeltaOpcode::ArrPop => (arb_deep_site(DEPTH_MAX - 1), -4i64..4)
+            .prop_map(move |(site, index)| case_at(&site, array.clone(), OwnedOp::ArrPop(index)))
+            .boxed(),
+        DeltaOpcode::ArrTrim => (arb_deep_site(DEPTH_MAX - 1), 0i64..2, 0i64..2)
+            .prop_map(move |(site, start, stop)| {
+                case_at(&site, array.clone(), OwnedOp::ArrTrim(start, stop))
+            })
+            .boxed(),
+    }
+}
+
+/// What one opcode's run reached (ADR-0169 Falsifier 2's engagement).
+#[derive(Default, Debug)]
+struct Reach {
+    checked: bool,
+    accepted_at_bound: bool,
+    refused_past_bound: bool,
+    applied_deep: bool,
+}
+
+impl Reach {
+    fn note(&mut self, case: &AgreementCase, judgement: Judgement) {
+        // The op's own table row decides, never a list in this test.
+        self.checked = !matches!(case.op.borrow().written(), Written::WithinPreImage);
+        match judgement {
+            Judgement::Accepted { model_depth } => {
+                self.accepted_at_bound |= model_depth == DEPTH_MAX;
+                self.applied_deep |= case.site_enclosing >= DEPTH_MAX - 1;
+            }
+            Judgement::Refused { model_depth } => {
+                self.refused_past_bound |= model_depth == DEPTH_MAX + 1;
+            }
+            Judgement::NoEdit => {}
+        }
+    }
+
+    fn engaged(&self) -> bool {
+        match self.checked {
+            true => self.accepted_at_bound && self.refused_past_bound,
+            false => self.applied_deep,
+        }
+    }
+}
+
+const AGREEMENT_CASES_PER_OPCODE: u32 = 64;
+
+/// ADR-0169 Falsifier 2 over every opcode the delta codec knows: the
+/// writer never returns a document or an operand a reader refuses, replay
+/// reproduces its bytes, and a depth refusal happens exactly when the
+/// independent model nests past `DEPTH_MAX`. An opcode that never reached
+/// its cliff (checked) or its deepest site (unchecked) is VACUOUS — red.
+#[test]
+fn writer_reader_agreement_over_the_opcode_table() {
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+    let config = Config {
+        cases: AGREEMENT_CASES_PER_OPCODE,
+        failure_persistence: None,
+        ..Config::default()
+    };
+    for &opcode in DeltaOpcode::ALL {
+        let reach = std::cell::RefCell::new(Reach::default());
+        let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+        let mut runner = TestRunner::new_with_rng(config.clone(), rng);
+        let verdict = runner.run(&arb_op_for(opcode), |case| {
+            let judgement = judge(&case, observe(&case))
+                .map_err(|violation| TestCaseError::fail(format!("{violation:?}")))?;
+            reach.borrow_mut().note(&case, judgement);
+            Ok(())
+        });
+        if let Err(failure) = verdict {
+            panic!("{opcode:?}: {failure}");
+        }
+        let reach = reach.into_inner();
+        assert!(reach.engaged(), "VACUOUS: {opcode:?} never reached its cliff: {reach:?}");
+    }
+}
+
+/// Raw bytes: one more array around a canonical body, past the builder's
+/// own refusal, as a planted canary needs.
+fn raw_array_around(body: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(body.len()).expect("a canary body is small");
+    let mut out = vec![0xA8];
+    out.extend_from_slice(&len.to_le_bytes()[..3]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Raw bytes: a v1 header over `body`.
+fn raw_document(body: &[u8]) -> Vec<u8> {
+    let mut out = tape_of("0")[..inf_doc::HEADER_LEN].to_vec();
+    out[4..8].copy_from_slice(&u32::try_from(body.len()).expect("small").to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// The checker's canaries (ADR-0169 Falsifier 2), in the property's own
+/// binary: each planted disagreement must turn it red with its typed
+/// violation.
+#[test]
+fn agreement_checker_goes_red_on_planted_outputs() {
+    let shallow = |op: OwnedOp| case_at(&[false], Value::Arr(vec![Value::I64(1)]), op);
+    let deepest = fragment_of(&nested_arrays(DEPTH_MAX, "0"));
+    // (a) A returned document that nests 129.
+    let planted = raw_document(&raw_array_around(&deepest));
+    assert_eq!(
+        judge(&shallow(OwnedOp::Toggle), Observed::Document(planted)),
+        Err(Violation::OutputRefused(inf_doc::DocError::DepthExceeded))
+    );
+    // (b) An `ArrAppend` whose operand wrapper nests 129.
+    let case = shallow(OwnedOp::ArrAppend(Vec::new(), raw_array_around(&deepest)));
+    assert_eq!(
+        judge(&case, Observed::Document(tape_of("[1,2]"))),
+        Err(Violation::OperandRefused(DeltaDecodeError::BadFragment(
+            inf_doc::DocError::DepthExceeded
+        )))
+    );
+    // (c) A depth refusal whose model output nests exactly 128.
+    let value = wrap(&[false; DEPTH_MAX - 1], Value::I64(0));
+    let frag = fragment(&value);
+    let case = shallow(OwnedOp::SetReplace(value, frag));
+    assert_eq!(
+        judge(&case, Observed::Refused(ApplyError::DepthExceeded)),
+        Err(Violation::RefusedWithinBound { model_depth: DEPTH_MAX })
+    );
 }

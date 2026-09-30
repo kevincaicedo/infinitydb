@@ -211,7 +211,8 @@ fn depth_cap_binds_at_129() {
 
 #[test]
 fn size_cap_rejects_incrementally() {
-    let mut p = JsonParser::with_limits(ParseLimits { max_body: 64, ..ParseLimits::default() });
+    let doc = inf_doc::DocLimits::new(inf_doc::limits::DEPTH_MAX, 64);
+    let mut p = JsonParser::with_limits(ParseLimits { doc, ..ParseLimits::default() });
     let text = format!("[{}]", (0..64).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
     let e = p.parse(text.as_bytes()).unwrap_err();
     assert_eq!(e.kind, JsonErrorKind::DocumentTooLarge);

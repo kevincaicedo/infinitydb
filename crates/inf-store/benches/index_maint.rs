@@ -32,8 +32,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_doc::JsonParser;
 use inf_doc::path::compile;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, Keyspace, NsId, PkRef, StoreConfig};
 
@@ -67,8 +67,11 @@ fn declare(ks: &mut Keyspace, ns: NsId, id: u32, path: &str, key_type: IndexKeyT
 /// Median ns per bracketed `JSON.SET` alternating two documents.
 fn sweep_set(label: &str, ks: &mut Keyspace, ns: NsId, indexed: bool) -> f64 {
     let key = b"bench:hot";
-    let doc_a = parse(r#"{"price":1234.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
-    let doc_b = parse(r#"{"price":6789.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
+    let bytes_a = parse(r#"{"price":1234.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
+    let bytes_b = parse(r#"{"price":6789.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
+    // Receipts built once, outside the timed rounds.
+    let doc_a = CanonicalDoc::validate(&bytes_a).expect("canonical fixture");
+    let doc_b = CanonicalDoc::validate(&bytes_b).expect("canonical fixture");
     let now = Nanos(1_000_000_000);
     let mut rounds = Vec::with_capacity(ROUNDS);
     let mut checksum = 0u64;
@@ -141,6 +144,7 @@ fn main() {
     {
         let seed = parse(r#"{"price":0.5,"pad":"xxxxxxxxxxxxxxxx"}"#);
         ks.idx_bracket_begin(ns, &[b"bench:hot"], None).expect("headroom");
+        let seed = CanonicalDoc::validate(&seed).expect("canonical fixture");
         ks.db_mut(0).json_set(b"bench:hot", &seed, Default::default(), now).expect("seed");
         ks.idx_bracket_commit(ns, &[b"bench:hot"]);
         let tree = ks.idx_tree_mut(ns, IndexId(1)).expect("tree");
@@ -171,6 +175,7 @@ fn main() {
         r#"{"price":10.5,"name":"alpha","qty":7,"tags":["a","b"],"other":1,"pad":"xxxxxxxx"}"#,
     );
     ks4.idx_bracket_begin(ns, &[b"bench:hot"], None).expect("headroom");
+    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
     ks4.db_mut(0).json_set(b"bench:hot", &doc, Default::default(), now).expect("seed");
     ks4.idx_bracket_commit(ns, &[b"bench:hot"]);
     let unpruned = sweep_bracket("bracket_4idx_unpruned", &mut ks4, ns, None);

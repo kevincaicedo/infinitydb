@@ -23,9 +23,35 @@ use crate::apply::{ApplyOp, Number};
 use crate::tape::{ValueRef, canonical_fragment};
 use crate::{DocError, emit};
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum DeltaOpcode {
+/// One `Variant = tag` list emits the enum, [`DeltaOpcode::ALL`] and the
+/// decoder's [`DeltaOpcode::from_u8`] (ADR-0169 §Class), so a variant
+/// cannot exist outside the table or the decoder. A duplicate discriminant
+/// does not compile, and a duplicate tag is an unreachable pattern that
+/// `-D warnings` refuses.
+macro_rules! delta_opcodes {
+    ($($variant:ident = $tag:literal,)+) => {
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        #[repr(u8)]
+        pub enum DeltaOpcode {
+            $($variant = $tag,)+
+        }
+
+        impl DeltaOpcode {
+            /// Every opcode, in tag order: the table the writer/reader
+            /// agreement property iterates.
+            pub const ALL: &'static [DeltaOpcode] = &[$(DeltaOpcode::$variant,)+];
+
+            pub const fn from_u8(tag: u8) -> Option<DeltaOpcode> {
+                match tag {
+                    $($tag => Some(DeltaOpcode::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+delta_opcodes! {
     SetReplace = 1,
     SetMember = 2,
     Del = 3,
@@ -39,27 +65,6 @@ pub enum DeltaOpcode {
     ArrPop = 11,
     ArrTrim = 12,
     Merge = 13,
-}
-
-impl DeltaOpcode {
-    pub fn from_u8(tag: u8) -> Option<DeltaOpcode> {
-        Some(match tag {
-            1 => DeltaOpcode::SetReplace,
-            2 => DeltaOpcode::SetMember,
-            3 => DeltaOpcode::Del,
-            4 => DeltaOpcode::NumIncrBy,
-            5 => DeltaOpcode::NumMultBy,
-            6 => DeltaOpcode::StrAppend,
-            7 => DeltaOpcode::Toggle,
-            8 => DeltaOpcode::Clear,
-            9 => DeltaOpcode::ArrAppend,
-            10 => DeltaOpcode::ArrInsert,
-            11 => DeltaOpcode::ArrPop,
-            12 => DeltaOpcode::ArrTrim,
-            13 => DeltaOpcode::Merge,
-            _ => return None,
-        })
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -292,6 +297,18 @@ mod tests {
             assert_eq!(again_opcode, opcode);
             assert_eq!(again, encoded);
         }
+    }
+
+    /// The generated table and decoder agree: `ALL` round-trips through
+    /// `from_u8` in tag order, and no other tag decodes.
+    #[test]
+    fn the_opcode_table_is_the_decoder() {
+        for (index, opcode) in DeltaOpcode::ALL.iter().enumerate() {
+            assert_eq!(usize::from(*opcode as u8), index + 1);
+            assert_eq!(DeltaOpcode::from_u8(*opcode as u8), Some(*opcode));
+        }
+        let decoded = (0..=u8::MAX).filter_map(DeltaOpcode::from_u8).count();
+        assert_eq!(decoded, DeltaOpcode::ALL.len());
     }
 
     #[test]
