@@ -5666,6 +5666,18 @@ fn json_amplified_replies_refuse_at_the_wire() {
     read_exactly(&mut client, b"*1\r\n:1\r\n");
     client.write_all(&cmd(&[b"PING"])).expect("write");
     read_exactly(&mut client, b"+PONG\r\n");
+    // Each cell counts the refusal it executed, and the bytes it built
+    // before the rollback: past the budget by at most one patched bulk's
+    // slack and scalar token (39 B), or short of it by less than one
+    // frame, the largest here a 4,107 B popped element.
+    let budget = u64::try_from(StoreConfig::default().doc_max_reply_bytes).expect("u64");
+    for cell in [0, 1] {
+        let stats = info_text(&mut conn_on_cell(&node, cell), b"stats");
+        assert_eq!(info_field(&stats, "json_reply_refusals_cell"), 1, "cell {cell}: {stats}");
+        let refused_bytes = info_field(&stats, "json_reply_refused_bytes_cell");
+        let span = budget - 4_106..=budget + 39;
+        assert!(span.contains(&refused_bytes), "cell {cell}: {refused_bytes} B refused");
+    }
     node.stop();
 }
 

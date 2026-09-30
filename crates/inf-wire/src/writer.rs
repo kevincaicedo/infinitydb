@@ -26,18 +26,11 @@ pub struct RespWriter<'b> {
 /// Where one command's reply starts in the send buffer (ADR-0099 A1): the
 /// point [`RespWriter::rollback`] truncates back to, so a reply refused
 /// part-way leaves no byte behind while earlier pipelined replies stay.
-/// Only [`RespWriter::mark`] makes one; not `Copy`, so a reply holds its
-/// own mark rather than a loose offset.
+/// Only [`RespWriter::mark`] makes one; not `Copy`, and its offset is
+/// private, so a reply holds its own mark rather than a loose offset.
 #[derive(Debug)]
 pub struct ReplyMark {
     offset_bytes: usize,
-}
-
-impl ReplyMark {
-    /// The buffer offset the reply starts at.
-    pub fn offset_bytes(&self) -> usize {
-        self.offset_bytes
-    }
 }
 
 impl<'b> RespWriter<'b> {
@@ -749,8 +742,8 @@ mod tests {
     fn rollback_to_a_mid_buffer_mark_keeps_the_earlier_reply() {
         let out = render(Protocol::Resp2, |w| {
             w.simple("OK");
+            assert_eq!(w.buffered_bytes(), 5);
             let mark = w.mark();
-            assert_eq!(mark.offset_bytes(), 5);
             w.array_header(2);
             w.bulk_patched(|out| out.extend_from_slice(b"[1,2]"));
             w.int(3);

@@ -43,37 +43,44 @@ pub const JSON_TOGGLE_REPLY_BYTES_MAX: usize = 11;
 #[cfg(feature = "doc")]
 pub const JSON_FIXED_REPLY_BYTES_MAX: usize = 4 + inf_wire::limits::DOUBLE_REPLY_BYTES_MAX;
 
-/// The shapes of a `JSON.*` reply known only after its effect. The command
-/// reserves the shape's maximum before the effect and then makes its one
-/// write (ADR-0099 A1).
-#[cfg(feature = "doc")]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum FixedShape {
-    /// Root `SET`, `MERGE`'s root create.
-    Status,
-    /// Root `DEL`/`FORGET`.
-    Count,
-    /// In-place `TOGGLE`.
-    Toggle,
-    /// In-place `NUMINCRBY`/`NUMMULTBY`.
-    Number,
+/// Declares [`FixedShape`], [`FixedShape::ALL`] and
+/// [`FixedShape::reply_bytes_max`] from one list of rows, so a new shape is
+/// a row of `ALL` by construction and the column assertion below sees it.
+macro_rules! fixed_shapes {
+    ($($(#[$row:meta])* $shape:ident => $reply_bytes_max:expr,)+) => {
+        /// The shapes of a `JSON.*` reply known only after its effect. The
+        /// command reserves the shape's maximum before the effect and then
+        /// makes its one write (ADR-0099 A1).
+        #[cfg(feature = "doc")]
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        pub enum FixedShape {
+            $($(#[$row])* $shape,)+
+        }
+
+        #[cfg(feature = "doc")]
+        impl FixedShape {
+            /// Every row, for the column's assertion.
+            pub const ALL: &'static [FixedShape] = &[$(FixedShape::$shape,)+];
+
+            /// The row's maximum reply bytes, M(shape).
+            pub const fn reply_bytes_max(self) -> usize {
+                match self {
+                    $(FixedShape::$shape => $reply_bytes_max,)+
+                }
+            }
+        }
+    };
 }
 
-#[cfg(feature = "doc")]
-impl FixedShape {
-    /// Every row, for the table's assertions and its oracle.
-    pub const ALL: [FixedShape; 4] =
-        [FixedShape::Status, FixedShape::Count, FixedShape::Toggle, FixedShape::Number];
-
-    /// The row's maximum reply bytes, M(shape).
-    pub const fn reply_bytes_max(self) -> usize {
-        match self {
-            FixedShape::Status => JSON_STATUS_REPLY_BYTES_MAX,
-            FixedShape::Count => JSON_COUNT_REPLY_BYTES_MAX,
-            FixedShape::Toggle => JSON_TOGGLE_REPLY_BYTES_MAX,
-            FixedShape::Number => JSON_FIXED_REPLY_BYTES_MAX,
-        }
-    }
+fixed_shapes! {
+    /// Root `SET`, `MERGE`'s root create.
+    Status => JSON_STATUS_REPLY_BYTES_MAX,
+    /// Root `DEL`/`FORGET`.
+    Count => JSON_COUNT_REPLY_BYTES_MAX,
+    /// In-place `TOGGLE`.
+    Toggle => JSON_TOGGLE_REPLY_BYTES_MAX,
+    /// In-place `NUMINCRBY`/`NUMMULTBY`.
+    Number => JSON_FIXED_REPLY_BYTES_MAX,
 }
 
 #[cfg(feature = "doc")]

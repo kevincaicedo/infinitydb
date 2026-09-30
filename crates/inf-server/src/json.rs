@@ -26,6 +26,8 @@
 
 mod reply;
 
+use std::num::NonZeroU32;
+
 use inf_doc::apply::{ApplyError, ApplyOp, ApplyOutcome, MatchResult, Number, apply};
 use inf_doc::path::{EvalLimits, Matches, PathProgram, Segment, eval, resolve};
 use inf_doc::ser::{Reply, ReplyTooLarge, SerializeOpts};
@@ -84,7 +86,9 @@ pub(crate) enum DocLogIntent {
     Delta {
         program: PathProgram,
         opcode: DeltaOpcode,
-        match_count: u32,
+        /// A delta record counts at least one match: the log decoder
+        /// refuses zero (ADR-0043 D3).
+        match_count: NonZeroU32,
     },
 }
 
@@ -109,8 +113,7 @@ impl DocLogScratch {
         self.operand.clear();
     }
 
-    fn delta(&mut self, program: &PathProgram, op: &ApplyOp<'_>, match_count: u32) {
-        assert!(match_count > 0, "a logged document delta changed at least one match");
+    fn delta(&mut self, program: &PathProgram, op: &ApplyOp<'_>, match_count: NonZeroU32) {
         let opcode = encode_apply_op(op, &mut self.operand);
         self.intent = DocLogIntent::Delta { program: program.clone(), opcode, match_count };
     }
@@ -131,7 +134,7 @@ fn capture_delete(cx: &ConnCx) {
 }
 
 #[inline]
-fn capture_delta(cx: &ConnCx, program: &PathProgram, op: &ApplyOp<'_>, match_count: u32) {
+fn capture_delta(cx: &ConnCx, program: &PathProgram, op: &ApplyOp<'_>, match_count: NonZeroU32) {
     if cx.node.doc_log_admission.get().is_some() {
         cx.node.doc_log.borrow_mut().delta(program, op, match_count);
     }
@@ -214,9 +217,11 @@ pub(crate) fn execute_json(
         "a declined reply refused nothing"
     );
     // The one site that folds a reply's refusal figures into this cell's
-    // counters (ADR-0099 A1).
+    // counters (ADR-0099 A1). Both saturate: they are lifetime metrics,
+    // and no accounting reads them.
     let node = &cx.node;
-    node.json_reply_refusals_cell.set(node.json_reply_refusals_cell.get() + settled.refusals());
+    let refusals = node.json_reply_refusals_cell.get();
+    node.json_reply_refusals_cell.set(refusals.saturating_add(settled.refusals()));
     let refused_bytes = node.json_reply_refused_bytes_cell.get();
     node.json_reply_refused_bytes_cell.set(refused_bytes.saturating_add(settled.refused_bytes()));
 }
@@ -343,9 +348,15 @@ fn commit(store: &mut CellStore, edit: &PathEdit<'_>, cx: &ConnCx, now: Nanos) -
     match store.json_replace(edit.key, document, now) {
         Ok(replaced) => {
             debug_assert!(replaced, "the key was resolved by the freeze above");
-            let match_count = edit.outcome.results.len();
-            let match_count = u32::try_from(match_count).expect("match set is capped at u32");
-            capture_delta(cx, edit.program, edit.op, match_count);
+            // A delta's match count is a nonzero u32 replay witness
+            // (ADR-0043 D3). A match set that cannot be one logs the full
+            // post-image, the other record D5 allows for a path edit and
+            // the one the fit check above admitted.
+            let match_count = u32::try_from(edit.outcome.results.len()).ok();
+            match match_count.and_then(NonZeroU32::new) {
+                Some(match_count) => capture_delta(cx, edit.program, edit.op, match_count),
+                None => capture_full(cx),
+            }
             CommitOutcome::Committed
         }
         Err(error) => CommitOutcome::Refused(ReplyError::Op(error)),
@@ -841,7 +852,7 @@ fn num_op(
     let legacy = program.is_legacy();
     let unapplied = match store.json_patch_scalar(key, &program, &op, now) {
         Ok(Some(JsonScalarPatch::Number(number))) => {
-            capture_delta(cx, &program, &op, 1);
+            capture_delta(cx, &program, &op, NonZeroU32::MIN);
             return fixed.write(FixedValue::Number { legacy, number });
         }
         Ok(Some(JsonScalarPatch::Missing)) if legacy => {
@@ -1075,7 +1086,7 @@ fn toggle(
     let legacy = program.is_legacy();
     let unapplied = match store.json_patch_scalar(key, &program, &op, now) {
         Ok(Some(JsonScalarPatch::Toggled(value))) => {
-            capture_delta(cx, &program, &op, 1);
+            capture_delta(cx, &program, &op, NonZeroU32::MIN);
             return fixed.write(FixedValue::Toggled { legacy, value });
         }
         Ok(Some(JsonScalarPatch::Missing)) if legacy => {
@@ -2089,6 +2100,74 @@ mod tests {
         let want = format!("-{}\r\n", crate::durable::STAGING_BUSY_ERROR);
         assert_eq!(String::from_utf8_lossy(&reply), want);
         assert_eq!(cx.node.log_admission_busy.get(), 1, "the refusal is the staging one");
+    }
+
+    /// A delta record counts at least one match (the log decoder refuses
+    /// zero), so a committed edit whose match set cannot be that count is
+    /// logged as its full post-image, which replay always accepts, never a
+    /// cell panic. `apply` reports a result per raw match today; the test
+    /// empties the set by hand to reach the one state the type rules out.
+    #[test]
+    fn a_committed_edit_without_a_delta_count_logs_its_full_image() {
+        let mut store = CellStore::new(Default::default());
+        let cx = durable_cx(usize::MAX, usize::MAX);
+        let now = Nanos::from_millis(1);
+        let set = run(&[b"JSON.SET", b"doc", b"$", br#"{"arr":[1]}"#], &mut store, &cx, now);
+        assert_eq!(set, b"+OK\r\n");
+        cx.node.doc_log.borrow_mut().clear();
+        let op = ApplyOp::Clear;
+        let Ok((program, mut outcome)) = mutate(&mut store, &cx, b"doc", b"$.arr", &op, now) else {
+            panic!("the fixture edit plans");
+        };
+        assert!(outcome.document.is_some(), "the fixture edit applies");
+        outcome.results.clear();
+        let edit = PathEdit { key: b"doc", program: &program, op: &op, outcome: &outcome };
+        let committed = commit(&mut store, &edit, &cx, now);
+        assert!(matches!(committed, CommitOutcome::Committed), "the edit commits");
+        let intent = &cx.node.doc_log.borrow().intent;
+        assert!(matches!(intent, DocLogIntent::Full), "doc-log intent {intent:?}");
+        let get = run(&[b"JSON.GET", b"doc", b"$"], &mut store, &cx, now);
+        assert_eq!(String::from_utf8_lossy(&get), "$12\r\n[{\"arr\":[]}]\r\n");
+    }
+
+    /// `json_reply_refusals_cell` and `json_reply_refused_bytes_cell`
+    /// (ADR-0099 A1's observables): a refused reply counts one and the
+    /// bytes it built before its rollback; each refused `MGET` element
+    /// counts one; a served or declined reply counts nothing; both folds
+    /// saturate. `$[0,0]` over `[[1,2,3]]` answers `*2\r\n:3\r\n:3\r\n`
+    /// (12 B): at 11 B the header and the first count (8 B) are written,
+    /// then the second count crosses.
+    #[test]
+    fn reply_refusals_fold_into_this_cells_counters() {
+        let config = inf_store::StoreConfig { doc_max_reply_bytes: 11, ..Default::default() };
+        let mut store = CellStore::new(config);
+        let cx = durable_cx(usize::MAX, usize::MAX);
+        let now = Nanos::from_millis(1);
+        let node = &cx.node;
+        let refusals = &node.json_reply_refusals_cell;
+        let refused_bytes = &node.json_reply_refused_bytes_cell;
+        let counters = || (refusals.get(), refused_bytes.get());
+        assert_eq!(run(&[b"JSON.SET", b"k", b"$", b"[[1,2,3]]"], &mut store, &cx, now), b"+OK\r\n");
+        assert_eq!(run(&[b"JSON.ARRLEN", b"k", b"$[0]"], &mut store, &cx, now), b"*1\r\n:3\r\n");
+        assert_eq!(counters(), (0, 0), "a served reply counts nothing");
+        let refused = run(&[b"JSON.ARRLEN", b"k", b"$[0,0]"], &mut store, &cx, now);
+        assert_eq!(refused, b"-ERR reply too large\r\n");
+        assert_eq!(counters(), (1, 8), "one refusal, the 8 B it rolled back");
+        let declined = run(&[b"JSON.ARRLEN", b"k", b"$["], &mut store, &cx, now);
+        assert!(declined.starts_with(b"-ERR"), "{}", String::from_utf8_lossy(&declined));
+        assert_eq!(counters(), (1, 8), "a declined reply counts nothing");
+        // Each MGET element is its own account: `$` answers the bulk
+        // `[[[1,2,3]]]` (18 B), which crosses 11 B.
+        let mget = run(&[b"JSON.MGET", b"k", b"k", b"$"], &mut store, &cx, now);
+        assert_eq!(mget, b"*2\r\n-ERR reply too large\r\n-ERR reply too large\r\n");
+        let (refusal_count, bytes) = counters();
+        assert_eq!(refusal_count, 3, "two refused elements count two");
+        assert!(bytes > 8, "the refused elements' built bytes count");
+        refusals.set(u64::MAX);
+        refused_bytes.set(u64::MAX);
+        let refused = run(&[b"JSON.ARRLEN", b"k", b"$[0,0]"], &mut store, &cx, now);
+        assert_eq!(refused, b"-ERR reply too large\r\n");
+        assert_eq!(counters(), (u64::MAX, u64::MAX), "both folds saturate");
     }
 
     /// JSON text: `levels` nested arrays around `0`.

@@ -44,6 +44,8 @@ pub(super) const REPLY_TOO_LARGE: &str = "ERR reply too large";
 pub(super) struct JsonReply<'w, 'b> {
     writer: &'w mut RespWriter<'b>,
     mark: ReplyMark,
+    /// The buffer length at the mark: bytes before it are earlier replies.
+    start_offset_bytes: usize,
     budget_bytes: usize,
     /// The buffer length the reply may reach: the mark plus the budget.
     limit_at: usize,
@@ -191,9 +193,10 @@ impl<'w, 'b> JsonReply<'w, 'b> {
     /// Opens the command's account at the writer's current end. Called by
     /// `execute_json` alone, once per command (ADR-0099 A1).
     pub(super) fn open(writer: &'w mut RespWriter<'b>, budget_bytes: usize) -> Self {
+        let start_offset_bytes = writer.buffered_bytes();
         let mark = writer.mark();
-        let limit_at = mark.offset_bytes().saturating_add(budget_bytes);
-        JsonReply { writer, mark, budget_bytes, limit_at, discarded_bytes: 0 }
+        let limit_at = start_offset_bytes.saturating_add(budget_bytes);
+        JsonReply { writer, mark, start_offset_bytes, budget_bytes, limit_at, discarded_bytes: 0 }
     }
 
     pub(super) fn protocol(&self) -> Protocol {
@@ -293,8 +296,8 @@ impl<'w, 'b> JsonReply<'w, 'b> {
         &mut self,
         serialize: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), ReplyTooLarge>,
     ) -> Result<(), ReplyTooLarge> {
+        let frame_at = self.writer.buffered_bytes();
         let frame = self.writer.mark();
-        let frame_at = frame.offset_bytes();
         let limit = self.limit_at.saturating_add(PATCHED_HEADER_SLACK_BYTES);
         let mut built_bytes = 0;
         let written = self.writer.try_bulk_patched(|out| {
@@ -329,7 +332,7 @@ impl<'w, 'b> JsonReply<'w, 'b> {
 
     /// Rolls the whole reply back and answers `ERR reply too large`.
     pub(super) fn refuse(self, _refusal: ReplyTooLarge) -> Settled {
-        let written = self.writer.buffered_bytes() - self.mark.offset_bytes();
+        let written = self.writer.buffered_bytes() - self.start_offset_bytes;
         self.writer.rollback(&self.mark);
         self.writer.error(REPLY_TOO_LARGE);
         let refused_bytes = u64::try_from(written + self.discarded_bytes).unwrap_or(u64::MAX);
@@ -356,7 +359,7 @@ impl<'w, 'b> JsonReply<'w, 'b> {
     /// reservation is the command's first write, so it refuses exactly
     /// when the budget is below M(shape) (ADR-0099 A1, the fixed rows).
     pub(super) fn reserve_fixed(self, shape: FixedShape) -> FixedReservation<'w, 'b> {
-        debug_assert_eq!(self.writer.buffered_bytes(), self.mark.offset_bytes(), "first write");
+        debug_assert_eq!(self.writer.buffered_bytes(), self.start_offset_bytes, "first write");
         match self.charge(shape.reply_bytes_max()) {
             Ok(()) => FixedReservation::Reserved(FixedReply { reply: self, shape }),
             Err(refusal) => FixedReservation::Refused(self.refuse(refusal)),
@@ -516,9 +519,7 @@ impl PerElementArray<'_, '_> {
     /// One element's JSON text; a crossing element answers the pinned
     /// error as that element (the `EXEC` error-in-array precedent).
     pub(super) fn document(&mut self, reply: &Reply<'_>) {
-        let element = self.reply.writer.mark();
-        self.reply.limit_at = element.offset_bytes().saturating_add(self.reply.budget_bytes);
-        self.reply.discarded_bytes = 0;
+        self.open_element();
         if let Err(ReplyTooLarge) = self.reply.reply_tree(reply, &SerializeOpts::default()) {
             self.refuse_element();
         }
@@ -526,12 +527,18 @@ impl PerElementArray<'_, '_> {
 
     /// A missing or non-document key's null element.
     pub(super) fn null(&mut self) {
-        let element = self.reply.writer.mark();
-        self.reply.limit_at = element.offset_bytes().saturating_add(self.reply.budget_bytes);
-        self.reply.discarded_bytes = 0;
+        self.open_element();
         if let Err(ReplyTooLarge) = self.reply.null() {
             self.refuse_element();
         }
+    }
+
+    /// Opens the next element's account of the whole budget at the
+    /// buffer's end. A crossing write rolls its own frame back.
+    fn open_element(&mut self) {
+        let element_at = self.reply.writer.buffered_bytes();
+        self.reply.limit_at = element_at.saturating_add(self.reply.budget_bytes);
+        self.reply.discarded_bytes = 0;
     }
 
     fn refuse_element(&mut self) {

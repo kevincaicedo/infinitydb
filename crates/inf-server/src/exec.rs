@@ -149,7 +149,8 @@ pub struct NodeState {
     /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` (a
     /// refused `JSON.MGET` element counts one) and the reply bytes those
     /// refusals built and discarded — the CPU the limit cost (ADR-0099 A1;
-    /// `INFO stats`, cell scope).
+    /// `INFO stats`, cell scope). Lifetime counters that saturate at
+    /// `u64::MAX`: metrics only, no accounting reads them.
     #[cfg(feature = "doc")]
     pub json_reply_refusals_cell: Cell<u64>,
     #[cfg(feature = "doc")]

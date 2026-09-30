@@ -475,12 +475,10 @@ I	1	crates/inf-server/src/durable.rs	unreachable	a waiting frame is never sealed
 I	1	crates/inf-server/src/durable/ckpt.rs	unreachable	just opened	`open_stream` set `phase = Stream` on the line above
 I	1	crates/inf-server/src/durable/ckpt.rs	unreachable	matched above	the `matches!` on the line above saw `CkptPhase::Stream`
 C	1	crates/inf-server/src/exec.rs	unreachable	keyspace-level and pub/sub commands dispatch in execute()	`crates/inf-server/src/exec.rs:execute` routes those `CommandId`s before `execute_db`; a table-iterating compat test covers every registry row
-I	1	crates/inf-server/src/json.rs	assert	a logged document delta changed at least one match	`delta` is called from `commit` only after an applied edit (`outcome.bytes` present, which requires a non-skipped result) and from the in-place scalar arms with a count of 1
 I	2	crates/inf-server/src/json.rs	expect	a prefix of an accepted program encodes under the ceiling	the same function compiled `path` a few lines above (the ceiling check is the encoder's, F-L10-04); the parent AST is that program's segments minus the last, so its encoding is a strict byte prefix of bytes the ceiling admitted
 I	2	crates/inf-server/src/json.rs	expect	compile above accepted this text	the same function compiled `path` a few lines above; `parse_ast` accepts what the compiler accepted
 I	1	crates/inf-server/src/json.rs	expect	matches resolve on their document	`matches` was just evaluated on `read.root`; `resolve` walks the same tape
 I	1	crates/inf-server/src/json.rs	expect	matches resolve on their own document	`matches` was just evaluated on `root`; `resolve` walks the same tape
-C	1	crates/inf-server/src/json.rs	expect	match set is capped at u32	`crates/inf-doc/src/path/eval.rs:Matches::record` refuses beyond `EvalLimits::max_matches` (65,536 — `crates/inf-doc/src/path/eval.rs:EvalLimits::default`)
 C	1	crates/inf-server/src/json.rs	expect	one document is bounded far below i64::MAX	a document is one arena record: `crates/inf-store/src/store.rs:check_bounds` bounds record length to the store's record cap (≪ 2^63); `json_memory_usage` sums that record and its attributed pools
 C	1	crates/inf-server/src/json.rs	unreachable	execute_db routes exactly the JSON family here	`crates/inf-server/src/exec.rs:execute_db` dispatches the `Json*` ids to this function and nothing else
 I	1	crates/inf-server/src/json.rs	unreachable	numeric ops apply numbers	`mutate_with` under a numeric `ApplyOp` yields `MatchResult::Num`/`Skipped` only (the applier's own typestate)
