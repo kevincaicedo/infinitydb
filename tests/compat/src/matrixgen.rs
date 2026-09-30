@@ -414,8 +414,12 @@ pub static DECLARED: &[Declared] = &[
         "JSON.SET",
         Status::Partial,
         "M3",
-        "S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL \
-         (as RedisJSON — S22 probe); durable writes use M3-S17 document records",
+        "S21 corpus exact except parser-specific malformed-input text, a 128-level value \
+         (accepted; RedisJSON refuses a parsed value's 128th container) and the composed-depth \
+         refusal: a path write whose result would nest past 128 containers answers `ERR document \
+         nesting too deep` and changes nothing, where RedisJSON stores a document its own \
+         JSON.SET cannot read back — a permanent product boundary (ADR-0042 A1); root sets \
+         preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records",
     ),
     d(
         "JSON.GET",
@@ -500,8 +504,12 @@ pub static DECLARED: &[Declared] = &[
         "JSON.ARRAPPEND",
         Status::Partial,
         "M3",
-        "S21 corpus exact; three-argument form appends one value at the legacy root, a form \
-         the pinned RedisJSON rejects with an arity error (S22 probe)",
+        "S21 corpus exact except the composed-depth refusal — an append whose result would nest \
+         past 128 containers answers `ERR document nesting too deep` and changes nothing, a \
+         permanent product boundary (ADR-0042 A1) — and a 128-level element's refusal text \
+         (RedisJSON answers its recursion-limit parse error; both refuse before the key \
+         lookup); three-argument form appends one value at the legacy root, a form the pinned \
+         RedisJSON rejects with an arity error (S22 probe)",
     ),
     d(
         "JSON.ARRINSERT",

@@ -15,7 +15,7 @@ corpus runs against both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 658 byte-compared executions · 60 documented deviations · 0 tolerated failures.
+**Corpus:** 672 byte-compared executions · 72 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 53 full · 33 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -102,7 +102,7 @@ as membership in the oracle's live keys.
 | `INF.TAKE` | internal | M1 | write fast | -2 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, executed only on a program-marked Apply; read/delete+TTL, IF value deadline conditionally deletes the matching string snapshot (ADR-0110) |
 | `INF.PEEK` | internal | M1 | readonly fast | -2 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss accounting (ADR-0110) |
 | `INF.PUT` | internal | M1 | write | -4 | 0 | 0 | fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still answers OOM (ADR-0110 third amendment) |
-| `JSON.SET` | partial | M3 | write denyoom | -4 | 32 | 32 | S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
+| `JSON.SET` | partial | M3 | write denyoom | -4 | 38 | 38 | S21 corpus exact except parser-specific malformed-input text, a 128-level value (accepted; RedisJSON refuses a parsed value's 128th container) and the composed-depth refusal: a path write whose result would nest past 128 containers answers `ERR document nesting too deep` and changes nothing, where RedisJSON stores a document its own JSON.SET cannot read back — a permanent product boundary (ADR-0042 A1); root sets preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records |
 | `JSON.GET` | partial | M3 | readonly | -2 | 36 | 36 | S21 corpus exact except documented large-exponent f64 text and module-specific WRONGTYPE wording; INDENT/NEWLINE/SPACE covered; path match sets capped by doc-max-path-matches |
 | `JSON.MGET` | partial | M3 | readonly | -3 | 2 | 2 | S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves its key at its own serve time) |
 | `JSON.DEL` | partial | M3 | write | -2 | 6 | 6 | recursive-overlap result count differs from RedisJSON while post-state is identical |
@@ -114,15 +114,15 @@ as membership in the oracle's live keys.
 | `JSON.STRLEN` | full | M3 | readonly fast | -2 | 6 | 6 | lengths reported in bytes, matching the pinned oracle (S21 corpus + S22 multibyte probe) |
 | `JSON.TOGGLE` | full | M3 | write fast | -2 | 4 | 4 | S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split matches the pinned oracle (S22 probe) |
 | `JSON.CLEAR` | full | M3 | write | -2 | 2 | 2 | already-empty containers and zero numbers skip (uncounted), matching the pinned oracle (S21 corpus + S22 probe) |
-| `JSON.ARRAPPEND` | partial | M3 | write denyoom | -3 | 4 | 4 | S21 corpus exact; three-argument form appends one value at the legacy root, a form the pinned RedisJSON rejects with an arity error (S22 probe) |
-| `JSON.ARRINSERT` | partial | M3 | write denyoom | -5 | 6 | 6 | resolved index outside 0..=len aborts the whole command atomically; RedisJSON can mutate an earlier match before a later index error |
+| `JSON.ARRAPPEND` | partial | M3 | write denyoom | -3 | 8 | 8 | S21 corpus exact except the composed-depth refusal — an append whose result would nest past 128 containers answers `ERR document nesting too deep` and changes nothing, a permanent product boundary (ADR-0042 A1) — and a 128-level element's refusal text (RedisJSON answers its recursion-limit parse error; both refuse before the key lookup); three-argument form appends one value at the legacy root, a form the pinned RedisJSON rejects with an arity error (S22 probe) |
+| `JSON.ARRINSERT` | partial | M3 | write denyoom | -5 | 8 | 8 | resolved index outside 0..=len aborts the whole command atomically; RedisJSON can mutate an earlier match before a later index error |
 | `JSON.ARRINDEX` | partial | M3 | readonly | -4 | 6 | 6 | scalar needles only (container needles rejected — ADR-0042 D3); mixed-width numbers compare numerically; S21 corpus exact |
 | `JSON.ARRLEN` | partial | M3 | readonly fast | -2 | 8 | 8 | S21 corpus exact except module-specific WRONGTYPE error text |
 | `JSON.ARRPOP` | partial | M3 | write | -2 | 6 | 6 | out-of-range clamps and empty-array null match the pinned oracle (S22 probes); the popped-value text shares JSON.GET's large-exponent f64 deviation (the oracle echoes a 3e72 literal as 2.9999999999999996e72); S21 corpus exact |
 | `JSON.ARRTRIM` | partial | M3 | write | 5 | 6 | 6 | inclusive window and out-of-range clamps; overlapping mixed-type reply/error shape differs from RedisJSON with the same post-state |
 | `JSON.OBJKEYS` | full | M3 | readonly | -2 | 4 | 4 | keys in insertion order, as the pinned RedisJSON returns them (the only order the format has — ADR-0036); S21 corpus exact |
 | `JSON.OBJLEN` | full | M3 | readonly fast | -2 | 6 | 6 | S21 RESP2/RESP3 corpus exact |
-| `JSON.MERGE` | partial | M3 | write denyoom | 4 | 10 | 10 | RFC 7386 at the selected value; null members inside object patches delete keys, while a path-targeted null is literal (ADR-0042 D6); retaining overlaps use one immutable snapshot rather than RedisJSON cascade semantics; missing keys create at the root only |
+| `JSON.MERGE` | partial | M3 | write denyoom | 4 | 12 | 12 | RFC 7386 at the selected value; null members inside object patches delete keys, while a path-targeted null is literal (ADR-0042 D6); retaining overlaps use one immutable snapshot rather than RedisJSON cascade semantics; missing keys create at the root only |
 | `JSON.DEBUG` | partial | M3 | readonly fast | 3 | 4 | 4 | MEMORY reports InfinityDB-attributed record + external document bytes; missing-key and allocator-specific RedisJSON parity are intentionally not claimed |
 
 ## Documented deviations (the allowlist, verbatim)
@@ -208,7 +208,11 @@ bytes or post-state differ by an understood, reviewed design decision.
 ### `JSON.SET`
 
 - RedisJSON RESP2 `edge-invalid-json`: both reject the malformed input at the first member; parser-specific error text differs
+- RedisJSON RESP2 `depth-set-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
+- RedisJSON RESP2 `depth-set-128-value`: a 128-level value: InfinityDB accepts it (its bound is 128 containers); RedisJSON refuses a parsed value's 128th container — a permissive difference, a permanent product boundary (ADR-0042 A1)
 - RedisJSON RESP3 `edge-invalid-json`: both reject the malformed input at the first member; parser-specific error text differs
+- RedisJSON RESP3 `depth-set-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
+- RedisJSON RESP3 `depth-set-128-value`: a 128-level value: InfinityDB accepts it (its bound is 128 containers); RedisJSON refuses a parsed value's 128th container — a permissive difference, a permanent product boundary (ADR-0042 A1)
 
 ### `JSON.GET`
 
@@ -222,10 +226,19 @@ bytes or post-state differ by an understood, reviewed design decision.
 - RedisJSON RESP2 `edge-del-overlap`: recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical
 - RedisJSON RESP3 `edge-del-overlap`: recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical
 
+### `JSON.ARRAPPEND`
+
+- RedisJSON RESP2 `depth-arrappend-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
+- RedisJSON RESP2 `depth-arrappend-128-element`: a 128-level element: both refuse it before the write; InfinityDB answers `ERR document nesting too deep`, RedisJSON its recursion-limit parse error — a permanent product boundary (ADR-0042 A1)
+- RedisJSON RESP3 `depth-arrappend-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
+- RedisJSON RESP3 `depth-arrappend-128-element`: a 128-level element: both refuse it before the write; InfinityDB answers `ERR document nesting too deep`, RedisJSON its recursion-limit parse error — a permanent product boundary (ADR-0042 A1)
+
 ### `JSON.ARRINSERT`
 
 - RedisJSON RESP2 `edge-get-after-abort`: InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error
+- RedisJSON RESP2 `depth-arrinsert-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
 - RedisJSON RESP3 `edge-get-after-abort`: InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error
+- RedisJSON RESP3 `depth-arrinsert-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
 
 ### `JSON.ARRLEN`
 
@@ -240,7 +253,9 @@ bytes or post-state differ by an understood, reviewed design decision.
 ### `JSON.MERGE`
 
 - RedisJSON RESP2 `edge-merge-overlap-get`: InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results
+- RedisJSON RESP2 `depth-merge-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
 - RedisJSON RESP3 `edge-merge-overlap-get`: InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results
+- RedisJSON RESP3 `depth-merge-129`: composed depth 129: InfinityDB refuses a write whose result would nest past 128 containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, and its JSON.SET then refuses that document's JSON.GET text — a permanent product boundary (ADR-0042 A1)
 
 ### `JSON.DEBUG`
 
