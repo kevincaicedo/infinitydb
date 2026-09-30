@@ -3,6 +3,47 @@
 //! ADR-0103), rollback, and the apply-send path with its credit wait.
 
 use super::*;
+use crate::control::{CkptCredit, CkptTarget};
+
+/// The reply of every checkpoint producer whose cell's quota cannot cover
+/// its reservation (ADR-0159 A1.2): the `IdentityExhausted(Checkpoint)`
+/// refusal (ADR-0163 D5.3), returned before any effect. One const holds
+/// the bytes; the refusal class's type, when built, renders the same ones.
+pub(crate) const CKPT_IDENTITY_EXHAUSTED: &str = "ERR checkpoint identity space exhausted";
+
+/// Why a checkpoint producer could not reserve its units.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CkptRefusal {
+    /// No control plane is wired: a node without a data dir.
+    NoPlane,
+    /// This cell's quota cannot cover the reservation (ADR-0159 D1).
+    Exhausted,
+}
+
+impl CkptRefusal {
+    fn reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        self,
+        shared: &Rc<Shared<O, F>>,
+        proto: Protocol,
+    ) -> Vec<u8> {
+        match self {
+            CkptRefusal::NoPlane => error_reply(shared, proto, CKPT_NO_PLANE),
+            CkptRefusal::Exhausted => error_reply(shared, proto, CKPT_IDENTITY_EXHAUSTED),
+        }
+    }
+}
+
+const CKPT_NO_PLANE: &str = "ERR checkpointing requires a durable node (no data dir)";
+
+/// Reserves `K` checkpoint units from this cell's quota — every unit the
+/// program will issue, before its first effect (ADR-0159 D1, A1.2).
+fn reserve_ckpt<const K: usize, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+) -> Result<[CkptCredit; K], CkptRefusal> {
+    let mut quota = shared.ckpt_quota.borrow_mut();
+    let Some(quota) = quota.as_mut() else { return Err(CkptRefusal::NoPlane) };
+    quota.reserve::<K>().map_err(|inf_foundation::issue::IssueExhausted| CkptRefusal::Exhausted)
+}
 
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
@@ -265,81 +306,116 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
 }
 
 /// `INF.CKPT [CELL k] [WAIT]` + `BGSAVE`/`LASTSAVE` (M2-S20, ADR-0021
-/// D6): requests bump the control board's epochs (cells run checkpoints
-/// in their own MAINTAIN slices — L1); `WAIT` parks the pump until every
-/// targeted slot's **published** epoch covers the request. Publication
-/// happens at the MANIFEST swap's dir-fsync commit, so `WAIT` returns
-/// only after durability — a swap abort does not publish; the retried
-/// swap does (fault-injection verified). `LASTSAVE` = unix seconds of
-/// the newest publication across cells (0 before the first — deviation
-/// documented; Redis reports process-start time).
+/// D6): a request issues one epoch from this cell's quota into the
+/// board (cells run checkpoints in their own MAINTAIN slices — L1);
+/// `WAIT` parks the pump until the target's **published** epoch covers
+/// the request. Publication happens at the MANIFEST swap's dir-fsync
+/// commit, so `WAIT` returns only after durability — a swap abort does
+/// not publish; the retried swap does (fault-injection verified).
+/// `LASTSAVE` = unix seconds of the newest publication this cell has
+/// observed (ADR-0159 A1.4: its completed sweep, raised by its own
+/// `WAIT CELL k`s; 0 before the first — deviation documented; Redis
+/// reports process-start time).
 pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     id: CommandId,
     argv: &[&[u8]],
 ) -> Vec<u8> {
-    let no_plane = "ERR checkpointing requires a durable node (no data dir)";
     let control = shared.control.borrow().clone();
     let Some(control) = control else {
-        return error_reply(shared, proto, no_plane);
+        return error_reply(shared, proto, CKPT_NO_PLANE);
     };
     if shared.durable.borrow().is_none() {
-        return error_reply(shared, proto, no_plane);
+        return error_reply(shared, proto, CKPT_NO_PLANE);
     }
     if id == CommandId::Lastsave {
-        let unix_s = control.ckpt_board().max_unix_ms() / 1000;
+        let observed = shared.ckpt_sweep.borrow().observed();
+        let unix_s = observed.lastsave_unix_s(shared.lastsave_floor_ms.get());
         return int_reply(shared, proto, unix_s as i64);
     }
-    let mut cell: Option<u16> = None;
-    let mut wait = false;
-    if id == CommandId::InfCkpt {
-        let mut i = 1;
-        while i < argv.len() {
-            if argv[i].eq_ignore_ascii_case(b"WAIT") {
-                wait = true;
-                i += 1;
-            } else if argv[i].eq_ignore_ascii_case(b"CELL") && i + 1 < argv.len() {
-                let parsed = core::str::from_utf8(argv[i + 1]).ok().and_then(|s| s.parse().ok());
-                let Some(k) = parsed.filter(|&k: &u16| k < shared.cells) else {
-                    return error_reply(
-                        shared,
-                        proto,
-                        "ERR CELL wants an index below the cell count",
-                    );
-                };
-                cell = Some(k);
-                i += 2;
-            } else {
-                return error_reply(shared, proto, "ERR syntax: INF.CKPT [CELL k] [WAIT]");
-            }
-        }
-    } else if argv.len() > 2 || (argv.len() == 2 && !argv[1].eq_ignore_ascii_case(b"SCHEDULE")) {
-        // BGSAVE [SCHEDULE]: SCHEDULE is accepted and moot — checkpoints
-        // never fork, so there is nothing to defer (deviation documented).
-        return error_reply(shared, proto, "ERR syntax: BGSAVE [SCHEDULE]");
-    }
-    let epoch = match cell {
-        Some(k) => control.request_ckpt_cell(k),
-        None => control.request_ckpt_all(),
+    let args = match parse_ckpt_args(shared.cells, id, argv) {
+        Ok(args) => args,
+        Err(message) => return error_reply(shared, proto, message),
     };
-    if wait {
-        loop {
-            let board = control.ckpt_board();
-            let satisfied = match cell {
-                Some(k) => board.slot(k).published() >= epoch,
-                None => board.min_published() >= epoch,
-            };
-            if satisfied {
-                break;
-            }
-            shared.ckpt_waiters.wait(0).await;
-        }
+    // ADR-0159 D1: one unit, after parsing and the `CELL` check, before
+    // any request — a refusal changes nothing.
+    let credit = match reserve_ckpt::<1, O, F>(shared) {
+        Ok([credit]) => credit,
+        Err(refusal) => return refusal.reply(shared, proto),
+    };
+    let target = args.cell.map_or(CkptTarget::All, |k| CkptTarget::Cell(CellId(k)));
+    let epoch = credit.issue(target);
+    if args.wait {
+        wait_for_ckpt(shared, &control, args.cell, epoch).await;
     }
     if id == CommandId::Bgsave {
         simple_reply(shared, proto, "Background saving started")
     } else {
         simple_reply(shared, proto, "OK")
+    }
+}
+
+/// The parsed `INF.CKPT [CELL k] [WAIT]` / `BGSAVE [SCHEDULE]` arguments.
+struct CkptArgs {
+    /// `CELL k`, validated below the cell count.
+    cell: Option<u16>,
+    wait: bool,
+}
+
+fn parse_ckpt_args(cells: u16, id: CommandId, argv: &[&[u8]]) -> Result<CkptArgs, &'static str> {
+    let mut args = CkptArgs { cell: None, wait: false };
+    if id == CommandId::InfCkpt {
+        let mut i = 1;
+        while i < argv.len() {
+            if argv[i].eq_ignore_ascii_case(b"WAIT") {
+                args.wait = true;
+                i += 1;
+            } else if argv[i].eq_ignore_ascii_case(b"CELL") && i + 1 < argv.len() {
+                let parsed = core::str::from_utf8(argv[i + 1]).ok().and_then(|s| s.parse().ok());
+                let Some(k) = parsed.filter(|&k: &u16| k < cells) else {
+                    return Err("ERR CELL wants an index below the cell count");
+                };
+                args.cell = Some(k);
+                i += 2;
+            } else {
+                return Err("ERR syntax: INF.CKPT [CELL k] [WAIT]");
+            }
+        }
+    } else if argv.len() > 2 || (argv.len() == 2 && !argv[1].eq_ignore_ascii_case(b"SCHEDULE")) {
+        // BGSAVE [SCHEDULE]: SCHEDULE is accepted and moot — checkpoints
+        // never fork, so there is nothing to defer (deviation documented).
+        return Err("ERR syntax: BGSAVE [SCHEDULE]");
+    }
+    Ok(args)
+}
+
+/// Parks until the target published `epoch`. `CELL k` reads slot `k` and
+/// raises this cell's `LASTSAVE` floor with the publication time it
+/// confirmed (ADR-0159 A1.4); an all-cell wait reads this cell's completed
+/// sweep, a lower bound that is never early (D4). The sweep's completion
+/// wakes the waitlist.
+async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    control: &Arc<ControlHandle>,
+    cell: Option<u16>,
+    epoch: crate::control::CheckpointEpoch,
+) {
+    loop {
+        let satisfied = match cell {
+            Some(k) => match control.ckpt_board().slot(k).covered_at(epoch) {
+                Some(unix_ms) => {
+                    shared.lastsave_floor_ms.set(shared.lastsave_floor_ms.get().max(unix_ms));
+                    true
+                }
+                None => false,
+            },
+            None => shared.ckpt_sweep.borrow().observed().min_published >= epoch.get(),
+        };
+        if satisfied {
+            return;
+        }
+        shared.ckpt_waiters.wait(0).await;
     }
 }
 
@@ -382,9 +458,10 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     // ADR-0103: a CREATE persisted before the fan; its pending entry
     // retires once the fan is done (either way), and it needs no
     // trailing persist. `created` carries what a rollback needs
-    // (ADR-0108 D3): the id, the name, and whether the namespace is
-    // durable (tombstone) / tiered (teardown hold).
-    let mut created: Option<(u32, Vec<u8>, bool, bool)> = None;
+    // (ADR-0108 D3): the id, the name, a durable namespace's reserved
+    // cleanup credit (its tombstone's stamp, ADR-0159 D2) and whether it
+    // is tiered (teardown hold).
+    let mut created: Option<(u32, Vec<u8>, Option<CkptCredit>, bool)> = None;
     let fan: Vec<Vec<u8>> = if create {
         let draft = match crate::admin::parse_ns_create(argv) {
             Ok(draft) => draft,
@@ -397,6 +474,15 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
                 "ERR this node has no durable storage (start infinityd with a data dir)",
             );
         }
+        // ADR-0159 D2: a durable CREATE reserves its two units before any
+        // effect — the rollback's cleanup request and the pacing unit,
+        // which a CREATE never spends.
+        let cleanup = match (draft.mode == NsMode::Durable).then(|| reserve_ckpt::<2, O, F>(shared))
+        {
+            None => None,
+            Some(Ok([cleanup, _pacing])) => Some(cleanup),
+            Some(Err(refusal)) => return refusal.reply(shared, proto),
+        };
         let ns_id = control.alloc_ns_id();
         let spec = draft.with_id(ns_id);
         // ADR-0103 D1 (review of 2026-08-30, C14): persist before
@@ -467,8 +553,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
             crate::admin::ns_error(e, &mut RespWriter::new(&mut reply, proto));
             return reply;
         }
-        created =
-            Some((ns_id, spec.name.clone(), spec.mode == NsMode::Durable, spec.tier.is_some()));
+        created = Some((ns_id, spec.name.clone(), cleanup, spec.tier.is_some()));
         let fsync = spec.fsync.map_or("-", |f| match f {
             FsyncClass::Everysec => "everysec",
             FsyncClass::Always => "always",
@@ -525,7 +610,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     // shape — `if let Ok` silently dropped the cell).
     let fan_argv: Vec<&[u8]> = fan.iter().map(Vec::as_slice).collect();
     let failure = fan_all_or_first_error(shared, proto, &fan_argv).await;
-    if let Some((id, name, durable, tiered)) = created {
+    if let Some((id, name, cleanup, tiered)) = created {
         if let Some(error) = failure {
             // ADR-0108 D3: a `CREATE` whose fan failed on any peer rolls
             // back — the origin drops its copy, fans `DROP`, persists the
@@ -533,7 +618,7 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
             // reply says. Before this the peers that accepted their leg
             // (and the origin) served it while the client held an error,
             // and `META` kept naming it until the next persist.
-            rollback_create(shared, &control, proto, id, &name, durable, tiered).await;
+            rollback_create(shared, &control, proto, id, &name, cleanup, tiered).await;
             return error;
         }
         // Every leg answered `+OK`: each cell's export carries the
@@ -572,9 +657,19 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     name: &[u8],
 ) -> Vec<u8> {
     let durable = shared.store.borrow().ns_get(name).is_some_and(|s| s.mode == NsMode::Durable);
-    if durable && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX {
-        let epoch = control.request_ckpt_all();
-        while control.ckpt_board().min_published() < epoch {
+    // ADR-0159 D2: a durable DROP reserves its two units under the ticket,
+    // before pacing and any effect — the tombstone pacing request and the
+    // post-fan cleanup request. A refusal leaves everything unchanged.
+    let (pacing, cleanup) = match durable.then(|| reserve_ckpt::<2, O, F>(shared)) {
+        None => (None, None),
+        Some(Ok([pacing, cleanup])) => (Some(pacing), Some(cleanup)),
+        Some(Err(refusal)) => return refusal.reply(shared, proto),
+    };
+    if let Some(pacing) = pacing
+        && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX
+    {
+        let epoch = pacing.issue(CkptTarget::All);
+        while shared.ckpt_sweep.borrow().observed().min_published < epoch.get() {
             shared.ckpt_waiters.wait(0).await;
         }
     }
@@ -625,11 +720,13 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if let Some(error) = fan_all_or_first_error(shared, proto, &fan).await {
         return error;
     }
-    if let Some(id) = drop {
+    // The ticket keeps the namespace's mode fixed between the reservation
+    // and the drop: a durable drop holds its cleanup credit.
+    debug_assert_eq!(drop.is_some(), cleanup.is_some(), "a durable drop reserved its cleanup");
+    if let (Some(id), Some(cleanup)) = (drop, cleanup) {
         // Every cell applied the drop: a checkpoint requested now
         // publishes MANIFESTs without it (ADR-0100 D3).
-        let ckpt_epoch = control.request_ckpt_all();
-        control.stamp_drop(id, ckpt_epoch);
+        control.stamp_drop(id, cleanup.issue(CkptTarget::All).get());
     }
     simple_reply(shared, proto, "OK")
 }
@@ -670,16 +767,18 @@ async fn fan_all_or_first_error<O: PlaneObserver + 'static, F: SegmentFs + Clone
 /// pending entry retires with it; a durable namespace gets its
 /// tombstone), every peer gets `INF.NSFAN DROP name epoch` (a peer that
 /// never applied its leg answers "not found" — accepted), and a durable
-/// drop is stamped for retirement. Runs under the DDL ticket.
+/// drop is stamped for retirement with the cleanup credit its CREATE
+/// reserved (ADR-0159 D2). Runs under the DDL ticket.
 async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &Arc<ControlHandle>,
     proto: Protocol,
     id: u32,
     name: &[u8],
-    durable: bool,
+    cleanup: Option<CkptCredit>,
     tiered: bool,
 ) {
+    let durable = cleanup.is_some();
     // The origin's own copy (`Unknown` here would mean the fan's local
     // apply never happened — nothing to undo).
     let _ = shared.store.borrow_mut().ns_drop(name);
@@ -703,9 +802,8 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // Peers that refused or never received their CREATE leg answer
     // "namespace not found" — the rollback is idempotent per cell.
     let _ = fan_all_or_first_error(shared, proto, &fan).await;
-    if durable {
-        let ckpt_epoch = control.request_ckpt_all();
-        control.stamp_drop(id, ckpt_epoch);
+    if let Some(cleanup) = cleanup {
+        control.stamp_drop(id, cleanup.issue(CkptTarget::All).get());
     }
 }
 

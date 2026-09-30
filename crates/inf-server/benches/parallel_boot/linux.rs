@@ -203,6 +203,7 @@ fn drive_cell(
     listener: std::net::TcpListener,
     fabric: inf_fabric::CellFabric,
     control: Arc<inf_server::ControlHandle>,
+    issuer: inf_server::CellIssuer,
     root: &Path,
     stop: &AtomicBool,
 ) {
@@ -236,7 +237,7 @@ fn drive_cell(
         NoopObserver,
         false,
     );
-    plane.set_control(control);
+    plane.set_control(control, issuer).expect("the issuer of this cell");
     // M2.5-S08 A/B arm on the config (ADR-0109): the prefetch wrapper is
     // Recovery-private; the plane's filesystem is the bare tier.
     let mut cfg = durable_config(root);
@@ -270,8 +271,10 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let catalog = inf_server::load_catalog(root).expect("catalog");
-    let control =
-        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cells, boot_unix_ms);
+    let cell_count = inf_foundation::CellCount::new(cells).expect("a valid bench topology");
+    let (control, issuers) =
+        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms);
+    let mut cell_issuers = issuers.cells.into_iter();
     let board = Arc::clone(control.recovery_board());
 
     let started = Instant::now();
@@ -279,6 +282,7 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
     for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
         let stop = Arc::clone(&stop);
         let control = Arc::clone(&control);
+        let issuer = cell_issuers.next().expect("one issuer per cell");
         let root = root.to_path_buf();
         handles.push(std::thread::spawn(move || {
             // M2.5-S08 A/B: INF_BOOT_READAHEAD=1 forces the prefetch arm
@@ -286,7 +290,7 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
             // — the A/B that measured why); default matches the shipped
             // multi-cell posture (no prefetch).
             let boot_prefetch = env_u64("INF_BOOT_READAHEAD", 0) != 0;
-            drive_cell(boot_prefetch, i, cells, listener, fabric, control, &root, &stop);
+            drive_cell(boot_prefetch, i, cells, listener, fabric, control, issuer, &root, &stop);
         }));
     }
     while !board.all_ready() {

@@ -77,9 +77,13 @@ dag:
 deny:
     cargo deny check
 
-# Loom model of the SPSC ring (PRs touching inf-fabric must run this).
+# Loom models: the SPSC ring and checkpoint issuance (PRs touching inf-fabric
+# or inf-foundation's `issue` module must run this).
 loom:
     RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-fabric --release loom_
+    # ADR-0159 A1.6/A1.7: the checkpoint issuance orderings, checked on the
+    # product's own `issue` types.
+    RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 cargo test -p inf-foundation --release loom_
 
 # Compat-diff requires Redis 8.0.5 on PATH or INF_COMPAT_ORACLE_ADDR.
 compat:

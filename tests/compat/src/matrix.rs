@@ -769,8 +769,10 @@ pub static MATRIX: &[Case] = &[
     ),
     skip(
         &["LASTSAVE"],
-        "M2-S20: newest durable MANIFEST publication time; 0 before the first save vs \
-         Redis's process-start time; the planeless candidate answers its documented error",
+        "M2-S20: newest durable MANIFEST publication time this cell has observed (it can \
+         trail the board by up to two bounded sweeps, except after a `WAIT` on the same cell — \
+         ADR-0159 A1.4); 0 before the first save vs Redis's process-start time; the planeless \
+         candidate answers its documented error",
     ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),

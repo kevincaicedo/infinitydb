@@ -1,5 +1,13 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
+/// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
+/// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one
+/// Maintenance unit per turn as MAINTAIN's first budgeted step. Crossing:
+/// pacing — the sweep resumes at its cursor next turn, so a board of `N`
+/// cells completes in `ceil(N / 64)` turns (256 at 16,384 cells) and a
+/// publication is observed within two completed sweeps.
+pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
+
 /// Bytes read by the process supervisor for one CPU sample. An oversized
 /// procfs record is refused and the read board retains its preceding sample.
 pub const PROCESS_STAT_BYTES_MAX: u64 = 16 * 1024;

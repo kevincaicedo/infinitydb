@@ -17,9 +17,16 @@
 //! emits until every cell has published a `MANIFEST` past the drop (the
 //! origin requests that checkpoint and stamps the tombstone with its
 //! epoch; the writer retires stamped tombstones at the next persist once
-//! `CkptBoard::min_published` covers them). Recovery reads the set to
+//! every cell's published epoch covers them). Recovery reads the set to
 //! tell dropped residue from corruption.
+//!
+//! Checkpoint requests are issued, not counted (ADR-0159 A1): a boot's
+//! partition mints one quota per cell, one for this writer and one final
+//! credit per cell, and only a credit advances the checkpoint clock, so an
+//! epoch can neither wrap nor repeat. An exhausted quota refuses before
+//! any effect.
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -27,9 +34,16 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, 
 use std::sync::mpsc;
 use std::time::Duration;
 
+use inf_foundation::issue::{
+    self, FinalCredit, IssueClock, IssueCredit, IssueExhausted, IssueQuota, IssueSpace, Issued,
+    Partition, PartitionRefused, RequestWord,
+};
+use inf_foundation::{CellCount, CellId};
 use inf_log::fs::StdSegmentFs;
 use inf_log::meta::{read_meta, write_meta};
 use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog, NsSpec};
+
+use crate::limits::CKPT_BOARD_VISITS_PER_TURN;
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
 /// D2/D4 as amended): how many segments ended their data at a foreign-
@@ -275,14 +289,15 @@ impl RecoveryBoard {
 
 /// One cell's checkpoint request/publication slot (M2-S20, ADR-0021 D6).
 /// Same L1 control-plane carve-out class as the recovery board: the
-/// request side is written by command programs (any cell's pump), the
-/// publication side by the owning cell when the MANIFEST swap's
-/// dir-fsync commits (the durability point — ADR-0017). Readers are
-/// `INF.CKPT WAIT` pollers, `LASTSAVE`, and `INFO` aggregation.
+/// request side is raised by an issuer (a targeted or final request —
+/// ADR-0159 A1.3), the publication side by the owning cell when the
+/// MANIFEST swap's dir-fsync commits (the durability point — ADR-0017).
+/// Readers are the owning cell's MAINTAIN, `WAIT CELL k` and the cells'
+/// board sweeps.
 #[derive(Debug, Default)]
 pub struct CkptSlot {
-    /// Highest requested epoch (cells edge-detect this in MAINTAIN).
-    req: AtomicU64,
+    /// Requests aimed at this cell alone (`INF.CKPT CELL k`, its stop).
+    req: RequestWord,
     /// Highest epoch whose checkpoint reached a *durable* MANIFEST.
     published: AtomicU64,
     /// The published checkpoint id / unix ms (the `LASTSAVE` currency).
@@ -291,11 +306,6 @@ pub struct CkptSlot {
 }
 
 impl CkptSlot {
-    /// Highest requested epoch (the MAINTAIN edge-detection input).
-    pub fn req(&self) -> u64 {
-        self.req.load(Ordering::Relaxed)
-    }
-
     /// Publication (owning cell, at the swap's dir-fsync commit).
     pub fn publish(&self, epoch: u64, ckpt_id: u64, unix_ms: u64) {
         self.ckpt_id.store(ckpt_id, Ordering::Relaxed);
@@ -314,15 +324,34 @@ impl CkptSlot {
     pub fn last_ckpt_id(&self) -> u64 {
         self.ckpt_id.load(Ordering::Relaxed)
     }
+
+    /// `WAIT CELL k`'s check (ADR-0159 A1.4): once this slot published
+    /// `epoch`, the publication time read after the `Acquire` load that
+    /// satisfied it — the waiting cell raises its `LASTSAVE` floor with it.
+    #[must_use]
+    pub fn covered_at(&self, epoch: CheckpointEpoch) -> Option<u64> {
+        (self.published() >= epoch.get()).then(|| self.last_unix_ms())
+    }
 }
 
-/// Node-wide checkpoint board: one slot per cell.
+/// Node-wide checkpoint board (ADR-0159 A1.3): the all-cell request word
+/// and one slot per cell. The boot's issue clock owns it, so only a credit
+/// of this boot raises a request (ADR-0159 A1.2).
 #[derive(Debug)]
 pub struct CkptBoard {
-    cells: Vec<CkptSlot>,
+    /// All-cell requests: one `fetch_max` per request, never a fan.
+    request_all: RequestWord,
+    cells: Box<[CkptSlot]>,
 }
 
 impl CkptBoard {
+    fn new(cells: CellCount) -> CkptBoard {
+        CkptBoard {
+            request_all: RequestWord::new(),
+            cells: (0..cells.get()).map(|_| CkptSlot::default()).collect(),
+        }
+    }
+
     /// This cell's slot.
     ///
     /// # Panics
@@ -332,25 +361,338 @@ impl CkptBoard {
         &self.cells[usize::from(cell)]
     }
 
-    /// The lowest published epoch across cells — `INF.CKPT WAIT` (all
-    /// cells) completes when this covers its request epoch.
+    /// The checkpoint epoch `cell` owes: the larger of the all-cell word
+    /// and its own slot (A1.3), both read with `Acquire` (A1.6). The owning
+    /// cell's MAINTAIN edge-detects it.
     #[must_use]
-    pub fn min_published(&self) -> u64 {
+    pub fn requested(&self, cell: u16) -> u64 {
+        self.request_all.read().max(self.slot(cell).req.read())
+    }
+
+    /// Cells on the board (the boot's `CellCount`).
+    #[must_use]
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    fn raise(&self, target: CkptTarget, issued: Issued) {
+        match target {
+            CkptTarget::All => self.request_all.raise(issued),
+            CkptTarget::Cell(cell) => self.slot(cell.0).req.raise(issued),
+        }
+    }
+
+    /// The lowest published epoch across cells: the catalog writer's retire
+    /// fold (ADR-0100 D3), one pass of `N <= 16,384` `Acquire` loads per
+    /// persist on the control thread, never on a cell. Cells read their
+    /// sweep's observation instead (ADR-0159 D4).
+    fn min_published(&self) -> u64 {
         self.cells.iter().map(CkptSlot::published).min().unwrap_or(0)
     }
 
-    /// Sum of published epochs — a cheap any-cell-published change signal
-    /// (the MAINTAIN wake edge for parked waiters).
+    /// One bounded step of a cell's sweep (ADR-0159 D4, A1.4): at most
+    /// [`CKPT_BOARD_VISITS_PER_TURN`] slots from the sweep's cursor, each
+    /// read `published` (`Acquire`) then its publication time. A sweep of
+    /// `N` cells completes in `ceil(N / 64)` steps and then publishes its
+    /// observation.
+    pub fn sweep_step(&self, sweep: &mut BoardSweep) -> SweepStep {
+        let begin = sweep.cursor;
+        let end = self.cells.len().min(begin + CKPT_BOARD_VISITS_PER_TURN);
+        debug_assert!(begin < end, "a sweep's cursor stays below the board's cell count");
+        for slot in &self.cells[begin..end] {
+            let published = slot.published();
+            let unix_ms = slot.last_unix_ms();
+            let partial = &mut sweep.partial;
+            partial.min_published = partial.min_published.min(published);
+            // ADR-0159 D4: at most 2^14 epochs below 2^64 each — the sum is
+            // below 2^78.
+            partial.published_sum += u128::from(published);
+            partial.max_unix_ms = partial.max_unix_ms.max(unix_ms);
+        }
+        let visits = end - begin;
+        debug_assert!(visits <= CKPT_BOARD_VISITS_PER_TURN, "A1.4: at most 64 visits per turn");
+        sweep.visits += visits as u64;
+        if end < self.cells.len() {
+            sweep.cursor = end;
+            return SweepStep::InProgress;
+        }
+        sweep.cursor = 0;
+        sweep.sweeps_completed += 1;
+        let previous = core::mem::replace(&mut sweep.observed, sweep.partial);
+        sweep.partial = BoardSweep::EMPTY_PARTIAL;
+        if sweep.observed.published_sum == previous.published_sum {
+            SweepStep::Unchanged
+        } else {
+            SweepStep::Progressed
+        }
+    }
+}
+
+/// A completed sweep's view of the board (ADR-0159 D4). The sweep reads
+/// slots at different times, so `min_published` is a lower bound on every
+/// slot's current publication — never early for `WAIT` or DROP
+/// pacing — and the sum of a later sweep is never smaller.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BoardObservation {
+    /// Lowest published epoch: `WAIT` (all cells) and DROP pacing.
+    pub min_published: u64,
+    /// Sum of published epochs, in `u128` so it cannot wrap (D4): the
+    /// wake signal for parked `WAIT`s.
+    pub published_sum: u128,
+    /// Newest publication time (unix ms): the `rdb_last_save_time` gauge.
+    pub max_unix_ms: u64,
+}
+
+impl BoardObservation {
+    /// `LASTSAVE` (ADR-0159 A1.4): the newest publication this cell has
+    /// observed — its completed sweep, or a slot a `WAIT CELL k` on this
+    /// cell confirmed (`floor_ms`) — in unix seconds.
     #[must_use]
-    pub fn published_sum(&self) -> u64 {
-        self.cells.iter().map(CkptSlot::published).sum()
+    pub fn lastsave_unix_s(self, floor_ms: u64) -> u64 {
+        self.max_unix_ms.max(floor_ms) / 1000
+    }
+}
+
+/// One cell's resumable sweep over the board (ADR-0159 D4): a cursor into
+/// the fixed boot board and the partial folds. No slot reference crosses a
+/// turn; the board's membership never changes within a boot.
+#[derive(Debug)]
+pub struct BoardSweep {
+    cursor: usize,
+    partial: BoardObservation,
+    observed: BoardObservation,
+    /// Slot visits so far — the sweep's liveness counter (per cell).
+    visits: u64,
+    /// Completed sweeps so far (per cell).
+    sweeps_completed: u64,
+}
+
+/// What one sweep step did (ADR-0159 D4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SweepStep {
+    /// The sweep resumes at its cursor next turn.
+    InProgress,
+    /// A sweep completed with the previous observation's sum.
+    Unchanged,
+    /// A sweep completed and some slot published since the last one: wake
+    /// the parked `WAIT`s.
+    Progressed,
+}
+
+impl BoardSweep {
+    const EMPTY_PARTIAL: BoardObservation =
+        BoardObservation { min_published: u64::MAX, published_sum: 0, max_unix_ms: 0 };
+
+    #[must_use]
+    pub fn new() -> BoardSweep {
+        BoardSweep {
+            cursor: 0,
+            partial: BoardSweep::EMPTY_PARTIAL,
+            observed: BoardObservation::default(),
+            visits: 0,
+            sweeps_completed: 0,
+        }
     }
 
-    /// Newest durable MANIFEST publication time across cells (unix ms) —
-    /// `LASTSAVE`/`rdb_last_save_time` (0 before the first publication).
+    /// The last completed sweep's observation (all zero before the first).
     #[must_use]
-    pub fn max_unix_ms(&self) -> u64 {
-        self.cells.iter().map(CkptSlot::last_unix_ms).max().unwrap_or(0)
+    pub fn observed(&self) -> BoardObservation {
+        self.observed
+    }
+
+    /// A sweep is part-way through the board.
+    #[must_use]
+    pub fn in_progress(&self) -> bool {
+        self.cursor != 0
+    }
+
+    #[must_use]
+    pub fn visits(&self) -> u64 {
+        self.visits
+    }
+
+    #[must_use]
+    pub fn sweeps_completed(&self) -> u64 {
+        self.sweeps_completed
+    }
+}
+
+impl Default for BoardSweep {
+    fn default() -> BoardSweep {
+        BoardSweep::new()
+    }
+}
+
+/// A checkpoint request's epoch (ADR-0159 D1): built only by issuing a
+/// credit of this boot's clock, so it is nonzero and above every earlier
+/// request of the boot. `WAIT` compares a published epoch against it.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct CheckpointEpoch(Issued);
+
+impl CheckpointEpoch {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Which cells a checkpoint request asks (ADR-0159 A1.3).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CkptTarget {
+    /// Every cell: one raise of the board's request word.
+    All,
+    /// One cell (`INF.CKPT CELL k`, a cell's stop): a raise of its slot.
+    /// The id is below the board's count: the command's `CELL` check, or
+    /// the cell's own id.
+    Cell(CellId),
+}
+
+/// One ordinary checkpoint issue (ADR-0159 D1): not `Clone`, consumed by
+/// value; dropped unused, it is spent.
+#[derive(Debug)]
+pub struct CkptCredit(IssueCredit<CkptBoard>);
+
+impl CkptCredit {
+    /// Issues the request: the epoch is assigned now, late, then raised
+    /// into `target` (A1.3, A1.6).
+    pub fn issue(self, target: CkptTarget) -> CheckpointEpoch {
+        CheckpointEpoch(self.0.issue(|board, issued| board.raise(target, issued)))
+    }
+}
+
+/// An owner's checkpoint quota (ADR-0159 A1.2): a cell's, or the control
+/// writer's, which the host holds after construction.
+#[derive(Debug)]
+pub struct CkptQuota(IssueQuota<CkptBoard>);
+
+impl CkptQuota {
+    /// Takes `K` credits, or none.
+    ///
+    /// # Errors
+    /// [`IssueExhausted`]: fewer than `K` units remain; nothing changed.
+    pub fn reserve<const K: usize>(&mut self) -> Result<[CkptCredit; K], IssueExhausted> {
+        self.0.reserve::<K>().map(|credits| credits.map(CkptCredit))
+    }
+
+    /// Reserves one unit and issues it into `target`: the direct admin,
+    /// test and simulator request.
+    ///
+    /// # Errors
+    /// [`IssueExhausted`] before any request.
+    pub fn request(&mut self, target: CkptTarget) -> Result<CheckpointEpoch, IssueExhausted> {
+        let [credit] = self.reserve::<1>()?;
+        Ok(credit.issue(target))
+    }
+
+    /// Units left.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.0.remaining()
+    }
+}
+
+/// A cell's stop-checkpoint issue (ADR-0159 D3): outside its quota, bound
+/// to its own slot, issued once.
+#[derive(Debug)]
+pub struct CkptFinalCredit {
+    credit: FinalCredit<CkptBoard>,
+    cell: CellId,
+}
+
+impl CkptFinalCredit {
+    /// Issues the stop request into this cell's own slot.
+    pub fn issue(self) -> CheckpointEpoch {
+        let target = CkptTarget::Cell(self.cell);
+        CheckpointEpoch(self.credit.issue(|board, issued| board.raise(target, issued)))
+    }
+}
+
+/// One cell's checkpoint allowance (ADR-0159 A1.2, D3), wired with its
+/// control handle by `ServerPlane::set_control` on the cell it was minted
+/// for, and only there.
+#[derive(Debug)]
+pub struct CellIssuer {
+    pub(crate) quota: CkptQuota,
+    pub(crate) final_credit: CkptFinalCredit,
+}
+
+impl CellIssuer {
+    /// The cell this allowance was minted for: its final credit raises
+    /// this cell's slot alone (ADR-0159 D3).
+    #[must_use]
+    pub fn cell(&self) -> CellId {
+        self.final_credit.cell
+    }
+}
+
+/// `ServerPlane::set_control` was handed the allowance of another cell
+/// (ADR-0159 D3: a stop credit raises its own cell's slot, and a cell's
+/// stop waits on its own slot, so a crossed pair would wait until the stop
+/// deadline). Nothing was wired; the allowance comes back to the host.
+#[derive(Debug)]
+pub struct IssuerCellMismatch {
+    /// The cell of the plane that refused it.
+    pub plane: CellId,
+    /// The refused allowance, whose [`CellIssuer::cell`] differs.
+    pub issuer: CellIssuer,
+}
+
+impl std::fmt::Display for IssuerCellMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cell {} was handed the checkpoint issuer minted for cell {}",
+            self.plane.0,
+            self.issuer.cell().0
+        )
+    }
+}
+
+impl std::error::Error for IssuerCellMismatch {}
+
+/// What a control-plane constructor mints besides the handle (ADR-0159
+/// A1.2): each cell's allowance, in cell order, and the control writer's
+/// quota. The writer's quota paid for the boot restamp during
+/// construction; it now belongs to the host that owns the writer, for
+/// direct admin, test and simulator requests. No cell holds it.
+#[derive(Debug)]
+pub struct CkptIssuers {
+    pub host: CkptQuota,
+    pub cells: Vec<CellIssuer>,
+}
+
+/// One boot's checkpoint issuance space, fixed with its cell count
+/// (ADR-0159 A1.2, A1.5).
+#[derive(Copy, Clone, Debug)]
+pub struct CkptSpace {
+    cells: CellCount,
+    space: IssueSpace,
+}
+
+impl CkptSpace {
+    /// The production split: `N + 1` quotas of
+    /// `floor((u64::MAX − N) / (N + 1))` units and `N` final credits.
+    #[must_use]
+    pub fn full(cells: CellCount) -> CkptSpace {
+        CkptSpace { cells, space: IssueSpace::full(u32::from(cells.get())) }
+    }
+
+    /// The test seam (A1.5): `headroom` units per quota, the clock started
+    /// so that the last credit issues `u64::MAX`.
+    ///
+    /// # Errors
+    /// [`PartitionRefused`] when `(N + 1) × headroom + N` overflows `u64`.
+    pub fn with_headroom(
+        cells: CellCount,
+        headroom: NonZeroU64,
+    ) -> Result<CkptSpace, PartitionRefused> {
+        let space = IssueSpace::with_headroom(u32::from(cells.get()), headroom)?;
+        Ok(CkptSpace { cells, space })
+    }
+
+    #[must_use]
+    pub fn cells(self) -> CellCount {
+        self.cells
     }
 }
 
@@ -785,14 +1127,10 @@ pub struct ControlHandle {
     next_index_generation: AtomicU64,
     next_epoch: AtomicU64,
     persisted_epoch: Arc<AtomicU64>,
-    /// Manual-checkpoint request epoch (M2-S10, ADR-0016 D7): bumping it
-    /// asks every durable cell to checkpoint; cells edge-detect it in
-    /// MAINTAIN (one relaxed load — the persisted-epoch pattern).
-    /// `INF.CKPT`/`BGSAVE` ride this at S20 (per-cell targeting refines
-    /// there).
-    ckpt_epoch: AtomicU64,
-    /// Per-cell checkpoint request/publication slots (M2-S20).
-    ckpt_board: Arc<CkptBoard>,
+    /// The boot's checkpoint clock and the board it owns (ADR-0159 A1):
+    /// the all-cell request word and the per-cell request/publication
+    /// slots. Only a partition credit advances the clock.
+    ckpt_clock: Arc<IssueClock<CkptBoard>>,
     /// Boot-recovery progress + readiness (M2-S15).
     recovery: Arc<RecoveryBoard>,
     /// Per-cell memory gauges for node-scope `INFO` (M3-S25 fix).
@@ -971,30 +1309,19 @@ impl ControlHandle {
         self.persisted_epoch.load(Ordering::Acquire)
     }
 
-    /// Requests a checkpoint on every durable cell (M2-S10/S20 — the
-    /// `INF.CKPT`/`BGSAVE` surface). Returns the request epoch; `WAIT`
-    /// completes once every slot's published epoch covers it.
-    pub fn request_ckpt_all(&self) -> u64 {
-        let epoch = self.ckpt_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        for cell in &self.ckpt_board.cells {
-            cell.req.fetch_max(epoch, Ordering::Relaxed);
-        }
-        epoch
-    }
-
-    /// Requests a checkpoint on one cell (`INF.CKPT CELL k`, M2-S20).
-    /// Epochs come from the same allocator, so cross-target `WAIT`s
-    /// compose (published epochs are monotone per slot).
-    pub fn request_ckpt_cell(&self, cell: u16) -> u64 {
-        let epoch = self.ckpt_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        self.ckpt_board.slot(cell).req.fetch_max(epoch, Ordering::Relaxed);
-        epoch
-    }
-
-    /// The checkpoint board (request/publication slots per cell).
+    /// The checkpoint board (the request word and the per-cell
+    /// request/publication slots). Requests reach it only through a
+    /// credit ([`CkptQuota`], [`CkptFinalCredit`]).
     #[must_use]
-    pub fn ckpt_board(&self) -> &Arc<CkptBoard> {
-        &self.ckpt_board
+    pub fn ckpt_board(&self) -> &CkptBoard {
+        self.ckpt_clock.board()
+    }
+
+    /// The last checkpoint epoch issued this boot (tests and oracles: the
+    /// engagement check of a drive to the top of the space).
+    #[must_use]
+    pub fn ckpt_last_issued(&self) -> u64 {
+        self.ckpt_clock.last()
     }
 
     /// The boot-recovery board (M2-S15): cells publish their slot, the
@@ -1095,6 +1422,15 @@ impl std::fmt::Debug for ControlInbox {
 }
 
 impl ControlInbox {
+    /// The lowest published checkpoint epoch across cells — the writer's
+    /// own retire fold, for the host that drains this inbox (the
+    /// simulator's checkpoint waits). No cell folds the whole board
+    /// (ADR-0159 D4).
+    #[must_use]
+    pub fn ckpt_min_published(&self) -> u64 {
+        self.handle.ckpt_board().min_published()
+    }
+
     /// Drains queued control work against `fs`. A failed catalog swap is
     /// an error (the control thread's fail-stop analog — the caller owns
     /// the verdict); failed unlinks are ignored (boot GC re-collects).
@@ -1130,13 +1466,17 @@ impl ControlInbox {
     }
 }
 
+/// A detached control plane (M2-S19): the handle, the writer's inbox the
+/// host drains inline, and the boot's checkpoint issuers (ADR-0159 A1.2).
+pub type DetachedControl = (Arc<ControlHandle>, ControlInbox, CkptIssuers);
+
 impl ControlHandle {
     /// A control plane without the thread (M2-S19): the caller drains the
     /// returned [`ControlInbox`] inline. Production nodes use
     /// [`spawn`]; the sim's determinism forbids the thread.
     #[must_use]
-    pub fn detached(cells: u16, start_unix_ms: u64) -> (Arc<ControlHandle>, ControlInbox) {
-        ControlHandle::detached_with_catalog(None, cells, start_unix_ms)
+    pub fn detached(cells: CellCount, start_unix_ms: u64) -> DetachedControl {
+        ControlHandle::detached_in(None, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// A detached control plane seeded from a recovered catalog (the
@@ -1145,28 +1485,45 @@ impl ControlHandle {
     #[must_use]
     pub fn detached_with_catalog(
         seed: Option<&NsCatalog>,
-        cells: u16,
+        cells: CellCount,
         start_unix_ms: u64,
-    ) -> (Arc<ControlHandle>, ControlInbox) {
-        let (handle, rx, tombstones) = ControlHandle::new_parts(seed, cells, start_unix_ms);
+    ) -> DetachedControl {
+        ControlHandle::detached_in(seed, CkptSpace::full(cells), start_unix_ms)
+    }
+
+    /// [`detached_with_catalog`](Self::detached_with_catalog) over an
+    /// explicit issuance space — the A1.5 headroom seam for tests.
+    #[must_use]
+    pub fn detached_in(
+        seed: Option<&NsCatalog>,
+        space: CkptSpace,
+        start_unix_ms: u64,
+    ) -> DetachedControl {
+        let (handle, rx, tombstones, issuers) =
+            ControlHandle::new_parts(seed, space, start_unix_ms);
         let inbox = ControlInbox {
             rx,
             handle: Arc::clone(&handle),
             tombstones,
             pending: PendingCreates::default(),
         };
-        (handle, inbox)
+        (handle, inbox, issuers)
     }
 
-    /// The handle, the writer's inbox, and the writer's tombstone set
-    /// seeded from the boot catalog — every survivor re-stamped with one
-    /// fresh node-wide checkpoint request (ADR-0100 D3: cells edge-detect
-    /// it after recovery, and the next persist retires what they cover).
+    /// The handle, the writer's inbox, the writer's tombstone set seeded
+    /// from the boot catalog, and the boot's checkpoint issuers. Every
+    /// surviving tombstone is re-stamped with one fresh all-cell request
+    /// (ADR-0100 D3: cells edge-detect it after recovery, and the next
+    /// persist retires what they cover), paid by the control writer's
+    /// quota before any cell serves (ADR-0159 A1.2).
     fn new_parts(
         seed: Option<&NsCatalog>,
-        cells: u16,
+        space: CkptSpace,
         start_unix_ms: u64,
-    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, DropTombstones) {
+    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, DropTombstones, CkptIssuers) {
+        let cells = space.cells.get();
+        let Partition { clock, owner, participants } =
+            issue::partition(CkptBoard::new(space.cells), space.space);
         let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
         let next_index_id = seed.map_or(FIRST_INDEX_ID, |c| c.index.next_id.max(FIRST_INDEX_ID));
         let next_index_generation = seed.map_or(FIRST_INDEX_GENERATION, |c| {
@@ -1180,10 +1537,7 @@ impl ControlHandle {
             next_index_generation: AtomicU64::new(next_index_generation),
             next_epoch: AtomicU64::new(0),
             persisted_epoch: Arc::new(AtomicU64::new(0)),
-            ckpt_epoch: AtomicU64::new(0),
-            ckpt_board: Arc::new(CkptBoard {
-                cells: (0..cells).map(|_| CkptSlot::default()).collect(),
-            }),
+            ckpt_clock: clock,
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
@@ -1192,13 +1546,27 @@ impl ControlHandle {
             ddl_holder: AtomicU16::new(0),
             ddl_generation: AtomicU64::new(0),
         });
+        let mut host = CkptQuota(owner);
+        let cell_issuers = participants
+            .into_iter()
+            .zip(0..cells)
+            .map(|(participant, cell)| CellIssuer {
+                quota: CkptQuota(participant.quota),
+                final_credit: CkptFinalCredit {
+                    credit: participant.final_credit,
+                    cell: CellId(cell),
+                },
+            })
+            .collect();
         let mut tombstones = DropTombstones::seed(seed.map_or(&[][..], |c| &c.dropped));
         if tombstones.len() > 0 {
-            let epoch = handle.request_ckpt_all();
-            tombstones.stamp_unstamped(epoch);
+            let epoch = host
+                .request(CkptTarget::All)
+                .expect("a fresh quota holds at least one unit (IssueSpace: Q >= 1)");
+            tombstones.stamp_unstamped(epoch.get());
             handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
         }
-        (handle, rx, tombstones)
+        (handle, rx, tombstones, CkptIssuers { host, cells: cell_issuers })
     }
 }
 
@@ -1211,10 +1579,22 @@ impl ControlHandle {
 pub fn spawn(
     data_dir: PathBuf,
     seed: Option<&NsCatalog>,
-    cells: u16,
+    cells: CellCount,
     start_unix_ms: u64,
-) -> Arc<ControlHandle> {
-    let (handle, rx, tombstones) = ControlHandle::new_parts(seed, cells, start_unix_ms);
+) -> (Arc<ControlHandle>, CkptIssuers) {
+    spawn_in(data_dir, seed, CkptSpace::full(cells), start_unix_ms)
+}
+
+/// [`spawn`] over an explicit issuance space — the A1.5 headroom seam for
+/// tests. Returns the handle and the boot's checkpoint issuers.
+pub fn spawn_in(
+    data_dir: PathBuf,
+    seed: Option<&NsCatalog>,
+    space: CkptSpace,
+    start_unix_ms: u64,
+) -> (Arc<ControlHandle>, CkptIssuers) {
+    let cells = space.cells.get();
+    let (handle, rx, tombstones, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms);
     let allocator = Arc::clone(&handle);
     let persisted = Arc::clone(&handle.persisted_epoch);
     let board = Arc::clone(&handle.recovery);
@@ -1237,7 +1617,7 @@ pub fn spawn(
             }
         })
         .expect("spawn control thread");
-    handle
+    (handle, issuers)
 }
 
 /// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
@@ -1548,5 +1928,263 @@ mod drop_tombstone_tests {
         assert_eq!(verdict.get(), None, "unset until the writer ran");
         verdict.set(CreateOutcome::NameExists);
         assert_eq!(verdict.get(), Some(CreateOutcome::NameExists));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
+
+    use inf_foundation::{CellCount, CellId, SLOT_COUNT};
+
+    use super::{
+        BoardObservation, BoardSweep, CkptBoard, CkptSlot, CkptSpace, CkptTarget, ControlHandle,
+        SweepStep,
+    };
+
+    fn cells(count: u16) -> CellCount {
+        CellCount::new(count).expect("a valid test topology")
+    }
+
+    fn headroom(units: u64) -> NonZeroU64 {
+        NonZeroU64::new(units).expect("nonzero")
+    }
+
+    /// The pre-change folds, one whole-board pass at one instant: the
+    /// control leg's reference. The sum is the pre-fix `u64` fold with its
+    /// release behaviour (it wrapped), kept as the alias canary.
+    fn old_fold(board: &CkptBoard) -> (u64, u64, u64) {
+        let min = board.cells.iter().map(CkptSlot::published).min().unwrap_or(0);
+        let sum = board.cells.iter().map(CkptSlot::published).fold(0u64, u64::wrapping_add);
+        let max = board.cells.iter().map(CkptSlot::last_unix_ms).max().unwrap_or(0);
+        (min, sum, max)
+    }
+
+    /// The alias oracle: a wake signal equal to the initial state after a
+    /// publication hides the publication.
+    fn aliases_the_initial_state(signal: u128) -> bool {
+        signal == 0
+    }
+
+    /// Steps `sweep` until it completes; returns the steps taken.
+    fn complete_sweep(board: &CkptBoard, sweep: &mut BoardSweep) -> (u32, SweepStep) {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match board.sweep_step(sweep) {
+                SweepStep::InProgress => {}
+                done @ (SweepStep::Unchanged | SweepStep::Progressed) => return (steps, done),
+            }
+        }
+    }
+
+    /// ADR-0159 D1, A1.2 (every issue is nonzero and above every earlier
+    /// one of its boot), through the A1.5 seam: every credit of a 2-cell
+    /// boot — both cells' quotas, the host's and both final credits —
+    /// issues a distinct, increasing, nonzero epoch, the drive reaches
+    /// `u64::MAX` exactly (engagement), and past it every reservation is a
+    /// typed refusal: no issue can wrap or panic.
+    #[test]
+    fn ckpt_issue_at_u64_max_never_repeats() {
+        let space = CkptSpace::with_headroom(cells(2), headroom(2)).expect("fits");
+        let (handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        assert_eq!(handle.ckpt_last_issued(), u64::MAX - (3 * 2 + 2), "(N + 1)·h + N below");
+        let mut ledger = BTreeSet::new();
+        let mut previous = handle.ckpt_last_issued();
+        let mut record = |epoch: u64| {
+            assert!(epoch > previous, "epoch {epoch} is not above {previous}");
+            assert!(ledger.insert(epoch), "epoch {epoch} repeats");
+            previous = epoch;
+        };
+        let mut host = issuers.host;
+        while let Ok(epoch) = host.request(CkptTarget::All) {
+            record(epoch.get());
+        }
+        let mut finals = Vec::new();
+        for (cell, issuer) in issuers.cells.into_iter().enumerate() {
+            let mut quota = issuer.quota;
+            let target = CkptTarget::Cell(CellId(cell as u16));
+            while let Ok(epoch) = quota.request(target) {
+                record(epoch.get());
+            }
+            assert!(quota.reserve::<1>().is_err(), "an exhausted quota refuses");
+            finals.push(issuer.final_credit);
+        }
+        for final_credit in finals {
+            record(final_credit.issue().get());
+        }
+        assert_eq!(handle.ckpt_last_issued(), u64::MAX, "the drive reached the top");
+        assert_eq!(ledger.len(), 8);
+        assert!(host.request(CkptTarget::All).is_err(), "past the top, only refusals");
+        let board = handle.ckpt_board();
+        assert_eq!(board.requested(1), u64::MAX, "cell 1's final request is the last epoch");
+    }
+
+    /// ADR-0159 D4 (observed sums cannot wrap): two publications at 2^63
+    /// fold to 2^64 in the sweep's `u128` sum — a change from the initial
+    /// observation, so the wake fires.
+    #[test]
+    fn published_sum_at_2_pow_63_is_not_the_initial_state() {
+        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let board = handle.ckpt_board();
+        board.slot(0).publish(1 << 63, 1, 1);
+        board.slot(1).publish(1 << 63, 1, 1);
+        let mut sweep = BoardSweep::new();
+        assert_eq!(board.sweep_step(&mut sweep), SweepStep::Progressed, "the wake fires");
+        assert_eq!(sweep.observed().published_sum, 1 << 64);
+        assert!(!aliases_the_initial_state(sweep.observed().published_sum));
+    }
+
+    /// Canary: the pre-fix `u64` fold aliases the initial state at
+    /// 2^63 + 2^63, and the alias oracle sees it.
+    #[test]
+    fn canary_the_u64_fold_aliases_the_initial_state() {
+        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let board = handle.ckpt_board();
+        board.slot(0).publish(1 << 63, 1, 1);
+        board.slot(1).publish(1 << 63, 1, 1);
+        let (_, old_sum, _) = old_fold(board);
+        assert!(aliases_the_initial_state(u128::from(old_sum)), "the alias canary must go red");
+    }
+
+    /// A1.2: one cell's exhausted quota never stops another cell's.
+    #[test]
+    fn one_exhausted_quota_leaves_the_others_reserving() {
+        let space = CkptSpace::with_headroom(cells(2), headroom(1)).expect("fits");
+        let (_handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        let mut quotas = issuers.cells.into_iter().map(|issuer| issuer.quota);
+        let (mut first, mut second) = (quotas.next().expect("cell 0"), quotas.next().expect("1"));
+        assert!(first.request(CkptTarget::All).is_ok());
+        assert!(first.request(CkptTarget::All).is_err(), "cell 0 is exhausted");
+        assert!(second.request(CkptTarget::All).is_ok(), "cell 1 still reserves");
+    }
+
+    /// The observer at the topology limit (ADR-0159 D4, A1.4): 256
+    /// turns of at most 64 visits per sweep, and a publication made at
+    /// any point is observed within two completed sweeps.
+    #[test]
+    fn a_full_board_sweeps_in_256_bounded_turns_and_sees_an_advance_within_two() {
+        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let board = handle.ckpt_board();
+        let mut sweep = BoardSweep::new();
+        let mut turns = 0u32;
+        loop {
+            let before = sweep.visits();
+            let step = board.sweep_step(&mut sweep);
+            turns += 1;
+            assert!(sweep.visits() - before <= 64, "A1.4: at most 64 visits per turn");
+            if step != SweepStep::InProgress {
+                break;
+            }
+        }
+        assert_eq!(turns, 256, "ceil(16,384 / 64) turns per sweep");
+        assert_eq!(sweep.sweeps_completed(), 1);
+        // Publish behind the cursor, part-way into a sweep: the sweep in
+        // progress misses it, the next one sees it.
+        for _ in 0..100 {
+            board.sweep_step(&mut sweep);
+        }
+        board.slot(3).publish(7, 1, 1_000);
+        let seen_within = observed_within(board, &mut sweep, 512, |board, sweep| {
+            board.sweep_step(sweep);
+        });
+        assert!(seen_within.is_some(), "an advance is observed within two sweeps");
+    }
+
+    /// Canary: a stalled observer. The liveness counter stays flat and
+    /// the two-sweep oracle goes red.
+    #[test]
+    fn canary_a_stalled_sweep_is_caught() {
+        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let board = handle.ckpt_board();
+        let mut sweep = BoardSweep::new();
+        board.slot(3).publish(7, 1, 1_000);
+        let seen = observed_within(board, &mut sweep, 512, |_, _| {});
+        assert!(seen.is_none(), "the stalled-sweep canary must go red");
+        assert_eq!(sweep.visits(), 0, "the liveness counter shows the stall");
+    }
+
+    /// Turns until the sweep's observation carries a nonzero sum, up to
+    /// `turns_max`.
+    fn observed_within(
+        board: &CkptBoard,
+        sweep: &mut BoardSweep,
+        turns_max: u32,
+        step: impl Fn(&CkptBoard, &mut BoardSweep),
+    ) -> Option<u32> {
+        (1..=turns_max).find(|_| {
+            step(board, sweep);
+            sweep.observed().published_sum != 0
+        })
+    }
+
+    /// The control leg (ADR-0159 D4): at `N <= 64` one MAINTAIN completes a
+    /// sweep, and its observation equals the pre-change fold over the same
+    /// board state — `WAIT`, DROP pacing and the INFO gauge are unchanged.
+    #[test]
+    fn at_64_cells_or_fewer_one_step_equals_the_old_fold() {
+        for count in [1u16, 2, 7, 64] {
+            let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
+            let board = handle.ckpt_board();
+            for cell in 0..count {
+                let epoch = u64::from(cell) * 7 + 3;
+                board.slot(cell).publish(epoch, 1, 1_000 + u64::from(cell) * 13 % 50);
+            }
+            let mut sweep = BoardSweep::new();
+            let (steps, _) = complete_sweep(board, &mut sweep);
+            assert_eq!(steps, 1, "one turn at {count} cells");
+            let (min, sum, max) = old_fold(board);
+            let observed = sweep.observed();
+            assert_eq!(observed.min_published, min);
+            assert_eq!(observed.published_sum, u128::from(sum));
+            assert_eq!(observed.max_unix_ms, max);
+        }
+    }
+
+    /// ADR-0159 A1.4: with the sweep stalled, a `WAIT CELL 1`'s
+    /// confirmation raises this cell's `LASTSAVE` floor to slot 1's
+    /// publication second.
+    #[test]
+    fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
+        let (lastsave, published_ms) = wait_cell_then_lastsave(true);
+        assert!(lastsave >= published_ms / 1000, "LASTSAVE {lastsave} trails the WAIT");
+    }
+
+    /// Canary: the observation-only read, without the floor, trails.
+    #[test]
+    fn canary_lastsave_without_the_floor_trails_the_wait() {
+        let (lastsave, published_ms) = wait_cell_then_lastsave(false);
+        assert!(lastsave < published_ms / 1000, "the no-floor canary must go red");
+    }
+
+    /// A 2-cell board whose sweep never steps; cell 0 waits on `CELL 1`.
+    fn wait_cell_then_lastsave(with_floor: bool) -> (u64, u64) {
+        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
+        let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
+        let board = handle.ckpt_board();
+        assert_eq!(board.requested(1), epoch.get());
+        assert_eq!(board.requested(0), 0, "a targeted request reaches one slot");
+        let published_ms = 1_700_000_123_456;
+        assert!(board.slot(1).covered_at(epoch).is_none(), "not yet published");
+        board.slot(1).publish(epoch.get(), 9, published_ms);
+        let floor_ms = board.slot(1).covered_at(epoch).expect("published");
+        let stalled = BoardSweep::new().observed();
+        assert_eq!(stalled, BoardObservation::default());
+        let lastsave = stalled.lastsave_unix_s(if with_floor { floor_ms } else { 0 });
+        (lastsave, published_ms)
+    }
+
+    /// A1.1 from the embedded assembly path: the constructors take only a
+    /// `CellCount`, whose constructor refuses `SLOT_COUNT + 1`, and the
+    /// largest topology builds.
+    #[test]
+    fn the_embedded_assembly_refuses_a_cell_past_the_slot_count() {
+        assert!(CellCount::new(SLOT_COUNT + 1).is_err());
+        let (handle, _inbox, issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        assert_eq!(handle.ckpt_board().cell_count(), usize::from(SLOT_COUNT));
+        assert_eq!(issuers.cells.len(), usize::from(SLOT_COUNT));
+        assert!(issuers.host.remaining() >= 1 << 49, "Q >= 2^49 at 16,384 cells (A1.2)");
     }
 }

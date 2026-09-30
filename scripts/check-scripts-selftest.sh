@@ -477,6 +477,38 @@ expect red "canaries: a plain run that never ran the named test is not green" en
 expect red "canaries: an empty row table is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-empty-rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite" >"$work/canary-short-row"
 expect red "canaries: a malformed crate-test row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
+# stub answers only when it sees it, so a driver that dropped the cfg is
+# red for another reason, never a catch.
+loom_fixture() {
+    local name=$1 planted=$2 plain=$3 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "loom_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir"
+    echo "inf_canary_fixture loom fake the_row" >"$dir/rows"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'case "${RUSTFLAGS:-}" in'
+        echo '  *"--cfg loom"*inf_canary_fixture*)'
+        echo "$planted"
+        echo '  ;;'
+        echo '  "--cfg loom")'
+        echo "$plain"
+        echo '  ;;'
+        echo '  *) echo "error[E0433]: use of undeclared crate loom"; exit 101 ;;'
+        echo 'esac'
+    } >"$dir/cargo"
+    chmod +x "$dir/cargo"
+    echo "$dir"
+}
+dir=$(loom_fixture loom-caught "$failed_line" "$ok_line")
+expect green "canaries: a loom model FAILED on the planted build, ok on the plain loom one" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(loom_fixture loom-toothless "$ok_line" "$ok_line")
+expect red "canaries: a loom model that stays green when planted is NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(loom_fixture loom-no-control "$failed_line" "$failed_line")
+expect red "canaries: a loom model red on the plain loom build is no control leg" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture loom fake" >"$work/canary-short-loom-row"
+expect red "canaries: a malformed loom row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
 
 # --------------------------------------------------- release-assert inventory
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and

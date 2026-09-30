@@ -1441,6 +1441,9 @@ pub(crate) struct Node {
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
     inbox: ControlInbox,
+    /// The control writer's checkpoint quota, held by this host after
+    /// construction (ADR-0159 A1.2): the harness's direct requests.
+    pub(crate) ckpt_host: inf_server::CkptQuota,
     data_dir: PathBuf,
     /// ADR-0103 (the `m2-ns-create-window` scenario): while set, `step`
     /// skips the control-inbox drain — the catalog swap is "in flight"
@@ -1474,13 +1477,19 @@ pub(crate) fn boot(
         "harness: the write-vs-fsync reorder window is closed on this disk (F-L04-06) — \
          arm StallConfig::write_reorder() or the m2 stall device"
     );
+    // ADR-0159 A1.1: the DST host takes the checked cell count too.
+    let cell_count = inf_foundation::CellCount::new(scenario.cells).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--cells {e}"))
+    })?;
     let catalog = load_catalog_from(disk, &data_dir)?;
-    let (control, inbox) = inf_server::ControlHandle::detached_with_catalog(
+    let (control, inbox, issuers) = inf_server::ControlHandle::detached_with_catalog(
         catalog.as_ref(),
-        scenario.cells,
+        cell_count,
         // Virtual boot instant (ms): control-plane display only.
         clock.now().as_millis(),
     );
+    let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
+    let mut cell_issuers = cell_issuers.into_iter();
     let fabrics = Mesh::new(scenario.cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
     let mut nets = Vec::new();
     let mut cells = Vec::new();
@@ -1542,7 +1551,12 @@ pub(crate) fn boot(
             fill: scenario.fill,
             group: scenario.group,
         };
-        plane.set_control(std::sync::Arc::clone(&control));
+        let issuer = cell_issuers.next().ok_or_else(|| {
+            std::io::Error::other("the partition minted one checkpoint issuer per cell")
+        })?;
+        plane
+            .set_control(std::sync::Arc::clone(&control), issuer)
+            .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
         let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config);
@@ -1554,6 +1568,7 @@ pub(crate) fn boot(
         nets,
         control,
         inbox,
+        ckpt_host,
         data_dir,
         hold_inbox: false,
         frozen: None,

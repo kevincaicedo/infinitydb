@@ -346,28 +346,35 @@ pub static DECLARED: &[Declared] = &[
          OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave \
          the node `maxmemory` comparison — the node budget bounds the pool, numbered dbs + \
          budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys \
-         typed (tiered budgets belong to `MEM-BUDGET`)",
+         typed (tiered budgets belong to `MEM-BUDGET`). A durable `CREATE`/`DROP` reserves two \
+         checkpoint units of its cell's quota before any effect; an exhausted quota answers \
+         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2)",
     ),
     d(
         "INF.CKPT",
         Status::Extension,
         "M2",
         "checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new \
-         MANIFEST is durable — no fork, per-cell timing (ADR-0021)",
+         MANIFEST is durable — no fork, per-cell timing (ADR-0021); each request spends one unit \
+         of its cell's checkpoint quota, and an exhausted quota answers \
+         `-ERR checkpoint identity space exhausted` before any request (ADR-0159 A1.2)",
     ),
     d(
         "BGSAVE",
         Status::Partial,
         "M2",
         "maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and \
-         moot; reply byte-identical; memory-only nodes answer a documented error",
+         moot; reply byte-identical; memory-only nodes answer a documented error; an exhausted \
+         checkpoint quota answers `-ERR checkpoint identity space exhausted` (ADR-0159 A1.2)",
     ),
     d(
         "LASTSAVE",
         Status::Partial,
         "M2",
-        "unix seconds of the newest durable MANIFEST publication; 0 before the first \
-         (Redis reports process-start time); loading flag docs-derived, not capture-verified",
+        "unix seconds of the newest durable MANIFEST publication this cell has observed; 0 \
+         before the first (Redis reports process-start time); the observation can trail the \
+         board by up to two bounded sweeps, except after a `WAIT` on the same cell (ADR-0159 \
+         A1.4); loading flag docs-derived, not capture-verified",
     ),
     d(
         "INF.TAKE",

@@ -64,8 +64,10 @@ fn start_node(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let control =
-        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), 1, boot_unix_ms);
+    let one_cell = inf_foundation::CellCount::new(1).expect("one cell");
+    let (control, issuers) =
+        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms);
+    let issuer = issuers.cells.into_iter().next().expect("one cell's issuer");
     let dir = data_dir.to_path_buf();
     let fabric = Mesh::new(1, MeshConfig { ring_capacity: 1024, data_credits: 256 })
         .into_iter()
@@ -105,7 +107,7 @@ fn start_node(
             NoopObserver,
             false,
         );
-        plane.set_control(Arc::clone(&board));
+        plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
         let config =
             LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };

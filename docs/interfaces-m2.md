@@ -35,7 +35,7 @@ Formats defined by ADR-0011 unless noted.
 | Durable plane over `SegmentFs` (generic) | `inf-server` | implemented (M2-S19, ADR-0021 D1 — `ServerPlane<O, F = StdSegmentFs>`, `DurableCell/CkptCell/ManifestCell/BootRecovery<F>`; `begin_recovery(fs, …)`; monomorphized, zero std-tier change) |
 | Detached control plane (`ControlInbox`) | `inf-server` | implemented (M2-S19, ADR-0021 D2 — `ControlHandle::detached[_with_catalog]` + inline `drain(fs, dir)`: catalog swaps + unlinks inside the deterministic sim loop; `load_catalog_from<F>`) |
 | Durability oracle + sweep (`m2-durable`) | `inf-sim` | implemented (M2-S19, ADR-0021 D3-D5 — ack-stream oracle incl. the survival audit on taxonomy-refused boots; `--sweep/--shard/--out`; 10k-seed gate artifact green; `Plant::FsyncLies` canary) |
-| Checkpoint board (`CkptBoard`/`CkptSlot`) | `inf-server::control` | implemented (M2-S20, ADR-0021 D6 — per-cell request/publication epoch slots; publication at the MANIFEST swap's dir-fsync commit; aborted swaps retry after backoff so `WAIT` cannot hang) |
+| Checkpoint board (`CkptBoard`/`CkptSlot`) | `inf-server::control` | implemented (M2-S20, ADR-0021 D6 — per-cell request/publication epoch slots; publication at the MANIFEST swap's dir-fsync commit; aborted swaps retry after backoff so `WAIT` cannot hang. ADR-0159 A1: an all-cell request word beside the slots, requests issued only by partition credits, cells observe the board through a bounded sweep) |
 | `INF.CKPT`/`BGSAVE`/`LASTSAVE` | `inf-wire`/`inf-server` | implemented (M2-S20 — registry grew to 68 (hash multipliers re-searched); pump-routed `program_ckpt`; compat entries + deviations declared) |
 | Persistence counter set | `inf-log`/`inf-server`/`inf-bench` | implemented (M2-S21, ADR-0021 D7 — `INFO persistence` gains rates/percentiles/ages; the acks-per-fsync grouping tripwire is report-enforced in `gate-run m2` with a canary mode) |
 
@@ -883,20 +883,50 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
 - Checkpoint I/O failure **aborts the checkpoint, never the process**
   (milestone risk-table rule; deliberately narrower than §8.4 — nothing
   was acked against the checkpoint and the log stays authoritative).
-- Trigger v1 (ADR-0016 D7): cell-local `interval_bytes` threshold +
-  `ControlHandle::request_ckpt_all()` epoch (polled in MAINTAIN — the
-  persisted-epoch pattern). One checkpoint in flight per cell; triggers
-  latch, never stack. `INF.CKPT`/`BGSAVE` ride this at S20.
+- Trigger v1 (ADR-0016 D7): cell-local `interval_bytes` threshold + the
+  manual request epoch the cell owes, `CkptBoard::requested(cell)`
+  (polled in MAINTAIN — the persisted-epoch pattern). One checkpoint in
+  flight per cell; triggers latch, never stack. `INF.CKPT`/`BGSAVE` ride
+  this.
+- Manual requests are issued, never counted (ADR-0159 D1, A1):
+  - A boot's partition (`inf_foundation::issue`) mints `N + 1` quotas of
+    `floor((u64::MAX − N) / (N + 1))` units — one per cell, one for the
+    control writer — and one final credit per cell, over a `CellCount`
+    `N` (`1 ≤ N ≤ 16,384`). Only a credit advances the checkpoint clock,
+    so every epoch is nonzero and above every earlier one of its boot; the
+    clock cannot wrap.
+  - A program reserves every unit it will issue before its first effect,
+    from its own cell's quota: `INF.CKPT`/`BGSAVE` one, a durable
+    namespace `CREATE`/`DROP` two (tombstone pacing and cleanup). An
+    exhausted quota answers `-ERR checkpoint identity space exhausted`
+    and changes nothing; it is permanent for the boot. The control
+    writer's quota pays the boot tombstone restamp, then belongs to the
+    host (direct admin, test and simulator requests). A cell's final
+    credit issues its stop checkpoint, even past exhaustion.
+  - The epoch is assigned when the credit issues (late), then raised into
+    the all-cell request word or one cell's slot. Orderings (ADR-0159
+    A1.6): the issue is an `AcqRel` `fetch_add`; every write to the word or
+    a slot is a `Release` `fetch_max`; `requested(cell)` is the larger of
+    two `Acquire` loads. An effect that happens before the issue of `e`
+    happens before every checkpoint begun after a load of
+    `requested(cell) ≥ e`. Loom checks it on the same types.
+  - Cells never fold the whole board. Each cell sweeps it, at most 64 slots
+    per MAINTAIN turn (`limits::CKPT_BOARD_VISITS_PER_TURN`, one Maintenance
+    unit, MAINTAIN's first budgeted step), folding the minimum, a `u128`
+    sum and the newest publication time; a completed sweep publishes its
+    observation, and a changed sum wakes the parked `WAIT`s. All-cell
+    `WAIT` and DROP pacing read the observation's minimum (a lower bound,
+    never early); `WAIT CELL k` reads slot `k`. `LASTSAVE` and
+    `rdb_last_save_time` read the observation, and a `WAIT CELL k`
+    raises the waiting cell's `LASTSAVE` floor to the time it confirmed —
+    so `LASTSAVE` can trail the board by up to two sweeps, except after a
+    `WAIT` on the same cell. The catalog writer alone folds the whole board
+    (tombstone retirement, one pass per persist on the control thread).
 
-  > **Accepted 2026-09-21/23, implementation open — ADR-0145, ADR-0159:**
+  > **Accepted 2026-09-21, implementation open — ADR-0145:**
   > [ADR-0145](../../docs/adr/0145-bounded-relocation-pressure-checkpoints.md)
   > adds a typed `RelocationPressure` cause beside Manual and Interval;
-  > `interval_bytes = 0` now disables only the Interval cause.
-  > [ADR-0159](../../docs/adr/0159-reserved-checkpoint-issuance-and-bounded-observation.md)
-  > replaces the infallible `request_ckpt_all()` with reserved issuance
-  > credits (typed `CheckpointExhausted` before effects), late epoch
-  > assignment, per-cell protected final credits and an overflow-free
-  > bounded observer that no longer sums epochs into `u64`. Neither is built.
+  > `interval_bytes = 0` now disables only the Interval cause. Not built.
 
 ### `.ick` container v3 (M4.5-S36 — ADR-0088 D3) — aligned blocks, direct writes
 
@@ -1413,9 +1443,11 @@ per episode). A drained cell always seals — never slower than K = 1.
      into every payload and drops any entry a tombstone names (replica
      lag from a concurrent DDL — ids never reuse). A tombstone is added
      by a durable namespace's `DROP`, stamped with the node-wide
-     checkpoint epoch the origin requests after the fan, and retired at
-     the next persist once `CkptBoard::min_published` covers it; boot
-     re-stamps survivors with one fresh request. Bound `DROPPED_NS_MAX
+     checkpoint epoch the origin requests after the fan (the cleanup unit
+     the `DROP` reserved before any effect, ADR-0159 D2), and retired at
+     the next persist once every cell's published epoch covers it; boot
+     re-stamps survivors with one fresh request on the control writer's
+     quota. Bound `DROPPED_NS_MAX
      = 256` — at the cap the `DROP` waits for its checkpoint first.
   2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
      the persist epoch of the swap that drops the namespace; peers park

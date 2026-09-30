@@ -163,7 +163,7 @@ See [validation prerequisites](docs/validation.md).
 ```bash
 just compat       # byte-diff vs a local redis-server
 just sim-smoke    # deterministic simulator, trace-identity check
-just loom         # concurrency model-check of the SPSC ring
+just loom         # concurrency model-checks: the SPSC ring, checkpoint issuance
 ```
 
 ## Roadmap

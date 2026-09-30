@@ -280,9 +280,13 @@ pub(super) fn lift_regime_seed_checkpoint(
             }
         }
     }
-    let epoch = node.control.request_ckpt_all();
+    let epoch = node
+        .ckpt_host
+        .request(inf_server::CkptTarget::All)
+        .map_err(|_| "lift seed: the host's checkpoint quota is exhausted".to_string())?
+        .get();
     for _ in 0..STALL_STEPS {
-        if node.control.ckpt_board().min_published() >= epoch {
+        if node.inbox.ckpt_min_published() >= epoch {
             return Ok(());
         }
         node.step(rng, clock, disk, scenario.step_ns_max)

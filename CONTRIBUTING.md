@@ -115,7 +115,7 @@ cargo test --workspace
 Layer-specific checks, run them when you touch the relevant area:
 
 ```bash
-just loom           # SPSC-ring concurrency model-check (touching inf-fabric)
+just loom           # concurrency model-checks: SPSC ring, checkpoint issuance
 just compat         # Redis byte-diff suite (needs redis-server on PATH)
 just sim-smoke      # deterministic simulator trace-identity check
 cargo deny check    # dependency licenses/advisories

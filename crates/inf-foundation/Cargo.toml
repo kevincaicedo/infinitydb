@@ -18,6 +18,12 @@ fault-points = []
 # under a secret has no constructible collision — that is the point).
 collision-oracle = []
 
+# ADR-0159 A1.7: Loom replaces the `issue` module's atomics and `Arc` under
+# `RUSTFLAGS="--cfg loom"`; the dependency is never compiled into a normal
+# or shipping build.
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
 [lints]
 workspace = true
 

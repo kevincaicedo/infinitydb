@@ -281,6 +281,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         {
             return true;
         }
+        // ADR-0159 A1.4: a registered checkpoint waiter keeps the cell
+        // unparked until its sweep completes — at most one sweep of
+        // `ceil(N / 64)` unparked turns per wake.
+        if self.shared.ckpt_waiters.waiting() > 0 && self.shared.ckpt_sweep.borrow().in_progress() {
+            return true;
+        }
         let Some(flags) = &self.park_flags else { return false };
         let me = usize::from(self.shared.cell.0);
         flags[me].store(true, Ordering::Relaxed);
@@ -664,6 +670,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
     fn maintain(&mut self, cx: &mut LoopCx<'_>) {
         self.shared.now.set(cx.now);
         self.drive_stop();
+        // ---- checkpoint-board sweep (ADR-0159 D4, A1.4): MAINTAIN's first
+        // budgeted step, so nothing charged before it can starve it.
+        self.maintain_ckpt_sweep(cx);
         // ---- early fabric publish (M2.5-S21): remote ops staged during
         // EXECUTE become peer-visible NOW instead of at FABRIC-OUT (step
         // 8) — the peer drains them while this cell runs MAINTAIN/LOG/
@@ -966,10 +975,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
             let write_through_wanted = self.shared.store.borrow().has_always_namespace();
             cell.maintain(cx, write_through_wanted);
-            // Manual checkpoint requests ride the control handle (one
-            // relaxed load — the persisted-epoch pattern, ADR-0016 D7).
+            // Manual checkpoint requests: the larger of the all-cell word
+            // and this cell's slot (two Acquire loads, ADR-0159 A1.3/A1.6),
+            // edge-detected — the persisted-epoch pattern (ADR-0016 D7).
             if let Some(control) = self.shared.control.borrow().as_ref() {
-                let epoch = control.ckpt_board().slot(self.shared.cell.0).req();
+                let epoch = control.ckpt_board().requested(self.shared.cell.0);
                 if epoch != self.ckpt_epoch_seen {
                     self.ckpt_epoch_seen = epoch;
                     cell.request_ckpt(epoch);
@@ -1031,6 +1041,31 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// One MAINTAIN concern of `maintain`, in phase order: the
+    /// checkpoint-board sweep (ADR-0159 D4, A1.4). One step of at most
+    /// `CKPT_BOARD_VISITS_PER_TURN` slot visits, charged one Maintenance
+    /// unit. A completed sweep publishes the observation `WAIT`, DROP
+    /// pacing and `LASTSAVE` read; when any slot published since the last
+    /// one, the parked `INF.CKPT WAIT` pumps re-check their target (the
+    /// M2-S20 wake). The INFO gauge follows the observation.
+    fn maintain_ckpt_sweep(&mut self, cx: &mut LoopCx<'_>) {
+        let control = self.shared.control.borrow();
+        let Some(control) = control.as_ref() else { return };
+        if cx.budget(GroupClass::Maintenance) == 0 {
+            return;
+        }
+        let step = control.ckpt_board().sweep_step(&mut self.shared.ckpt_sweep.borrow_mut());
+        cx.charge(GroupClass::Maintenance, 1);
+        match step {
+            crate::control::SweepStep::InProgress | crate::control::SweepStep::Unchanged => {}
+            crate::control::SweepStep::Progressed => {
+                self.shared.ckpt_waiters.wake_all(0);
+            }
+        }
+        let observed = self.shared.ckpt_sweep.borrow().observed();
+        self.shared.node.rdb_last_save_ms.set(observed.max_unix_ms);
+    }
+
     /// One MAINTAIN concern of `maintain`, in phase order:
     ///  DDL persist wakes (ADR-0015 D3): one relaxed load per
     /// MAINTAIN; parked DDL pumps wake on epoch edges.
@@ -1048,16 +1083,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 self.shared.ddl_gen_seen.set(generation);
                 self.shared.ddl_waiters.wake_all(0);
             }
-            // ---- checkpoint-publication wakes (M2-S20): any cell's
-            // durable MANIFEST changes the board sum; parked INF.CKPT
-            // WAIT pumps re-check their target. Also the LASTSAVE gauge.
-            let board = control.ckpt_board();
-            let sum = board.published_sum();
-            if sum != self.shared.ckpt_pub_seen.get() {
-                self.shared.ckpt_pub_seen.set(sum);
-                self.shared.ckpt_waiters.wake_all(0);
-            }
-            self.shared.node.rdb_last_save_ms.set(board.max_unix_ms());
             self.shared.node.ns_drop_tombstones.set(control.drop_tombstones() as u64);
         }
     }

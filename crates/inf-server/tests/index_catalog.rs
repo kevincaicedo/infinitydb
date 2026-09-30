@@ -42,10 +42,14 @@ fn idx_spec(id: u32, generation: u64, name: &[u8]) -> IndexSpec {
     }
 }
 
+fn cell_count() -> inf_foundation::CellCount {
+    inf_foundation::CellCount::new(CELLS).expect("eight cells")
+}
+
 /// Eight cells' registries plus the control handle — the DDL fan's
 /// destination set, driven directly (S10 wires the wire-level verbs).
 fn fleet() -> (Vec<Keyspace>, std::sync::Arc<ControlHandle>, inf_server::ControlInbox) {
-    let (control, inbox) = ControlHandle::detached(CELLS, 0);
+    let (control, inbox, _issuers) = ControlHandle::detached(cell_count(), 0);
     let mut cells = Vec::new();
     for _ in 0..CELLS {
         let mut ks = Keyspace::new(StoreConfig::default());
@@ -177,7 +181,8 @@ fn declarations_survive_restart_through_the_meta_swap() {
 
     // "Reboot": load the catalog, re-seed control plane + a fresh cell.
     let loaded = load_catalog(&dir).expect("readable").expect("present");
-    let (control2, _inbox2) = ControlHandle::detached_with_catalog(Some(&loaded), CELLS, 0);
+    let (control2, _inbox2, _issuers2) =
+        ControlHandle::detached_with_catalog(Some(&loaded), cell_count(), 0);
     assert!(control2.next_index_id() > dropping_id.0, "ids never regress");
     assert!(control2.next_index_generation() > dropping_generation, "generations never regress");
     let mut fresh = Keyspace::new(StoreConfig::default());

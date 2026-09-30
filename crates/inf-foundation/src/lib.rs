@@ -2,7 +2,9 @@
 //!
 //! Types, ids, time/randomness injection seams (L7), stable hashing, CRC16
 //! slot math, varints, the always-on latency histogram, and the frozen
-//! tripwire counter names. This crate is dependency-free and fully safe.
+//! tripwire counter names, and lifetime identity issuance. This crate is
+//! dependency-free (Loom replaces `issue`'s atomics under `--cfg loom` only)
+//! and fully safe.
 #![forbid(unsafe_code)]
 // ADR-0144 D1: a production `match` names every variant of its enum.
 #![cfg_attr(
@@ -24,6 +26,7 @@ mod footprint;
 mod hash;
 mod hist;
 mod ids;
+pub mod issue;
 pub mod limits;
 mod local;
 pub mod rng;
@@ -41,5 +44,5 @@ pub use hash::{
     hash64, siphash13,
 };
 pub use hist::LogHistogram;
-pub use ids::{CellId, KeySlot, SLOT_COUNT};
+pub use ids::{CellCount, CellCountError, CellId, KeySlot, SLOT_COUNT};
 pub use local::{CachePadded, LocalCounter};

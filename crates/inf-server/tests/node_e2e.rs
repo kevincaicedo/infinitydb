@@ -94,6 +94,9 @@ struct Node {
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
     control: Option<Arc<inf_server::ControlHandle>>,
+    /// The control writer's checkpoint quota, which the host holds after
+    /// construction (ADR-0159 A1.2): the harness's direct requests.
+    ckpt_host: std::cell::RefCell<Option<inf_server::CkptQuota>>,
     /// A harness-driven catalog writer instead of the control thread
     /// (review of 2026-08-30, C14): the detached `ControlInbox` is drained
     /// by a harness thread only while `hold` is clear — the e2e form of
@@ -134,6 +137,7 @@ impl Node {
             None,
             Default::default(),
             Some(hold),
+            None,
         )
     }
 
@@ -182,6 +186,7 @@ impl Node {
             Some(default_ns.to_vec()),
             Default::default(),
             None,
+            None,
         )
     }
 
@@ -211,6 +216,33 @@ impl Node {
                 provenance: Default::default(),
             },
             None,
+            None,
+        )
+    }
+
+    /// A durable node whose checkpoint issuance space starts `(N + 1)·h + N`
+    /// below `u64::MAX` (ADR-0159 A1.5): `units` per quota, so the wire
+    /// reaches the last epochs and every quota's exhaustion.
+    fn start_durable_with_ckpt_headroom(
+        cells: u16,
+        data_dir: &std::path::Path,
+        units: u64,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
         )
     }
 
@@ -418,6 +450,7 @@ impl Node {
             None,
             Default::default(),
             None,
+            None,
         )
     }
 
@@ -436,6 +469,7 @@ impl Node {
         default_ns: Option<Vec<u8>>,
         device: inf_server::DeviceConfig,
         held_catalog: Option<Arc<AtomicBool>>,
+        ckpt_headroom: Option<std::num::NonZeroU64>,
     ) -> Node {
         let stop = Arc::new(AtomicBool::new(false));
         let mut process_sampler = inf_server::ProcessSampler::default();
@@ -460,23 +494,30 @@ impl Node {
         let fabrics = Mesh::new(cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
         // Catalog before cells (ADR-0015 D3): the id→definition map must
         // exist before any cell replays records that name ids.
+        // ADR-0159 A1.5: a test may start the checkpoint clock near the top
+        // of its space; production and every other test use the full split.
+        let cell_count = inf_foundation::CellCount::new(cells).expect("a valid test topology");
+        let space = match ckpt_headroom {
+            None => inf_server::CkptSpace::full(cell_count),
+            Some(h) => inf_server::CkptSpace::with_headroom(cell_count, h).expect("space fits"),
+        };
         let boot = data_dir.map(|dir| {
             let catalog = inf_server::load_catalog(&dir).expect("readable catalog");
             let boot_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let control = match &held_catalog {
+            let (control, issuers) = match &held_catalog {
                 None => {
-                    inf_server::spawn_control(dir.clone(), catalog.as_ref(), cells, boot_unix_ms)
+                    inf_server::spawn_control_in(dir.clone(), catalog.as_ref(), space, boot_unix_ms)
                 }
                 Some(hold) => {
                     // The sim's detached writer, driven by a harness
                     // thread that honours `hold` — same `prepare_persist`,
                     // same on-disk swap, no control thread.
-                    let (control, mut inbox) = inf_server::ControlHandle::detached_with_catalog(
+                    let (control, mut inbox, issuers) = inf_server::ControlHandle::detached_in(
                         catalog.as_ref(),
-                        cells,
+                        space,
                         boot_unix_ms,
                     );
                     let hold = Arc::clone(hold);
@@ -498,11 +539,17 @@ impl Node {
                         })
                     };
                     catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
-                    control
+                    (control, issuers)
                 }
             };
-            (dir, catalog, control)
+            ((dir, catalog, control), issuers)
         });
+        let (boot, ckpt_host, mut cell_issuers) = match boot {
+            Some((boot, inf_server::CkptIssuers { host, cells })) => {
+                (Some(boot), Some(host), cells.into_iter().map(Some).collect::<Vec<_>>())
+            }
+            None => (None, None, Vec::new()),
+        };
         let mut handles = Vec::new();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
             let process_board = process_sampler.board();
@@ -512,6 +559,7 @@ impl Node {
             let quiet = Arc::clone(&quiet);
             let drained = Arc::clone(&drained);
             let boot = boot.clone();
+            let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
             let default_ns = default_ns.clone();
             handles.push(std::thread::spawn(move || {
@@ -575,7 +623,8 @@ impl Node {
                 if let Some((cfg, control)) = durable {
                     // Loop-resident recovery (M2-S15): the cell serves
                     // -LOADING while MAINTAIN replays its log.
-                    plane.set_control(control);
+                    let issuer = issuer.expect("one checkpoint issuer per cell");
+                    plane.set_control(control, issuer).expect("the issuer of this cell");
                     plane.begin_recovery(
                         inf_server::StdSegmentFs,
                         &cfg,
@@ -631,6 +680,7 @@ impl Node {
             drained,
             handles,
             control,
+            ckpt_host: std::cell::RefCell::new(ckpt_host),
             catalog_pump,
             process_sampler: std::cell::RefCell::new(process_sampler),
         };
@@ -655,6 +705,14 @@ impl Node {
             }
         }
         node
+    }
+
+    /// A direct all-cell checkpoint request on the host's quota (the
+    /// surface `INF.CKPT` rides): the harness's manual trigger.
+    fn request_ckpt_all(&self) -> u64 {
+        let mut host = self.ckpt_host.borrow_mut();
+        let host = host.as_mut().expect("a durable node");
+        host.request(inf_server::CkptTarget::All).expect("the host's quota holds a unit").get()
     }
 
     fn connect(&self) -> TcpStream {
@@ -3064,7 +3122,7 @@ fn drive_paced_ckpt_with_pump(
     timeout: Duration,
 ) -> u32 {
     let before = scrape_u64(probe, b"persistence", "ckpts_completed:");
-    node.control.as_ref().expect("durable node").request_ckpt_all();
+    node.request_ckpt_all();
     let deadline = Instant::now() + timeout;
     let mut pumped = 0u32;
     loop {
@@ -4030,7 +4088,7 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     // Manual trigger (the surface INF.CKPT rides at S20), then keep
     // writing while the walker streams — the dirty-under-checkpoint shape
     // on the real path.
-    node.control.as_ref().expect("durable node").request_ckpt_all();
+    node.request_ckpt_all();
     let deadline = Instant::now() + Duration::from_secs(20);
     let info = loop {
         for i in 0..20 {
@@ -4604,7 +4662,7 @@ fn ckpt_slice_budget_rehearsal() {
 
     // Trigger, then hammer GETs and sample per-request latency until the
     // checkpoint completes.
-    node.control.as_ref().expect("durable").request_ckpt_all();
+    node.request_ckpt_all();
     let ckpt_started = Instant::now();
     let mut max_get_us = 0u128;
     let mut gets = 0u64;
@@ -5080,6 +5138,246 @@ fn inf_ckpt_cell_targets_one_cell() {
     let err = read_line(&mut c);
     assert!(err.starts_with(b"-ERR CELL"), "{err:?}");
 
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The refusal every checkpoint producer answers once its cell's quota is
+/// exhausted (ADR-0159 A1.2, `IdentityExhausted(Checkpoint)`), byte-exact.
+const CKPT_EXHAUSTED_REPLY: &[u8] = b"-ERR checkpoint identity space exhausted\r\n";
+
+/// What a refused checkpoint producer must leave unchanged (ADR-0159 D1:
+/// refused before effects, existing state unchanged), read by the harness
+/// from the disk, the wire and the control handle.
+#[derive(Debug, PartialEq, Eq)]
+struct CkptProducerSnapshot {
+    meta_bytes: Vec<u8>,
+    listings: Vec<Vec<u8>>,
+    next_ns_id: u32,
+    persisted_epoch: u64,
+    drop_tombstones: usize,
+    requested: Vec<u64>,
+    published: Vec<u64>,
+}
+
+fn ckpt_producer_snapshot(node: &Node, dir: &std::path::Path) -> CkptProducerSnapshot {
+    let control = node.control.as_ref().expect("a durable node");
+    let board = control.ckpt_board();
+    let mut listings = Vec::new();
+    for cell in 0..node.cells {
+        let mut c = conn_on_cell(node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"LIST"])).expect("write");
+        listings.push(read_frame(&mut c));
+    }
+    CkptProducerSnapshot {
+        meta_bytes: std::fs::read(dir.join(inf_log::meta::META_FILE)).unwrap_or_default(),
+        listings,
+        next_ns_id: control.next_ns_id(),
+        persisted_epoch: control.persisted_epoch(),
+        drop_tombstones: control.drop_tombstones(),
+        requested: (0..node.cells).map(|cell| board.requested(cell)).collect(),
+        published: (0..node.cells).map(|cell| board.slot(cell).published()).collect(),
+    }
+}
+
+/// ADR-0159 A1.5 driven over the wire (1 cell, 3 units per quota): the
+/// last epochs of the space serve `WAIT`; a durable DROP or CREATE whose
+/// cell holds fewer than its two units is refused byte-exact and changes
+/// nothing, while a memory-mode CREATE (no unit) still answers `+OK`;
+/// `INF.CKPT` spends the last unit, after which `INF.CKPT` and `BGSAVE`
+/// are refused the same way; the graceful stop still publishes its
+/// checkpoint on the final credit, and a restart serves the namespace.
+#[test]
+fn ckpt_identity_exhaustion_refuses_before_effects_and_the_stop_still_publishes() {
+    let dir = temp_data_dir("ckptexhaust");
+    let node = Node::start_durable_with_ckpt_headroom(1, &dir, 3);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let mut c = node.connect();
+    // CREATE reserves its two units: one is left.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"keep", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"keep"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // A DROP needs two units: refused before any effect.
+    let before = ckpt_producer_snapshot(&node, &dir);
+    let mut d = node.connect();
+    d.write_all(&cmd(&[b"INF.NS", b"DROP", b"keep"])).expect("write");
+    read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused DROP changed state");
+    // So does a durable CREATE: refused before its namespace id is taken.
+    d.write_all(&cmd(&[b"INF.NS", b"CREATE", b"more", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused CREATE changed state");
+    // A memory-mode CREATE reserves no unit: it serves on the same cell,
+    // and the snapshot oracle sees it (engagement for the CREATE arm).
+    d.write_all(&cmd(&[b"INF.NS", b"CREATE", b"scratch", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut d, b"+OK\r\n");
+    assert_ne!(ckpt_producer_snapshot(&node, &dir), before, "the oracle missed a CREATE");
+    // The one unit left: `INF.CKPT WAIT` at the top of the space.
+    let completed = scrape_u64(&mut d, b"persistence", "ckpts_completed:");
+    d.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut d, b"+OK\r\n");
+    assert!(scrape_u64(&mut d, b"persistence", "ckpts_completed:") > completed);
+    let top = control.ckpt_last_issued();
+    assert!(top >= u64::MAX - 7, "engagement: the drive reached the last epochs ({top})");
+    assert!(control.ckpt_board().slot(0).published() >= top, "WAIT fenced its publication");
+    let before = ckpt_producer_snapshot(&node, &dir);
+    for refused in [&[&b"INF.CKPT"[..]][..], &[b"BGSAVE"], &[b"INF.CKPT", b"WAIT"]] {
+        d.write_all(&cmd(refused)).expect("write");
+        read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    }
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused INF.CKPT changed state");
+    drop((c, d));
+    node.stop_gracefully();
+    let final_epoch = control.ckpt_last_issued();
+    assert!(final_epoch > top, "the stop issued its final credit past exhaustion");
+    assert!(control.ckpt_board().slot(0).published() >= final_epoch, "the stop published");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"keep"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Canary: the snapshot oracle, run on a DROP that succeeds, must see the
+/// difference (otherwise the refusal check above proves nothing).
+#[test]
+fn canary_the_snapshot_oracle_sees_a_drop_that_succeeds() {
+    let dir = temp_data_dir("ckptsnapcanary");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"gone", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let before = ckpt_producer_snapshot(&node, &dir);
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"gone"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    assert_ne!(ckpt_producer_snapshot(&node, &dir), before, "the snapshot canary must go red");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 D4 at the top of the space (2 cells): both slots publish
+/// epochs near `u64::MAX`, so the published sum passes 2^64 — `WAIT`
+/// returns only after both cells' checkpoints complete, and the sweep's
+/// wake is not lost to a wrapped sum.
+#[test]
+fn ckpt_wait_at_the_top_of_the_space_returns_after_both_cells_publish() {
+    let dir = temp_data_dir("ckpttopwait");
+    let node = Node::start_durable_with_ckpt_headroom(2, &dir, 2);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let mut cells = [conn_on_cell(&node, 0), conn_on_cell(&node, 1)];
+    let completed: Vec<u64> =
+        cells.iter_mut().map(|c| scrape_u64(c, b"persistence", "ckpts_completed:")).collect();
+    for round in 0..2 {
+        cells[0].write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut cells[0], b"+OK\r\n");
+        for (cell, c) in cells.iter_mut().enumerate() {
+            let now = scrape_u64(c, b"persistence", "ckpts_completed:");
+            assert!(now > completed[cell] + round, "cell {cell} checkpointed before WAIT returned");
+        }
+    }
+    let board = control.ckpt_board();
+    let sum = u128::from(board.slot(0).published()) + u128::from(board.slot(1).published());
+    assert!(sum >= 1 << 64, "engagement: the published sum passed 2^64 ({sum})");
+    drop(cells);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 A1.2 at the wire (2 cells, 1 unit each): one cell's quota
+/// exhausted, the other cell still answers `+OK`.
+#[test]
+fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
+    let dir = temp_data_dir("ckptpercell");
+    let node = Node::start_durable_with_ckpt_headroom(2, &dir, 1);
+    let mut first = conn_on_cell(&node, 0);
+    let mut second = conn_on_cell(&node, 1);
+    first.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut first, b"+OK\r\n");
+    first.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut first, CKPT_EXHAUSTED_REPLY);
+    second.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut second, b"+OK\r\n");
+    drop((first, second));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 D3 at the wiring seam: a cell's stop credit raises its own
+/// slot and its stop waits on that slot, so a plane accepts only the
+/// issuer minted for its cell. Another cell's issuer is refused with
+/// nothing wired and comes back in the error; its own cell accepts it.
+#[test]
+fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = |cell: u16| {
+        let listener = listen_reuseport(0).expect("listen");
+        ServerPlane::<NoopObserver, inf_server::StdSegmentFs>::new(
+            CellId(cell),
+            2,
+            listener.into_raw_fd(),
+            Keyspace::new(StoreConfig::default()),
+            fabrics.next().expect("one fabric per cell"),
+            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+            NoopObserver,
+            false,
+        )
+    };
+    let (mut first, mut second) = (plane(0), plane(1));
+    let mut issuers = issuers.cells.into_iter();
+    let (zero, one) = (issuers.next().expect("cell 0"), issuers.next().expect("cell 1"));
+    assert_eq!((zero.cell(), one.cell()), (CellId(0), CellId(1)), "minted in cell order");
+    let refused =
+        first.set_control(Arc::clone(&control), one).expect_err("cell 1's issuer on cell 0");
+    assert_eq!((refused.plane, refused.issuer.cell()), (CellId(0), CellId(1)));
+    second.set_control(Arc::clone(&control), refused.issuer).expect("custody came back");
+    first.set_control(control, zero).expect("cell 0's own issuer");
+}
+
+/// ADR-0159 A1.4 (2 cells): after `INF.CKPT CELL k WAIT` on one
+/// connection, `LASTSAVE` on the same connection is at or after the second
+/// the `WAIT` was sent — the waiting cell's floor covers the checkpoint
+/// the `WAIT` fenced even while its sweep trails the board.
+#[test]
+fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
+    let dir = temp_data_dir("ckptlastsave");
+    let node = Node::start_durable(2, &dir);
+    let mut c = conn_on_cell(&node, 0);
+    // Mid-second, and past every earlier publication's second.
+    let unix_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    let start_s = unix_ms() / 1000;
+    while unix_ms() / 1000 == start_s || unix_ms() % 1000 >= 500 {
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let sent_s = unix_ms() / 1000;
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"LASTSAVE"])).expect("write");
+    let line = read_line(&mut c);
+    let lastsave: u64 = std::str::from_utf8(&line[1..line.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("LASTSAVE answered {line:?}"));
+    assert!(lastsave >= sent_s, "LASTSAVE {lastsave} trails the WAIT sent at {sent_s}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

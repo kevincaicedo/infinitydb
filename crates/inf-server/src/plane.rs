@@ -102,7 +102,10 @@ use scatter::{
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
 use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
 
-use crate::control::{ControlHandle, RecoveryBoard};
+use crate::control::{
+    BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
+    IssuerCellMismatch, RecoveryBoard,
+};
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
@@ -341,8 +344,19 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// Last DDL-ticket generation MAINTAIN observed (ADR-0108 D1: a
     /// release wakes the pumps parked on the ticket).
     ddl_gen_seen: Cell<u64>,
-    /// Board published-sum at the last MAINTAIN (the ckpt-wake edge).
-    ckpt_pub_seen: Cell<u64>,
+    /// This cell's checkpoint quota (ADR-0159 A1.2): a producer reserves
+    /// every unit its program will issue before its first effect. Wired
+    /// with `control` by `set_control` (one call sets both); `None`
+    /// exactly when it is.
+    ckpt_quota: RefCell<Option<CkptQuota>>,
+    /// This cell's sweep of the checkpoint board (ADR-0159 D4, A1.4) and
+    /// its completed observation, which all-cell `WAIT`, DROP pacing,
+    /// `LASTSAVE` and the INFO gauge read. Stepped once per MAINTAIN.
+    ckpt_sweep: RefCell<BoardSweep>,
+    /// `LASTSAVE`'s floor (ADR-0159 A1.4, unix ms): the publication time
+    /// of every slot a `WAIT CELL k` on this cell confirmed, so a
+    /// `LASTSAVE` after it covers the checkpoint it fenced.
+    lastsave_floor_ms: Cell<u64>,
     /// Node is loading (M2-S15): commands without the LOADING flag answer
     /// `-LOADING` until every cell's recovery completes. One predictable
     /// `Cell<bool>` load on the command path; false forever after boot.
@@ -574,6 +588,9 @@ pub struct ServerPlane<
     /// keyspace-report walk is cheap but not free, so peers' `INFO`
     /// totals refresh on a coarse cadence instead of every iteration.
     memory_publish_in: u32,
+    /// This cell's stop-checkpoint credit (ADR-0159 D3) until a stop takes
+    /// it; wired with the control handle by `set_control`.
+    final_credit: Option<CkptFinalCredit>,
     /// The graceful stop (ADR-0124 D2); `None` while serving.
     stop: Option<StopDrive>,
     /// Take a checkpoint before the final sync of a stop (D2 step 3).
@@ -631,9 +648,19 @@ struct StopDrive {
     conns_marked: bool,
     /// The assembly saw every cell `Quiet` (`finish_stop`).
     finish: bool,
-    /// The stop checkpoint's request epoch, once requested.
-    ckpt_epoch: Option<u64>,
+    /// The stop checkpoint (ADR-0159 D3).
+    checkpoint: StopCheckpoint,
     final_sync_requested: bool,
+}
+
+/// A stop's checkpoint (ADR-0159 D3): the cell's final credit until the
+/// drain issues it — once, after every cell is `Quiet` — then the epoch
+/// the drain waits for this cell to publish.
+enum StopCheckpoint {
+    /// No control plane is wired: the stop takes no checkpoint.
+    Unwired,
+    Ready(CkptFinalCredit),
+    Requested(CheckpointEpoch),
 }
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
@@ -698,7 +725,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ckpt_waiters: WaitList::new(),
                 ddl_epoch_seen: Cell::new(0),
                 ddl_gen_seen: Cell::new(0),
-                ckpt_pub_seen: Cell::new(0),
+                ckpt_quota: RefCell::new(None),
+                ckpt_sweep: RefCell::new(BoardSweep::new()),
+                lastsave_floor_ms: Cell::new(0),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
                 parse_prefetch: Cell::new(false),
@@ -728,6 +757,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             boot_error: None,
             loading_board: None,
             memory_publish_in: 1,
+            final_credit: None,
             stop: None,
             stop_checkpoint: true,
         }
@@ -1161,11 +1191,28 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// Wires the node control-thread handle (DDL id allocation + catalog
-    /// persistence — ADR-0015 D2/D3). Also hands `INFO` the node-wide
-    /// memory board (M3-S25 attribution fix).
-    pub fn set_control(&mut self, control: Arc<ControlHandle>) {
+    /// persistence — ADR-0015 D2/D3) with this cell's checkpoint allowance
+    /// from the same boot (ADR-0159 A1.2: one call sets both). Also hands
+    /// `INFO` the node-wide memory board (M3-S25 attribution fix).
+    ///
+    /// # Errors
+    /// [`IssuerCellMismatch`] when `issuer` was minted for another cell
+    /// (ADR-0159 D3: the stop credit raises its own cell's slot, and this
+    /// cell's stop waits on this cell's slot). Nothing is wired, and the
+    /// allowance comes back in the error.
+    pub fn set_control(
+        &mut self,
+        control: Arc<ControlHandle>,
+        issuer: CellIssuer,
+    ) -> Result<(), IssuerCellMismatch> {
+        if issuer.cell() != self.shared.cell {
+            return Err(IssuerCellMismatch { plane: self.shared.cell, issuer });
+        }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
         *self.shared.control.borrow_mut() = Some(control);
+        *self.shared.ckpt_quota.borrow_mut() = Some(issuer.quota);
+        self.final_credit = Some(issuer.final_credit);
+        Ok(())
     }
 
     /// Durable counters for tests/stats (`None` = memory-only cell).
@@ -1365,11 +1412,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// `Drained`.
     pub fn request_stop(&mut self) {
         if self.stop.is_none() {
+            let checkpoint =
+                self.final_credit.take().map_or(StopCheckpoint::Unwired, StopCheckpoint::Ready);
             self.stop = Some(StopDrive {
                 phase: StopPhase::Draining,
                 conns_marked: false,
                 finish: false,
-                ckpt_epoch: None,
+                checkpoint,
                 final_sync_requested: false,
             });
         }
@@ -1429,8 +1478,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 && let Some(control) = control.as_ref()
             {
                 let me = self.shared.cell.0;
-                let epoch = *stop.ckpt_epoch.get_or_insert_with(|| control.request_ckpt_cell(me));
-                if control.ckpt_board().slot(me).published() < epoch {
+                // ADR-0159 D3: the final credit issues once, after the
+                // all-cells-Quiet barrier, even past ordinary exhaustion.
+                // `set_control` accepted only this cell's credit, so it
+                // raises the slot waited on below.
+                let checkpoint = core::mem::replace(&mut stop.checkpoint, StopCheckpoint::Unwired);
+                stop.checkpoint = match checkpoint {
+                    StopCheckpoint::Ready(credit) => StopCheckpoint::Requested(credit.issue()),
+                    StopCheckpoint::Unwired | StopCheckpoint::Requested(_) => checkpoint,
+                };
+                if let StopCheckpoint::Requested(epoch) = stop.checkpoint
+                    && control.ckpt_board().slot(me).published() < epoch.get()
+                {
                     return;
                 }
             }

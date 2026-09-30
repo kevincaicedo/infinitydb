@@ -20,7 +20,7 @@
       workspace tests)
 - [ ] Tests land **with** the change (the DST scenario / fuzz target /
       regression test that guards it — not in a follow-up)
-- [ ] Layer checks for touched areas: `just loom` (inf-fabric) ·
+- [ ] Layer checks for touched areas: `just loom` (inf-fabric, inf-foundation `issue`) ·
       `just compat` (reply bytes) · `just sim-smoke` (determinism) ·
       Miri (unsafe leaves) · fuzz smoke (decoders)
 - [ ] **Performance work (L4):** hypothesis + target metric + workload stated
