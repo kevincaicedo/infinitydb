@@ -2,7 +2,7 @@
 
 Predeclared before measurement. This package resumes campaign Q and
 ADR-0093 D9 and adds the L07 DBSIZE-under-tickets row. The runner is
-`scripts/run-s37-reference.sh`; the measurement instrument is `inf-bench`.
+`run-s37-reference.sh`, kept with the evidence records outside this repository; the measurement instrument is `inf-bench`.
 These are in-house engine measurements; no competitor comparison is made.
 
 ## Measurement status
@@ -111,7 +111,7 @@ this campaign does not perform either. Then:
 ```bash
 # From the Rust repository root, after operator-controlled host preparation:
 cargo build --locked --release -p infinityd -p inf-bench
-./scripts/run-s37-reference.sh
+# then the reference-box runner, run-s37-reference.sh
 ```
 
 The runner creates a fresh directory under `~/bench-data/s37/`; optionally

@@ -238,7 +238,7 @@ comparator = "<"
 unit = "pct per 24 h (storm-resistant first/last-5% medians)"
 tier = "linux-reference-box"
 source = "endurance:rss_slope_pct_per_24h"
-measured_by = "scripts/soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
+measured_by = "soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
 
 [[gate]]
 id = "endurance_crashes"
@@ -248,7 +248,7 @@ comparator = "<="
 unit = "crashes"
 tier = "any"
 source = "endurance:crashes"
-measured_by = "scripts/soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
+measured_by = "soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
 
 [[gate]]
 id = "m3_regression_worst"

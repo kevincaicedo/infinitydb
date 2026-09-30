@@ -38,7 +38,7 @@ the headline). Deterministic from `--seed` (op-stream checksums +
 `--verify-seed` assert + a DBSIZE-integrity loader). Until command wiring
 (M4-S26) lifts the D8 refusal, runs drop to harness-validation mode with
 the tiered split named-absent; `--attach-port`/`--ns`/`--skip-fill` drive
-an already-running node (the `scripts/soak-m4.sh` legs).
+an already-running node (the reference-box `soak-m4.sh` legs).
 
 ### `env-check`
 

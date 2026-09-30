@@ -135,15 +135,16 @@ performance measurement. Historical commit IDs changed during the rewrite.
 |---|---|
 | Cache, memory, durability and tiered gate matrices | [`inf-bench gate-run`](../bins/inf-bench/README.md) |
 | Comparisons with independent generators | [`inf-compare`](../bins/inf-compare/README.md), `just benchmark` |
-| Document wire and RSS shapes | `scripts/bench-m3-wire.sh`, `scripts/bench-m3-rss.sh` |
-| Parser-free document reads | `scripts/check-doc-read-profile.sh` |
-| Ticketed DEL, shadow overwrite, DBSIZE | [`S37 protocol`](validation-s37.md), `scripts/run-s37-reference.sh` |
-| Recovery shape and cold/warm cache | `scripts/recovery-brackets.sh` (set `BIN` to the declared build) |
-| Soak with cache, documents and tiered storage | `scripts/soak-unified.sh` |
 | Write accounting versus block-device counters | `cargo bench -p inf-store --bench write_accounting` |
 | Write-amplification invariants | `cargo test -p inf-store --test tiered_write_amp` |
-| Historical model refactor equivalence | `scripts/model-equivalence-reproduce.sh` (two pinned revisions) |
 | Loading admission and recovery completion | `cargo test -p inf-server --test node_e2e loading_` |
+
+The reference-box campaign harnesses are kept with the evidence records
+outside this repository: document wire and RSS shapes (`bench-m3-wire.sh`,
+`bench-m3-rss.sh`), the parser-free read profile, the
+[S37 protocol](validation-s37.md) runner, recovery brackets, the soaks and
+the historical model-equivalence proof. The claim ledger cites each run with
+its revision, box and command.
 
 Harness source and `--help` define supported knobs and defaults. For example:
 
@@ -153,9 +154,6 @@ Harness source and `--help` define supported knobs and defaults. For example:
 just benchmark --reference-box --workload mixed --duration 15 \
   --out .artifacts/compare
 ```
-
-The historical equivalence check needs a full clone containing both pinned
-revisions; it compares that refactor, not all later model changes.
 
 Local output is useful for inspecting a run and diagnosing failures. It is
 not committed. Keep correctness fixtures separate from generated data so a
