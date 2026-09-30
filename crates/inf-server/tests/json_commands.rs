@@ -1252,6 +1252,26 @@ const fn dollar(mut f: Fixture, at: usize, dollar: bool) -> Fixture {
     f
 }
 
+/// Matches of the RESP3 double fixture: enough 7 B `,0.75\r\n` frames that
+/// the general path's reply, not the fixed floor, sets arm (c)'s boundary.
+const FLOAT_LEAVES: usize = 80;
+
+/// `[{"x":0.5}, …]` with [`FLOAT_LEAVES`] members and its `$..x` += 0.25
+/// replies, built from the reply-shape contract: RESP2 one bulk of
+/// `[0.75,…]` (409 B), RESP3 `*80` and a native double per match (565 B).
+fn float_leaves() -> (&'static [(&'static str, &'static str)], &'static str, &'static str) {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    let doc = format!("[{}]", vec![r#"{"x":0.5}"#; FLOAT_LEAVES].join(","));
+    let text = format!("[{}]", vec!["0.75"; FLOAT_LEAVES].join(","));
+    let resp2 = format!("${}\r\n{text}\r\n", text.len());
+    let resp3 = format!("*{FLOAT_LEAVES}\r\n{}", ",0.75\r\n".repeat(FLOAT_LEAVES));
+    let floor = inf_server::limits::JSON_FIXED_REPLY_BYTES_MAX;
+    assert!(resp2.len() > floor, "the RESP2 reply passes the fixed floor");
+    assert!(resp3.len() > floor, "the RESP3 reply passes the fixed floor");
+    let docs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([("m", leak(doc))]));
+    (docs, leak(resp2), leak(resp3))
+}
+
 /// One or more fixtures per registry row. The pinned bytes are written by
 /// hand from the reply-shape contract, not produced by the server.
 fn reply_fixtures() -> Vec<Fixture> {
@@ -1259,6 +1279,7 @@ fn reply_fixtures() -> Vec<Fixture> {
     use FixedShape::{Count, Number, Status, Toggle};
     use Settlement::{Charged, Fixed, FixedThenCharged, PerElement};
     let ok = "+OK\r\n";
+    let (float_docs, float_resp2, float_resp3) = float_leaves();
     vec![
         dollar(
             fx("JSON.SET", Root, Fixed(Status), &[], &["JSON.SET", "k", "$", "[1]"], ok, ok),
@@ -1470,6 +1491,21 @@ fn reply_fixtures() -> Vec<Fixture> {
             2,
             true,
         ),
+        // RESP3 answers each match as a native double. Over the 348 B
+        // floor, so arm (c) is decided by the charged `,0.75\r\n` frames.
+        dollar(
+            fx(
+                "JSON.NUMINCRBY",
+                General,
+                FixedThenCharged(Number),
+                float_docs,
+                &["JSON.NUMINCRBY", "m", "$..x", "0.25"],
+                float_resp2,
+                float_resp3,
+            ),
+            2,
+            true,
+        ),
         dollar(
             fx(
                 "JSON.STRAPPEND",
@@ -1492,6 +1528,21 @@ fn reply_fixtures() -> Vec<Fixture> {
                 &["JSON.STRLEN", "k", "$.s"],
                 "*1\r\n:1\r\n",
                 "*1\r\n:1\r\n",
+            ),
+            2,
+            true,
+        ),
+        // A two-digit integer as the crossing frame: the decimal-width
+        // count past its first digit.
+        dollar(
+            fx(
+                "JSON.STRLEN",
+                Plain,
+                Charged,
+                &[("k", r#"{"s":"abcdefghijkl"}"#)],
+                &["JSON.STRLEN", "k", "$.s"],
+                "*1\r\n:12\r\n",
+                "*1\r\n:12\r\n",
             ),
             2,
             true,
@@ -1589,6 +1640,22 @@ fn reply_fixtures() -> Vec<Fixture> {
             2,
             true,
         ),
+        // `charge` adds a frame's prediction to the bytes already written,
+        // so only the crossing frame's predictor decides arm (c): here the
+        // signed integer's, `:-1` (a miss) as the final frame.
+        dollar(
+            fx(
+                "JSON.ARRINDEX",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRINDEX", "k", "$.arr", "9"],
+                "*1\r\n:-1\r\n",
+                "*1\r\n:-1\r\n",
+            ),
+            2,
+            true,
+        ),
         dollar(
             fx(
                 "JSON.ARRLEN",
@@ -1598,6 +1665,21 @@ fn reply_fixtures() -> Vec<Fixture> {
                 &["JSON.ARRLEN", "k", "$.arr"],
                 "*1\r\n:2\r\n",
                 "*1\r\n:2\r\n",
+            ),
+            2,
+            true,
+        ),
+        // No match: the array header is the whole reply, so its predictor
+        // writes the crossing frame.
+        dollar(
+            fx(
+                "JSON.ARRLEN",
+                Plain,
+                Charged,
+                &[("k", D)],
+                &["JSON.ARRLEN", "k", "$.zz"],
+                "*0\r\n",
+                "*0\r\n",
             ),
             2,
             true,
