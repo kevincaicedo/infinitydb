@@ -45,6 +45,73 @@ fn reserve_ckpt<const K: usize, O: PlaneObserver + 'static, F: SegmentFs + Clone
     quota.reserve::<K>().map_err(|inf_foundation::issue::IssueExhausted| CkptRefusal::Exhausted)
 }
 
+/// A namespace DDL's post-fan duty (ADR-0100 D3, ADR-0159 D2). One value
+/// decides both whether the drop carries a tombstone and the credit that
+/// stamps it, so a durable drop without its stamp cannot be represented.
+enum NsCleanup {
+    /// Not durable: no tombstone, no checkpoint request.
+    NoTombstone,
+    /// Durable: the drop carries a tombstone, stamped after the fan with
+    /// this credit, reserved before the DDL's first effect.
+    Tombstone(CkptCredit),
+}
+
+impl NsCleanup {
+    fn has_tombstone(&self) -> bool {
+        match self {
+            NsCleanup::NoTombstone => false,
+            NsCleanup::Tombstone(_) => true,
+        }
+    }
+
+    /// Every cell applied the drop: a checkpoint requested now publishes
+    /// MANIFESTs without the namespace, and retires its tombstone.
+    fn stamp(self, control: &ControlHandle, id: u32) {
+        match self {
+            NsCleanup::NoTombstone => {}
+            NsCleanup::Tombstone(credit) => {
+                control.stamp_drop(id, credit.issue(CkptTarget::All).get());
+            }
+        }
+    }
+}
+
+/// Reserves a namespace DDL's checkpoint units before its first effect
+/// (ADR-0159 D2): a durable namespace's two, the tombstone-pacing request
+/// and the cleanup; none for any other mode. A refusal changes nothing.
+/// A namespace's mode is fixed at its CREATE, and the DDL ticket holds its
+/// name, so the mode read here is the one the program applies.
+fn reserve_ns_units<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    mode: NsMode,
+) -> Result<(Option<CkptCredit>, NsCleanup), CkptRefusal> {
+    match mode {
+        NsMode::Durable => {
+            let [pacing, cleanup] = reserve_ckpt::<2, O, F>(shared)?;
+            Ok((Some(pacing), NsCleanup::Tombstone(cleanup)))
+        }
+        NsMode::Memory | NsMode::Topic => Ok((None, NsCleanup::NoTombstone)),
+    }
+}
+
+/// A CREATE's admission, before any effect: a durable namespace needs this
+/// node's durable storage and reserves its two units, the rollback's
+/// cleanup and the pacing unit, which a CREATE never spends (ADR-0159 D2).
+fn admit_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    proto: Protocol,
+    mode: NsMode,
+) -> Result<NsCleanup, Vec<u8>> {
+    if mode == NsMode::Durable && shared.durable.borrow().is_none() {
+        let refusal = "ERR this node has no durable storage (start infinityd with a data dir)";
+        return Err(error_reply(shared, proto, refusal));
+    }
+    match reserve_ns_units(shared, mode) {
+        Ok((_pacing, cleanup)) => Ok(cleanup),
+        Err(refusal) => Err(refusal.reply(shared, proto)),
+    }
+}
+
 /// One named-namespace command on the pump (M2-S08). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
@@ -330,8 +397,7 @@ pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clon
         return error_reply(shared, proto, CKPT_NO_PLANE);
     }
     if id == CommandId::Lastsave {
-        let observed = shared.ckpt_sweep.borrow().observed();
-        let unix_s = observed.lastsave_unix_s(shared.lastsave_floor_ms.get());
+        let unix_s = shared.ckpt_sweep.borrow().lastsave_unix_s();
         return int_reply(shared, proto, unix_s as i64);
     }
     let args = match parse_ckpt_args(shared.cells, id, argv) {
@@ -390,11 +456,11 @@ fn parse_ckpt_args(cells: u16, id: CommandId, argv: &[&[u8]]) -> Result<CkptArgs
     Ok(args)
 }
 
-/// Parks until the target published `epoch`. `CELL k` reads slot `k` and
-/// raises this cell's `LASTSAVE` floor with the publication time it
-/// confirmed (ADR-0159 A1.4); an all-cell wait reads this cell's completed
-/// sweep, a lower bound that is never early (D4). The sweep's completion
-/// wakes the waitlist.
+/// Parks until the target published `epoch`. `CELL k` reads slot `k`
+/// through the sweep's confirmation, which raises this cell's `LASTSAVE`
+/// floor in the same step (ADR-0159 A1.4); an all-cell wait reads this
+/// cell's completed sweep, a lower bound that is never early (D4). The
+/// sweep's completion wakes the waitlist.
 async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &Arc<ControlHandle>,
@@ -403,13 +469,10 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
 ) {
     loop {
         let satisfied = match cell {
-            Some(k) => match control.ckpt_board().slot(k).covered_at(epoch) {
-                Some(unix_ms) => {
-                    shared.lastsave_floor_ms.set(shared.lastsave_floor_ms.get().max(unix_ms));
-                    true
-                }
-                None => false,
-            },
+            Some(k) => {
+                let slot = control.ckpt_board().slot(k);
+                shared.ckpt_sweep.borrow_mut().confirm_cell_wait(slot, epoch)
+            }
             None => shared.ckpt_sweep.borrow().observed().min_published >= epoch.get(),
         };
         if satisfied {
@@ -458,30 +521,18 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     // ADR-0103: a CREATE persisted before the fan; its pending entry
     // retires once the fan is done (either way), and it needs no
     // trailing persist. `created` carries what a rollback needs
-    // (ADR-0108 D3): the id, the name, a durable namespace's reserved
-    // cleanup credit (its tombstone's stamp, ADR-0159 D2) and whether it
-    // is tiered (teardown hold).
-    let mut created: Option<(u32, Vec<u8>, Option<CkptCredit>, bool)> = None;
+    // (ADR-0108 D3): the id, the name, its cleanup (a durable namespace's
+    // tombstone stamp, ADR-0159 D2) and whether it is tiered (teardown
+    // hold).
+    let mut created: Option<(u32, Vec<u8>, NsCleanup, bool)> = None;
     let fan: Vec<Vec<u8>> = if create {
         let draft = match crate::admin::parse_ns_create(argv) {
             Ok(draft) => draft,
             Err(msg) => return error_reply(shared, proto, &msg),
         };
-        if draft.mode == NsMode::Durable && shared.durable.borrow().is_none() {
-            return error_reply(
-                shared,
-                proto,
-                "ERR this node has no durable storage (start infinityd with a data dir)",
-            );
-        }
-        // ADR-0159 D2: a durable CREATE reserves its two units before any
-        // effect — the rollback's cleanup request and the pacing unit,
-        // which a CREATE never spends.
-        let cleanup = match (draft.mode == NsMode::Durable).then(|| reserve_ckpt::<2, O, F>(shared))
-        {
-            None => None,
-            Some(Ok([cleanup, _pacing])) => Some(cleanup),
-            Some(Err(refusal)) => return refusal.reply(shared, proto),
+        let cleanup = match admit_ns_create(shared, proto, draft.mode) {
+            Ok(cleanup) => cleanup,
+            Err(refusal) => return refusal,
         };
         let ns_id = control.alloc_ns_id();
         let spec = draft.with_id(ns_id);
@@ -656,14 +707,17 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     proto: Protocol,
     name: &[u8],
 ) -> Vec<u8> {
-    let durable = shared.store.borrow().ns_get(name).is_some_and(|s| s.mode == NsMode::Durable);
     // ADR-0159 D2: a durable DROP reserves its two units under the ticket,
-    // before pacing and any effect — the tombstone pacing request and the
-    // post-fan cleanup request. A refusal leaves everything unchanged.
-    let (pacing, cleanup) = match durable.then(|| reserve_ckpt::<2, O, F>(shared)) {
-        None => (None, None),
-        Some(Ok([pacing, cleanup])) => (Some(pacing), Some(cleanup)),
-        Some(Err(refusal)) => return refusal.reply(shared, proto),
+    // before pacing and any effect. An unknown name reserves none; `ns_drop`
+    // refuses it below.
+    let mode = shared.store.borrow().ns_get(name).map(|spec| spec.mode);
+    let reserved = match mode {
+        Some(mode) => reserve_ns_units(shared, mode),
+        None => Ok((None, NsCleanup::NoTombstone)),
+    };
+    let (pacing, cleanup) = match reserved {
+        Ok(units) => units,
+        Err(refusal) => return refusal.reply(shared, proto),
     };
     if let Some(pacing) = pacing
         && control.drop_tombstones() >= crate::control::DROPPED_NS_MAX
@@ -691,7 +745,8 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         }
         return error_reply(shared, proto, "ERR fault: ns_drop_before_meta");
     }
-    let drop = (spec.mode == NsMode::Durable).then_some(spec.id.0);
+    // A namespace's mode is fixed at its CREATE: the reservation read it.
+    debug_assert_eq!(spec.mode == NsMode::Durable, cleanup.has_tombstone(), "the reserved mode");
     let epoch = control.request_persist_drop(
         shared.store.borrow().export_catalog(
             control.next_ns_id(),
@@ -699,7 +754,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             control.next_index_generation(),
         ),
         spec.id.0,
-        drop.is_some(),
+        cleanup.has_tombstone(),
     );
     if spec.tier.is_some() {
         shared.ns_drop_releases.borrow_mut().push((spec.id, epoch));
@@ -720,14 +775,7 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     if let Some(error) = fan_all_or_first_error(shared, proto, &fan).await {
         return error;
     }
-    // The ticket keeps the namespace's mode fixed between the reservation
-    // and the drop: a durable drop holds its cleanup credit.
-    debug_assert_eq!(drop.is_some(), cleanup.is_some(), "a durable drop reserved its cleanup");
-    if let (Some(id), Some(cleanup)) = (drop, cleanup) {
-        // Every cell applied the drop: a checkpoint requested now
-        // publishes MANIFESTs without it (ADR-0100 D3).
-        control.stamp_drop(id, cleanup.issue(CkptTarget::All).get());
-    }
+    cleanup.stamp(control, spec.id.0);
     simple_reply(shared, proto, "OK")
 }
 
@@ -775,10 +823,9 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     proto: Protocol,
     id: u32,
     name: &[u8],
-    cleanup: Option<CkptCredit>,
+    cleanup: NsCleanup,
     tiered: bool,
 ) {
-    let durable = cleanup.is_some();
     // The origin's own copy (`Unknown` here would mean the fan's local
     // apply never happened — nothing to undo).
     let _ = shared.store.borrow_mut().ns_drop(name);
@@ -789,7 +836,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             control.next_index_generation(),
         ),
         id,
-        durable,
+        cleanup.has_tombstone(),
     );
     if tiered {
         shared.ns_drop_releases.borrow_mut().push((NsId(id), epoch));
@@ -802,9 +849,7 @@ async fn rollback_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // Peers that refused or never received their CREATE leg answer
     // "namespace not found" — the rollback is idempotent per cell.
     let _ = fan_all_or_first_error(shared, proto, &fan).await;
-    if let Some(cleanup) = cleanup {
-        control.stamp_drop(id, cleanup.issue(CkptTarget::All).get());
-    }
+    cleanup.stamp(control, id);
 }
 
 /// Ship `argv` to `to` as an `ApplyNs` (named-namespace op — ADR-0015 D1)

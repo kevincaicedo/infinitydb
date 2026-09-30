@@ -1557,6 +1557,47 @@ pub(crate) struct Node {
     pub(crate) frozen: Option<(usize, u64)>,
 }
 
+/// One cell's durable configuration for `scenario` (every cell of a node
+/// gets the same one).
+fn durable_config(
+    scenario: &DurableScenario,
+    data_dir: &std::path::Path,
+) -> inf_server::DurableConfig {
+    inf_server::DurableConfig {
+        data_dir: data_dir.to_path_buf(),
+        staging: inf_server::StagingConfig {
+            frames_in_flight: scenario.frames_in_flight,
+            ..Default::default()
+        },
+        segment: inf_server::SegmentConfig {
+            segment_bytes: scenario.segment_bytes,
+            io_mode: scenario.io_mode,
+            recycle_slots: scenario.recycle_slots,
+            prealloc: scenario.prealloc,
+            ..Default::default()
+        },
+        ckpt: inf_server::CkptConfig {
+            interval_bytes: scenario.ckpt_interval_bytes,
+            stream_bytes_per_sec: scenario
+                .ckpt_stream_bytes_per_sec
+                .unwrap_or(inf_server::CkptConfig::default().stream_bytes_per_sec),
+            section_bytes: scenario
+                .ckpt_section_bytes
+                .unwrap_or(inf_server::CkptConfig::default().section_bytes),
+            section_bound: scenario
+                .ckpt_section_bound
+                .unwrap_or(inf_server::CkptConfig::default().section_bound),
+            ..Default::default()
+        },
+        recover: Default::default(),
+        flush_bound: 1,
+        fua_p50_us_probed: 0,
+        device: scenario.device,
+        fill: scenario.fill,
+        group: scenario.group,
+    }
+}
+
 pub(crate) fn boot(
     scenario: &DurableScenario,
     data_dir: PathBuf,
@@ -1618,39 +1659,7 @@ pub(crate) fn boot(
             observer.clone(),
             false,
         );
-        let cfg = inf_server::DurableConfig {
-            data_dir: data_dir.clone(),
-            staging: inf_server::StagingConfig {
-                frames_in_flight: scenario.frames_in_flight,
-                ..Default::default()
-            },
-            segment: inf_server::SegmentConfig {
-                segment_bytes: scenario.segment_bytes,
-                io_mode: scenario.io_mode,
-                recycle_slots: scenario.recycle_slots,
-                prealloc: scenario.prealloc,
-                ..Default::default()
-            },
-            ckpt: inf_server::CkptConfig {
-                interval_bytes: scenario.ckpt_interval_bytes,
-                stream_bytes_per_sec: scenario
-                    .ckpt_stream_bytes_per_sec
-                    .unwrap_or(inf_server::CkptConfig::default().stream_bytes_per_sec),
-                section_bytes: scenario
-                    .ckpt_section_bytes
-                    .unwrap_or(inf_server::CkptConfig::default().section_bytes),
-                section_bound: scenario
-                    .ckpt_section_bound
-                    .unwrap_or(inf_server::CkptConfig::default().section_bound),
-                ..Default::default()
-            },
-            recover: Default::default(),
-            flush_bound: 1,
-            fua_p50_us_probed: 0,
-            device: scenario.device,
-            fill: scenario.fill,
-            group: scenario.group,
-        };
+        let cfg = durable_config(scenario, &data_dir);
         let issuer = cell_issuers.next().ok_or_else(|| {
             std::io::Error::other("the partition minted one checkpoint issuer per cell")
         })?;

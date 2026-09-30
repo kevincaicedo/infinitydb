@@ -325,11 +325,11 @@ impl CkptSlot {
         self.ckpt_id.load(Ordering::Relaxed)
     }
 
-    /// `WAIT CELL k`'s check (ADR-0159 A1.4): once this slot published
-    /// `epoch`, the publication time read after the `Acquire` load that
-    /// satisfied it — the waiting cell raises its `LASTSAVE` floor with it.
-    #[must_use]
-    pub fn covered_at(&self, epoch: CheckpointEpoch) -> Option<u64> {
+    /// Once this slot published `epoch`, the publication time read after
+    /// the `Acquire` load that satisfied it. Private: the one caller is
+    /// [`BoardSweep::confirm_cell_wait`], which raises the `LASTSAVE` floor
+    /// with it in the same step.
+    fn covered_at(&self, epoch: CheckpointEpoch) -> Option<u64> {
         (self.published() >= epoch.get()).then(|| self.last_unix_ms())
     }
 }
@@ -443,16 +443,6 @@ pub struct BoardObservation {
     pub max_unix_ms: u64,
 }
 
-impl BoardObservation {
-    /// `LASTSAVE` (ADR-0159 A1.4): the newest publication this cell has
-    /// observed — its completed sweep, or a slot a `WAIT CELL k` on this
-    /// cell confirmed (`floor_ms`) — in unix seconds.
-    #[must_use]
-    pub fn lastsave_unix_s(self, floor_ms: u64) -> u64 {
-        self.max_unix_ms.max(floor_ms) / 1000
-    }
-}
-
 /// One cell's resumable sweep over the board (ADR-0159 D4): a cursor into
 /// the fixed boot board and the partial folds. No slot reference crosses a
 /// turn; the board's membership never changes within a boot.
@@ -465,6 +455,9 @@ pub struct BoardSweep {
     visits: u64,
     /// Completed sweeps so far (per cell).
     sweeps_completed: u64,
+    /// The newest publication time (unix ms) a `WAIT CELL k` on this cell
+    /// confirmed: `LASTSAVE`'s floor (ADR-0159 A1.4).
+    lastsave_floor_ms: u64,
 }
 
 /// What one sweep step did (ADR-0159 D4).
@@ -491,6 +484,7 @@ impl BoardSweep {
             observed: BoardObservation::default(),
             visits: 0,
             sweeps_completed: 0,
+            lastsave_floor_ms: 0,
         }
     }
 
@@ -498,6 +492,31 @@ impl BoardSweep {
     #[must_use]
     pub fn observed(&self) -> BoardObservation {
         self.observed
+    }
+
+    /// `WAIT CELL k`'s check (ADR-0159 A1.4): whether `slot` published
+    /// `epoch`. When it did, the publication time read after the `Acquire`
+    /// load that satisfied the check raises this cell's `LASTSAVE` floor in
+    /// the same step, so a `WAIT CELL k` that returns leaves `LASTSAVE`
+    /// covering the checkpoint it fenced, even while the sweep trails.
+    pub fn confirm_cell_wait(&mut self, slot: &CkptSlot, epoch: CheckpointEpoch) -> bool {
+        let Some(unix_ms) = slot.covered_at(epoch) else { return false };
+        // Canary: the confirmation without its floor raise.
+        #[cfg(not(inf_canary_lastsave_floor_skipped))]
+        {
+            self.lastsave_floor_ms = self.lastsave_floor_ms.max(unix_ms);
+        }
+        #[cfg(inf_canary_lastsave_floor_skipped)]
+        let _ = unix_ms;
+        true
+    }
+
+    /// `LASTSAVE` (ADR-0159 A1.4): the newest publication this cell has
+    /// observed, from its completed sweep or a slot a `WAIT CELL k` on
+    /// this cell confirmed, in unix seconds.
+    #[must_use]
+    pub fn lastsave_unix_s(&self) -> u64 {
+        self.observed.max_unix_ms.max(self.lastsave_floor_ms) / 1000
     }
 
     /// A sweep is part-way through the board.
@@ -623,32 +642,86 @@ impl CellIssuer {
     pub fn cell(&self) -> CellId {
         self.final_credit.cell
     }
-}
 
-/// `ServerPlane::set_control` was handed the allowance of another cell
-/// (ADR-0159 D3: a stop credit raises its own cell's slot, and a cell's
-/// stop waits on its own slot, so a crossed pair would wait until the stop
-/// deadline). Nothing was wired; the allowance comes back to the host.
-#[derive(Debug)]
-pub struct IssuerCellMismatch {
-    /// The cell of the plane that refused it.
-    pub plane: CellId,
-    /// The refused allowance, whose [`CellIssuer::cell`] differs.
-    pub issuer: CellIssuer,
-}
-
-impl std::fmt::Display for IssuerCellMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "cell {} was handed the checkpoint issuer minted for cell {}",
-            self.plane.0,
-            self.issuer.cell().0
-        )
+    /// The wiring check of `ServerPlane::set_control`: every fact this
+    /// allowance's use relies on, against the handle and the plane it is
+    /// handed to. Pure; the caller wires nothing unless it passes.
+    ///
+    /// # Errors
+    /// The first [`IssuerMismatch`], in the order the variants list them.
+    pub(crate) fn check_wiring(
+        &self,
+        control: &ControlHandle,
+        plane: CellId,
+        plane_cells: u16,
+    ) -> Result<(), IssuerMismatch> {
+        let clock = &*control.ckpt_clock;
+        if !self.quota.0.issues_on(clock) || !self.final_credit.credit.issues_on(clock) {
+            return Err(IssuerMismatch::OtherBoot);
+        }
+        let board = clock.board().cell_count();
+        if usize::from(plane_cells) != board {
+            return Err(IssuerMismatch::CellCount { plane: plane_cells, board });
+        }
+        if self.cell() != plane {
+            return Err(IssuerMismatch::OtherCell { issuer: self.cell() });
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for IssuerCellMismatch {}
+/// Why `ServerPlane::set_control` refused a checkpoint allowance: each is a
+/// host's wiring error, found before anything is wired.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IssuerMismatch {
+    /// Minted by another control handle's partition (ADR-0159 A1.2: a
+    /// credit issues only into its own boot's board). Wired, its requests
+    /// would raise a board this cell never reads: `INF.CKPT WAIT` would
+    /// park for ever and the stop would wait out its deadline.
+    OtherBoot,
+    /// The plane routes `plane` cells over a board of `board` slots
+    /// (ADR-0159 A1.1: one `CellCount` per boot). `INF.CKPT CELL k` is
+    /// checked against the plane, so `k` could index past the board.
+    CellCount { plane: u16, board: usize },
+    /// Minted for cell `issuer` (ADR-0159 D3: a stop credit raises its own
+    /// cell's slot, and a cell's stop waits on its own slot, so a crossed
+    /// pair would wait until the stop deadline).
+    OtherCell { issuer: CellId },
+}
+
+/// `ServerPlane::set_control` refused `issuer`. Nothing was wired; the
+/// allowance comes back to the host.
+#[derive(Debug)]
+pub struct IssuerRefused {
+    /// The cell of the plane that refused it.
+    pub plane: CellId,
+    /// The first fact that did not match.
+    pub mismatch: IssuerMismatch,
+    /// The refused allowance, unspent.
+    pub issuer: CellIssuer,
+}
+
+impl std::fmt::Display for IssuerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let plane = self.plane.0;
+        match self.mismatch {
+            IssuerMismatch::OtherBoot => {
+                write!(f, "cell {plane} was handed a checkpoint issuer of another boot")
+            }
+            IssuerMismatch::CellCount { plane: cells, board } => write!(
+                f,
+                "cell {plane} routes {cells} cells but its checkpoint board holds {board} slots"
+            ),
+            IssuerMismatch::OtherCell { issuer } => write!(
+                f,
+                "cell {plane} was handed the checkpoint issuer minted for cell {}",
+                issuer.0
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IssuerRefused {}
 
 /// What a control-plane constructor mints besides the handle (ADR-0159
 /// A1.2): each cell's allowance, in cell order, and the control writer's
@@ -2142,45 +2215,41 @@ mod tests {
         }
     }
 
-    /// ADR-0159 A1.4: with the sweep stalled, a `WAIT CELL 1`'s
-    /// confirmation raises this cell's `LASTSAVE` floor to slot 1's
-    /// publication second.
+    /// ADR-0159 A1.4 through the product's own step: with this cell's
+    /// sweep stalled (it never read the board), the `WAIT CELL 1`
+    /// confirmation raises its `LASTSAVE` floor to slot 1's publication
+    /// second. `wait_for_ckpt` and `LASTSAVE` call exactly these two
+    /// methods; the planted `inf_canary_lastsave_floor_skipped` (the
+    /// confirmation without its raise) must fail this test.
     #[test]
     fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
-        let (lastsave, published_ms) = wait_cell_then_lastsave(true);
-        assert!(lastsave >= published_ms / 1000, "LASTSAVE {lastsave} trails the WAIT");
-    }
-
-    /// Canary: the observation-only read, without the floor, trails.
-    #[test]
-    fn canary_lastsave_without_the_floor_trails_the_wait() {
-        let (lastsave, published_ms) = wait_cell_then_lastsave(false);
-        assert!(lastsave < published_ms / 1000, "the no-floor canary must go red");
-    }
-
-    /// A 2-cell board whose sweep never steps; cell 0 waits on `CELL 1`.
-    fn wait_cell_then_lastsave(with_floor: bool) -> (u64, u64) {
         let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
         let board = handle.ckpt_board();
         assert_eq!(board.requested(1), epoch.get());
         assert_eq!(board.requested(0), 0, "a targeted request reaches one slot");
+        let mut sweep = BoardSweep::new();
+        assert!(!sweep.confirm_cell_wait(board.slot(1), epoch), "not yet published");
         let published_ms = 1_700_000_123_456;
-        assert!(board.slot(1).covered_at(epoch).is_none(), "not yet published");
         board.slot(1).publish(epoch.get(), 9, published_ms);
-        let floor_ms = board.slot(1).covered_at(epoch).expect("published");
-        let stalled = BoardSweep::new().observed();
-        assert_eq!(stalled, BoardObservation::default());
-        let lastsave = stalled.lastsave_unix_s(if with_floor { floor_ms } else { 0 });
-        (lastsave, published_ms)
+        assert!(sweep.confirm_cell_wait(board.slot(1), epoch), "slot 1 published the epoch");
+        // Engagement: the observation alone would answer 0.
+        assert_eq!(sweep.observed(), BoardObservation::default(), "the sweep trails the board");
+        let lastsave = sweep.lastsave_unix_s();
+        assert!(lastsave >= published_ms / 1000, "LASTSAVE {lastsave} trails the WAIT");
+        // The floor only rises: an older publication it confirms leaves it.
+        board.slot(0).publish(epoch.get(), 1, 1_000);
+        assert!(sweep.confirm_cell_wait(board.slot(0), epoch));
+        assert_eq!(sweep.lastsave_unix_s(), lastsave);
     }
 
-    /// A1.1 from the embedded assembly path: the constructors take only a
+    /// ADR-0159 A1.1 at the control-plane constructors: they take only a
     /// `CellCount`, whose constructor refuses `SLOT_COUNT + 1`, and the
-    /// largest topology builds.
+    /// largest topology builds with `Q >= 2^49`. The embedded host has no
+    /// assembly yet, so this covers only the constructors it will call.
     #[test]
-    fn the_embedded_assembly_refuses_a_cell_past_the_slot_count() {
+    fn control_constructors_take_a_cell_count_up_to_the_slot_count() {
         assert!(CellCount::new(SLOT_COUNT + 1).is_err());
         let (handle, _inbox, issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
         assert_eq!(handle.ckpt_board().cell_count(), usize::from(SLOT_COUNT));

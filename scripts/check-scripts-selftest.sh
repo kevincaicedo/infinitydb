@@ -485,7 +485,7 @@ loom_fixture() {
     [ -n "$name" ] && [ -n "$work" ] || { echo "loom_fixture: empty name or work dir" >&2; exit 2; }
     dir="$work/$name"
     mkdir -p "$dir"
-    echo "inf_canary_fixture loom fake the_row" >"$dir/rows"
+    echo "inf_canary_fixture loom fake the_row WITNESS:" >"$dir/rows"
     {
         echo '#!/usr/bin/env bash'
         echo 'case "${RUSTFLAGS:-}" in'
@@ -501,14 +501,18 @@ loom_fixture() {
     chmod +x "$dir/cargo"
     echo "$dir"
 }
-dir=$(loom_fixture loom-caught "$failed_line" "$ok_line")
-expect green "canaries: a loom model FAILED on the planted build, ok on the plain loom one" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+witness_line='echo "panicked: WITNESS: a stale effect"; echo "test the_row ... FAILED"; exit 101'
+dir=$(loom_fixture loom-caught "$witness_line" "$ok_line")
+expect green "canaries: a loom model FAILED on its witness when planted, ok on the plain loom one" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(loom_fixture loom-other-panic "$failed_line" "$ok_line")
+expect red "canaries: a loom model FAILED without its witness assertion is not a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the witness-less red is named" "expected the model's assertion" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 dir=$(loom_fixture loom-toothless "$ok_line" "$ok_line")
 expect red "canaries: a loom model that stays green when planted is NOT CAUGHT" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
-dir=$(loom_fixture loom-no-control "$failed_line" "$failed_line")
+dir=$(loom_fixture loom-no-control "$witness_line" "$failed_line")
 expect red "canaries: a loom model red on the plain loom build is no control leg" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
-echo "inf_canary_fixture loom fake" >"$work/canary-short-loom-row"
-expect red "canaries: a malformed loom row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture loom fake the_row" >"$work/canary-short-loom-row"
+expect red "canaries: a loom row without its witness is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
 
 # --------------------------------------------------- release-assert inventory
 # ADR-0107 D2: a fixture crate with one release assert and one expect, and

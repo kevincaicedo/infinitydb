@@ -268,6 +268,14 @@ impl<B> IssueQuota<B> {
     pub fn remaining(&self) -> u64 {
         self.remaining
     }
+
+    /// Whether this quota's credits issue on `clock`, the one its
+    /// partition built (A1.2: a credit issues only into its own boot's
+    /// board). A clock is never zero-sized, so its address is its identity.
+    #[must_use]
+    pub fn issues_on(&self, clock: &IssueClock<B>) -> bool {
+        core::ptr::eq(&*self.clock, clock)
+    }
 }
 
 /// The right to one issue. Not `Clone`; consumed by value. A credit dropped
@@ -304,6 +312,12 @@ impl<B> FinalCredit<B> {
     /// Issues the final identity; see [`IssueCredit::issue`].
     pub fn issue(self, publish: impl FnOnce(&B, Issued)) -> Issued {
         self.0.issue(publish)
+    }
+
+    /// Whether this credit issues on `clock`; see [`IssueQuota::issues_on`].
+    #[must_use]
+    pub fn issues_on(&self, clock: &IssueClock<B>) -> bool {
+        core::ptr::eq(&*self.0.clock, clock)
     }
 }
 
@@ -435,6 +449,21 @@ mod tests {
             extra.issue(|(), _| {});
         }));
         assert!(caught.is_err(), "an over-minted issue past u64::MAX went unnoticed");
+    }
+
+    /// A1.2: a quota and a final credit name the clock of the partition
+    /// that minted them, and no other boot's.
+    #[test]
+    fn credits_issue_on_their_own_partitions_clock_only() {
+        let Partition { clock, owner, participants } = partition((), IssueSpace::full(1));
+        let other = partition((), IssueSpace::full(1));
+        let own = &participants[0];
+        assert!(owner.issues_on(&clock));
+        assert!(own.quota.issues_on(&clock));
+        assert!(own.final_credit.issues_on(&clock));
+        assert!(!own.quota.issues_on(&other.clock), "another boot's clock");
+        assert!(!own.final_credit.issues_on(&other.clock), "another boot's clock");
+        assert!(!other.owner.issues_on(&clock), "and the other way round");
     }
 
     #[test]

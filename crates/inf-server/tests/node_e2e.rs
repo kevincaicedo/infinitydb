@@ -5417,8 +5417,12 @@ fn ckpt_identity_exhaustion_refuses_before_effects_and_the_stop_still_publishes(
     d.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
     read_exactly(&mut d, b"+OK\r\n");
     assert!(scrape_u64(&mut d, b"persistence", "ckpts_completed:") > completed);
+    // The clock started (N + 1)·h + N = 7 below the top, and CREATE's two
+    // units are reserved but never issued (the pacing unit, and a cleanup
+    // only a rollback spends): the WAIT issued the first epoch. Engagement:
+    // a WAIT that issued nothing leaves `u64::MAX - 7`.
     let top = control.ckpt_last_issued();
-    assert!(top >= u64::MAX - 7, "engagement: the drive reached the last epochs ({top})");
+    assert_eq!(top, u64::MAX - 6, "the WAIT issued the first epoch of the space");
     assert!(control.ckpt_board().slot(0).published() >= top, "WAIT fenced its publication");
     let before = ckpt_producer_snapshot(&node, &dir);
     for refused in [&[&b"INF.CKPT"[..]][..], &[b"BGSAVE"], &[b"INF.CKPT", b"WAIT"]] {
@@ -5429,7 +5433,7 @@ fn ckpt_identity_exhaustion_refuses_before_effects_and_the_stop_still_publishes(
     drop((c, d));
     node.stop_gracefully();
     let final_epoch = control.ckpt_last_issued();
-    assert!(final_epoch > top, "the stop issued its final credit past exhaustion");
+    assert_eq!(final_epoch, top + 1, "the stop issued its final credit past exhaustion");
     assert!(control.ckpt_board().slot(0).published() >= final_epoch, "the stop published");
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
@@ -5439,6 +5443,36 @@ fn ckpt_identity_exhaustion_refuses_before_effects_and_the_stop_still_publishes(
     read_exactly(&mut c, b"$1\r\nv\r\n");
     drop(c);
     node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 A1.5 driven to the integer maximum (1 cell, 1 unit per quota:
+/// the clock starts 3 below `u64::MAX`). The host's unit issues
+/// `u64::MAX - 2` and `INF.CKPT WAIT` the cell's `u64::MAX - 1`, the highest
+/// epoch a `WAIT` can reach, since final credits issue only at the stop.
+/// The cell's next `INF.CKPT` is refused, and the graceful stop's final
+/// credit issues `u64::MAX` itself: the cell edge-detects a request of
+/// `u64::MAX`, checkpoints and publishes it. No credit is left unissued, so
+/// the drive ends exactly at the top.
+#[test]
+fn ckpt_the_stop_checkpoint_issues_and_publishes_u64_max() {
+    let dir = temp_data_dir("ckptmax");
+    let node = Node::start_durable_with_ckpt_headroom(1, &dir, 1);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    assert_eq!(node.request_ckpt_all(), u64::MAX - 2, "the host's one unit");
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 1, "the cell's one unit");
+    assert!(control.ckpt_board().slot(0).published() >= u64::MAX - 1, "WAIT fenced it");
+    c.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut c, CKPT_EXHAUSTED_REPLY);
+    drop(c);
+    node.stop_gracefully();
+    assert_eq!(control.ckpt_last_issued(), u64::MAX, "the final credit issued the top");
+    let board = control.ckpt_board();
+    assert_eq!(board.requested(0), u64::MAX, "the stop requested u64::MAX");
+    assert_eq!(board.slot(0).published(), u64::MAX, "the stop published u64::MAX");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -5481,6 +5515,8 @@ fn ckpt_wait_at_the_top_of_the_space_returns_after_both_cells_publish() {
             assert!(now > completed[cell] + round, "cell {cell} checkpointed before WAIT returned");
         }
     }
+    // Two issues into a space that starts (N + 1)·h + N = 8 below the top.
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 6, "engagement: both WAITs issued");
     let board = control.ckpt_board();
     let sum = u128::from(board.slot(0).published()) + u128::from(board.slot(1).published());
     assert!(sum >= 1 << 64, "engagement: the published sum passed 2^64 ({sum})");
@@ -5503,6 +5539,9 @@ fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
     read_exactly(&mut first, CKPT_EXHAUSTED_REPLY);
     second.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
     read_exactly(&mut second, b"+OK\r\n");
+    // Two issues into a space that starts (N + 1)·h + N = 5 below the top.
+    let control = node.control.as_ref().expect("durable");
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 3, "engagement: both cells issued");
     drop((first, second));
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -5517,19 +5556,7 @@ fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
     let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
-    let mut plane = |cell: u16| {
-        let listener = listen_reuseport(0).expect("listen");
-        ServerPlane::<NoopObserver, inf_server::StdSegmentFs>::new(
-            CellId(cell),
-            2,
-            listener.into_raw_fd(),
-            Keyspace::new(StoreConfig::default()),
-            fabrics.next().expect("one fabric per cell"),
-            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
-            NoopObserver,
-            false,
-        )
-    };
+    let mut plane = |cell: u16| unwired_plane(cell, 2, fabrics.next().expect("a fabric per cell"));
     let (mut first, mut second) = (plane(0), plane(1));
     let mut issuers = issuers.cells.into_iter();
     let (zero, one) = (issuers.next().expect("cell 0"), issuers.next().expect("cell 1"));
@@ -5537,14 +5564,75 @@ fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
     let refused =
         first.set_control(Arc::clone(&control), one).expect_err("cell 1's issuer on cell 0");
     assert_eq!((refused.plane, refused.issuer.cell()), (CellId(0), CellId(1)));
+    let other_cell = inf_server::IssuerMismatch::OtherCell { issuer: CellId(1) };
+    assert_eq!(refused.mismatch, other_cell);
     second.set_control(Arc::clone(&control), refused.issuer).expect("custody came back");
     first.set_control(control, zero).expect("cell 0's own issuer");
 }
 
-/// ADR-0159 A1.4 (2 cells): after `INF.CKPT CELL k WAIT` on one
-/// connection, `LASTSAVE` on the same connection is at or after the second
-/// the `WAIT` was sent — the waiting cell's floor covers the checkpoint
-/// the `WAIT` fenced even while its sweep trails the board.
+/// A plane of `cells` with no control handle wired yet: the subject of the
+/// wiring checks below.
+fn unwired_plane(
+    cell: u16,
+    cells: u16,
+    fabric: inf_fabric::CellFabric,
+) -> ServerPlane<NoopObserver, inf_server::StdSegmentFs> {
+    let listener = listen_reuseport(0).expect("listen");
+    ServerPlane::new(
+        CellId(cell),
+        cells,
+        listener.into_raw_fd(),
+        Keyspace::new(StoreConfig::default()),
+        fabric,
+        Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+        NoopObserver,
+        false,
+    )
+}
+
+/// ADR-0159 A1.2 at the wiring seam: a credit issues only into its own
+/// boot's board, so a plane refuses a cell issuer minted by another
+/// control handle's partition. Wired, its `INF.CKPT WAIT` would raise a
+/// board this cell never reads and park for ever, and its stop would wait
+/// out the deadline on the handle's slot. The allowance comes back, and the
+/// handle that minted it accepts it.
+#[test]
+fn set_control_refuses_an_issuer_of_another_boot() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, _issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (other, _other_inbox, other_issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = unwired_plane(0, 2, fabrics.next().expect("cell 0's fabric"));
+    let foreign = other_issuers.cells.into_iter().next().expect("the other boot's cell 0");
+    let refused = plane.set_control(control, foreign).expect_err("another boot's issuer");
+    assert_eq!(refused.mismatch, inf_server::IssuerMismatch::OtherBoot);
+    plane.set_control(other, refused.issuer).expect("the minting boot's handle accepts it");
+}
+
+/// ADR-0159 A1.1 at the wiring seam: the plane validates `INF.CKPT CELL k`
+/// against its own cell count, so its board must hold exactly that many
+/// slots. A 4-cell plane over a 2-cell board is refused before anything
+/// is wired; wired, `CELL 3` would pass the check and index past the board
+/// after the clock had moved.
+#[test]
+fn set_control_refuses_a_board_of_another_cell_count() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(4, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = unwired_plane(0, 4, fabrics.next().expect("cell 0's fabric"));
+    let zero = issuers.cells.into_iter().next().expect("cell 0's issuer");
+    let refused = plane.set_control(control, zero).expect_err("a 4-cell plane, a 2-cell board");
+    let mismatch = inf_server::IssuerMismatch::CellCount { plane: 4, board: 2 };
+    assert_eq!(refused.mismatch, mismatch);
+}
+
+/// ADR-0159 A1.4 at the wire (2 cells): after `INF.CKPT CELL k WAIT` on
+/// one connection, `LASTSAVE` on the same connection is at or after the
+/// second the `WAIT` was sent. This is the reachability leg only: the sweep
+/// that wakes the `WAIT` has usually read slot `k` already, so it passes
+/// with or without the floor. The floor itself is pinned by the control
+/// unit test `lastsave_after_wait_cell_covers_the_fenced_checkpoint` and
+/// its planted canary.
 #[test]
 fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
     let dir = temp_data_dir("ckptlastsave");

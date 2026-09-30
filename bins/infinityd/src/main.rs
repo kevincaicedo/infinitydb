@@ -1081,6 +1081,7 @@ fn main() {
         let wake_fd = wake_fds[i].take();
         #[cfg(not(target_os = "linux"))]
         let wake_fd = None;
+        let launch = CellLaunch { cell: i as u16, fabric, wake_fd, cache_permit, ckpt_issuer };
         handles.push(
             std::thread::Builder::new()
                 .name(format!("cell-{i}"))
@@ -1093,19 +1094,7 @@ fn main() {
                     // an io_uring_setup failure nobody printed. A cell that
                     // cannot run takes the node down loudly, here and now.
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell_main(
-                            CellLaunch {
-                                cell: i as u16,
-                                fabric,
-                                wake_fd,
-                                cache_permit,
-                                ckpt_issuer,
-                            },
-                            &args,
-                            boot,
-                            hasher,
-                            &wiring,
-                        )
+                        cell_main(launch, &args, boot, hasher, &wiring)
                     }));
                     match outcome {
                         Ok(Ok(())) => Ok::<(), std::io::Error>(()),

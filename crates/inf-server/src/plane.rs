@@ -104,7 +104,7 @@ use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
 
 use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
-    IssuerCellMismatch, RecoveryBoard,
+    IssuerRefused, RecoveryBoard,
 };
 use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
@@ -349,14 +349,11 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// with `control` by `set_control` (one call sets both); `None`
     /// exactly when it is.
     ckpt_quota: RefCell<Option<CkptQuota>>,
-    /// This cell's sweep of the checkpoint board (ADR-0159 D4, A1.4) and
-    /// its completed observation, which all-cell `WAIT`, DROP pacing,
-    /// `LASTSAVE` and the INFO gauge read. Stepped once per MAINTAIN.
+    /// This cell's sweep of the checkpoint board (ADR-0159 D4, A1.4): its
+    /// completed observation, which all-cell `WAIT`, DROP pacing and the
+    /// INFO gauge read, and `LASTSAVE`'s floor, which every `WAIT CELL k`
+    /// on this cell raises as it confirms. Stepped once per MAINTAIN.
     ckpt_sweep: RefCell<BoardSweep>,
-    /// `LASTSAVE`'s floor (ADR-0159 A1.4, unix ms): the publication time
-    /// of every slot a `WAIT CELL k` on this cell confirmed, so a
-    /// `LASTSAVE` after it covers the checkpoint it fenced.
-    lastsave_floor_ms: Cell<u64>,
     /// Node is loading (M2-S15): commands without the LOADING flag answer
     /// `-LOADING` until every cell's recovery completes. One predictable
     /// `Cell<bool>` load on the command path; false forever after boot.
@@ -720,7 +717,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ddl_gen_seen: Cell::new(0),
                 ckpt_quota: RefCell::new(None),
                 ckpt_sweep: RefCell::new(BoardSweep::new()),
-                lastsave_floor_ms: Cell::new(0),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
                 parse_prefetch: Cell::new(false),
@@ -1186,17 +1182,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// `INFO` the node-wide memory board (M3-S25 attribution fix).
     ///
     /// # Errors
-    /// [`IssuerCellMismatch`] when `issuer` was minted for another cell
-    /// (ADR-0159 D3: the stop credit raises its own cell's slot, and this
-    /// cell's stop waits on this cell's slot). Nothing is wired, and the
-    /// allowance comes back in the error.
+    /// [`IssuerRefused`] when `issuer` was minted by another handle's
+    /// partition, the handle's board does not hold this plane's cell count,
+    /// or `issuer` was minted for another cell (`IssuerMismatch`). Nothing
+    /// is wired, and the allowance comes back in the error.
     pub fn set_control(
         &mut self,
         control: Arc<ControlHandle>,
         issuer: CellIssuer,
-    ) -> Result<(), IssuerCellMismatch> {
-        if issuer.cell() != self.shared.cell {
-            return Err(IssuerCellMismatch { plane: self.shared.cell, issuer });
+    ) -> Result<(), IssuerRefused> {
+        let plane = self.shared.cell;
+        if let Err(mismatch) = issuer.check_wiring(&control, plane, self.shared.cells) {
+            return Err(IssuerRefused { plane, mismatch, issuer });
         }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
         *self.shared.control.borrow_mut() = Some(control);

@@ -13,10 +13,14 @@
 #     store-tier index rows, ADR-0139). The planted build must report
 #     exactly that test `FAILED`; a build that is red for any other
 #     reason — a compile error, another test — is not a catch;
-#   `<cfg> loom <package> <test name>` — a Loom model in the package's
-#     library, for a memory ordering no other oracle can see (ADR-0159
-#     A1.6): built `--cfg loom --cfg <cfg>` in release, judged like a
-#     crate-test row, with the plain `--cfg loom` build as the control.
+#   `<cfg> loom <package> <test name> <witness>` — a Loom model in the
+#     package's library, for a memory ordering no other oracle can see
+#     (ADR-0159 A1.6): built `--cfg loom --cfg <cfg>` in release, judged
+#     like a crate-test row, with the plain `--cfg loom` build as the
+#     control. The planted log must also carry `<witness>`, a whitespace-
+#     free piece of the model's own assertion: a Loom budget panic, the
+#     model's VACUOUS check or an `expect` also fail the test, and none of
+#     them is the oracle seeing the stale effect.
 # Usage: scripts/sim-canaries.sh [seed]
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
 # replaces the row table and INF_CANARY_CARGO the cargo binary.
@@ -122,11 +126,14 @@ rows=(
   # Loom effect witness must see an effect written before an issue go
   # missing after a request that covers it.
   # The issue is Relaxed: issues no longer form a happens-before chain.
-  "inf_canary_issue_clock_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request"
+  "inf_canary_issue_clock_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request A1.6:"
   # A request word is raised with a Relaxed RMW.
-  "inf_canary_request_raise_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request"
+  "inf_canary_request_raise_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request A1.6:"
   # A request word is read with a Relaxed load.
-  "inf_canary_request_read_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request"
+  "inf_canary_request_read_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request A1.6:"
+  # ADR-0159 A1.4: `WAIT CELL k`'s confirmation skips its LASTSAVE floor
+  # raise, so a LASTSAVE after the WAIT trails the checkpoint it fenced.
+  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_after_wait_cell_covers_the_fenced_checkpoint"
   # ADR-0170 — an offer above its class cap is issued by a counted overrun.
   # The answer before it, "not this slice" for ever: the budget scenario's
   # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized
@@ -187,10 +194,11 @@ crate_test() {
   fi
 }
 
-# loom_test <cfg> <package> <test name>: the model under `--cfg loom`,
-# planted and plain, each in its own target dir (RUSTFLAGS differ).
+# loom_test <cfg> <package> <test name> <witness>: the model under
+# `--cfg loom`, planted and plain, each in its own target dir (RUSTFLAGS
+# differ).
 loom_test() {
-  local cfg=$1 package=$2 name=$3
+  local cfg=$1 package=$2 name=$3 witness=$4
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package loom $name on the planted build must go red"
   if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
@@ -201,8 +209,12 @@ loom_test() {
     echo "   red for another reason (expected 'test $name ... FAILED'):"
     tail -5 "$log"
     fail=1
+  elif ! grep -Fq -- "$witness" "$log"; then
+    echo "   red for another reason (expected the model's assertion '$witness'):"
+    tail -5 "$log"
+    fail=1
   else
-    echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
+    echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
   fi
   echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
   if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
@@ -225,8 +237,8 @@ for row in "${rows[@]}"; do
     continue
   fi
   if [ "${parts[1]}" = loom ]; then
-    [ "${#parts[@]}" -eq 4 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    loom_test "$cfg" "${parts[2]}" "${parts[3]}"
+    [ "${#parts[@]}" -eq 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
+    loom_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}"
     continue
   fi
   name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")

@@ -283,8 +283,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         }
         // ADR-0159 A1.4: a registered checkpoint waiter keeps the cell
         // unparked until its sweep completes — at most one sweep of
-        // `ceil(N / 64)` unparked turns per wake.
-        if self.shared.ckpt_waiters.waiting() > 0 && self.shared.ckpt_sweep.borrow().in_progress() {
+        // `ceil(N / 64)` unparked turns per wake. The O(1) cursor test goes
+        // first: at `N <= 64` a sweep never stays in progress, and
+        // `waiting()` walks every queued waiter.
+        if self.shared.ckpt_sweep.borrow().in_progress() && self.shared.ckpt_waiters.waiting() > 0 {
             return true;
         }
         let Some(flags) = &self.park_flags else { return false };
