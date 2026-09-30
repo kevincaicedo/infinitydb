@@ -64,6 +64,8 @@ USAGE:
                    [--infinityd-bin PATH] [--redis-bin PATH]
                    m1 rows: [--storm-keys N] [--flushall-keys N] [--maxmemory-mb N]
                             [--subs N] [--sub-channels N]
+                            [--only-empty-node] [--data-root DIR]  (empty-node
+                            rows run first; data-root must not be tmpfs)
                    m2 rows: [--baseline-bin PATH]  (pre-M2 infinityd for the
                             zero-cost A/B; delta rows PENDING without it)
                    m4 rows: [--baseline-bin PATH]  (M3-tip infinityd for the

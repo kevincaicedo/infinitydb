@@ -579,6 +579,13 @@ struct S37DelCycle {
     rss_after_del: u64,
 }
 
+/// VmRSS of the row's server: a failed read fails the row, never a 0.
+fn s37_rss(pid: u32, when: &str) -> Result<u64, String> {
+    crate::gaterun::read_proc(pid, None)
+        .map(|sample| sample.rss_bytes)
+        .map_err(|e| format!("s37 ticketed-DEL VmRSS {when}: {e}"))
+}
+
 fn s37_del_cycle(
     port: u16,
     pid: u32,
@@ -606,16 +613,19 @@ fn s37_del_cycle(
     }
     let mid = scrape_cells(port, cells)?;
     let d_set = |f: &str| sum_field(&mid, f).saturating_sub(sum_field(&before, f));
-    let rss_before_del = crate::gaterun::rss_bytes_of(pid);
+    let rss_before_del = s37_rss(pid, "before the DEL window")?;
     let stop = std::sync::atomic::AtomicBool::new(false);
     let peak = std::sync::atomic::AtomicU64::new(rss_before_del);
+    let read_failures = std::sync::atomic::AtomicU64::new(0);
     let del = std::thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                peak.fetch_max(
-                    crate::gaterun::rss_bytes_of(pid),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                match crate::gaterun::read_proc(pid, None) {
+                    Ok(sample) => {
+                        peak.fetch_max(sample.rss_bytes, std::sync::atomic::Ordering::Relaxed)
+                    }
+                    Err(_) => read_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                };
                 #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -631,7 +641,11 @@ fn s37_del_cycle(
             del.error_samples.first()
         ));
     }
-    let rss_after_del = crate::gaterun::rss_bytes_of(pid);
+    let failures = read_failures.load(std::sync::atomic::Ordering::Relaxed);
+    if failures > 0 {
+        return Err(format!("s37 ticketed-DEL @{from}: {failures} peak VmRSS read(s) failed"));
+    }
+    let rss_after_del = s37_rss(pid, "after the DEL window")?;
     let after = scrape_cells(port, cells)?;
     let d_del = |f: &str| sum_field(&after, f).saturating_sub(sum_field(&mid, f));
     Ok(S37DelCycle {
@@ -782,7 +796,7 @@ pub(super) fn s37_ticketed_del_row(
             for (key, value) in config {
                 config_set(port, key, value)?;
             }
-            let rss_base = crate::gaterun::rss_bytes_of(pid);
+            let rss_base = s37_rss(pid, "at the leg's base")?;
             let mut rows: Vec<S37DelCycle> = Vec::new();
             for cycle in 0..cycles {
                 let from = cycle * del_keys;
@@ -816,7 +830,7 @@ pub(super) fn s37_ticketed_del_row(
                 println!("  s37 {}", raw.lines().last().unwrap_or(""));
                 rows.push(c);
             }
-            let rss_end = crate::gaterun::rss_bytes_of(pid);
+            let rss_end = s37_rss(pid, "at the leg's end")?;
             let med = |f: &dyn Fn(&S37DelCycle) -> f64| {
                 let mut v: Vec<f64> = rows.iter().map(f).collect();
                 median(&mut v)

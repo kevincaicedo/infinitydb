@@ -67,7 +67,8 @@ fn run_leg(
     m.raw_section(&format!("{name} {label} rep {rep}"), &render(&report));
     samples.ops.push(report.ops_per_sec);
     samples.p999.push(report.p999_us as f64);
-    samples.rss.push(server.rss_bytes() as f64);
+    let sample = server.proc_sample().map_err(|e| format!("{name} {label} rep {rep} RSS: {e}"))?;
+    samples.rss.push(sample.rss_bytes as f64);
     Ok(())
 }
 

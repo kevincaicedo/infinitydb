@@ -263,7 +263,7 @@ fn s40_leg(
         target_ops_per_sec: Some(offered),
         ..LoadSpec::default()
     };
-    let ticks_before = crate::gaterun::cpu_ticks_of(server.pid());
+    let ticks_before = server.proc_sample().map_err(|e| format!("s40: CPU ticks before: {e}"))?;
     let t0 = Instant::now();
     let load = std::thread::spawn(move || run_load(&spec));
     let mut timeline: Vec<S40Sample> = Vec::new();
@@ -275,8 +275,10 @@ fn s40_leg(
         std::thread::sleep(Duration::from_millis(S40_SAMPLE_MS));
     }
     let wall = t0.elapsed().as_secs_f64().max(1e-9);
-    let ticks = crate::gaterun::cpu_ticks_of(server.pid()).saturating_sub(ticks_before);
+    let ticks_after = server.proc_sample();
     let report = load.join().map_err(|_| "s40: load thread panicked".to_string())??;
+    let ticks_after = ticks_after.map_err(|e| format!("s40: CPU ticks after: {e}"))?;
+    let ticks = ticks_after.cpu_ticks.saturating_sub(ticks_before.cpu_ticks);
     if report.errors > report.busy_retryable {
         return Err(format!(
             "s40: {} non-BUSY errors (first: {:?})",

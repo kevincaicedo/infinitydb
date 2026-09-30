@@ -314,10 +314,15 @@ fn checked_load(
 }
 
 pub(super) fn measured_load(spec: &LoadSpec) -> Result<(LoadReport, f64), String> {
+    let generator = |when: &str, expected_start: Option<u64>| {
+        crate::gaterun::read_proc(std::process::id(), expected_start)
+            .map_err(|e| format!("generator CPU ticks {when} the leg: {e}"))
+    };
     let started = Instant::now();
-    let ticks = crate::gaterun::cpu_ticks_of(std::process::id());
+    let before = generator("before", None)?;
     let result = run_load(spec)?;
-    let ticks = crate::gaterun::cpu_ticks_of(std::process::id()).saturating_sub(ticks);
+    let after = generator("after", Some(before.start_ticks))?;
+    let ticks = after.cpu_ticks.saturating_sub(before.cpu_ticks);
     let cpu_pct =
         ticks as f64 / crate::gaterun::CLOCK_TICKS_PER_S as f64 / started.elapsed().as_secs_f64()
             * 100.0;

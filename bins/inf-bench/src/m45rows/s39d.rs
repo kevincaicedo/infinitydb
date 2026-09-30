@@ -164,19 +164,6 @@ fn s39d_settle_truncation(
     }
 }
 
-/// `read_bytes` of `/proc/<pid>/io` — bytes the process caused to be
-/// fetched from the storage layer (0 when unreadable; disclosed).
-fn proc_read_bytes(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/io"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("read_bytes:"))
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0)
-}
-
 /// Exactly one first boot of the untouched crashed image: wall time to
 /// `loading:0` on every cell, the per-cell phase decomposition, and the
 /// process's storage reads at that instant.
@@ -198,7 +185,8 @@ fn s39d_boot(
             && sum_field(&infos, "loading") == 0
         {
             let wall = t0.elapsed().as_secs_f64();
-            let reads = proc_read_bytes(server.pid());
+            let reads = crate::gaterun::proc::read_io_bytes(server.pid(), None)
+                .map_err(|e| format!("s39d: /proc/<pid>/io read_bytes: {e}"))?;
             return Ok((wall, reads, infos.iter().map(S39dPhases::from_info).collect()));
         }
         if Instant::now() >= deadline {

@@ -175,3 +175,91 @@ unit = "libraries"
 tier = "any"
 source = "external:client_smoke"
 measured_by = "CI client-smoke job: redis-py, node-redis, go-redis, lettuce"
+
+# ---- Empty-node rows ---------------------------------------------------
+# The idle node's own cost at the default topology (4 cells, no named
+# namespace, one idle connection), measured first in gate-run m1, before
+# any fill. Each threshold is the design's bill, derived from the code's
+# constants before any run. The rows are a measured baseline
+# (informational): never a published target. gate-run m1 runs a
+# same-binary control set (A′, interleaved with A; row value = median(A))
+# and a planted red per row in every run. A row whose plant reads green or
+# never engaged, or whose A/A′ spread exceeds its budget, stays unset and
+# fails the run. A value over its bill is the finding the row exists to
+# make: the threshold is never raised to fit.
+
+# Idle RSS bill, N = 4 cells: receive pools pinned by fixed-buffer
+# registration N × 4096 × 4 KiB = 64 MiB; mesh ring slots N(N−1) × 4096 ×
+# 64 B = 3 MiB; io_uring SQ + CQ N × 4096 × 96 B = 1.5 MiB; per-cell
+# remainder 4 MiB × N = 16 MiB; per-node remainder 16 MiB. Σ 100.5 MiB.
+# Scope: memory-only node; every cell's registration proven by VmPin over
+# 2(N−1) × 4096 × 4 KiB (else the row is withheld). Plant: --buffers 8192
+# must rise ≥ 0.9 × 64 MiB and read over the bill.
+[[gate]]
+id = "empty_idle_rss"
+name = "Empty node: idle RSS"
+threshold = 100.5
+comparator = "<="
+unit = "MiB (VmRSS, node)"
+tier = "linux-reference-box"
+source = "loadgen:empty_idle_rss_mib"
+informational = true
+measured_by = "gate-run m1: 4-cell memory node, 5 s settle, VmRSS at the end of a 10 s idle window"
+
+# Empty data directory bill, in allocated 4 KiB blocks, N = 4: the root
+# directory 1, key-hash.toml 1, topology.toml 1, io-properties.toml 1
+# (LOCK is never written); per cell the shard, log and ckpt directories 3,
+# MANIFEST 1, the stop checkpoint's .ick (header + footer) 2, the floor
+# segment's one frame 1. The active and next segments are sparse: with no
+# `always` namespace there is no zero-fill, on either barrier class.
+# Σ 4 + 7N = 32 blocks = 128 KiB, with no remainder: an unnamed block is
+# what the row catches. Scope: Σ st_blocks × 512 after a warm boot served
+# 15 s, each inode once, symlinks not followed, filesystem blocks of at
+# most 4 KiB. Plant: a filler written at depth 3 must rise the walk by its
+# size and read over the bill; a sparse 1 GiB file must not move it.
+[[gate]]
+id = "empty_data_dir_bytes"
+name = "Empty node: data directory, allocated"
+threshold = 128
+comparator = "<="
+unit = "KiB allocated"
+tier = "linux-reference-box"
+source = "loadgen:empty_data_dir_kib"
+informational = true
+measured_by = "gate-run m1: durable 4-cell node, walked after each warm boot's idle window"
+
+# Warm boot bill, spawn to the first +PONG on a warm directory: exec and
+# loader 2 ms; main-thread setup 3 ms (rings, eventfds, lock, key-hash,
+# the io-properties identity check with no probe, topology); per cell in
+# parallel 7 ms (ring 1, pool + pin of 16 MiB 5, keyspace 1); empty
+# recovery 5 ms (MANIFEST, the stop checkpoint, no replayed frame, boot
+# GC); first reply 1 ms. Σ 18 ms, rounded up to 20 ms. The boot instant is
+# the first +PONG, never the accept: the listener binds before the cells
+# serve. Plant: the probing first boot must read over the bill and ≥ 2 s
+# over the median warm boot.
+[[gate]]
+id = "empty_warm_boot"
+name = "Empty node: warm boot to first PONG"
+threshold = 20
+comparator = "<="
+unit = "ms"
+tier = "linux-reference-box"
+source = "loadgen:empty_warm_boot_ms"
+informational = true
+measured_by = "gate-run m1: spawn to the first +PONG, then DBSIZE :0, stop checkpoint on"
+
+# Idle CPU bill, of one core: N × 10⁶ / 500 µs park = 8 000 wakes/s at
+# 5 µs per idle wake = 4.0 %, plus the sampler thread 10/s × 50 µs =
+# 0.05 %. Σ 4.05 %, rounded up to 5 %. Scope: memory-only node, one idle
+# connection, utime + stime over the 10 s window. Plant: --park-us 20
+# (its own bill 96 %) must read over the bill and rise ≥ 19.2 %.
+[[gate]]
+id = "empty_idle_cpu"
+name = "Empty node: idle CPU"
+threshold = 5
+comparator = "<="
+unit = "% of one core"
+tier = "linux-reference-box"
+source = "loadgen:empty_idle_cpu_pct"
+informational = true
+measured_by = "gate-run m1: 4-cell memory node, utime + stime over a 10 s idle window"

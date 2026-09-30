@@ -63,6 +63,7 @@ use s39b::{
 };
 use s39d::s39d_recovery_row;
 use s40::s40_stall_row;
+pub(crate) use s42::s42_file_class;
 use s42::s42_first_boot_row;
 
 mod s37measure;
@@ -1266,7 +1267,7 @@ fn s36_write_leg(
     offered: Option<u64>,
 ) -> Result<S36Leg, String> {
     let before = scrape_cells(port, cells)?;
-    let ticks_before = crate::gaterun::cpu_ticks_of(server.pid());
+    let ticks_before = server.proc_sample().map_err(|e| format!("s36: CPU ticks before: {e}"))?;
     let wall = Instant::now();
     let report = run_load(&LoadSpec {
         port,
@@ -1284,7 +1285,8 @@ fn s36_write_leg(
         ..LoadSpec::default()
     })?;
     let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
-    let ticks = crate::gaterun::cpu_ticks_of(server.pid()).saturating_sub(ticks_before);
+    let ticks_after = server.proc_sample().map_err(|e| format!("s36: CPU ticks after: {e}"))?;
+    let ticks = ticks_after.cpu_ticks.saturating_sub(ticks_before.cpu_ticks);
     if report.errors > report.busy_retryable {
         return Err(format!(
             "s36 leg: {} non-BUSY errors (first: {:?})",

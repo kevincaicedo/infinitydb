@@ -84,7 +84,7 @@ fn s42_boot(flags: &Flags, infinityd: &str, cells: u16, dir: &str) -> Result<S42
 /// `barrier_class` is the *active segment's* class — `flush` on a fresh
 /// cell until ADR-0086 D4's upgrade rotation — so the configured class
 /// is read where it was decided.
-fn s42_file_class(dir: &str) -> String {
+pub(crate) fn s42_file_class(dir: &str) -> String {
     let path = std::path::Path::new(dir).join("io-properties.toml");
     let Ok(text) = std::fs::read_to_string(path) else { return "absent".to_string() };
     text.lines()

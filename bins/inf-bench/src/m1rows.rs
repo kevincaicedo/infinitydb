@@ -24,6 +24,7 @@ use crate::gaterun::{
 use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, encode_command, request};
 
+mod empty_node;
 mod memory;
 
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
@@ -125,6 +126,21 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     }
     if !reference_box {
         m.note("dev-tier run: reference-box gates report measured values, non-binding verdicts");
+    }
+
+    // The empty-node rows run first, before any fill leaves dirty
+    // writeback on the device the durable legs boot from.
+    empty_node::run(flags, &gates_list, &mut m, &infinityd, cells, reference_box)?;
+    if flags.bool("only-empty-node") {
+        return finish_report(
+            "m1",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!("cells: {cells} · replicates: {replicates} · empty-node rows only"),
+        );
     }
 
     // Row 1 — baseline (M0-regression leg): same shape as the m0 pipelined
@@ -451,17 +467,27 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             ..Default::default()
         };
         run_load(&fill)?;
-        let our_rss = ours.rss_bytes();
+        // A server that exited after the fill is an unreaped zombie with no
+        // `VmRSS`: that read fails, so the release-blocking row stays unset.
+        let our_rss = ours.proc_sample().map(|sample| sample.rss_bytes);
         drop(ours);
-        match spawn_redis(&redis_bin) {
-            Err(e) => m.fail(format!("Redis RSS startup failed: {e}")),
-            Ok(redis) => {
+        match (our_rss, spawn_redis(&redis_bin)) {
+            (Err(e), _) => m.fail(format!("infinityd RSS after the fill: {e}")),
+            (Ok(_), Err(e)) => m.fail(format!("Redis RSS startup failed: {e}")),
+            (Ok(our_rss), Ok(redis)) => {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 run_load(&fill)?;
-                let redis_rss = redis.rss_bytes();
-                let ratio = our_rss as f64 / redis_rss as f64;
-                println!("  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x");
-                m.set("external:rss_attribution", ratio);
+                match redis.proc_sample() {
+                    Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
+                    Ok(sample) => {
+                        let redis_rss = sample.rss_bytes;
+                        let ratio = our_rss as f64 / redis_rss as f64;
+                        println!(
+                            "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"
+                        );
+                        m.set("external:rss_attribution", ratio);
+                    }
+                }
             }
         }
     }

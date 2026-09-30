@@ -20,14 +20,15 @@ use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, parse_info, request};
 
 mod loop_scrape;
+pub(crate) mod proc;
 mod saturation;
+pub(crate) mod serving;
+
+pub(crate) use proc::{CLOCK_TICKS_PER_S, ProcReadError, ProcSample, read_proc};
 
 pub(crate) struct ServerGuard {
     child: Child,
     pub port: u16,
-    /// Spawn to first accepted connection — the boot the M4.5-S42 row
-    /// times (a probing first boot against a file-backed second one).
-    pub boot: Duration,
 }
 
 impl ServerGuard {
@@ -49,57 +50,81 @@ impl Drop for ServerGuard {
 }
 
 impl ServerGuard {
-    pub(crate) fn rss_bytes(&self) -> u64 {
-        std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmRSS:"))
-                    .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-            })
-            .map_or(0, |kb| kb * 1024)
-    }
-
     /// Server pid for out-of-band samplers (M2-S12 RSS tracking).
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// One `/proc` read of the server. The guard holds the child unreaped
+    /// until it drops, so its pid cannot name another process: a server
+    /// that exited reads `ProcReadError::Exited`, never a zero.
+    pub(crate) fn proc_sample(&self) -> Result<ProcSample, ProcReadError> {
+        read_proc(self.child.id(), None)
+    }
+
+    /// `SIGTERM`, then exit 0 within [`GRACEFUL_STOP_DEADLINE_S`]: the
+    /// stop drained and wrote its stop checkpoint (ADR-0124 D2/D3), so the
+    /// data directory is warm. Any other end is a [`StopError`].
+    pub(crate) fn stop_graceful(mut self) -> Result<CleanStop, StopError> {
+        let pid = self.child.id().to_string();
+        let signal = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .map_err(|e| StopError::Signal(format!("kill -TERM {pid}: {e}")))?;
+        if !signal.success() {
+            return Err(StopError::Signal(format!("kill -TERM {pid}: {signal}")));
+        }
+        let give_up = Instant::now() + Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(CleanStop(())),
+                Ok(Some(status)) => return Err(StopError::Exit(status)),
+                Ok(None) => {}
+                Err(e) => return Err(StopError::Signal(format!("wait {pid}: {e}"))),
+            }
+            if Instant::now() >= give_up {
+                return Err(StopError::Deadline);
+            }
+            std::thread::sleep(Duration::from_millis(GRACEFUL_STOP_POLL_MS));
+        }
+    }
 }
 
-/// CPU time (user + system, in clock ticks) the process has consumed —
-/// fields 14 and 15 of `/proc/<pid>/stat` (M4.5-S36, ADR-0088 D7: the
-/// server-busy tripwire of the pure-write row). Linux `USER_HZ` is 100
-/// on every mainstream kernel; [`CLOCK_TICKS_PER_S`] names it.
-pub(crate) fn cpu_ticks_of(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            // The comm field may contain spaces; split after its ')'.
-            let rest = s.rsplit_once(')').map(|(_, r)| r)?;
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            // After ')', field 3 (state) is index 0; utime is field 14 →
-            // index 11, stime field 15 → index 12.
-            let utime: u64 = fields.get(11)?.parse().ok()?;
-            let stime: u64 = fields.get(12)?.parse().ok()?;
-            Some(utime + stime)
-        })
-        .unwrap_or(0)
+/// The longest wait for a graceful stop, in seconds: infinityd's
+/// `--shutdown-timeout-ms` default (10 s of drain) plus 5 s for the stop
+/// checkpoint and the exit. Crossing: `StopError::Deadline`; the guard's
+/// drop kills the child and the caller discards the directory.
+pub(crate) const GRACEFUL_STOP_DEADLINE_S: u64 = 15;
+
+/// The poll period while waiting for the stopped child. Fixed.
+const GRACEFUL_STOP_POLL_MS: u64 = 10;
+
+/// Proof that a server exited 0 after `SIGTERM`. Only
+/// [`ServerGuard::stop_graceful`] builds it.
+#[derive(Debug)]
+pub(crate) struct CleanStop(());
+
+/// Why a graceful stop did not end in exit 0.
+#[derive(Debug)]
+pub(crate) enum StopError {
+    /// The signal could not be sent, or the child could not be waited.
+    Signal(String),
+    /// The server exited, but not 0 (a drain timeout exits 1).
+    Exit(std::process::ExitStatus),
+    /// The server outlived [`GRACEFUL_STOP_DEADLINE_S`].
+    Deadline,
 }
 
-/// Linux `USER_HZ` (the `/proc/<pid>/stat` tick).
-pub(crate) const CLOCK_TICKS_PER_S: u64 = 100;
-
-/// Peak-VmRSS of `pid` (same parse as [`ServerGuard::rss_bytes`], usable
-/// from a sampler thread that must not borrow the guard).
-pub(crate) fn rss_bytes_of(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-        })
-        .map_or(0, |kb| kb * 1024)
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopError::Signal(why) => write!(f, "stop signal failed: {why}"),
+            StopError::Exit(status) => write!(f, "stopped with {status}, not exit 0"),
+            StopError::Deadline => {
+                write!(f, "still running {GRACEFUL_STOP_DEADLINE_S} s after SIGTERM")
+            }
+        }
+    }
 }
 
 fn free_port() -> u16 {
@@ -123,11 +148,51 @@ fn wait_ready(port: u16) -> Result<(), String> {
     }
 }
 
+/// Spawns infinityd and waits for its port to accept (the orchestration
+/// readiness most rows use; the empty-node rows time the first `+PONG`
+/// instead, through [`launch_infinityd`] and [`serving::wait_pong`]).
 pub(crate) fn spawn_infinityd(
     bin: &str,
     cells: u16,
     extra: &[&str],
 ) -> Result<ServerGuard, String> {
+    // A boot that probes (ADR-0091 D1: `--device-probe auto` on a fresh
+    // directory, ≈ 10 s on the reference device, bounded by
+    // `--probe-seconds` × nine rows) needs a longer ready deadline than
+    // the instant start every explicit arm gets.
+    let probes = extra.windows(2).any(|w| w[0] == "--device-probe" && w[1] == "auto");
+    let ready_within = Duration::from_secs(if probes { 180 } else { 10 });
+    let (mut guard, started) = launch_infinityd(bin, cells, extra)?;
+    let port = guard.port;
+    // Poll the child alongside the port: a fail-stopped server (M2.5-S01 —
+    // e.g. io_uring_setup ENOMEM prints `cell N failed: …` and exits) is
+    // detected in milliseconds and named, instead of burning the full TCP
+    // deadline on a corpse and reporting an unclassified "never came up".
+    let deadline = started + ready_within;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(guard);
+        }
+        if let Some(status) = guard.child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "server on {port} exited before ready ({status}) — fail-stop \
+                 (stderr: infinityd-{port}.stderr)"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("server on {port} never came up"));
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Spawns infinityd without waiting for it: the guard and the spawn
+/// instant, from which a caller times its own readiness.
+pub(crate) fn launch_infinityd(
+    bin: &str,
+    cells: u16,
+    extra: &[&str],
+) -> Result<(ServerGuard, Instant), String> {
     let port = free_port();
     let mut cmd = Command::new(bin);
     cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()]);
@@ -152,36 +217,9 @@ pub(crate) fn spawn_infinityd(
             cmd.stderr(Stdio::null());
         }
     }
-    // A boot that probes (ADR-0091 D1: `--device-probe auto` on a fresh
-    // directory, ≈ 10 s on the reference device, bounded by
-    // `--probe-seconds` × nine rows) needs a longer ready deadline than
-    // the instant start every explicit arm gets.
-    let probes = extra.windows(2).any(|w| w[0] == "--device-probe" && w[1] == "auto");
-    let ready_within = Duration::from_secs(if probes { 180 } else { 10 });
     let started = Instant::now();
     let child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
-    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
-    // Poll the child alongside the port: a fail-stopped server (M2.5-S01 —
-    // e.g. io_uring_setup ENOMEM prints `cell N failed: …` and exits) is
-    // detected in milliseconds and named, instead of burning the full TCP
-    // deadline on a corpse and reporting an unclassified "never came up".
-    let deadline = started + ready_within;
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            guard.boot = started.elapsed();
-            return Ok(guard);
-        }
-        if let Some(status) = guard.child.try_wait().map_err(|e| e.to_string())? {
-            return Err(format!(
-                "server on {port} exited before ready ({status}) — fail-stop \
-                 (stderr: infinityd-{port}.stderr)"
-            ));
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("server on {port} never came up"));
-        }
-        std::thread::yield_now();
-    }
+    Ok((ServerGuard { child, port }, started))
 }
 
 /// Comparator spawn (ADR-0006 shape): thread count matched to our cell
@@ -199,10 +237,8 @@ pub(crate) fn spawn_dragonfly(bin: &str, cells: u16) -> Result<ServerGuard, Stri
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let started = Instant::now();
-    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
+    let guard = ServerGuard { child, port };
     wait_ready(port)?;
-    guard.boot = started.elapsed();
     Ok(guard)
 }
 
@@ -226,10 +262,8 @@ pub(crate) fn spawn_redis(bin: &str) -> Result<ServerGuard, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let started = Instant::now();
-    let mut guard = ServerGuard { child, port, boot: Duration::ZERO };
+    let guard = ServerGuard { child, port };
     wait_ready(port)?;
-    guard.boot = started.elapsed();
     Ok(guard)
 }
 
@@ -525,6 +559,8 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // namespace (both arms read the same keys, no misses).
         "read-leg-fill",
         "model-absent",
+        // The empty-node rows alone (gate-run m1).
+        "only-empty-node",
     ],
     &[
         "allow-dirty",
@@ -644,6 +680,7 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "s39d-baseline",
         "read-leg-fill",
         "model-absent",
+        "only-empty-node",
         // M4.5-S35 row: seconds idled before every durable leg (the S34
         // drive-state rule; default 40, 0 for harness smoke).
         "leg-idle-s",
@@ -965,7 +1002,8 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         };
         let fill_report = run_load(&fill)?;
         println!("  infinityd fill: {:.0} sets/s", fill_report.ops_per_sec);
-        let our_rss = ours.rss_bytes();
+        let our_rss =
+            ours.proc_sample().map_err(|e| format!("infinityd RSS after the fill: {e}"))?.rss_bytes;
         let infos = scrape_cells(ours.port, cells)?;
         let domains = sum_field(&infos, "records_resident_bytes")
             + sum_field(&infos, "index_bytes")
@@ -991,10 +1029,17 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 let report = run_load(&fill)?;
                 println!("  redis fill: {:.0} sets/s", report.ops_per_sec);
-                let redis_rss = redis.rss_bytes();
-                let ratio = our_rss as f64 / redis_rss as f64;
-                println!("  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x");
-                m.set("external:rss_attribution", ratio);
+                match redis.proc_sample() {
+                    Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
+                    Ok(sample) => {
+                        let redis_rss = sample.rss_bytes;
+                        let ratio = our_rss as f64 / redis_rss as f64;
+                        println!(
+                            "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"
+                        );
+                        m.set("external:rss_attribution", ratio);
+                    }
+                }
             }
         }
     }
@@ -1036,6 +1081,70 @@ mod tests {
             let error = result.expect_err("missing STOP gate must fail");
             assert!(error.contains("probe"), "{error}");
         }
+    }
+
+    /// Polls `/proc/<pid>/stat` field 3 until the unreaped child is a
+    /// zombie (at most 5 s, every 1 ms).
+    #[cfg(target_os = "linux")]
+    fn wait_zombie(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("child stat");
+            let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next());
+            if state == Some("Z") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "child {pid} never became a zombie");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A server that exited and was not reaped is a zombie: its `status`
+    /// has no `VmRSS` line. A reader that folds that into 0 passes every
+    /// `<=` row (the `memory_1x` false green), so the read must fail.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_zombie_is_not_a_measurement() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        wait_zombie(pid);
+        assert_eq!(read_proc(pid, None), Err(ProcReadError::Exited));
+        assert_eq!(proc::read_io_bytes(pid, None), Err(ProcReadError::Exited));
+        child.wait().expect("reap");
+    }
+
+    /// A warm directory needs exit 0 after `SIGTERM`: a process the signal
+    /// kills, or one that exits 1 (a drain timeout), is a `StopError`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_graceful_stop_needs_exit_zero() {
+        let guard = |script: &str| {
+            let child = Command::new("sh").args(["-c", script]).spawn().expect("spawn sh");
+            ServerGuard { child, port: 0 }
+        };
+        // `sh` runs a trap only once its foreground `sleep` returns, so the
+        // loop sleeps briefly and the trap lands within one pass.
+        let traps = |code: u8| format!("trap 'exit {code}' TERM; while :; do sleep 0.01; done");
+        let settle = || std::thread::sleep(Duration::from_millis(100));
+        let clean = guard(&traps(0));
+        settle();
+        assert!(clean.stop_graceful().is_ok(), "exit 0 after SIGTERM");
+        let failing = guard(&traps(1));
+        settle();
+        let result = failing.stop_graceful();
+        assert!(matches!(result, Err(StopError::Exit(s)) if s.code() == Some(1)), "{result:?}");
+        let killed = guard("while :; do sleep 0.01; done");
+        settle();
+        let result = killed.stop_graceful();
+        assert!(matches!(result, Err(StopError::Exit(s)) if s.code().is_none()), "{result:?}");
+    }
+
+    /// A pid that names no process is not a measurement of zero.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_gone_pid_is_not_a_measurement() {
+        assert_eq!(read_proc(u32::MAX, None), Err(ProcReadError::Missing));
+        assert_eq!(proc::read_io_bytes(u32::MAX, None), Err(ProcReadError::Missing));
     }
 
     fn one_gate() -> Vec<gates::Gate> {

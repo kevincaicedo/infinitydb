@@ -81,6 +81,31 @@ Commit harnesses and reproduction instructions, not generated reports. See
   ≤ 1.0× **RSS** leg, and (with `--with-zipfian`) the LFU **hit-rate parity**
   row — against `docs/milestones/m1-gates.toml`.
 
+The four **empty-node** rows run first in `gate-run m1`, before any fill
+(`--only-empty-node` runs them alone). They measure the idle node at the
+default topology: **idle RSS** and **idle CPU** on a 4-cell memory node,
+the **data directory's allocated bytes** after a warm boot, and **warm boot**
+from spawn to the first `+PONG`. The listener accepts before the cells serve,
+so an accepted connection is never the boot instant, and `DBSIZE` must then
+answer `:0`. Each threshold is the design's own bill, stated beside its row
+in the gates file. The rows are informational: a measured baseline, never a
+published target.
+
+Every value comes from a read the harness parses itself: `/proc/<pid>`,
+`lstat` block counts (each inode once, no symlink followed) and the wire.
+A failed, partial or exited-process `/proc` read is an error that fails the
+leg. It is never a zero that passes a `<=` row. Each row runs a
+same-binary control set A′, interleaved with A, and publishes median(A) only
+when |median(A) − median(A′)| stays within its spread budget. It also runs a
+planted red in every run: `--buffers 8192`, a filler written at depth 3 of
+the stopped directory plus a sparse 1 GiB file, the probing first boot, and
+`--park-us 20`. A plant that reads green or never engages keeps its row
+unset and fails the run. The rows are withheld with a note on another cell
+count, off Linux, when fixed-buffer registration is unproven (VmPin), on a
+memory-filesystem data root (`--data-root`, default
+`.artifacts/m1/empty-node-data`), or on filesystem blocks over 4 KiB.
+A binding run fails instead of withholding when a precondition is unproven.
+
 M0/M1/M2 reports require a generator-saturation disposition (ADR-0135).
 Steady native load rows run once more with 50% more connections, rounded
 up and capped at 1024. Workload, pipeline, duration, warmup, seed and
@@ -117,6 +142,7 @@ Common flags:
 --storm-keys N      --flushall-keys N   --fill-keys N
 --maxmemory-mb N    --subs N            --sub-channels N
 --with-zipfian      --zipfian-keyspace N  --zipfian-ops N  --zipfian-maxmemory-mb N
+--only-empty-node   --data-root DIR
 ```
 
 Example (full reference-box M1 campaign):
