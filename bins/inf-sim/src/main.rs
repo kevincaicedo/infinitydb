@@ -1455,6 +1455,7 @@ fn run_durable(
     // deferrals issued, seal-pace waits, worst frame-write latency.
     let mut budget_bytes = 0u64;
     let mut budget_deferrals = 0u64;
+    let (mut budget_unattainable, mut block_wait_ns_max) = (0u64, 0u64);
     let mut waits_pace = 0u64;
     let mut stall_max_us = 0u64;
     // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
@@ -1516,6 +1517,8 @@ fn run_durable(
         hold_episode_violations += report.hold_episode_violations;
         budget_bytes += report.budget_background_bytes;
         budget_deferrals += report.budget_deferrals;
+        budget_unattainable += report.budget_unattainable;
+        block_wait_ns_max = block_wait_ns_max.max(report.ckpt_block_wait_ns_max);
         waits_pace += report.frame_waits_pace;
         stall_max_us = stall_max_us.max(report.write_stall_max_us);
         reopened_packed_tails += report.reopened_packed_tails;
@@ -1572,7 +1575,9 @@ fn run_durable(
          [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
          waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget \
          [background_bytes:{budget_bytes} \
-         deferrals:{budget_deferrals} waits_pace:{waits_pace} write_stall_max_us:{stall_max_us}], \
+         deferrals:{budget_deferrals} unattainable:{budget_unattainable} \
+         ckpt_block_wait_ns_max:{block_wait_ns_max} waits_pace:{waits_pace} \
+         write_stall_max_us:{stall_max_us}], \
          reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
          bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log \
          oracles \
@@ -1601,7 +1606,8 @@ fn run_durable(
              cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
              waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
              waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} \
-             budget_deferrals={budget_deferrals} \
+             budget_deferrals={budget_deferrals} budget_unattainable={budget_unattainable} \
+             ckpt_block_wait_ns_max={block_wait_ns_max} \
              waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
              reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
              ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \

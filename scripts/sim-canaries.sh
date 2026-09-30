@@ -122,6 +122,23 @@ rows=(
   "inf_canary_request_raise_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request"
   # A request word is read with a Relaxed load.
   "inf_canary_request_read_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request"
+  # ADR-0170 — an offer above its class cap is issued by a counted overrun.
+  # The answer before it, "not this slice" for ever: the budget scenario's
+  # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized
+  # checkpoint block wait past T_ckpt, and R1 and R2 must fail.
+  "inf_canary_unattainable_deferred m2-device-budget T_ckpt --sweep 4"
+  "inf_canary_unattainable_deferred crate-test inf-runtime lib a_checkpoint_block_above_the_class_cap_is_issued_within_its_bound"
+  "inf_canary_unattainable_deferred crate-test inf-server test:node_e2e a_checkpoint_holding_a_value_above_the_class_cap_completes"
+  # The overrun granted from any held credit: an attainable offer beside a
+  # same-class overrunner starves (the class oracle's I12).
+  "inf_canary_overrun_any_held crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
+  # A grant ends the rest pass and its refund leaves it ended: every
+  # overrun behind a zero-work sibling starves (I14).
+  "inf_canary_grant_clears_rest crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
+  # ADR-0170 A1: the checkpoint keep-up term floored on its own before the
+  # max drops up to (α − 1)/α byte a refill near the crossover.
+  "inf_canary_keepup_truncates crate-test inf-runtime lib the_keepup_floor_keeps_its_remainder_at_the_crossover"
+  "inf_canary_keepup_truncates crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

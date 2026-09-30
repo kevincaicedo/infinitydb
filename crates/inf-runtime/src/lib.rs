@@ -50,8 +50,8 @@ mod uring;
 
 pub use affinity::unpin_current_thread;
 pub use budget::{
-    Admission, BURST_HORIZON_NS, ClassCounters, ClassSlice, DeviceBudget, DeviceModel,
-    FLOOR_DIVISOR, IoClass, SealPace,
+    BURST_HORIZON_NS, ClassCap, ClassCounters, ClassSlice, DeviceBudget, DeviceModel,
+    FLOOR_DIVISOR, IoClass, Issue, SealPace,
 };
 pub use cold::{
     ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,

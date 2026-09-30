@@ -725,6 +725,10 @@ pub(super) fn budget_oracles(
         };
         let observed = node.cells[cell].0.driver().observed_io();
         let ckpt_slice = f64::from(scenario.ckpt_section_bytes.unwrap_or(256 << 10) + 4096);
+        // ADR-0170: the arm's largest checkpoint block is a block bound in
+        // (a) and (e), and the one debt the rate bound (b) must allow.
+        let ckpt_block = ckpt_block_max(scenario);
+        let overrun_slack = if scenario.ckpt_overrun.is_some() { ckpt_block } else { 0.0 };
         // (a) Accounting identity: what the budget counted is what the
         // driver saw, for every token-classed class — up to the ops the
         // cut caught between push and submit (`LoopCx::push` queues; the
@@ -737,7 +741,7 @@ pub(super) fn budget_oracles(
             match class {
                 IoClass::LogFrame => u64::from(scenario.segment_bytes),
                 IoClass::ZeroFill => 256 << 10,
-                IoClass::Checkpoint => ckpt_slice as u64,
+                IoClass::Checkpoint => ckpt_block as u64,
                 IoClass::BlobWrite
                 | IoClass::ColdReadForeground
                 | IoClass::TierFlush
@@ -790,7 +794,7 @@ pub(super) fn budget_oracles(
         // over α — ADR-0088 D2 amended). Foreground subtraction only
         // lowers the weighted grant.
         let horizon_bytes = share.write_bytes_per_s as f64 * BURST_HORIZON_NS as f64 / 1e9;
-        let slices = 256.0 * 1024.0 + ckpt_slice + 1024.0 * 1024.0 + 16.0 * 1024.0;
+        let slices = 256.0 * 1024.0 + ckpt_slice + 1024.0 * 1024.0 + 16.0 * 1024.0 + overrun_slack;
         let keepup = stats.log_frame_bytes as f64 / 2.0;
         let bound =
             share.write_bytes_per_s as f64 * elapsed_s + 2.0 * horizon_bytes + slices + keepup;
@@ -854,7 +858,7 @@ pub(super) fn budget_oracles(
         // and one scheduler step of completion quantization.
         let rate = stall.write_bytes_per_s as f64;
         let frame_max = f64::from(scenario.segment_bytes);
-        let block_max = (256.0_f64 * 1024.0).max(ckpt_slice);
+        let block_max = (256.0_f64 * 1024.0).max(ckpt_block);
         let service_us = (stall.through_base_ns * (1 + stall.tail_mult)) as f64 / 1e3;
         let bound_us = (frame_max + block_max + horizon_bytes) / rate * 1e6
             + service_us
@@ -872,6 +876,78 @@ pub(super) fn budget_oracles(
         if stats.io_budget_model_absent == 1 {
             report.violations.push(format!("cell {cell}: the budget model is absent"));
         }
+    }
+}
+
+/// The largest checkpoint block the scenario can offer: the section slice
+/// (`ick_align_up(target + 16)`), or the ADR-0170 arm's padded block.
+fn ckpt_block_max(scenario: &DurableScenario) -> f64 {
+    let target = scenario.ckpt_section_bytes.unwrap_or(256 << 10);
+    let slice = f64::from(target + 4096);
+    scenario.ckpt_overrun.map_or(slice, |arm| arm.block_max(u64::from(target)) as f64)
+}
+
+/// ADR-0170 D4's `T_ckpt(B_max)` for the scenario, in injected ns,
+/// computed from the model and D4's formula — never from budget code:
+/// `max over axes of (O + cap + C + lag) / r + 2Δ`, with `r` the class's
+/// floored share (on bytes with α = 2, `share / 7`), `C` one checkpoint's
+/// unconditional charges (a 4 KiB header block; five barrier ops: the
+/// header, the completion sync and the swap's three), the owed amount
+/// `O ≤ (B_max − cap)⁺ + C` (I6), a lag of three units for the carries
+/// (the keep-up max included: one carry, ADR-0170 A1), and `Δ` the
+/// scenario's step bound (every cell iterates once per step).
+fn t_ckpt_ns(scenario: &DurableScenario) -> f64 {
+    const LAG_UNITS: f64 = 3.0;
+    let share = scenario.device.model_share;
+    let alpha = inf_server::CkptConfig::default().alpha as f64;
+    let (weight, weights) = (2.0_f64, 10.0_f64);
+    let slice = f64::from(scenario.ckpt_section_bytes.unwrap_or(256 << 10) + 4096);
+    let axis = |rate: f64, slice: f64, block: f64, charged: f64, keepup: bool| {
+        let floor = weight / (8.0 * weights);
+        let r = rate * if keepup { floor.max(weight / (alpha * weight + weights)) } else { floor };
+        let cap = slice.max(rate * weight / weights * 0.05);
+        let owed = (block - cap).max(0.0) + charged;
+        (owed + cap + charged + LAG_UNITS) / r
+    };
+    let bytes = axis(share.write_bytes_per_s as f64, slice, ckpt_block_max(scenario), 4096.0, true);
+    let ops = axis(share.write_ops_per_s as f64, 1.0, 1.0, 5.0, false);
+    let delta = (scenario.step_ns_max + 1_000) as f64 / 1e9;
+    (bytes.max(ops) + 2.0 * delta) * 1e9
+}
+
+/// ADR-0170's sim oracles on the budget scenario: (c′) the arm engaged —
+/// some cell counted a checkpoint offer above the class cap, or the run is
+/// VACUOUS — while on the control seeds no class ever did (8 KiB sections
+/// of values ≤ 512 B fit the 12 KiB cap); (g) no checkpoint block waited
+/// past `T_ckpt(B_max)` from its first offer, a pending block included.
+pub(super) fn overrun_oracles(scenario: &DurableScenario, node: &Node, report: &mut DurableReport) {
+    use inf_runtime::IoClass;
+    let seed = scenario.seed;
+    let bound_ns = t_ckpt_ns(scenario);
+    let mut unattainable_checkpoint = 0u64;
+    for cell in 0..usize::from(scenario.cells) {
+        let Some(stats) = node.plane(cell).durable_stats() else { continue };
+        let counted: u64 =
+            IoClass::ALL.iter().map(|c| stats.io_budget[c.index()].unattainable).sum();
+        unattainable_checkpoint += stats.io_budget[IoClass::Checkpoint.index()].unattainable;
+        if scenario.ckpt_overrun.is_none() && counted > 0 {
+            report.violations.push(format!(
+                "OVERRUN CONTROL seed {seed:#x} cell {cell}: {counted} offers above a class cap \
+                 off the arm (ADR-0170 control leg)"
+            ));
+        }
+        let waited = stats.ckpt_block_wait_ns_max;
+        if waited as f64 > bound_ns {
+            report.violations.push(format!(
+                "CKPT BLOCK WAIT seed {seed:#x} cell {cell}: a checkpoint block waited \
+                 {waited} ns, past T_ckpt {bound_ns:.0} ns (ADR-0170 D4, oracle (g))"
+            ));
+        }
+    }
+    if scenario.ckpt_overrun.is_some() && unattainable_checkpoint == 0 {
+        report.violations.push(format!(
+            "OVERRUN ARM VACUOUS seed {seed:#x}: no checkpoint offer above the class cap"
+        ));
     }
 }
 

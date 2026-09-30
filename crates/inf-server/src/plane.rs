@@ -50,8 +50,8 @@ use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::GroupClass;
 use inf_runtime::{
-    Admission, CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait,
-    IoClass, IoOp, LoopCx, RawFd, TokenClass, WaitList,
+    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
+    Issue, LoopCx, RawFd, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -984,12 +984,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             durable: &'a RefCell<Option<DurableCell<F>>>,
         }
         impl<F: SegmentFs> crate::tier_cell::FlushAdmission for DurableFlushAdmission<'_, F> {
-            fn admit(&mut self, bytes: u64, ops: u64) -> bool {
+            fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
                 match self.durable.borrow_mut().as_mut() {
-                    Some(cell) => {
-                        cell.admit_background(IoClass::TierFlush, bytes, ops) == Admission::Granted
-                    }
-                    None => true,
+                    Some(cell) => cell.offer_background(IoClass::TierFlush, bytes, ops),
+                    None => Issue::Now,
                 }
             }
             fn refund(&mut self, bytes: u64, ops: u64) {
@@ -1128,14 +1126,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     Some(cell) => match class {
                         inf_runtime::ReadClass::Foreground => {
                             cell.charge_foreground(IoClass::ColdReadForeground, bytes, 1);
-                            true
+                            Issue::Now
                         }
                         inf_runtime::ReadClass::Maintain => {
-                            cell.admit_background(IoClass::ColdReadMaintain, bytes, 1)
-                                == Admission::Granted
+                            cell.offer_background(IoClass::ColdReadMaintain, bytes, 1)
                         }
                     },
-                    None => true,
+                    None => Issue::Now,
                 },
                 |class, unused_bytes, unused_ops| {
                     if let Some(cell) = durable.borrow_mut().as_mut() {

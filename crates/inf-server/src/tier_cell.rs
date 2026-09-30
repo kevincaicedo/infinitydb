@@ -32,7 +32,7 @@ use inf_log::flush::unlink_tier_file;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
-    ColdReadConfig, ColdReads, CompletionToken, IoOp, TierFileId, TokenClass, WaitList,
+    ColdReadConfig, ColdReads, CompletionToken, IoOp, Issue, TierFileId, TokenClass, WaitList,
     WriteBarrier,
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
@@ -59,12 +59,12 @@ const _: () = assert!(
 pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
 
 /// The device budget's answer to "may a flush round of up to `bytes`
-/// bytes and `ops` ops stage now?" plus the refund of the unissued part
-/// (ADR-0088 D5). Generic, not `dyn`: one monomorphized closure per
-/// plane. `None` = no durable plane (the MemFs test tier) — always
-/// granted, nothing metered.
+/// bytes and `ops` ops stage now?" (ADR-0170 D1's [`Issue`]) plus the
+/// refund of the unissued part (ADR-0088 D5). Generic, not `dyn`: one
+/// monomorphized closure per plane. `None` = no durable plane (the MemFs
+/// test tier) — always `Now`, nothing metered.
 pub(crate) trait FlushAdmission {
-    fn admit(&mut self, bytes: u64, ops: u64) -> bool;
+    fn admit(&mut self, bytes: u64, ops: u64) -> Issue;
     fn refund(&mut self, bytes: u64, ops: u64);
 }
 
@@ -926,15 +926,21 @@ fn drive_flush_round<F: SegmentFs>(
         stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
         return Ok(0);
     }
-    // ADR-0088 D5: the round's byte bound is offered to the device budget
-    // before anything stages; `Deferred` ⇒ not this tick — the sealed
-    // backlog waits where it is (no state moved), re-offered next tick.
-    // The bound is the slice; the unissued remainder is refunded after
-    // staging reports the exact bytes.
-    let slice_bound = t.flush.slice_bytes();
-    if !admission.admit(slice_bound, TIER_ROUND_MAX_OPS) {
-        stats.rounds_deferred += 1;
+    // ADR-0170 D3: a round offers only when a chunk is there to take — an
+    // idle namespace asks the budget for nothing. ADR-0088 D5: the slice
+    // is offered before anything stages; `NotThisSlice` leaves the sealed
+    // backlog where it is, re-offered next pass; the unissued remainder is
+    // refunded once staging reports the exact bytes.
+    if !table.flush_pending(&t.flush) {
         return Ok(0);
+    }
+    let slice_bound = t.flush.slice_bytes();
+    match admission.admit(slice_bound, TIER_ROUND_MAX_OPS) {
+        Issue::Now => {}
+        Issue::NotThisSlice => {
+            stats.rounds_deferred += 1;
+            return Ok(0);
+        }
     }
     // An errored stage may still leave a valid round (a seal staged
     // before a refused file creation — F-L01-02): it is submitted like

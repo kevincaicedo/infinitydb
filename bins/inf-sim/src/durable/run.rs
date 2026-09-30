@@ -53,6 +53,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         write_through_entries_max: 0,
         budget_background_bytes: 0,
         budget_deferrals: 0,
+        budget_unattainable: 0,
+        ckpt_block_wait_ns_max: 0,
         frame_waits_pace: 0,
         write_stall_max_us: 0,
         reopened_packed_tails: 0,
@@ -727,12 +729,16 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                     report.budget_background_bytes += c.spent_bytes;
                 }
                 report.budget_deferrals += c.deferrals;
+                report.budget_unattainable += c.unattainable;
             }
+            report.ckpt_block_wait_ns_max =
+                report.ckpt_block_wait_ns_max.max(stats.ckpt_block_wait_ns_max);
         }
     }
     engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
         budget_oracles(scenario, &node, clock.now(), &mut report);
+        overrun_oracles(scenario, &node, &mut report);
     }
     if scenario.ckpt_direct_refused_after.is_some() {
         for cell in 0..usize::from(scenario.cells) {

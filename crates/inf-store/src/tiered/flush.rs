@@ -108,10 +108,7 @@ impl TieredTable {
         let flushed0 = self.space.flushed().to_raw();
         let sealed0 = flush.sealed().len();
         let mut outcome = FlushSliceOutcome::default();
-        // Resume where the pipeline's append cursor stands — bytes may be
-        // staged ahead of `flushed` (partial-frame holdback), and they
-        // must never be re-appended.
-        let mut cursor = flush.append_cursor().unwrap_or(flushed0);
+        let mut cursor = self.flush_start_cursor(flush);
         assert!(cursor >= flushed0, "flush cursor behind the watermark");
         let mut spent = 0u64;
         let mut wrote = false;
@@ -323,7 +320,7 @@ impl TieredTable {
         debug_assert!(!flush.round_active(), "staging over an in-flight round");
         let budget = flush.slice_bytes();
         let flushed0 = self.space.flushed().to_raw();
-        let mut cursor = flush.append_cursor().unwrap_or(flushed0);
+        let mut cursor = self.flush_start_cursor(flush);
         assert!(cursor >= flushed0, "flush cursor behind the watermark");
         let mut spent = 0u64;
         let mut wrote = false;
@@ -359,6 +356,24 @@ impl TieredTable {
             flush.sync_queued();
         }
         Ok(spent)
+    }
+
+    /// Where the next flush stage starts, for the seam drive, the reactor
+    /// stage and the tier round's work gate alike: the pipeline's append
+    /// cursor — bytes may be staged ahead of `flushed` (partial-frame
+    /// holdback), and they must never be re-appended — else the flushed
+    /// watermark.
+    fn flush_start_cursor<F: SegmentFs>(&self, flush: &TierFlush<F>) -> u64 {
+        flush.append_cursor().unwrap_or(self.space.flushed().to_raw())
+    }
+
+    /// True exactly when the next [`stage_flush_round`](Self::stage_flush_round)
+    /// would take a chunk (records or a gap) and so open a round. The tier
+    /// round offers its slice to the device budget only when this holds
+    /// (ADR-0170 D3): an idle namespace asks no credit.
+    #[must_use]
+    pub fn flush_pending<F: SegmentFs>(&self, flush: &TierFlush<F>) -> bool {
+        self.space.flush_work_at(self.flush_start_cursor(flush))
     }
 
     /// Applies a completed round's deferred effects **in stage order**

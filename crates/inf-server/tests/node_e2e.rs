@@ -4102,10 +4102,7 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
             c.write_all(&cmd(&[b"SET", key.as_bytes(), b"late"])).expect("write");
             read_exactly(&mut c, b"+OK\r\n");
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info.contains("ckpts_completed:1") || Instant::now() > deadline {
             break info;
         }
@@ -4219,10 +4216,7 @@ fn bytes_threshold_triggers_a_checkpoint() {
             read_exactly(&mut c, b"+OK\r\n");
             i += 1;
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if !info.contains("ckpts_completed:0") || Instant::now() > deadline {
             break info;
         }
@@ -4288,10 +4282,7 @@ fn recovery_phases_report_bytes_and_sum_to_the_total() {
     }
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
-    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-    let mut buf = vec![0u8; 8192];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = info_persistence(&mut c);
     let f = |field: &str| info_u64(&info, field);
     assert!(f("recover_ckpt_bytes") > 256 * 2048, "the checkpoint's bytes were read: {info}");
     assert!(f("recover_replay_bytes") >= u64::from(tail_keys) * 2048, "tail bytes: {info}");
@@ -4366,13 +4357,222 @@ fn a_checkpoint_requested_on_an_idle_budgeted_node_completes() {
     c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     let took = t0.elapsed();
-    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-    let mut buf = vec![0u8; 8192];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = info_persistence(&mut c);
     assert!(info.contains("io_budget_model:probed"), "the budget was in force: {info}");
     assert!(info_u64(&info, "ckpts_completed") >= 1, "{info}");
     assert!(took < Duration::from_secs(10), "an idle checkpoint of ~2 MiB/cell took {took:?}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The device model of the ADR-0170 wire tests: 40 MB/s and 40 000
+/// ops/s per device in both directions, so at 2 cells each cell's share
+/// is 20 MB/s — a checkpoint cap of one 266 240 B section slice, a tier
+/// cap of the 1 MiB default slice, and a 1 MB pool per direction.
+fn overrun_test_model() -> inf_runtime::DeviceModel {
+    inf_runtime::DeviceModel {
+        write_bytes_per_s: 40_000_000,
+        write_ops_per_s: 40_000,
+        read_bytes_per_s: 40_000_000,
+        read_ops_per_s: 40_000,
+    }
+}
+
+/// The first `count` keys `{prefix}:{i}` a contiguous router gives `cell`.
+fn keys_on_cell(cells: u16, cell: u16, prefix: &str, count: usize) -> Vec<Vec<u8>> {
+    let router = SlotRouter::new_contiguous(cells);
+    (0..1_000_000u32)
+        .map(|i| format!("{prefix}:{i}").into_bytes())
+        .filter(|key| router.cell_of(SlotRouter::slot_of(key)) == CellId(cell))
+        .take(count)
+        .collect()
+}
+
+/// ADR-0170 D4 for the checkpoint byte axis at α > 0: the class's credit
+/// gains at least `share / 7` per second at α = 2 (the ⅛ floor's weighted
+/// share and the keep-up floor cross there), within three bytes for the
+/// carries' lag (A1). Returns `T_ckpt` in seconds for an offer first
+/// made while the class owes `owed` bytes.
+fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, delta: f64) -> f64 {
+    const LAG_UNITS: f64 = 3.0;
+    let alpha = 2.0;
+    let (weight, weights) = (2.0, 10.0);
+    let rate =
+        share_bytes_per_s * f64::max(weight / (8.0 * weights), weight / (alpha * weight + weights));
+    (owed + cap + charged + LAG_UNITS) / rate + 2.0 * delta
+}
+
+/// R2 (ADR-0170): a checkpoint whose section holds one value above the
+/// class cap plus the pool completes. Before the overrun the budget
+/// answered that block "not this slice" on every call — the walk never
+/// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
+/// returned. The bound is two D4 waits (the oversized block, then the
+/// footer behind its debt) plus 2 s of harness slack.
+#[test]
+fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
+    let dir = temp_data_dir("ckpt-overrun");
+    let model = overrun_test_model();
+    let key = key_for_cell(2, 0);
+    let chunk = vec![b'v'; 900 << 10];
+    let value_len = 4 * chunk.len();
+    {
+        let node = Node::start_durable_with_device_model(2, &dir, model);
+        let mut c = conn_on_cell(&node, 0);
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"big",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        let mut c = conn_on_cell_use(&node, 0, b"big");
+        for a in 1..=4 {
+            c.write_all(&cmd(&[b"APPEND", &key, &chunk])).expect("write");
+            read_exactly(&mut c, format!(":{}\r\n", a * chunk.len()).as_bytes());
+        }
+        // 20 MB/s per cell: cap 266 240 B (the section slice), pool 1 MB.
+        let share = 20_000_000.0;
+        let cap = 266_240.0;
+        let header_block = 4_096.0;
+        // A section block is one record plus less than one target, aligned.
+        let block_max = value_len as f64 + cap + header_block;
+        let delta = 0.005; // the harness loop's idle park
+        let bound = t_ckpt_seconds(share, 0.0, cap, header_block, delta)
+            + t_ckpt_seconds(share, block_max - cap, cap, header_block, delta)
+            + 2.0;
+        c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+        let t0 = Instant::now();
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let took = t0.elapsed().as_secs_f64();
+        assert!(
+            took < bound,
+            "the oversized block's checkpoint took {took:.2} s, bound {bound:.2}"
+        );
+        let info = info_text(&mut c, b"persistence");
+        assert!(info.contains("io_budget_model:probed"), "the budget was in force: {info}");
+        assert!(info_field(&info, "ckpts_completed") >= 1, "{info}");
+        assert!(
+            info_field(&info, "io_budget_unattainable_checkpoint") >= 1,
+            "engagement: the block was above the class cap: {info}"
+        );
+        drop(c);
+        node.stop();
+    }
+    let node = Node::start_durable_with_device_model(2, &dir, model);
+    let mut c = connect_use(&node, b"big");
+    c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+    c.write_all(&cmd(&[b"GET", &key])).expect("write");
+    assert_eq!(read_bulk(&mut c), vec![b'v'; value_len], "the value survives byte-exact");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Creates R3's tiered namespace `t` (ADR-0170): `MEM-BUDGET 4mb`, a
+/// `MAINTAIN-SLICE` of 8 MiB — above the 20 MB/s share's tier cap plus
+/// pool — and a `TAIL-STALL-TIMEOUT` of twice `T_tier(8 MiB)` at D4's
+/// floor rate (share / 20 = 1 MB/s: (7 340 032 + 1 048 576) / 10⁶ s +
+/// 2Δ ≈ 8.4 s). Returns a connection on cell 0 using `t`, reading with a
+/// 60 s timeout.
+fn overrun_tier_namespace(node: &Node) -> TcpStream {
+    let mut c = conn_on_cell(node, 0);
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"4mb",
+        b"MAINTAIN-SLICE",
+        b"8mb",
+        b"TAIL-STALL-TIMEOUT",
+        b"20000",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    let c = conn_on_cell_use(node, 0, b"t");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    c
+}
+
+/// Writes `count` 64 KiB values to cell 0 of `t`, each acknowledged `+OK`.
+fn fill_tier_cell0(c: &mut TcpStream, count: usize) {
+    let value = vec![b'x'; 64 << 10];
+    for key in keys_on_cell(2, 0, "tier", count) {
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    }
+}
+
+/// Polls cell 0's `INFO tiering` until a flush round completed, within
+/// R3's tail-stall timeout (a round completes after the last reply).
+fn wait_tier_round_completed(c: &mut TcpStream) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let tiering = info_text(c, b"tiering");
+        if info_field(&tiering, "tiering_flush_rounds") >= 1 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "no flush round completed: {tiering}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// R3 (ADR-0170): a tier round of `MAINTAIN-SLICE 8mb` — above the tier
+/// cap plus the pool — is issued by an overrun. Before it, the round was
+/// deferred on every pass, nothing flushed, and the first write the full
+/// ring parked waited out the tail-stall timeout.
+#[test]
+fn a_tier_round_above_the_class_cap_is_issued() {
+    let dir = temp_data_dir("tier-overrun");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = overrun_tier_namespace(&node);
+    // 24 MiB on cell 0: 20 MiB past MEM-BUDGET, three 8 MiB rounds.
+    fill_tier_cell0(&mut c, 384);
+    wait_tier_round_completed(&mut c);
+    let info = info_text(&mut c, b"persistence");
+    assert!(
+        info_field(&info, "io_budget_unattainable_tier_flush") >= 1,
+        "engagement: the round was above the class cap: {info}"
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R5 (ADR-0170 D3): a tiered namespace with nothing to flush makes no
+/// tier offer. Before the gate, an idle namespace offered its whole slice
+/// on every pass — deferred every time at `MAINTAIN-SLICE 8mb` — and the
+/// budget's rule alone would overrun on every rested pass and refund.
+/// Then the gate opens on work: R3's writes are issued.
+#[test]
+fn an_idle_tiered_namespace_makes_no_tier_offer() {
+    let dir = temp_data_dir("tier-idle-offer");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = overrun_tier_namespace(&node);
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_secs(1));
+    for cell in 0..2u16 {
+        let mut probe = conn_on_cell(&node, cell);
+        let info = info_text(&mut probe, b"persistence");
+        assert_eq!(info_field(&info, "io_budget_deferrals_tier_flush"), 0, "cell {cell}: {info}");
+        assert_eq!(info_field(&info, "io_budget_unattainable_tier_flush"), 0, "cell {cell}");
+    }
+    // 12 MiB on cell 0: 8 MiB past MEM-BUDGET.
+    fill_tier_cell0(&mut c, 192);
+    wait_tier_round_completed(&mut c);
+    let info = info_text(&mut c, b"persistence");
+    assert!(info_field(&info, "io_budget_unattainable_tier_flush") >= 1, "{info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -4517,10 +4717,7 @@ fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
             #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
             std::thread::sleep(Duration::from_millis(20));
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info_u64(&info, "segments_truncated") >= 2 || Instant::now() > deadline {
             break info;
         }
@@ -4534,20 +4731,14 @@ fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
     // prealloc'd next (+1 transient around a rotation).
     let settle = Instant::now() + Duration::from_secs(15);
     loop {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let sample = info_persistence(&mut c);
         if info_u64(&sample, "log_segments_live") <= 3 {
             break;
         }
         assert!(Instant::now() < settle, "never settled to the bound: {sample}");
     }
     for _ in 0..5 {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let sample = info_persistence(&mut c);
         assert!(
             info_u64(&sample, "log_segments_live") <= 3,
             "retained log bounded by interval + one segment (+ next): {sample}"
@@ -4694,10 +4885,7 @@ fn ckpt_slice_budget_rehearsal() {
             }
             gets += 1;
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info.contains("ckpts_completed:1") {
             break true;
         }

@@ -496,6 +496,19 @@ impl AddressSpace {
 
     // ---- flush-work query (M4-S11, ADR-0056 D3) ----
 
+    /// Whether a flush stage whose cursor stands at the raw address
+    /// `cursor` has a chunk to take: the cursor is below the ro-boundary.
+    /// [`next_flush_chunk`](Self::next_flush_chunk) answers `None` exactly
+    /// when this is false, and the tier round asks it before offering its
+    /// slice to the device budget, so no credit is asked for work that
+    /// does not exist (ADR-0170 D3). The stage's cursor never passes the
+    /// ro-boundary (`next_flush_chunk`'s chunks end at or below it).
+    #[must_use]
+    pub fn flush_work_at(&self, cursor: u64) -> bool {
+        debug_assert!(cursor <= self.ro_boundary, "flush cursor above ro_boundary");
+        cursor < self.ro_boundary
+    }
+
     /// The next unit of flush work at `cursor`, bounded by `max_bytes` —
     /// a pure query; the pipeline appends/seals, fdatasyncs, then
     /// confirms via [`advance_flushed`](Self::advance_flushed). `cursor`
@@ -518,7 +531,7 @@ impl AddressSpace {
         let c = cursor.to_raw();
         assert!(c >= self.flushed, "flush cursor below flushed");
         assert!(c <= self.ro_boundary, "flush cursor above ro_boundary");
-        if c == self.ro_boundary {
+        if !self.flush_work_at(c) {
             return None;
         }
         // A hole beginning at the cursor is the gap chunk (its whole

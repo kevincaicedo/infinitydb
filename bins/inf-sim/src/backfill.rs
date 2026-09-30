@@ -125,6 +125,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         frames_in_flight: 1,
         device: Default::default(),
         budget_oracle: false,
+        ckpt_overrun: None,
         reorder_oracle: false,
         ckpt_direct_refused_after: None,
         fill: Default::default(),

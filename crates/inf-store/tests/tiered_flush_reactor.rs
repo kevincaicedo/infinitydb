@@ -240,3 +240,62 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
     }
     assert!(cold > 50, "the storm demoted a real cold set ({cold})");
 }
+
+/// ADR-0170 D3: the tier round's work gate is the stage's own test.
+/// `flush_pending` before a stage is true exactly when that stage opens a
+/// round, and false exactly when it stages nothing — so the plane asks
+/// the device budget for a slice only when a chunk (records or a ring-top
+/// gap) is there to take. A seeded storm drives both answers many times,
+/// across file rotations and ring wraps.
+#[test]
+fn flush_pending_is_true_exactly_when_the_stage_opens_a_round() {
+    let disk = SimDisk::new();
+    let mut ks = keyspace();
+    let mut flush = pipeline(disk.clone());
+    flush.set_drive(TierDrive::Reactor);
+    let mut seed = 0x6A7E_F10Du64;
+    let (mut idle_stages, mut work_stages) = (0u32, 0u32);
+    let mut placed: BTreeMap<Vec<u8>, (u32, usize)> = BTreeMap::new();
+    for _ in 0..400 {
+        for _ in 0..64 {
+            let idx = seeded(&mut seed) % 900;
+            let key = format!("gate:{idx:05}").into_bytes();
+            let value = vec![7u8; 40 + (seeded(&mut seed) % 200) as usize];
+            let hash = KeyHasher::default().hash(&key);
+            let table = ks.tiered_store_mut(NS).expect("materialized");
+            let at = match table.lookup(&key, hash, &[]) {
+                TieredLookup::Ram(old) | TieredLookup::Cold(old) => {
+                    let (old_version, old_len) = placed[&key];
+                    table
+                        .update(&key, &value, hash, old, old_len, old_version)
+                        .expect("paced storm fits the window")
+                }
+                TieredLookup::Miss => {
+                    table.insert(&key, &value, hash).expect("paced storm fits the window")
+                }
+            };
+            let parts = table.record(at);
+            placed.insert(key, (parts.version, parts.encoded_len));
+        }
+        loop {
+            let d = ks.demote_tick();
+            let table = ks.tiered_store_mut(NS).expect("materialized");
+            let pending = table.flush_pending(&flush);
+            let staged = table.stage_flush_round(&mut flush).expect("stage round");
+            assert_eq!(pending, flush.round_active(), "the gate is the stage's own work test");
+            if pending {
+                work_stages += 1;
+                run_round(&disk, table, &mut flush);
+            } else {
+                idle_stages += 1;
+                assert_eq!(staged, 0, "an idle stage stages nothing");
+            }
+            if d.sealed_bytes + d.released_bytes + u64::from(pending) == 0 {
+                break;
+            }
+        }
+    }
+    assert!(work_stages > 100, "the storm staged rounds ({work_stages})");
+    assert!(idle_stages > 100, "the storm reached idle stages ({idle_stages})");
+    assert!(flush.sealed().len() > 3, "file rotation happened ({})", flush.sealed().len());
+}

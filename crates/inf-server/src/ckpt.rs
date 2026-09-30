@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use inf_alloc::AlignedBox;
 use inf_foundation::KeyHashId;
+use inf_foundation::time::Nanos;
 use inf_log::ckpt::{ICK_BLOCK_ALIGN, ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{CkptConfig, IckStream, Lsn, Manifest, SectionLease, SegmentId, StagedAt};
@@ -145,6 +146,43 @@ pub struct CkptStats {
     pub padding_bytes: u64,
     pub interval_bytes: u64,
     pub records_since_begin: u64,
+    /// ADR-0170 D5: the longest injected-time wait of one checkpoint
+    /// block on the device budget, first offer to `Now`, this cell's
+    /// life — the pending block's age at its last offer included.
+    pub block_wait_ns_max: u64,
+}
+
+/// One checkpoint block's wait on the device budget (ADR-0170 D5): the
+/// walk offers a block every slice until the budget answers `Now`.
+/// Injected time; the source of `CkptStats::block_wait_ns_max`.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct BlockWait {
+    /// The pending block's first offer; `None` while no block waits.
+    offered_at: Option<Nanos>,
+    /// The pending block's age at its last offer.
+    age_ns: u64,
+    /// The longest ended wait.
+    max_ns: u64,
+}
+
+impl BlockWait {
+    /// A block is offered at `now`; its first offer starts the wait.
+    pub(crate) fn offered(&mut self, now: Nanos) {
+        let first = *self.offered_at.get_or_insert(now);
+        self.age_ns = now.saturating_sub(first).0;
+    }
+
+    /// The pending block issued, or its checkpoint aborted: the wait ends.
+    pub(crate) fn ended(&mut self) {
+        self.max_ns = self.max_ns.max(self.age_ns);
+        self.offered_at = None;
+        self.age_ns = 0;
+    }
+
+    /// The longest wait, a pending block's age included.
+    fn max_ns(&self) -> u64 {
+        self.max_ns.max(self.age_ns)
+    }
 }
 
 /// How the `.ick.new` staging file is written (ADR-0088 D3 as amended
@@ -218,6 +256,8 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     /// the last checkpoint's bytes; the floor before the first).
     pub interval_bytes: u64,
     pub phase: CkptPhase<F::File>,
+    /// The pending block's budget wait (ADR-0170 D5).
+    pub block_wait: BlockWait,
     stats: CkptStats,
 }
 
@@ -252,6 +292,7 @@ impl<F: SegmentFs> CkptCell<F> {
             records_at_begin: 0,
             interval_bytes: cfg.derive_interval(0),
             phase: CkptPhase::Idle,
+            block_wait: BlockWait::default(),
             stats: CkptStats::default(),
         })
     }
@@ -466,6 +507,7 @@ impl<F: SegmentFs> CkptCell<F> {
         if let Some(id) = id {
             eprintln!("cell {}: checkpoint {id} aborted at {what}: {detail}", self.cell);
             self.phase = CkptPhase::Idle; // drops the stream + fd first
+            self.block_wait.ended();
             let _ = self.fs.remove_file(&self.dir.join(ick_staging_file_name(id)));
             self.next_id = id + 1;
             self.stats.aborted += 1;
@@ -510,6 +552,7 @@ impl<F: SegmentFs> CkptCell<F> {
             records_since_begin: records_total.saturating_sub(base),
             io_mode_buffered: u64::from(self.io_mode == CkptIoMode::Buffered),
             io_mode_downgrades: self.io_mode_downgrades,
+            block_wait_ns_max: self.block_wait.max_ns(),
             ..self.stats
         }
     }

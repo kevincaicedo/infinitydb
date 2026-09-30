@@ -30,8 +30,8 @@ use inf_log::{
     build_recycle_sentinel,
 };
 use inf_runtime::{
-    Admission, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
-    IoOp, LoopCx, SealPace, TokenClass, WaitList, WatermarkGate, WriteBarrier,
+    ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass, IoOp, Issue,
+    LoopCx, SealPace, TokenClass, WaitList, WatermarkGate, WriteBarrier,
 };
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
@@ -506,6 +506,9 @@ pub struct DurableStats {
     /// ADR-0117: sections sealed for the section bound (the DST's
     /// engagement witness for the in-chain resume).
     pub ckpt_bound_splits: u64,
+    /// ADR-0170 D5: the longest injected-time wait of one checkpoint
+    /// block on the device budget, a pending block's age included.
+    pub ckpt_block_wait_ns_max: u64,
     /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
     /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
     /// undefined (0, with `_undefined = 1`) until the first checkpoint
@@ -915,43 +918,45 @@ impl<F: SegmentFs> DurableCell<F> {
     /// once every zero byte landed.
     fn zero_fill(&mut self, cx: &mut LoopCx<'_>) {
         // ADR-0088 D5: the head-start bound says "no further"; the budget
-        // says "not this slice". The budget is asked with the slice bound
-        // *before* the slice is taken — `next_zero_slice` marks it in
-        // flight, and a taken-but-unissued slice is a phantom the
-        // rotation waits on forever (the sweep's finding) — and the
-        // unissued remainder of the bound is refunded.
+        // says "not this slice" (ADR-0170 D1). The budget is offered the
+        // slice bound *before* the slice is taken — `next_zero_slice`
+        // marks it in flight, and a taken-but-unissued slice is a phantom
+        // the rotation waits on forever — and the unissued remainder of
+        // the bound is refunded against the same grant (ADR-0170 D2).
         let bound = u64::from(ZERO_FILL_SLICE_BYTES);
-        if self.write_through_wanted
-            && self.rotor.zero_fill_pending()
-            && self.budget.admit(IoClass::ZeroFill, bound, 1) == Admission::Granted
-        {
-            let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) else {
-                self.budget.refund(IoClass::ZeroFill, bound, 1);
-                return;
-            };
-            self.budget.refund(IoClass::ZeroFill, bound - u64::from(slice.len), 0);
-            let data = match slice.source {
-                FillSource::Zeros => log_bytes::zero_window(&self.zero_window, slice.len),
-                // ADR-0090 A15: the recycled file's one-block sentinel,
-                // built for its old id and copied into the aligned window.
-                FillSource::RecycleSentinel { old } => {
-                    let image = build_recycle_sentinel(
-                        &mut self.sentinel_builder,
-                        old,
-                        self.rotor.segment_bytes(),
-                    );
-                    self.sentinel_window.bytes_mut().copy_from_slice(image);
-                    log_bytes::zero_window(&self.sentinel_window, slice.len)
+        if self.write_through_wanted && self.rotor.zero_fill_pending() {
+            match self.budget.offer(IoClass::ZeroFill, bound, 1) {
+                Issue::NotThisSlice => {}
+                Issue::Now => {
+                    let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) else {
+                        self.budget.refund(IoClass::ZeroFill, bound, 1);
+                        return;
+                    };
+                    self.budget.refund(IoClass::ZeroFill, bound - u64::from(slice.len), 0);
+                    let data = match slice.source {
+                        FillSource::Zeros => log_bytes::zero_window(&self.zero_window, slice.len),
+                        // ADR-0090 A15: the recycled file's one-block sentinel,
+                        // built for its old id and copied into the aligned window.
+                        FillSource::RecycleSentinel { old } => {
+                            let image = build_recycle_sentinel(
+                                &mut self.sentinel_builder,
+                                old,
+                                self.rotor.segment_bytes(),
+                            );
+                            self.sentinel_window.bytes_mut().copy_from_slice(image);
+                            log_bytes::zero_window(&self.sentinel_window, slice.len)
+                        }
+                    };
+                    cx.push(IoOp::LogWrite {
+                        fd: slice.fd,
+                        // A `u32` segment cursor: always addressable (ADR-0167 D2).
+                        offset: FileOffset::from_u32_bytes(slice.offset),
+                        data,
+                        token: CompletionToken::new(TokenClass::ZeroFillWrite, 0, 0),
+                        barrier: WriteBarrier::None,
+                    });
                 }
-            };
-            cx.push(IoOp::LogWrite {
-                fd: slice.fd,
-                // A `u32` segment cursor: always addressable (ADR-0167 D2).
-                offset: FileOffset::from_u32_bytes(slice.offset),
-                data,
-                token: CompletionToken::new(TokenClass::ZeroFillWrite, 0, 0),
-                barrier: WriteBarrier::None,
-            });
+            }
         }
         if self.zero_fill_ticket.is_none()
             && let Some(fd) = self.rotor.take_zero_fill_barrier()
@@ -1430,14 +1435,16 @@ impl<F: SegmentFs> DurableCell<F> {
         self.fail_stop("I/O", &format!("errno {errno} on {:?}", token.class()))
     }
 
-    /// Tier-flush and compaction offer their slices here (ADR-0088 D5);
-    /// the plane owns the tier cell, the cell owns the budget.
-    pub fn admit_background(&mut self, class: IoClass, bytes: u64, ops: u64) -> Admission {
+    /// Tier-flush and compaction offer their slices here (ADR-0088 D5,
+    /// ADR-0170 D1); the plane owns the tier cell, the cell owns the
+    /// budget.
+    pub fn offer_background(&mut self, class: IoClass, bytes: u64, ops: u64) -> Issue {
         debug_assert!(!class.is_foreground(), "foreground classes charge, never ask");
-        self.budget.admit(class, bytes, ops)
+        self.budget.offer(class, bytes, ops)
     }
 
-    /// Return a granted offer's unissued remainder (ADR-0088 D5).
+    /// Return the unissued remainder of the grant just before this call
+    /// (ADR-0170 D2's receipt).
     pub fn refund_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
         debug_assert!(!class.is_foreground());
         self.budget.refund(class, bytes, ops);
@@ -1572,6 +1579,7 @@ impl<F: SegmentFs> DurableCell<F> {
             ckpt_io_mode_buffered: ckpt.io_mode_buffered,
             ckpt_io_mode_downgrades: ckpt.io_mode_downgrades,
             ckpt_bound_splits: ckpt.bound_splits,
+            ckpt_block_wait_ns_max: ckpt.block_wait_ns_max,
             write_amp_milli_log_checkpoint: write_amp,
             write_amp_log_checkpoint_undefined: undefined,
             accounted_host_write_bytes,

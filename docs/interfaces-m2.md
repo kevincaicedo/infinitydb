@@ -971,39 +971,107 @@ the cap, which bounds recovery); `derive_interval` release-asserts
 bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
 `write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
 
-## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2/D2b)
+## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0170)
 
 ```rust
 pub enum IoClass { LogFrame, BlobWrite, ColdReadForeground,      // foreground: charged, never deferred
                    ZeroFill, TierFlush, Checkpoint, ColdReadMaintain } // background: priority order, weights 4:4:2:1
 pub struct DeviceModel { write_bytes_per_s, write_ops_per_s, read_bytes_per_s, read_ops_per_s } // 0 = unbudgeted
-pub enum Admission { Granted, Deferred { short_bytes, short_ops } }
-impl DeviceBudget { fn refill(&mut self, now: Nanos);            // once per MAINTAIN entry
-                    fn admit(&mut self, class, bytes, ops) -> Admission;
-                    fn refund(&mut self, class, bytes, ops); }
+pub enum Issue { Now, NotThisSlice }                                // a background producer's only answer
+pub struct ClassCap { bytes, ops }                                  // the most a class's own credit holds
+impl DeviceBudget { fn refill(&mut self, now: Nanos);               // once per MAINTAIN entry
+                    fn offer(&mut self, class, bytes, ops) -> Issue; // the one background entry point
+                    fn charge(&mut self, class, bytes, ops);         // unconditional; owes what credit cannot hold
+                    fn refund(&mut self, class, bytes, ops);         // the unissued part of the grant just before it
+                    fn cap(&self, class) -> ClassCap; }
 pub struct SealPace;  // take(now, held) -> bool: a second frame seals at the cell's share of write_ops_per_s_4k_qd4
 ```
 
-Per cell, per direction (write, read): the grant for the elapsed interval
-is the cell's share (`model / cells`, computed once at boot — L1) minus
-the foreground's spend since the last refill, clamped at `≥ share /
-FLOOR_DIVISOR` (8); split by weight into per-class deficits capped at
-`max(slice_c, share × w_c/Σw × BURST_HORIZON_NS)` (50 ms, derived from
-the S27 D5 bar); overflow pools per direction (cap `share × horizon`);
-a class draws its deficit then the pool. `Deferred` is "not this slice":
-the caller's own state machine re-offers next tick — nothing queues,
-nothing waits, no client reply is ever derived from it. Consult sites:
-zero-fill (`next_zero_slice` peek → admit → push), tier flush (round
-slice bound offered before `stage_flush_round`, unissued part refunded),
-checkpoint (header/section/footer block at its padded length, before
-the seal; completion fdatasync metered as one op), cold-read drain
-(`drain_budgeted`: maintain reads ask with the pool buffer bound and
-refund the unused window; foreground reads are charged). Charges:
-`queue_frame` (`LogFrame`, bytes + 1 op, +1 for a linked sync),
-`write_blob` (`BlobWrite`), MANIFEST envelope bytes + barriers
-(`Checkpoint`). Model absent ⇒ every admission `Granted`, every counter
-counts, the checkpoint keeps its 64 MiB/s pace (ADR-0017) — the pre-S36
-behaviour, reported as `io_budget_model:absent`.
+**The grant rule (ADR-0170 D2).** Per cell, per direction (write, read)
+and per axis (bytes, ops): the grant for the elapsed interval is the
+cell's share (`model / cells`, computed once at boot — L1) minus the
+foreground's spend since the last refill, clamped at `≥ share /
+FLOOR_DIVISOR` (8); carries keep every sub-unit remainder. It is split by
+weight into per-class credit capped at `cap_c = max(slice_c, share ×
+w_c/Σw × BURST_HORIZON_NS)` (50 ms, derived from the S27 D5 bar), and what
+a capped class cannot hold overflows into a per-direction pool (cap
+`share × horizon`). On the checkpoint's byte axis the grant is floored at
+the log's bytes since the last refill over the trigger's α (the keep-up
+floor): the floor and the weighted share are compared exactly and
+rounded once, with one remainder carried (ADR-0170 A1).
+
+- An offer at most `cap_c` on every budgeted axis is **attainable**: it is
+  granted from the class's credit, then the pool, or answered
+  `NotThisSlice` — the producer keeps it and re-offers next slice, with
+  nothing moved. A class that owes is granted nothing.
+- An offer above `cap_c` on a budgeted axis can never be covered by the
+  class's own credit, and the pool is not its to wait on: another class
+  may always drain it first. It is issued by a counted **overrun** once
+  the class is *rested* at its cap — its credit, then what the pool holds,
+  and the rest is owed, repaid by refills before the credit grows again.
+  A class is rested when every budgeted axis held its cap before a
+  refill's grant. Refill alone decides it, so a draw ends the rest pass
+  (the class drops below its cap) and a grant refunded in full does not.
+- `charge` (a checkpoint's header block and barriers, any foreground op)
+  spends unconditionally and owes what the credit cannot hold.
+- The budget keeps the last background `Now` answer's draws. The refund
+  directly after it returns at most that — the debt first, then the pool,
+  then the credit — so a full refund is the grant's exact inverse. Any
+  other call voids it, and a refund without it returns nothing.
+
+Producers match `Issue` and nothing else; the three outcomes and the
+overrun are resolved in `offer`, once. Consult sites: zero-fill
+(`next_zero_slice` peek → offer → push), tier flush (a round offers its
+slice only when the stage has a chunk to take — `TieredTable::
+flush_pending` — before `stage_flush_round`, the unissued part refunded),
+checkpoint (header/section/footer block at its padded length, before the
+seal; completion fdatasync charged as one op), cold-read drain
+(`drain_budgeted`: maintain reads offer the pool buffer bound and refund
+the unused window; foreground reads are charged). Charges: `queue_frame`
+(`LogFrame`, bytes + 1 op, +1 for a linked sync), `write_blob`
+(`BlobWrite`), MANIFEST barriers (`Checkpoint`). Model absent ⇒ every
+offer `Now`, every counter counts, the checkpoint keeps its 64 MiB/s pace
+(ADR-0017) — reported as `io_budget_model:absent`. No client reply is
+ever derived from `NotThisSlice` or an overrun.
+
+**Progress (ADR-0170 D4).** A class with one producer on the cell —
+zero-fill, the checkpoint, the cold-read drain, and tier flush with one
+tiered namespace — has every offer issued within `max over budgeted axes
+of (O + cap_c + C_c + 3) / r_c + 2Δ` of injected time. `r_c = share ×
+w_c / (8 Σw)`, and on the checkpoint's byte axis `share × max(w_c /
+(8 Σw), w_c / (α w_c + Σw))` (`share / 7` at α = 2). `O` is the class's
+debt when the offer is first made, at most `(largest offer − cap_c)⁺ +
+C_c`; `C_c` its unconditional charges between two offers (the
+checkpoint's header block and barrier ops); the 3 units cover the
+carries' lag — each carry stage (the rate product, the ⅛ floor, the
+weighted split or the keep-up floor's one carry) trails its exact sum
+by under one unit, under 2⅛ in all (ADR-0170 A1); `Δ` is the longest
+refill interval — one for quantization, one for the rest pass. It is a
+progress bound, not a latency promise: a tier round whose bound exceeds
+its namespace's `TAIL-STALL-TIMEOUT` parks writers into the typed
+timeout.
+
+**The limit and the deviations** (ADR-0170 D4):
+
+- *Checkpoint block — a limit.* A section block holds one record plus
+  less than one section target. Above the class cap it issues as one
+  burst of up to the record bound (≤ 64 MiB + 8 KiB at the largest
+  `--log-staging-mib`), the same device time the log already spent
+  writing that record as one frame. `--log-staging-mib` owns it.
+- *Several tiered namespaces on a cell (DV-1).* No per-namespace bound:
+  the plane visits namespaces in index order, and an overrunning
+  namespace waits while another has a flush backlog on every pass (an
+  idle one never delays it). Owner: grouped tier rounds and a fair host
+  visit (ADR-0155 D4). Expiry proposed 2026-10-31.
+- *Tier rounds above the cap (DV-2).* A round with `MAINTAIN-SLICE` above
+  the class cap issues as one burst of up to the slice, past the 50 ms
+  horizon premise, every round. Owner: tier groups of at most 1 MiB, each
+  offered on its own (ADR-0155 D4). Expiry proposed 2026-10-31.
+
+INFO, per class and cell scope: `io_budget_bytes_c`, `io_budget_ops_c`,
+`io_budget_deferrals_c` (every `NotThisSlice`), `io_budget_unattainable_c`
+(offers above the cap, repeats included) and `io_budget_overrun_bytes_c`
+(bytes issued overruns offered above the cap, cumulative).
 
 `SealPace` (ADR-0088 D2b): a token bucket at `write_ops_per_s_4k_qd4 /
 cells`, capacity K. The LOG step asks only when `!staging.drained()`;
@@ -1793,31 +1861,59 @@ The reactor-drive flush state machine (`TierFlush` round state in
   re-CRC'd (windows are never written after stage — custody, not
   checksum).
 
-### A.8 — Device budget (M4.5-S36, ADR-0088 D2/D2b)
+### A.8 — Device budget (M4.5-S36, ADR-0088 D2b; ADR-0170)
 
 `DeviceBudget` (`inf-runtime/src/budget.rs`) and `SealPace`:
 
-- **Foreground is never deferred** — by-construction (`admit` returns
-  `Granted` before any deficit arithmetic for `is_foreground()` classes);
-  the sim's `ObservedIo` and INFO `io_budget_deferrals_{foreground}`
-  read 0 by construction — a non-zero value there is an internal-
+- **Foreground is never deferred** — by construction (`offer` answers
+  `Now` before any credit arithmetic for `is_foreground()` classes and
+  for an unbudgeted direction); INFO `io_budget_deferrals_{foreground}`
+  reads 0 by construction — a non-zero value there is an internal-
   invariant bug, not a metric.
-- **Bounded everything**: every class deficit ≤ its cap, every pool ≤ its
-  cap (`min` on every refill); `admit` never allocates or waits —
-  by-construction; pinned by `caps_are_one_burst_horizon_and_never_below
-  _one_slice` and `a_class_past_its_cap_overflows_into_the_shared_pool`.
+- **Three outcomes, one place** — type: a producer sees only `Issue`; the
+  attainable, deferred and unattainable split and the overrun are private
+  to `budget.rs` and resolved in `offer` alone. Review-only, with the
+  reason: a `matches!`, `if let` or `let … else` collapse on those private
+  enums compiles (the wildcard lints see `match` arms only); the
+  population is `offer`, one site.
+- **Holds or owes, never both** — type: per axis the credit is `Held(h ≤
+  cap)` or `Owed(non-zero)`; a debtor is granted nothing.
+- **Bounded everything**: every class's credit ≤ its cap and every pool ≤
+  its cap (`min` on every refill and refund); a class owes at most
+  `(largest offer − cap)⁺` plus its charges, because an overrun needs the
+  class rested at its cap; `offer` never allocates or waits.
+- **An idle producer holds no overrun back** — construction: a grant
+  refunded in full leaves credit, debt, pool, rest state and `spent` as
+  they were (the receipt; the rest state written by refill alone), and a
+  tier round with nothing to stage makes no offer.
+- **Progress** — the class oracle `no_background_offer_waits_past_its_
+  bound`: every background class × seven hostile offers (1, cap − 1, cap,
+  cap + 1, cap + pool, cap + pool + 1, the largest producer offer) × five
+  shares × three refill intervals × seven regimes (idle, pool drained,
+  foreground at 10× the share, foreground at the keep-up crossover, a
+  same-class overrunner before and after, a zero-work sibling) — 2 940
+  cases, the invariants checked after every call, every issue checked
+  against the D4 bound computed from the formula, and each regime's
+  engagement asserted. Its canaries: a producer that re-offers without
+  the overrun, an overrun from any held credit, a grant that ends the rest
+  pass, a keep-up floor rounded on its own before the max.
 - **Accounting identity** (`io_budget_bytes_c == bytes the driver saw
   under class c`, ops likewise; the two cold-read classes together ==
   the driver's reads) — asserted every seed by the `m2-device-budget`
   oracle on the sim driver's `ObservedIo`; `refund` keeps it exact.
 - **Rate bound** (background bytes over a run ≤ `share × elapsed + 2 ×
-  horizon + Σ slices`) — the `m2-device-budget` oracle.
-- **Engagement, progress, foreground bound** — the same oracle: the
-  checkpoint class deferred ≥ 1 (non-vacuous), ≥ 1 checkpoint published
-  and zero-fill landed (no starvation), `write_stall_max_us ≤ (frame +
-  one background block + horizon bytes) / disk rate + base·(1 + tail) +
-  one scheduler step` (physics in both modes; guards a budget bug that
-  admits two blocks at once).
+  horizon + Σ slices`, plus one largest block per class that can
+  overrun) — the `m2-device-budget` oracle.
+- **Engagement, progress, foreground bound, liveness** — the same oracle:
+  the budget deferred ≥ 1 (non-vacuous), ≥ 1 checkpoint published and
+  zero-fill landed (no starvation), `write_stall_max_us ≤ (frame + one
+  background block + horizon bytes) / disk rate + base·(1 + tail) + one
+  scheduler step` (physics in both modes; guards a budget bug that admits
+  two blocks at once). On seeds ≡ 1 mod 4 values are padded above the
+  checkpoint cap plus the pool: an offer above the cap must be counted
+  (else the run is vacuous) and every checkpoint block issued within
+  `T_ckpt` of its first offer (`ckpt_block_wait_ns_max`); on the other
+  seeds no class counts one (the control leg).
 - **Determinism** — pinned by `two_budgets_fed_the_same_sequence_agree_
   exactly`; the sim's trace hash under `--verify-determinism`.
 - **Seal pace never defers a drained cell** — by-construction (the LOG

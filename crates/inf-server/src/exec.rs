@@ -216,12 +216,12 @@ pub struct NodeState {
     /// observed high-water mark, and its two bounded waits.
     pub frames_in_flight: Cell<u64>,
     pub frames_in_flight_max: Cell<u64>,
-    /// M4.5-S36 (ADR-0088 D7): the device budget's ledger — slot order
-    /// frozen as `IoClass::ALL` × {bytes, ops, deferrals} — model
+    /// M4.5-S36 (ADR-0088 D7, ADR-0170 D5): the device budget's ledger —
+    /// one `ClassCounters` per class in `IoClass::ALL` order — model
     /// presence, the cell's byte shares, the seal pacer's wait episodes,
     /// the checkpoint domain's bytes, the derived trigger and the
     /// `write_amp_milli_log_checkpoint` figure (+ its undefined flag).
-    pub io_budget: Cell<[u64; 3 * inf_runtime::IoClass::COUNT]>,
+    pub io_budget: Cell<[inf_runtime::ClassCounters; inf_runtime::IoClass::COUNT]>,
     pub io_budget_model_absent: Cell<u64>,
     pub io_budget_write_bytes_per_s: Cell<u64>,
     pub io_budget_read_bytes_per_s: Cell<u64>,

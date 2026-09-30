@@ -1203,14 +1203,7 @@ fn publish_durable_stats(node: &NodeInfo, stats: crate::durable::DurableStats) {
     node.log_segments_live.set(stats.log_segments_live);
     // M4.5-S36 (ADR-0088 D7): the device budget's ledger, the
     // checkpoint domain's bytes, the derived trigger, the figure.
-    let mut io_budget = [0u64; 3 * IoClass::COUNT];
-    for class in IoClass::ALL {
-        let c = stats.io_budget[class.index()];
-        io_budget[3 * class.index()] = c.spent_bytes;
-        io_budget[3 * class.index() + 1] = c.spent_ops;
-        io_budget[3 * class.index() + 2] = c.deferrals;
-    }
-    node.io_budget.set(io_budget);
+    node.io_budget.set(stats.io_budget);
     node.io_budget_model_absent.set(stats.io_budget_model_absent);
     node.io_budget_write_bytes_per_s.set(stats.io_budget_write_bytes_per_s);
     node.io_budget_read_bytes_per_s.set(stats.io_budget_read_bytes_per_s);

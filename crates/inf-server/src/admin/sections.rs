@@ -550,11 +550,16 @@ fn io_budget_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("io_budget_write_bytes_per_s:{}", node.io_budget_write_bytes_per_s.get()));
     push(text, &format!("io_budget_read_bytes_per_s:{}", node.io_budget_read_bytes_per_s.get()));
     let budget = node.io_budget.get();
+    // ADR-0170 D5: offers above the class cap (repeats included) and the
+    // bytes issued overruns offered above it, beside the deferrals — cell
+    // scope, like them.
     for class in inf_runtime::IoClass::ALL {
-        let at = 3 * class.index();
-        push(text, &format!("io_budget_bytes_{}:{}", class.name(), budget[at]));
-        push(text, &format!("io_budget_ops_{}:{}", class.name(), budget[at + 1]));
-        push(text, &format!("io_budget_deferrals_{}:{}", class.name(), budget[at + 2]));
+        let (name, c) = (class.name(), budget[class.index()]);
+        push(text, &format!("io_budget_bytes_{name}:{}", c.spent_bytes));
+        push(text, &format!("io_budget_ops_{name}:{}", c.spent_ops));
+        push(text, &format!("io_budget_deferrals_{name}:{}", c.deferrals));
+        push(text, &format!("io_budget_unattainable_{name}:{}", c.unattainable));
+        push(text, &format!("io_budget_overrun_bytes_{name}:{}", c.overrun_bytes));
     }
     push(text, &format!("frame_waits_pace:{}", node.frame_waits_pace.get()));
     push(text, &format!("log_frame_bytes:{}", node.log_frame_bytes.get()));

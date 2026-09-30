@@ -314,11 +314,12 @@ enum BlockOffer {
     Unaddressable(FileOffsetRefused),
 }
 
-/// Offers the next checkpoint block; when the budget grants it, seals it
-/// and pushes its write. The block lands at the stream's running size,
+/// Offers the next checkpoint block; when the budget answers `Now`, seals
+/// it and pushes its write. The block lands at the stream's running size,
 /// checked before the budget offer and the seal, so a refusal admits and
 /// seals nothing (ADR-0167 D2). The budget sees the block at its padded
-/// length before it seals (ADR-0088 D2/D3).
+/// length before it seals; a block above the class cap is issued by the
+/// budget's overrun, never refused for ever (ADR-0170 D1/D3).
 fn offer_ckpt_block(
     stream: &mut IckStream,
     block: CkptBlock,
@@ -336,8 +337,9 @@ fn offer_ckpt_block(
         CkptBlock::Section => stream.pending_block_len(),
         CkptBlock::Footer => stream.footer_block_len(),
     };
-    if budget.admit(IoClass::Checkpoint, block_bytes as u64, 1) != Admission::Granted {
-        return BlockOffer::Deferred;
+    match budget.offer(IoClass::Checkpoint, block_bytes as u64, 1) {
+        Issue::Now => {}
+        Issue::NotThisSlice => return BlockOffer::Deferred,
     }
     let lease = match block {
         CkptBlock::Section => stream.seal_section(),
@@ -694,9 +696,13 @@ impl<F: SegmentFs> DurableCell<F> {
             None
         };
         if let Some(block) = block {
+            self.ckpt.block_wait.offered(cx.now);
             match offer_ckpt_block(stream, block, *fd, write_seq, in_flight, &mut self.budget, cx) {
-                BlockOffer::Pushed if block == CkptBlock::Footer => *footer_staged = true,
-                BlockOffer::Pushed | BlockOffer::Deferred => {}
+                BlockOffer::Pushed => {
+                    self.ckpt.block_wait.ended();
+                    *footer_staged |= block == CkptBlock::Footer;
+                }
+                BlockOffer::Deferred => {}
                 BlockOffer::Unaddressable(refused) => {
                     self.ckpt.abort("offset", &refused.to_string());
                     return emitted.div_ceil(1024).max(1);

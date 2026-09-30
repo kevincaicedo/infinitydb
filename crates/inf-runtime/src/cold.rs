@@ -69,6 +69,7 @@ use inf_alloc::{AlignedBufId, AlignedPool};
 use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
 use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
+use crate::budget::Issue;
 use crate::driver::{CompletionResult, IoOp, RawFd, StableBytesMut};
 use crate::gate::{GateWait, KeyedGate};
 use crate::token::{CompletionToken, MAX_SLOT, TokenClass};
@@ -472,16 +473,17 @@ impl ColdReads {
     /// idempotent when nothing is admissible). Returns device reads
     /// issued.
     pub fn drain(&self, push: impl FnMut(IoOp)) -> u32 {
-        self.drain_budgeted(|_, _| true, |_, _, _| {}, push)
+        self.drain_budgeted(|_, _| Issue::Now, |_, _, _| {}, push)
     }
 
     /// [`drain`](Self::drain) under a device budget (M4.5-S36, ADR-0088
-    /// D2/D5): before a class's read is built, `admit(class, bytes)` is
-    /// asked with the pool buffer size (the window's bound); a refused
-    /// `Maintain` read stays queued and the drain continues with the
-    /// foreground only — "not this slice". `Foreground` is charged, never
-    /// refused (the caller's `admit` returns true for it by contract; a
-    /// refusal ends the slice, bounded either way).
+    /// D5; the answer is ADR-0170 D1's [`Issue`]): before a class's read
+    /// is built, `admit(class, bytes)` is asked with the pool buffer size
+    /// (the window's bound); a `Maintain` read answered `NotThisSlice`
+    /// stays queued and the drain continues with the foreground only.
+    /// `Foreground` is charged, never refused (the caller's `admit`
+    /// answers `Now` for it by contract; a refusal ends the slice,
+    /// bounded either way).
     /// Every `admit` is one device op beside its bytes. After the op is
     /// built, `refund(class, unused_bytes, unused_ops)` returns the bound
     /// minus the issued window and no op; a pool-dry stall issues nothing
@@ -490,7 +492,7 @@ impl ColdReads {
     /// turn taken.
     pub fn drain_budgeted(
         &self,
-        mut admit: impl FnMut(ReadClass, u64) -> bool,
+        mut admit: impl FnMut(ReadClass, u64) -> Issue,
         mut refund: impl FnMut(ReadClass, u64, u64),
         mut push: impl FnMut(IoOp),
     ) -> u32 {
@@ -509,20 +511,23 @@ impl ColdReads {
             let (class, grant_spent) = Self::pick_class(state, maintain_allowed);
             let class_enum = if class == 0 { ReadClass::Foreground } else { ReadClass::Maintain };
             let bound = state.pool.buf_size() as u64;
-            if !admit(class_enum, bound) {
-                if class_enum == ReadClass::Foreground {
-                    // Contract breach (ADR-0088 D2: the foreground is never
+            match admit(class_enum, bound) {
+                Issue::Now => {}
+                Issue::NotThisSlice if class_enum == ReadClass::Foreground => {
+                    // Contract breach (ADR-0170 D1: the foreground is never
                     // refused). Nothing changes within this slice, so it
                     // ends here with the intent queued for the next one —
-                    // a `continue` would spin the cell (F-L11-03).
+                    // a `continue` would spin the cell.
                     break;
                 }
-                state.counters.maintain_deferred += 1;
-                maintain_allowed = false;
-                if grant_spent {
-                    state.grants[1] += 1;
+                Issue::NotThisSlice => {
+                    state.counters.maintain_deferred += 1;
+                    maintain_allowed = false;
+                    if grant_spent {
+                        state.grants[1] += 1;
+                    }
+                    continue;
                 }
-                continue;
             }
             let Some(buf) = state.pool.try_lease() else {
                 state.counters.pool_dry += 1;
@@ -1354,7 +1359,7 @@ mod tests {
         let issued = cold.drain_budgeted(
             |_, _| {
                 asked += 1;
-                false
+                Issue::NotThisSlice
             },
             |_, _, _| {},
             |_| panic!("a refused read never issues"),
@@ -1383,7 +1388,7 @@ mod tests {
             |_, bytes| {
                 charged_bytes += bytes;
                 charged_ops += 1;
-                true
+                Issue::Now
             },
             |_, bytes, ops| {
                 refunded_bytes += bytes;
@@ -1425,7 +1430,10 @@ mod tests {
         // then the fourth foreground drains alone.
         let mut first = Vec::new();
         let issued = cold.drain_budgeted(
-            |class, _| class == ReadClass::Foreground,
+            |class, _| match class {
+                ReadClass::Foreground => Issue::Now,
+                ReadClass::Maintain => Issue::NotThisSlice,
+            },
             |_, _, _| {},
             |op| first.push(op),
         );
@@ -1435,7 +1443,7 @@ mod tests {
         // comes first — its grant survived the deferral.
         waiters.push(ask(&cold, 3, file, 50 << 20, 64));
         let mut second = Vec::new();
-        cold.drain_budgeted(|_, _| true, |_, _, _| {}, |op| second.push(op));
+        cold.drain_budgeted(|_, _| Issue::Now, |_, _, _| {}, |op| second.push(op));
         let IoOp::TierRead { offset, .. } = second[0] else { panic!("TierRead") };
         assert_eq!(
             offset.bytes(),
