@@ -15,9 +15,6 @@
 //! Size override: `ORDERED_BENCH_N=1000000` (default 10M — the AC shape).
 //! Artifact: 3–5 replicates recorded under `.artifacts/m4.5/s01/`.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -190,7 +187,6 @@ fn var_rows(n: usize) {
 }
 
 fn main() {
-    overflow_profile_canary::run_if_requested();
     let n = entry_count();
     println!("# ordered bench: n={n} rounds={ROUNDS} hot_set={HOT_SET}");
     println!("# probe_ops_per_round_min={PROBE_OPS_PER_ROUND_MIN} warmup_rounds=1");

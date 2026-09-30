@@ -3,9 +3,6 @@
 //! clocks). Gate artifacts come from the Linux reference box; local runs are
 //! dev-tier numbers.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -37,7 +34,6 @@ fn pipeline(commands: usize) -> Vec<u8> {
 }
 
 fn bench_parse(c: &mut Criterion) {
-    overflow_profile_canary::run_if_requested();
     let stream = pipeline(4096);
     let mut group = c.benchmark_group("resp_parse");
     group.throughput(Throughput::Bytes(stream.len() as u64));

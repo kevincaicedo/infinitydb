@@ -11,9 +11,6 @@
 //! plus the S10 program-cache row. The S25 campaign re-runs the true
 //! wire-level gates on the reference box.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -115,7 +112,6 @@ fn verify_commands(text: &str, plain: &[u8]) {
 }
 
 fn bench_json_cmd(c: &mut Criterion) {
-    overflow_profile_canary::run_if_requested();
     let text = doc_corpus::shape(doc_corpus::CANONICAL_SEED, "gate-1KiB").json;
     let plain = vec![0xABu8; text.len()];
     verify_commands(&text, &plain);

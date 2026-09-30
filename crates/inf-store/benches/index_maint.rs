@@ -29,9 +29,6 @@
 //! Run: `taskset -c 4 cargo bench -p inf-store --bench index_maint`
 //! Artifact: 3 replicates recorded under `.artifacts/m4.5/s04/`.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -129,7 +126,6 @@ fn report_samples(label: &str, samples: &[f64]) {
 }
 
 fn main() {
-    overflow_profile_canary::run_if_requested();
     println!("# index_maint rounds={ROUNDS} ops={OPS_PER_ROUND} warmup_rounds=1");
     let ns = NsId(0);
     let now = Nanos(1_000_000_000);

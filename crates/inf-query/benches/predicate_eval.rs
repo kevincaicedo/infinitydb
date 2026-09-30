@@ -18,9 +18,6 @@
 //! - `residual_multi_match`: `items[*]` existential over 12 array
 //!   elements on the 2 KiB shape — the multi-match cost row.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -40,7 +37,6 @@ fn vm(predicate: &Predicate) -> PredicateVm {
 }
 
 fn bench_predicate_eval(c: &mut Criterion) {
-    overflow_profile_canary::run_if_requested();
     let gate_text = doc_corpus::shape(doc_corpus::CANONICAL_SEED, "gate-1KiB").json;
     let gate_bytes = JsonParser::new().parse(gate_text.as_bytes()).expect("corpus parses");
     let gate = TapeDoc::from_bytes(&gate_bytes).expect("validates");

@@ -16,9 +16,6 @@
 //! instrument shares no document parser or serializer with the system
 //! under test.
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -103,7 +100,6 @@ fn verify_corpus(corpus: &[(&str, String)]) {
 }
 
 fn bench_parse(c: &mut Criterion) {
-    overflow_profile_canary::run_if_requested();
     let corpus: Vec<(&str, String)> = doc_corpus::generate(doc_corpus::CANONICAL_SEED)
         .into_iter()
         .map(|doc| (doc.name, doc.json))

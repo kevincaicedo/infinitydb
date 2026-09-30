@@ -14,9 +14,6 @@
 //! Env: `INF_STORE_BENCH_KEYS` overrides the key count (default: sized to
 //! load factor 0.85 of a 16M-slot table when RAM allows, else 4M-slot).
 
-#[path = "../../../scripts/overflow-profile-canary.rs"]
-mod overflow_profile_canary;
-
 use std::time::Instant;
 
 use inf_foundation::time::Nanos;
@@ -43,7 +40,6 @@ fn mem_available_bytes() -> u64 {
 }
 
 fn main() {
-    overflow_profile_canary::run_if_requested();
     // Load factor 0.85 by construction: 85% of a power-of-two slot count.
     let default_keys = if mem_available_bytes() > 6 << 30 {
         (16u64 << 20) * 85 / 100 // 14.26M keys → ~1.4 GiB records+index
