@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_foundation::FileOffset;
 use inf_log::fs::sim::{DeviceFault, SimDisk};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -41,9 +42,11 @@ fn read_eio_is_one_file_one_op() {
     // The driver tier consumes the same budget.
     disk.inject(&a, DeviceFault::ReadEio, 1).expect("armed");
     let fd = fa.raw_fd().expect("sim fd");
-    let err = disk.driver_read_at(fd, 0, &mut buf).expect_err("driver read fails");
+    let err = disk
+        .driver_read_at(fd, FileOffset::from_u32_bytes(0), &mut buf)
+        .expect_err("driver read fails");
     assert!(eio(&err));
-    assert_eq!(disk.driver_read_at(fd, 0, &mut buf).expect("next"), 5);
+    assert_eq!(disk.driver_read_at(fd, FileOffset::from_u32_bytes(0), &mut buf).expect("next"), 5);
     assert_eq!(disk.faults_fired(), 2);
 }
 
@@ -60,8 +63,12 @@ fn write_eio_lands_nothing() {
     disk.inject(&path, DeviceFault::WriteEio, 3).expect("armed");
     assert!(eio(&file.write_at(0, b"lost").expect_err("blocking")));
     let fd = file.raw_fd().expect("sim fd");
-    assert!(eio(&disk.driver_write_at(fd, 0, b"lost").expect_err("plain")));
-    assert!(eio(&disk.driver_write_through(fd, 0, b"lost").expect_err("through")));
+    assert!(eio(&disk
+        .driver_write_at(fd, FileOffset::from_u32_bytes(0), b"lost")
+        .expect_err("plain")));
+    assert!(eio(&disk
+        .driver_write_through(fd, FileOffset::from_u32_bytes(0), b"lost")
+        .expect_err("through")));
     assert_eq!(disk.contents(&path).expect("os view"), b"keep");
     assert_eq!(disk.faults_fired(), 3);
     file.write_at(0, b"next").expect("budget spent");

@@ -34,6 +34,7 @@
 
 use super::*;
 use crate::exec::Argv;
+use inf_runtime::ColdRefused;
 use inf_store::{LogicalAddr, TieredLookup, TieredTable};
 mod write;
 
@@ -356,9 +357,24 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
         return Probe::Fail(ERR_COLD_BUSY);
     }
+    let offset = unaddressable_plant(offset);
     match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us) {
         Ok(wait) => Probe::Cold(ColdPlan { wait, addr, frames, skip }),
-        Err(_) => Probe::Fail(ERR_COLD_BUSY),
+        Err(ColdRefused::QueueFull) => Probe::Fail(ERR_COLD_BUSY),
+        // Permanent (ADR-0167 D3): the one cold-read-failure reply, never
+        // backpressure a client would retry.
+        Err(ColdRefused::Unrepresentable(_)) => Probe::Fail(ERR_COLD_IO),
+    }
+}
+
+/// The `cold_enqueue_unaddressable` fault point (ADR-0167 D3): replaces a
+/// planned cold-read position with the first one the kernel cannot address,
+/// right before `enqueue`, so the real refusal and the caller's real arm run.
+fn unaddressable_plant(offset: u64) -> u64 {
+    if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_UNADDRESSABLE) {
+        i64::MAX.cast_unsigned() + 1
+    } else {
+        offset
     }
 }
 
@@ -1083,10 +1099,13 @@ fn plan_key_fetch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             if inf_foundation::fault::fire(crate::fault::COLD_ENQUEUE_FULL) {
                 return Ok(KeyFetch::Busy);
             }
+            let offset = unaddressable_plant(offset);
             match cold.enqueue(fd, file, offset, bytes, inf_runtime::ReadClass::Foreground, now_us)
             {
                 Ok(wait) => Ok(KeyFetch::Planned(ColdPlan { wait, addr, frames, skip })),
-                Err(_) => Ok(KeyFetch::Busy),
+                Err(ColdRefused::QueueFull) => Ok(KeyFetch::Busy),
+                // Permanent (ADR-0167 D3): the page fails typed, never BUSY.
+                Err(ColdRefused::Unrepresentable(_)) => Err(ERR_COLD_IO),
             }
         }
         None => {
@@ -1161,15 +1180,20 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
             // Same-clock stamp as `on_completion` (the `cold_read_p99_us`
             // pair).
-            cold.enqueue(
+            let asked = cold.enqueue(
                 fd,
                 file,
                 inf_log::blob::extent_frame_offset(first),
                 frames as usize * inf_log::TIER_FRAME_BYTES,
                 inf_runtime::ReadClass::Foreground,
                 shared.now.get().as_micros(),
-            )
-            .ok()?
+            );
+            // Either refusal ends the fetch, which the resolver answers
+            // `ERR_BLOB_READ` (ADR-0167 D3's callers table).
+            match asked {
+                Ok(wait) => wait,
+                Err(ColdRefused::QueueFull | ColdRefused::Unrepresentable(_)) => return None,
+            }
         };
         let done = wait.await;
         done.outcome().ok()?;

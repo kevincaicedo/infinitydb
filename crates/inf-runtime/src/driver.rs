@@ -18,6 +18,7 @@ use std::io;
 use std::time::Duration;
 
 use inf_alloc::{AlignedPool, BufferId, BufferPool};
+use inf_foundation::FileOffset;
 
 use crate::token::CompletionToken;
 
@@ -198,7 +199,9 @@ pub enum IoOp {
     /// `LogWritten` never names a partially durable frame.
     LogWrite {
         fd: RawFd,
-        offset: u64,
+        /// The frame's position: a `FileOffset`, so the op's span end is
+        /// at most `i64::MAX`, never the kernel's `−1` (ADR-0167 D1).
+        offset: FileOffset,
         data: StableBytes,
         token: CompletionToken,
         barrier: WriteBarrier,
@@ -215,8 +218,9 @@ pub enum IoOp {
     /// `BufferId` rides the completion because the recv pool is not
     /// involved. A read past EOF that cannot fill the buffer completes
     /// `Error{EIO}` — tier reads are always within the flushed range, so
-    /// a short file is corruption, not a condition.
-    TierRead { fd: RawFd, offset: u64, buf: StableBytesMut, token: CompletionToken },
+    /// a short file is corruption, not a condition. The position is a
+    /// `FileOffset`, like `LogWrite`'s (ADR-0167 D1).
+    TierRead { fd: RawFd, offset: FileOffset, buf: StableBytesMut, token: CompletionToken },
 }
 
 /// How every backend treats an `accept(2)` failure — one table, so the

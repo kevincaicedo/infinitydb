@@ -4,6 +4,9 @@
 
 use super::*;
 
+use inf_foundation::FileOffsetRefused;
+use inf_log::{IckStream, SectionLease};
+
 // ---- tiered checkpoint walk (M4-S26; ADR-0057 D1/D3, ADR-0059 D3) ----
 
 /// One tiered walk step's verdict.
@@ -289,6 +292,70 @@ fn sidecar_walk_step(
     }
 }
 
+// ---- block offer (ADR-0088 D2/D3; ADR-0167 D2) ----
+
+/// Which block a checkpoint slice offers next.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum CkptBlock {
+    /// A full or final section, or a class-boundary seal.
+    Section,
+    /// The footer, once the walk and the sidecars drained.
+    Footer,
+}
+
+/// What offering one checkpoint block did.
+enum BlockOffer {
+    /// Sealed and pushed; its lease is in flight.
+    Pushed,
+    /// The device budget deferred it: nothing sealed, re-offered next slice.
+    Deferred,
+    /// Its position is above the driver's range: nothing admitted or
+    /// sealed, and the caller aborts the checkpoint (ADR-0167 D2).
+    Unaddressable(FileOffsetRefused),
+}
+
+/// Offers the next checkpoint block; when the budget grants it, seals it
+/// and pushes its write. The block lands at the stream's running size,
+/// checked before the budget offer and the seal, so a refusal admits and
+/// seals nothing (ADR-0167 D2). The budget sees the block at its padded
+/// length before it seals (ADR-0088 D2/D3).
+fn offer_ckpt_block(
+    stream: &mut IckStream,
+    block: CkptBlock,
+    fd: std::os::fd::RawFd,
+    write_seq: &mut u64,
+    in_flight: &mut Option<SectionLease>,
+    budget: &mut DeviceBudget,
+    cx: &mut LoopCx<'_>,
+) -> BlockOffer {
+    let position = match FileOffset::new(stream.file_bytes()) {
+        Ok(position) => position,
+        Err(refused) => return BlockOffer::Unaddressable(refused),
+    };
+    let block_bytes = match block {
+        CkptBlock::Section => stream.pending_block_len(),
+        CkptBlock::Footer => stream.footer_block_len(),
+    };
+    if budget.admit(IoClass::Checkpoint, block_bytes as u64, 1) != Admission::Granted {
+        return BlockOffer::Deferred;
+    }
+    let lease = match block {
+        CkptBlock::Section => stream.seal_section(),
+        CkptBlock::Footer => stream.finish(),
+    };
+    debug_assert_eq!(lease.offset(), position.bytes(), "the block lands where it was checked");
+    *write_seq += 1;
+    cx.push(IoOp::LogWrite {
+        fd,
+        offset: position,
+        data: log_bytes::ckpt_block(stream, &lease),
+        token: ckpt_token(TokenClass::CkptWrite, *write_seq),
+        barrier: WriteBarrier::None,
+    });
+    *in_flight = Some(lease);
+    BlockOffer::Pushed
+}
+
 impl<F: SegmentFs> DurableCell<F> {
     /// One fuzzy-checkpoint slice (M2-S10, ADR-0016 D5): runs under the
     /// `GroupClass::Checkpoint` deficit — `budget_units` convert at
@@ -364,6 +431,7 @@ impl<F: SegmentFs> DurableCell<F> {
             }
             let CkptPhase::Stream(st) = &mut self.ckpt.phase else { unreachable!("just opened") };
             let lease = st.in_flight.as_ref().expect("header staged by open_stream");
+            debug_assert_eq!(lease.offset(), 0, "IckStream::begin leases the first block");
             // The header is one block, charged unconditionally (the file
             // is already created); the class deficit absorbs it and the
             // first section offer pays for it (ADR-0088 D2).
@@ -371,7 +439,8 @@ impl<F: SegmentFs> DurableCell<F> {
             st.write_seq += 1;
             cx.push(IoOp::LogWrite {
                 fd: st.fd,
-                offset: lease.offset(),
+                // The file's first block: always addressable (ADR-0167 D2).
+                offset: FileOffset::from_u32_bytes(0),
                 data: log_bytes::ckpt_block(&st.stream, lease),
                 token: ckpt_token(TokenClass::CkptWrite, st.write_seq),
                 barrier: WriteBarrier::None,
@@ -612,46 +681,27 @@ impl<F: SegmentFs> DurableCell<F> {
         // Queue at most one block per slice: a full (or final partial)
         // section, a class-boundary seal (M4-S26 tiered passes / S06
         // index boundaries), or — once everything drained — the footer.
-        // ADR-0088 D2/D3: each block is offered to the budget at its
-        // padded length *before* it seals — `Deferred` leaves the section
-        // staged (the walk simply does not advance past it this tick)
-        // and the offer repeats next slice.
-        if stream.section_full()
+        // `Deferred` leaves the section staged (the walk simply does not
+        // advance past it this tick) and the offer repeats next slice.
+        let block = if stream.section_full()
             || (force_seal && stream.can_seal())
             || (*walk_done && *sidecar_done && stream.can_seal())
         {
-            let block = stream.pending_block_len() as u64;
-            if self.budget.admit(IoClass::Checkpoint, block, 1) != Admission::Granted {
-                *streamed_bytes += u64::from(emitted);
-                return emitted.div_ceil(1024).max(1);
-            }
-            let lease = stream.seal_section();
-            *write_seq += 1;
-            cx.push(IoOp::LogWrite {
-                fd: *fd,
-                offset: lease.offset(),
-                data: log_bytes::ckpt_block(stream, &lease),
-                token: ckpt_token(TokenClass::CkptWrite, *write_seq),
-                barrier: WriteBarrier::None,
-            });
-            *in_flight = Some(lease);
+            Some(CkptBlock::Section)
         } else if *walk_done && *sidecar_done {
-            let block = stream.footer_block_len() as u64;
-            if self.budget.admit(IoClass::Checkpoint, block, 1) != Admission::Granted {
-                *streamed_bytes += u64::from(emitted);
-                return emitted.div_ceil(1024).max(1);
+            Some(CkptBlock::Footer)
+        } else {
+            None
+        };
+        if let Some(block) = block {
+            match offer_ckpt_block(stream, block, *fd, write_seq, in_flight, &mut self.budget, cx) {
+                BlockOffer::Pushed if block == CkptBlock::Footer => *footer_staged = true,
+                BlockOffer::Pushed | BlockOffer::Deferred => {}
+                BlockOffer::Unaddressable(refused) => {
+                    self.ckpt.abort("offset", &refused.to_string());
+                    return emitted.div_ceil(1024).max(1);
+                }
             }
-            let lease = stream.finish();
-            *write_seq += 1;
-            cx.push(IoOp::LogWrite {
-                fd: *fd,
-                offset: lease.offset(),
-                data: log_bytes::ckpt_block(stream, &lease),
-                token: ckpt_token(TokenClass::CkptWrite, *write_seq),
-                barrier: WriteBarrier::None,
-            });
-            *in_flight = Some(lease);
-            *footer_staged = true;
         }
         *streamed_bytes += u64::from(emitted);
         emitted.div_ceil(1024).max(1)

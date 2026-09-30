@@ -15,6 +15,7 @@ mod receipt;
 
 use std::path::PathBuf;
 
+use inf_foundation::FileOffset;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
@@ -78,7 +79,9 @@ impl Lab {
                     build_recycle_sentinel(&mut b, old, SEGMENT_BYTES).to_vec()
                 }
             };
-            self.disk.driver_write_at(slice.fd, slice.offset, &bytes).expect("fill write");
+            self.disk
+                .driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &bytes)
+                .expect("fill write");
             self.rotor.note_zero_slice_written();
         }
         if let Some(fd) = self.rotor.take_zero_fill_barrier() {
@@ -97,7 +100,9 @@ impl Lab {
         self.seq += 1;
         let bytes = b.finalize(slot.first_record_lsn(), stamp(self.seq), FrameLayout::Aligned);
         let fd = self.rotor.active_raw_fd().expect("fd");
-        self.disk.driver_write_through(fd, u64::from(slot.base().offset), bytes).expect("frame");
+        self.disk
+            .driver_write_through(fd, FileOffset::from_u32_bytes(slot.base().offset), bytes)
+            .expect("frame");
         self.rotor.commit_frame_queued(slot);
         handoff.is_some()
     }
@@ -152,12 +157,14 @@ fn covered_prezeroed_segment_is_pooled_and_renamed_into_the_next_id() {
     assert!(lab.rotor.next_zero_filling(), "the sentinel block is pending");
     let slice = lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).expect("the sentinel slice");
     assert_eq!(slice.source, FillSource::RecycleSentinel { old: SegmentId(1) });
-    assert_eq!(slice.offset, u64::from(SEGMENT_BYTES - FRAME_ALIGN));
+    assert_eq!(slice.offset, SEGMENT_BYTES - FRAME_ALIGN);
     assert_eq!(slice.len, FRAME_ALIGN);
     assert!(lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none(), "one slice in flight");
     let mut b = FrameBuilder::with_capacity(FRAME_ALIGN as usize);
     let image = build_recycle_sentinel(&mut b, SegmentId(1), SEGMENT_BYTES);
-    lab.disk.driver_write_at(slice.fd, slice.offset, image).expect("sentinel write");
+    lab.disk
+        .driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), image)
+        .expect("sentinel write");
     lab.rotor.note_zero_slice_written();
     assert!(lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none(), "one block, no more");
     let fd = lab.rotor.take_zero_fill_barrier().expect("the fill barrier");
@@ -349,7 +356,9 @@ fn a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor() {
     lab.disk.driver_fdatasync(fd).expect("dir barrier");
     while let Some(slice) = lab.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
         let zeros = vec![0u8; slice.len as usize];
-        lab.disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+        lab.disk
+            .driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &zeros)
+            .expect("zero write");
         lab.rotor.note_zero_slice_written();
     }
     let fd = lab.rotor.take_zero_fill_barrier().expect("fill barrier");

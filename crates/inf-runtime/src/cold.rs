@@ -66,7 +66,8 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBufId, AlignedPool};
-use inf_foundation::{BuildIntHasher, LogHistogram};
+use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
+use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
 use crate::driver::{CompletionResult, IoOp, RawFd, StableBytesMut};
 use crate::gate::{GateWait, KeyedGate};
@@ -191,15 +192,37 @@ impl ColdReadCounters {
     }
 }
 
-/// Why [`ColdReads::enqueue`] refused (backpressure, never failure).
+/// Why [`ColdReads::enqueue`] refused: temporary backpressure, or a
+/// request no device read can serve. Neither changed any state.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[non_exhaustive]
 pub enum ColdRefused {
-    /// The class FIFO is at `overflow_cap`. The command layer surfaces
-    /// backpressure (retry next iteration / typed error upward). Pool
-    /// dryness is no longer a refusal: it stalls the drain and counts
+    /// The class FIFO is at `overflow_cap`: temporary. The command layer
+    /// surfaces backpressure (retry next iteration / typed error upward).
+    /// Pool dryness is no longer a refusal: it stalls the drain and counts
     /// `pool_dry` (S10 moved admission off the enqueue path).
     QueueFull,
+    /// The request cannot become a device read: permanent, so the same
+    /// request is refused again (ADR-0167 D3). Checked before the queue
+    /// bound; the caller answers a read failure, never backpressure.
+    Unrepresentable(UnrepresentableRead),
+}
+
+/// Which check refused an [`ColdRefused::Unrepresentable`] request, in the
+/// order `enqueue` runs them (ADR-0167 D3): a request with two faults
+/// answers the first.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum UnrepresentableRead {
+    /// The position is above `FILE_OFFSET_BYTES_MAX` (ADR-0167 D1).
+    OffsetAboveMax(FileOffsetRefused),
+    /// A zero-byte window.
+    EmptyWindow,
+    /// A window wider than one pool buffer, the read-window maximum.
+    WindowAboveMax {
+        /// The requested window, before any narrowing.
+        window_bytes: usize,
+        /// The pool buffer size.
+        window_bytes_max: usize,
+    },
 }
 
 /// A queued read intent — plain data; the §3.3 pin is taken at enqueue.
@@ -207,7 +230,7 @@ struct Intent {
     token: CompletionToken,
     fd: RawFd,
     file: TierFileId,
-    offset: u64,
+    offset: FileOffset,
     len: u32,
     enqueued_us: u64,
 }
@@ -284,6 +307,30 @@ impl ColdState {
     }
 }
 
+/// The cold-read boundary (ADR-0167 D3): a request becomes a typed
+/// `(position, window)` or is refused, checking the position, then an empty
+/// window, then one wider than a pool buffer. The window checks read the
+/// `usize` before it narrows, so `1 << 32` is refused as too wide, never
+/// read as an empty window.
+fn parse_window(
+    offset_bytes: u64,
+    window_bytes: usize,
+    buf_size: usize,
+) -> Result<(FileOffset, u32), UnrepresentableRead> {
+    let offset = FileOffset::new(offset_bytes).map_err(UnrepresentableRead::OffsetAboveMax)?;
+    if window_bytes == 0 {
+        return Err(UnrepresentableRead::EmptyWindow);
+    }
+    let too_wide = UnrepresentableRead::WindowAboveMax { window_bytes, window_bytes_max: buf_size };
+    if window_bytes > buf_size {
+        return Err(too_wide);
+    }
+    // `window_bytes ≤ buf_size ≤ DRIVER_OP_BYTES_MAX` (`with_config`), so
+    // this narrowing never refuses; were it to, the fault is the same.
+    let len = u32::try_from(window_bytes).map_err(|_| too_wide)?;
+    Ok((offset, len))
+}
+
 /// Leak report from [`ColdReads::reconcile`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct ColdLeak {
@@ -320,13 +367,20 @@ impl ColdReads {
     ///
     /// # Panics
     /// Panics on a zero cap, zero queue bound, or zero grant — a
-    /// zero-limit config is a misconfiguration, not a throttle.
+    /// zero-limit config is a misconfiguration, not a throttle — and on a
+    /// pool buffer wider than [`DRIVER_OP_BYTES_MAX`]: the buffer is the
+    /// read-window maximum, and a device read's length is a `u32`
+    /// (ADR-0167 D1).
     #[must_use]
     pub fn with_config(pool: AlignedPool, config: ColdReadConfig) -> ColdReads {
         assert!(config.qd_cap > 0, "qd_cap must admit at least one device read");
         assert!(config.overflow_cap > 0, "overflow_cap must queue at least one intent");
         assert!(config.grants_foreground > 0, "foreground grants must be nonzero");
         assert!(config.grants_maintain > 0, "maintain grants must be nonzero");
+        assert!(
+            pool.buf_size() as u64 <= DRIVER_OP_BYTES_MAX,
+            "cold-read pool buffer exceeds a driver op's byte range"
+        );
         let grants = [config.grants_foreground, config.grants_maintain];
         ColdReads {
             state: Rc::new(RefCell::new(ColdState {
@@ -373,13 +427,11 @@ impl ColdReads {
     /// sim time in DST — it feeds the `cold_read_p99_us` histogram.
     ///
     /// # Errors
-    /// [`ColdRefused::QueueFull`] when the class FIFO is at its bound —
-    /// backpressure the caller shapes, never an error.
-    ///
-    /// # Panics
-    /// Panics when `len` is zero or exceeds the pool buffer size — the
-    /// caller computed the window from the record header, so a mismatch
-    /// is a programmer error.
+    /// [`ColdRefused::Unrepresentable`] when the request cannot become a
+    /// device read — permanent, answered before the queue bound and with no
+    /// state changed (ADR-0167 D3). [`ColdRefused::QueueFull`] when the
+    /// class FIFO is at its bound — backpressure the caller shapes; it
+    /// counts `queue_full` and changes nothing else.
     pub fn enqueue(
         &self,
         fd: RawFd,
@@ -390,8 +442,8 @@ impl ColdReads {
         now_us: u64,
     ) -> Result<ColdWait, ColdRefused> {
         let mut state = self.state.borrow_mut();
-        assert!(len > 0, "empty cold read");
-        assert!(len <= state.pool.buf_size(), "cold-read window exceeds a pool buffer");
+        let (offset, len) = parse_window(offset, len, state.pool.buf_size())
+            .map_err(ColdRefused::Unrepresentable)?;
         if state.pending[class.index()].len() >= state.config.overflow_cap {
             state.counters.queue_full += 1;
             return Err(ColdRefused::QueueFull);
@@ -403,7 +455,7 @@ impl ColdReads {
             fd,
             file,
             offset,
-            len: len as u32,
+            len,
             enqueued_us: now_us,
         });
         state.counters.enqueued += 1;
@@ -550,8 +602,10 @@ impl ColdReads {
             let queue = &mut pending[class];
             let seed = queue.pop_front().expect("picked class has a live head");
             debug_assert!(gate.has_waiter(&seed.token), "heads were purged");
-            let mut lo = seed.offset;
-            let mut hi = seed.offset + u64::from(seed.len);
+            // Span ends come from `bytes_after`: at most `i64::MAX`, so the
+            // union arithmetic below cannot wrap (ADR-0167 D1).
+            let mut lo = seed.offset.bytes();
+            let mut hi = seed.offset.bytes_after(seed.len);
             let (seed_fd, seed_file) = (seed.fd, seed.file);
             debug_assert!(merge_scratch.is_empty(), "scratch drained after every admit");
             merge_scratch.push(seed);
@@ -567,8 +621,8 @@ impl ColdReads {
                         counters.cancelled_queued += 1;
                         continue;
                     }
-                    let start = intent.offset;
-                    let end = start + u64::from(intent.len);
+                    let start = intent.offset.bytes();
+                    let end = intent.offset.bytes_after(intent.len);
                     // One device read has one fd: an intent on the same
                     // file id through a different descriptor never joins
                     // (blob extents open one reader per fetch under one
@@ -596,20 +650,24 @@ impl ColdReads {
         let ColdState { pool, inflight, counters, qd_hist, spare_waiters, merge_scratch, .. } =
             state;
         let (fd, file) = (merge_scratch[0].fd, merge_scratch[0].file);
+        // The lowest intent's position is already a `FileOffset`: the merged
+        // read never re-parses a position (ADR-0167 D3).
         let lo = merge_scratch.iter().map(|intent| intent.offset).min().expect("seed present");
         let hi = merge_scratch
             .iter()
-            .map(|intent| intent.offset + u64::from(intent.len))
+            .map(|intent| intent.offset.bytes_after(intent.len))
             .max()
             .expect("seed present");
-        let window_len = (hi - lo) as usize;
+        // Lossless below: the union is at most `buf_size`, which
+        // `with_config` bounds by `DRIVER_OP_BYTES_MAX` (a `u32`).
+        let window_len = (hi - lo.bytes()) as usize;
         debug_assert!(window_len <= buf_size, "merge respected the buffer cap");
         let mut waiters = spare_waiters.pop().unwrap_or_default();
         debug_assert!(waiters.is_empty(), "spare lists come back drained");
         for intent in merge_scratch.drain(..) {
             waiters.push(Waiter {
                 token: intent.token,
-                skip: (intent.offset - lo) as u32,
+                skip: (intent.offset.bytes() - lo.bytes()) as u32,
                 len: intent.len,
                 enqueued_us: intent.enqueued_us,
             });
@@ -878,6 +936,7 @@ impl core::fmt::Debug for ColdDone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
 
     const BUF: usize = 4 * inf_alloc::TIER_READ_ALIGN;
     const FRAME: u64 = inf_alloc::TIER_READ_ALIGN as u64;
@@ -1062,7 +1121,7 @@ mod tests {
             .iter()
             .map(|op| {
                 let IoOp::TierRead { offset, .. } = op else { panic!("TierRead") };
-                *offset
+                offset.bytes()
             })
             .collect();
         assert_eq!(issued, offsets[..2], "FIFO admission order");
@@ -1072,7 +1131,7 @@ mod tests {
         let ops = drain_ops(&cold);
         assert_eq!(ops.len(), 1, "one freed slot admits one queued intent");
         let IoOp::TierRead { offset, .. } = &ops[0] else { panic!("TierRead") };
-        assert_eq!(*offset, offsets[2], "oldest queued intent first");
+        assert_eq!(offset.bytes(), offsets[2], "oldest queued intent first");
         assert!(cold.counters().queue_depth_high_water >= 4);
         assert!(cold.qd_percentile(99.0) <= 2, "sampled QD never exceeded the cap");
         drop(waiters);
@@ -1092,7 +1151,7 @@ mod tests {
         let mut ops = drain_ops(&cold);
         assert_eq!(ops.len(), 1, "one merged device read");
         let IoOp::TierRead { offset, ref buf, .. } = ops[0] else { panic!("TierRead") };
-        assert_eq!(offset, FRAME);
+        assert_eq!(offset.bytes(), FRAME);
         assert_eq!(buf.len() as u64, 3 * FRAME, "the union window");
         let counters = cold.counters();
         assert_eq!(counters.issued, 1);
@@ -1218,7 +1277,7 @@ mod tests {
             let mut ops = drain_ops(&cold);
             assert_eq!(ops.len(), 1, "qd_cap 1 serializes admissions");
             let IoOp::TierRead { offset, .. } = ops[0] else { panic!("TierRead") };
-            order.push(if offset >= 100 << 20 { 'm' } else { 'f' });
+            order.push(if offset.bytes() >= 100 << 20 { 'm' } else { 'f' });
             let token = complete(ops.remove(0), 0x11);
             cold.on_completion(token, CompletionResult::TierRead, 0);
         }
@@ -1378,8 +1437,136 @@ mod tests {
         let mut second = Vec::new();
         cold.drain_budgeted(|_, _| true, |_, _, _| {}, |op| second.push(op));
         let IoOp::TierRead { offset, .. } = second[0] else { panic!("TierRead") };
-        assert_eq!(offset, 100 << 20, "the deferred maintain read goes first, not a refilled fff");
+        assert_eq!(
+            offset.bytes(),
+            100 << 20,
+            "the deferred maintain read goes first, not a refilled fff"
+        );
         drop((first, second, waiters));
+    }
+
+    /// Everything a refused `enqueue` must leave untouched (ADR-0167 D3):
+    /// counters, queue depth, the file's pins and the token sequence.
+    fn footprint(cold: &ColdReads, file: TierFileId) -> (ColdReadCounters, usize, u32, u64) {
+        let next_read = cold.state.borrow().next_read;
+        (cold.counters(), cold.queue_depth(), cold.inflight_on(file), next_read)
+    }
+
+    /// The permanent refusal `enqueue` answered, or a panic naming `what`.
+    fn unrepresentable(asked: Result<ColdWait, ColdRefused>, what: &str) -> UnrepresentableRead {
+        match asked {
+            Err(ColdRefused::Unrepresentable(read)) => read,
+            Err(ColdRefused::QueueFull) => panic!("{what}: answered QueueFull"),
+            Ok(_) => panic!("{what}: enqueue accepted it"),
+        }
+    }
+
+    /// ADR-0167 D3: a position above `FILE_OFFSET_BYTES_MAX` is one the
+    /// kernel cannot address for a whole driver op (io_uring reads
+    /// `u64::MAX` as its −1 "current position" sentinel). `enqueue` refuses
+    /// it, carrying the value, before any state changes. The saturated blob
+    /// extent position is the real producer of `u64::MAX`.
+    #[test]
+    fn enqueue_refuses_an_offset_the_kernel_cannot_address() {
+        let cold = path(1);
+        let file = TierFileId::new(16);
+        let saturated =
+            inf_log::blob::extent_frame_offset(u64::MAX / inf_log::TIER_FRAME_BYTES as u64 + 1);
+        assert_eq!(saturated, u64::MAX, "the extent producer saturates");
+        let inputs = [i64::MAX.cast_unsigned() + 1, u64::MAX, FILE_OFFSET_BYTES_MAX + 1, saturated];
+        for offset in inputs {
+            let before = footprint(&cold, file);
+            let asked = cold.enqueue(3, file, offset, FRAME as usize, ReadClass::Foreground, 0);
+            let Err(ColdRefused::Unrepresentable(UnrepresentableRead::OffsetAboveMax(refused))) =
+                asked
+            else {
+                panic!("enqueue accepted offset {offset} (above FILE_OFFSET_BYTES_MAX)");
+            };
+            assert_eq!(refused.offset_bytes(), offset, "the refusal carries the value");
+            assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+        }
+        assert_eq!(cold.counters(), ColdReadCounters::default(), "nothing enqueued or counted");
+        assert!(drain_ops(&cold).is_empty(), "no device read");
+        assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// ADR-0167 D3: an empty window, and one wider than a pool buffer, are
+    /// permanent refusals read on the `usize` — `1 << 32` would narrow to
+    /// an empty `u32` window, and is refused as too wide instead.
+    #[test]
+    fn enqueue_refuses_an_empty_or_oversized_window() {
+        let cold = path(1);
+        let file = TierFileId::new(17);
+        let before = footprint(&cold, file);
+        let asked = cold.enqueue(3, file, FRAME, 0, ReadClass::Foreground, 0);
+        assert_eq!(unrepresentable(asked, "window 0"), UnrepresentableRead::EmptyWindow);
+        for window_bytes in [BUF + 1, 1usize << 32] {
+            let asked = cold.enqueue(3, file, FRAME, window_bytes, ReadClass::Maintain, 0);
+            assert_eq!(
+                unrepresentable(asked, "oversized window"),
+                UnrepresentableRead::WindowAboveMax { window_bytes, window_bytes_max: BUF },
+                "the refusal carries the unnarrowed length"
+            );
+        }
+        assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+        assert_eq!(cold.reconcile(), Ok(()));
+    }
+
+    /// ADR-0167 D3's order: the position is checked first, so a request
+    /// that is both unaddressable and a bad window answers `OffsetAboveMax`.
+    #[test]
+    fn an_unaddressable_offset_is_refused_before_the_window() {
+        let cold = path(1);
+        let file = TierFileId::new(18);
+        let offset = i64::MAX.cast_unsigned() + 1;
+        let before = footprint(&cold, file);
+        for window_bytes in [0, BUF + 1] {
+            let asked = cold.enqueue(3, file, offset, window_bytes, ReadClass::Foreground, 0);
+            let read = unrepresentable(asked, "two-fault request");
+            let UnrepresentableRead::OffsetAboveMax(refused) = read else {
+                panic!("window {window_bytes}: answered {read:?}, not the position fault");
+            };
+            assert_eq!(refused.offset_bytes(), offset);
+        }
+        assert_eq!(footprint(&cold, file), before, "a refusal changes nothing");
+    }
+
+    /// ADR-0167 D3: an unrepresentable request is refused permanently even
+    /// when its class FIFO is full — never `QueueFull`, which a caller would
+    /// retry, and `queue_full` does not count it.
+    #[test]
+    fn an_unrepresentable_request_wins_over_a_full_queue() {
+        let config = ColdReadConfig { overflow_cap: 1, ..ColdReadConfig::default() };
+        let cold = shaped(2, config);
+        let file = TierFileId::new(19);
+        let _queued = ask(&cold, 3, file, 0, 64);
+        let before = footprint(&cold, file);
+        let asked = cold.enqueue(3, file, u64::MAX, FRAME as usize, ReadClass::Foreground, 0);
+        let read = unrepresentable(asked, "unaddressable into a full FIFO");
+        assert!(matches!(read, UnrepresentableRead::OffsetAboveMax(_)), "{read:?}");
+        assert_eq!(footprint(&cold, file), before, "queue_full unchanged; nothing pinned");
+        assert_eq!(cold.counters().queue_full, 0);
+    }
+
+    /// ADR-0055 D4's merge at the top of the range (ADR-0167 D3): windows at
+    /// `bound − 1 frame` and at `bound` join into one device read at the
+    /// lower position; the span end (`bound + 1 frame ≤ i64::MAX`) comes
+    /// from `bytes_after` and is never re-parsed as a position.
+    #[test]
+    fn boundary_windows_merge_below_i64_max() {
+        let cold = path(2);
+        let file = TierFileId::new(20);
+        let bound = FILE_OFFSET_BYTES_MAX;
+        let low = ask(&cold, 3, file, bound - FRAME, FRAME as usize);
+        let high = ask(&cold, 3, file, bound, FRAME as usize);
+        let ops = drain_ops(&cold);
+        assert_eq!(ops.len(), 1, "the two windows join");
+        let IoOp::TierRead { offset, ref buf, .. } = ops[0] else { panic!("TierRead") };
+        assert_eq!(offset.bytes(), bound - FRAME, "the merged read starts at the lower window");
+        assert_eq!(u64::from(buf.len()), 2 * FRAME, "the union window");
+        assert!(offset.bytes_after(buf.len()) <= i64::MAX.cast_unsigned(), "span end in range");
+        assert_eq!(cold.counters().merged_waiters, 1);
+        drop((low, high, ops));
     }
 
     /// Minimal single-future block_on for gate waiters whose value is

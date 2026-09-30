@@ -101,8 +101,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::{FileOffset, hash64};
 
 use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 
@@ -1121,16 +1121,17 @@ impl SimDisk {
     }
 
     /// Driver tier (ADR-0020 D7): execute a `LogWrite` payload against a
-    /// fake file fd. Page-cache semantics — NOT durable.
+    /// fake file fd. Page-cache semantics — NOT durable. The position is a
+    /// `LogWrite`'s `FileOffset` (ADR-0167 D2).
     ///
     /// # Errors
     /// `EBADF`-class errors for unknown fds; the dead-switch error when
     /// the disk is dead.
-    pub fn driver_write_at(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
+    pub fn driver_write_at(&self, fd: i32, offset: FileOffset, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         let (open, inode) = state.open_file_mut(fd)?;
-        assert_direct_aligned(open.direct, offset, data.len());
+        assert_direct_aligned(open.direct, offset.bytes(), data.len());
         if open.direct {
             inode.direct_write_gate()?;
         }
@@ -1138,7 +1139,7 @@ impl SimDisk {
             state.faults_fired += 1;
             return Err(eio());
         }
-        inode.write(offset, data);
+        inode.write(offset.bytes(), data);
         Ok(())
     }
 
@@ -1148,11 +1149,11 @@ impl SimDisk {
     ///
     /// # Errors
     /// As [`Self::driver_write_at`].
-    pub fn driver_write_through(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
+    pub fn driver_write_through(&self, fd: i32, offset: FileOffset, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         let (open, inode) = state.open_file_mut(fd)?;
-        assert_direct_aligned(open.direct, offset, data.len());
+        assert_direct_aligned(open.direct, offset.bytes(), data.len());
         if open.direct {
             inode.direct_write_gate()?;
         }
@@ -1160,7 +1161,7 @@ impl SimDisk {
             state.faults_fired += 1;
             return Err(eio());
         }
-        inode.write_through(offset, data);
+        inode.write_through(offset.bytes(), data);
         Ok(())
     }
 
@@ -1172,7 +1173,7 @@ impl SimDisk {
     ///
     /// # Errors
     /// As [`Self::driver_write_at`].
-    pub fn driver_read_at(&self, fd: i32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn driver_read_at(&self, fd: i32, offset: FileOffset, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         let (_, inode) = state.open_file_mut(fd)?;
@@ -1180,7 +1181,7 @@ impl SimDisk {
             state.faults_fired += 1;
             return Err(eio());
         }
-        let offset = usize::try_from(offset).expect("offset fits usize");
+        let offset = usize::try_from(offset.bytes()).expect("offset fits usize");
         if offset >= inode.os.len() {
             return Ok(0);
         }

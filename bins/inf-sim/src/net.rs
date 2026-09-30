@@ -9,6 +9,7 @@ use std::io;
 use std::rc::Rc;
 
 use inf_alloc::{BufferPool, LeaseKind};
+use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
@@ -228,18 +229,18 @@ struct PendingSync {
 enum PendingKind {
     Fsync,
     WriteThrough {
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
     },
     Write {
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
         linked: Option<CompletionToken>,
     },
     /// A tier read under the bandwidth model (ADR-0088 D8): the buffer is
     /// filled at its due time, never before.
     Read {
-        offset: u64,
+        offset: FileOffset,
         buf: StableBytesMut,
     },
 }
@@ -344,7 +345,7 @@ fn write_through(
     disk: &SimDisk,
     plant: Plant,
     fd: i32,
-    offset: u64,
+    offset: FileOffset,
     data: &StableBytes,
 ) -> CompletionResult {
     let result = if plant == Plant::FsyncLies {
@@ -360,7 +361,12 @@ fn write_through(
 
 /// Execute one deferred plain write against the disk's volatile layer
 /// (ADR-0087 D7): `LogWritten` means reached the file, never durable.
-fn plain_write(disk: &SimDisk, fd: i32, offset: u64, data: &StableBytes) -> CompletionResult {
+fn plain_write(
+    disk: &SimDisk,
+    fd: i32,
+    offset: FileOffset,
+    data: &StableBytes,
+) -> CompletionResult {
     match disk.driver_write_at(fd, offset, stable_slice(data)) {
         Ok(()) => CompletionResult::LogWritten,
         Err(err) => CompletionResult::Error { errno: write_errno(&err), buf: None },

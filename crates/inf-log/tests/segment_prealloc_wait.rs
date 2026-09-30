@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use inf_foundation::FileOffset;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
@@ -81,7 +82,9 @@ impl Lab {
         let mut issued = 0;
         while let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
             let zeros = vec![0u8; slice.len as usize];
-            self.disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+            self.disk
+                .driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &zeros)
+                .expect("zero write");
             self.rotor.note_zero_slice_written();
             issued += slice.len;
         }
@@ -100,7 +103,9 @@ impl Lab {
         self.seq += 1;
         let bytes = b.finalize(slot.first_record_lsn(), stamp(self.seq), FrameLayout::Aligned);
         let fd = self.rotor.active_raw_fd().expect("fd");
-        self.disk.driver_write_through(fd, u64::from(slot.base().offset), bytes).expect("frame");
+        self.disk
+            .driver_write_through(fd, FileOffset::from_u32_bytes(slot.base().offset), bytes)
+            .expect("frame");
         self.rotor.commit_frame_queued(slot);
         handoff.is_some()
     }

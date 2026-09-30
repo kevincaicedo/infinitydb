@@ -367,11 +367,17 @@ those driver ops against the same `SimDisk`.
   ready and the active one is not; `RotorStats::{zero_fill_bytes,
   rotations_unzeroed, rotations_upgrade}`;
   `active_io_mode()`/`active_write_through()`.
+  **Amended 2026-09-30 (ADR-0167 D2):**
+  `ZeroSlice.offset` is `u32`, the segment cursor it is built from; its
+  `LogWrite` position is `FileOffset::from_u32_bytes`, total.
 - Sim disk: `create_segment_direct` creates an empty inode with a
   preallocation target; `driver_write_through(fd, offset, data)` is
   durable at completion and supersedes overlapping earlier pending
   writes; `StallConfig::through_base_ns` (0 = inline) and
   `schedule_write_through(now)`.
+  **Amended 2026-09-30 (ADR-0167 D2):**
+  `SimDisk::driver_write_at`, `driver_write_through` and `driver_read_at`
+  take `offset: FileOffset`.
 
 ### M4-S09/S11 additions (ADR-0054, ADR-0056)
 
@@ -540,6 +546,13 @@ freeze discipline). The token *layout* is unchanged; `TokenClass` gains
   frame's durability fact, no `Synced` follows; a short write re-arms its
   remainder write-through), `LinkedFsync { fsync_token }` (below). The
   state "write-through and a linked sync" is unrepresentable.
+  **Amended 2026-09-30 (ADR-0167 D2):** `offset` is
+  `FileOffset`. A log frame's and a zero fill's position come from a
+  `u32` segment cursor and a checkpoint header's is 0 (all total); a
+  checkpoint section's or footer's is checked before `admit`, and a
+  refusal aborts the checkpoint with nothing admitted or sealed. A tier
+  flush round's write positions are checked when the round opens (the
+  flush-round inventory below).
 - `WriteBarrier::LinkedFsync { fsync_token }` chains an fdatasync —
   `IOSQE_IO_LINK` on uring (kept unsplittable across submit boundaries),
   issued after the write's completion on fallback tiers.
@@ -1734,6 +1747,14 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `fail_stop` — checked by `check-fsync-fail-stop.sh` (allowlisted with
   the review note); write errors resubmit byte-identical (ENOSPC latches
   admission first, ADR-0063 D4).
+- **Amended 2026-09-30 (ADR-0167 D4):** an
+  unaddressable write position is fatal too. The round checks every write
+  position before `FlushRound` exists; a refusal opens no round, pushes
+  no op and returns `TierFlushError::Unaddressable { path, offset_bytes }`
+  from the same MAINTAIN, to the plane's fatal arm and `fail_stop`.
+  `is_fatal` names both causes, and `Unaddressable` is not storage-full. A
+  write-error resubmission reads the position the round holds, never
+  checked again.
 - **Deliberately unchecked**: op-index/kind agreement between the token
   and the round table is a `debug_assert` (the generation check already
   rejects cross-round routing); resubmitted write bytes are not

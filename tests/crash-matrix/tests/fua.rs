@@ -58,6 +58,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crash_matrix::{CELL, NS, anchor, config, fresh_keyspace, now};
+use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
@@ -74,12 +75,12 @@ const SEGMENT_BYTES: u32 = 64 << 10;
 /// One op executed against the disk: what the plane would push.
 enum Issued {
     /// Write-through frame: durable at execution.
-    Through { id: FrameId, ticket: inf_log::FsyncTicket, offset: u64, bytes: Vec<u8> },
+    Through { id: FrameId, ticket: inf_log::FsyncTicket, offset: FileOffset, bytes: Vec<u8> },
     /// Plain write + the linked FLUSH-class sync (executed together).
-    Linked { id: FrameId, ticket: inf_log::FsyncTicket, offset: u64, bytes: Vec<u8> },
+    Linked { id: FrameId, ticket: inf_log::FsyncTicket, offset: FileOffset, bytes: Vec<u8> },
     /// Plain write, no barrier (the due accumulates behind an in-flight
     /// FLUSH-class entry — the ADR-0022 D3 discipline).
-    Plain { id: FrameId, offset: u64, bytes: Vec<u8> },
+    Plain { id: FrameId, offset: FileOffset, bytes: Vec<u8> },
 }
 
 struct Rig {
@@ -148,7 +149,9 @@ impl Rig {
         self.disk.sync_dir(Path::new("data/shard-0/log")).expect("names");
         while let Some(slice) = self.rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
             let zeros = vec![0u8; slice.len as usize];
-            self.disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero");
+            self.disk
+                .driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &zeros)
+                .expect("zero");
             self.rotor.note_zero_slice_written();
         }
         let fd = self.rotor.take_zero_fill_barrier().expect("barrier owed");
@@ -204,7 +207,7 @@ impl Rig {
         let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
         let id = self.commit.note_frame_queued(end, slot.len());
         self.frame_keys.push((end.to_u64(), keys));
-        let offset = u64::from(slot.base().offset);
+        let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let bytes = self.ring.leased_frame(&lease).to_vec();
         let issued = match plan {
             FramePlan::WriteThrough => Issued::Through {

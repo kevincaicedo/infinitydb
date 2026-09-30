@@ -17,6 +17,7 @@ mod receipt;
 
 use std::path::Path;
 
+use inf_foundation::FileOffset;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
@@ -378,7 +379,8 @@ fn run_reactor_round(disk: &SimDisk, flush: &mut TierFlush<SimDisk>, sync_too: b
     let writes = flush.round_write_count();
     for index in 0..writes {
         let op = flush.round_op(index);
-        disk.driver_write_at(op.fd, op.offset, op.bytes).expect("driver write");
+        let offset = FileOffset::new(op.offset).expect("staged positions are addressable");
+        disk.driver_write_at(op.fd, offset, op.bytes).expect("driver write");
     }
     if sync_too {
         for index in writes..flush.round_op_count() {

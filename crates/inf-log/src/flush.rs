@@ -86,9 +86,11 @@ pub struct TierFlushConfig {
     pub slice_bytes: u64,
 }
 
-/// A flush-pipeline failure. `Fsync` is fatal-by-default (§8.4): the
-/// caller must freeze the flushed watermark and stop — constructing this
-/// variant is audited by `check-fsync-fail-stop.sh` (ADR-0056 D4).
+/// A flush-pipeline failure. Two causes are fatal (§8.4): `Fsync` — the
+/// caller must freeze the flushed watermark and stop; constructing this
+/// variant is audited by `check-fsync-fail-stop.sh` (ADR-0056 D4) — and
+/// `Unaddressable`, a staged write position outside the driver's range
+/// (ADR-0167 D4).
 #[derive(Debug)]
 pub enum TierFlushError {
     /// An fdatasync-class barrier failed — non-recoverable by contract.
@@ -106,6 +108,17 @@ pub enum TierFlushError {
         /// The device error.
         source: io::Error,
     },
+    /// A staged reactor-drive write position is above the driver's range
+    /// (`FILE_OFFSET_BYTES_MAX`, ADR-0167 D4): the round opens nothing and
+    /// the cell stops. Fatal because the position was checked after
+    /// staging, and a retry would stage the same position. Not
+    /// storage-full: no space was refused.
+    Unaddressable {
+        /// The namespace's tier directory the round writes into.
+        path: PathBuf,
+        /// The refused position.
+        offset_bytes: u64,
+    },
 }
 
 impl core::fmt::Display for TierFlushError {
@@ -120,6 +133,12 @@ impl core::fmt::Display for TierFlushError {
             TierFlushError::Io { path, source } => {
                 write!(f, "tier flush I/O failed on {}: {source}", path.display())
             }
+            TierFlushError::Unaddressable { path, offset_bytes } => write!(
+                f,
+                "FATAL: tier write position {offset_bytes} on {} is outside the kernel's loff_t \
+                 range — cell must stop",
+                path.display()
+            ),
         }
     }
 }
@@ -127,12 +146,17 @@ impl core::fmt::Display for TierFlushError {
 impl std::error::Error for TierFlushError {}
 
 impl TierFlushError {
-    /// True for the §8.4 fatal class — callers use this to route to the
-    /// terminal fail-stop handler without naming the variant.
+    /// True for the §8.4 fatal class — a failed fsync or an unaddressable
+    /// write position (ADR-0167 D4) — so callers route to the terminal
+    /// fail-stop handler without naming the variant.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        // fsync-fail-stop-allow: is_fatal classifier: answers true, takes no action
-        matches!(self, TierFlushError::Fsync { .. })
+        match self {
+            // fsync-fail-stop-allow: is_fatal classifier: answers true, takes no action
+            TierFlushError::Fsync { .. } => true,
+            TierFlushError::Unaddressable { .. } => true,
+            TierFlushError::Io { .. } => false,
+        }
     }
 
     /// True when the failed operation was a write-time space refusal
@@ -146,6 +170,8 @@ impl TierFlushError {
             // fsync-fail-stop-allow: is_retryable classifier: answers false — the rule that forbids
             // the fsyncgate retry
             TierFlushError::Fsync { .. } => false,
+            // A position fault refused no space (ADR-0167 D4).
+            TierFlushError::Unaddressable { .. } => false,
         }
     }
 }
@@ -1041,9 +1067,24 @@ mod tests {
         assert!(err.to_string().contains("FATAL"), "the message says stop");
     }
 
+    /// ADR-0167 D4: an unaddressable round write position is the second
+    /// fatal cause — it routes to fail-stop, and it is never storage-full
+    /// (the device-full latch would otherwise take it for a space refusal).
+    #[test]
+    fn unaddressable_is_fatal_not_storage_full() {
+        let offset_bytes = i64::MAX.cast_unsigned() + 1;
+        let err = TierFlushError::Unaddressable { path: Path::new("ns/cold").into(), offset_bytes };
+        assert!(err.is_fatal(), "an unaddressable position stops the cell");
+        assert!(!err.is_storage_full(), "no space was refused");
+        let text = err.to_string();
+        assert!(text.contains("FATAL"), "the message says stop: {text}");
+        assert!(text.contains(&offset_bytes.to_string()), "the message names the value: {text}");
+    }
+
     // ---- reactor drive (M4.5-S31, ADR-0084) ----
 
     use crate::fs::sim::SimDisk;
+    use inf_foundation::FileOffset;
     use inf_foundation::fault::FaultSpec;
 
     fn sim_seam_pipeline(disk: &SimDisk, capacity: u64) -> TierFlush<SimDisk> {
@@ -1086,7 +1127,8 @@ mod tests {
         for index in 0..writes {
             let op = flush.round_op(index);
             assert!(!op.is_barrier, "writes lead the op list");
-            disk.driver_write_at(op.fd, op.offset, op.bytes).expect("driver write");
+            let offset = FileOffset::new(op.offset).expect("staged positions are addressable");
+            disk.driver_write_at(op.fd, offset, op.bytes).expect("driver write");
         }
         for index in writes..flush.round_op_count() {
             let op = flush.round_op(index);

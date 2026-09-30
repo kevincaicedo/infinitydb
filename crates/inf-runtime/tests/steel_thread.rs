@@ -23,6 +23,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBox, AlignedBufId, AlignedPool, BufferPool};
+use inf_foundation::FileOffset;
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
@@ -128,7 +129,7 @@ fn plan_first_window(
             let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd: ctx.tier_fd,
-                offset: tier_frame_offset(first_frame),
+                offset: FileOffset::new(tier_frame_offset(first_frame)).expect("addressable"),
                 buf: stable,
                 token,
             });
@@ -193,7 +194,7 @@ fn resume_first_window(
             let stable = unsafe { StableBytesMut::new(boxed.bytes_mut()) };
             ctx.driver.push(IoOp::TierRead {
                 fd: ctx.tier_fd,
-                offset: tier_frame_offset(first),
+                offset: FileOffset::new(tier_frame_offset(first)).expect("addressable"),
                 buf: stable,
                 token,
             });

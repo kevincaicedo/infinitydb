@@ -16,6 +16,7 @@ use std::os::fd::IntoRawFd;
 use std::path::PathBuf;
 
 use inf_alloc::BufferPool;
+use inf_foundation::FileOffset;
 use inf_runtime::{
     BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass,
     Wait, WriteBarrier,
@@ -77,7 +78,7 @@ fn log_write_with_linked_fsync_orders_write_before_sync() {
     let data = unsafe { StableBytes::new(&frame) };
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 4096,
+        offset: FileOffset::from_u32_bytes(4096),
         data,
         token: wtoken(1),
         barrier: WriteBarrier::LinkedFsync { fsync_token: ftoken(1) },
@@ -118,7 +119,7 @@ fn failed_write_cancels_the_linked_fsync() {
     let data = unsafe { StableBytes::new(&frame) };
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 0,
+        offset: FileOffset::from_u32_bytes(0),
         data,
         token: wtoken(2),
         barrier: WriteBarrier::LinkedFsync { fsync_token: ftoken(2) },
@@ -163,7 +164,7 @@ fn standalone_fdatasync_and_sequential_offsets() {
         let data = unsafe { StableBytes::new(frame) };
         driver.push(IoOp::LogWrite {
             fd,
-            offset,
+            offset: FileOffset::new(offset).expect("test positions are addressable"),
             data,
             token: wtoken(10 + i as u32),
             barrier: WriteBarrier::None,
@@ -229,7 +230,7 @@ fn write_through_completes_alone_and_lands() {
     let data = unsafe { StableBytes::new(&window.bytes()[..4096]) };
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 4096,
+        offset: FileOffset::from_u32_bytes(4096),
         data,
         token: wtoken(7),
         barrier: WriteBarrier::WriteThrough,

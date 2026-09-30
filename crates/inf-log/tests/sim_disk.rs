@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_foundation::FileOffset;
 use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_log::fs::{SegmentFile, SegmentFs};
 
@@ -316,9 +317,11 @@ fn driver_ops_execute_against_the_same_layers() {
         let dir_fd = dir.raw_fd().expect("dir fd");
         // Commit the create through the DRIVER dir barrier.
         disk.driver_fdatasync(dir_fd).expect("dir barrier via driver");
-        disk.driver_write_at(seg_fd, 0, b"frame-one").expect("LogWrite");
+        disk.driver_write_at(seg_fd, FileOffset::from_u32_bytes(0), b"frame-one")
+            .expect("LogWrite");
         disk.driver_fdatasync(seg_fd).expect("linked fsync");
-        disk.driver_write_at(seg_fd, 512, b"frame-two-unsynced").expect("LogWrite");
+        disk.driver_write_at(seg_fd, FileOffset::from_u32_bytes(512), b"frame-two-unsynced")
+            .expect("LogWrite");
         disk.power_cut(seed);
         let bytes = disk.contents(&path("seg-000000.ilog")).expect("committed name survives");
         assert_eq!(&bytes[..9], b"frame-one", "seed {seed}: synced driver write survives");
@@ -329,7 +332,8 @@ fn driver_ops_execute_against_the_same_layers() {
     assert!(lost > 0, "no seed lost the un-synced driver write");
 
     let disk = disk();
-    let err = disk.driver_write_at(42, 0, b"x").expect_err("unknown fd");
+    let err =
+        disk.driver_write_at(42, FileOffset::from_u32_bytes(0), b"x").expect_err("unknown fd");
     assert!(err.to_string().contains("not a sim file fd"), "{err}");
 }
 

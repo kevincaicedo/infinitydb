@@ -37,7 +37,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use inf_alloc::{AlignedPool, BufferId, BufferPool, LeaseKind};
-use inf_foundation::BuildIntHasher;
+use inf_foundation::{BuildIntHasher, FileOffset};
 use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
@@ -114,7 +114,7 @@ enum OpState {
         fd: RawFd,
         token: CompletionToken,
         data: StableBytes,
-        offset: u64,
+        offset: FileOffset,
         written: u32,
         fsync: Option<(CompletionToken, u64)>,
         write_through: bool,
@@ -133,7 +133,7 @@ enum OpState {
         fd: RawFd,
         token: CompletionToken,
         buf: StableBytesMut,
-        offset: u64,
+        offset: FileOffset,
         got: u32,
     },
 }
@@ -395,7 +395,7 @@ impl UringDriver {
     fn arm_tier_read(
         &mut self,
         fd: RawFd,
-        offset: u64,
+        offset: FileOffset,
         buf: StableBytesMut,
         token: CompletionToken,
         got: u32,
@@ -414,11 +414,11 @@ impl UringDriver {
         let ptr = unsafe { buf.as_mut_ptr().add(got as usize) };
         let entry = match fixed {
             Some(index) => opcode::ReadFixed::new(Fd(fd), ptr, buf.len() - got, index)
-                .offset(offset + u64::from(got))
+                .offset(offset.bytes_after(got))
                 .build()
                 .user_data(id),
             None => opcode::Read::new(Fd(fd), ptr, buf.len() - got)
-                .offset(offset + u64::from(got))
+                .offset(offset.bytes_after(got))
                 .build()
                 .user_data(id),
         };
@@ -434,7 +434,7 @@ impl UringDriver {
     fn arm_log_write(
         &mut self,
         fd: RawFd,
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
         token: CompletionToken,
         written: u32,
@@ -465,7 +465,7 @@ impl UringDriver {
         // that shape, the segment mode decides the fd.
         let rw_flags = if write_through { libc::RWF_DSYNC } else { 0 };
         let entry = opcode::Write::new(Fd(fd), ptr, data.len() - written)
-            .offset(offset + u64::from(written))
+            .offset(offset.bytes_after(written))
             .rw_flags(rw_flags)
             .build()
             .user_data(wid);

@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBufId, AlignedPool, BufferPool};
-use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::{FileOffset, hash64};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -160,7 +160,8 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
             let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd,
-                offset: tier_frame_offset(first_frame),
+                offset: FileOffset::new(tier_frame_offset(first_frame))
+                    .expect("a 48-bit address is addressable"),
                 buf: stable,
                 token,
             });

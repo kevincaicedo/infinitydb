@@ -55,7 +55,7 @@ pub use budget::{
 };
 pub use cold::{
     ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
-    ReadClass, TierFileId,
+    ReadClass, TierFileId, UnrepresentableRead,
 };
 pub use driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,

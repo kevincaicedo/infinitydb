@@ -205,6 +205,28 @@ pub(super) async fn shadow_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone
     }
 }
 
+/// Enqueues one compaction-chain read; `None` ends the chain. A full queue
+/// backs off to the next round. An unrepresentable read cannot come from
+/// the chain's 48-bit `LogicalAddr` (ADR-0167 D2), so it is loud under
+/// debug and DST, and a quiet end of the chain in release (ADR-0167 D3).
+fn chain_enqueue(
+    cold: &inf_runtime::ColdReads,
+    fd: inf_runtime::RawFd,
+    file: inf_runtime::TierFileId,
+    offset: u64,
+    len: usize,
+    now_us: u64,
+) -> Option<inf_runtime::ColdWait> {
+    match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, now_us) {
+        Ok(wait) => Some(wait),
+        Err(inf_runtime::ColdRefused::QueueFull) => None,
+        Err(inf_runtime::ColdRefused::Unrepresentable(read)) => {
+            debug_assert!(false, "compaction planned an unaddressable read at {offset}: {read:?}");
+            None
+        }
+    }
+}
+
 /// One compaction read chain (M4-S26 driving ADR-0059 D2): chunked cold
 /// reads of the candidate through `ColdReads` (`ReadClass::Maintain`),
 /// each chunk fed to `TieredTable::compaction_apply` at the exact scan
@@ -238,11 +260,10 @@ pub(super) async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 // Same-clock stamp as `on_completion` (the
                 // `cold_read_p99_us` pair).
                 let now_us = shared.now.get().as_micros();
-                match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, now_us)
-                {
-                    Ok(wait) => (wait, frames, skip),
-                    Err(_) => break 'chain, // queue full: back off to the next round
-                }
+                let Some(wait) = chain_enqueue(&cold, fd, file, offset, len, now_us) else {
+                    break 'chain;
+                };
+                (wait, frames, skip)
             };
             let done = wait.await;
             if done.outcome().is_err() {

@@ -253,7 +253,7 @@ fn plan_read(world: &Rc<RefCell<World>>, key: &[u8], hash: u64, exclude: &[Logic
                 now_us,
             ) {
                 Ok(wait) => Plan::Fetch { addr, wait, window_frames, skip },
-                Err(_) => Plan::Dry,
+                Err(refused) => refused_plan(refused),
             }
         }
     }
@@ -287,7 +287,20 @@ fn plan_chunk(world: &Rc<RefCell<World>>, addr: u64, done: usize, remaining: usi
             window_frames,
             skip,
         },
-        Err(_) => Plan::Dry,
+        Err(refused) => refused_plan(refused),
+    }
+}
+
+/// A refused enqueue's plan: a full queue is backpressure (retry next
+/// round); an unrepresentable read is permanent, and no generator here
+/// plans a position above 2^49, so it is a corruption the storm reports
+/// (ADR-0167 D3).
+fn refused_plan(refused: inf_runtime::ColdRefused) -> Plan {
+    match refused {
+        inf_runtime::ColdRefused::QueueFull => Plan::Dry,
+        inf_runtime::ColdRefused::Unrepresentable(read) => {
+            Plan::Corrupt(format!("enqueue refused an unrepresentable read: {read:?}"))
+        }
     }
 }
 

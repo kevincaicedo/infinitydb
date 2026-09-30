@@ -3435,6 +3435,191 @@ fn tiered_cold_read_failure_is_typed_for_every_read_command() {
     receipt::verified("cold_enqueue_full", "read-typed-error");
 }
 
+/// The cold-read failure reply (`plane::tiered::ERR_COLD_IO`), framed.
+const COLD_IO_REPLY: &[u8] = b"-ERR cold read failed (tier I/O error)\r\n";
+
+/// `INFO tiering` counters a refused cold read must leave unchanged
+/// (ADR-0167 D3). The last two name the background readers — compaction
+/// and the shadow reconciler — so a background enqueue reads as that,
+/// never as this change's.
+const COLD_STATE_HELD: [&str; 4] = [
+    "cold_reads_enqueued:",
+    "cold_queue_full:",
+    "tiering_compaction_bytes:",
+    "tiering_shadow_reads_issued:",
+];
+
+/// One `INFO tiering` field. A missing line panics: an absent counter is a
+/// broken instrument, never a zero.
+fn tiering_field(text: &str, field: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("INFO tiering has no {field} line"))
+}
+
+/// A durable tiered namespace demoted past its budget with
+/// `cold_enqueue_unaddressable` armed on the cell thread at boot (the
+/// `tiered_cold_read_failure_is_typed_for_every_read_command` recipe).
+/// Every key is written once: no dead bytes feed compaction and no shadow
+/// ticket feeds the reconciler.
+fn unaddressable_fixture(tag: &str) -> (Node, TcpStream, std::path::PathBuf) {
+    let dir = temp_data_dir(tag);
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(
+            inf_server::fault::COLD_ENQUEUE_UNADDRESSABLE,
+            inf_foundation::fault::FaultSpec::Always,
+        )],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..UNADDRESSABLE_KEYS {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let mut demoted = false;
+    for _ in 0..1000 {
+        let text = info_text(&mut c, b"tiering");
+        if tiering_field(&text, "tiering_flush_confirmed_bytes:") > 3 << 20
+            && tiering_field(&text, "tiering_region_decommit_pages:") > 0
+        {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never made a cold working set");
+    (node, c, dir)
+}
+
+/// Keys the unaddressable fixture writes.
+const UNADDRESSABLE_KEYS: usize = 150;
+
+/// After the refused reads' replies: one more command proves each read got
+/// exactly one reply, then a bounded poll waits for the in-flight gauge to
+/// settle, and the refusals must have changed no cold-read state and been
+/// counted (ADR-0167 D3's no-state-change rule, over the wire).
+fn assert_refusals_left_no_cold_state(c: &mut TcpStream, before: &str, io_errors: u64) {
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(c, b"+PONG\r\n");
+    let mut after = info_text(c, b"tiering");
+    for _ in 0..1000 {
+        if tiering_field(&after, "cold_reads_inflight:") == 0 {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        after = info_text(c, b"tiering");
+    }
+    assert_eq!(tiering_field(&after, "cold_reads_inflight:"), 0, "no device read in flight");
+    assert_eq!(tiering_field(&after, "cold_queue_depth:"), 0, "nothing queued");
+    for field in COLD_STATE_HELD {
+        assert_eq!(
+            tiering_field(&after, field),
+            tiering_field(before, field),
+            "{field} moved across refused reads"
+        );
+    }
+    let counted = tiering_field(&after, "tiering_cold_read_errors:")
+        - tiering_field(before, "tiering_cold_read_errors:");
+    assert!(counted >= io_errors, "tiering_cold_read_errors rose {counted}, replies {io_errors}");
+}
+
+/// ADR-0167 D3 over the wire, GET leg: `enqueue` refuses a position the
+/// kernel cannot address permanently, so a cold `GET` answers the cold I/O
+/// error — once, never the `BUSY` a client would retry — and the refusal
+/// leaves no cold-read state behind. The `cold_enqueue_unaddressable`
+/// point plants the position right before the real `enqueue` in `probe`;
+/// keys still in RAM are served (they never reach the queue).
+#[test]
+fn tiered_unaddressable_get_replies_cold_io() {
+    let (node, mut c, dir) = unaddressable_fixture("tiered-unaddressable-get");
+    let before = info_text(&mut c, b"tiering");
+    let mut io_errors = 0u64;
+    for i in 0..UNADDRESSABLE_KEYS {
+        let key = format!("big:{i:04}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        match read_get(&mut c) {
+            Ok(value) => {
+                assert_eq!(value, format!("B{i:04}:").into_bytes().repeat(6_667), "{key}");
+            }
+            Err(line) => {
+                assert_eq!(
+                    line.as_bytes(),
+                    COLD_IO_REPLY,
+                    "{key}: never BUSY, never another error"
+                );
+                io_errors += 1;
+            }
+        }
+    }
+    assert!(io_errors > 0, "no GET reached a cold key — the refusal was never exercised");
+    assert_refusals_left_no_cold_state(&mut c, &before, io_errors);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_unaddressable", "read-permanent-cold-io");
+}
+
+/// ADR-0167 D3 over the wire, SCAN leg: a page over cold keys fails whole
+/// with the cold I/O error — once, never `BUSY` — when the key fetch's
+/// `enqueue` refuses permanently (the point plants in `plan_key_fetch`),
+/// and the refusal leaves no cold-read state behind.
+#[test]
+fn tiered_unaddressable_scan_replies_cold_io() {
+    let (node, mut c, dir) = unaddressable_fixture("tiered-unaddressable-scan");
+    let before = info_text(&mut c, b"tiering");
+    let mut io_errors = 0u64;
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    for _ in 0..10_000 {
+        c.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", b"64"])).expect("write");
+        let head = read_line(&mut c);
+        if head.first() == Some(&b'-') {
+            assert_eq!(head, COLD_IO_REPLY, "the page fails with the cold I/O error, never BUSY");
+            io_errors += 1;
+            break;
+        }
+        assert_eq!(head, b"*2\r\n", "scan reply shape");
+        let next = read_get(&mut c).expect("cursor bulk");
+        let inner = read_line(&mut c);
+        assert_eq!(inner.first(), Some(&b'*'), "keys array");
+        let n: usize =
+            std::str::from_utf8(&inner[1..inner.len() - 2]).expect("ascii").parse().expect("len");
+        for _ in 0..n {
+            let _ = read_get(&mut c);
+        }
+        if next == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert!(io_errors > 0, "SCAN completed with every cold key fetch refused — silent omission");
+    assert_refusals_left_no_cold_state(&mut c, &before, io_errors);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_unaddressable", "read-permanent-cold-io");
+}
+
 /// Review of 2026-08-30 (C7 / F-L04-08; ADR-0096) over the wire: a
 /// header-valid boot orphan — an extent file no durable artifact
 /// references, the crashed-blob-write shape — is **quarantined** by the

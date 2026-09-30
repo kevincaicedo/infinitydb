@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use inf_alloc::BufferPool;
-use inf_foundation::LogHistogram;
+use inf_foundation::{FileOffset, LogHistogram};
 use inf_runtime::{
     BackendDriver, CompletionResult, CompletionToken, IoOp, RawFd, StableBytes, TokenClass,
     UringDriver, Wait, WriteBarrier,
@@ -178,7 +178,7 @@ fn commit_frame(
     let expected = if policy.write_is_barrier() { 1 } else { 2 };
     driver.push(IoOp::LogWrite {
         fd,
-        offset,
+        offset: FileOffset::new(offset).expect("bench positions are addressable"),
         data,
         token: CompletionToken::new(TokenClass::LogWrite, 1, 0),
         barrier,

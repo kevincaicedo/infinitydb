@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use inf_alloc::BufferPool;
+use inf_foundation::FileOffset;
 use inf_log::fs::sim::SimFile;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_runtime::{
@@ -60,7 +61,7 @@ fn log_write_is_buffered_until_the_linked_sync() {
     // Write + linked fsync: completions in submission order.
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 0,
+        offset: FileOffset::from_u32_bytes(0),
         data: stable(b"frame-one"),
         token: token(TokenClass::LogWrite, 1),
         barrier: WriteBarrier::LinkedFsync { fsync_token: token(TokenClass::Fsync, 2) },
@@ -73,7 +74,7 @@ fn log_write_is_buffered_until_the_linked_sync() {
     // A second write WITHOUT a sync: page-cache only.
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 512,
+        offset: FileOffset::from_u32_bytes(512),
         data: stable(b"frame-two-unsynced"),
         token: token(TokenClass::LogWrite, 3),
         barrier: WriteBarrier::None,
@@ -93,9 +94,11 @@ fn log_write_is_buffered_until_the_linked_sync() {
             probe.create_segment(&Path::new(DIR).join("seg-000000.ilog"), 4096).expect("create");
         probe.sync_dir(Path::new(DIR)).expect("commit");
         let pfd = seg.raw_fd().expect("fd");
-        probe.driver_write_at(pfd, 0, b"frame-one").expect("write");
+        probe.driver_write_at(pfd, FileOffset::from_u32_bytes(0), b"frame-one").expect("write");
         probe.driver_fdatasync(pfd).expect("sync");
-        probe.driver_write_at(pfd, 512, b"frame-two-unsynced").expect("write");
+        probe
+            .driver_write_at(pfd, FileOffset::from_u32_bytes(512), b"frame-two-unsynced")
+            .expect("write");
         probe.power_cut(seed);
         let bytes = probe.contents(&Path::new(DIR).join("seg-000000.ilog")).expect("named");
         assert_eq!(&bytes[..9], b"frame-one", "seed {seed}: synced bytes survive");
@@ -120,7 +123,7 @@ fn failed_write_cancels_the_linked_sync() {
     disk.cut_after_ops(0); // dead: every op fails from here
     driver.push(IoOp::LogWrite {
         fd,
-        offset: 0,
+        offset: FileOffset::from_u32_bytes(0),
         data: stable(b"never-lands"),
         token: token(TokenClass::LogWrite, 1),
         barrier: WriteBarrier::LinkedFsync { fsync_token: token(TokenClass::Fsync, 2) },
@@ -170,7 +173,7 @@ fn the_reorder_window_is_closed_on_the_instant_device_and_open_on_write_reorder(
             let mut pool = BufferPool::new(8, 512);
             driver.push(IoOp::LogWrite {
                 fd,
-                offset: 0,
+                offset: FileOffset::from_u32_bytes(0),
                 data: stable(&[0x5A; 4096]),
                 token: token(TokenClass::LogWrite, 1),
                 barrier: WriteBarrier::None,

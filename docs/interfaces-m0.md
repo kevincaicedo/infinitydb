@@ -178,6 +178,16 @@ impl Arena {
 > The first real consumer of the `IoGate` seam; the cold-read path
 > freezes at M4 exit (M4 plan §3.2) after S08 hardens it.
 >
+> **Amended 2026-09-30 (ADR-0167 D1/D2):**
+> `IoOp::TierRead.offset` and `IoOp::LogWrite.offset` are
+> `inf_foundation::FileOffset`, not `u64`: a position in
+> `0..=FILE_OFFSET_BYTES_MAX` (`i64::MAX − u32::MAX`), so an op's span
+> end is at most `i64::MAX` and never the kernel's `−1` current-position
+> sentinel. It is built only by the range check `FileOffset::new`
+> (refused as `FileOffsetRefused`, carrying the value) or the total
+> `from_u32_bytes`; backends read `bytes_after` and `position_after`.
+> Token layout unchanged.
+>
 > **Extended at M4-S08 under the same discipline:** `BackendDriver`
 > gains `register_tier_pool(&mut self, pool: &mut AlignedPool)` (default
 > no-op — readiness/sim backends serve `TierRead` positionally either
@@ -204,6 +214,17 @@ impl Arena {
 > window fits one registered pool buffer (`ReadFixed` upgrade preserved).
 > `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
+>
+> **Amended 2026-09-30 (ADR-0167 D3):** `enqueue`
+> checks the position, then `len == 0`, then `len > buf_size` (on the
+> `usize`), before the queue bound and before any state changes, and
+> answers the first fault with the permanent
+> `ColdRefused::Unrepresentable(OffsetAboveMax | EmptyWindow |
+> WindowAboveMax)`, carrying the refused value where there is one, even
+> when the class queue is full; it changes no depth, pin, token or
+> counter. `ColdRefused` is exhaustive. `with_config` panics on a pool
+> buffer above `DRIVER_OP_BYTES_MAX` (`u32::MAX`). A merged read's span
+> end is `bytes_after(len)`, and a union stays within `buf_size`.
 
 > **Accepted 2026-09-22, implementation open — ADR-0152:**
 > [bounded cold-read result delivery](../../docs/adr/0152-bounded-cold-read-delivery.md)

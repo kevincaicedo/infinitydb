@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use inf_foundation::FileOffset;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode, StdSegmentFs};
@@ -228,10 +229,11 @@ fn frames_above_fua_max_are_not_write_through() {
 fn zero_fill_to_ready(rotor: &mut SegmentRotor<SimDisk>, disk: &SimDisk, segment_bytes: u32) {
     let mut filled = 0;
     while let Some(slice) = rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
-        assert_eq!(slice.offset, u64::from(filled));
+        assert_eq!(slice.offset, filled);
         assert!(slice.len > 0 && slice.len.is_multiple_of(FRAME_ALIGN));
         let zeros = vec![0u8; slice.len as usize];
-        disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+        disk.driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &zeros)
+            .expect("zero write");
         assert!(rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES).is_none(), "one slice in flight");
         rotor.note_zero_slice_written();
         filled += slice.len;
@@ -416,7 +418,8 @@ fn reopen_after_a_torn_zero_fill_runs_flush_class() {
             // Every slice written, the barrier owed but never issued.
             while let Some(slice) = rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
                 let zeros = vec![0u8; slice.len as usize];
-                disk.driver_write_at(slice.fd, slice.offset, &zeros).expect("zero write");
+                disk.driver_write_at(slice.fd, FileOffset::from_u32_bytes(slice.offset), &zeros)
+                    .expect("zero write");
                 rotor.note_zero_slice_written();
             }
             assert!(rotor.take_zero_fill_barrier().is_some(), "barrier owed");
@@ -451,7 +454,7 @@ fn reopen_after_a_torn_zero_fill_runs_flush_class() {
 /// Zero-fills `[0, len)` through the driver and commits the mapping with
 /// the barrier — the ADR-0086 D4 discipline a write-through relies on.
 fn commit_extent(disk: &SimDisk, fd: i32, len: usize) {
-    disk.driver_write_at(fd, 0, &vec![0u8; len]).expect("zero-fill");
+    disk.driver_write_at(fd, FileOffset::from_u32_bytes(0), &vec![0u8; len]).expect("zero-fill");
     disk.driver_fdatasync(fd).expect("barrier");
 }
 
@@ -470,10 +473,10 @@ fn sim_write_through_is_durable_and_supersedes_overlaps() {
     let fd = file.raw_fd().expect("sim fd");
     commit_extent(&disk, fd, 14);
     // Pending plain write over [0, 8), then a write-through over [4, 12).
-    disk.driver_write_at(fd, 0, &[1u8; 8]).expect("plain");
-    disk.driver_write_through(fd, 4, &[2u8; 8]).expect("through");
+    disk.driver_write_at(fd, FileOffset::from_u32_bytes(0), &[1u8; 8]).expect("plain");
+    disk.driver_write_through(fd, FileOffset::from_u32_bytes(4), &[2u8; 8]).expect("through");
     // Later plain write over [10, 14).
-    disk.driver_write_at(fd, 10, &[3u8; 4]).expect("plain");
+    disk.driver_write_at(fd, FileOffset::from_u32_bytes(10), &[3u8; 4]).expect("plain");
     assert_eq!(disk.contents(&path).expect("os view"), {
         let mut v = vec![1u8; 4];
         v.extend_from_slice(&[2; 6]);
@@ -491,9 +494,9 @@ fn sim_write_through_is_durable_and_supersedes_overlaps() {
         disk.sync_dir(dir).expect("name");
         let fd = file.raw_fd().expect("sim fd");
         commit_extent(&disk, fd, 14);
-        disk.driver_write_at(fd, 0, &[1u8; 8]).expect("plain");
-        disk.driver_write_through(fd, 4, &[2u8; 8]).expect("through");
-        disk.driver_write_at(fd, 10, &[3u8; 4]).expect("plain");
+        disk.driver_write_at(fd, FileOffset::from_u32_bytes(0), &[1u8; 8]).expect("plain");
+        disk.driver_write_through(fd, FileOffset::from_u32_bytes(4), &[2u8; 8]).expect("through");
+        disk.driver_write_at(fd, FileOffset::from_u32_bytes(10), &[3u8; 4]).expect("plain");
         disk.power_cut(seed);
         let image = disk.contents(&path).expect("survives");
         assert_eq!(&image[4..10], &[2u8; 6], "seed {seed}: through bytes never resurrected over");
@@ -522,7 +525,7 @@ fn sim_write_through_needs_no_fdatasync() {
     disk.sync_dir(dir).expect("name");
     let fd = file.raw_fd().expect("sim fd");
     commit_extent(&disk, fd, 512);
-    disk.driver_write_through(fd, 0, b"durable").expect("through");
+    disk.driver_write_through(fd, FileOffset::from_u32_bytes(0), b"durable").expect("through");
     disk.power_cut(7);
     assert_eq!(&disk.contents(&path).expect("survives")[..7], b"durable");
 }
@@ -543,7 +546,7 @@ fn sim_write_through_into_a_hole_rides_the_cut() {
         let file = disk.create_segment(&path, 0).expect("create");
         disk.sync_dir(dir).expect("name");
         let fd = file.raw_fd().expect("sim fd");
-        disk.driver_write_through(fd, 0, b"durable").expect("through");
+        disk.driver_write_through(fd, FileOffset::from_u32_bytes(0), b"durable").expect("through");
         disk.power_cut(seed);
         match disk.contents(&path).expect("name survives").as_slice() {
             b"durable" => kept += 1,
@@ -573,7 +576,12 @@ fn sim_torn_zero_fill_is_not_fully_allocated() {
         let fd = file.raw_fd().expect("sim fd");
         assert!(!file.fully_allocated().expect("fact"), "born sparse");
         for piece in 0..target / 4096 {
-            disk.driver_write_at(fd, (piece * 4096) as u64, &[0xAB; 4096]).expect("fill");
+            disk.driver_write_at(
+                fd,
+                FileOffset::new((piece * 4096) as u64).expect("addressable"),
+                &[0xAB; 4096],
+            )
+            .expect("fill");
         }
         assert!(file.fully_allocated().expect("fact"), "written through, barrier pending");
         drop(file);
@@ -667,7 +675,12 @@ fn zero_fill_is_paced_by_the_active_segments_fill() {
     rotor.maintain_deferred(0).expect("maintain");
     let mut issued = 0u32;
     while let Some(slice) = rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
-        disk.driver_write_at(slice.fd, slice.offset, &vec![0u8; slice.len as usize]).expect("w");
+        disk.driver_write_at(
+            slice.fd,
+            FileOffset::from_u32_bytes(slice.offset),
+            &vec![0u8; slice.len as usize],
+        )
+        .expect("w");
         rotor.note_zero_slice_written();
         issued += slice.len;
     }
@@ -686,7 +699,12 @@ fn zero_fill_is_paced_by_the_active_segments_fill() {
     }
     let mut total = issued;
     while let Some(slice) = rotor.next_zero_slice(ZERO_FILL_SLICE_BYTES) {
-        disk.driver_write_at(slice.fd, slice.offset, &vec![0u8; slice.len as usize]).expect("w");
+        disk.driver_write_at(
+            slice.fd,
+            FileOffset::from_u32_bytes(slice.offset),
+            &vec![0u8; slice.len as usize],
+        )
+        .expect("w");
         rotor.note_zero_slice_written();
         total += slice.len;
     }
@@ -754,8 +772,12 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     assert_eq!(slot.layout(), FrameLayout::Packed);
     assert_eq!(slot.base().offset, packed_end);
     let second = frame(2, slot.first_record_lsn(), FrameLayout::Packed);
-    disk.driver_write_at(rotor.active_raw_fd().expect("fd"), u64::from(packed_end), &second)
-        .expect("write");
+    disk.driver_write_at(
+        rotor.active_raw_fd().expect("fd"),
+        FileOffset::from_u32_bytes(packed_end),
+        &second,
+    )
+    .expect("write");
     rotor.commit_frame_queued(slot);
     let second_end = rotor.active_written();
     // MAINTAIN pre-zeroes segment 1; the next frame is the upgrade rotation.
@@ -771,7 +793,12 @@ fn packed_tail_reopens_buffered_under_a_direct_rotor_and_upgrades_at_rotation() 
     assert_eq!(rotor.active_io_mode(), SegmentIoMode::Direct);
     assert_eq!(rotor.stats().rotations_upgrade, 1);
     let third = frame(3, slot.first_record_lsn(), FrameLayout::Aligned);
-    disk.driver_write_through(rotor.active_raw_fd().expect("fd"), 0, &third).expect("through");
+    disk.driver_write_through(
+        rotor.active_raw_fd().expect("fd"),
+        FileOffset::from_u32_bytes(0),
+        &third,
+    )
+    .expect("through");
     rotor.commit_frame_queued(slot);
     drop(handoff);
 
@@ -866,7 +893,8 @@ fn direct_handle_stays_alignment_checked_after_a_buffered_reopen() {
     let direct = disk.create_segment_direct(&path, 64 << 10).expect("create direct");
     let direct_fd = direct.raw_fd().expect("sim fd");
     let _buffered = disk.open_segment_append(&path, SegmentIoMode::Buffered).expect("reopen");
-    disk.driver_write_through(direct_fd, 7, &[0u8; 13]).expect("misaligned on the direct fd");
+    disk.driver_write_through(direct_fd, FileOffset::from_u32_bytes(7), &[0u8; 13])
+        .expect("misaligned on the direct fd");
 }
 
 /// F-L04-07, the converse: a `Buffered` handle is never alignment-checked
@@ -882,7 +910,8 @@ fn buffered_handle_is_not_alignment_checked_after_a_direct_reopen() {
     let buffered = disk.create_segment(&path, 64 << 10).expect("create buffered");
     let buffered_fd = buffered.raw_fd().expect("sim fd");
     let _direct = disk.open_segment_append(&path, SegmentIoMode::Direct).expect("reopen");
-    disk.driver_write_at(buffered_fd, 7, &[0x5A; 13]).expect("packed write on the buffered fd");
+    disk.driver_write_at(buffered_fd, FileOffset::from_u32_bytes(7), &[0x5A; 13])
+        .expect("packed write on the buffered fd");
     let image = disk.contents(&path).expect("exists");
     assert_eq!(&image[7..20], &[0x5A; 13], "the packed write landed");
 }
@@ -902,9 +931,11 @@ fn each_open_is_its_own_file_description() {
     let (a, b) = (first.raw_fd().expect("fd"), second.raw_fd().expect("fd"));
     assert_ne!(a, b, "two opens, two file descriptions");
     drop(first);
-    let err = disk.driver_write_at(a, 0, &[1u8; 8]).expect_err("closed fd");
+    let err =
+        disk.driver_write_at(a, FileOffset::from_u32_bytes(0), &[1u8; 8]).expect_err("closed fd");
     assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{err}");
-    disk.driver_write_at(b, 0, &[2u8; 8]).expect("the live handle's fd serves");
+    disk.driver_write_at(b, FileOffset::from_u32_bytes(0), &[2u8; 8])
+        .expect("the live handle's fd serves");
     assert_eq!(&disk.contents(&path).expect("exists")[..8], &[2u8; 8]);
 }
 

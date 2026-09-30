@@ -26,7 +26,7 @@ use std::os::fd::IntoRawFd;
 use std::time::{Duration, Instant};
 
 use inf_alloc::BufferPool;
-use inf_foundation::LogHistogram;
+use inf_foundation::{FileOffset, LogHistogram};
 use inf_runtime::{
     BackendDriver, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass, UringDriver,
     Wait, WriteBarrier,
@@ -88,7 +88,7 @@ fn main() {
             let t0 = Instant::now();
             driver.push(IoOp::LogWrite {
                 fd,
-                offset,
+                offset: FileOffset::new(offset).expect("bench positions are addressable"),
                 data,
                 token: CompletionToken::new(TokenClass::LogWrite, 1, 0),
                 barrier: WriteBarrier::LinkedFsync {

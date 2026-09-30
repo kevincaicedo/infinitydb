@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
+use inf_foundation::FileOffset;
 use inf_foundation::time::Nanos;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
@@ -69,7 +70,7 @@ pub enum IoMode {
 enum PendingKind {
     Write {
         fd: RawFd,
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
         written: u32,
         token: CompletionToken,
@@ -133,7 +134,14 @@ impl ScriptedDriver {
         self.delays.pop_front().unwrap_or(0)
     }
 
-    fn write_chunk(&self, fd: RawFd, offset: u64, data: StableBytes, written: u32, chunk: u32) {
+    fn write_chunk(
+        &self,
+        fd: RawFd,
+        offset: FileOffset,
+        data: StableBytes,
+        written: u32,
+        chunk: u32,
+    ) {
         if self.mode == IoMode::Recorded {
             return;
         }
@@ -146,7 +154,7 @@ impl ScriptedDriver {
         let slice = unsafe {
             std::slice::from_raw_parts(data.as_ptr().add(written as usize), chunk as usize)
         };
-        file.write_all_at(slice, offset + u64::from(written)).expect("test pwrite");
+        file.write_all_at(slice, offset.bytes_after(written)).expect("test pwrite");
     }
 
     fn sync_fd(&self, fd: RawFd) {
@@ -563,7 +571,7 @@ impl CellPlane for DurablePlane {
             } else {
                 WriteBarrier::None
             };
-            let offset = u64::from(slot.base().offset);
+            let offset = FileOffset::from_u32_bytes(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std tier has fds");
             self.rotor.commit_frame_queued(slot);
             self.write_seq += 1;

@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use inf_alloc::AlignedBox;
+use inf_foundation::FileOffset;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
@@ -945,7 +946,8 @@ impl<F: SegmentFs> DurableCell<F> {
             };
             cx.push(IoOp::LogWrite {
                 fd: slice.fd,
-                offset: slice.offset,
+                // A `u32` segment cursor: always addressable (ADR-0167 D2).
+                offset: FileOffset::from_u32_bytes(slice.offset),
                 data,
                 token: CompletionToken::new(TokenClass::ZeroFillWrite, 0, 0),
                 barrier: WriteBarrier::None,
@@ -1213,7 +1215,8 @@ impl<F: SegmentFs> DurableCell<F> {
             FramePlan::Plain => (WriteBarrier::None, FrameBarrier::None),
             FramePlan::Wait => unreachable!("a waiting frame is never sealed"),
         };
-        let offset = u64::from(slot.base().offset);
+        // A `u32` segment cursor: always addressable (ADR-0167 D2).
+        let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
         // ADR-0088 D2: the foreground is metered (one write, plus the
         // linked barrier when the plan carries one), never deferred.

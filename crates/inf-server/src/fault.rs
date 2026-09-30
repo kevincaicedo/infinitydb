@@ -29,6 +29,11 @@
 //!   saturated` — `GET`, `MGET`, `EXISTS`/`TOUCH`, and a `SCAN` page alike — never a nil, a `:0`,
 //!   or
 //!   a silently shorter page
+//! - `cold_enqueue_unaddressable` — `plane::tiered::probe` + `plane::tiered::plan_key_fetch` — the
+//!   planned cold-read position is replaced with `i64::MAX + 1` right before `ColdReads::enqueue`,
+//!   so the real refusal runs: `enqueue` answers the permanent `Unrepresentable` (ADR-0167 D3),
+//!   and a cold `GET` and a `SCAN` page over cold keys answer the cold I/O error once, never
+//!   `BUSY`; the refused read changes no cold-read state
 //! - `ns_drop_before_meta` — `plane::program_ns_ddl` (the DROP branch, after the local apply,
 //!   before the catalog persist request) — the DDL stops with the origin's registry already lacking
 //!   the namespace and nothing durable changed — the on-disk state of a power cut before the
@@ -67,6 +72,7 @@ pub const DURABLE_FSYNC_EIO: &str = "durable_fsync_eio";
 pub const SHADOW_TWIN_READ_FAIL: &str = "shadow_twin_read_fail";
 pub const SHADOW_RECONCILE_READ_FAIL: &str = "shadow_reconcile_read_fail";
 pub const COLD_ENQUEUE_FULL: &str = "cold_enqueue_full";
+pub const COLD_ENQUEUE_UNADDRESSABLE: &str = "cold_enqueue_unaddressable";
 pub const MSET_MIDWAY_OOM: &str = "mset_midway_oom";
 pub const NS_DROP_BEFORE_META: &str = "ns_drop_before_meta";
 pub const NS_DROP_AFTER_META: &str = "ns_drop_after_meta";
@@ -79,6 +85,7 @@ pub const ALL: &[&str] = &[
     SHADOW_TWIN_READ_FAIL,
     SHADOW_RECONCILE_READ_FAIL,
     COLD_ENQUEUE_FULL,
+    COLD_ENQUEUE_UNADDRESSABLE,
     MSET_MIDWAY_OOM,
     NS_DROP_BEFORE_META,
     NS_DROP_AFTER_META,

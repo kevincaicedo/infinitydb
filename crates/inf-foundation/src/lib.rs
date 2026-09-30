@@ -19,10 +19,12 @@ mod addr;
 mod crc;
 mod device;
 pub mod fault;
+mod file_offset;
 mod footprint;
 mod hash;
 mod hist;
 mod ids;
+pub mod limits;
 mod local;
 pub mod rng;
 pub mod time;
@@ -32,6 +34,7 @@ pub mod varint;
 pub use addr::LogicalAddr;
 pub use crc::{crc16, hashtag};
 pub use device::{DeviceIdentity, IdentityVerdict};
+pub use file_offset::{FileOffset, FileOffsetRefused};
 pub use footprint::rc_allocation_bytes;
 pub use hash::{
     BuildIntHasher, COLLISION_KEY_PREFIX, COLLISION_ORACLE, IntHasher, KeyHashId, KeyHasher,

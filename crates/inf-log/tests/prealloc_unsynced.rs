@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use inf_foundation::FileOffset;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode};
 use inf_log::{
@@ -36,7 +37,7 @@ fn frame(rotor: &mut SegmentRotor<SimDisk>, disk: &SimDisk, seq: u64) {
     let (slot, _) = rotor.begin_frame_deferred(b.frame_len(), 0).expect("reserve");
     let bytes = b.finalize(slot.first_record_lsn(), stamp(seq), FrameLayout::Packed);
     let fd = rotor.active_raw_fd().expect("fd");
-    disk.driver_write_at(fd, u64::from(slot.base().offset), bytes).expect("frame");
+    disk.driver_write_at(fd, FileOffset::from_u32_bytes(slot.base().offset), bytes).expect("frame");
     rotor.commit_frame_queued(slot);
 }
 

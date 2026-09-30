@@ -1003,9 +1003,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         units += used;
                         compact_reads.extend(work);
                     }
-                    // Tier fsync failure is fatal-by-default (§8.4,
-                    // ADR-0056 D4); typed I/O refusals already latched
-                    // the device-full state inside the flush slice.
+                    // Tier fsync failure (§8.4, ADR-0056 D4) and an
+                    // unaddressable round write position (ADR-0167 D4)
+                    // are fatal; typed I/O refusals already latched the
+                    // device-full state inside the flush slice.
                     Err(err) if err.is_fatal() => {
                         fatal = Some(err.to_string());
                         break;

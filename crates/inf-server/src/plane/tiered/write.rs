@@ -278,7 +278,9 @@ pub(in crate::plane) async fn read_cold_record<
             let now_us = shared.now.get().as_micros();
             match cold.enqueue(fd, file, offset, bytes, class, now_us) {
                 Ok(wait) => (wait, frames, skip),
-                Err(_) => return Err(ERR_COLD_BUSY),
+                Err(ColdRefused::QueueFull) => return Err(ERR_COLD_BUSY),
+                // Permanent (ADR-0167 D3); a 48-bit address cannot reach it.
+                Err(ColdRefused::Unrepresentable(_)) => return Err(ERR_COLD_IO),
             }
         };
         let done = wait.await;

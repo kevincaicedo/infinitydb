@@ -559,10 +559,12 @@ enum Prealloc {
 /// One fill write for the plane to issue (ADR-0086 D4): `fd` of the
 /// next segment, absolute `offset`, `len` bytes — zeros from the cell's
 /// aligned zero window, or the recycle sentinel image (ADR-0090 A15).
+/// `offset` is the `u32` segment cursor it is built from, so its
+/// `LogWrite` position converts totally (ADR-0167 D2).
 #[derive(Copy, Clone, Debug)]
 pub struct ZeroSlice {
     pub fd: std::os::fd::RawFd,
-    pub offset: u64,
+    pub offset: u32,
     pub len: u32,
     pub source: FillSource,
 }
@@ -943,7 +945,7 @@ impl<F: SegmentFs> SegmentRotor<F> {
             debug_assert_eq!(len, FRAME_ALIGN, "the sentinel is one block");
             self.stats.recycle_sentinels += 1;
         }
-        Some(ZeroSlice { fd, offset: u64::from(cursor), len, source: next.fill })
+        Some(ZeroSlice { fd, offset: cursor, len, source: next.fill })
     }
 
     /// The in-flight zero slice's `LogWritten` arrived.

@@ -25,6 +25,7 @@ use std::io;
 use std::time::Duration;
 
 use inf_alloc::{BufferId, BufferPool, LeaseKind};
+use inf_foundation::FileOffset;
 
 use crate::driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
@@ -253,7 +254,7 @@ impl KqueueDriver {
     fn log_write(
         &mut self,
         fd: RawFd,
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
         token: CompletionToken,
         barrier: WriteBarrier,
@@ -643,7 +644,7 @@ fn set_nonblocking(fd: RawFd) {
 /// terminal failure; zero-progress writes surface as `EIO`.
 fn log_pwrite_all(
     fd: RawFd,
-    offset: u64,
+    offset: FileOffset,
     data: StableBytes,
     stats: &mut SubmitStats,
 ) -> Result<(), i32> {
@@ -656,7 +657,7 @@ fn log_pwrite_all(
                 fd,
                 data.as_ptr().add(written as usize).cast(),
                 (data.len() - written) as usize,
-                (offset + u64::from(written)) as libc::off_t,
+                offset.position_after(written),
             )
         };
         stats.syscalls += 1;
@@ -682,7 +683,7 @@ fn log_pwrite_all(
 /// flushed range, so a short file is corruption, not a condition.
 fn tier_pread_all(
     fd: RawFd,
-    offset: u64,
+    offset: FileOffset,
     buf: StableBytesMut,
     stats: &mut SubmitStats,
 ) -> Result<(), i32> {
@@ -696,7 +697,7 @@ fn tier_pread_all(
                 fd,
                 buf.as_mut_ptr().add(got as usize).cast(),
                 (buf.len() - got) as usize,
-                (offset + u64::from(got)) as libc::off_t,
+                offset.position_after(got),
             )
         };
         stats.syscalls += 1;

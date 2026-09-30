@@ -148,6 +148,30 @@ tier = "node"
 platform = "linux"
 test = "inf-server::node_e2e::tiered_cold_read_failure_is_typed_for_every_read_command"
 expect = "read-typed-error"
+# ADR-0167 D3: the ColdReads enqueue refuses a position the kernel cannot
+# address (the point plants `i64::MAX + 1` right before it in `probe` and
+# `plan_key_fetch`). Carried by `inf-server/tests/node_e2e.rs`, one carrier
+# per read path, armed on the cell thread at boot.
+#   read-permanent-cold-io — a cold GET, and a SCAN page over cold keys,
+#                            answer the cold I/O error once, never BUSY
+#                            (the refusal is permanent); the refused read
+#                            changes no cold-read state (`cold_queue_depth`
+#                            and `cold_reads_inflight` 0;
+#                            `cold_reads_enqueued` and `cold_queue_full`
+#                            unchanged); `tiering_cold_read_errors` counts
+#                            every refusal served.
+[[row]]
+point = "cold_enqueue_unaddressable"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_unaddressable_get_replies_cold_io"
+expect = "read-permanent-cold-io"
+[[row]]
+point = "cold_enqueue_unaddressable"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_unaddressable_scan_replies_cold_io"
+expect = "read-permanent-cold-io"
 # Review of 2026-08-30 (H2 / F-L17-11, ADR-0098): a multi-key write
 # applies a prefix and then fails mid-way (the deterministic stand-in
 # for arena OOM — bounds are pre-validated since ADR-0098, so the

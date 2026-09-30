@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use inf_alloc::AlignedPool;
-use inf_foundation::LogHistogram;
+use inf_foundation::{FileOffset, LogHistogram};
 use inf_log::blob::ExtentId;
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::{SegmentFile, SegmentFs};
@@ -45,6 +45,13 @@ const EIO: i32 = 5;
 /// typical record in one read; oversized records stage through chunked
 /// continuation windows (the S08 `cold_hardened` shape).
 pub(crate) const COLD_POOL_BUF: usize = 4 * inf_log::TIER_FRAME_BYTES;
+
+// The window maximum fits one driver op, so `ColdReads::with_config`'s pool
+// width check holds for this pool by construction (ADR-0167 D1).
+const _: () = assert!(
+    COLD_POOL_BUF as u64 <= inf_foundation::limits::DRIVER_OP_BYTES_MAX,
+    "a cold-read pool buffer is one driver op"
+);
 
 /// The most driver ops one flush round can carry (the ADR-0084 D3
 /// token op-index bound) — the tier-flush class's ops slice for the
@@ -122,6 +129,12 @@ pub(crate) struct TierNs<F: SegmentFs> {
 /// the identity its completion tokens carry.
 pub(crate) struct FlushRound {
     states: Vec<OpState>,
+    /// Write positions checked when the round opened, indexed like
+    /// `round_op` (writes occupy `0..round_write_count()`, barriers
+    /// follow). Staged ops are immutable until `finish_round`, so a held
+    /// position stays the staged op's; every emit re-checks it in debug
+    /// builds (ADR-0167 D4).
+    write_positions: Vec<FileOffset>,
     /// Ops submitted, not yet terminal.
     pending: u32,
     /// Wave 2 submitted (barriers ride only after every write landed —
@@ -144,9 +157,16 @@ enum OpState {
 }
 
 impl FlushRound {
-    fn new(op_count: usize, round_seq: u32, staged_at_us: u64) -> FlushRound {
+    fn new(
+        op_count: usize,
+        write_positions: Vec<FileOffset>,
+        round_seq: u32,
+        staged_at_us: u64,
+    ) -> FlushRound {
+        debug_assert!(write_positions.len() <= op_count, "writes lead the round's ops");
         FlushRound {
             states: vec![OpState::Unsent; op_count],
+            write_positions,
             pending: 0,
             barriers_sent: false,
             round_seq,
@@ -935,14 +955,46 @@ fn drive_flush_round<F: SegmentFs>(
             let _ = table.complete_flush_round(&mut t.flush);
             stats.rounds += 1;
         } else {
-            t.round_seq = t.round_seq.wrapping_add(1);
-            let mut round = FlushRound::new(op_count, t.round_seq, now_us);
-            emit_round_wave(&t.flush, &mut round, t.lane, RoundWave::Writes, ops);
-            t.round = Some(round);
+            // ADR-0167 D4: a refused position fails ahead of the stage's
+            // own result — the round opens whole or not at all.
+            open_round(t, now_us, ops, |flush, index| flush.round_op(index).offset)?;
         }
     }
     stage_result?;
     Ok(staged_bytes)
+}
+
+/// Opens the staged round whole or not at all (ADR-0167 D4): every write
+/// position is checked before a [`FlushRound`] exists, so a refusal opens
+/// no round, pushes no op and advances no round sequence, and the round
+/// never checks a position again. `position_of(flush, index)` reads the
+/// staged write's position — the production source is
+/// `flush.round_op(index).offset`; tests plant through it. Fatal on a
+/// refusal: the check follows staging, and a retry would stage the same
+/// position.
+fn open_round<F: SegmentFs>(
+    t: &mut TierNs<F>,
+    now_us: u64,
+    ops: &mut Vec<IoOp>,
+    position_of: impl Fn(&TierFlush<F>, usize) -> u64,
+) -> Result<(), TierFlushError> {
+    let writes = t.flush.round_write_count();
+    let mut write_positions = Vec::with_capacity(writes);
+    for index in 0..writes {
+        let position = FileOffset::new(position_of(&t.flush, index)).map_err(|refused| {
+            TierFlushError::Unaddressable {
+                path: t.dir.join("cold"),
+                offset_bytes: refused.offset_bytes(),
+            }
+        })?;
+        write_positions.push(position);
+    }
+    t.round_seq = t.round_seq.wrapping_add(1);
+    let op_count = t.flush.round_op_count();
+    let mut round = FlushRound::new(op_count, write_positions, t.round_seq, now_us);
+    emit_round_wave(&t.flush, &mut round, t.lane, RoundWave::Writes, ops);
+    t.round = Some(round);
+    Ok(())
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -985,9 +1037,11 @@ fn emit_round_wave<F: SegmentFs>(
             ops.push(IoOp::Fdatasync { fd: view.fd, token });
         } else {
             let token = CompletionToken::new(TokenClass::TierFlushWrite, slot, round.round_seq);
+            let position = round.write_positions[index];
+            debug_assert_eq!(position.bytes(), view.offset, "held position is the staged op's");
             ops.push(IoOp::LogWrite {
                 fd: view.fd,
-                offset: view.offset,
+                offset: position,
                 data: crate::log_bytes::tier_round_bytes(&view),
                 token,
                 barrier: WriteBarrier::None,
@@ -1002,6 +1056,8 @@ fn emit_round_wave<F: SegmentFs>(
 mod lane_tests {
     use super::*;
     use inf_log::fs::mem::MemFs;
+    use inf_log::fs::sim::SimDisk;
+    use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher};
     use inf_store::{Keyspace, StoreConfig, TierSpec};
 
     fn spec() -> TierSpec {
@@ -1048,6 +1104,74 @@ mod lane_tests {
         assert_eq!(cell.next_lane, (inf_runtime::MAX_SLOT >> 8) + 1, "no fresh lane was minted");
     }
 
+    /// A tiered keyspace on `NsId(16)` filled past its demotion threshold,
+    /// sealed, and staged into `cell`'s own `SimDisk` pipeline: a real
+    /// reactor round, the new file's header write first (the
+    /// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
+    /// no fds.
+    fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
+        const PAGE: u64 = 4 << 10;
+        let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+        let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+        let space = AddressSpaceConfig {
+            reserve_bytes,
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::ZERO,
+        };
+        let mut ks = Keyspace::new(StoreConfig::default());
+        assert!(ks.materialize_tiered(NsId(16), space, demote, 2048).is_ok());
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+        let hasher = KeyHasher::default();
+        let mut index = 0u32;
+        // Seal marks sit at page boundaries: fill past the threshold until
+        // a slice seals.
+        let mut sealed = 0;
+        while sealed == 0 {
+            let key = format!("round:{index:06}").into_bytes();
+            table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits the window");
+            index += 1;
+            assert!(index < 100_000, "the fill reaches the demotion threshold");
+            if table.demote_due() {
+                sealed = table.seal_slice();
+            }
+        }
+        let flush = &mut cell.namespaces[0].flush;
+        table.stage_flush_round(flush).expect("stage");
+        ks
+    }
+
+    /// ADR-0167 D4: a refused write position opens nothing — no round, no
+    /// op, no round sequence spent — and the error is fatal, carrying the
+    /// value. The refusal is planted on the last write, so a check that
+    /// emitted as it went would already have pushed the others. The same
+    /// staged round, unplanted, opens with every write in wave 1.
+    #[test]
+    fn unaddressable_round_opens_nothing() {
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &spec());
+        let _ks = staged_round(&mut cell);
+        let t = &mut cell.namespaces[0];
+        let writes = t.flush.round_write_count();
+        assert!(writes >= 2, "a header and at least one data write: {writes}");
+        let planted = i64::MAX.cast_unsigned() + 1;
+        let seq_before = t.round_seq;
+        let mut ops = Vec::new();
+        let refused = open_round(t, 7, &mut ops, |flush, index| {
+            if index + 1 == writes { planted } else { flush.round_op(index).offset }
+        });
+        let err = refused.expect_err("an unaddressable position refuses the round");
+        assert!(err.is_fatal(), "fail-stop, not a retry: {err}");
+        let TierFlushError::Unaddressable { offset_bytes, .. } = &err else { panic!("{err}") };
+        assert_eq!(*offset_bytes, planted, "the refusal carries the value");
+        assert!(ops.is_empty(), "no op was pushed");
+        assert!(t.round.is_none(), "no round opened");
+        assert_eq!(t.round_seq, seq_before, "no round sequence spent");
+        open_round(t, 7, &mut ops, |flush, index| flush.round_op(index).offset)
+            .expect("the unplanted round opens");
+        assert_eq!(ops.len(), writes, "wave 1 carries every write");
+        assert!(t.round.is_some(), "the round is open");
+    }
+
     /// A drained round returns its lane too (the `round_drain` path).
     #[test]
     fn drained_namespace_lane_recycles_at_maintain() {
@@ -1055,7 +1179,7 @@ mod lane_tests {
         cell.create_ns(NsId(16), &spec());
         cell.namespaces[0].round_seq = 3;
         // Park a finished round on it so the drop routes through the drain.
-        cell.namespaces[0].round = Some(FlushRound::new(0, 3, 0));
+        cell.namespaces[0].round = Some(FlushRound::new(0, Vec::new(), 3, 0));
         let ks = Keyspace::new(StoreConfig::default());
         let mut releases = vec![(NsId(16), 1)];
         cell.sync_namespaces(&ks, &mut releases);

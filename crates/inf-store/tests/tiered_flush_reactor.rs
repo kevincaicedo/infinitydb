@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use inf_foundation::FileOffset;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
@@ -85,7 +86,8 @@ fn run_round(disk: &SimDisk, table: &mut TieredTable, flush: &mut TierFlush<SimD
         if op.is_barrier {
             disk.driver_fdatasync(op.fd).expect("driver barrier");
         } else {
-            disk.driver_write_at(op.fd, op.offset, op.bytes).expect("driver write");
+            let offset = FileOffset::new(op.offset).expect("staged positions are addressable");
+            disk.driver_write_at(op.fd, offset, op.bytes).expect("driver write");
         }
     }
     // Nothing moved while the round was in flight (ADR-0084 D2).
