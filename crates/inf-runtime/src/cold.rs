@@ -194,7 +194,8 @@ impl ColdReadCounters {
 }
 
 /// Why [`ColdReads::enqueue`] refused: temporary backpressure, or a
-/// request no device read can serve. Neither changed any state.
+/// request no device read can serve. `QueueFull` counts `queue_full` and
+/// changes nothing else; `Unrepresentable` changes nothing (ADR-0167 D3).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ColdRefused {
     /// The class FIFO is at `overflow_cap`: temporary. The command layer

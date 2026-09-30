@@ -205,10 +205,13 @@ pub(super) async fn shadow_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone
     }
 }
 
-/// Enqueues one compaction-chain read; `None` ends the chain. A full queue
-/// backs off to the next round. An unrepresentable read cannot come from
-/// the chain's 48-bit `LogicalAddr` (ADR-0167 D2), so it is loud under
-/// debug and DST, and a quiet end of the chain in release (ADR-0167 D3).
+/// Enqueues one compaction-chain read; either refusal ends the chain, its
+/// cursor persisted for the next MAINTAIN. A full queue is backpressure,
+/// counted in INFO's `cold_queue_full`. An unrepresentable read cannot come
+/// from the chain's 48-bit `LogicalAddr` (ADR-0167 D2); its `debug_assert!`
+/// fires only where debug assertions are compiled in. A release build, the
+/// release-built DST campaigns included, ends the chain with no trace: no
+/// counter moves and no violation is raised (ADR-0167 D3).
 fn chain_enqueue(
     cold: &inf_runtime::ColdReads,
     fd: inf_runtime::RawFd,
@@ -216,15 +219,12 @@ fn chain_enqueue(
     offset: u64,
     len: usize,
     now_us: u64,
-) -> Option<inf_runtime::ColdWait> {
-    match cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, now_us) {
-        Ok(wait) => Some(wait),
-        Err(inf_runtime::ColdRefused::QueueFull) => None,
-        Err(inf_runtime::ColdRefused::Unrepresentable(read)) => {
-            debug_assert!(false, "compaction planned an unaddressable read at {offset}: {read:?}");
-            None
-        }
+) -> Result<inf_runtime::ColdWait, inf_runtime::ColdRefused> {
+    let asked = cold.enqueue(fd, file, offset, len, inf_runtime::ReadClass::Maintain, now_us);
+    if let Err(inf_runtime::ColdRefused::Unrepresentable(read)) = &asked {
+        debug_assert!(false, "compaction planned an unaddressable read at {offset}: {read:?}");
     }
+    asked
 }
 
 /// One compaction read chain (M4-S26 driving ADR-0059 D2): chunked cold
@@ -260,7 +260,7 @@ pub(super) async fn compact_pump<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 // Same-clock stamp as `on_completion` (the
                 // `cold_read_p99_us` pair).
                 let now_us = shared.now.get().as_micros();
-                let Some(wait) = chain_enqueue(&cold, fd, file, offset, len, now_us) else {
+                let Ok(wait) = chain_enqueue(&cold, fd, file, offset, len, now_us) else {
                     break 'chain;
                 };
                 (wait, frames, skip)

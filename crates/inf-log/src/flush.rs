@@ -25,6 +25,7 @@ use std::io;
 use std::path::PathBuf;
 
 use inf_foundation::LogicalAddr;
+use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
 
 use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
@@ -135,8 +136,8 @@ impl core::fmt::Display for TierFlushError {
             }
             TierFlushError::Unaddressable { path, offset_bytes } => write!(
                 f,
-                "FATAL: tier write position {offset_bytes} on {} is outside the kernel's loff_t \
-                 range — cell must stop",
+                "FATAL: tier write position {offset_bytes} on {} is above \
+                 {FILE_OFFSET_BYTES_MAX}, the largest a driver op may carry — cell must stop",
                 path.display()
             ),
         }
@@ -1079,6 +1080,11 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("FATAL"), "the message says stop: {text}");
         assert!(text.contains(&offset_bytes.to_string()), "the message names the value: {text}");
+        // The refusal is the driver-op bound, not the kernel's range: a
+        // position in (bound, i64::MAX] is a valid loff_t (ADR-0167 D1).
+        let bound = FILE_OFFSET_BYTES_MAX.to_string();
+        assert!(text.contains(&bound), "the message names the bound it crossed: {text}");
+        assert!(!text.contains("loff_t"), "the message blames the bound, not loff_t: {text}");
     }
 
     // ---- reactor drive (M4.5-S31, ADR-0084) ----
