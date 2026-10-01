@@ -53,9 +53,10 @@ pub use config::{ConfigSetError, ConfigStore, MAXMEMORY_POLICIES, ReloadClass};
 pub use control::{
     BoardObservation, BoardSweep, CellIssuer, CellRecoverySlot, CheckpointEpoch, CkptBoard,
     CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlHandle,
-    ControlInbox, CreateOutcome, CreateVerdict, DdlTicket, DetachedControl, INDEX_SLOTS,
-    IndexBoard, IssuerMismatch, IssuerRefused, PENDING_CREATE_MAX, RecoveryBoard, SweepStep,
-    load_catalog, load_catalog_from, spawn as spawn_control, spawn_in as spawn_control_in,
+    ControlInbox, CreateOutcome, CreateVerdict, DROPPED_NS_MAX, DdlTicket, DetachedControl,
+    INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, PENDING_CREATE_MAX, RecoveryBoard,
+    SweepStep, load_catalog, load_catalog_from, spawn as spawn_control,
+    spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
 pub use durable::{

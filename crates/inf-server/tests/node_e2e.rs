@@ -5544,6 +5544,49 @@ fn canary_the_snapshot_oracle_sees_a_drop_that_succeeds() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// ADR-0159 D2 at the tombstone cap (2 cells): a durable DROP that finds
+/// `DROPPED_NS_MAX` live tombstones issues its pacing unit as one all-cell
+/// checkpoint and persists only after every cell published it; below the
+/// cap the unit is dropped unissued. Every DROP here is cut after its
+/// catalog swap (`ns_drop_after_meta`), so no fan runs, no cleanup stamp is
+/// issued and the tombstones stay live. The cut also ends the DROP at the
+/// cap, after its pacing wait: the branch under test.
+#[test]
+fn a_drop_at_the_tombstone_cap_waits_for_its_pacing_checkpoint() {
+    let dir = temp_data_dir("ckptpacing");
+    let cut = (inf_server::fault::NS_DROP_AFTER_META, inf_foundation::fault::FaultSpec::Always);
+    let node = Node::start_durable_with_faults(2, &dir, vec![cut]);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let cap = inf_server::DROPPED_NS_MAX;
+    let mut c = conn_on_cell(&node, 0);
+    let create_and_drop = |c: &mut TcpStream, index: usize| {
+        let name = format!("paced{index}");
+        let create = [&b"INF.NS"[..], b"CREATE", name.as_bytes(), b"MODE", b"durable"];
+        c.write_all(&cmd(&create)).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"DROP", name.as_bytes()])).expect("write");
+        read_exactly(c, b"-ERR fault: ns_drop_after_meta\r\n");
+    };
+    let issued = control.ckpt_last_issued();
+    for index in 0..cap {
+        create_and_drop(&mut c, index);
+    }
+    assert_eq!(control.drop_tombstones(), cap, "every cut DROP left its tombstone live");
+    assert_eq!(control.ckpt_last_issued(), issued, "below the cap no DROP issued an epoch");
+    create_and_drop(&mut c, cap);
+    let paced = control.ckpt_last_issued();
+    assert_eq!(paced, issued + 1, "the DROP at the cap issued its one pacing epoch");
+    let board = control.ckpt_board();
+    for cell in 0..node.cells {
+        let published = board.slot(cell).published();
+        assert!(published >= paced, "cell {cell} published {published} before the DROP persisted");
+    }
+    assert_eq!(control.drop_tombstones(), cap + 1, "the paced DROP persisted its own tombstone");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// ADR-0159 D4 at the top of the space (2 cells): both slots publish
 /// epochs near `u64::MAX`, so the published sum passes 2^64 — `WAIT`
 /// returns only after both cells' checkpoints complete, and the sweep's
