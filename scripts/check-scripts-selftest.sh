@@ -1142,7 +1142,7 @@ expect red "file-length: 3001 production lines" env INF_CHECK_ROOT="$root" $FILE
 { printf 'pub fn f() {\n'; for _ in $(seq 1 2499); do printf '    let _x = 1;\n'; done; printf '}\n#[cfg(test)]\nmod tests {\n'; for _ in $(seq 1 600); do printf '    fn t() {}\n'; done; printf '}\n'; } >"$root/crates/fake/src/lib.rs"
 expect green "file-length: 3103 lines of which 602 are a test module" env INF_CHECK_ROOT="$root" $FILELEN
 expect_output "file-length: the OK line discloses the largest file" "largest: 2501 crates/fake/src/lib.rs" env INF_CHECK_ROOT="$root" $FILELEN
-rm -rf "$root/bins"
+[ -n "$root" ] && [ -d "$root/bins" ] && rm -rf "$root/bins"
 expect red "file-length: a missing bins/ is a scope error, not a skip" env INF_CHECK_ROOT="$root" $FILELEN
 root=$(style_root lw)
 printf 'pub fn f() {}\n// %s\n' "$(printf 'x%.0s' $(seq 1 97))" >"$root/crates/fake/src/lib.rs"
@@ -1154,7 +1154,7 @@ expect red "line-width: a 109-column string literal" env INF_CHECK_ROOT="$root" 
 printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
 printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
 expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
-rm -rf "$root/tests"
+[ -n "$root" ] && [ -d "$root/tests" ] && rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
 # ------------------------------------------------------------ lint-ratchet
 # ADR-0144 D3 (absorbs ADR-0125's fn-length ratchet). Fixtures are captured
@@ -1596,7 +1596,9 @@ printf 'crates/fake/src/lib.rs\tf\tk\n' >>"$root/docs/lint-exemptions.tsv"
 expect red "lint-scopes: the row arrives with its allow — the table grew against HEAD" ls_run "$root"
 # a repository whose history starts before the gate and its table
 root=$(ls_root ls-exempt2)
-rm -rf "$root/.git" "$root/scripts" "$root/docs"
+for ls_part in .git scripts docs; do
+    [ -n "$root" ] && [ -e "$root/$ls_part" ] && rm -rf "${root:?}/$ls_part"
+done
 git -C "$root" init -q
 ls_commit "$root" "before the gate"
 git -C "$root" branch -q base-tip
