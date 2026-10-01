@@ -362,9 +362,13 @@ class DocumentPaths(unittest.TestCase):
         self.root = self.parent / "infinitydb"
         (self.root / "docs").mkdir(parents=True)
         (self.root / "Cargo.toml").write_text("[workspace]\n")
-        (self.root / "docs/ARCHITECTURE.md").write_text("# Architecture\n")
+        (self.root / "docs/ARCHITECTURE.md").write_text(
+            "# Architecture\n\nSee [the style](INFINITY_STYLE.md).\n"
+        )
         (self.root / "docs/INFINITY_STYLE.md").write_text("# Style\n")
         (self.root / "docs/compat-matrix.md").write_text("**GENERATED — do not edit.**\n")
+        # The published Markdown set is git's: the root is its own work tree.
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
 
     def governance(self):
         docs = self.parent / "docs"
@@ -387,24 +391,68 @@ class DocumentPaths(unittest.TestCase):
             text=True, capture_output=True, timeout=15,
         )
 
-    def assert_red(self):
+    def assert_red(self, cause=None):
         result = self.gate()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        if cause is not None:
+            self.assertIn(cause, result.stdout)
 
-    def test_doc_workspace_links_belong_to_public_doc_links(self):
-        # One decision, one place: a workspace document's links — local,
-        # missing or into the parent — are check-public-doc-links.sh's
-        # (its self-test plants each); this gate neither accepts nor
-        # judges them, and says who does.
-        self.governance()
-        (self.root / "docs/ARCHITECTURE.md").write_text(
-            "[local](INFINITY_STYLE.md#safety) [wrong](missing.md) "
-            "[parent](../../docs/infinity-master-plan.md)\n"
+    def write_doc(self, text, name="docs/ARCHITECTURE.md"):
+        (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / name).write_text(text)
+
+    # Published links: every relative link in a published Markdown file
+    # resolves inside the repository to a published file.
+    def test_doc_valid_relative_links_are_green_and_counted(self):
+        self.write_doc(
+            "[style](INFINITY_STYLE.md#safety) [docs](./) [manifest](/Cargo.toml)\n"
+            "[ref]: ../Cargo.toml\n<a href=\"INFINITY_STYLE.md\">style</a>\n"
+            "`[code](missing.md)` and an index call `a[0](x)`\n"
+            "```text\n[fenced](missing.md)\n```\n"
+            "[web](https://example.com/missing.md) [mail](mailto:x@example.com) [top](#top)\n"
         )
         result = self.gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("workspace links: check-public-doc-links.sh", result.stdout)
-        self.assertIn("0 parent-record links", result.stdout)
+        self.assertIn("published links: 5 relative links in 3 Markdown files", result.stdout)
+        self.assertIn("HTML pages not judged here", result.stdout)
+
+    def test_doc_relative_link_naming_no_file_is_red(self):
+        for link in ["[wrong](missing.md)", '[wrong](missing.md "title")',
+                     "[wrong](<missing.md>)", '[wrong]: missing.md "title"',
+                     '<a href="missing.md">x</a>', "[wrong](/docs/missing.md)"]:
+            with self.subTest(link=link):
+                self.write_doc(link + "\n")
+                self.assert_red("names no published file")
+
+    def test_doc_relative_link_leaving_the_repository_is_red(self):
+        # The target exists, so the link is red for leaving, not for missing.
+        (self.parent / "outside.md").write_text("# Outside\n")
+        for link in ["[out](../../outside.md)", "[out](/../outside.md)"]:
+            with self.subTest(link=link):
+                self.write_doc(link + "\n")
+                self.assert_red("leaves the repository")
+
+    def test_doc_link_to_a_file_git_ignores_is_red(self):
+        (self.root / ".gitignore").write_text("notes/\n")
+        self.write_doc("# A local note\n", "notes/private.md")
+        self.write_doc("[note](../notes/private.md)\n")
+        self.assert_red("names no published file")
+
+    def test_doc_tracked_and_new_markdown_are_both_judged(self):
+        self.write_doc("[wrong](missing.md)\n", "docs/tracked.md")
+        subprocess.run(["git", "-C", str(self.root), "add", "docs/tracked.md"], check=True)
+        self.assert_red("docs/tracked.md:1: link missing.md names no published file")
+        (self.root / "docs/tracked.md").write_text("# Tracked\n")
+        self.write_doc("[wrong](missing.md)\n", "docs/new.md")
+        self.assert_red("docs/new.md:1: link missing.md names no published file")
+
+    def test_doc_link_scope_needs_the_top_of_a_git_work_tree(self):
+        shutil.rmtree(self.root / ".git")
+        self.assert_red("not the top of its own git work tree")
+
+    def test_doc_markdown_without_a_relative_link_is_a_scope_failure(self):
+        self.write_doc("# Architecture\n")
+        self.assert_red("hold no relative link")
 
     def test_doc_parent_links_are_checked_with_governance(self):
         docs = self.governance()

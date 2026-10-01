@@ -4,6 +4,8 @@ default: check
 
 check:
     cargo fmt --all --check
+    # Every relative link in a published Markdown file resolves inside the
+    # repository (ADR-0166 D5), beside the document identities.
     ./scripts/check-doc-artifacts.sh
     # The public docs are self-contained: no link in a Markdown file, website
     # page or docs table leaves the repository or names no file, and no path,

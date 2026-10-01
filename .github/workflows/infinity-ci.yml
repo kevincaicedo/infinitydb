@@ -54,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: fmt
         run: cargo fmt --all --check
-      - name: documentation artifact identities (ADR-0106 D15)
+      - name: documentation identities and relative links (ADR-0106 D15, ADR-0166 D5)
         run: ./scripts/check-doc-artifacts.sh
       - name: public docs are self-contained (no link or path outside the repository)
         run: ./scripts/check-public-doc-links.sh

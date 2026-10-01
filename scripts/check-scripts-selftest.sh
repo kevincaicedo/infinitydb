@@ -1276,11 +1276,17 @@ DOCS=./scripts/check-doc-artifacts.sh
 doc_case="$work/doc-artifacts"
 doc_root="$doc_case/infinitydb"
 mkdir -p "$doc_root/docs"
+git init -q "$doc_root"
 printf '[workspace]\n' >"$doc_root/Cargo.toml"
-printf '# Architecture\n' >"$doc_root/docs/ARCHITECTURE.md"
+printf '# Architecture\n\nSee [the style](INFINITY_STYLE.md).\n' >"$doc_root/docs/ARCHITECTURE.md"
 printf '# Style\n' >"$doc_root/docs/INFINITY_STYLE.md"
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
+expect_output "docs: the OK line states the published-link scope" \
+    "published links: 1 relative links in 3 Markdown files" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '[gone](missing.md)\n' >>"$doc_root/docs/ARCHITECTURE.md"
+expect red "docs: a relative link naming no file" env INF_CHECK_ROOT="$doc_root" $DOCS
+printf '# Architecture\n\nSee [the style](INFINITY_STYLE.md).\n' >"$doc_root/docs/ARCHITECTURE.md"
 expect_output "docs: standalone discloses the absent governance scope" "parent governance absent, not validated" env INF_CHECK_ROOT="$doc_root" $DOCS
 rm -f "$doc_root/Cargo.toml"
 expect red "docs: workspace manifest missing" env INF_CHECK_ROOT="$doc_root" $DOCS
@@ -1330,7 +1336,6 @@ printf '\n65 commands\n' >>"$doc_case/docs/compat-matrix.md"
 expect red "docs: counts added to the pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
 
 cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
-git init -q "$doc_root"
 mkdir -p "$doc_root/tests/fixtures" "$doc_root/bins/inf-sim/seeds"
 printf 'regression input\n' >"$doc_root/tests/fixtures/artifacts.txt"
 printf '0xC0FFEE\n' >"$doc_root/bins/inf-sim/seeds/regression.txt"
