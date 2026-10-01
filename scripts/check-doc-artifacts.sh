@@ -31,7 +31,7 @@ def read_required(path):
 
 read_required(root / "Cargo.toml")
 sources = {
-    root / "ARCHITECTURE.md": read_required(root / "ARCHITECTURE.md"),
+    root / "docs/ARCHITECTURE.md": read_required(root / "docs/ARCHITECTURE.md"),
     root / "docs/INFINITY_STYLE.md": read_required(root / "docs/INFINITY_STYLE.md"),
 }
 matrix = read_required(root / "docs/compat-matrix.md")
@@ -87,14 +87,21 @@ if governance:
 else:
     scope = "workspace matrix; standalone checkout: parent governance absent, not validated"
 
-links_checked = parent_links = adr_paths = 0
+# A workspace document's links and paths are check-public-doc-links.sh's:
+# it owns every link of the published repository (inside it, existing, not
+# run output) and refuses a pointer into the parent's records. Here only
+# the parent's governing files have their links resolved.
+links_checked = adr_paths = 0
 for path, body in sources.items():
+    governing = not path.resolve().is_relative_to(root.resolve())
     for line, text in enumerate(body.splitlines(), 1):
         location = f"{path}:{line}"
         if re.search(r"(?<![\w-])infinity/|tests/compat-suite", text):
             errors.append(f"DOC PATH: obsolete workspace/harness path at {location}")
         if "`docs/vortex-master-plan.md`" in text:
             errors.append(f"DOC PATH: deleted legacy document cited as current at {location}")
+        if not governing:
+            continue
         destinations = re.findall(r"\]\(\s*(?:<([^>]+)>|([^\s)]+))", text)
         destinations += re.findall(r"^ {0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|([^\s]+))", text)
         for wrapped, plain in destinations:
@@ -104,12 +111,8 @@ for path, body in sources.items():
             target = unquote(target.split("#", 1)[0])
             if not target:
                 continue
-            resolved = (path.parent / target).resolve()
-            if not governance and not resolved.is_relative_to(root):
-                parent_links += 1
-                continue
             links_checked += 1
-            if not resolved.exists():
+            if not (path.parent / target).resolve().exists():
                 errors.append(f"DOC PATH: {location}: missing link {target}")
         # NNNN names are future deliverables; 00xx is the obsolete landed-ADR spelling.
         for target in re.findall(r"docs/adr/(?:[0-9]{4}|00xx)-[\w.-]+\.md", text):
@@ -121,8 +124,8 @@ for path, body in sources.items():
                     errors.append(f"DOC PATH: {location}: missing ADR citation {target}")
 
 scope += (
-    f"; {len(sources)} governing/plan files, {links_checked} local links, "
-    f"{adr_paths} ADR paths, {parent_links} parent links unvalidated"
+    f"; {len(sources)} governing/plan files, {links_checked} parent-record links, "
+    f"{adr_paths} ADR paths; workspace links: check-public-doc-links.sh"
 )
 if errors:
     print("\n".join(errors))

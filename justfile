@@ -5,7 +5,13 @@ default: check
 check:
     cargo fmt --all --check
     ./scripts/check-doc-artifacts.sh
-    # ADR-0164: the parent repository's ADR-link and record gates.
+    # The public docs are self-contained: no link in a Markdown file, website
+    # page or docs table leaves the repository or names no file, and no path,
+    # URL, prose, section or removed-document name points into records that
+    # are not published with it.
+    ./scripts/check-public-doc-links.sh
+    # ADR-0164: the document gates of the combined checkout; a standalone
+    # checkout prints the skip.
     ./scripts/check-parent-doc-gates.sh
     ./scripts/check-dep-dag.sh
     ./scripts/check-cell-denylist.sh
@@ -34,7 +40,7 @@ check:
     ./scripts/check-arith-spellings.sh
     # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
     # denies unsafe_code, the deny set is the audited-leaf list, and every
-    # allow is module-scoped — the §17.3 posture, mechanical.
+    # allow is module-scoped — the unsafe posture, mechanical.
     ./scripts/check-unsafe-roots.sh
     # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
     # request fault-points/collision-oracle — a workspace build would link
@@ -100,7 +106,7 @@ compat:
 # m4-recovery is the M4-S12 unified-recovery power-cut chain (hybrid
 # checkpoints, MANIFEST v2, D4 tail replay, never-none oracle);
 # m4-tiered is the M4-S26 command-driven tiered node (RESP over the sim
-# net against the wired plane: cut → recover → §8.2 command audit →
+# net against the wired plane: cut → recover → durability-class command audit →
 # re-pressure flush liveness → DISKFULL clamp → the S19 drop race).
 sim-smoke:
     # F-L19-03 (review 2026-08-30): one registry — every scenario the
@@ -114,7 +120,7 @@ sim-smoke:
 sim-canaries:
     ./scripts/sim-canaries.sh
 
-# M2-S19 durability sweep (the §6 dst_sweep gate shape). Every *-sweep
+# M2-S19 durability sweep (the dst_sweep gate shape). Every *-sweep
 # recipe runs through scripts/run-sweep.sh (ADR-0106 D7): eight shards,
 # each waited on by pid, each manifest required to carry ` violations=0 `
 # — the old inline bodies ended in a bare `wait`, whose status is 0
@@ -162,7 +168,7 @@ reorder-sweep seeds="2000" base="0x2E0D0000":
 recycle-sweep seeds="10000" base="0xD5EE0000":
     ./scripts/run-sweep.sh m2-recycle {{seeds}} {{base}}
 
-# M3-S24 document power-cut + replay-equivalence sweep (the M3 §7 crash
+# M3-S24 document power-cut + replay-equivalence sweep (the M3 exit-gate crash
 # and replay-equivalence gate shape; ADR-0045). Usage:
 #   just doc-sweep [seeds] [base]
 doc-sweep seeds="10000" base="0xD0C24000":

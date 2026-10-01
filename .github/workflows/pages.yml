@@ -1,4 +1,4 @@
-# InfinityDB website — GitHub Pages deployment (M2.5-S05).
+# InfinityDB website — GitHub Pages deployment.
 #
 # Guarantees enforced before every deploy:
 #   1. The compat page is regenerated from the repo's generated artifact
@@ -6,9 +6,13 @@
 #      can never drift from the implementation (L8).
 #   2. The ledger-copy check scans every HTML page: any performance-shaped
 #      number not covered by an Allowed claim-ledger row fails the build
-#      (L10). The ledger of record lives in the planning repo; this repo
-#      carries a committed snapshot (website/site/_ledger-snapshot.md) that
-#      the release-manager checklist refreshes alongside any copy change.
+#      (L10). The claim ledger is published with the site
+#      (website/site/_ledger-snapshot.md); the release-manager checklist
+#      refreshes it alongside any copy change.
+#   3. The public-doc-links gate judges every page before it is uploaded: a
+#      site page links only inside the site, every link names a published
+#      file, and nothing points into planning documents that are not
+#      published. The gate reads the whole history, so the checkout is full.
 
 name: website
 
@@ -37,6 +41,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Regenerate compat page from the repo artifact
         run: |
@@ -60,6 +66,9 @@ jobs:
             --ledger website/site/_ledger-snapshot.md \
             --allowlist website/scripts/ledger-allowed-numbers.txt \
             --print-tokens
+
+      - name: Public doc links (every page self-contained)
+        run: ./scripts/check-public-doc-links.sh
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -56,21 +56,23 @@ jobs:
         run: cargo fmt --all --check
       - name: documentation artifact identities (ADR-0106 D15)
         run: ./scripts/check-doc-artifacts.sh
+      - name: public docs are self-contained (no link or path outside the repository)
+        run: ./scripts/check-public-doc-links.sh
       - name: dep-DAG law
         run: ./scripts/check-dep-dag.sh
       - name: cell deny-list
         run: ./scripts/check-cell-denylist.sh
-      - name: fault-point inventory (M2-S16)
+      - name: fault-point inventory
         run: ./scripts/check-fault-points.sh
-      - name: fsync fail-stop grep (M2-S17, §8.4)
+      - name: fsync fail-stop grep
         run: ./scripts/check-fsync-fail-stop.sh
-      - name: panic-policy grep (M2.5-S13)
+      - name: panic-policy grep
         run: ./scripts/check-panic-policy.sh
       # ADR-0107 D2 (review 2026-08-30, Theme 4): release asserts justified
       # by a claim about a caller are an inventory, gated.
       - name: release-assert inventory (ADR-0107 D2)
         run: ./scripts/check-release-asserts.sh
-      - name: SAFETY.md inventory (M2.5-S16, §17.3)
+      - name: SAFETY.md inventory
         run: ./scripts/check-safety-inventory.sh
       # ADR-0106: the gates must go red on a planted violation, or their OK
       # is a claim (review 2026-08-30 P1/P1c: two had been inert for months).

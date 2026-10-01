@@ -362,7 +362,7 @@ class DocumentPaths(unittest.TestCase):
         self.root = self.parent / "infinitydb"
         (self.root / "docs").mkdir(parents=True)
         (self.root / "Cargo.toml").write_text("[workspace]\n")
-        (self.root / "ARCHITECTURE.md").write_text("# Architecture\n")
+        (self.root / "docs/ARCHITECTURE.md").write_text("# Architecture\n")
         (self.root / "docs/INFINITY_STYLE.md").write_text("# Style\n")
         (self.root / "docs/compat-matrix.md").write_text("**GENERATED — do not edit.**\n")
 
@@ -391,35 +391,33 @@ class DocumentPaths(unittest.TestCase):
         result = self.gate()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_doc_valid_workspace_and_parent_links(self):
+    def test_doc_workspace_links_belong_to_public_doc_links(self):
+        # One decision, one place: a workspace document's links — local,
+        # missing or into the parent — are check-public-doc-links.sh's
+        # (its self-test plants each); this gate neither accepts nor
+        # judges them, and says who does.
         self.governance()
-        (self.root / "ARCHITECTURE.md").write_text(
-            "[local](docs/INFINITY_STYLE.md#safety) [parent](../docs/infinity-master-plan.md)\n"
+        (self.root / "docs/ARCHITECTURE.md").write_text(
+            "[local](INFINITY_STYLE.md#safety) [wrong](missing.md) "
+            "[parent](../../docs/infinity-master-plan.md)\n"
         )
         result = self.gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_doc_missing_local_link_in_standalone_is_red(self):
-        (self.root / "ARCHITECTURE.md").write_text("[wrong](docs/missing.md)\n")
-        self.assert_red()
-
-    def test_doc_titled_wrapped_and_reference_links_are_checked(self):
-        for link in ['[wrong](docs/missing.md "title")', '[wrong](<docs/missing.md>)',
-                     '[wrong]: docs/missing.md "title"']:
-            with self.subTest(link=link):
-                (self.root / "ARCHITECTURE.md").write_text(link + "\n")
-                self.assert_red()
-
-    def test_doc_standalone_parent_link_is_disclosed(self):
-        (self.root / "ARCHITECTURE.md").write_text("[parent](../docs/infinity-master-plan.md)\n")
-        result = self.gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("1 parent links unvalidated", result.stdout)
+        self.assertIn("workspace links: check-public-doc-links.sh", result.stdout)
+        self.assertIn("0 parent-record links", result.stdout)
 
     def test_doc_parent_links_are_checked_with_governance(self):
-        self.governance()
-        (self.root / "ARCHITECTURE.md").write_text("[wrong](../docs/missing.md)\n")
+        docs = self.governance()
+        (docs / "infinity-master-plan.md").write_text("[wrong](missing.md)\n")
         self.assert_red()
+
+    def test_doc_titled_wrapped_and_reference_parent_links_are_checked(self):
+        docs = self.governance()
+        for link in ['[wrong](adr/missing.md "title")', '[wrong](<adr/missing.md>)',
+                     '[wrong]: adr/missing.md "title"']:
+            with self.subTest(link=link):
+                (docs / "infinity-master-plan.md").write_text(link + "\n")
+                self.assert_red()
 
     def test_doc_every_milestone_link_is_checked(self):
         docs = self.governance()
@@ -427,7 +425,7 @@ class DocumentPaths(unittest.TestCase):
         self.assert_red()
 
     def test_doc_missing_governing_workspace_input_is_red(self):
-        (self.root / "ARCHITECTURE.md").unlink()
+        (self.root / "docs/ARCHITECTURE.md").unlink()
         self.assert_red()
 
     def test_doc_empty_milestone_scope_is_red(self):

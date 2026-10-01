@@ -1277,7 +1277,7 @@ doc_case="$work/doc-artifacts"
 doc_root="$doc_case/infinitydb"
 mkdir -p "$doc_root/docs"
 printf '[workspace]\n' >"$doc_root/Cargo.toml"
-printf '# Architecture\n' >"$doc_root/ARCHITECTURE.md"
+printf '# Architecture\n' >"$doc_root/docs/ARCHITECTURE.md"
 printf '# Style\n' >"$doc_root/docs/INFINITY_STYLE.md"
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
@@ -1344,6 +1344,776 @@ for output in .artifacts/gate.log artifacts/claim.json tests/fuzz/artifacts/cras
     expect red "docs: tracked output is forbidden ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
     git -C "$doc_root" rm -q --cached -f "$output"
 done
+
+# ------------------------------------------------------- public doc links
+# check-public-doc-links.sh: its header is the one list of what the gate
+# refuses and exempts (checks (a)-(g), the tiers, markers and owned-line
+# rows). Each check, each spelling family, each scope failure and each
+# deviation bound is planted below in the file class it names, and turns the
+# gate red with its named cause; the sanctioned shapes are green controls.
+# The clock is pinned (INF_CHECK_TODAY) fourteen days before the evidence
+# record's expiry, so the deviation dates below stay inside the horizon.
+LINKS=$SCRIPT_DIR/check-public-doc-links.sh
+dl_expiry=$(grep -o 'EVIDENCE_RECORDS = {[^}]*}' "$LINKS" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)
+[ -n "$dl_expiry" ] || dl_expiry=$(python3 -c \
+    'import datetime as d; print(d.datetime.now(d.timezone.utc).date() + d.timedelta(days=14))')
+dl_today=$(python3 -c \
+    'import datetime as d, sys; print(d.date.fromisoformat(sys.argv[1]) - d.timedelta(days=14))' \
+    "$dl_expiry")
+dl_case="$work/doc-links"
+dl_root="$dl_case/eng"
+mkdir -p "$dl_root/docs/milestones" "$dl_root/website/site" "$dl_root/.artifacts" \
+    "$dl_root/notes" "$dl_root/tools" "$dl_case/other"
+printf '# Outside\n' >"$dl_case/other/x.md"
+git init -q "$dl_root"
+git -C "$dl_root" remote add origin https://github.com/acme/eng.git
+printf '.artifacts/\nnotes/\n' >"$dl_root/.gitignore"
+printf '# Old protocol\n' >"$dl_root/docs/old-protocol.md"
+git -C "$dl_root" add -A
+git -C "$dl_root" -c user.name=t -c user.email=t@t commit -q -m base
+git -C "$dl_root" rm -q docs/old-protocol.md
+git -C "$dl_root" -c user.name=t -c user.email=t@t commit -q -m 'remove the protocol'
+cat >"$dl_root/README.md" <<'EOF'
+# Engine
+
+See [the docs](docs/README.md) and [below](#engine); the rules are
+[the docs](docs/README.md) §3.
+EOF
+cat >"$dl_root/docs/README.md" <<'EOF'
+# Docs
+
+Back to the [overview](../README.md); the gates are `docs/milestones/m0-gates.toml`.
+The seams are in [the interfaces](interfaces-m0.md). A URL is not a path:
+[example](https://example.com/reviews/x/docs/adr/0001.md), and a file URL
+into this repository names a file it has:
+https://github.com/acme/eng/blob/main/docs/milestones/m0-gates.toml.
+
+```rust
+let reply = handlers[0](&args); // an index call, not a link
+```
+
+````md
+```
+[fenced](missing-in-a-long-fence.md)
+```
+````
+
+## 3. Rules
+
+The rules (§3) merge patches per RFC 7386 §2.
+EOF
+printf '%s\n' '# Interfaces' '' 'Decisions are cited as bare text (ADR-0087 D2, M4-S27).' \
+    >"$dl_root/docs/interfaces-m0.md"
+printf '# gate rows for M0\n' >"$dl_root/docs/milestones/m0-gates.toml"
+printf 'I\t1\tcrates/x/src/lib.rs\tassert\tslot class\tthe invariant is local\n' \
+    >"$dl_root/docs/table.tsv"
+printf 'generated output\n' >"$dl_root/.artifacts/gate.log"
+printf '# A local note\n' >"$dl_root/notes/private.md"
+printf 'print("the matrix")\n' >"$dl_root/tools/matrixgen.py"
+printf '[the matrix](../../docs/README.md)\n' >"$dl_root/website/site/snapshot.md"
+printf '| C1 | claim | Allowed (ADR-0087 D2, M4-S27, M4.5) |\n' \
+    >"$dl_root/website/site/_ledger-snapshot.md"
+printf '%s\n' '<p><a href="snapshot.md">snapshot</a>, the <a' \
+    'href="https://github.com/acme/eng/blob/main/README.md">readme</a></p>' \
+    >"$dl_root/website/site/index.html"
+dl_line='Master plan §14 owns the staging policy; milestone plans own acceptance'
+dl_banner='> **GENERATED — do not edit.** Rendered by `tools/matrixgen.py`.'
+printf '%s\n' '# Matrix' '' "$dl_banner" '' "$dl_line" >"$dl_root/docs/compat-matrix.md"
+dl_row="$(printf 'docs/compat-matrix.md\t%s\ttools/matrixgen.py renders it' "$dl_line")"
+printf '%s\n' '# file<TAB>line text<TAB>owning source<TAB>owner<TAB>expiry' \
+    "$(printf '%s\t@owner\t%s' "$dl_row" "$dl_expiry")" >"$dl_root/docs/doc-link-generated.tsv"
+git -C "$dl_root" add -A
+dl_run() { env INF_CHECK_TODAY="$dl_today" INF_CHECK_ROOT="$dl_root" "$LINKS"; }
+expect green "doc-links: self-contained docs, repository paths, sections, URLs and fenced code" dl_run
+expect_output "doc-links: the OK line names each class and tier" \
+    "OK: 6 Markdown, 1 HTML, 3 table files (5 engineering, 1 evidence, 4 first-read)" dl_run
+expect_output "doc-links: the OK line counts removed names and own URLs, discloses standalone" \
+    "1 removed document names, 2 own-repository URLs (acme/eng), 0 parent repositories (standalone" \
+    dl_run
+expect_output "doc-links: the owned-line row is listed with its owner and expiry" \
+    "owned line: docs/compat-matrix.md: .*owner @owner, expires $dl_expiry" dl_run
+expect_output "doc-links: the OK line discloses what the rows exempt" \
+    "1 of 1 owned-line rows live (exempt: each live row's text, and docs/doc-link-generated.tsv's text column)" \
+    dl_run
+expect_output "doc-links: the evidence record is listed with its owner, expiry and what it keeps" \
+    "evidence record: website/site/_ledger-snapshot.md (owner @kevincaicedo, expires $dl_expiry; keeps 3 decision or story identifiers)" \
+    dl_run
+# dl_red <label> <file> <text> <cause>: the text appended to the file turns
+# the gate red and the message names the cause; the file is restored after.
+dl_red() {
+    local label=$1 file=$2 text=$3 cause=$4
+    cp "$dl_root/$file" "$dl_case/saved"
+    printf '%s\n' "$text" >>"$dl_root/$file"
+    expect red "doc-links: $label" dl_run
+    expect_output "doc-links: $label names its cause" "$cause" dl_run
+    cp "$dl_case/saved" "$dl_root/$file"
+}
+# dl_green <label> <file> <text…>: the lines appended to the file keep the
+# gate green; the file is restored after.
+dl_green() {
+    local label=$1 file=$2
+    shift 2
+    cp "$dl_root/$file" "$dl_case/saved"
+    printf '%s\n' "$@" >>"$dl_root/$file"
+    expect green "doc-links: $label" dl_run
+    cp "$dl_case/saved" "$dl_root/$file"
+}
+# (a) links.
+dl_red "a link that leaves the repository" docs/interfaces-m0.md \
+    '[plan](../../docs/infinity-master-plan.md)' "leaves the repository"
+dl_red "a root-level link that leaves the repository" README.md \
+    '[adr](../docs/adr/0149-x.md)' "leaves the repository"
+dl_red "a root-absolute link that climbs out of the repository" README.md \
+    '[x](/../other/x.md)' "leaves the repository"
+dl_red "a link to a removed document" docs/interfaces-m0.md \
+    '[protocol](validation-s37.md)' "names no file"
+for form in '[wrong](docs/missing.md "title")' '[wrong](<docs/missing.md>)' \
+    '[wrong]: docs/missing.md "title"'; do
+    dl_red "a titled, wrapped or reference link naming no file: $form" README.md \
+        "$form" "names no file"
+done
+dl_red "a link into ignored run output" README.md \
+    '[log](.artifacts/gate.log)' "ignored run output"
+dl_red "a link to an existing file git ignores" README.md \
+    '[note](notes/private.md)' "names a file git ignores"
+dl_red "a link to a directory holding no published file" README.md \
+    '[notes](notes/)' "no published file"
+dl_red "a broken link after a four-backtick fence holding a three-backtick line" README.md \
+    "$(printf '````md\n```\n````\n\n[after](missing-after-fence.md)')" "names no file"
+dl_red "an HTML link that leaves the repository" docs/interfaces-m0.md \
+    '<a href="../../reviews/x.md">review</a>' "leaves the repository"
+# A root-absolute href in a site page resolves from the site's root.
+dl_red "a root-absolute site href that exists only from the repository root" \
+    website/site/index.html '<a href="/docs/README.md">docs</a>' "names no file"
+dl_red "a root-absolute site href that climbs out of the site" website/site/index.html \
+    '<a href="/../../README.md">x</a>' "leaves the site's root"
+dl_green "a root-absolute site href to a site page" website/site/index.html \
+    '<a href="/index.html">home</a>'
+# The renderer picks the base: the site serves its HTML pages, so a relative
+# href that leaves website/site is dead there; the repository renders
+# Markdown, website/site's included, so its root-absolute links start at the
+# repository root.
+dl_red "a relative site href that leaves the site" website/site/index.html \
+    '<a href="../../docs/README.md#docs">docs</a>' "leaves the site's root"
+dl_red "a root-absolute link in site Markdown that exists only from the site root" \
+    website/site/snapshot.md '[home](/index.html)' "names no file"
+dl_green "a root-absolute link in site Markdown resolves from the repository root" \
+    website/site/snapshot.md '[docs](/docs/README.md)'
+# (b) paths.
+dl_red "an ADR path in inline code" docs/interfaces-m0.md \
+    'the rule is `docs/adr/0087-frames.md`' "points into planning"
+dl_red "a milestone plan the repository does not carry" docs/interfaces-m0.md \
+    'see docs/milestones/m4.5-indexes-query.md' "points into planning"
+dl_red "a design record path" docs/interfaces-m0.md 'per docs/drr/ARCH-W0.3b.md' "points into planning"
+dl_red "a review path" docs/interfaces-m0.md \
+    '(recorded in `reviews/milestones/2026-06-11/m0.md`)' "points into planning"
+dl_red "a ticket path" docs/interfaces-m0.md 'progress: tickets/2026-09-30/X.md' "points into planning"
+dl_red "the master plan by name" docs/interfaces-m0.md 'the infinity-master-plan rules' "points into planning"
+dl_red "the claim ledger by path" README.md 'rows in docs/claim-ledger.md' "points into planning"
+dl_red "a parent path inside a fenced block" docs/interfaces-m0.md \
+    "$(printf '```text\n../../docs/adr/0001-x.md\n```')" "points into planning"
+dl_red "a GitHub file URL into another repository's planning documents" docs/interfaces-m0.md \
+    'https://github.com/acme/private/blob/main/docs/adr/0001-x.md' "points into planning"
+dl_red "a GitLab file URL into planning documents" docs/interfaces-m0.md \
+    'https://gitlab.com/acme/private/-/blob/main/docs/adr/0001-x.md' "points into planning"
+dl_red "a github.dev file URL into planning documents" docs/interfaces-m0.md \
+    'https://github.dev/acme/private/blob/main/docs/adr/0001-x.md' "points into planning"
+dl_red "a vscode.dev file URL into planning documents" docs/interfaces-m0.md \
+    'https://vscode.dev/github/acme/private/blob/main/docs/milestones/m4-plan.md' \
+    "points into planning"
+# (c) prose.
+dl_red "the master plan in prose" docs/interfaces-m0.md 'the rule is master plan §17.4' "names a planning document"
+dl_red "a milestone plan in prose" README.md 'see the owning milestone plan' "names a planning document"
+dl_red "the milestones plans in prose" docs/interfaces-m0.md 'the milestones plans own it' \
+    "names a planning document"
+dl_red "a numbered milestone plan in prose" docs/interfaces-m0.md \
+    'declared absent per the M3 plan anti-goals' "names a planning document"
+dl_red "a plan AC in prose" docs/interfaces-m0.md 'the bar is plan AC 1.2' "names a planning document"
+dl_red "per the plan, in prose" docs/interfaces-m0.md 'per the plan, the bound holds' "names a planning document"
+dl_red "the plan requires, in prose" docs/interfaces-m0.md 'the plan requires a DST seed' "names a planning document"
+dl_red "an internal plan in prose" docs/interfaces-m0.md 'the internal plan says so' "names a planning document"
+dl_red "the review ledger in prose" docs/interfaces-m0.md \
+    'as the review ledger records' "names a planning document"
+dl_red "a design review record in prose" docs/interfaces-m0.md \
+    'claimed only on a Design Review Record' "names a planning document"
+dl_red "the parent repository in prose" docs/interfaces-m0.md \
+    'kept in the parent repository' "names a planning document"
+dl_red "the outer repository in prose" docs/interfaces-m0.md \
+    'kept in the outer repository' "names a planning document"
+dl_red "the governance docs in prose" docs/interfaces-m0.md \
+    'kept in the governance docs' "names a planning document"
+dl_red "a DRR in prose" docs/interfaces-m0.md 'as the DRR decides' "names a planning document"
+dl_red "a design record in prose" docs/interfaces-m0.md 'see the design record' "names a planning document"
+dl_red "the plan's section in prose" docs/interfaces-m0.md \
+    "recorded in the plan's S36 section" "names a planning document"
+dl_red "in the plan, in prose" docs/interfaces-m0.md 'S22 interpretation (recorded in the plan)' \
+    "names a planning document"
+dl_red "a phrase wrapped across two lines" docs/interfaces-m0.md \
+    "$(printf 'the rule is the master\nplan, not this file')" '"master plan" names a planning'
+dl_red "a phrase wrapped across two HTML lines" website/site/index.html \
+    "$(printf '<p>kept in the parent\nrepository</p>')" '"parent repository" names a planning'
+# (d) sections.
+dl_red "a section of an unpublished plan" README.md 'the abort rule (§3.4 R4)' \
+    "no numbered section of this file"
+dl_red "a section the cited document does not have" docs/interfaces-m0.md \
+    'the overview ([readme](../README.md) §3)' "no numbered section of ../README.md"
+# (e) removed documents.
+dl_red "the name of a removed document" docs/interfaces-m0.md \
+    'see old-protocol.md for the protocol' "removed from the repository"
+dl_red "the bare stem of a removed document" docs/interfaces-m0.md \
+    'see old-protocol for the protocol' "old-protocol names a document removed"
+# (g) decision and story identifiers in first-read copy: case-folded, and
+# any Unicode hyphen reads as "-".
+for ident in 'decided by ADR-0087 D2' 'decided by ADR 0087' 'decided by adr-0087' \
+    'shipped in M4-S27' 'shipped in M4‑S27' 'the M4.5 train' 'the S19 closure campaign' \
+    'epic E4.7' 'ARCH-W0.2 landed' 'the W0.3b wave'; do
+    dl_red "an identifier in first-read copy: $ident" README.md "$ident" "first-read copy"
+done
+dl_red "an ADR number behind a non-breaking-hyphen entity" website/site/index.html \
+    '<p>decided by ADR&#8209;0087</p>' "first-read copy"
+# (g) review identifiers are history, not rules: red in every tier, the
+# engineering references and the tables included.
+for file in README.md docs/interfaces-m0.md docs/table.tsv; do
+    for ident in 'finding F-L12-05' 'item FCR-DOC-01' '(review 2026-08-30, C6)' \
+        'the review of 2026-08-30' 'full-codebase review C14' 'the header patch (review C9)' \
+        'remediation batch 37' 'batch 43 amendment' 'the batch-12 row' \
+        '(2026-09-01, review finding N4)' 'the F2 finding is a barrier term' \
+        '(owner review, 2026-09-22)' 'fixed after the 2026-08-30 review' \
+        'the cell (the review of `2cb6074`)' 'recorded at the M0 review' \
+        'the review of commit 2cb6074' 'fixed after the S37 review' \
+        'the M4-S27 review' 'held by the E4.7 review' \
+        '**Narrowed (2026-09-15, batch 66)**' 'first amendment 2026-09-05 (batch 14)' \
+        '(batch 34: widened later)' 'the bound (C9, batch 43)' \
+        'Since batch 21 the verdict needs a control' 'widened in batch 35' \
+        'before batch 12 it was implicit' 'Fixed in batches 18-23.' \
+        'two flakes in batches 57/58' 'the tree, batch 14 of the 2026-08-30 sweep'; do
+        dl_red "a review identifier in $file: $ident" "$file" "$ident" "carries no review"
+    done
+done
+dl_red "a review identifier in website copy" website/site/index.html \
+    '<p>fixed in remediation batch 41</p>' "carries no review"
+dl_red "a review identifier wrapped across two lines" docs/interfaces-m0.md \
+    "$(printf 'the contract (owner review,\n2026-09-22) is superseded')" "review, 2026-09-22"
+dl_red "a review by commit wrapped across two lines" docs/interfaces-m0.md \
+    "$(printf 'the bound (the review of commit\n2cb6074) holds')" "review of commit 2cb6074"
+dl_green "a story's finding, law/decision/claim labels and a commit are not review ids" \
+    docs/interfaces-m0.md 'The S27 finding and the S13 slice finding hold (L10, D16, C7);' \
+    'commit `2cb6074` moved the bound; an independent review precedes the change.' \
+    'The S37 story was reviewed before its build.'
+dl_green "batch sizes, a review verb and S3 are the engine's vocabulary, not identifiers" \
+    README.md 'SQEs go out at batch 32 per tick; a batch-64 MSET pipeline; batches of 16 keys.' \
+    'Always review L2 misses first. S3-compatible storage and an S3 bucket.'
+# Text is judged as a reader sees it, in Markdown and HTML alike: entities
+# decoded, U+00A0 and whitespace runs one space, inline tags without a space,
+# and the attribute values a reader sees, quoted or not.
+dl_red "an ADR number behind a non-breaking-hyphen entity in Markdown" README.md \
+    'decided by ADR&#8209;0087' "first-read copy"
+dl_red "an ADR number split by an inline tag in Markdown" README.md \
+    'decided by ADR-<b>0087</b>' "first-read copy"
+dl_red "the master plan behind a no-break-space entity in Markdown" README.md \
+    'per the master&nbsp;plan' '"master plan" names a planning'
+dl_red "the master plan behind a literal no-break space" README.md \
+    "$(printf 'per the master\302\240plan')" '"master plan" names a planning'
+dl_red "the master plan behind two spaces" README.md \
+    'per the master  plan' '"master plan" names a planning'
+dl_red "a plan section behind a section-sign entity in Markdown" README.md \
+    'the abort rule (&sect;3.4 R4)' "no numbered section of this file"
+dl_red "a remediation batch behind two spaces" docs/interfaces-m0.md \
+    'fixed in remediation  batch 37' "carries no review"
+dl_red "an ADR number split by an inline tag in HTML" website/site/index.html \
+    '<p>decided by ADR-<b>0087</b></p>' "first-read copy"
+dl_red "an ADR number in an unquoted title attribute" website/site/index.html \
+    '<p title=ADR-0087>x</p>' "first-read copy"
+dl_red "the master plan in a data attribute" website/site/index.html \
+    '<p data-tip="per the master plan">x</p>' '"master plan" names a planning'
+# Markdown inline syntax renders before it is judged: emphasis, escapes, link
+# brackets; a comment closed on its line renders no space, in Markdown and HTML.
+for form in 'decided by ADR-**0087**' 'decided by ADR\-0087' 'decided by ADR-<!-- -->0087' \
+    'decided by ADR-_0087_'; do
+    dl_red "an ADR number behind Markdown inline syntax: $form" README.md "$form" "first-read copy"
+done
+dl_red "a finding behind Markdown escapes" docs/interfaces-m0.md 'fixed in F\-L12\-05' \
+    "carries no review"
+for form in 'The master *plan* decides.' 'The master _plan_ decides.' \
+    'The master [plan](https://example.com) decides.' \
+    "$(printf 'The master [plan][1] decides.\n\n[1]: https://example.com')"; do
+    dl_red "the master plan behind Markdown inline syntax: $form" README.md "$form" \
+        '"master plan" names a planning'
+done
+dl_red "an ADR number split by an HTML comment" website/site/index.html \
+    '<p>decided by ADR-<!-- x -->0087</p>' "first-read copy"
+dl_green "Markdown syntax inside inline code and word-inner underscores stay as written" \
+    README.md 'Globs like `interfaces-m*.md` and `RUST_LOG`, snake_case_names, 5 * 3.'
+# HTML comments are published text: their bodies are judged.
+dl_red "the master plan in an HTML comment" website/site/index.html \
+    '<!-- per the master plan §17.4 -->' "names a planning document"
+dl_red "an ADR number in an HTML comment" website/site/index.html \
+    '<p>fast</p><!-- ADR-0087 -->' "first-read copy"
+dl_red "a story in an HTML comment" website/site/index.html \
+    '<!-- decided in M4-S27 -->' "first-read copy"
+dl_red "a finding in an HTML comment" website/site/index.html \
+    '<!-- fixed by F-L12-05 -->' "carries no review"
+dl_green "an HTML comment that names nothing" website/site/index.html \
+    '<!-- particles -->' '<!-- ============ 06 ROADMAP ============ -->'
+# An own-repository code-host URL is a link written absolute: it resolves
+# against the published set like (a), and (e) judges the file it names.
+dl_red "an own-repository URL to a removed document" docs/README.md \
+    'https://github.com/acme/eng/blob/main/docs/old-protocol.md' "removed from the repository"
+dl_red "an own-repository link to a removed document in HTML" website/site/index.html \
+    '<a href="https://github.com/acme/eng/blob/main/docs/old-protocol.md">x</a>' \
+    "removed from the repository"
+dl_red "an own-repository URL to a missing file" docs/README.md \
+    '[x](https://github.com/acme/eng/blob/main/docs/nothing-here.md)' "names no published file"
+dl_red "an own-repository raw URL to a missing file" README.md \
+    'https://raw.githubusercontent.com/acme/eng/main/docs/nothing-here.md' "names no published file"
+dl_red "an own-repository URL to a file git ignores" README.md \
+    'https://github.com/acme/eng/blob/main/notes/private.md' "names no published file"
+dl_red "an own-repository URL into run output" README.md \
+    'https://github.com/acme/eng/blob/main/.artifacts/gate.log' "ignored run output"
+dl_red "an own-repository URL to a removed document inside a fenced block" docs/README.md \
+    "$(printf '```text\nhttps://github.com/acme/eng/blob/main/docs/old-protocol.md\n```')" \
+    "removed from the repository"
+# Every view that names a repository path is the same link: each view the
+# gate's CODE_HOST_FILE lists, one plant per alternative, so dropping any
+# view from the pattern turns its two plants green.
+for view in github.com/acme/eng/tree/main github.com/acme/eng/raw/main \
+    github.com/acme/eng/edit/main github.com/acme/eng/blame/main \
+    github.com/acme/eng/commits/main github.com/acme/eng/history/main \
+    github.dev/acme/eng/blob/main github.dev/acme/eng/tree/main \
+    vscode.dev/github/acme/eng/blob/main vscode.dev/github/acme/eng/tree/main \
+    gitlab.com/acme/eng/-/blob/main gitlab.com/acme/eng/-/tree/main \
+    gitlab.com/acme/eng/-/raw/main gitlab.com/acme/eng/-/blame/main \
+    gitlab.com/acme/eng/-/commits/main bitbucket.org/acme/eng/src/main \
+    codeberg.org/acme/eng/src/branch/main codeberg.org/acme/eng/src/tag/v1 \
+    codeberg.org/acme/eng/commits/branch/main codeberg.org/acme/eng/commits/commit/0a1b2c3; do
+    dl_red "an own-repository $view URL to a removed document" README.md \
+        "https://$view/docs/old-protocol.md" "removed from the repository"
+    dl_red "an own-repository $view URL to a missing file" README.md \
+        "https://$view/docs/nothing-here.md" "names no published file"
+done
+dl_green "own URLs naming a published file or directory, another repository's URL" README.md \
+    'Source: https://github.com/acme/eng/blob/main/docs/README.md#docs,' \
+    'https://github.com/acme/eng/tree/main/docs and' \
+    'https://github.com/other/thing/blob/main/nothing-here.md'
+git -C "$dl_root" remote remove origin
+expect_output "doc-links: a root with no remote discloses that no own URL was resolved" \
+    "0 own-repository URLs (no remote: none resolved)" dl_run
+git -C "$dl_root" remote add origin https://github.com/acme/eng.git
+dl_red "an ADR number in the docs index" docs/README.md 'decided by ADR-0087' "first-read copy"
+dl_red "an ADR number in website copy" website/site/index.html \
+    '<p>decided by ADR-0087</p>' "first-read copy"
+dl_red "an ADR number in an image's alt text" website/site/index.html \
+    '<img alt="the ADR-0087 frame diagram" src="../../README.md">' "first-read copy"
+dl_red "the master plan in a meta description" website/site/index.html \
+    '<meta name="description" content="built per the master plan">' "names a planning document"
+dl_red "the master plan in a title attribute" website/site/index.html \
+    '<p title="see the master plan">x</p>' "names a planning document"
+dl_red "the master plan in website HTML" website/site/index.html \
+    '<p>per master&nbsp;plan &sect;22</p>' "names a planning document"
+dl_red "an HTML href that leaves the repository" website/site/index.html \
+    '<a href="../../../docs/adr/0001.md">adr</a>' "leaves the repository"
+dl_red "an unquoted HTML href naming no file" website/site/index.html \
+    '<a href=missing.html>x</a>' "names no file"
+dl_red "the master plan in a docs table" docs/table.tsv \
+    "$(printf 'I\t1\tx.rs\tassert\tslot class (master plan §6.1)\tjust')" "names a planning document"
+dl_red "a plan section in a docs table" docs/table.tsv \
+    "$(printf 'I\t2\tx.rs\tassert\tfailed cell\texits the process (§8.4)')" "no numbered section"
+dl_red "the plan in a gates table" docs/milestones/m0-gates.toml \
+    "# the plan's rule: < 15 % throughput" "names a planning document"
+# Tiers: closed — every document is in exactly one.
+printf '# Extra\n\nA page no tier names.\n' >"$dl_root/docs/extra.md"
+expect red "doc-links: a document in no tier" dl_run
+expect_output "doc-links: the untiered document names its cause" "docs/extra.md: in 0 tiers" dl_run
+rm -f "$dl_root/docs/extra.md"
+mkdir -p "$dl_root/.github"
+printf 'Decided by ADR-0087.\n' >"$dl_root/.github/PULL_REQUEST_TEMPLATE.md"
+expect red "doc-links: the pull-request template is first-read copy" dl_run
+rm -rf "$dl_root/.github"
+printf '# Safety\n' >"$dl_root/website/site/SAFETY.md"
+expect red "doc-links: a document in two tiers" dl_run
+expect_output "doc-links: the two-tier document names its cause" \
+    "website/site/SAFETY.md: in 2 tiers" dl_run
+rm -f "$dl_root/website/site/SAFETY.md"
+# Owned-line rows: an owner, an expiry inside the horizon, a published
+# owning source, an engineering file, exactly one line; a row exempts only
+# its own text.
+dl_red "the generated footer's phrase outside its file" README.md "$dl_line" \
+    "names a planning document"
+dl_red "an owned-line row's line appearing twice" docs/compat-matrix.md "$dl_line" "matched 2 lines"
+cp "$dl_root/docs/compat-matrix.md" "$dl_case/saved"
+printf '%s\n' '# Matrix' '' "$dl_banner" '' "$dl_line (F-L12-05) [x](missing.md)" \
+    >"$dl_root/docs/compat-matrix.md"
+expect red "doc-links: a row exempts only its text" dl_run
+expect_output "doc-links: the rest of a row's line is judged" "F-L12-05 — a published" dl_run
+expect_output "doc-links: a row never waives (a)" "link missing.md names no file" dl_run
+cp "$dl_case/saved" "$dl_root/docs/compat-matrix.md"
+dl_red "an owned-line row without an owner and expiry" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\tmilestone plans own\ttools/matrixgen.py')" \
+    "a row is file, text, owning source, owner, expiry"
+dl_red "an owned-line row whose expiry is not a date" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\tmilestone plans own\ttools/matrixgen.py\t@owner\tsoon')" \
+    "is not YYYY-MM-DD"
+dl_red "an owned-line row past the deviation horizon" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\tmilestone plans own\ttools/matrixgen.py\t@owner\t2999-12-31')" \
+    "past the 30-day horizon"
+dl_red "an owned-line row whose owning source is no published file" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\tmilestone plans own\tnothing/generates/this.rs\t@owner\t%s' \
+        "$dl_expiry")" "owning source nothing/generates/this.rs is no published file"
+dl_red "an owned-line row on the table itself" docs/doc-link-generated.tsv \
+    "$(printf 'docs/doc-link-generated.tsv\tfile<TAB>\ttools/matrixgen.py\t@owner\t%s' "$dl_expiry")" \
+    "not an engineering reference"
+# A row's claims are checked: code or a script owns the line (never a scanned
+# document), the file is generated or a docs table, the owner is an @handle,
+# and the text fires a check by itself.
+dl_red "an owned-line row whose owning source is a scanned document" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\t%s\tREADME.md says so\t@owner\t%s' "$dl_line" "$dl_expiry")" \
+    "owning source README.md is a scanned document"
+dl_red "an owned-line row on a hand-written engineering reference" docs/doc-link-generated.tsv \
+    "$(printf 'docs/interfaces-m0.md\tDecisions are cited\ttools/matrixgen.py\t@owner\t%s' \
+        "$dl_expiry")" "neither a docs table nor a generated file"
+dl_red "an owned-line row whose owner is no handle" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\t%s\ttools/matrixgen.py\tanyone\t%s' "$dl_line" "$dl_expiry")" \
+    "the row's owner 'anyone' is no @handle"
+dl_red "an owned-line row whose text fires no check" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\t# Matrix\ttools/matrixgen.py renders it\t@owner\t%s' \
+        "$dl_expiry")" "exempts nothing: its text fires none of (b)-(g)"
+cp "$dl_root/docs/interfaces-m0.md" "$dl_case/saved"
+cp "$dl_root/docs/doc-link-generated.tsv" "$dl_case/saved-table"
+dl_text='per the master plan §17.4 (F-L12-05, remediation batch 37)'
+printf '%s\n' "$dl_text" >>"$dl_root/docs/interfaces-m0.md"
+printf '%s\n' "$(printf 'docs/interfaces-m0.md\t%s\tREADME.md says so\tx\t%s' "$dl_text" "$dl_expiry")" \
+    >>"$dl_root/docs/doc-link-generated.tsv"
+expect red "doc-links: a document-owned row on a hand-written reference exempts nothing" dl_run
+for cause in "owning source README.md is a scanned document" "neither a docs table nor a generated" \
+    "the row's owner 'x' is no @handle" '"master plan" names a planning' \
+    "F-L12-05 — a published"; do
+    expect_output "doc-links: the document-owned row names: $cause" "$cause" dl_run
+done
+cp "$dl_case/saved" "$dl_root/docs/interfaces-m0.md"
+cp "$dl_case/saved-table" "$dl_root/docs/doc-link-generated.tsv"
+cp "$dl_root/README.md" "$dl_case/saved"
+cp "$dl_root/docs/doc-link-generated.tsv" "$dl_case/saved-table"
+printf '%s\n' 'Built per the master plan §17 (ADR-0087, F-L12-05, batch 37, docs/adr/0087-x.md)' \
+    >>"$dl_root/README.md"
+printf '%s\n' "$(printf 'README.md\tper the master plan\tnothing/generates/this.rs\tanyone\t2999-12-31')" \
+    >>"$dl_root/docs/doc-link-generated.tsv"
+expect red "doc-links: an owned-line row on first-read copy exempts nothing" dl_run
+expect_output "doc-links: a first-read row names its cause" \
+    "README.md is not an engineering reference" dl_run
+expect_output "doc-links: the first-read row's line is judged" \
+    '"master plan" names a planning document' dl_run
+cp "$dl_case/saved" "$dl_root/README.md"
+cp "$dl_case/saved-table" "$dl_root/docs/doc-link-generated.tsv"
+cp "$dl_root/docs/doc-link-generated.tsv" "$dl_case/saved"
+printf '%s\n' '# expired' "$(printf '%s\t@owner\t2000-01-01' "$dl_row")" \
+    >"$dl_root/docs/doc-link-generated.tsv"
+expect red "doc-links: an owned-line row past its expiry" dl_run
+expect_output "doc-links: the expired row names its owner" \
+    "expired on 2000-01-01 — @owner fixes tools/matrixgen.py" dl_run
+expect_output "doc-links: an expired row no longer exempts its text" \
+    '"Master plan" names a planning document' dl_run
+cp "$dl_case/saved" "$dl_root/docs/doc-link-generated.tsv"
+cp "$dl_root/docs/compat-matrix.md" "$dl_case/saved"
+printf '%s\n' '# Matrix' '' "$dl_banner" >"$dl_root/docs/compat-matrix.md"
+expect red "doc-links: an owned-line row whose line is gone is stale" dl_run
+expect_output "doc-links: the stale row names itself" "matched 0 lines" dl_run
+# The GENERATED banner counts in the first five lines only.
+printf '%s\n' '# Matrix' '' 'one' 'two' "$dl_banner" '' "$dl_line" >"$dl_root/docs/compat-matrix.md"
+expect green "doc-links: a GENERATED banner on line 5 makes the file generated" dl_run
+printf '%s\n' '# Matrix' '' 'one' 'two' 'three' "$dl_banner" '' "$dl_line" \
+    >"$dl_root/docs/compat-matrix.md"
+expect red "doc-links: a GENERATED banner on line 6 does not" dl_run
+expect_output "doc-links: the late banner names its cause" \
+    "neither a docs table nor a generated file" dl_run
+cp "$dl_case/saved" "$dl_root/docs/compat-matrix.md"
+# The table is scanned: its comments and its other columns are judged.
+dl_red "planning paths in the table's comment" docs/doc-link-generated.tsv \
+    '# see ../../docs/adr/0087-x.md, master plan §3' "points into planning"
+dl_red "a finding in the table's comment" docs/doc-link-generated.tsv \
+    '# see F-L12-05, review 2026-08-30' "carries no review"
+dl_red "the master plan in a row's source column" docs/doc-link-generated.tsv \
+    "$(printf 'docs/compat-matrix.md\tstaging policy\ttools/matrixgen.py per the master plan\t@o\t%s' \
+        "$dl_expiry")" "names a planning document"
+# Markers: `doc-link-allow(<checks>) <@owner> <date>: <why>` waives only the
+# named checks, only in its line's quoted text (<pre>, <code>, an inline code
+# span, a fence), never (a), and is red when stale or expired.
+dl_marker="doc-link-allow(d) @owner $dl_expiry"
+dl_green "a scoped, owned and dated marker on quoted text" docs/interfaces-m0.md \
+    "the process exits \`(§8.4)\` <!-- $dl_marker: quoted stderr -->"
+# The two website/site/docs/operations.html markers, verbatim: the quoted
+# text opens on the first line and runs into the second.
+dl_live="doc-link-allow(d) @kevincaicedo $dl_expiry: infinityd's stderr, quoted verbatim; it goes when the engine's fail-stop message drops the section number"
+dl_green "the live operations.html markers: quoted text open across two lines" \
+    website/site/index.html \
+    "<pre><code>infinityd: cell 2 recovery failed (fail-stop, &sect;8.4): log corruption<!-- $dl_live -->" \
+    "offset 0x40000 &mdash; refusing to start (&sect;8.4)</code></pre><!-- $dl_live -->"
+dl_green "a marker spelled inside inline code is text about markers" docs/interfaces-m0.md \
+    'The form is `doc-link-allow(<checks>) <@owner> <YYYY-MM-DD>: <why>`, one per line.'
+cp "$dl_root/docs/interfaces-m0.md" "$dl_case/saved"
+printf '%s\n' "the process exits \`(§8.4)\` <!-- $dl_marker: quoted stderr -->" \
+    >>"$dl_root/docs/interfaces-m0.md"
+expect_output "doc-links: the marker is listed with its checks, owner and expiry" \
+    "allowed: docs/interfaces-m0.md:4: (d) @owner, expires $dl_expiry: quoted stderr" dl_run
+cp "$dl_case/saved" "$dl_root/docs/interfaces-m0.md"
+dl_red "a dead link on a marker line" docs/interfaces-m0.md \
+    "[y](missing.md) \`(§8.4)\` <!-- $dl_marker: quoted stderr -->" "names no file"
+dl_red "a marker that names (a)" docs/interfaces-m0.md \
+    "[y](missing.md) <!-- doc-link-allow(a) @owner $dl_expiry: quoted -->" "never waives (a)"
+dl_red "a marker without checks, owner or expiry" docs/interfaces-m0.md \
+    '[plan](../../docs/x.md) <!-- doc-link-allow: quoting stderr -->' "a marker is doc-link-allow("
+dl_red "a marker without an owner" docs/interfaces-m0.md \
+    "(§8.4) <!-- doc-link-allow(d) $dl_expiry: why -->" "a marker is doc-link-allow("
+dl_red "a marker without a reason" docs/interfaces-m0.md \
+    "(§8.4) <!-- $dl_marker: -->" "without a reason"
+dl_red "a marker past its expiry" docs/interfaces-m0.md \
+    '(§8.4) <!-- doc-link-allow(d) @owner 2000-01-01: why -->' "expired on 2000-01-01"
+dl_red "a marker past the deviation horizon" docs/interfaces-m0.md \
+    '(§8.4) <!-- doc-link-allow(d) @owner 2999-12-31: why -->' "past the 30-day horizon"
+dl_red "a check the marker does not name" docs/interfaces-m0.md \
+    "\`fixed in F-L12-05 (§8.4)\` <!-- $dl_marker: why -->" "carries no review"
+dl_red "a waivable check the marker does not name" docs/interfaces-m0.md \
+    "\`per the master plan (§8.4)\` <!-- $dl_marker: why -->" '"master plan" names a planning'
+dl_red "a marker whose check does not fire" docs/interfaces-m0.md \
+    "plain text <!-- $dl_marker: why -->" "waives nothing on this line"
+# Quoted text only: outside it, a marker line is judged with no waiver.
+dl_red "a (c) marker on unquoted first-read text" README.md \
+    "The master plan decides the staging policy. <!-- doc-link-allow(c) @owner $dl_expiry: temporary -->" \
+    '"master plan" names a planning'
+dl_red "a (d) marker on unquoted first-read text" README.md \
+    "Staging follows §14 of the plan. <!-- doc-link-allow(d) @owner $dl_expiry: temporary -->" \
+    "no numbered section of this file"
+dl_red "an (e) marker on unquoted first-read text" README.md \
+    "The rule was in old-protocol.md. <!-- doc-link-allow(e) @owner $dl_expiry: temporary -->" \
+    "names a document removed"
+dl_red "a marker on unquoted text beside quoted text" website/site/index.html \
+    "<p>see §8.4 and <code>exits (§8.4)</code></p><!-- $dl_marker: quoted -->" \
+    "§8.4 is no numbered section of this file"
+# Only a <pre>/<code> tag that is markup opens quoted text. One spelled in
+# inline code, in a comment, in another tag's attribute value or in raw text
+# (each open across lines where the renderer's is), behind a Markdown escape,
+# as a longer tag name, or in a table (no markup) is text: the text after it
+# is judged with no waiver.
+dl_red "a <code> tag spelled in inline code on the marker's line" README.md \
+    "The \`<code>\` element; the master plan decides. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a <pre> tag spelled in inline code on the line before" README.md \
+    "$(printf 'Wrap stderr in `<pre>` to quote it.\nThe master plan decides. <!-- doc-link-allow(c) @owner %s: quoted -->' \
+        "$dl_expiry")" '"master plan" names a planning'
+dl_red "a <pre> tag inside an HTML comment in Markdown" README.md \
+    "<!-- <pre> --> Staging follows §14 of the plan. <!-- $dl_marker: quoted -->" \
+    "§14 is no numbered section of this file"
+dl_red "a <code> tag inside an HTML comment" website/site/index.html \
+    "<!-- a <code> sample --><p>see §8.4</p><!-- $dl_marker: quoted -->" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <pre> tag inside a comment open across lines" website/site/index.html \
+    "$(printf '<!-- the old sample:\n<pre> -->\n<p>see §8.4</p><!-- %s: quoted -->' "$dl_marker")" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <code> tag inside a quoted attribute value holding >" website/site/index.html \
+    "<p title=\"1 > 0, <code> sample\">see §8.4</p><!-- $dl_marker: quoted -->" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <code> tag inside the attribute value of a tag open across lines" \
+    website/site/index.html \
+    "$(printf '<p title="the\n<code> sample">see §8.4</p><!-- %s: quoted -->' "$dl_marker")" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <pre> tag in a script's raw text" website/site/index.html \
+    "<script>var s = \"<pre>\";</script><p>see §8.4</p><!-- $dl_marker: quoted -->" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <pre> tag in raw text open across lines" website/site/index.html \
+    "$(printf '<script>\nvar s = "<pre>";\n</script><p>see §8.4</p><!-- %s: quoted -->' \
+        "$dl_marker")" "§8.4 is no numbered section of this file"
+dl_red "a <code> tag behind a Markdown escape" README.md \
+    "Escaped \\<code> tag: staging follows §14. <!-- $dl_marker: quoted -->" \
+    "§14 is no numbered section of this file"
+dl_red "a longer tag name that begins with code" website/site/index.html \
+    "<code-sample>see §8.4</code-sample><!-- $dl_marker: quoted -->" \
+    "§8.4 is no numbered section of this file"
+dl_red "a <code> tag in a table, which has no markup" docs/table.tsv \
+    "$(printf 'I\t3\tx.rs\tassert\t<code>exits (§8.4)</code>\tjust <!-- %s: quoted -->' \
+        "$dl_marker")" "§8.4 is no numbered section of this file"
+dl_green "a <code> tag that is Markdown markup opens quoted text" README.md \
+    "Run <code>exits (§8.4)</code> now. <!-- $dl_marker: quoted -->"
+dl_green "a Markdown '<' that opens no whole tag is text and leaves nothing open" README.md \
+    'Keys a<b sort first.' "Keys a<b and <code>exits (§8.4)</code> <!-- $dl_marker: quoted -->"
+dl_green "a <code> tag whose quoted attribute value holds >" website/site/index.html \
+    "<code title=\"a > b\">exits (§8.4)</code><!-- $dl_marker: quoted -->"
+# A Markdown tag is well-formed as CommonMark reads one: a name of letters,
+# digits and "-", and well-formed attributes. Any other "<" is text.
+dl_red "a Markdown <code> tag holding a stray backtick is text" README.md \
+    "<code \`x> The master plan decides. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a Markdown <code> tag whose unquoted value holds a backtick is text" README.md \
+    "<code x=\`y\`>the master plan</code> <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a Markdown tag name CommonMark rejects hides no closing tag" README.md \
+    "<code>x <a.b title='</code>'> the master plan <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+# Inline code is the same scanner's: a backtick run pairs only with the next run
+# of its length on the line, each run whole, and only where a tag would be
+# markup (outside a comment, a tag's attribute values and raw text, and not
+# behind a Markdown escape). Quoted text, (a)'s links, the published text and
+# markers all take its code spans; any other backtick is text.
+dl_red "a backtick in an HTML comment pairs with none" README.md \
+    "<!-- \` --> The master plan decides \` here. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a backtick behind a Markdown escape pairs with none" README.md \
+    "Escaped \\\` then the master plan decides \` here. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a backtick in an attribute value pairs with none" README.md \
+    "<a title=\"\`x\">The master plan decides</a> \` here. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a run that no run closes opens nothing from its second tick" README.md \
+    "\`\`The master plan decides\` here. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_red "a closing run that is part of a longer run closes nothing" README.md \
+    "\`The master plan\`\` decides. <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    '"master plan" names a planning'
+dl_green "a double-tick code span holding a single tick is quoted text" docs/interfaces-m0.md \
+    "the process exits \`\`a \` (§8.4)\`\` <!-- $dl_marker: quoted stderr -->"
+dl_red "a dead link after an escaped backtick" README.md \
+    'Escaped \` then [x](missing.md) and ` here.' "link missing.md names no file"
+dl_red "emphasis after an escaped backtick renders" README.md \
+    'Escaped \` then the mas*ter* plan decides ` here.' '"master plan" names a planning'
+dl_red "quoted inline code is read as written" docs/interfaces-m0.md \
+    "\`the mas*ter* plan\` <!-- doc-link-allow(c) @owner $dl_expiry: quoted -->" \
+    "doc-link-allow(c) waives nothing on this line"
+dl_green "a marker after an escaped backtick is a marker" docs/interfaces-m0.md \
+    "Run \`exits (§8.4)\` now; escaped \\\` <!-- doc-link-allow(d) @owner $dl_expiry: quoted, see \` -->"
+dl_green "a marker's own inline code is read as written" docs/interfaces-m0.md \
+    "the process exits \`(§8.4)\` <!-- doc-link-allow(d) @owner $dl_expiry: quoted, not \`the mas*ter* plan\` -->"
+dl_green "a marker between backticks on a fence line is a marker: a fence has no inline code" \
+    docs/interfaces-m0.md '```text' \
+    "\`infinityd <!-- $dl_marker: quoted stderr --> exits (§8.4)\`" '```'
+cp "$dl_root/docs/compat-matrix.md" "$dl_case/saved"
+cp "$dl_root/docs/doc-link-generated.tsv" "$dl_case/saved-table"
+printf '%s\n' '`the mas*ter* plan`' >>"$dl_root/docs/compat-matrix.md"
+printf '%s\n' "$(printf 'docs/compat-matrix.md\t`the mas*ter* plan`\ttools/matrixgen.py renders it\t@owner\t%s' \
+    "$dl_expiry")" >>"$dl_root/docs/doc-link-generated.tsv"
+expect red "doc-links: a row whose text is inline code is read as written" dl_run
+expect_output "doc-links: the inline-code row names its cause" \
+    "exempts nothing: its text fires none of (b)-(g)" dl_run
+cp "$dl_case/saved" "$dl_root/docs/compat-matrix.md"
+cp "$dl_case/saved-table" "$dl_root/docs/doc-link-generated.tsv"
+# The marker is no part of the line it waives on, and is judged by itself.
+dl_red "the retired operations.html marker, whose reason held the section it waives" \
+    website/site/index.html \
+    "<pre>cell 2 recovery failed<!-- doc-link-allow(d) @owner $dl_expiry: infinityd's stderr, quoted verbatim; its §8.4 goes when the engine's fail-stop message drops it --></pre>" \
+    "doc-link-allow(d) waives nothing on this line"
+dl_red "the live operations.html marker on a line with no section" website/site/index.html \
+    "<pre><code>infinityd: cell 2 recovery failed (fail-stop): log corruption<!-- $dl_live --></code></pre>" \
+    "doc-link-allow(d) waives nothing on this line"
+dl_red "a marker whose reason names the master plan and a finding" docs/interfaces-m0.md \
+    "plain text <!-- doc-link-allow(c,g) @owner $dl_expiry: per the master plan, F-L12-05 -->" \
+    '(doc-link-allow marker): "master plan" names a planning'
+dl_red "a valid marker's reason is judged with no waiver" docs/interfaces-m0.md \
+    "kept in the parent repository <!-- doc-link-allow(c) @owner $dl_expiry: per the master plan -->" \
+    '(doc-link-allow marker): "master plan" names a planning'
+# One marker per line: a second is red, and each is parsed, printed and
+# judged by itself.
+cp "$dl_root/README.md" "$dl_case/saved"
+printf '%s\n' "Plain words here. <!-- doc-link-allow(c) @owner $dl_expiry: quoted --> <!-- doc-link-allow(c) @owner $dl_expiry: per the master plan -->" \
+    >>"$dl_root/README.md"
+expect red "doc-links: two markers on one line" dl_run
+for cause in "2 doc-link-allow markers on one line" \
+    '(doc-link-allow marker): "master plan" names a planning' \
+    "(c) @owner, expires $dl_expiry: per the master plan"; do
+    expect_output "doc-links: the second marker on a line names: $cause" "$cause" dl_run
+done
+cp "$dl_case/saved" "$dl_root/README.md"
+dl_red "two (d) markers on one line" website/site/index.html \
+    "<p>Plain words here.</p><!-- $dl_marker: quoted --> <!-- $dl_marker: see §8.4 -->" \
+    "2 doc-link-allow markers on one line"
+# A marker waives quoted text only, (c)-(e), in every tier.
+dl_red "a marker that waives an identifier in first-read copy" README.md \
+    "Decided by \`ADR-0087 in M4-S27\`. <!-- doc-link-allow(g) @owner $dl_expiry: temporary -->" \
+    "never waives (g)"
+dl_red "a marker that waives a review identifier in an engineering reference" \
+    docs/interfaces-m0.md "\`fixed in F-L12-05\` <!-- doc-link-allow(g) @owner $dl_expiry: temporary -->" \
+    "never waives (g)"
+dl_red "a marker that waives a planning path" README.md \
+    "See \`docs/adr/0087-frames.md\` <!-- doc-link-allow(b) @owner $dl_expiry: temporary -->" \
+    "never waives (b)"
+dl_red "a marker that waives the parent's repository" docs/interfaces-m0.md \
+    "https://github.com/acme/private <!-- doc-link-allow(f) @owner $dl_expiry: temporary -->" \
+    "never waives (f)"
+dl_red "a marker whose owner is no handle" docs/interfaces-m0.md \
+    "(§8.4) <!-- doc-link-allow(d) owner $dl_expiry: why -->" "a marker is doc-link-allow("
+printf '[new](../../docs/adr/0001-x.md)\n' >"$dl_root/docs/new.md"
+expect red "doc-links: an untracked new document is checked before its first commit" dl_run
+rm -f "$dl_root/docs/new.md"
+printf '<a href="../docs/adr/0001-x.md">adr</a>\n' >"$dl_root/website/site/new.html"
+expect red "doc-links: an untracked new website page is checked" dl_run
+rm -f "$dl_root/website/site/new.html"
+# The evidence-record carve-out has an owner and an expiry the gate enforces.
+expect red "doc-links: the evidence-record carve-out past its expiry" \
+    env INF_CHECK_TODAY=2999-01-01 INF_CHECK_ROOT="$dl_root" "$LINKS"
+expect_output "doc-links: the expired carve-out names itself" \
+    "the evidence-record carve-out expired on $dl_expiry" \
+    env INF_CHECK_TODAY=2999-01-01 INF_CHECK_ROOT="$dl_root" "$LINKS"
+expect_output "doc-links: an expired carve-out's record is judged as first-read copy" \
+    "_ledger-snapshot.md:1: ADR-0087 — first-read copy" \
+    env INF_CHECK_TODAY=2999-01-01 INF_CHECK_ROOT="$dl_root" "$LINKS"
+dl_red "a review identifier in the evidence record" website/site/_ledger-snapshot.md \
+    '| C2 | claim | Narrowed (2026-09-15, batch 66; F-L07-01) |' "carries no review"
+cp "$dl_root/website/site/_ledger-snapshot.md" "$dl_case/saved"
+printf '| C1 | claim | Allowed |\n' >"$dl_root/website/site/_ledger-snapshot.md"
+expect red "doc-links: an evidence-record carve-out that waives no identifier" dl_run
+expect_output "doc-links: the stale carve-out names itself" "carve-out waives nothing" dl_run
+cp "$dl_case/saved" "$dl_root/website/site/_ledger-snapshot.md"
+expect red "doc-links: a malformed pinned clock is a scope failure" \
+    env INF_CHECK_TODAY=soon INF_CHECK_ROOT="$dl_root" "$LINKS"
+# The parent work tree's repositories: a URL naming one is red; the work
+# tree's own repository is not the parent's.
+dp_case="$work/doc-links-parent"
+mkdir -p "$dp_case/eng/docs" "$dp_case/eng/website/site"
+git init -q "$dp_case"
+git -C "$dp_case" remote add origin git@github.com:acme/private.git
+git init -q "$dp_case/eng"
+git -C "$dp_case/eng" remote add origin https://github.com/acme/eng.git
+printf '# Engine\n\n[Readme](README.md). Source: https://github.com/acme/eng/blob/main/README.md\n' \
+    >"$dp_case/eng/README.md"
+printf 'I\t1\tx.rs\tassert\tslot class\tlocal\n' >"$dp_case/eng/docs/table.tsv"
+printf '<p>home</p>\n' >"$dp_case/eng/website/site/index.html"
+printf '| C1 | claim (ADR-0087 D2) |\n' >"$dp_case/eng/website/site/_ledger-snapshot.md"
+dp_run() { env INF_CHECK_TODAY="$dl_today" INF_CHECK_ROOT="$dp_case/eng" "$LINKS"; }
+expect green "doc-links: the work tree's own repository URL" dp_run
+expect_output "doc-links: the parent's repositories are counted" "1 parent repositories," dp_run
+printf 'Plans: https://github.com/acme/private/tree/main\n' >>"$dp_case/eng/README.md"
+expect red "doc-links: a URL naming the parent's repository" dp_run
+expect_output "doc-links: the parent's repository names its cause" "names the parent's repository" dp_run
+# Scope failures: red, never a skip.
+mkdir -p "$dl_case/empty" "$dl_case/plain" "$dl_case/linkless"
+git init -q "$dl_case/empty"
+: >"$dl_case/empty/notes.txt"
+expect red "doc-links: no Markdown files is a scope failure" \
+    env INF_CHECK_ROOT="$dl_case/empty" "$LINKS"
+git init -q "$dl_case/linkless"
+printf '# Linkless\n\nNo relative link anywhere.\n' >"$dl_case/linkless/README.md"
+expect red "doc-links: Markdown without a relative link is a scope failure" \
+    env INF_CHECK_ROOT="$dl_case/linkless" "$LINKS"
+expect_output "doc-links: the linkless scope failure names its cause" \
+    "hold no relative link" env INF_CHECK_ROOT="$dl_case/linkless" "$LINKS"
+printf '# Plain\n' >"$dl_case/plain/README.md"
+expect red "doc-links: a root outside any git work tree is a scope failure" \
+    env INF_CHECK_ROOT="$dl_case/plain" "$LINKS"
+expect red "doc-links: a root below its work tree's top is a scope failure" \
+    env INF_CHECK_ROOT="$dl_root/docs" "$LINKS"
+mv "$dl_root/website" "$dl_case/website-saved"
+expect red "doc-links: a declared class with no file (no HTML) is a scope failure" dl_run
+expect_output "doc-links: the empty class names itself" "no HTML files found" dl_run
+mv "$dl_case/website-saved" "$dl_root/website"
+mv "$dl_root/docs/table.tsv" "$dl_root/docs/milestones/m0-gates.toml" \
+    "$dl_root/docs/doc-link-generated.tsv" "$dl_case/"
+expect red "doc-links: a declared class with no file (no table) is a scope failure" dl_run
+expect_output "doc-links: the empty table class names itself" "no table files found" dl_run
+mv "$dl_case/table.tsv" "$dl_root/docs/table.tsv"
+mv "$dl_case/m0-gates.toml" "$dl_root/docs/milestones/m0-gates.toml"
+mv "$dl_case/doc-link-generated.tsv" "$dl_root/docs/doc-link-generated.tsv"
+expect green "doc-links: the fixture is whole again" dl_run
+git clone -q --depth 1 "file://$dl_root" "$dl_case/shallow"
+expect red "doc-links: a shallow clone is a scope failure ((e) reads history)" \
+    env INF_CHECK_TODAY="$dl_today" INF_CHECK_ROOT="$dl_case/shallow" "$LINKS"
+expect_output "doc-links: the shallow clone names its cause" "is a shallow clone" \
+    env INF_CHECK_TODAY="$dl_today" INF_CHECK_ROOT="$dl_case/shallow" "$LINKS"
 
 # ------------------------------------------------------------- lint-scopes
 # ADR-0144 D1/D2: the crate-root wildcard deny, the structural suppression
@@ -1763,4 +2533,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, public-doc-links, parent-doc-gates, arith-spellings, lint-scopes each red on a planted violation)"
