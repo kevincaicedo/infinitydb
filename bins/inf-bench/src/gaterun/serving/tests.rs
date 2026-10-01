@@ -134,6 +134,34 @@ fn an_unknown_reply_is_refused_and_quoted_within_its_bound() {
     assert_eq!(quoted, UNEXPECTED_QUOTE_BYTES_MAX, "the quote is cut at its bound");
 }
 
+/// A `-LOADING` padded to `length_bytes` in all: a reply the boot machine
+/// has a transition for, so its size alone decides the outcome.
+fn loading_of(length_bytes: usize) -> &'static [u8] {
+    let pad = length_bytes - b"-LOADING \r\n".len();
+    Box::leak(format!("-LOADING {}\r\n", "x".repeat(pad)).into_bytes().into())
+}
+
+/// A reply of exactly `SERVE_REPLY_BYTES_MAX` bytes is read whole and
+/// counted; one byte more is refused at the bound, never read on.
+#[test]
+fn a_reply_at_its_bound_reads_and_one_byte_over_is_refused() {
+    let at_bound = loading_of(SERVE_REPLY_BYTES_MAX);
+    assert_eq!(at_bound.len(), SERVE_REPLY_BYTES_MAX);
+    let script = vec![Step::Reply(at_bound), Step::Reply(b"+PONG\r\n"), Step::Reply(b":0\r\n")];
+    let (port, node) = fake_node(script);
+    let serving = wait_pong(port, Instant::now(), TEST_DEADLINE, never_exits).expect("serves");
+    assert_eq!(serving.loading_replies(), 1, "the reply at the bound is one -LOADING");
+    drop(serving);
+    node.join().expect("fake node");
+
+    let (port, _node) = fake_node(vec![Step::Reply(loading_of(SERVE_REPLY_BYTES_MAX + 1))]);
+    let result = wait_pong(port, Instant::now(), TEST_DEADLINE, never_exits);
+    assert!(
+        matches!(&result, Err(ServeError::Unexpected(quote)) if quote.starts_with("-LOADING x")),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn a_silent_node_times_out() {
     let (port, _node) = fake_node(vec![Step::Silent]);

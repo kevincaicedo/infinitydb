@@ -12,7 +12,7 @@ fn_length	1	bins/inf-bench/src/bootstorm.rs
 fn_length	1	bins/inf-bench/src/load.rs
 fn_length	3	bins/inf-bench/src/m2rows.rs
 fn_length	4	bins/inf-bench/src/m45rows.rs
-fn_length	3	bins/inf-bench/src/m45rows/s37.rs
+fn_length	2	bins/inf-bench/src/m45rows/s37.rs
 fn_length	2	bins/inf-bench/src/m45rows/s39b.rs
 fn_length	1	bins/inf-bench/src/m45rows/s39d.rs
 fn_length	3	bins/inf-bench/src/m45rows/s40.rs

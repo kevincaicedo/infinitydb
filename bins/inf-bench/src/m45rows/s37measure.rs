@@ -321,8 +321,8 @@ pub(super) fn measured_load(spec: &LoadSpec) -> Result<(LoadReport, f64), String
     let started = Instant::now();
     let before = generator("before", None)?;
     let result = run_load(spec)?;
-    let after = generator("after", Some(before.start_ticks))?;
-    let ticks = after.cpu_ticks.saturating_sub(before.cpu_ticks);
+    let after = generator("after", Some(before.start_ticks()))?;
+    let ticks = after.cpu_ticks().saturating_sub(before.cpu_ticks());
     let cpu_pct =
         ticks as f64 / crate::gaterun::CLOCK_TICKS_PER_S as f64 / started.elapsed().as_secs_f64()
             * 100.0;

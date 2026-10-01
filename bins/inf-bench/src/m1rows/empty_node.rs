@@ -10,6 +10,7 @@
 //! VACUOUS and keeps its row unset. The thresholds live only in
 //! `docs/milestones/m1-gates.toml`, and the plants read them from there.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,8 @@ use crate::cli::Flags;
 use crate::gaterun::proc::read_memlock_limit;
 use crate::gaterun::serving::{EMPTY_BOOT_DEADLINE_S, Serving, wait_pong};
 use crate::gaterun::{
-    CLOCK_TICKS_PER_S, CleanStop, Measurements, ProcReadError, ProcSample, ServerGuard,
-    launch_infinityd, read_proc,
+    CLOCK_TICKS_PER_S, CleanStop, GRACEFUL_STOP_DEADLINE_S, Measurements, ProcReadError,
+    ProcSample, ServerGuard, SourceValue, launch_infinityd, read_proc,
 };
 use crate::gates::Gate;
 
@@ -79,7 +80,7 @@ const DATA_ROOT_DEFAULT: &str = ".artifacts/m1/empty-node-data";
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// The four rows, one table: every per-row decision is a column here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Row {
     IdleRss,
     DataDir,
@@ -127,6 +128,30 @@ impl Row {
     /// default: a gates file without the row makes the plant VACUOUS.
     fn gate(self, gates: &[Gate]) -> Option<&Gate> {
         gates.iter().find(|gate| gate.source == self.key())
+    }
+}
+
+/// The rows' published values. The map is private to this module and its
+/// one writer, [`publish`](Self::publish), consumes a [`ControlChecked`]:
+/// both control sets, the control within budget, the row's own plant red.
+/// The report reads the rows' sources only from here
+/// ([`Measurements::measured`]), so no other path publishes them.
+#[derive(Debug, Default)]
+pub(crate) struct EmptyNodeValues {
+    values: BTreeMap<Row, f64>,
+}
+
+impl EmptyNodeValues {
+    /// Whether `source` is one of the rows, and its value if published.
+    pub(crate) fn lookup(&self, source: &str) -> SourceValue {
+        match Row::ALL.into_iter().find(|row| row.key() == source) {
+            Some(row) => SourceValue::Proven(self.values.get(&row).copied()),
+            None => SourceValue::Plain,
+        }
+    }
+
+    fn publish(&mut self, checked: ControlChecked) {
+        self.values.insert(checked.row, checked.value);
     }
 }
 
@@ -238,10 +263,10 @@ fn pin_proven_floor(cells: u64, buffers: u64) -> Option<u64> {
 impl PinnedRss {
     fn prove(sample: &ProcSample, cells: u64, buffers: u64) -> Result<PinnedRss, PinUnproven> {
         let floor_bytes = pin_proven_floor(cells, buffers).unwrap_or(u64::MAX);
-        if sample.pinned_bytes > floor_bytes {
-            Ok(PinnedRss { rss_bytes: sample.rss_bytes })
+        if sample.pinned_bytes() > floor_bytes {
+            Ok(PinnedRss { rss_bytes: sample.rss_bytes() })
         } else {
-            Err(PinUnproven { pinned_bytes: sample.pinned_bytes, floor_bytes })
+            Err(PinUnproven { pinned_bytes: sample.pinned_bytes(), floor_bytes })
         }
     }
 
@@ -262,8 +287,8 @@ impl IdleWindow {
     fn cpu_pct(&self) -> Result<f64, String> {
         let ticks = self
             .last
-            .cpu_ticks
-            .checked_sub(self.first.cpu_ticks)
+            .cpu_ticks()
+            .checked_sub(self.first.cpu_ticks())
             .ok_or("CPU ticks went backwards within one process")?;
         let seconds = self.elapsed.as_secs_f64();
         if seconds <= 0.0 {
@@ -290,7 +315,7 @@ where
     let first = sample(None)?;
     let started = Instant::now();
     std::thread::sleep(window);
-    let last = sample(Some(first.start_ticks))?;
+    let last = sample(Some(first.start_ticks()))?;
     Ok(IdleWindow { first, last, elapsed: started.elapsed() })
 }
 
@@ -305,19 +330,27 @@ fn serve(guard: &mut ServerGuard, spawned_at: Instant) -> Result<Serving, String
         .map_err(|e| format!("boot on port {port}: {e}"))
 }
 
-/// Which memory node a leg boots: the control, or one of the two plants.
+/// The memory plants: one flag each over the shipped default.
+#[derive(Clone, Copy, Debug)]
+enum MemoryPlant {
+    /// `--buffers 8192`: the RSS row's planted red.
+    Buffers,
+    /// `--park-us 20`: the CPU row's planted red.
+    Park,
+}
+
+/// Which memory node a leg boots: the control, or a plant.
 #[derive(Clone, Copy, Debug)]
 enum MemoryArm {
     Control,
-    PlantBuffers,
-    PlantPark,
+    Plant(MemoryPlant),
 }
 
 impl MemoryArm {
     fn buffers(self) -> u64 {
         match self {
-            MemoryArm::Control | MemoryArm::PlantPark => RECEIVE_BUFFERS_DEFAULT,
-            MemoryArm::PlantBuffers => PLANT_RECEIVE_BUFFERS,
+            MemoryArm::Control | MemoryArm::Plant(MemoryPlant::Park) => RECEIVE_BUFFERS_DEFAULT,
+            MemoryArm::Plant(MemoryPlant::Buffers) => PLANT_RECEIVE_BUFFERS,
         }
     }
 
@@ -327,10 +360,10 @@ impl MemoryArm {
         let mut args = vec!["--device-probe".to_string(), "auto".to_string()];
         match self {
             MemoryArm::Control => {}
-            MemoryArm::PlantBuffers => {
+            MemoryArm::Plant(MemoryPlant::Buffers) => {
                 args.extend(["--buffers".to_string(), PLANT_RECEIVE_BUFFERS.to_string()]);
             }
-            MemoryArm::PlantPark => {
+            MemoryArm::Plant(MemoryPlant::Park) => {
                 args.extend(["--park-us".to_string(), PLANT_PARK_US.to_string()]);
             }
         }
@@ -338,7 +371,29 @@ impl MemoryArm {
     }
 }
 
-/// One memory leg's facts. Planted legs feed only plant verdicts.
+/// A control leg: the shipped default node. [`boot`](Self::boot) is its
+/// only constructor and a [`LegSet`] holds nothing else, so a planted
+/// node's facts never reach a row value.
+#[derive(Debug)]
+struct ControlLeg(MemoryLeg);
+
+impl ControlLeg {
+    fn boot(ctx: &Context<'_>) -> Result<ControlLeg, String> {
+        memory_leg(ctx, MemoryArm::Control).map(ControlLeg)
+    }
+}
+
+/// A planted leg: its facts feed its plant's verdict and the notes only.
+#[derive(Debug)]
+struct PlantLeg(MemoryLeg);
+
+impl PlantLeg {
+    fn boot(ctx: &Context<'_>, plant: MemoryPlant) -> Result<PlantLeg, String> {
+        memory_leg(ctx, MemoryArm::Plant(plant)).map(PlantLeg)
+    }
+}
+
+/// One memory leg's facts, wrapped as a [`ControlLeg`] or a [`PlantLeg`].
 #[derive(Debug)]
 struct MemoryLeg {
     rss: Result<PinnedRss, PinUnproven>,
@@ -366,8 +421,8 @@ fn memory_leg(ctx: &Context<'_>, arm: MemoryArm) -> Result<MemoryLeg, String> {
         .map_err(|e| format!("{arm:?} memory leg: {e}"))?;
     Ok(MemoryLeg {
         rss: PinnedRss::prove(&idle.last, u64::from(EMPTY_NODE_CELLS), arm.buffers()),
-        rss_bytes: idle.last.rss_bytes,
-        pinned_bytes: idle.last.pinned_bytes,
+        rss_bytes: idle.last.rss_bytes(),
+        pinned_bytes: idle.last.pinned_bytes(),
         cpu_pct: idle.cpu_pct().map_err(|e| format!("{arm:?} memory leg: {e}"))?,
         boot: serving.boot(),
         loading_replies: serving.loading_replies(),
@@ -448,6 +503,15 @@ enum BootOf<'a> {
     Warm(WarmDir<'a>),
 }
 
+impl<'a> BootOf<'a> {
+    fn dir(&self) -> &'a RunDir {
+        match self {
+            BootOf::Fresh(dir) => dir,
+            BootOf::Warm(warm) => warm.dir,
+        }
+    }
+}
+
 /// One durable boot's facts; `walk` is set for warm boots only.
 struct DurableBoot {
     boot: Duration,
@@ -470,10 +534,7 @@ fn durable_boot<'a>(
     ctx: &Context<'_>,
     of: BootOf<'a>,
 ) -> Result<(DurableBoot, WarmDir<'a>), String> {
-    let (dir, warm) = match of {
-        BootOf::Fresh(dir) => (dir, false),
-        BootOf::Warm(warm) => (warm.dir, true),
-    };
+    let dir = of.dir();
     let path = dir.path.to_str().ok_or("the data root is not UTF-8")?;
     let args = ["--data-dir", path, "--device-probe", "auto"];
     let (mut guard, spawned_at) = launch_infinityd(ctx.infinityd, EMPTY_NODE_CELLS, &args)?;
@@ -482,10 +543,11 @@ fn durable_boot<'a>(
     let (settle, window) = idle_durations();
     let idle = idle_window(&serving, settle, window, |expected| read_proc(pid, expected))
         .map_err(|e| format!("durable leg on {path}: {e}"))?;
-    let walk = if warm {
-        Some(walk_allocated(&dir.path, EMPTY_NODE_CELLS).map_err(|e| format!("{path}: {e}"))?)
-    } else {
-        None
+    let walk = match of {
+        BootOf::Fresh(_) => None,
+        BootOf::Warm(_) => {
+            Some(walk_allocated(&dir.path, EMPTY_NODE_CELLS).map_err(|e| format!("{path}: {e}"))?)
+        }
     };
     let facts = DurableBoot {
         boot: serving.boot(),
@@ -495,7 +557,9 @@ fn durable_boot<'a>(
         attribution: info_attribution(guard.port, &BOOT_ATTRIBUTION_FIELDS),
     };
     drop(serving);
-    let clean = guard.stop_graceful().map_err(|e| format!("stop on {path}: {e}"))?;
+    let clean = guard
+        .stop_graceful(Duration::from_secs(GRACEFUL_STOP_DEADLINE_S))
+        .map_err(|e| format!("stop on {path}: {e}"))?;
     Ok((facts, WarmDir { dir, _clean: clean }))
 }
 
@@ -533,10 +597,10 @@ struct WarmLeg {
     walk: DirWalk,
 }
 
-/// One control set's complete legs (A or A′).
+/// One control set's complete legs (A or A′): control legs only.
 #[derive(Debug, Default)]
 struct LegSet {
-    memory: Vec<MemoryLeg>,
+    memory: Vec<ControlLeg>,
     warm: Vec<WarmLeg>,
 }
 
@@ -683,8 +747,8 @@ fn replicates<'a>(
     let (mut a, mut a_prime) = (LegSet::default(), LegSet::default());
     for rep in 0..ctx.replicates {
         for (set, label) in [(&mut a, "A"), (&mut a_prime, "A′")] {
-            let leg = memory_leg(ctx, MemoryArm::Control)?;
-            log_memory(log, &format!("{label} memory rep{rep}"), &leg);
+            let leg = ControlLeg::boot(ctx)?;
+            log_memory(log, &format!("{label} memory rep{rep}"), &leg.0);
             set.memory.push(leg);
         }
         if let Some(current) = pair.take() {
@@ -798,7 +862,7 @@ fn judge(gate: Option<&Gate>, reading: f64, baseline: f64, rise_min: f64) -> Pla
 /// `--buffers 8192` adds N × 4096 × 4 KiB = 64 MiB of pinned pool: the
 /// reading must rise by 0.9 of it and exceed the RSS bill.
 fn rss_plant(ctx: &Context<'_>, control_mib: Option<f64>, log: &mut String) -> PlantVerdict {
-    let leg = match memory_leg(ctx, MemoryArm::PlantBuffers) {
+    let PlantLeg(leg) = match PlantLeg::boot(ctx, MemoryPlant::Buffers) {
         Ok(leg) => leg,
         Err(e) => return PlantVerdict::Unengaged(format!("plant leg: {e}")),
     };
@@ -825,7 +889,7 @@ fn cpu_plant_bill_pct() -> f64 {
 }
 
 fn cpu_plant(ctx: &Context<'_>, control_pct: Option<f64>, log: &mut String) -> PlantVerdict {
-    let leg = match memory_leg(ctx, MemoryArm::PlantPark) {
+    let PlantLeg(leg) = match PlantLeg::boot(ctx, MemoryPlant::Park) {
         Ok(leg) => leg,
         Err(e) => return PlantVerdict::Unengaged(format!("plant leg: {e}")),
     };
@@ -848,29 +912,42 @@ fn median_of(values: &[f64]) -> Option<f64> {
 }
 
 fn set_values(set: &LegSet, value: impl Fn(&MemoryLeg) -> f64) -> Vec<f64> {
-    set.memory.iter().map(value).collect()
+    set.memory.iter().map(|ControlLeg(leg)| value(leg)).collect()
 }
 
 /// The set's RSS median in MiB, only when every leg's pin is proven.
 fn set_rss_median(set: &LegSet) -> Option<f64> {
-    let values: Option<Vec<f64>> =
-        set.memory.iter().map(|leg| leg.rss.as_ref().ok().map(|rss| rss.mib())).collect();
+    let values: Option<Vec<f64>> = set
+        .memory
+        .iter()
+        .map(|ControlLeg(leg)| leg.rss.as_ref().ok().map(|rss| rss.mib()))
+        .collect();
     median_of(&values?)
+}
+
+/// Why a row is withheld, which decides what it means per tier.
+#[derive(Debug)]
+enum Withholding {
+    /// A declared scope limit (a memory-filesystem data root, a block over
+    /// the bill's): a note in every tier.
+    Declared(String),
+    /// A precondition the run did not prove (a pin, D′'s io
+    /// configuration): a note on the dev tier, a failure when binding.
+    PreconditionUnproven(String),
 }
 
 /// A row's values from both sets, or why the row is withheld.
 #[derive(Debug)]
 enum RowInput {
-    Measured {
-        a: Vec<f64>,
-        a_prime: Vec<f64>,
-    },
-    /// `precondition`: an unproven precondition (binding: a failure), as
-    /// against a declared withholding (a note in every tier).
-    Withheld {
-        reason: String,
-        precondition: bool,
-    },
+    Measured { a: Vec<f64>, a_prime: Vec<f64> },
+    Withheld(Withholding),
+}
+
+/// The two rows the durable legs feed.
+#[derive(Clone, Copy, Debug)]
+enum DurableRow {
+    WarmBoot,
+    DataDir,
 }
 
 fn row_input(row: Row, a: &LegSet, a_prime: &LegSet, durable: &Durable) -> RowInput {
@@ -880,42 +957,44 @@ fn row_input(row: Row, a: &LegSet, a_prime: &LegSet, durable: &Durable) -> RowIn
             a: set_values(a, |leg| leg.cpu_pct),
             a_prime: set_values(a_prime, |leg| leg.cpu_pct),
         },
-        Row::WarmBoot | Row::DataDir => match durable {
-            Durable::Withheld(reason) => {
-                RowInput::Withheld { reason: reason.clone(), precondition: false }
-            }
-            Durable::Ran { io: Err(IoPropertiesDiffer(reason)) } => {
-                RowInput::Withheld { reason: reason.clone(), precondition: true }
-            }
-            Durable::Ran { io: Ok(same) } => warm_input(row, a, a_prime, same),
-        },
+        Row::WarmBoot => durable_input(DurableRow::WarmBoot, a, a_prime, durable),
+        Row::DataDir => durable_input(DurableRow::DataDir, a, a_prime, durable),
+    }
+}
+
+fn durable_input(row: DurableRow, a: &LegSet, a_prime: &LegSet, durable: &Durable) -> RowInput {
+    match durable {
+        Durable::Withheld(reason) => RowInput::Withheld(Withholding::Declared(reason.clone())),
+        Durable::Ran { io: Err(IoPropertiesDiffer(reason)) } => {
+            RowInput::Withheld(Withholding::PreconditionUnproven(reason.clone()))
+        }
+        Durable::Ran { io: Ok(same) } => warm_input(row, a, a_prime, same),
     }
 }
 
 fn rss_input(a: &LegSet, a_prime: &LegSet) -> RowInput {
-    let unproven = a.memory.iter().chain(&a_prime.memory).find_map(|leg| leg.rss.err());
+    let unproven = a.memory.iter().chain(&a_prime.memory).find_map(|ControlLeg(leg)| leg.rss.err());
     if let Some(unproven) = unproven {
-        return RowInput::Withheld { reason: unproven.to_string(), precondition: true };
+        return RowInput::Withheld(Withholding::PreconditionUnproven(unproven.to_string()));
     }
     let mib = |set: &LegSet| -> Vec<f64> {
-        set.memory.iter().filter_map(|leg| leg.rss.ok()).map(PinnedRss::mib).collect()
+        set.memory.iter().filter_map(|ControlLeg(leg)| leg.rss.ok()).map(PinnedRss::mib).collect()
     };
     RowInput::Measured { a: mib(a), a_prime: mib(a_prime) }
 }
 
 /// The durable rows read D and D′ only with the proof that they ran one
 /// io configuration.
-fn warm_input(row: Row, a: &LegSet, a_prime: &LegSet, _same: &SameIoProperties) -> RowInput {
+fn warm_input(row: DurableRow, a: &LegSet, a_prime: &LegSet, _same: &SameIoProperties) -> RowInput {
     let block = a.warm.iter().chain(&a_prime.warm).map(|leg| leg.walk.block_bytes_max).max();
-    if row == Row::DataDir && block.is_some_and(|b| b > FS_BLOCK_BYTES_MAX) {
-        return RowInput::Withheld {
-            reason: format!("filesystem block {block:?} B over the bill's {FS_BLOCK_BYTES_MAX} B"),
-            precondition: false,
-        };
+    let over_block = block.is_some_and(|bytes| bytes > FS_BLOCK_BYTES_MAX);
+    if matches!(row, DurableRow::DataDir) && over_block {
+        let reason = format!("filesystem block {block:?} B over the bill's {FS_BLOCK_BYTES_MAX} B");
+        return RowInput::Withheld(Withholding::Declared(reason));
     }
     let value = |leg: &WarmLeg| match row {
-        Row::DataDir => walk::bytes_to_kib(leg.walk.allocated_bytes),
-        Row::WarmBoot | Row::IdleRss | Row::IdleCpu => leg.boot_ms,
+        DurableRow::DataDir => walk::bytes_to_kib(leg.walk.allocated_bytes),
+        DurableRow::WarmBoot => leg.boot_ms,
     };
     RowInput::Measured {
         a: a.warm.iter().map(value).collect(),
@@ -923,8 +1002,8 @@ fn warm_input(row: Row, a: &LegSet, a_prime: &LegSet, _same: &SameIoProperties) 
     }
 }
 
-/// A row value whose control passed and whose plant read red: the only
-/// input the rows' `Measurements::set` takes.
+/// A row value whose control passed and whose own plant read red: the
+/// only input [`EmptyNodeValues::publish`] takes.
 #[derive(Debug)]
 struct ControlChecked {
     row: Row,
@@ -935,62 +1014,79 @@ struct ControlChecked {
 /// Why a row stays unset.
 #[derive(Debug)]
 enum Refusal {
-    Withheld { reason: String, precondition: bool },
+    Withheld(Withholding),
     Spread(String),
     Vacuous(String),
 }
 
 impl ControlChecked {
-    fn check(row: Row, input: RowInput, plant: &PlantVerdict) -> Result<ControlChecked, Refusal> {
-        let (a, a_prime) = match input {
-            RowInput::Measured { a, a_prime } => (a, a_prime),
-            RowInput::Withheld { reason, precondition } => {
-                return Err(Refusal::Withheld { reason, precondition });
-            }
-        };
-        match plant {
-            PlantVerdict::Red(_) => {}
-            PlantVerdict::Green(why) | PlantVerdict::Unengaged(why) => {
-                return Err(Refusal::Vacuous(why.clone()));
-            }
-        }
-        let (Some(median_a), Some(median_ap)) = (median_of(&a), median_of(&a_prime)) else {
-            return Err(Refusal::Spread("a control set has no legs".into()));
-        };
-        let allowed = (row.spread_budget() * median_a.abs()).max(row.resolution());
-        let delta = (median_a - median_ap).abs();
-        let detail = format!(
-            "median(A) {median_a:.3}, median(A′) {median_ap:.3}, |Δ| {delta:.3} ≤ {allowed:.3}"
-        );
-        if delta.is_nan() || delta > allowed {
-            return Err(Refusal::Spread(detail.replace('≤', "over")));
-        }
-        Ok(ControlChecked { row, value: median_a, detail })
+    /// The row's proof, from the outcome's own input and plant for that
+    /// row: no caller can pair a row with another row's plant or values.
+    fn check(row: Row, outcome: &Outcome) -> Result<ControlChecked, Refusal> {
+        let input = row_input(row, &outcome.a, &outcome.a_prime, &outcome.durable);
+        let (value, detail) = control(row, input, outcome.plants.of(row))?;
+        Ok(ControlChecked { row, value, detail })
     }
+}
+
+/// The row's value, median(A), when its plant read red and its A/A′
+/// control is within budget; with the detail for the note.
+fn control(row: Row, input: RowInput, plant: &PlantVerdict) -> Result<(f64, String), Refusal> {
+    let (a, a_prime) = match input {
+        RowInput::Measured { a, a_prime } => (a, a_prime),
+        RowInput::Withheld(withholding) => return Err(Refusal::Withheld(withholding)),
+    };
+    match plant {
+        PlantVerdict::Red(_) => {}
+        PlantVerdict::Green(why) | PlantVerdict::Unengaged(why) => {
+            return Err(Refusal::Vacuous(why.clone()));
+        }
+    }
+    let (Some(median_a), Some(median_ap)) = (median_of(&a), median_of(&a_prime)) else {
+        return Err(Refusal::Spread("a control set has no legs".into()));
+    };
+    let allowed = (row.spread_budget() * median_a.abs()).max(row.resolution());
+    let delta = (median_a - median_ap).abs();
+    let detail = format!(
+        "median(A) {median_a:.3}, median(A′) {median_ap:.3}, |Δ| {delta:.3} ≤ {allowed:.3}"
+    );
+    if delta.is_nan() || delta > allowed {
+        return Err(Refusal::Spread(detail.replace('≤', "over")));
+    }
+    Ok((median_a, detail))
 }
 
 fn publish(m: &mut Measurements, checked: ControlChecked) {
     m.note(format!("empty-node {}: {}", checked.row.key(), checked.detail));
-    m.set(checked.row.key(), checked.value);
+    m.empty_node.publish(checked);
+}
+
+/// An unproven precondition fails a binding run; every other withholding
+/// is a note.
+fn withhold(m: &mut Measurements, row: Row, withholding: Withholding, tier: Tier) {
+    match (withholding, tier) {
+        (Withholding::PreconditionUnproven(reason), Tier::Binding) => {
+            m.fail(format!("empty-node {} precondition unproven: {reason}", row.key()));
+        }
+        (Withholding::PreconditionUnproven(reason), Tier::Dev)
+        | (Withholding::Declared(reason), Tier::Dev | Tier::Binding) => {
+            m.note(format!("empty-node {} withheld: {reason}", row.key()));
+        }
+    }
 }
 
 fn publish_rows(m: &mut Measurements, tier: Tier, outcome: &Outcome) {
     for row in Row::ALL {
-        let plant = outcome.plants.of(row);
-        m.note(format!("empty-node plant {}: {plant}", row.key()));
-        let input = row_input(row, &outcome.a, &outcome.a_prime, &outcome.durable);
-        match (ControlChecked::check(row, input, plant), tier) {
-            (Ok(checked), _) => publish(m, checked),
-            (Err(Refusal::Withheld { reason, precondition: true }), Tier::Binding) => {
-                m.fail(format!("empty-node {} precondition unproven: {reason}", row.key()));
+        m.note(format!("empty-node plant {}: {}", row.key(), outcome.plants.of(row)));
+        match (ControlChecked::check(row, outcome), tier) {
+            (Ok(checked), Tier::Dev | Tier::Binding) => publish(m, checked),
+            (Err(Refusal::Withheld(withholding)), Tier::Dev | Tier::Binding) => {
+                withhold(m, row, withholding, tier);
             }
-            (Err(Refusal::Withheld { reason, .. }), Tier::Dev | Tier::Binding) => {
-                m.note(format!("empty-node {} withheld: {reason}", row.key()));
-            }
-            (Err(Refusal::Spread(detail)), _) => {
+            (Err(Refusal::Spread(detail)), Tier::Dev | Tier::Binding) => {
                 m.fail(format!("empty-node instrument spread {}: {detail}", row.key()));
             }
-            (Err(Refusal::Vacuous(why)), _) => {
+            (Err(Refusal::Vacuous(why)), Tier::Dev | Tier::Binding) => {
                 m.fail(format!("VACUOUS canary {}: {why}", row.key()));
             }
         }

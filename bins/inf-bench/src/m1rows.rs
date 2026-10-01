@@ -27,6 +27,8 @@ use crate::resp::{connect, encode_command, request};
 mod empty_node;
 mod memory;
 
+pub(crate) use empty_node::EmptyNodeValues;
+
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut conn = connect("127.0.0.1", port)?;
     request(&mut conn, argv)
@@ -469,7 +471,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         run_load(&fill)?;
         // A server that exited after the fill is an unreaped zombie with no
         // `VmRSS`: that read fails, so the release-blocking row stays unset.
-        let our_rss = ours.proc_sample().map(|sample| sample.rss_bytes);
+        let our_rss = ours.proc_sample().map(|sample| sample.rss_bytes());
         drop(ours);
         match (our_rss, spawn_redis(&redis_bin)) {
             (Err(e), _) => m.fail(format!("infinityd RSS after the fill: {e}")),
@@ -480,7 +482,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
                 match redis.proc_sample() {
                     Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
                     Ok(sample) => {
-                        let redis_rss = sample.rss_bytes;
+                        let redis_rss = sample.rss_bytes();
                         let ratio = our_rss as f64 / redis_rss as f64;
                         println!(
                             "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"

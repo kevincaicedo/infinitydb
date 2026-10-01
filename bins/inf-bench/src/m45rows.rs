@@ -1286,7 +1286,7 @@ fn s36_write_leg(
     })?;
     let elapsed = wall.elapsed().as_secs_f64().max(1e-9);
     let ticks_after = server.proc_sample().map_err(|e| format!("s36: CPU ticks after: {e}"))?;
-    let ticks = ticks_after.cpu_ticks.saturating_sub(ticks_before.cpu_ticks);
+    let ticks = ticks_after.cpu_ticks().saturating_sub(ticks_before.cpu_ticks());
     if report.errors > report.busy_retryable {
         return Err(format!(
             "s36 leg: {} non-BUSY errors (first: {:?})",

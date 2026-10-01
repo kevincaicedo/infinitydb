@@ -123,3 +123,17 @@ fn operational_failure_is_fatal_even_when_every_gate_passes() {
         assert!(body.contains("NOT citation-grade"));
     }
 }
+
+/// An empty-node row's value reaches the report only through its proof
+/// (both control sets, the control within budget, the row's plant red): a
+/// plain `set` of its key, from any module, is never a measurement.
+#[test]
+fn a_plain_set_of_a_proven_source_is_never_a_measurement() {
+    let mut proven = gate("linux-reference-box", true);
+    proven.source = "loadgen:empty_data_dir_kib".into();
+    let mut m = Measurements::new();
+    m.set("loadgen:empty_data_dir_kib", 0.0);
+    let (result, body) = report(&[proven], &m, false);
+    result.unwrap();
+    assert!(body.contains("| — | UNMEASURED (informational) |"), "{body}");
+}

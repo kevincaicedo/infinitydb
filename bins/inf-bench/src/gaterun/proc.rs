@@ -4,6 +4,8 @@
 //! a finite value that passes a `<=` row.
 
 use std::io::Read as _;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Linux `USER_HZ`: the tick of `utime`/`stime` in `/proc/<pid>/stat`.
 pub(crate) const CLOCK_TICKS_PER_S: u64 = 100;
@@ -23,17 +25,138 @@ const STAT_UTIME_INDEX: usize = 11;
 const STAT_STIME_INDEX: usize = 12;
 const STAT_START_INDEX: usize = 19;
 
-/// One read of a live process.
+/// One read of a live process. The fields are private and [`read_proc`]
+/// is the only constructor outside tests, so no module can prove a pin or
+/// publish an RSS from a sample no `/proc` read produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProcSample {
+    rss_bytes: u64,
+    pinned_bytes: u64,
+    cpu_ticks: u64,
+    start_ticks: u64,
+}
+
+impl ProcSample {
     /// `VmRSS`.
-    pub(crate) rss_bytes: u64,
+    pub(crate) fn rss_bytes(&self) -> u64 {
+        self.rss_bytes
+    }
+
     /// `VmPin`: pages pinned by io_uring fixed-buffer registration.
-    pub(crate) pinned_bytes: u64,
+    pub(crate) fn pinned_bytes(&self) -> u64 {
+        self.pinned_bytes
+    }
+
     /// `utime + stime`, in [`CLOCK_TICKS_PER_S`] ticks.
-    pub(crate) cpu_ticks: u64,
+    pub(crate) fn cpu_ticks(&self) -> u64 {
+        self.cpu_ticks
+    }
+
     /// `starttime`: the process's identity beside its pid.
-    pub(crate) start_ticks: u64,
+    pub(crate) fn start_ticks(&self) -> u64 {
+        self.start_ticks
+    }
+
+    /// A sample no `/proc` read produced: test fixtures only.
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        rss_bytes: u64,
+        pinned_bytes: u64,
+        cpu_ticks: u64,
+        start_ticks: u64,
+    ) -> ProcSample {
+        ProcSample { rss_bytes, pinned_bytes, cpu_ticks, start_ticks }
+    }
+}
+
+/// The peak `VmRSS` of one process over a window, read by a sampler
+/// thread while a load runs. Every read raises the peak or counts a
+/// failure, and [`finish`](Self::finish) is the only way to the peak: one
+/// failed read fails it, and a window with no read at all is no peak, so a
+/// sampler that skipped a failure or never ran cannot under-read a `<=`
+/// row.
+#[derive(Debug)]
+pub(crate) struct PeakRssSampler {
+    pid: u32,
+    /// The first read's `starttime`: every later read must be the same
+    /// process.
+    start_ticks: OnceLock<u64>,
+    peak_bytes: AtomicU64,
+    reads: AtomicU64,
+    read_failures: AtomicU64,
+    first_error: OnceLock<ProcReadError>,
+}
+
+/// Why a sampled window has no peak.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeakRssError {
+    /// `failures` of `attempts` reads failed; `first` is the first error.
+    Failed { failures: u64, attempts: u64, first: ProcReadError },
+    /// No read ran in the window.
+    NoRead,
+}
+
+impl std::fmt::Display for PeakRssError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeakRssError::Failed { failures, attempts, first } => {
+                write!(f, "{failures} of {attempts} VmRSS read(s) failed (first: {first})")
+            }
+            PeakRssError::NoRead => write!(f, "no VmRSS read ran in the window"),
+        }
+    }
+}
+
+impl PeakRssSampler {
+    pub(crate) fn new(pid: u32) -> PeakRssSampler {
+        PeakRssSampler {
+            pid,
+            start_ticks: OnceLock::new(),
+            peak_bytes: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            read_failures: AtomicU64::new(0),
+            first_error: OnceLock::new(),
+        }
+    }
+
+    /// One read: raises the peak and returns the reading, or counts the
+    /// failure and returns it.
+    pub(crate) fn sample(&self) -> Result<u64, ProcReadError> {
+        match read_proc(self.pid, self.start_ticks.get().copied()) {
+            Ok(sample) => {
+                self.start_ticks.get_or_init(|| sample.start_ticks);
+                self.peak_bytes.fetch_max(sample.rss_bytes, Ordering::Relaxed);
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                Ok(sample.rss_bytes)
+            }
+            Err(error) => {
+                self.read_failures.fetch_add(1, Ordering::Relaxed);
+                let _first_wins = self.first_error.set(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// One read whose value the caller does not use: a failure is still
+    /// counted and fails [`finish`](Self::finish).
+    pub(crate) fn record(&self) {
+        let _counted_for_finish = self.sample();
+    }
+
+    /// The window's peak: `Err` when any read failed or none ran. Every
+    /// failed read sets the first error, so its presence is the failure.
+    pub(crate) fn finish(self) -> Result<u64, PeakRssError> {
+        let reads = self.reads.into_inner();
+        if let Some(first) = self.first_error.into_inner() {
+            let failures = self.read_failures.into_inner();
+            let attempts = reads.saturating_add(failures);
+            return Err(PeakRssError::Failed { failures, attempts, first });
+        }
+        if reads == 0 {
+            return Err(PeakRssError::NoRead);
+        }
+        Ok(self.peak_bytes.into_inner())
+    }
 }
 
 /// Why a `/proc` read produced no sample.

@@ -431,7 +431,7 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     #[allow(clippy::disallowed_methods)] // bench settle, not cell code
     std::thread::sleep(Duration::from_secs(1));
     let rss_baseline =
-        server.proc_sample().map_err(|e| format!("mixed-audit: baseline VmRSS: {e}"))?.rss_bytes;
+        server.proc_sample().map_err(|e| format!("mixed-audit: baseline VmRSS: {e}"))?.rss_bytes();
     let domains_baseline = sum_domains(&scrape_cells(port, cells)?);
 
     // The tiered dataset has to exist before anything can read it cold.
@@ -495,37 +495,26 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     // RSS (100 ms) and the attribution domains (~1 s, all cells).
     println!("== mixed-audit: mixed run (cache + document, sampler on) ==");
     let stop = AtomicBool::new(false);
-    let rss_peak = AtomicU64::new(0);
-    // Failed reads are counted and fail the audit, never folded into a
+    // Failed reads fail the audit through `finish`, never folded into the
     // peak or a divergence sample.
-    let rss_read_failures = AtomicU64::new(0);
+    let rss_peak = crate::gaterun::PeakRssSampler::new(server.pid());
     let worst_div_milli = AtomicU64::new(0);
     let div_samples = AtomicU64::new(0);
-    let pid = server.pid();
     let tier_pre_mixed = scrape_cells(port, cells)?;
     let (cache_mixed, doc_mixed, tier_mixed) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
-            let read_rss = || {
-                let read = crate::gaterun::read_proc(pid, None).map(|sample| sample.rss_bytes);
-                if read.is_err() {
-                    rss_read_failures.fetch_add(1, Ordering::Relaxed);
-                }
-                read.ok()
-            };
             while !stop.load(Ordering::Relaxed) {
                 for _ in 0..10 {
                     #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
                     std::thread::sleep(Duration::from_millis(100));
-                    if let Some(rss) = read_rss() {
-                        rss_peak.fetch_max(rss, Ordering::Relaxed);
-                    }
+                    rss_peak.record();
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
                 }
-                let Some(rss_before) = read_rss() else { continue };
+                let Ok(rss_before) = rss_peak.sample() else { continue };
                 let Ok(infos) = scrape_cells(port, cells) else { continue };
-                let Some(rss_after) = read_rss() else { continue };
+                let Ok(rss_after) = rss_peak.sample() else { continue };
                 // Bracket the scrape with RSS reads: the domains are not
                 // an instant, so pair them with the midpoint.
                 let rss_now = (rss_before + rss_after) / 2;
@@ -598,11 +587,8 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         .max()
         .unwrap_or(0);
     let final_rss =
-        server.proc_sample().map_err(|e| format!("mixed-audit: final VmRSS: {e}"))?.rss_bytes;
-    let failures = rss_read_failures.load(Ordering::Relaxed);
-    if failures > 0 {
-        return Err(format!("mixed-audit: {failures} sampler VmRSS read(s) failed"));
-    }
+        server.proc_sample().map_err(|e| format!("mixed-audit: final VmRSS: {e}"))?.rss_bytes();
+    let rss_peak = rss_peak.finish().map_err(|e| format!("mixed-audit: sampler {e}"))?;
     drop(server);
     drop(guard);
     if tier_tables != u64::from(cells) {
@@ -742,8 +728,7 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
     push(&format!(
         "- peak RSS {} B · final RSS {} B · standing tiered reservation {tier_reserved} B VA, \
          {tier_committed} B committed",
-        rss_peak.load(Ordering::Relaxed),
-        final_rss
+        rss_peak, final_rss
     ));
     push(&format!(
         "- page-cache disclosure: the tiered leg does real file I/O this run \

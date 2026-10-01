@@ -278,7 +278,7 @@ fn s40_leg(
     let ticks_after = server.proc_sample();
     let report = load.join().map_err(|_| "s40: load thread panicked".to_string())??;
     let ticks_after = ticks_after.map_err(|e| format!("s40: CPU ticks after: {e}"))?;
-    let ticks = ticks_after.cpu_ticks.saturating_sub(ticks_before.cpu_ticks);
+    let ticks = ticks_after.cpu_ticks().saturating_sub(ticks_before.cpu_ticks());
     if report.errors > report.busy_retryable {
         return Err(format!(
             "s40: {} non-BUSY errors (first: {:?})",

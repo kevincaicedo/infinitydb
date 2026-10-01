@@ -582,8 +582,43 @@ struct S37DelCycle {
 /// VmRSS of the row's server: a failed read fails the row, never a 0.
 fn s37_rss(pid: u32, when: &str) -> Result<u64, String> {
     crate::gaterun::read_proc(pid, None)
-        .map(|sample| sample.rss_bytes)
+        .map(|sample| sample.rss_bytes())
         .map_err(|e| format!("s37 ticketed-DEL VmRSS {when}: {e}"))
+}
+
+/// The DEL window with the server's VmRSS sampled every 20 ms through
+/// it: the load, the VmRSS before it and the peak over it. A failed read
+/// fails the row.
+fn s37_sampled_del(
+    spec: &LoadSpec,
+    pid: u32,
+    from: u64,
+) -> Result<(crate::load::LoadReport, u64, u64), String> {
+    let peak = crate::gaterun::PeakRssSampler::new(pid);
+    let rss_before_del =
+        peak.sample().map_err(|e| format!("s37 ticketed-DEL VmRSS before the DEL window: {e}"))?;
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let del = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                peak.record();
+                #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let del = run_load(spec);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        del
+    })?;
+    if del.errors > del.busy_retryable {
+        return Err(format!(
+            "s37 ticketed-DEL DEL window @{from}: {} non-BUSY errors (first: {:?})",
+            del.errors - del.busy_retryable,
+            del.error_samples.first()
+        ));
+    }
+    let rss_peak_del = peak.finish().map_err(|e| format!("s37 ticketed-DEL @{from}: {e}"))?;
+    Ok((del, rss_before_del, rss_peak_del))
 }
 
 fn s37_del_cycle(
@@ -613,38 +648,8 @@ fn s37_del_cycle(
     }
     let mid = scrape_cells(port, cells)?;
     let d_set = |f: &str| sum_field(&mid, f).saturating_sub(sum_field(&before, f));
-    let rss_before_del = s37_rss(pid, "before the DEL window")?;
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let peak = std::sync::atomic::AtomicU64::new(rss_before_del);
-    let read_failures = std::sync::atomic::AtomicU64::new(0);
-    let del = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                match crate::gaterun::read_proc(pid, None) {
-                    Ok(sample) => {
-                        peak.fetch_max(sample.rss_bytes, std::sync::atomic::Ordering::Relaxed)
-                    }
-                    Err(_) => read_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                };
-                #[allow(clippy::disallowed_methods)] // bench sampler, not cell code
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        let del = run_load(&window(crate::load::FillOp::Del));
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        del
-    })?;
-    if del.errors > del.busy_retryable {
-        return Err(format!(
-            "s37 ticketed-DEL DEL window @{from}: {} non-BUSY errors (first: {:?})",
-            del.errors - del.busy_retryable,
-            del.error_samples.first()
-        ));
-    }
-    let failures = read_failures.load(std::sync::atomic::Ordering::Relaxed);
-    if failures > 0 {
-        return Err(format!("s37 ticketed-DEL @{from}: {failures} peak VmRSS read(s) failed"));
-    }
+    let (del, rss_before_del, rss_peak_del) =
+        s37_sampled_del(&window(crate::load::FillOp::Del), pid, from)?;
     let rss_after_del = s37_rss(pid, "after the DEL window")?;
     let after = scrape_cells(port, cells)?;
     let d_del = |f: &str| sum_field(&after, f).saturating_sub(sum_field(&mid, f));
@@ -669,7 +674,7 @@ fn s37_del_cycle(
         del_p999_us: del.p999_us as f64,
         del_max_us: del.max_us,
         rss_before_del,
-        rss_peak_del: peak.load(std::sync::atomic::Ordering::Relaxed),
+        rss_peak_del,
         rss_after_del,
     })
 }

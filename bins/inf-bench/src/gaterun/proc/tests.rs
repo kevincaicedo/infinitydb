@@ -99,14 +99,67 @@ fn a_file_over_the_bound_is_truncated_not_a_prefix() {
 fn this_process_reads_and_keeps_its_identity() {
     let pid = std::process::id();
     let first = read_proc(pid, None).expect("self read");
-    assert!(first.rss_bytes > 0, "a live process has resident pages");
-    let again = read_proc(pid, Some(first.start_ticks)).expect("same process");
-    assert_eq!(again.start_ticks, first.start_ticks);
-    assert!(again.cpu_ticks >= first.cpu_ticks, "ticks never go back");
+    assert!(first.rss_bytes() > 0, "a live process has resident pages");
+    let again = read_proc(pid, Some(first.start_ticks())).expect("same process");
+    assert_eq!(again.start_ticks(), first.start_ticks());
+    assert!(again.cpu_ticks() >= first.cpu_ticks(), "ticks never go back");
     assert!(matches!(
-        read_proc(pid, Some(first.start_ticks + 1)),
+        read_proc(pid, Some(first.start_ticks() + 1)),
         Err(ProcReadError::ProcessReplaced { .. })
     ));
-    assert!(read_io_bytes(pid, Some(first.start_ticks)).is_ok());
+    assert!(read_io_bytes(pid, Some(first.start_ticks())).is_ok());
     assert!(read_memlock_limit(pid).is_ok_and(|limit| !limit.is_empty()));
+}
+
+/// A peak is read only through `finish`: one failed read among good ones
+/// fails it, and a window with no read at all is no peak of zero.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_peak_needs_every_read_to_succeed_and_at_least_one() {
+    let own = PeakRssSampler::new(std::process::id());
+    let first = own.sample().expect("own process");
+    assert!(first > 0, "a live process has resident pages");
+    own.sample().expect("again");
+    assert!(own.finish().expect("a peak") >= first);
+
+    let mut child = std::process::Command::new("sleep").arg("10").spawn().expect("sleep");
+    let dies = PeakRssSampler::new(child.id());
+    dies.sample().expect("the child is alive");
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+    assert_eq!(dies.sample(), Err(ProcReadError::Missing));
+    let failed = dies.finish();
+    let first = ProcReadError::Missing;
+    assert_eq!(failed, Err(PeakRssError::Failed { failures: 1, attempts: 2, first }));
+
+    assert_eq!(PeakRssSampler::new(std::process::id()).finish(), Err(PeakRssError::NoRead));
+}
+
+/// The first good read fixes the sampled process's `starttime`, and every
+/// later read is checked against it: a read that finds another process
+/// fails, and the window's peak with it, even after good reads. The pid
+/// reuse is planted by seeding the identity the sampler holds.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_sampler_read_of_a_replaced_pid_fails_the_peak() {
+    let pid = std::process::id();
+    let own_start = read_proc(pid, None).expect("self read").start_ticks();
+    let replaced = ProcReadError::ProcessReplaced {
+        expected_start_ticks: own_start + 1,
+        found_start_ticks: own_start,
+    };
+
+    let seeded = PeakRssSampler::new(pid);
+    seeded.start_ticks.set(own_start + 1).expect("no read has set the identity");
+    assert_eq!(seeded.sample(), Err(replaced.clone()));
+    let first = replaced.clone();
+    assert_eq!(seeded.finish(), Err(PeakRssError::Failed { failures: 1, attempts: 1, first }));
+
+    let mut reused = PeakRssSampler::new(pid);
+    reused.sample().expect("own process");
+    assert_eq!(reused.start_ticks.get(), Some(&own_start), "the first read fixes the identity");
+    reused.start_ticks = OnceLock::from(own_start + 1);
+    assert_eq!(reused.sample(), Err(replaced.clone()));
+    let first = replaced;
+    assert_eq!(reused.finish(), Err(PeakRssError::Failed { failures: 1, attempts: 2, first }));
 }

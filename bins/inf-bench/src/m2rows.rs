@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use crate::cli::Flags;
 use crate::gaterun::{
-    Measurements, ServerGuard, env_gate, finish_report, load_gates, max_field, median, read_proc,
-    scrape_cells, spawn_infinityd, sum_field,
+    Measurements, PeakRssSampler, ServerGuard, env_gate, finish_report, load_gates, max_field,
+    median, scrape_cells, spawn_infinityd, sum_field,
 };
 use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, request};
@@ -348,12 +348,8 @@ fn pressure_leg(
 
     // VmRSS + live ckpt-buffer sampler (100 ms) across the whole mix.
     let stop = AtomicBool::new(false);
-    let rss_peak = AtomicU64::new(0);
-    // A failed read is counted, never folded into the peak: one that read 0
-    // would under-read the RSS row the peak feeds.
-    let rss_read_failures = AtomicU64::new(0);
+    let rss_peak = PeakRssSampler::new(server.pid());
     let buf_peak = AtomicU64::new(0);
-    let pid = server.pid();
     let port = server.port;
     let spec = LoadSpec {
         port: server.port,
@@ -370,18 +366,14 @@ fn pressure_leg(
     };
     let (report, ()) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
-            let sample_rss = || match read_proc(pid, None) {
-                Ok(sample) => rss_peak.fetch_max(sample.rss_bytes, Ordering::Relaxed),
-                Err(_) => rss_read_failures.fetch_add(1, Ordering::Relaxed),
-            };
             while !stop.load(Ordering::Relaxed) {
-                sample_rss();
+                rss_peak.record();
                 // One INFO per ~300 ms: the live ckpt_buffer_bytes gauge
                 // (the L5 attribution observable) at whichever cell answers.
                 for _ in 0..3 {
                     #[allow(clippy::disallowed_methods)] // bench sampler thread, not cell code
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    sample_rss();
+                    rss_peak.record();
                 }
                 if let Ok(infos) = scrape_cells(port, 1) {
                     buf_peak.fetch_max(sum_field(&infos, "ckpt_buffer_bytes"), Ordering::Relaxed);
@@ -394,17 +386,14 @@ fn pressure_leg(
         (report, ())
     });
     let report = report?;
-    let failures = rss_read_failures.load(Ordering::Relaxed);
-    if failures > 0 {
-        return Err(format!("ckpt-pressure {label}: {failures} VmRSS read(s) failed"));
-    }
+    let rss_peak = rss_peak.finish().map_err(|e| format!("ckpt-pressure {label}: {e}"))?;
     m.raw_section(&format!("ckpt-pressure {label}"), &render(&report));
 
     let infos = scrape_cells(server.port, cells)?;
     let leg = PressureLeg {
         ops_per_sec: report.ops_per_sec,
         p999_us: report.p999_us,
-        rss_peak: rss_peak.load(Ordering::Relaxed),
+        rss_peak,
         ckpts_completed: sum_field(&infos, "ckpts_completed"),
         manifests_published: sum_field(&infos, "manifests_published"),
         segments_truncated: sum_field(&infos, "segments_truncated"),
@@ -760,7 +749,7 @@ fn attribution_row(
         + sum_field(&infos, "doc_scratch_bytes")
         + sum_field(&infos, "doc_path_cache_bytes");
     let rss =
-        server.proc_sample().map_err(|e| format!("attribution row: VmRSS read: {e}"))?.rss_bytes;
+        server.proc_sample().map_err(|e| format!("attribution row: VmRSS read: {e}"))?.rss_bytes();
     drop(server);
     drop(guard);
     let divergence = ((rss as f64 - domains as f64) / rss as f64 * 100.0).abs();

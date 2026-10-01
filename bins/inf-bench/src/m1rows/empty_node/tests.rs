@@ -21,7 +21,7 @@ fn row_gate(row: Row, threshold: f64) -> Gate {
 }
 
 fn sample(rss_bytes: u64, pinned_bytes: u64, cpu_ticks: u64, start_ticks: u64) -> ProcSample {
-    ProcSample { rss_bytes, pinned_bytes, cpu_ticks, start_ticks }
+    ProcSample::fixture(rss_bytes, pinned_bytes, cpu_ticks, start_ticks)
 }
 
 /// A scratch directory for one test, removed on drop.
@@ -93,6 +93,7 @@ fn another_topology_withholds_every_row_without_a_spawn() {
     let mut m = Measurements::new();
     run(&flags, &[], &mut m, "/nonexistent/infinityd", 8, true).expect("withheld, not refused");
     assert!(m.values.is_empty());
+    assert!(Row::ALL.iter().all(|row| m.measured(row.key()).is_none()));
     assert!(m.notes.iter().any(|note| note.contains("withheld: --cells 8")), "{:?}", m.notes);
 }
 
@@ -153,7 +154,7 @@ fn the_control_compares_in_resolution_units_at_zero() {
     let red = PlantVerdict::Red("planted".into());
     let check = |row, a: &[f64], a_prime: &[f64]| {
         let input = RowInput::Measured { a: a.to_vec(), a_prime: a_prime.to_vec() };
-        ControlChecked::check(row, input, &red).map(|checked| checked.value)
+        control(row, input, &red).map(|(value, _detail)| value)
     };
     assert_eq!(check(Row::IdleCpu, &[0.0, 0.0, 0.0], &[0.1, 0.0, 0.1]).ok(), Some(0.0));
     assert!(matches!(check(Row::IdleCpu, &[0.0; 3], &[0.2; 3]), Err(Refusal::Spread(_))));
@@ -167,15 +168,15 @@ fn the_control_compares_in_resolution_units_at_zero() {
 fn a_green_or_unengaged_plant_keeps_its_row_unset() {
     let measured = || RowInput::Measured { a: vec![128.0], a_prime: vec![128.0] };
     for plant in [PlantVerdict::Green("g".into()), PlantVerdict::Unengaged("u".into())] {
-        let result = ControlChecked::check(Row::DataDir, measured(), &plant);
+        let result = control(Row::DataDir, measured(), &plant);
         assert!(matches!(result, Err(Refusal::Vacuous(_))), "{plant}");
     }
     let red = PlantVerdict::Red("r".into());
-    let withheld = RowInput::Withheld { reason: "declared".into(), precondition: false };
-    let result = ControlChecked::check(Row::DataDir, withheld, &red);
-    assert!(matches!(result, Err(Refusal::Withheld { precondition: false, .. })));
-    let checked = ControlChecked::check(Row::DataDir, measured(), &red).expect("publishes");
-    assert_eq!((checked.row, checked.value), (Row::DataDir, 128.0));
+    let withheld = RowInput::Withheld(Withholding::Declared("declared".into()));
+    let result = control(Row::DataDir, withheld, &red);
+    assert!(matches!(result, Err(Refusal::Withheld(Withholding::Declared(_)))));
+    let (value, _detail) = control(Row::DataDir, measured(), &red).expect("publishes");
+    assert_eq!(value, 128.0);
 }
 
 #[test]
@@ -224,7 +225,7 @@ fn warm_leg_fixture(boot_ms: f64, allocated_bytes: u64, block_bytes_max: u64) ->
 
 fn outcome_fixture(rss: Result<PinnedRss, PinUnproven>, block_bytes_max: u64) -> Outcome {
     let set = || LegSet {
-        memory: vec![memory_leg_fixture(rss, 2.0)],
+        memory: vec![ControlLeg(memory_leg_fixture(rss, 2.0))],
         warm: vec![warm_leg_fixture(15.0, 131_072, block_bytes_max)],
     };
     let red = || PlantVerdict::Red("planted".into());
@@ -241,17 +242,35 @@ fn publication_sets_exactly_the_checked_rows() {
     let pinned = Ok(PinnedRss { rss_bytes: 80 << 20 });
     let mut m = Measurements::new();
     publish_rows(&mut m, Tier::Binding, &outcome_fixture(pinned, 4096));
-    assert_eq!(m.values.get(Row::IdleRss.key()), Some(&80.0));
-    assert_eq!(m.values.get(Row::DataDir.key()), Some(&128.0));
-    assert_eq!(m.values.get(Row::WarmBoot.key()), Some(&15.0));
-    assert_eq!(m.values.get(Row::IdleCpu.key()), Some(&2.0));
+    assert_eq!(m.measured(Row::IdleRss.key()), Some(80.0));
+    assert_eq!(m.measured(Row::DataDir.key()), Some(128.0));
+    assert_eq!(m.measured(Row::WarmBoot.key()), Some(15.0));
+    assert_eq!(m.measured(Row::IdleCpu.key()), Some(2.0));
+    assert!(m.values.is_empty(), "the rows never publish through a plain set");
+}
 
-    let mut outcome = outcome_fixture(pinned, 4096);
-    outcome.plants.dir = PlantVerdict::Green("walk blind".into());
-    let mut m = Measurements::new();
-    publish_rows(&mut m, Tier::Dev, &outcome);
-    assert_eq!(m.values.get(Row::DataDir.key()), None, "a green plant keeps the row unset");
-    assert_eq!(m.values.len(), 3);
+/// Each row is judged by its own plant: one green plant keeps exactly its
+/// row unset, whichever row it is, and a plain `set` of that row's key
+/// publishes nothing.
+#[test]
+fn a_green_plant_unsets_its_own_row_only() {
+    let pinned = Ok(PinnedRss { rss_bytes: 80 << 20 });
+    for green in Row::ALL {
+        let mut outcome = outcome_fixture(pinned, 4096);
+        let verdict = PlantVerdict::Green("blind".into());
+        match green {
+            Row::IdleRss => outcome.plants.rss = verdict,
+            Row::DataDir => outcome.plants.dir = verdict,
+            Row::WarmBoot => outcome.plants.boot = verdict,
+            Row::IdleCpu => outcome.plants.cpu = verdict,
+        }
+        let mut m = Measurements::new();
+        m.set(green.key(), 0.0);
+        publish_rows(&mut m, Tier::Dev, &outcome);
+        for row in Row::ALL {
+            assert_eq!(m.measured(row.key()).is_some(), row != green, "{green:?} green, {row:?}");
+        }
+    }
 }
 
 #[test]
@@ -259,20 +278,20 @@ fn unproven_preconditions_withhold_their_rows() {
     let unproven = Err(PinUnproven { pinned_bytes: 1, floor_bytes: 2 });
     let mut m = Measurements::new();
     publish_rows(&mut m, Tier::Dev, &outcome_fixture(unproven, 65_536));
-    assert_eq!(m.values.get(Row::IdleRss.key()), None, "an unproven pin withholds RSS");
-    assert_eq!(m.values.get(Row::DataDir.key()), None, "a 64 KiB block withholds the dir row");
-    assert_eq!(m.values.get(Row::WarmBoot.key()), Some(&15.0));
+    assert_eq!(m.measured(Row::IdleRss.key()), None, "an unproven pin withholds RSS");
+    assert_eq!(m.measured(Row::DataDir.key()), None, "a 64 KiB block withholds the dir row");
+    assert_eq!(m.measured(Row::WarmBoot.key()), Some(15.0));
     assert_eq!(m.notes.iter().filter(|note| note.contains("withheld")).count(), 2);
 
     let mut binding = Measurements::new();
     publish_rows(&mut binding, Tier::Binding, &outcome_fixture(unproven, 4096));
-    assert_eq!(binding.values.get(Row::IdleRss.key()), None);
+    assert_eq!(binding.measured(Row::IdleRss.key()), None);
     assert!(!binding.notes.iter().any(|note| note.contains("withheld")), "binding: a failure");
 
     let mut outcome = outcome_fixture(Ok(PinnedRss { rss_bytes: 1 }), 4096);
     outcome.durable = Durable::Ran { io: Err(IoPropertiesDiffer("reprobed".into())) };
     let input = row_input(Row::WarmBoot, &outcome.a, &outcome.a_prime, &outcome.durable);
-    assert!(matches!(input, RowInput::Withheld { precondition: true, .. }));
+    assert!(matches!(input, RowInput::Withheld(Withholding::PreconditionUnproven(_))));
 }
 
 // ---- the walk -----------------------------------------------------------

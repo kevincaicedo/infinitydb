@@ -31,7 +31,7 @@ fn gate_verdicts(gates: &[gates::Gate], m: &Measurements, reference_box: bool) -
     };
     println!("\n== gate verdicts ==");
     for gate in gates {
-        let measured = m.values.get(gate.source.as_str()).filter(|v| v.is_finite());
+        let measured = m.measured(gate.source.as_str()).filter(|v| v.is_finite());
         let (value, verdict) = match measured {
             None if gate.informational => ("—".into(), "UNMEASURED (informational)".into()),
             None => {
@@ -39,7 +39,7 @@ fn gate_verdicts(gates: &[gates::Gate], m: &Measurements, reference_box: bool) -
                 ("—".into(), "UNMEASURED STOP — INCOMPLETE".into())
             }
             Some(value) => {
-                let pass = gate.passes(*value);
+                let pass = gate.passes(value);
                 let tag = if pass { "PASS" } else { "FAIL" };
                 let verdict = if gate.informational {
                     format!("{tag} (informational)")

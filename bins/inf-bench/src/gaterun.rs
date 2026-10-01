@@ -24,7 +24,7 @@ pub(crate) mod proc;
 mod saturation;
 pub(crate) mod serving;
 
-pub(crate) use proc::{CLOCK_TICKS_PER_S, ProcReadError, ProcSample, read_proc};
+pub(crate) use proc::{CLOCK_TICKS_PER_S, PeakRssSampler, ProcReadError, ProcSample, read_proc};
 
 pub(crate) struct ServerGuard {
     child: Child,
@@ -62,10 +62,12 @@ impl ServerGuard {
         read_proc(self.child.id(), None)
     }
 
-    /// `SIGTERM`, then exit 0 within [`GRACEFUL_STOP_DEADLINE_S`]: the
-    /// stop drained and wrote its stop checkpoint (ADR-0124 D2/D3), so the
-    /// data directory is warm. Any other end is a [`StopError`].
-    pub(crate) fn stop_graceful(mut self) -> Result<CleanStop, StopError> {
+    /// `SIGTERM`, then exit 0 within `deadline`: the stop drained and
+    /// wrote its stop checkpoint (ADR-0124 D2/D3), so the data directory is
+    /// warm. Any other end is a [`StopError`], and the guard's drop kills
+    /// and reaps the child. `deadline` is [`GRACEFUL_STOP_DEADLINE_S`]
+    /// outside tests.
+    pub(crate) fn stop_graceful(mut self, deadline: Duration) -> Result<CleanStop, StopError> {
         let pid = self.child.id().to_string();
         let signal = Command::new("kill")
             .args(["-TERM", &pid])
@@ -74,7 +76,7 @@ impl ServerGuard {
         if !signal.success() {
             return Err(StopError::Signal(format!("kill -TERM {pid}: {signal}")));
         }
-        let give_up = Instant::now() + Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
+        let give_up = Instant::now() + deadline;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) if status.success() => return Ok(CleanStop(())),
@@ -83,7 +85,7 @@ impl ServerGuard {
                 Err(e) => return Err(StopError::Signal(format!("wait {pid}: {e}"))),
             }
             if Instant::now() >= give_up {
-                return Err(StopError::Deadline);
+                return Err(StopError::Deadline(deadline));
             }
             std::thread::sleep(Duration::from_millis(GRACEFUL_STOP_POLL_MS));
         }
@@ -111,8 +113,8 @@ pub(crate) enum StopError {
     Signal(String),
     /// The server exited, but not 0 (a drain timeout exits 1).
     Exit(std::process::ExitStatus),
-    /// The server outlived [`GRACEFUL_STOP_DEADLINE_S`].
-    Deadline,
+    /// The server outlived the stop deadline.
+    Deadline(Duration),
 }
 
 impl std::fmt::Display for StopError {
@@ -120,8 +122,8 @@ impl std::fmt::Display for StopError {
         match self {
             StopError::Signal(why) => write!(f, "stop signal failed: {why}"),
             StopError::Exit(status) => write!(f, "stopped with {status}, not exit 0"),
-            StopError::Deadline => {
-                write!(f, "still running {GRACEFUL_STOP_DEADLINE_S} s after SIGTERM")
+            StopError::Deadline(deadline) => {
+                write!(f, "still running {} ms after SIGTERM", deadline.as_millis())
             }
         }
     }
@@ -391,6 +393,15 @@ pub(crate) fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+/// Where a gate source's value lives.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SourceValue {
+    /// A proof table owns the source: its published value, or unset.
+    Proven(Option<f64>),
+    /// No table owns it: [`Measurements::set`] holds it.
+    Plain,
+}
+
 /// One workload row's write-amplification obligation (M4-S16). Opened by
 /// the row, filled after it; a row that reaches
 /// [`finish_report`] unfilled is an invalid row and fails the run.
@@ -401,6 +412,10 @@ struct RowWriteAmp {
 
 pub(crate) struct Measurements {
     pub(crate) values: BTreeMap<&'static str, f64>,
+    /// The empty-node rows' values. Its one writer consumes a row's proof,
+    /// and [`measured`](Self::measured) reads those rows' sources only
+    /// from here.
+    pub(crate) empty_node: crate::m1rows::EmptyNodeValues,
     pub(crate) notes: Vec<String>,
     pub(crate) raw: String,
     rows: Vec<RowWriteAmp>,
@@ -413,6 +428,7 @@ impl Measurements {
     pub(crate) fn new() -> Measurements {
         Measurements {
             values: BTreeMap::new(),
+            empty_node: crate::m1rows::EmptyNodeValues::default(),
             notes: Vec::new(),
             raw: String::new(),
             rows: Vec::new(),
@@ -452,6 +468,16 @@ impl Measurements {
 
     pub(crate) fn set(&mut self, key: &'static str, value: f64) {
         self.values.insert(key, value);
+    }
+
+    /// A gate source's measured value. A source a proof table owns reads
+    /// only from that table, so a plain [`set`](Self::set) of its key, from
+    /// any module, is never a measurement.
+    pub(crate) fn measured(&self, source: &str) -> Option<f64> {
+        match self.empty_node.lookup(source) {
+            SourceValue::Proven(value) => value,
+            SourceValue::Plain => self.values.get(source).copied(),
+        }
     }
 
     pub(crate) fn note(&mut self, text: impl Into<String>) {
@@ -1002,8 +1028,10 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         };
         let fill_report = run_load(&fill)?;
         println!("  infinityd fill: {:.0} sets/s", fill_report.ops_per_sec);
-        let our_rss =
-            ours.proc_sample().map_err(|e| format!("infinityd RSS after the fill: {e}"))?.rss_bytes;
+        let our_rss = ours
+            .proc_sample()
+            .map_err(|e| format!("infinityd RSS after the fill: {e}"))?
+            .rss_bytes();
         let infos = scrape_cells(ours.port, cells)?;
         let domains = sum_field(&infos, "records_resident_bytes")
             + sum_field(&infos, "index_bytes")
@@ -1032,7 +1060,7 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                 match redis.proc_sample() {
                     Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
                     Ok(sample) => {
-                        let redis_rss = sample.rss_bytes;
+                        let redis_rss = sample.rss_bytes();
                         let ratio = our_rss as f64 / redis_rss as f64;
                         println!(
                             "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"
@@ -1126,17 +1154,38 @@ mod tests {
         // loop sleeps briefly and the trap lands within one pass.
         let traps = |code: u8| format!("trap 'exit {code}' TERM; while :; do sleep 0.01; done");
         let settle = || std::thread::sleep(Duration::from_millis(100));
+        let deadline = Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
         let clean = guard(&traps(0));
         settle();
-        assert!(clean.stop_graceful().is_ok(), "exit 0 after SIGTERM");
+        assert!(clean.stop_graceful(deadline).is_ok(), "exit 0 after SIGTERM");
         let failing = guard(&traps(1));
         settle();
-        let result = failing.stop_graceful();
+        let result = failing.stop_graceful(deadline);
         assert!(matches!(result, Err(StopError::Exit(s)) if s.code() == Some(1)), "{result:?}");
         let killed = guard("while :; do sleep 0.01; done");
         settle();
-        let result = killed.stop_graceful();
+        let result = killed.stop_graceful(deadline);
         assert!(matches!(result, Err(StopError::Exit(s)) if s.code().is_none()), "{result:?}");
+    }
+
+    /// A server still running at the stop deadline is a `StopError`, never
+    /// a clean stop, and the guard's drop kills and reaps it: the caller
+    /// discards its directory and no warm boot reuses it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_stop_past_its_deadline_is_refused_and_the_child_reaped() {
+        let script = "trap '' TERM; while :; do sleep 0.01; done";
+        let child = Command::new("sh").args(["-c", script]).spawn().expect("spawn sh");
+        let pid = child.id();
+        let deaf = ServerGuard { child, port: 0 };
+        // The trap must be installed before the signal lands.
+        std::thread::sleep(Duration::from_millis(100));
+        let deadline = Duration::from_millis(100);
+        let asked = Instant::now();
+        let result = deaf.stop_graceful(deadline);
+        assert!(matches!(result, Err(StopError::Deadline(d)) if d == deadline), "{result:?}");
+        assert!(asked.elapsed() >= deadline, "gave up before the deadline");
+        assert_eq!(read_proc(pid, None), Err(ProcReadError::Missing), "killed and reaped");
     }
 
     /// A pid that names no process is not a measurement of zero.
