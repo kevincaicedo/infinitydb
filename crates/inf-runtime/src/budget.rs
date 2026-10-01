@@ -1346,6 +1346,31 @@ mod tests {
         assert_eq!(held(&b, IoClass::Checkpoint).0, grant - 4096);
     }
 
+    /// The debtor's charge row (ADR-0170 D2): a charge to a class that
+    /// already owes adds to its debt, and the refill repays the whole of
+    /// it before the class holds a byte. A tier round that overran its cap
+    /// and then staged past its offer reaches this row, as does a
+    /// checkpoint header charged while the class still owes a block.
+    #[test]
+    fn a_charge_to_a_debtor_adds_to_its_debt() {
+        let mut b = budget();
+        let cap = b.cap(IoClass::TierFlush);
+        let (above, excess) = (3 * MIB, MIB / 2);
+        // From boot the class is rested at its cap and the pool is empty,
+        // so the overrun owes everything above the cap.
+        assert_eq!(b.offer(IoClass::TierFlush, cap.bytes + above, 1), Issue::Now);
+        assert_eq!(b.meters[IoClass::TierFlush.index()].credit[BYTES], Credit::owing(above));
+        b.charge(IoClass::TierFlush, excess, 0);
+        let owed = b.meters[IoClass::TierFlush.index()].credit[BYTES];
+        assert_eq!(owed, Credit::owing(above + excess), "added to the debt, never forgiven");
+        assert_eq!(b.counters(IoClass::TierFlush).spent_bytes, cap.bytes + above + excess);
+        // The tier share is 40 MiB/s: 87.5 ms grants exactly the 3.5 MiB
+        // owed, so the class ends at zero — a forgiven charge would leave
+        // it holding the half megabyte.
+        b.refill(Nanos(87_500_000));
+        assert_eq!(b.meters[IoClass::TierFlush.index()].credit[BYTES], Credit::Held(0));
+    }
+
     /// The checkpoint keep-up floor: under foreground saturation the
     /// checkpoint class still receives `foreground bytes / α` per refill
     /// (and the ops to issue it), so it completes within α intervals.
