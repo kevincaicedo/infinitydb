@@ -97,6 +97,25 @@ fn another_topology_withholds_every_row_without_a_spawn() {
     assert!(m.notes.iter().any(|note| note.contains("withheld: --cells 8")), "{:?}", m.notes);
 }
 
+/// The bills and the pin floor are written for infinityd's defaults, which
+/// this crate cannot import (they are the binary's own). The control legs
+/// pass none of these flags, so a default that moves must fail here before
+/// a floor computed for the old value "proves" fewer cells or a plant's
+/// rise is judged against the wrong baseline.
+#[test]
+fn the_harness_copies_are_infinityds_defaults() {
+    let server = include_str!("../../../../infinityd/src/main.rs");
+    let shipped = |line: String| {
+        assert!(server.contains(&line), "infinityd no longer ships `{line}`: re-derive the bills");
+    };
+    shipped(format!("buffers: {RECEIVE_BUFFERS_DEFAULT},"));
+    shipped(format!("buf_size: {RECEIVE_BUFFER_BYTES},"));
+    shipped(format!("if args.cells.get() > 1 {{ {DEFAULT_PARK_US} }}"));
+    // The stop deadline is the server's drain default plus 5 s.
+    shipped("shutdown_timeout_ms: 10_000,".into());
+    assert_eq!(GRACEFUL_STOP_DEADLINE_S, 10 + 5);
+}
+
 #[test]
 fn the_pin_floor_proves_every_cell() {
     let floor = pin_proven_floor(4, RECEIVE_BUFFERS_DEFAULT).expect("fits");
