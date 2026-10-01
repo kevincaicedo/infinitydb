@@ -241,8 +241,8 @@ fn parse_args() -> Result<Args, String> {
             "--cells" => {
                 let cells: u16 = take("--cells")?.parse().map_err(|e| format!("--cells: {e}"))?;
                 // ADR-0159 A1.1: `CellCount`'s constructor is the bound's one
-                // check. Past SLOT_COUNT the fabric mesh (cells² rings) was
-                // once built first and ate the box (2026-09-02).
+                // check, taken here so a count past SLOT_COUNT is refused
+                // before the fabric mesh (cells² rings) allocates anything.
                 args.cells =
                     inf_foundation::CellCount::new(cells).map_err(|e| format!("--cells {e}"))?;
             }
