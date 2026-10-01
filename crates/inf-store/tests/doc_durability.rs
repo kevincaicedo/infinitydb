@@ -620,6 +620,30 @@ fn replay_of_a_member_append_inside_a_replaced_member_is_typed() {
     assert_eq!(after, pre, "a refused replay changes nothing");
 }
 
+/// An `ARRAPPEND` delta whose operand is the empty array is no record a
+/// writer produced (it wraps at least one value): replay refuses it at the
+/// decoder and changes nothing. It used to apply a zero-width insert and
+/// bump the version.
+#[test]
+fn replay_refuses_a_delta_whose_array_operand_is_empty() {
+    let pre = JsonParser::new().parse(br#"{"a":[1,2]}"#).expect("fixture");
+    let empty = fragment_of("[]");
+    let op = ApplyOp::ArrAppend { elements: &empty };
+    let post_len = u32::try_from(pre.len()).expect("a small document");
+    let mut ks = keyspace_holding(&pre);
+    let wire = delta_wire(&compile(b"$.a").expect("path"), &op, post_len);
+    let (decoded, _) = inf_log::decode_record(&wire).expect("the record codec carries it");
+    let before = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
+    let verdict = ks.apply_record(&decoded, NOW, ANCHOR);
+    let refused = matches!(
+        verdict,
+        Err(ReplayError::InvalidDelta(inf_doc::DeltaDecodeError::EmptyArrayOperand))
+    );
+    assert!(refused, "{verdict:?}");
+    let after = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
+    assert!(after == before, "a refused replay changes nothing");
+}
+
 /// The header-less canonical fragment of `json`.
 fn fragment_of(json: &str) -> Vec<u8> {
     JsonParser::new().parse(json.as_bytes()).expect("fixture")[HEADER_LEN..].to_vec()

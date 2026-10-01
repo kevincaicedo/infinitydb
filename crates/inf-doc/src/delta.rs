@@ -75,6 +75,10 @@ pub enum DeltaDecodeError {
     BadVarint,
     BadUtf8,
     WrongOperandKind,
+    /// An `ArrAppend`/`ArrInsert` operand with no element. The writer wraps
+    /// at least one value (ADR-0042 D2), and the plan splices what the
+    /// operand holds, so an empty one is no record a writer produced.
+    EmptyArrayOperand,
     BadFragment(DocError),
 }
 
@@ -89,6 +93,9 @@ impl fmt::Display for DeltaDecodeError {
             DeltaDecodeError::BadVarint => write!(f, "non-canonical document delta varint"),
             DeltaDecodeError::BadUtf8 => write!(f, "document delta member key is not UTF-8"),
             DeltaDecodeError::WrongOperandKind => write!(f, "wrong document delta operand kind"),
+            DeltaDecodeError::EmptyArrayOperand => {
+                write!(f, "document delta array operand holds no element")
+            }
             DeltaDecodeError::BadFragment(error) => {
                 write!(f, "invalid canonical document delta fragment: {error}")
             }
@@ -235,8 +242,11 @@ fn number(bytes: &[u8]) -> Result<Number, DeltaDecodeError> {
     }
 }
 
+/// The one array operand `ArrAppend` and `ArrInsert` carry: a canonical
+/// array of at least one element, what `array_operand` writes.
 fn require_array(bytes: &[u8]) -> Result<(), DeltaDecodeError> {
     match canonical_fragment(bytes).map_err(DeltaDecodeError::BadFragment)? {
+        ValueRef::Arr(elements) if elements.is_empty() => Err(DeltaDecodeError::EmptyArrayOperand),
         ValueRef::Arr(_) => Ok(()),
         ValueRef::Null
         | ValueRef::Bool(_)
@@ -316,5 +326,22 @@ mod tests {
         assert_eq!(decode_apply_op(3, b"x").unwrap_err(), DeltaDecodeError::TrailingBytes);
         assert_eq!(decode_apply_op(9, &[1]).unwrap_err(), DeltaDecodeError::WrongOperandKind);
         assert_eq!(decode_apply_op(99, &[]).unwrap_err(), DeltaDecodeError::UnknownOpcode(99));
+    }
+
+    /// The array operand's reader bound is its writer's: at least one
+    /// element. `[]` (`TAG_ARR`, length 0) is a canonical fragment, so only
+    /// this check keeps a zero-element splice out of the plan.
+    #[test]
+    fn an_empty_array_operand_is_refused() {
+        let empty = [0xA8, 0, 0, 0];
+        assert!(canonical_fragment(&empty).is_ok(), "the fixture is a canonical empty array");
+        let append = DeltaOpcode::ArrAppend as u8;
+        let refused = DeltaDecodeError::EmptyArrayOperand;
+        assert_eq!(decode_apply_op(append, &empty).unwrap_err(), refused);
+        let mut insert = Vec::new();
+        encode_apply_op(&ApplyOp::ArrInsert { index: 0, elements: &empty }, &mut insert);
+        assert_eq!(decode_apply_op(DeltaOpcode::ArrInsert as u8, &insert).unwrap_err(), refused);
+        let one = [0xA8, 1, 0, 0, 0x07];
+        assert!(decode_apply_op(append, &one).is_ok(), "one element decodes");
     }
 }
