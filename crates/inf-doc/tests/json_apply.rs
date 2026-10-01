@@ -994,13 +994,50 @@ fn assert_replays(result: &Result<ApplyOutcome, ApplyError>, what: &str) {
 }
 
 /// The five ops that compose a site's depth with an operand's nesting.
+/// Merge has a row for each RFC 7386 arm: onto a scalar the merged value
+/// is the patch; into an object it is the patch and the surviving target,
+/// with the patch's bottom member landing as each object/object-frame
+/// transition that keeps a patch container writes it.
 #[derive(Copy, Clone, Debug)]
 enum Deepening {
     SetReplace,
     SetMember,
     Merge,
+    MergeIntoObject(PatchMember),
     ArrAppend,
     ArrInsert,
+}
+
+impl Deepening {
+    const ALL: [Deepening; 7] = [
+        Deepening::SetReplace,
+        Deepening::SetMember,
+        Deepening::Merge,
+        Deepening::MergeIntoObject(PatchMember::New),
+        Deepening::MergeIntoObject(PatchMember::OverScalar),
+        Deepening::ArrAppend,
+        Deepening::ArrInsert,
+    ];
+}
+
+/// Where an object-target Merge's bottom patch member lands against the
+/// target's `{"b":1}`: a key the target lacks (the frame's patch phase
+/// writes it beside `"b"`) or the target's scalar `"b"` (its target phase
+/// writes the patch value over it). Recursion along the shared object
+/// chain above is the frame's third container-keeping transition.
+#[derive(Copy, Clone, Debug)]
+enum PatchMember {
+    New,
+    OverScalar,
+}
+
+impl PatchMember {
+    fn key(self) -> &'static str {
+        match self {
+            PatchMember::New => "x",
+            PatchMember::OverScalar => "b",
+        }
+    }
 }
 
 /// Where a row's sites sit. ADR-0169 D3 counts only kept edits and the
@@ -1060,22 +1097,30 @@ struct CliffRow {
 impl CliffRow {
     fn new(kind: Deepening, layout: Layout, composed: usize) -> CliffRow {
         let below = composed - layout.deepest_enclosing();
-        let (site, operand) = match kind {
+        let (site, operand): (String, Vec<u8>) = match kind {
             // The fragment replaces the site: its own nesting.
-            Deepening::SetReplace => ("0", fragment_of(&nested_arrays(below, "0"))),
+            Deepening::SetReplace => ("0".into(), fragment_of(&nested_arrays(below, "0"))),
             // The member lands inside the site: one more.
-            Deepening::SetMember => ("{}", fragment_of(&nested_arrays(below - 1, "0"))),
+            Deepening::SetMember => ("{}".into(), fragment_of(&nested_arrays(below - 1, "0"))),
             // An object patch merged into a scalar keeps every container.
-            Deepening::Merge => ("0", fragment_of(&nested_objects(below, "0"))),
+            Deepening::Merge => ("0".into(), fragment_of(&nested_objects(below, "0"))),
+            // The patch follows the target's object chain through the merge
+            // frames and writes `{}` at its member, beside or over `"b"`:
+            // the output nests exactly the patch, one deeper than the target.
+            Deepening::MergeIntoObject(member) => {
+                let bottom = format!(r#"{{"{}":{{}}}}"#, member.key());
+                let patch = fragment_of(&nested_objects(below - 2, &bottom));
+                (nested_objects(below - 2, r#"{"b":1}"#), patch)
+            }
             // Elements land inside the site: one more.
             Deepening::ArrAppend | Deepening::ArrInsert => {
                 let element = fragment_of(&nested_arrays(below - 1, "0"));
                 let operand =
                     inf_doc::array_operand(&[&element]).expect("a 127-level element wraps");
-                ("[]", operand)
+                ("[]".into(), operand)
             }
         };
-        let (doc, path) = layout.doc(site);
+        let (doc, path) = layout.doc(&site);
         CliffRow { kind, doc, path, operand }
     }
 
@@ -1083,7 +1128,9 @@ impl CliffRow {
         match self.kind {
             Deepening::SetReplace => ApplyOp::SetReplace { fragment: &self.operand },
             Deepening::SetMember => ApplyOp::SetMember { key: b"x", fragment: &self.operand },
-            Deepening::Merge => ApplyOp::Merge { patch: &self.operand },
+            Deepening::Merge | Deepening::MergeIntoObject(_) => {
+                ApplyOp::Merge { patch: &self.operand }
+            }
             Deepening::ArrAppend => ApplyOp::ArrAppend { elements: &self.operand },
             Deepening::ArrInsert => ApplyOp::ArrInsert { index: 0, elements: &self.operand },
         }
@@ -1091,7 +1138,8 @@ impl CliffRow {
 }
 
 /// One cliff row: accepted with every site kept at composed depth 127 and
-/// 128, refused at 129, and never a document the replay validator refuses.
+/// 128, with an output that nests exactly that deep; refused at 129; and
+/// never a document the replay validator refuses.
 fn assert_cliff_row(kind: Deepening, layout: Layout, composed: usize) {
     let row = CliffRow::new(kind, layout, composed);
     let result = run(&row.doc, row.path, &row.op());
@@ -1099,31 +1147,35 @@ fn assert_cliff_row(kind: Deepening, layout: Layout, composed: usize) {
     assert_replays(&result, &what);
     if composed <= DEPTH_MAX {
         let outcome = result.expect(&what);
-        assert!(outcome.document.is_some(), "{what}: an edit applied");
+        let nesting = outcome.document.as_ref().map(|document| output_nesting(document));
+        assert_eq!(nesting, Some(composed), "{what}: an edit applied, nesting the composed depth");
         assert_eq!(outcome.applied, layout.sites(), "{what}: every site applied");
     } else {
         assert_eq!(result.err(), Some(ApplyError::DepthExceeded), "{what}: refused");
     }
 }
 
+/// Containers on the output's deepest path, counted by the test's own
+/// recursion over the decoded tree.
+fn output_nesting(document: &CanonicalDoc<'_>) -> usize {
+    let doc = TapeDoc::from_bytes(document.as_bytes()).expect("apply output validates");
+    model_nesting(&model::from_tape(&doc))
+}
+
 /// ADR-0169 Falsifier 1: the five deepening ops accept at composed depth
 /// 127 and 128 and refuse 129, measured at the deepest kept site whether it
-/// comes first or last; the other eight never refuse at a container site
-/// enclosed by `DEPTH_MAX − 1` containers or a scalar site enclosed by
-/// `DEPTH_MAX`. Every document `apply` returns passes the replay validator
-/// — the pre-fix engine returned a 129-level one.
+/// comes first or last, and Merge onto a scalar and into an object, its
+/// bottom patch member new or over the target's scalar member;
+/// the other eight never refuse at a container site enclosed by
+/// `DEPTH_MAX − 1` containers or a scalar site enclosed by `DEPTH_MAX`.
+/// Every document `apply` returns passes the replay validator — the
+/// pre-fix engine returned a 129-level one — and nests exactly the
+/// composed depth the check computed (D3: the check is exact).
 #[test]
 fn apply_output_replays_at_the_depth_cliff() {
-    let kinds = [
-        Deepening::SetReplace,
-        Deepening::SetMember,
-        Deepening::Merge,
-        Deepening::ArrAppend,
-        Deepening::ArrInsert,
-    ];
     for composed in [DEPTH_MAX - 1, DEPTH_MAX, DEPTH_MAX + 1] {
         for layout in Layout::ALL {
-            for kind in kinds {
+            for kind in Deepening::ALL {
                 assert_cliff_row(kind, layout, composed);
             }
         }
@@ -1235,6 +1287,9 @@ enum Violation {
     ReplayDiffers,
     /// The engine's bytes differ from the model's output.
     ModelDiffers,
+    /// No edit where the model's output differs from the pre-image: a
+    /// writer that drops what the op writes (canary d).
+    MissedEdit,
     /// A document the independent model nests past `DEPTH_MAX`.
     AcceptedPastBound { model_depth: usize },
     /// A depth refusal the independent model nests within `DEPTH_MAX`
@@ -1270,13 +1325,19 @@ fn observe(case: &AgreementCase) -> Observed {
 /// ADR-0169 Falsifier 2's checker. A returned document must pass the
 /// replay validator, its operand must decode, and re-executing the decoded
 /// operand under replay's recorded bound must reproduce it; a depth
-/// refusal must coincide with the model's output nesting past `DEPTH_MAX`.
+/// refusal must coincide with the model's output nesting past `DEPTH_MAX`;
+/// no edit must coincide with a model output equal to the pre-image.
 fn judge(case: &AgreementCase, observed: Observed) -> Result<Judgement, Violation> {
     let mut model_out = case.doc.clone();
     model_apply_at(&mut model_out, &case.steps, &case.op);
     let model_depth = model_nesting(&model_out);
     let bytes = match observed {
-        Observed::NoEdit => return Ok(Judgement::NoEdit),
+        Observed::NoEdit => {
+            return match model_out == case.doc {
+                true => Ok(Judgement::NoEdit),
+                false => Err(Violation::MissedEdit),
+            };
+        }
         Observed::Refused(ApplyError::DepthExceeded) => {
             return match model_depth > DEPTH_MAX {
                 true => Ok(Judgement::Refused { model_depth }),
@@ -1373,10 +1434,74 @@ fn arb_deep_site(site_max: usize) -> impl Strategy<Value = Vec<bool>> {
     prop_oneof![3 => Just(site_max), 1 => (site_max - 4)..=site_max].prop_flat_map(arb_kinds)
 }
 
-fn arb_op_for(opcode: DeltaOpcode) -> BoxedStrategy<AgreementCase> {
+/// An object patch merged into a scalar target: the merged value is the
+/// patch with its nulls stripped, every container kept.
+fn arb_merge_onto_scalar() -> BoxedStrategy<AgreementCase> {
+    arb_deepening(0, DEPTH_MAX, |site, value| {
+        let patch = match value {
+            Value::Arr(items) => Value::Obj(vec![("p".into(), Value::Arr(items))]),
+            other => other,
+        };
+        let frag = fragment(&patch);
+        case_at(&site, Value::I64(1), OwnedOp::Merge(patch, frag))
+    })
+    .prop_filter("an object patch keeps the target's nesting", |case| {
+        let OwnedOp::Merge(patch, _) = &case.op else { return true };
+        case.site_enclosing + model_nesting(patch) <= DEPTH_MAX + 2
+    })
+    .boxed()
+}
+
+/// An object patch merged into an object target, RFC 7386's arm where the
+/// merged value is not the patch (ADR-0169 D3's exact Merge bound). The
+/// site holds `shared` object levels around `{"b":1}`; the patch follows
+/// them through the merge frames and writes `V` at `member`, beside the
+/// surviving `"b"` or over it, so the output nests exactly the patch. `V`
+/// nests the rest: a scalar, or a chain ending in `{}`, weighted to the
+/// shallow tails where the deepest container is the member a merge frame
+/// writes.
+fn arb_merge_into_object(member: PatchMember) -> BoxedStrategy<AgreementCase> {
+    arb_composed()
+        .prop_flat_map(|composed| {
+            // The patch nests `composed − enclosing`, a parsed operand, so at
+            // most `DEPTH_MAX`; the target is a container under the site.
+            let low = composed.saturating_sub(DEPTH_MAX);
+            (Just(composed), low..=(composed - 1).min(DEPTH_MAX - 1))
+        })
+        .prop_flat_map(|(composed, enclosing)| {
+            // `shared + nesting(V)`; the pre-image nests `composed − nesting(V)`.
+            let below = composed - enclosing - 1;
+            let tail_min = composed.saturating_sub(DEPTH_MAX);
+            let tail = prop_oneof![
+                2 => tail_min..=below.min(tail_min + 1),
+                1 => tail_min..=below,
+            ];
+            (Just(below), arb_kinds(enclosing), tail)
+        })
+        .prop_flat_map(|(below, site, tail)| (Just(below - tail), Just(site), arb_kinds(tail)))
+        .prop_map(move |(shared, site, tail)| {
+            let value = match tail.split_last() {
+                Some((_, outer)) => wrap(outer, Value::Obj(Vec::new())),
+                None => Value::I64(7),
+            };
+            let chain = vec![true; shared];
+            let target = wrap(&chain, Value::Obj(vec![("b".into(), Value::I64(1))]));
+            let patch = wrap(&chain, Value::Obj(vec![(member.key().into(), value)]));
+            let frag = fragment(&patch);
+            case_at(&site, target, OwnedOp::Merge(patch, frag))
+        })
+        .boxed()
+}
+
+/// Each opcode's generator arms. Merge has three: onto a scalar target,
+/// and into an object target with the bottom patch member new or over the
+/// target's scalar member — with the shared chain's recursion, every
+/// transition of the object/object frame that keeps a patch container.
+/// Every other opcode has one. Each arm is judged for engagement on its own.
+fn arb_op_for(opcode: DeltaOpcode) -> Vec<BoxedStrategy<AgreementCase>> {
     let number = Value::I64(5);
     let array = Value::Arr(vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
-    match opcode {
+    let arm = match opcode {
         DeltaOpcode::SetReplace => arb_deepening(0, DEPTH_MAX, |site, value| {
             let frag = fragment(&value);
             case_at(&site, Value::I64(1), OwnedOp::SetReplace(value, frag))
@@ -1386,19 +1511,13 @@ fn arb_op_for(opcode: DeltaOpcode) -> BoxedStrategy<AgreementCase> {
             let op = OwnedOp::SetMember("m".into(), value, frag);
             case_at(&site, Value::Obj(vec![("b".into(), Value::I64(1))]), op)
         }),
-        DeltaOpcode::Merge => arb_deepening(0, DEPTH_MAX, |site, value| {
-            let patch = match value {
-                Value::Arr(items) => Value::Obj(vec![("p".into(), Value::Arr(items))]),
-                other => other,
-            };
-            let frag = fragment(&patch);
-            case_at(&site, Value::I64(1), OwnedOp::Merge(patch, frag))
-        })
-        .prop_filter("an object patch keeps the target's nesting", |case| {
-            let OwnedOp::Merge(patch, _) = &case.op else { return true };
-            case.site_enclosing + model_nesting(patch) <= DEPTH_MAX + 2
-        })
-        .boxed(),
+        DeltaOpcode::Merge => {
+            return vec![
+                arb_merge_onto_scalar(),
+                arb_merge_into_object(PatchMember::New),
+                arb_merge_into_object(PatchMember::OverScalar),
+            ];
+        }
         DeltaOpcode::ArrAppend => arb_deepening(1, DEPTH_MAX - 1, |site, value| {
             let values = vec![Value::I64(0), value];
             let operand = arr_operand(&values);
@@ -1442,10 +1561,11 @@ fn arb_op_for(opcode: DeltaOpcode) -> BoxedStrategy<AgreementCase> {
                 case_at(&site, array.clone(), OwnedOp::ArrTrim(start, stop))
             })
             .boxed(),
-    }
+    };
+    vec![arm]
 }
 
-/// What one opcode's run reached (ADR-0169 Falsifier 2's engagement).
+/// What one generator arm's run reached (ADR-0169 Falsifier 2's engagement).
 #[derive(Default, Debug)]
 struct Reach {
     checked: bool,
@@ -1478,36 +1598,37 @@ impl Reach {
     }
 }
 
-const AGREEMENT_CASES_PER_OPCODE: u32 = 64;
+const AGREEMENT_CASES_PER_ARM: u32 = 64;
 
 /// ADR-0169 Falsifier 2 over every opcode the delta codec knows: the
 /// writer never returns a document or an operand a reader refuses, replay
 /// reproduces its bytes, and a depth refusal happens exactly when the
-/// independent model nests past `DEPTH_MAX`. An opcode that never reached
-/// its cliff (checked) or its deepest site (unchecked) is VACUOUS — red.
+/// independent model nests past `DEPTH_MAX`. A generator arm that never
+/// reached its cliff (checked) or its deepest site (unchecked) is
+/// VACUOUS — red.
 #[test]
 fn writer_reader_agreement_over_the_opcode_table() {
     use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
-    let config = Config {
-        cases: AGREEMENT_CASES_PER_OPCODE,
-        failure_persistence: None,
-        ..Config::default()
-    };
+    let config =
+        Config { cases: AGREEMENT_CASES_PER_ARM, failure_persistence: None, ..Config::default() };
     for &opcode in DeltaOpcode::ALL {
-        let reach = std::cell::RefCell::new(Reach::default());
-        let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
-        let mut runner = TestRunner::new_with_rng(config.clone(), rng);
-        let verdict = runner.run(&arb_op_for(opcode), |case| {
-            let judgement = judge(&case, observe(&case))
-                .map_err(|violation| TestCaseError::fail(format!("{violation:?}")))?;
-            reach.borrow_mut().note(&case, judgement);
-            Ok(())
-        });
-        if let Err(failure) = verdict {
-            panic!("{opcode:?}: {failure}");
+        for (arm, strategy) in arb_op_for(opcode).iter().enumerate() {
+            let reach = std::cell::RefCell::new(Reach::default());
+            let rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+            let mut runner = TestRunner::new_with_rng(config.clone(), rng);
+            let verdict = runner.run(strategy, |case| {
+                let judgement = judge(&case, observe(&case))
+                    .map_err(|violation| TestCaseError::fail(format!("{violation:?}")))?;
+                reach.borrow_mut().note(&case, judgement);
+                Ok(())
+            });
+            if let Err(failure) = verdict {
+                panic!("{opcode:?} arm {arm}: {failure}");
+            }
+            let reach = reach.into_inner();
+            let what = format!("{opcode:?} arm {arm}");
+            assert!(reach.engaged(), "VACUOUS: {what} never reached its cliff: {reach:?}");
         }
-        let reach = reach.into_inner();
-        assert!(reach.engaged(), "VACUOUS: {opcode:?} never reached its cliff: {reach:?}");
     }
 }
 
@@ -1557,5 +1678,12 @@ fn agreement_checker_goes_red_on_planted_outputs() {
     assert_eq!(
         judge(&case, Observed::Refused(ApplyError::DepthExceeded)),
         Err(Violation::RefusedWithinBound { model_depth: DEPTH_MAX })
+    );
+    // (d) No edit where the model appends: a writer that drops what it writes.
+    let values = vec![Value::I64(2)];
+    let operand = arr_operand(&values);
+    assert_eq!(
+        judge(&shallow(OwnedOp::ArrAppend(values, operand)), Observed::NoEdit),
+        Err(Violation::MissedEdit)
     );
 }
