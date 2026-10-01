@@ -889,6 +889,9 @@ impl<F: SegmentFs> DurableCell<F> {
         }
         // ADR-0170 D2: one refill per MAINTAIN entry, injected clock.
         self.budget.refill(cx.now);
+        // ADR-0170 D5: a pending checkpoint block ages on that clock even
+        // in a slice that makes no offer.
+        self.ckpt.block_wait.observed(cx.now);
         self.write_through_wanted = write_through_wanted;
         match self.rotor.maintain_deferred(cx.now.as_millis()) {
             Ok((_report, Some(barrier))) => {

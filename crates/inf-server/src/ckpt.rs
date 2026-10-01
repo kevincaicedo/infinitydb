@@ -148,7 +148,8 @@ pub struct CkptStats {
     pub records_since_begin: u64,
     /// ADR-0170 D5: the longest injected-time wait of one checkpoint
     /// block on the device budget, first offer to `Now`, this cell's
-    /// life — the pending block's age at its last offer included.
+    /// life — the pending block's age at this cell's last MAINTAIN entry
+    /// included, whether or not that slice offered it.
     pub block_wait_ns_max: u64,
 }
 
@@ -159,7 +160,7 @@ pub struct CkptStats {
 pub(crate) struct BlockWait {
     /// The pending block's first offer; `None` while no block waits.
     offered_at: Option<Nanos>,
-    /// The pending block's age at its last offer.
+    /// The pending block's age at the last offer or observation.
     age_ns: u64,
     /// The longest ended wait.
     max_ns: u64,
@@ -168,8 +169,17 @@ pub(crate) struct BlockWait {
 impl BlockWait {
     /// A block is offered at `now`; its first offer starts the wait.
     pub(crate) fn offered(&mut self, now: Nanos) {
-        let first = *self.offered_at.get_or_insert(now);
-        self.age_ns = now.saturating_sub(first).0;
+        self.offered_at.get_or_insert(now);
+        self.observed(now);
+    }
+
+    /// The cell's clock reached `now`: a pending block has waited that
+    /// long, offered this slice or not. A slice the scheduler withholds
+    /// from the checkpoint makes no offer, and the block still waits.
+    pub(crate) fn observed(&mut self, now: Nanos) {
+        if let Some(first) = self.offered_at {
+            self.age_ns = now.saturating_sub(first).0;
+        }
     }
 
     /// The pending block issued, or its checkpoint aborted: the wait ends.
@@ -1127,6 +1137,27 @@ mod tests {
     fn cell(fs: &SimDisk) -> CkptCell<SimDisk> {
         let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
         CkptCell::new(fs.clone(), dirs.ckpt, 0, CkptConfig::default()).expect("cell")
+    }
+
+    /// ADR-0170 D5: a pending block's wait is its age on the cell's clock,
+    /// not at its last offer — a slice that makes no offer still ages it —
+    /// and the longest ended wait survives the next block.
+    #[test]
+    fn a_pending_block_ages_without_an_offer() {
+        let second = 1_000_000_000;
+        let mut wait = BlockWait::default();
+        wait.observed(Nanos(second));
+        assert_eq!(wait.max_ns(), 0, "no block waits");
+        wait.offered(Nanos(2 * second));
+        assert_eq!(wait.max_ns(), 0, "the first offer starts the wait");
+        wait.observed(Nanos(7 * second));
+        assert_eq!(wait.max_ns(), 5 * second, "aged by a slice that offered nothing");
+        wait.offered(Nanos(8 * second));
+        wait.ended();
+        assert_eq!(wait.max_ns(), 6 * second, "the ended wait is kept");
+        wait.offered(Nanos(9 * second));
+        wait.observed(Nanos(10 * second));
+        assert_eq!(wait.max_ns(), 6 * second, "a shorter pending wait does not lower it");
     }
 
     /// The boot probe decides the staging mode once (ADR-0088 D3 as
