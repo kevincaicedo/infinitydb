@@ -80,8 +80,8 @@ pub static DECLARED: &[Declared] = &[
         Status::Partial,
         "M0",
         "the reply's identity fields (server, version, id) are InfinityDB's own, so no \
-         handshake case byte-compares (F-L19-10: its one compared case was the subscriber-mode \
-         refusal); the protocol switch is proven by the RESP3-keyed cases that follow it",
+         handshake case byte-compares (its one compared case is the subscriber-mode refusal, \
+         an error path); the protocol switch is proven by the RESP3-keyed cases that follow it",
     ),
     d(
         "QUIT",
@@ -130,8 +130,7 @@ pub static DECLARED: &[Declared] = &[
         "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
              Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
              Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded \
-             by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built \
-             (F-L13-04)",
+             by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built",
     ),
     d("STRLEN", Status::Full, "M0", ""),
     d(
@@ -153,7 +152,7 @@ pub static DECLARED: &[Declared] = &[
              family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares \
              against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's \
              publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the \
-             worst wheel debt across every store, F-L05-03); `# Persistence`/`# Tiering`/`# \
+             worst wheel debt across every store); `# Persistence`/`# Tiering`/`# \
              Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); \
              an unknown section name selects nothing (empty body, Redis shape); client-smoke CI \
              is the open M1-S14 AC",
@@ -188,7 +187,7 @@ pub static DECLARED: &[Declared] = &[
         "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 \
              (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the \
              namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty \
-             patch is a length read on every path, as in Redis (F-L13-04)",
+             patch is a length read on every path, as in Redis",
     ),
     d(
         "GETEX",
@@ -242,8 +241,8 @@ pub static DECLARED: &[Declared] = &[
         Status::Full,
         "M1",
         "cursor values are engine-internal; the corpus compares the key set a full cursor \
-         walk enumerates (F-L19-10), the store-tier proptest covers every-resident-key-≥-once \
-         under concurrent mutation",
+         walk enumerates (ADR-0129 D3), the store-tier proptest covers \
+         every-resident-key-≥-once under concurrent mutation",
     ),
     d("FLUSHDB", Status::Full, "M1", ""),
     d(
@@ -582,7 +581,7 @@ pub struct CommandRow {
     pub compared_cases: usize,
     /// Compared cases whose reply is neither an error nor a null — the
     /// cases that exercise the command's guarantee rather than its
-    /// argument validation (review 2026-08-30, F-L19-10). JSON cases
+    /// argument validation (ADR-0129 D3). JSON cases
     /// count as compared and as evidence unclassified (S22 audited every
     /// `JSON.*` row by hand under both protocols).
     pub evidence_cases: usize,
@@ -672,8 +671,8 @@ pub fn rows() -> Vec<CommandRow> {
                 "{} is declared full but has no byte-compared corpus case",
                 meta.name
             );
-            // F-L19-10: one error-path case made a command `full` (`SCAN`
-            // was full on two argument errors, `RANDOMKEY` on a nil).
+            // A `full` claim needs a case that exercises the guarantee: an
+            // error or a null proves only validation (ADR-0129 D3).
             if evidence_cases == 0 {
                 no_evidence.push(format!("{} ({compared_cases} compared)", meta.name));
             }
@@ -765,9 +764,9 @@ pub fn render() -> String {
     ));
     push("Every covered behavior is byte-diffed under its declared protocol; any new or");
     push("stale deviation fails CI (L8 — honesty is total).");
-    push("Candidates: the in-process executor **and**, since 2026-09-01 (review");
-    push("F-L19-09), a spawned **4-cell durable `infinityd`** behind TCP — the core");
-    push("corpus runs against both, plus a namespace-bound fan-out/tier lane");
+    push("Candidates: the in-process executor **and**, since 2026-09-01, a spawned");
+    push("**4-cell durable `infinityd`** behind TCP — the core corpus runs against");
+    push("both, plus a namespace-bound fan-out/tier lane");
     push("(`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned");
     push("byte-exact there, never silently excused.");
     push("");
@@ -791,10 +790,10 @@ pub fn render() -> String {
     push("inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric");
     push("program primitives — unknown to clients and hidden from COMMAND (ADR-0115).");
     push("`Cases` = compared corpus executions; `Evidence` = those answering neither an");
-    push("error nor a null — a `full` row needs at least one (review 2026-08-30,");
-    push("F-L19-10: an error-path case alone no longer makes a command `full`). `KEYS`");
-    push("compares as a set, `SCAN` as the set a full cursor walk enumerates, `RANDOMKEY`");
-    push("as membership in the oracle's live keys.");
+    push("error nor a null — a `full` row needs at least one, so an error-path case alone");
+    push("never makes a command `full` (ADR-0129 D3). `KEYS` compares as a set, `SCAN` as");
+    push("the set a full cursor walk enumerates, `RANDOMKEY` as membership in the oracle's");
+    push("live keys.");
     push("");
     push("## Commands");
     push("");

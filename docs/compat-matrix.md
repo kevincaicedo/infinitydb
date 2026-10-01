@@ -9,9 +9,9 @@ Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 **redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a** with ReJSON/20809.
 Every covered behavior is byte-diffed under its declared protocol; any new or
 stale deviation fails CI (L8 — honesty is total).
-Candidates: the in-process executor **and**, since 2026-09-01 (review
-F-L19-09), a spawned **4-cell durable `infinityd`** behind TCP — the core
-corpus runs against both, plus a namespace-bound fan-out/tier lane
+Candidates: the in-process executor **and**, since 2026-09-01, a spawned
+**4-cell durable `infinityd`** behind TCP — the core corpus runs against
+both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
@@ -24,10 +24,10 @@ are representational: ordering, identity payloads, opaque cursors/art);
 inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric
 program primitives — unknown to clients and hidden from COMMAND (ADR-0115).
 `Cases` = compared corpus executions; `Evidence` = those answering neither an
-error nor a null — a `full` row needs at least one (review 2026-08-30,
-F-L19-10: an error-path case alone no longer makes a command `full`). `KEYS`
-compares as a set, `SCAN` as the set a full cursor walk enumerates, `RANDOMKEY`
-as membership in the oracle's live keys.
+error nor a null — a `full` row needs at least one, so an error-path case alone
+never makes a command `full` (ADR-0129 D3). `KEYS` compares as a set, `SCAN` as
+the set a full cursor walk enumerates, `RANDOMKEY` as membership in the oracle's
+live keys.
 
 ## Commands
 
@@ -35,7 +35,7 @@ as membership in the oracle's live keys.
 |---|---|---|---|---|---|---|---|
 | `PING` | full | M0 | fast | -1 | 7 | 6 |  |
 | `ECHO` | full | M0 | fast | 2 | 3 | 1 |  |
-| `HELLO` | partial | M0 | fast | -1 | 1 | 0 | the reply's identity fields (server, version, id) are InfinityDB's own, so no handshake case byte-compares (F-L19-10: its one compared case was the subscriber-mode refusal); the protocol switch is proven by the RESP3-keyed cases that follow it |
+| `HELLO` | partial | M0 | fast | -1 | 1 | 0 | the reply's identity fields (server, version, id) are InfinityDB's own, so no handshake case byte-compares (its one compared case is the subscriber-mode refusal, an error path); the protocol switch is proven by the RESP3-keyed cases that follow it |
 | `QUIT` | partial | M1 | fast | 1 | 0 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
 | `GET` | full | M0 | readonly fast | 2 | 30 | 22 |  |
 | `SET` | full | M0 | write denyoom | -3 | 105 | 66 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
@@ -51,20 +51,20 @@ as membership in the oracle's live keys.
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 | 1 |  |
 | `INCRBY` | full | M0 | write denyoom fast | 3 | 3 | 2 |  |
 | `DECRBY` | full | M0 | write denyoom fast | 3 | 2 | 1 |  |
-| `APPEND` | full | M0 | write denyoom fast | 3 | 4 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built (F-L13-04) |
+| `APPEND` | full | M0 | write denyoom fast | 3 | 4 | 3 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built |
 | `STRLEN` | full | M0 | readonly fast | 2 | 5 | 3 |  |
 | `EXPIRE` | full | M0 | write fast | -3 | 21 | 15 | TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PEXPIRE` | full | M0 | write fast | -3 | 4 | 3 | same u40 clamp |
 | `TTL` | full | M0 | readonly fast | 2 | 23 | 22 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 | 3 |  |
-| `INFO` | partial | M0 | admin | -1 | 1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store, F-L05-03); `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
+| `INFO` | partial | M0 | admin | -1 | 1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store); `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | 2 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 | 4 |  |
 | `MSET` | full | M1 | write denyoom | -3 | 3 | 1 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
 | `MSETNX` | partial | M1 | write denyoom | -3 | 3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
 | `GETRANGE` | full | M1 | readonly | 4 | 8 | 7 |  |
-| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | 3 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis (F-L13-04) |
+| `SETRANGE` | full | M1 | write denyoom | 4 | 4 | 3 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis |
 | `GETEX` | full | M1 | write fast | -2 | 25 | 8 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | 4 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
 | `SUBSTR` | full | M1 | readonly | 4 | 1 | 1 |  |
@@ -76,7 +76,7 @@ as membership in the oracle's live keys.
 | `DBSIZE` | full | M1 | readonly fast | 1 | 5 | 5 |  |
 | `KEYS` | full | M1 | readonly | 2 | 5 | 5 | result ordering is engine-defined; the corpus compares the set |
 | `RANDOMKEY` | full | M1 | readonly | 1 | 2 | 1 | two-level random (cell, then key); the corpus compares the draw against the oracle's live keys |
-| `SCAN` | full | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (F-L19-10), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation |
+| `SCAN` | full | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (ADR-0129 D3), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation |
 | `FLUSHDB` | full | M1 | write | -1 | 4 | 3 |  |
 | `FLUSHALL` | partial | M1 | write | -1 | 2 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | 6 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |
