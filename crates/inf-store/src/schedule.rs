@@ -100,9 +100,14 @@ struct Pass {
     began_ms: u64,
     begin_slot: usize,
     slots_left: usize,
-    /// `owed` when the pass began (under `inf_canary_sweep_owed_by_own_refusals`,
-    /// the sweep's own refusal count instead).
+    /// What the pass compares at its end to go idle: `owed` when it began
+    /// (under `inf_canary_sweep_owed_by_own_refusals`, the sweep's own
+    /// refusal count instead).
+    stamp: u64,
+    /// `owed` and `own_refusals` when the pass began: their advances tell
+    /// the pass's own refusals from every other owed event.
     owed: u64,
+    own_refusals: u64,
     rebuilds: u64,
 }
 
@@ -120,15 +125,16 @@ pub(crate) struct ExpirySchedule {
     /// The next index slot the sweep walks. A new pass begins here, never
     /// at slot 0, so no slot range starves under voided passes.
     sweep_cursor: usize,
-    /// When the last clean or dirty pass since the sweep left idle began
-    /// (a voided pass completes nothing).
+    /// When the last pass that vouches for every record began, since the
+    /// sweep left idle: one no rebuild voided and no owed event but its
+    /// own refusals dirtied (the drain predicate reads it).
     completed_began_ms: Option<u64>,
     /// Events that owe the sweep a pass: every `Refused` placement (a
     /// write, a `Moved`, the sweep's own) and every `Over`. u64 cannot
     /// wrap: at most one per operation, 584 years at one per nanosecond.
     owed: u64,
-    /// The sweep's own refusals — read only by the canary that stamps a
-    /// pass with them alone (I11's canary).
+    /// The sweep's own refusals: a pass they alone dirtied still visited
+    /// every record, and the canary of I11 stamps a pass with them alone.
     own_refusals: u64,
     /// Records with a deadline (`INFO keyspace` `expires=`), exact (I8).
     ttl_live: u64,
@@ -347,7 +353,9 @@ impl ExpirySchedule {
                     began_ms: now_ms,
                     begin_slot,
                     slots_left: capacity,
-                    owed: self.pass_stamp(),
+                    stamp: self.pass_stamp(),
+                    owed: self.owed,
+                    own_refusals: self.own_refusals,
                     rebuilds,
                 });
                 capacity
@@ -387,17 +395,23 @@ impl ExpirySchedule {
         );
         let end = if pass.rebuilds != rebuilds {
             PassEnd::Voided
-        } else if pass.owed != stamp {
+        } else if pass.stamp != stamp {
             PassEnd::Dirty
         } else {
             PassEnd::Clean
         };
-        // A clean or dirty pass visited every record present between
-        // rebuilds; a voided one proves nothing (a rebuild moved records
-        // across the cursor), so it completes no pass the drain reads.
+        // What the drain reads: a pass vouches for every record present at
+        // its end when no rebuild moved records across its cursor and every
+        // owed event since it began was a refusal of its own. Any other
+        // one, a write refused meanwhile or an `Over`, may have left a
+        // record behind the cursor, unvisited.
+        let owed_since = self.owed - pass.owed;
+        let own_since = self.own_refusals - pass.own_refusals;
         match end {
-            PassEnd::Clean | PassEnd::Dirty => self.completed_began_ms = Some(pass.began_ms),
-            PassEnd::Voided => {}
+            PassEnd::Clean | PassEnd::Dirty if owed_since == own_since => {
+                self.completed_began_ms = Some(pass.began_ms);
+            }
+            PassEnd::Clean | PassEnd::Dirty | PassEnd::Voided => {}
         }
         self.phase = if end == PassEnd::Clean { SweepPhase::Idle } else { SweepPhase::Owed };
         end

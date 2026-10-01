@@ -938,6 +938,46 @@ fn a_write_refused_behind_the_sweep_cursor_is_reaped() {
     assert_eq!(store.len(), 16, "{} expired writes outlived the drain", store.len() - 16);
 }
 
+/// O3's drain against a pass that was already under way: an expired write
+/// refused behind its cursor at the drain's own instant was not visited,
+/// so that pass must not settle the drain, though it began at that
+/// instant. Only a pass that saw no refusal but its own vouches for every
+/// record present when it ends. Same setup as the test above, with the
+/// late writes already expired and the drain frozen at their instant.
+#[test]
+fn a_pass_dirtied_by_a_refused_write_does_not_settle_the_drain() {
+    let cfg = StoreConfig { initial_keys: 1_024, ..small_cap(16) };
+    let mut store = CellStore::new(cfg);
+    let now = ms(2);
+    for i in 0..16 {
+        set_with_ttl(&mut store, format!("far:{i}").as_bytes(), 1_000_000, ms(0));
+    }
+    for i in 0..32 {
+        set_with_ttl(&mut store, format!("wave:{i}").as_bytes(), 1, ms(0));
+    }
+    let capacity = store.index_capacity();
+    let slice = ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX, max_sweep_slots: 16 };
+    let (begin, cursor) = (0..capacity)
+        .find_map(|_| {
+            store.expire_tick(now, slice);
+            let (begin, cursor) = store.sweep_pass_slots()?;
+            let walked = cursor.wrapping_sub(begin) % capacity;
+            (walked >= capacity / 2).then_some((begin, cursor))
+        })
+        .expect("a sweep pass is under way and reaches mid-table");
+    let walked = cursor.wrapping_sub(begin) % capacity;
+    let mut behind = 0;
+    for i in 0..64 {
+        let key = format!("late:{i}");
+        set_with_ttl(&mut store, key.as_bytes(), 1, now);
+        let slot = store.key_index_slot(key.as_bytes()).expect("slotted");
+        behind += u32::from(slot.wrapping_sub(begin) % capacity < walked);
+    }
+    assert!(behind > 0, "engagement: no expired write landed behind the cursor");
+    drain_settled(&mut store, now);
+    assert_eq!(store.len(), 16, "{} expired writes outlived the drain", store.len() - 16);
+}
+
 /// Rule 6 and O3's drain: an index rebuild moves records across the sweep
 /// cursor, so a pass it voided vouches for nothing — it must not settle a
 /// drain frozen at the instant it began. Setup: one record swept (the node

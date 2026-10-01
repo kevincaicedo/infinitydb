@@ -398,17 +398,18 @@ pub enum SweepState {
     #[default]
     Idle,
     /// A pass is owed: under way since `pass_began_ms`, or (`None`) begins
-    /// at the next slice. `completed_pass_began_ms` is when the last clean
-    /// or dirty pass since the sweep left `Idle` began; a pass an index
-    /// rebuild voided completes nothing.
+    /// at the next slice. `completed_pass_began_ms` is when the last pass
+    /// that vouches for every record began, since the sweep left `Idle`:
+    /// one no index rebuild voided and no owed event but its own refusals
+    /// dirtied. A write refused while a pass walks may sit behind its
+    /// cursor, so that pass completes nothing here.
     Walking { pass_began_ms: Option<u64>, completed_pass_began_ms: Option<u64> },
 }
 
 impl SweepState {
     /// The sweep owes nothing a drain frozen at `t_ms` must wait for:
-    /// idle, or its last completed pass began at or after `t_ms` (a pass
-    /// that began then and saw no rebuild visited every record present at
-    /// `t_ms`).
+    /// idle, or its last vouching pass began at or after `t_ms` (it
+    /// visited every record present when it ended).
     #[must_use]
     pub fn settled_since(self, t_ms: u64) -> bool {
         match self {
