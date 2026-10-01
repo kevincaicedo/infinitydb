@@ -761,6 +761,44 @@ fn one_key_keeps_one_wheel_node_under_every_ttl_rewrite() {
     }
 }
 
+/// The state table's last row: `FLUSH*` resets the schedule with the record
+/// table. A store flushed with every kind of schedule state live — nodes
+/// at the cap, a tombstone, refused records and a sweep pass under way —
+/// holds no node, no tombstone, no census and an idle sweep, and keys
+/// written after it expire actively with no fire finding a hash that has
+/// no member (`wheel_stale`).
+#[test]
+fn flush_resets_the_schedule_with_the_table() {
+    let cfg = StoreConfig { initial_keys: 1_024, ..small_cap(16) };
+    let mut store = CellStore::new(cfg);
+    for i in 0..48 {
+        set_with_ttl(&mut store, format!("old:{i}").as_bytes(), 1_000 + i, ms(0));
+    }
+    // The first key filed is its list's tail: clearing it leaves a tombstone.
+    persist(&mut store, b"old:0", ms(0));
+    let slice = ExpiryBudget { max_fires: u32::MAX, max_steps: u32::MAX, max_sweep_slots: 16 };
+    store.expire_tick(ms(1), slice);
+    let before = store.expiry_audit();
+    assert!(before.armed > 0 && before.tombstones > 0, "engagement: {before:?}");
+    assert_eq!(before.ttl_live, 47, "engagement: the census holds every deadline");
+    assert!(store.sweep_pass_slots().is_some(), "engagement: a sweep pass is under way");
+
+    store.flush(ms(5));
+    let after = store.expiry_audit();
+    assert_eq!(store.len(), 0);
+    assert_eq!((after.armed, after.tombstones, after.ttl_live, after.orphans), (0, 0, 0, 0));
+    assert!(after.sweep_idle, "nothing is owed once no record remains");
+
+    for i in 0..8 {
+        set_with_ttl(&mut store, format!("new:{i}").as_bytes(), 10 + i, ms(5));
+    }
+    let stale = store.stats().wheel_stale;
+    drain_settled(&mut store, ms(2_000));
+    assert_eq!(store.len(), 0, "keys written after the flush expire without a read");
+    assert_eq!(store.stats().wheel_stale, stale, "a node outlived the flush and fired");
+    assert_eq!(store.expiry_audit().ttl_live, 0);
+}
+
 /// Rule 3's crossing at the node budget: a refused placement is swept,
 /// never left to lazy expiry. `wheel_nodes_max` 64 with 0, 1, cap − 1,
 /// cap, cap + 1 and 200 keys, drained with `expire_tick` alone (no read).
