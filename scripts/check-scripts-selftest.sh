@@ -1723,10 +1723,11 @@ pd_parent red-ledger fail
 pd_parent no-doc-links missing check-public-doc-links.sh
 pd_parent noexec-doc-links noexec check-public-doc-links.sh
 pd_parent red-doc-links fail check-public-doc-links.sh
-expect green "parent-doc-gates: a parent with all four gates runs the ledger lint" \
-    pd_ran "$PARENT" full check-claim-ledger.sh
-expect green "parent-doc-gates: a parent with all four gates runs the public-docs gate" \
-    pd_ran "$PARENT" full check-public-doc-links.sh
+PD_GATES=(check-adr-links.sh check-drr.sh check-claim-ledger.sh check-public-doc-links.sh)
+for pd_gate in "${PD_GATES[@]}"; do
+    expect green "parent-doc-gates: a parent with all four gates runs $pd_gate" \
+        pd_ran "$PARENT" full "$pd_gate"
+done
 expect_output "parent-doc-gates: the adr-links and drr gates ran first" \
     "stub check-drr.sh ran" env INF_CHECK_ROOT="$work/parent-no-ledger/eng" "$PARENT"
 expect red "parent-doc-gates: only the claim-ledger lint missing is red" \
@@ -1752,9 +1753,11 @@ expect red "parent-doc-gates: only the public-docs gate not executable is red" \
     env INF_CHECK_ROOT="$work/parent-noexec-doc-links/eng" "$PARENT"
 expect red "parent-doc-gates: a red public-docs gate is red" \
     env INF_CHECK_ROOT="$work/parent-red-doc-links/eng" "$PARENT"
-# A runner whose gate list drops one gate is caught by the runs above.
-for pd_gate in check-claim-ledger.sh check-public-doc-links.sh; do
-    sed "s/^\(for gate in .*\) ${pd_gate//./\\.}\([ ;]\)/\1\2/" "$PARENT" >"$work/pd-drop-$pd_gate"
+# A runner whose gate list drops any one gate is caught by the runs above:
+# every name of the list has its plant, in whatever position it stands.
+for pd_gate in "${PD_GATES[@]}"; do
+    sed "s/^\(for gate in\)\(.*\) ${pd_gate//./\\.}\([ ;]\)/\1\2\3/" "$PARENT" \
+        >"$work/pd-drop-$pd_gate"
     chmod +x "$work/pd-drop-$pd_gate"
     expect red "parent-doc-gates: the runner plant dropped $pd_gate from the gate list" \
         cmp -s "$PARENT" "$work/pd-drop-$pd_gate"
