@@ -18,7 +18,7 @@ output directories.
 | Fuzz targets and minimized regression inputs | Owning crate's `fuzz/` source and regression corpus |
 | Benchmark instruments | `bins/inf-bench/`, `bins/inf-compare/`, crate `benches/` |
 | Reusable validation/campaign drivers | `scripts/` |
-| Commands, assumptions, decisions and result summaries | `docs/` and the owning ledger |
+| Commands, assumptions, decisions and result summaries | The pull request description; `docs/` when a decision changes what a document says |
 | Generated output | Ignored `.artifacts/`, `target/` or an explicit external directory |
 
 Do not replace a failing test with its transcript. Record a defect's trigger,
@@ -100,10 +100,11 @@ ADR-0022; these are reference details, not a live host-health assertion:
 | Placement | Server and load generator on disjoint physical cores; record affinity and sibling lists |
 | Repeats | 3–5 under the same declared workload, with result spread and A/B ordering |
 
-The NVMe is an explicit deviation from the plan's Gen4 profile. Keep that
-limitation beside device-bound results; do not silently relax a gate.
+The NVMe is an explicit deviation from the Gen4 profile the device-bound
+gates were specified against. Keep that limitation beside device-bound
+results; do not silently relax a gate.
 Inspect `lscpu`, `uname -a`, the filesystem/device, governor/EPP and thermal
-state for each run. Four-cell S37 campaigns use server CPUs 0,2,4,6 and
+state for each run. Four-cell reference campaigns use server CPUs 0,2,4,6 and
 generator CPUs 8,10,12,14 on this host; verify topology before reusing those
 numbers elsewhere. Measure device profiles on the target device, never copy
 a historical `io-properties.toml` as portable configuration.
@@ -129,6 +130,63 @@ The repository cleanup baseline is commit
 `2a86a3c` outside the removed output tree. It is a source baseline, not a new
 performance measurement. Historical commit IDs changed during the rewrite.
 
+### Differences of a few percent
+
+Two separately built binaries place the same code at different addresses,
+and that alone moves timings. On the reference host, a cross-binary
+Criterion comparison moved rows whose code had not changed by up to about
+6 % in either direction — for example the `scan/simd` row of
+`crates/inf-doc/benches/parse.rs` and `incr_plain` in
+`crates/inf-server/benches/json_cmd.rs`. A same-binary A/A control cannot
+see this, because both of its legs share one layout. A cross-binary timing
+A/B is therefore no evidence for or against a change smaller than that band.
+
+Before calling a small loss or gain:
+
+1. **Count instructions.** Drive the operation for a fixed number of
+   iterations `n` and for zero iterations, read exact user-space
+   instructions for each (`perf stat -e instructions:u`), and report
+   `(I(n) − I(0)) / n` per operation. Code placement does not move this
+   count. An equal count shows that the change executes no more
+   instructions. It does not show equal time: cache misses and branch
+   behavior can change with no new instruction, so a timing claim still
+   needs step 2.
+2. **Time both variants in one binary.** Compile the old and the new
+   implementation side by side into one benchmark binary and alternate their
+   order across legs on one pinned CPU. The shared binary removes differences
+   in the rest of the layout, and alternation cancels order effects and drift.
+   Each variant's own code still sits at its own addresses, so its placement
+   still differs; pair the timing with step 1's instruction count.
+
+Record which of these the conclusion rests on. A cross-binary timing result
+is context, not the verdict.
+
+### Rows that fail a spread budget on an unchanged binary
+
+Some rows fail a spread budget with no change in the code. Three causes have
+been seen on the reference host, each with a known instance:
+
+- **Two stable modes.** `numincrby_json` and `numincrby_json_forced_tree` in
+  `crates/inf-server/benches/json_cmd.rs` read about 117 and 108 ns in most
+  legs, and about 125 and 118 ns (6–10 % slower) in about one leg in four.
+  The same two values appeared in two separate campaigns.
+- **One outlier leg near the budget.** The ordered-map point probe at
+  fanout 32, hot set 1 000, early-exit search
+  (`crates/inf-store/benches/ordered.rs`): in one set of four legs, one read
+  112.0 ns against 109.4–109.9 ns for the other three. The row's spread was
+  2.3–2.4 % in three separate runs.
+- **Timer resolution.** `direct_call` in
+  `crates/inf-runtime/benches/executor.rs` is a 0.6 ns row, so a spread of a
+  few percent is at the resolution of the timer.
+
+Re-running such a row until it passes is not a measurement. Its repair is
+specified before the run that uses it: a discarded warm-up leg or more legs
+for an outlier, a declared rule for choosing a mode for a bimodal row, and an
+instruction count or more work per sample for a row at resolution. A
+comparison that depends on one of these rows states which repair it used.
+Until a repair is in place, an over-budget result on these rows alone leaves
+the comparison pending; it neither passes nor fails the change.
+
 ## Harness entry points
 
 | Question | Maintained instrument |
@@ -139,11 +197,11 @@ performance measurement. Historical commit IDs changed during the rewrite.
 | Write-amplification invariants | `cargo test -p inf-store --test tiered_write_amp` |
 | Loading admission and recovery completion | `cargo test -p inf-server --test node_e2e loading_` |
 
-The reference-box campaign harnesses are kept with the evidence records
-outside this repository: document wire and RSS shapes (`bench-m3-wire.sh`,
-`bench-m3-rss.sh`), the parser-free read profile, the
-[S37 protocol](validation-s37.md) runner, recovery brackets, the soaks and
-the historical model-equivalence proof. The claim ledger cites each run with
+Long-running reference-box campaigns — document wire and RSS shapes, the
+parser-free read profile, the device-barrier protocol, recovery brackets and
+the soaks — are driven by tools that are not part of this repository. A
+result from one of them reaches public copy only as described in
+[Recording a claim or gate result](#recording-a-claim-or-gate-result), with
 its revision, box and command.
 
 Harness source and `--help` define supported knobs and defaults. For example:
@@ -168,8 +226,3 @@ valid measurements, clean-tree reference runs, same-run tripwires and release
 revalidation. The availability of a harness alone proves no performance claim.
 For failed attempts retain a concise reason; do not accumulate log bundles.
 
-In the combined development checkout, the master plan, milestone plans,
-ADRs and claim/review ledgers live in the parent `docs/` and `reviews/`.
-ADR-0127 supersedes their older instructions to commit run output. Historical
-artifact paths are retired provenance labels. Revalidate an old result with
-the maintained harness before using it for a new release claim.
