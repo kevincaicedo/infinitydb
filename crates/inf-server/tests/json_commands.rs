@@ -42,6 +42,19 @@ impl Db {
         let owned: Vec<&[u8]> = argv.iter().map(|s| s.as_bytes()).collect();
         self.run(&owned)
     }
+
+    /// Runs `argv` into a send buffer that already holds `earlier`, an
+    /// earlier pipelined reply, and returns the command's own reply. The
+    /// earlier bytes must survive: a reply's account and its rollback start
+    /// at its own mark, never at the buffer's start.
+    fn run_behind(&mut self, earlier: &[u8], argv: &[&str]) -> Vec<u8> {
+        self.clock += 1;
+        let owned: Vec<&[u8]> = argv.iter().map(|s| s.as_bytes()).collect();
+        let mut out = earlier.to_vec();
+        execute_slices(&owned, &mut self.ks, &mut self.cx, Nanos(self.clock), &mut out);
+        assert!(out.starts_with(earlier), "{argv:?} changed an earlier pipelined reply");
+        out.split_off(earlier.len())
+    }
 }
 
 fn assert_reply(db: &mut Db, argv: &[&str], expected: &str) {
@@ -1736,6 +1749,20 @@ fn reply_fixtures() -> Vec<Fixture> {
             2,
             true,
         ),
+        // The last frame is a bulk with a two-digit length header.
+        dollar(
+            fx(
+                "JSON.OBJKEYS",
+                Plain,
+                Charged,
+                &[("k", r#"{"o":{"long_key_0":1}}"#)],
+                &["JSON.OBJKEYS", "k", "$.o"],
+                "*1\r\n*1\r\n$10\r\nlong_key_0\r\n",
+                "*1\r\n*1\r\n$10\r\nlong_key_0\r\n",
+            ),
+            2,
+            true,
+        ),
         dollar(
             fx(
                 "JSON.OBJKEYS",
@@ -1824,7 +1851,12 @@ fn state(db: &mut Db, f: &Fixture) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
-/// One leg on a fresh keyspace at `budget` reply bytes.
+/// The reply already in the send buffer when a leg's command runs.
+const PIPELINED: &[u8] = b"+PONG\r\n";
+
+/// One leg on a fresh keyspace at `budget` reply bytes, answered behind
+/// [`PIPELINED`]: a budget counted from the buffer's start, or a refusal
+/// that truncates to it, fails every arm of every row.
 fn leg(f: &Fixture, proto: Protocol, budget: usize) -> Leg {
     let mut db = db_with_reply_budget(budget);
     db.cx.proto = proto;
@@ -1833,7 +1865,7 @@ fn leg(f: &Fixture, proto: Protocol, budget: usize) -> Leg {
     }
     let before = state(&mut db, f);
     let in_place_before = db.ks.stats().json_scalar_patches_in_place;
-    let reply = db.run_str(f.argv);
+    let reply = db.run_behind(PIPELINED, f.argv);
     let in_place = db.ks.stats().json_scalar_patches_in_place - in_place_before;
     let after = state(&mut db, f);
     Leg { reply, before, after, in_place }
