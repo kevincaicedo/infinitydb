@@ -191,12 +191,16 @@ impl Arena {
 > **Extended at M4-S08 under the same discipline:** `BackendDriver`
 > gains `register_tier_pool(&mut self, pool: &mut AlignedPool)` (default
 > no-op — readiness/sim backends serve `TierRead` positionally either
-> way). On io_uring the aligned pool's buffers become the ring's
-> registered-buffer table (the M0 recv-pool registration was a
-> capability probe with no consumer, and io_uring has one table);
-> in-range `TierRead` ops upgrade to the fixed-buffer read opcode
-> transparently, and registration failure degrades
-> `Capabilities::fixed_buffers` instead of failing boot. The custody
+> way). On io_uring a call makes the aligned pool's buffers the ring's
+> registered-buffer table, replacing the boot-time recv-pool
+> registration (a capability probe with no consumer; io_uring has one
+> table); in-range `TierRead` ops then take the fixed-buffer read opcode,
+> and registration failure degrades `Capabilities::fixed_buffers` instead
+> of failing boot. No shipped path calls it: the server builds its
+> cold-read pool (`TierCell::create_ns`) unregistered, so every cold read
+> is a plain positional `Read`; one test and two benches register. ADR-0153
+> (below) replaces the method; until it is built, no cold read uses a
+> fixed buffer. The custody
 > vocabulary above it — `ColdReads` / `ColdDone` / `TierFileId` in
 > `inf_runtime::cold` — is the cold-read-path freeze content
 > (aligned-pool contract, `IoToken` usage, per-file pins, and the
@@ -211,7 +215,8 @@ impl Arena {
 > fan-out (last drop releases the lease). `on_completion` gains the
 > injected `now_us` and returns the delivered-waiter count. The driver
 > contract is untouched: a merged read is one ordinary `TierRead` whose
-> window fits one registered pool buffer (`ReadFixed` upgrade preserved).
+> window fits one pool buffer (the `ReadFixed` upgrade applies only to a
+> registered pool).
 > `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
 >

@@ -441,7 +441,7 @@
     <div class="arrow-list">
       <div><span class="a">&rarr;</span><span class="txt">Every command is a resumable state machine &mdash; the fast path completes synchronously and never pays for the capability.</span></div>
       <div><span class="a">&rarr;</span><span class="txt">Batch every boundary: syscalls, fsyncs, fabric hops, and cache misses are paid per batch, never per op &mdash; and the batching metrics are CI-gated tripwires, not dashboards.</span></div>
-      <div><span class="a">&rarr;</span><span class="txt">Expiry, eviction, checkpoints, and compaction run under deficit-weighted budgets &mdash; tail latency is protected by construction.</span></div>
+      <div><span class="a">&rarr;</span><span class="txt">Background work runs in bounded slices &mdash; expiry, eviction, and checkpoints sized by deficit-weighted budgets, tier flush and compaction by their own caps and a device budget. Parsing and inline command execution are not budgeted: an iteration parses every receive buffer handed to it and runs its local commands inline.</span></div>
       <div><span class="a">&rarr;</span><span class="txt">Deterministic by design: the whole node replays under simulation from a seed &mdash; every failure is reproducible.</span></div>
     </div>
   </div>

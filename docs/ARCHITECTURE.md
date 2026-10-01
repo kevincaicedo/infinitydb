@@ -442,9 +442,10 @@ uses multishot accept and multishot receive over a kernel-provided buffer
 group. On older 5.15-class kernels it runs a degraded mode with one-shot
 operations and the same observable behaviour. At most half of the cell's
 buffer pool is handed to the kernel for receives, so the send path can always
-get a buffer. Registered (fixed) buffers are used only for cold-tier disk
-reads; network I/O uses plain sends and receives. Accepted sockets get
-`TCP_NODELAY`.
+get a buffer. No operation uses registered (fixed) buffers: at boot the
+receive pool is registered once, only to probe the capability; network I/O
+uses plain sends and receives, and cold-tier reads are plain positional
+reads. Accepted sockets get `TCP_NODELAY`.
 
 **kqueue (macOS, development only).** A readiness-to-completion adapter so
 the whole stack builds and tests on a laptop. It is never used for
@@ -1091,8 +1092,9 @@ address as a candidate and the command suspends:
 
 1. The read joins a bounded per-class queue (foreground or maintenance).
 2. Once per iteration the queues drain into `O_DIRECT` reads from an aligned
-   buffer pool registered with io_uring, up to a per-cell queue-depth cap,
-   3 : 1 in favour of foreground, merging adjacent ranges of the same file.
+   buffer pool (plain positional reads; the pool is not registered with
+   io_uring), up to a per-cell queue-depth cap, 3 : 1 in favour of
+   foreground, merging adjacent ranges of the same file.
 3. When the read completes, the command resumes, compares the full key, and
    looks the key up again through the index, because anything may have
    changed while it waited. The fingerprint can match the wrong key with
@@ -1521,8 +1523,9 @@ order and grouping are in [roadmap.md](roadmap.md).
   `FLUSHALL` is refused. On a named namespace, `FLUSHDB` and `COPY` are
   refused, and so is a multi-key command whose keys live on more than one
   cell, except `JSON.MGET`.
-- **Bounds still open.** A hard cap on executor tasks, and incremental index
-  growth to replace stop-and-copy.
+- **Bounds still open.** A hard cap on executor tasks, a foreground budget
+  that bounds the commands one iteration parses and runs inline, and
+  incremental index growth to replace stop-and-copy.
 
 ## References
 

@@ -118,7 +118,8 @@ Docker's default seccomp profile blocks `io_uring`; the bundled one allows it
   eviction, flushing, compaction) is designed to run in budgeted slices and
   every queue to have a bound, so overload becomes backpressure or a clear
   error rather than a stall. The gaps still open (no hard cap on executor
-  tasks yet, a pause while the key index grows) are listed in the
+  tasks yet, no budget on parsing and inline command execution within a loop
+  iteration, a pause while the key index grows) are listed in the
   architecture document.
 - **Memory efficiency.** Compact records, per-cell memory attribution, JSON
   as a compact binary tape, per-namespace memory budgets, and tiering to
