@@ -69,12 +69,15 @@ impl ProcSample {
     }
 }
 
-/// The peak `VmRSS` of one process over a window, read by a sampler
-/// thread while a load runs. Every read raises the peak or counts a
-/// failure, and [`finish`](Self::finish) is the only way to the peak: one
-/// failed read fails it, and a window with no read at all is no peak, so a
-/// sampler that skipped a failure or never ran cannot under-read a `<=`
-/// row.
+/// The largest `VmRSS` a sampler thread read from one process while a
+/// load ran. Estimator: the maximum over the caller's polls, so its
+/// resolution is the poll interval (20–100 ms at the call sites) — a rise
+/// and fall inside one interval is not seen, and the last poll precedes
+/// the window's end by up to one interval. Every read raises the maximum
+/// or counts a failure, and [`finish`](Self::finish) is the only way to
+/// it: one failed read fails it, and a window with no read at all has
+/// none, so a skipped failure or a sampler that never ran cannot lower a
+/// `<=` row.
 #[derive(Debug)]
 pub(crate) struct PeakRssSampler {
     pid: u32,
