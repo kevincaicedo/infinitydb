@@ -1158,8 +1158,11 @@ subtree can be skipped in O(1). Each value has exactly one encoding and the
 validator rejects any other, so two equal documents are byte-identical,
 which lets replay and tests compare raw bytes. A document of up to 512 bytes
 is stored inside its record; a larger one lives in a per-cell document arena
-and the record points to it. Nesting depth is capped at 128, and a document
-at 16 MiB − 1 bytes.
+and the record points to it. Nesting depth is capped at 128 containers, and
+a document's body at 16,777,192 bytes: the 16 MiB − 1 record value less the
+document's value prefix and header, so every stored document fits one record
+and one full-image log record. A write whose result would cross either bound
+is refused before anything changes.
 
 **Parsing.** The JSON parser uses simdjson's approach: SIMD classification of
 64-byte blocks, then a streaming pass that writes the canonical tape directly,
@@ -1328,7 +1331,7 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Log space | the device | segment creation failing with `ENOSPC`: durable writes refused (`NOSPACE`), memory namespaces unaffected; a failed frame or zero-fill write (the usual case, since segments are sparse): the node stops |
 | Output buffer | `client-output-buffer-limit`: normal clients unlimited (as in Redis); subscribers 32 MiB hard, or 8 MiB for 60 s | client disconnected |
 | Cold-read queue | `COLD-READ-QD` (64) and overflow cap | `BUSY` |
-| Document depth / size / reply | 128 / 16 MiB − 1 / 128 MiB | typed error |
+| Document depth / body size / reply | 128 containers / 16,777,192 bytes / 128 MiB | typed error; nothing changes |
 
 Two things are unbounded by default:
 

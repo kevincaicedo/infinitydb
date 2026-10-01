@@ -429,7 +429,11 @@ enum MutationEffect<'a> {
   `inf-doc::apply` semantics and bumps once; `0 < distance < 2^23` is a
   counted stale skip; the other half-range is corruption. Replay uses the
   record's exact `match_count` and `post_len`, not current boot limits,
-  and fail-stops if the result count or canonical output length disagrees.
+  and fail-stops if the result count or canonical output length disagrees,
+  or if re-executing the delta crosses the format bounds every writer
+  enforces: nesting past 128 containers or a document past the record clamp
+  (ADR-0169 D6; a delta a pre-fix build wrote that way is corruption,
+  ADR-0042 A1).
   This is ADR-0043 D6, including recreation and version
   wrap.
 
