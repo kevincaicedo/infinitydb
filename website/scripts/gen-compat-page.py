@@ -3,16 +3,25 @@
 
 The compat page is NEVER hand-written (project law L8: compatibility is
 staged and honest). This script is the contract: it converts the repo's
-generated artifact `infinitydb/docs/compat-matrix.md` (itself rendered from
+generated artifact `docs/compat-matrix.md` (itself rendered from
 the inf-wire command registry + the oracle-diff corpus by
 `tests/compat/src/matrixgen.rs`, with a CI staleness gate) into
 `site/docs/compat.html`. The generated page is committed; CI regenerates it
 and fails if it drifted.
 
-Usage:
-    python3 scripts/gen-compat-page.py \
-        --matrix infinitydb/docs/compat-matrix.md \
-        --out site/docs/compat.html
+The page is first-read copy: the Markdown artifact is an engineering
+reference and cites decisions, stories and review findings by identifier
+(the engine's code comments cite them the same way), but those records are
+not published with the repository. `public_text` drops each citation, and
+each `§` section of an unpublished document, and folds a story or dot
+milestone into its milestone (`M4-S19` and `M4.5` read `M4`), so the page
+states the behavior and names only what a reader can open.
+`scripts/check-public-doc-links.sh` refuses the page if one survives.
+
+Usage (from the repository root):
+    python3 website/scripts/gen-compat-page.py \
+        --matrix docs/compat-matrix.md \
+        --out website/site/docs/compat.html
 
 stdlib only. No third-party dependencies.
 """
@@ -25,6 +34,7 @@ from datetime import date
 from pathlib import Path
 
 STATUS_ORDER = ["full", "partial", "stub", "extension", "internal"]
+COLUMNS = ["command", "status", "since", "flags", "arity", "cases", "evidence", "notes"]
 STATUS_CLASS = {
     "full": "st-full",
     "partial": "st-partial",
@@ -41,6 +51,52 @@ def md_inline(text: str) -> str:
     out = re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
     out = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", out)
     return out
+
+
+# A citation of a record the repository does not publish: a decision
+# (`ADR-0122 D3 + A1`, an amendment's item `ADR-0159 A1.2`, `ADR-0110 third
+# amendment`), a review finding, a review date, a section of an unpublished
+# document (`§3.4 R4`).
+_CITE = (
+    r"(?:ADR-\d{4}(?:\s+(?:[DA]\d+[a-z]?(?:\.\d+)?"
+    r"(?:\s*[+/,]\s*[DA]\d+[a-z]?(?:\.\d+)?)*"
+    r"|(?:first|second|third|fourth|fifth|sixth) amendment))?"
+    r"|F-L\d{2}-\d{2}|FCR-[A-Z0-9]+-\d+|review \d{4}-\d{2}-\d{2}"
+    r"|§\s?\d+(?:\.\d+)*[a-z]?(?:\s+R\d+)?)"
+)
+_CITES = _CITE + r"(?:\s*[,;+]\s*" + _CITE + r")*"
+_SEP = r"(?:\s+—\s+|\s*[;,:]\s*)"
+_PUBLIC_REWRITES = [
+    # A story or epic folds into its milestone; so does a dot milestone.
+    (re.compile(r"\bM(\d+)(?:\.\d+)?-[A-Z]{1,4}\d+[a-z]?\b"), r"M\1"),
+    (re.compile(r"\bM(\d+)\.\d+\b"), r"M\1"),
+    # A bare story reference before what it produced: "S21 corpus".
+    (re.compile(r"\bS\d{1,2}[a-z]?\s+(?=[A-Za-z(])"), ""),
+    # A parenthetical of citations only goes whole.
+    (re.compile(r"\s*\(\s*" + _CITES + r"\s*\)"), ""),
+    # A citation leading, trailing or inside a parenthetical goes with its
+    # separator.
+    (re.compile(r"\(\s*" + _CITES + _SEP), "("),
+    (re.compile(_SEP + _CITES + r"\s*\)"), ")"),
+    (re.compile(r"\s*[;,]\s*" + _CITES + r"(?=\s*[;,])"), ""),
+    # A citation in running text.
+    (re.compile(r"\s+(?:since|in|per|by)\s+" + _CITES + r"\b"), ""),
+    (re.compile(r"\bthe\s+" + _CITES + r"\s+"), "the "),
+    # A decision label the citation left behind: "the D8 `USE` refusal".
+    (re.compile(r"\bthe [DA]\d+ (?=\S)"), "the "),
+    (re.compile(r"\s*" + _CITES), ""),
+    (re.compile(r"\(\s*\)"), ""),
+    (re.compile(r"[ \t]{2,}"), " "),
+    (re.compile(r"\s+([;,)])"), r"\1"),
+]
+
+
+def public_text(text: str) -> str:
+    """The first-read form of an artifact sentence: no citation of an
+    unpublished record, stories folded into their milestone."""
+    for pattern, replacement in _PUBLIC_REWRITES:
+        text = pattern.sub(replacement, text)
+    return text.strip()
 
 
 def parse_matrix(md: str) -> dict:
@@ -70,20 +126,22 @@ def parse_matrix(md: str) -> dict:
         i += 1
     if i >= len(lines):
         sys.exit("error: command table not found in matrix artifact")
+    # Columns are read by their header, so a column the renderer adds
+    # (`Evidence`) moves no other; Notes is the last and keeps any `|`.
+    header = [c.strip().lower() for c in lines[i].strip().strip("|").split("|")]
+    missing = [c for c in COLUMNS if c not in header]
+    if missing or header[-1] != "notes":
+        sys.exit(f"error: command table header {header} lacks {missing} or does not end in Notes")
+    at = {name: header.index(name) for name in COLUMNS}
     i += 2  # skip header + separator
     while i < len(lines) and lines[i].startswith("|"):
         cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-        if len(cells) >= 7:
-            cmd = cells[0].strip("`").strip()
-            data["rows"].append({
-                "command": cmd,
-                "status": cells[1],
-                "since": cells[2],
-                "flags": cells[3],
-                "arity": cells[4],
-                "cases": cells[5],
-                "notes": cells[6],
-            })
+        if len(cells) < len(header):
+            sys.exit(f"error: command row has {len(cells)} cells, header has {len(header)}: {lines[i]}")
+        cells[len(header) - 1:] = ["|".join(cells[len(header) - 1:]).strip()]
+        row = {name: cells[at[name]] for name in COLUMNS}
+        row["command"] = row["command"].strip("`").strip()
+        data["rows"].append(row)
         i += 1
 
     # --- deviations ---
@@ -187,7 +245,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   <div class="callout">
     <span class="callout-tag"><strong>Generated page &mdash; do not edit.</strong></span>
-    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on {gen_date}. {preamble}
+    Rendered from <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> (itself generated from the <code>inf-wire</code> command registry and the oracle-diff corpus by <code>tests/compat/src/matrixgen.rs</code>, with a CI staleness gate) by <code>scripts/gen-compat-page.py</code> on {gen_date}. Notes are stated without the artifact&rsquo;s internal decision and story identifiers. {preamble}
   </div>
 
   <div class="stat-row">
@@ -203,6 +261,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <li><span class="st st-ext">extension</span>&ensp;<code>INF.*</code> surface unknown to Redis</li>
     <li><span class="st st-int">internal</span>&ensp;fabric program primitives, not a client surface</li>
   </ul>
+  <p class="muted"><strong>Cases</strong> counts the compared corpus executions; <strong>Evidence</strong> counts those answering neither an error nor a null &mdash; a <code>full</code> row needs at least one, so an error-path case alone never makes a command <code>full</code>.</p>
 
   <h2>Commands</h2>
   <div class="filters" role="group" aria-label="Filter by status">
@@ -212,7 +271,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="table-wrap">
     <table class="data" id="matrix">
       <thead>
-        <tr><th>Command</th><th>Status</th><th>Since</th><th>Flags</th><th>Arity</th><th>Cases</th><th>Notes</th></tr>
+        <tr><th>Command</th><th>Status</th><th>Since</th><th>Flags</th><th>Arity</th><th>Cases</th><th>Evidence</th><th>Notes</th></tr>
       </thead>
       <tbody>
 {rows}
@@ -220,7 +279,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     </table>
   </div>
 
-  <h2>Documented deviations (the allowlist, verbatim)</h2>
+  <h2>Documented deviations (the allowlist)</h2>
   <p class="muted">Each entry is a justification from the diff corpus: the candidate must still produce well-formed RESP for these cases, but the bytes differ from the oracle by design.</p>
   <div class="dev">
 {deviations}
@@ -303,7 +362,7 @@ def render(data: dict, gen_date: str) -> str:
             "        <tr data-status=\"{st}\"><td><code>{cmd}</code></td>"
             "<td><span class=\"st {cls}\">{st}</span></td>"
             "<td>{since}</td><td class=\"faint\">{flags}</td>"
-            "<td>{arity}</td><td>{cases}</td><td>{notes}</td></tr>".format(
+            "<td>{arity}</td><td>{cases}</td><td>{evidence}</td><td>{notes}</td></tr>".format(
                 st=html.escape(r["status"]),
                 cmd=html.escape(r["command"]),
                 cls=cls,
@@ -311,7 +370,8 @@ def render(data: dict, gen_date: str) -> str:
                 flags=html.escape(r["flags"]) or "&mdash;",
                 arity=html.escape(r["arity"]),
                 cases=html.escape(r["cases"]),
-                notes=md_inline(r["notes"]) if r["notes"] else "",
+                evidence=html.escape(r["evidence"]),
+                notes=md_inline(public_text(r["notes"])) if r["notes"] else "",
             )
         )
     rows = "\n".join(row_html)
@@ -321,7 +381,7 @@ def render(data: dict, gen_date: str) -> str:
         dev_html.append("    <h3><code>{}</code></h3>".format(html.escape(cmd)))
         dev_html.append("    <ul>")
         for b in bullets:
-            dev_html.append("      <li>{}</li>".format(md_inline(b)))
+            dev_html.append("      <li>{}</li>".format(md_inline(public_text(b))))
         dev_html.append("    </ul>")
     deviations = "\n".join(dev_html)
 
@@ -329,14 +389,14 @@ def render(data: dict, gen_date: str) -> str:
     # keep only its upstream-regeneration instructions.
     joined = " ".join(p for p in data["preamble"] if p)
     m = re.search(r"(Regenerate:.*)$", joined)
-    preamble = md_inline(m.group(1)).replace("Regenerate:", "Upstream regenerate:", 1) if m else ""
+    preamble = md_inline(public_text(m.group(1))).replace("Regenerate:", "Upstream regenerate:", 1) if m else ""
 
     return PAGE_TEMPLATE.format(
         gen_date=gen_date,
         preamble=preamble,
         stats=stats,
-        corpus_html=md_inline(data["corpus"]),
-        surface_html=md_inline(data["surface"]),
+        corpus_html=md_inline(public_text(data["corpus"])),
+        surface_html=md_inline(public_text(data["surface"])),
         total=total,
         filter_buttons=filter_buttons,
         rows=rows,
@@ -346,7 +406,7 @@ def render(data: dict, gen_date: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--matrix", required=True, help="path to infinitydb/docs/compat-matrix.md")
+    ap.add_argument("--matrix", required=True, help="path to docs/compat-matrix.md")
     ap.add_argument("--out", required=True, help="path to write site/docs/compat.html")
     ap.add_argument("--date", default=None, help="generation date stamp (default: today, UTC)")
     args = ap.parse_args()

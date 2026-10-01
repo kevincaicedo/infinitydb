@@ -14,7 +14,7 @@ cargo build --release -p inf-sim --features dst --bin inf-sim
 bin=target/release/inf-sim
 
 # F-L11-05: an accept-path error is a counter, never connection teardown.
-# Group 0 (review §5.5): adversarial key/value lengths at 4 cells.
+# Adversarial key/value lengths at 4 cells.
 # F-L19-05/06: namespace-bound + SELECTed clients, the served surface and
 # the stored content under audit at 4 cells.
 # F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines.

@@ -1,7 +1,6 @@
 # inf-fabric SAFETY
 
-`inf-fabric` is one of the four crates allowed `unsafe` (milestone M0 §3.3),
-and scopes it mechanically: the crate root is `#![deny(unsafe_code)]` with a
+`inf-fabric` is one of the four audited unsafe-leaf crates, and scopes it mechanically: the crate root is `#![deny(unsafe_code)]` with a
 single `#[allow(unsafe_code)]` on the `ring` module. Everything outside
 `ring.rs` — codec, mesh, credits, doorbells — is safe Rust.
 
@@ -34,7 +33,7 @@ All unsafe blocks rest on one protocol, documented on `Shared<T>`:
   writes a slot the consumer may still read. A read or write *past* the
   cached bound is the race — `loom_stale_tail_cache_serves_without_a_refresh`
   reads on a stale cache while the producer recycles a freed slot, and
-  loom reports the over-read as a causality violation (batch 48, F-L12-05).
+  loom reports the over-read as a causality violation.
 - `unsafe impl Sync for Shared<T> where T: Send`: only values of `T` cross
   threads (by move); no `&T` is ever shared, so `T: Sync` is not required.
 - `Drop for Shared` runs when both handles are gone — the final `Arc` drop
@@ -52,9 +51,7 @@ All unsafe blocks rest on one protocol, documented on `Shared<T>`:
 - **Miri**: the non-loom unit tests (including a two-thread stress test at
   reduced count) run under Miri in CI with strict provenance.
 - **`perf c2c`** false-sharing attribution of the `CachePadded` index lines
-  (M0-S08 third AC, reference box, pinned P-cores 4/6): the only HITM
-  lines are the two index lines — offset 0x0 only, 128 B apart — and the
-  slot payload lines; remote HITM 0. Artifacts: `.artifacts/m0/2026-06-11-
-  linux-devbox/spsc-ring-perf-c2c.txt` (95,778 samples) and
-  `.artifacts/review/batch49/spsc-ring-perf-c2c-20260913.txt` (92,609
-  samples, the same shape at the post-batch-48 tree).
+  (reference box, pinned P-cores 4/6): the only HITM lines are the two
+  index lines — offset 0x0 only, 128 B apart — and the slot payload lines;
+  remote HITM 0. Measured twice, 2026-06-11 (95,778 samples) and
+  2026-09-13 (92,609 samples, the same shape on the later tree).

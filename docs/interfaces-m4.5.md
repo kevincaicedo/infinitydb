@@ -1,7 +1,7 @@
 # M4.5 interface freezes — indexes & query (draft until M4.5 exit)
 
 Companion to `interfaces-m0.md`/`interfaces-m2.md`, same contract: these
-interfaces freeze at **M4.5 exit** (plan §3.2); changing a frozen one
+interfaces freeze at **M4.5 exit**; changing a frozen one
 afterwards requires an ADR. Until the milestone exits they are *drafts* —
 changes before exit still record their reasoning in the owning ADR.
 Status column tracks arrival.
@@ -14,7 +14,7 @@ Status column tracks arrival.
 | Index catalog persistence (namespace-catalog payload **v3**; v2 byte-identical while pristine) | `inf-store` (encoding) / `inf-server` (swap) | implemented (M4.5-S03, ADR-0075 D2 — index records + never-regressing id/generation counters ride the `META` swap; `fuzz_catalog` in the same PR) |
 | Declaration lifecycle {declared → backfilling → ready → dropping} + fleet-readiness aggregation | `inf-store` / `inf-server::control` | implemented (M4.5-S03, ADR-0075 D3–D5 — explicit invalid-transition rejection; `IndexBoard` per-cell × per-slot ready generations; catalog `ready` ⟺ every cell reports the exact generation) |
 | Cursor/compile binding gate `{ns, index id, generation}` | `inf-store` | implemented (M4.5-S03, ADR-0075 D7 — `IndexRegistry::validate_binding`, typed `{UnknownIndex, StaleGeneration, NotReady}`; S09/S11 consult it) |
-| At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04; mechanics ADR-0139 since ARCH-W0.2 — alias-group identity, coverage by entry point and full key, bounded enumeration; attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
+| At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04; mechanics ADR-0139 — alias-group identity, coverage by entry point and full key, bounded enumeration; attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
 | Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
 | Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078 under the ADR-0073 constraints — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
 | Access-program form v1 | `inf-query` | implemented (M4.5-S09, ADR-0080 — `access::AccessProgram`: one access step + residual + page spec, serialized/versioned, `from_bytes` trust boundary; EXPLAIN rendering golden-pinned) |
@@ -53,10 +53,10 @@ Status column tracks arrival.
 ## Maintenance surface (M4.5-S04; mechanics ADR-0139, which supersedes ADR-0076)
 
 - **Accepted, unbuilt construction extension:**
-  [ADR-0160](../../docs/adr/0160-borrowed-path-program-views-and-fallible-index-ownership.md)
+  ADR-0160
   specifies borrowed program views, fallible attachment ownership and
   preparation before local registry/attachment publication. Complete
-  [ARCH-W0.3b](../../docs/drr/ARCH-W0.3b.md) review still gates the build.
+  design review still gates the build.
 - **Tree custody (ADR-0139 D1):** each `CellStore` owns its namespace's
   trees in an attach block (`index_maint::CellIndexes`) — the
   maintenance-facing cache of the registry, resynced at DDL transitions,
@@ -137,7 +137,7 @@ Status column tracks arrival.
   (`Keyspace::idx_degraded` — S09/S11 must consult it beside
   `validate_binding`); a death hook that cannot evaluate or grow degrades
   the index. Rebuild clears the veto. The pre-apply refusal of a
-  post-image is ADR-0139 D5 (ARCH-W1.6), not built.
+  post-image is ADR-0139 D5, not built.
 - **Replay arm:** `Keyspace::idx_set_replay_maintenance(ns,
   Option<MaintMode>)` — `None` at boot (the no-sidecar path rebuilds via
   S05); S06's sidecar load arms `CatchUp`. Same code path as live,
@@ -153,7 +153,7 @@ Status column tracks arrival.
   `Keyspace::idx_counters[_total]`; `INFO stats` renders the fold as
   `idx_*`; `INF.IDX LIST` (S10) renders per-index detail.
 
-## Backfill surface (M4.5-S05, ADR-0077 — the plan's backfill machine as-built)
+## Backfill surface (M4.5-S05, ADR-0077 — the backfill machine as built)
 
 - **The tick:** `Keyspace::idx_backfill_tick(now, BackfillBudget)` —
   registry sync (job create / rebuild-reset / drop / park) then budgeted
@@ -242,7 +242,7 @@ Status column tracks arrival.
 - **Total compilation:** `inf_query::partiql::compile[_with_max_bytes]`
   — statement text → `CompiledStatement { program, access, vm }`, or a
   `QlError` whose `Display` string is the documented rejection
-  (`infinitydb/docs/partiql-subset.md` §7 — the compat contract; the
+  ([`partiql-subset.md`](partiql-subset.md) §7 — the compat contract; the
   300-case golden suite pins it verbatim). The output type has exactly
   one access-step field; no code path compares two candidate plans —
   ambiguity is a typed refusal naming the explicit `FROM ns."index"`

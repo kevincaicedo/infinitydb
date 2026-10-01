@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Roadmap — InfinityDB Docs</title>
-<meta name="description" content="The InfinityDB milestone train: what is done, what is in progress, and what each milestone ships, with STOP gates and the ADR reorders named.">
+<meta name="description" content="The InfinityDB milestone train: what is done, what is in progress, and what each milestone ships.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2034%2018'%3E%3Ccircle%20cx='10'%20cy='9'%20r='7'%20fill='none'%20stroke='%237c5cff'%20stroke-width='2.4'/%3E%3Ccircle%20cx='24'%20cy='9'%20r='7'%20fill='none'%20stroke='%233ee6c4'%20stroke-width='2.4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -57,73 +57,64 @@
     <article>
       <p class="doc-kicker">Reference</p>
   <h1 class="page-title">The milestone train</h1>
-  <p class="lede">InfinityDB ships on a release train with <strong>STOP gates</strong>: every milestone ends with hard, numeric, end-to-end acceptance criteria measured on a designated reference box, and a milestone that fails its gate halts feature work &mdash; the fix happens at the architecture layer, not as an optimization pass later. Every milestone is an independently shippable product.</p>
+  <p class="lede">InfinityDB is built as a sequence of milestones, each scoped by capability rather than by date: a milestone is done when its features work from the wire and its correctness gates pass, not when a calendar says so. InfinityDB is <strong>alpha</strong> software &mdash; no release has been published yet; the first public alpha is cut inside M4, after trust and safety and before JSON documents beyond RAM. Milestones after the current one may be reordered.</p>
 
   <div class="callout">
     <span class="callout-tag"><strong>How to read this page:</strong></span>
-    statuses are honest. &ldquo;Done&rdquo; means the milestone&rsquo;s verdict was reached with its evidence recorded; durations are estimates from the plan, not promises; and none of the numeric gate targets are reproduced here, because targets are not achievements &mdash; the project&rsquo;s claim ledger governs which numbers may be published. The plan sections behind it (&sect;21&ndash;22) are maintained in the project&rsquo;s governance repository.
-  </div>
-
-  <div class="callout">
-    <span class="callout-tag"><strong>The train was reordered &mdash; by ADR, in the open.</strong></span>
-    <strong>ADR-0023</strong> (2026-07-05) reordered the train <em>documents-first</em> and renumbered it (JSON documents moved from sixth position to M3; tiered storage to M4; the collection types to M5; transactions to M6; streams to M7), and inserted <strong>M2.5 &ldquo;Hardening &amp; First Alpha.&rdquo;</strong> <strong>ADR-0024</strong> inserted <strong>M4.5 &ldquo;Indexes &amp; Query&rdquo;</strong> &mdash; typed secondary indexes plus a planner-free PartiQL subset, pre-1.0. <strong>ADR-0025</strong> restructured M2.5 performance-first: the first public tag carries the paid performance debt. <strong>ADR-0048</strong> (2026-07-16) retired <code>v0.2.0-alpha.1</code> unused and moved the first public tag to M3. <strong>ADR-0067</strong> (2026-08-06) applied the same rule one milestone later: <code>v0.3.0-alpha.1</code> is retired unused, and the first public tag is <strong>M4&rsquo;s <code>v0.4.0-alpha</code></strong>, shipping the M3 and M4 milestones together under one release act, one campaign, one signed announcement. Documents dated before 2026-07-05 use the old numbering.
+    statuses are honest. &ldquo;Done&rdquo; means built, tested, and its gates run; &ldquo;Planned&rdquo; means designed and scheduled on the train, not started. No gate target is reproduced here, because a target is not an achievement &mdash; only measured, reproducible results are published. The <a href="compat.html">command matrix</a> is the source of truth for which commands work today. The same roadmap lives in the repository as <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/roadmap.md"><code>docs/roadmap.md</code></a>.
   </div>
 
   <h2>Done</h2>
 
-  <h3>M0 &mdash; Skeleton: proof of architecture <span class="pill pill-ship">DONE &middot; VERDICT, NO RELEASE</span></h3>
-  <p>The single most important milestone, and deliberately feature-free: an end-to-end vertical &mdash; cell loop on io_uring, the SPSC fabric, the SIMD RESP wire, a minimal store, the benchmark harness with tripwire metrics, and the deterministic simulator&rsquo;s walking skeleton &mdash; measured against hard gates <em>before any feature work was allowed to exist</em>. The predecessor project died because this step never existed. One gate (pipelined node throughput at the spec&rsquo;d cell count) remains formally open, dispositioned by ADR-0029 and carried into M2.5&rsquo;s performance work rather than silently narrowed.</p>
+  <h3>M0 &mdash; Architecture skeleton <span class="pill pill-ship">DONE &middot; VERDICT, NO RELEASE</span></h3>
+  <p>Deliberately feature-free: shard cells, each a thread with its own <code>io_uring</code> event loop (<code>kqueue</code> on macOS for development); the fabric, a mesh of single-producer/single-consumer rings between cells with credit-based flow control; the RESP wire protocol with perfect-hash command dispatch and a minimal store; the benchmark and gate harness; and the deterministic simulator. It ended in an architecture verdict, measured against other servers, before any feature work was allowed to exist.</p>
 
   <h3>M1 &mdash; Cache core <span class="pill pill-ship">DONE</span></h3>
-  <p>The full string/key/expiry/server command surface, per-cell TTL wheel with budgeted active expiry, all 8 eviction policies, namespaces v1, pub/sub with RESP3 push, the generated compatibility matrix with its CI staleness gate, oracle byte-diffing against a pinned Redis 8.0.5, Docker/CI release engineering, and the nightly deterministic-simulation fleet. <code>v0.1.0-alpha.1</code> was never tagged, and <code>v0.2.0-alpha.1</code> and <code>v0.3.0-alpha.1</code> were later retired unused (ADR-0048, ADR-0067) &mdash; the first public tag, <code>v0.4.0-alpha</code>, ships durability, JSON documents, and tiered storage included.</p>
+  <p>The string, key, expiry and server command families, diffed byte for byte against Redis; a hierarchical timer wheel with budgeted active expiry that holds tail latency during mass expiry; all eight Redis eviction policies; namespaces (<code>SELECT</code> and the <code>INF.NS</code> registry) and pub/sub across cells with RESP3 push and per-connection output limits; the generated compatibility matrix checked in CI, release tooling, and nightly simulation runs.</p>
 
-  <h3>M2 &mdash; Durability <span class="pill pill-ship">DONE &middot; GO VERDICT</span></h3>
-  <p>The log spine complete: segments, batch frames, CRC, group commit, manifest; <code>everysec</code>/<code>always</code> namespaces with watermark-gated acks; fuzzy fork-free checkpoints with truncation; parallel recovery; the fault-point harness and crash matrix; deterministic disk-fault simulation (torn writes, fsync lies, power cuts); <code>INF.CKPT</code>/<code>BGSAVE</code>. The binding campaign ran on the designated reference box: the correctness gates passed (see <a href="durability.html">the durability evidence</a>); several device-bound performance rows were honestly dispositioned as Evidence-pending on Gen4-class hardware rather than narrowed. Verdict: GO &mdash; the release act itself later moved forward with the train (ADR-0048, ADR-0067).</p>
+  <h3>M2 &mdash; Durability <span class="pill pill-ship">DONE</span></h3>
+  <p>A per-cell append-only log: checksummed records and frames, segments, group commit and a manifest. Durable namespaces with <code>always</code> (acknowledged after fsync) or <code>everysec</code> (a bounded loss window on power failure, like Redis). Fuzzy checkpoints, log truncation and parallel recovery; <code>INF.CKPT</code> and <code>BGSAVE</code>. A crash matrix and simulated disk faults (torn writes, lying fsyncs, power cuts) in the deterministic simulator. Then a hardening pass: group-commit and replay performance, cross-cell overhead, a comparison harness against Redis, Valkey and Dragonfly, fuzzing and soundness audits.</p>
 
-  <h3>M2.5 &mdash; Hardening &amp; first alpha <span class="pill pill-ship">DONE &middot; RELEASE ACT &rarr; v0.4.0-alpha</span></h3>
-  <p>No new command surface. The milestone that turned M2&rsquo;s GO verdict into a hardened, evidence-clean core before the feature train resumed &mdash; performance-first per ADR-0025:</p>
-  <ul>
-    <li><strong>Paid the debt:</strong> the boot-wedge stop-item root-caused and fixed; measured performance levers on group formation, recovery read-ahead, and the cross-cell remote-penalty campaign &mdash; each A/B&rsquo;d on the designated box and dispositioned by ADR (losing levers recorded and <em>not merged</em>); the anchored cross-cell gate ratified by ADR-0035.</li>
-    <li><strong>Shipped the instrument:</strong> the first binding comparative campaign with the zero-dependency <code>inf-compare</code> harness, this website and docs v1, and full evidence closure &mdash; zero undispositioned claim-ledger rows (the S19 walk, 2026-07-10).</li>
-    <li><strong>Hardened:</strong> TigerBeetle-grade assertion and soundness audits, deeper simulation fleets, fuzz-hour accumulation, and the documents-first seam-readiness review for M3 (ADR-0032). Per <strong>ADR-0048</strong>, the tag + announcement act folded into M3 &mdash; <code>v0.2.0-alpha.1</code> was retired unused rather than shipping an alpha its successor would immediately supersede.</li>
-  </ul>
-
-  <h3>M3 &mdash; JSON documents <span class="pill pill-ship">DONE &middot; VERDICT &middot; SHIPS IN v0.4.0-alpha</span></h3>
-  <p>JSON objects as first-class values, not a module: a compact binary document tree (tape-structured for parse-free traversal), the RedisJSON-compatible <code>JSON.*</code> surface with a compiled JSONPath subset, in-place path mutation, delta log records with periodic full-document records to bound replay, and a compat suite with digest-pinned RedisJSON as the oracle &mdash; byte-diff-verified, with every deviation documented. Document reads are profile-proven parse-free (a CI check greps a live-load profile for parser symbols and fails on any hit), and document memory is attributed always-on, per namespace. M3 exited on its engineering gates; per <strong>ADR-0067</strong> its release act folded into M4&rsquo;s <code>v0.4.0-alpha</code>, and its quality tail (binding reference-box rows, the unified 24 h soak, fuzz-hour accrual) carries forward as binding release prerequisites.</p>
+  <h3>M3 &mdash; JSON documents <span class="pill pill-ship">DONE</span></h3>
+  <p>JSON as a first-class value, stored as a compact binary tape; a SIMD JSON parser and a JSONPath subset compiled to cached path programs; RedisJSON-compatible <code>JSON.*</code> commands, diffed against RedisJSON, with in-place path updates; durable documents through delta log records, crash-atomic updates and per-document memory accounting. JSONPath filter expressions moved to M4, where the query engine lands.</p>
 
   <h2>Now</h2>
 
-  <h3>M4 &mdash; Tiered storage <span class="pill pill-now">IN PROGRESS &rarr; v0.4.0-alpha &middot; FIRST PUBLIC TAG</span></h3>
-  <p>Beyond-RAM datasets via the hybrid-log design (Microsoft FASTER lineage): one logical address space per cell spanning disk, read-only RAM, and mutable RAM regions; async cold reads suspend the command and resume it when the disk answers &mdash; the executor&rsquo;s state-machine design paying off; compaction, demotion, flush, and blob reclaim run in budgeted slices under explicit disk budgets with a documented <code>DISKFULL</code> refusal taxonomy. Cache-mode namespaces are the degenerate case and never execute this code &mdash; that zero-cost contract is itself a hard gate, re-proven A/B against the pre-tiering binary in every campaign. Landed so far: the address space and region machinery, O_DIRECT cold-tier I/O with queue-depth-capped read shaping, the tier file format and flush pipeline, checkpoint/recovery composition over tiered state, per-namespace memory <em>and</em> disk budgets, per-namespace <code>MAXMEMORY</code> eviction enforcement, and the full command wiring proven by command-driven deterministic simulation. In flight: the binding gate campaign, the 24 h endurance run, and the release act itself &mdash; this milestone carries the project&rsquo;s <strong>first public tag</strong>, shipping M3&rsquo;s documents and M4&rsquo;s tiering together (ADR-0067). Its headline reporting rule is already fixed: memory-hit and cold-read percentiles are always published <em>separately</em> &mdash; a blended p99 over a bimodal distribution is a lie by construction.</p>
+  <h3>M4 &mdash; Beyond RAM, indexes and query <span class="pill pill-now">IN PROGRESS &middot; FIRST PUBLIC ALPHA</span></h3>
+  <ul>
+    <li><strong>Tiered storage (done for string values):</strong> a per-cell hybrid-log address space, cold reads through <code>io_uring</code> with direct I/O, compaction, large values as blob extents, and per-namespace memory and disk budgets. Cache-mode namespaces never execute this code.</li>
+    <li><strong>Write path (done):</strong> write barriers chosen by a device probe at first boot, a bounded frame pipeline, a device I/O budget, log segment recycling, backpressure instead of errors under load, and a graceful stop that keeps every acknowledged write.</li>
+    <li><strong>Secondary indexes and a PartiQL subset (in progress):</strong> the ordered index, index maintenance and backfill, the predicate VM and the query compiler are built and tested; the command surface (index DDL, queries, <code>EXPLAIN</code>, JSONPath filters) comes next. Planner-free by design: one access path per statement, anything outside the subset rejected with a documented error.</li>
+    <li><strong>Trust and safety (planned):</strong> bind-address control with a protected default, <code>AUTH</code>/<code>requirepass</code>, bounded request sizes, and published format and support matrices. The first public alpha release follows.</li>
+    <li><strong>JSON documents beyond RAM (planned):</strong> cold document reads and updates, expiry on tiered namespaces, indexes over cold documents, and queries that target a single partition.</li>
+  </ul>
+  <p>Its reporting rule is already fixed: memory-hit and cold-read percentiles are always published <em>separately</em> &mdash; a blended percentile over a bimodal distribution is a lie by construction.</p>
 
   <h2>Next</h2>
 
-  <h3>M4.5 &mdash; Indexes &amp; query <span class="pill pill-plan">v0.4.5-alpha &middot; ADR-0024</span></h3>
-  <p>Typed secondary indexes over document paths (<code>INF.IDX</code>) on the per-cell ordered key-range projection, plus a <strong>planner-free PartiQL subset</strong> over RESP (<code>INF.QL</code> + <code>EXPLAIN</code>): one access path per statement, grammar-driven compilation, residual filters on a predicate VM, no cost model, no joins &mdash; anything outside the subset is rejected with a documented error. The DynamoDB discipline: access paths are keys and <em>declared</em> indexes, never a planner&rsquo;s guess.</p>
+  <h3>M5 &mdash; Data types <span class="pill pill-plan">PLANNED</span></h3>
+  <p>Hashes, lists, sets and sorted sets (sorted sets reuse M4&rsquo;s ordered index); bitmaps, bitfields and HyperLogLog; size-adaptive encodings, the <code>SCAN</code> family for every type, <code>OBJECT</code> and <code>MEMORY USAGE</code>; keyspace notifications, sharded pub/sub, <code>SLOWLOG</code> and <code>MONITOR</code>.</p>
 
-  <h3>M5 &mdash; Data types <span class="pill pill-plan">v0.5.0-alpha</span></h3>
-  <p>Hashes, lists, sets, sorted sets, bitmaps, bitfield, HyperLogLog; small&rarr;large encoding morphs with measured thresholds; the SCAN family; keyspace notifications; the compat matrix grows to roughly the full conventional Redis surface.</p>
+  <h3>M6 &mdash; Transactions &amp; scripting <span class="pill pill-plan">PLANNED</span></h3>
+  <p><code>MULTI</code>/<code>EXEC</code>/<code>WATCH</code>/<code>DISCARD</code>: inline on one cell, and across cells through deterministic, ordered lock acquisition; a native all-or-nothing transaction command and conditional writes on a revision; Lua scripting with declared keys and a <code>FUNCTION</code> subset.</p>
 
-  <h3>M6 &mdash; Transactions &amp; scripting <span class="pill pill-plan">v0.6.0-alpha</span></h3>
-  <p><code>MULTI</code>/<code>EXEC</code>/<code>WATCH</code> (single-cell inline; cross-cell via deterministic two-phase intent locking, the Dragonfly-proven shape), Lua with declared keys, a <code>FUNCTION</code> subset.</p>
+  <h3>M7 &mdash; Streams &amp; queues <span class="pill pill-plan">PLANNED &middot; FIRST BETA</span></h3>
+  <p>Topics and partitions on the same log and the full Redis Streams surface; offset consumption, idempotent producers, dead-letter queues, delayed delivery and retention; client tracking, multi-user ACLs, TLS and RDB import; an agent-memory profile; backup, restore and point-in-time recovery.</p>
 
-  <h3>M7 &mdash; Streams &amp; queues <span class="pill pill-plan">v0.7.0-beta.1 &middot; FIRST BETA</span></h3>
-  <p>Topics and partitions directly on the log spine; the full Redis Streams surface; Kafka-style offset consumption, producer idempotence, DLQs, delayed delivery; retention; client tracking and client-side caching; <strong>AUTH + TLS</strong> (beta means people deploy it); RDB import for migration.</p>
+  <h3>M8 &mdash; Vector search <span class="pill pill-plan">PLANNED</span></h3>
+  <p>Redis-compatible vector sets and native vector collections: per-cell HNSW with SQ8 quantization and rescoring, k-NN gathered across cells, filter predicates, in-memory or tiered residency, and embeddings kept in step with document revisions.</p>
 
-  <h3>M8 &mdash; Vectors <span class="pill pill-plan">v0.8.0-beta</span></h3>
-  <p>Redis-8-compatible vector sets plus <code>INF.VEC</code> collections: per-cell HNSW graphs, SQ8 quantization with rescoring, scatter-gather k-NN over the fabric, filter predicates. Vectors are ordinary durable records &mdash; replicated and tiered like everything else.</p>
+  <h3>M9 &mdash; Replication &amp; HA <span class="pill pill-plan">PLANNED</span></h3>
+  <p>Per-partition log shipping with state digests to verify replicas; <code>WAIT</code>, <code>WAITAOF</code> and read-from-replica with session tokens; an asynchronous-replica profile with a stated recovery point and a strong-HA profile over a replicated log; a Raft control plane for metadata only, fenced failover, migration from a live Redis replica, and a Jepsen-style fault harness before any HA claim.</p>
 
-  <h3>M9 &mdash; Replication &amp; HA <span class="pill pill-plan">v0.9.0-beta</span></h3>
-  <p>Per-cell log shipping to replicas, <code>wait-replica</code> ack gating, read-from-replica with session watermarks, a Raft control plane for election and failover (data never flows through Raft), object-storage backups with point-in-time recovery, live migration by posing as a Redis replica &mdash; verified by Jepsen-style harnesses and simulated cluster scenarios before any HA claim.</p>
+  <h3>M10 &mdash; Compute &amp; enterprise <span class="pill pill-plan">PLANNED &middot; RELEASE CANDIDATE</span></h3>
+  <p>WASM reducers that run on the cell that owns the data, with fuel and memory limits, scoped capabilities and transactional invocation; an embedded library mode and a shared-memory IPC transport; full ACLs, an audit log, and documented extension seams.</p>
 
-  <h3>M10 &mdash; Compute &amp; enterprise <span class="pill pill-plan">v0.10.0-rc.1</span></h3>
-  <p>The WASM reducer host: sandboxed modules running inside the process on the core that owns their data &mdash; fuel-metered, memory-capped, capability-scoped, transactional. Plus the embedded Rust crate, shared-memory IPC transport, full ACLs, and the documented seam inventory the post-1.0 extension SDK stabilizes against.</p>
+  <h3>M11 &mdash; Hardening for 1.0 <span class="pill pill-plan">PLANNED &middot; 1.0</span></h3>
+  <p>No new features: long mixed-workload soaks, broader fuzzing, and a full performance re-baseline with every public claim measured again; a frozen compatibility matrix and frozen extension seams; an upgrade and downgrade path and a third-party security audit. InfinityDB 1.0 is a single-node and replicated database with a stated failure model per HA profile, serving cache, durable key/value, JSON documents (beyond RAM, with expiry and indexes), streams and queues, and vector search over RESP, with WASM reducers and embedded modes.</p>
 
-  <h3>M11 &mdash; GA hardening <span class="pill pill-plan">1.0.0</span></h3>
-  <p>No features: long mixed-profile soaks, fuzz-corpus expansion, a full performance re-baseline with claim-ledger re-validation, the compatibility matrix frozen and published, the extension-seam freeze, and a third-party security audit. 1.0.0 means: single-node and replicated InfinityDB serving cache, durable KV, JSON documents (memory-exceeding), streams/queues, and vector search over RESP, with WASM reducers and embedded/IPC modes &mdash; every public number evidence-backed.</p>
-
-  <h2>Post-1.0 horizon <span class="pill pill-plan">COMMITTED DIRECTION, UNCOMMITTED DATES</span></h2>
-  <p>Cluster mode (slot migration &mdash; the 16,384-slot space was designed for it from day one); the native extension SDK; live queries/subscriptions over RESP3 push; protocol gateways in priority order &mdash; DynamoDB-compatible HTTP, native HTTP/JSON + WebSocket, PartiQL over those gateways, a Kafka wire-protocol gateway. A MongoDB wire listener is evaluated, not committed. Scope fences hold until then: no SQL planner, no multi-region active-active, no Redis modules ABI.</p>
+  <h2>Beyond 1.0 <span class="pill pill-plan">COMMITTED DIRECTION, UNCOMMITTED DATES</span></h2>
+  <p>Cluster mode with slot migration, a native extension SDK against versioned seams, live queries, protocol gateways (a DynamoDB-compatible HTTP API first, then HTTP/JSON, WebSocket and the Kafka wire protocol), a Kubernetes operator, compacted topics and multi-region asynchronous replication. Scope fences hold until then: no SQL planner or joins, no wire-compatible clone of DynamoDB, MongoDB or Kafka, no multi-region, and no Redis <code>.so</code> modules &mdash; the module APIs InfinityDB supports, such as <code>JSON.*</code>, are native.</p>
 
   <div class="doc-footer-nav">
     <a href="compat.html">&larr; Compatibility matrix</a>

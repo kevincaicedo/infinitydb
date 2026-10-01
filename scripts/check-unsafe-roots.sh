@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Batch 44 (review 2026-08-30, F-L17-09; ADR-0121): the §17.3 posture is
+# Batch 44 (review 2026-08-30, F-L17-09; ADR-0121): the unsafe posture is
 # mechanical. Every crate root (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`)
 # under crates/, bins/ and tests/ carries `#![forbid(unsafe_code)]` or
 # `#![deny(unsafe_code)]`; the set of `deny` roots equals the audited-leaf
@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
-# The §17.3 exception list as amended by ADR-0121 — crate name → the
+# The unsafe exception list (ADR-0121) — crate name → the
 # roots that carry `deny`. Overridable for the self-test's fixtures.
 LEAVES="${INF_UNSAFE_LEAVES-inf-simd inf-alloc inf-fabric inf-runtime inf-doc inf-server inf-probe inf-sim}"
 

@@ -1,7 +1,6 @@
-# M3 exit gates (STOP) — machine-readable encoding of the M3 milestone plan
-# §7 (internal). Values are fixed by the project master plan §22 (M3,
-# internal); changing a threshold here is a master-plan amendment, not an
-# edit (L10: a gate may not be passed by narrowing it).
+# M3 exit gates (STOP) — machine-readable encoding of the M3 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # This file is the single authority for the M3 gate values: it lives in
 # this repository because the M3 harness scripts + `inf-bench` are its only
@@ -10,9 +9,8 @@
 #
 # Measurement instrument (S25, plan-sanctioned blessing): the M3 wire and
 # RSS rows are produced by the reference-box harness (`bench-m3-wire.sh`,
-# `bench-m3-rss.sh`, kept with the evidence records outside this
-# repository — the hand-run harness blessed in the S25 ledger entry),
-# labeled per §19, with the `inf-compare` `json` lanes as the
+# `bench-m3-rss.sh`, reference-box campaign tools that are not part of
+# this repository), labeled by tier, with the `inf-compare` `json` lanes as the
 # independent-generator cross-check beside them. external:*
 # rows come from campaign tooling (DST sweeps, crash matrix, fuzz reports,
 # soak) and are supplied as artifacts. The RSS gate binds on corpus v2

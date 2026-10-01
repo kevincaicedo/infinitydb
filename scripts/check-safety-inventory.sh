@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# M2.5-S16: SAFETY.md inventory vs code (§17.3, INFINITY_STYLE §Unsafe Rust).
+# SAFETY.md inventory vs code (INFINITY_STYLE §Unsafe Rust).
 #
 # One direction is load-bearing and enforced hard: every file under a
 # crate's src/ that USES unsafe (blocks, fns, impls, extern) must be named

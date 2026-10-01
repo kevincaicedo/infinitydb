@@ -1,4 +1,4 @@
-# Allowed internal dependency edges (master plan §20, milestone M0 §3.3).
+# Allowed internal dependency edges (the crate fences of law L11).
 #
 # ADR-0106 D16: every normal/build permission must occur in Cargo metadata
 # or have an unused annotation below. Activation removes the annotation.
@@ -26,14 +26,14 @@ inf-log = ["inf-foundation", "inf-simd"]
 # inf-store → inf-log: effect/record vocabulary (`NsId`, `FsyncClass`,
 # `RecordView`) for durable namespaces, the catalog encoding, and
 # `Keyspace::apply_record` replay (ADR-0012 D1 direction, ADR-0015 D7 wiring).
-# inf-store -> inf-doc: the M3 engine edge (ADR-0032 D7; M3 plan §3.3).
+# inf-store -> inf-doc: the M3 engine edge (ADR-0032 D7).
 inf-store = ["inf-foundation", "inf-alloc", "inf-simd", "inf-log", "inf-doc"]
 inf-stream = ["inf-foundation", "inf-log", "inf-store"]
 # inf-doc -> inf-simd: SIMD structural scanning behind safe wrappers
-# (ADR-0032 D7; M3 plan §3.3). Never inf-wire/inf-log/inf-server.
+# (ADR-0032 D7). Never inf-wire/inf-log/inf-server.
 inf-doc = ["inf-foundation", "inf-alloc", "inf-simd"]
-# inf-query -> inf-doc/inf-store: the M4.5 engine edges (ADR-0072 D9;
-# M4.5 plan §3.3) — cursor reads and the public index/range APIs. Never
+# inf-query -> inf-doc/inf-store: the M4.5 engine edges (ADR-0072 D9) —
+# cursor reads and the public index/range APIs. Never
 # inf-wire/inf-log/inf-server/inf-fabric: the crate sees no RESP, no
 # sockets, no raw record memory, no log files (L11 proof case #1). The
 # S01 B+-tree leaf-search kernels live in inf-simd and reach inf-store
@@ -46,7 +46,7 @@ inf-replica = ["inf-foundation", "inf-log"]
 # JSON text at ingest, path compile/eval + the program cache, and reply
 # serialization into wire buffers (the ADR-0039 D1 split). Feature-gated
 # (`doc`); the arrow points down and inf-doc still never sees RESP,
-# records, sockets, or logs (M3 plan §3.3).
+# records, sockets, or logs.
 # inf-server -> inf-query: the M4.5-S10/S11 command-surface edge
 # (ADR-0072 D9, reserved below): INF.QL/INF.IDX dispatch behind a `query`
 # feature, the ADR-0041 D3 `doc` precedent. Slim builds compile it out.

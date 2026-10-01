@@ -8,9 +8,9 @@ with throughput, latency (p50/p99/p99.9), RSS, and bytes/key.
 
 It is the competitor-anchored complement to [`inf-bench`](../inf-bench/README.md).
 `inf-bench` is the *in-house* loadgen + exit-gate harness; `inf-compare` is the
-*independent generator* cross-check the master plan §22 requires: _"same box,
-same workload files, configs published. No comparison ships from a run the
-competitor wasn't in."_
+*independent generator* cross-check every published comparison requires:
+same box, same workload files, configs published — no comparison ships from
+a run the competitor was not in.
 
 Zero dependencies: it only orchestrates external binaries
 and parses their output with a hand-rolled JSON reader (`src/json.rs`), so it
@@ -18,8 +18,11 @@ shares neither code nor a dependency surface with the system under test.
 
 ## Quick start
 
+`just benchmark` alone runs all present engines, all workloads and both
+generators:
+
 ```bash
-just benchmark                       # all present engines, all workloads, both generators
+just benchmark
 just benchmark --workload mixed --duration 10 --pipeline 1
 cargo run --release -p inf-compare -- run [options]
 cargo run --release -p inf-compare -- list-workloads
@@ -149,11 +152,11 @@ or SMT isolation; the reference environment must document those separately.
 | `--reference-box` | Requires both CPU ranges on Linux host launches and a clean box (`inf-bench env-check` must pass). |
 | `--unsafe-env` | Proceed on a non-clean box; stamps the run non-citable. |
 
-## Workloads (gated to the M1 string surface)
+## Workloads (gated to the string surface)
 
 `redis-benchmark`'s default `-t` set fires `lpush/sadd/hset/zadd/lrange`, none of
-which M1 implements (collections are M3) — so every workload here names
-string-family commands only.
+which InfinityDB implements yet (collection types are on the roadmap) — so
+every workload here names string-family commands only.
 
 | Workload | Driver | redis-benchmark cross-check | In `all` |
 |---|---|---|---|

@@ -6,10 +6,10 @@
 # (3) a fleet of fresh m0/m1/boot-storm seeds (derived from the run id —
 # recorded in the log, replayable verbatim) runs with determinism
 # verification, (4) seeded 48 h virtual-time expiry campaigns push the
-# simulated-seconds budget past the master-plan target (≥ 1M sim-seconds/
-# night, §17.1). Oracles armed: per-key linearizability (model replay), TTL
+# simulated-seconds budget past the target (≥ 1M sim-seconds per
+# night). Oracles armed: per-key linearizability (model replay), TTL
 # semantics, pub/sub delivery (confirmed ⇒ reachable, per-publisher FIFO,
-# exact final ledger), accounting reconciliation at quiescence, §8.2 durable
+# exact final ledger), accounting reconciliation at quiescence, durable
 # admissible-set + survival audit, everysec ack-deferral (M2.5-S14),
 # L2 memory-volatility + log-scan (M2.5-S14), boot-storm fsync-free ready
 # path (M2.5-S01).
@@ -162,7 +162,7 @@ jobs:
           echo "tiered sweep seed base: $base" | tee -a /tmp/fleet.log
           # 4,000 m4-tiered seeds nightly (~0.2 s/seed): the command-driven
           # tiered node — RESP through the sim net against the wired plane,
-          # seeded cut → recovery → §8.2 command audit → re-pressure flush
+          # seeded cut → recovery → durability-class command audit → re-pressure flush
           # liveness → DISKFULL clamp/reopen → the S19 drop race. The
           # manifest discloses demotion/cold/blob/refusal coverage.
           for i in 0 1 2 3 4 5 6 7; do
@@ -183,8 +183,7 @@ jobs:
 
       - name: corpus replay (full size)
         run: |
-          # Review of 2026-08-30 (§5.5 "several gates cannot go red at
-          # all"): the old `grep | while | tee` pipeline's status was
+          # A gate that cannot go red is not a gate: the old `grep | while | tee` pipeline's status was
           # tee's, always 0 — a corpus divergence left the step green.
           # `if !` keeps the loop running past a failing seed (pipefail
           # + `-e` would abort at the first one); an empty corpus is red.

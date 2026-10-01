@@ -94,7 +94,7 @@
         </a>
         <a class="card" href="roadmap.html" style="display:block;color:inherit">
           <h3 style="font-size:18px">Roadmap</h3>
-          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">The milestone train, gate by gate: what is done, what is in progress (M4 &mdash; tiered storage, closing on the first public tag), what each future milestone ships, and the ADRs that reordered the train.</p>
+          <p class="muted" style="font-size:13.5px;margin:0;line-height:1.6">The milestone train: what is done, what is in progress (M4 &mdash; beyond RAM, indexes and query; the first public alpha is cut inside M4, after trust and safety and before JSON documents beyond RAM), and what each future milestone ships.</p>
         </a>
         <a class="card" href="../blog/the-log-is-the-database.html" style="display:block;color:inherit">
           <h3 style="font-size:18px">How it&rsquo;s built</h3>
@@ -104,11 +104,11 @@
 
       <h2 id="claims">Claims &amp; evidence</h2>
       <p>Every number or comparative statement in InfinityDB&rsquo;s public copy must have an <strong style="color:var(--text)">Allowed</strong> row in the project&rsquo;s claim ledger, citing a validated artifact (replicated runs, clean tree, recorded environment, competitors in the same run). A claim absent from the ledger does not exist &mdash; and this website is checked against the ledger in CI.</p>
-      <p>The ledger is maintained in the project&rsquo;s governance repository; the copy this site is checked against is published here in full as <a href="../_ledger-snapshot.md"><code>_ledger-snapshot.md</code></a>, refreshed with each release. The full methodology &mdash; harnesses, environment rules, replicate discipline, the instrument checks &mdash; and every currently-Allowed number with its artifact live on the <a href="benchmarks.html">benchmarks &amp; evidence page</a>; the binding comparative campaign report is published verbatim as <a href="../evidence/inf-compare.html">an evidence page</a>. Pipelined peaks, <code>always</code>-mode write rates, absolute tail-latency claims, and every tiered-storage number are still <em>Narrowed</em> or <em>Evidence-pending</em>, so they are absent by rule, not by oversight.</p>
+      <p>The ledger is published here in full as <a href="../_ledger-snapshot.md"><code>_ledger-snapshot.md</code></a> &mdash; the copy this site is checked against, refreshed with each release. The full methodology &mdash; harnesses, environment rules, replicate discipline, the instrument checks &mdash; and every currently-Allowed number with its artifact live on the <a href="benchmarks.html">benchmarks &amp; evidence page</a>; the binding comparative campaign report is published verbatim as <a href="../evidence/inf-compare.html">an evidence page</a>. Pipelined peaks, <code>always</code>-mode write rates, absolute tail-latency claims, and every tiered-storage number are still <em>Narrowed</em> or <em>Evidence-pending</em>, so they are absent by rule, not by oversight.</p>
 
       <h2>In the repository</h2>
       <ul style="color:var(--text-muted);font-size:14px;line-height:1.8">
-        <li><a href="https://github.com/kevincaicedo/infinitydb/blob/main/ARCHITECTURE.md"><code>ARCHITECTURE.md</code></a> &mdash; the internals overview (the long form of the <a href="architecture.html">architecture page</a>).</li>
+        <li><a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a> &mdash; how InfinityDB works (the long form of the <a href="architecture.html">architecture page</a>).</li>
         <li><a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/INFINITY_STYLE.md"><code>docs/INFINITY_STYLE.md</code></a> &mdash; the normative engineering style: what reviews are run against.</li>
         <li><a href="https://github.com/kevincaicedo/infinitydb/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> &mdash; the contributor path: reading order, validation ladder, the onboarding exercise, and the PR review checklist.</li>
         <li><a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a> &mdash; the generated compatibility matrix source.</li>

@@ -1,4 +1,4 @@
-# Cell code must never block or share state through std primitives (master plan L1/L6).
+# Cell code must never block or share state through std primitives (laws L1/L6).
 # `std::sync::Mutex` etc. are additionally grepped by scripts/check-cell-denylist.sh,
 # which scopes the ban to cell-resident crates.
 disallowed-types = [

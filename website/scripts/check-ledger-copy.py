@@ -10,23 +10,22 @@ allowlisted if an Allowed ledger row covers it (or if it is demonstrably a
 non-claim, e.g. a config example — say so in the line comment).
 
 This is deliberately pragmatic, not clever: it cannot judge *wording*, so
-the release-manager checklist in docs/claim-ledger.md still applies. What
+the release-manager checklist in the claim ledger still applies. What
 it guarantees mechanically is that no unreviewed performance number lands
 on the site.
 
 Ledger sources, in order of preference:
-  1. --ledger <path>   (the live docs/claim-ledger.md, when the site is
-                        built inside the monorepo)
-  2. site/_ledger-snapshot.md (a committed snapshot, so the check still
-                        runs if the site is split into its own repo; the
-                        tradeoff — snapshots can go stale — is documented
-                        in the website README)
+  1. --ledger <path>   (an explicit ledger file; CI passes the published
+                        site/_ledger-snapshot.md)
+  2. site/_ledger-snapshot.md (the published claim ledger, refreshed with
+                        every release and every copy change that touches
+                        a number — see the website README)
 The ledger is used for a soft cross-check (warn if an allowlisted token
 does not appear in the ledger text); the hard gate is the allowlist.
 
 Usage:
     python3 scripts/check-ledger-copy.py --site site \
-        [--ledger docs/claim-ledger.md] \
+        [--ledger site/_ledger-snapshot.md] \
         [--allowlist scripts/ledger-allowed-numbers.txt] \
         [--print-tokens]
 
@@ -137,7 +136,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Fail if site HTML carries a perf number absent from the ledger allowlist.")
     ap.add_argument("--site", default="site", help="site directory to scan (default: site)")
     ap.add_argument("--allowlist", default="scripts/ledger-allowed-numbers.txt")
-    ap.add_argument("--ledger", default=None, help="path to docs/claim-ledger.md (optional; falls back to <site>/_ledger-snapshot.md)")
+    ap.add_argument("--ledger", default=None, help="path to a claim-ledger file (optional; falls back to <site>/_ledger-snapshot.md)")
     ap.add_argument("--print-tokens", action="store_true", help="print every token found (debugging)")
     args = ap.parse_args()
 

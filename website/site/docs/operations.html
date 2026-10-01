@@ -73,7 +73,7 @@
   <h3>Repaired and counted</h3>
   <ul>
     <li><strong>A torn final batch frame</strong> (detected by CRC) is truncated and replay resumes cleanly behind it. This is the expected physics of a power cut mid-write.</li>
-    <li><strong>A provably un-covered gap in the un-synced tail.</strong> Since frame format v2 (ADR-0031), every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC. When a crash leaves a gap followed by surviving frames, recovery reads those attestations: if no surviving frame attests fsync coverage at or beyond the gap, nothing in it was ever acknowledged as durable &mdash; the tail truncates at the gap and the discarded frames are counted in the recovery stats, never silent.</li>
+    <li><strong>A provably un-covered gap in the un-synced tail.</strong> Since frame format v2, every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC. When a crash leaves a gap followed by surviving frames, recovery reads those attestations: if no surviving frame attests fsync coverage at or beyond the gap, nothing in it was ever acknowledged as durable &mdash; the tail truncates at the gap and the discarded frames are counted in the recovery stats, never silent.</li>
     <li><strong>Residue of a discarded log life:</strong> every frame&rsquo;s epoch stamp names which life of the log wrote it, so replay ends cleanly where an older life&rsquo;s leftover frames begin &mdash; discarded data can never resurrect into the live prefix (counted, like every repair).</li>
     <li><strong>Leftovers of interrupted maintenance</strong> &mdash; stale below-floor segments, orphaned <code>.ick.new</code> checkpoint stagings &mdash; are garbage-collected at boot.</li>
   </ul>
@@ -87,9 +87,9 @@
     <li><strong>A frame-format downgrade signature</strong> (a v1 frame after a v2 frame) &mdash; unreachable by any honest writer.</li>
   </ul>
   <p>A refusal looks like this on stderr (the corruption class, the file, the offsets, and the evidence are always named):</p>
-<pre><code>infinityd: cell 2 recovery failed (fail-stop, &sect;8.4): log corruption in seg-000004
+<pre><code>infinityd: cell 2 recovery failed (fail-stop, &sect;8.4): log corruption in seg-000004<!-- doc-link-allow(d) @kevincaicedo 2026-10-14: infinityd's stderr, quoted verbatim; it goes when the engine's fail-stop message drops the section number -->
 at 0x3f2c0: &lt;what the bytes looked like&gt;; a validating frame follows at seg-000004
-offset 0x40000 &mdash; interior data would be lost by truncation, refusing to start (&sect;8.4)</code></pre>
+offset 0x40000 &mdash; interior data would be lost by truncation, refusing to start (&sect;8.4)</code></pre><!-- doc-link-allow(d) @kevincaicedo 2026-10-14: infinityd's stderr, quoted verbatim; it goes when the engine's fail-stop message drops the section number -->
   <p>The process exits with code 1 and the whole node stops &mdash; a half-recovered node must never serve.</p>
 
   <div class="callout">
@@ -188,12 +188,12 @@ offset 0x40000 &mdash; interior data would be lost by truncation, refusing to st
   <p>The honest list. Every &ldquo;until M<em>n</em>&rdquo; label refers to the <a href="roadmap.html">roadmap</a>; nothing below is hidden behind marketing.</p>
   <ul>
     <li><strong>Single node.</strong> No replication, no cluster, no failover. The <code>wait-replica</code> durability class (zero loss across node failure) is M9 &mdash; not shipped. Single-node <code>always</code> means: survives any crash of <em>this</em> node; it does not survive the disk itself dying.</li>
-    <li><strong>No AUTH, no ACL, no TLS until M7.</strong> Bind to localhost or a trusted private network. Docker users: the io_uring <a href="deployment.html">seccomp profile</a> is required; it is a syscall filter, not an authentication substitute.</li>
+    <li><strong>No authentication or TLS yet.</strong> <code>AUTH</code>/<code>requirepass</code> and bind-address control arrive before the first public alpha release; TLS and multi-user ACLs at M7. The server listens on all interfaces: run it only on localhost or a trusted private network. Docker users: the io_uring <a href="deployment.html">seccomp profile</a> is required; it is a syscall filter, not an authentication substitute.</li>
     <li><strong>Strings, keys and expiry, SCAN, pub/sub, the <code>JSON.*</code> document surface, INFO/CONFIG/CLIENT admin, and the checkpoint surface</strong> &mdash; the exact per-command status is the <a href="compat.html">generated compatibility matrix</a>. No collections yet (lists, hashes, sets, sorted sets &mdash; M5), no <code>MULTI</code>/<code>EXEC</code> transactions or Lua (M6), streams at M7.</li>
     <li><strong>Bounded record sizes:</strong> keys up to 255 bytes, values up to 16 MiB &minus; 1 (the inline record bound &mdash; out-of-line blob storage is a later roadmap item). Oversized operations are refused at the command layer with an error, never truncated.</li>
-    <li><strong>Datasets are RAM-resident.</strong> Durable namespaces are recovered into memory; larger-than-RAM tiered storage is M4 &mdash; in dev now, shipping with <code>v0.4.0-alpha</code>.</li>
-    <li><strong>Durability is opt-in per namespace.</strong> The default namespaces behind <code>SELECT 0..15</code> are <code>memory</code> mode &mdash; a fresh node persists <em>nothing</em> until you create a durable namespace with <code>INF.NS</code>. This is the single most important operator fact on this page; the <a href="durability.html">durability page</a> is the contract.</li>
-    <li><strong>Operational surface is deliberately small:</strong> flags plus a <code>CONFIG</code> subset; no config file; no keyspace notifications, <code>SLOWLOG</code>, or <code>MONITOR</code> yet; no shutdown handshake (a stop is a crash, within the stated loss windows).</li>
+    <li><strong>Beyond RAM for strings only.</strong> Durable namespaces are recovered into memory unless they are tiered: a durable namespace created with a <code>MEM-BUDGET</code> keeps its hot data in RAM and tiers string values without expiry to disk. JSON documents stay RAM-resident until cold documents land later in M4.</li>
+    <li><strong>Durability is opt-in per namespace.</strong> The default namespaces behind <code>SELECT 0..15</code> are <code>memory</code> mode &mdash; a fresh node persists <em>nothing</em> until you create a durable namespace with <code>INF.NS CREATE</code> (the server needs <code>--data-dir</code>) and bind connections to it with <code>INF.NS USE</code>. A connection that never binds writes to database 0, which is memory-only, unless the server&rsquo;s <code>--conn-default-ns</code> names another namespace. This is the single most important operator fact on this page; the <a href="durability.html">durability page</a> is the contract.</li>
+    <li><strong>Operational surface is deliberately small:</strong> flags plus a <code>CONFIG</code> subset; no config file; no keyspace notifications, <code>SLOWLOG</code>, or <code>MONITOR</code> yet; a stop (<code>SIGTERM</code>/<code>SIGINT</code>) is graceful and leaves nothing to replay; a crash stays within the stated loss windows.</li>
     <li><strong>Linux with io_uring is the deployment target.</strong> macOS builds run for development only (kqueue) and are not a performance or deployment target.</li>
   </ul>
 

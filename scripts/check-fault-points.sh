@@ -2,8 +2,7 @@
 # Fault-point inventory check (M2-S16/S17; rewritten at ADR-0106 D9 on
 # review 2026-08-30, F-L20-04). Every fault point declared in a crate's
 # `src/fault.rs` must be (a) FIRED in production library code and (b) ARMED
-# by an exerciser — "an unexercised fault point fails the build"
-# (m2-durability §S16).
+# by an exerciser — "an unexercised fault point fails the build".
 #
 # What the old gate did instead: `grep -e fault::CONST -e "point"` over the
 # tests trees. Any textual mention satisfied it. Proven on this tree:

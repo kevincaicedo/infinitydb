@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dependency-DAG law enforcement (M0-S01, master plan §20).
+# Dependency-DAG law enforcement (the crate fences of law L11).
 # ADR-0106 D16: every permission is active or explicitly reserved.
 # Dev-dependencies are exempt (tests may cross layers).
 set -euo pipefail

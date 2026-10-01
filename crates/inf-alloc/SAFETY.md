@@ -1,14 +1,14 @@
 # SAFETY inventory — `inf-alloc`
 
-Unsafe-leaf crate (master plan §17.3). Every `unsafe` block in this crate is
+One of the four audited unsafe-leaf crates. Every `unsafe` block in this crate is
 listed here with its invariant and its test coverage. CI runs this crate's
 unit tests under Miri.
 
 | Location | Invariant | Coverage |
 |----------|-----------|----------|
 | `arena.rs::map_chunk` (`libc::mmap`) | anonymous private mapping, result checked against `MAP_FAILED` before use | unit tests + Miri (`storm_reconciles_byte_exact`) |
-| `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; the entry is zeroed after unmap and its slot recycled by the next `map_chunk`, so a stale addr is always bounds-checked against the slot's *current* entry — the zeroed one (panic) or the successor's live mapping (a wrong read, never the dead pointer). No generation bits exist to close that ABA (F-L16-03, batch 47 of the 2026-08-30 review); the caller's index slot is updated in the step that frees | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub`, `stale_huge_addr_after_slot_recycle_reads_the_successor_never_a_dead_pointer`, `stale_huge_addr_after_a_smaller_recycle_panics` |
-| `arena.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | `offset.checked_add(len)` bounds-checked against the owning chunk's mapped length before the slice is formed (total: a `len` near `usize::MAX` cannot wrap under the bound — batch 14 of the 2026-08-30 review; `bytes_refuses_a_wrapping_len` runs red on the plain add); `&self`/`&mut self` provide aliasing discipline; chunk memory lives until unmap/drop | whole arena test suite under Miri |
+| `arena.rs::unmap_chunk` / `Drop` (`libc::munmap`) | base/len are exactly one live mapping owned by the arena; the entry is zeroed after unmap and its slot recycled by the next `map_chunk`, so a stale addr is always bounds-checked against the slot's *current* entry — the zeroed one (panic) or the successor's live mapping (a wrong read, never the dead pointer). No generation bits exist to close that ABA; the caller's index slot is updated in the step that frees | `huge_allocations_map_and_unmap`, `stale_huge_addr_panics_not_ub`, `stale_huge_addr_after_slot_recycle_reads_the_successor_never_a_dead_pointer`, `stale_huge_addr_after_a_smaller_recycle_panics` |
+| `arena.rs::bytes`/`bytes_mut` (`from_raw_parts[_mut]`) | `offset.checked_add(len)` bounds-checked against the owning chunk's mapped length before the slice is formed (total: a `len` near `usize::MAX` cannot wrap under the bound; `bytes_refuses_a_wrapping_len` runs red on the plain add); `&self`/`&mut self` provide aliasing discipline; chunk memory lives until unmap/drop | whole arena test suite under Miri |
 | `counting_allocator.rs::GlobalAlloc` (test/feature-only) | successful requests delegate the caller's pointer/layout contract unchanged to `System`; a thread-owned one-shot refusal returns null before delegation, preserving a failed realloc's old allocation; const TLS counters never allocate or unwind | `delegates_and_counts_allocations`, `refusal_is_one_shot_and_thread_owned`, `refused_realloc_preserves_original`, `freed_bytes_include_successful_realloc` + `inf-doc/tests/scalar_patch_alloc.rs`; Miri covers the unit-test arm |
 | `region.rs::map_reservation` (`libc::mmap`, both cfg arms) | anonymous private mapping (PROT_NONE + NORESERVE; READ\|WRITE under Miri), no fixed address, result checked against `MAP_FAILED` before use | region unit tests under Miri (`commit_write_read_round_trip`, spans, recommit) |
 | `region.rs::protect_read_write` / `release_and_protect_none` (`mprotect`/`madvise`) | syscall range rounded to host pages inside the live reservation (commit widens to the envelope, decommit shrinks to fully-covered host pages — identity on hosts whose page divides the region page); logical range asserted against the per-page commit bitmap by the callers; DONTNEED/FREE only on committed private anonymous pages; return codes asserted (a failed protect is a violated invariant, not an operating error) | Linux unit tests (`decommit_then_recommit_reuses_pages`, `commit_decommit_at_host_page_interior_offsets` — the latter exercises the 16 KiB-host rounding on macOS CI); elided under Miri (unsupported shims — the bitmap asserts still run) |
@@ -21,7 +21,7 @@ unit tests under Miri.
 
 `buffer_pool` remains 100% safe code.
 
-Lifecycle errors fail loudly in every pool (F-L16-04): `Arena::free` panics
+Lifecycle errors fail loudly in every pool: `Arena::free` panics
 on a classed double free at the free-list head in every profile, and on one
 deeper in the list under `debug_assertions` (a per-slot tag in bytes 8..16
 of the freed slot, cleared on reuse); a huge double free panics on the

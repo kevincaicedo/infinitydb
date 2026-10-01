@@ -61,19 +61,18 @@
 
   <div class="callout warn">
     <span class="callout-tag"><strong>Alpha exposure warning:</strong></span>
-    there is no AUTH, no ACL, and no TLS until M7. Bind InfinityDB to localhost or a trusted private network only. Both paths below assume that posture.
+    there is no authentication and no TLS yet, and the server listens on all interfaces. <code>AUTH</code>/<code>requirepass</code> and bind-address control arrive before the first public alpha release; TLS and multi-user ACLs at M7 (see the <a href="roadmap.html">roadmap</a>). Until then, run InfinityDB only on localhost or a trusted private network. Both paths below assume that posture.
   </div>
 
   <h2>Docker</h2>
-  <p>Until the first public tag lands there are no published container images (see the <a href="quickstart.html">quickstart&rsquo;s packaging note</a>) &mdash; build the image from the repository. The <code>Dockerfile</code> produces a static musl binary in a <code>scratch</code>-based image: no shell, no libc, minimal CVE surface.</p>
-<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
-docker build -t infinitydb:dev .
+  <p>Until the first public tag lands there are no published container images (see the <a href="quickstart.html">quickstart&rsquo;s packaging note</a>) &mdash; build the image from the repository. The <code>Dockerfile</code> produces a static musl binary in a <code>scratch</code>-based image: no shell, no libc, minimal CVE surface. From the root of the clone:</p>
+<pre><code>docker build -t infinitydb:dev .
 
-docker run --rm -p 6379:6379 \
+docker run --rm -p 127.0.0.1:6379:6379 \
   --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
   -v infinitydb-data:/data \
   infinitydb:dev --data-dir /data</code></pre>
-  <p>The <code>-v</code> volume and <code>--data-dir /data</code> give the node durable storage; omit both to run a memory-only node (pure cache semantics, nothing survives a restart).</p>
+  <p>The <code>-v</code> volume and <code>--data-dir /data</code> give the node durable storage; omit both to run a memory-only node (pure cache semantics, nothing survives a restart). <code>-p 127.0.0.1:6379:6379</code> publishes the port on the host&rsquo;s loopback interface only.</p>
 
   <h3>The seccomp profile is required</h3>
   <p>InfinityDB&rsquo;s I/O plane is built on Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code>, <code>io_uring_enter</code>, <code>io_uring_register</code>). Under the default profile the node cannot create its reactor and exits immediately with:</p>
@@ -90,7 +89,7 @@ docker run --rm -p 6379:6379 \
   </div>
 
   <h2>systemd</h2>
-  <p><code>infinityd</code> runs in the foreground, logs to stderr, and takes no signals &mdash; <code>Type=simple</code> is correct. A minimal hardened unit:</p>
+  <p><code>infinityd</code> runs in the foreground, logs to stderr, and stops gracefully on <code>SIGTERM</code> or <code>SIGINT</code> &mdash; <code>Type=simple</code> is correct. A minimal hardened unit:</p>
 <pre><code>[Unit]
 Description=InfinityDB node
 After=network-online.target local-fs.target
@@ -119,12 +118,15 @@ WantedBy=multi-user.target</code></pre>
   <p>Two honesty notes worth reading before you copy that file:</p>
   <ul>
     <li><strong><code>Restart=no</code> is a recommendation, not a limitation.</strong> InfinityDB&rsquo;s deliberate exits &mdash; a recovery refusal (exit code 1), a durable fsync failure (exit code 3), a cell panic (exit code 101) &mdash; all mean the same thing: restarting will not help, and a restart loop hides the evidence. The <a href="operations.html">operations page</a> explains each exit and what to do.</li>
-    <li><strong>Stopping the node is a crash, by design.</strong> There is no shutdown handshake: <code>systemctl stop</code> kills the process, and the next boot recovers from the log. That is exactly the crash model the <a href="durability.html">durability classes</a> are specified against &mdash; an <code>always</code> namespace loses nothing (every acknowledged write was fsynced before its ack), an <code>everysec</code> namespace can lose up to its stated one-second window, a <code>memory</code> namespace loses everything. If those windows surprise you, read the durability page before deploying.</li>
+    <li><strong>Stopping the node is graceful; a crash is still safe.</strong> <code>systemctl stop</code> sends <code>SIGTERM</code>: every cell stops admitting and drains its connections, a durable cell publishes a stop checkpoint and its final sync, and the node exits 0 &mdash; the next boot replays nothing. <code>--shutdown-timeout-ms</code> (default 10&nbsp;000) bounds the drain; when it expires the node exits 1, naming the phase it was in. A second signal terminates at once. A crash or a <code>SIGKILL</code> is the model the <a href="durability.html">durability classes</a> are specified against &mdash; an <code>always</code> namespace loses nothing (every acknowledged write was fsynced before its ack), an <code>everysec</code> namespace can lose up to its stated one-second window, a <code>memory</code> namespace loses everything. If those windows surprise you, read the durability page before deploying.</li>
   </ul>
 
   <h2>The data directory</h2>
-  <p>With <code>--data-dir</code> set, the node owns a directory tree of exactly four kinds of file &mdash; every one CRC-protected, every one swap-published atomically (write-new + fsync + rename + directory-fsync):</p>
+  <p>With <code>--data-dir</code> set, the node owns this directory tree. Its metadata files (the catalog, each MANIFEST, each checkpoint) are CRC-protected and swap-published atomically (write-new + fsync + rename + directory-fsync); log segments are CRC-framed and append-only:</p>
 <pre><code>&lt;data-dir&gt;/
+&#9500;&#9472; topology.toml            <span class="c"># the --cells count, stamped at the first boot; another count is refused</span>
+&#9500;&#9472; io-properties.toml       <span class="c"># the device probe&rsquo;s result, bound to this filesystem and device</span>
+&#9500;&#9472; key-hash.toml            <span class="c"># the key-hash secret: back it up with the directory, never copy it to another</span>
 &#9500;&#9472; META                     <span class="c"># node namespace catalog (which namespaces exist, their durability class)</span>
 &#9500;&#9472; shard-0/                 <span class="c"># cell 0 — one directory per cell, recovered independently and in parallel</span>
 &#9474;  &#9500;&#9472; MANIFEST              <span class="c"># the recovery unit: checkpoint id, begin-LSN, live segment set</span>
@@ -158,7 +160,8 @@ WantedBy=multi-user.target</code></pre>
         <tr><td><code>--data-dir</code></td><td><em>unset</em></td><td>Durable-plane root. Absent = memory-only node: the durable machinery is not just idle but absent from the hot path (measured, ledger row C15).</td></tr>
         <tr><td><code>--ckpt-interval-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Bytes-appended checkpoint trigger, per cell. <code>0</code> = manual only (<code>INF.CKPT</code> / <code>BGSAVE</code>).</td></tr>
         <tr><td><code>--segment-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Log segment prealloc/seal size.</td></tr>
-        <tr><td><code>--sync-pipeline</code></td><td><code>1</code></td><td>Durability fsyncs in flight per cell: <code>1</code> or <code>2</code>, never a queue. The measured default is 1; 2 is a bounded pipeline kept as an A/B knob.</td></tr>
+        <tr><td><code>--device-probe</code></td><td><code>auto</code></td><td>At the first boot of a data directory, measure the device for about ten seconds and record the write model in <code>io-properties.toml</code>. <code>off</code> skips the probe and runs with conservative write settings.</td></tr>
+        <tr><td><code>--shutdown-timeout-ms</code></td><td><code>10000</code></td><td>Bound on the graceful stop&rsquo;s drain; when it expires the node exits 1, naming the phase it was in.</td></tr>
         <tr><td><code>--buffers</code> / <code>--buf-size</code></td><td><code>4096</code> / <code>4096</code></td><td>io_uring provided-buffer pool: buffer count and per-buffer bytes.</td></tr>
         <tr><td><code>--pin-start</code></td><td><em>unset</em></td><td>First core index to pin cells to; cell <em>i</em> pins to <code>pin-start + 2i</code> (every other logical core, leaving SMT siblings free). Unset = no pinning.</td></tr>
         <tr><td><code>--route-local-only</code></td><td><em>off</em></td><td>Treat every key as local to the accepting cell &mdash; benchmark/diagnostic mode, not for real data.</td></tr>
@@ -166,16 +169,16 @@ WantedBy=multi-user.target</code></pre>
       </tbody>
     </table>
   </div>
-  <p class="muted" style="font-size:14px">The remaining flags in <code>--help</code> (the fabric-flush, execute-order, and prefetch toggles) are measured A/B levers whose defaults carry the winning arm &mdash; leave them alone unless you are reproducing an experiment.</p>
+  <p class="muted" style="font-size:14px">The remaining flags in <code>--help</code> (the write-path tuning, fabric-flush, execute-order, and prefetch toggles) are measured A/B levers whose defaults carry the winning arm &mdash; leave them alone unless you are reproducing an experiment.</p>
   <p>Runtime configuration uses the Redis <code>CONFIG</code> surface (<code>maxmemory</code>, <code>maxmemory-policy</code>, and friends &mdash; see the <a href="compat.html">compatibility matrix</a>); per-namespace durability and eviction are set at <code>INF.NS CREATE</code> time (see <a href="durability.html">namespaces &amp; durability</a>).</p>
 
   <h2>Upgrades &amp; downgrades</h2>
-  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing, ADR-0031) as of M2.5. The rules, stated plainly:</p>
+  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing). The rules, stated plainly:</p>
   <ul>
     <li><strong>Reading is forever:</strong> the v0.2 line reads both frame format v1 and v2. A log written by an older alpha binary remains readable on every later alpha binary.</li>
     <li><strong>Writing is v2 only</strong> &mdash; there is no write-v1 mode. The first time a v2 binary appends to a log, that log contains v2 frames.</li>
     <li><strong>No downgrade after the first v2 write:</strong> pre-v2 binaries cannot read v2 frames, so once a v2 binary has appended, rolling back the binary means restoring the data directory from a pre-upgrade backup as well. Recovery additionally treats a v1 frame appearing <em>after</em> a v2 frame as a named refusal &mdash; no honest writer can produce that ordering.</li>
-    <li>Format changes are ADR events, not patches: each one lands with fuzzing of both formats, a crash-matrix re-run, and a fresh simulation sweep (law L9).</li>
+    <li>Format changes are recorded design decisions, not patches: each one lands with fuzzing of both formats, a crash-matrix re-run, and a fresh simulation sweep (law L9).</li>
   </ul>
 
   <div class="doc-footer-nav">

@@ -1,6 +1,6 @@
 # inf-sim — unsafe inventory
 
-`inf-sim` is not an unsafe leaf crate (§17.3); it carries exactly two
+`inf-sim` is not an unsafe-leaf crate; it carries exactly two
 audited `unsafe` constructions, following the `inf-server::log_bytes`
 precedent (ADR-0015 D4).
 

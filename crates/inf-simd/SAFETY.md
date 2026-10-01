@@ -1,6 +1,6 @@
 # inf-simd SAFETY
 
-`inf-simd` is one of the four crates allowed `unsafe` (milestone M0 §3.3).
+`inf-simd` is one of the four audited unsafe-leaf crates.
 All unsafe code is platform intrinsics in `crlf.rs`, `group16.rs`, and
 `crc32c.rs`; `swar.rs` is fully safe (64-bit integer tricks only).
 

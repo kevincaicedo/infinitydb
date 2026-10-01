@@ -1,13 +1,11 @@
 # JSONPath Subset — Grammar Specification (M3-S08)
 
-Normative grammar for the InfinityDB JSONPath subset (master plan §10.1;
-milestone M3 §2/§5). The compiled form — path-program bytecode v1 — and
-the evaluation contract are frozen by
-[ADR-0040](../../docs/adr/0040-m3-s08-s09-jsonpath-and-path-programs.md);
-this document owns what *text* is accepted and what it means. Behavior
-that RedisJSON decides differently surfaces at S21 as an oracle diff and
-lands in the deviation allowlist — the grammar itself changes only by
-ADR.
+Normative grammar for the InfinityDB JSONPath subset. The compiled
+form — path-program bytecode v1 — and the evaluation contract are frozen
+by ADR-0040; this document owns what *text* is accepted and what it
+means. Behavior that RedisJSON decides differently surfaces at S21 as an
+oracle diff and lands in the deviation allowlist — the grammar itself
+changes only by ADR.
 
 Filter expressions are **not in this grammar** (M4.5, ADR-0024): a `?(`
 token anywhere a selector may start is rejected with the documented
@@ -99,7 +97,7 @@ is the reader's map.
 | `$` | `Root` | the root value |
 | `.name` / `['name']` | `Child(name)` | member `name` of an object; nothing on non-objects |
 | `.*` / `[*]` | `ChildAny` | every member value (objects, insertion order) / every element (arrays) |
-| `[3]` / `[-1]` | `Index(3)` / `Index(-1)` | array element, negatives from the end; nothing on non-arrays or out of range. Indices are `i64`; a resolved index outside `[0, len)` selects nothing — including every value beyond the `u32` ordinal width, which never wraps onto a real element (review C10) |
+| `[3]` / `[-1]` | `Index(3)` / `Index(-1)` | array element, negatives from the end; nothing on non-arrays or out of range. Indices are `i64`; a resolved index outside `[0, len)` selects nothing — including every value beyond the `u32` ordinal width, which never wraps onto a real element |
 | `[a:b:s]` | `Slice(a,b,s)` | Python slice semantics over arrays: negatives resolved against `len`, then clamped; `s < 0` walks backward; omitted fields default per Python (`s` omitted = 1; `a`/`b` defaults depend on sign of `s`); nothing on non-arrays |
 | `[x, 1, a:b]` | `Union(n)` + members | concatenation of member selections, member order, duplicates kept (canonicalized to document order + deduplicated for mutation, ADR-0040 D5/R5) |
 | `..sel` | `Descend` + sel | `sel` applied to the node itself and every descendant, pre-order (document order) |
@@ -124,8 +122,7 @@ bounds, `len 0`).
 `s` is any non-zero `i64` and the walk is total: the cursor advances by
 saturating addition, so a step of any magnitude yields exactly the index
 set above (a step ≥ `len` from any in-range `a` yields one element) and
-never wraps — `[1::9223372036854775807]` on `[10,20,30]` is `[20]`
-(review C11).
+never wraps — `[1::9223372036854775807]` on `[10,20,30]` is `[20]`.
 
 ## 5. Canonical printing (the `parse(print(ast)) == ast` contract)
 
@@ -167,8 +164,7 @@ Limits are ADR-0040 D6; they exist because compiled programs are durable
 - ≥ 200-case table-driven suite (valid → expected AST/print; invalid →
   expected error kind and offset), **re-derived from the RedisJSON
   documentation and RFC 9535** — RedisJSON's own test files are
-  RSALv2/SSPL-licensed and are not copied (the licensing arm of the S08
-  AC, recorded in the ledger).
+  RSALv2/SSPL-licensed and are not copied.
 - Property: `parse(print(ast)) == ast` over generated ASTs (both modes).
 - The `fuzz_path_program` target (S09) also drives this parser: text →
   compile → decode ≡ intent, arbitrary bytes never panic.

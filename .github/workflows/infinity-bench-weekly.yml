@@ -1,5 +1,5 @@
-# InfinityDB weekly pressure-row campaign (M1 §5: "new pressure rows in
-# CI-bench — reduced, reference box weekly").
+# InfinityDB weekly pressure-row campaign (the M1 pressure rows, reduced,
+# on the reference box weekly).
 #
 # REQUIRES a self-hosted runner labeled `reference-box` (the M0-R2 box:
 # pinned cores, performance governor, redis-server 8.x installed). The rows

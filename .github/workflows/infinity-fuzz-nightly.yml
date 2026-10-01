@@ -3,8 +3,8 @@
 # crash uploads the reproducing artifact — fixes land WITH the input
 # minimized into the target's corpus.
 #
-# Per-target budget: 5.5 h (owner decision 2026-08-08, v0.4.0 readiness
-# §9 D4 — max out the runner). GitHub hard-kills jobs at 6 h wall
+# Per-target budget: 5.5 h (owner decision 2026-08-08 — max out the
+# runner). GitHub hard-kills jobs at 6 h wall
 # including checkout/toolchain/cargo-install/fuzz-build overhead, so a
 # literal 6 h of fuzz time would be killed mid-run and bank nothing;
 # 5.5 h + overhead fits. The 24 h/target release gate accrues in 5
@@ -36,7 +36,7 @@ jobs:
           - { dir: crates/inf-fabric, target: fabric_codec }
           - { dir: crates/inf-server, target: glob_match }
           - { dir: crates/inf-server, target: scan_cursor }
-          # Group 0 item 3 (review of 2026-08-30, §5.5 / the C3 lesson):
+          # Adversarial surface coverage:
           # the whole command registry under adversarial argv shapes.
           - { dir: crates/inf-server, target: command_surface }
           # F-L18-07 (review of 2026-08-30, batch 63): every parser in
@@ -61,7 +61,7 @@ jobs:
           # accrual was not wired — L9 requires the hours, not the file).
           - { dir: crates/inf-log, target: manifest_decode }
           - { dir: crates/inf-log, target: extent_decode }
-          # M4-S11 tier-file decoder — the M4 §6 plan requires it nightly.
+          # The tier-file decoder accrues its fuzz hours nightly.
           - { dir: crates/inf-log, target: fuzz_tierfile_decode }
           # M3-S01/S02 (gap caught in S05: the S02 ledger recorded this
           # accrual but the matrix was never extended) + M3-S05.

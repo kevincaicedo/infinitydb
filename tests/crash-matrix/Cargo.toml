@@ -29,7 +29,7 @@ inf-doc.workspace = true
 # `collision-oracle` off and the row reported "0 Ticketed refusals" —
 # green only under `cargo test --workspace`, where `inf-server`'s dev-edge
 # unified the feature in, and red under `cargo test -p crash-matrix`
-# (found in batch 15 of the 2026-08-30 review, §5.5 class).
+# (a gate that could not go red on its own).
 inf-sim = { path = "../../bins/inf-sim", features = ["dst"] }
 
 # The fsyncgate row boots a real single-cell uring node in a child

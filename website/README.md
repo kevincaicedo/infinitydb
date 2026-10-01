@@ -1,13 +1,11 @@
-# InfinityDB website v2 (design refresh, 2026-07-17)
+# InfinityDB website
 
 Fully static, multi-page project website for GitHub Pages. Plain HTML/CSS +
-minimal vanilla JS — no framework, no build step for pages. The only
-generated page is the compat matrix (see below). v2 ports the approved
-dual-accent design prototypes `assests/Landing.dc.html` / `Docs.dc.html` /
-`Blog.dc.html` (violet #7c5cff + teal #3ee6c4 on #06070d — see DESIGN.md,
-"Two Lamps on Near-Black"), with all `sc-if`/`x-dc`/`support.js`
-scaffolding replaced by vanilla equivalents (copy button,
-IntersectionObserver bar triggers, nav toggle).
+minimal vanilla JS — no framework, no build step for pages. The generated
+pages are the compat matrix and the comparative evidence report (see
+below). The visual system is the dual-accent design (violet #7c5cff + teal
+#3ee6c4 on #06070d — see [DESIGN.md](DESIGN.md), "Two Lamps on
+Near-Black"); product intent is in [PRODUCT.md](PRODUCT.md).
 
 ## Layout
 
@@ -15,19 +13,19 @@ IntersectionObserver bar triggers, nav toggle).
 site/                          ← the deployable root (upload this to Pages)
   index.html                   landing page
   assets/site.css              the one shared stylesheet
-  _ledger-snapshot.md          committed snapshot of docs/claim-ledger.md (CI fallback)
+  _ledger-snapshot.md          the published claim ledger the copy check reads
   docs/
     index.html                 docs hub + claims/evidence explainer
     quickstart.html            source build + Docker-from-repo + seccomp note
-                               + client snippets (redis-py/node-redis/go-redis/Lettuce, M2.5-S06)
+                               + client snippets (redis-py/node-redis/go-redis/Lettuce)
     durability.html            namespaces, durability classes, loss windows, recovery
-    deployment.html            docker/systemd/seccomp, data-dir layout, flags, upgrades (M2.5-S06)
-    operations.html            -LOADING, refusal taxonomy, INFO persistence, alpha limits (M2.5-S06)
+    deployment.html            docker/systemd/seccomp, data-dir layout, flags, upgrades
+    operations.html            -LOADING, refusal taxonomy, INFO persistence, alpha limits
     architecture.html          the internals tour with animated diagrams
-                               (cell, fabric, group commit, M4 tiering)
+                               (cell, fabric, group commit, tiering)
     benchmarks.html            methodology + every Allowed number w/ artifact
     compat.html                GENERATED — do not edit (see below)
-    roadmap.html               the milestone train, ADR reorders named
+    roadmap.html               the milestone train
   evidence/
     inf-compare.html           GENERATED — the binding comparative campaign
                                report, rendered verbatim (see below)
@@ -43,17 +41,10 @@ scripts/
   ledger-allowed-numbers.txt   the allowlist (regenerated from Allowed rows)
 ```
 
-The Vortex post-mortem article and comparison bar were retired 2026-08-10
-(owner decision): no vortex content on the site; the predecessor survives
-only as unnamed context in the discipline post.
-
-Placement (as landed, M2.5-S05): this directory is `website/` in the
-InfinityDB repo; the deploy workflow is `.github/workflows/pages.yml` with
-paths already adjusted (`website/site`, `website/scripts`,
-`docs/compat-matrix.md`). The ledger of record (`docs/claim-ledger.md`)
-lives in the outer planning repo, so CI checks against the committed
-snapshot `site/_ledger-snapshot.md` — refresh it whenever site copy or the
-ledger changes (release-manager checklist step).
+The deploy workflow is `.github/workflows/pages.yml`. The claim ledger is
+published with the site as `site/_ledger-snapshot.md`; maintainers refresh
+it with every release and whenever site copy adds, removes or re-words a
+number. The copy check (below) reads it.
 
 ## Preview locally
 
@@ -67,16 +58,20 @@ JetBrains Mono); the site degrades gracefully to system fonts offline.
 
 ## The compat page is generated — never edit it
 
-`site/docs/compat.html` is rendered from the repo's own generated artifact
-`infinitydb/docs/compat-matrix.md` (which is itself rendered from the
+`site/docs/compat.html` is rendered from the repository's own generated
+artifact `docs/compat-matrix.md` (which is itself rendered from the
 `inf-wire` command registry by `tests/compat/src/matrixgen.rs`, with its own
 CI staleness gate). The chain keeps the website incapable of drifting from
-the implementation (law L8). Regenerate after the matrix changes:
+the implementation (law L8). The page is first-read copy: the renderer
+states each note without the matrix's internal decision and story
+identifiers, and folds a story or dot milestone into its milestone;
+`scripts/check-public-doc-links.sh` refuses the page if one survives.
+Regenerate after the matrix changes, from the repository root:
 
 ```bash
-python3 scripts/gen-compat-page.py \
-  --matrix infinitydb/docs/compat-matrix.md \
-  --out site/docs/compat.html
+python3 website/scripts/gen-compat-page.py \
+  --matrix docs/compat-matrix.md \
+  --out website/site/docs/compat.html
 ```
 
 Commit the regenerated page. The workflow regenerates it and fails the
@@ -84,29 +79,26 @@ build if the committed page is stale (only the date stamp may differ).
 
 ## The ledger-copy check
 
-Project law L10: no number in public copy without an **Allowed** row in
-`docs/claim-ledger.md`. `scripts/check-ledger-copy.py` mechanizes the
-website half of that rule: it strips every HTML page to visible text,
-extracts performance-claim-shaped tokens (multipliers `2.7x`, rates
-`ops/s`, bandwidth, latencies, sizes, percentages, `p99 < N` comparisons)
-and fails unless each token is in `scripts/ledger-allowed-numbers.txt`.
+Project law L10: no number in public copy without an **Allowed** row in the
+claim ledger. `scripts/check-ledger-copy.py` mechanizes the website half of
+that rule: it strips every HTML page to visible text, extracts
+performance-claim-shaped tokens (multipliers `2.7x`, rates `ops/s`,
+bandwidth, latencies, sizes, percentages, `p99 < N` comparisons) and fails
+unless each token is in `scripts/ledger-allowed-numbers.txt`. From the
+repository root:
 
 ```bash
-python3 scripts/check-ledger-copy.py --site site \
-  --ledger docs/claim-ledger.md \
-  --allowlist scripts/ledger-allowed-numbers.txt --print-tokens
+python3 website/scripts/check-ledger-copy.py --site website/site \
+  --ledger website/site/_ledger-snapshot.md \
+  --allowlist website/scripts/ledger-allowed-numbers.txt --print-tokens
 ```
 
 - The allowlist is maintained **from the ledger's Allowed rows** — every
   entry's comment names its row (or documents why it is a non-claim, e.g.
   the `MAXMEMORY 16gb` config example). Review it whenever the ledger
   changes.
-- Ledger source: pass `--ledger` when building inside the monorepo (the
-  workflow does). If the site is ever split into its own repo, the
-  committed snapshot `site/_ledger-snapshot.md` is used instead —
-  **tradeoff**: a snapshot can go stale relative to the live ledger, which
-  is why the workflow refreshes it from `docs/claim-ledger.md` on every
-  deploy and the snapshot is only a fallback.
+- The ledger text is a soft cross-check (a warning when an allowlisted
+  token does not appear in an Allowed row); the allowlist is the hard gate.
 - The check is a tripwire, not a replacement for the release-manager
   checklist in the ledger (it checks numbers, not wording).
 
@@ -116,25 +108,24 @@ the 1.72× Dragonfly cross-cell anchor, disclosures in the mono footnote),
 **C7** (0.61× RSS), **C8** (96.19% LFU parity), **C12** (10k-seed sweep),
 **C14** (9.8 s cold boot), **C16** (14.4 MiB checkpoint overhead) — in
 evidence blocks and stat tiles; `docs/benchmarks.html` carries the full
-Allowed set including the M3 document rows (**C21**, **C24–C27**) beside
-the methodology (**C19**'s everysec range came OFF the page 2026-08-11 —
-its S24 re-read did not reproduce and the row reverted to
-Evidence-pending; the page's absence list tells that story); the durability
-page cites **C12–C16, C21** verbatim with artifacts; the blog cites
-**C3, C4, C12**. Deployment/operations carry only config non-claims
-(`256 MiB` defaults, `16 MiB` bound). `evidence/inf-compare.html` is the
-generated verbatim render of the binding comparative report (excluded
-from the copy check by design — it IS the artifact; the generator
-refuses non-binding reports). Pipelined peaks, `always`-mode write
-rates, absolute tail-latency claims, and all tiered-storage numbers
-remain absent — Narrowed/Evidence-pending rows never render, and both
-the landing's "what you don't see here" callout and the benchmarks
-page's absence list say so explicitly.
+Allowed set including the document rows (**C21**, **C24–C27**) beside
+the methodology (**C19**'s everysec range came off the page 2026-08-11 —
+its re-read did not reproduce and the row reverted to Evidence-pending;
+the page's absence list tells that story); the durability page cites
+**C12–C16, C21** verbatim with artifacts; the blog cites **C3, C4, C12**.
+Deployment/operations carry only config non-claims (`256 MiB` defaults,
+`16 MiB` bound). `evidence/inf-compare.html` is the generated verbatim
+render of the binding comparative report (excluded from the copy check by
+design — it IS the artifact; the generator refuses non-binding reports).
+Pipelined peaks, `always`-mode write rates, absolute tail-latency claims,
+and all tiered-storage numbers remain absent — Narrowed/Evidence-pending
+rows never render, and both the landing's "what you don't see here"
+callout and the benchmarks page's absence list say so explicitly.
 
 ## Deploying to GitHub Pages
 
-1. Copy `pages.yml` to `.github/workflows/pages.yml` (adjust paths if you
-   relocated `site/`/`scripts/`).
+1. The workflow is `.github/workflows/pages.yml` (adjust its paths if you
+   relocate `site/`/`scripts/`).
 2. In the GitHub repo: **Settings → Pages → Build and deployment → Source:
    GitHub Actions.**
 3. Push to `main` (or run the workflow manually). The workflow runs the
@@ -143,39 +134,31 @@ page's absence list say so explicitly.
 4. Optional custom domain: Settings → Pages → Custom domain, then add a
    `site/CNAME` file containing the domain so deploys keep it.
 
-## TODO before going live (fill these in)
+## Before going live
 
-- [ ] **Real GitHub repo URL** — every `href="https://github.com/"` in the
-  HTML is a placeholder (nav "GitHub" button, hero/CTA "Star on GitHub",
-  footer links, the architecture page's repo links). Search-and-replace
-  `https://github.com/` → `https://github.com/<org>/<repo>` (and deep links
-  like `.../blob/main/infinitydb/ARCHITECTURE.md` where appropriate).
 - [ ] Enable GitHub Pages as described above; verify the deployed URL.
 - [ ] Custom domain, if any (`site/CNAME` + DNS).
-- [ ] S05 AC: verify the quickstart cold on a clean machine (source build +
-  Docker-from-repo path), per the milestone plan.
-- [ ] When `v0.4.0-alpha` actually tags: update the quickstart's "no
+- [ ] Verify the quickstart cold on a clean machine (source build +
+  Docker-from-repo path).
+- [ ] When the first release is tagged: update the quickstart's "no
   published binaries yet" callout to point at the release artifacts,
   re-run the ledger check against the release's re-validated ledger, and
-  regenerate `evidence/inf-compare.html` from the v0.4.0 campaign's
-  binding report once its rows are signed (S25 release checklist).
+  regenerate `evidence/inf-compare.html` from that release's binding
+  comparative report once its rows are signed.
 
 ## Honesty invariants baked into the copy (keep them when editing)
 
-- Shipping today = Redis-compatible in-memory cache + durable KV
-  namespaces + the built-and-verified JSON document plane (M3 · verdict
-  reached, tags at v0.4.0-alpha); tiered storage is M4 · IN DEV.
-  Queries/collections/streams/vectors/compute/HA are roadmap items and
-  every mention carries its milestone label — including terminal
+- InfinityDB is alpha. What ships is labeled as shipping; everything else
+  (collections, streams, vectors, compute, high availability) is a roadmap
+  item and every mention carries its milestone label — including terminal
   commands and diagram nodes.
-- Version badge = `v0.4.0-alpha · IN DEV` (ADR-0067, 2026-08-06:
-  `v0.3.0-alpha.1` retired unused; the first public tag is M4's
-  `v0.4.0-alpha`, shipping M3 + M4 together, release act in M4-S25;
-  nothing has been tagged yet).
-- The roadmap page mirrors master plan §21–22 including the
-  ADR-0023/0024 reorders, M4.5, and the ADR-0048 → ADR-0067 first-tag
-  moves; the design prototypes' stale train (old numbering, "M1 · NOW")
-  was corrected during the port, not reproduced.
+- Nothing has been tagged yet; version badges never claim a release that
+  does not exist.
+- The roadmap page mirrors [the repository roadmap](../docs/roadmap.md):
+  the big milestones, in order, with honest status.
 - The Docker quickstart builds from the repo and keeps the io_uring seccomp
   requirement front and center.
-- The `wait-replica` durability row is labeled M9 (not shipped).
+- The `wait-replica` durability row is labeled with the replication
+  milestone (not shipped).
+- The predecessor project is not named on the site; it survives only as
+  unnamed context in the discipline post.

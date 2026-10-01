@@ -119,7 +119,7 @@
 
   <div class="evidence">
     <span class="tag">C5 &middot; Narrowed &rarr; binding rows citable</span> &mdash; Unpipelined GET/SET at 512 connections: <strong style="color:var(--text)">3.21&times; Redis</strong>, same run, same box, 4 cells. Cross-cell comparator anchor: <strong style="color:var(--text)">1.72&times; Dragonfly</strong> in-run at 4 cells. Pipelined rows exist and bind but are quoted only with their shape context &mdash; the 8-cell natural row carries a disclosed red batching tripwire and is never quoted bare.
-    <span class="artifact">.artifacts/m0/1783698386-gate-run/ &middot; S19 closure campaign 2026-07-10 &middot; i7-13700KF, turbo off</span>
+    <span class="artifact">.artifacts/m0/1783698386-gate-run/ &middot; closure campaign 2026-07-10 &middot; i7-13700KF, turbo off</span>
   </div>
   <div class="evidence">
     <span class="tag">C7 &middot; Allowed</span> &mdash; <strong style="color:var(--text)">0.61&times; Redis RSS</strong> at 10M keys &times; (16 B keys, 64 B values), both engines filled in the same run on the same box.
@@ -147,19 +147,19 @@
   </div>
   <div class="evidence">
     <span class="tag">C24 &middot; Allowed</span> &mdash; Documents are stored as a compact binary tape (<code>idoc</code> v1): <strong style="color:var(--text)">1.108&times; msgpack</strong> and <strong style="color:var(--text)">0.764&times; JSON text</strong> aggregate density on the reference corpus shapes (deterministic byte counts; per-shape worst cases live in the artifact and travel with any per-shape quote).
-    <span class="artifact">infinitydb/.artifacts/m3/s02-idoc-20260710/</span>
+    <span class="artifact">.artifacts/m3/s02-idoc-20260710/</span>
   </div>
   <div class="evidence">
     <span class="tag">C25 &middot; Allowed</span> &mdash; Document reads never run a JSON text parser &mdash; profile-proven: zero parser/path-compiler symbols in a 1,659-row profile under a live <code>JSON.GET</code> load, and a CI check greps the profile so a regression fails loudly.
-    <span class="artifact">infinitydb/.artifacts/m3/s25-dev-20260716/ &middot; dev-tier proof, named; the release campaign re-proves it</span>
+    <span class="artifact">.artifacts/m3/s25-dev-20260716/ &middot; dev-tier proof, named; the release campaign re-proves it</span>
   </div>
   <div class="evidence">
     <span class="tag">C26 &middot; Allowed</span> &mdash; Every document path mutation is one delta log record &mdash; <strong style="color:var(--text)">0.066&times;</strong> full-document log volume on the 64-op mutation mix &mdash; and 10,000 simulated document power-cut seeds produced zero durability-oracle and zero replay-equivalence violations, replayed state byte-exact including lineage and version.
-    <span class="artifact">infinitydb/.artifacts/m3/s16-s17-20260712/ + s23-s24-20260716/doc-sweep-10k.txt</span>
+    <span class="artifact">.artifacts/m3/s16-s17-20260712/ + s23-s24-20260716/doc-sweep-10k.txt</span>
   </div>
   <div class="evidence">
     <span class="tag">C27 &middot; Allowed</span> &mdash; Document memory is attributed always-on (tape/tree/slack/path-cache domains, per namespace); attribution reconciles with RSS at <strong style="color:var(--text)">0.056%</strong> divergence on a 65k-document load (10% fails CI).
-    <span class="artifact">infinitydb/.artifacts/m3/s18-s19-20260713/</span>
+    <span class="artifact">.artifacts/m3/s18-s19-20260713/</span>
   </div>
 
   <h2>What you will not find here, and why</h2>

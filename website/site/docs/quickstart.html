@@ -57,52 +57,61 @@
     <article>
       <p class="doc-kicker">Getting started</p>
   <h1 class="page-title">Quickstart</h1>
-  <p class="lede">InfinityDB speaks the Redis wire protocol, so the only client you need to try it is <code>redis-cli</code> (or any Redis SDK). It is an <strong>early alpha</strong>: single-node, no authentication or TLS yet (both arrive at M7), not production-ready.</p>
+  <p class="lede">InfinityDB speaks the Redis wire protocol, so the only client you need to try it is <code>redis-cli</code> (or any Redis SDK). It is an <strong>early alpha</strong>: single-node, not production-ready, and with no authentication or TLS yet &mdash; <code>AUTH</code>/<code>requirepass</code> and bind-address control arrive before the first public alpha release, TLS and multi-user ACLs at M7 (see the <a href="roadmap.html">roadmap</a>). The server listens on all interfaces, so run it only on localhost or a trusted network.</p>
 
   <div class="callout warn">
     <span class="callout-tag"><strong>Honest packaging note:</strong></span>
-    the first public tagged release, <code>v0.4.0-alpha</code>, is in preparation (ADR-0067: it ships the JSON-documents milestone and beyond-RAM tiered storage together; <code>v0.2.0-alpha.1</code> and <code>v0.3.0-alpha.1</code> were retired unused rather than shipping alphas their successors would immediately supersede). Until it lands there are <strong>no published binaries and no published container images</strong> &mdash; both paths below build from the repository. When the release pipeline runs on the first tag, prebuilt static Linux binaries and an image will be attached to the release.
+    the first public release is in preparation (it ships the JSON-documents milestone and beyond-RAM tiered storage together). Until it lands there are <strong>no published binaries and no published container images</strong> &mdash; both paths below build from the repository. When the release pipeline runs on the first tag, prebuilt static Linux binaries and an image will be attached to the release.
   </div>
 
   <h2>Requirements</h2>
   <ul>
     <li><strong>Linux with io_uring</strong> &mdash; kernel 5.15+ (6.1+ recommended). InfinityDB&rsquo;s I/O plane is built on io_uring from the ground up; this is not optional on the serving path.</li>
-    <li><strong>Rust 1.95+</strong> for the source build.</li>
+    <li><strong>Rust 1.95+</strong> for the source build (the repository&rsquo;s <code>rust-toolchain.toml</code> pins it, and <code>rustup</code> installs it for you).</li>
     <li>macOS builds for <em>development only</em> via kqueue &mdash; it is not a performance or deployment target.</li>
   </ul>
 
   <h2>Path A — build from source</h2>
-<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
-just check                            <span class="c"># fmt + dep-DAG law + cell deny-list + clippy + tests</span>
+  <p>Build the server and start it:</p>
+<pre><code>git clone https://github.com/kevincaicedo/infinitydb.git
+cd infinitydb
 cargo build --release -p infinityd
 ./target/release/infinityd --port 6379</code></pre>
 
-  <p>Then, from another terminal:</p>
-<pre><code>redis-cli -p 6379 ping                <span class="c"># PONG</span>
-redis-cli -p 6379 set hello world     <span class="c"># OK</span>
-redis-cli -p 6379 get hello           <span class="c"># "world"</span></code></pre>
+  <p>The server runs in the foreground. In another terminal:</p>
+<pre><code>redis-cli -p 6379 ping
+redis-cli -p 6379 set hello world
+redis-cli -p 6379 get hello</code></pre>
+  <p>The three replies are <code>PONG</code>, <code>OK</code> and <code>"world"</code>.</p>
 
   <h2>Path B — build the Docker image from the repo</h2>
-  <p>The repository carries a <code>Dockerfile</code> (static musl build into a <code>scratch</code>-based image). Build and run it locally:</p>
-<pre><code><span class="c"># from the repository root, inside infinitydb/</span>
-docker build -t infinitydb:dev .
-
-docker run --rm -p 6379:6379 \
+  <p>The repository carries a <code>Dockerfile</code> (static musl build into a <code>scratch</code>-based image). From the root of the clone, build and run it locally:</p>
+<pre><code>docker build -t infinitydb:dev .
+docker run --rm -p 127.0.0.1:6379:6379 \
   --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
   infinitydb:dev</code></pre>
+  <p><code>-p 127.0.0.1:6379:6379</code> publishes the port on the host&rsquo;s loopback interface only.</p>
 
   <div class="callout">
     <span class="callout-tag"><strong>The <code>--security-opt seccomp=&hellip;</code> flag is required.</strong></span>
     InfinityDB uses Linux io_uring, and <strong>Docker&rsquo;s default seccomp profile blocks the io_uring syscalls</strong> (<code>io_uring_setup</code> and friends). The bundled profile at <code>deploy/seccomp/infinitydb-seccomp.json</code> re-enables io_uring while still denying the dangerous container-escape syscalls. Alternatives (including a strict allow-list posture and why <code>seccomp=unconfined</code> is development-only) are on the <a href="deployment.html">deployment page</a>. If the container exits complaining about io_uring setup, seccomp is the cause.
   </div>
-  <p>Running with a mounted data directory, systemd units, the data-dir layout, and every server flag are on the <a href="deployment.html">deployment page</a>.</p>
+  <p>Running with a mounted data directory, systemd units, the data-dir layout, and the server flags are on the <a href="deployment.html">deployment page</a>.</p>
 
   <h2>First durable namespace</h2>
-  <p>Durability in InfinityDB is a property of the <em>namespace</em>, not the server. A fresh node serves memory-mode namespaces (pure cache semantics). One command creates a durable one:</p>
-<pre><code>redis-cli -p 6379
-inf&gt; INF.NS CREATE orders MODE durable FSYNC always
-inf&gt; SET orders:invoice:1009 "paid"     <span class="c"># the reply arrives only after group-commit fsync</span>
-inf&gt; INF.CKPT WAIT                       <span class="c"># take a fuzzy checkpoint; returns when the MANIFEST is durable</span></code></pre>
+  <p>Durability in InfinityDB is a property of the <em>namespace</em>, not the server, and a durable namespace needs a data directory. The numbered databases behind <code>SELECT 0..15</code> are always memory-only (pure cache semantics). Stop the Path A server (Ctrl-C), then start it again with a data directory outside the clone:</p>
+<pre><code>./target/release/infinityd --port 6379 --data-dir ~/infinity-data</code></pre>
+  <p>The first boot of a new directory spends about ten seconds measuring the device before it accepts connections (<code>--device-probe off</code> skips it, with conservative write settings).</p>
+  <p>In another terminal, create a durable namespace, write to it and take a checkpoint. <code>INF.NS USE</code> selects a namespace for the connection (like <code>SELECT</code>), so the commands go through one <code>redis-cli</code> connection:</p>
+<pre><code>printf '%s\n' \
+  'INF.NS CREATE orders MODE durable FSYNC always' \
+  'INF.NS USE orders' \
+  'SET order:1 shipped' \
+  'INF.CKPT WAIT' | redis-cli -p 6379</code></pre>
+  <p>Each command answers <code>OK</code>. Under <code>FSYNC always</code> the <code>SET</code> reply arrives only after its log record is on disk; <code>INF.CKPT WAIT</code> takes a checkpoint and returns once it is durable.</p>
+  <p>Stop the server with Ctrl-C (a graceful stop) and start it again with the same command. Then, in the other terminal, read the key back:</p>
+<pre><code>printf '%s\n' 'INF.NS USE orders' 'GET order:1' | redis-cli -p 6379</code></pre>
+  <p>It prints <code>OK</code>, then <code>"shipped"</code>: the write survived the restart.</p>
   <p>What <code>always</code>, <code>everysec</code>, and <code>memory</code> mean precisely &mdash; ack points, loss windows, crash behavior, recovery &mdash; is specified on the <a href="durability.html">namespaces &amp; durability page</a>. Read it before trusting the durable modes with anything you care about; it is short and unusually honest.</p>
 
   <h2 id="clients">Client libraries</h2>
@@ -166,20 +175,17 @@ try (StatefulRedisConnection&lt;String, String&gt; conn = client.connect()) {
 }</code></pre>
 
   <h2>Kicking the tires</h2>
-<pre><code><span class="c"># which commands exist, and at what compatibility level?</span>
-redis-cli -p 6379 command              <span class="c"># the honest registry: implemented surface only</span>
-
-<span class="c"># watch persistence internals</span>
-redis-cli -p 6379 info persistence    <span class="c"># watermark, fsync histograms, checkpoint state, loading progress</span>
-
-<span class="c"># pub/sub with RESP3 push</span>
+  <p><code>COMMAND</code> lists the implemented surface only; <code>INFO persistence</code> shows the durability internals (watermark, fsync histograms, checkpoint state, loading progress); the last line subscribes to a channel with RESP3 push:</p>
+<pre><code>redis-cli -p 6379 command
+redis-cli -p 6379 info persistence
 redis-cli -3 -p 6379 subscribe orders:events</code></pre>
   <p>The per-command compatibility story &mdash; what is <code>full</code> (byte-diff-verified against Redis 8.0.5), what is <code>partial</code> with documented deviations &mdash; is in the <a href="compat.html">generated compatibility matrix</a>.</p>
 
   <h2>Developer extras</h2>
-<pre><code>just compat        <span class="c"># byte-diff vs a local redis-server</span>
-just sim-smoke     <span class="c"># deterministic simulator, trace-identity check</span>
-just loom          <span class="c"># concurrency model-check of the SPSC ring</span></code></pre>
+  <p>From the clone: <code>just compat</code> diffs replies byte for byte against a local Redis 8.0.5 <code>redis-server</code>, <code>just sim-smoke</code> runs the deterministic simulator and checks trace identity, and <code>just loom</code> model-checks the inter-cell SPSC ring:</p>
+<pre><code>just compat
+just sim-smoke
+just loom</code></pre>
 
   <div class="doc-footer-nav">
     <a href="index.html">&larr; Docs home</a>

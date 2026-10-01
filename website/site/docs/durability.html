@@ -64,6 +64,7 @@
 <pre><code>INF.NS CREATE cache    MODE memory   EVICTION allkeys-lfu MAXMEMORY 16gb
 INF.NS CREATE ledger   MODE durable  FSYNC always
 INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
+  <p><code>INF.NS USE ledger</code> binds a connection to a namespace. The choice is per connection, never by key prefix: a command runs in the connection&rsquo;s current namespace, which starts as database 0 (or the server&rsquo;s <code>--conn-default-ns</code>) until <code>INF.NS USE</code> or <code>SELECT</code> changes it. Namespace DDL needs the server started with <code>--data-dir</code>; without one, <code>INF.NS CREATE</code> is refused.</p>
   <p>A <code>memory</code> namespace never touches the log &mdash; not &ldquo;rarely,&rdquo; never: memory-only workloads append zero log records, which is verified by a report-enforced check in the benchmark harness. <code>topic</code> namespaces (retention instead of eviction, the queue substrate) arrive at M7.</p>
 
   <h2>Durability classes</h2>
@@ -123,21 +124,21 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
   <p>Recovery is per cell and parallel: each cell loads its named checkpoint (a materialized log prefix in the same record format), then replays its log tail from the checkpoint&rsquo;s position. There is no global log sequence number and no merge step &mdash; cells recover independently.</p>
   <ul>
     <li><strong>While loading,</strong> the node answers exactly like Redis does: non-exempt commands receive <code>-LOADING Redis is loading the dataset in memory</code> (the exempt set is pinned to observed Redis behavior). Loading progress is visible in <code>INFO persistence</code>. The gate is node-scoped: a recovered cell still answers <code>-LOADING</code> while a peer replays.</li>
-    <li><strong>Torn tails are expected physics:</strong> a torn final batch frame (detected by CRC) is truncated, and replay resumes cleanly behind it &mdash; the defined crash window. Since frame format v2 (ADR-0031), every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC, so recovery can also <em>prove</em> when a crash-window gap in the un-synced tail was never fsync-covered: those gaps truncate too, and the discarded frames are counted in the recovery stats, never silent.</li>
+    <li><strong>Torn tails are expected physics:</strong> a torn final batch frame (detected by CRC) is truncated, and replay resumes cleanly behind it &mdash; the defined crash window. Since frame format v2, every frame carries an epoch, a sequence number, and the durability watermark at seal time under its CRC, so recovery can also <em>prove</em> when a crash-window gap in the un-synced tail was never fsync-covered: those gaps truncate too, and the discarded frames are counted in the recovery stats, never silent.</li>
     <li><strong>Everything else is a refusal, not a guess.</strong> A surviving frame attesting fsync coverage past the point where valid data ends (the log itself proving the disk lost covered bytes), corruption or residue inside sealed segments, a MANIFEST that names a checkpoint or segment that is missing or corrupt, an unknown record type or flag, a frame-format downgrade signature &mdash; each is a <em>named</em> error and the boot fail-stops. InfinityDB never silently skips records and never falls back to &ldquo;replay whatever we can find,&rdquo; because a database that boots with quietly missing acknowledged data is worse than one that refuses and says why.</li>
   </ul>
   <div class="callout">
     <span class="callout-tag"><strong>What a refusal means for you:</strong></span>
-    a refused boot names the corruption class and the file. It means the on-disk state failed an integrity check that <em>could</em> have hidden lost data. The simulation evidence below audits these refusals: in the sweep, every refusal was legal (the fault genuinely destroyed named state) &mdash; refusals are not false alarms, and they are rare; frame format v2&rsquo;s per-frame attestations narrowed them further by design (ADR-0031), with the &sect;8.2 promises unchanged. The operator&rsquo;s view &mdash; the exact error shape, exit codes, and what to do next &mdash; is on the <a href="operations.html">operations page</a>.
+    a refused boot names the corruption class and the file. It means the on-disk state failed an integrity check that <em>could</em> have hidden lost data. The simulation evidence below audits these refusals: in the sweep, every refusal was legal (the fault genuinely destroyed named state) &mdash; refusals are not false alarms, and they are rare; frame format v2&rsquo;s per-frame attestations narrowed them further by design, with the durability-class promises unchanged. The operator&rsquo;s view &mdash; the exact error shape, exit codes, and what to do next &mdash; is on the <a href="operations.html">operations page</a>.
   </div>
 
   <h2>The evidence</h2>
-  <p>These are the claim-ledger rows behind this page &mdash; each <strong>Allowed</strong>, each citing a committed artifact. Environment for the measured rows: the project&rsquo;s designated reference box (i7-13700KF, pinned P-cores, <code>performance</code> governor, consumer Gen3 DRAM-less NVMe &mdash; the device class is disclosed because it matters).</p>
+  <p>These are the claim-ledger rows behind this page &mdash; each <strong>Allowed</strong>, each citing its artifact. Environment for the measured rows: the project&rsquo;s designated reference box (i7-13700KF, pinned P-cores, <code>performance</code> governor, consumer Gen3 DRAM-less NVMe &mdash; the device class is disclosed because it matters).</p>
 
   <div class="evidence">
     <span class="tag">Deterministic durability testing (ledger C12).</span>
     &ldquo;Durability is deterministically tested: 10,000 simulated power-cut/disk-fault seeds, zero durability-oracle violations &mdash; every <code>always</code>-acked write survives, <code>everysec</code> loses at most one second (simulated time); every seed replays byte-identically &mdash; and on the frame-v2 tree, zero recovery refusals across the same 10,000 seeds.&rdquo; (Frame format v2 retired the earlier legally-refusing recovery class; the historical numbers live in the artifacts.)
-    <span class="artifact">artifact: infinitydb/.artifacts/m2/dst-sweep-10k-s22-20260705/ &middot; m2.5/s12-frame-seq-20260709/</span>
+    <span class="artifact">artifact: .artifacts/m2/dst-sweep-10k-s22-20260705/ &middot; m2.5/s12-frame-seq-20260709/</span>
   </div>
 
   <div class="evidence">
@@ -149,25 +150,25 @@ INF.NS CREATE sessions MODE durable  FSYNC everysec</code></pre>
   <div class="evidence">
     <span class="tag">Cold-boot recovery (ledger C14).</span>
     &ldquo;A 10 GB node (8 cells) cold-boots to serving in under 10 seconds on the reference box (9.8 s, cold page cache, 3 replicates &lt; 1% spread).&rdquo; Measured 9.8 s against a 15 s gate; Gen3 DRAM-less device named.
-    <span class="artifact">artifact: infinitydb/.artifacts/m2/parallel-boot-cold-20260705/</span>
+    <span class="artifact">artifact: .artifacts/m2/parallel-boot-cold-20260705/</span>
   </div>
 
   <div class="evidence">
     <span class="tag">Memory namespaces pay zero for durability (ledger C15).</span>
     &ldquo;Memory namespaces pay zero for durability: A/B vs the pre-durability build shows &le; 1% on every gate mix (worst 0.63%, p99.9 same-bucket-or-better), and memory-only runs append zero log records (report-enforced).&rdquo;
-    <span class="artifact">artifact: infinitydb/.artifacts/m2/1783232863-gate-run/</span>
+    <span class="artifact">artifact: .artifacts/m2/1783232863-gate-run/</span>
   </div>
 
   <div class="evidence">
     <span class="tag">Checkpoints are fork-free and memory-flat (ledger C16).</span>
     &ldquo;Checkpoints are fork-free and memory-flat: continuous checkpoint cycling under a saturating durable write mix costs &le; 15 MiB of peak RSS vs a no-checkpoint control (a fork/COW rewrite would cost the dataset).&rdquo; Measured 14.4 MiB over 176 cycles.
-    <span class="artifact">artifact: M2-S22 binding report &middot; infinitydb/.artifacts/m2/</span>
+    <span class="artifact">artifact: M2 binding report &middot; .artifacts/m2/</span>
   </div>
 
   <div class="evidence">
     <span class="tag">Exact memory accounting with the durable plane live (ledger C21).</span>
     &ldquo;Memory attribution stays exact with the durable plane live: sum(domains) &mdash; including log staging and checkpoint buffers &mdash; within 1.1% of RSS on a 1 GB durable fill.&rdquo;
-    <span class="artifact">artifact: M2-S22 binding report attribution row</span>
+    <span class="artifact">artifact: M2 binding report attribution row</span>
   </div>
 
   <p class="muted" style="font-size:14px">What you will <em>not</em> find here: <code>always</code>-mode throughput numbers, <code>everysec</code> penalty percentages, or replay-bandwidth claims. Those rows are still Evidence-pending or Narrowed in the ledger (several are gated on a Gen4-class device), and this project does not publish targets as achievements. When they flip to Allowed, they appear here with their artifacts.</p>

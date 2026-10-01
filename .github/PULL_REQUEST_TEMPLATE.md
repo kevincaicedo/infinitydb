@@ -1,16 +1,17 @@
-<!-- InfinityDB PR checklist (M2.5-S23). The full lifecycle is
+<!-- InfinityDB PR checklist. The full lifecycle is
      CONTRIBUTING.md + docs/INFINITY_STYLE.md (normative). Deviations are
      review rejects, not style preferences. -->
 
 ## What & why
 
-<!-- One paragraph: the change, and the invariant/story/issue it serves. -->
+<!-- One paragraph: the change, and the invariant/issue it serves. -->
 
 ## Author checklist
 
-- [ ] **Design Review Record** linked and `Reviewed` by someone who is not
-      the author **before** this code was written (L12); the change matches
-      it, or the record carries a dated revision (third revision = stop)
+- [ ] **Design** written and reviewed by someone who is not the author
+      **before** this code was written (L12) — linked issue or design note;
+      the change matches it, or the design carries a dated revision (third
+      revision = stop)
 - [ ] **Fix? Class question answered:** the type, table or lint that makes
       the sibling impossible — or why no class exists
 - [ ] One logical change per commit; reachable from the wire at the shipped
@@ -28,7 +29,8 @@
       (3–5 replicates, environment named); a losing A/B is recorded and the code **not merged**
 - [ ] Generated output stays ignored; tests, seeds and harnesses are committed
 - [ ] **Correctness-only** label if shipping without perf acceptance
-- [ ] Frozen seam / dep-DAG edge / format change → the ADR merged **first**
+- [ ] Frozen seam / dep-DAG edge / format change → the decision (ADR)
+      accepted by maintainers **before** the code
 - [ ] Unsafe touched → `// SAFETY:` on every block, crate `SAFETY.md`
       inventory updated (script-checked), Miri/Loom run
 
@@ -42,8 +44,8 @@
       inferred from encoded output · trust-boundary values parsed into a type
       once · nothing validated before a suspension used after it · every new
       limit has a crossing behavior · no second copy of a decision (L13)
-- [ ] Every new oracle, gate or claim row names its canary and the canary
-      ran; the oracle shares no code with what it checks
+- [ ] Every new oracle or gate names its canary and the canary ran; the
+      oracle shares no code with what it checks
 - [ ] Evidence discipline holds (L10): no number or "faster/slower" claim
       in code, docs, or the PR description without measured results and reproduction details
 - [ ] Crate fences respected (dep-DAG green is necessary, not sufficient —

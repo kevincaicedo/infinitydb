@@ -1,7 +1,6 @@
-# M1 exit gates (STOP) — machine-readable encoding of the M1 milestone plan
-# §6 (internal). Values are fixed by the project master plan §22 (M1, internal);
-# changing a threshold here is a master-plan amendment, not an
-# edit (L10: a gate may not be passed by narrowing it).
+# M1 exit gates (STOP) — machine-readable encoding of the M1 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # Consumed by `inf-bench gate-run m1`. Field semantics identical to
 # m0-gates.toml: loadgen:* rows are measured natively by gate-run; external:*

@@ -1,5 +1,5 @@
-# M4.5 gate rows — machine-readable encoding of the M4.5 milestone plan's
-# E4.5 performance stories. First occupant: the S29 tiered-`always`
+# M4.5 gate rows — machine-readable encoding of the M4.5 write-path
+# performance gates. First occupant: the S29 tiered-`always`
 # concurrency-scaling row. Second:
 # the S27 durable-write-backpressure row (ADR-0083 D7 — refusals,
 # decay, and max in the provoked `--log-staging-mib 1` regime; the
@@ -11,7 +11,7 @@
 # 3.9× for 4× conns on the same node/binary/device. These gates therefore
 # bind on the slope and the tiered:flat parity ratio, never on a peak —
 # a fix that raises a single point without restoring the slope has not
-# addressed the defect (plan §5, M4.5-S29 pitfalls).
+# addressed the defect.
 #
 # Thresholds carry margin on both sides of the measured arms
 # (pre-fix: slope 0.89×, parity@256 0.09×, p99 ratio ~40×;
@@ -101,23 +101,23 @@ measured_by = "gate-run m4.5 durable-write-backpressure row, default-staging D5 
 # actually waited on (write-through p50 under FUA, linked-fdatasync p50
 # under FLUSH), at the 32-conn closed loop S33's bound-2 arm lost, and
 # as the N-cell ÷ 1-cell p50 ratio (S34's F2 AC, owned by S35).
-# Thresholds carry margin: the plan's "≤ 1.2 × barrier + loop overhead"
+# Thresholds carry margin: the target "≤ 1.2 × barrier + loop overhead"
 # is encoded as 1.3 (a 0.1-window allowance ≈ 60 µs at a 0.6 ms barrier
 # — the reactor iteration + seal wait; K = 1 reads ~1.85, the preview's
-# K = 3/2 MiB 1.18–1.24, K = 4 1.10–1.15); the ratio bar is the plan's.
+# K = 3/2 MiB 1.18–1.24, K = 4 1.10–1.15); the ratio bar is the target's.
 
 [[gate]]
 id = "s35_p50_over_barrier"
 name = "S35: always p50 over the barrier p50 at 32 conns"
 threshold = 1.3
 comparator = "<="
-unit = "x (client p50 / barrier p50; plan AC 1.2 + 0.1-window loop overhead — K = 1 reads ~1.85)"
+unit = "x (client p50 / barrier p50; target 1.2 + 0.1-window loop overhead — K = 1 reads ~1.85)"
 tier = "linux-reference-box"
 source = "s35:p50_over_barrier_x"
 measured_by = "gate-run m4.5 frame-pipeline row, median of replicates, N cells, 32 conns closed-loop"
 
 # Amended 2026-08-22 (ADR-0087 D8, third amendment — recorded before the
-# rerun it governs): the F2 finding is a *barrier* contention term (fsync
+# rerun it governs): the N-cell p50 excess is a *barrier* contention term (fsync
 # p50 1,535 µs at 1 cell → 2,751 at 4 under FLUSH — the device-wide flush
 # unit), and the binding gate now measures it directly as the N-cell ÷
 # 1-cell ratio of the barrier the clients waited on, per replicate. The
@@ -172,7 +172,7 @@ informational = true
 # background I/O. Gated as the server's CPU across the closed-loop leg,
 # the leg's throughput against a same-session tmpfs control (the
 # device-free arm), the cell-scope write-amplification figure with
-# checkpoints active (the plan's 1.5× is the checkpoint term alone —
+# checkpoints active (the 1.5× target is the checkpoint term alone —
 # `(2D + D) / 2D`; v3 frame padding and framing at the 1 KiB/~50-record
 # shape add ≈ 4 %, so the bar is 1.6 and the gate says so rather than
 # reading a derived number as a measured one), and the S27 D5 `max` bar
@@ -201,7 +201,7 @@ source = "s36:everysec_vs_tmpfs_x"
 measured_by = "gate-run m4.5 device-budget row, closed-loop legs on both roots"
 
 # Amended 2026-08-21 with the first S36 campaign's evidence (L10 — the
-# amendment is recorded in the plan's S36 section and ADR-0088 D9): the
+# amendment is ADR-0088 D9): the
 # combined figure conflated the checkpoint term S36 owns with the v3
 # frame padding S34 disclosed, and at the row's own shape (K = 3, 32
 # conns, 2.2 records per 4 KiB frame) the padding alone is ~1.7×. The
@@ -416,7 +416,7 @@ informational = true
 # by phase (loop-clock time + bytes per phase). The total ratio is
 # DIAGNOSTIC (informational): it names the phase to work on, it cannot
 # turn recycling off by itself — only the absolute S18 gate re-read on the
-# recycled log below can (the plan's S39d wording).
+# recycled log below can (S39d's acceptance wording).
 [[gate]]
 id = "s39d_recovery_total_x"
 name = "S39d: fixed-work first-boot recovery, slowest cell's engine total, arm over baseline"
@@ -499,7 +499,7 @@ informational = true
 # M4.5-S37 step 1 (2026-08-22): the cold-overwrite ceiling — arm B is an
 # UNSOUND bench-diagnostics instrument (a cold candidate treated as
 # absent) that bounds what removing ADR-0085 D5's verifying read could
-# buy. The plan's rule: "< 15 % throughput and < 20 % p99 ⇒ step 2
+# buy. The step-2 rule: "< 15 % throughput and < 20 % p99 ⇒ step 2
 # Rejected". PASS here means the ceiling clears the bar (step 2 opens);
 # FAIL means step 2 is Rejected with this artifact — informational both
 # ways, the decision is written in the ledger.

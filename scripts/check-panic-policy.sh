@@ -4,7 +4,7 @@
 # `.unwrap()` (or `todo!`/`unimplemented!`) is a review reject. `expect()`
 # with an invariant justification is an assertion and is allowed; `panic!`/
 # `unreachable!` are for violated internal invariants (audited in
-# reviews/ + the interfaces-m2 invariant inventory). Backstops review.
+# review findings + the interfaces-m2 invariant inventory). Backstops review.
 #
 # Review 2026-08-30, P1c (F-L00-19, F-L17-08, F-L18-04, F-L19-15,
 # F-L20-02) — ADR-0106: the old grep cut each file at its FIRST
@@ -37,7 +37,7 @@ STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 # One ERE; awk dynamic-regex safe (bracket classes instead of backslash
 # escapes). `[.]unwrap[(][)]` cannot match `unwrap_or(`/`unwrap_or_default(`,
 # so no line-level exclusion is needed for them (the old `grep -v unwrap_or`
-# dropped a whole line, hiding any `.unwrap()` that shared it — L18 §4).
+# dropped a whole line, hiding any `.unwrap()` that shared it).
 PATTERN='[.]unwrap[(][)]|todo!|unimplemented!'
 MARKER='panic-policy-allow'
 

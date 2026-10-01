@@ -12,7 +12,7 @@ inf-foundation.workspace = true
 inf-alloc.workspace = true
 libc.workspace = true
 
-# The only crate allowed to name io_uring symbols (milestone M0 §3.3).
+# The only crate allowed to name io_uring symbols (docs/dep-dag.toml).
 # Feature-gated: Linux CI runs `--features uring`; default builds stay
 # backend-free so the workspace compiles on any host.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,8 +1,7 @@
 # inf-sim
 
-The **deterministic simulator** for InfinityDB (milestone M0-S20, master plan
-§17.1) — the project's main tool for finding concurrency and correctness bugs
-and making them *reproducible*.
+The **deterministic simulator** for InfinityDB — the project's main tool for
+finding concurrency and correctness bugs and making them *reproducible*.
 
 ## What it is
 
@@ -69,15 +68,21 @@ window (the lost-wakeup tripwire).
 ## Usage
 
 ```bash
-# from the repository root
-cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE
+# from the repository root; the simulator refuses to run without `--features dst`
+cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+  --scenario m0-smoke --seed 0xC0FFEE
 
 # verify determinism: run twice, byte-compare the traces
-cargo run --release --bin inf-sim -- --scenario m1-cache --seed 0xCAFE --verify-determinism
+cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+  --scenario m2-durable --seed 0xCAFE --verify-determinism
 
-# the just shortcut
+# every scenario the binary accepts, once, determinism-verified
 just sim-smoke
 ```
+
+`scripts/sim-smoke.sh` is the registry of every scenario (cache, durability,
+device, document, tiering and index scenarios); the table below
+describes the original two.
 
 ### Flags
 

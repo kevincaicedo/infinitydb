@@ -1,12 +1,12 @@
 # inf-bench
 
-The InfinityDB benchmark and exit-gate harness (milestones M0-E6 / M1-S17).
+The InfinityDB benchmark and exit-gate harness.
 
 `inf-bench` spawns the system under test (`infinityd`) and, where relevant,
 real `redis-server` as a comparator, drives load with its own RESP client, and
-produces per-gate PASS/FAIL reports against the machine-readable gate files in
-`docs/milestones/`. It has no external dependencies; internal dependencies
-are allowed (ADR-0134). It shares `inf-foundation` RNG, checksum and histogram
+produces per-gate PASS/FAIL reports against the machine-readable gate files
+`docs/milestones/*-gates.toml`. It has no external dependencies; internal
+dependencies are allowed. It shares `inf-foundation` RNG, checksum and histogram
 primitives with the system under test. The client-side RESP in `src/resp.rs`
 is independent of the server parser; shared primitives are not an independent
 correctness oracle. `inf-compare` supplies the separate external generators.
@@ -21,28 +21,28 @@ retain their original resolution; this repair does not remeasure them.
 
 ```
 inf-bench env-check [--allow-dirty]
-inf-bench load --host H --port P [--threads N] [--pipeline P] [--duration S] ...
+inf-bench load --host H --port P [--conns N] [--pipeline P] [--duration S] ...
 inf-bench gate-run m0|m1|m2|m4 [flags]
 inf-bench zipfian [flags]
-inf-bench mixed-audit [flags]          # M4-S20 coexistence audit
-inf-bench ycsb [flags]                 # M4-S22 YCSB rows, split latency reporting
+inf-bench mixed-audit [flags]          # mixed-node coexistence audit
+inf-bench ycsb [flags]                 # YCSB rows, split latency reporting
 ```
 
-### `ycsb` (M4-S22)
+### `ycsb`
 
 YCSB-style workloads A–F (E adapted to cursor-scan slices — documented in
 every report preamble) at dataset = N× a namespace memory budget, scrambled
 zipfian θ=0.99 or uniform, with memory-hit and cold-read percentiles
-reported **separately** (§18/§19 — the combined number is context, never
-the headline). Deterministic from `--seed` (op-stream checksums +
-`--verify-seed` assert + a DBSIZE-integrity loader). Until command wiring
-(M4-S26) lifts the D8 refusal, runs drop to harness-validation mode with
-the tiered split named-absent; `--attach-port`/`--ns`/`--skip-fill` drive
-an already-running node (the reference-box `soak-m4.sh` legs).
+reported **separately** (the combined number is context, never the
+headline). Deterministic from `--seed` (op-stream checksums +
+`--verify-seed` assert + a DBSIZE-integrity loader). Tiered rows need the
+tiered command wiring; a build without it drops to harness-validation mode
+with the tiered split named-absent. `--attach-port`/`--ns`/`--skip-fill`
+drive an already-running node (long-running soak legs).
 
 ### `env-check`
 
-Validates that the box is fit to produce citation-grade numbers (M0-S03):
+Validates that the box is fit to produce citation-grade numbers:
 refuses a dirty git tree, a non-`performance` CPU governor or EPP, and any
 thermal throttling. Every other subcommand starts here — see
 [Reference-box requirements](#reference-box-requirements).
@@ -106,7 +106,7 @@ memory-filesystem data root (`--data-root`, default
 `.artifacts/m1/empty-node-data`), or on filesystem blocks over 4 KiB.
 A binding run fails instead of withholding when a precondition is unproven.
 
-M0/M1/M2 reports require a generator-saturation disposition (ADR-0135).
+M0/M1/M2 reports require a generator-saturation disposition.
 Steady native load rows run once more with 50% more connections, rounded
 up and capped at 1024. Workload, pipeline, duration, warmup, seed and
 namespace stay fixed. The report retains both samples and the connection
@@ -124,13 +124,15 @@ under pub/sub, and M2 memory A/B, everysec arms, always writes and checkpoint
 pressure arms, including `--only-always`/`--only-everysec`. Reports explicitly
 exclude transient expiry/FLUSHALL, manually paced pub/sub/control checks,
 and fill/hit-rate rows from capacity inference. The grouping canary remains
-a correctness witness. Reference campaigns still owe every other §19 check.
+a correctness witness. Reference campaigns still owe every other
+run-validity check: replicates, a clean tree, governor/EPP and thermals,
+same-run tripwires and competitors on the same box.
 
 The M1 eviction note sums cell-owned logical domains and reads the maximum
 observed node-fold `used_memory` once. Each scrape must declare
 `memory_scope:node`; asynchronous scrapes can differ. This is accounted
-resident memory, not process RSS. INFO uses distinct node and cell names
-under ADR-0122, independent of section selection/order.
+resident memory, not process RSS. INFO uses distinct node and cell names,
+independent of section selection/order.
 
 Common flags:
 

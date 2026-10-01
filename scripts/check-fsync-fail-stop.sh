@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fsync fail-stop gate (M2-S17, §3.3/§8.4 — the PostgreSQL fsyncgate
+# fsync fail-stop gate (M2-S17 — the PostgreSQL fsyncgate
 # lesson): an fsync failure surfaces as a typed, non-recoverable error and
 # **no caller may catch and continue**. Rewritten at ADR-0106 D10 (review
 # 2026-08-30, F-L20-06); the old gate had two structural gaps, both proven
@@ -194,7 +194,7 @@ done
 scope="$derived_count derived fsync-error patterns, $files files / $lines lines scanned, $sites typed sites ($allowed audited), $syncs raw sync call sites"
 if [ "$fail" -ne 0 ]; then
     echo "fsync fail-stop FAILED ($scope)"
-    echo "fsync failure is fail-stop (§8.4): prove the site is terminal and mark it"
+    echo "fsync failure is fail-stop: prove the site is terminal and mark it"
     echo "  // fsync-fail-stop-allow: <why this site cannot catch and continue>"
     exit 1
 fi

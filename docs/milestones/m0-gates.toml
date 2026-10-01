@@ -1,7 +1,6 @@
-# M0 exit gates (STOP) — machine-readable encoding of the M0 milestone plan
-# §6 (internal). Values are fixed by the project master plan §22 (M0, internal);
-# changing a threshold here is a master-plan amendment,
-# not an edit (L10: a gate may not be passed by narrowing it).
+# M0 exit gates (STOP) — machine-readable encoding of the M0 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # Consumed by `inf-bench gate-run m0`. Field semantics:
 #   threshold/comparator/unit — the gate inequality, e.g. measured >= 6000000 ops/s.

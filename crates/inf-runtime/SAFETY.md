@@ -1,10 +1,10 @@
 # inf-runtime SAFETY
 
-`inf-runtime` is one of the four crates allowed `unsafe` (milestone M0
-§3.3). Every unsafe block carries a `// SAFETY:` comment (clippy
+`inf-runtime` is one of the four audited unsafe-leaf crates. Every unsafe
+block carries a `// SAFETY:` comment (clippy
 `undocumented_unsafe_blocks = deny`); this file records the audited areas
 and the invariants they rest on. Inventory-vs-code agreement is
-script-checked (`scripts/check-safety-inventory.sh`, M2.5-S16): every
+script-checked (`scripts/check-safety-inventory.sh`): every
 src file using unsafe must be named here.
 
 ## 1. Backend FFI (`kqueue.rs`, `uring.rs`, `net.rs`)

@@ -20,9 +20,9 @@
 #   • workflow_dispatch — the Actions "Run workflow" button (also requires the
 #     file on `main`).
 #
-# Real benchmark *numbers* never come from CI (shared runners; L10 / §19). The
+# Real benchmark *numbers* never come from CI (shared runners; L10). The
 # bench job tests and compiles; gate numbers come from the reference-box campaign
-# (M3 plan H6: inf-bench gate-run --reference-box, inf-compare).
+# (inf-bench gate-run --reference-box, inf-compare).
 name: infinity-ci-full
 
 on:
@@ -143,10 +143,10 @@ jobs:
       - name: fuzz fabric codec (smoke)
         run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
         working-directory: crates/inf-fabric
-      - name: fuzz glob matcher (smoke, M1 §5)
+      - name: fuzz glob matcher (smoke)
         run: cargo +nightly fuzz run glob_match -- -max_total_time=300
         working-directory: crates/inf-server
-      - name: fuzz SCAN cursor (smoke, M1 §5)
+      - name: fuzz SCAN cursor (smoke)
         run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
         working-directory: crates/inf-server
       - name: fuzz log frame decoder (smoke, M2-S01)
@@ -164,7 +164,7 @@ jobs:
       - name: fuzz extent decoder (smoke, M4-S17 — readiness F2)
         run: cargo +nightly fuzz run extent_decode -- -max_total_time=300
         working-directory: crates/inf-log
-      - name: fuzz tier-file decoder (smoke, M4-S11 — M4 §6 requires nightly accrual)
+      - name: fuzz tier-file decoder (smoke; the nightly accrues its hours)
         run: cargo +nightly fuzz run fuzz_tierfile_decode -- -max_total_time=300
         working-directory: crates/inf-log
       - name: fuzz idoc decoder (smoke, M3-S01/S02)
@@ -187,7 +187,7 @@ jobs:
   bench-build:
     # Benchmark sanity — release instrument tests and compilation, also on PRs.
     # NO measurements: CI runners never
-    # back a number (L10 / §19). Real gate numbers come from the reference
+    # back a number (L10). Real gate numbers come from the reference
     # box (inf-bench gate-run --reference-box, inf-compare).
     needs: authorize
     runs-on: ubuntu-24.04

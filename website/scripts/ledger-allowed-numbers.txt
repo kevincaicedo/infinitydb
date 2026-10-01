@@ -2,7 +2,7 @@
 # format "<number> <unit>", lowercase, no thousands separators.
 #
 # RULE: a token may only be added here if
-#   (a) an **Allowed** row in docs/claim-ledger.md covers the number, in
+#   (a) an **Allowed** row in the claim ledger (site/_ledger-snapshot.md) covers the number, in
 #       which case the comment names the row; or
 #   (b) it is demonstrably NOT a performance claim (config example, wire
 #       format bound), in which case the comment says so explicitly.
@@ -58,7 +58,7 @@
 0.056 %         # C27: attribution vs RSS divergence, 65k-document load
 
 # --- non-claims (documented) ---------------------------------------------
-16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — master plan §4.2 example, not a measurement
+16 gb           # config example in the INF.NS docs (MAXMEMORY 16gb) — a configuration example, not a measurement
 16 mib          # record-format value bound (SETRANGE note in the compat matrix; value bound on the operations limitations list) — wire format, not a measurement
 1 mib           # non-claim: proto-max-bulk-len configuration floor in the generated compat matrix (ADR-0122)
 512 mib         # non-claim: Redis protocol bulk limit disclosed in the generated compat matrix (ADR-0122)

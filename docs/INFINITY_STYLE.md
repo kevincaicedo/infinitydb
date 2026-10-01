@@ -2,13 +2,13 @@
 
 > Inspired by TigerBeetle's
 > [TIGER_STYLE](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
-> adapted to Rust, and InfinityDB's
+> adapted to Rust and to InfinityDB's design laws.
 >
 > Normative for every **design and** all code in this workspace. Read it
-> in full before writing a Design Review Record and before writing code;
-> the record's reviewer affirms conformance of the design, the code
-> reviewer of the code (ADR-0025, ADR-0138). This document states
-> enduring engineering rules.
+> in full before writing a design and before writing code; the design's
+> reviewer affirms conformance of the design, the code reviewer of the
+> code (ADR-0025, ADR-0138). This document states enduring engineering
+> rules.
 
 ## Why Have Style?
 
@@ -60,10 +60,9 @@ worth more than a clever implementation of a complicated design.
 
 ## Design Before Code
 
-The cheapest defect is the one a page of design removes (L12). A story
-is claimed only on a **Design Review Record** reviewed by someone who
-did not write it. The record answers, in tables and
-arithmetic, not prose:
+The cheapest defect is the one a page of design removes (L12). Work
+starts only on a **written design** reviewed by someone who did not
+write it. The design answers, in tables and arithmetic, not prose:
 
 1. **State and transitions** — state × event → state, effect; the
    invariant inventory, each row marked *type*, *lint*, *assert* or
@@ -118,7 +117,7 @@ their fixes are verified; changing this policy does not close them.
   substrate status: done means reachable from the wire at the shipped
   topology.
 - **A plan or document sentence the tree contradicts is a red row**
-  until an ADR withdraws it or a story builds it.
+  until an ADR withdraws it or a change builds it.
 
 ## Safety
 
@@ -447,8 +446,8 @@ backend/affinity/executor modules) and the module-scoped regions
 `deny(unsafe_code)` at its root with `#[allow(unsafe_code)]` on exactly
 the audited `mod` items, or one whole-file inner allow; never on a
 function or block). The posture is mechanical: `check-unsafe-roots.sh`
-refuses a crate root with no attribute, a `deny` root outside the master
-plan's audited set, a listed leaf that went `forbid`, and any allow that
+refuses a crate root with no attribute, a `deny` root outside the
+audited leaf set, a listed leaf that went `forbid`, and any allow that
 is not module-scoped — a new unsafe block outside a named module is a
 compile error in every build.
 Every unsafe block has a concrete `// SAFETY:` argument, an
@@ -510,16 +509,27 @@ virtual clocks that advanced), and a sweep recipe's exit status is the
 verdict of every shard.
 
 Documentation identities are checked too (ADR-0106 D15):
-`check-doc-artifacts.sh` enforces unique ADR numbers and the link to the
-one generated compatibility matrix when the parent governance checkout
-is present. D17 also checks local Markdown links in this document,
-`ARCHITECTURE.md`, the master plan and the execution plans, numbered ADR
-paths, obsolete layout names and landed-ADR placeholders. Abbreviated module
-names and future deliverables remain review obligations. Standalone
-workspace CI explicitly reports absent parent documents and unvalidated
-parent links. The release job checks the matrix against its renderer before
-packaging it. The dependency gate (D16) checks active and reserved edges in
-both directions, requires a row for every package and prints dev exemptions.
+`check-doc-artifacts.sh` requires the one generated compatibility matrix
+and refuses tracked run output; D17 checks this document and
+`docs/ARCHITECTURE.md` for obsolete layout names and landed-ADR
+placeholders. The public documentation is self-contained, and one gate owns
+every link and pointer in it: `check-public-doc-links.sh`. A public
+document states a rule instead of pointing into the project's unpublished
+records. An engineering reference may cite a bare decision identifier
+(`ADR-0087 D2`) beside the rule it states, never as a link and never in
+the rule's place. The copy a newcomer reads first carries no decision or
+story identifier, and no published document carries a review, finding or
+batch identifier: a review's result is stated as the rule it produced. The
+gate's header is the one list of what it refuses, which tier each document
+is in and what it exempts; every exemption carries an owner and an
+expiry. The published claim-ledger snapshot is an evidence record kept
+in the engineering tier; it is maintained by hand from its source, not
+copied verbatim. A spelling the gate does not list, a bare parenthesised
+label, abbreviated module names and future deliverables remain review
+obligations. The release job checks the matrix against its
+renderer before packaging it. The dependency gate (D16) checks active and
+reserved edges in both directions, requires a row for every package and
+prints dev exemptions.
 
 ## Performance
 
@@ -674,7 +684,8 @@ useful throughput within latency, memory, and durability contracts.
   optimization. Correctness fixes may be `Correctness-only`; unrun
   measurements remain `Evidence-pending`, with the missing run named.
 - `inf-bench` proves in-house gates. Disclose a workload the external generator cannot drive; 
-  never silently substitute instruments. Only the claim ledger authorizes public numbers (L10).
+  never silently substitute instruments. A public number needs a recorded,
+  reproducible run that meets these rules (L10).
 
 ## Developer Experience
 
@@ -689,7 +700,7 @@ they are recurring sources of database defects, not just readability issues.
   acronyms as words: `Crc32Frame`, not `CRC32Frame`), then our additions.
 - **Get the nouns and verbs right.** A name that requires its own
   explanation is a draft. Prefer nouns that survive being spoken in a
-  design review and written in a ledger (`replica.pipeline`, not
+  design review and written in a metric name (`replica.pipeline`, not
   `replica.preparing`).
 - **Units and qualifiers go last, most significant first**:
   `latency_ms_max`, `budget_bytes_slice`, `expiry_fires_per_slice_cap`.
@@ -702,8 +713,8 @@ they are recurring sources of database defects, not just readability issues.
   else is renamed when its function is next touched — there is no naming
   gate. Long-form flags in scripts and CLIs: `--reference-box`, never `-r`.
 - Prefer clear, symmetric pairs such as `source`/`target` and
-  `begin`/`end`. `src`/`dst`/`dest` are not used (renamed workspace-wide
-  in batch 68). Meaning takes precedence over matching name lengths.
+  `begin`/`end`. `src`/`dst`/`dest` are not used. Meaning takes precedence
+  over matching name lengths.
 - Infuse allocator/handle names with their contract: `arena:`-prefixed
   things do not get freed item-by-item; `pool` things return whence they
   came; a `lease` must be returned before suspension.
@@ -737,8 +748,8 @@ they are recurring sources of database defects, not just readability issues.
 - Use a short, one-line commit message stating the concrete change. **One
   logical change per commit**, so bisect and the sim A/B diff work at the
   granularity of a decision. Keep detailed reasoning, reproduction
-  commands and results in the ticket. Do not append model co-author
-  trailers.
+  commands and results in the pull request description. Do not append
+  model co-author trailers.
 
 ### Cache invalidation
 

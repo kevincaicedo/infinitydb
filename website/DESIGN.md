@@ -243,7 +243,7 @@ number on the site lives in one or in a stat tile citing its row.
 Near-black tile, seam-mid border, 10px radius: mono 700 22px value
 (Ink, or teal/violet-soft when the value itself is the lamp), faint
 9.5px uppercase label. Used only for ledger-Allowed measurements —
-never targets (§18 of the master plan forbids targets in public copy).
+never targets (a target is never published as a number).
 
 ### Benchmark Bars (signature, new)
 SVG bar pairs with gradient-filled InfinityDB bars and slate competitor
@@ -294,7 +294,7 @@ columns; last row loses its border.
 Sticky, 14px blur over `rgba(6,7,13,0.82)`, bottom hairline. Brand:
 the dual-circle logo (violet + teal rings — the infinity mark),
 `infinityDB` in 800 with teal `DB`, and the version badge pill
-(`v0.4.0-alpha · IN DEV` on the landing; a neutral section badge
+(`ALPHA · IN DEV` on the landing; a neutral section badge
 `DOCS`/`BLOG`/`EVIDENCE` on inner pages). Links: mono 12px, 0.1em,
 uppercase, muted → teal on hover/current. One filled CTA (`★ GITHUB`).
 
@@ -336,8 +336,8 @@ Quiet, mechanical, continuous — the machine is running:
   SMIL (hide `.anim-dot`, skip `beginElement`).
 
 ### Don't:
-- **Don't** publish targets as numbers anywhere on the site — master
-  plan §18 forbids it; targets live in the plan, measurements on the
+- **Don't** publish targets as numbers anywhere on the site — the
+  evidence rules forbid it; targets live in plans, measurements on the
   page ("MEASURED, NOT PROMISED" is the section's name for a reason).
 - **Don't** blend or swap the lamps: no teal NOW dots, no violet links,
   no gradient on anything but the three sanctioned sites.

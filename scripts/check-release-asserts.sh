@@ -12,7 +12,7 @@
 #   C   a claim about a caller — the justification names the check that
 #       enforces it at every call site (`file.rs:function`)
 #   F   a fail-stop on an operating condition the policy sanctions
-#       (§8.4 fsync failure, the control thread's death, …) — cites it
+#       (fsync failure, the control thread's death, …) — cites it
 #   U   unaudited (a crate outside the audited set); counted, disclosed
 #
 # The site identity is `file <TAB> kind <TAB> message` (the first string
