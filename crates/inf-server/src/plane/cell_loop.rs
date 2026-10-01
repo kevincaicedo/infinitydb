@@ -721,10 +721,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             // Fires (each one bounded group walk, whatever it reaped — the
             // unit `max_fires` budgets) and sweep reaps are foreground-
             // visible work; cursor steps and sweep slots are cheap walking
-            // (ADR-0008 A1 rule 6), charged at 1/64.
+            // (ADR-0008 A1 rule 6), charged per `EXPIRY_WALK_PER_UNIT`.
             let fired = stats.fires_charged();
-            let units =
-                fired.min(u64::from(u32::MAX)) as u32 + stats.steps / 64 + stats.sweep_slots / 64;
+            let walked =
+                stats.steps / EXPIRY_WALK_PER_UNIT + stats.sweep_slots / EXPIRY_WALK_PER_UNIT;
+            let units = fired.min(u64::from(u32::MAX)) as u32 + walked;
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }

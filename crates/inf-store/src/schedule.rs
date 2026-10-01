@@ -108,8 +108,9 @@ struct Pass {
 
 enum SweepPhase {
     Idle,
-    /// A pass is owed; `None` until the next slice begins it.
-    Walking(Option<Pass>),
+    /// A pass is owed; the next slice begins it.
+    Owed,
+    Walking(Pass),
 }
 
 pub(crate) struct ExpirySchedule {
@@ -286,7 +287,7 @@ impl ExpirySchedule {
     fn owe(&mut self) {
         self.owed += 1;
         if matches!(self.phase, SweepPhase::Idle) {
-            self.phase = SweepPhase::Walking(None);
+            self.phase = SweepPhase::Owed;
             self.completed_began_ms = None;
         }
     }
@@ -336,31 +337,34 @@ impl ExpirySchedule {
         capacity: usize,
         rebuilds: u64,
     ) -> Option<SweepAt> {
-        let stamp = self.pass_stamp();
         let begin_slot = self.sweep_cursor & (capacity - 1);
         self.sweep_cursor = begin_slot;
-        let pass = match &mut self.phase {
+        let slots_left = match &self.phase {
             SweepPhase::Idle => return None,
-            SweepPhase::Walking(pass) => pass.get_or_insert(Pass {
-                began_ms: now_ms,
-                begin_slot,
-                slots_left: capacity,
-                owed: stamp,
-                rebuilds,
-            }),
+            SweepPhase::Walking(pass) => pass.slots_left,
+            SweepPhase::Owed => {
+                self.phase = SweepPhase::Walking(Pass {
+                    began_ms: now_ms,
+                    begin_slot,
+                    slots_left: capacity,
+                    owed: self.pass_stamp(),
+                    rebuilds,
+                });
+                capacity
+            }
         };
-        Some(SweepAt { cursor: self.sweep_cursor, slots_left: pass.slots_left })
+        Some(SweepAt { cursor: begin_slot, slots_left })
     }
 
     /// Records one walked chunk of `walked` slots ending at `next_cursor`.
     pub(crate) fn sweep_walked(&mut self, next_cursor: usize, walked: usize) -> SweepAt {
         self.sweep_cursor = next_cursor;
         let slots_left = match &mut self.phase {
-            SweepPhase::Walking(Some(pass)) => {
+            SweepPhase::Walking(pass) => {
                 pass.slots_left = pass.slots_left.saturating_sub(walked);
                 pass.slots_left
             }
-            SweepPhase::Walking(None) | SweepPhase::Idle => {
+            SweepPhase::Owed | SweepPhase::Idle => {
                 debug_assert!(false, "a chunk walked with no pass under way");
                 0
             }
@@ -372,7 +376,7 @@ impl ExpirySchedule {
     /// another pass is owed and begins at the next slice.
     pub(crate) fn sweep_end(&mut self, capacity: usize, rebuilds: u64) -> PassEnd {
         let stamp = self.pass_stamp();
-        let SweepPhase::Walking(Some(pass)) = &self.phase else {
+        let SweepPhase::Walking(pass) = &self.phase else {
             debug_assert!(false, "a pass ended with none under way");
             return PassEnd::Dirty;
         };
@@ -395,8 +399,7 @@ impl ExpirySchedule {
             PassEnd::Clean | PassEnd::Dirty => self.completed_began_ms = Some(pass.began_ms),
             PassEnd::Voided => {}
         }
-        self.phase =
-            if end == PassEnd::Clean { SweepPhase::Idle } else { SweepPhase::Walking(None) };
+        self.phase = if end == PassEnd::Clean { SweepPhase::Idle } else { SweepPhase::Owed };
         end
     }
 
@@ -420,8 +423,12 @@ impl ExpirySchedule {
     pub(crate) fn sweep_state(&self) -> SweepState {
         match &self.phase {
             SweepPhase::Idle => SweepState::Idle,
+            SweepPhase::Owed => SweepState::Walking {
+                pass_began_ms: None,
+                completed_pass_began_ms: self.completed_began_ms,
+            },
             SweepPhase::Walking(pass) => SweepState::Walking {
-                pass_began_ms: pass.as_ref().map(|p| p.began_ms),
+                pass_began_ms: Some(pass.began_ms),
                 completed_pass_began_ms: self.completed_began_ms,
             },
         }
@@ -431,8 +438,8 @@ impl ExpirySchedule {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn sweep_pass_slots(&self) -> Option<(usize, usize)> {
         match &self.phase {
-            SweepPhase::Walking(Some(pass)) => Some((pass.begin_slot, self.sweep_cursor)),
-            SweepPhase::Walking(None) | SweepPhase::Idle => None,
+            SweepPhase::Walking(pass) => Some((pass.begin_slot, self.sweep_cursor)),
+            SweepPhase::Owed | SweepPhase::Idle => None,
         }
     }
 

@@ -56,6 +56,17 @@ pub const WHEEL_MEMBER_SHARDS: usize = 256;
 /// rotation's hand parks at the first store left unserved.
 pub const EXPIRY_SWEEP_SLOTS_PER_SLICE: u32 = 256;
 
+/// Unbounded expiry slices one frozen-time drain may take (ADR-0008 A1
+/// O3; the accounting oracles' drain, never a serving path). Owner: the
+/// callers of `expiry_settled` — the plane's `drain_expiry`, the
+/// simulator's model drain and the store tests. An unbounded slice catches
+/// every wheel up and ends at most one sweep pass per store; settling
+/// takes the pass under way and one begun at the frozen instant, plus one
+/// more for each `Over` that owes the sweep meanwhile. Crossing: the drain
+/// returns unsettled and the oracle reading the records reports what it
+/// retained.
+pub const EXPIRY_DRAIN_SLICES_MAX: usize = 64;
+
 /// Index slots one sweep chunk walks before the slice's fire budget is
 /// checked again (ADR-0008 A1 rule 6). Crossing ⇒ a slice overshoots its
 /// fire budget by at most this many reaps.

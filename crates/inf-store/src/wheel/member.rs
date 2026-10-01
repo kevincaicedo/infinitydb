@@ -18,6 +18,10 @@ use crate::limits::WHEEL_MEMBER_SHARDS;
 const EMPTY: u32 = u32::MAX;
 /// A shard's first allocation, in entries.
 const SHARD_SLOTS_MIN: usize = 8;
+/// A shard doubles before an insert would pass `LOAD_NUM / LOAD_DEN` of
+/// its slots (ADR-0008 A1 rule 7), so a probe always meets an `EMPTY`.
+const LOAD_NUM: usize = 7;
+const LOAD_DEN: usize = 8;
 const NODE_MASK: u32 = NIL;
 
 const _: () = assert!(WHEEL_MEMBER_SHARDS == 256, "the shard is the hash's top byte");
@@ -117,7 +121,7 @@ impl Membership {
             self.shards.resize_with(WHEEL_MEMBER_SHARDS, || Shard { slots: Vec::new(), len: 0 });
         }
         let shard = &mut self.shards[shard_of(hash)];
-        if (shard.len as usize + 1) * 8 > shard.slots.len() * 7 {
+        if (shard.len as usize + 1) * LOAD_DEN > shard.slots.len() * LOAD_NUM {
             let before = shard.slots.capacity();
             shard.grow(pool)?;
             self.slot_bytes += ((shard.slots.capacity() - before) * size_of::<u32>()) as u64;
@@ -287,7 +291,7 @@ mod tests {
         for (node, hash) in hashes.iter().enumerate() {
             members.insert(*hash, node as u32, &pool).expect("growth");
             let shard = &members.shards[shard_of(*hash)];
-            assert!(shard.len as usize * 8 <= shard.slots.len() * 7);
+            assert!(shard.len as usize * LOAD_DEN <= shard.slots.len() * LOAD_NUM);
         }
         assert_eq!(members.slot_bytes(), (2_048 * size_of::<u32>()) as u64);
     }

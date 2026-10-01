@@ -152,14 +152,11 @@ fn equalize_expiry(cells: &Cells, model: &mut Keyspace, now: Nanos) {
     drain_model_expiry(model, now);
 }
 
-/// Unbounded model slices one drain may take — the node drain's bound.
-const MODEL_DRAIN_SLICES_MAX: usize = 64;
-
 /// The model's side of ADR-0008 A1 O3's drain: time frozen at `now`,
 /// every budget unbounded, until every wheel has caught up and every sweep
 /// is idle or completed a pass that began at `now`.
 pub(super) fn drain_model_expiry(model: &mut Keyspace, now: Nanos) {
-    for _ in 0..MODEL_DRAIN_SLICES_MAX {
+    for _ in 0..inf_store::limits::EXPIRY_DRAIN_SLICES_MAX {
         model.expire_tick(now, ExpiryBudget::UNBOUNDED);
         if model.expiry_settled(now) {
             return;

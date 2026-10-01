@@ -421,6 +421,10 @@ const ARGV_INLINE: usize = 16;
 /// Hard cap on wheel fires per expiry MAINTAIN slice — the debt-aware
 /// escalation (M1-S05) may multiply the deficit budget, never exceed this.
 const MAX_EXPIRY_FIRES_PER_SLICE: u32 = 4096;
+/// Wheel cursor steps, and sweep slots, one Maintenance unit pays for: a
+/// step or a slot is one table read, where a fire is a bounded group walk
+/// and costs a unit by itself (ADR-0008 A1 rule 6).
+const EXPIRY_WALK_PER_UNIT: u32 = 64;
 
 /// Hard caps on one backfill MAINTAIN tick (M4.5-S05, ADR-0077 D3): the
 /// deficit budget scales the slice, these bound its worst case — the
@@ -1559,13 +1563,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// `now`. Sim accounting oracle only: equalizes active-vs-lazy expiry
     /// between the node (wheel slices ran) and the replay model (none
     /// did) before live-record counts are compared. Bounded by
-    /// [`EXPIRY_DRAIN_SLICES_MAX`](crate::limits::EXPIRY_DRAIN_SLICES_MAX);
+    /// [`EXPIRY_DRAIN_SLICES_MAX`](inf_store::limits::EXPIRY_DRAIN_SLICES_MAX);
     /// a drain that never settles leaves the retained records to the oracle
     /// that reads them.
     pub fn drain_expiry(&self, now: Nanos) -> u64 {
         let mut ks = self.shared.store.borrow_mut();
         let mut reaped = 0;
-        for _ in 0..crate::limits::EXPIRY_DRAIN_SLICES_MAX {
+        for _ in 0..inf_store::limits::EXPIRY_DRAIN_SLICES_MAX {
             let stats = ks.expire_tick(now, ExpiryBudget::UNBOUNDED);
             reaped += stats.reaped + stats.swept;
             if ks.expiry_settled(now) {

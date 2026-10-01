@@ -12,15 +12,6 @@ pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 /// procfs record is refused and the read board retains its preceding sample.
 pub const PROCESS_STAT_BYTES_MAX: u64 = 16 * 1024;
 
-/// Unbounded expiry slices one frozen-time drain may take (ADR-0008 A1
-/// O3; the simulator's accounting oracle, never a serving path). Owner:
-/// `ServerPlane::drain_expiry`. An unbounded slice catches every wheel up
-/// and ends at most one sweep pass per store; settling needs at most three
-/// (the pass under way, a dirty one, and one begun at the frozen instant).
-/// Crossing: the drain returns unsettled and the oracle reading the
-/// records reports what it retained.
-pub const EXPIRY_DRAIN_SLICES_MAX: usize = 64;
-
 /// Bytes of the longest reply root `JSON.SET` and `JSON.MERGE`'s root
 /// create write after their store call: `+OK\r\n`, or the NX/XX null
 /// (`$-1\r\n`; RESP3 `_\r\n`). A command whose reply budget has fewer

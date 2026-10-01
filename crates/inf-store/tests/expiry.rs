@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 
 use inf_foundation::time::Nanos;
-use inf_store::limits::{EXPIRY_SWEEP_SLOTS_PER_SLICE, IDX_ALIAS_GROUP_MAX};
+use inf_store::limits::{
+    EXPIRY_DRAIN_SLICES_MAX, EXPIRY_SWEEP_SLOTS_PER_SLICE, IDX_ALIAS_GROUP_MAX,
+};
 use inf_store::{
     COLLISION_KEY_PREFIX, CellStore, EvictionPolicy, ExpireCond, ExpiryAudit, ExpiryBudget,
     Keyspace, MAX_EXPIRE_MS, NsId, NsMode, NsSpec, SetExpire, SetOptions, StoreConfig, TtlUpdate,
@@ -68,17 +70,12 @@ fn drain(store: &mut CellStore, now: Nanos) -> u64 {
     }
 }
 
-/// Slices one frozen-time drain may take before it counts as stuck: an
-/// unbounded slice catches the wheel up and ends at most one sweep pass,
-/// and settling needs at most three.
-const DRAIN_SLICES_MAX: usize = 64;
-
 /// ADR-0008 A1 O3's drain at the store tier: time frozen at `now`, every
 /// budget unbounded, until the wheel has caught up and the sweep is idle
 /// or completed a pass that began at `now`. Returns the records reaped.
 fn drain_settled(store: &mut CellStore, now: Nanos) -> u64 {
     let mut reaped = 0;
-    for _ in 0..DRAIN_SLICES_MAX {
+    for _ in 0..EXPIRY_DRAIN_SLICES_MAX {
         let stats = store.expire_tick(now, ExpiryBudget::UNBOUNDED);
         reaped += stats.reaped + stats.swept;
         if store.expiry_settled(now) {
