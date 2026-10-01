@@ -4389,17 +4389,19 @@ fn keys_on_cell(cells: u16, cell: u16, prefix: &str, count: usize) -> Vec<Vec<u8
         .collect()
 }
 
-/// ADR-0170 D4 for the checkpoint byte axis at α > 0: the class's credit
-/// gains at least `share / 7` per second at α = 2 (the ⅛ floor's weighted
-/// share and the keep-up floor cross there), within three bytes for the
-/// carries' lag (A1). Returns `T_ckpt` in seconds for an offer first
-/// made while the class owes `owed` bytes.
+/// ADR-0170 D4 for the checkpoint byte axis: the class's credit gains at
+/// least the larger of the ⅛ floor's weighted share and, at α > 0, the
+/// keep-up crossover `w / (αw + Σw)` of the share per second — `share / 7`
+/// at α = 2 — within three bytes for the carries' lag (A1). α is the
+/// harness's: the manual trigger R2 runs carries the product default.
+/// Returns `T_ckpt` in seconds for an offer first made while the class
+/// owes `owed` bytes.
 fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, delta: f64) -> f64 {
     const LAG_UNITS: f64 = 3.0;
-    let alpha = 2.0;
+    let alpha = CkptTrigger::Manual.config().alpha as f64;
     let (weight, weights) = (2.0, 10.0);
-    let rate =
-        share_bytes_per_s * f64::max(weight / (8.0 * weights), weight / (alpha * weight + weights));
+    let keep_up = if alpha > 0.0 { weight / (alpha * weight + weights) } else { 0.0 };
+    let rate = share_bytes_per_s * f64::max(weight / (8.0 * weights), keep_up);
     (owed + cap + charged + LAG_UNITS) / rate + 2.0 * delta
 }
 

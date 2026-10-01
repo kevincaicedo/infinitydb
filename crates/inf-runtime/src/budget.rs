@@ -1487,7 +1487,8 @@ mod tests {
     /// before the overrun it was "not this slice" on every call. Built at
     /// t = 0 the class is rested at its cap and the pool is empty, so the
     /// overrun owes 4 194 304 − 611 250 B; a 256 KiB block after it is
-    /// issued within `T_ckpt` of injected time (D4, α = 2: r = share / 7).
+    /// issued within `T_ckpt` of injected time (D4 with A1's three units
+    /// of carry lag; α = 2: r = share / 7).
     #[test]
     fn a_checkpoint_block_above_the_class_cap_is_issued_within_its_bound() {
         let reference = DeviceModel {
@@ -1506,7 +1507,8 @@ mod tests {
         assert_eq!(c.overrun_bytes, 3_583_054);
         let owed = b.meters[IoClass::Checkpoint.index()].credit[BYTES].owed();
         assert_eq!(owed, 3_583_054, "B − cap, with nothing in the pool");
-        let bound_ns = (owed + 611_250) as f64 / (61_125_000.0 / 7.0) * 1e9 + 2e6;
+        let units = owed + 611_250 + super::class_oracle::CARRY_LAG_UNITS;
+        let bound_ns = units as f64 / (61_125_000.0 / 7.0) * 1e9 + 2e6;
         let mut step = 0u64;
         loop {
             step += 1;
@@ -1628,7 +1630,10 @@ mod tests {
 /// class of `IoClass::ALL`, so a new class joins without edits, under the
 /// limits' hostile offers, five shares, three refill intervals and seven
 /// regimes. The bound `T_c(B)` is computed from D4's formula — the
-/// floored weighted share `r_c` per axis — never from budget code.
+/// floored weighted share `r_c` per axis and D2's cap — never from budget
+/// code, and the budget's caps are checked against that formula. I14 is
+/// checked on every full refund (the zero-work sibling), I15 on a partial
+/// refund of each of the case's grants, made on a copy of the budget.
 #[cfg(test)]
 mod class_oracle {
     use super::*;
@@ -1653,7 +1658,7 @@ mod class_oracle {
     /// per carry stage — the rate product, the ⅛ floor, and the weighted
     /// split (for the floored checkpoint, the one carry of the keep-up
     /// max): under 2⅛ units, so three whole units (ADR-0170 A1).
-    const CARRY_LAG_UNITS: u64 = 3;
+    pub(super) const CARRY_LAG_UNITS: u64 = 3;
     /// A case ends once its producer issued this many offers in the coarse
     /// phase (each wait checked) — the steady cycle then repeats — or at
     /// its last step. A starved offer therefore always runs to the end.
@@ -1718,6 +1723,9 @@ mod class_oracle {
         keepup_bound: u64,
         overrun_delayed: u64,
         sibling_ahead: u64,
+        /// Partial refunds of a grant that drew from two of debt, pool
+        /// and credit — where the return order decides the result.
+        refund_split: u64,
     }
 
     /// The production slices (`DurableCell::new`): zero-fill's 256 KiB
@@ -1761,6 +1769,36 @@ mod class_oracle {
 
     fn background() -> impl Iterator<Item = IoClass> {
         IoClass::ALL.into_iter().filter(|class| !class.is_foreground())
+    }
+
+    /// The case's per-axis rate in the class's direction, from the model
+    /// (the budget's share is the model it is given).
+    fn rate_of(class: IoClass, share: u64) -> [u64; 2] {
+        let model = model_of(share);
+        if class.is_read() {
+            [model.read_bytes_per_s, model.read_ops_per_s]
+        } else {
+            [model.write_bytes_per_s, model.write_ops_per_s]
+        }
+    }
+
+    /// `rate × weight / weights × 50 ms`, floored once.
+    fn horizon_units(rate: u64, weight: u64, weights: u64) -> u64 {
+        let units = u128::from(rate) * u128::from(weight) * u128::from(BURST_HORIZON_NS)
+            / (u128::from(weights) * NS_PER_S);
+        u64::try_from(units).unwrap_or(u64::MAX)
+    }
+
+    /// D2's cap from its formula, not from budget code: `cap_c =
+    /// max(slice_c, rate × w_c / Σw × 50 ms)`, at least 1 on the ops axis.
+    fn d2_cap(class: IoClass, rate: [u64; 2]) -> [u64; 2] {
+        let slice = production_slices()[class.index()];
+        let weights: u64 = background()
+            .filter(|other| other.is_read() == class.is_read())
+            .map(IoClass::weight)
+            .sum();
+        let horizon = |axis: usize| horizon_units(rate[axis], class.weight(), weights);
+        [slice.bytes.max(horizon(BYTES)), slice.ops.max(horizon(OPS)).max(1)]
     }
 
     /// D4's `r_c` per axis, per second: the ⅛ floor's weighted share; on
@@ -1813,10 +1851,9 @@ mod class_oracle {
         let mut cases = Vec::new();
         for class in background() {
             for share in SHARES {
-                let probe =
-                    DeviceBudget::new(model_of(share), production_slices(), ALPHA, Nanos(0));
-                let cap = probe.cap(class).bytes;
-                let pool_cap = probe.direction(class).pool_cap[BYTES];
+                let rate = rate_of(class, share);
+                let cap = d2_cap(class, rate)[BYTES];
+                let pool_cap = horizon_units(rate[BYTES], 1, 1);
                 let ops = production_slices()[class.index()].ops;
                 let bytes = [
                     1,
@@ -2132,8 +2169,61 @@ mod class_oracle {
                 self.last_overrun_by_overrunner = false;
                 self.coarse_issues += u32::from(self.pass >= FINE_STEPS);
                 self.settle_wait();
+                if self.case.policy == Policy::Offer {
+                    self.partial_refund(&m, dir_before);
+                }
             }
             self.check_state("producer");
+        }
+
+        /// I15 on a partial refund of each of the case's grants (a tier
+        /// round that staged half its slice), made on a copy of the budget
+        /// so the run's timing is the unrefunded one: half of what was
+        /// granted returns last-taken first — the debt, then the pool,
+        /// then the credit — computed here from the draws the grant made,
+        /// and neither the credit nor the pool rises above its value
+        /// before the grant.
+        fn partial_refund(&mut self, before: &Meter, pool_before: [u64; 2]) {
+            let class = self.case.class;
+            let refund = [self.case.offer[BYTES] / 2, self.case.offer[OPS] / 2];
+            let granted = self.b.meters[class.index()];
+            let pool_granted = self.b.direction(class).pool;
+            let (mut credit_due, mut pool_due) = (granted.credit, pool_granted);
+            for axis in AXES.into_iter().filter(|&axis| self.rate[axis] > 0) {
+                let debt = granted.credit[axis].owed();
+                // A grant only draws; one that raised either is caught below.
+                let pool = pool_before[axis].saturating_sub(pool_granted[axis]);
+                let credit = before.credit[axis].held().saturating_sub(granted.credit[axis].held());
+                let to_debt = refund[axis].min(debt);
+                let to_pool = (refund[axis] - to_debt).min(pool);
+                let to_credit = refund[axis] - to_debt - to_pool;
+                let sources = [debt, pool, credit].into_iter().filter(|&draw| draw > 0).count();
+                self.engagement.refund_split += u64::from(sources > 1 && refund[axis] > 0);
+                credit_due[axis] = if debt > to_debt {
+                    Credit::owing(debt - to_debt)
+                } else {
+                    Credit::Held(granted.credit[axis].held() + to_credit)
+                };
+                pool_due[axis] = pool_granted[axis] + to_pool;
+            }
+            let mut copy = self.b.clone();
+            copy.refund(class, refund[BYTES], refund[OPS]);
+            let (m, pool) = (copy.meters[class.index()], copy.direction(class).pool);
+            if m.credit != credit_due || pool != pool_due {
+                let what = format!("{:?} {pool:?}, due {credit_due:?} {pool_due:?}", m.credit);
+                self.violation(format!("I15: a partial refund returned {what}"));
+            }
+            let lifted = AXES.into_iter().filter(|&axis| self.rate[axis] > 0).any(|axis| {
+                m.credit[axis].held() > before.credit[axis].held() || pool[axis] > pool_before[axis]
+            });
+            if lifted {
+                self.violation("I15: a refund lifted the credit or the pool".to_owned());
+            }
+            for axis in AXES.into_iter().filter(|&axis| granted.spent[axis] < u64::MAX) {
+                if m.spent[axis] != granted.spent[axis] - refund[axis] {
+                    self.violation(format!("I15: spent {:?} after refunding {refund:?}", m.spent));
+                }
+            }
         }
 
         fn at_cap_of(&self, m: &Meter) -> bool {
@@ -2203,8 +2293,8 @@ mod class_oracle {
 
     fn run_case(case: Case, engagement: &mut Engagement) -> Vec<String> {
         let b = DeviceBudget::new(model_of(case.share), production_slices(), ALPHA, Nanos(0));
-        let cap = b.meters[case.class.index()].cap;
-        let rate = b.direction(case.class).rate;
+        let rate = rate_of(case.class, case.share);
+        let cap = d2_cap(case.class, rate);
         let mut run = Run {
             case,
             b,
@@ -2232,6 +2322,13 @@ mod class_oracle {
         let longest = wait_ns(case.class, rate, cap, run.owed_max());
         run.coarse_ns = case.fine_ns.max((longest / COARSE_DIVISOR).ceil() as u64);
         run.engagement.cases += 1;
+        for class in background() {
+            let (built, due) =
+                (run.b.meters[class.index()].cap, d2_cap(class, rate_of(class, case.share)));
+            if built != due {
+                run.violation(format!("cap: {class:?} built {built:?}, D2's formula {due:?}"));
+            }
+        }
         run.run()
     }
 
@@ -2265,6 +2362,7 @@ mod class_oracle {
             total.keepup_bound += engagement.keepup_bound;
             total.overrun_delayed += engagement.overrun_delayed;
             total.sibling_ahead += engagement.sibling_ahead;
+            total.refund_split += engagement.refund_split;
             failures.extend(part);
         }
         (total, failures)
@@ -2287,6 +2385,7 @@ mod class_oracle {
         assert!(engagement.keepup_bound > 0, "vacuous: the keep-up term never set a grant");
         assert!(engagement.overrun_delayed > 0, "vacuous: no overrun delayed an offer");
         assert!(engagement.sibling_ahead > 0, "vacuous: the zero-work sibling never went first");
+        assert!(engagement.refund_split > 0, "vacuous: no partial refund met a split grant");
     }
 
     /// R4's own canary: a producer that re-offers through the attainable
