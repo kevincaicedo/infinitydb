@@ -36,7 +36,9 @@
 //! - **Deletes contribute no user bytes and do contribute WAL bytes.** A
 //!   tombstone-heavy workload therefore reports write amplification above
 //!   the write-twice baseline. That is a true statement about the
-//!   workload, not an accounting artifact, and is reported as such.
+//!   workload, not an accounting artifact, so the ratio takes no
+//!   tombstone discount, and a delete-only namespace reports `undefined`
+//!   ([`WriteAmplification`]).
 //! - **Frame header/trailer bytes are not pro-rated across namespaces.**
 //!   One WAL frame carries records from every namespace the cell wrote
 //!   that iteration; splitting its 20-odd envelope bytes per namespace

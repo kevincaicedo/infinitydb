@@ -232,12 +232,16 @@ pub const DEFAULT_CKPT_SLICE_BYTES: u32 = 64 << 10;
 /// the checkpoint's share of device writes to half the log's — (log +
 /// checkpoint) / log ≤ 1.5 by construction; the two caps keep recovery
 /// inside the boot gate in the same expression (recovery is bound by
-/// record count — 476 k records/s/cell measured — and the M2 replay row
-/// by bytes; either alone lets the other shape escape).
+/// record count — [`DEFAULT_REPLAY_RECORDS_PER_S`] — and the M2 replay
+/// row by bytes; either alone lets the other shape escape).
 pub const DEFAULT_CKPT_ALPHA: u64 = 2;
 /// The M2 replay gate's rate (≥ 1 GB/s/cell replay).
 pub const DEFAULT_REPLAY_BYTES_PER_S: u64 = 1 << 30;
-/// The measured record replay rate, rounded down (ops doc: 476 k/s/cell).
+/// A conservative record replay rate. A warm four-cell boot replayed
+/// 2.81 M records per cell within a 5.906 s whole boot: 476 k
+/// records/s/cell (the claim ledger's C38b row). The whole boot includes
+/// the `Start` phase, so 476 k is a floor on that boot's replay rate;
+/// 400 k rounds the floor down.
 pub const DEFAULT_REPLAY_RECORDS_PER_S: u64 = 400_000;
 /// The replay share of the 15 s boot gate: 15 s minus the `Start` row's
 /// 5 s bar minus a 5 s `.ick` load allowance — three named terms.
