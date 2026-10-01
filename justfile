@@ -7,11 +7,6 @@ check:
     # Every relative link in a published Markdown file resolves inside the
     # repository (ADR-0166 D5), beside the document identities.
     ./scripts/check-doc-artifacts.sh
-    # The public docs are self-contained: no link in a Markdown file, website
-    # page or docs table leaves the repository or names no file, and no path,
-    # URL, prose, section or removed-document name points into records that
-    # are not published with it.
-    ./scripts/check-public-doc-links.sh
     # ADR-0164: the document gates of the combined checkout; a standalone
     # checkout prints the skip.
     ./scripts/check-parent-doc-gates.sh

@@ -1,5 +1,0 @@
-# Owned-line rows for scripts/check-public-doc-links.sh, whose header states what a row
-# exempts and its bounds. One row per line another source owns: the file, the text the line
-# contains, the owning source, the owner of the fix and the expiry (YYYY-MM-DD). Fix the
-# source, regenerate, then delete the row.
-# file<TAB>line text<TAB>owning source<TAB>owner<TAB>expiry

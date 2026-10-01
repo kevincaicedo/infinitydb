@@ -64,9 +64,9 @@ artifact `docs/compat-matrix.md` (which is itself rendered from the
 CI staleness gate). The chain keeps the website incapable of drifting from
 the implementation (law L8). The page is first-read copy: the renderer
 states each note without the matrix's internal decision and story
-identifiers, and folds a story or dot milestone into its milestone;
-`scripts/check-public-doc-links.sh` refuses the page if one survives.
-Regenerate after the matrix changes, from the repository root:
+identifiers, and folds a story or dot milestone into its milestone; none
+may survive on the page. Regenerate after the matrix changes, from the
+repository root:
 
 ```bash
 python3 website/scripts/gen-compat-page.py \

@@ -15,8 +15,8 @@ reference and cites decisions, stories and review findings by identifier
 not published with the repository. `public_text` drops each citation, and
 each `§` section of an unpublished document, and folds a story or dot
 milestone into its milestone (`M4-S19` and `M4.5` read `M4`), so the page
-states the behavior and names only what a reader can open.
-`scripts/check-public-doc-links.sh` refuses the page if one survives.
+states the behavior and names only what a reader can open. None may
+survive on the generated page.
 
 Usage (from the repository root):
     python3 website/scripts/gen-compat-page.py \

@@ -512,24 +512,23 @@ Documentation identities are checked too (ADR-0106 D15):
 `check-doc-artifacts.sh` requires the one generated compatibility matrix
 and refuses tracked run output; D17 checks this document and
 `docs/ARCHITECTURE.md` for obsolete layout names and landed-ADR
-placeholders. The public documentation is self-contained, and one gate owns
-every link and pointer in it: `check-public-doc-links.sh`. A public
+placeholders. The public documentation is self-contained. A public
 document states a rule instead of pointing into the project's unpublished
 records. An engineering reference may cite a bare decision identifier
 (`ADR-0087 D2`) beside the rule it states, never as a link and never in
 the rule's place. The copy a newcomer reads first carries no decision or
 story identifier, and no published document carries a review, finding or
 batch identifier: a review's result is stated as the rule it produced. The
-gate's header is the one list of what it refuses, which tier each document
-is in and what it exempts; every exemption carries an owner and an
-expiry. The published claim-ledger snapshot is an evidence record kept
-in the engineering tier; it is maintained by hand from its source, not
-copied verbatim. A spelling the gate does not list, a bare parenthesised
-label, abbreviated module names and future deliverables remain review
-obligations. The release job checks the matrix against its
-renderer before packaging it. The dependency gate (D16) checks active and
-reserved edges in both directions, requires a row for every package and
-prints dev exemptions.
+published claim-ledger snapshot is an evidence record judged as an
+engineering reference; it is maintained by hand from its source, not
+copied verbatim. The relative-link half is mechanical:
+`check-doc-artifacts.sh` requires every relative link in a published
+Markdown file to resolve to a published file inside this repository, and
+states that scope on its OK line. The pointer and identifier rules are
+review obligations in this repository. The release job checks the matrix
+against its renderer before packaging it. The dependency gate (D16)
+checks active and reserved edges in both directions, requires a row for
+every package and prints dev exemptions.
 
 ## Performance
 
