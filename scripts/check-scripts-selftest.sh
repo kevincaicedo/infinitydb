@@ -2454,6 +2454,60 @@ expect green "parent-doc-gates: a standalone checkout is green" \
     env INF_CHECK_ROOT="$work/parent-none/eng" "$PARENT"
 expect red "parent-doc-gates: a parent without its gates is red" \
     env INF_CHECK_ROOT="$work/parent-bare/eng" "$PARENT"
+# One gate at a time: a parent holding the other two gates, with the
+# claim-ledger lint missing, not executable, or failing, is red, and the
+# runner's run of a complete parent must reach the ledger lint. Stubs stand
+# in for the parent's gates, so the plants judge the runner alone.
+pd_parent() { # <name> <ledger: ok|missing|noexec|fail>
+    local root="$work/parent-$1" gate
+    mkdir -p "$root/eng" "$root/docs" "$root/scripts"
+    : >"$root/docs/infinity-master-plan.md"
+    for gate in check-adr-links.sh check-drr.sh check-claim-ledger.sh; do
+        [ "$gate" = check-claim-ledger.sh ] && [ "$2" = missing ] && continue
+        printf '#!/usr/bin/env bash\necho "stub %s ran on $INF_ENGINE_ROOT"\n' "$gate" \
+            >"$root/scripts/$gate"
+        chmod +x "$root/scripts/$gate"
+    done
+    case $2 in
+        noexec) chmod -x "$root/scripts/check-claim-ledger.sh" ;;
+        fail) printf '#!/usr/bin/env bash\necho "stub ledger lint red"\nexit 1\n' \
+            >"$root/scripts/check-claim-ledger.sh" ;;
+    esac
+}
+# pd_ledger_ran <runner> <name>: the runner is green on the parent and its
+# output shows the ledger lint ran against the checkout under test.
+pd_ledger_ran() {
+    local out
+    out=$(env INF_CHECK_ROOT="$work/parent-$2/eng" "$1" 2>&1) || return 1
+    grep -qxF "stub check-claim-ledger.sh ran on $work/parent-$2/eng" <<<"$out"
+}
+pd_parent full ok
+pd_parent no-ledger missing
+pd_parent noexec-ledger noexec
+pd_parent red-ledger fail
+expect green "parent-doc-gates: a parent with all three gates runs the ledger lint" \
+    pd_ledger_ran "$PARENT" full
+expect_output "parent-doc-gates: the adr-links and drr gates ran first" \
+    "stub check-drr.sh ran" env INF_CHECK_ROOT="$work/parent-no-ledger/eng" "$PARENT"
+expect red "parent-doc-gates: only the claim-ledger lint missing is red" \
+    env INF_CHECK_ROOT="$work/parent-no-ledger/eng" "$PARENT"
+expect_output "parent-doc-gates: the missing gate is named" \
+    "check-claim-ledger.sh missing or not executable" \
+    env INF_CHECK_ROOT="$work/parent-no-ledger/eng" "$PARENT"
+expect red "parent-doc-gates: only the claim-ledger lint not executable is red" \
+    env INF_CHECK_ROOT="$work/parent-noexec-ledger/eng" "$PARENT"
+expect_output "parent-doc-gates: the non-executable gate is named" \
+    "check-claim-ledger.sh missing or not executable" \
+    env INF_CHECK_ROOT="$work/parent-noexec-ledger/eng" "$PARENT"
+expect red "parent-doc-gates: a red claim-ledger lint is red" \
+    env INF_CHECK_ROOT="$work/parent-red-ledger/eng" "$PARENT"
+# A runner whose gate list drops the ledger lint is caught by the run above.
+sed 's/^\(for gate in .*\) check-claim-ledger\.sh;/\1;/' "$PARENT" >"$work/pd-no-ledger.sh"
+chmod +x "$work/pd-no-ledger.sh"
+expect red "parent-doc-gates: the runner plant changed the gate list" \
+    cmp -s "$PARENT" "$work/pd-no-ledger.sh"
+expect red "parent-doc-gates: a runner that drops the claim-ledger lint is red" \
+    pd_ledger_ran "$work/pd-no-ledger.sh" full
 
 # ADR-0165 D2: the spelling table equals the tree, both ways; comments, test
 # modules and code outside an item scope are not sites.
