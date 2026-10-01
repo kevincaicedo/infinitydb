@@ -21,9 +21,11 @@
 //!   the modeled rate minus what the foreground spent since the last
 //!   refill, never below one [`FLOOR_DIVISOR`]th of the share (a
 //!   background that cannot run at all is a recovery-time bug, a
-//!   foreground stall, or a class downgrade — under foreground saturation
-//!   the device is shared 7:1, visibly). Carries keep every sub-unit
-//!   remainder, so any refill interval grants its exact share over time.
+//!   foreground stall, or a class downgrade). The floor is a lower bound
+//!   on the weighted grant, not a ratio the device is held to: the
+//!   checkpoint's keep-up grant below is paid on top of it. Carries keep
+//!   every sub-unit remainder, so any refill interval grants its exact
+//!   share over time.
 //! - *Split*: by weight among the background classes; each class's
 //!   credit is capped at `cap = max(slice, share × weight/Σw × horizon)`,
 //!   and what a capped class cannot hold flows to a per-direction pool
@@ -62,6 +64,11 @@
 //! device's write capacity splits `α : 1` between the log and the
 //! checkpoint at saturation — the 1.5× write-amplification model made
 //! arithmetic — and the checkpoint always completes within α intervals.
+//! The keep-up grant is refilled like any other: what a checkpoint
+//! resting at its cap cannot hold overflows to the write pool, where the
+//! tier and zero-fill classes may draw it. With the checkpoint idle and
+//! the log at the whole share, those classes can therefore issue well
+//! above their own floor share (ADR-0170 D2, as designed).
 //! The floor and the weighted share are compared exactly and rounded
 //! once, with one remainder carried (ADR-0170 A1): rounding the floor on
 //! its own lost up to `(α − 1)/α` byte a refill where the two cross.
@@ -246,8 +253,10 @@ impl DeviceModel {
 /// `max ≤ 50 ms` bar, not tuned.
 pub const BURST_HORIZON_NS: u64 = 50_000_000;
 
-/// Under foreground saturation the background grant is clamped at no
-/// less than `share / FLOOR_DIVISOR` — the device is shared 7:1.
+/// Under foreground saturation the weighted background grant is clamped
+/// at no less than `share / FLOOR_DIVISOR`. A lower bound only: the
+/// checkpoint's keep-up grant and its overflow into the pool are paid
+/// above it.
 pub const FLOOR_DIVISOR: u64 = 8;
 
 const NS_PER_S: u128 = 1_000_000_000;
