@@ -293,6 +293,25 @@ fn set_member_same_offset_nested_inserts_order_deepest_first() {
     assert_eq!(outcome.applied, 2);
 }
 
+/// A member append into an object that an outer match replaces wholesale
+/// is superseded: the append sits at the very byte the replaced member
+/// ends on, so its offset alone does not place it inside the range. The
+/// writer never issues this set (it creates a member only when no parent
+/// has the key); a replayed delta can.
+#[test]
+fn set_member_append_inside_a_replaced_member_is_superseded() {
+    let frag = fragment(&Value::I64(7));
+    let op = ApplyOp::SetMember { key: b"k", fragment: &frag };
+    let (json, outcome) = applied_json(r#"{"k":{"k":{}}}"#, "$..k", &op);
+    assert_eq!(json, r#"{"k":{"k":7}}"#, "reverse-order mutation: the inner append is replaced");
+    assert_eq!(outcome.applied, 2);
+    // The mirror shape keeps both edits: the outer object appends after
+    // the inner one's replaced member, at the same byte, outside its range.
+    let (json, outcome) = applied_json(r#"{"x":{"x":{"k":1}}}"#, "$..x", &op);
+    assert_eq!(json, r#"{"x":{"x":{"k":7},"k":7}}"#);
+    assert_eq!(outcome.applied, 2);
+}
+
 // ---- bounds + no-op discipline ---------------------------------------------
 
 #[test]
@@ -356,35 +375,68 @@ fn arb_value() -> impl Strategy<Value = Value> {
     })
 }
 
-fn arb_op() -> impl Strategy<Value = OwnedOp> {
+/// The reference property's generator for one opcode. The match is
+/// exhaustive and [`arb_op`] draws over `DeltaOpcode::ALL`, so an op
+/// cannot exist outside the property: a new opcode does not compile until
+/// it has an arm here.
+fn arb_op_of(opcode: DeltaOpcode) -> BoxedStrategy<OwnedOp> {
     let values = || proptest::collection::vec(arb_value(), 1..3);
-    prop_oneof![
-        (-1000i64..1000).prop_map(|n| OwnedOp::NumIncrBy(Number::I64(n))),
-        (-100i64..100).prop_map(|n| OwnedOp::NumIncrBy(Number::F64(n as f64 * 0.25))),
-        (-30i64..30).prop_map(|n| OwnedOp::NumMultBy(Number::I64(n))),
-        Just(OwnedOp::StrAppend(b"+tail".to_vec())),
-        Just(OwnedOp::Toggle),
-        Just(OwnedOp::Clear),
-        Just(OwnedOp::Del),
-        arb_value().prop_map(|v| {
-            let frag = fragment(&v);
-            OwnedOp::SetReplace(v, frag)
-        }),
-        values().prop_map(|vs| {
-            let operand = arr_operand(&vs);
-            OwnedOp::ArrAppend(vs, operand)
-        }),
-        (values(), -4i64..4).prop_map(|(vs, index)| {
-            let operand = arr_operand(&vs);
-            OwnedOp::ArrInsert(index, vs, operand)
-        }),
-        (-4i64..4).prop_map(OwnedOp::ArrPop),
-        (-4i64..4, -4i64..4).prop_map(|(start, stop)| OwnedOp::ArrTrim(start, stop)),
-        arb_value().prop_map(|v| {
-            let frag = fragment(&v);
-            OwnedOp::Merge(v, frag)
-        }),
-    ]
+    match opcode {
+        DeltaOpcode::NumIncrBy => prop_oneof![
+            (-1000i64..1000).prop_map(|n| OwnedOp::NumIncrBy(Number::I64(n))),
+            (-100i64..100).prop_map(|n| OwnedOp::NumIncrBy(Number::F64(n as f64 * 0.25))),
+        ]
+        .boxed(),
+        DeltaOpcode::NumMultBy => {
+            (-30i64..30).prop_map(|n| OwnedOp::NumMultBy(Number::I64(n))).boxed()
+        }
+        DeltaOpcode::StrAppend => Just(OwnedOp::StrAppend(b"+tail".to_vec())).boxed(),
+        DeltaOpcode::Toggle => Just(OwnedOp::Toggle).boxed(),
+        DeltaOpcode::Clear => Just(OwnedOp::Clear).boxed(),
+        DeltaOpcode::Del => Just(OwnedOp::Del).boxed(),
+        DeltaOpcode::SetReplace => arb_value()
+            .prop_map(|v| {
+                let frag = fragment(&v);
+                OwnedOp::SetReplace(v, frag)
+            })
+            .boxed(),
+        // The keys `arb_value` draws, so a matched object holds the member
+        // or lacks it: a replace and an append meet in one edit set.
+        DeltaOpcode::SetMember => {
+            (prop_oneof![Just("a"), Just("b"), Just("k"), Just("z9")], arb_value())
+                .prop_map(|(key, v)| {
+                    let frag = fragment(&v);
+                    OwnedOp::SetMember(key.to_string(), v, frag)
+                })
+                .boxed()
+        }
+        DeltaOpcode::ArrAppend => values()
+            .prop_map(|vs| {
+                let operand = arr_operand(&vs);
+                OwnedOp::ArrAppend(vs, operand)
+            })
+            .boxed(),
+        DeltaOpcode::ArrInsert => (values(), -4i64..4)
+            .prop_map(|(vs, index)| {
+                let operand = arr_operand(&vs);
+                OwnedOp::ArrInsert(index, vs, operand)
+            })
+            .boxed(),
+        DeltaOpcode::ArrPop => (-4i64..4).prop_map(OwnedOp::ArrPop).boxed(),
+        DeltaOpcode::ArrTrim => {
+            (-4i64..4, -4i64..4).prop_map(|(start, stop)| OwnedOp::ArrTrim(start, stop)).boxed()
+        }
+        DeltaOpcode::Merge => arb_value()
+            .prop_map(|v| {
+                let frag = fragment(&v);
+                OwnedOp::Merge(v, frag)
+            })
+            .boxed(),
+    }
+}
+
+fn arb_op() -> impl Strategy<Value = OwnedOp> {
+    proptest::strategy::Union::new(DeltaOpcode::ALL.iter().map(|&opcode| arb_op_of(opcode)))
 }
 
 /// Owned op mirror (proptest values must be `'static`). Value-carrying

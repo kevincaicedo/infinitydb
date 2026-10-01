@@ -952,20 +952,33 @@ fn drop_superseded(edits: &mut Vec<Edit>) -> Vec<Edit> {
     use core::cmp::Reverse;
     edits.sort_by_key(|e| (e.start, Reverse(e.depth)));
     let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
-    let mut covered_end = 0u32;
-    let mut covering = false;
+    // The last kept non-empty range, as `(start, end)`.
+    let mut covered: Option<(u32, u32)> = None;
     for edit in edits.drain(..) {
-        if covering && edit.start < covered_end {
-            debug_assert!(edit.end <= covered_end, "value extents nest, never straddle");
+        if covered.is_some_and(|range| inside(&edit, range)) {
             continue;
         }
         if edit.end > edit.start {
-            covered_end = edit.end;
-            covering = true;
+            covered = Some((edit.start, edit.end));
         }
         kept.push(edit);
     }
     kept
+}
+
+/// Whether `edit` lies inside the kept range `(start, end)`. Edits arrive
+/// in ascending start order, so one that starts before `end` is inside.
+/// An insert at `end` itself is inside when the container it inserts into
+/// is: an append to an object ends on the byte the object ends on, so its
+/// offset cannot tell it from a sibling that follows the range. An
+/// insert's last patched header is its own container (`with_self`).
+fn inside(edit: &Edit, (start, end): (u32, u32)) -> bool {
+    if edit.start < end {
+        debug_assert!(edit.end <= end, "value extents nest, never straddle");
+        return true;
+    }
+    let insert_at_end = edit.start == end && edit.end == edit.start;
+    insert_at_end && edit.patch.last().is_some_and(|&container| container >= start)
 }
 
 /// Stream the new document in one pass: gaps memcpy, ancestor headers

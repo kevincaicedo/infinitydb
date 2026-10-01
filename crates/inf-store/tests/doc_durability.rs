@@ -456,6 +456,16 @@ fn keyspace_holding(pre: &[u8]) -> Keyspace {
 /// The one-match `DocDelta` on `doc` at base version 1, in the record
 /// codec's bytes.
 fn delta_wire(program: &inf_doc::PathProgram, op: &ApplyOp<'_>, post_len: u32) -> Vec<u8> {
+    delta_wire_matching(program, op, post_len, 1)
+}
+
+/// [`delta_wire`] for a record whose program matched `match_count` values.
+fn delta_wire_matching(
+    program: &inf_doc::PathProgram,
+    op: &ApplyOp<'_>,
+    post_len: u32,
+    match_count: u32,
+) -> Vec<u8> {
     let mut operand = Vec::new();
     let opcode = encode_apply_op(op, &mut operand) as u8;
     let delta = RecordView::DocDelta {
@@ -463,7 +473,7 @@ fn delta_wire(program: &inf_doc::PathProgram, op: &ApplyOp<'_>, post_len: u32) -
         key: b"doc",
         lineage: LINEAGE,
         base_version: 1,
-        match_count: 1,
+        match_count,
         post_len,
         opcode,
         program: program.as_bytes(),
@@ -577,6 +587,37 @@ fn replay_planted(pre: &[u8], path: &[u8], op: &ApplyOp<'_>, post_len: u32) -> P
     let after = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
     let unchanged = after == before;
     Planted { verdict, after: after.0.0, unchanged }
+}
+
+/// A `SetMember` delta no writer logs still replays to a typed verdict:
+/// its program matches an object that has the key and, as that member's
+/// value, an object that lacks it, so one edit replaces the range the
+/// other appends into. The append is superseded, as reverse-order
+/// mutation gives. The planner used to keep it: a record carrying the
+/// true length then failed `TooLarge`, and one carrying the length the
+/// kept append sums to (the pre-image's, here) sliced out of bounds — a
+/// cell panic at boot. That record now fails typed and changes nothing.
+#[test]
+fn replay_of_a_member_append_inside_a_replaced_member_is_typed() {
+    let pre = JsonParser::new().parse(br#"{"k":{"k":{}}}"#).expect("fixture");
+    let post = JsonParser::new().parse(br#"{"k":{"k":7}}"#).expect("fixture");
+    let fragment = fragment_of("7");
+    let op = ApplyOp::SetMember { key: b"k", fragment: &fragment };
+    let program = compile(b"$..k").expect("path");
+    let replay = |recorded_len: usize| {
+        let mut ks = keyspace_holding(&pre);
+        let post_len = u32::try_from(recorded_len).expect("a small document");
+        let wire = delta_wire_matching(&program, &op, post_len, 2);
+        let (decoded, _) = inf_log::decode_record(&wire).expect("the planted delta decodes");
+        let verdict = ks.apply_record(&decoded, NOW, ANCHOR);
+        (verdict, stored(ks.ns_store_mut(NS).expect("store")).0)
+    };
+    let (verdict, after) = replay(post.len());
+    assert!(matches!(verdict, Ok(ReplayOutcome::Applied)), "{verdict:?}");
+    assert_eq!(after, post, "the replayed bytes");
+    let (verdict, after) = replay(pre.len());
+    assert!(matches!(verdict, Err(ReplayError::CorruptDocument(_))), "{verdict:?}");
+    assert_eq!(after, pre, "a refused replay changes nothing");
 }
 
 /// The header-less canonical fragment of `json`.
