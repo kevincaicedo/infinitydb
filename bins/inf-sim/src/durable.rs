@@ -781,7 +781,7 @@ impl DurableScenario {
         };
         scenario.io_mode = second;
         scenario.prelude = Some(Prelude { io_mode: first, ops_per_writer: 40 });
-        // The device budget (ADR-0088 D2) at the `m2-device-budget`
+        // The device budget (ADR-0170 D2) at the `m2-device-budget`
         // model, 32 KiB/s per device: the zero-fill class's share grants
         // the 16 KiB next-segment fill only after ~1–2 sim-seconds, so
         // the first frames of a `Direct` life land in the reopened tail

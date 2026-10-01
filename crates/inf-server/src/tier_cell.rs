@@ -55,17 +55,21 @@ const _: () = assert!(
 
 /// The most driver ops one flush round can carry (the ADR-0084 D3
 /// token op-index bound) — the tier-flush class's ops slice for the
-/// device budget (ADR-0088 D2).
+/// device budget (ADR-0170 D2).
 pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
 
 /// The device budget's answer to "may a flush round of up to `bytes`
 /// bytes and `ops` ops stage now?" (ADR-0170 D1's [`Issue`]) plus the
-/// refund of the unissued part (ADR-0088 D5). Generic, not `dyn`: one
-/// monomorphized closure per plane. `None` = no durable plane (the MemFs
-/// test tier) — always `Now`, nothing metered.
+/// settlement of what the round then staged (ADR-0170 D2): the unstaged
+/// part refunded against the grant's receipt, bytes staged past the
+/// grant charged. Generic, not `dyn`: one monomorphized closure per
+/// plane. `None` = no durable plane (the MemFs test tier) — always
+/// `Now`, nothing metered.
 pub(crate) trait FlushAdmission {
     fn admit(&mut self, bytes: u64, ops: u64) -> Issue;
     fn refund(&mut self, bytes: u64, ops: u64);
+    /// Spend past the grant: owed when the class's credit cannot hold it.
+    fn charge(&mut self, bytes: u64);
 }
 
 /// Extent-reclaim candidates examined per MAINTAIN slice (ADR-0061 D5
@@ -929,8 +933,8 @@ fn drive_flush_round<F: SegmentFs>(
     // ADR-0170 D3: a round offers only when a chunk is there to take — an
     // idle namespace asks the budget for nothing. ADR-0088 D5: the slice
     // is offered before anything stages; `NotThisSlice` leaves the sealed
-    // backlog where it is, re-offered next pass; the unissued remainder is
-    // refunded once staging reports the exact bytes.
+    // backlog where it is, re-offered next pass; the grant is settled
+    // once staging reports the exact bytes.
     if !table.flush_pending(&t.flush) {
         return Ok(0);
     }
@@ -942,16 +946,17 @@ fn drive_flush_round<F: SegmentFs>(
             return Ok(0);
         }
     }
-    // An errored stage may still leave a valid round (a seal staged
-    // before a refused file creation — F-L01-02): it is submitted like
-    // any other; the error surfaces after, and the next slice retries.
+    // A refused stage may still leave a valid round (the chunks and the
+    // seal staged before a refused file creation): it is submitted like
+    // any other, its staged bytes are settled like any other, the error
+    // surfaces after, and the next slice retries.
     let stage_result = table.stage_flush_round(&mut t.flush);
-    let staged_bytes = *stage_result.as_ref().unwrap_or(&0);
+    let staged_bytes = match &stage_result {
+        Ok(staged_bytes) => *staged_bytes,
+        Err(failed) => failed.staged_bytes,
+    };
     let issued_ops = if t.flush.round_active() { t.flush.round_op_count() as u64 } else { 0 };
-    admission.refund(
-        slice_bound.saturating_sub(staged_bytes),
-        TIER_ROUND_MAX_OPS.saturating_sub(issued_ops),
-    );
+    settle_round_grant(admission, slice_bound, staged_bytes, issued_ops);
     if t.flush.round_active() {
         let op_count = t.flush.round_op_count();
         assert!(op_count <= 256, "flush round exceeds the token op-index bound (ADR-0084 D3)");
@@ -966,8 +971,32 @@ fn drive_flush_round<F: SegmentFs>(
             open_round(t, now_us, ops, |flush, index| flush.round_op(index).offset)?;
         }
     }
-    stage_result?;
+    stage_result.map_err(|failed| failed.error)?;
     Ok(staged_bytes)
+}
+
+/// Settles a round's grant against the record bytes it staged (ADR-0170
+/// D2, A2): the unstaged part of the offer is refunded against the grant's
+/// receipt, and bytes staged past the offer are charged — owed when the
+/// class's credit cannot hold them. A stage can pass its offer: each
+/// chunk takes at least one seal cut past its cursor, and a span with no
+/// recorded cut runs to its hard bound (`AddressSpace::next_flush_chunk`).
+/// Either way `spent` counts every staged byte (I10). Ops never pass the
+/// offer: a round carries at most [`TIER_ROUND_MAX_OPS`].
+fn settle_round_grant(
+    admission: &mut impl FlushAdmission,
+    offered_bytes: u64,
+    staged_bytes: u64,
+    issued_ops: u64,
+) {
+    admission.refund(
+        offered_bytes.saturating_sub(staged_bytes),
+        TIER_ROUND_MAX_OPS.saturating_sub(issued_ops),
+    );
+    let past_offer_bytes = staged_bytes.saturating_sub(offered_bytes);
+    if past_offer_bytes > 0 {
+        admission.charge(past_offer_bytes);
+    }
 }
 
 /// Opens the staged round whole or not at all (ADR-0167 D4): every write
@@ -1061,8 +1090,11 @@ fn emit_round_wave<F: SegmentFs>(
 #[cfg(test)]
 mod lane_tests {
     use super::*;
+    use inf_foundation::fault::FaultSpec;
+    use inf_foundation::time::Nanos;
     use inf_log::fs::mem::MemFs;
     use inf_log::fs::sim::SimDisk;
+    use inf_runtime::{ClassSlice, DeviceBudget, DeviceModel, IoClass};
     use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher};
     use inf_store::{Keyspace, StoreConfig, TierSpec};
 
@@ -1110,12 +1142,11 @@ mod lane_tests {
         assert_eq!(cell.next_lane, (inf_runtime::MAX_SLOT >> 8) + 1, "no fresh lane was minted");
     }
 
-    /// A tiered keyspace on `NsId(16)` filled past its demotion threshold,
-    /// sealed, and staged into `cell`'s own `SimDisk` pipeline: a real
-    /// reactor round, the new file's header write first (the
-    /// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
-    /// no fds.
-    fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
+    /// A tiered keyspace on `NsId(16)` filled past its demotion threshold
+    /// and sealed `seal_steps` times, nothing staged. Seal marks sit at
+    /// page boundaries and the demotion slice is one 4 KiB page, so each
+    /// step — one flush cut — is one page's records, about 4 KiB.
+    fn sealed_backlog(seal_steps: u32) -> Keyspace {
         const PAGE: u64 = 4 << 10;
         let demote = DemotionConfig::for_budget(1 << 20, PAGE);
         let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
@@ -1129,21 +1160,152 @@ mod lane_tests {
         let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
         let hasher = KeyHasher::default();
         let mut index = 0u32;
-        // Seal marks sit at page boundaries: fill past the threshold until
-        // a slice seals.
         let mut sealed = 0;
-        while sealed == 0 {
+        while sealed < seal_steps {
             let key = format!("round:{index:06}").into_bytes();
             table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits the window");
             index += 1;
             assert!(index < 100_000, "the fill reaches the demotion threshold");
-            if table.demote_due() {
-                sealed = table.seal_slice();
+            if table.demote_due() && table.seal_slice() > 0 {
+                sealed += 1;
             }
         }
+        ks
+    }
+
+    /// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
+    /// real reactor round, the new file's header write first (the
+    /// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
+    /// no fds.
+    fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
+        let mut ks = sealed_backlog(1);
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
         let flush = &mut cell.namespaces[0].flush;
         table.stage_flush_round(flush).expect("stage");
         ks
+    }
+
+    /// The tier class's budget as the plane wires it: a real
+    /// `DeviceBudget`, called in the order `drive_flush_round` calls it.
+    struct BudgetAdmission(DeviceBudget);
+
+    impl FlushAdmission for BudgetAdmission {
+        fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
+            self.0.offer(IoClass::TierFlush, bytes, ops)
+        }
+        fn refund(&mut self, bytes: u64, ops: u64) {
+            self.0.refund(IoClass::TierFlush, bytes, ops);
+        }
+        fn charge(&mut self, bytes: u64) {
+            self.0.charge(IoClass::TierFlush, bytes, 0);
+        }
+    }
+
+    /// The flush slice of the settlement tests: above one ~4 KiB seal
+    /// step and below two, so a backlog of three steps stages two — the
+    /// second through `next_flush_chunk`'s minimum-progress cut.
+    const SETTLE_SLICE: u64 = 6 << 10;
+
+    /// A budget whose tier cap is [`SETTLE_SLICE`] (1 000 B/s: the 50 ms
+    /// horizon of the tier's 400 B/s is 20 B), so the class holds exactly
+    /// one slice at boot and refills 400 B a second.
+    fn slice_capped_budget() -> BudgetAdmission {
+        let model = DeviceModel {
+            write_bytes_per_s: 1_000,
+            write_ops_per_s: 1_000,
+            read_bytes_per_s: 0,
+            read_ops_per_s: 0,
+        };
+        let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
+        slices[IoClass::TierFlush.index()] =
+            ClassSlice { bytes: SETTLE_SLICE, ops: TIER_ROUND_MAX_OPS };
+        let budget = DeviceBudget::new(model, slices, 2, Nanos(0));
+        assert_eq!(budget.cap(IoClass::TierFlush).bytes, SETTLE_SLICE);
+        BudgetAdmission(budget)
+    }
+
+    fn settle_cell() -> TierCell<SimDisk> {
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SETTLE_SLICE, ..spec() });
+        cell
+    }
+
+    /// ADR-0170 D2 and I10: a round stages past the slice it was granted
+    /// whenever the next seal cut lies beyond the slice's remainder (the
+    /// stage takes at least one cut), and `spent` must count every staged
+    /// byte, the excess owed — never forgiven by a refund that saturates
+    /// at zero. The class held exactly one slice, so the excess is debt:
+    /// a refill smaller than it leaves a debtor that is granted nothing.
+    #[test]
+    fn a_round_staged_past_its_slice_is_charged_in_full() {
+        let mut cell = settle_cell();
+        let mut ks = sealed_backlog(3);
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+        let mut admission = slice_capped_budget();
+        let (mut stats, mut ops) = (TierFlushStats::default(), Vec::new());
+        let t = &mut cell.namespaces[0];
+        let staged = drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission)
+            .expect("the round stages");
+        assert!(staged > SETTLE_SLICE, "engagement: staged {staged} B past the slice");
+        let spent = admission.0.counters(IoClass::TierFlush).spent_bytes;
+        assert_eq!(spent, staged, "spent counts every staged byte (ADR-0170 I10)");
+        admission.0.refill(Nanos(1_000_000_000));
+        let next = admission.0.offer(IoClass::TierFlush, 1, 1);
+        assert!(matches!(next, Issue::NotThisSlice), "the excess is owed: {next:?}");
+    }
+
+    /// ADR-0170, Publication and failure: a stage that fails after staging
+    /// part of its round still issues that part (its round opens; the
+    /// error surfaces after), so those bytes stay spent. The pipeline
+    /// rotates at a 4 KiB file capacity and the second file's first
+    /// directory hold is refused — `tier_dir_open_fail`'s third firing,
+    /// two holds per creation — so the round keeps the first chunk and
+    /// its file's seal. The first chunk's length comes from a twin
+    /// pipeline staged with a one-byte slice: the minimum-progress cut.
+    #[test]
+    fn a_failed_stage_keeps_the_bytes_it_staged_spent() {
+        let mut twin = settle_cell();
+        let config = TierFlushConfig { slice_bytes: 1, ..flush_config(&twin, 1 << 20) };
+        let fs = twin.fs.clone();
+        let twin_flush = &mut twin.namespaces[0].flush;
+        *twin_flush = TierFlush::new(fs, config, 0);
+        twin_flush.set_drive(TierDrive::Reactor);
+        let mut twin_ks = sealed_backlog(3);
+        let twin_table = twin_ks.tiered_store_mut(NsId(16)).expect("materialized");
+        let first_chunk =
+            twin_table.stage_flush_round(twin_flush).expect("the twin stages a chunk");
+        let mut cell = settle_cell();
+        let mut ks = sealed_backlog(3);
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+        let config = flush_config(&cell, 4 << 10);
+        let fs = cell.fs.clone();
+        let t = &mut cell.namespaces[0];
+        t.flush = TierFlush::new(fs, config, 0);
+        t.flush.set_drive(TierDrive::Reactor);
+        let mut admission = slice_capped_budget();
+        let (mut stats, mut ops) = (TierFlushStats::default(), Vec::new());
+        inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(3));
+        let refused = drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission);
+        inf_foundation::fault::disarm_all();
+        let err = refused.expect_err("the second file's creation is refused");
+        assert!(!err.is_fatal(), "a refused creation retries next slice: {err}");
+        assert!(t.round.is_some(), "engagement: the partial round opened");
+        assert!(first_chunk > 0 && first_chunk < SETTLE_SLICE, "first chunk {first_chunk} B");
+        let spent = admission.0.counters(IoClass::TierFlush).spent_bytes;
+        assert_eq!(spent, first_chunk, "the issued chunk stays spent");
+    }
+
+    /// The pipeline `create_ns` builds for `NsId(16)` on `cell`, at a file
+    /// capacity of `file_capacity` data bytes.
+    fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64) -> TierFlushConfig {
+        TierFlushConfig {
+            shard_dir: cell.shard_dir.join("ns-16"),
+            cell: cell.cell,
+            ns: NsId(16),
+            mode: spec().tier_io_mode,
+            file_capacity,
+            slice_bytes: SETTLE_SLICE,
+        }
     }
 
     /// ADR-0167 D4: a refused write position opens nothing — no round, no

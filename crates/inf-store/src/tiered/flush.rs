@@ -3,6 +3,19 @@
 
 use super::*;
 
+/// A reactor-drive stage refused part-way (ADR-0084 D2): the round keeps
+/// what was staged before the refusal and is issued like any other, so
+/// the device budget settles the round's grant against `staged_bytes`,
+/// never against zero (ADR-0170 A2).
+#[derive(Debug)]
+pub struct StageFailed {
+    /// Record bytes the round holds, all staged before the refusal.
+    pub staged_bytes: u64,
+    /// The refusal, classified as the seam drive's (`is_fatal`,
+    /// `is_storage_full`).
+    pub error: TierFlushError,
+}
+
 impl TieredTable {
     /// One seal step (ADR-0053 D2/D3): advances the ro-boundary toward
     /// `tail − mutable_target`, landing only on a recorded record-start
@@ -286,19 +299,23 @@ impl TieredTable {
     /// [`complete_flush_round`](Self::complete_flush_round) applies at
     /// the round's last barrier completion. Rounds end early at a
     /// ring-top gap (effect-ordering simplicity; gaps are once per ring
-    /// wrap). Returns the staged record bytes.
+    /// wrap). Returns the staged record bytes, which may exceed the
+    /// slice: a chunk ends at the first seal cut past the slice's
+    /// remainder when none lies within it.
     ///
     /// # Errors
     /// File-creation metadata I/O only (the once-per-`TIER-FILE-BYTES`
     /// open — ADR-0084 D2); a `StorageFull`-class refusal latches the
-    /// device leg exactly like the seam drive (ADR-0063 D4).
+    /// device leg exactly like the seam drive (ADR-0063 D4). The error
+    /// carries the record bytes staged before it, which the round still
+    /// holds.
     pub fn stage_flush_round<F: SegmentFs>(
         &mut self,
         flush: &mut TierFlush<F>,
-    ) -> Result<u64, TierFlushError> {
+    ) -> Result<u64, StageFailed> {
         let res = self.stage_flush_round_inner(flush);
-        if let Err(e) = &res {
-            if e.is_storage_full() {
+        if let Err(failed) = &res {
+            if failed.error.is_storage_full() {
                 self.disk_admit.device_full = true;
             }
             // A failed stage leaves either no round or a round holding
@@ -316,7 +333,7 @@ impl TieredTable {
     fn stage_flush_round_inner<F: SegmentFs>(
         &mut self,
         flush: &mut TierFlush<F>,
-    ) -> Result<u64, TierFlushError> {
+    ) -> Result<u64, StageFailed> {
         debug_assert!(!flush.round_active(), "staging over an in-flight round");
         let budget = flush.slice_bytes();
         let flushed0 = self.space.flushed().to_raw();
@@ -335,7 +352,9 @@ impl TieredTable {
                 }
                 FlushChunk::Records { addr, len } => {
                     let n = usize::try_from(len).expect("chunk fits usize");
-                    flush.append_range_queued(addr, self.space.bytes(addr, n))?;
+                    flush
+                        .append_range_queued(addr, self.space.bytes(addr, n))
+                        .map_err(|error| StageFailed { staged_bytes: spent, error })?;
                     // File the chunk (M4-S14) — stage-time, exactly like
                     // the seam drive (durability is not the counters'
                     // input; the recovery appliers reconcile).

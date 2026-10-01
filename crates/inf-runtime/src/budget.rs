@@ -43,18 +43,19 @@
 //!   budgeted axis already held its cap before the refill's grant. A draw
 //!   ends the rest pass (it leaves the class below its cap); a grant
 //!   refunded in full does not.
-//! - *Charge*: spend is unconditional and what the credit cannot hold is
-//!   owed.
+//! - *Charge*: spend is unconditional — a checkpoint header or barrier,
+//!   or a tier round's bytes staged past its grant — and what the credit
+//!   cannot hold is owed.
 //! - *Receipt*: the budget remembers the last background `Now` answer's
 //!   draws; the refund directly after it returns at most that, the debt
 //!   first, then the pool, then the credit — so a full refund is the
 //!   grant's exact inverse. Every other call voids the receipt.
 //!
-//! **The checkpoint keep-up floor** (ADR-0088 D2, carried whole into
-//! ADR-0170 D2): under foreground saturation a weighted share alone
-//! starved the checkpoint class (340 k deferrals, no publish in 20 s of
-//! 270 k ops/s) — a retained log that grows for as long as saturation
-//! lasts, i.e. an unbounded recovery tail. The checkpoint's grant is
+//! **The checkpoint keep-up floor** (ADR-0170 D2): under foreground
+//! saturation a weighted share alone starved the checkpoint class (340 k
+//! deferrals, no publish in 20 s of 270 k ops/s) — a retained log that
+//! grows for as long as saturation lasts, i.e. an unbounded recovery
+//! tail. The checkpoint's grant is
 //! therefore floored at `foreground_write_bytes_since_refill / α`, the
 //! bytes a checkpoint must write to stay inside the interval it is
 //! triggered at (`interval = α × ckpt_bytes_last`, ADR-0088 D4): the
@@ -260,9 +261,11 @@ const AXES: [usize; 2] = [BYTES, OPS];
 /// offer and re-offer it next slice with nothing moved. It has two
 /// variants because a producer has two answers; a bounded wait and an
 /// overrun's wait differ only in the counters. Not comparable outside
-/// this crate's tests: a producer matches it.
+/// this crate's tests: a producer matches it, and must — an answer
+/// dropped unread would issue on `NotThisSlice` without credit.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
+#[must_use = "a producer issues only on `Issue::Now` (ADR-0170 D1)"]
 pub enum Issue {
     Now,
     NotThisSlice,
@@ -419,8 +422,16 @@ struct Meter {
     /// at `u64::MAX` (16 EiB, centuries at any device rate); past it a
     /// refund's correction is no longer exact.
     spent: [u64; 2],
+    /// `NotThisSlice` answers over the cell's life. Width policy: one
+    /// increment per call, so 2⁶⁴ calls — 5 800 years at one a
+    /// nanosecond — is unreachable and the add is plain.
     deferrals: u64,
+    /// Offers above the cap over the cell's life; the same width policy
+    /// as `deferrals`.
     unattainable: u64,
+    /// `B − cap` summed over the cell's overruns. Width policy: saturates
+    /// at `u64::MAX` — one call can add up to `u64::MAX − cap` — and is
+    /// an approximate total past it; the live debt is the class's credit.
     overrun_bytes: u64,
     /// Sub-unit remainders of the weighted share (mod `weights`), carried
     /// across refills so a grant too small to divide still accrues.
@@ -914,7 +925,8 @@ impl DeviceBudget {
 
     /// Spend unconditionally (ADR-0170 D2): the op is issued whatever the
     /// credit says (a checkpoint header — its file is already created —
-    /// its barriers, or any foreground op). A background class owes what
+    /// its barriers, a tier round's bytes staged past its grant, or any
+    /// foreground op). A background class owes what
     /// its credit cannot hold, repaid before its credit grows again; the
     /// counters stay exact. Never a deferral.
     pub fn charge(&mut self, class: IoClass, bytes: u64, ops: u64) {

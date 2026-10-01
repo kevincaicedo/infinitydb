@@ -103,7 +103,7 @@ pub struct DurableConfig {
     /// tripwire's reference. 0 = unknown (tripwire disarmed; the FLUSH
     /// class needs none).
     pub fua_p50_us_probed: u64,
-    /// M4.5-S36 (ADR-0088 D2/D2b/D6): the cell's static share of the
+    /// M4.5-S36 (ADR-0170 D2; ADR-0088 D2b, D6): the cell's static share of the
     /// probed device model and the frame-seal pace. `Default` = absent
     /// model = unbudgeted, unpaced — the pre-S36 behaviour byte-for-byte.
     pub device: DeviceConfig,
@@ -507,7 +507,8 @@ pub struct DurableStats {
     /// engagement witness for the in-chain resume).
     pub ckpt_bound_splits: u64,
     /// ADR-0170 D5: the longest injected-time wait of one checkpoint
-    /// block on the device budget, a pending block's age included.
+    /// block on this cell's device budget over the cell's life, a
+    /// pending block's age included — cell scope.
     pub ckpt_block_wait_ns_max: u64,
     /// `ceil_milli((log_frame_bytes + ckpt_bytes_total +
     /// manifest_bytes_total) / append_bytes)` — cell scope, boot life;
@@ -656,7 +657,7 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     group_round_target: u64,
     /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
     io_provenance: IoProvenance,
-    /// M4.5-S36 (ADR-0088 D2): the cell's device budget — refilled at
+    /// M4.5-S36 (ADR-0170 D2): the cell's device budget — refilled at
     /// every MAINTAIN entry from the injected clock, consulted by the
     /// background issuing sites, charged by the foreground ones.
     budget: DeviceBudget,
@@ -709,8 +710,8 @@ impl<F: SegmentFs> DurableCell<F> {
         let mut staging = StagingRing::new(staging);
         staging.set_frame_epoch(rotor.resume_epoch());
         let in_flight = VecDeque::with_capacity(usize::from(staging.frames_in_flight()));
-        // ADR-0088 D2: each background class's smallest offer — its
-        // deficit cap can never be below one slice.
+        // ADR-0170 D2: each background class's declared slice — its cap
+        // is never below one slice.
         let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
         slices[IoClass::ZeroFill.index()] =
             ClassSlice { bytes: u64::from(ZERO_FILL_SLICE_BYTES), ops: 1 };
@@ -886,7 +887,7 @@ impl<F: SegmentFs> DurableCell<F> {
         if self.failed {
             return;
         }
-        // ADR-0088 D2: one refill per MAINTAIN entry, injected clock.
+        // ADR-0170 D2: one refill per MAINTAIN entry, injected clock.
         self.budget.refill(cx.now);
         self.write_through_wanted = write_through_wanted;
         match self.rotor.maintain_deferred(cx.now.as_millis()) {
@@ -1223,7 +1224,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // A `u32` segment cursor: always addressable (ADR-0167 D2).
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
-        // ADR-0088 D2: the foreground is metered (one write, plus the
+        // ADR-0170 D2: the foreground is metered (one write, plus the
         // linked barrier when the plan carries one), never deferred.
         let ops = 1 + u64::from(matches!(ticket, FrameBarrier::Linked(_)));
         self.budget.charge(IoClass::LogFrame, u64::from(slot.len()), ops);
@@ -1448,6 +1449,14 @@ impl<F: SegmentFs> DurableCell<F> {
     pub fn refund_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
         debug_assert!(!class.is_foreground());
         self.budget.refund(class, bytes, ops);
+    }
+
+    /// Background spend past the grant just before it (ADR-0170 D2's
+    /// charge row): a tier round that staged more than its offer. What the
+    /// class's credit cannot hold is owed, repaid before it grows again.
+    pub fn charge_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
+        debug_assert!(!class.is_foreground(), "foreground classes are metered, never settled");
+        self.budget.charge(class, bytes, ops);
     }
 
     /// The cold-read drain's refund: either class (a foreground refund

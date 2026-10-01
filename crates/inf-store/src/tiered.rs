@@ -42,6 +42,8 @@ use crate::write_accounting::WriteAccounting;
 mod extent;
 mod flush;
 
+pub use flush::StageFailed;
+
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
 /// Answer of a tiered lookup. `Cold` is a *candidate*: the 22-bit

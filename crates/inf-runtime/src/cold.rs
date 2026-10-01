@@ -1349,9 +1349,10 @@ mod tests {
         assert_eq!(cold.reconcile(), Ok(()));
     }
 
-    /// F-L11-03: a caller whose `admit` refuses the foreground breaches
-    /// ADR-0088 D2 — the slice must END (the intent stays queued for the
-    /// next one), never spin on a refusal that cannot change within it.
+    /// A caller whose `admit` refuses the foreground breaches ADR-0170 D1
+    /// (a foreground offer is `Now`) — the slice must END (the intent
+    /// stays queued for the next one), never spin on a refusal that cannot
+    /// change within it.
     #[test]
     fn a_refused_foreground_ends_the_slice() {
         let cold = path(2);

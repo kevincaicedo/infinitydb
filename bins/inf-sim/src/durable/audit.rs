@@ -791,7 +791,7 @@ pub(super) fn budget_oracles(
         // the run never exceed the share's grant plus two burst horizons
         // (the class caps plus the pool) plus one slice per class (the
         // cap floor) plus the checkpoint keep-up floor (the log's bytes
-        // over α — ADR-0088 D2 amended). Foreground subtraction only
+        // over α — ADR-0170 D2). Foreground subtraction only
         // lowers the weighted grant.
         let horizon_bytes = share.write_bytes_per_s as f64 * BURST_HORIZON_NS as f64 / 1e9;
         let slices = 256.0 * 1024.0 + ckpt_slice + 1024.0 * 1024.0 + 16.0 * 1024.0 + overrun_slack;
@@ -806,15 +806,15 @@ pub(super) fn budget_oracles(
         if background as f64 > bound {
             report.violations.push(format!(
                 "cell {cell}: background wrote {background} bytes in {elapsed_s:.3} s against a \
-                 share of {} B/s — bound {bound:.0} (ADR-0088 D2 rate bound)",
+                 share of {} B/s — bound {bound:.0} (ADR-0170 D2 rate bound)",
                 share.write_bytes_per_s
             ));
         }
         // (c) Engagement: the regime is not vacuous — some background
         // class was deferred at least once (the S27 lesson: a pressure
         // row whose counter stayed at 0 measured nothing). The checkpoint
-        // class itself is floored to keep up with the log (ADR-0088 D2
-        // amended), so its deferrals are not the signal; zero-fill's are.
+        // class itself is floored to keep up with the log (ADR-0170 D2),
+        // so its deferrals are not the signal; zero-fill's are.
         let background_deferrals: u64 = IoClass::ALL
             .iter()
             .filter(|c| !c.is_foreground())

@@ -4313,8 +4313,8 @@ fn recovery_phases_report_bytes_and_sum_to_the_total() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0088 D2 as amended (M4.5-S39d's finding): a checkpoint requested
-/// on an **idle** node that spends a device budget completes. Before the
+/// ADR-0170 D2's carries: a checkpoint requested on an **idle** node
+/// that spends a device budget completes. Before the
 /// carry, the reference box's probe (2 540 write ops/s per device) on a
 /// loop iterating every few hundred µs granted the checkpoint class
 /// `⌊1270 × 0.0004⌋ × 2/10 = 0` ops per refill forever — `INF.CKPT
@@ -4477,11 +4477,17 @@ fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
 
 /// Creates R3's tiered namespace `t` (ADR-0170): `MEM-BUDGET 4mb`, a
 /// `MAINTAIN-SLICE` of 8 MiB — above the 20 MB/s share's tier cap plus
-/// pool — and a `TAIL-STALL-TIMEOUT` of twice `T_tier(8 MiB)` at D4's
-/// floor rate (share / 20 = 1 MB/s: (7 340 032 + 1 048 576) / 10⁶ s +
-/// 2Δ ≈ 8.4 s). Returns a connection on cell 0 using `t`, reading with a
-/// 60 s timeout.
+/// pool — and a 20 s `TAIL-STALL-TIMEOUT`, above `T_tier(8 MiB)` at D4's
+/// floor rate (share / 20 = 1 MB/s) with a round's bytes staged past its
+/// slice `C_tier ≤ 3 MiB` (ADR-0170 D4, A2): (7 340 032 + 3 145 728 +
+/// 1 048 576 + 3 145 728 + 3) / 10⁶ s + 2Δ ≈ 14.7 s. Returns a connection
+/// on cell 0 using `t`, reading with a 60 s timeout.
 fn overrun_tier_namespace(node: &Node) -> TcpStream {
+    tier_namespace_with_slice(node, b"8mb")
+}
+
+/// R3's namespace `t` with `MAINTAIN-SLICE slice`.
+fn tier_namespace_with_slice(node: &Node, slice: &[u8]) -> TcpStream {
     let mut c = conn_on_cell(node, 0);
     c.write_all(&cmd(&[
         b"INF.NS",
@@ -4492,7 +4498,7 @@ fn overrun_tier_namespace(node: &Node) -> TcpStream {
         b"MEM-BUDGET",
         b"4mb",
         b"MAINTAIN-SLICE",
-        b"8mb",
+        slice,
         b"TAIL-STALL-TIMEOUT",
         b"20000",
     ]))
@@ -4545,6 +4551,47 @@ fn a_tier_round_above_the_class_cap_is_issued() {
         info_field(&info, "io_budget_unattainable_tier_flush") >= 1,
         "engagement: the round was above the class cap: {info}"
     );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0170 D2 and I10 at the wire: a tier round stages past its slice
+/// whenever the next seal cut lies beyond it — every round here, since a
+/// 512 KiB record is one cut and `MAINTAIN-SLICE` is 64 KiB — and the
+/// tier class's `spent` counts every staged byte. Without the charge each
+/// round counted its 64 KiB offer while the device wrote the record:
+/// eight times its grant, unmetered. Tiering is read before the budget,
+/// so every byte counted as flushed was staged before `spent` is read.
+#[test]
+fn a_tier_round_staged_past_its_slice_counts_every_byte() {
+    const SLICE: u64 = 64 << 10;
+    let dir = temp_data_dir("tier-past-slice");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = tier_namespace_with_slice(&node, b"64kb");
+    let value = vec![b'x'; 512 << 10];
+    // 8 MiB on cell 0: 4 MiB past MEM-BUDGET, so at least 3 MiB flushes.
+    for key in keys_on_cell(2, 0, "past-slice", 16) {
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (rounds, flushed) = loop {
+        let tiering = info_text(&mut c, b"tiering");
+        let confirmed = info_field(&tiering, "tiering_flush_confirmed_bytes");
+        let holes = info_field(&tiering, "tiering_seal_hole_bytes");
+        let flushed = confirmed.saturating_sub(holes);
+        if flushed >= 3 << 20 {
+            break (info_field(&tiering, "tiering_flush_rounds"), flushed);
+        }
+        assert!(Instant::now() < deadline, "the flush stalled: {tiering}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(flushed > rounds * SLICE, "engagement: {rounds} rounds flushed {flushed} B");
+    let info = info_text(&mut c, b"persistence");
+    let spent = info_field(&info, "io_budget_bytes_tier_flush");
+    assert!(spent >= flushed, "tier spent {spent} B, flushed {flushed} B (ADR-0170 I10): {info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();

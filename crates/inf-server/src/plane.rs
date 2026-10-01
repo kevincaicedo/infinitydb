@@ -984,6 +984,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     cell.refund_background(IoClass::TierFlush, bytes, ops);
                 }
             }
+            fn charge(&mut self, bytes: u64) {
+                if let Some(cell) = self.durable.borrow_mut().as_mut() {
+                    cell.charge_background(IoClass::TierFlush, bytes, 0);
+                }
+            }
         }
         let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
         let mut shadow_reads: Vec<(NsId, inf_store::ShadowRead)> = Vec::new();
@@ -1107,7 +1112,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cx.push(IoOp::Fdatasync { fd, token: crate::durable::fsync_token(ticket) });
         }
         if let Some(cold) = cold {
-            // ADR-0088 D2/D5: maintain-class reads consult the durable
+            // ADR-0170 D2, ADR-0088 D5: maintain-class reads consult the durable
             // cell's budget; foreground reads are charged, never refused.
             let durable = &self.shared.durable;
             cold.drain_budgeted(
