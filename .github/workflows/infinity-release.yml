@@ -1,4 +1,4 @@
-# InfinityDB release pipeline (M1-S14): one tag push produces the whole
+# InfinityDB release pipeline: one tag push produces the whole
 # release — linux x86-64/aarch64 static binaries, SHA256SUMS, SBOM, the
 # multi-arch Docker image on GHCR (scanned), and a GitHub release that links
 # the generated compat matrix and the claim ledger.
@@ -184,12 +184,16 @@ jobs:
           fi
           size=$(docker image inspect ${{ env.IMAGE }}:${{ needs.meta.outputs.version }} --format '{{.Size}}')
           echo "image size: $size bytes"
-          # 10 MB — owner decision 2026-08-08 (v0.4.0 readiness §9 D6);
-          # matches m1-gates.toml image_size and the M1 §6 table.
+          # 10 MB — owner decision 2026-08-08; matches m1-gates.toml
+          # image_size.
           test "$size" -lt 10485760
-      - name: smoke (redis-cli out of the box)
+      - name: smoke (redis-cli, the documented run command)
         run: |
-          docker run -d --name inf -p 6399:6379 ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
+          # Docker's default seccomp profile denies io_uring, so the image
+          # runs under the bundled profile, as docs/deployment.md says.
+          docker run -d --name inf -p 127.0.0.1:6399:6379 \
+            --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+            ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}
           sudo apt-get update && sudo apt-get install -y redis-tools
           for i in $(seq 1 50); do redis-cli -p 6399 PING && break || sleep 0.2; done
           test "$(redis-cli -p 6399 PING)" = "PONG"
@@ -246,10 +250,14 @@ jobs:
           body: |
             InfinityDB ${{ needs.meta.outputs.version }}
 
-            - Docker: `docker run -p 6379:6379 ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}`
+            - Docker: `docker run --rm -p 127.0.0.1:6379:6379 --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}`
+              — Docker's default seccomp profile blocks io_uring and the server exits at start.
+              The profile ships in the repository at this tag, not in the tarballs: run from
+              a checkout or download that file; `docs/deployment.md` explains it and the
+              alternatives. The loopback bind keeps the unauthenticated port off other interfaces.
             - Compat matrix: `docs/compat-matrix.md` (generated artifact, included in the tarballs)
             - Checksums: `SHA256SUMS`; SBOM: `infinitydb-${{ needs.meta.outputs.version }}.spdx.json`
 
             This is a draft. Release notes are written by the maintainer, and every
             performance or comparative claim is verified against the project's
-            (internal) claim ledger before publishing — the draft flag is that gate.
+            published claim ledger before publishing — the draft flag is that gate.
