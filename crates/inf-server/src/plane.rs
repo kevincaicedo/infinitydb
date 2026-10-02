@@ -721,7 +721,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ddl_epoch_seen: Cell::new(0),
                 ddl_gen_seen: Cell::new(0),
                 ckpt_quota: RefCell::new(None),
+                #[cfg(not(inf_canary_ckpt_sweep_own_slot_zero))]
                 ckpt_sweep: RefCell::new(BoardSweep::new(cell)),
+                // Canary: every cell's sweep watches slot 0 as its own.
+                #[cfg(inf_canary_ckpt_sweep_own_slot_zero)]
+                ckpt_sweep: RefCell::new(BoardSweep::new(CellId(0))),
                 loading: Cell::new(false),
                 apply_prefetch: Cell::new(false),
                 parse_prefetch: Cell::new(false),

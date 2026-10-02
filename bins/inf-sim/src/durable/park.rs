@@ -241,6 +241,53 @@ fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
     );
 }
 
+/// The same term at the shipped multi-cell topology, on a cell other than
+/// cell 0: `INF.CKPT CELL 1 WAIT` on cell 1 at 2, 65 and 130 cells. Beyond
+/// 64 cells a sweep takes `S = ceil(N / 64)` turns. The longest window is
+/// the one in which the sweep in progress at the publication had already
+/// read slot 1: it completes without the publication, the own-slot term
+/// alone holds the cell at that completion, and the wake waits for the
+/// next sweep, more than `S` turns in all. Each topology is run at up to
+/// `S` sweep phases, until one reaches that window. A sweep that watched
+/// another cell's slot (`inf_canary_ckpt_sweep_own_slot_zero`) parks at
+/// every topology here, as the guard without the term does.
+#[test]
+fn an_own_publication_on_a_peer_cell_does_not_park_before_its_wake() {
+    let mut parked = Vec::new();
+    for cells in [2u16, 65, 130] {
+        let sweep_turns = usize::from(cells).div_ceil(64);
+        let mut held_by_the_own_slot_term = false;
+        for skipped_steps in 0..sweep_turns {
+            let read = own_publication_window(
+                cells,
+                1,
+                skipped_steps as u32,
+                &[b"INF.CKPT", b"CELL", b"1", b"WAIT"],
+            );
+            assert!(read.parks_before > 0, "liveness: the instrument read no park in {read:?}");
+            if read.flags.contains(&true) {
+                parked.push((cells, read.flags));
+                break;
+            }
+            // At one turn per sweep the one flag is the own-slot term's.
+            if sweep_turns == 1 || read.flags.len() > sweep_turns {
+                held_by_the_own_slot_term = true;
+                break;
+            }
+        }
+        assert!(
+            held_by_the_own_slot_term || parked.last().is_some_and(|(at, _)| *at == cells),
+            "VACUOUS: at {cells} cells no phase left the own-slot term alone in holding the cell"
+        );
+    }
+    assert!(
+        parked.is_empty(),
+        "a parked iteration between an own publication on cell 1 and its wake, as (cells, \
+         parked flags from the iteration after the publishing one through the waking one): \
+         {parked:?}"
+    );
+}
+
 /// The guard ends: an all-cell `WAIT` on a 2-cell node whose peer never
 /// publishes is not satisfied by this cell's own publication. The own-slot
 /// term holds for one turn at 64 cells or fewer, the wake's re-check takes
