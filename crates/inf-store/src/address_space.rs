@@ -82,6 +82,57 @@ pub enum FlushChunk {
     },
 }
 
+/// What one tail allocation would do to the space — the one computation
+/// of the ring-top hole, the start and the committed top an allocation
+/// of `len` bytes needs (ADR-0174 D2 rule 1). [`AddressSpace::alloc`],
+/// [`AddressSpace::stall_target`] and [`AddressSpace::room`] consume it;
+/// none carries a copy of the arithmetic (two copies are how the stall
+/// target came to answer a need above the tail).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Prospect {
+    /// The record's length.
+    len: u64,
+    /// The ring-top hole the allocation makes first (ADR-0052 D2); 0
+    /// when the record fits below the ring top.
+    hole: u64,
+    /// The record's start, relative to the life origin: the tail past
+    /// the hole.
+    start_rel: u64,
+    /// The committed top the allocation needs — after the hole and after
+    /// the record — relative to the origin, page-aligned, never below
+    /// the committed top of today.
+    top_rel: u64,
+}
+
+/// The room question's answer (ADR-0174 D2 rule 1): what must happen
+/// before an allocation of `len` bytes can be placed. The need it
+/// carries is never above the tail — a need that would lie above it is
+/// answered as a [`Pad`](Room::Pad) instead (D2 rule 6), so a demote
+/// step always has a reachable target.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Room {
+    /// The allocation fits now: [`AddressSpace::alloc`] places it.
+    Fits,
+    /// The head must reach this address — a page multiple above the
+    /// head, at or below the tail — before the allocation fits: the
+    /// demote step's target.
+    Demote(LogicalAddr),
+    /// The need lies above the tail: pad the tail to this address first
+    /// ([`AddressSpace::pad_tail`] — the ring top when the record needs
+    /// a ring-top hole, else the next commit-page boundary), then ask
+    /// again. The next answer is `Demote` or `Fits`.
+    Pad(LogicalAddr),
+    /// The 48-bit end of the space: no watermark progress places it.
+    End,
+}
+
+/// A [`AddressSpace::pad_tail`] refusal: the pages the pad would commit
+/// exceed the window. Nothing changed. [`AddressSpace::room`] answers
+/// `Pad` only where the pad fits, so this is the pair check of that
+/// arithmetic, never an operating condition.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WindowFull;
+
 /// Construction parameters. The ring size is derived from the namespace
 /// memory budget by the caller (S07/S19 own budget policy).
 #[derive(Copy, Clone, Debug)]
@@ -183,11 +234,15 @@ pub struct AddressSpace {
     /// engages at the budget, not at the (up to 2×) ring wall.
     window_limit: u64,
     dead_bytes: u64,
-    /// Ring-top holes not yet passed by `flushed` — `(start, len)`, in
-    /// address order (ADR-0056 D3: ADR-0052 D2's "recorded sealed-dead
-    /// interval" made literal so the flush can skip them). Structurally
-    /// ≤ 2 pending: `tail − head ≤ R` means the RAM window crosses at
-    /// most one interior ring multiple, plus one in transition.
+    /// Sealed-dead intervals not yet passed by `flushed` — `(start, len)`,
+    /// in address order (ADR-0056 D3: ADR-0052 D2's "recorded sealed-dead
+    /// interval" made literal so the flush can skip them): ring-top holes
+    /// and tail pads (ADR-0174 D2 rule 6). Structurally ≤ 3 pending:
+    /// `tail − head ≤ R` means the RAM window crosses at most one
+    /// interior ring multiple, plus one in transition, plus one page pad,
+    /// whose mark `flushed` passes before its record applies (a page pad
+    /// needs a record longer than the window less a page, so the demote
+    /// step that follows it seals past the pad).
     hole_marks: VecDeque<(u64, u64)>,
     /// Record-boundary flush cut points in `(flushed, ro_boundary]` —
     /// every `advance_ro_boundary` target is one (seal steps land on
@@ -396,9 +451,102 @@ impl AddressSpace {
 
     // ---- tail allocation ----
 
+    /// The one computation of what allocating `len` bytes at the tail
+    /// would need (ADR-0174 D2 rule 1): the ring-top hole, the start and
+    /// the committed top. Pure.
+    ///
+    /// # Panics
+    /// Panics on an empty allocation or one above half the ring —
+    /// programmer errors, bounded by the record and blob limits.
+    fn prospect(&self, len: usize) -> Prospect {
+        assert!(len > 0, "empty allocation");
+        let ring = self.ring_mask + 1;
+        assert!((len as u64) <= ring / 2, "allocation exceeds half the ring");
+        let len = len as u64;
+        let rel_tail = self.tail - self.life_origin;
+        let ring_offset = rel_tail & self.ring_mask;
+        let hole = if ring_offset + len > ring { ring - ring_offset } else { 0 };
+        let start_rel = rel_tail + hole;
+        let top_rel = self.page_ceil(start_rel + len).max(self.commit_top_rel);
+        Prospect { len, hole, start_rel, top_rel }
+    }
+
+    /// [`Room::Fits`]'s predicate: the committed window the prospect
+    /// needs, in whole pages, stays inside the admission bound
+    /// (ADR-0053 D1).
+    #[inline]
+    fn fits(&self, prospect: Prospect) -> bool {
+        prospect.top_rel - self.commit_floor_rel <= self.window_limit
+    }
+
+    /// An address of this life from its relative offset. Every offset
+    /// classified by [`room`](Self::room) lies at or below a record end
+    /// the 48-bit check admitted.
+    #[inline]
+    fn addr_at(&self, rel: u64) -> LogicalAddr {
+        LogicalAddr::from_raw(self.life_origin + rel).expect("watermarks stay 48-bit")
+    }
+
+    /// The room question (ADR-0174 D2 rule 1): what must happen before
+    /// `len` bytes can be placed at the tail. Pure; mutates nothing.
+    /// Boot replay asks it at most four times per record (`Demote`,
+    /// `Pad`, `Demote`, `Fits` — D2 rule 6's proof), and the live path
+    /// consumes the same arithmetic through [`alloc`](Self::alloc) and
+    /// [`stall_target`](Self::stall_target).
+    ///
+    /// # Panics
+    /// As [`alloc`](Self::alloc).
+    pub fn room(&self, len: usize) -> Room {
+        self.classify(self.prospect(len))
+    }
+
+    /// Classifies a prospect against the window and the tail (D2 rules 1
+    /// and 6). A need below or at the tail is a `Demote`; one above it is
+    /// unreachable by any release — the tail pads first: in case (a), a
+    /// ring-top hole, to the ring top the hole would make, which may need
+    /// room of its own, always at or below the tail (the hole is shorter
+    /// than the record, and a record is at most half the ring, at most
+    /// the window); in case (b) to the next commit-page boundary, which
+    /// commits nothing.
+    fn classify(&self, prospect: Prospect) -> Room {
+        let inside = self
+            .life_origin
+            .checked_add(prospect.start_rel)
+            .and_then(|start| start.checked_add(prospect.len))
+            .is_some_and(|end| end <= LogicalAddr::MAX_RAW);
+        if !inside {
+            return Room::End;
+        }
+        if self.fits(prospect) {
+            return Room::Fits;
+        }
+        let rel_tail = self.tail - self.life_origin;
+        let need_rel = prospect.top_rel - self.window_limit;
+        debug_assert!(need_rel > self.head - self.life_origin, "a need the head already passed");
+        if need_rel <= rel_tail {
+            return Room::Demote(self.addr_at(need_rel));
+        }
+        if cfg!(inf_canary_replay_no_pad) {
+            return Room::Demote(self.addr_at(rel_tail));
+        }
+        if prospect.hole > 0 {
+            let pad = self.prospect(prospect.hole as usize);
+            debug_assert_eq!(pad.start_rel, rel_tail, "a ring-top pad starts at the tail");
+            debug_assert_eq!(pad.top_rel, prospect.start_rel, "and ends at the ring top");
+            if self.fits(pad) {
+                return Room::Pad(self.addr_at(prospect.start_rel));
+            }
+            let pad_need_rel = pad.top_rel - self.window_limit;
+            debug_assert!(pad_need_rel <= rel_tail, "a ring-top pad's need is reachable");
+            return Room::Demote(self.addr_at(pad_need_rel));
+        }
+        Room::Pad(self.addr_at(self.page_ceil(rel_tail)))
+    }
+
     /// Allocates `len` bytes at the tail, committing ring pages as
-    /// needed. `None` when the RAM window (in whole pages) would exceed
-    /// the admission bound (the budget window — ADR-0053 D1; the ring by
+    /// needed, only where [`room`](Self::room) answers [`Room::Fits`]:
+    /// `None` when the RAM window (in whole pages) would exceed the
+    /// admission bound (the budget window — ADR-0053 D1; the ring by
     /// default) — the backpressure signal S07 turns into
     /// suspend-on-flushed-progress — or at the 48-bit end of the space.
     ///
@@ -406,37 +554,76 @@ impl AddressSpace {
     /// hole bytes are dead on arrival, counted, and tripwired. No state
     /// changes on refusal.
     pub fn alloc(&mut self, len: usize) -> Option<LogicalAddr> {
-        assert!(len > 0, "empty allocation");
-        let ring = self.ring_mask + 1;
-        assert!((len as u64) <= ring / 2, "allocation exceeds half the ring");
-        // Prospective values first — refusal must mutate nothing.
-        let rel_tail = self.tail - self.life_origin;
-        let ring_offset = rel_tail & self.ring_mask;
-        let hole = if ring_offset + len as u64 > ring { ring - ring_offset } else { 0 };
-        let alloc_rel = rel_tail + hole;
-        let new_rel_tail = alloc_rel + len as u64;
-        let new_top_rel = self.page_ceil(new_rel_tail).max(self.commit_top_rel);
-        if new_top_rel - self.commit_floor_rel > self.window_limit {
-            return None; // RAM window (whole pages) would exceed the budget bound.
+        let prospect = self.prospect(len);
+        match self.classify(prospect) {
+            Room::Fits => {}
+            Room::Demote(_) | Room::Pad(_) | Room::End => return None,
         }
-        // Monotonic space: refuse at the 48-bit end, never wrap.
-        let addr = LogicalAddr::from_raw(self.life_origin.checked_add(alloc_rel)?)?;
-        addr.advanced(len as u64)?;
-        if new_top_rel > self.commit_top_rel {
-            self.commit_rel_pages(self.commit_top_rel, new_top_rel);
-            self.commit_top_rel = new_top_rel;
+        let addr = self.addr_at(prospect.start_rel);
+        if prospect.top_rel > self.commit_top_rel {
+            self.commit_rel_pages(self.commit_top_rel, prospect.top_rel);
+            self.commit_top_rel = prospect.top_rel;
         }
-        if hole > 0 {
+        if prospect.hole > 0 {
             self.counters.seal_holes += 1;
-            self.counters.seal_hole_bytes += hole;
-            self.dead_bytes += hole;
-            self.hole_marks.push_back((self.tail, hole));
-            debug_assert!(self.hole_marks.len() <= 2, "RAM window spans one ring multiple");
+            self.counters.seal_hole_bytes += prospect.hole;
+            self.dead_bytes += prospect.hole;
+            self.hole_marks.push_back((self.tail, prospect.hole));
+            debug_assert!(self.hole_marks.len() <= 3, "two ring tops and one pad at most");
         }
         self.counters.tail_allocs += 1;
-        self.tail = self.life_origin + new_rel_tail;
+        self.tail = self.life_origin + prospect.start_rel + prospect.len;
         self.assert_watermark_order();
         Some(addr)
+    }
+
+    /// Pads the tail to `to`, a [`Room::Pad`] answer (ADR-0174 D2 rule
+    /// 6): the ring top when the next record needs a ring-top hole, else
+    /// the next commit-page boundary. The skipped span is a sealed-dead
+    /// interval (ADR-0052 D2): counted dead, a hole mark, no record; the
+    /// flush crosses it as a gap after the preceding file's seal. A
+    /// ring-top pad is the ring-top seal the record would have made and
+    /// counts as one; a page pad commits nothing.
+    ///
+    /// # Errors
+    /// [`WindowFull`] when the pages the pad commits would exceed the
+    /// window — nothing changed. `room` answers `Pad` only where they do
+    /// not; this is that arithmetic's pair check.
+    ///
+    /// # Panics
+    /// Panics when `to` is not a pad target of the current tail (at or
+    /// below it, or neither the ring top nor the next page boundary) —
+    /// a stale or invented answer, a programmer error.
+    pub fn pad_tail(&mut self, to: LogicalAddr) -> Result<(), WindowFull> {
+        let t = to.to_raw();
+        assert!(t > self.tail, "pad at or below the tail");
+        let rel_tail = self.tail - self.life_origin;
+        let ring = self.ring_mask + 1;
+        let ring_top_rel = rel_tail + (ring - (rel_tail & self.ring_mask));
+        let to_rel = t - self.life_origin;
+        assert!(
+            to_rel == ring_top_rel || to_rel == self.page_ceil(rel_tail),
+            "pad target is neither the ring top nor the next page"
+        );
+        let top_rel = self.page_ceil(to_rel).max(self.commit_top_rel);
+        if top_rel - self.commit_floor_rel > self.window_limit {
+            return Err(WindowFull);
+        }
+        if top_rel > self.commit_top_rel {
+            self.commit_rel_pages(self.commit_top_rel, top_rel);
+            self.commit_top_rel = top_rel;
+        }
+        let pad = t - self.tail;
+        if to_rel == ring_top_rel {
+            self.counters.seal_holes += 1;
+            self.counters.seal_hole_bytes += pad;
+        }
+        self.dead_bytes += pad;
+        self.hole_marks.push_back((self.tail, pad));
+        debug_assert!(self.hole_marks.len() <= 3, "two ring tops and one pad at most");
+        self.tail = t;
+        self.assert_watermark_order();
+        Ok(())
     }
 
     /// The flushed-watermark value that would let a refused `alloc(len)`
@@ -447,25 +634,22 @@ impl AddressSpace {
     /// ambiguity. Pure query: counting a stall is the caller's explicit
     /// act ([`note_tail_alloc_stall`](Self::note_tail_alloc_stall)).
     ///
-    /// The arithmetic mirrors [`alloc`](Self::alloc): the window binds at
-    /// `new_top_rel − commit_floor_rel ≤ window_limit`, `commit_floor_rel`
-    /// follows `head`, and `head` may only chase `flushed` — so the wait
-    /// key is `life_origin + (new_top_rel − window_limit)`. Both terms
-    /// are page multiples, so once `flushed` reaches the target and the
-    /// release slice runs, the retried allocation fits by construction
-    /// (no spurious wakes).
+    /// Reads the same [`Prospect`] as [`alloc`](Self::alloc): the window
+    /// binds at `top_rel − commit_floor_rel ≤ window_limit`,
+    /// `commit_floor_rel` follows `head`, and `head` may only chase
+    /// `flushed` — so the wait key is `life_origin + (top_rel −
+    /// window_limit)`. Both terms are page multiples, so once `flushed`
+    /// reaches the target and the release slice runs, the retried
+    /// allocation fits by construction (no spurious wakes). The target
+    /// is reported as it stands, above the tail included — the live
+    /// path's answer to that case is its own finding, FCR-STTIER-N4;
+    /// boot replay asks [`room`](Self::room) instead.
     pub fn stall_target(&self, len: usize) -> Option<LogicalAddr> {
-        assert!(len > 0, "empty allocation");
-        let ring = self.ring_mask + 1;
-        assert!((len as u64) <= ring / 2, "allocation exceeds half the ring");
-        let rel_tail = self.tail - self.life_origin;
-        let ring_offset = rel_tail & self.ring_mask;
-        let hole = if ring_offset + len as u64 > ring { ring - ring_offset } else { 0 };
-        let new_top_rel = self.page_ceil(rel_tail + hole + len as u64).max(self.commit_top_rel);
-        if new_top_rel - self.commit_floor_rel <= self.window_limit {
+        let prospect = self.prospect(len);
+        if self.fits(prospect) {
             return None; // fits now — the caller's alloc will succeed.
         }
-        LogicalAddr::from_raw(self.life_origin.checked_add(new_top_rel - self.window_limit)?)
+        LogicalAddr::from_raw(self.life_origin.checked_add(prospect.top_rel - self.window_limit)?)
     }
 
     /// Counts one tail-allocation stall (the caller is about to park on
@@ -1014,6 +1198,215 @@ mod tests {
         space.bytes_mut(sealed, 300).fill(0xCD);
         assert!(space.bytes(sealed, 300).iter().all(|&b| b == 0xCD));
         assert_eq!(space.resolve(first), AddrClass::Cold);
+    }
+
+    fn page_floor_of(rel: u64, page: u64) -> u64 {
+        rel / page * page
+    }
+
+    fn page_ceil_of(rel: u64, page: u64) -> u64 {
+        rel.div_ceil(page) * page
+    }
+
+    /// Builds a space at `window` (bytes, a page multiple) over its ring
+    /// with the tail at `rel_tail` and the committed floor at `floor`:
+    /// `floor` bytes placed and released, then `rel_tail − floor` placed,
+    /// sealed and flushed but resident. No chunk crosses the ring top.
+    fn space_at(ring: usize, page: usize, window: u64, rel_tail: u64, floor: u64) -> AddressSpace {
+        let mut sp = space(ring, page);
+        sp.set_window_limit(window);
+        let half = ring as u64 / 2;
+        let mut placed = 0u64;
+        let mut place = |sp: &mut AddressSpace, up_to: u64, release: bool| {
+            while placed < up_to {
+                let chunk = (up_to - placed).min(half);
+                sp.alloc(chunk as usize).expect("placement chunk fits");
+                placed += chunk;
+                sp.advance_ro_boundary(sp.tail());
+                sp.advance_flushed(sp.tail());
+                if release {
+                    sp.advance_head(sp.tail());
+                }
+            }
+        };
+        place(&mut sp, floor, true);
+        place(&mut sp, rel_tail, false);
+        assert_eq!(sp.tail().to_raw(), rel_tail);
+        assert_eq!(sp.head().to_raw(), floor);
+        sp
+    }
+
+    /// The four-ask protocol (ADR-0174 D2 rule 1) over one state and one
+    /// record, judged by the window inequality written out here — never
+    /// by `alloc`, which consumes the same prospect: after the asks the
+    /// record is placed with `page_ceil(end) − page_floor(head) ≤ W`, the
+    /// region's own committed count is at most `W`, every `Demote(H)` has
+    /// `head < H ≤ tail`, at most one pad, and `Fits` within four asks.
+    /// Returns the pads placed: (ring-top pads, page pads).
+    fn room_protocol(sp: &mut AddressSpace, len: usize, window: u64, page: u64) -> (u32, u32) {
+        let ring = sp.ring_bytes();
+        let mut asks = 0u32;
+        let mut pads = (0u32, 0u32);
+        loop {
+            asks += 1;
+            assert!(
+                asks <= 4,
+                "a fifth ask: len {len} window {window} tail {}",
+                sp.tail().to_raw()
+            );
+            match sp.room(len) {
+                Room::Fits => {
+                    let addr = sp.alloc(len).expect("Fits places");
+                    let end = addr.to_raw() + len as u64;
+                    let head = sp.head().to_raw();
+                    assert!(
+                        page_ceil_of(end, page) - page_floor_of(head, page) <= window,
+                        "the window inequality: end {end} head {head} window {window}"
+                    );
+                    assert!(sp.report().committed_bytes <= window, "the region's own count");
+                    return pads;
+                }
+                Room::Demote(h) => {
+                    let (h, tail, head) = (h.to_raw(), sp.tail().to_raw(), sp.head().to_raw());
+                    assert!(h <= tail, "a need above the tail: {h} > {tail} (len {len})");
+                    assert!(h > head, "a need the head passed: {h} <= {head}");
+                    assert_eq!(h % page, 0, "a demote target is a page multiple");
+                    // The demote step's model: seal, flush, release to H.
+                    sp.advance_ro_boundary(sp.tail());
+                    sp.advance_flushed(sp.tail());
+                    sp.advance_head(LogicalAddr::from_raw(h).expect("48-bit"));
+                }
+                Room::Pad(to) => {
+                    if to.to_raw() % ring == 0 {
+                        pads.0 += 1;
+                    } else {
+                        pads.1 += 1;
+                    }
+                    assert!(pads.0 + pads.1 <= 1, "a second pad for one record (len {len})");
+                    assert!(to.to_raw() > sp.tail().to_raw(), "a pad above the tail");
+                    sp.pad_tail(to).expect("room answered Pad: the pad fits");
+                }
+                Room::End => unreachable!("far below the 48-bit end"),
+            }
+        }
+    }
+
+    /// Every legal state at `page`: windows of 4–9 pages over their
+    /// rings — `next_pow2(W)`, and `2W` where `W` is a power of two
+    /// (`MEM-BUDGET + MAINTAIN-SLICE` a little above it: the window is
+    /// half its ring, ADR-0174 D2 rule 6's case (b)) — the tail at each
+    /// offset of `offsets(ring)`, every legal committed floor, and each
+    /// length of `lengths(ring)`. Returns (cases, ring-top pads, page
+    /// pads); both pad kinds must occur, else the arm is VACUOUS.
+    fn room_property(
+        page: usize,
+        offsets: impl Fn(u64) -> Vec<u64>,
+        lengths: impl Fn(u64) -> Vec<u64>,
+    ) -> (u64, u64, u64) {
+        let page_bytes = page as u64;
+        let mut cases = 0u64;
+        let mut pads = (0u64, 0u64);
+        let mut states: Vec<(u64, u64)> = Vec::new();
+        for window_pages in 4..=9u64 {
+            let window = window_pages * page_bytes;
+            states.push((window, window.next_power_of_two()));
+            if window_pages.is_power_of_two() {
+                states.push((window, 2 * window));
+            }
+        }
+        for (window, ring) in states {
+            for rel_tail in offsets(ring) {
+                let top = page_ceil_of(rel_tail, page_bytes);
+                let lowest = top.saturating_sub(window);
+                let mut floor = lowest;
+                while floor <= page_floor_of(rel_tail, page_bytes) {
+                    for len in lengths(ring) {
+                        let mut sp = space_at(ring as usize, page, window, rel_tail, floor);
+                        let placed = room_protocol(&mut sp, len as usize, window, page_bytes);
+                        pads.0 += u64::from(placed.0);
+                        pads.1 += u64::from(placed.1);
+                        cases += 1;
+                    }
+                    floor += page_bytes;
+                }
+            }
+        }
+        assert!(pads.0 > 0 && pads.1 > 0, "VACUOUS: pads (ring top, page) {pads:?}");
+        (cases, pads.0, pads.1)
+    }
+
+    /// The room property, exhaustive at a 4-unit page (DRR FCR-STTIER-01
+    /// §6, I15; ADR-0174 D2 rule 6): every tail offset of the ring,
+    /// every length up to half the ring.
+    #[test]
+    fn room_reaches_fits_in_four_asks_exhaustively_at_a_four_unit_page() {
+        let (cases, ring_top_pads, page_pads) =
+            room_property(4, |ring| (0..ring).collect(), |ring| (1..=ring / 2).collect());
+        assert!(cases > 20_000, "the exhaustive arm ran {cases} cases");
+        eprintln!(
+            "room property: {cases} cases, {ring_top_pads} ring-top pads, {page_pads} page pads"
+        );
+    }
+
+    /// The same property on the real 4 KiB page: every page boundary ∓ 1
+    /// as the tail offset and as the length, the one-byte and half-ring
+    /// records included.
+    #[test]
+    fn room_reaches_fits_in_four_asks_at_page_boundaries() {
+        let page = 4u64 << 10;
+        let around = move |limit: u64, from: u64| -> Vec<u64> {
+            let mut out = vec![from, limit];
+            let mut k = page;
+            while k <= limit {
+                out.extend([k - 1, k, k + 1]);
+                k += page;
+            }
+            out.retain(|&v| v >= from && v <= limit);
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        let (cases, _, _) = room_property(
+            page as usize,
+            move |ring| around(ring - 1, 0),
+            move |ring| around(ring / 2, 1),
+        );
+        assert!(cases > 5_000, "the boundary arm ran {cases} cases");
+    }
+
+    /// The hostile specs of DRR FCR-STTIER-01 §6 at the real 1 MiB
+    /// commit page: a window below its ring with records at the inline
+    /// maximum — `MEM-BUDGET 4mb BLOB-THRESHOLD 3mb` (a 5 MiB window, an
+    /// 8 MiB ring, 2.9 MiB records), `4mb + 64kb` (a 4 MiB window, half
+    /// its ring, records of 3.9 MiB and of exactly half the ring), and
+    /// the default slice at 8, 16 and 32 MiB budgets with the longest
+    /// inline record — at every 64 KiB tail offset of the ring. Each
+    /// spec must place a pad on at least one offset, else VACUOUS.
+    #[test]
+    fn room_pads_the_hostile_specs_at_the_commit_page() {
+        const MIB: u64 = 1 << 20;
+        let page = MIB;
+        let specs: [(u64, u64, &[u64]); 5] = [
+            (5 * MIB, 8 * MIB, &[2_900 * MIB / 1000]),
+            (4 * MIB, 8 * MIB, &[3_900 * MIB / 1000, 4 * MIB, 4 * MIB - 1]),
+            (9 * MIB, 16 * MIB, &[8 * MIB, 8 * MIB - 1]),
+            (17 * MIB, 32 * MIB, &[16 * MIB, 16 * MIB - 1]),
+            (33 * MIB, 64 * MIB, &[32 * MIB, 32 * MIB - 1]),
+        ];
+        for (window, ring, lens) in specs {
+            let mut pads_placed = 0u64;
+            let mut rel_tail = 0u64;
+            while rel_tail < ring {
+                for &len in lens {
+                    let floor = page_floor_of(rel_tail, page);
+                    let mut sp = space_at(ring as usize, page as usize, window, rel_tail, floor);
+                    let placed = room_protocol(&mut sp, len as usize, window, page);
+                    pads_placed += u64::from(placed.0 + placed.1);
+                }
+                rel_tail += 64 << 10;
+            }
+            assert!(pads_placed > 0, "VACUOUS: no pad at window {window} ring {ring}");
+        }
     }
 
     #[test]

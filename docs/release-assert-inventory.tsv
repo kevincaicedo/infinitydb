@@ -569,8 +569,8 @@ C	2	crates/inf-simd/src/json.rs	assert	caller guarantees 32 bytes of window	`cra
 C	2	crates/inf-simd/src/json.rs	assert	fixstr payload length	`crates/inf-doc/src/json.rs:try_fixstr_fast` is entered with `len <= FIXSTR_MAX_LEN` (31) and returns early for `len == 0`; the `_short` twin has no production caller
 I	1	crates/inf-simd/src/json.rs	expect	8-byte chunk	`src[i..i + 8]` under the loop guard `i + 8 <= len`
 I	1	crates/inf-simd/src/json.rs	expect	slack-checked word	`window[p..p + 8]` with `p ∈ {0, 8, 16, 24}` (`len ≤ 31`, step 8) inside the asserted 32-byte window
-C	2	crates/inf-store/src/address_space.rs	assert	allocation exceeds half the ring	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
-C	2	crates/inf-store/src/address_space.rs	assert	empty allocation	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
+C	1	crates/inf-store/src/address_space.rs	assert	allocation exceeds half the ring	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
+C	1	crates/inf-store/src/address_space.rs	assert	empty allocation	`crates/inf-store/src/tiered.rs:TieredTable::append` bounds a record to HEADER + MAX_KEY_LEN + MAX_VAL_LEN, and crates/inf-store/src/ns.rs:TierSpec::validate bounds BLOB-THRESHOLD to half the ring so every inline record fits (ADR-0052 D1)
 C	1	crates/inf-store/src/address_space.rs	assert	empty flush budget	`crates/inf-store/src/tiered/flush.rs:TieredTable::flush_slice_inner` / `stage_flush_round_inner` pass budget = slice_bytes (> 0) and a cursor they assert ≥ flushed
 I	1	crates/inf-store/src/address_space.rs	assert	end_walk without begin_walk	walk pin is the space's own state (one walk per cell)
 I	1	crates/inf-store/src/address_space.rs	assert	flush above ro_boundary	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
@@ -580,6 +580,8 @@ I	1	crates/inf-store/src/address_space.rs	assert	flushed retreat	watermark order
 I	1	crates/inf-store/src/address_space.rs	assert	head retreat	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
 I	1	crates/inf-store/src/address_space.rs	assert	in-place write below ro_boundary	the watermark-order corollary (no in-place write below `ro_boundary`, or a flushed disk copy goes stale) enforced structurally: the ro-boundary is the space's own watermark
 I	1	crates/inf-store/src/address_space.rs	assert	one checkpoint walk in flight per cell	walk pin is the space's own state (one walk per cell)
+C	1	crates/inf-store/src/address_space.rs	assert	pad at or below the tail	`crates/inf-store/src/address_space.rs:AddressSpace::room` is the one producer of a `Room::Pad` target: the ring top the record's hole would make, or the next commit-page boundary, both above the tail it answered for (ADR-0174 D2 rule 6)
+C	1	crates/inf-store/src/address_space.rs	assert	pad target is neither the ring top nor the next page	`crates/inf-store/src/address_space.rs:AddressSpace::room` is the one producer of a `Room::Pad` target: the ring top the record's hole would make, or the next commit-page boundary, both above the tail it answered for (ADR-0174 D2 rule 6)
 I	1	crates/inf-store/src/address_space.rs	assert	page release above flushed	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
 I	1	crates/inf-store/src/address_space.rs	assert	page release past a pinned watermark or record	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
 I	1	crates/inf-store/src/address_space.rs	assert	RAM read below head	memory-safety guard on the space's own window: below head is a decommitted page (SAFETY.md `region.rs::bytes`)
@@ -589,7 +591,7 @@ I	1	crates/inf-store/src/address_space.rs	assert	ro_boundary past tail	watermark
 I	1	crates/inf-store/src/address_space.rs	assert	ro_boundary retreat	watermark order head ≤ flushed ≤ ro_boundary ≤ tail is the space's own invariant (ADR-0052 D2)
 C	1	crates/inf-store/src/address_space.rs	assert	window limit smaller than four pages	crates/inf-store/src/ns.rs:TierSpec::validate (MAINTAIN-SLICE ≥ 64 KiB ⇒ budget+slice ≥ 4 pages) and `crates/inf-store/src/tiered.rs:TieredTable::new` refuses typed below 4 pages
 I	1	crates/inf-store/src/address_space.rs	expect	origin is 48-bit	watermarks advance only through `LogicalAddr` values (48-bit by type)
-I	8	crates/inf-store/src/address_space.rs	expect	watermarks stay 48-bit	watermarks advance only through `LogicalAddr` values (48-bit by type)
+I	9	crates/inf-store/src/address_space.rs	expect	watermarks stay 48-bit	watermarks advance only through `LogicalAddr` values (48-bit by type)
 I	3	crates/inf-store/src/catalog.rs	expect	length checked	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	1	crates/inf-store/src/doc.rs	expect	2-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction
 I	5	crates/inf-store/src/doc.rs	expect	4-byte field	fixed-width sub-slice of a length-checked buffer — infallible by construction

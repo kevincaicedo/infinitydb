@@ -184,6 +184,12 @@ rows=(
   # max drops up to (α − 1)/α byte a refill near the crossover.
   "inf_canary_keepup_truncates crate-test inf-runtime lib the_keepup_floor_keeps_its_remainder_at_the_crossover"
   "inf_canary_keepup_truncates crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
+  # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
+  # above the tail — no pad. The room property judges every demote target
+  # (a page multiple above the head, at or below the tail) and the placed
+  # record by the window inequality written out in the test.
+  "inf_canary_replay_no_pad crate-test inf-store lib room_reaches_fits_in_four_asks_exhaustively_at_a_four_unit_page"
+  "inf_canary_replay_no_pad crate-test inf-store lib room_pads_the_hostile_specs_at_the_commit_page"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
