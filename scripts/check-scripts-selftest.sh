@@ -1816,13 +1816,29 @@ lc_append_to() { # <file> <line…>
     shift
     printf '%s\n' "$@" >>"$root/$file"
 }
-lc_edit() { sed -i.bak "$1" "$root/$2" && rm -f "$root/$2.bak"; }
+lc_edit() {
+    [ -n "$root" ] && [ -n "$2" ] || { echo "lc_edit: empty root or file" >&2; exit 2; }
+    sed -i.bak "$1" "$root/$2" && rm -f "$root/$2.bak"
+}
+# `git -C ""` runs in the current directory, and a root that is not its own
+# repository lets git walk up to an enclosing one: refuse both before a
+# reset or a clean (the rule every destructive command on a variable keeps).
 lc_reset() {
+    [ -n "$root" ] && [ -d "$root/.git" ] || { echo "lc_reset: no fixture repository at '$root'" >&2; exit 2; }
     git -C "$root" reset -q --hard HEAD && git -C "$root" clean -fdq
     for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
         mkdir -p "$root/${entry%%|*}"  # git keeps no empty directory
     done
 }
+# the guard's canary, inside a throwaway repository with a commit and an
+# untracked file: an empty root is refused, and the file survives
+lc_guard_canary() (
+    mkdir -p "$work/lc-guard" && cd "$work/lc-guard" && git init -q &&
+        git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base && : >untracked &&
+        root="" && lc_reset
+)
+expect red "lint-scopes: containers — lc_reset refuses an empty root" lc_guard_canary
+expect green "lint-scopes: containers — the refused reset cleaned nothing" test -f "$work/lc-guard/untracked"
 root=$(ls_root ls-containers)
 printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
