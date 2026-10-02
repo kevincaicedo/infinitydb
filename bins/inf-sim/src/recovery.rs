@@ -804,10 +804,11 @@ impl Run {
     /// mutations).
     /// FCR-STTIER-01 (ADR-0174 D1): the replay-above-window regime. Fills
     /// the tail with distinct inline keys (values under the harness's
-    /// blob threshold), demoted live as a running node would, until the record bytes replay re-appends from the tail
-    /// reach a multiple of the window drawn from DRR FCR-STTIER-01 §6's
-    /// first row (window − 1 page, the window, window + 1 page, 3 ×,
-    /// 16 ×); counts the life when the unit exceeds the window.
+    /// blob threshold), demoted live as a running node would, until the
+    /// record bytes replay re-appends from the tail reach a multiple of
+    /// the window drawn from DRR FCR-STTIER-01 §6's first row (window −
+    /// 1 page, the window, window + 1 page, 3 ×, 16 ×); counts the life
+    /// when the unit exceeds the window.
     fn fill_replay_unit(&mut self, life: &mut Life, rng: &mut SplitMix64, life_index: u64) {
         let window = demote().mem_budget_bytes + demote().slice_bytes;
         let target = match rng.next_u64() % 8 {
