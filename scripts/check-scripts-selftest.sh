@@ -2111,6 +2111,31 @@ expect_red_because "lint-scopes: containers — a mock swap's production twin is
     "crates/fake/src/a/swap_real.rs:1: \`HashMap\` names std::collections::HashMap outside every \`container:\` allow" \
     lc_run "$root"
 lc_reset
+# rustc reads `a/inner/probe.rs` here; a resolver that drops the inline
+# module's name takes production `a/probe.rs` for test code, and the backstop
+# then skips its code no build compiles (so do the two aliases below).
+lc_append 'pub mod probe;' 'mod inner {' '    #[cfg(test)]' '    mod probe;' '}'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: a feature neither build enables'
+mkdir -p "$root/crates/fake/src/a/inner"
+printf 'pub fn probe() {}\n' >"$root/crates/fake/src/a/inner/probe.rs"
+expect_red_because "lint-scopes: containers — a test module declared inside an inline module" \
+    "$LC_A:21: \`mod probe;\` inside an inline module or a block" lc_run "$root"
+lc_reset
+lc_append '#[cfg(test)]' 'mod tests {' '    mod model;' '}'
+expect_red_because "lint-scopes: containers — an out-of-line child of an inline test module" \
+    "$LC_A:20: \`mod model;\` inside an inline module or a block" lc_run "$root"
+lc_reset
+lc_append_to crates/fake/src/lib.rs 'pub mod b;' "${LC_TEST_DECL[@]}" '#[path = "b.rs"]' 'mod b_again;'
+lc_testmod crates/fake/src/b.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a test module whose #[path] names a production module's file" \
+    "test-only \`mod b_again;\` names crates/fake/src/b.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]}" '#[path = "lib.rs"]' 'mod root_again;'
+expect_red_because "lint-scopes: containers — a test module whose #[path] names the crate root" \
+    "test-only \`mod root_again;\` names crates/fake/src/lib.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2000-01-01
 expect_red_because "lint-scopes: containers — an expired row" \
     "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"

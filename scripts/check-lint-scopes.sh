@@ -28,7 +28,9 @@
 #     from the text too, so code this host's builds do not compile (another
 #     `target_os`, a feature neither build enables) is held the same. Test
 #     code is outside both: an inline test module's body, and the whole file
-#     of an out-of-line one (`#[cfg(test)] mod x;`, its allow on that line).
+#     of an out-of-line one (`#[cfg(test)] mod x;`, its allow on that line)
+#     unless production code also compiles that file. A `mod x;` inside an
+#     inline module is red: the audit does not resolve its file.
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
@@ -164,7 +166,8 @@ TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")  # the st
 MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;\s*$")
 PATH_ATTR = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\s*\]\s*$')
 strip_reports = {}  # cell file -> the stripper's report
-test_module_files = set()  # the files of out-of-line test modules: test code whole
+test_module_files = {}  # the file of an out-of-line test module (test code whole) -> its declaration
+production_files = set()  # the cell crates' roots and the files their other `mod x;` name
 test_decls = {}  # cell file -> indexes of its lines that declare one
 
 
@@ -241,39 +244,61 @@ def strip_report(path):
     return strip_reports[key]
 
 
-def test_modules(path):
-    """The stripper reports each `mod x;` under a test-only attribute
-    (`modfile x`) and leaves its file to the caller: that file is test code
-    whole, as an inline test module's body is, so it is outside the API audit
-    and the backstop, and the declaration (which carries the module's allow)
-    is blanked like an inline module's `mod x {`. The file is the
-    declaration's own `#[path]`, else Rust's: beside a crate root or mod.rs,
-    else under the declaring file's stem. A file not found is red."""
-    names = {line.split()[1] for line in strip_report(path).splitlines() if line.startswith("modfile ")}
-    if not names:
-        return
+def line_depths(lines):
+    """The brace depth of code at each line's start (comments, strings and
+    char literals are not code)."""
+    delta = [0] * len(lines)
+    for i, _, ch in scope_table.code_chars(lines):
+        delta[i] += (ch == "{") - (ch == "}")
+    depths, depth = [], 0
+    for step in delta:
+        depths.append(depth)
+        depth += step
+    return depths
+
+
+def module_declarations(path):
+    """Each `mod x;` of a cell file, rustfmt-shaped as the stripper reads it,
+    and the file it names: the declaration's own `#[path]`, else Rust's,
+    beside a crate root or mod.rs, else under the declaring file's stem. That
+    holds at the file's own level only: inside an inline module or a block,
+    rustc adds the module's name to the path, so a declaration there is red
+    (its scope is not established). The stripper reports a `mod x;` under a
+    test-only attribute (`modfile x`); with that attribute among its own, its
+    file is test code whole, as an inline test module's body is: outside the
+    API audit and the backstop, the declaration (which carries the module's
+    allow) blanked like an inline module's `mod x {`, and red if not found.
+    Any other declaration's file is production code."""
     lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
-    for i, line in enumerate(lines):
-        decl = MOD_DECL.match(line)
-        if not decl or decl.group(1) not in names:
+    decls = [(i, m.group(1)) for i, m in enumerate(map(MOD_DECL.match, lines)) if m]
+    if not decls:
+        return
+    names = {line.split()[1] for line in strip_report(path).splitlines() if line.startswith("modfile ")}
+    depths = line_depths(lines)
+    for i, name in decls:
+        if depths[i]:
+            errors.append(f"{path}:{i + 1}: `mod {name};` inside an inline module or a block — rustc nests "
+                          "the enclosing module's name in its path, which the audit does not resolve: its "
+                          "scope is not established (declare the enclosing module out of line)")
             continue
         attrs, j = [], i
         while j > 0 and lines[j - 1].strip().startswith("#["):
             j -= 1
             attrs.append(lines[j])
-        if not any(TEST_ATTR.match(a) for a in attrs):
-            continue
-        name = decl.group(1)
         named = [m.group(1) for m in map(PATH_ATTR.match, attrs) if m]
         root_like = path.name in ("lib.rs", "main.rs", "mod.rs") or path.parent.name == "bin"
         base = path.parent if root_like else path.parent / path.stem
         candidates = [path.parent / named[0]] if named else [base / f"{name}.rs", base / name / "mod.rs"]
         found = next((c for c in candidates if c.is_file()), None)
+        if not (name in names and any(TEST_ATTR.match(a) for a in attrs)):
+            if found is not None:
+                production_files.add(os.path.normpath(found))
+            continue
         if found is None:
             errors.append(f"{path}:{i + 1}: test-only `mod {name};` names no file the audit can find "
                           f"({', '.join(map(str, candidates))}) — its scope is not established")
             continue
-        test_module_files.add(os.path.normpath(found))
+        test_module_files.setdefault(os.path.normpath(found), (f"{path}:{i + 1}", name))
         test_decls.setdefault(str(path), set()).add(i)
 
 
@@ -450,13 +475,22 @@ if roots == 0:
     print("LINT-SCOPES SCOPE ERROR: no crate root found under crates/ and bins/")
     sys.exit(1)
 
-# ---- the cell crates' out-of-line test modules, before any file is audited
+# ---- the cell crates' out-of-line test modules, before any file is audited.
+# A file production code also compiles (a crate root, a production `mod`'s
+# file: the mock swap's twin, a `#[path]` alias) stays production code.
 for cell_dir in CELL_DIRS:
+    production_files.update(os.path.normpath(p) for p in [cell_dir / "lib.rs", cell_dir / "main.rs"]
+                            + sorted((cell_dir / "bin").glob("*.rs")) if p.is_file())
     for dirpath, dirnames, names in os.walk(cell_dir):
         dirnames.sort()
         for name in sorted(names):
             if name.endswith(".rs"):
-                test_modules(Path(dirpath) / name)
+                module_declarations(Path(dirpath) / name)
+for file in sorted(production_files & set(test_module_files)):
+    site, name = test_module_files.pop(file)
+    errors.append(f"{site}: test-only `mod {name};` names {file}, which production code also compiles "
+                  "(a crate root, or the file of a `mod` with no test-only attribute) — its scope is not "
+                  "established")
 
 # ---- D2: the suppression audit
 files, exempt_sites = 0, []
