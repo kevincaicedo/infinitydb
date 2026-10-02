@@ -29,8 +29,10 @@
 #     `target_os`, a feature neither build enables) is held the same. Test
 #     code is outside both: an inline test module's body, and the whole file
 #     of an out-of-line one (`#[cfg(test)] mod x;`, its allow on that line)
-#     unless production code also compiles that file. A `mod x;` inside an
-#     inline module is red: the audit does not resolve its file.
+#     unless production code also compiles that file. A `mod x;` (read in
+#     code, comments removed) the audit does not resolve is red: one inside
+#     an inline module, off a line of its own, or with its path in another
+#     attribute than `#[path = "…"]`; so is an `include!` of an expression.
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
@@ -163,8 +165,14 @@ container_sites = []
 production_of = {}  # cell file -> its production lines (test modules blanked)
 STRIPPER = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
 TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")  # the stripper's test-only attributes
-MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;\s*$")
+# A `mod x;` anywhere in code, and the shape the audit resolves (rustc reads
+# a raw identifier `r#x`'s file as x's).
+MOD_TOKEN = re.compile(r"\bmod\s+(?:r#)?([A-Za-z0-9_]+)\s*;")
+MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?[A-Za-z0-9_]+\s*;\s*$")
 PATH_ATTR = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\s*\]\s*$')
+PATH_NAMED = re.compile(r"\bpath\s*=")
+INCLUDE = re.compile(r"\binclude!\s*[(\[{]")  # any of a macro's three delimiters
+INCLUDE_LITERAL = re.compile(r'include!\s*[(\[{]\s*"([^"\\]+)"\s*[)\]}]')
 strip_reports = {}  # cell file -> the stripper's report
 test_module_files = {}  # the file of an out-of-line test module (test code whole) -> its declaration
 production_files = set()  # the cell crates' roots and the files their other `mod x;` name
@@ -257,34 +265,91 @@ def line_depths(lines):
     return depths
 
 
+def blanked(lines, literals=False):
+    """`lines` with comments blanked and, unless `literals`, string, raw-string
+    and char literals too; every column kept (the gates' one lexer)."""
+    out = [list(" " * len(line)) for line in lines]
+    for i, j, ch in scope_table.code_chars(lines, literals=literals):
+        out[i][j] = ch
+    return ["".join(row) for row in out]
+
+
+def own_attributes(text, at):
+    """The (first, end) line ranges, in source order, of the outer attributes
+    of the item at `text[at]` (comments blanked), read upward over blank and
+    comment lines. At an item's level a line that ends in `]` ends an outer
+    attribute, which starts at the nearest `#[` line above; an inner
+    attribute (`#![`, the module's own) has none above it."""
+    spans, k = [], at
+    while k > 0:
+        above = text[k - 1].strip()
+        if not above:
+            k -= 1
+            continue
+        if not above.endswith("]"):
+            break
+        first = next((m for m in range(k - 1, -1, -1) if text[m].lstrip().startswith("#[")), None)
+        if first is None:
+            break
+        spans.append((first, k))
+        k = first
+    return spans[::-1]
+
+
 def module_declarations(path):
-    """Each `mod x;` of a cell file, rustfmt-shaped as the stripper reads it,
-    and the file it names: the declaration's own `#[path]`, else Rust's,
-    beside a crate root or mod.rs, else under the declaring file's stem. That
-    holds at the file's own level only: inside an inline module or a block,
-    rustc adds the module's name to the path, so a declaration there is red
-    (its scope is not established). The stripper reports a `mod x;` under a
-    test-only attribute (`modfile x`); with that attribute among its own, its
-    file is test code whole, as an inline test module's body is: outside the
-    API audit and the backstop, the declaration (which carries the module's
-    allow) blanked like an inline module's `mod x {`, and red if not found.
-    Any other declaration's file is production code."""
+    """Each `mod x;` in a cell file's code (comments are not code) and the
+    file it names: the declaration's own `#[path]` (rustc reads the first),
+    else Rust's, beside a crate root or mod.rs, else under the declaring
+    file's stem; and each file an `include!` names, beside the declaring
+    file. That holds for a declaration on its own line, at the file's own
+    level, its attributes above it, and a path only `#[path = "…"]` names:
+    any other declaration is red (its scope is not established; inside an
+    inline module or a block rustc adds the module's name to the path), as
+    is an `include!` of an expression. The stripper reports a `mod x;` under
+    a test-only attribute (`modfile x`); with that attribute among its own,
+    its file is test code whole, as an inline test module's body is: outside
+    the API audit and the backstop, the declaration (which carries the
+    module's allow) blanked like an inline module's `mod x {`, and red if
+    not found. Any other declaration's file, and an included one, is
+    production code."""
     lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
-    decls = [(i, m.group(1)) for i, m in enumerate(map(MOD_DECL.match, lines)) if m]
-    if not decls:
+    code = blanked(lines)
+    joined = "\n".join(code)
+    decls, includes = list(MOD_TOKEN.finditer(joined)), list(INCLUDE.finditer(joined))
+    if not decls and not includes:
         return
+    text = blanked(lines, literals=True)
+    starts = [0]
+    for line in code:
+        starts.append(starts[-1] + len(line) + 1)
+    for m in includes:
+        i = bisect.bisect_right(starts, m.start()) - 1
+        literal = INCLUDE_LITERAL.match(text[i], m.start() - starts[i])
+        if not literal:
+            errors.append(f"{path}:{i + 1}: `include!` names its file by an expression the audit does not "
+                          "read — its scope is not established (name it by a string literal)")
+            continue
+        production_files.add(os.path.normpath(path.parent / literal.group(1)))
     names = {line.split()[1] for line in strip_report(path).splitlines() if line.startswith("modfile ")}
     depths = line_depths(lines)
-    for i, name in decls:
+    for m in decls:
+        i, name = bisect.bisect_right(starts, m.start()) - 1, m.group(1)
         if depths[i]:
             errors.append(f"{path}:{i + 1}: `mod {name};` inside an inline module or a block — rustc nests "
                           "the enclosing module's name in its path, which the audit does not resolve: its "
                           "scope is not established (declare the enclosing module out of line)")
             continue
-        attrs, j = [], i
-        while j > 0 and lines[j - 1].strip().startswith("#["):
-            j -= 1
-            attrs.append(lines[j])
+        if not MOD_DECL.match(code[i]):
+            errors.append(f"{path}:{i + 1}: `mod {name};` is not on a line of its own, its attributes on the "
+                          "lines above — the audit does not resolve its file: its scope is not established")
+            continue
+        spans = own_attributes(text, i)
+        attrs = [" ".join(t.strip() for t in text[first:end]) for first, end in spans]
+        if any(PATH_NAMED.search(" ".join(code[first:end])) and not PATH_ATTR.match(attr)
+               for (first, end), attr in zip(spans, attrs)):
+            errors.append(f"{path}:{i + 1}: `mod {name};` names its file through an attribute the audit does "
+                          "not read (only `#[path = \"…\"]` alone) — its scope is not established")
+            continue
         named = [m.group(1) for m in map(PATH_ATTR.match, attrs) if m]
         root_like = path.name in ("lib.rs", "main.rs", "mod.rs") or path.parent.name == "bin"
         base = path.parent if root_like else path.parent / path.stem
@@ -311,10 +376,7 @@ def container_names(lines):
     banned = "|".join(map(re.escape, sorted(CONTAINER_BY_NAME)))
     if not re.search(rf"\b({banned})\b", "\n".join(lines)):
         return []
-    code = [list(" " * len(line)) for line in lines]
-    for i, j, ch in scope_table.code_chars(lines):
-        code[i][j] = ch
-    code = ["".join(row) for row in code]
+    code = blanked(lines)
     starts = [0]
     for line in code:
         starts.append(starts[-1] + len(line) + 1)
@@ -477,7 +539,8 @@ if roots == 0:
 
 # ---- the cell crates' out-of-line test modules, before any file is audited.
 # A file production code also compiles (a crate root, a production `mod`'s
-# file: the mock swap's twin, a `#[path]` alias) stays production code.
+# file: the mock swap's twin, a `#[path]` alias; an `include!`'s) stays
+# production code.
 for cell_dir in CELL_DIRS:
     production_files.update(os.path.normpath(p) for p in [cell_dir / "lib.rs", cell_dir / "main.rs"]
                             + sorted((cell_dir / "bin").glob("*.rs")) if p.is_file())
@@ -489,8 +552,8 @@ for cell_dir in CELL_DIRS:
 for file in sorted(production_files & set(test_module_files)):
     site, name = test_module_files.pop(file)
     errors.append(f"{site}: test-only `mod {name};` names {file}, which production code also compiles "
-                  "(a crate root, or the file of a `mod` with no test-only attribute) — its scope is not "
-                  "established")
+                  "(a crate root, the file of a `mod` with no test-only attribute, or an `include!`'s) — "
+                  "its scope is not established")
 
 # ---- D2: the suppression audit
 files, exempt_sites = 0, []

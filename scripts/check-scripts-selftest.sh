@@ -2155,6 +2155,96 @@ expect_red_because "lint-scopes: containers — a test module whose #[path] name
     "test-only \`mod root_again;\` names crates/fake/src/lib.rs, which production code also compiles" \
     lc_run "$root"
 lc_reset
+# The resolver reads each line's code, comments removed, so a comment does
+# not hide a production declaration or its #[path]; what it cannot read is
+# red, and no exclusion trusts it.
+lc_append '#[cfg(not(test))]' 'mod probe; // the real one' "${LC_TEST_DECL[@]}" 'mod probe;'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a mock swap whose production twin carries a comment" \
+    "test-only \`mod probe;\` names crates/fake/src/a/probe.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append 'pub mod probe; // the production module'
+lc_append_to crates/fake/src/lib.rs "${LC_TEST_DECL[@]}" '#[path = "a/probe.rs"]' 'mod probe_again;'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a #[path] alias of a production module whose declaration carries a comment" \
+    "test-only \`mod probe_again;\` names crates/fake/src/a/probe.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+LC_ALIAS=("${LC_TEST_DECL[@]}" '#[path = "a/real.rs"]' 'mod real_again;')
+lc_append '#[path = "a/real.rs"] // the production file' 'pub mod live;' "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a production #[path] that carries a comment" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append '#[path = "a/real.rs"]' '// a comment line between the attribute and its item' 'pub mod live;' \
+    "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a production #[path] above a comment line" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append '#[path = "a/real.rs"]' '#[path = "a/other.rs"]' 'pub mod live;' "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a production declaration with two #[path]s, of which rustc reads the first" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append 'pub mod r#probe;' "${LC_TEST_DECL[@]}" '#[path = "a/probe.rs"]' 'mod probe_again;'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a production declaration by a raw identifier" \
+    "test-only \`mod probe_again;\` names crates/fake/src/a/probe.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]}" '#[path = "swap_fake.rs"]' 'mod probe;' '#[cfg(not(test))]' 'mod probe;'
+lc_testmod crates/fake/src/swap_fake.rs ' // uncompiled: test code'
+mkdir -p "$root/crates/fake/src/a"
+printf 'pub fn probe() {}\n' >"$root/crates/fake/src/a/probe.rs"
+expect green "lint-scopes: containers — a mock swap whose production twin follows the test-only one (control)" \
+    lc_run "$root"
+lc_reset
+lc_append '#[doc = "its path = the default"]' 'pub mod probe;'
+mkdir -p "$root/crates/fake/src/a"
+printf 'pub fn probe() {}\n' >"$root/crates/fake/src/a/probe.rs"
+expect green "lint-scopes: containers — \`path =\` inside a string of a declaration's attribute (control)" \
+    lc_run "$root"
+lc_reset
+lc_append 'include!("a/real.rs");' "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a test module aliasing a file production code includes" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append 'include!["a/real.rs"];' "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a test module aliasing a file production code includes in brackets" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append 'include! { "a/real.rs" }' "${LC_ALIAS[@]}"
+lc_testmod crates/fake/src/a/real.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a test module aliasing a file production code includes in braces" \
+    "test-only \`mod real_again;\` names crates/fake/src/a/real.rs, which production code also compiles" \
+    lc_run "$root"
+lc_reset
+lc_append 'include!(concat!("a/", "real.rs"));'
+expect_red_because "lint-scopes: containers — an include! whose file is an expression" \
+    "$LC_A:18: \`include!\` names its file by an expression the audit does not read" lc_run "$root"
+lc_reset
+lc_append '#[cfg(not(test))] mod probe;' "${LC_TEST_DECL[@]}" 'mod probe;'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: a feature neither build enables'
+expect_red_because "lint-scopes: containers — a declaration not on a line of its own" \
+    "$LC_A:18: \`mod probe;\` is not on a line of its own" lc_run "$root"
+lc_reset
+lc_append '#[cfg_attr(not(test), path = "a/real.rs")]' 'mod live;'
+expect_red_because "lint-scopes: containers — a declaration whose path is a cfg_attr" \
+    "$LC_A:19: \`mod live;\` names its file through an attribute the audit does not read" lc_run "$root"
+lc_reset
+lc_append '#[cfg_attr(' '    not(test),' '    path = "a/real.rs"' ')]' 'mod live;'
+expect_red_because "lint-scopes: containers — a declaration whose path is a cfg_attr over several lines" \
+    "$LC_A:22: \`mod live;\` names its file through an attribute the audit does not read" lc_run "$root"
+lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2000-01-01
 expect_red_because "lint-scopes: containers — an expired row" \
     "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"

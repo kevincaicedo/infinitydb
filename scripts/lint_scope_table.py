@@ -164,12 +164,14 @@ def denied(attributes, inner):
     return out
 
 
-def code_chars(lines, start=0):
+def code_chars(lines, start=0, literals=False):
     """Yield (line, column, char) for every code character from line `start`.
 
     The one Rust lexer of the gates: string, raw-string and char-literal
     text and comments are skipped, so a brace, a call or a name inside
-    them is never code. Its state carries across lines.
+    them is never code. Its state carries across lines. With `literals`,
+    a literal's characters, its delimiters included, are yielded too: only
+    comments are skipped.
     """
     i, j = start, 0
     raw_close = None
@@ -180,13 +182,20 @@ def code_chars(lines, start=0):
         while j < len(text):
             if raw_close is not None:
                 end = text.find(raw_close, j)
+                stop = len(text) if end < 0 else end + len(raw_close)
+                if literals:
+                    yield from ((i, k, text[k]) for k in range(j, stop))
                 if end < 0:
                     break
-                j, raw_close = end + len(raw_close), None
+                j, raw_close = stop, None
                 continue
             if in_str:
+                if literals:
+                    yield i, j, text[j]
                 if text[j] == "\\":
                     j += 1
+                    if literals and j < len(text):
+                        yield i, j, text[j]
                 elif text[j] == '"':
                     in_str = False
                 j += 1
@@ -206,12 +215,18 @@ def code_chars(lines, start=0):
                 continue
             raw = RAW.match(text, j)
             if raw and (j == 0 or not (text[j - 1].isalnum() or text[j - 1] == "_")):
+                if literals:
+                    yield from ((i, k, text[k]) for k in range(j, raw.end()))
                 raw_close, j = '"' + raw.group(1), raw.end()
                 continue
             ch = text[j]
             if ch == '"':
                 in_str = True
+                if literals:
+                    yield i, j, ch
             elif ch == "'" and (lit := CHAR.match(text, j)):
+                if literals:
+                    yield from ((i, k, text[k]) for k in range(j, lit.end()))
                 j = lit.end()
                 continue
             else:
