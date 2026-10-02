@@ -1839,6 +1839,28 @@ lc_append 'pub trait Build {' '    fn build() -> usize;' '}' 'impl Build for Own
 expect_red_because "lint-scopes: containers — two allows in one file with one key" \
     "2 \`container:\` allows share the item key \`fn Owner::build\`" lc_run "$root"
 lc_reset
+lc_append '#[allow(clippy::disallowed_types, reason = "boot: a handle taken at startup")]' \
+    'pub struct Booted {' '    pub queue: VecDeque<u8>,' '}'
+expect_red_because "lint-scopes: containers — a container under an allow of another class" \
+    "$LC_A:20: std::collections::VecDeque lacks a narrow allow of its own API class" lc_run "$root"
+lc_reset
+lc_edit 's|reason = "container: E"|reason = "container: T"|' "$LC_A"
+expect_red_because "lint-scopes: containers — an allow's record differs from its row's" \
+    "\`container: T\` but its row says record E" lc_run "$root"
+lc_reset
+lc_row "$LC_A" 'struct Exempt' 1 T 2099-12-31
+expect_red_because "lint-scopes: containers — a row listed twice" \
+    "$LC_A \`struct Exempt\` is listed twice" lc_run "$root"
+lc_reset
+lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();\n        #[allow(clippy::disallowed_types, reason = "container: E")]\n        fn inner() -> HashMap<u8, u8> {\n            Default::default()\n        }\n        let _ = inner();|' "$LC_A"
+lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t1\tE\t|' "$LC_T"
+lc_row "$LC_A" 'fn Owner::inner' 1 E 2099-12-31
+expect green "lint-scopes: containers — a span inside two allowed items counts on the narrower (control)" \
+    lc_run "$root"
+lc_edit 's|            Default::default()|            HashMap::new()|' "$LC_A"
+expect_red_because "lint-scopes: containers — a second container in the inner of two allowed items" \
+    "\`fn Owner::inner\` holds 2 container span(s), its row says 1" lc_run "$root"
+lc_reset
 lc_edit 's|reason = "container: E"|reason = "container: M"|' "$LC_A"
 lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t2\tM\t|' "$LC_T"
 expect_red_because "lint-scopes: containers — a file and record pair the copy lacks" \
@@ -1864,6 +1886,12 @@ printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts
 ls_commit "$root" "a lower maximum"
 expect_red_because "lint-scopes: containers — a raised maximum" \
     "CONTAINER_EXEMPTIONS_MAX = $LC_MAX is above the HEAD's $((LC_MAX - 1))" lc_run "$root"
+git -C "$root" reset -q --hard HEAD~1
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
+lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+ls_commit "$root" "a raise, committed"
+expect_red_because "lint-scopes: containers — a committed raise is red against the base tip" \
+    "record T counts sum to 4, above the base tip's 3" lc_run "$root"
 git -C "$root" reset -q --hard HEAD~1
 lc_append '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub mod inner {' \
     '    pub struct Q(pub std::collections::VecDeque<u8>);' '}'
@@ -1990,6 +2018,22 @@ expect_output "lint-scopes: containers — the first landing discloses the boots
 lc_row "$LC_A" 'struct Wide' "$((LC_MAX + 1))" T 2099-12-31
 expect_red_because "lint-scopes: containers — until a copy exists the maximum bounds the sum" \
     "above CONTAINER_EXEMPTIONS_MAX = $LC_MAX" lc_run "$root"
+# after a commit, with a base tip that predates the container gate, the
+# introducing commit is the copy that binds
+root=$(ls_root ls-containers-intro)
+git -C "$root" rm -q "$LC_T"
+git -C "$root" -c user.name=t -c user.email=t@t commit -q --amend -m "base: before the container gate"
+git -C "$root" branch -q -f base-tip HEAD
+printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
+printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
+lc_source
+lc_table
+ls_commit "$root" "the container gate and its table"
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
+lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+ls_commit "$root" "a raise, committed"
+expect_red_because "lint-scopes: containers — a committed raise is red against the introducing commit" \
+    "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
 
 # the probe's judge: a plant that compiles clean, and a plant that fails
 # for an unrelated reason, are both red (ADR-0144 D5's probe rule).
