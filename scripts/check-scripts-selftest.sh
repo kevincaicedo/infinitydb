@@ -1727,9 +1727,26 @@ for _ in range(2):
 (root / "api.json").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 PY
 }
+LC_SCOPES=$LINTSCOPES
 lc_run() {
     lc_diag "$1"
-    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LINTSCOPES"
+    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LC_SCOPES"
+}
+# lc_gate <maximum> <backing sites>: a copy of the gate, its code unchanged,
+# with its two constants set to a fixture's own; LC_SCOPES then runs it.
+LC_GATE_DIR="$work/lc-gate"
+lc_gate() {
+    [ -n "$work" ] && [ -d "$work" ] || { echo "lc_gate: no work dir" >&2; exit 2; }
+    mkdir -p "$LC_GATE_DIR"
+    cp "$SCRIPT_DIR/check-lint-scopes.sh" "$SCRIPT_DIR/check-lint-ratchet.sh" "$SCRIPT_DIR/lint_scope_table.py" \
+        "$SCRIPT_DIR/cell-crates.sh" "$SCRIPT_DIR/strip-test-modules.awk" "$LC_GATE_DIR/"
+    sed -i.bak -e "s/^CONTAINER_EXEMPTIONS_MAX=[0-9][0-9]*\$/CONTAINER_EXEMPTIONS_MAX=$1/" \
+        -e "s/^CAPPED_BACKING_SITES=[0-9][0-9]*\$/CAPPED_BACKING_SITES=$2/" "$LC_GATE_DIR/check-lint-scopes.sh"
+    rm -f "$LC_GATE_DIR/check-lint-scopes.sh.bak"
+    grep -q "^CONTAINER_EXEMPTIONS_MAX=$1\$" "$LC_GATE_DIR/check-lint-scopes.sh" &&
+        grep -q "^CAPPED_BACKING_SITES=$2\$" "$LC_GATE_DIR/check-lint-scopes.sh" ||
+        { echo "lc_gate: the gate's constants are not where the copy sets them" >&2; exit 2; }
+    LC_SCOPES="$LC_GATE_DIR/check-lint-scopes.sh"
 }
 lc_census() {
     lc_diag "$1"
@@ -1912,6 +1929,23 @@ lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing
 expect_red_because "lint-scopes: containers — a capped-backing allow past CAPPED_BACKING_SITES" \
     "1 \`container: capped-backing\` allow(s)" lc_run "$root"
 lc_reset
+lc_gate "$LC_MAX" 1
+LC_B=crates/inf-foundation/src/bounded/deque.rs
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
+    'pub struct CappedDeque<T> {' '    inner: std::collections::VecDeque<T>,' '}'
+expect green "lint-scopes: containers — the one backing, on struct CappedDeque in bounded/ (control, the gate at 1)" \
+    lc_run "$root"
+lc_edit 's|    inner: std::collections::VecDeque<T>,|    inner: std::collections::VecDeque<T>,\n    spare: std::collections::VecDeque<T>,|' "$LC_B"
+expect_red_because "lint-scopes: containers — a second container inside the backing" \
+    "the backing \`struct CappedDeque\` holds 2 container span(s)" lc_run "$root"
+lc_reset
+lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' 'pub struct Holder {' \
+    '    pub queue: VecDeque<u8>,' '}'
+expect_red_because "lint-scopes: containers — the backing allow on another item" \
+    "\`container: capped-backing\` on \`struct Holder\` in $LC_A" lc_run "$root"
+lc_reset
+LC_SCOPES=$LINTSCOPES
 lc_append 'pub const CAP: u32 = Cap::entries("x", 1);'
 expect_red_because "lint-scopes: containers — Cap::entries outside a limits.rs" \
     "\`Cap::entries\` outside a \`limits.rs\`" lc_run "$root"

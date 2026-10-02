@@ -90,7 +90,7 @@ CENSUS = os.environ.get("INF_CONTAINER_CENSUS") == "1"
 # A D R F). `capped-backing` is the one sanctioned holder's allow (ADR-0151
 # D6) and has no row.
 RECORDS = ("T", "E", "M", "C", "A", "D", "R", "F")
-BACKING = "capped-backing"
+BACKING, BACKING_ITEM, BACKING_HOME = "capped-backing", "struct CappedDeque", "crates/inf-foundation/src/bounded"
 HOST_OS = {"linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
 
 # lint -> (scope, reason classes). Scope `fn`: the attribute sits on a
@@ -683,6 +683,13 @@ if len(backing) != BACKING_SITES:
     where = ", ".join(s[5] for s in backing) or "none"
     errors.append(f"{len(backing)} `container: {BACKING}` allow(s) ({where}); the gate wants exactly "
                   f"{BACKING_SITES}: the one sanctioned holder's backing (ADR-0151 D6)")
+for f, _, _, key, _, site in backing:
+    if key != BACKING_ITEM or not Path(f).is_relative_to(BACKING_HOME):
+        errors.append(f"{site}: `container: {BACKING}` on `{key}` in {f} — the one backing is "
+                      f"`{BACKING_ITEM}` under {BACKING_HOME}/ (ADR-0151 D6)")
+    elif diagnostics and census.get((f, key), 0) != 1:
+        errors.append(f"{site}: the backing `{key}` holds {census.get((f, key), 0)} container span(s) — "
+                      "exactly one (ADR-0151 D6)")
 exempt = [s for s in container_sites if s[4] != BACKING]
 keys = {}
 for f, _, _, key, record, site in exempt:
