@@ -22,7 +22,11 @@
 #     item. The table is generated from the tree (the census below), its
 #     counts per file and record only shrink against the approved copies,
 #     and `container: capped-backing` is allowed exactly
-#     CAPPED_BACKING_SITES times, with no row.
+#     CAPPED_BACKING_SITES times, with no row. clippy.toml owns the banned
+#     paths and the ban's sentence; this gate reads both from it. A banned
+#     name in cell production code outside every `container:` allow is red
+#     from the text too, so code this host's builds do not compile (another
+#     `target_os`, a feature neither build enables) is held the same.
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
@@ -60,12 +64,14 @@ done
 INF_CELL_DIRS="$CELL_DIRS" INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
     INF_CONTAINERS="$CONTAINERS" INF_CONTAINER_MAX="$CONTAINER_EXEMPTIONS_MAX" INF_BACKING_SITES="$CAPPED_BACKING_SITES" \
     INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
+import bisect
 import datetime
 import os
 import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
@@ -80,11 +86,9 @@ CONTAINERS = os.environ["INF_CONTAINERS"]
 CONTAINER_MAX = int(os.environ["INF_CONTAINER_MAX"])
 BACKING_SITES = int(os.environ["INF_BACKING_SITES"])
 CENSUS = os.environ.get("INF_CONTAINER_CENSUS") == "1"
-# ADR-0163 D2: the three banned paths, and the site records that own an
-# exempt row (ADR-0163 D3: T E M C A D R F). `capped-backing` is the one
-# sanctioned holder's allow (ADR-0151 D6) and has no row.
-CONTAINER_PATHS = {f"std::collections::{name}" for name in ("HashMap", "HashSet", "VecDeque")}
-CONTAINER_NAME = re.compile(r"\b(HashMap|HashSet|VecDeque)\b")
+# ADR-0163 D2: the site records that own an exempt row (ADR-0163 D3: T E M C
+# A D R F). `capped-backing` is the one sanctioned holder's allow (ADR-0151
+# D6) and has no row.
 RECORDS = ("T", "E", "M", "C", "A", "D", "R", "F")
 BACKING = "capped-backing"
 HOST_OS = {"linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
@@ -108,6 +112,20 @@ if os.environ.get("INF_LINT_RULES") == "1":
         example = next(cls for cls in classes if cls != "ADR-0143:")
         print(f"{lint}\t{scope}\t{example}")
     sys.exit(0)
+# The banned container paths and their sentence: clippy.toml's
+# `disallowed-types` under `std::collections::` (the probe's judge pins their
+# number, so a lost or added path is red there too).
+if not Path("clippy.toml").is_file():
+    print("LINT-SCOPES SCOPE ERROR: clippy.toml is missing — the banned container paths cannot be read")
+    sys.exit(1)
+CONTAINER_REASON = {row["path"]: row.get("reason", "")
+                    for row in tomllib.loads(Path("clippy.toml").read_text()).get("disallowed-types", [])
+                    if row.get("path", "").startswith("std::collections::")}
+if not CONTAINER_REASON:
+    print("LINT-SCOPES SCOPE ERROR: clippy.toml bans no std::collections path — the container class has no scope")
+    sys.exit(1)
+CONTAINER_PATHS = set(CONTAINER_REASON)
+CONTAINER_BY_NAME = {path.rsplit("::", 1)[1]: path for path in CONTAINER_PATHS}
 API_LINTS = {lint for lint in LINTS if lint.startswith("disallowed_")}
 CELL_DIRS = [Path(p) for p in os.environ["INF_CELL_DIRS"].splitlines()]
 ITEM = re.compile(r"^\s*(pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(impl|mod|trait|struct|enum|type|use|const|static|fn)\b")
@@ -196,14 +214,30 @@ def production_lines(path):
     return production_of[key]
 
 
-def container_names(lines, first, last):
-    """(line, column) of each banned name in code (not strings or comments)
-    of 1-based lines first..last: the text census of a file this host does
-    not compile."""
-    code = {(i, j) for i, j, _ in scope_table.code_chars(lines)}
-    return {(i + 1, m.start() + 1)
-            for i in range(first - 1, min(last, len(lines)))
-            for m in CONTAINER_NAME.finditer(lines[i]) if (i, m.start()) in code}
+def container_names(lines):
+    """(line, column, name, path), 1-based, of each banned name in the code of
+    `lines` (comments, strings and char literals are not code) and of each use
+    of a same-file `as` rename of one; the rename's own token is not a use.
+    The text census of a file this host does not compile, and the backstop.
+    A rename re-exported from another file is not followed (review's)."""
+    banned = "|".join(map(re.escape, sorted(CONTAINER_BY_NAME)))
+    if not re.search(rf"\b({banned})\b", "\n".join(lines)):
+        return []
+    code = [list(" " * len(line)) for line in lines]
+    for i, j, ch in scope_table.code_chars(lines):
+        code[i][j] = ch
+    code = ["".join(row) for row in code]
+    starts = [0]
+    for line in code:
+        starts.append(starts[-1] + len(line) + 1)
+    paths, renames = dict(CONTAINER_BY_NAME), set()
+    for m in re.finditer(rf"\b({banned})\s+as\s+([A-Za-z][A-Za-z0-9_]*|_[A-Za-z0-9_]+)\b", "\n".join(code)):
+        paths[m.group(2)] = CONTAINER_BY_NAME[m.group(1)]
+        i = bisect.bisect_right(starts, m.start(2)) - 1
+        renames.add((i, m.start(2) - starts[i]))
+    name = re.compile(r"\b(" + "|".join(map(re.escape, sorted(paths))) + r")\b")
+    return [(i + 1, m.start() + 1, m.group(1), paths[m.group(1)])
+            for i, line in enumerate(code) for m in name.finditer(line) if (i, m.start()) not in renames]
 
 
 def host_gated(file):
@@ -424,7 +458,8 @@ denied_n, ratchet_n = len(scopes_tbl.families("deny")), len(scopes_tbl.families(
 # existing JSON passes. --force-warn exposes even allowed calls, so a clock:
 # allow cannot hide a file acquisition, nor a boot: allow an ambient clock.
 diagnostics = os.environ.get("INF_LINT_API_DIAGNOSTICS")
-container_spans = set()  # (file, line, column) of the three paths, cell production code
+container_spans = set()  # (file, line, column) of the banned paths, cell production code
+unallowed = set()  # (file, line) of a banned path the audit already reports
 if diagnostics:
     completed, resolved, in_build = 0, set(), set()
     expected = {lint for _, _, _, lints, _ in api_sites for lint in lints}
@@ -472,6 +507,8 @@ if diagnostics:
             if not any(file == f and first <= line <= last and code in lints and cls in classes
                        for f, first, last, lints, cls in api_sites):
                 errors.append(f"{file}:{line}: {path} lacks a narrow allow of its own API class")
+                if container:
+                    unallowed.add((file, line))
     if completed != 2:
         errors.append(f"API audit needs two completed feature-set builds, got {completed}")
     if in_build:
@@ -481,10 +518,17 @@ if diagnostics:
     print(f"API call-class audit: {len(resolved)} resolved production sites, {completed} completed builds")
 
 # ---- ADR-0163 D2: the container census. A `container:` allow covers the
-# distinct primary spans (file, line, column) of the three paths inside its
+# distinct primary spans (file, line, column) of the banned paths inside its
 # item; a span inside two allowed items belongs to the narrower. A file this
 # host does not compile (a `mod` under another `target_os`) is counted from
-# its text instead, and disclosed.
+# its text instead (a same-file rename counted), and disclosed.
+def holder(file, line):
+    """The key of the narrowest `container:`-allowed item of `file` holding
+    `line`, or None."""
+    holders = [s for s in container_sites if s[0] == file and s[1] <= line <= s[2]]
+    return min(holders, key=lambda s: s[2] - s[1])[3] if holders else None
+
+
 census, text_counted = {}, {}
 if diagnostics:
     for f, _, _, key, _, _ in container_sites:
@@ -496,15 +540,26 @@ if diagnostics:
         gate_os = host_gated(f)
         if gate_os and gate_os != HOST_OS:
             text_counted[f] = gate_os
-            spans_of[f] = set()
-            for _, first, last, _, _, _ in (s for s in container_sites if s[0] == f):
-                spans_of[f] |= container_names(production_lines(f), first, last)
+            spans_of[f] = {(line, column) for line, column, _, _ in container_names(production_lines(f))}
     for f, spans in spans_of.items():
-        sites = [s for s in container_sites if s[0] == f]
         for line, _ in spans:
-            holders = [s for s in sites if s[1] <= line <= s[2]]
-            if holders:
-                census[(f, min(holders, key=lambda s: s[2] - s[1])[3])] += 1
+            key = holder(f, line)
+            if key is not None:
+                census[(f, key)] += 1
+    # The backstop inside an exempt item of a compiled file: its text names
+    # no more containers than its compiled spans, so a field under a feature
+    # neither build enables is not hidden by the row.
+    for f in sorted({site[0] for site in container_sites} - set(text_counted)):
+        written = {}
+        for line, _, _, _ in container_names(production_lines(f)):
+            key = holder(f, line)
+            if key is not None:
+                written[key] = written.get(key, 0) + 1
+        for key, n in sorted(written.items()):
+            if n > census[(f, key)]:
+                errors.append(f"{f}: `{key}` names {n} container(s) in its text, {census[(f, key)]} in "
+                              "the compiled spans — one neither build compiles is still a container, and a "
+                              "container added to an exempt item is red: use a capped type")
 if CENSUS:
     if not diagnostics:
         print("LINT-SCOPES SCOPE ERROR: the container census needs the ratchet's passes")
@@ -518,6 +573,18 @@ if CENSUS:
                     for f, os_name in sorted(text_counted.items()))
     print(f"# container census: {len(rows)} rows, sum {sum(r[2] for r in rows)}{gated}")
     sys.exit(0)
+
+# ---- ADR-0163 D2's backstop, read from the text and so the same on every
+# host: a banned name in cell production code (test modules stripped) outside
+# every `container:` allow is red, whether or not either build compiles it.
+# A line the audit above already reports is not reported twice.
+backstop_files = 0
+for f, production in sorted(production_of.items()):
+    backstop_files += 1
+    for line, _, name, path in container_names(production):
+        if (f, line) not in unallowed and holder(f, line) is None:
+            errors.append(f"{f}:{line}: `{name}` names {path} outside every `container:` allow (read from "
+                          f"the text, whatever the host compiles) — {CONTAINER_REASON[path]}")
 
 # ---- D1: the frozen exemption table
 if not Path(EXEMPTIONS).is_file():
@@ -712,7 +779,8 @@ if errors:
 scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted"
 scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
-          + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass"))
+          + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
+          + f", {backstop_files} cell file(s) read as text for a banned name outside an allow")
 scope += "".join(f"; {f} counted from its text (compiled only on {os_name})" for f, os_name in sorted(text_counted.items()))
 if notes:
     scope += "; " + "; ".join(notes)

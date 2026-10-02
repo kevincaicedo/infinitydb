@@ -1445,6 +1445,7 @@ ls_root() {
     printf '%s\nfn main() {}\n' "$LS_ATTR" >"$root/bins/fake/src/main.rs"
     printf '# file\tfn\tcolumn\n' >"$root/docs/lint-exemptions.tsv"
     printf '# gate\n' >"$root/scripts/check-lint-scopes.sh"
+    cp clippy.toml "$root/clippy.toml"  # the container class reads its paths there
     ls_scopes "$root"
     git -C "$root" init -q
     git -C "$root" add -A
@@ -1694,8 +1695,10 @@ expect red "lint-scopes: a table deleted from under the gate is not a bootstrap"
 
 # ADR-0163 D2: the container exemption table. The fixture's compiler output
 # is synthesized from its source (one `disallowed_types` span per banned
-# name outside comments, in two completed builds), so these cases judge the
-# table; the probe below proves clippy's own spans. Each red names its cause.
+# name outside comments, in two completed builds; a line tagged
+# `// uncompiled` stands for code neither build compiles), so these cases
+# judge the table; the probe below proves clippy's own spans. Each red names
+# its cause.
 LC_MAX=$(sed -n 's/^CONTAINER_EXEMPTIONS_MAX=\([0-9][0-9]*\)$/\1/p' "$LINTSCOPES")
 [ -n "$LC_MAX" ] || { echo "selftest: no CONTAINER_EXEMPTIONS_MAX in $LINTSCOPES" >&2; exit 2; }
 LC_A=crates/fake/src/a.rs
@@ -1712,6 +1715,8 @@ for _ in range(2):
             continue
         rel = f.relative_to(root).as_posix()
         for n, line in enumerate(f.read_text().split("\n"), 1):
+            if "// uncompiled" in line:
+                continue
             for m in re.finditer(r"\b(HashMap|HashSet|VecDeque)\b", line.split("//", 1)[0]):
                 rows.append({"reason": "compiler-message", "message": {
                     "code": {"code": "clippy::disallowed_types"},
@@ -1759,6 +1764,11 @@ lc_source() {
         '}' >"$root/$LC_A"
 }
 lc_append() { printf '%s\n' "$@" >>"$root/$LC_A"; }
+lc_append_to() { # <file> <line…>
+    local file=$1
+    shift
+    printf '%s\n' "$@" >>"$root/$file"
+}
 lc_edit() { sed -i.bak "$1" "$root/$2" && rm -f "$root/$2.bak"; }
 lc_reset() {
     git -C "$root" reset -q --hard HEAD && git -C "$root" clean -fdq
@@ -1808,6 +1818,16 @@ lc_reset
 lc_append 'pub struct Bare {' '    pub queue: VecDeque<u8>,' '}'
 expect_red_because "lint-scopes: containers — a new container with no allow" \
     "std::collections::VecDeque lacks a narrow allow of its own API class" lc_run "$root"
+lc_reset
+lc_append '#[cfg(feature = "absent")]' 'pub struct Off {' \
+    '    pub queue: VecDeque<u8>, // uncompiled: neither build enables the feature' '}'
+expect_red_because "lint-scopes: containers — a container in an item neither build compiles" \
+    "$LC_A:20: \`VecDeque\` names std::collections::VecDeque outside every \`container:\` allow" \
+    lc_run "$root"
+lc_reset
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    #[cfg(feature = "absent")]\n    pub off: HashMap<u8, u8>, // uncompiled|' "$LC_A"
+expect_red_because "lint-scopes: containers — a container neither build compiles, inside an exempt item" \
+    "\`struct Exempt\` names 2 container(s) in its text, 1 in the compiled spans" lc_run "$root"
 lc_reset
 lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
 expect_red_because "lint-scopes: containers — a row with no allow" \
@@ -1911,23 +1931,45 @@ lc_row crates/fake/src/two/other.rs 'struct Moved' 1 T 2099-12-31
 expect_red_because "lint-scopes: containers — an exempt item moved to another file" \
     "crates/fake/src/two/other.rs has record T rows and the HEAD's table has none" lc_run "$root"
 lc_reset
+LC_G=crates/fake/src/gated.rs
 printf '%s\n' '#[cfg(target_os = "windows")]' 'mod gated;' >>"$root/crates/fake/src/lib.rs"
-printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: D")]' 'pub struct Gated {' \
-    '    pub map: std::collections::HashMap<u8, u8>,' '}' >"$root/crates/fake/src/gated.rs"
-lc_row crates/fake/src/gated.rs 'struct Gated' 1 D 2099-12-31
+printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: D")]' \
+    'use std::collections::HashMap as Map;' '' \
+    '#[allow(clippy::disallowed_types, reason = "container: D")]' 'pub struct Gated {' \
+    '    pub map: Map<u8, u8>,' '}' >"$root/$LC_G"
+lc_gated_rows() {
+    lc_row "$LC_G" 'struct Gated' 1 D 2099-12-31
+    lc_row "$LC_G" 'use std::collections::HashMap as Map' 1 D 2099-12-31
+}
+lc_gated_rows
 ls_commit "$root" "a host-gated module"
 git -C "$root" branch -q -f base-tip HEAD
+expect green "lint-scopes: containers — a host-gated module, a same-file rename counted (control)" \
+    lc_run "$root"
 expect_output "lint-scopes: containers — a module this host does not compile is counted from its text" \
-    "crates/fake/src/gated.rs counted from its text (compiled only on windows)" lc_run "$root"
-lc_edit 's|    pub map: std::collections::HashMap<u8, u8>,|    pub map: (std::collections::HashMap<u8, u8>, std::collections::HashSet<u8>),|' \
-    crates/fake/src/gated.rs
+    "$LC_G counted from its text (compiled only on windows)" lc_run "$root"
+lc_edit 's|    pub map: Map<u8, u8>,|    pub map: (Map<u8, u8>, std::collections::HashSet<u8>),|' "$LC_G"
 expect_red_because "lint-scopes: containers — the text census sees a second container there" \
     "\`struct Gated\` holds 2 container span(s), its row says 1" lc_run "$root"
+lc_reset
+lc_append_to "$LC_G" 'pub struct Hole {' '    pub queue: std::collections::VecDeque<u8>,' '}'
+expect_red_because "lint-scopes: containers — a new item with no allow, in a module this host does not compile" \
+    "$LC_G:9: \`VecDeque\` names std::collections::VecDeque outside every \`container:\` allow" \
+    lc_run "$root"
+lc_reset
+lc_append_to "$LC_G" 'pub struct Renamed {' '    pub map: Map<u8, u8>,' '}'
+expect_red_because "lint-scopes: containers — a same-file rename used with no allow there" \
+    "$LC_G:9: \`Map\` names std::collections::HashMap outside every \`container:\` allow" lc_run "$root"
+lc_reset
+lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: D")\]$/{N;/pub struct Gated/s|^[^\n]*\n||;}' "$LC_G"
+lc_edit '/\tstruct Gated\t/d' "$LC_T"
+expect_red_because "lint-scopes: containers — an allow and its row deleted there, the container kept" \
+    "$LC_G:5: \`Map\` names std::collections::HashMap outside every \`container:\` allow" lc_run "$root"
 lc_reset
 git -C "$root" rm -q "$LC_T"
 ls_commit "$root" "the table deleted"
 lc_table
-lc_row crates/fake/src/gated.rs 'struct Gated' 1 D 2099-12-31
+lc_gated_rows
 expect_red_because "lint-scopes: containers — the table deleted at a ref whose gate has the maximum" \
     "has the container gate and no $LC_T — a deleted table is not a bootstrap" lc_run "$root"
 # first landing: every copy predates the container gate (bootstrap) and the
