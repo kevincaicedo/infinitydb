@@ -213,6 +213,11 @@ never a literal at the use site.
   item not yet migrated to a capped type carries a `container: <record>`
   allow, and `docs/container-exemptions.tsv` counts what each allow covers:
   a new container in an exempt item is red, and the counts only shrink.
+  The lint is workspace-wide, so code outside the cell crates allows it
+  once, with a reason: a test target, a bench or a binary at its crate
+  root (`#![allow(clippy::disallowed_types, reason = "test target: …")]`),
+  and a test module inside a cell crate on its `#[cfg(test)] mod`
+  (`reason = "test-only: …"`).
 - Bound **bytes and work as well as item counts**. A batch of a few large
   values can monopolize a core. Bound fan-out, response expansion, nesting,
   scratch space, and the bytes retained while waiting.
@@ -836,10 +841,11 @@ Use distinct names and types for different quantities:
   (`disallowed-methods`, ADR-0106 D7; `UNIX_EPOCH.elapsed()` and
   `_rdtsc` included): it breaks the simulator's authority over the
   universe, which is the single most valuable testing asset we own.
-  The same rule reaches containers: a cell-resident `HashMap`/`HashSet`
-  never carries `std`'s per-process `RandomState` — use
+  The same rule reaches containers: a new cell container is a capped type
+  (above), and a cell-resident `HashMap`/`HashSet` not yet migrated never
+  carries `std`'s per-process `RandomState` — it keeps
   `inf_foundation::BuildIntHasher` for internally generated keys
-  (addresses, tokens, keyed-hash outputs) or a `BTreeMap` when ordered
+  (addresses, tokens, keyed-hash outputs), or is a `BTreeMap` when ordered
   traversal is required. User-controlled keys use the keyed-hash contract;
   a deterministic integer hasher is not a substitute. Hash-map iteration
   order must not choose state-changing execution order.
