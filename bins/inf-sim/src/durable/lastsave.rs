@@ -36,7 +36,7 @@ fn rdb_last_save_time(reply: &[u8]) -> u64 {
 /// reads from the board itself.
 #[test]
 fn lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep() {
-    let mut quiet = Quiet::boot(2, super::DurableScenario::SPIN_ITERS);
+    let mut quiet = Quiet::boot(2, super::DurableScenario::SPIN_ITERS, 0);
     let mut client = MiniClient::connect(&mut quiet.node, 0);
     // Cell 1 cannot publish while cell 0 takes the three commands.
     quiet.node.frozen = Some((1, u64::MAX));
@@ -47,7 +47,7 @@ fn lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep()
     for _ in 0..256 {
         quiet.step();
     }
-    assert_eq!(quiet.node.plane(0).ckpt_waiters_for_sim(), 1, "the WAIT is parked on cell 0");
+    assert_eq!(quiet.waiters(), 1, "the WAIT is parked on cell 0");
     assert_eq!(client.recv(&mut quiet.node), None, "nothing answers before slot 1 publishes");
 
     // Cell 0 publishes for a host request; the sweep that sees it wakes
@@ -55,7 +55,7 @@ fn lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep()
     let own_before = quiet.published(0);
     quiet.node.ckpt_host.request(CkptTarget::Cell(CellId(0))).expect("a host unit");
     let mut steps = 0;
-    while quiet.node.plane(0).ckpt_waiters_for_sim() > 0 {
+    while quiet.waiters() > 0 {
         assert!(steps < STEPS_MAX, "cell 0's sweep never woke the WAIT");
         quiet.step();
         steps += 1;

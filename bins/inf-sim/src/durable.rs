@@ -1554,10 +1554,11 @@ pub(crate) struct Node {
     disk: SimDisk,
     observed_ready: bool,
     cells: Vec<(SimLoop, SimPlane)>,
-    /// Each cell's last reactor iteration, as `run_iteration` reported it
-    /// (all default before its first; a frozen cell keeps its last).
+    /// What each cell's reactor iteration reported in the last scheduler
+    /// step, as `run_iteration` returned it: `None` for a cell that step
+    /// did not run (frozen), and before the first step.
     #[allow(dead_code, reason = "read by the loop-tier tests, through `Node::iter_stats`")]
-    iter_stats: Vec<IterStats>,
+    iter_stats: Vec<Option<IterStats>>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
     inbox: ControlInbox,
@@ -1693,7 +1694,7 @@ pub(crate) fn boot(
         cells.push((cell_loop, plane));
     }
     Ok(Node {
-        iter_stats: vec![IterStats::default(); cells.len()],
+        iter_stats: vec![None; cells.len()],
         cells,
         nets,
         control,
@@ -1755,10 +1756,11 @@ impl Node {
         for i in 0..n {
             let idx = (i + rotate) % n;
             if Some(idx) == skip {
+                self.iter_stats[idx] = None;
                 continue;
             }
             let (cell_loop, plane) = &mut self.cells[idx];
-            self.iter_stats[idx] = cell_loop.run_iteration(plane).expect("sim iteration");
+            self.iter_stats[idx] = Some(cell_loop.run_iteration(plane).expect("sim iteration"));
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
             }
@@ -1788,12 +1790,14 @@ impl Node {
         &mut self.cells[cell].1
     }
 
-    /// What `cell`'s last reactor iteration reported. `parked` is the
-    /// reactor's own decision, made before the driver call: the sim driver
-    /// ignores the wait, so a park shows as this flag and never as elapsed
-    /// virtual time. Read between scheduler steps.
+    /// What `cell`'s reactor iteration reported in the last scheduler step,
+    /// `None` when that step did not run the cell (frozen): a skipped cell
+    /// has no iteration to read. `parked` is the reactor's own decision,
+    /// made before the driver call: the sim driver ignores the wait, so a
+    /// park shows as this flag and never as elapsed virtual time. Read
+    /// between scheduler steps.
     #[cfg(test)]
-    pub(crate) fn iter_stats(&self, cell: usize) -> IterStats {
+    pub(crate) fn iter_stats(&self, cell: usize) -> Option<IterStats> {
         self.iter_stats[cell]
     }
 

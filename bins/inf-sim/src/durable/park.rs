@@ -3,13 +3,16 @@
 //! plane over the sim driver.
 //!
 //! - **Estimator and scope:** `IterStats::parked` of one cell's reactor
-//!   iteration, kept by [`Node::iter_stats`]. It is the reactor's own
-//!   decision (spin exhausted, no ready task, no `before_park` veto), made
-//!   before the driver call. The sim driver ignores the wait, so a park is
-//!   this flag and never elapsed virtual time.
+//!   iteration, kept by [`Node::iter_stats`]: the cell a [`Quiet`] node
+//!   watches, any cell of the node. It is the reactor's own decision (spin
+//!   exhausted, no ready task, no `before_park` veto), made before the
+//!   driver call, so it reads the state the iteration before it left. The
+//!   sim driver ignores the wait, so a park is this flag and never elapsed
+//!   virtual time.
 //! - **Resolution:** one reactor iteration. The harness runs each cell
 //!   once per scheduler step, and the publishing iteration is the step in
-//!   which the cell's board slot moved.
+//!   which the cell's board slot moved. A step that skips the watched cell
+//!   (frozen) reads nothing: no flag, no count.
 //! - **Spread, and the control leg:** none. Time is virtual and the
 //!   scheduler seeded, so two runs of one seed read the same flags (the
 //!   control test asserts it). The control is the same publication with no
@@ -39,13 +42,18 @@ pub(super) struct Quiet {
     pub(super) clock: Rc<VirtualClock>,
     disk: SimDisk,
     step_ns_max: u64,
-    /// Iterations of cell 0 the instrument read, and how many parked.
+    /// The cell whose reactor the instrument reads.
+    watched: u16,
+    /// Iterations of the watched cell the instrument read, and how many
+    /// parked.
     iterations_read: u64,
     parks_read: u64,
 }
 
 impl Quiet {
-    pub(super) fn boot(cells: u16, spin_iters: u32) -> Quiet {
+    /// Boots a `cells`-cell node and watches cell `watched`.
+    pub(super) fn boot(cells: u16, spin_iters: u32, watched: u16) -> Quiet {
+        assert!(watched < cells, "the watched cell is on the node");
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
         let disk = build_disk(SEED, Some(&StallConfig::write_reorder()));
         let scenario = DurableScenario { cells, spin_iters, ..DurableScenario::m2_durable(SEED) };
@@ -57,6 +65,7 @@ impl Quiet {
             clock,
             disk,
             step_ns_max: scenario.step_ns_max,
+            watched,
             iterations_read: 0,
             parks_read: 0,
         };
@@ -69,39 +78,51 @@ impl Quiet {
         panic!("the node did not recover in {STEPS_MAX} steps");
     }
 
-    /// One scheduler step; reads cell 0's park decision for it.
-    pub(super) fn step(&mut self) -> bool {
+    /// One scheduler step. Returns the park decision of the iteration the
+    /// watched cell ran in it, `None` when the step skipped that cell
+    /// (frozen): it ran no iteration, so nothing is read or counted.
+    pub(super) fn step(&mut self) -> Option<bool> {
         self.node.step(&mut self.rng, &self.clock, &self.disk, self.step_ns_max).expect("step");
-        let parked = self.node.iter_stats(0).parked;
+        let parked = self.node.iter_stats(usize::from(self.watched))?.parked;
         self.iterations_read += 1;
         self.parks_read += u64::from(parked);
-        parked
+        Some(parked)
+    }
+
+    /// One scheduler step in which the watched cell runs: its park decision.
+    fn step_watched(&mut self) -> bool {
+        self.step().expect("the watched cell is frozen: it ran no iteration to read")
     }
 
     pub(super) fn published(&self, cell: u16) -> u64 {
         self.node.control.ckpt_board().slot(cell).published()
     }
 
-    /// Steps until cell 0's slot moves: the step that returns is cell 0's
-    /// publishing iteration. Returns the waiters registered on cell 0 when
-    /// that iteration began.
-    pub(super) fn step_to_own_publication(&mut self) -> usize {
-        let before = self.published(0);
+    /// Pumps parked on the watched cell's checkpoint waitlist.
+    pub(super) fn waiters(&self) -> usize {
+        self.node.plane(usize::from(self.watched)).ckpt_waiters_for_sim()
+    }
+
+    /// Steps until the watched cell's slot moves: the step that returns is
+    /// its publishing iteration. Returns the waiters registered on the cell
+    /// when that iteration began.
+    fn step_to_own_publication(&mut self) -> usize {
+        let before = self.published(self.watched);
         for _ in 0..STEPS_MAX {
-            let waiters = self.node.plane(0).ckpt_waiters_for_sim();
-            self.step();
-            if self.published(0) != before {
+            let waiters = self.waiters();
+            self.step_watched();
+            if self.published(self.watched) != before {
                 return waiters;
             }
         }
-        panic!("cell 0 published no checkpoint in {STEPS_MAX} steps");
+        panic!("cell {} published no checkpoint in {STEPS_MAX} steps", self.watched);
     }
 }
 
-/// What the instrument read around one own publication of cell 0.
+/// What the instrument read around one own publication of the watched cell.
 #[derive(Debug, PartialEq, Eq)]
 struct ParkRead {
-    /// Waiters on cell 0 when its publishing iteration began.
+    /// Waiters on the cell when its publishing iteration began.
     waiters_at_publication: usize,
     /// `parked` of the iteration after the publishing one.
     parked_after: bool,
@@ -112,13 +133,13 @@ struct ParkRead {
 /// The control leg's run: a 1-cell node, `INF.CKPT` with no `WAIT`, read
 /// through the iteration after the publishing one.
 fn publication_with_no_waiter(spin_iters: u32) -> ParkRead {
-    let mut quiet = Quiet::boot(1, spin_iters);
+    let mut quiet = Quiet::boot(1, spin_iters, 0);
     let mut client = MiniClient::connect(&mut quiet.node, 0);
     let Quiet { node, rng, clock, disk, step_ns_max, .. } = &mut quiet;
     let reply = client.call(node, rng, clock, disk, *step_ns_max, &[b"INF.CKPT"]).expect("call");
     assert_eq!(reply.as_deref(), Some(b"+OK\r\n".as_slice()), "INF.CKPT");
     let waiters_at_publication = quiet.step_to_own_publication();
-    let parked_after = quiet.step();
+    let parked_after = quiet.step_watched();
     ParkRead {
         waiters_at_publication,
         parked_after,
@@ -135,7 +156,6 @@ fn a_publication_with_no_waiter_parks_the_next_iteration() {
     let read = publication_with_no_waiter(0);
     assert_eq!(read.waiters_at_publication, 0, "the control leg has no waiter");
     assert!(read.parked_after, "the iteration after the publication did not park: {read:?}");
-    assert!(read.parks_read > 0, "liveness: the instrument read no park in {read:?}");
     assert_eq!(read, publication_with_no_waiter(0), "one seed, one sequence of flags");
 }
 
@@ -151,62 +171,101 @@ fn canary_a_spinning_loop_reads_no_park_after_the_publication() {
     assert!(read.iterations_read > 0);
 }
 
-/// ADR-0159 A1.4's own-slot term at the loop tier: with `spin_iters: 0` and
-/// an `INF.CKPT WAIT` parked on the cell that publishes last, no iteration
-/// parks from the one after the publishing iteration through the one whose
-/// MAINTAIN wakes the waitlist. Without the term the cell parks on top of a
-/// satisfied `WAIT` and answers it one park timeout late.
-#[test]
-fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
-    let mut quiet = Quiet::boot(1, 0);
-    let mut client = MiniClient::connect(&mut quiet.node, 0);
-    client.send(&mut quiet.node, &[b"INF.CKPT", b"WAIT"]);
-    let waiters = quiet.step_to_own_publication();
-    assert_eq!(waiters, 1, "VACUOUS: no WAIT was registered when cell 0 published");
-    let mut window = Vec::new();
-    while quiet.node.plane(0).ckpt_waiters_for_sim() > 0 {
-        assert!(window.len() < 16, "the waitlist was never woken: {window:?}");
-        window.push(quiet.step());
+/// What the instrument read from an own publication through its wake.
+#[derive(Debug)]
+struct WakeWindow {
+    /// `parked` of each iteration from the one after the publishing
+    /// iteration through the one whose MAINTAIN woke the waitlist.
+    flags: Vec<bool>,
+    /// Parks the instrument read up to the publishing iteration: its
+    /// liveness in this run.
+    parks_before: u64,
+}
+
+/// An own publication of cell `waiter` with `argv` (a `WAIT` that this
+/// publication satisfies) parked on that cell, on a `cells`-cell node at
+/// `spin_iters: 0`. The cell first sits out `skipped_steps` scheduler
+/// steps, which moves its sweep's phase at the publication. The window is
+/// bounded by the guard's limit, `2 * ceil(N / 64)` turns, and the `WAIT`
+/// then answers.
+fn own_publication_window(
+    cells: u16,
+    waiter: u16,
+    skipped_steps: u32,
+    argv: &[&[u8]],
+) -> WakeWindow {
+    let mut quiet = Quiet::boot(cells, 0, waiter);
+    quiet.node.frozen = Some((usize::from(waiter), u64::from(skipped_steps)));
+    for _ in 0..skipped_steps {
+        assert_eq!(quiet.step(), None, "a skipped cell runs no iteration");
     }
-    assert!(
-        !window.contains(&true),
-        "a parked iteration between the publication and its wake (parked flags, from the \
-         iteration after the publishing one through the waking one): {window:?}"
-    );
+    let mut client = MiniClient::connect(&mut quiet.node, usize::from(waiter));
+    client.send(&mut quiet.node, argv);
+    let waiters = quiet.step_to_own_publication();
+    assert_eq!(waiters, 1, "VACUOUS: no WAIT was registered when cell {waiter} published");
+    let parks_before = quiet.parks_read;
+    let turns_max = 2 * usize::from(cells).div_ceil(64);
+    let mut flags = Vec::new();
+    while quiet.waiters() > 0 {
+        assert!(
+            flags.len() < turns_max,
+            "{cells} cells: the waitlist was not woken within {turns_max} turns: {flags:?}"
+        );
+        flags.push(quiet.step_watched());
+    }
     let reply = (0..16).find_map(|_| {
         quiet.step();
         client.recv(&mut quiet.node)
     });
     assert_eq!(reply.as_deref(), Some(b"+OK\r\n".as_slice()), "the WAIT answers");
+    WakeWindow { flags, parks_before }
 }
 
-/// The guard ends (ADR-0159 A1.4): an all-cell `WAIT` on a 2-cell node
-/// whose peer never publishes is not satisfied by this cell's own
-/// publication. Once a sweep that began after the publication completed,
-/// the cell parks with its waiter still registered: the own-slot term holds
-/// for at most `2 * ceil(N / 64)` turns, and the wake's re-check takes one.
+/// The park guard's own-slot term at the loop tier (`interfaces-m2.md`,
+/// "Cells never fold the whole board"): with `spin_iters: 0` and an
+/// `INF.CKPT WAIT` parked on the cell that publishes last, no iteration
+/// parks from the one after the publishing iteration through the one whose
+/// MAINTAIN wakes the waitlist: one turn at 1 cell. Without the term the
+/// cell parks on top of a satisfied `WAIT` and answers it one park timeout
+/// late.
+#[test]
+fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
+    let read = own_publication_window(1, 0, 0, &[b"INF.CKPT", b"WAIT"]);
+    assert!(read.parks_before > 0, "liveness: the instrument read no park in {read:?}");
+    assert_eq!(
+        read.flags,
+        [false],
+        "a parked iteration between the publication and its wake (parked flags, from the \
+         iteration after the publishing one through the waking one), or more than the one \
+         turn a 1-cell sweep takes"
+    );
+}
+
+/// The guard ends: an all-cell `WAIT` on a 2-cell node whose peer never
+/// publishes is not satisfied by this cell's own publication. The own-slot
+/// term holds for one turn at 64 cells or fewer, the wake's re-check takes
+/// the next, and then the cell parks with its waiter still registered.
 #[test]
 fn a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park() {
-    const CELLS: u16 = 2;
-    let mut quiet = Quiet::boot(CELLS, 0);
+    let mut quiet = Quiet::boot(2, 0, 0);
     let mut client = MiniClient::connect(&mut quiet.node, 0);
     // The peer is never stepped again, so its slot stays at 0.
     quiet.node.frozen = Some((1, u64::MAX));
     client.send(&mut quiet.node, &[b"INF.CKPT", b"WAIT"]);
     let waiters = quiet.step_to_own_publication();
     assert_eq!(waiters, 1, "VACUOUS: no WAIT was registered when cell 0 published");
-    let turns_max = 2 * usize::from(CELLS).div_ceil(64) + 2;
     let mut flags = Vec::new();
     while flags.last() != Some(&true) {
-        assert!(flags.len() < turns_max, "the cell never parks after its publication: {flags:?}");
-        flags.push(quiet.step());
+        assert!(flags.len() < 3, "the cell never parks after its publication: {flags:?}");
+        flags.push(quiet.step_watched());
     }
-    // The wake's re-check, if it is still owed, runs and parks again.
+    assert_eq!(flags, [false, false, true], "one guard turn, the re-check's turn, then a park");
+    // Nothing owed is left: the cell stays parked on its unsatisfied WAIT.
     for _ in 0..4 {
         quiet.step();
     }
     assert_eq!(quiet.published(1), 0, "the peer published");
-    assert_eq!(quiet.node.plane(0).ckpt_waiters_for_sim(), 1, "the WAIT is still parked");
+    assert_eq!(quiet.waiters(), 1, "the WAIT is still parked");
     assert_eq!(client.recv(&mut quiet.node), None, "an unsatisfied WAIT answered");
 }
 
@@ -216,15 +275,15 @@ fn a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park() {
 /// registered waiter would read no park here.
 #[test]
 fn a_peers_publication_does_not_hold_the_waiting_cell_awake() {
-    let mut quiet = Quiet::boot(2, 0);
+    let mut quiet = Quiet::boot(2, 0, 0);
     let mut client = MiniClient::connect(&mut quiet.node, 0);
     client.send(&mut quiet.node, &[b"INF.CKPT", b"CELL", b"1", b"WAIT"]);
     let mut parks_while_waiting = 0u32;
     let mut steps = 0;
     while quiet.published(1) == 0 {
         assert!(steps < STEPS_MAX, "cell 1 published no checkpoint");
-        let waiting = quiet.node.plane(0).ckpt_waiters_for_sim() == 1;
-        parks_while_waiting += u32::from(quiet.step() && waiting);
+        let waiting = quiet.waiters() == 1;
+        parks_while_waiting += u32::from(quiet.step_watched() && waiting);
         steps += 1;
     }
     assert_eq!(quiet.published(0), 0, "cell 0 published: the WAIT targets cell 1 alone");
