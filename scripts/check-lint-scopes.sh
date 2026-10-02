@@ -32,9 +32,10 @@
 # which lint"; later slices add their lints as rows, not as new scans.
 #
 # INF_LINT_BASE_REF=<ref> names the base branch tip (default origin/main).
-# INF_CONTAINER_CENSUS=1 prints the container census (file, item, count,
-# record — the table's generated columns) from the ratchet's two clippy
-# passes and judges nothing else.
+# INF_CONTAINER_CENSUS=1 prints docs/container-exemptions.tsv as the tree
+# makes it (header, rows, each expiry carried from the working table) on
+# stdout, from the ratchet's two clippy passes, and judges nothing else; its
+# other output, the ratchet's verdict included, goes to stderr.
 
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -73,6 +74,7 @@ import json
 import re
 import subprocess
 import sys
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -88,10 +90,18 @@ CONTAINERS = os.environ["INF_CONTAINERS"]
 CONTAINER_MAX = int(os.environ["INF_CONTAINER_MAX"])
 BACKING_SITES = int(os.environ["INF_BACKING_SITES"])
 CENSUS = os.environ.get("INF_CONTAINER_CENSUS") == "1"
-# ADR-0163 D2: the site records that own an exempt row (ADR-0163 D3: T E M C
-# A D R F). `capped-backing` is the one sanctioned holder's allow (ADR-0151
-# D6) and has no row.
-RECORDS = ("T", "E", "M", "C", "A", "D", "R", "F")
+# The census's stdout is the container table alone; everything else it says
+# goes to stderr.
+TABLE_OUT = sys.stdout
+if CENSUS:
+    sys.stdout = sys.stderr
+# ADR-0163 D2: the site records that own an exempt row, and what each holds
+# (ADR-0163 D3; the census prints this as the table's legend).
+# `capped-backing` is the one sanctioned holder's allow (ADR-0151 D6) and has
+# no row.
+RECORDS = {"T": "tier write path", "E": "executor and gates", "M": "timers", "C": "cold reads",
+           "A": "accept and connection", "D": "driver states", "R": "relocation and shadow",
+           "F": "retirement and namespace lifetimes"}
 BACKING, BACKING_ITEM, BACKING_HOME = "capped-backing", "struct CappedDeque", "crates/inf-foundation/src/bounded"
 HOST_OS = {"linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
 
@@ -524,6 +534,44 @@ if diagnostics:
 # item; a span inside two allowed items belongs to the narrower. A file this
 # host does not compile (a `mod` under another `target_os`) is counted from
 # its text instead (a same-file rename counted), and disclosed.
+# ---- ADR-0163 D2: the container exemption table's rows.
+# Columns: file, item, count, record, expiry. The census generates them,
+# carrying each expiry, which is set by hand and only moves earlier.
+DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+GATE_MAX = re.compile(r"^CONTAINER_EXEMPTIONS_MAX=([0-9]+)[ \t]*$", re.M)
+
+
+def container_rows(text, label):
+    rows = {}
+    for n, line in enumerate(text.split("\n"), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        at = f"{label}:{n}"
+        if len(cols) != 5 or not all(cols):
+            errors.append(f"{at}: malformed row (file<TAB>item<TAB>count<TAB>record<TAB>expiry)")
+            continue
+        file, item, count, record, expiry = cols
+        if not re.fullmatch(r"[1-9][0-9]*", count):
+            errors.append(f"{at}: count `{count}` is not a positive integer")
+            continue
+        if record not in RECORDS:
+            errors.append(f"{at}: record `{record}` is not a site record ({' '.join(RECORDS)})")
+            continue
+        try:
+            due = datetime.date.fromisoformat(expiry) if DATE.match(expiry) else None
+        except ValueError:
+            due = None
+        if due is None:
+            errors.append(f"{at}: expiry `{expiry}` is not a date (YYYY-MM-DD)")
+            continue
+        if (file, item) in rows:
+            errors.append(f"{at}: {file} `{item}` is listed twice")
+            continue
+        rows[(file, item)] = (int(count), record, due)
+    return rows
+
+
 def holder(file, line):
     """The key of the narrowest `container:`-allowed item of `file` holding
     `line`, or None."""
@@ -562,18 +610,49 @@ if diagnostics:
                 errors.append(f"{f}: `{key}` names {n} container(s) in its text, {census[(f, key)]} in "
                               "the compiled spans — one neither build compiles is still a container, and a "
                               "container added to an exempt item is red: use a capped type")
+TABLE_HEADER = """\
+# ADR-0163 D2: the cell-crate items that still name a std container clippy.toml bans, each under
+# a `container: <record>` allow. Generated whole, header included, by `INF_CONTAINER_CENSUS=1
+# scripts/check-lint-scopes.sh >table.new`, then `mv table.new` over this file (the census reads
+# each expiry here, so never redirect onto it). A merge conflict, a renamed or split item and a
+# lowered count are resolved by regenerating. `count`: the distinct spans the allow covers.
+# `expiry`, the one hand edit, only moves earlier; the census carries it by (file, item), else
+# from the file and record's earliest date. Per file and record the counts only shrink against
+# the approved copies, and their sum is CONTAINER_EXEMPTIONS_MAX exactly."""
 if CENSUS:
     if not diagnostics:
         print("LINT-SCOPES SCOPE ERROR: the container census needs the ratchet's passes")
         sys.exit(1)
+    working = {}
+    if Path(CONTAINERS).is_file():
+        if not Path(CONTAINERS).read_text().strip():
+            print(f"LINT-SCOPES SCOPE ERROR: {CONTAINERS} is empty — write the census to another file "
+                  "and move it over the table: the census reads each expiry from it")
+            sys.exit(1)
+        working = container_rows(Path(CONTAINERS).read_text(), CONTAINERS)
+    earliest = {}
+    for (f, _), (_, record, due) in working.items():
+        earliest[(f, record)] = min(due, earliest.get((f, record), due))
     record_of = {(s[0], s[3]): s[4] for s in container_sites}
-    rows = [(f, key, n, record_of[(f, key)]) for (f, key), n in sorted(census.items())
-            if record_of[(f, key)] != BACKING]
+    rows = []
+    for (f, key), n in sorted(census.items()):
+        record = record_of[(f, key)]
+        if record == BACKING:
+            continue
+        kept = working.get((f, key))
+        due = kept[2] if kept and kept[1] == record else earliest.get((f, record))
+        rows.append((f, key, n, record, due.isoformat() if due else "undated"))
+    legend = " · ".join(f"{letter} {holds}" for letter, holds in RECORDS.items())
+    print(TABLE_HEADER, file=TABLE_OUT)
+    for line in textwrap.wrap(f"Records (ADR-0163 D3): {legend}.", width=96):
+        print(f"# {line}", file=TABLE_OUT)
+    print("# file\titem\tcount\trecord\texpiry", file=TABLE_OUT)
     for row in rows:
-        print("\t".join(str(col) for col in row))
+        print("\t".join(str(col) for col in row), file=TABLE_OUT)
     gated = "".join(f"; {f} counted from its text (compiled only on {os_name})"
                     for f, os_name in sorted(text_counted.items()))
-    print(f"# container census: {len(rows)} rows, sum {sum(r[2] for r in rows)}{gated}")
+    print(f"# container census: {len(rows)} rows, sum {sum(r[2] for r in rows)} "
+          f"(CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX}){gated}")
     sys.exit(0)
 
 # ---- ADR-0163 D2's backstop, read from the text and so the same on every
@@ -637,44 +716,6 @@ for label, ref in copies:
         was = (renames.get(row[0], row[0]), row[1], row[2])
         if row not in approved and was not in approved:
             errors.append(f"{EXEMPTIONS}: row {row[0]} {row[1]} is not in the {label}'s table — the table only shrinks (a renamed file keeps its row once the rename is staged)")
-
-# ---- ADR-0163 D2: the container exemption table.
-# Columns: file, item, count, record, expiry. The first four are the
-# census's; the expiry is assigned by hand and only moves earlier.
-DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-GATE_MAX = re.compile(r"^CONTAINER_EXEMPTIONS_MAX=([0-9]+)[ \t]*$", re.M)
-
-
-def container_rows(text, label):
-    rows = {}
-    for n, line in enumerate(text.split("\n"), 1):
-        if not line.strip() or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        at = f"{label}:{n}"
-        if len(cols) != 5 or not all(cols):
-            errors.append(f"{at}: malformed row (file<TAB>item<TAB>count<TAB>record<TAB>expiry)")
-            continue
-        file, item, count, record, expiry = cols
-        if not re.fullmatch(r"[1-9][0-9]*", count):
-            errors.append(f"{at}: count `{count}` is not a positive integer")
-            continue
-        if record not in RECORDS:
-            errors.append(f"{at}: record `{record}` is not a site record ({' '.join(RECORDS)})")
-            continue
-        try:
-            due = datetime.date.fromisoformat(expiry) if DATE.match(expiry) else None
-        except ValueError:
-            due = None
-        if due is None:
-            errors.append(f"{at}: expiry `{expiry}` is not a date (YYYY-MM-DD)")
-            continue
-        if (file, item) in rows:
-            errors.append(f"{at}: {file} `{item}` is listed twice")
-            continue
-        rows[(file, item)] = (int(count), record, due)
-    return rows
-
 
 if not Path(CONTAINERS).is_file():
     print(f"LINT-SCOPES SCOPE ERROR: {CONTAINERS} is missing")

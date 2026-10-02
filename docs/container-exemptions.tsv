@@ -1,9 +1,14 @@
-# ADR-0163 D2: the cell-crate items that still name a std HashMap, HashSet or VecDeque, each
-# under a `container: <record>` allow. Generated: `INF_CONTAINER_CENSUS=1
-# scripts/check-lint-scopes.sh` prints the first four columns (count: the distinct spans the
-# allow covers). `expiry` is assigned by hand (T: 2026-10-31, the date of ADR-0170 DV-1 and
-# DV-2; every other record: 2026-11-30) and only moves earlier. Per file and record the counts
-# only shrink against the approved copies; their sum is CONTAINER_EXEMPTIONS_MAX at most.
+# ADR-0163 D2: the cell-crate items that still name a std container clippy.toml bans, each under
+# a `container: <record>` allow. Generated whole, header included, by `INF_CONTAINER_CENSUS=1
+# scripts/check-lint-scopes.sh >table.new`, then `mv table.new` over this file (the census reads
+# each expiry here, so never redirect onto it). A merge conflict, a renamed or split item and a
+# lowered count are resolved by regenerating. `count`: the distinct spans the allow covers.
+# `expiry`, the one hand edit, only moves earlier; the census carries it by (file, item), else
+# from the file and record's earliest date. Per file and record the counts only shrink against
+# the approved copies, and their sum is CONTAINER_EXEMPTIONS_MAX exactly.
+# Records (ADR-0163 D3): T tier write path · E executor and gates · M timers · C cold reads · A
+# accept and connection · D driver states · R relocation and shadow · F retirement and namespace
+# lifetimes.
 # file	item	count	record	expiry
 crates/inf-log/src/commit.rs	fn GroupCommit::with_flush_bound	2	T	2026-10-31
 crates/inf-log/src/commit.rs	struct GroupCommit	2	T	2026-10-31

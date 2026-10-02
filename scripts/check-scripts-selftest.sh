@@ -1756,6 +1756,25 @@ lc_census() {
     env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" \
         INF_CONTAINER_CENSUS=1 "$LINTSCOPES"
 }
+# lc_census_is_table <root> [via-ratchet]: the census's stdout is a table
+# alone — every row five columns, the rows the root's table's — and a
+# census through the ratchet still prints when the ratchet's verdict is red,
+# which it reports on stderr.
+lc_census_is_table() {
+    local out="$work/census.out" err="$work/census.err"
+    if [ "${2:-}" = via-ratchet ]; then
+        lc_diag "$1"
+        env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_INPUT="$1/api.json" \
+            INF_CONTAINER_CENSUS=1 "$LS_GATE/scripts/check-lint-ratchet.sh" >"$out" 2>"$err" || return 1
+        grep -q 'lint-ratchet FAILED' "$err" || { echo "the ratchet's red verdict is not on stderr"; return 1; }
+    else
+        lc_census "$1" >"$out" 2>"$err" || return 1
+    fi
+    cat "$out"
+    grep -v '^#' "$out" | awk -F'\t' 'NF != 5 { print "not five columns: " $0; bad = 1 } END { exit bad }' ||
+        return 1
+    diff <(grep -v '^#' "$out" | LC_ALL=C sort) <(grep -v '^#' "$1/$LC_T" | LC_ALL=C sort)
+}
 lc_row() { printf '%s\t%s\t%s\t%s\t%s\n' "$@" >>"$root/$LC_T"; }
 lc_table() {
     printf '# file\titem\tcount\trecord\texpiry\n' >"$root/$LC_T"
@@ -1805,8 +1824,28 @@ ls_commit "$root" containers
 git -C "$root" branch -q -f base-tip HEAD
 ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
-expect_output "lint-scopes: containers — the census prints file, item, count, record" \
-    "$(printf 'fn Owner::build\t2\tE')" lc_census "$root"
+expect_output "lint-scopes: containers — the census prints file, item, count, record, expiry" \
+    "$(printf 'fn Owner::build\t2\tE\t2099-12-31')" lc_census "$root"
+expect green "lint-scopes: containers — the census's stdout is the table: its rows, five columns" \
+    lc_census_is_table "$root"
+expect_output "lint-scopes: containers — the census's header carries the record legend" \
+    "^# Records (ADR-0163 D3): T tier write path" lc_census "$root"
+printf 'fn_length\t1\t%s\n' "$LC_A" >"$root/docs/lint-baseline.tsv"
+expect green "lint-scopes: containers — the census runs when the ratchet's own verdict is red" \
+    lc_census_is_table "$root" via-ratchet
+lc_reset
+lc_edit 's|pub struct Exempt {|pub struct Kept {|' "$LC_A"
+expect_output "lint-scopes: containers — a renamed item's row carries its file and record's date" \
+    "$(printf 'struct Kept\t1\tT\t2099-12-31')" lc_census "$root"
+lc_append '#[allow(clippy::disallowed_types, reason = "container: A")]' 'pub struct Fresh {' \
+    '    pub queue: VecDeque<u8>,' '}'
+expect_output "lint-scopes: containers — a row with no date to carry is printed undated" \
+    "$(printf 'struct Fresh\t1\tA\tundated')" lc_census "$root"
+lc_reset
+: >"$root/$LC_T"
+expect_red_because "lint-scopes: containers — the census refuses a table emptied by its own redirect" \
+    "is empty" lc_census "$root"
+lc_reset
 expect_output "lint-scopes: containers — the OK line discloses the table" \
     "container exemptions: 3 row(s), counts 5/$LC_MAX, 0/0 capped-backing" lc_run "$root"
 lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"

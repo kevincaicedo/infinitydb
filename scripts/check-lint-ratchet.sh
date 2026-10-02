@@ -23,10 +23,18 @@
 # INF_LINT_BASE_REF=<ref> names the base branch tip (default origin/main).
 # INF_LINT_RATCHET_HOST=<uname -s>: the baseline is recorded on Linux; on
 # another host a row whose cfg-gated file never compiled is disclosed.
+# INF_CONTAINER_CENSUS=1 (check-lint-scopes.sh's census, which runs these
+# passes through here): stdout carries the census's table alone, this
+# ratchet's report goes to stderr, and its red verdict does not stop the
+# census — with fixture input too, which then stands for the passes.
 
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
+CENSUS=${INF_CONTAINER_CENSUS:-0}
+if [ "$CENSUS" = 1 ]; then
+    exec 3>&1 1>&2
+fi
 work=$(mktemp -d)
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
@@ -50,12 +58,13 @@ else
     }
 fi
 
+verdict=0
 INF_BASELINE="${INF_LINT_BASELINE:-docs/lint-baseline.tsv}" \
 INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" \
 INF_BASE_REF="${INF_LINT_BASE_REF:-origin/main}" \
 INF_HOST="${INF_LINT_RATCHET_HOST:-$(uname -s)}" \
 INF_SCRIPT_DIR="$SCRIPT_DIR" \
-python3 -B - "$work/clippy.json" <<'PY'
+python3 -B - "$work/clippy.json" <<'PY' || verdict=$?
 import json
 import os
 import re
@@ -249,6 +258,11 @@ PY
 
 # The compiler exposes suppressed API calls in these same two passes. Their
 # exact classes/scopes have one audit, shared with the ordinary scope gate.
+if [ "$CENSUS" = 1 ]; then
+    INF_LINT_API_DIAGNOSTICS="$work/clippy.json" "$SCRIPT_DIR/check-lint-scopes.sh" >&3
+    exit 0
+fi
+[ "$verdict" -eq 0 ] || exit "$verdict"
 if [ -z "${INF_LINT_RATCHET_INPUT:-}" ]; then
     INF_LINT_API_DIAGNOSTICS="$work/clippy.json" "$SCRIPT_DIR/check-lint-scopes.sh"
 fi
