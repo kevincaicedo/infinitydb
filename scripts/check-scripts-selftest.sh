@@ -2125,6 +2125,25 @@ lc_append '#[cfg(test)]' 'mod tests {' '    mod model;' '}'
 expect_red_because "lint-scopes: containers — an out-of-line child of an inline test module" \
     "$LC_A:20: \`mod model;\` inside an inline module or a block" lc_run "$root"
 lc_reset
+# The depth is the code's: a brace in a comment or a char literal is not one.
+lc_append 'mod inner {' '    // a comment that ends in a brace: }' '    #[cfg(test)]' '    mod probe;' '}'
+lc_testmod crates/fake/src/a/probe.rs ' // uncompiled: test code'
+expect_red_because "lint-scopes: containers — a test module inside an inline module, after a comment's brace" \
+    "$LC_A:21: \`mod probe;\` inside an inline module or a block" lc_run "$root"
+lc_reset
+lc_append "const OPEN: char = '{';" "${LC_TEST_DECL[@]}" 'mod tests;'
+lc_testmod crates/fake/src/a/tests.rs ' // uncompiled: test code'
+expect green "lint-scopes: containers — a '{' char literal above a file-level test module (control)" \
+    lc_run "$root"
+lc_reset
+# The stripper reports no `modfile` for this visibility, so the declaration
+# is production code and its file is held by the backstop.
+lc_append '#[cfg(test)]' 'pub(in crate::a) mod t;'
+lc_testmod crates/fake/src/a/t.rs ' // uncompiled: test code'
+expect_red_because "lint-scopes: containers — a test-only declaration the stripper does not report" \
+    "crates/fake/src/a/t.rs:1: \`HashMap\` names std::collections::HashMap outside every \`container:\` allow" \
+    lc_run "$root"
+lc_reset
 lc_append_to crates/fake/src/lib.rs 'pub mod b;' "${LC_TEST_DECL[@]}" '#[path = "b.rs"]' 'mod b_again;'
 lc_testmod crates/fake/src/b.rs ' // uncompiled: a feature neither build enables'
 expect_red_because "lint-scopes: containers — a test module whose #[path] names a production module's file" \
