@@ -1973,6 +1973,8 @@ expect_red_because "lint-scopes: containers — a new container with no allow" \
     "std::collections::VecDeque lacks a narrow allow of its own API class" lc_run "$root"
 expect green "lint-scopes: containers — a new container is reported once, with the ban's sentence" \
     lc_red_once "$root" "$LC_A:19: std::collections::VecDeque lacks a narrow allow of its own API class — cell code holds no growable std container: use"
+expect green "lint-scopes: containers — the site has one violation line: the backstop does not repeat it" \
+    lc_red_once "$root" "LINT-SCOPES violation: $LC_A:19: "
 lc_reset
 lc_append '#[cfg(feature = "absent")]' 'pub struct Off {' \
     '    pub queue: VecDeque<u8>, // uncompiled: neither build enables the feature' '}'
@@ -2099,6 +2101,25 @@ lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing
     '    pub queue: VecDeque<u8>,' '}'
 expect_red_because "lint-scopes: containers — the backing allow on another item" \
     "\`container: capped-backing\` on \`struct Holder\` in $LC_A" lc_run "$root"
+lc_reset
+# the backing's place has two halves, each with its own plant: the item and
+# the directory; and the one backing holds exactly one container
+lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
+    'pub struct CappedDeque<T> {' '    inner: VecDeque<T>,' '}'
+expect_red_because "lint-scopes: containers — the backing's item outside bounded/" \
+    "\`container: capped-backing\` on \`struct CappedDeque\` in $LC_A" lc_run "$root"
+lc_reset
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
+    'pub struct Spare<T> {' '    inner: std::collections::VecDeque<T>,' '}'
+expect_red_because "lint-scopes: containers — another item in bounded/ under the backing's allow" \
+    "\`container: capped-backing\` on \`struct Spare\` in $LC_B" lc_run "$root"
+lc_reset
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
+    'pub struct CappedDeque<T> {' '    inner: Vec<T>,' '}'
+expect_red_because "lint-scopes: containers — the backing holds no container" \
+    "the backing \`struct CappedDeque\` holds 0 container span(s)" lc_run "$root"
 lc_reset
 ls_gate "$LC_MAX" 0
 lc_append 'pub const CAP: u32 = Cap::entries("x", 1);'
