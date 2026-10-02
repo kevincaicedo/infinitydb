@@ -71,6 +71,44 @@ expect_red_because() {
     fi
 }
 
+# fx_git <root> <git args…>: git in a fixture repository only. `git -C ""`
+# runs in the current directory, and a root that is not its own repository
+# lets git walk up to an enclosing one, the developer's engine branch: a root
+# that is empty, outside $work or without its own `.git` is refused before
+# git runs (the rule every destructive command on a variable keeps). `init`
+# creates that `.git`, so it alone runs bare, on a root its guarded
+# constructor made.
+fx_git() {
+    local root=$1
+    shift
+    case $root in
+    "$work"/?*) ;;
+    *) echo "fx_git: '$root' is not a fixture directory under $work" >&2; exit 2 ;;
+    esac
+    [ -d "$root/.git" ] || { echo "fx_git: no repository of its own at '$root'" >&2; exit 2; }
+    git -C "$root" "$@"
+}
+# fx_only <file>: every `git -C` on a variable in <file> is fx_git's own or an
+# `init`; the canary is this file with a raw reset appended.
+fx_only() {
+    ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
+}
+expect green "self-test: every git command on a fixture root goes through fx_git" \
+    fx_only "$SCRIPT_DIR/check-scripts-selftest.sh"
+cp "$SCRIPT_DIR/check-scripts-selftest.sh" "$work/selftest-raw-git"
+printf 'git -C "%sroot" reset -q --hard HEAD~1\n' '$' >>"$work/selftest-raw-git"
+expect red "self-test: a raw git reset on a fixture root is refused (canary)" fx_only "$work/selftest-raw-git"
+fx_empty_canary() (
+    mkdir -p "$work/fx-guard" && cd "$work/fx-guard" && git init -q &&
+        git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base && : >untracked &&
+        fx_git "" clean -fdq
+)
+expect red "self-test: fx_git refuses an empty root" fx_empty_canary
+expect green "self-test: the refused clean removed nothing" test -f "$work/fx-guard/untracked"
+fx_outside_canary() (fx_git "$SCRIPT_DIR/.." status)
+expect_red_because "self-test: fx_git refuses a root outside the fixture directory" \
+    "is not a fixture directory under" fx_outside_canary
+
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
 # exist; a fixture root carries each of them as an empty `src/` so the
 # self-test is independent of which crates are excluded today.
@@ -1215,7 +1253,7 @@ expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$
 # ADR-0144 D3 (absorbs ADR-0125's fn-length ratchet). Fixtures are captured
 # clippy JSON; the approved copies are real commits in a fixture repository.
 RATCHET="$SCRIPT_DIR/check-lint-ratchet.sh"
-ls_commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+ls_commit() { fx_git "$1" add -A && fx_git "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
 rt_msg() { # rt_msg <lint> <file> <line> <col>
     printf '{"reason":"compiler-message","message":{"code":{"code":"clippy::%s"},"level":"warning","message":"m","children":[],"spans":[{"file_name":"%s","line_start":%s,"column_start":%s,"is_primary":true}]}}\n' "$1" "$2" "$3" "$4"
 }
@@ -1230,7 +1268,7 @@ rt_root() {
     printf 't/x\tcrates/fake/src/dec.rs\tcast,arith\tratchet\n' >"$root/docs/lint-scopes.tsv"
     git -C "$root" init -q
     ls_commit "$root" "before the gate"
-    git -C "$root" branch -q base-tip
+    fx_git "$root" branch -q base-tip
     printf '# gate\n' >"$root/scripts/check-lint-ratchet.sh"
     echo "$root"
 }
@@ -1277,29 +1315,29 @@ printf 'arith\t2\t%s\ncast\t1\t%s\n' $D $D >"$root/docs/lint-baseline.tsv"
 expect red "lint-ratchet: a violation with its row raised to match, uncommitted (HEAD leg)" rt_run "$root"
 ls_commit "$root" "combined change"
 expect red "lint-ratchet: the combined change committed is still red (introducing-commit leg)" rt_run "$root"
-git -C "$root" reset -q --hard HEAD~1
+fx_git "$root" reset -q --hard HEAD~1
 # a fix does not buy a violation: -1 in dec.rs, +1 in an existing file
 printf 't/x\t%s\tcast,arith\tratchet\nt/x\t%s\tcast,arith\tratchet\n' $D $F >"$root/docs/lint-scopes.tsv"
 { rt_msg arithmetic_side_effects $F 2 1; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
 printf 'arith\t1\t%s\ncast\t1\t%s\n' $F $D >"$root/docs/lint-baseline.tsv"
 expect red "lint-ratchet: sites fixed in one file do not pay for new ones in an existing file" rt_run "$root"
 # a split carries its counts to an added file
-git -C "$root" reset -q --hard HEAD
+fx_git "$root" reset -q --hard HEAD
 printf 'pub fn h() {}\n' >"$root/crates/fake/src/split.rs"
 printf 't/x\t%s\tcast,arith\tratchet\nt/x\tcrates/fake/src/split.rs\tcast,arith\tratchet\n' $D >"$root/docs/lint-scopes.tsv"
 { rt_msg arithmetic_side_effects crates/fake/src/split.rs 1 1; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
 printf 'arith\t1\tcrates/fake/src/split.rs\ncast\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
-git -C "$root" add -A
+fx_git "$root" add -A
 expect green "lint-ratchet: a split carries its count to an added file" rt_run "$root"
 expect_output "lint-ratchet: the moved row is printed" "moved: arith crates/fake/src/split.rs" rt_run "$root"
-git -C "$root" reset -q --hard HEAD
+fx_git "$root" reset -q --hard HEAD
 expect red "lint-ratchet: an unresolvable base ref is a scope error" env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=no-such-ref INF_LINT_RATCHET_INPUT="$root/clippy.json" "$RATCHET"
 # two changes that each pass: the base tip moved down, this branch did not
-git -C "$root" checkout -q -b feature
-git -C "$root" checkout -q -B base-tip
+fx_git "$root" checkout -q -b feature
+fx_git "$root" checkout -q -B base-tip
 printf 'cast\t1\t%s\n' $D >"$root/docs/lint-baseline.tsv"
 ls_commit "$root" "PR1: arith fixed on the base"
-git -C "$root" checkout -q feature
+fx_git "$root" checkout -q feature
 { rt_msg arithmetic_side_effects $D 4 9; rt_msg cast_possible_truncation $D 5 9; rt_done; } >"$root/clippy.json"
 expect red "lint-ratchet: a branch that is green against its merge base is red against the base tip" rt_run "$root"
 # a row counts its own family in its own scope: casts denied where
@@ -1394,15 +1432,15 @@ cp "$work/matrix-pointer" "$doc_case/docs/compat-matrix.md"
 mkdir -p "$doc_root/tests/fixtures" "$doc_root/bins/inf-sim/seeds"
 printf 'regression input\n' >"$doc_root/tests/fixtures/artifacts.txt"
 printf '0xC0FFEE\n' >"$doc_root/bins/inf-sim/seeds/regression.txt"
-git -C "$doc_root" add tests/fixtures/artifacts.txt bins/inf-sim/seeds/regression.txt
+fx_git "$doc_root" add tests/fixtures/artifacts.txt bins/inf-sim/seeds/regression.txt
 expect green "docs: regression inputs and seeds belong in source" env INF_CHECK_ROOT="$doc_root" $DOCS
 for output in .artifacts/gate.log artifacts/claim.json tests/fuzz/artifacts/crash; do
     mkdir -p "$doc_root/$(dirname "$output")"
     printf 'generated output\n' >"$doc_root/$output"
     expect green "docs: local output may exist ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
-    git -C "$doc_root" add -f "$output"
+    fx_git "$doc_root" add -f "$output"
     expect red "docs: tracked output is forbidden ($output)" env INF_CHECK_ROOT="$doc_root" $DOCS
-    git -C "$doc_root" rm -q --cached -f "$output"
+    fx_git "$doc_root" rm -q --cached -f "$output"
 done
 
 # ------------------------------------------------------------- lint-scopes
@@ -1465,13 +1503,13 @@ ls_root() {
     cp clippy.toml "$root/clippy.toml"  # the container class reads its paths there
     ls_scopes "$root"
     git -C "$root" init -q
-    git -C "$root" add -A
-    git -C "$root" -c user.name=t -c user.email=t@t commit -q -m base
-    git -C "$root" branch -q base-tip
+    fx_git "$root" add -A
+    fx_git "$root" -c user.name=t -c user.email=t@t commit -q -m base
+    fx_git "$root" branch -q base-tip
     echo "$root"
 }
 ls_run() { env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip "$LINTSCOPES"; }
-ls_commit() { git -C "$1" add -A && git -C "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
+ls_commit() { fx_git "$1" add -A && fx_git "$1" -c user.name=t -c user.email=t@t commit -q -m "$2"; }
 root=$(ls_root ls-clean)
 expect green "lint-scopes: clean roots, empty table" ls_run "$root"
 printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
@@ -1679,7 +1717,7 @@ for ls_part in .git scripts docs; do
 done
 git -C "$root" init -q
 ls_commit "$root" "before the gate"
-git -C "$root" branch -q base-tip
+fx_git "$root" branch -q base-tip
 mkdir -p "$root/scripts" "$root/docs"
 printf "# gate\n" >"$root/scripts/check-lint-scopes.sh"
 ls_scopes "$root"
@@ -1695,23 +1733,23 @@ printf 'crates/fake/src/a.rs\tg\tk\n' >>"$root/docs/lint-exemptions.tsv"
 expect red "lint-scopes: a new exemption with its row, uncommitted (HEAD leg)" ls_run "$root"
 ls_commit "$root" combined
 expect red "lint-scopes: the same change committed is still red (introducing-commit leg)" ls_run "$root"
-git -C "$root" reset -q --hard HEAD~1
-git -C "$root" mv crates/fake/src/a.rs crates/fake/src/moved.rs
+fx_git "$root" reset -q --hard HEAD~1
+fx_git "$root" mv crates/fake/src/a.rs crates/fake/src/moved.rs
 printf 'crates/fake/src/moved.rs\tf\tk\n' >"$root/docs/lint-exemptions.tsv"
-git -C "$root" add -A
+fx_git "$root" add -A
 expect green "lint-scopes: a renamed file keeps its row" ls_run "$root"
-git -C "$root" reset -q --hard HEAD
+fx_git "$root" reset -q --hard HEAD
 printf '%s\n' '#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column k")]' 'pub fn f2() {}' >"$root/crates/fake/src/extra.rs"
 sed -i.bak 's/pub fn f2/pub fn f/' "$root/crates/fake/src/extra.rs" && rm "$root/crates/fake/src/extra.rs.bak"
 expect red "lint-scopes: a second ADR-0143 allow with no row of its own" ls_run "$root"
-git -C "$root" rm -q -f docs/lint-exemptions.tsv
+fx_git "$root" rm -q -f docs/lint-exemptions.tsv
 expect red "lint-scopes: a missing table is a scope error" ls_run "$root"
-git -C "$root" reset -q --hard HEAD
+fx_git "$root" reset -q --hard HEAD
 rm -f "$root/crates/fake/src/extra.rs"
 expect red "lint-scopes: an unresolvable base ref is a scope error" env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=no-such-ref "$LINTSCOPES"
-git -C "$root" checkout -q -b feature
-git -C "$root" branch -q -f base-tip HEAD
-git -C "$root" rm -q -f docs/lint-exemptions.tsv
+fx_git "$root" checkout -q -b feature
+fx_git "$root" branch -q -f base-tip HEAD
+fx_git "$root" rm -q -f docs/lint-exemptions.tsv
 expect red "lint-scopes: a table deleted from under the gate is not a bootstrap" ls_run "$root"
 
 # ADR-0163 D2: the container exemption table. The fixture's compiler output
@@ -1880,32 +1918,20 @@ lc_row_set() {
         { print }
         END { exit !hit }'
 }
-# `git -C ""` runs in the current directory, and a root that is not its own
-# repository lets git walk up to an enclosing one: refuse both before a
-# reset or a clean (the rule every destructive command on a variable keeps).
+# lc_reset [<ref>]: the fixture at <ref> (HEAD), its untracked files removed
 lc_reset() {
-    [ -n "$root" ] && [ -d "$root/.git" ] || { echo "lc_reset: no fixture repository at '$root'" >&2; exit 2; }
-    git -C "$root" reset -q --hard HEAD && git -C "$root" clean -fdq
+    fx_git "$root" reset -q --hard "${1:-HEAD}" && fx_git "$root" clean -fdq
     for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
         mkdir -p "$root/${entry%%|*}"  # git keeps no empty directory
     done
 }
-# the guard's canary, inside a throwaway repository with a commit and an
-# untracked file: an empty root is refused, and the file survives
-lc_guard_canary() (
-    mkdir -p "$work/lc-guard" && cd "$work/lc-guard" && git init -q &&
-        git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base && : >untracked &&
-        root="" && lc_reset
-)
-expect red "lint-scopes: containers — lc_reset refuses an empty root" lc_guard_canary
-expect green "lint-scopes: containers — the refused reset cleaned nothing" test -f "$work/lc-guard/untracked"
 root=$(ls_root ls-containers)
 printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
 lc_source
 lc_table
 ls_commit "$root" containers
-git -C "$root" branch -q -f base-tip HEAD
+fx_git "$root" branch -q -f base-tip HEAD
 ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
 # the fixture edits' canaries: an escape BSD sed misreads is refused, and an
@@ -1916,7 +1942,7 @@ expect_red_because "lint-scopes: containers — lc_edit refuses an escape BSD se
 lc_unmatched_canary() (lc_row_set "$LC_A" 'struct Absent' count 2)
 expect_red_because "lint-scopes: containers — a fixture edit that matches nothing is refused" \
     "the edit of $LC_T matched nothing" lc_unmatched_canary
-expect green "lint-scopes: containers — the refused edits changed nothing" git -C "$root" diff --quiet
+expect green "lint-scopes: containers — the refused edits changed nothing" fx_git "$root" diff --quiet
 expect_output "lint-scopes: containers — the census prints file, item, count, record, expiry" \
     "$(printf 'fn Owner::build\t2\tE\t2099-12-31')" lc_census "$root"
 expect green "lint-scopes: containers — the census's stdout is the table: its rows, five columns" \
@@ -2078,7 +2104,7 @@ printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts
 ls_commit "$root" "a lower maximum"
 expect_red_because "lint-scopes: containers — a raised maximum" \
     "CONTAINER_EXEMPTIONS_MAX = $LC_MAX is above the HEAD's $((LC_MAX - 1))" lc_run "$root"
-git -C "$root" reset -q --hard HEAD~1
+lc_reset HEAD~1
 sed -i.bak "s/^CONTAINER_EXEMPTIONS_MAX=$LC_MAX\$/CONTAINER_EXEMPTIONS_MAX=$LC_MAX # the sum/" "$LINTSCOPES"
 rm -f "$LINTSCOPES.bak"
 expect_red_because "lint-scopes: containers — a maximum spelled so no approved copy can read it" \
@@ -2097,7 +2123,7 @@ lc_row_set "$LC_A" 'struct Exempt' count 2
 ls_commit "$root" "a raise, committed"
 expect_red_because "lint-scopes: containers — a committed raise is red against the base tip" \
     "record T counts sum to 4, above the base tip's 3" lc_run "$root"
-git -C "$root" reset -q --hard HEAD~1
+lc_reset HEAD~1
 lc_append '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub mod inner {' \
     '    pub struct Q(pub std::collections::VecDeque<u8>);' '}'
 expect_red_because "lint-scopes: containers — an allow on a mod" \
@@ -2180,10 +2206,10 @@ ls_gate $((LC_MAX - 1)) 0
 expect green "lint-scopes: containers — a removed row and a lowered maximum (control)" lc_run "$root"
 ls_gate "$LC_MAX" 0
 lc_reset
-git -C "$root" mv "$LC_A" crates/fake/src/moved.rs
+fx_git "$root" mv "$LC_A" crates/fake/src/moved.rs
 lc_row_set "$LC_A" '*' file crates/fake/src/moved.rs
 lc_edit 's|^pub mod a;|pub mod moved;|' crates/fake/src/lib.rs
-git -C "$root" add -A
+fx_git "$root" add -A
 expect green "lint-scopes: containers — a renamed file keeps its rows (control)" lc_run "$root"
 lc_reset
 lc_edit 's|pub struct Exempt {|pub struct Kept {|' "$LC_A"
@@ -2228,7 +2254,7 @@ lc_gated_rows() {
 lc_gated_rows
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX + 2))" >"$root/scripts/check-lint-scopes.sh"
 ls_commit "$root" "a host-gated module"
-git -C "$root" branch -q -f base-tip HEAD
+fx_git "$root" branch -q -f base-tip HEAD
 ls_gate $((LC_MAX + 2)) 0
 expect green "lint-scopes: containers — a host-gated module, a same-file rename counted (control)" \
     lc_run "$root"
@@ -2252,7 +2278,7 @@ lc_row_set "$LC_G" 'struct Gated' drop
 expect_red_because "lint-scopes: containers — an allow and its row deleted there, the container kept" \
     "$LC_G:5: \`Map\` names std::collections::HashMap outside every \`container:\` allow" lc_run "$root"
 lc_reset
-git -C "$root" rm -q "$LC_T"
+fx_git "$root" rm -q "$LC_T"
 ls_commit "$root" "the table deleted"
 lc_table
 lc_gated_rows
@@ -2280,9 +2306,9 @@ expect_red_because "lint-scopes: containers — until a copy exists the maximum 
 # after a commit, with a base tip that predates the container gate, the
 # introducing commit is the copy that binds
 root=$(ls_root ls-containers-intro)
-git -C "$root" rm -q "$LC_T"
-git -C "$root" -c user.name=t -c user.email=t@t commit -q --amend -m "base: before the container gate"
-git -C "$root" branch -q -f base-tip HEAD
+fx_git "$root" rm -q "$LC_T"
+fx_git "$root" -c user.name=t -c user.email=t@t commit -q --amend -m "base: before the container gate"
+fx_git "$root" branch -q -f base-tip HEAD
 printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
 lc_source
