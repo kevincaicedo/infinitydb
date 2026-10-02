@@ -103,11 +103,15 @@ fx_empty_canary() (
         git -c user.name=t -c user.email=t@t commit -q --allow-empty -m base && : >untracked &&
         fx_git "" clean -fdq
 )
-expect red "self-test: fx_git refuses an empty root" fx_empty_canary
+expect_red_because "self-test: fx_git refuses an empty root" "fx_git: '' is not a fixture directory under" \
+    fx_empty_canary
 expect green "self-test: the refused clean removed nothing" test -f "$work/fx-guard/untracked"
 fx_outside_canary() (fx_git "$SCRIPT_DIR/.." status)
 expect_red_because "self-test: fx_git refuses a root outside the fixture directory" \
     "is not a fixture directory under" fx_outside_canary
+fx_norepo_canary() (mkdir -p "$work/fx-norepo" && fx_git "$work/fx-norepo" status)
+expect_red_because "self-test: fx_git refuses a fixture directory with no repository of its own" \
+    "no repository of its own" fx_norepo_canary
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
 # exist; a fixture root carries each of them as an empty `src/` so the
