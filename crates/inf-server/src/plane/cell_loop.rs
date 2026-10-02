@@ -1053,6 +1053,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// completed sweep. False on a cell with no control plane.
     fn ckpt_observation_owed(&self) -> bool {
         let sweep = self.shared.ckpt_sweep.borrow();
+        // Canary: the guard without its cursor term.
+        #[cfg(not(inf_canary_ckpt_park_guard_cursor_skipped))]
         if sweep.in_progress() {
             return true;
         }

@@ -147,6 +147,9 @@ rows=(
   # ADR-0159 A1.4: the park guard without its own-slot term — a cell parks
   # on top of a `WAIT` its own publication satisfied.
   "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake"
+  # The guard without its cursor term: beyond 64 cells a cell with a waiter
+  # parks while its sweep is part-way.
+  "inf_canary_ckpt_park_guard_cursor_skipped crate-test inf-sim lib a_part_way_sweep_holds_a_waiting_cell_awake"
   # Every cell's sweep watches slot 0: the term is back to nothing on every
   # other cell of a multi-cell node.
   "inf_canary_ckpt_sweep_own_slot_zero crate-test inf-sim lib an_own_publication_on_a_peer_cell_does_not_park_before_its_wake"

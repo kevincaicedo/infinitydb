@@ -288,6 +288,63 @@ fn an_own_publication_on_a_peer_cell_does_not_park_before_its_wake() {
     );
 }
 
+/// The park guard's cursor term (ADR-0159 A1.4) at the loop tier, beyond
+/// 64 cells: a cell with a registered waiter does not park while its sweep
+/// is part-way. The `WAIT` targets a peer that never publishes, so there
+/// is no own publication and the cursor term is the only one that holds.
+/// A sweep takes `S = ceil(N / 64)` turns: the cell parks after the turn
+/// that completes one and stays unparked through the next `S - 1`, so its
+/// parks are `S` turns apart: closer and it parked part-way, farther and
+/// the guard outlived its sweep. The control leg is the same node before
+/// the `WAIT`: with no waiter it parks turn after turn, and the same
+/// oracle reads adjacent parks. Without the term
+/// (`inf_canary_ckpt_park_guard_cursor_skipped`) the waiting cell does too.
+#[test]
+fn a_part_way_sweep_holds_a_waiting_cell_awake() {
+    let mut parked_part_way = Vec::new();
+    for cells in [65u16, 130] {
+        let sweep_turns = usize::from(cells).div_ceil(64);
+        let turns = 4 * sweep_turns;
+        let mut quiet = Quiet::boot(cells, 0, 0);
+        let idle: Vec<bool> = (0..turns).map(|_| quiet.step_watched()).collect();
+        assert_eq!(quiet.waiters(), 0, "the control leg has no waiter");
+        assert_eq!(
+            closest_parks(&idle),
+            Some(1),
+            "the control leg: an idle cell with no waiter parks turn after turn: {idle:?}"
+        );
+        // The peer is never stepped again, so its slot stays at 0.
+        quiet.node.frozen = Some((1, u64::MAX));
+        let mut client = MiniClient::connect(&mut quiet.node, 0);
+        client.send(&mut quiet.node, &[b"INF.CKPT", b"CELL", b"1", b"WAIT"]);
+        // The command's own turns are work; the read starts once they end.
+        for _ in 0..64 {
+            quiet.step_watched();
+        }
+        let waiting: Vec<bool> = (0..turns).map(|_| quiet.step_watched()).collect();
+        assert_eq!(quiet.waiters(), 1, "VACUOUS: the WAIT is not parked on cell 0");
+        assert_eq!(quiet.published(0), 0, "VACUOUS: cell 0 published, so the own-slot term held");
+        assert_eq!(quiet.published(1), 0, "the peer published");
+        assert_eq!(client.recv(&mut quiet.node), None, "an unsatisfied WAIT answered");
+        assert!(waiting.contains(&true), "the guard never ended at {cells} cells: {waiting:?}");
+        if closest_parks(&waiting) != Some(sweep_turns) {
+            parked_part_way.push((cells, waiting));
+        }
+    }
+    assert!(
+        parked_part_way.is_empty(),
+        "a waiting cell's parks are not ceil(N / 64) turns apart (closer: it parked while its \
+         sweep was part-way), as (cells, parked flags): {parked_part_way:?}"
+    );
+}
+
+/// The fewest turns between two parks in `flags`: 1 for adjacent parks,
+/// `None` with fewer than two parks.
+fn closest_parks(flags: &[bool]) -> Option<usize> {
+    let parks: Vec<usize> = (0..flags.len()).filter(|&turn| flags[turn]).collect();
+    parks.windows(2).map(|pair| pair[1] - pair[0]).min()
+}
+
 /// The guard ends: an all-cell `WAIT` on a 2-cell node whose peer never
 /// publishes is not satisfied by this cell's own publication. The own-slot
 /// term holds for one turn at 64 cells or fewer, the wake's re-check takes
