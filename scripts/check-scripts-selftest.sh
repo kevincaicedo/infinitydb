@@ -1816,9 +1816,69 @@ lc_append_to() { # <file> <line…>
     shift
     printf '%s\n' "$@" >>"$root/$file"
 }
+# Fixture edits that add a line, drop a line or touch a table cell take
+# exact text: BSD sed (the macOS leg) reads `\n` in a replacement and `\t`
+# anywhere as the letters n and t, so lc_edit refuses both.
 lc_edit() {
     [ -n "$root" ] && [ -n "$2" ] || { echo "lc_edit: empty root or file" >&2; exit 2; }
+    case $1 in
+    *'\n'* | *'\t'*)
+        echo "lc_edit: '$1' spells \\n or \\t, which BSD sed reads as a letter: use lc_lines, lc_unallow or lc_row_set" >&2
+        exit 2
+        ;;
+    esac
     sed -i.bak "$1" "$root/$2" && rm -f "$root/$2.bak"
+}
+# lc_awk <file> <program>: rewrite the fixture file through awk; the program
+# exits non-zero when it matched nothing, which is a harness error.
+lc_awk() {
+    [ -n "$root" ] && [ -n "$1" ] || { echo "lc_awk: empty root or file" >&2; exit 2; }
+    awk "$2" "$root/$1" >"$root/$1.lc" && mv "$root/$1.lc" "$root/$1" ||
+        { rm -f "$root/$1.lc"; echo "lc_awk: the edit of $1 matched nothing" >&2; exit 2; }
+}
+# lc_lines <file> <line> <line>…: every line equal to the second argument
+# becomes the rest, one per line.
+lc_lines() {
+    local file=$1 old=$2
+    shift 2
+    [ "$#" -gt 0 ] || { echo "lc_lines: no replacement lines" >&2; exit 2; }
+    LC_OLD=$old LC_NEW=$(printf '%s\n' "$@") lc_awk "$file" '
+        "" $0 == "" ENVIRON["LC_OLD"] { hit = 1; print ENVIRON["LC_NEW"]; next }
+        { print }
+        END { exit !hit }'
+}
+# lc_unallow <file> <item line>: the `disallowed_types` allow directly above
+# each line equal to <item line> is deleted.
+lc_unallow() {
+    LC_ITEM=$2 lc_awk "$1" '
+        NR > 1 {
+            if ("" $0 == "" ENVIRON["LC_ITEM"] && index(held, "#[allow(clippy::disallowed_types") == 1) hit = 1
+            else print held
+        }
+        { held = $0 }
+        END { if (NR > 0) print held; exit !hit }'
+}
+# lc_row_set <file> <item|*> <column> <value>: that row of the container
+# table (every row of the file for `*`) takes <value> in <column>; the
+# column `drop` deletes the row.
+lc_row_set() {
+    case $3 in
+    file | item | count | record | expiry | drop) ;;
+    *) echo "lc_row_set: no column '$3'" >&2; exit 2 ;;
+    esac
+    LC_FILE=$1 LC_ITEM=$2 LC_COL=$3 LC_VALUE=${4:-} lc_awk "$LC_T" '
+        BEGIN {
+            FS = OFS = "\t"
+            split("file item count record expiry", names, " ")
+            for (k in names) column[names[k]] = k
+        }
+        $1 == ENVIRON["LC_FILE"] && (ENVIRON["LC_ITEM"] == "*" || $2 == ENVIRON["LC_ITEM"]) {
+            hit = 1
+            if (ENVIRON["LC_COL"] == "drop") next
+            $(column[ENVIRON["LC_COL"]]) = ENVIRON["LC_VALUE"]
+        }
+        { print }
+        END { exit !hit }'
 }
 # `git -C ""` runs in the current directory, and a root that is not its own
 # repository lets git walk up to an enclosing one: refuse both before a
@@ -1848,6 +1908,15 @@ ls_commit "$root" containers
 git -C "$root" branch -q -f base-tip HEAD
 ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
+# the fixture edits' canaries: an escape BSD sed misreads is refused, and an
+# edit that matches nothing is a harness error; neither changes the file
+lc_escape_canary() (lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n|' "$LC_A")
+expect_red_because "lint-scopes: containers — lc_edit refuses an escape BSD sed reads as a letter" \
+    "which BSD sed reads as a letter" lc_escape_canary
+lc_unmatched_canary() (lc_row_set "$LC_A" 'struct Absent' count 2)
+expect_red_because "lint-scopes: containers — a fixture edit that matches nothing is refused" \
+    "the edit of $LC_T matched nothing" lc_unmatched_canary
+expect green "lint-scopes: containers — the refused edits changed nothing" git -C "$root" diff --quiet
 expect_output "lint-scopes: containers — the census prints file, item, count, record, expiry" \
     "$(printf 'fn Owner::build\t2\tE\t2099-12-31')" lc_census "$root"
 expect green "lint-scopes: containers — the census's stdout is the table: its rows, five columns" \
@@ -1872,14 +1941,14 @@ expect_red_because "lint-scopes: containers — the census refuses a table empti
 lc_reset
 expect_output "lint-scopes: containers — the OK line discloses the table" \
     "container exemptions: 3 row(s), counts 5/$LC_MAX, 0/0 capped-backing" lc_run "$root"
-lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
+lc_lines "$LC_A" '    pub queue: VecDeque<u8>,' '    pub queue: VecDeque<u8>,' '    pub second: HashMap<u8, u8>,'
 expect_red_because "lint-scopes: containers — a second HashMap field in an exempt struct" \
     "\`struct Exempt\` holds 2 container span(s), its row says 1" lc_run "$root"
-lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' count 2
 expect_red_because "lint-scopes: containers — raising the row with it is red against HEAD" \
     "record T counts sum to 4, above the HEAD's 3" lc_run "$root"
 lc_reset
-lc_edit 's|        map.len()|        let more: VecDeque<u8> = VecDeque::new();\n        map.len()|' "$LC_A"
+lc_lines "$LC_A" '        map.len()' '        let more: VecDeque<u8> = VecDeque::new();' '        map.len()'
 expect_red_because "lint-scopes: containers — a second deque local in an exempt fn" \
     "\`fn Owner::build\` holds 4 container span(s), its row says 2" lc_run "$root"
 lc_reset
@@ -1911,11 +1980,12 @@ expect_red_because "lint-scopes: containers — a container in an item neither b
     "$LC_A:20: \`VecDeque\` names std::collections::VecDeque outside every \`container:\` allow" \
     lc_run "$root"
 lc_reset
-lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    #[cfg(feature = "absent")]\n    pub off: HashMap<u8, u8>, // uncompiled|' "$LC_A"
+lc_lines "$LC_A" '    pub queue: VecDeque<u8>,' '    pub queue: VecDeque<u8>,' '    #[cfg(feature = "absent")]' \
+    '    pub off: HashMap<u8, u8>, // uncompiled'
 expect_red_because "lint-scopes: containers — a container neither build compiles, inside an exempt item" \
     "\`struct Exempt\` names 2 container(s) in its text, 1 in the compiled spans" lc_run "$root"
 lc_reset
-lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
+lc_unallow "$LC_A" 'pub struct Exempt {'
 expect_red_because "lint-scopes: containers — a row with no allow" \
     "row $LC_A \`struct Exempt\` has no \`container:\` allow" lc_run "$root"
 lc_reset
@@ -1938,8 +2008,10 @@ lc_row "$LC_A" 'struct Exempt' 1 T 2099-12-31
 expect_red_because "lint-scopes: containers — a row listed twice" \
     "$LC_A \`struct Exempt\` is listed twice" lc_run "$root"
 lc_reset
-lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();\n        #[allow(clippy::disallowed_types, reason = "container: E")]\n        fn inner() -> HashMap<u8, u8> {\n            Default::default()\n        }\n        let _ = inner();|' "$LC_A"
-lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t1\tE\t|' "$LC_T"
+lc_lines "$LC_A" '        let map: HashMap<u8, u8> = HashMap::new();' '        let map: HashMap<u8, u8> = Default::default();' \
+    '        #[allow(clippy::disallowed_types, reason = "container: E")]' '        fn inner() -> HashMap<u8, u8> {' \
+    '            Default::default()' '        }' '        let _ = inner();'
+lc_row_set "$LC_A" 'fn Owner::build' count 1
 lc_row "$LC_A" 'fn Owner::inner' 1 E 2099-12-31
 expect green "lint-scopes: containers — a span inside two allowed items counts on the narrower (control)" \
     lc_run "$root"
@@ -1948,24 +2020,24 @@ expect_red_because "lint-scopes: containers — a second container in the inner 
     "\`fn Owner::inner\` holds 2 container span(s), its row says 1" lc_run "$root"
 lc_reset
 lc_edit 's|reason = "container: E"|reason = "container: M"|' "$LC_A"
-lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t2\tM\t|' "$LC_T"
+lc_row_set "$LC_A" 'fn Owner::build' record M
 expect_red_because "lint-scopes: containers — a file and record pair the copy lacks" \
     "has record M rows and the HEAD's table has none" lc_run "$root"
 lc_reset
 lc_edit 's|reason = "container: E"|reason = "container: X"|' "$LC_A"
-lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t2\tX\t|' "$LC_T"
+lc_row_set "$LC_A" 'fn Owner::build' record X
 expect_red_because "lint-scopes: containers — an unknown record letter" \
     "record \`X\` is not a site record" lc_run "$root"
 lc_reset
-lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2000-01-01|' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2000-01-01
 expect_red_because "lint-scopes: containers — an expired row" \
     "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"
 lc_reset
-lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2100-01-01|' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2100-01-01
 expect_red_because "lint-scopes: containers — a date moved later" \
     "a date only moves earlier" lc_run "$root"
 lc_reset
-lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2099-01-01|' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' expiry 2099-01-01
 expect green "lint-scopes: containers — a date moved earlier (control)" lc_run "$root"
 lc_reset
 printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts/check-lint-scopes.sh"
@@ -1986,8 +2058,8 @@ sed -i.bak '$d' "$LINTSCOPES"
 rm -f "$LINTSCOPES.bak"
 ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the gate copy restored (control)" lc_run "$root"
-lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
-lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+lc_lines "$LC_A" '    pub queue: VecDeque<u8>,' '    pub queue: VecDeque<u8>,' '    pub second: HashMap<u8, u8>,'
+lc_row_set "$LC_A" 'struct Exempt' count 2
 ls_commit "$root" "a raise, committed"
 expect_red_because "lint-scopes: containers — a committed raise is red against the base tip" \
     "record T counts sum to 4, above the base tip's 3" lc_run "$root"
@@ -2018,7 +2090,8 @@ lc_append_to "$LC_B" '#[allow(clippy::disallowed_types, reason = "container: cap
     'pub struct CappedDeque<T> {' '    inner: std::collections::VecDeque<T>,' '}'
 expect green "lint-scopes: containers — the one backing, on struct CappedDeque in bounded/ (control, the gate at 1)" \
     lc_run "$root"
-lc_edit 's|    inner: std::collections::VecDeque<T>,|    inner: std::collections::VecDeque<T>,\n    spare: std::collections::VecDeque<T>,|' "$LC_B"
+lc_lines "$LC_B" '    inner: std::collections::VecDeque<T>,' '    inner: std::collections::VecDeque<T>,' \
+    '    spare: std::collections::VecDeque<T>,'
 expect_red_because "lint-scopes: containers — a second container inside the backing" \
     "the backing \`struct CappedDeque\` holds 2 container span(s)" lc_run "$root"
 lc_reset
@@ -2038,7 +2111,7 @@ lc_reset
 lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
 expect_red_because "lint-scopes: containers — fewer than the row" \
     "\`fn Owner::build\` holds 1 container span(s), its row says 2 — lower the row to 1" lc_run "$root"
-lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t1\tE\t|' "$LC_T"
+lc_row_set "$LC_A" 'fn Owner::build' count 1
 expect_red_because "lint-scopes: containers — a lowered count with the maximum left above the sum" \
     "counts sum to 4, below CONTAINER_EXEMPTIONS_MAX = $LC_MAX — lower the maximum to 4" lc_run "$root"
 ls_gate $((LC_MAX - 1)) 0
@@ -2048,14 +2121,14 @@ lc_reset
 lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: Vec<u8>,|' "$LC_A"
 expect_red_because "lint-scopes: containers — an allow that covers no container" \
     "the allow on \`struct Exempt\` covers no container" lc_run "$root"
-lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
-lc_edit '/\tstruct Exempt\t/d' "$LC_T"
+lc_unallow "$LC_A" 'pub struct Exempt {'
+lc_row_set "$LC_A" 'struct Exempt' drop
 ls_gate $((LC_MAX - 1)) 0
 expect green "lint-scopes: containers — a removed row and a lowered maximum (control)" lc_run "$root"
 ls_gate "$LC_MAX" 0
 lc_reset
 git -C "$root" mv "$LC_A" crates/fake/src/moved.rs
-lc_edit 's|^crates/fake/src/a.rs\t|crates/fake/src/moved.rs\t|' "$LC_T"
+lc_row_set "$LC_A" '*' file crates/fake/src/moved.rs
 lc_edit 's|^pub mod a;|pub mod moved;|' crates/fake/src/lib.rs
 git -C "$root" add -A
 expect green "lint-scopes: containers — a renamed file keeps its rows (control)" lc_run "$root"
@@ -2063,11 +2136,11 @@ lc_reset
 lc_edit 's|pub struct Exempt {|pub struct Kept {|' "$LC_A"
 expect_red_because "lint-scopes: containers — a renamed item whose row kept the old key names the fix" \
     "rename the row's item to \`struct Kept\`" lc_run "$root"
-lc_edit 's|\tstruct Exempt\t|\tstruct Kept\t|' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' item 'struct Kept'
 expect green "lint-scopes: containers — a renamed item (control)" lc_run "$root"
 lc_reset
 mv "$root/$LC_A" "$root/crates/fake/src/moved.rs"
-lc_edit 's|^crates/fake/src/a.rs\t|crates/fake/src/moved.rs\t|' "$LC_T"
+lc_row_set "$LC_A" '*' file crates/fake/src/moved.rs
 lc_edit 's|^pub mod a;|pub mod moved;|' crates/fake/src/lib.rs
 expect_red_because "lint-scopes: containers — a renamed file not yet staged says to stage it" \
     "keeps its rows once the rename is staged" lc_run "$root"
@@ -2075,16 +2148,16 @@ lc_reset
 lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
 lc_append 'impl Exempt {' '    #[allow(clippy::disallowed_types, reason = "container: E")]' \
     '    pub fn fresh() -> HashMap<u8, u8> {' '        Default::default()' '    }' '}'
-lc_edit 's|\tfn Owner::build\t2\tE\t2099-12-31|\tfn Owner::build\t1\tE\t2099-12-31|' "$LC_T"
+lc_row_set "$LC_A" 'fn Owner::build' count 1
 lc_row "$LC_A" 'fn Exempt::fresh' 1 E 2099-12-31
 expect green "lint-scopes: containers — a split item, the same file and record sum (control)" lc_run "$root"
 lc_reset
 mkdir -p "$root/crates/fake/src/two"
 printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub struct Moved {' \
     '    pub queue: VecDeque<u8>,' '}' >"$root/crates/fake/src/two/other.rs"
-lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
+lc_unallow "$LC_A" 'pub struct Exempt {'
 lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: Vec<u8>,|' "$LC_A"
-lc_edit '/\tstruct Exempt\t/d' "$LC_T"
+lc_row_set "$LC_A" 'struct Exempt' drop
 lc_row crates/fake/src/two/other.rs 'struct Moved' 1 T 2099-12-31
 expect_red_because "lint-scopes: containers — an exempt item moved to another file" \
     "crates/fake/src/two/other.rs has record T rows and the HEAD's table has none" lc_run "$root"
@@ -2121,8 +2194,8 @@ lc_append_to "$LC_G" 'pub struct Renamed {' '    pub map: Map<u8, u8>,' '}'
 expect_red_because "lint-scopes: containers — a same-file rename used with no allow there" \
     "$LC_G:9: \`Map\` names std::collections::HashMap outside every \`container:\` allow" lc_run "$root"
 lc_reset
-lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: D")\]$/{N;/pub struct Gated/s|^[^\n]*\n||;}' "$LC_G"
-lc_edit '/\tstruct Gated\t/d' "$LC_T"
+lc_unallow "$LC_G" 'pub struct Gated {'
+lc_row_set "$LC_G" 'struct Gated' drop
 expect_red_because "lint-scopes: containers — an allow and its row deleted there, the container kept" \
     "$LC_G:5: \`Map\` names std::collections::HashMap outside every \`container:\` allow" lc_run "$root"
 lc_reset
@@ -2162,8 +2235,8 @@ printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-l
 lc_source
 lc_table
 ls_commit "$root" "the container gate and its table"
-lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
-lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+lc_lines "$LC_A" '    pub queue: VecDeque<u8>,' '    pub queue: VecDeque<u8>,' '    pub second: HashMap<u8, u8>,'
+lc_row_set "$LC_A" 'struct Exempt' count 2
 ls_commit "$root" "a raise, committed"
 expect_red_because "lint-scopes: containers — a committed raise is red against the introducing commit" \
     "record T counts sum to 4, above the introducing commit's 3" lc_run "$root"
