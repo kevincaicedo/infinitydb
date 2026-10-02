@@ -848,6 +848,25 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   ADR); the walker never emits it; `Keyspace::apply_record` counts it
   `SkippedReserved` (tiered replay routes through `TieredTable::apply_*`
   until command wiring). Fuzz: `ick_decode` extended over the v2 arm.
+- > **Accepted 2026-10-02, implementation open — ADR-0174:**
+  > tiered boot replay demotes when the RAM window fills, and changes
+  > three rules above. Within one namespace every ref section precedes
+  > every image section: the checkpoint stream refuses to stage a ref for
+  > a namespace that has staged an image, and boot refuses a ref section
+  > for a namespace that already holds a record of this life. A tag-8
+  > marker naming an address below the life origin (the manifested
+  > `flushed`) removes that exact slot as above; one at or above it is a
+  > counted no-op, and its mutation resolves by key. Replay reads cold
+  > bytes where it settles a pair: a tail `DEL` reads each same-hash cold
+  > slot at or above the life origin, and a RAM record about to be sealed,
+  > or left unsealed at the end of replay in a namespace that demoted,
+  > reads each same-hash cold slot. A read is the record's key window
+  > through the file's creation-mode handle, parsed into a type whose
+  > constructor checks that the key hashes to the slot's hash; a failed
+  > read or parse is a typed boot refusal. `Keyspace::apply_record` takes
+  > the replay seam, which lends the namespace's replay state and charges
+  > its I/O to the recovery step; room is made, and a `DEL`'s reads done,
+  > before the marker drain.
 - **M4-S14 amendment (ADR-0058 D3) — tag 0x04 activated.** v2 adds block
   tag **0x04 — live-set section**: `tag · body_len u32 · entry_count u32
   · ns u32 · entry_count × (file_id u32 · data_len u64 · dead_bytes u64
@@ -1287,6 +1306,21 @@ per episode). A drained cell always seals — never slower than K = 1.
   (catalog clamped to `flushed`; zero-confirmed files not named).
   `TierFlush::with_catalog` seeds a recovered pipeline. Fuzz:
   `manifest_decode` extended over epoch 2 with the tiling invariants.
+- > **Accepted 2026-10-02, implementation open — ADR-0174:**
+  > every tiered namespace in the catalog recovers through a manifest
+  > section. One that no section names (no MANIFEST yet, or one published
+  > before the namespace was created) recovers through the empty section
+  > (`flushed` 0, no files, next file id 0), so its tier files are removed
+  > before any flush. A replay allocation the window refuses demotes
+  > through the recovered pipeline on the seam drive (seal, flush, one
+  > barrier the boot pipeline claims whole, release), padding the tail to
+  > the ring top or the next commit page when the need lies above it; it
+  > never fails the boot. A boot that fits every window writes only the
+  > `Recovered` reseal. Boot-written files stay unmanifested until the next
+  > checkpoint publishes, and a crash leaves them for the next boot to
+  > remove. A namespace that demoted seals its active file at the end of
+  > replay and reaches the plane with a handle for every sealed file. A
+  > live-set entry naming a file this boot created restores nothing.
 - > **Accepted 2026-09-23, implementation open — ADR-0156:**
   > bounded, acknowledged tier-file retirement
   > replaces the plane-layer unlink below with an owned cell→control job:
@@ -1996,6 +2030,13 @@ The reactor-drive flush state machine (`TierFlush` round state in
   both_orders`, the `m4-recovery` cardinality oracle (`len() ==
   model.len()` at quiescence) and the `m4-tiered` quiescence oracle
   (Σcells `DBSIZE` == model live keys; `live + dead == allocated`).
+- > **Accepted 2026-10-02, implementation open — ADR-0174:** release
+  > can run during boot replay, so a replayed winner is never sealed with
+  > its twin unverified, and cold slots at the rebuild can be this life's.
+  > A namespace that demoted settles every same-key pair before the
+  > rebuild, which then tickets only distinct keys that share a hash. The
+  > rebuild's settle reads its slot through replay's checked read: bytes
+  > whose key does not hash to the slot's hash are a typed boot refusal.
 - **Bounded everything** — tickets ≤ `SHADOW_TICKETS_CAP`, the pinned
   suffix ≤ `MEM-BUDGET / 8`, reads in flight ≤ `SHADOW_READS_IN_FLIGHT`;
   each exhaustion is a counted refusal that leaves the synchronous
