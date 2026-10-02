@@ -2093,6 +2093,24 @@ lc_append "${LC_TEST_DECL[@]}" 'mod gone;'
 expect_red_because "lint-scopes: containers — a test module whose file the gate cannot find" \
     "test-only \`mod gone;\` names no file the audit can find" lc_run "$root"
 lc_reset
+lc_append_to crates/fake/src/lib.rs "${LC_TEST_DECL[@]}" 'mod lib_tests;'
+lc_testmod crates/fake/src/lib_tests.rs ' // uncompiled: test code'
+expect green "lint-scopes: containers — one declared in the crate root, its file beside it (control)" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]}" 'mod dir_tests;'
+lc_testmod crates/fake/src/a/dir_tests/mod.rs ' // uncompiled: test code'
+expect green "lint-scopes: containers — one whose file is the module's mod.rs (control)" lc_run "$root"
+lc_reset
+# The mock swap: the production twin of a test-only module keeps its file,
+# held by the backstop where no build compiles it.
+lc_append '#[cfg(not(test))]' 'mod swap_real;' "${LC_TEST_DECL[@]}" '#[path = "swap_fake.rs"]' 'mod swap_real;'
+lc_testmod crates/fake/src/a/swap_real.rs ' // uncompiled: a feature neither build enables'
+lc_testmod crates/fake/src/swap_fake.rs ' // uncompiled: test code'
+expect_red_because "lint-scopes: containers — a mock swap's production twin is production code" \
+    "crates/fake/src/a/swap_real.rs:1: \`HashMap\` names std::collections::HashMap outside every \`container:\` allow" \
+    lc_run "$root"
+lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2000-01-01
 expect_red_because "lint-scopes: containers — an expired row" \
     "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"
