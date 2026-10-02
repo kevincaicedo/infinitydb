@@ -260,56 +260,72 @@ fn unified_recovery_round_trips_all_classes() {
         &[NS.0],
     )
     .expect("create ick");
-    let mut cursor = 0u64;
+    // Two passes, as the reactor writer walks (ADR-0174 R2: every ref
+    // section of a namespace precedes every image section): a full walk
+    // for refs, then one for images, each slice-interleaved with the
+    // same fuzzy mutation and maintain rounds.
     let mut refs_emitted = 0u64;
     let mut images_emitted = 0u64;
     let mut round = 0u64;
-    loop {
-        let cold_resolves_before = rig.table.space().counters().cold_resolves;
-        let mut refs: Vec<(u64, u64)> = Vec::new();
-        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        cursor = rig.table.ckpt_walk_slice(
-            cursor,
-            64,
-            |hash, addr| refs.push((hash, addr.to_raw())),
-            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
-        );
-        // The walker touched zero cold state (ADR-0057 D2 — structural,
-        // and here observed: the resolve counter is flat across slices).
-        assert_eq!(
-            rig.table.space().counters().cold_resolves,
-            cold_resolves_before,
-            "the walker never resolves a cold address"
-        );
-        for (hash, addr) in refs {
-            assert!(addr < w, "refs sit below the walk watermark");
-            writer.append_ref(NS.0, w, hash, addr).expect("ref");
-            refs_emitted += 1;
-        }
-        for (key, value) in images {
-            writer
-                .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })
-                .expect("image");
-            images_emitted += 1;
-        }
-        if cursor == 0 {
-            break;
-        }
-        // Fuzzy interleaving: mutations and demotion progress mid-walk.
-        round += 1;
-        for _ in 0..8 {
-            let idx = seeded(&mut seed) % keys;
-            let key = format!("k:{idx:05}").into_bytes();
-            if seeded(&mut seed).is_multiple_of(5) {
-                rig.del(&key);
-            } else {
-                let value =
-                    vec![(seeded(&mut seed) % 251) as u8; 40 + (seeded(&mut seed) % 160) as usize];
-                rig.set(&key, &value);
+    for pass in 0..2u8 {
+        let mut cursor = 0u64;
+        loop {
+            let cold_resolves_before = rig.table.space().counters().cold_resolves;
+            let mut refs: Vec<(u64, u64)> = Vec::new();
+            let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            cursor = rig.table.ckpt_walk_slice(
+                cursor,
+                64,
+                |hash, addr| {
+                    if pass == 0 {
+                        refs.push((hash, addr.to_raw()));
+                    }
+                },
+                |parts| {
+                    if pass == 1 {
+                        images.push((parts.key.to_vec(), parts.value.to_vec()));
+                    }
+                },
+            );
+            // The walker touched zero cold state (ADR-0057 D2 — structural,
+            // and here observed: the resolve counter is flat across slices).
+            assert_eq!(
+                rig.table.space().counters().cold_resolves,
+                cold_resolves_before,
+                "the walker never resolves a cold address"
+            );
+            for (hash, addr) in refs {
+                assert!(addr < w, "refs sit below the walk watermark");
+                writer.append_ref(NS.0, w, hash, addr).expect("ref");
+                refs_emitted += 1;
             }
-        }
-        if round.is_multiple_of(4) {
-            rig.maintain();
+            for (key, value) in images {
+                writer
+                    .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })
+                    .expect("image");
+                images_emitted += 1;
+            }
+            if cursor == 0 {
+                break;
+            }
+            // Fuzzy interleaving: mutations and demotion progress mid-walk.
+            round += 1;
+            for _ in 0..8 {
+                let idx = seeded(&mut seed) % keys;
+                let key = format!("k:{idx:05}").into_bytes();
+                if seeded(&mut seed).is_multiple_of(5) {
+                    rig.del(&key);
+                } else {
+                    let value = vec![
+                        (seeded(&mut seed) % 251) as u8;
+                        40 + (seeded(&mut seed) % 160) as usize
+                    ];
+                    rig.set(&key, &value);
+                }
+            }
+            if round.is_multiple_of(4) {
+                rig.maintain();
+            }
         }
     }
     assert!(refs_emitted > 0, "the walk exercised the ref class");

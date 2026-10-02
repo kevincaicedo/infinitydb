@@ -210,23 +210,47 @@ pub fn recover_tiered_ns<F: SegmentFs>(
 /// step 3): cross-checks the section's walk watermark against the
 /// manifested flushed watermark — the §3.1 corollary's recovery half — a
 /// section claiming refs above it means the checkpoint and manifest are
-/// not one recovery unit (fail-stop), then applies every entry
-/// idempotently.
+/// not one recovery unit (fail-stop); refuses a section for a namespace
+/// whose table already holds a record of this life (ADR-0174 R2: within
+/// a namespace every ref section precedes every image section, so a ref
+/// can never name a key a replayed record of this life already settled
+/// against); then applies every entry idempotently.
 ///
 /// # Errors
-/// `InvalidData` on the watermark cross-check.
+/// `InvalidData` on the watermark cross-check and on the section order.
 pub fn apply_ref_section(
     table: &mut TieredTable,
     section: &IckRefSection<'_>,
     manifested_flushed: u64,
 ) -> io::Result<()> {
-    if section.walk_watermark > manifested_flushed {
+    apply_refs(table, section.ns, section.walk_watermark, section.iter(), manifested_flushed)
+}
+
+/// [`apply_ref_section`]'s body over the section's facts — the one place
+/// of both checks (reachable by a test without a decoded section).
+fn apply_refs(
+    table: &mut TieredTable,
+    ns: u32,
+    walk_watermark: u64,
+    refs: impl Iterator<Item = (u64, u64)>,
+    manifested_flushed: u64,
+) -> io::Result<()> {
+    if walk_watermark > manifested_flushed {
         return Err(invalid(format!(
-            "ick ref section (ns {}) walk watermark {} outruns the manifested flushed {}",
-            section.ns, section.walk_watermark, manifested_flushed
+            "ick ref section (ns {ns}) walk watermark {walk_watermark} outruns the manifested \
+             flushed {manifested_flushed}"
         )));
     }
-    for (hash, addr) in section.iter() {
+    let (origin, tail) = (table.space().life_origin(), table.space().tail());
+    if tail > origin {
+        return Err(invalid(format!(
+            "ick ref section (ns {ns}) after an image of its namespace: the table holds {} bytes \
+             of this life above its origin {} (ADR-0174 R2)",
+            tail.offset_from(origin),
+            origin.to_raw()
+        )));
+    }
+    for (hash, addr) in refs {
         table.apply_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
     }
     Ok(())
@@ -258,4 +282,65 @@ pub fn apply_blob_ref_section(table: &mut TieredTable, section: &IckBlobRefSecti
 
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::KeyHasher;
+
+    use super::*;
+
+    /// A recovered table at origin 1 MiB with one manifested file below
+    /// it (a ref must name a file's range).
+    fn table() -> TieredTable {
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        let mut table = TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                page_bytes: 4 << 10,
+                life_origin: LogicalAddr::from_raw(1 << 20).expect("48-bit"),
+            },
+            demote,
+            64,
+            KeyHasher::default(),
+        )
+        .expect("ring");
+        table.seed_recovered_files(
+            &[TierFileMeta {
+                id: 0,
+                base: LogicalAddr::ZERO,
+                data_len: 1 << 20,
+                reason: SealReason::Capacity,
+                path: std::path::Path::new("shard-0/cold/tier-000000.itier").to_path_buf(),
+            }],
+            1,
+        );
+        table
+    }
+
+    /// ADR-0174 R2, the reader half (E9): a ref section for a namespace
+    /// whose table already holds a record of this life is a typed boot
+    /// refusal naming the namespace; the reverse order applies. Red
+    /// before the law: the refs applied beside the image.
+    #[test]
+    fn a_ref_section_after_an_image_of_its_namespace_refuses_the_boot() {
+        let flushed = 1u64 << 20;
+        let hash = KeyHasher::default().hash(b"k");
+        let refs = [(hash, 4096u64)];
+        let mut t = table();
+        apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed).expect("refs first");
+        t.apply_image(b"k", b"v", hash).expect("fits");
+        assert_eq!(t.len(), 2, "two slots: the ref and this life's record (no rebuild yet)");
+        let err = apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed)
+            .expect_err("a ref section after an image of its namespace");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let text = err.to_string();
+        assert!(text.contains("ns 41") && text.contains("ADR-0174 R2"), "{text}");
+        let mut fresh = table();
+        fresh.apply_image(b"k", b"v", hash).expect("fits");
+        let err = apply_refs(&mut fresh, 41, flushed, refs.iter().copied(), flushed)
+            .expect_err("the first ref section after an image refuses too");
+        assert!(err.to_string().contains("ADR-0174 R2"));
+        assert!(!fresh.contains_pair(hash, LogicalAddr::from_raw(4096).expect("48-bit")));
+    }
 }

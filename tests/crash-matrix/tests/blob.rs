@@ -316,19 +316,26 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         &[NS.0],
     )
     .expect("create ick");
+    // Refs first, then images (ADR-0174 R2), as the reactor writer walks.
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<(u64, u64)> = Vec::new();
+        cursor = t.ckpt_walk_slice(cursor, 64, |h, a| refs.push((h, a.to_raw())), |_| {});
+        for (h, a) in refs {
+            writer.append_ref(NS.0, w.to_raw(), h, a).expect("ref");
+        }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
         let mut images: Vec<(Vec<u8>, Vec<u8>, Option<ExtentRef>)> = Vec::new();
         cursor = t.ckpt_walk_slice(
             cursor,
             64,
-            |h, a| refs.push((h, a.to_raw())),
+            |_, _| {},
             |parts| images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref())),
         );
-        for (h, a) in refs {
-            writer.append_ref(NS.0, w.to_raw(), h, a).expect("ref");
-        }
         for (k, v, ext) in images {
             match ext {
                 Some(ext) => writer

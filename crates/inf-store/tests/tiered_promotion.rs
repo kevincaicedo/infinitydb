@@ -549,19 +549,31 @@ fn promoted_after_c0(emit_origins: bool) -> (Rig, Vec<Vec<u8>>) {
         &[NS.0],
     )
     .expect("create ick");
+    // Refs first, then images (ADR-0174 R2), as the reactor writer walks.
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<(u64, u64)> = Vec::new();
-        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         cursor = rig.table.ckpt_walk_slice(
             cursor,
             128,
             |hash, addr| refs.push((hash, addr.to_raw())),
-            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
+            |_| {},
         );
         for (hash, addr) in refs {
             writer.append_ref(NS.0, w, hash, addr).expect("ref");
         }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
+        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            128,
+            |_, _| {},
+            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
+        );
         for (key, value) in images {
             writer
                 .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })

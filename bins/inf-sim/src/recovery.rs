@@ -1474,74 +1474,94 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             &[NS.0],
         )
         .expect("create ick");
-        let mut cursor = 0u64;
-        loop {
-            let cold_before = life.table.space().counters().cold_resolves;
-            let mut refs: Vec<(u64, u64)> = Vec::new();
-            let mut images: Vec<(Vec<u8>, Vec<u8>, Option<ExtentRef>)> = Vec::new();
-            cursor = life.table.ckpt_walk_slice(
-                cursor,
-                48,
-                |hash, addr| refs.push((hash, addr.to_raw())),
-                |parts| {
-                    images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref()));
-                },
-            );
-            if life.table.space().counters().cold_resolves != cold_before {
-                run.report.violations.push("walker resolved a cold address".into());
-            }
-            for (hash, addr) in refs {
-                writer.append_ref(NS.0, w, hash, addr).expect("ref");
-                run.report.refs_emitted += 1;
-            }
-            for (key, value, ext) in images {
-                match ext {
-                    // M4-S17 (ADR-0061 D2): resident extent records
-                    // image as tag-9 — the reference, never the value.
-                    Some(ext) => writer
-                        .append(&RecordView::StringExtentRef {
-                            ns: NS,
-                            key: &key,
-                            extent_id: ext.extent_id,
-                            offset: ext.offset,
-                            len: ext.len,
-                        })
-                        .expect("extent image"),
-                    None => writer
-                        .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })
-                        .expect("image"),
+        // Two passes, as the reactor writer walks (ADR-0174 R2: every ref
+        // section of a namespace precedes every image section): a full
+        // walk for refs, then one for images, each slice-interleaved with
+        // the same mutation, maintain, reconcile and compaction rounds —
+        // so a cold key overwritten between its ref in pass 0 and pass 1
+        // reaching it has a ref, an image and a tail marker (ADR-0057 D4
+        // rule 1's shape, now the ordinary one).
+        for pass in 0..2u8 {
+            let mut cursor = 0u64;
+            loop {
+                let cold_before = life.table.space().counters().cold_resolves;
+                let mut refs: Vec<(u64, u64)> = Vec::new();
+                let mut images: Vec<(Vec<u8>, Vec<u8>, Option<ExtentRef>)> = Vec::new();
+                cursor = life.table.ckpt_walk_slice(
+                    cursor,
+                    48,
+                    |hash, addr| {
+                        if pass == 0 {
+                            refs.push((hash, addr.to_raw()));
+                        }
+                    },
+                    |parts| {
+                        if pass == 1 {
+                            let image = (parts.key.to_vec(), parts.value.to_vec());
+                            images.push((image.0, image.1, parts.extent_ref()));
+                        }
+                    },
+                );
+                if life.table.space().counters().cold_resolves != cold_before {
+                    run.report.violations.push("walker resolved a cold address".into());
                 }
-                run.report.images_emitted += 1;
-            }
-            if cursor == 0 {
-                break;
-            }
-            for _ in 0..4 {
-                let key = seeded_key(&mut rng, scenario.keys, &pairs);
-                let op = seeded_op(&mut rng);
-                run.apply_op(&mut life, &key, op);
-            }
-            if !life.flush_lag && rng.next_u64().is_multiple_of(4) {
-                run.maintain(&mut life);
-            }
-            // Mid-walk reconciliation (ADR-0093 D5): a resolution under
-            // a pinned walk records the walk's own id as the origin's
-            // stamp, so the ref this walk may have emitted for the twin
-            // is covered by the origin until the next checkpoint lands.
-            if rng.next_u64().is_multiple_of(3) {
-                run.reconcile(&mut life, 1, &format!("life {life_index} mid-walk"));
-            }
-            // Mid-walk copy-forward attempt (ADR-0059 D9-1): the pin
-            // pauses compaction — a mid-walk relocation would let this
-            // walk emit a ref and an image for one key. The call
-            // exercises the pause path; relocations must not move.
-            if !life.flush_lag && rng.next_u64().is_multiple_of(3) {
-                let before = run.report.relocations;
-                run.compact(&mut life, false, 2, &format!("life {life_index} mid-walk"));
-                if run.report.relocations != before {
-                    run.report
-                        .violations
-                        .push(format!("life {life_index}: compaction ran under a pinned walk"));
+                for (hash, addr) in refs {
+                    writer.append_ref(NS.0, w, hash, addr).expect("ref");
+                    run.report.refs_emitted += 1;
+                }
+                for (key, value, ext) in images {
+                    match ext {
+                        // M4-S17 (ADR-0061 D2): resident extent records
+                        // image as tag-9 — the reference, never the value.
+                        Some(ext) => writer
+                            .append(&RecordView::StringExtentRef {
+                                ns: NS,
+                                key: &key,
+                                extent_id: ext.extent_id,
+                                offset: ext.offset,
+                                len: ext.len,
+                            })
+                            .expect("extent image"),
+                        None => writer
+                            .append(&RecordView::StringPostImage {
+                                ns: NS,
+                                key: &key,
+                                value: &value,
+                            })
+                            .expect("image"),
+                    }
+                    run.report.images_emitted += 1;
+                }
+                if cursor == 0 {
+                    break;
+                }
+                for _ in 0..4 {
+                    let key = seeded_key(&mut rng, scenario.keys, &pairs);
+                    let op = seeded_op(&mut rng);
+                    run.apply_op(&mut life, &key, op);
+                }
+                if !life.flush_lag && rng.next_u64().is_multiple_of(4) {
+                    run.maintain(&mut life);
+                }
+                // Mid-walk reconciliation (ADR-0093 D5): a resolution under
+                // a pinned walk records the walk's own id as the origin's
+                // stamp, so the ref this walk may have emitted for the twin
+                // is covered by the origin until the next checkpoint lands.
+                if rng.next_u64().is_multiple_of(3) {
+                    run.reconcile(&mut life, 1, &format!("life {life_index} mid-walk"));
+                }
+                // Mid-walk copy-forward attempt (ADR-0059 D9-1): the pin
+                // pauses compaction — a mid-walk relocation would let this
+                // walk emit a ref and an image for one key. The call
+                // exercises the pause path; relocations must not move.
+                if !life.flush_lag && rng.next_u64().is_multiple_of(3) {
+                    let before = run.report.relocations;
+                    run.compact(&mut life, false, 2, &format!("life {life_index} mid-walk"));
+                    if run.report.relocations != before {
+                        run.report
+                            .violations
+                            .push(format!("life {life_index}: compaction ran under a pinned walk"));
+                    }
                 }
             }
         }

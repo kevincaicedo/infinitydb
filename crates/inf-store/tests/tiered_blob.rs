@@ -560,19 +560,31 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         &[NS.0],
     )
     .expect("create ick");
+    // Refs first, then images (ADR-0174 R2), as the reactor writer walks.
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<(u64, u64)> = Vec::new();
-        let mut images: Vec<(Vec<u8>, Vec<u8>, Option<inf_store::ExtentRef>)> = Vec::new();
         cursor = rig.table.ckpt_walk_slice(
             cursor,
             64,
             |hash, addr| refs.push((hash, addr.to_raw())),
-            |parts| images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref())),
+            |_| {},
         );
         for (hash, addr) in refs {
             writer.append_ref(NS.0, w, hash, addr).expect("ref");
         }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
+        let mut images: Vec<(Vec<u8>, Vec<u8>, Option<inf_store::ExtentRef>)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            64,
+            |_, _| {},
+            |parts| images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref())),
+        );
         for (key, value, ext) in images {
             match ext {
                 Some(ext) => writer

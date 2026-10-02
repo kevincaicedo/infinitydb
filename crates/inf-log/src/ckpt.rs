@@ -609,6 +609,11 @@ pub struct IckStream {
     sections: u32,
     records_total: u64,
     entries_per_ns: Vec<(u32, u64)>,
+    /// Namespaces that have staged an image (ADR-0174 R2, the writer
+    /// half of the section-order law): a ref for one of them is refused,
+    /// so no writer can emit what the reader refuses. Bounded by the
+    /// checkpoint's namespaces, as `entries_per_ns` is.
+    imaged_ns: Vec<u32>,
     digest: u64,
     header_written: bool,
     finished: bool,
@@ -703,6 +708,7 @@ impl IckStream {
             sections: 0,
             records_total: 0,
             entries_per_ns: Vec::new(),
+            imaged_ns: Vec::new(),
             digest: DIGEST_SEED,
             header_written: false,
             finished: false,
@@ -764,6 +770,13 @@ impl IckStream {
         assert_eq!(self.staged_class, Some(SectionClass::Images), "seal before switching class");
         buf.with_vec(|v| view.encode_into(v));
         self.staged_records += 1;
+        if let RecordView::StringPostImage { ns, .. }
+        | RecordView::DocFull { ns, .. }
+        | RecordView::StringExtentRef { ns, .. } = view
+            && !self.imaged_ns.contains(&ns.0)
+        {
+            self.imaged_ns.push(ns.0);
+        }
         if let RecordView::StringPostImage { ns, .. } | RecordView::DocFull { ns, .. } = view {
             match self.entries_per_ns.iter_mut().find(|(id, _)| *id == ns.0) {
                 Some((_, n)) => *n += 1,
@@ -779,12 +792,19 @@ impl IckStream {
     ///
     /// # Panics
     /// Panics on a v1 stream, when the pending section holds images or a
-    /// different `{ns, walk_watermark}`, or when an address breaches the
+    /// different `{ns, walk_watermark}`, when the namespace has already
+    /// staged an image (ADR-0174 R2: within a namespace every ref section
+    /// precedes every image section — the reader refuses the reverse, so
+    /// the writer may not emit it), or when an address breaches the
     /// watermark or the 48-bit space (walker bugs, never input).
     pub fn stage_addr_ref(&mut self, ns: u32, walk_watermark: u64, hash: u64, addr: u64) {
         assert!(self.header_written, "stage before the header");
         assert!(!self.finished, "stage after finish");
         assert!(self.version >= ICK_VERSION_V2, "addr refs are a v2 vocabulary");
+        assert!(
+            !self.imaged_ns.contains(&ns),
+            "a ref section after an image of its namespace (ADR-0174 R2)"
+        );
         assert!(addr < walk_watermark, "a ref must sit below its walk watermark");
         assert!(walk_watermark < ADDR_LIMIT, "watermarks are 48-bit");
         let buf = &mut self.bufs[self.staging];
@@ -1750,13 +1770,13 @@ mod tests {
             &[16],
         )
         .expect("create v2");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append(&RecordView::StringPostImage {
             ns: crate::record::NsId(16),
             key: b"k",
             value: b"v",
         })
         .expect("image");
-        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append_live_set(16, 1, 4096, 0, true).expect("live set");
         w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
         let meta = IdxSidecarMeta {
@@ -1797,9 +1817,9 @@ mod tests {
             &[16],
         )
         .expect("create v2");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
             .expect("image");
-        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append_live_set(16, 1, 4096, 0, true).expect("live set");
         w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
         let meta = IdxSidecarMeta {
@@ -2043,9 +2063,9 @@ mod tests {
             &[16],
         )
         .expect("create v3");
+        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
             .expect("image");
-        w.append_ref(16, 4096, 0xfeed_beef, 128).expect("addr ref");
         w.append_live_set(16, 1, 4096, 0, true).expect("live set");
         w.append_blob_ref(16, 100, 7, 4096).expect("blob ref");
         let meta = IdxSidecarMeta {
@@ -2225,13 +2245,12 @@ mod tests {
             &[16, 17],
         )
         .expect("create");
-        // Interleave classes the way a home-group walk does: the writer
-        // seals at every class/namespace boundary internally.
+        // The format's section order (ADR-0174 R2): within a namespace
+        // every ref section precedes every image section — the walker's
+        // pass 0, then its pass 1; the writer seals at every class and
+        // namespace boundary internally.
         let mut want_refs: Vec<(u32, u64, u64)> = Vec::new();
         for i in 0..40u32 {
-            let key = format!("hot:{i:04}").into_bytes();
-            w.append(&RecordView::StringPostImage { ns: NsId(16), key: &key, value: b"vv" })
-                .expect("append");
             let (hash, addr) = (0x1000 + u64::from(i), u64::from(i) * 100);
             w.append_ref(16, w_mark, hash, addr).expect("ref");
             want_refs.push((16, hash, addr));
@@ -2239,6 +2258,11 @@ mod tests {
         // A second namespace's refs under a different watermark.
         w.append_ref(17, 500, 0xAA, 12).expect("ref");
         want_refs.push((17, 0xAA, 12));
+        for i in 0..40u32 {
+            let key = format!("hot:{i:04}").into_bytes();
+            w.append(&RecordView::StringPostImage { ns: NsId(16), key: &key, value: b"vv" })
+                .expect("append");
+        }
         let summary = w.finish().expect("finish");
         assert_eq!(summary.records, 81);
         let mut counts = summary.entries_per_ns.clone();
@@ -2335,9 +2359,9 @@ mod tests {
             &[16],
         )
         .expect("create");
+        w.append_ref(16, 10_000, 0x1000, 96).expect("ref");
         w.append(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" })
             .expect("append");
-        w.append_ref(16, 10_000, 0x1000, 96).expect("ref");
         let want = [
             LiveSetFileEntry { file_id: 0, data_len: 4096, dead_bytes: 4096, byte_exact: true },
             LiveSetFileEntry { file_id: 1, data_len: 65_536, dead_bytes: 700, byte_exact: false },
@@ -2932,6 +2956,26 @@ mod tests {
             stream.stage_addr_ref(16, 100, 0x1, 0);
         });
         assert!(result.is_err(), "v1 streams must refuse addr refs");
+    }
+
+    /// ADR-0174 R2, the writer half: a ref for a namespace that has
+    /// staged an image is refused at staging, so no writer can emit what
+    /// the reader refuses (E9). Red before the law: the ref staged.
+    #[test]
+    #[should_panic(expected = "a ref section after an image of its namespace (ADR-0174 R2)")]
+    fn a_ref_after_an_image_of_its_namespace_is_refused_at_staging() {
+        let mut stream = IckStream::new_v2(&small_cfg());
+        let lease = stream.begin(0, 1, Lsn::new(crate::lsn::SegmentId(0), 0), &[16, 17]);
+        stream.release(lease);
+        stream.stage_record(&RecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v" });
+        let lease = stream.seal_section();
+        stream.release(lease);
+        // Another namespace's ref is fine after the image...
+        stream.stage_addr_ref(17, 100, 0x1, 0);
+        let lease = stream.seal_section();
+        stream.release(lease);
+        // ...the imaged namespace's is not.
+        stream.stage_addr_ref(16, 100, 0x1, 0);
     }
 
     #[test]
