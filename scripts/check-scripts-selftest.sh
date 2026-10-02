@@ -55,6 +55,22 @@ expect_output() {
     fi
 }
 
+# expect_red_because <label> <pattern> <command…>: red, and for its own
+# reason — a plant that is red for another reason is not evidence.
+expect_red_because() {
+    local label=$1 pattern=$2 status=0
+    shift 2
+    local log="$work/log"
+    "$@" >"$log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ] && grep -q -- "$pattern" "$log"; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "SELFTEST FAIL: expected red naming '$pattern', got exit $status — $label"
+        sed 's/^/    | /' "$log"
+    fi
+}
+
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
 # exist; a fixture root carries each of them as an empty `src/` so the
 # self-test is independent of which crates are excluded today.
@@ -1718,6 +1734,39 @@ expect red "lint-scopes: the unstable feature must match its census" ls_probe "$
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
+
+# ADR-0163 D2: the container plants under a fixture config, the production
+# config plus the three paths the ban adds. Each plant draws its lint naming
+# its path, the backing needs its one allow, and two containers on one line
+# are two spans (the census's unit).
+ls_container_probe() {
+    local dir="$work/$1"
+    cp -R "$SCRIPT_DIR/lint-scope-probe" "$dir"
+    cp "$dir/fixtures/containers.rs" "$dir/src/containers.rs"
+    printf 'pub mod containers;\n' >>"$dir/src/lib.rs"
+    python3 - "$SCRIPT_DIR/../clippy.toml" "$dir/clippy.toml" <<'PY'
+import sys
+text, anchor = open(sys.argv[1]).read(), "disallowed-types = [\n"
+assert text.count(anchor) == 1, "clippy.toml: one disallowed-types table"
+entries = "".join(f'    {{ path = "std::collections::{name}", reason = "fixture" }},\n'
+                  for name in ("HashMap", "HashSet", "VecDeque"))
+open(sys.argv[2], "w").write(text.replace(anchor, anchor + entries, 1))
+PY
+}
+ls_container_probe probe-containers
+expect green "lint-scopes: container plants draw their lint and path under the fixture config" ls_probe "$work/probe-containers"
+ls_container_probe probe-containers-unconfigured
+rm "$work/probe-containers-unconfigured/clippy.toml"
+expect_red_because "lint-scopes: container plants under a config without the paths compile clean" \
+    "did NOT draw clippy::disallowed_types std::collections::VecDeque" ls_probe "$work/probe-containers-unconfigured"
+ls_container_probe probe-containers-backing
+sed -i.bak '/reason = "container: capped-backing"/d' "$work/probe-containers-backing/src/containers.rs"
+expect_red_because "lint-scopes: the backing without its one allow draws on its field" \
+    "control drew \[('clippy::disallowed_types', 'std::collections::VecDeque')\]" ls_probe "$work/probe-containers-backing"
+ls_container_probe probe-containers-one-span
+sed -i.bak 's|(std::collections::VecDeque<u8>, std::collections::VecDeque<u8>)|(std::collections::VecDeque<u8>, u8)|; s|pair.1.capacity()|usize::from(pair.1)|' "$work/probe-containers-one-span/src/containers.rs"
+expect_red_because "lint-scopes: a two-span plant over a line that holds one container" \
+    "wants 2 distinct spans of clippy::disallowed_types" ls_probe "$work/probe-containers-one-span"
 
 # ADR-0164: the parent doc gates state their scope — a standalone checkout
 # skips out loud; a parent whose gates are missing is red, not a skip.

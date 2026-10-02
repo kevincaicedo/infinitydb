@@ -4,6 +4,8 @@ usage: judge.py <probe lib.rs> <clippy JSON> <clippy.toml> <rustc JSON> <rustc e
 
 Every plant must report its own lint and, for disallowed APIs, its resolved
 path. Unrelated errors, unmarked diagnostics and missing config plants fail.
+A plant marked `xN` must draw exactly N distinct spans (columns) on its line:
+the container census counts spans, so two containers on one line are two.
 """
 import json
 from pathlib import Path
@@ -16,15 +18,17 @@ config, unstable_diag = Path(sys.argv[3]), Path(sys.argv[4])
 unstable_exit = int(sys.argv[5])
 # This is an exact census, not a fallback for missing Clippy witnesses.
 UNSTABLE = {"std::fs::set_times": ("set_times.rs", "fs_set_times")}
-plants, controls, errors = {}, set(), []
+plants, controls, errors, spans_wanted = {}, set(), [], {}
 probe_root = src.parent.parent
 for file in sorted(src.parent.glob("*.rs")):
     relative = file.relative_to(probe_root).as_posix()
     for n, line in enumerate(file.read_text().splitlines(), 1):
         at = (relative, n)
-        marker = re.search(r"// PLANT (\S+)(?: (\S+))?\s*$", line)
+        marker = re.search(r"// PLANT (\S+)(?: (\S+?))?(?: x([2-9]))?\s*$", line)
         if marker:
-            plants[at] = marker.groups()
+            plants[at] = marker.groups()[:2]
+            if marker.group(3):
+                spans_wanted[at] = int(marker.group(3))
         elif re.search(r"// CONTROL\s*$", line):
             controls.add(at)
 
@@ -33,13 +37,23 @@ def filesystem(path):
     return path.startswith(("std::fs::", "std::path::Path::", "std::os::unix::fs::"))
 
 
+def container(path):
+    return path.startswith("std::collections::")
+
+
 cfg = tomllib.loads(config.read_text())
-for key, lint, count in (("disallowed-methods", "disallowed_methods", 37),
-                         ("disallowed-types", "disallowed_types", 5)):
-    paths = [row["path"] for row in cfg[key] if filesystem(row["path"])]
-    if len(paths) != count or len(set(paths)) != len(paths):
-        errors.append(f"config needs {count} distinct filesystem {key}, found {len(paths)}")
-    witnesses = {path for code, path in plants.values() if code == f"clippy::{lint}"}
+# (config key, lint, family, its name, the exact count or None). The container
+# family's count is whatever the config holds: every entry needs a plant and
+# every plant an entry, in the shipped probe and under a fixture config alike.
+CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
+          ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
+          ("disallowed-types", "disallowed_types", container, "container", None))
+for key, lint, family, label, count in CENSUS:
+    paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
+    if (count is not None and len(paths) != count) or len(set(paths)) != len(paths):
+        errors.append(f"config needs {count} distinct {label} {key}, found {len(paths)}")
+    witnesses = {path for code, path in plants.values()
+                 if code == f"clippy::{lint}" and path and family(path)}
     unstable = set(UNSTABLE) if lint == "disallowed_methods" else set()
     for path in sorted(unstable - set(paths)):
         errors.append(f"unstable path {path} has no config entry")
@@ -50,7 +64,7 @@ for key, lint, count in (("disallowed-methods", "disallowed_methods", 37),
     if witnesses & unstable:
         errors.append("an unstable call must not be counted as a Clippy plant")
 
-seen, messages = {}, 0
+seen, columns, messages = {}, {}, 0
 for raw in diag.read_text().splitlines():
     try:
         msg = json.loads(raw)
@@ -77,6 +91,7 @@ for raw in diag.read_text().splitlines():
             file = file.relative_to(probe_root)
         at = (file.as_posix(), sp["line_start"])
         seen.setdefault(at, set()).add((code, path.group(1) if path else None))
+        columns.setdefault((at, code, path.group(1) if path else None), set()).add(sp["column_start"])
 
 for at, (lint_spec, path) in sorted(plants.items()):
     lints = set(lint_spec.split(","))
@@ -84,6 +99,9 @@ for at, (lint_spec, path) in sorted(plants.items()):
     for lint in sorted(lints):
         if not any(code == lint and (path is None or actual == path) for code, actual in drew):
             errors.append(f"{at}: did NOT draw {lint} {path or ''}; drew {sorted(drew)}")
+        elif at in spans_wanted and len(columns.get((at, lint, path), ())) != spans_wanted[at]:
+            got = sorted(columns.get((at, lint, path), ()))
+            errors.append(f"{at}: wants {spans_wanted[at]} distinct spans of {lint}, drew columns {got}")
     if any(code not in lints or (path is not None and actual != path) for code, actual in drew):
         errors.append(f"{at}: plant drew an unrelated diagnostic: {sorted(drew)}")
 for at in sorted(controls):
