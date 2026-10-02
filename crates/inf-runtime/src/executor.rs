@@ -66,15 +66,13 @@ enum TaskState {
     Dead,
 }
 
-/// Ready queue shared between the executor and every waker. `Rc<RefCell<…>>`
-/// — single-threaded interior mutability, no atomics (L1).
-type ReadyQueue = Rc<RefCell<VecDeque<u32>>>;
-
 /// Per-task shared state. Wakers are `Rc<TaskHeader>` behind a raw vtable.
 struct TaskHeader {
     state: Cell<TaskState>,
     slot: Cell<u32>,
-    ready: ReadyQueue,
+    /// The ready queue shared between the executor and every waker:
+    /// `Rc<RefCell<…>>`, single-threaded interior mutability, no atomics (L1).
+    ready: Rc<RefCell<VecDeque<u32>>>,
 }
 
 /// The wake transition. Runs inside `Waker::wake`, so it must not touch the
@@ -257,7 +255,7 @@ struct TaskEntry {
 pub struct CellExecutor {
     entries: Vec<Option<TaskEntry>>,
     free: Vec<u32>,
-    ready: ReadyQueue,
+    ready: Rc<RefCell<VecDeque<u32>>>,
     /// Recycled header for the fast path (no allocation on Ready).
     spare_header: Option<Rc<TaskHeader>>,
     /// Recycled storage for the fast path (no malloc on Ready).

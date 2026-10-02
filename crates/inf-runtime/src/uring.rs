@@ -41,11 +41,6 @@ use inf_foundation::{BuildIntHasher, FileOffset};
 use io_uring::types::Fd;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
-/// Driver-internal op tables key by kernel-issued fds and our own sequential
-/// tokens — trusted integers, hashed with one folded multiply (see
-/// `gate::GateMap`; the S21 Phase-H hashing lever).
-type DriverMap<K, V> = HashMap<K, V, BuildIntHasher>;
-
 use crate::driver::{
     AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
     StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
@@ -182,17 +177,19 @@ pub struct UringDriver {
     pending_ops: Vec<IoOp>,
     /// SQEs that did not fit the SQ; flushed first next submit.
     backlog: VecDeque<SqeChain>,
-    states: DriverMap<u64, OpState>,
+    // The op tables key by kernel-issued fds and our own sequential tokens:
+    // trusted integers, hashed with one folded multiply (`BuildIntHasher`).
+    states: HashMap<u64, OpState, BuildIntHasher>,
     next_id: u64,
-    accepts: DriverMap<RawFd, AcceptArm>,
-    recvs: DriverMap<RawFd, RecvArm>,
+    accepts: HashMap<RawFd, AcceptArm, BuildIntHasher>,
+    recvs: HashMap<RawFd, RecvArm, BuildIntHasher>,
     /// Closes in flight by close op id — `Closed` is delivered only after
     /// the sends the close cancelled resolve (their buffers return first,
     /// per contract).
-    closing: DriverMap<u64, CloseWait>,
+    closing: HashMap<u64, CloseWait, BuildIntHasher>,
     /// Buffers currently owned by the kernel's provided group, by bid.
     /// CQE `buffer_select` ids resolve through this map — never minted.
-    provided: DriverMap<u16, BufferId>,
+    provided: HashMap<u16, BufferId, BuildIntHasher>,
     /// Wake eventfd watched via `PollAdd` (see [`OpState::WakeWatch`]).
     wake_fd: Option<std::os::fd::OwnedFd>,
     /// Registered cold-read pool geometry (M4-S08): set by
@@ -286,12 +283,12 @@ impl UringDriver {
             },
             pending_ops: Vec::with_capacity(64),
             backlog: VecDeque::new(),
-            states: DriverMap::default(),
+            states: HashMap::default(),
             next_id: 0,
-            accepts: DriverMap::default(),
-            recvs: DriverMap::default(),
-            closing: DriverMap::default(),
-            provided: DriverMap::default(),
+            accepts: HashMap::default(),
+            recvs: HashMap::default(),
+            closing: HashMap::default(),
+            provided: HashMap::default(),
             wake_fd: None,
             tier_fixed: None,
             stats: SubmitStats::default(),
@@ -1111,7 +1108,7 @@ impl UringDriver {
     /// predecessor's stream on a recycled number delivers its payload but
     /// never pauses the successor's arm.
     fn handle_recv_payload(
-        provided: &mut DriverMap<u16, BufferId>,
+        provided: &mut HashMap<u16, BufferId, BuildIntHasher>,
         arm: Option<&mut RecvArm>,
         token: CompletionToken,
         result: i32,
