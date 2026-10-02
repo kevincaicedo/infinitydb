@@ -136,6 +136,14 @@ rows=(
   # ADR-0159 A1.4: `WAIT CELL k`'s confirmation skips its LASTSAVE floor
   # raise, so a LASTSAVE after the WAIT trails the checkpoint it fenced.
   "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_after_wait_cell_covers_the_fenced_checkpoint"
+  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
+  # The confirmation raises the floor but does not write the cell's
+  # `LastSave`: both surfaces stay below the checkpoint the WAIT fenced.
+  "inf_canary_lastsave_cell_stale crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
+  # INFO's `rdb_last_save_time` renders the sweep's term alone: after a
+  # `WAIT CELL k` that confirms ahead of the sweep it differs from LASTSAVE.
+  "inf_canary_info_lastsave_from_observation crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
+  "inf_canary_info_lastsave_from_observation crate-test inf-sim lib lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep"
   # ADR-0159 A1.4: the park guard without its own-slot term — a cell parks
   # on top of a `WAIT` its own publication satisfied.
   "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake"

@@ -1070,17 +1070,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// One MAINTAIN concern of `maintain`, in phase order: the
     /// checkpoint-board sweep (ADR-0159 D4, A1.4). One step of at most
     /// `CKPT_BOARD_VISITS_PER_TURN` slot visits, charged one Maintenance
-    /// unit. A completed sweep publishes the observation `WAIT`, DROP
-    /// pacing and `LASTSAVE` read; when any slot published since the last
-    /// one, the parked `INF.CKPT WAIT` pumps re-check their target (the
-    /// M2-S20 wake). The INFO gauge follows the observation.
+    /// unit. A completed sweep publishes the observation `WAIT` and DROP
+    /// pacing read, and with it the cell's `LastSave`; when any slot
+    /// published since the last one, the parked `INF.CKPT WAIT` pumps
+    /// re-check their target (the M2-S20 wake).
     fn maintain_ckpt_sweep(&mut self, cx: &mut LoopCx<'_>) {
         let control = self.shared.control.borrow();
         let Some(control) = control.as_ref() else { return };
         if cx.budget(GroupClass::Maintenance) == 0 {
             return;
         }
-        let step = control.ckpt_board().sweep_step(&mut self.shared.ckpt_sweep.borrow_mut());
+        let step = control
+            .ckpt_board()
+            .sweep_step(&mut self.shared.ckpt_sweep.borrow_mut(), &self.shared.node.lastsave);
         cx.charge(GroupClass::Maintenance, 1);
         match step {
             crate::control::SweepStep::InProgress | crate::control::SweepStep::Unchanged => {}
@@ -1088,8 +1090,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 self.shared.ckpt_waiters.wake_all(0);
             }
         }
-        let observed = self.shared.ckpt_sweep.borrow().observed();
-        self.shared.node.rdb_last_save_ms.set(observed.max_unix_ms);
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order:

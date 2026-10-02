@@ -350,9 +350,10 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// exactly when it is.
     ckpt_quota: RefCell<Option<CkptQuota>>,
     /// This cell's sweep of the checkpoint board (ADR-0159 D4, A1.4): its
-    /// completed observation, which all-cell `WAIT`, DROP pacing and the
-    /// INFO gauge read, and `LASTSAVE`'s floor, which every `WAIT CELL k`
-    /// on this cell raises as it confirms. Stepped once per MAINTAIN.
+    /// completed observation, which all-cell `WAIT` and DROP pacing read,
+    /// and `LASTSAVE`'s floor, which every `WAIT CELL k` on this cell
+    /// raises as it confirms. Both write `node.lastsave`. Stepped once per
+    /// MAINTAIN.
     ckpt_sweep: RefCell<BoardSweep>,
     /// Node is loading (M2-S15): commands without the LOADING flag answer
     /// `-LOADING` until every cell's recovery completes. One predictable

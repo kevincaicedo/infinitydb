@@ -241,11 +241,16 @@ fn persistence_section(text: &mut String, node: &NodeInfo, now: Nanos) {
         push(text, &format!("loading_cells:{}", node.cells.get()));
     }
     push(text, "rdb_changes_since_last_save:0");
-    // M2-S20: BGSAVE maps onto the fuzzy checkpoint (no fork); the
-    // save time is the newest durable MANIFEST publication (board
-    // max across cells, unix seconds — the LASTSAVE currency).
+    // M2-S20: BGSAVE maps onto the fuzzy checkpoint (no fork); the save
+    // time is the cell's `LastSave`, the value `LASTSAVE` answers
+    // (ADR-0159 A1.4).
     push(text, &format!("rdb_bgsave_in_progress:{}", node.ckpt_in_progress.get()));
-    push(text, &format!("rdb_last_save_time:{}", node.rdb_last_save_ms.get() / 1000));
+    // Canary: the gauge renders the completed sweep's term alone.
+    #[cfg(not(inf_canary_info_lastsave_from_observation))]
+    let last_save_s = node.lastsave.unix_s();
+    #[cfg(inf_canary_info_lastsave_from_observation)]
+    let last_save_s = node.lastsave.observed_unix_s();
+    push(text, &format!("rdb_last_save_time:{last_save_s}"));
     // ADR-0100 D7: durable namespaces dropped since every cell last
     // published a MANIFEST past the drop (node scope).
     push(text, &format!("ns_drop_tombstones:{}", node.ns_drop_tombstones.get()));

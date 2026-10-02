@@ -380,9 +380,9 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
 /// commit, so `WAIT` returns only after durability — a swap abort does
 /// not publish; the retried swap does (fault-injection verified).
 /// `LASTSAVE` = unix seconds of the newest publication this cell has
-/// observed (ADR-0159 A1.4: its completed sweep, raised by its own
-/// `WAIT CELL k`s; 0 before the first — deviation documented; Redis
-/// reports process-start time).
+/// observed (ADR-0159 A1.4: the cell's `LastSave`, which INFO's
+/// `rdb_last_save_time` reads too; 0 before the first — deviation
+/// documented; Redis reports process-start time).
 pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
@@ -397,8 +397,7 @@ pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clon
         return error_reply(shared, proto, CKPT_NO_PLANE);
     }
     if id == CommandId::Lastsave {
-        let unix_s = shared.ckpt_sweep.borrow().lastsave_unix_s();
-        return int_reply(shared, proto, unix_s as i64);
+        return int_reply(shared, proto, shared.node.lastsave.unix_s() as i64);
     }
     let args = match parse_ckpt_args(shared.cells, id, argv) {
         Ok(args) => args,
@@ -457,8 +456,8 @@ fn parse_ckpt_args(cells: u16, id: CommandId, argv: &[&[u8]]) -> Result<CkptArgs
 }
 
 /// Parks until the target published `epoch`. `CELL k` reads slot `k`
-/// through the sweep's confirmation, which raises this cell's `LASTSAVE`
-/// floor in the same step (ADR-0159 A1.4); an all-cell wait reads this
+/// through the sweep's confirmation, which raises this cell's `LastSave`
+/// in the same step (ADR-0159 A1.4); an all-cell wait reads this
 /// cell's completed sweep, a lower bound that is never early (D4). The
 /// sweep's completion wakes the waitlist.
 async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -471,7 +470,8 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         let satisfied = match cell {
             Some(k) => {
                 let slot = control.ckpt_board().slot(k);
-                shared.ckpt_sweep.borrow_mut().confirm_cell_wait(slot, epoch)
+                let lastsave = &shared.node.lastsave;
+                shared.ckpt_sweep.borrow_mut().confirm_cell_wait(slot, epoch, lastsave)
             }
             None => shared.ckpt_sweep.borrow().observed().min_published >= epoch.get(),
         };

@@ -26,6 +26,7 @@
 //! epoch can neither wrap nor repeat. An exhausted quota refuses before
 //! any effect.
 
+use core::cell::Cell;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -411,9 +412,9 @@ impl CkptBoard {
     /// [`CKPT_BOARD_VISITS_PER_TURN`] slots from the sweep's cursor, each
     /// read `published` (`Acquire`) then its publication time. A sweep of
     /// `N` cells completes in `ceil(N / 64)` steps and then publishes its
-    /// observation. A sweep's first step loads its own cell's slot before
-    /// any visit.
-    pub fn sweep_step(&self, sweep: &mut BoardSweep) -> SweepStep {
+    /// observation, and with it the cell's `lastsave`. A sweep's first step
+    /// loads its own cell's slot before any visit.
+    pub fn sweep_step(&self, sweep: &mut BoardSweep, lastsave: &LastSave) -> SweepStep {
         let begin = sweep.cursor;
         if begin == 0 {
             // The sweep's start, before any visit: a sweep whose `own_seen`
@@ -448,6 +449,7 @@ impl CkptBoard {
         {
             sweep.own_seen = sweep.partial_own;
         }
+        sweep.write_lastsave(lastsave);
         if sweep.observed.published_sum == previous.published_sum {
             SweepStep::Unchanged
         } else {
@@ -467,8 +469,41 @@ pub struct BoardObservation {
     /// Sum of published epochs, in `u128` so it cannot wrap (D4): the
     /// wake signal for parked `WAIT`s.
     pub published_sum: u128,
-    /// Newest publication time (unix ms): the `rdb_last_save_time` gauge.
+    /// Newest publication time (unix ms): one term of the cell's
+    /// [`LastSave`].
     pub max_unix_ms: u64,
+}
+
+/// One cell's `LASTSAVE` value (ADR-0159 A1.4), unix ms: the newest
+/// publication time in the cell's completed board sweep, raised by every
+/// slot a `WAIT CELL k` on the cell confirmed; 0 before the first. The
+/// `LASTSAVE` command and INFO's `rdb_last_save_time` both read it, so on
+/// one cell they cannot differ. It is written only by the two steps that
+/// change one of its terms ([`CkptBoard::sweep_step`] and
+/// [`BoardSweep::confirm_cell_wait`]): no setter leaves this module.
+#[derive(Debug, Default)]
+pub struct LastSave {
+    unix_ms: Cell<u64>,
+    /// Canary: the completed sweep's term alone, for an INFO gauge that
+    /// reads its own source again.
+    #[cfg(inf_canary_info_lastsave_from_observation)]
+    observed_unix_ms: Cell<u64>,
+}
+
+impl LastSave {
+    /// The value in unix seconds: what `LASTSAVE` and `rdb_last_save_time`
+    /// answer.
+    #[must_use]
+    pub fn unix_s(&self) -> u64 {
+        self.unix_ms.get() / 1000
+    }
+
+    /// Canary: the completed sweep's term alone, in unix seconds.
+    #[cfg(inf_canary_info_lastsave_from_observation)]
+    #[must_use]
+    pub fn observed_unix_s(&self) -> u64 {
+        self.observed_unix_ms.get() / 1000
+    }
 }
 
 /// One cell's resumable sweep over the board (ADR-0159 D4): a cursor into
@@ -535,10 +570,16 @@ impl BoardSweep {
 
     /// `WAIT CELL k`'s check (ADR-0159 A1.4): whether `slot` published
     /// `epoch`. When it did, the publication time read after the `Acquire`
-    /// load that satisfied the check raises this cell's `LASTSAVE` floor in
-    /// the same step, so a `WAIT CELL k` that returns leaves `LASTSAVE`
-    /// covering the checkpoint it fenced, even while the sweep trails.
-    pub fn confirm_cell_wait(&mut self, slot: &CkptSlot, epoch: CheckpointEpoch) -> bool {
+    /// load that satisfied the check raises this cell's `LASTSAVE` floor and
+    /// `lastsave` in the same step, so a `WAIT CELL k` that returns leaves
+    /// `LASTSAVE` and `rdb_last_save_time` covering the checkpoint it
+    /// fenced, even while the sweep trails.
+    pub fn confirm_cell_wait(
+        &mut self,
+        slot: &CkptSlot,
+        epoch: CheckpointEpoch,
+        lastsave: &LastSave,
+    ) -> bool {
         let Some(unix_ms) = slot.covered_at(epoch) else { return false };
         // Canary: the confirmation without its floor raise.
         #[cfg(not(inf_canary_lastsave_floor_skipped))]
@@ -547,15 +588,20 @@ impl BoardSweep {
         }
         #[cfg(inf_canary_lastsave_floor_skipped)]
         let _ = unix_ms;
+        // Canary: the confirmation without its write of the cell's value.
+        #[cfg(not(inf_canary_lastsave_cell_stale))]
+        self.write_lastsave(lastsave);
+        #[cfg(inf_canary_lastsave_cell_stale)]
+        let _ = lastsave;
         true
     }
 
-    /// `LASTSAVE` (ADR-0159 A1.4): the newest publication this cell has
-    /// observed, from its completed sweep or a slot a `WAIT CELL k` on
-    /// this cell confirmed, in unix seconds.
-    #[must_use]
-    pub fn lastsave_unix_s(&self) -> u64 {
-        self.observed.max_unix_ms.max(self.lastsave_floor_ms) / 1000
+    /// The cell's `LASTSAVE` value from its two terms. The two steps that
+    /// change a term call it, so the value never lags either.
+    fn write_lastsave(&self, lastsave: &LastSave) {
+        lastsave.unix_ms.set(self.observed.max_unix_ms.max(self.lastsave_floor_ms));
+        #[cfg(inf_canary_info_lastsave_from_observation)]
+        lastsave.observed_unix_ms.set(self.observed.max_unix_ms);
     }
 
     /// A sweep is part-way through the board.
@@ -2042,12 +2088,16 @@ mod tests {
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
 
+    use inf_foundation::time::Nanos;
     use inf_foundation::{CellCount, CellId, SLOT_COUNT};
+    use inf_store::{Keyspace, StoreConfig};
+    use inf_wire::{Protocol, RespWriter};
 
     use super::{
         BoardObservation, BoardSweep, CkptBoard, CkptSlot, CkptSpace, CkptTarget, ControlHandle,
-        SweepStep,
+        LastSave, SweepStep,
     };
+    use crate::exec::NodeInfo;
 
     fn cells(count: u16) -> CellCount {
         CellCount::new(count).expect("a valid test topology")
@@ -2078,7 +2128,7 @@ mod tests {
         let mut steps = 0;
         loop {
             steps += 1;
-            match board.sweep_step(sweep) {
+            match board.sweep_step(sweep, &LastSave::default()) {
                 SweepStep::InProgress => {}
                 done @ (SweepStep::Unchanged | SweepStep::Progressed) => return (steps, done),
             }
@@ -2137,7 +2187,11 @@ mod tests {
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
         let mut sweep = BoardSweep::new(CellId(0));
-        assert_eq!(board.sweep_step(&mut sweep), SweepStep::Progressed, "the wake fires");
+        assert_eq!(
+            board.sweep_step(&mut sweep, &LastSave::default()),
+            SweepStep::Progressed,
+            "the wake fires"
+        );
         assert_eq!(sweep.observed().published_sum, 1 << 64);
         assert!(!aliases_the_initial_state(sweep.observed().published_sum));
     }
@@ -2177,7 +2231,7 @@ mod tests {
         let mut turns = 0u32;
         loop {
             let before = sweep.visits();
-            let step = board.sweep_step(&mut sweep);
+            let step = board.sweep_step(&mut sweep, &LastSave::default());
             turns += 1;
             assert!(sweep.visits() - before <= 64, "A1.4: at most 64 visits per turn");
             if step != SweepStep::InProgress {
@@ -2189,11 +2243,11 @@ mod tests {
         // Publish behind the cursor, part-way into a sweep: the sweep in
         // progress misses it, the next one sees it.
         for _ in 0..100 {
-            board.sweep_step(&mut sweep);
+            board.sweep_step(&mut sweep, &LastSave::default());
         }
         board.slot(3).publish(7, 1, 1_000);
         let seen_within = observed_within(board, &mut sweep, 512, |board, sweep| {
-            board.sweep_step(sweep);
+            board.sweep_step(sweep, &LastSave::default());
         });
         assert!(seen_within.is_some(), "an advance is observed within two sweeps");
     }
@@ -2269,7 +2323,10 @@ mod tests {
             board.slot(1).publish(5, 1, 1_000);
             assert!(!board.own_unobserved(&sweep), "slot 1 is not slot 0");
             for _ in 0..steps_in {
-                assert_eq!(board.sweep_step(&mut sweep), SweepStep::InProgress);
+                assert_eq!(
+                    board.sweep_step(&mut sweep, &LastSave::default()),
+                    SweepStep::InProgress
+                );
             }
             board.slot(0).publish(7, 2, 2_000);
             let expected =
@@ -2277,7 +2334,7 @@ mod tests {
             let mut turns = 0;
             while board.own_unobserved(&sweep) {
                 assert!(turns < 2 * SWEEP_TURNS, "the own-slot term never ended ({steps_in} in)");
-                board.sweep_step(&mut sweep);
+                board.sweep_step(&mut sweep, &LastSave::default());
                 turns += 1;
             }
             assert_eq!(turns, expected, "published {steps_in} steps into a sweep");
@@ -2299,7 +2356,7 @@ mod tests {
         board.slot(0).publish(3, 1, 1_000);
         board.slot(1).publish(4, 1, 1_000);
         assert!(!board.own_unobserved(&sweep));
-        assert_eq!(board.sweep_step(&mut sweep), SweepStep::Progressed);
+        assert_eq!(board.sweep_step(&mut sweep, &LastSave::default()), SweepStep::Progressed);
         assert!(!board.own_unobserved(&sweep));
         assert_eq!(sweep.observed().min_published, 3);
     }
@@ -2307,9 +2364,10 @@ mod tests {
     /// ADR-0159 A1.4 through the product's own step: with this cell's
     /// sweep stalled (it never read the board), the `WAIT CELL 1`
     /// confirmation raises its `LASTSAVE` floor to slot 1's publication
-    /// second. `wait_for_ckpt` and `LASTSAVE` call exactly these two
-    /// methods; the planted `inf_canary_lastsave_floor_skipped` (the
-    /// confirmation without its raise) must fail this test.
+    /// second. `wait_for_ckpt` calls exactly this method and `LASTSAVE`
+    /// reads exactly this `LastSave`; the planted
+    /// `inf_canary_lastsave_floor_skipped` (the confirmation without its
+    /// raise) must fail this test.
     #[test]
     fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
         let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
@@ -2319,18 +2377,73 @@ mod tests {
         assert_eq!(board.requested(1), epoch.get());
         assert_eq!(board.requested(0), 0, "a targeted request reaches one slot");
         let mut sweep = BoardSweep::new(CellId(0));
-        assert!(!sweep.confirm_cell_wait(board.slot(1), epoch), "not yet published");
+        let lastsave = LastSave::default();
+        assert!(!sweep.confirm_cell_wait(board.slot(1), epoch, &lastsave), "not yet published");
         let published_ms = 1_700_000_123_456;
         board.slot(1).publish(epoch.get(), 9, published_ms);
-        assert!(sweep.confirm_cell_wait(board.slot(1), epoch), "slot 1 published the epoch");
+        assert!(sweep.confirm_cell_wait(board.slot(1), epoch, &lastsave), "slot 1 published");
         // Engagement: the observation alone would answer 0.
         assert_eq!(sweep.observed(), BoardObservation::default(), "the sweep trails the board");
-        let lastsave = sweep.lastsave_unix_s();
-        assert!(lastsave >= published_ms / 1000, "LASTSAVE {lastsave} trails the WAIT");
+        let answered = lastsave.unix_s();
+        assert!(answered >= published_ms / 1000, "LASTSAVE {answered} trails the WAIT");
         // The floor only rises: an older publication it confirms leaves it.
         board.slot(0).publish(epoch.get(), 1, 1_000);
-        assert!(sweep.confirm_cell_wait(board.slot(0), epoch));
-        assert_eq!(sweep.lastsave_unix_s(), lastsave);
+        assert!(sweep.confirm_cell_wait(board.slot(0), epoch, &lastsave));
+        assert_eq!(lastsave.unix_s(), answered);
+    }
+
+    /// `rdb_last_save_time` of the product's `INFO persistence` for `node`.
+    fn info_rdb_last_save_time(node: &NodeInfo) -> u64 {
+        let keyspace = Keyspace::new(StoreConfig::default());
+        let argv: [&[u8]; 2] = [b"INFO", b"persistence"];
+        let mut reply = Vec::new();
+        let mut writer = RespWriter::new(&mut reply, Protocol::Resp2);
+        crate::admin::info(&argv[..], &keyspace, node, Nanos(1), &mut writer);
+        let text = String::from_utf8(reply).expect("INFO is text");
+        text.lines()
+            .find_map(|line| line.strip_prefix("rdb_last_save_time:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no rdb_last_save_time in {text:?}"))
+    }
+
+    /// ADR-0159 A1.4, one `LASTSAVE` value per cell: after a `WAIT CELL 1`
+    /// confirmed with the sweep stalled on an older observation, the value
+    /// the `LASTSAVE` command answers (`node.lastsave`) and the
+    /// `rdb_last_save_time` the product's INFO renders are the same second,
+    /// at or after slot 1's publication second, which the test reads from
+    /// the board. Planted, each must fail this test: the confirmation
+    /// without its write of the cell's value
+    /// (`inf_canary_lastsave_cell_stale`), and an INFO gauge that renders
+    /// the sweep's term alone (`inf_canary_info_lastsave_from_observation`).
+    #[test]
+    fn lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell() {
+        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
+        let board = handle.ckpt_board();
+        let node = NodeInfo::try_default().expect("fixture cache allocation");
+        let mut sweep = BoardSweep::new(CellId(0));
+        assert_eq!((node.lastsave.unix_s(), info_rdb_last_save_time(&node)), (0, 0));
+        // One completed sweep over an older publication: both surfaces
+        // answer its second.
+        let older_ms = 1_700_000_100_000;
+        board.slot(0).publish(1, 1, older_ms);
+        assert_eq!(board.sweep_step(&mut sweep, &node.lastsave), SweepStep::Progressed);
+        assert_eq!(node.lastsave.unix_s(), older_ms / 1000);
+        assert_eq!(info_rdb_last_save_time(&node), older_ms / 1000);
+        // The sweep stalls there; slot 1 publishes and the WAIT confirms.
+        let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
+        board.slot(1).publish(epoch.get(), 9, 1_700_000_123_456);
+        assert!(sweep.confirm_cell_wait(board.slot(1), epoch, &node.lastsave));
+        // Engagement: the observation still holds the older second.
+        assert_eq!(sweep.observed().max_unix_ms, older_ms, "the sweep trails the board");
+        let fenced_s = board.slot(1).last_unix_ms() / 1000;
+        let command = node.lastsave.unix_s();
+        let info = info_rdb_last_save_time(&node);
+        assert!(command >= fenced_s, "LASTSAVE {command} is below slot 1's second {fenced_s}");
+        assert_eq!(info, command, "rdb_last_save_time and LASTSAVE differ on one cell");
+        // The next completed sweep changes neither: it reads the same slot.
+        assert_eq!(board.sweep_step(&mut sweep, &node.lastsave), SweepStep::Progressed);
+        assert_eq!((node.lastsave.unix_s(), info_rdb_last_save_time(&node)), (fenced_s, fenced_s));
     }
 
     /// ADR-0159 A1.1 at the control-plane constructors: they take only a

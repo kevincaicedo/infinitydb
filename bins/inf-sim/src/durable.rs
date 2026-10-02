@@ -55,6 +55,8 @@ use crate::resp::reply_len;
 
 mod audit;
 #[cfg(test)]
+mod lastsave;
+#[cfg(test)]
 mod park;
 mod run;
 pub use run::run_durable_scenario;

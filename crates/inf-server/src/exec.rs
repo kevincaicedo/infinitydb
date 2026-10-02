@@ -313,13 +313,12 @@ pub struct NodeState {
     pub manifests_aborted: Cell<u64>,
     pub segments_truncated: Cell<u64>,
     pub log_segments_live: Cell<u64>,
-    /// Checkpoint operator surface (M2-S20): streaming-now flag + the
-    /// newest durable MANIFEST publication in this cell's completed board
-    /// sweep (unix ms, ADR-0159 D4) — `rdb_last_save_time`. `LASTSAVE`
-    /// answers the same value, raised by a slot its own `WAIT CELL k`
-    /// confirmed (A1.4).
+    /// Checkpoint operator surface (M2-S20): the streaming-now flag, and
+    /// the newest durable MANIFEST publication this cell has observed
+    /// (ADR-0159 A1.4), which `LASTSAVE` and `rdb_last_save_time` both
+    /// answer.
     pub ckpt_in_progress: Cell<u64>,
-    pub rdb_last_save_ms: Cell<u64>,
+    pub lastsave: crate::control::LastSave,
     /// ADR-0100 D7: live drop tombstones in the catalog writer (node
     /// scope, refreshed at MAINTAIN from the control handle).
     pub ns_drop_tombstones: Cell<u64>,

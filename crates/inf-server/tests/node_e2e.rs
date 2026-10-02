@@ -5757,6 +5757,37 @@ fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// ADR-0159 A1.4 at the wire (2 cells): after `INF.CKPT CELL k WAIT`,
+/// `LASTSAVE` and INFO's `rdb_last_save_time` answer the same second on
+/// the same connection, sent in one write. The reachability leg only: on
+/// the wire the sweep that wakes the `WAIT` has usually read slot `k`. The
+/// schedule in which it has not is the simulator's
+/// `lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep`,
+/// and the unit test `lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell`
+/// carries the planted canaries.
+#[test]
+fn lastsave_and_rdb_last_save_time_answer_one_second_after_inf_ckpt_cell_wait() {
+    let dir = temp_data_dir("ckptonelastsave");
+    let node = Node::start_durable(2, &dir);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut pipeline = cmd(&[b"LASTSAVE"]);
+    pipeline.extend_from_slice(&cmd(&[b"INFO", b"persistence"]));
+    c.write_all(&pipeline).expect("write");
+    let line = read_line(&mut c);
+    let lastsave: u64 = std::str::from_utf8(&line[1..line.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("LASTSAVE answered {line:?}"));
+    let info = String::from_utf8(read_bulk(&mut c)).expect("INFO is text");
+    assert!(lastsave > 0, "the WAIT fenced a publication");
+    assert_eq!(info_u64(&info, "rdb_last_save_time"), lastsave, "one value per cell: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
 /// key with single-key sub-ops whose `*1` elements reassemble in argv
 /// order — over the default db, and over a **named** namespace, which is

@@ -924,13 +924,14 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
     sweep that wakes its own waiter is the next turn's (at most
     `2 * ceil(N / 64)` unparked turns per own publication). A waiter
     whose last publisher is a peer is woken by the cell's next completed
-    sweep after a park. All-cell
-    `WAIT` and DROP pacing read the observation's minimum (a lower bound,
-    never early); `WAIT CELL k` reads slot `k`. `LASTSAVE` and
-    `rdb_last_save_time` read the observation, and a `WAIT CELL k`
-    raises the waiting cell's `LASTSAVE` floor to the time it confirmed —
-    so `LASTSAVE` can trail the board by up to two sweeps, except after a
-    `WAIT` on the same cell. The catalog writer alone folds the whole board
+    sweep after a park. All-cell `WAIT` and DROP pacing read the
+    observation's minimum (a lower bound, never early); `WAIT CELL k`
+    reads slot `k`. `LASTSAVE` and `rdb_last_save_time` read one per-cell
+    value (`LastSave`): the observation's newest publication time, raised
+    by every slot a `WAIT CELL k` on that cell confirmed, and written by
+    those two steps alone. On one cell the two surfaces cannot differ;
+    both can trail the board by up to two sweeps, except after a `WAIT` on
+    the same cell. The catalog writer alone folds the whole board
     (tombstone retirement, one pass per persist on the control thread).
 
   > **Accepted 2026-09-21, implementation open — ADR-0145:** ADR-0145
