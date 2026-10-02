@@ -1002,6 +1002,17 @@ bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
 
 ## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0170)
 
+> **Not built yet (ADR-0178).** ADR-0178 supersedes ADR-0170 and restates this section's
+> contract under the same decision numbers. The grant rule, the overrun, the receipt and the
+> one-producer progress bound below are unchanged. The tier flush changes when its part is
+> built: a round is issued in groups of at most 1 MiB and 64 ops, each offered on its own and
+> never above the class cap, so no tier offer overruns; a round issues exactly what it
+> offers, and the settlement below (the unstaged part refunded, the bytes past the slice
+> charged) is removed; a cell prepares at most one round per MAINTAIN pass; tiered namespaces
+> offer in id order, and a refused group ends the pass for the tier class and is offered
+> first on the next. Both deviations below end with that build. Until then the text below
+> describes the tree.
+
 ```rust
 pub enum IoClass { LogFrame, BlobWrite, ColdReadForeground,      // foreground: charged, never deferred
                    ZeroFill, TierFlush, Checkpoint, ColdReadMaintain } // background: priority order, weights 4:4:2:1
