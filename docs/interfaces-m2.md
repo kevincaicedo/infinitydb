@@ -864,9 +864,8 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   > through the file's creation-mode handle, parsed into a type whose
   > constructor checks that the key hashes to the slot's hash; a failed
   > read or parse is a typed boot refusal. `Keyspace::apply_record` takes
-  > the replay seam, which lends the namespace's replay state and charges
-  > its I/O to the recovery step; room is made, and a `DEL`'s reads done,
-  > before the marker drain.
+  > the replay seam; no marker is drained and no slot moves until the room
+  > exists.
 - **M4-S14 amendment (ADR-0058 D3) — tag 0x04 activated.** v2 adds block
   tag **0x04 — live-set section**: `tag · body_len u32 · entry_count u32
   · ns u32 · entry_count × (file_id u32 · data_len u64 · dead_bytes u64
