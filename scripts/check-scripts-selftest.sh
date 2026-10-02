@@ -2031,6 +2031,38 @@ lc_row_set "$LC_A" 'fn Owner::build' record X
 expect_red_because "lint-scopes: containers — an unknown record letter" \
     "record \`X\` is not a site record" lc_run "$root"
 lc_reset
+# An out-of-line test module (`#[cfg(test)] mod x;`) is test code whole, as an
+# inline one's body is: its allow sits on the declaration (INFINITY_STYLE),
+# and neither production build compiles its file (`// uncompiled`).
+lc_testmod() { # <file> <tag>
+    mkdir -p "$(dirname "$root/$1")"
+    printf '%s\n' "use std::collections::HashMap;$2" '' 'pub fn model() -> usize {' \
+        "    let m: HashMap<u8, u8> = HashMap::new();$2" '    m.len()' '}' >"$root/$1"
+}
+LC_TEST_DECL=('#[cfg(test)]' '#[allow(clippy::disallowed_types, reason = "test-only: a model of the queue")]')
+lc_append "${LC_TEST_DECL[@]}" '#[path = "a_tests.rs"]' 'mod a_tests;'
+lc_testmod crates/fake/src/a_tests.rs ' // uncompiled: test code'
+expect green "lint-scopes: containers — an out-of-line test module, its allow on the declaration (control)" \
+    lc_run "$root"
+expect_output "lint-scopes: containers — the OK line names the test module file it leaves out" \
+    "out-of-line test module file(s) outside the API audit and the backstop: crates/fake/src/a_tests.rs" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]}" 'mod tests;'
+lc_testmod crates/fake/src/a/tests.rs ' // uncompiled: test code'
+expect green "lint-scopes: containers — one with no #[path], under the declaring file's stem (control)" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]:1}" '#[path = "a_tests.rs"]' 'mod a_tests;'
+lc_testmod crates/fake/src/a_tests.rs ''
+expect_red_because "lint-scopes: containers — the same module without #[cfg(test)] is production code" \
+    "crates/fake/src/a_tests.rs:1: std::collections::HashMap lacks a narrow allow of its own API class" \
+    lc_run "$root"
+lc_reset
+lc_append "${LC_TEST_DECL[@]}" 'mod gone;'
+expect_red_because "lint-scopes: containers — a test module whose file the gate cannot find" \
+    "test-only \`mod gone;\` names no file the audit can find" lc_run "$root"
+lc_reset
 lc_row_set "$LC_A" 'struct Exempt' expiry 2000-01-01
 expect_red_because "lint-scopes: containers — an expired row" \
     "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"

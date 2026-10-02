@@ -26,7 +26,9 @@
 #     paths and the ban's sentence; this gate reads both from it. A banned
 #     name in cell production code outside every `container:` allow is red
 #     from the text too, so code this host's builds do not compile (another
-#     `target_os`, a feature neither build enables) is held the same.
+#     `target_os`, a feature neither build enables) is held the same. Test
+#     code is outside both: an inline test module's body, and the whole file
+#     of an out-of-line one (`#[cfg(test)] mod x;`, its allow on that line).
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
@@ -157,6 +159,13 @@ errors, oks, deny_sites, api_sites = [], [], [], []
 # (file, first line, last line, item key, record, site) per `container:` allow
 container_sites = []
 production_of = {}  # cell file -> its production lines (test modules blanked)
+STRIPPER = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
+TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")  # the stripper's test-only attributes
+MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0-9_]+)\s*;\s*$")
+PATH_ATTR = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\s*\]\s*$')
+strip_reports = {}  # cell file -> the stripper's report
+test_module_files = set()  # the files of out-of-line test modules: test code whole
+test_decls = {}  # cell file -> indexes of its lines that declare one
 
 
 def next_item_at(lines, at):
@@ -221,9 +230,51 @@ def item_key(lines, at, last):
 def production_lines(path):
     key = str(path)
     if key not in production_of:
-        stripper = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
-        production_of[key] = subprocess.check_output(["awk", "-f", stripper, key], text=True).split("\n")
+        production_of[key] = subprocess.check_output(["awk", "-f", STRIPPER, key], text=True).split("\n")
     return production_of[key]
+
+
+def strip_report(path):
+    key = str(path)
+    if key not in strip_reports:
+        strip_reports[key] = subprocess.check_output(["awk", "-v", "mode=report", "-f", STRIPPER, key], text=True)
+    return strip_reports[key]
+
+
+def test_modules(path):
+    """The stripper reports each `mod x;` under a test-only attribute
+    (`modfile x`) and leaves its file to the caller: that file is test code
+    whole, as an inline test module's body is, so it is outside the API audit
+    and the backstop, and the declaration (which carries the module's allow)
+    is blanked like an inline module's `mod x {`. The file is the
+    declaration's own `#[path]`, else Rust's: beside a crate root or mod.rs,
+    else under the declaring file's stem. A file not found is red."""
+    names = {line.split()[1] for line in strip_report(path).splitlines() if line.startswith("modfile ")}
+    if not names:
+        return
+    lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+    for i, line in enumerate(lines):
+        decl = MOD_DECL.match(line)
+        if not decl or decl.group(1) not in names:
+            continue
+        attrs, j = [], i
+        while j > 0 and lines[j - 1].strip().startswith("#["):
+            j -= 1
+            attrs.append(lines[j])
+        if not any(TEST_ATTR.match(a) for a in attrs):
+            continue
+        name = decl.group(1)
+        named = [m.group(1) for m in map(PATH_ATTR.match, attrs) if m]
+        root_like = path.name in ("lib.rs", "main.rs", "mod.rs") or path.parent.name == "bin"
+        base = path.parent if root_like else path.parent / path.stem
+        candidates = [path.parent / named[0]] if named else [base / f"{name}.rs", base / name / "mod.rs"]
+        found = next((c for c in candidates if c.is_file()), None)
+        if found is None:
+            errors.append(f"{path}:{i + 1}: test-only `mod {name};` names no file the audit can find "
+                          f"({', '.join(map(str, candidates))}) — its scope is not established")
+            continue
+        test_module_files.add(os.path.normpath(found))
+        test_decls.setdefault(str(path), set()).add(i)
 
 
 def container_names(lines):
@@ -276,15 +327,14 @@ def host_gated(file):
 
 def audit(path, exempt_sites):
     lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
-    cell = any(path.is_relative_to(root) for root in CELL_DIRS)
+    cell = any(path.is_relative_to(root) for root in CELL_DIRS) and str(path) not in test_module_files
     production = []
     if cell:
-        stripper = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
-        report = subprocess.check_output(["awk", "-v", "mode=report", "-f", stripper, str(path)], text=True)
-        if "unterminated" in report:
+        if "unterminated" in strip_report(path):
             errors.append(f"{path}: test-only module never closed; API audit cannot establish scope")
-        production = subprocess.check_output(["awk", "-f", stripper, str(path)], text=True).split("\n")
-        production_of[str(path)] = production
+        production = production_lines(path)
+        for i in test_decls.get(str(path), ()):
+            production[i] = ""
         if path.name != "limits.rs" and "Cap::entries" in "\n".join(production):
             code = {(n, c) for n, c, _ in scope_table.code_chars(production)}
             for n, line in enumerate(production):
@@ -399,6 +449,14 @@ for top in (Path("crates"), Path("bins")):
 if roots == 0:
     print("LINT-SCOPES SCOPE ERROR: no crate root found under crates/ and bins/")
     sys.exit(1)
+
+# ---- the cell crates' out-of-line test modules, before any file is audited
+for cell_dir in CELL_DIRS:
+    for dirpath, dirnames, names in os.walk(cell_dir):
+        dirnames.sort()
+        for name in sorted(names):
+            if name.endswith(".rs"):
+                test_modules(Path(dirpath) / name)
 
 # ---- D2: the suppression audit
 files, exempt_sites = 0, []
@@ -865,6 +923,9 @@ scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINE
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
           + f", {backstop_files} cell file(s) read as text for a banned name outside an allow")
 scope += "".join(f"; {f} counted from its text (compiled only on {os_name})" for f, os_name in sorted(text_counted.items()))
+if test_module_files:
+    scope += ("; out-of-line test module file(s) outside the API audit and the backstop: "
+              + ", ".join(sorted(test_module_files)))
 if notes:
     scope += "; " + "; ".join(notes)
 print(f"lint-scopes OK: {scope}")
