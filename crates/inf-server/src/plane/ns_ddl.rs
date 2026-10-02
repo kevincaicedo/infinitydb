@@ -380,8 +380,8 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
 /// commit, so `WAIT` returns only after durability — a swap abort does
 /// not publish; the retried swap does (fault-injection verified).
 /// `LASTSAVE` = unix seconds of the newest publication this cell has
-/// observed (ADR-0159 A1.4: the cell's `LastSave`, which INFO's
-/// `rdb_last_save_time` reads too; 0 before the first — deviation
+/// observed (ADR-0159 A1.4): the cell's `LastSave`, which INFO's
+/// `rdb_last_save_time` reads too. It is 0 before the first (deviation
 /// documented; Redis reports process-start time).
 pub(super) async fn program_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,

@@ -149,8 +149,9 @@ rows=(
   # `WAIT CELL k` that confirms ahead of the sweep it differs from LASTSAVE.
   "inf_canary_info_lastsave_from_observation crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell rdb_last_save_time and LASTSAVE differ on one cell"
   "inf_canary_info_lastsave_from_observation crate-test inf-sim lib lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep rdb_last_save_time and LASTSAVE differ on one cell"
-  # ADR-0159 A1.4: the park guard without its own-slot term — a cell parks
-  # on top of a `WAIT` its own publication satisfied.
+  # The park guard without its own-slot term (interfaces-m2.md, "Cells
+  # never fold the whole board"): a cell parks on top of a `WAIT` its own
+  # publication satisfied.
   "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake a parked iteration between the publication and its wake"
   # The guard without its cursor term: beyond 64 cells a cell with a waiter
   # parks while its sweep is part-way.

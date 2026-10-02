@@ -398,9 +398,10 @@ impl CkptBoard {
     }
 
     /// Whether the sweep's own cell published since the start of its last
-    /// completed sweep (ADR-0159 A1.4): until a sweep that began after the
-    /// publication completes, the cell's observation may lack it. The cell
-    /// publishes after its sweep step in a MAINTAIN, so a cell with a
+    /// completed sweep: the park guard's own-slot term (`interfaces-m2.md`,
+    /// "Cells never fold the whole board"). Until a sweep that began after
+    /// the publication completes, the cell's observation may lack it. The
+    /// cell publishes after its sweep step in a MAINTAIN, so a cell with a
     /// checkpoint waiter does not park while this holds; it ends within
     /// `2 * ceil(N / 64)` sweep steps of the publication.
     #[must_use]
@@ -483,8 +484,9 @@ pub struct BoardObservation {
 /// One cell's `LASTSAVE` value (ADR-0159 A1.4), unix ms: the newest
 /// publication time in the cell's completed board sweep, raised by every
 /// slot a `WAIT CELL k` on the cell confirmed; 0 before the first. The
-/// `LASTSAVE` command and INFO's `rdb_last_save_time` both read it, so on
-/// one cell they cannot differ. It is written only by the two steps that
+/// `LASTSAVE` command and INFO's `rdb_last_save_time` both read it
+/// (`interfaces-m2.md`, "Cells never fold the whole board"), so on one
+/// cell they cannot differ. It is written only by the two steps that
 /// change one of its terms ([`CkptBoard::sweep_step`] and
 /// [`BoardSweep::confirm_cell_wait`]): no setter leaves this module.
 #[derive(Debug, Default)]
@@ -2460,9 +2462,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no rdb_last_save_time in {text:?}"))
     }
 
-    /// ADR-0159 A1.4, one `LASTSAVE` value per cell: after a `WAIT CELL 1`
-    /// confirmed with the sweep stalled on an older observation, the value
-    /// the `LASTSAVE` command answers (`node.lastsave`) and the
+    /// One `LASTSAVE` value per cell (`interfaces-m2.md`, "Cells never fold
+    /// the whole board"): after a `WAIT CELL 1` confirmed with the sweep
+    /// stalled on an older observation, the value the `LASTSAVE` command
+    /// answers (`node.lastsave`) and the
     /// `rdb_last_save_time` the product's INFO renders are the same second,
     /// at or after slot 1's publication second, which the test reads from
     /// the board. Planted, each must fail this test: the confirmation

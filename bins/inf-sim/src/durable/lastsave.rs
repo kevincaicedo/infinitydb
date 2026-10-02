@@ -1,6 +1,6 @@
-//! `LASTSAVE` and `rdb_last_save_time` at the loop tier (ADR-0159 A1.4):
-//! one value per cell, in the one schedule where a `WAIT CELL k` confirms
-//! ahead of the cell's sweep.
+//! `LASTSAVE` and `rdb_last_save_time` at the loop tier: one value per
+//! cell (`interfaces-m2.md`, "Cells never fold the whole board"), in the
+//! one schedule where a `WAIT CELL k` confirms ahead of the cell's sweep.
 
 use inf_foundation::CellId;
 use inf_foundation::time::Nanos;

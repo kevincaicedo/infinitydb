@@ -5757,7 +5757,8 @@ fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0159 A1.4 at the wire (2 cells): after `INF.CKPT CELL k WAIT`,
+/// One `LASTSAVE` value per cell (`interfaces-m2.md`, "Cells never fold
+/// the whole board") at the wire (2 cells): after `INF.CKPT CELL k WAIT`,
 /// `LASTSAVE` and INFO's `rdb_last_save_time` answer the same second on
 /// the same connection, sent in one write. The reachability leg only: on
 /// the wire the sweep that wakes the `WAIT` has usually read slot `k`. The

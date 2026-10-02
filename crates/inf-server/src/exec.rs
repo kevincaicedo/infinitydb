@@ -314,9 +314,9 @@ pub struct NodeState {
     pub segments_truncated: Cell<u64>,
     pub log_segments_live: Cell<u64>,
     /// Checkpoint operator surface (M2-S20): the streaming-now flag, and
-    /// the newest durable MANIFEST publication this cell has observed
-    /// (ADR-0159 A1.4), which `LASTSAVE` and `rdb_last_save_time` both
-    /// answer.
+    /// the newest durable MANIFEST publication this cell has observed,
+    /// which `LASTSAVE` answers (ADR-0159 A1.4) and `rdb_last_save_time`
+    /// with it (`interfaces-m2.md`, "Cells never fold the whole board").
     pub ckpt_in_progress: Cell<u64>,
     pub lastsave: crate::control::LastSave,
     /// ADR-0100 D7: live drop tombstones in the catalog writer (node

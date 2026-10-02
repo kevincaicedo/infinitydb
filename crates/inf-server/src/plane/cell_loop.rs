@@ -281,14 +281,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         {
             return true;
         }
-        // ADR-0159 A1.4: a registered checkpoint waiter keeps the cell
-        // unparked while its sweep is part-way, and while its own slot
-        // published since the start of its last completed sweep: the cell
-        // publishes after its sweep step in a MAINTAIN, so the observation
-        // that satisfies its own waiter is the next turn's. At most
-        // `2 * ceil(N / 64)` unparked turns per own publication. The two
-        // O(1) tests go first; the waitlist test stops at its first live
-        // waiter.
+        // A registered checkpoint waiter keeps the cell unparked while its
+        // sweep is part-way (ADR-0159 A1.4), and while its own slot
+        // published since the start of its last completed sweep
+        // (`interfaces-m2.md`, "Cells never fold the whole board"): the
+        // cell publishes after its sweep step in a MAINTAIN, so the
+        // observation that satisfies its own waiter is the next turn's. At
+        // most `2 * ceil(N / 64)` unparked turns per own publication. The
+        // two O(1) tests go first; the waitlist test stops at its first
+        // live waiter.
         if self.ckpt_observation_owed() && self.shared.ckpt_waiters.any_waiting() {
             return true;
         }
@@ -1049,9 +1050,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// Whether this cell's next completed sweep can observe what its last
-    /// one could not (ADR-0159 A1.4): the sweep is part-way through the
-    /// board, or the cell's own slot published since the start of the last
-    /// completed sweep. False on a cell with no control plane.
+    /// one could not: the sweep is part-way through the board (ADR-0159
+    /// A1.4), or the cell's own slot published since the start of the last
+    /// completed sweep (`interfaces-m2.md`, "Cells never fold the whole
+    /// board"). False on a cell with no control plane.
     fn ckpt_observation_owed(&self) -> bool {
         let sweep = self.shared.ckpt_sweep.borrow();
         // Canary: the guard without its cursor term.
