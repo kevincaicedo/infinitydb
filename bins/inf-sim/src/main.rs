@@ -67,6 +67,10 @@ fn main() {
     // F-L14-01 (batch 20): force the m2 lift regime on any seed — the
     // arm on a seed known to lift (the sweep discloses which).
     let mut lift_regime = false;
+    // FCR-STTIER-01 (ADR-0174 D1): force the replay-above-window regime
+    // on any seed of m4-recovery and m4-tiered — the tail replay must
+    // demote; a run under it that never exceeded a window is VACUOUS.
+    let mut replay_above_window = false;
     let mut ops_override: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
@@ -109,6 +113,7 @@ fn main() {
                 "--out" => out_dir = Some(take("--out")?),
                 "--replay-canary" => replay_canary = true,
                 "--lift-regime" => lift_regime = true,
+                "--replay-above-window" => replay_above_window = true,
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -119,7 +124,7 @@ fn main() {
                         "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
-                         [--replay-canary] [--lift-regime] [--cells N] \
+                         [--replay-canary] [--lift-regime] [--replay-above-window] [--cells N] \
                          [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
@@ -367,7 +372,8 @@ fn main() {
     // staging, cancellation, pin-deferred unlinks).
     if scenario_name == "m4-recovery" {
         let run_one = |seed: u64| {
-            let scenario = RecoveryScenario::m4_recovery(seed);
+            let mut scenario = RecoveryScenario::m4_recovery(seed);
+            scenario.replay_above_window |= replay_above_window;
             inf_sim::run_recovery_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
@@ -514,7 +520,8 @@ fn main() {
              {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
              cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
              {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
-             origins covered, {} held rows / {} re-formed / {} not restored, trace {:#x}",
+             origins covered, {} held rows / {} re-formed / {} not restored, {} lives above the \
+             window (largest unit {} windows), trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -545,6 +552,8 @@ fn main() {
             report.shadow_held_rows,
             report.shadow_held_reformed,
             report.shadow_held_not_restored,
+            report.replay_above_window_lives,
+            report.replay_unit_windows_max,
             report.trace_hash
         );
         if verify {
@@ -574,6 +583,9 @@ fn main() {
             let mut scenario = inf_sim::TieredScenario::m4_tiered(seed);
             // F-L04-02: the flag forces the seed-cadence arm on.
             scenario.tier_read_fault |= plant == Plant::TierReadEio;
+            if replay_above_window {
+                scenario = scenario.with_replay_above_window();
+            }
             inf_sim::run_tiered_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
@@ -826,7 +838,8 @@ fn main() {
              phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
              (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
-             / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), trace \
+             / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
+             unit above the window on {} cell(s) (acked record bytes per cell {:?}), trace \
              {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
@@ -870,6 +883,8 @@ fn main() {
             report.ckpt_bound_splits,
             report.scan_cold_pages,
             report.scan_cold_reads,
+            report.replay_above_window_cells,
+            report.acked_record_bytes_per_cell,
             report.trace.len(),
             report.trace_hash
         );

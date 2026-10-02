@@ -126,6 +126,9 @@ const MUTABLE_FRACTION_CLAMP: &[u8] = b"10";
 /// `BLOB-THRESHOLD` at its 4 KiB floor: the blob generator arm (≥ 6 KiB
 /// values) stores out of line, the inline arm (≤ 4 KiB) never does.
 const BLOB_THRESHOLD: &[u8] = b"4kb";
+/// The same threshold as the generator reads it (a value at or above it
+/// stores out of line and re-appends as a 24-byte reference at replay).
+const BLOB_THRESHOLD_BYTES: usize = 4 << 10;
 /// `TIER-IO-MODE buffered`: the simulated disk models a buffered device
 /// (every store-tier sim scenario runs Buffered; the plane's `Direct`
 /// default is a real-NVMe posture the sim cannot honor).
@@ -180,6 +183,14 @@ pub struct TieredScenario {
     /// stale value, or an unattributed fault is a violation. Seeds ≡ 7
     /// (mod 8); `--plant tier-read-eio` forces it.
     pub tier_read_fault: bool,
+    /// FCR-STTIER-01 (ADR-0174 D1): the replay-above-window regime — the
+    /// checkpoint interval lies above the run and phase 2 writes three
+    /// times its usual volume, so at least one cell's acknowledged tiered
+    /// records since the last `begin` exceed its window
+    /// (`MEM-BUDGET + MAINTAIN-SLICE`) and the reboot must demote during
+    /// replay. `--replay-above-window` forces it; a run under it where no
+    /// cell exceeded its window is VACUOUS.
+    pub replay_above_window: bool,
 }
 
 impl TieredScenario {
@@ -214,7 +225,17 @@ impl TieredScenario {
             ckpt_section_bound: DurableScenario::section_bound_for(seed, 1 << 10),
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
             tier_read_fault: seed % 8 == 7,
+            replay_above_window: false,
         }
+    }
+
+    /// The regime's knobs (FCR-STTIER-01): the interval above any run,
+    /// three times the phase-2 volume. Applied by the binary's flag.
+    pub fn with_replay_above_window(mut self) -> TieredScenario {
+        self.replay_above_window = true;
+        self.ckpt_interval_bytes = 1 << 30;
+        self.ops_per_writer *= 3;
+        self
     }
 
     /// The harness plumbing view of this scenario (`boot` + `Node::step`
@@ -287,6 +308,12 @@ pub struct TieredNodeReport {
     pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
+    /// FCR-STTIER-01 (ADR-0174 D1): per cell, the record bytes of the
+    /// tiered `SET`s acknowledged in phase 2 (header + key + value — what
+    /// the reboot re-appends when no checkpoint publishes in the run),
+    /// and the cells whose sum exceeded the window at the cut.
+    pub acked_record_bytes_per_cell: Vec<u64>,
+    pub replay_above_window_cells: u64,
     /// The reboot refused with the ADR-0018 taxonomy error — legal
     /// (§8.4 prefers refusing to serve over truncating possibly-covered
     /// data), counted, and the run ends early with phases 5–9 skipped.
@@ -780,6 +807,19 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         }
     }
     report.blob_sets = blob_sets;
+    // FCR-STTIER-01: the regime's engagement — which cells the reboot
+    // must demote for (the window is the smallest legal one, 4 MiB).
+    let window: u64 = 4 << 20;
+    report.replay_above_window_cells =
+        report.acked_record_bytes_per_cell.iter().filter(|&&bytes| bytes > window).count() as u64;
+    if scenario.replay_above_window && report.replay_above_window_cells == 0 {
+        let message = format!(
+            "REPLAY-ABOVE-WINDOW VACUOUS: no cell's acknowledged tiered records exceeded the \
+             window before the cut ({:?} bytes)",
+            report.acked_record_bytes_per_cell
+        );
+        fail(&mut report, message);
+    }
     // Pre-cut coverage scrape (pumps a bounded number of extra steps —
     // part of the deterministic schedule, and the cut still lands with
     // writers mid-flight because the scrape never quiesces them).

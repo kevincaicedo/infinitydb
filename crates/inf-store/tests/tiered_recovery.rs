@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
@@ -669,4 +670,174 @@ fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
     }
     assert_eq!(table.len(), 1, "the victim survives every foreign displacement");
     assert_eq!(table.live_set().files()[0].live_count, 1, "and stays counted in its file");
+}
+
+/// One checkpoint of `rig`'s table in the format's section order
+/// (ADR-0174 R2: within a namespace every ref section precedes every
+/// image section — the reactor writer's pass 0, then its pass 1), with
+/// no mutation between slices. Returns (refs, images) emitted.
+fn write_checkpoint_two_pass(rig: &Rig, writer: &mut SyncIckWriter<MemFs>, w: u64) -> (u64, u64) {
+    let (mut refs_emitted, mut images_emitted) = (0u64, 0u64);
+    let mut cursor = 0u64;
+    loop {
+        let mut refs: Vec<(u64, u64)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            64,
+            |hash, addr| refs.push((hash, addr.to_raw())),
+            |_image| {},
+        );
+        for (hash, addr) in refs {
+            writer.append_ref(NS.0, w, hash, addr).expect("ref");
+            refs_emitted += 1;
+        }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
+        let mut images: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            64,
+            |_hash, _addr| {},
+            |parts| images.push((parts.key.to_vec(), parts.value.to_vec())),
+        );
+        for (key, value) in images {
+            writer
+                .append(&RecordView::StringPostImage { ns: NS, key: &key, value: &value })
+                .expect("image");
+            images_emitted += 1;
+        }
+        if cursor == 0 {
+            break;
+        }
+    }
+    (refs_emitted, images_emitted)
+}
+
+/// FCR-STTIER-01 (ADR-0174 D1), the store tier's red: a tail of three
+/// windows of distinct keys written after the checkpoint began replays
+/// into the recovered table, which demotes through the replay seam
+/// instead of refusing at the window. Red at engine `b5cae02`: the
+/// replay's `apply_image(..).expect("fits")` panics on `OutOfMemory`
+/// once the re-appended tail commits more pages than
+/// `MEM-BUDGET + MAINTAIN-SLICE`.
+#[test]
+#[ignore = "FCR-STTIER-01 stage 3 (ADR-0174 D1): red at b5cae02 until boot replay demotes"]
+fn a_tail_of_three_windows_replays_into_the_recovered_table() {
+    let mut rig = Rig::new();
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let window = demote.mem_budget_bytes + demote.slice_bytes;
+    for i in 0..64u64 {
+        let key = format!("pre:{i:04}").into_bytes();
+        rig.set(&key, &[0x5A; 200]);
+    }
+    rig.maintain();
+    rig.fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
+    rig.begun = true;
+    let ckpt_id = 1u64;
+    let w = rig.table.begin_ckpt_walk(ckpt_id).to_raw();
+    let begin_lsn = Lsn::new(SegmentId(1), 64);
+    let mut writer = SyncIckWriter::create_v2(
+        rig.fs.clone(),
+        Path::new(SHARD),
+        &CkptConfig::default(),
+        0,
+        ckpt_id,
+        begin_lsn,
+        &[NS.0],
+    )
+    .expect("create ick");
+    write_checkpoint_two_pass(&rig, &mut writer, w);
+    for f in rig.table.live_set().files().to_vec() {
+        writer.append_live_set(NS.0, f.id, f.data_len, f.dead_bytes, f.byte_exact).expect("0x04");
+    }
+    writer.finish().expect("finish ick");
+    rig.table.end_ckpt_walk();
+    let tier_section = rig.table.tier_manifest(NS.0, &rig.flush);
+    write_manifest(
+        &rig.fs,
+        Path::new(SHARD),
+        &Manifest {
+            ckpt_id,
+            begin_lsn,
+            segments: vec![SegmentId(1)],
+            tiers: vec![tier_section],
+            key_hash_id: KeyHasher::default().identity(),
+        },
+    )
+    .expect("manifest swap");
+    // The tail: three windows of distinct keys after the publication,
+    // demoted live as they would be on a running node (the crashed life
+    // never fills its window; the replay re-appends every one of them).
+    let value = vec![0xAB; 1000];
+    let mut tail_bytes = 0u64;
+    let mut i = 0u64;
+    while tail_bytes < 3 * window {
+        let key = format!("tail:{i:06}").into_bytes();
+        rig.set(&key, &value);
+        tail_bytes += (key.len() + value.len() + 8) as u64;
+        i += 1;
+        if i.is_multiple_of(64) {
+            rig.maintain();
+        }
+    }
+    rig.maintain();
+    assert!(tail_bytes > window, "the regime: the tail alone exceeds the window");
+
+    let fs = rig.fs.clone();
+    let model = rig.model.clone();
+    let tail = rig.tail.clone();
+    drop(rig);
+
+    let manifest = read_manifest(&fs, Path::new(SHARD)).expect("read").expect("present");
+    let tier = manifest.tier_ns(NS.0).expect("tier section").clone();
+    let recovered = recover_tiered_ns(
+        fs.clone(),
+        &tier,
+        manifest.ckpt_id,
+        flush_config(NS, FILE_CAPACITY),
+        space_config(demote, 0),
+        demote,
+        2048,
+        KeyHasher::default(),
+    )
+    .expect("tier recovery");
+    let table = std::cell::RefCell::new(recovered.table);
+    let ick_path = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(ckpt_id));
+    read_ick_hybrid(
+        &fs,
+        &ick_path,
+        inf_log::ckpt::IckReaderConfig::default(),
+        |record| {
+            if let RecordView::StringPostImage { key, value, .. } = record {
+                table
+                    .borrow_mut()
+                    .apply_image(key, value, KeyHasher::default().hash(key))
+                    .expect("fits");
+            }
+            Ok::<(), std::convert::Infallible>(())
+        },
+        |section| {
+            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed)
+                .expect("refs inside the unit");
+            Ok(())
+        },
+        |section| {
+            apply_live_set_section(&mut table.borrow_mut(), &section);
+            Ok(())
+        },
+        |section| {
+            inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
+            Ok(())
+        },
+        |_| panic!("no index-sidecar sections in this image"),
+    )
+    .expect("hybrid load");
+    let mut table = table.into_inner();
+    replay_tail(&mut table, &tail);
+    let mut recovered_rig =
+        Rig { table, fs, flush: recovered.flush, model, tail: Vec::new(), begun: false };
+    recovered_rig.audit();
 }

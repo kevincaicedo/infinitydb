@@ -105,6 +105,22 @@ pub(super) fn pump_writers(
                 let ops = writer.ledger.entry(pending.key.clone()).or_default();
                 let rec = ops.last_mut().expect("sent op has a ledger entry");
                 rec.acked_at = Some(clock.now());
+                if let Some(value) = &pending.state_after {
+                    // FCR-STTIER-01: the bytes a reboot re-appends for
+                    // this acknowledged record (the inline header, key
+                    // and value; a blob record re-appends its reference).
+                    if report.acked_record_bytes_per_cell.len() <= writer.cell {
+                        report.acked_record_bytes_per_cell.resize(writer.cell + 1, 0);
+                    }
+                    let inline = if value.len() >= super::BLOB_THRESHOLD_BYTES {
+                        inf_store::EXTENT_REF_LEN
+                    } else {
+                        value.len()
+                    };
+                    let record =
+                        inf_store::TieredTable::RECORD_HEADER_LEN + pending.key.len() + inline;
+                    report.acked_record_bytes_per_cell[writer.cell] += record as u64;
+                }
             }
             writer.replied += 1;
             report.commands_done += 1;

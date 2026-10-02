@@ -54,9 +54,9 @@ use inf_log::{
     tier_frame_span, write_manifest,
 };
 use inf_store::{
-    AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, ExtentRef, KeyHasher,
-    LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section, apply_live_set_section,
-    apply_ref_section, forced_collision_pair, recover_tiered_ns,
+    AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, EXTENT_REF_LEN, ExtentRef,
+    KeyHasher, LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section,
+    apply_live_set_section, apply_ref_section, forced_collision_pair, recover_tiered_ns,
 };
 
 const NS: NsId = NsId(88);
@@ -78,6 +78,13 @@ pub struct RecoveryScenario {
     pub lives: u64,
     /// Mutations per life phase.
     pub ops_per_phase: u64,
+    /// FCR-STTIER-01 (ADR-0174 D1): before each cut, fill the tail with
+    /// distinct keys until the bytes replay re-appends reach a multiple
+    /// of the window drawn from DRR FCR-STTIER-01 §6's first row, so the
+    /// boot must demote during replay. `--replay-above-window` forces the
+    /// regime on any seed; a run under it that never exceeded a window
+    /// reports `VACUOUS`.
+    pub replay_above_window: bool,
 }
 
 impl RecoveryScenario {
@@ -88,7 +95,13 @@ impl RecoveryScenario {
         // keeps demotion, flush rotation, and copy-forward relocation
         // coverage on the smoke seed (coverage disclosed, never
         // assumed).
-        RecoveryScenario { seed, keys: 800, lives: 4, ops_per_phase: 480 }
+        RecoveryScenario {
+            seed,
+            keys: 800,
+            lives: 4,
+            ops_per_phase: 480,
+            replay_above_window: false,
+        }
     }
 }
 
@@ -163,6 +176,11 @@ pub struct RecoveryReport {
     /// lives): legitimately absent after the boot, the key serves its
     /// image — disclosed, never a pass on its own.
     pub shadow_held_not_restored: u64,
+    /// FCR-STTIER-01 (ADR-0174 D1): lives whose replay unit — the tail's
+    /// record bytes since the last publish — exceeded the RAM window, and
+    /// the largest such unit in window multiples (engagement, disclosed).
+    pub replay_above_window_lives: u64,
+    pub replay_unit_windows_max: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -784,6 +802,47 @@ impl Run {
     /// One live-path mutation, recorded into the modeled tail with its
     /// displacement marker (ADR-0057 D4 — unconditional for displacing
     /// mutations).
+    /// FCR-STTIER-01 (ADR-0174 D1): the replay-above-window regime. Fills
+    /// the tail with distinct inline keys (values under the harness's
+    /// blob threshold), demoted live as a running node would, until the record bytes replay re-appends from the tail
+    /// reach a multiple of the window drawn from DRR FCR-STTIER-01 §6's
+    /// first row (window − 1 page, the window, window + 1 page, 3 ×,
+    /// 16 ×); counts the life when the unit exceeds the window.
+    fn fill_replay_unit(&mut self, life: &mut Life, rng: &mut SplitMix64, life_index: u64) {
+        let window = demote().mem_budget_bytes + demote().slice_bytes;
+        let target = match rng.next_u64() % 8 {
+            0 => window - PAGE,
+            1 => window,
+            2 | 3 => window + PAGE,
+            4..=6 => 3 * window,
+            _ => 16 * window,
+        };
+        let value = vec![0xF1u8; BLOB_THRESHOLD as usize - 56];
+        let mut unit = tail_record_bytes(&self.tail);
+        let mut i = 0u64;
+        while unit < target {
+            let key = format!("spill:{life_index:02}:{i:06}").into_bytes();
+            unit += (TieredTable::RECORD_HEADER_LEN + key.len() + value.len()) as u64;
+            self.apply_op(life, &key, Op::Set(value.clone()));
+            i += 1;
+            if i.is_multiple_of(64) {
+                self.maintain(life);
+            }
+        }
+        self.maintain(life);
+        debug_assert_eq!(unit, tail_record_bytes(&self.tail), "the fill's own count");
+        eprintln!(
+            "inf-sim: m4-recovery life {life_index}: replay unit {unit} bytes, {} window(s) of \
+             {window} (target {target})",
+            unit.div_ceil(window)
+        );
+        self.report.replay_unit_windows_max =
+            self.report.replay_unit_windows_max.max(unit.div_ceil(window));
+        if unit > window {
+            self.report.replay_above_window_lives += 1;
+        }
+    }
+
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
         let hash = life.table.hash_key(key);
         if key.starts_with(inf_store::COLLISION_KEY_PREFIX) {
@@ -1250,6 +1309,34 @@ fn check_live_set(
     }
 }
 
+/// The record bytes boot replay re-appends from a modeled tail: one
+/// record per image or extent reference (header + key + value bytes),
+/// nothing for a marker or a delete.
+fn tail_record_bytes(tail: &[u8]) -> u64 {
+    let mut rest = tail;
+    let mut bytes = 0u64;
+    while !rest.is_empty() {
+        let (record, consumed) = decode_record(rest).expect("tail records decode");
+        match record {
+            RecordView::StringPostImage { key, value, .. } => {
+                bytes += (TieredTable::RECORD_HEADER_LEN + key.len() + value.len()) as u64;
+            }
+            RecordView::StringExtentRef { key, .. } => {
+                bytes += (TieredTable::RECORD_HEADER_LEN + key.len() + EXTENT_REF_LEN) as u64;
+            }
+            RecordView::Delete { .. }
+            | RecordView::ColdDisplace { .. }
+            | RecordView::ExpireAt { .. }
+            | RecordView::NsOp { .. }
+            | RecordView::CkptBegin { .. }
+            | RecordView::DocDelta { .. }
+            | RecordView::DocFull { .. } => {}
+        }
+        rest = &rest[consumed..];
+    }
+    bytes
+}
+
 fn seeded_op(rng: &mut SplitMix64) -> Op {
     match rng.next_u64() % 8 {
         0 => Op::Del,
@@ -1535,6 +1622,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         } else {
             run.report.cut_before_publish += 1;
         }
+        if scenario.replay_above_window {
+            run.fill_replay_unit(&mut life, &mut rng, life_index);
+        }
 
         // Tickets deliberately left open across the cut (ADR-0093 D5):
         // recovery must re-form them from the checkpoint/tail.
@@ -1802,6 +1892,13 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             .concat(),
             run.report.trace_hash,
         );
+    }
+    if scenario.replay_above_window && run.report.replay_above_window_lives == 0 {
+        run.report.violations.push(format!(
+            "REPLAY-ABOVE-WINDOW VACUOUS: no life's replay unit exceeded the window (largest {} \
+             windows)",
+            run.report.replay_unit_windows_max
+        ));
     }
     run.report.state_hash = run.report.state.value();
     run.report
