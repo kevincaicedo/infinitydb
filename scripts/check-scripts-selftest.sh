@@ -2032,8 +2032,16 @@ git -C "$root" add -A
 expect green "lint-scopes: containers — a renamed file keeps its rows (control)" lc_run "$root"
 lc_reset
 lc_edit 's|pub struct Exempt {|pub struct Kept {|' "$LC_A"
+expect_red_because "lint-scopes: containers — a renamed item whose row kept the old key names the fix" \
+    "rename the row's item to \`struct Kept\`" lc_run "$root"
 lc_edit 's|\tstruct Exempt\t|\tstruct Kept\t|' "$LC_T"
 expect green "lint-scopes: containers — a renamed item (control)" lc_run "$root"
+lc_reset
+mv "$root/$LC_A" "$root/crates/fake/src/moved.rs"
+lc_edit 's|^crates/fake/src/a.rs\t|crates/fake/src/moved.rs\t|' "$LC_T"
+lc_edit 's|^pub mod a;|pub mod moved;|' crates/fake/src/lib.rs
+expect_red_because "lint-scopes: containers — a renamed file not yet staged says to stage it" \
+    "keeps its rows once the rename is staged" lc_run "$root"
 lc_reset
 lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
 lc_append 'impl Exempt {' '    #[allow(clippy::disallowed_types, reason = "container: E")]' \

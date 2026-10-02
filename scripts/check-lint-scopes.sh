@@ -751,10 +751,11 @@ for (f, key), sites in sorted(keys.items()):
         errors.append(f"{f}: {len(sites)} `container:` allows share the item key `{key}` "
                       f"({', '.join(sites)}) — the table cannot tell them apart")
 today = datetime.date.today()
+orphan_rows, orphan_allows = {}, {}  # (file, record) -> row keys with no allow; allows with no row
 for (f, key), (count, record, due) in sorted(crows.items()):
     sites = [s for s in exempt if (s[0], s[3]) == (f, key)]
     if not sites:
-        errors.append(f"{CONTAINERS}: row {f} `{key}` has no `container:` allow — delete it")
+        orphan_rows.setdefault((f, record), []).append(key)
     elif sites[0][4] != record:
         errors.append(f"{sites[0][5]}: `container: {sites[0][4]}` but its row says record {record}")
     if due < today:
@@ -770,9 +771,22 @@ for (f, key), (count, record, due) in sorted(crows.items()):
             errors.append(f"{f}: `{key}` holds {n} container span(s), its row says {count} — lower the row to {n}")
 for f, _, _, key, record, site in exempt:
     if (f, key) not in crows:
+        orphan_allows.setdefault((f, record), []).append((key, site))
+# One row and one allow of a file and record that miss each other are an
+# item whose key moved (a rename, an import joining a `use` line): say so.
+for f, record in sorted(set(orphan_rows) | set(orphan_allows)):
+    lost, found = orphan_rows.get((f, record), []), orphan_allows.get((f, record), [])
+    if len(lost) == 1 and len(found) == 1:
+        errors.append(f"{found[0][1]}: the allow on `{found[0][0]}` has no row and row {f} `{lost[0]}` "
+                      f"has no allow — rename the row's item to `{found[0][0]}` (the census prints it: "
+                      "INF_CONTAINER_CENSUS=1)")
+        continue
+    for key in lost:
+        errors.append(f"{CONTAINERS}: row {f} `{key}` has no `container:` allow — delete it")
+    for key, site in found:
         errors.append(f"{site}: `container: {record}` allow on `{key}` has no row in {CONTAINERS} — "
                       "new exemptions are closed")
-csum = sum(count for count, _, _ in crows.values())
+csum =sum(count for count, _, _ in crows.values())
 if csum > CONTAINER_MAX:
     errors.append(f"{CONTAINERS}: counts sum to {csum}, above CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX}")
 elif csum < CONTAINER_MAX:
@@ -819,7 +833,8 @@ for label, ref in ccopies:
         was = approved_sums.get((renames.get(f, f), record))
         if was is None:
             errors.append(f"{CONTAINERS}: {f} has record {record} rows and the {label}'s table has none — "
-                          "an exemption never moves to a new file or record")
+                          "an exemption never moves to a new file or record (a renamed file keeps its "
+                          "rows once the rename is staged: `git add -A`)")
         elif n > was:
             errors.append(f"{CONTAINERS}: {f} record {record} counts sum to {n}, above the {label}'s {was} — "
                           "the table only shrinks")
