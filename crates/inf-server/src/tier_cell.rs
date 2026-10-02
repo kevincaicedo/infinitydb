@@ -621,7 +621,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // Head advanced ⇒ ring space may have freed: wake stalled
         // writers. Also wake while any are parked so the typed timeout
         // is always reachable (bounded: waiters re-check, then repark).
-        if released > 0 || t.stall_waiters.waiting() > 0 {
+        if released > 0 || t.stall_waiters.any_waiting() {
             t.stall_waiters.wake_all(());
         }
 

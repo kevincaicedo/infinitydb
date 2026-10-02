@@ -248,8 +248,21 @@ impl<K: Eq + Hash + Copy> WaitList<K> {
         woken
     }
 
-    /// Live waiters across all keys (tests + leak asserts). Cancelled
-    /// entries pending lazy cleanup are not counted.
+    /// Whether any live waiter is queued, on any key: the emptiness test,
+    /// which stops at the first one where [`waiting`](Self::waiting) counts
+    /// them all. It passes over only the cancelled entries queued ahead of
+    /// that waiter.
+    pub fn any_waiting(&self) -> bool {
+        self.queues
+            .borrow()
+            .values()
+            .flat_map(|q| q.iter())
+            .any(|w| w.state.get() == WaiterState::Queued)
+    }
+
+    /// Live waiters across all keys (gauges, tests, leak asserts): a walk
+    /// of every queued entry. Cancelled entries pending lazy cleanup are
+    /// not counted.
     pub fn waiting(&self) -> usize {
         self.queues
             .borrow()

@@ -205,6 +205,32 @@ fn waitlist_drop_passes_the_baton() {
     assert_eq!(list.waiting(), 0, "second was woken by the baton pass");
 }
 
+/// `any_waiting` is `waiting() > 0` in every state of a queue: empty, a
+/// live waiter behind a cancelled one, cancelled entries only, and a woken
+/// waiter that has not run yet.
+#[test]
+fn waitlist_any_waiting_is_true_exactly_when_a_live_waiter_is_queued() {
+    let list: WaitList<u32> = WaitList::new();
+    assert!(!list.any_waiting(), "an empty list");
+    let first = list.wait(1);
+    let second = list.wait(1);
+    let other_key = list.wait(2);
+    assert!(list.any_waiting());
+    // Cancelled in place: the entry stays queued until a wake skips it.
+    drop(first);
+    assert_eq!(list.waiting(), 2);
+    assert!(list.any_waiting(), "a live waiter behind a cancelled entry");
+    drop(second);
+    drop(other_key);
+    assert_eq!(list.waiting(), 0);
+    assert!(!list.any_waiting(), "cancelled entries are not waiters");
+    let woken = list.wait(3);
+    assert!(list.wake_one(3));
+    assert_eq!(list.waiting(), 0);
+    assert!(!list.any_waiting(), "a woken waiter is no longer queued");
+    drop(woken);
+}
+
 #[test]
 fn watermark_gate_wakes_at_or_below() {
     let mut ex = CellExecutor::new(8);
