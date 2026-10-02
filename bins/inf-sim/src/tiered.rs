@@ -260,6 +260,7 @@ impl TieredScenario {
             recycle_oracle: false,
             recycle_open_fault: false,
             lift_regime: false,
+            spin_iters: DurableScenario::SPIN_ITERS,
         }
     }
 }

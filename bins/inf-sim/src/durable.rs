@@ -38,7 +38,7 @@ use inf_log::{
     REORDER_WINDOW_FRAMES, ReaderConfig, SegmentId, SegmentReader, WRITE_THROUGH_WINDOW_ENTRIES,
     read_manifest, scan_log_dir_from,
 };
-use inf_runtime::{CellLoop, LoopConfig};
+use inf_runtime::{CellLoop, IterStats, LoopConfig};
 use inf_server::{
     ControlInbox, ExecOrigin, ExecScope, NodeInfo, PlaneObserver, SegmentIoMode, ServerPlane,
     SimDisk, SimDiskConfig, StallConfig, load_catalog_from,
@@ -54,6 +54,8 @@ use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::reply_len;
 
 mod audit;
+#[cfg(test)]
+mod park;
 mod run;
 pub use run::run_durable_scenario;
 
@@ -259,6 +261,11 @@ pub struct DurableScenario {
     /// the pre-fix rotor turned this into an `AlreadyExists` fail-stop.
     /// `m2_recycle` sets it on one seed class in eight.
     pub recycle_open_fault: bool,
+    /// The reactor's busy iterations before it parks (`LoopConfig`):
+    /// [`Self::SPIN_ITERS`] on every scenario. The loop-tier park tests set
+    /// 0, the value at which an idle iteration parks at once, and read the
+    /// decision back from [`Node::iter_stats`].
+    pub spin_iters: u32,
 }
 
 /// The oversized-value pad of ADR-0170's sim arm (see
@@ -448,6 +455,10 @@ impl DurableScenario {
     /// The m2 shapes' section bound (see [`Self::section_bound_for`]).
     pub const M2_SECTION_BOUND: u32 = 64;
 
+    /// Every scenario's `spin_iters`: a few polls after work goes quiet,
+    /// so a stepped cell reaps what its last iteration submitted.
+    pub const SPIN_ITERS: u32 = 4;
+
     /// `m2-clean-stop` (ADR-0124): `m2-durable`'s shape, stopped
     /// gracefully before the cut. Single-cut: the second cut lands
     /// mid-recovery, which a clean stop never reaches.
@@ -529,6 +540,7 @@ impl DurableScenario {
             recycle_oracle: false,
             recycle_open_fault: false,
             lift_regime: false,
+            spin_iters: Self::SPIN_ITERS,
         }
     }
 
@@ -901,6 +913,7 @@ impl DurableScenario {
             recycle_oracle: false,
             recycle_open_fault: false,
             lift_regime: false,
+            spin_iters: Self::SPIN_ITERS,
         }
     }
 
@@ -955,6 +968,7 @@ impl DurableScenario {
             recycle_oracle: false,
             recycle_open_fault: false,
             lift_regime: false,
+            spin_iters: Self::SPIN_ITERS,
         }
     }
 }
@@ -1538,6 +1552,10 @@ pub(crate) struct Node {
     disk: SimDisk,
     observed_ready: bool,
     cells: Vec<(SimLoop, SimPlane)>,
+    /// Each cell's last reactor iteration, as `run_iteration` reported it
+    /// (all default before its first; a frozen cell keeps its last).
+    #[allow(dead_code, reason = "read by the loop-tier tests, through `Node::iter_stats`")]
+    iter_stats: Vec<IterStats>,
     pub(crate) nets: Vec<Rc<RefCell<CellNet>>>,
     pub(crate) control: std::sync::Arc<inf_server::ControlHandle>,
     inbox: ControlInbox,
@@ -1667,12 +1685,13 @@ pub(crate) fn boot(
             .set_control(std::sync::Arc::clone(&control), issuer)
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
-        let config = LoopConfig { spin_iters: 4, ..Default::default() };
+        let config = LoopConfig { spin_iters: scenario.spin_iters, ..Default::default() };
         let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
     Ok(Node {
+        iter_stats: vec![IterStats::default(); cells.len()],
         cells,
         nets,
         control,
@@ -1737,7 +1756,7 @@ impl Node {
                 continue;
             }
             let (cell_loop, plane) = &mut self.cells[idx];
-            cell_loop.run_iteration(plane).expect("sim iteration");
+            self.iter_stats[idx] = cell_loop.run_iteration(plane).expect("sim iteration");
             if let Some(err) = plane.take_boot_error() {
                 return Err(err);
             }
@@ -1765,6 +1784,15 @@ impl Node {
 
     pub(crate) fn plane_mut(&mut self, cell: usize) -> &mut SimPlane {
         &mut self.cells[cell].1
+    }
+
+    /// What `cell`'s last reactor iteration reported. `parked` is the
+    /// reactor's own decision, made before the driver call: the sim driver
+    /// ignores the wait, so a park shows as this flag and never as elapsed
+    /// virtual time. Read between scheduler steps.
+    #[cfg(test)]
+    pub(crate) fn iter_stats(&self, cell: usize) -> IterStats {
+        self.iter_stats[cell]
     }
 
     /// Summed pub/sub registry gauges across cells (combined-scenario

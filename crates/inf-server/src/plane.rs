@@ -1225,6 +1225,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         })
     }
 
+    /// Pumps parked on this cell's checkpoint waitlist (`INF.CKPT WAIT`,
+    /// DROP pacing), for the simulator's loop-tier tests: used only
+    /// between scheduler steps.
+    pub fn ckpt_waiters_for_sim(&self) -> usize {
+        self.shared.ckpt_waiters.waiting()
+    }
+
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
     /// `Arc` goes to every cell's fabric via `CellFabric::set_wakeups`).
     pub fn set_park_flags(&mut self, flags: Arc<Vec<AtomicBool>>) {
