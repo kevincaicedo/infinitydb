@@ -44,9 +44,11 @@ CONTAINERS="${INF_CONTAINER_EXEMPTIONS:-docs/container-exemptions.tsv}"
 BASE_REF="${INF_LINT_BASE_REF:-origin/main}"
 # Only a lower number may replace this one (ADR-0144 D1).
 ADR0143_EXEMPTIONS_MAX=15
-# The sum of the container table's counts: only a lower number may replace
-# it. The capped-backing allows are exact: 1 once `struct CappedDeque`
-# lands (ADR-0151 D6).
+# The sum of the container table's counts, exactly (a sum above or below it
+# is red), and only a lower number may replace it. The approved copies read
+# it from this one line, so it stays spelled `NAME=<digits>` alone. The
+# capped-backing allows are exact: 1 once `struct CappedDeque` lands
+# (ADR-0151 D6).
 CONTAINER_EXEMPTIONS_MAX=104
 CAPPED_BACKING_SITES=0
 if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
@@ -726,6 +728,9 @@ for f, _, _, key, record, site in exempt:
 csum = sum(count for count, _, _ in crows.values())
 if csum > CONTAINER_MAX:
     errors.append(f"{CONTAINERS}: counts sum to {csum}, above CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX}")
+elif csum < CONTAINER_MAX:
+    errors.append(f"{CONTAINERS}: counts sum to {csum}, below CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX} — "
+                  f"lower the maximum to {csum} in {SELF}")
 
 # approved copies: per file and record the counts only shrink, a pair the
 # copy lacks is red, a date only moves earlier, the maximum only falls. A

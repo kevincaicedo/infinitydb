@@ -1411,7 +1411,24 @@ done
 # and the frozen ADR-0143 exemption table against its approved copies —
 # fixture repositories with real commits, because the approved copies are
 # history (HEAD, the base tip, the table's introducing commit).
-LINTSCOPES="$SCRIPT_DIR/check-lint-scopes.sh"
+#
+# The fixtures run a copy of the gate, with the probe, the toolchain pin and
+# clippy.toml beside it as in the workspace: its code unchanged, its two
+# constants set to the fixture's own by ls_gate (a container table's sum is
+# its CONTAINER_EXEMPTIONS_MAX exactly, so an empty fixture table runs at 0).
+LS_GATE="$work/gate"
+mkdir -p "$LS_GATE"
+cp -R "$SCRIPT_DIR" "$LS_GATE/scripts"
+cp rust-toolchain.toml clippy.toml "$LS_GATE/"
+LINTSCOPES="$LS_GATE/scripts/check-lint-scopes.sh"
+ls_gate() { # <maximum> <backing sites>
+    sed -i.bak -e "s/^CONTAINER_EXEMPTIONS_MAX=[0-9][0-9]*\$/CONTAINER_EXEMPTIONS_MAX=$1/" \
+        -e "s/^CAPPED_BACKING_SITES=[0-9][0-9]*\$/CAPPED_BACKING_SITES=$2/" "$LINTSCOPES"
+    rm -f "$LINTSCOPES.bak"
+    grep -q "^CONTAINER_EXEMPTIONS_MAX=$1\$" "$LINTSCOPES" && grep -q "^CAPPED_BACKING_SITES=$2\$" "$LINTSCOPES" ||
+        { echo "ls_gate: the gate's constants are not where the copy sets them" >&2; exit 2; }
+}
+ls_gate 0 0
 LS_ATTR='#![cfg_attr(
     not(test),
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
@@ -1465,6 +1482,10 @@ ls_case() {
     printf '%s\n%s\n' "$LS_ATTR" "$body" >"$root/crates/fake/src/lib.rs"
     expect "$want" "lint-scopes: $label" ls_run "$root"
 }
+# The lint table, read once: a listing that fails or prints nothing stops the
+# self-test here instead of running no case.
+LS_RULES=$(env INF_LINT_RULES=1 INF_CHECK_ROOT="$root" "$LINTSCOPES")
+[ -n "$LS_RULES" ] || { echo "selftest: the gate listed no lint rule" >&2; exit 2; }
 while IFS=$'\t' read -r lint scope cls; do
     cls=${cls%:}
     ls_case red "$lint — allow without a reason" "#[allow(clippy::$lint)]
@@ -1486,7 +1507,7 @@ pub fn f() {}"
     reason = \"$cls: stated over two lines, through another attribute\"
 )]
 pub fn f() {}"
-done < <(env INF_LINT_RULES=1 "$LINTSCOPES")
+done <<<"$LS_RULES"
 ls_case red "filesystem methods cannot be allowed on a whole function" '#[allow(clippy::disallowed_methods, reason = "boot: filesystem setup")]
 pub fn f() {}'
 ls_case green "filesystem method allow is on its statement" 'pub fn f() {
@@ -1698,9 +1719,8 @@ expect red "lint-scopes: a table deleted from under the gate is not a bootstrap"
 # name outside comments, in two completed builds; a line tagged
 # `// uncompiled` stands for code neither build compiles), so these cases
 # judge the table; the probe below proves clippy's own spans. Each red names
-# its cause.
-LC_MAX=$(sed -n 's/^CONTAINER_EXEMPTIONS_MAX=\([0-9][0-9]*\)$/\1/p' "$LINTSCOPES")
-[ -n "$LC_MAX" ] || { echo "selftest: no CONTAINER_EXEMPTIONS_MAX in $LINTSCOPES" >&2; exit 2; }
+# its cause. LC_MAX is the fixture table's sum, and the gate copy's maximum.
+LC_MAX=5
 LC_A=crates/fake/src/a.rs
 LC_T=docs/container-exemptions.tsv
 lc_diag() {
@@ -1727,26 +1747,9 @@ for _ in range(2):
 (root / "api.json").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 PY
 }
-LC_SCOPES=$LINTSCOPES
 lc_run() {
     lc_diag "$1"
-    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LC_SCOPES"
-}
-# lc_gate <maximum> <backing sites>: a copy of the gate, its code unchanged,
-# with its two constants set to a fixture's own; LC_SCOPES then runs it.
-LC_GATE_DIR="$work/lc-gate"
-lc_gate() {
-    [ -n "$work" ] && [ -d "$work" ] || { echo "lc_gate: no work dir" >&2; exit 2; }
-    mkdir -p "$LC_GATE_DIR"
-    cp "$SCRIPT_DIR/check-lint-scopes.sh" "$SCRIPT_DIR/check-lint-ratchet.sh" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/cell-crates.sh" "$SCRIPT_DIR/strip-test-modules.awk" "$LC_GATE_DIR/"
-    sed -i.bak -e "s/^CONTAINER_EXEMPTIONS_MAX=[0-9][0-9]*\$/CONTAINER_EXEMPTIONS_MAX=$1/" \
-        -e "s/^CAPPED_BACKING_SITES=[0-9][0-9]*\$/CAPPED_BACKING_SITES=$2/" "$LC_GATE_DIR/check-lint-scopes.sh"
-    rm -f "$LC_GATE_DIR/check-lint-scopes.sh.bak"
-    grep -q "^CONTAINER_EXEMPTIONS_MAX=$1\$" "$LC_GATE_DIR/check-lint-scopes.sh" &&
-        grep -q "^CAPPED_BACKING_SITES=$2\$" "$LC_GATE_DIR/check-lint-scopes.sh" ||
-        { echo "lc_gate: the gate's constants are not where the copy sets them" >&2; exit 2; }
-    LC_SCOPES="$LC_GATE_DIR/check-lint-scopes.sh"
+    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LINTSCOPES"
 }
 lc_census() {
     lc_diag "$1"
@@ -1800,6 +1803,7 @@ lc_source
 lc_table
 ls_commit "$root" containers
 git -C "$root" branch -q -f base-tip HEAD
+ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
 expect_output "lint-scopes: containers — the census prints file, item, count, record" \
     "$(printf 'fn Owner::build\t2\tE')" lc_census "$root"
@@ -1929,7 +1933,7 @@ lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing
 expect_red_because "lint-scopes: containers — a capped-backing allow past CAPPED_BACKING_SITES" \
     "1 \`container: capped-backing\` allow(s)" lc_run "$root"
 lc_reset
-lc_gate "$LC_MAX" 1
+ls_gate "$LC_MAX" 1
 LC_B=crates/inf-foundation/src/bounded/deque.rs
 mkdir -p "$root/crates/inf-foundation/src/bounded"
 lc_append_to "$LC_B" '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
@@ -1945,7 +1949,7 @@ lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing
 expect_red_because "lint-scopes: containers — the backing allow on another item" \
     "\`container: capped-backing\` on \`struct Holder\` in $LC_A" lc_run "$root"
 lc_reset
-LC_SCOPES=$LINTSCOPES
+ls_gate "$LC_MAX" 0
 lc_append 'pub const CAP: u32 = Cap::entries("x", 1);'
 expect_red_because "lint-scopes: containers — Cap::entries outside a limits.rs" \
     "\`Cap::entries\` outside a \`limits.rs\`" lc_run "$root"
@@ -1957,14 +1961,20 @@ lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: H
 expect_red_because "lint-scopes: containers — fewer than the row" \
     "\`fn Owner::build\` holds 1 container span(s), its row says 2 — lower the row to 1" lc_run "$root"
 lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t1\tE\t|' "$LC_T"
-expect green "lint-scopes: containers — a lowered count (control)" lc_run "$root"
+expect_red_because "lint-scopes: containers — a lowered count with the maximum left above the sum" \
+    "counts sum to 4, below CONTAINER_EXEMPTIONS_MAX = $LC_MAX — lower the maximum to 4" lc_run "$root"
+ls_gate $((LC_MAX - 1)) 0
+expect green "lint-scopes: containers — a lowered count and maximum (control)" lc_run "$root"
+ls_gate "$LC_MAX" 0
 lc_reset
 lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: Vec<u8>,|' "$LC_A"
 expect_red_because "lint-scopes: containers — an allow that covers no container" \
     "the allow on \`struct Exempt\` covers no container" lc_run "$root"
 lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
 lc_edit '/\tstruct Exempt\t/d' "$LC_T"
-expect green "lint-scopes: containers — a removed row (control)" lc_run "$root"
+ls_gate $((LC_MAX - 1)) 0
+expect green "lint-scopes: containers — a removed row and a lowered maximum (control)" lc_run "$root"
+ls_gate "$LC_MAX" 0
 lc_reset
 git -C "$root" mv "$LC_A" crates/fake/src/moved.rs
 lc_edit 's|^crates/fake/src/a.rs\t|crates/fake/src/moved.rs\t|' "$LC_T"
@@ -2004,8 +2014,10 @@ lc_gated_rows() {
     lc_row "$LC_G" 'use std::collections::HashMap as Map' 1 D 2099-12-31
 }
 lc_gated_rows
+printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX + 2))" >"$root/scripts/check-lint-scopes.sh"
 ls_commit "$root" "a host-gated module"
 git -C "$root" branch -q -f base-tip HEAD
+ls_gate $((LC_MAX + 2)) 0
 expect green "lint-scopes: containers — a host-gated module, a same-file rename counted (control)" \
     lc_run "$root"
 expect_output "lint-scopes: containers — a module this host does not compile is counted from its text" \
@@ -2040,6 +2052,7 @@ root=$(ls_root ls-containers-first)
 printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
 lc_source
 lc_table
+ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the first landing (no copy has the gate) is the bootstrap" \
     lc_run "$root"
 expect_output "lint-scopes: containers — the first landing discloses the bootstrap" \
@@ -2071,6 +2084,7 @@ expect_red_because "lint-scopes: containers — a committed raise is red against
 
 # the probe's judge: a plant that compiles clean, and a plant that fails
 # for an unrelated reason, are both red (ADR-0144 D5's probe rule).
+ls_gate 0 0
 root=$(ls_root ls-probe)
 ls_probe() { env INF_CHECK_ROOT="$root" INF_LINT_BASE_REF=base-tip INF_LINT_PROBE=on INF_LINT_PROBE_SRC="$1" "$LINTSCOPES"; }
 expect green "lint-scopes: stable plants draw their lints and the unstable call is refused" ls_probe "$SCRIPT_DIR/lint-scope-probe"
