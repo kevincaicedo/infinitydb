@@ -545,6 +545,15 @@ if diagnostics:
 # carrying each expiry, which is set by hand and only moves earlier.
 DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 GATE_MAX = re.compile(r"^CONTAINER_EXEMPTIONS_MAX=([0-9]+)[ \t]*$", re.M)
+# The approved copies read each ref's maximum with GATE_MAX, so this gate's
+# own line is held to it: one line, the value in use. Respelled, a copy
+# would read as predating the container gate and its comparison be skipped.
+own_max = GATE_MAX.findall((Path(os.environ["INF_SCRIPT_DIR"]) / "check-lint-scopes.sh").read_text())
+if own_max != [str(CONTAINER_MAX)]:
+    print(f"LINT-SCOPES SCOPE ERROR: the gate spells CONTAINER_EXEMPTIONS_MAX on {len(own_max)} line(s) "
+          f"the approved copies can read ({', '.join(own_max) or 'none'}), in use {CONTAINER_MAX}: keep it "
+          "one line, `CONTAINER_EXEMPTIONS_MAX=<digits>` alone")
+    sys.exit(1)
 
 
 def container_rows(text, label):

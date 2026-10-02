@@ -1973,6 +1973,19 @@ ls_commit "$root" "a lower maximum"
 expect_red_because "lint-scopes: containers — a raised maximum" \
     "CONTAINER_EXEMPTIONS_MAX = $LC_MAX is above the HEAD's $((LC_MAX - 1))" lc_run "$root"
 git -C "$root" reset -q --hard HEAD~1
+sed -i.bak "s/^CONTAINER_EXEMPTIONS_MAX=$LC_MAX\$/CONTAINER_EXEMPTIONS_MAX=$LC_MAX # the sum/" "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+expect_red_because "lint-scopes: containers — a maximum spelled so no approved copy can read it" \
+    "the gate spells CONTAINER_EXEMPTIONS_MAX" lc_run "$root"
+sed -i.bak "s/^CONTAINER_EXEMPTIONS_MAX=$LC_MAX # the sum\$/CONTAINER_EXEMPTIONS_MAX=$LC_MAX/" "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+printf 'CONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >>"$LINTSCOPES"
+expect_red_because "lint-scopes: containers — the maximum spelled on two lines" \
+    "the gate spells CONTAINER_EXEMPTIONS_MAX" lc_run "$root"
+sed -i.bak '$d' "$LINTSCOPES"
+rm -f "$LINTSCOPES.bak"
+ls_gate "$LC_MAX" 0
+expect green "lint-scopes: containers — the gate copy restored (control)" lc_run "$root"
 lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
 lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
 ls_commit "$root" "a raise, committed"
