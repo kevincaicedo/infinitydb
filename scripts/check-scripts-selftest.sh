@@ -496,6 +496,26 @@ dir=$(canary_fixture canary-sim-dst "$failed_line" "$ok_line")
 expect red "canaries: a row on another package does not carry the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test inf-sim lib the_row" >"$dir/rows"
 expect green "canaries: a row on inf-sim builds with the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A test with more than one way to fail: a crate-test row's witness is a
+# phrase of the oracle's own assertion, and the planted log must carry it.
+# A red on the test's engagement check (`VACUOUS`) is never a catch, with
+# or without a witness.
+oracle_line='echo "panicked: the oracle saw a stale value: 7"; echo "test the_row ... FAILED"; exit 101'
+other_assert_line='echo "panicked: the fixture did not boot"; echo "test the_row ... FAILED"; exit 101'
+vacuous_line='echo "panicked: VACUOUS: the fault never fired"; echo "test the_row ... FAILED"; exit 101'
+dir=$(canary_fixture canary-witness "$oracle_line" "$ok_line")
+echo "inf_canary_fixture crate-test fake test:suite the_row the oracle saw a stale value" >"$dir/rows"
+expect green "canaries: a crate-test row FAILED on its witness phrase is a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the catch quotes the oracle's assertion" "caught: panicked: the oracle saw a stale value: 7" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-wrong-assertion "$other_assert_line" "$ok_line")
+echo "inf_canary_fixture crate-test fake test:suite the_row the oracle saw a stale value" >"$dir/rows"
+expect red "canaries: a crate-test row FAILED on another assertion is not a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the wrong-assertion red is named" "expected the oracle's assertion 'the oracle saw a stale value'" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(canary_fixture canary-vacuous "$vacuous_line" "$ok_line")
+expect red "canaries: a crate-test row FAILED on its engagement check is not a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect_output "canaries: the engagement red is named" "the test's engagement check, not its oracle" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture crate-test fake test:suite the_row VACUOUS: the fault never fired" >"$dir/rows"
+expect red "canaries: a witness cannot name the engagement check" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.

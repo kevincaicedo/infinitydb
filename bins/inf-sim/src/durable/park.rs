@@ -232,13 +232,13 @@ fn own_publication_window(
 fn an_own_publication_with_a_waiter_does_not_park_before_its_wake() {
     let read = own_publication_window(1, 0, 0, &[b"INF.CKPT", b"WAIT"]);
     assert!(read.parks_before > 0, "liveness: the instrument read no park in {read:?}");
-    assert_eq!(
-        read.flags,
-        [false],
+    assert!(
+        !read.flags.contains(&true),
         "a parked iteration between the publication and its wake (parked flags, from the \
-         iteration after the publishing one through the waking one), or more than the one \
-         turn a 1-cell sweep takes"
+         iteration after the publishing one through the waking one): {:?}",
+        read.flags
     );
+    assert_eq!(read.flags.len(), 1, "a 1-cell sweep wakes in one turn: {:?}", read.flags);
 }
 
 /// The same term at the shipped multi-cell topology, on a cell other than
@@ -333,8 +333,8 @@ fn a_part_way_sweep_holds_a_waiting_cell_awake() {
     }
     assert!(
         parked_part_way.is_empty(),
-        "a waiting cell's parks are not ceil(N / 64) turns apart (closer: it parked while its \
-         sweep was part-way), as (cells, parked flags): {parked_part_way:?}"
+        "a waiting cell parked while its sweep was part-way, or stayed awake past it: its parks \
+         are not ceil(N / 64) turns apart, as (cells, parked flags): {parked_part_way:?}"
     );
 }
 

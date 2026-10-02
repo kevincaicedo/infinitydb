@@ -8,13 +8,18 @@
 # Three row kinds:
 #   `<cfg> <scenario> <expected violation substring> [flags…]` — an
 #     `inf-sim` scenario (a sweep where one seed may not reach the rule);
-#   `<cfg> crate-test <package> <lib|test:NAME> <test name>` — a crate's
-#     own test, for a rule whose oracle lives below the simulator (the
-#     store-tier index rows, ADR-0139). The planted build must report
+#   `<cfg> crate-test <package> <lib|test:NAME> <test name> [witness…]` —
+#     a crate's own test, for a rule whose oracle lives below the simulator
+#     (the store-tier index rows, ADR-0139). The planted build must report
 #     exactly that test `FAILED`; a build that is red for any other
-#     reason — a compile error, another test — is not a catch. A row on
-#     `inf-sim` builds with `--features dst`, as every simulator recipe
-#     does (ADR-0107 D1): its tests do not compile without it;
+#     reason — a compile error, another test — is not a catch. Nor is a
+#     red whose log carries `VACUOUS`: that is the test's engagement check
+#     failing, not its oracle seeing the planted violation. The words after
+#     the test name are the row's witness, a phrase of the oracle's own
+#     assertion that the planted log must also carry, for a test with more
+#     than one way to fail. A row on `inf-sim` builds with `--features
+#     dst`, as every simulator recipe does (ADR-0107 D1): its tests do not
+#     compile without it;
 #   `<cfg> loom <package> <test name> <witness>` — a Loom model in the
 #     package's library, for a memory ordering no other oracle can see
 #     (ADR-0159 A1.6): built `--cfg loom --cfg <cfg>` in release, judged
@@ -135,32 +140,32 @@ rows=(
   "inf_canary_request_read_relaxed loom inf-foundation loom_an_effect_before_the_issue_is_visible_after_the_request A1.6:"
   # ADR-0159 A1.4: `WAIT CELL k`'s confirmation skips its LASTSAVE floor
   # raise, so a LASTSAVE after the WAIT trails the checkpoint it fenced.
-  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_after_wait_cell_covers_the_fenced_checkpoint"
-  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
+  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_after_wait_cell_covers_the_fenced_checkpoint trails the WAIT"
+  "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell is below slot"
   # The confirmation raises the floor but does not write the cell's
   # `LastSave`: both surfaces stay below the checkpoint the WAIT fenced.
-  "inf_canary_lastsave_cell_stale crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
+  "inf_canary_lastsave_cell_stale crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell is below slot"
   # INFO's `rdb_last_save_time` renders the sweep's term alone: after a
   # `WAIT CELL k` that confirms ahead of the sweep it differs from LASTSAVE.
-  "inf_canary_info_lastsave_from_observation crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell"
-  "inf_canary_info_lastsave_from_observation crate-test inf-sim lib lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep"
+  "inf_canary_info_lastsave_from_observation crate-test inf-server lib lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell rdb_last_save_time and LASTSAVE differ on one cell"
+  "inf_canary_info_lastsave_from_observation crate-test inf-sim lib lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep rdb_last_save_time and LASTSAVE differ on one cell"
   # ADR-0159 A1.4: the park guard without its own-slot term — a cell parks
   # on top of a `WAIT` its own publication satisfied.
-  "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake"
+  "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake a parked iteration between the publication and its wake"
   # The guard without its cursor term: beyond 64 cells a cell with a waiter
   # parks while its sweep is part-way.
-  "inf_canary_ckpt_park_guard_cursor_skipped crate-test inf-sim lib a_part_way_sweep_holds_a_waiting_cell_awake"
+  "inf_canary_ckpt_park_guard_cursor_skipped crate-test inf-sim lib a_part_way_sweep_holds_a_waiting_cell_awake a waiting cell parked while its sweep was part-way"
   # Every cell's sweep watches slot 0: the term is back to nothing on every
   # other cell of a multi-cell node.
-  "inf_canary_ckpt_sweep_own_slot_zero crate-test inf-sim lib an_own_publication_on_a_peer_cell_does_not_park_before_its_wake"
-  "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_on_a_peer_cell_does_not_park_before_its_wake"
+  "inf_canary_ckpt_sweep_own_slot_zero crate-test inf-sim lib an_own_publication_on_a_peer_cell_does_not_park_before_its_wake a parked iteration between an own publication on cell 1 and its wake"
+  "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_on_a_peer_cell_does_not_park_before_its_wake a parked iteration between an own publication on cell 1 and its wake"
   # A completed sweep leaves `own_seen` behind: the own-slot term never
   # ends, and a cell with an unsatisfied waiter never parks.
-  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-sim lib a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park"
-  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes"
+  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-sim lib a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park the cell never parks after its publication"
+  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes the own-slot term never ended"
   # The own slot loaded as the cursor passes it, not at the sweep's start:
   # beyond 64 cells the term ends over a peer the sweep read too early.
-  "inf_canary_ckpt_own_loaded_at_cursor crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes"
+  "inf_canary_ckpt_own_loaded_at_cursor crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes the term ended over a slot read before its publication"
   # ADR-0170 — an offer above its class cap is issued by a counted overrun.
   # The answer before it, "not this slice" for ever: the budget scenario's
   # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized
@@ -191,9 +196,9 @@ log=$(mktemp)
 [ -n "$log" ] && [ -f "$log" ] || { echo "sim-canaries: mktemp failed"; exit 2; }
 trap '[ -n "$log" ] && [ -f "$log" ] && rm -f "$log"' EXIT
 
-# crate_test <cfg> <package> <lib|test:NAME> <test name>
+# crate_test <cfg> <package> <lib|test:NAME> <test name> <witness, or empty>
 crate_test() {
-  local cfg=$1 package=$2 target=$3 name=$4 target_args
+  local cfg=$1 package=$2 target=$3 name=$4 witness=$5 target_args
   case "$target" in
     lib) target_args=(--lib) ;;
     test:*) target_args=(--test "${target#test:}") ;;
@@ -210,6 +215,16 @@ crate_test() {
     echo "   red for another reason (expected 'test $name ... FAILED'):"
     tail -5 "$log"
     fail=1
+  elif grep -Fq -- "VACUOUS" "$log"; then
+    echo "   red for another reason (the test's engagement check, not its oracle):"
+    grep -F -m1 -- "VACUOUS" "$log" | cut -c1-160
+    fail=1
+  elif [ -n "$witness" ] && ! grep -Fq -- "$witness" "$log"; then
+    echo "   red for another reason (expected the oracle's assertion '$witness'):"
+    tail -5 "$log"
+    fail=1
+  elif [ -n "$witness" ]; then
+    echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
   else
     echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
   fi
@@ -260,8 +275,8 @@ for row in "${rows[@]}"; do
   parts=($row)
   cfg=${parts[0]}
   if [ "${parts[1]}" = crate-test ]; then
-    [ "${#parts[@]}" -eq 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    crate_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}"
+    [ "${#parts[@]}" -ge 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
+    crate_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
     continue
   fi
   if [ "${parts[1]}" = loom ]; then
