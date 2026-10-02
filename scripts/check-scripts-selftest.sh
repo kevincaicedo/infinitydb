@@ -1751,6 +1751,14 @@ lc_run() {
     lc_diag "$1"
     env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LINTSCOPES"
 }
+# lc_red_once <root> <pattern>: the gate is red and prints the pattern on
+# exactly one line, though the fixture's two builds both report the site.
+lc_red_once() {
+    local out status=0
+    out=$(lc_run "$1" 2>&1) || status=$?
+    printf '%s\n' "$out"
+    [ "$status" -ne 0 ] && [ "$(printf '%s\n' "$out" | grep -c -- "$2")" -eq 1 ]
+}
 lc_census() {
     lc_diag "$1"
     env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" \
@@ -1878,6 +1886,8 @@ lc_reset
 lc_append 'pub struct Bare {' '    pub queue: VecDeque<u8>,' '}'
 expect_red_because "lint-scopes: containers — a new container with no allow" \
     "std::collections::VecDeque lacks a narrow allow of its own API class" lc_run "$root"
+expect green "lint-scopes: containers — a new container is reported once, with the ban's sentence" \
+    lc_red_once "$root" "$LC_A:19: std::collections::VecDeque lacks a narrow allow of its own API class — cell code holds no growable std container: use"
 lc_reset
 lc_append '#[cfg(feature = "absent")]' 'pub struct Off {' \
     '    pub queue: VecDeque<u8>, // uncompiled: neither build enables the feature' '}'

@@ -472,6 +472,7 @@ denied_n, ratchet_n = len(scopes_tbl.families("deny")), len(scopes_tbl.families(
 diagnostics = os.environ.get("INF_LINT_API_DIAGNOSTICS")
 container_spans = set()  # (file, line, column) of the banned paths, cell production code
 unallowed = set()  # (file, line) of a banned path the audit already reports
+reported = set()  # (file, line, path): a site both builds report is printed once
 if diagnostics:
     completed, resolved, in_build = 0, set(), set()
     expected = {lint for _, _, _, lints, _ in api_sites for lint in lints}
@@ -516,9 +517,14 @@ if diagnostics:
             if container:
                 container_spans.add((file, line, span["column_start"]))
             in_build.add(code)
+            if (file, line, path) in reported:
+                continue  # the other build's report of the same site
             if not any(file == f and first <= line <= last and code in lints and cls in classes
                        for f, first, last, lints, cls in api_sites):
-                errors.append(f"{file}:{line}: {path} lacks a narrow allow of its own API class")
+                reported.add((file, line, path))
+                why = (f" — {CONTAINER_REASON[path]}; a new `container:` allow is red too: the exemption "
+                       "table only shrinks" if container else "")
+                errors.append(f"{file}:{line}: {path} lacks a narrow allow of its own API class{why}")
                 if container:
                     unallowed.add((file, line))
     if completed != 2:
