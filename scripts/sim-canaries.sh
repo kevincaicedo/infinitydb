@@ -151,6 +151,9 @@ rows=(
   # ends, and a cell with an unsatisfied waiter never parks.
   "inf_canary_ckpt_own_seen_not_advanced crate-test inf-sim lib a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park"
   "inf_canary_ckpt_own_seen_not_advanced crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes"
+  # The own slot loaded as the cursor passes it, not at the sweep's start:
+  # beyond 64 cells the term ends over a peer the sweep read too early.
+  "inf_canary_ckpt_own_loaded_at_cursor crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes"
   # ADR-0170 — an offer above its class cap is issued by a counted overrun.
   # The answer before it, "not this slice" for ever: the budget scenario's
   # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized

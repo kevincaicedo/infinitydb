@@ -416,13 +416,19 @@ impl CkptBoard {
     /// loads its own cell's slot before any visit.
     pub fn sweep_step(&self, sweep: &mut BoardSweep, lastsave: &LastSave) -> SweepStep {
         let begin = sweep.cursor;
-        if begin == 0 {
-            // The sweep's start, before any visit: a sweep whose `own_seen`
-            // reaches a publication of this cell read every slot after it.
-            sweep.partial_own = self.own_published(sweep.me).unwrap_or(0);
-        }
         let end = self.cells.len().min(begin + CKPT_BOARD_VISITS_PER_TURN);
         debug_assert!(begin < end, "a sweep's cursor stays below the board's cell count");
+        // The sweep's start, before any visit: a sweep whose `own_seen`
+        // reaches a publication of this cell read every slot after it.
+        #[cfg(not(inf_canary_ckpt_own_loaded_at_cursor))]
+        let loads_own = begin == 0;
+        // Canary: the own slot loaded as the cursor passes it, over slots
+        // the sweep read before the publication.
+        #[cfg(inf_canary_ckpt_own_loaded_at_cursor)]
+        let loads_own = (begin..end).contains(&sweep.me);
+        if loads_own {
+            sweep.partial_own = self.own_published(sweep.me).unwrap_or(0);
+        }
         for slot in &self.cells[begin..end] {
             let published = slot.published();
             let unix_ms = slot.last_unix_ms();
@@ -2302,58 +2308,79 @@ mod tests {
         }
     }
 
-    /// ADR-0159 A1.4's own-slot term through the product's own methods: a
+    /// The park guard's own-slot term through the product's own methods
+    /// (`interfaces-m2.md`, "Cells never fold the whole board"): a
     /// publication of the sweep's own cell stays unobserved until a sweep
     /// that began after it completes, and no longer. `S = ceil(N / 64)`
     /// steps make a sweep, from one step (`N` = 1, 64) through three
-    /// (`N` = 130, the publication at cursor 64) to the topology limit's
-    /// 256. The expected turns are the test's own count of where it
-    /// published: `S` when the next step starts a sweep, else the rest of
-    /// the sweep in progress plus `S` — never above `2 * S`. The planted
-    /// `inf_canary_ckpt_own_seen_not_advanced` must fail this test.
+    /// (`N` = 130) to the topology limit's 256, and the own cell is the
+    /// board's first slot, its last, and slots on both sides of the cursor
+    /// (63, 64, 100). The expected turns are the test's own count of where
+    /// it published: `S` when the next step starts a sweep, else the rest
+    /// of the sweep in progress plus `S`, never above `2 * S`. Planted,
+    /// each must fail this test: `inf_canary_ckpt_own_seen_not_advanced`,
+    /// and `inf_canary_ckpt_own_loaded_at_cursor` (the own slot loaded as
+    /// the cursor passes it, which ends the term over a peer the sweep
+    /// read before that peer published).
     #[test]
     fn an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes() {
+        let mut ahead_of_the_cursor = 0;
         for count in [1u16, 64, 65, 130, SLOT_COUNT] {
             let sweep_turns = u32::from(count).div_ceil(64);
-            let mut worst = 0;
-            for steps_in in [0, 1, sweep_turns - 1] {
-                if steps_in >= sweep_turns {
-                    continue; // a one-step sweep is never part-way
+            for me in [0u16, 63, 64, 100, count - 1] {
+                if me >= count {
+                    continue;
                 }
-                let turns = turns_until_an_own_publication_is_observed(count, steps_in);
-                let expected = if steps_in == 0 {
-                    sweep_turns
-                } else {
-                    (sweep_turns - steps_in) + sweep_turns
-                };
-                assert_eq!(turns, expected, "{count} cells, published {steps_in} steps in");
-                worst = worst.max(turns);
+                let mut worst = 0;
+                for steps_in in [0, 1, sweep_turns - 1] {
+                    if steps_in >= sweep_turns {
+                        continue; // a one-step sweep is never part-way
+                    }
+                    let turns = turns_until_an_own_publication_is_observed(count, me, steps_in);
+                    let expected = if steps_in == 0 {
+                        sweep_turns
+                    } else {
+                        (sweep_turns - steps_in) + sweep_turns
+                    };
+                    let case = format!("{count} cells, cell {me}, published {steps_in} steps in");
+                    assert_eq!(turns, expected, "{case}");
+                    worst = worst.max(turns);
+                    ahead_of_the_cursor +=
+                        u32::from(steps_in > 0 && u32::from(me) >= steps_in * 64);
+                }
+                assert!(worst <= 2 * sweep_turns, "{count} cells, cell {me}: {worst} turns");
             }
-            assert!(worst <= 2 * sweep_turns, "{count} cells: {worst} turns");
         }
+        // Engagement: only a slot the sweep in progress has yet to read
+        // separates a load at the sweep's start from one at the cursor.
+        assert!(ahead_of_the_cursor > 0, "VACUOUS: no own slot lay ahead of a part-way cursor");
     }
 
-    /// Sweep steps from a publication of cell 0, made `steps_in` steps into
-    /// a sweep of a `count`-cell board, until `own_unobserved` ends.
-    fn turns_until_an_own_publication_is_observed(count: u16, steps_in: u32) -> u32 {
+    /// Sweep steps from a publication of cell `me`, made `steps_in` steps
+    /// into a sweep of a `count`-cell board, until `own_unobserved` ends. A
+    /// peer publishes just before `me` does, in a slot the sweep in
+    /// progress already read (any other slot when the sweep is at its
+    /// start): the observation that ends the term must carry both.
+    fn turns_until_an_own_publication_is_observed(count: u16, me: u16, steps_in: u32) -> u32 {
         let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
         let board = handle.ckpt_board();
         let lastsave = LastSave::default();
-        let mut sweep = BoardSweep::new(CellId(0));
+        let mut sweep = BoardSweep::new(CellId(me));
         assert!(!board.own_unobserved(&sweep), "nothing is published yet");
         let sweep_turns = complete_sweep(board, &mut sweep).0;
-        // A peer's publication is not this cell's.
+        for _ in 0..steps_in {
+            assert_eq!(board.sweep_step(&mut sweep, &lastsave), SweepStep::InProgress);
+        }
+        // Slots 0 and 1 are behind every part-way cursor (64 and above).
         let peer_epoch = if count > 1 {
-            board.slot(count - 1).publish(5, 1, 1_000);
+            let peer = if me == 0 { 1 } else { 0 };
+            board.slot(peer).publish(5, 1, 1_000);
             5
         } else {
             0
         };
-        assert!(!board.own_unobserved(&sweep), "a peer's slot is not slot 0");
-        for _ in 0..steps_in {
-            assert_eq!(board.sweep_step(&mut sweep, &lastsave), SweepStep::InProgress);
-        }
-        board.slot(0).publish(7, 2, 2_000);
+        assert!(!board.own_unobserved(&sweep), "a peer's slot is not slot {me}");
+        board.slot(me).publish(7, 2, 2_000);
         let mut turns = 0;
         while board.own_unobserved(&sweep) {
             assert!(turns < 2 * sweep_turns, "the own-slot term never ended at {count} cells");
@@ -2362,7 +2389,12 @@ mod tests {
         }
         // The observation that ended the term read every slot after the
         // publication: it carries both epochs.
-        assert_eq!(sweep.observed().published_sum, peer_epoch + 7);
+        assert_eq!(
+            sweep.observed().published_sum,
+            peer_epoch + 7,
+            "the term ended over a slot read before its publication ({count} cells, cell {me}, \
+             {steps_in} steps in, {turns} turns)"
+        );
         assert!(!sweep.in_progress(), "the term ends as a sweep completes");
         turns
     }
