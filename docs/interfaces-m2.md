@@ -917,7 +917,14 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
     per MAINTAIN turn (`limits::CKPT_BOARD_VISITS_PER_TURN`, one Maintenance
     unit, MAINTAIN's first budgeted step), folding the minimum, a `u128`
     sum and the newest publication time; a completed sweep publishes its
-    observation, and a changed sum wakes the parked `WAIT`s. All-cell
+    observation, and a changed sum wakes the parked `WAIT`s. A cell with
+    a registered checkpoint waiter does not park while its sweep is
+    part-way, nor while its own slot published since the start of its
+    last completed sweep: a cell publishes after its sweep step, so the
+    sweep that wakes its own waiter is the next turn's (at most
+    `2 * ceil(N / 64)` unparked turns per own publication). A waiter
+    whose last publisher is a peer is woken by the cell's next completed
+    sweep after a park. All-cell
     `WAIT` and DROP pacing read the observation's minimum (a lower bound,
     never early); `WAIT CELL k` reads slot `k`. `LASTSAVE` and
     `rdb_last_save_time` read the observation, and a `WAIT CELL k`

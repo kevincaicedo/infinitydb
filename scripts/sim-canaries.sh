@@ -12,7 +12,9 @@
 #     own test, for a rule whose oracle lives below the simulator (the
 #     store-tier index rows, ADR-0139). The planted build must report
 #     exactly that test `FAILED`; a build that is red for any other
-#     reason — a compile error, another test — is not a catch;
+#     reason — a compile error, another test — is not a catch. A row on
+#     `inf-sim` builds with `--features dst`, as every simulator recipe
+#     does (ADR-0107 D1): its tests do not compile without it;
 #   `<cfg> loom <package> <test name> <witness>` — a Loom model in the
 #     package's library, for a memory ordering no other oracle can see
 #     (ADR-0159 A1.6): built `--cfg loom --cfg <cfg>` in release, judged
@@ -134,6 +136,13 @@ rows=(
   # ADR-0159 A1.4: `WAIT CELL k`'s confirmation skips its LASTSAVE floor
   # raise, so a LASTSAVE after the WAIT trails the checkpoint it fenced.
   "inf_canary_lastsave_floor_skipped crate-test inf-server lib lastsave_after_wait_cell_covers_the_fenced_checkpoint"
+  # ADR-0159 A1.4: the park guard without its own-slot term — a cell parks
+  # on top of a `WAIT` its own publication satisfied.
+  "inf_canary_ckpt_park_guard_own_slot_skipped crate-test inf-sim lib an_own_publication_with_a_waiter_does_not_park_before_its_wake"
+  # A completed sweep leaves `own_seen` behind: the own-slot term never
+  # ends, and a cell with an unsatisfied waiter never parks.
+  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-sim lib a_waiter_the_own_publication_does_not_satisfy_lets_the_cell_park"
+  "inf_canary_ckpt_own_seen_not_advanced crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes"
   # ADR-0170 — an offer above its class cap is issued by a counted overrun.
   # The answer before it, "not this slice" for ever: the budget scenario's
   # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized
@@ -172,6 +181,7 @@ crate_test() {
     test:*) target_args=(--test "${target#test:}") ;;
     *) echo "   SCOPE ERROR: target '$target' is neither lib nor test:NAME"; fail=1; return ;;
   esac
+  if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $cfg: $package $target $name on the planted build must go red"
   if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \

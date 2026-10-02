@@ -477,6 +477,25 @@ expect red "canaries: a plain run that never ran the named test is not green" en
 expect red "canaries: an empty row table is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-empty-rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite" >"$work/canary-short-row"
 expect red "canaries: a malformed crate-test row is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# ADR-0107 D1: the simulator's tests compile only with its `dst` feature,
+# so a crate-test row on `inf-sim` passes it and no other package's row
+# does — the stub answers only when it sees the feature.
+dir=$(canary_fixture canary-sim-dst "$failed_line" "$ok_line")
+{
+    echo '#!/usr/bin/env bash'
+    echo 'case " $* " in'
+    echo '  *" --features dst "*) ;;'
+    echo '  *) echo "error[E0432]: unresolved import"; exit 101 ;;'
+    echo 'esac'
+    echo 'if [ -n "${RUSTFLAGS:-}" ]; then'
+    echo "$failed_line"
+    echo 'else'
+    echo "$ok_line"
+    echo 'fi'
+} >"$dir/cargo"
+expect red "canaries: a row on another package does not carry the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture crate-test inf-sim lib the_row" >"$dir/rows"
+expect green "canaries: a row on inf-sim builds with the dst feature" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 # ADR-0159 A1.6: a `loom` row builds both legs under `--cfg loom` — the
 # stub answers only when it sees it, so a driver that dropped the cfg is
 # red for another reason, never a catch.

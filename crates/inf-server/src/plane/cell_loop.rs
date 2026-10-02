@@ -282,11 +282,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             return true;
         }
         // ADR-0159 A1.4: a registered checkpoint waiter keeps the cell
-        // unparked until its sweep completes — at most one sweep of
-        // `ceil(N / 64)` unparked turns per wake. The O(1) cursor test goes
-        // first: at `N <= 64` a sweep never stays in progress, and
-        // `waiting()` walks every queued waiter.
-        if self.shared.ckpt_sweep.borrow().in_progress() && self.shared.ckpt_waiters.waiting() > 0 {
+        // unparked while its sweep is part-way, and while its own slot
+        // published since the start of its last completed sweep: the cell
+        // publishes after its sweep step in a MAINTAIN, so the observation
+        // that satisfies its own waiter is the next turn's. At most
+        // `2 * ceil(N / 64)` unparked turns per own publication. The two
+        // O(1) tests go first: `waiting()` walks every queued waiter.
+        if self.ckpt_observation_owed() && self.shared.ckpt_waiters.waiting() > 0 {
             return true;
         }
         let Some(flags) = &self.park_flags else { return false };
@@ -1043,6 +1045,26 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             node.ckpt_last_begin_lsn.set(ckpt.last_begin_lsn);
             node.ckpt_buffer_bytes.set(ckpt.buffer_bytes);
         }
+    }
+
+    /// Whether this cell's next completed sweep can observe what its last
+    /// one could not (ADR-0159 A1.4): the sweep is part-way through the
+    /// board, or the cell's own slot published since the start of the last
+    /// completed sweep. False on a cell with no control plane.
+    fn ckpt_observation_owed(&self) -> bool {
+        let sweep = self.shared.ckpt_sweep.borrow();
+        if sweep.in_progress() {
+            return true;
+        }
+        // Canary: the guard without its own-slot term.
+        #[cfg(inf_canary_ckpt_park_guard_own_slot_skipped)]
+        return false;
+        #[cfg(not(inf_canary_ckpt_park_guard_own_slot_skipped))]
+        self.shared
+            .control
+            .borrow()
+            .as_ref()
+            .is_some_and(|control| control.ckpt_board().own_unobserved(&sweep))
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order: the
