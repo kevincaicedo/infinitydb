@@ -104,7 +104,7 @@ pub struct DurableConfig {
     /// tripwire's reference. 0 = unknown (tripwire disarmed; the FLUSH
     /// class needs none).
     pub fua_p50_us_probed: u64,
-    /// M4.5-S36 (ADR-0170 D2; ADR-0088 D2b, D6): the cell's static share of the
+    /// M4.5-S36 (ADR-0178 D2; ADR-0088 D2b, D6): the cell's static share of the
     /// probed device model and the frame-seal pace. `Default` = absent
     /// model = unbudgeted, unpaced — the pre-S36 behaviour byte-for-byte.
     pub device: DeviceConfig,
@@ -507,7 +507,7 @@ pub struct DurableStats {
     /// ADR-0117: sections sealed for the section bound (the DST's
     /// engagement witness for the in-chain resume).
     pub ckpt_bound_splits: u64,
-    /// ADR-0170 D5: the longest injected-time wait of one checkpoint
+    /// ADR-0178 D5: the longest injected-time wait of one checkpoint
     /// block on this cell's device budget over the cell's life, a
     /// pending block's age included — cell scope.
     pub ckpt_block_wait_ns_max: u64,
@@ -659,7 +659,7 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     group_round_target: u64,
     /// M4.5-S42 (ADR-0091 D5): the device model's provenance.
     io_provenance: IoProvenance,
-    /// M4.5-S36 (ADR-0170 D2): the cell's device budget — refilled at
+    /// M4.5-S36 (ADR-0178 D2): the cell's device budget — refilled at
     /// every MAINTAIN entry from the injected clock, consulted by the
     /// background issuing sites, charged by the foreground ones.
     budget: DeviceBudget,
@@ -713,7 +713,7 @@ impl<F: SegmentFs> DurableCell<F> {
         let mut staging = StagingRing::new(staging);
         staging.set_frame_epoch(rotor.resume_epoch());
         let in_flight = VecDeque::with_capacity(usize::from(staging.frames_in_flight()));
-        // ADR-0170 D2: each background class's declared slice — its cap
+        // ADR-0178 D2: each background class's declared slice — its cap
         // is never below one slice.
         let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
         slices[IoClass::ZeroFill.index()] =
@@ -890,9 +890,9 @@ impl<F: SegmentFs> DurableCell<F> {
         if self.failed {
             return;
         }
-        // ADR-0170 D2: one refill per MAINTAIN entry, injected clock.
+        // ADR-0178 D2: one refill per MAINTAIN entry, injected clock.
         self.budget.refill(cx.now);
-        // ADR-0170 D5: a pending checkpoint block ages on that clock even
+        // ADR-0178 D5: a pending checkpoint block ages on that clock even
         // in a slice that makes no offer.
         self.ckpt.block_wait.observed(cx.now);
         self.write_through_wanted = write_through_wanted;
@@ -925,11 +925,11 @@ impl<F: SegmentFs> DurableCell<F> {
     /// once every zero byte landed.
     fn zero_fill(&mut self, cx: &mut LoopCx<'_>) {
         // ADR-0088 D5: the head-start bound says "no further"; the budget
-        // says "not this slice" (ADR-0170 D1). The budget is offered the
+        // says "not this slice" (ADR-0178 D1). The budget is offered the
         // slice bound *before* the slice is taken — `next_zero_slice`
         // marks it in flight, and a taken-but-unissued slice is a phantom
         // the rotation waits on forever — and the unissued remainder of
-        // the bound is refunded against the same grant (ADR-0170 D2).
+        // the bound is refunded against the same grant (ADR-0178 D2).
         let bound = u64::from(ZERO_FILL_SLICE_BYTES);
         if self.write_through_wanted && self.rotor.zero_fill_pending() {
             match self.budget.offer(IoClass::ZeroFill, bound, 1) {
@@ -1230,7 +1230,7 @@ impl<F: SegmentFs> DurableCell<F> {
         // A `u32` segment cursor: always addressable (ADR-0167 D2).
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
         let fd = self.rotor.active_raw_fd().expect("std segment tier has fds");
-        // ADR-0170 D2: the foreground is metered (one write, plus the
+        // ADR-0178 D2: the foreground is metered (one write, plus the
         // linked barrier when the plan carries one), never deferred.
         let ops = 1 + u64::from(matches!(ticket, FrameBarrier::Linked(_)));
         self.budget.charge(IoClass::LogFrame, u64::from(slot.len()), ops);
@@ -1443,7 +1443,7 @@ impl<F: SegmentFs> DurableCell<F> {
     }
 
     /// Tier-flush and compaction offer their slices here (ADR-0088 D5,
-    /// ADR-0170 D1); the plane owns the tier cell, the cell owns the
+    /// ADR-0178 D1); the plane owns the tier cell, the cell owns the
     /// budget.
     pub fn offer_background(&mut self, class: IoClass, bytes: u64, ops: u64) -> Issue {
         debug_assert!(!class.is_foreground(), "foreground classes charge, never ask");
@@ -1451,7 +1451,7 @@ impl<F: SegmentFs> DurableCell<F> {
     }
 
     /// Return the unissued remainder of the grant just before this call
-    /// (ADR-0170 D2's receipt).
+    /// (ADR-0178 D2's receipt).
     pub fn refund_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
         debug_assert!(!class.is_foreground());
         self.budget.refund(class, bytes, ops);

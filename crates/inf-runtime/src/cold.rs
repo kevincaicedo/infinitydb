@@ -482,7 +482,7 @@ impl ColdReads {
     }
 
     /// [`drain`](Self::drain) under a device budget (M4.5-S36, ADR-0088
-    /// D5; the answer is ADR-0170 D1's [`Issue`]): before a class's read
+    /// D5; the answer is ADR-0178 D1's [`Issue`]): before a class's read
     /// is built, `admit(class, bytes)` is asked with the pool buffer size
     /// (the window's bound); a `Maintain` read answered `NotThisSlice`
     /// stays queued and the drain continues with the foreground only.
@@ -519,7 +519,7 @@ impl ColdReads {
             match admit(class_enum, bound) {
                 Issue::Now => {}
                 Issue::NotThisSlice if class_enum == ReadClass::Foreground => {
-                    // Contract breach (ADR-0170 D1: the foreground is never
+                    // Contract breach (ADR-0178 D1: the foreground is never
                     // refused). Nothing changes within this slice, so it
                     // ends here with the intent queued for the next one —
                     // a `continue` would spin the cell.
@@ -1353,7 +1353,7 @@ mod tests {
         assert_eq!(cold.reconcile(), Ok(()));
     }
 
-    /// A caller whose `admit` refuses the foreground breaches ADR-0170 D1
+    /// A caller whose `admit` refuses the foreground breaches ADR-0178 D1
     /// (a foreground offer is `Now`) — the slice must END (the intent
     /// stays queued for the next one), never spin on a refusal that cannot
     /// change within it.

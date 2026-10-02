@@ -185,7 +185,7 @@ pub struct DurableScenario {
     /// scenario arms both; every other scenario stays byte-identical).
     pub device: inf_server::DeviceConfig,
     pub budget_oracle: bool,
-    /// ADR-0170's arm of the budget scenario (`m2-device-budget`, seeds ≡
+    /// ADR-0178's arm of the budget scenario (`m2-device-budget`, seeds ≡
     /// 1 mod 4): `Some` pads one in 16 of an `always` writer's `SET`s, in
     /// the run's first quarter, to a value whose checkpoint section block
     /// is above the class cap plus the pool — issued only by an overrun.
@@ -270,7 +270,7 @@ pub struct DurableScenario {
     pub spin_iters: u32,
 }
 
-/// The oversized-value pad of ADR-0170's sim arm (see
+/// The oversized-value pad of ADR-0178's sim arm (see
 /// [`DurableScenario::ckpt_overrun`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CkptOverrunArm {
@@ -287,7 +287,7 @@ impl CkptOverrunArm {
     /// One pad in this many of an `always` writer's `SET`s.
     pub const ONE_IN_SETS: u64 = 16;
 
-    /// The arm's largest checkpoint block (ADR-0170 D3's table: one record
+    /// The arm's largest checkpoint block (ADR-0178 D3's table: one record
     /// plus less than one section target, aligned): the padded value plus
     /// one target, and one 4 KiB block each for the record's framing and
     /// the section's header and alignment.
@@ -390,14 +390,14 @@ pub(crate) fn m2_stall_config() -> StallConfig {
     }
 }
 
-/// ADR-0170's arm of `m2-device-budget` (seeds ≡ 1 mod 4) and the device
+/// ADR-0178's arm of `m2-device-budget` (seeds ≡ 1 mod 4) and the device
 /// model each seed runs. Off the arm: 128 KiB/s per device. On it the
 /// device is raised to 768 KiB/s (384 KiB/s per cell at 2 cells), where
 /// the checkpoint class's cap is its 12 288 B section slice and the pool
 /// holds 19 660 B; values are padded from one above those two together
 /// to 40 KiB, and the segment is raised to 256 KiB so a frame holding the
 /// three `always` writers' pads fits it. The largest block
-/// is then 57 344 B, and ADR-0170 D4 with α = 2 (the class's credit gains
+/// is then 57 344 B, and ADR-0178 D4 with α = 2 (the class's credit gains
 /// at least share / 7 = 56 173 B/s), one 4 KiB header and five barrier
 /// ops charged per checkpoint and a 2 ms step gives `T_ckpt` ≈ 1.17 s on
 /// the byte axis and ≈ 0.66 s on the ops axis — under a quarter of the
@@ -419,7 +419,7 @@ fn device_budget_arm(
     if !armed {
         return (model, None);
     }
-    // ADR-0170 D2's cap and pool at the cell's share, from the table.
+    // ADR-0178 D2's cap and pool at the cell's share, from the table.
     let share = model.share(cells).write_bytes_per_s;
     let horizon = share * inf_runtime::BURST_HORIZON_NS / 1_000_000_000;
     let slice = inf_log::ckpt::ick_align_up(section_target as usize + 16) as u64;
@@ -795,7 +795,7 @@ impl DurableScenario {
         };
         scenario.io_mode = second;
         scenario.prelude = Some(Prelude { io_mode: first, ops_per_writer: 40 });
-        // The device budget (ADR-0170 D2) at the `m2-device-budget`
+        // The device budget (ADR-0178 D2) at the `m2-device-budget`
         // model, 32 KiB/s per device: the zero-fill class's share grants
         // the 16 KiB next-segment fill only after ~1–2 sim-seconds, so
         // the first frames of a `Direct` life land in the reopened tail
@@ -849,7 +849,7 @@ impl DurableScenario {
     /// per device. The oracles (`budget_oracles`) assert the accounting
     /// identity, the rate bound, engagement, progress, and the
     /// foreground bound; the m2 durability oracle runs unchanged. Seeds ≡
-    /// 1 mod 4 run ADR-0170's arm ([`device_budget_arm`]): oversized
+    /// 1 mod 4 run ADR-0178's arm ([`device_budget_arm`]): oversized
     /// checkpoint blocks, issued only by the budget's overrun, under the
     /// arm's engagement and block-wait oracles; the other seeds are its
     /// control leg.
@@ -885,7 +885,7 @@ impl DurableScenario {
             step_ns_max: 2_000_000,
             double_cut: seed % 8 == 3,
             plant: Plant::None,
-            // ADR-0170's arm: a frame of three maximal pads fits a segment.
+            // ADR-0178's arm: a frame of three maximal pads fits a segment.
             segment_bytes: if ckpt_overrun.is_some() { 256 << 10 } else { 64 << 10 },
             ckpt_interval_bytes: 24 << 10,
             ckpt_stream_bytes_per_sec: None,
@@ -1070,7 +1070,7 @@ pub struct DurableReport {
     /// pacer's wait episodes, and the worst frame-write latency.
     pub budget_background_bytes: u64,
     pub budget_deferrals: u64,
-    /// ADR-0170's arm coverage: offers above a class cap (every class,
+    /// ADR-0178's arm coverage: offers above a class cap (every class,
     /// every cell) and the worst checkpoint block wait in injected ns.
     pub budget_unattainable: u64,
     pub ckpt_block_wait_ns_max: u64,
@@ -1287,7 +1287,7 @@ pub(crate) struct Writer {
     pub(crate) models: BTreeMap<Vec<u8>, crate::document::DocModel>,
     /// Fuzz-corpus documents this writer embedded (M3-S24 disclosure).
     pub(crate) corpus_docs_used: u64,
-    /// `SET`s this writer built: the ADR-0170 arm pads ordinals ≡ 0 mod
+    /// `SET`s this writer built: the ADR-0178 arm pads ordinals ≡ 0 mod
     /// 16, so every armed `always` writer pads its first `SET`.
     pub(crate) sets: u64,
 }
@@ -1499,7 +1499,7 @@ impl Writer {
                     usize::try_from(self.rng.next_below(scenario.value_pad_max)).expect("fits");
                 value.extend(std::iter::repeat_n(b'p', pad));
             }
-            // ADR-0170's arm: a value whose checkpoint block only an
+            // ADR-0178's arm: a value whose checkpoint block only an
             // overrun can issue (`always` writers, the run's first quarter,
             // every 16th `SET` from the first — a fixed schedule, so no
             // armed seed goes without one).

@@ -146,14 +146,14 @@ pub struct CkptStats {
     pub padding_bytes: u64,
     pub interval_bytes: u64,
     pub records_since_begin: u64,
-    /// ADR-0170 D5: the longest injected-time wait of one checkpoint
+    /// ADR-0178 D5: the longest injected-time wait of one checkpoint
     /// block on the device budget, first offer to `Now`, this cell's
     /// life — the pending block's age at this cell's last MAINTAIN entry
     /// included, whether or not that slice offered it.
     pub block_wait_ns_max: u64,
 }
 
-/// One checkpoint block's wait on the device budget (ADR-0170 D5): the
+/// One checkpoint block's wait on the device budget (ADR-0178 D5): the
 /// walk offers a block every slice until the budget answers `Now`.
 /// Injected time; the source of `CkptStats::block_wait_ns_max`.
 #[derive(Copy, Clone, Debug, Default)]
@@ -266,7 +266,7 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     /// the last checkpoint's bytes; the floor before the first).
     pub interval_bytes: u64,
     pub phase: CkptPhase<F::File>,
-    /// The pending block's budget wait (ADR-0170 D5).
+    /// The pending block's budget wait (ADR-0178 D5).
     pub block_wait: BlockWait,
     stats: CkptStats,
 }
@@ -1139,7 +1139,7 @@ mod tests {
         CkptCell::new(fs.clone(), dirs.ckpt, 0, CkptConfig::default()).expect("cell")
     }
 
-    /// ADR-0170 D5: a pending block's wait is its age on the cell's clock,
+    /// ADR-0178 D5: a pending block's wait is its age on the cell's clock,
     /// not at its last offer — a slice that makes no offer still ages it —
     /// and the longest ended wait survives the next block.
     #[test]

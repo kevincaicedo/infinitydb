@@ -555,7 +555,7 @@ fn io_budget_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("io_budget_write_bytes_per_s:{}", node.io_budget_write_bytes_per_s.get()));
     push(text, &format!("io_budget_read_bytes_per_s:{}", node.io_budget_read_bytes_per_s.get()));
     let budget = node.io_budget.get();
-    // ADR-0170 D5: offers above the class cap (repeats included) and the
+    // ADR-0178 D5: offers above the class cap (repeats included) and the
     // bytes issued overruns offered above it, beside the deferrals — cell
     // scope, like them.
     for class in inf_runtime::IoClass::ALL {

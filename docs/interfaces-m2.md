@@ -1000,7 +1000,7 @@ the cap, which bounds recovery); `derive_interval` release-asserts
 bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
 `write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
 
-## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0170)
+## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0178)
 
 > **Not built yet (ADR-0178).** ADR-0178 supersedes ADR-0170 and restates this section's
 > contract under the same decision numbers. The grant rule, the overrun, the receipt and the
@@ -1027,7 +1027,7 @@ impl DeviceBudget { fn refill(&mut self, now: Nanos);               // once per 
 pub struct SealPace;  // take(now, held) -> bool: a second frame seals at the cell's share of write_ops_per_s_4k_qd4
 ```
 
-**The grant rule (ADR-0170 D2).** Per cell, per direction (write, read)
+**The grant rule (ADR-0178 D2).** Per cell, per direction (write, read)
 and per axis (bytes, ops): the grant for the elapsed interval is the
 cell's share (`model / cells`, computed once at boot — L1) minus the
 foreground's spend since the last refill, clamped at `≥ share /
@@ -1038,7 +1038,7 @@ a capped class cannot hold overflows into a per-direction pool (cap
 `share × horizon`). On the checkpoint's byte axis the grant is floored at
 the log's bytes since the last refill over the trigger's α (the keep-up
 floor): the floor and the weighted share are compared exactly and
-rounded once, with one remainder carried (ADR-0170 A1).
+rounded once, with one remainder carried (ADR-0178 D2).
 
 - An offer at most `cap_c` on every budgeted axis is **attainable**: it is
   granted from the class's credit, then the pool, or answered
@@ -1091,13 +1091,13 @@ checkpoint's header block and barrier ops; a tier round's bytes staged
 past its slice, below one flush chunk); the 3 units cover the
 carries' lag — each carry stage (the rate product, the ⅛ floor, the
 weighted split or the keep-up floor's one carry) trails its exact sum
-by under one unit, under 2⅛ in all (ADR-0170 A1); `Δ` is the longest
+by under one unit, under 2⅛ in all (ADR-0178 D4); `Δ` is the longest
 refill interval — one for quantization, one for the rest pass. It is a
 progress bound, not a latency promise: a tier round whose bound exceeds
 its namespace's `TAIL-STALL-TIMEOUT` parks writers into the typed
 timeout.
 
-**The limit and the deviations** (ADR-0170 D4):
+**The limit and the deviations** (ADR-0178 D4):
 
 - *Checkpoint block — a limit.* A section block holds one record plus
   less than one section target. Above the class cap it issues as one
@@ -1921,7 +1921,7 @@ The reactor-drive flush state machine (`TierFlush` round state in
   re-CRC'd (windows are never written after stage — custody, not
   checksum).
 
-### A.8 — Device budget (M4.5-S36, ADR-0088 D2b; ADR-0170)
+### A.8 — Device budget (M4.5-S36, ADR-0088 D2b; ADR-0178)
 
 `DeviceBudget` (`inf-runtime/src/budget.rs`) and `SealPace`:
 

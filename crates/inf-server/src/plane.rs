@@ -1125,7 +1125,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             cx.push(IoOp::Fdatasync { fd, token: crate::durable::fsync_token(ticket) });
         }
         if let Some(cold) = cold {
-            // ADR-0170 D2, ADR-0088 D5: maintain-class reads consult the durable
+            // ADR-0178 D2, ADR-0088 D5: maintain-class reads consult the durable
             // cell's budget; foreground reads are charged, never refused.
             let durable = &self.shared.durable;
             cold.drain_budgeted(

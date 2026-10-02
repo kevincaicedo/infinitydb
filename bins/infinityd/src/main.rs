@@ -1334,7 +1334,7 @@ fn cell_main(
             },
             flush_bound: 1,
             fua_p50_us_probed: io.fua_p50_us_4k,
-            // ADR-0170 D2, ADR-0088 D2b: static per-cell shares, computed once here
+            // ADR-0178 D2, ADR-0088 D2b: static per-cell shares, computed once here
             // (L1). Absent ⇒ `Default` ⇒ unbudgeted and unpaced.
             device: inf_server::DeviceConfig {
                 model_share: io.device.share(args.cells.get()),

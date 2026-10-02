@@ -217,7 +217,7 @@ pub struct NodeState {
     /// observed high-water mark, and its two bounded waits.
     pub frames_in_flight: Cell<u64>,
     pub frames_in_flight_max: Cell<u64>,
-    /// M4.5-S36 (ADR-0088 D7, ADR-0170 D5): the device budget's ledger —
+    /// M4.5-S36 (ADR-0088 D7, ADR-0178 D5): the device budget's ledger —
     /// one `ClassCounters` per class in `IoClass::ALL` order — model
     /// presence, the cell's byte shares, the seal pacer's wait episodes,
     /// the checkpoint domain's bytes, the derived trigger and the

@@ -167,7 +167,7 @@ rows=(
   # The own slot loaded as the cursor passes it, not at the sweep's start:
   # beyond 64 cells the term ends over a peer the sweep read too early.
   "inf_canary_ckpt_own_loaded_at_cursor crate-test inf-server lib an_own_publication_is_unobserved_until_a_sweep_begun_after_it_completes the term ended over a slot read before its publication"
-  # ADR-0170 — an offer above its class cap is issued by a counted overrun.
+  # ADR-0178 — an offer above its class cap is issued by a counted overrun.
   # The answer before it, "not this slice" for ever: the budget scenario's
   # arm (seeds ≡ 1 mod 4; the sweep reaches 0xC0FFF1) must see an oversized
   # checkpoint block wait past T_ckpt, and R1 and R2 must fail.
@@ -180,7 +180,7 @@ rows=(
   # A grant ends the rest pass and its refund leaves it ended: every
   # overrun behind a zero-work sibling starves (I14).
   "inf_canary_grant_clears_rest crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
-  # ADR-0170 A1: the checkpoint keep-up term floored on its own before the
+  # ADR-0178 D2: the checkpoint keep-up term floored on its own before the
   # max drops up to (α − 1)/α byte a refill near the crossover.
   "inf_canary_keepup_truncates crate-test inf-runtime lib the_keepup_floor_keeps_its_remainder_at_the_crossover"
   "inf_canary_keepup_truncates crate-test inf-runtime lib no_background_offer_waits_past_its_bound"

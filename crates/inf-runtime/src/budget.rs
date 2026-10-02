@@ -1,5 +1,5 @@
 //! Per-cell device budget (M4.5-S36, ADR-0088 D1; the grant rule is
-//! ADR-0170 D2): device I/O classes over a measured device model, spent
+//! ADR-0178 D2): device I/O classes over a measured device model, spent
 //! through per-class byte and op credit refilled on the injected clock.
 //!
 //! The shape is Seastar's io-queue with the one change L1 demands:
@@ -14,7 +14,7 @@
 //! next slice with nothing moved. Nothing queues, nothing allocates,
 //! nothing waits.
 //!
-//! **The grant rule (ADR-0170 D2).** Per direction (write, read) and per
+//! **The grant rule (ADR-0178 D2).** Per direction (write, read) and per
 //! axis (bytes, ops), all integers:
 //!
 //! - *Refill*: the grant for the elapsed interval is the cell's share of
@@ -53,7 +53,7 @@
 //!   first, then the pool, then the credit — so a full refund is the
 //!   grant's exact inverse. Every other call voids the receipt.
 //!
-//! **The checkpoint keep-up floor** (ADR-0170 D2): under foreground
+//! **The checkpoint keep-up floor** (ADR-0178 D2): under foreground
 //! saturation a weighted share alone starved the checkpoint class (340 k
 //! deferrals, no publish in 20 s of 270 k ops/s) — a retained log that
 //! grows for as long as saturation lasts, i.e. an unbounded recovery
@@ -68,14 +68,14 @@
 //! resting at its cap cannot hold overflows to the write pool, where the
 //! tier and zero-fill classes may draw it. With the checkpoint idle and
 //! the log at the whole share, those classes can therefore issue well
-//! above their own floor share (ADR-0170 D2, as designed).
+//! above their own floor share (ADR-0178 D2, as designed).
 //! The floor and the weighted share are compared exactly and rounded
-//! once, with one remainder carried (ADR-0170 A1): rounding the floor on
+//! once, with one remainder carried (ADR-0178 D2): rounding the floor on
 //! its own lost up to `(α − 1)/α` byte a refill where the two cross.
 //! Zero-fill has no such floor: its shortfall is a visible class
 //! downgrade (`rotations_unzeroed`), never a correctness term.
 //!
-//! **Progress (ADR-0170 D4, A1).** A class with one producer on the cell
+//! **Progress (ADR-0178 D4).** A class with one producer on the cell
 //! has every offer issued within `(owed + cap + charges + 3) / r + 2Δ` of
 //! injected time, `r` the class's floored weighted share (on the
 //! checkpoint's bytes, the larger of that and the keep-up crossover), 3
@@ -192,7 +192,7 @@ impl IoClass {
         }
     }
 
-    /// Background share weights (ADR-0170 D2): `ZeroFill 4 : TierFlush 4
+    /// Background share weights (ADR-0178 D2): `ZeroFill 4 : TierFlush 4
     /// : Checkpoint 2 : ColdReadMaintain 1`. Foreground weight is 0 —
     /// it is not granted, it is subtracted.
     #[must_use]
@@ -248,7 +248,7 @@ impl DeviceModel {
     }
 }
 
-/// The burst horizon (ADR-0170 D2): a class's credit and the shared pool
+/// The burst horizon (ADR-0178 D2): a class's credit and the shared pool
 /// hold at most this much modeled device time. Derived from the S27 D5
 /// `max ≤ 50 ms` bar, not tuned.
 pub const BURST_HORIZON_NS: u64 = 50_000_000;
@@ -266,7 +266,7 @@ const BYTES: usize = 0;
 const OPS: usize = 1;
 const AXES: [usize; 2] = [BYTES, OPS];
 
-/// A background producer's answer (ADR-0170 D1): issue now, or keep the
+/// A background producer's answer (ADR-0178 D1): issue now, or keep the
 /// offer and re-offer it next slice with nothing moved. It has two
 /// variants because a producer has two answers; a bounded wait and an
 /// overrun's wait differ only in the counters. Not comparable outside
@@ -274,13 +274,13 @@ const AXES: [usize; 2] = [BYTES, OPS];
 /// dropped unread would issue on `NotThisSlice` without credit.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-#[must_use = "a producer issues only on `Issue::Now` (ADR-0170 D1)"]
+#[must_use = "a producer issues only on `Issue::Now` (ADR-0178 D1)"]
 pub enum Issue {
     Now,
     NotThisSlice,
 }
 
-/// A background class's cap (ADR-0170 D2): the most its own credit can
+/// A background class's cap (ADR-0178 D2): the most its own credit can
 /// hold on each axis. An offer above it on a budgeted axis is issued
 /// only by an overrun.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -298,7 +298,7 @@ pub struct ClassSlice {
 }
 
 /// The three outcomes of an offer, resolved by [`DeviceBudget::offer`]
-/// alone (ADR-0170 D1). Private: no producer can compare or collapse
+/// alone (ADR-0178 D1). Private: no producer can compare or collapse
 /// them.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -316,7 +316,7 @@ enum Admission {
     },
 }
 
-/// The overrun's two outcomes (ADR-0170 D2).
+/// The overrun's two outcomes (ADR-0178 D2).
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 enum Overrun {
@@ -327,7 +327,7 @@ enum Overrun {
     Deferred { short_bytes: u64, short_ops: u64 },
 }
 
-/// One axis of a background class's credit (ADR-0170 D2). `Held(h)`
+/// One axis of a background class's credit (ADR-0178 D2). `Held(h)`
 /// holds `h ≤ cap`; a debt is never zero. The type makes "holds and
 /// owes" unrepresentable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -391,7 +391,7 @@ impl Credit {
     }
 }
 
-/// A background class's rest pass (ADR-0170 D2), written by refill
+/// A background class's rest pass (ADR-0178 D2), written by refill
 /// alone: `Rested` when every budgeted axis already held its cap before
 /// the refill added its grant. An overrun needs it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -409,7 +409,7 @@ struct Draw {
     debt: u64,
 }
 
-/// The last background `Now` answer (ADR-0170 D2): its class, what it
+/// The last background `Now` answer (ADR-0178 D2): its class, what it
 /// granted per axis, and per budgeted axis what it drew. A refund
 /// directly after its grant returns at most this, last-taken first; any
 /// other call voids it.
@@ -527,7 +527,7 @@ impl Direction {
     }
 }
 
-/// The checkpoint keep-up floor (ADR-0170 D2 as its Amendment A1 states
+/// The checkpoint keep-up floor (ADR-0178 D2's keep-up grant, as its row states
 /// it): the divisor α (none = no floor), and the one sub-unit remainder
 /// the checkpoint's byte grant carries while the floor applies, in units
 /// of `1 / (Σw × α)` — below `Σw × α`, so a u128.
@@ -551,7 +551,7 @@ impl KeepUp {
     /// `max(grant × w / Σw, foreground / α)` compared exactly, then
     /// rounded once with the one remainder carried, so over any window
     /// the grants trail the sum of the exact per-refill maxima by under
-    /// one unit (ADR-0170 A1). Each term is a whole part and a numerator below the
+    /// one unit (ADR-0178 D2). Each term is a whole part and a numerator below the
     /// denominator `Σw × α`, compared as a pair; every intermediate stays
     /// below 2⁶⁹ (`Σw ≤ 16`, `α < 2⁶⁴`), so nothing overflows.
     fn bytes(
@@ -569,9 +569,9 @@ impl KeepUp {
         let weighted_num = u128::from(grant) * weight;
         let weighted = (weighted_num / weights, weighted_num % weights * alpha);
         let foreground = u128::from(foreground);
-        // A planted canary: the keep-up term floored on its own, the rule
-        // before ADR-0170 A1 (the class oracle's crossover regime and the
-        // crossover unit test must go red).
+        // A planted canary: the keep-up term floored on its own, against
+        // ADR-0178 D2's one carried remainder (the class oracle's crossover
+        // regime and the crossover unit test must go red).
         let keepup_frac =
             if cfg!(inf_canary_keepup_truncates) { 0 } else { foreground % alpha * weights };
         let keepup = (foreground / alpha, keepup_frac);
@@ -589,7 +589,7 @@ impl KeepUp {
     }
 }
 
-/// One background class's grant for one refill (ADR-0170 D2): its
+/// One background class's grant for one refill (ADR-0178 D2): its
 /// weighted share per axis, each axis with its own remainder; on the
 /// checkpoint's byte axis with the keep-up floor on, [`KeepUp::bytes`],
 /// and when the keep-up term sets it, an ops grant of at least
@@ -637,7 +637,7 @@ pub struct DeviceBudget {
     receipt: Option<Receipt>,
 }
 
-/// Per-class counters for INFO (ADR-0088 D7, ADR-0170 D5), per cell.
+/// Per-class counters for INFO (ADR-0088 D7, ADR-0178 D5), per cell.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClassCounters {
     pub spent_bytes: u64,
@@ -696,7 +696,7 @@ impl DeviceBudget {
                 horizon_of(dir.rate[BYTES], class.weight(), dir.weights).max(slice.bytes);
             m.cap[OPS] =
                 horizon_of(dir.rate[OPS], class.weight(), dir.weights).max(slice.ops.max(1));
-            // Boot: every class holds its cap and is rested (ADR-0170 D2).
+            // Boot: every class holds its cap and is rested (ADR-0178 D2).
             m.credit = [Credit::Held(m.cap[BYTES]), Credit::Held(m.cap[OPS])];
         }
         DeviceBudget {
@@ -722,14 +722,14 @@ impl DeviceBudget {
         (self.write.rate[BYTES], self.read.rate[BYTES])
     }
 
-    /// The class's cap (ADR-0170 D2).
+    /// The class's cap (ADR-0178 D2).
     #[must_use]
     pub fn cap(&self, class: IoClass) -> ClassCap {
         let m = &self.meters[class.index()];
         ClassCap { bytes: m.cap[BYTES], ops: m.cap[OPS] }
     }
 
-    /// Once per MAINTAIN entry (ADR-0170 D2). Time moving backwards or
+    /// Once per MAINTAIN entry (ADR-0178 D2). Time moving backwards or
     /// not at all is a no-op that keeps `last` (iteration-quantized
     /// clock).
     pub fn refill(&mut self, now: Nanos) {
@@ -777,7 +777,7 @@ impl DeviceBudget {
         }
     }
 
-    /// Offer `bytes`/`ops` for `class` (ADR-0170 D1): the one background
+    /// Offer `bytes`/`ops` for `class` (ADR-0178 D1): the one background
     /// entry point. Foreground classes and an unbudgeted direction are
     /// `Now` before any arithmetic (charged, counted). A background offer
     /// at most its class cap is granted from the credit then the pool, or
@@ -808,7 +808,7 @@ impl DeviceBudget {
         let m = &mut self.meters[class.index()];
         match issue {
             // A planted canary: a grant ends the rest pass, the rule
-            // ADR-0170 rejects (the class oracle must see every overrun
+            // ADR-0178 rejects (the class oracle must see every overrun
             // behind a zero-work sibling starve).
             #[cfg(inf_canary_grant_clears_rest)]
             Issue::Now => m.rest = Rest::Filling,
@@ -819,7 +819,7 @@ impl DeviceBudget {
         issue
     }
 
-    /// An offer above the class cap (ADR-0170 D2): counted, then the
+    /// An offer above the class cap (ADR-0178 D2): counted, then the
     /// overrun if the class is `Rested` at its cap.
     fn offer_above_cap(&mut self, class: IoClass, request: [u64; 2], cap: ClassCap) -> Issue {
         self.meters[class.index()].unattainable += 1;
@@ -859,7 +859,7 @@ impl DeviceBudget {
         }
     }
 
-    /// The attainable half (ADR-0170 D2 table): unattainable above the
+    /// The attainable half (ADR-0178 D2 table): unattainable above the
     /// cap on a budgeted axis; a debtor draws nothing; otherwise the
     /// class's credit, then the pool, or the exact shortfall.
     fn admit(&mut self, class: IoClass, request: [u64; 2]) -> Admission {
@@ -888,7 +888,7 @@ impl DeviceBudget {
         Admission::Granted
     }
 
-    /// The overrun (ADR-0170 D2): only while the class is `Rested` and
+    /// The overrun (ADR-0178 D2): only while the class is `Rested` and
     /// holds its cap on every budgeted axis. Per axis it draws what the
     /// class holds, then what the pool holds, and owes the rest.
     fn admit_overrun(&mut self, class: IoClass, request: [u64; 2]) -> Overrun {
@@ -932,7 +932,7 @@ impl DeviceBudget {
         self.receipt = Some(Receipt { class, granted: request, draws });
     }
 
-    /// Spend unconditionally (ADR-0170 D2): the op is issued whatever the
+    /// Spend unconditionally (ADR-0178 D2): the op is issued whatever the
     /// credit says (a checkpoint header — its file is already created —
     /// its barriers, a tier round's bytes staged past its grant, or any
     /// foreground op). A background class owes what
@@ -961,7 +961,7 @@ impl DeviceBudget {
     /// that grant and returns it last-taken first — the debt, then the
     /// pool, then the credit — so a full refund is the grant's exact
     /// inverse and no refund lifts the credit or the pool above their
-    /// values before it (ADR-0170 D2, I14/I15). A refund with no receipt
+    /// values before it (ADR-0178 D2, I14/I15). A refund with no receipt
     /// of its class returns nothing. Foreground classes correct their
     /// counters only.
     pub fn refund(&mut self, class: IoClass, bytes: u64, ops: u64) {
@@ -1024,7 +1024,7 @@ impl DeviceBudget {
     }
 }
 
-/// One class's refill row (ADR-0170 D2), per budgeted axis: the debt is
+/// One class's refill row (ADR-0178 D2), per budgeted axis: the debt is
 /// repaid first, the credit grows to its cap, the excess overflows to
 /// the pool; `Rest` is `Rested` iff every budgeted axis held its cap
 /// before the grant.
@@ -1039,10 +1039,10 @@ fn refill_class(m: &mut Meter, rate: [u64; 2], add: [u64; 2], overflow: &mut [u6
     m.rest = if at_cap { Rest::Rested } else { Rest::Filling };
 }
 
-/// The overrun's precondition (ADR-0170 D2, I5): `Rested`, and the cap
+/// The overrun's precondition (ADR-0178 D2, I5): `Rested`, and the cap
 /// held on every budgeted axis (`short` is what the class lacks to reach
 /// it). The planted canary grants it from any held state instead — the
-/// rule ADR-0170 rejects, which R4's same-class overrunner regime must
+/// rule ADR-0178 rejects, which R4's same-class overrunner regime must
 /// catch starving an attainable offer.
 fn overrun_ready(rest: Rest, short: [u64; 2], credit: [Credit; 2]) -> bool {
     if cfg!(inf_canary_overrun_any_held) {
@@ -1300,7 +1300,7 @@ mod tests {
         assert_eq!((fg.spent_bytes, fg.spent_ops, fg.deferrals), (10 * MIB, 100, 0));
     }
 
-    /// The receipt (ADR-0170 D2): a refund returns at most the grant just
+    /// The receipt (ADR-0178 D2): a refund returns at most the grant just
     /// before it, the debt first, then the pool, then the credit.
     #[test]
     fn a_refund_returns_at_most_its_grant_and_corrects_the_counters() {
@@ -1331,7 +1331,7 @@ mod tests {
         b.refund(IoClass::TierFlush, MIB, 256);
     }
 
-    /// `charge` owes what the credit cannot hold (ADR-0170 D2): the debt
+    /// `charge` owes what the credit cannot hold (ADR-0178 D2): the debt
     /// is repaid before the credit grows again, and a debtor is granted
     /// nothing — neither credit nor pool.
     #[test]
@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!(held(&b, IoClass::Checkpoint).0, grant - 4096);
     }
 
-    /// The debtor's charge row (ADR-0170 D2): a charge to a class that
+    /// The debtor's charge row (ADR-0178 D2): a charge to a class that
     /// already owes adds to its debt, and the refill repays the whole of
     /// it before the class holds a byte. A tier round that overran its cap
     /// and then staged past its offer reaches this row, as does a
@@ -1515,7 +1515,7 @@ mod tests {
         assert!(held(&b, IoClass::TierFlush).1 > 0);
     }
 
-    /// R1 (ADR-0170): the 8-cell share of the 489 MB/s reference device
+    /// R1 (ADR-0178): the 8-cell share of the 489 MB/s reference device
     /// is 61 125 000 B/s — a checkpoint cap of 611 250 B and a pool cap
     /// of 3 056 250 B. A 4 MiB section block is above both together, so
     /// before the overrun it was "not this slice" on every call. Built at
@@ -1555,7 +1555,7 @@ mod tests {
         assert!(((step * 1_000_000) as f64) <= bound_ns, "issued at {step} ms");
     }
 
-    /// ADR-0170 D4 with Amendment A1: near the crossover of the weighted
+    /// ADR-0178 D4: near the crossover of the weighted
     /// share and the keep-up floor the checkpoint's credit still gains
     /// `share / 7` per second at α = 2, within three units over any
     /// window. The 8-cell reference share refilled every 10 µs grants
@@ -1660,7 +1660,7 @@ mod tests {
     }
 }
 
-/// R4 — the class oracle (ADR-0170 D4, I2–I8, I12–I15). Every background
+/// R4 — the class oracle (ADR-0178 D4, I2–I8, I12–I15). Every background
 /// class of `IoClass::ALL`, so a new class joins without edits, under the
 /// limits' hostile offers, five shares, three refill intervals and seven
 /// regimes. The bound `T_c(B)` is computed from D4's formula — the
@@ -1691,7 +1691,7 @@ mod class_oracle {
     /// class's integer grant trails `r_c × window` by less than one unit
     /// per carry stage — the rate product, the ⅛ floor, and the weighted
     /// split (for the floored checkpoint, the one carry of the keep-up
-    /// max): under 2⅛ units, so three whole units (ADR-0170 A1).
+    /// max): under 2⅛ units, so three whole units (ADR-0178 D4).
     pub(super) const CARRY_LAG_UNITS: u64 = 3;
     /// A case ends once its producer issued this many offers in the coarse
     /// phase (each wait checked) — the steady cycle then repeats — or at

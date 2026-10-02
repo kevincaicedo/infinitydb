@@ -292,7 +292,7 @@ fn sidecar_walk_step(
     }
 }
 
-// ---- block offer (ADR-0170 D2, ADR-0088 D3; ADR-0167 D2) ----
+// ---- block offer (ADR-0178 D2, ADR-0088 D3; ADR-0167 D2) ----
 
 /// Which block a checkpoint slice offers next.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -319,7 +319,7 @@ enum BlockOffer {
 /// checked before the budget offer and the seal, so a refusal admits and
 /// seals nothing (ADR-0167 D2). The budget sees the block at its padded
 /// length before it seals; a block above the class cap is issued by the
-/// budget's overrun, never refused for ever (ADR-0170 D1/D3).
+/// budget's overrun, never refused for ever (ADR-0178 D1/D3).
 fn offer_ckpt_block(
     stream: &mut IckStream,
     block: CkptBlock,
@@ -437,7 +437,7 @@ impl<F: SegmentFs> DurableCell<F> {
             // The header is one block, charged unconditionally (the file
             // is already created): what the class's credit cannot hold is
             // owed and repaid before it grows again — D4's `C` term in the
-            // class's progress bound (ADR-0170 D2, D4).
+            // class's progress bound (ADR-0178 D2, D4).
             self.budget.charge(IoClass::Checkpoint, u64::from(lease.len()), 1);
             st.write_seq += 1;
             cx.push(IoOp::LogWrite {

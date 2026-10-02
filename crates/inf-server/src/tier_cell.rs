@@ -56,11 +56,11 @@ const _: () = assert!(
 
 /// The most driver ops one flush round can carry (the ADR-0084 D3
 /// token op-index bound) — the tier-flush class's ops slice for the
-/// device budget (ADR-0170 D2).
+/// device budget (ADR-0178 D2).
 pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
 
 /// The device budget's answer to "may a flush round of up to `bytes`
-/// bytes and `ops` ops stage now?" (ADR-0170 D1's [`Issue`]) plus the
+/// bytes and `ops` ops stage now?" (ADR-0178 D1's [`Issue`]) plus the
 /// settlement of what the round then staged (ADR-0170 D2): the unstaged
 /// part refunded against the grant's receipt, bytes staged past the
 /// grant charged. Generic, not `dyn`: one monomorphized closure per
@@ -1257,7 +1257,7 @@ mod lane_tests {
         assert!(matches!(next, Issue::NotThisSlice), "the excess is owed: {next:?}");
     }
 
-    /// ADR-0170, Publication and failure: a stage that fails after staging
+    /// ADR-0178, Publication and failure: a stage that fails after staging
     /// part of its round still issues that part (its round opens; the
     /// error surfaces after), so those bytes stay spent. The pipeline
     /// rotates at a 4 KiB file capacity and the second file's first

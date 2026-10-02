@@ -4313,7 +4313,7 @@ fn recovery_phases_report_bytes_and_sum_to_the_total() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0170 D2's carries: a checkpoint requested on an **idle** node
+/// ADR-0178 D2's carries: a checkpoint requested on an **idle** node
 /// that spends a device budget completes. Before the
 /// carry, the reference box's probe (2 540 write ops/s per device) on a
 /// loop iterating every few hundred µs granted the checkpoint class
@@ -4366,7 +4366,7 @@ fn a_checkpoint_requested_on_an_idle_budgeted_node_completes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The device model of the ADR-0170 wire tests: 40 MB/s and 40 000
+/// The device model of the ADR-0178 wire tests: 40 MB/s and 40 000
 /// ops/s per device in both directions, so at 2 cells each cell's share
 /// is 20 MB/s — a checkpoint cap of one 266 240 B section slice, a tier
 /// cap of the 1 MiB default slice, and a 1 MB pool per direction.
@@ -4389,7 +4389,7 @@ fn keys_on_cell(cells: u16, cell: u16, prefix: &str, count: usize) -> Vec<Vec<u8
         .collect()
 }
 
-/// ADR-0170 D4 for the checkpoint byte axis: the class's credit gains at
+/// ADR-0178 D4 for the checkpoint byte axis: the class's credit gains at
 /// least the larger of the ⅛ floor's weighted share and, at α > 0, the
 /// keep-up crossover `w / (αw + Σw)` of the share per second — `share / 7`
 /// at α = 2 — within three bytes for the carries' lag (A1). α is the
@@ -4405,7 +4405,7 @@ fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, del
     (owed + cap + charged + LAG_UNITS) / rate + 2.0 * delta
 }
 
-/// R2 (ADR-0170): a checkpoint whose section holds one value above the
+/// R2 (ADR-0178): a checkpoint whose section holds one value above the
 /// class cap plus the pool completes. Before the overrun the budget
 /// answered that block "not this slice" on every call — the walk never
 /// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
