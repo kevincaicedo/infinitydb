@@ -190,6 +190,11 @@ rows=(
   # record by the window inequality written out in the test.
   "inf_canary_replay_no_pad crate-test inf-store lib room_reaches_fits_in_four_asks_exhaustively_at_a_four_unit_page"
   "inf_canary_replay_no_pad crate-test inf-store lib room_pads_the_hostile_specs_at_the_commit_page"
+  # ADR-0174 D3: `ColdKey`'s constructor checks nothing — another key's
+  # record, a type tag of 0 and a length past the file each parse, and the
+  # rebuild answers "distinct" (or `lookup`'s own hash check, in debug)
+  # where the identity refusal is expected.
+  "inf_canary_replay_settle_unchecked crate-test inf-store test:tiered_shadow a_rebuilt_slot_settles_only_on_a_verified_record_of_its_hash"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

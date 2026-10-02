@@ -47,6 +47,7 @@ inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_h
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast,arith	deny
 inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
 inf-store/fuzz_catalog	crates/inf-store/src/catalog.rs	cast,arith	deny
+inf-store/fuzz_cold_key	crates/inf-store/src/record.rs::from_window	cast,arith	deny
 inf-store/fuzz_index_key	crates/inf-store/src/index_key.rs	cast,arith	deny
 inf-wire/resp_parse	crates/inf-wire/src/parser.rs	cast,arith	deny
 inf-wire/resp_reply_frame	crates/inf-wire/src/writer.rs	cast	deny

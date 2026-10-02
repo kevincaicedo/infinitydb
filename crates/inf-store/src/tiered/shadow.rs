@@ -51,6 +51,7 @@ use inf_foundation::{BuildIntHasher, LocalCounter, LogicalAddr};
 use super::TieredTable;
 use crate::address_space::AddrClass;
 use crate::index::{GROUP, HomeGroupCursor};
+use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::TieredLookup;
 
 /// Open tickets per table (ADR-0093 D7): above it new eligible writes
@@ -172,6 +173,28 @@ pub enum ShadowRefusal {
     Origin,
 }
 
+/// How a settled cold slot's death is attributed and where its address
+/// goes — ADR-0174 D3's R8, the one typed argument of `settle_pair`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum SettleCase {
+    /// A ref settled at boot, below the life origin: counted and
+    /// stamped as a marker's removal is (the file's slot count and unref
+    /// stamp) and its blob reference released, **no bytes charged** —
+    /// the crashed life may have charged this death already; the address
+    /// is chained into the survivor's origins.
+    #[allow(dead_code, reason = "FCR-STTIER-01 stage 2 builds the boot settles that pass it")]
+    RefAtBoot,
+    /// A slot this boot's replay demoted, at or above the origin: the
+    /// exact death (this life's file is byte-exact); the survivor takes
+    /// the slot's origins and gains none — the address names nothing an
+    /// older checkpoint references.
+    #[allow(dead_code, reason = "FCR-STTIER-01 stage 2 builds the boot settles that pass it")]
+    ThisLife { len: u32 },
+    /// The live settle and the rebuild: the exact death; the address and
+    /// its own origins chain into the survivor's.
+    Exact { len: u32 },
+}
+
 /// The reconciler's verdict on one read (D4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShadowVerdict {
@@ -254,12 +277,26 @@ impl fmt::Display for SettleError {
 
 impl std::error::Error for SettleError {}
 
+/// What a settle read hands back (ADR-0174 D3, the settle read's `read`
+/// step): the record's key window — its first
+/// [`TieredTable::KEY_PREFIX_LEN`] bytes, or fewer at the file's end —
+/// and `left`, the bytes from the record's address to the end of its
+/// file, which bounds the record's length. The window parses into a
+/// [`ColdKey`](crate::ColdKey) under the slot's hash, or refuses typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyWindow {
+    pub bytes: Vec<u8>,
+    pub left: u64,
+}
+
 /// Why [`TieredTable::rebuild_shadow_tickets`] stopped before the index
-/// was fully walked: the caller's read failed on a slot, or the slot
-/// could not be settled. Either is a recovery fail-stop for the server.
+/// was fully walked: the caller's read failed on a slot, the bytes it
+/// read are not a verified record of the slot's hash, or the slot could
+/// not be settled. Each is a recovery fail-stop for the server.
 #[derive(Debug)]
 pub enum ShadowRebuildError<E> {
     Read { slot: SettleSlot, cause: E },
+    Identity { slot: SettleSlot, cause: ColdKeyError },
     Settle { slot: SettleSlot, cause: SettleError },
 }
 
@@ -269,6 +306,13 @@ impl<E: fmt::Display> fmt::Display for ShadowRebuildError<E> {
             ShadowRebuildError::Read { slot, cause } => write!(
                 f,
                 "shadow rebuild: settle slot at {} ({:?}) unreadable: {cause}",
+                slot.cold.to_raw(),
+                slot.reason
+            ),
+            ShadowRebuildError::Identity { slot, cause } => write!(
+                f,
+                "shadow rebuild: settle slot at {} ({:?}) fails the identity check: {cause} \
+                 (ADR-0174 D3)",
                 slot.cold.to_raw(),
                 slot.reason
             ),
@@ -1016,7 +1060,7 @@ impl TieredTable {
     fn settle_ticket(&mut self, c: u64) -> bool {
         let entry = self.shadow.by_cold[&c];
         let len = entry.verified_len.expect("settle of an unverified ticket");
-        if !self.settle_pair(entry.hash, c, entry.winner, len) {
+        if !self.settle_pair(entry.hash, c, entry.winner, SettleCase::Exact { len }) {
             self.shadow.counters.deferred_origin += 1;
             return false;
         }
@@ -1026,23 +1070,41 @@ impl TieredTable {
     }
 
     /// The settle itself, ticket or no ticket (the live path's verified
-    /// ticket, the boot's rebuilt slot): remove the exact cold pair,
-    /// attribute the exact death, chain the address and its own origins
-    /// into the winner's list. `false` — nothing changed — when the
-    /// winner's list has no room for them (`RELOC_ORIGIN_CAP`).
-    fn settle_pair(&mut self, hash: u64, c: u64, w: u64, len: u32) -> bool {
+    /// ticket, the boot's rebuilt slot, replay's seal and end settles):
+    /// remove the exact cold pair, attribute its death and move its
+    /// origins as `case` says (ADR-0174 D3 R8). `false` — nothing
+    /// changed — when the winner's list has no room for what the case
+    /// chains (`RELOC_ORIGIN_CAP`).
+    pub(super) fn settle_pair(&mut self, hash: u64, c: u64, w: u64, case: SettleCase) -> bool {
         debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
         let cold = LogicalAddr::from_raw(c).expect("48-bit");
-        let incoming = self.reloc_origins.get(&(hash, c)).map_or(0, Vec::len) + 1;
+        let own = self.reloc_origins.get(&(hash, c)).map_or(0, Vec::len);
+        let chains_self = !matches!(case, SettleCase::ThisLife { .. });
+        let incoming = own + usize::from(chains_self);
         let existing = self.reloc_origins.get(&(hash, w)).map_or(0, Vec::len);
         if existing + incoming > super::RELOC_ORIGIN_CAP {
             return false;
         }
         self.index.remove(hash, cold);
-        self.note_death(cold, u64::from(len));
+        match case {
+            SettleCase::RefAtBoot => {
+                debug_assert!(cold < self.space.life_origin(), "a ref lies below the origin");
+                self.live.note_displaced(c);
+                self.extents.note_death(c);
+            }
+            SettleCase::ThisLife { len } => {
+                debug_assert!(cold >= self.space.life_origin(), "this life's slot");
+                self.note_death(cold, u64::from(len));
+            }
+            SettleCase::Exact { len } => self.note_death(cold, u64::from(len)),
+        }
         let mut origins = self.reloc_origins.remove(&(hash, c)).unwrap_or_default();
-        origins.push((c, self.live.ckpt_begun()));
-        self.reloc_origins.entry((hash, w)).or_default().extend(origins);
+        if chains_self {
+            origins.push((c, self.live.ckpt_begun()));
+        }
+        if !origins.is_empty() {
+            self.reloc_origins.entry((hash, w)).or_default().extend(origins);
+        }
         true
     }
 
@@ -1213,21 +1275,28 @@ impl TieredTable {
     }
 
     /// Drives a whole rebuild: every slot the walk hands back is read by
-    /// `read` and settled by its full key; the first failure ends it.
-    /// The server's `finish_tier_replay` and the simulators call this;
-    /// its memory is the cursor's — no list of slots exists at any point.
+    /// `read` (its key window and `left`), parsed into a [`ColdKey`]
+    /// under the slot's hash and this table's keyed hash, and settled by
+    /// its full key; the first failure ends it. The server's
+    /// `finish_tier_replay` and the simulators call this; its memory is
+    /// the cursor's — no list of slots exists at any point.
     ///
     /// # Errors
-    /// An unreadable slot (`read`'s error) or an unsettleable one — both
-    /// the recovery's fail-stop class for the server.
+    /// An unreadable slot (`read`'s error), bytes that are not a verified
+    /// record of the slot's hash, or an unsettleable slot — each the
+    /// recovery's fail-stop class for the server.
     pub fn rebuild_shadow_tickets<E>(
         &mut self,
-        mut read: impl FnMut(&SettleSlot) -> Result<Vec<u8>, E>,
+        mut read: impl FnMut(&SettleSlot) -> Result<KeyWindow, E>,
     ) -> Result<(), ShadowRebuildError<E>> {
         let mut rebuild = self.begin_shadow_rebuild();
         while let Some(slot) = self.shadow_rebuild_next(&mut rebuild) {
-            let image = read(&slot).map_err(|cause| ShadowRebuildError::Read { slot, cause })?;
-            self.settle_rebuilt_slot(slot.hash, slot.cold, &image)
+            let window = read(&slot).map_err(|cause| ShadowRebuildError::Read { slot, cause })?;
+            let key = ColdKey::from_window(&window.bytes, window.left, slot.hash, |key| {
+                self.hash_key(key)
+            })
+            .map_err(|cause| ShadowRebuildError::Identity { slot, cause })?;
+            self.settle_rebuilt_slot(slot.cold, key)
                 .map_err(|cause| ShadowRebuildError::Settle { slot, cause })?;
         }
         Ok(())
@@ -1239,42 +1308,37 @@ impl TieredTable {
     /// is its old record, removed now with the exact death and the origin
     /// chain (the synchronous path's removal on the same evidence, §I3);
     /// not found ⇒ the slot is a distinct key's and nothing changes.
-    /// `image` is the verbatim cold record. The boot runs with no walk
-    /// pinned and empty origin lists, and a checkpoint names at most one
-    /// cold record per key, so the origin room a same-key settle needs is
-    /// always there — its absence is corrupt input, a typed error.
+    /// `key` is the twin's identity, verified against the slot's hash by
+    /// its one constructor (ADR-0174 D3) — the settle never answers from
+    /// unchecked bytes. The boot runs with no walk pinned and empty
+    /// origin lists, and a checkpoint names at most one cold record per
+    /// key, so the origin room a same-key settle needs is always there —
+    /// its absence is corrupt input, a typed error.
     ///
     /// # Errors
     /// [`SettleError::OriginRoom`] — the winner's list is full.
     ///
     /// # Panics
-    /// Panics when the slot is not a cold exact pair, `image` is not
-    /// exactly one record, or a walk is pinned — the caller read the slot
-    /// the rebuild named, before serving.
+    /// Panics when the slot is not a cold exact pair of the key's hash,
+    /// is ticketed, or a walk is pinned — the caller read the slot the
+    /// rebuild named, before serving.
     pub fn settle_rebuilt_slot(
         &mut self,
-        hash: u64,
         cold: LogicalAddr,
-        image: &[u8],
+        key: ColdKey<'_>,
     ) -> Result<SettleOutcome, SettleError> {
+        let hash = key.hash();
         assert!(self.index.contains_pair(hash, cold), "settle of a slot that is not there");
         assert!(self.space.resolve(cold) == AddrClass::Cold, "settle of a RAM slot");
-        assert_eq!(
-            crate::record::encoded_len_from_header(image),
-            image.len(),
-            "settle image is not exactly one record"
-        );
         assert!(!self.is_shadow_cold(cold), "settle of a ticketed slot");
         assert!(self.space.walk_watermark().is_none(), "a boot settle under a pinned walk");
         self.shadow.counters.rebuild_reads += 1;
-        let key = TieredTable::decode_record(image).key;
-        debug_assert_eq!(hash, self.hash_key(key), "a slot carries its record's hash");
-        let TieredLookup::Ram(winner) = self.lookup(key, hash, &[]) else {
+        let TieredLookup::Ram(winner) = self.lookup(key.key(), hash, &[]) else {
             self.shadow.counters.rebuild_settled_distinct += 1;
             return Ok(SettleOutcome::Distinct);
         };
-        let len = u32::try_from(image.len()).expect("record lengths fit u32");
-        if !self.settle_pair(hash, cold.to_raw(), winner.to_raw(), len) {
+        let case = SettleCase::Exact { len: key.record_len() };
+        if !self.settle_pair(hash, cold.to_raw(), winner.to_raw(), case) {
             return Err(SettleError::OriginRoom { winner, cold });
         }
         self.shadow.counters.rebuild_settled_same_key += 1;
@@ -1324,5 +1388,102 @@ impl TieredTable {
     fn sync_shadow_pin(&mut self) {
         let pin = self.shadow.oldest_winner().map(|w| LogicalAddr::from_raw(w).expect("48-bit"));
         self.space.set_record_pin(pin);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::KeyHasher;
+    use inf_log::TierFileMeta;
+    use inf_log::tier::SealReason;
+
+    use super::*;
+    use crate::address_space::AddressSpaceConfig;
+    use crate::demote::DemotionConfig;
+
+    fn table_at(origin: u64) -> TieredTable {
+        TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: 1 << 16,
+                page_bytes: 1 << 12,
+                life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
+            },
+            DemotionConfig::for_budget(1 << 16, 1 << 12),
+            64,
+            KeyHasher::default(),
+        )
+        .expect("reservation")
+    }
+
+    /// ADR-0174 D3 R8, a ref settled at boot: the slot leaves the index,
+    /// its recovered file is uncounted and stamped as a marker's removal
+    /// does, **no bytes are charged** to it or to the space, and the
+    /// address is chained into the survivor's origins.
+    #[test]
+    fn settle_pair_ref_at_boot_counts_and_chains_but_charges_no_bytes() {
+        let origin = 1u64 << 20;
+        let mut t = table_at(origin);
+        t.seed_recovered_files(
+            &[TierFileMeta {
+                id: 0,
+                base: LogicalAddr::ZERO,
+                data_len: origin,
+                reason: SealReason::Capacity,
+                path: std::path::Path::new("shard-0/cold/tier-000000.itier").to_path_buf(),
+            }],
+            3,
+        );
+        let hash = t.hash_key(b"k");
+        let cold = LogicalAddr::from_raw(4096).expect("48-bit");
+        t.apply_ref(hash, cold);
+        let winner = t.insert(b"k", &[0x11; 100], hash).expect("fits");
+        let dead_before = t.space().report().dead_bytes;
+        t.live.note_ckpt_begun(9);
+        assert!(t.settle_pair(hash, cold.to_raw(), winner.to_raw(), SettleCase::RefAtBoot));
+        assert!(!t.contains_pair(hash, cold), "the pair is gone");
+        let file = &t.live_set().files()[0];
+        assert_eq!(file.live_count, 0, "uncounted as a marker's removal is");
+        assert_eq!(file.unref_stamp, 9, "stamped as a marker's removal is");
+        assert_eq!(file.dead_bytes, 0, "no bytes charged to the recovered file");
+        assert_eq!(t.space().report().dead_bytes, dead_before, "none to the space");
+        assert_eq!(t.take_displacement_origins(hash, winner), vec![(cold.to_raw(), 9)]);
+    }
+
+    /// ADR-0174 D3 R8, a slot this life demoted: the exact death is
+    /// charged, the survivor inherits the slot's origins and gains none
+    /// — so a survivor already at the origin cap still takes a slot with
+    /// no origins of its own, where the live form (`Exact`) could not.
+    #[test]
+    fn settle_pair_this_life_charges_exactly_and_inherits_without_chaining() {
+        let mut t = table_at(0);
+        let hash = t.hash_key(b"k");
+        let old = t.insert(b"k", &[0x22; 100], hash).expect("fits");
+        let old_len = t.record(old).encoded_len;
+        let newer = t.append(b"k", &[0x33; 100], 1).expect("fits");
+        t.index.insert(hash, newer);
+        t.reloc_origins.insert((hash, old.to_raw()), vec![(7, 1)]);
+        let dead_before = t.space().report().dead_bytes;
+        let case = SettleCase::ThisLife { len: u32::try_from(old_len).expect("fits") };
+        assert!(t.settle_pair(hash, old.to_raw(), newer.to_raw(), case));
+        assert!(!t.contains_pair(hash, old));
+        assert_eq!(t.space().report().dead_bytes, dead_before + old_len as u64, "exact death");
+        assert_eq!(
+            t.take_displacement_origins(hash, newer),
+            vec![(7, 1)],
+            "inherited, not chained"
+        );
+
+        // At the cap with nothing to inherit: `ThisLife` settles, `Exact` refuses.
+        let third = t.append(b"k", &[0x44; 100], 2).expect("fits");
+        t.index.insert(hash, third);
+        t.reloc_origins.insert((hash, third.to_raw()), vec![(1, 1), (2, 1), (3, 1)]);
+        let newer_len = u32::try_from(t.record(newer).encoded_len).expect("fits");
+        let exact = SettleCase::Exact { len: newer_len };
+        assert!(!t.settle_pair(hash, newer.to_raw(), third.to_raw(), exact), "no room to chain");
+        assert!(t.contains_pair(hash, newer), "a refusal changes nothing");
+        let this_life = SettleCase::ThisLife { len: newer_len };
+        assert!(t.settle_pair(hash, newer.to_raw(), third.to_raw(), this_life));
+        assert!(!t.contains_pair(hash, newer));
+        assert_eq!(t.displacement_origins_len(hash, third), 3, "nothing gained");
     }
 }

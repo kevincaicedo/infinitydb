@@ -98,8 +98,8 @@ pub use ordered::{
     OrderedMapMemory, PkRef, VarKey,
 };
 pub use record::{
-    EXTENT_REF_LEN, ExtentRef, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, TypeTag,
-    saturating_deadline,
+    ColdKey, ColdKeyError, EXTENT_REF_LEN, ExtentRef, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN,
+    TypeTag, saturating_deadline,
 };
 pub use router::SlotRouter;
 #[cfg(feature = "test-support")]
@@ -113,9 +113,10 @@ pub use store::{
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::shadow::{
-    COLLISION_KEY_PREFIX, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP,
-    SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters, ShadowProbe, ShadowRead,
-    ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket, ShadowVerdict,
+    COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
+    SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,
+    ShadowProbe, ShadowRead, ShadowRebuild, ShadowRebuildError, ShadowRefusal, ShadowTicket,
+    ShadowVerdict,
 };
 #[cfg(feature = "collision-oracle")]
 pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};

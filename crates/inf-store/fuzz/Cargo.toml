@@ -30,4 +30,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_cold_key"
+path = "fuzz_targets/fuzz_cold_key.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

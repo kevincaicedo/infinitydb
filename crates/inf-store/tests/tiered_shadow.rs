@@ -28,15 +28,22 @@ use inf_log::{
 use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, Index,
-    LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleError, SettleOutcome,
+    KeyWindow, LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleError, SettleOutcome,
     SettleReason, SettleSlot, ShadowProbe, ShadowRebuildError, ShadowRefusal, ShadowVerdict,
     TieredLookup, TieredMode, TieredTable, forced_collision_pair, forced_collision_triple,
 };
 
 /// A rebuild driver for tables whose walk must hand back nothing: any
 /// settle slot is a test failure.
-fn no_settle(slot: &SettleSlot) -> Result<Vec<u8>, String> {
+fn no_settle(slot: &SettleSlot) -> Result<KeyWindow, String> {
     Err(format!("unexpected settle slot {slot:?}"))
+}
+
+/// The settle read's answer for a whole record image: the window is the
+/// image (shorter than the key window at a file's end is legal) and the
+/// file holds exactly it.
+fn window_of(image: &[u8]) -> KeyWindow {
+    KeyWindow { bytes: image.to_vec(), left: image.len() as u64 }
 }
 
 const RING: u64 = 1 << 20;
@@ -959,9 +966,9 @@ fn rebuild_settles_an_ambiguous_twin_against_its_true_owner() {
         let b2 = t.apply_image(&k2, b"two", hash).expect("fits");
         let mut handed: Vec<SettleSlot> = Vec::new();
         let image = record_image(twin_key, twin_value);
-        t.rebuild_shadow_tickets(|slot| -> Result<Vec<u8>, String> {
+        t.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
             handed.push(*slot);
-            Ok(image.clone())
+            Ok(window_of(&image))
         })
         .expect("settles");
         assert_eq!(t.shadow_pending(), 0, "no guess, no ticket");
@@ -995,9 +1002,9 @@ fn rebuild_settles_an_ambiguous_twin_against_its_true_owner() {
     assert_eq!(KeyHasher::default().hash(&k3), hash, "a third key with the same hash");
     let image = record_image(&k3, b"three");
     let mut handed = 0usize;
-    t.rebuild_shadow_tickets(|_| -> Result<Vec<u8>, String> {
+    t.rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> {
         handed += 1;
-        Ok(image.clone())
+        Ok(window_of(&image))
     })
     .expect("settles");
     assert_eq!(handed, 1);
@@ -1034,7 +1041,12 @@ fn rebuild_sends_pairs_beyond_the_cap_to_the_boot_settle_one_at_a_time() {
         assert!(t.shadow_pending() <= SHADOW_TICKETS_CAP, "the cap holds at every step");
         assert_eq!(slot.reason, SettleReason::OverCap);
         handed += 1;
-        let outcome = t.settle_rebuilt_slot(slot.hash, slot.cold, &images[&slot.cold.to_raw()]);
+        let image = &images[&slot.cold.to_raw()];
+        let key = inf_store::ColdKey::from_window(image, image.len() as u64, slot.hash, |k| {
+            KeyHasher::default().hash(k)
+        })
+        .expect("a verified record of the slot's hash");
+        let outcome = t.settle_rebuilt_slot(slot.cold, key);
         assert_eq!(outcome, Ok(SettleOutcome::SameKey));
         assert!(!t.contains_pair(slot.hash, slot.cold), "the excess pair settled at boot");
         assert_eq!(t.shadow_pending(), SHADOW_TICKETS_CAP, "never registered");
@@ -1107,9 +1119,9 @@ fn rebuild_walks_a_displaced_chain_and_settles_mid_chain() {
     }
     assert_eq!(t.index_group_count() - 1, mask, "no growth");
     let mut handed: Vec<SettleSlot> = Vec::new();
-    t.rebuild_shadow_tickets(|slot| -> Result<Vec<u8>, String> {
+    t.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
         handed.push(*slot);
-        Ok(images[&slot.cold.to_raw()].clone())
+        Ok(window_of(&images[&slot.cold.to_raw()]))
     })
     .expect("settles");
     assert_eq!(handed.len(), 1, "exactly the ambiguous slot was read");
@@ -1123,6 +1135,78 @@ fn rebuild_walks_a_displaced_chain_and_settles_mid_chain() {
     let c = t.shadow_counters();
     assert_eq!((c.rebuild_reads, c.rebuild_settled_same_key), (1, 1));
     assert_eq!(t.len(), PAIRS + 2, "24 keys + the two colliding keys");
+}
+
+/// ADR-0174 D3 (the settle read's identity, DRR FCR-STTIER-01 §6): a
+/// rebuilt slot whose bytes are another key's record, carry a type tag
+/// of 0, or claim a length past the file's end is a **typed** refusal
+/// naming the check — never "distinct", never a settle; a record shorter
+/// than the key window at its file's end settles (the window is clamped
+/// to the file). Red under `inf_canary_replay_settle_unchecked`, where
+/// the constructor checks nothing and each refusal arm settles or stays.
+#[test]
+fn a_rebuilt_slot_settles_only_on_a_verified_record_of_its_hash() {
+    use inf_store::ColdKeyError;
+    let pre_life = LogicalAddr::from_raw(4096).expect("fits");
+    let mut misplaced = record_image(b"k", b"old");
+    misplaced[0] &= 0x0F; // a type tag of 0
+    let own = record_image(b"k", b"old");
+    type Expected = fn(&ColdKeyError) -> bool;
+    let arms: [(&str, KeyWindow, Expected); 3] = [
+        ("another key's record", window_of(&record_image(b"other", b"x")), |e| {
+            matches!(e, ColdKeyError::HashMismatch { .. })
+        }),
+        ("a type tag of 0", window_of(&misplaced), |e| {
+            matches!(e, ColdKeyError::TypeTag { bits: 0 })
+        }),
+        (
+            "a length past the file",
+            KeyWindow { bytes: own.clone(), left: own.len() as u64 - 1 },
+            |e| matches!(e, ColdKeyError::LengthPastFile { .. }),
+        ),
+    ];
+    for (name, window, is_expected) in arms {
+        let (k1, k2) = collision_pair(6);
+        let hash = KeyHasher::default().hash(&k1);
+        let mut t = recovered_table();
+        t.apply_ref(hash, pre_life);
+        t.apply_image(&k1, b"one", hash).expect("fits");
+        t.apply_image(&k2, b"two", hash).expect("fits");
+        let err = t
+            .rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> { Ok(window.clone()) })
+            .expect_err(name);
+        match err {
+            ShadowRebuildError::Identity { slot, cause } => {
+                assert_eq!(slot.cold, pre_life, "{name}");
+                assert!(is_expected(&cause), "{name}: {cause}");
+            }
+            other => panic!("{name}: {other}"),
+        }
+        assert!(t.contains_pair(hash, pre_life), "{name}: the slot stays, unsettled");
+        assert_eq!(t.shadow_counters().rebuild_settled_distinct, 0, "{name}: never distinct");
+        assert_eq!(t.shadow_counters().rebuild_settled_same_key, 0, "{name}: never settled");
+    }
+    // The legal short window: a record shorter than the key window at
+    // its file's end, the window clamped to the file — read because two
+    // RAM siblings share its hash, settled against its true owner.
+    let (k1, k2) = collision_pair(6);
+    let hash = KeyHasher::default().hash(&k1);
+    let mut t = recovered_table();
+    t.apply_ref(hash, pre_life);
+    let b1 = t.apply_image(&k1, b"one", hash).expect("fits");
+    t.apply_image(&k2, b"two", hash).expect("fits");
+    let short = record_image(&k1, b"v");
+    assert!(short.len() < TieredTable::KEY_PREFIX_LEN, "shorter than the key window");
+    let mut handed = 0usize;
+    t.rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> {
+        handed += 1;
+        Ok(window_of(&short))
+    })
+    .expect("a verified short record settles");
+    assert_eq!(handed, 1);
+    assert!(!t.contains_pair(hash, pre_life), "settled");
+    assert_eq!(t.take_displacement_origins(hash, b1).len(), 1, "chained into its owner");
+    assert_eq!(t.shadow_counters().rebuild_settled_same_key, 1);
 }
 
 /// ADR-0093 A4′ (the review's "full origin lists"): at boot the origin
@@ -1145,7 +1229,7 @@ fn a_fourth_same_key_twin_at_boot_is_a_typed_settle_error() {
     t.apply_image(&k2, b"two", hash).expect("fits");
     let image = record_image(&k1, b"one-old");
     let err = t
-        .rebuild_shadow_tickets(|_| -> Result<Vec<u8>, String> { Ok(image.clone()) })
+        .rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> { Ok(window_of(&image)) })
         .expect_err("the fourth twin has no origin room");
     match err {
         ShadowRebuildError::Settle { slot, cause: SettleError::OriginRoom { winner, cold } } => {

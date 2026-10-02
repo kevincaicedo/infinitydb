@@ -963,10 +963,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 // those, never the general index, never a list of them.
                 // An unreadable or unsettleable slot is a recovery
                 // fail-stop (corrupt input, ADR-0057's posture).
+                // The settle answers from a `ColdKey` (ADR-0174 D3): the
+                // read hands back the record and the bytes it occupies,
+                // and the table verifies the key against the slot's hash.
                 let ns = tier.ns;
                 let stats = &mut self.stats;
                 table
-                    .rebuild_shadow_tickets(|slot| -> io::Result<Vec<u8>> {
+                    .rebuild_shadow_tickets(|slot| -> io::Result<inf_store::KeyWindow> {
                         let addr = slot.cold.to_raw();
                         let read = |len: usize| -> io::Result<Vec<u8>> {
                             tier.flush.read_span_blocking(addr, len)?.ok_or_else(|| {
@@ -977,7 +980,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         let len = inf_store::TieredTable::record_len_from_header(&head);
                         let image = read(len)?;
                         stats.shadow_settle_reads += 1;
-                        Ok(image)
+                        Ok(inf_store::KeyWindow { left: image.len() as u64, bytes: image })
                     })
                     .map_err(|err| io_msg(format!("ns {}: {err} (ADR-0093 A4′)", ns.0)))?;
             }

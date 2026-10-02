@@ -275,6 +275,138 @@ pub(crate) fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
     bytes.get(at..at + klen)
 }
 
+/// A cold record's identity as a boot settle may use it (ADR-0174 D3;
+/// the settle read's `parse` step): parsed from the record's **key
+/// window** — its first `TieredTable::KEY_PREFIX_LEN` bytes, or fewer at
+/// its file's end — by the one constructor that checks, in order, that
+/// the window holds the header, that the type tag decodes, that the key
+/// is whole, that the record's encoded length lies inside its file
+/// (`left`, the bytes from the record's address to the file's end) and
+/// that **the key hashes to the slot's hash**. A boot settle keeps or
+/// removes a slot only on one of these: a frame checksum checks bytes,
+/// not identity, and "distinct key" is answered only for a verified
+/// record of another key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ColdKey<'a> {
+    key: &'a [u8],
+    record_len: u32,
+    kind: TypeTag,
+    hash: u64,
+}
+
+/// Why a key window did not parse into a [`ColdKey`] — each a typed boot
+/// refusal naming the check, never "distinct".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColdKeyError {
+    /// Fewer bytes than the fixed header.
+    ShortHeader { len: usize },
+    /// The type tag's bits name no record type.
+    TypeTag { bits: u8 },
+    /// The window ends inside the key (or the header's TTL extension).
+    KeyTruncated { len: usize },
+    /// The record's encoded length runs past its file's end.
+    LengthPastFile { record_len: u64, left: u64 },
+    /// The key does not hash to the slot's hash: another key's record,
+    /// misplaced or misdirected, under valid frame checksums.
+    HashMismatch { slot: u64, key: u64 },
+}
+
+impl core::fmt::Display for ColdKeyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ColdKeyError::ShortHeader { len } => {
+                write!(f, "key window of {len} bytes holds no record header")
+            }
+            ColdKeyError::TypeTag { bits } => write!(f, "record type tag {bits} is unknown"),
+            ColdKeyError::KeyTruncated { len } => {
+                write!(f, "key window of {len} bytes ends inside the key")
+            }
+            ColdKeyError::LengthPastFile { record_len, left } => {
+                write!(f, "record length {record_len} runs past the file's end ({left} bytes left)")
+            }
+            ColdKeyError::HashMismatch { slot, key } => {
+                write!(f, "the record's key hashes to {key:#018x}, the slot to {slot:#018x}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ColdKeyError {}
+
+impl<'a> ColdKey<'a> {
+    /// The one constructor (the checks in the type's documentation, in
+    /// that order). `hash_of` is the namespace's keyed hash (ADR-0094).
+    /// Total over arbitrary bytes: every refusal is a [`ColdKeyError`].
+    // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+    #[cfg_attr(
+        not(test),
+        deny(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_wrap,
+            clippy::arithmetic_side_effects
+        )
+    )]
+    pub fn from_window(
+        window: &'a [u8],
+        left: u64,
+        slot_hash: u64,
+        hash_of: impl FnOnce(&[u8]) -> u64,
+    ) -> Result<ColdKey<'a>, ColdKeyError> {
+        if window.len() < HEADER_LEN {
+            return Err(ColdKeyError::ShortHeader { len: window.len() });
+        }
+        let bits = window[0] >> 4;
+        let kind = match TypeTag::from_bits(bits) {
+            Some(kind) => kind,
+            // The planted canary (DRR FCR-STTIER-01 §6): a constructor
+            // that checks nothing takes an unknown tag for a string.
+            None if cfg!(inf_canary_replay_settle_unchecked) => TypeTag::String,
+            None => return Err(ColdKeyError::TypeTag { bits }),
+        };
+        let Some(key) = key_from_prefix(window) else {
+            return Err(ColdKeyError::KeyTruncated { len: window.len() });
+        };
+        let record_len = encoded_len_from_header(window);
+        let record_len_u64 = u64::try_from(record_len)
+            .map_err(|_| ColdKeyError::LengthPastFile { record_len: u64::MAX, left })?;
+        if record_len_u64 > left && !cfg!(inf_canary_replay_settle_unchecked) {
+            return Err(ColdKeyError::LengthPastFile { record_len: record_len_u64, left });
+        }
+        let key_hash = hash_of(key);
+        if key_hash != slot_hash && !cfg!(inf_canary_replay_settle_unchecked) {
+            return Err(ColdKeyError::HashMismatch { slot: slot_hash, key: key_hash });
+        }
+        let record_len = u32::try_from(record_len)
+            .map_err(|_| ColdKeyError::LengthPastFile { record_len: record_len_u64, left })?;
+        Ok(ColdKey { key, record_len, kind, hash: slot_hash })
+    }
+
+    /// The verified key.
+    #[inline]
+    pub fn key(&self) -> &'a [u8] {
+        self.key
+    }
+
+    /// The record's exact encoded length — its death's bytes.
+    #[inline]
+    pub fn record_len(&self) -> u32 {
+        self.record_len
+    }
+
+    /// The record's type.
+    #[inline]
+    pub fn kind(&self) -> TypeTag {
+        self.kind
+    }
+
+    /// The slot's hash the key verified against.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
 /// Computes a record's full encoded length from its fixed header alone —
 /// how the store sizes the second arena read (header first, then the whole
 /// record).
@@ -429,6 +561,8 @@ impl core::fmt::Debug for RecordView<'_> {
 
 #[cfg(test)]
 mod tests {
+    use inf_foundation::KeyHasher;
+
     use super::*;
 
     /// ADR-0061 D2: `offset` is 0 in v1 and asserted so — on the decode
@@ -524,6 +658,70 @@ mod tests {
         assert_eq!(view.version(), 0xAD_BEEF);
         assert_eq!(view.expire_at_ms(), Some(MAX_EXPIRE_MS));
         assert_eq!(view.encoded_len(), buf.len());
+    }
+
+    /// ADR-0174 D3: the one constructor refuses, in order, a window
+    /// without a header, an unbound type tag, a key the window cuts, a
+    /// length past the file and a key that does not hash to the slot's
+    /// hash — and accepts a record shorter than the key window at its
+    /// file's end, the window clamped to the file.
+    #[test]
+    fn cold_key_checks_in_order_and_accepts_a_clamped_window() {
+        let hash_of = |key: &[u8]| KeyHasher::default().hash(key);
+        let spec = RecordSpec {
+            key: b"k",
+            value: &[0xAB; 300],
+            version: 1,
+            expire_at_ms: Some(5),
+            kind: RecordKind::String { raw: false },
+        };
+        let buf = roundtrip(spec);
+        let slot = hash_of(b"k");
+        let len = buf.len() as u64;
+        assert_eq!(
+            ColdKey::from_window(&buf[..HEADER_LEN - 1], len, slot, hash_of),
+            Err(ColdKeyError::ShortHeader { len: HEADER_LEN - 1 })
+        );
+        let mut untagged = buf.clone();
+        untagged[0] &= 0x0F;
+        assert_eq!(
+            ColdKey::from_window(&untagged, len, slot, hash_of),
+            Err(ColdKeyError::TypeTag { bits: 0 })
+        );
+        let cut = HEADER_LEN + TTL_EXT_LEN; // the TTL extension, not the key
+        assert_eq!(
+            ColdKey::from_window(&buf[..cut], len, slot, hash_of),
+            Err(ColdKeyError::KeyTruncated { len: cut })
+        );
+        assert_eq!(
+            ColdKey::from_window(&buf, len - 1, slot, hash_of),
+            Err(ColdKeyError::LengthPastFile { record_len: len, left: len - 1 })
+        );
+        let other = hash_of(b"other");
+        assert_eq!(
+            ColdKey::from_window(&buf, len, other, hash_of),
+            Err(ColdKeyError::HashMismatch { slot: other, key: slot })
+        );
+        // The key window (268 B) is shorter than the record: the key is
+        // whole, the length is the header's, the hash checks.
+        let window = &buf[..HEADER_LEN + TTL_EXT_LEN + 1];
+        let cold = ColdKey::from_window(window, len, slot, hash_of).expect("a verified key");
+        assert_eq!(cold.key(), b"k");
+        assert_eq!(u64::from(cold.record_len()), len);
+        assert_eq!(cold.kind(), TypeTag::String);
+        assert_eq!(cold.hash(), slot);
+        // A record shorter than the key window at its file's end: the
+        // whole record is the window and the file holds exactly it.
+        let short = roundtrip(RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: 0,
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        });
+        let cold = ColdKey::from_window(&short, short.len() as u64, slot, hash_of)
+            .expect("clamped to the file");
+        assert_eq!(u64::from(cold.record_len()), short.len() as u64);
     }
 
     #[test]

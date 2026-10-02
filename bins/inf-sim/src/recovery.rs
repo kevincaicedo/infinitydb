@@ -55,7 +55,7 @@ use inf_log::{
 };
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, EXTENT_REF_LEN, ExtentRef,
-    KeyHasher, LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section,
+    KeyHasher, KeyWindow, LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section,
     apply_live_set_section, apply_ref_section, forced_collision_pair, recover_tiered_ns,
 };
 
@@ -1789,11 +1789,11 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // twin) or beyond the cap, read and settled by their full key
         // before the life serves.
         let settled_at_boot = &mut run.report.shadow_settled_at_boot;
-        if let Err(err) = table.rebuild_shadow_tickets(|slot| -> Result<Vec<u8>, String> {
+        if let Err(err) = table.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
             let image = read_cold_record(&disk, &recovered.flush, slot.cold.to_raw())
                 .ok_or_else(|| "unreadable while its slot is live".to_owned())?;
             *settled_at_boot += 1;
-            Ok(image)
+            Ok(KeyWindow { left: image.len() as u64, bytes: image })
         }) {
             run.report.violations.push(format!("life {life_index}: {err}"));
             run.report.state_hash = run.report.state.value();

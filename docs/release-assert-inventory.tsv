@@ -736,13 +736,12 @@ C	1	crates/inf-store/src/tiered/shadow.rs	assert	shadow candidate is not cold	`c
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	shadow candidate is not slotted	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_admit` resolves both classes and both index pairs before a producer registers (ADR-0093 D1)
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	shadow winner is not RAM-resident	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_admit` resolves both classes and both index pairs before a producer registers (ADR-0093 D1)
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	shadow winner is not slotted	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_admit` resolves both classes and both index pairs before a producer registers (ADR-0093 D1)
-I	1	crates/inf-store/src/tiered/shadow.rs	assert_eq	settle image is not exactly one record	the image length was computed from the record header by the cold read the table itself issued
 I	1	crates/inf-store/src/tiered/shadow.rs	assert_eq	shadow image is not exactly one record	the image length was computed from the record header by the cold read the table itself issued
 I	3	crates/inf-store/src/tiered/shadow.rs	expect	48-bit	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	3	crates/inf-store/src/tiered/shadow.rs	expect	by_winner and by_cold agree	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	2	crates/inf-store/src/tiered/shadow.rs	expect	listed	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	1	crates/inf-store/src/tiered/shadow.rs	expect	present	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
-I	2	crates/inf-store/src/tiered/shadow.rs	expect	record lengths fit u32	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
+I	1	crates/inf-store/src/tiered/shadow.rs	expect	record lengths fit u32	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	1	crates/inf-store/src/tiered/shadow.rs	expect	settle of an unverified ticket	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	3	crates/inf-store/src/tiered/shadow.rs	expect	slot addresses are 48-bit	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)
 I	1	crates/inf-store/src/wheel.rs	assert	every node index is below NIL	compile-time `const _: () = assert!`: the node budget fits the u24 link with `NIL` reserved, indices `0..NIL` (ADR-0008 A1 rule 7) — a build failure, never a runtime panic
