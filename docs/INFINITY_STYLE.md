@@ -208,6 +208,11 @@ constants are an open finding), a new bound is a named `const` in its
 crate's `limits` module with the crossing behavior in its doc comment —
 never a literal at the use site.
 
+- A growable std container has no cap, so in cell crates `HashMap`,
+  `HashSet` and `VecDeque` are clippy `disallowed-types` (ADR-0163 D2). An
+  item not yet migrated to a capped type carries a `container: <record>`
+  allow, and `docs/container-exemptions.tsv` counts what each allow covers:
+  a new container in an exempt item is red, and the counts only shrink.
 - Bound **bytes and work as well as item counts**. A batch of a few large
   values can monopolize a core. Bound fan-out, response expansion, nesting,
   scratch space, and the bytes retained while waiting.

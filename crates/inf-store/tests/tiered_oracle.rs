@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M4-S02 AC: tiered store/lookup/delete vs a HashMap oracle across
 //! simulated region migrations — zero misses, zero stales. Records
 //! migrate mutable → read-only → cold underneath live traffic (watermark

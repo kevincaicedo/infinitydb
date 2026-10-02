@@ -16,6 +16,7 @@
 //! advances from `GroupCommit::on_fsync_complete`, which only fires on
 //! `Synced` completions (ADR-0013 D3).
 
+#[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -590,6 +591,7 @@ enum FrameBarrier {
 }
 
 /// One cell's durable plane state (plane-owned; `inf-store` never sees it).
+#[allow(clippy::disallowed_types, reason = "container: T")]
 pub(crate) struct DurableCell<F: SegmentFs> {
     pub staging: StagingRing,
     pub rotor: SegmentRotor<F>,
@@ -697,6 +699,7 @@ pub(crate) struct DurableCell<F: SegmentFs> {
 }
 
 impl<F: SegmentFs> DurableCell<F> {
+    #[allow(clippy::disallowed_types, reason = "container: T")]
     pub fn new(
         cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
@@ -1661,6 +1664,7 @@ fn write_seq_of(token: CompletionToken) -> u64 {
 /// linked sync on `a` with plain `b` behind it) keeps `a`: `a`'s acks
 /// must not wait for `b`'s barrier. An unwritten `b` is never merged
 /// into — a standalone may still cover exactly `a`.
+#[allow(clippy::disallowed_types, reason = "container: T")]
 fn coalesce_ack_map(
     map: &mut VecDeque<(Lsn, u64)>,
     written: Lsn,
@@ -1681,6 +1685,7 @@ fn coalesce_ack_map(
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod ack_map_tests {
     use std::collections::VecDeque;

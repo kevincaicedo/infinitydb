@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M4-S05/S06 AC: mutation storms over the tiered table vs a shadow
 //! model. What every op proves:
 //!

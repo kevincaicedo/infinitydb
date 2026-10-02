@@ -32,6 +32,7 @@
 //!   to nothing in `infinityd`.
 
 use core::cell::{Cell, RefCell};
+#[allow(clippy::disallowed_types, reason = "container: A")]
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -168,6 +169,7 @@ pub(super) struct OwnerPub {
     tag: Option<(Vec<u8>, Vec<u8>)>,
 }
 
+#[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
     fd: RawFd,
     parser: ConnParser,
@@ -220,6 +222,7 @@ pub(super) struct GatedReply {
     reply: Vec<u8>,
 }
 
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
@@ -661,6 +664,7 @@ enum StopCheckpoint {
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
+    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
@@ -1302,6 +1306,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
 
     /// One accepted socket becomes a connection of this cell (or is
     /// refused: a drain admits nothing, `maxclients`, a full slab).
+    #[allow(clippy::disallowed_types, reason = "container: A")]
     fn admit_accepted(&mut self, cx: &mut LoopCx<'_>, fd: RawFd) {
         // A drain admits nothing (ADR-0124 D2 step 1): closed
         // unanswered — the `SO_REUSEPORT` group still routes here,

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M4-S07 AC: fill a tiered namespace to 4× its memory budget under the
 //! demotion MAINTAIN loop — RAM residency (committed ring bytes) stays
 //! ≤ budget + one slice's slack at **every** observation point, zero

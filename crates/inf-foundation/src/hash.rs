@@ -357,6 +357,7 @@ impl core::hash::BuildHasher for BuildIntHasher {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     /// ADR-0094 D6: the identity is a function of the secret alone —

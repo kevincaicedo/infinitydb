@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! The S09 COUNT(*) paging AC (plan AC 2): page counts sum to
 //! scan-derived truth under mutation load, per-page work is bounded by
 //! the scan budget (counters asserted), and resume is exact — mid-key

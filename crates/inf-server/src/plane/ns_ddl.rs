@@ -116,6 +116,7 @@ fn admit_ns_create<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 /// the connection is gone.
 #[allow(clippy::too_many_arguments)] // the pump dispatch context
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column ns_program")]
+#[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,

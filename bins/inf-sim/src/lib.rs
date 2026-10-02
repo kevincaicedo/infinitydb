@@ -2,6 +2,10 @@
     clippy::disallowed_methods,
     reason = "sim-harness: fixture files outside the simulated cells (ADR-0144 D5)"
 )]
+#![allow(
+    clippy::disallowed_types,
+    reason = "sim-harness: the simulator's models and harness, not cell code (ADR-0163 D2)"
+)]
 //! `inf-sim` — the deterministic simulator skeleton (M0-S20, master plan
 //! §17.1): the whole node — N cells, fabric, wire, store, command plane —
 //! runs single-threaded with injected time and entropy. Same seed ⇒

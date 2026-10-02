@@ -62,6 +62,7 @@
 //! the only promotion path, and the `READ-PROMOTE` knob stays reserved.
 
 use core::cell::RefCell;
+#[allow(clippy::disallowed_types, reason = "container: C")]
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
@@ -261,6 +262,7 @@ struct SharedWindow {
     remaining: u32,
 }
 
+#[allow(clippy::disallowed_types, reason = "container: C")]
 struct ColdState {
     pool: AlignedPool,
     config: ColdReadConfig,
@@ -290,6 +292,7 @@ struct ColdState {
 }
 
 impl ColdState {
+    #[allow(clippy::disallowed_types, reason = "container: C")]
     fn unpin(pins: &mut HashMap<TierFileId, u32, BuildIntHasher>, file: TierFileId) {
         let count = pins.get_mut(&file).expect("pinned file has a pin entry");
         *count -= 1;
@@ -374,6 +377,7 @@ impl ColdReads {
     /// read-window maximum, and a device read's length is a `u32`
     /// (ADR-0167 D1).
     #[must_use]
+    #[allow(clippy::disallowed_types, reason = "container: C")]
     pub fn with_config(pool: AlignedPool, config: ColdReadConfig) -> ColdReads {
         assert!(config.qd_cap > 0, "qd_cap must admit at least one device read");
         assert!(config.overflow_cap > 0, "overflow_cap must queue at least one intent");

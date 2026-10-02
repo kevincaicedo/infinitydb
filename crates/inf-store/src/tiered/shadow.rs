@@ -42,6 +42,7 @@
 //! the index minus the open tickets, exact once every open ticket is
 //! verified.
 
+#[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
@@ -439,6 +440,7 @@ struct ColdEntry {
 }
 
 /// The open tickets of one table (L1: cell-local, one owner).
+#[allow(clippy::disallowed_types, reason = "container: R")]
 pub(super) struct ShadowSet {
     /// `(winner, cold)`, ascending by winner: the front is the oldest
     /// unresolved winner — the record pin — and the read order.
@@ -468,6 +470,7 @@ pub(super) struct ShadowSet {
 }
 
 impl ShadowSet {
+    #[allow(clippy::disallowed_types, reason = "container: R")]
     pub(super) fn new() -> ShadowSet {
         ShadowSet {
             by_winner: BTreeMap::new(),

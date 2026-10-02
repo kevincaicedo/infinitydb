@@ -20,6 +20,7 @@ use core::future::Future;
 use core::hash::Hash;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
+#[allow(clippy::disallowed_types, reason = "container: E")]
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 
@@ -47,6 +48,7 @@ enum SlotState<V> {
 
 /// Single-waiter, value-carrying gate keyed by `K`. The primitive behind
 /// [`FabricGate`] and [`IoGate`].
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct KeyedGate<K: Eq + Hash + Copy, V> {
     slots: Rc<RefCell<HashMap<K, SlotState<V>, BuildIntHasher>>>,
 }
@@ -58,6 +60,7 @@ impl<K: Eq + Hash + Copy, V> Default for KeyedGate<K, V> {
 }
 
 impl<K: Eq + Hash + Copy, V> KeyedGate<K, V> {
+    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new() -> KeyedGate<K, V> {
         KeyedGate { slots: Rc::new(RefCell::new(HashMap::default())) }
     }
@@ -130,6 +133,7 @@ impl<K: Eq + Hash + Copy, V> core::fmt::Debug for KeyedGate<K, V> {
 /// Future returned by [`KeyedGate::waiter`]. Dropping it before completion
 /// deregisters the key; a late `complete` then returns `false` instead of
 /// waking a dead task.
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct GateWait<K: Eq + Hash + Copy, V> {
     slots: Rc<RefCell<HashMap<K, SlotState<V>, BuildIntHasher>>>,
     key: K,
@@ -200,6 +204,7 @@ struct Waiter {
     clippy::type_complexity,
     reason = "an alias of a banned container is refused (ADR-0163 D2)"
 )]
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct WaitList<K: Eq + Hash + Copy> {
     queues: Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
 }
@@ -211,6 +216,7 @@ impl<K: Eq + Hash + Copy> Default for WaitList<K> {
 }
 
 impl<K: Eq + Hash + Copy> WaitList<K> {
+    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new() -> WaitList<K> {
         WaitList { queues: Rc::new(RefCell::new(HashMap::default())) }
     }
@@ -290,6 +296,7 @@ impl<K: Eq + Hash + Copy> core::fmt::Debug for WaitList<K> {
     clippy::type_complexity,
     reason = "an alias of a banned container is refused (ADR-0163 D2)"
 )]
+#[allow(clippy::disallowed_types, reason = "container: E")]
 fn wake_one_in<K: Eq + Hash + Copy>(
     queues: &Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
     key: K,
@@ -330,6 +337,7 @@ fn wake_one_in<K: Eq + Hash + Copy>(
     clippy::type_complexity,
     reason = "an alias of a banned container is refused (ADR-0163 D2)"
 )]
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct ListWait<K: Eq + Hash + Copy> {
     queues: Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
     key: K,

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! ADR-0117 D2 (review of 2026-08-30, F-L03-02): the checkpoint walk's
 //! in-chain resume. A refused image stops the walk *before* that entry;
 //! the next slice re-enters the home group at exactly it — no miss, no

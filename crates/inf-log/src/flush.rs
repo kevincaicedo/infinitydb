@@ -179,6 +179,7 @@ impl TierFlushError {
 
 /// The per-namespace flush pipeline (one per (cell, tiered namespace) —
 /// L1: cell-local, single owner).
+#[allow(clippy::disallowed_types, reason = "container: T")]
 pub struct TierFlush<F: SegmentFs> {
     fs: F,
     config: TierFlushConfig,
@@ -264,6 +265,7 @@ impl<F: SegmentFs> TierFlush<F> {
     /// # Panics
     /// Panics on a zero capacity/slice config, a catalog not strictly
     /// ascending by id and base, or `next_id` not above every seeded id.
+    #[allow(clippy::disallowed_types, reason = "container: T")]
     pub fn with_catalog(
         fs: F,
         config: TierFlushConfig,

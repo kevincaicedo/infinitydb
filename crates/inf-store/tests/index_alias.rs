@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! ARCH-W0.2 — index entry identity under a 64-bit hash alias (ADR-0139
 //! D2, D4, D9, D12; record `docs/drr/ARCH-W0.2.md` §6).
 //!

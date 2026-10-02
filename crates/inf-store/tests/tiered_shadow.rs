@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M4.5-S37 — shadow-slot reconciliation at the seam tier (ADR-0093):
 //! the eligible write's probe and admission, the winner's supremacy in
 //! lookup order, the record pin on the release ceiling, the

@@ -14,20 +14,41 @@
 #   * D1's frozen exemptions: the `ADR-0143:` allows are exactly the rows
 #     of docs/lint-exemptions.tsv, one allow per row, at most
 #     ADR0143_EXEMPTIONS_MAX, and the table only shrinks against its
-#     approved copies (HEAD, the base branch tip, its introducing commit).
+#     approved copies (HEAD, the base branch tip, its introducing commit);
+#   * ADR-0163 D2's container ban: a cell crate names a std `HashMap`,
+#     `HashSet` or `VecDeque` only under a `container: <record>` allow whose
+#     row of docs/container-exemptions.tsv counts what it covers — the
+#     distinct primary spans of the resolved diagnostics inside the allowed
+#     item. The table is generated from the tree (the census below), its
+#     counts per file and record only shrink against the approved copies,
+#     and `container: capped-backing` is allowed exactly
+#     CAPPED_BACKING_SITES times, with no row.
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
 #
 # INF_LINT_BASE_REF=<ref> names the base branch tip (default origin/main).
+# INF_CONTAINER_CENSUS=1 prints the container census (file, item, count,
+# record — the table's generated columns) from the ratchet's two clippy
+# passes and judges nothing else.
 
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 EXEMPTIONS="${INF_LINT_EXEMPTIONS:-docs/lint-exemptions.tsv}"
+CONTAINERS="${INF_CONTAINER_EXEMPTIONS:-docs/container-exemptions.tsv}"
 BASE_REF="${INF_LINT_BASE_REF:-origin/main}"
 # Only a lower number may replace this one (ADR-0144 D1).
 ADR0143_EXEMPTIONS_MAX=15
+# The sum of the container table's counts: only a lower number may replace
+# it. The capped-backing allows are exact: 1 once `struct CappedDeque`
+# lands (ADR-0151 D6).
+CONTAINER_EXEMPTIONS_MAX=104
+CAPPED_BACKING_SITES=0
+if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
+    # The census reads the ratchet's two passes; the ratchet calls back here.
+    exec "$SCRIPT_DIR/check-lint-ratchet.sh"
+fi
 # Cell membership has one owner, shared with the runtime safety gates.
 . "$SCRIPT_DIR/cell-crates.sh"
 CELL_DIRS=$(cell_crate_dirs)
@@ -37,7 +58,9 @@ for dir in crates bins; do
 done
 
 INF_CELL_DIRS="$CELL_DIRS" INF_SCOPES="${INF_LINT_SCOPES:-docs/lint-scopes.tsv}" INF_EXEMPTIONS="$EXEMPTIONS" INF_BASE_REF="$BASE_REF" INF_MAX="$ADR0143_EXEMPTIONS_MAX" \
+    INF_CONTAINERS="$CONTAINERS" INF_CONTAINER_MAX="$CONTAINER_EXEMPTIONS_MAX" INF_BACKING_SITES="$CAPPED_BACKING_SITES" \
     INF_SELF="scripts/check-lint-scopes.sh" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
+import datetime
 import os
 import json
 import re
@@ -53,6 +76,18 @@ EXEMPTIONS = os.environ["INF_EXEMPTIONS"]
 BASE_REF = os.environ["INF_BASE_REF"]
 MAX = int(os.environ["INF_MAX"])
 SELF = os.environ["INF_SELF"]
+CONTAINERS = os.environ["INF_CONTAINERS"]
+CONTAINER_MAX = int(os.environ["INF_CONTAINER_MAX"])
+BACKING_SITES = int(os.environ["INF_BACKING_SITES"])
+CENSUS = os.environ.get("INF_CONTAINER_CENSUS") == "1"
+# ADR-0163 D2: the three banned paths, and the site records that own an
+# exempt row (ADR-0163 D3: T E M C A D R F). `capped-backing` is the one
+# sanctioned holder's allow (ADR-0151 D6) and has no row.
+CONTAINER_PATHS = {f"std::collections::{name}" for name in ("HashMap", "HashSet", "VecDeque")}
+CONTAINER_NAME = re.compile(r"\b(HashMap|HashSet|VecDeque)\b")
+RECORDS = ("T", "E", "M", "C", "A", "D", "R", "F")
+BACKING = "capped-backing"
+HOST_OS = {"linux": "linux", "darwin": "macos"}.get(sys.platform, sys.platform)
 
 # lint -> (scope, reason classes). Scope `fn`: the attribute sits on a
 # function.
@@ -66,7 +101,7 @@ LINTS = {
     # ADR-0125 D2's opt-out, audited here since the ratchet absorbed it.
     "too_many_lines": ("fn", ("shape:",)),
     "disallowed_methods": ("statement", ("clock:", "fs-seam:", "boot:", "control-thread:")),
-    "disallowed_types": ("item", ("fs-seam:", "boot:", "control-thread:")),
+    "disallowed_types": ("item", ("fs-seam:", "boot:", "control-thread:", "container:")),
 }
 if os.environ.get("INF_LINT_RULES") == "1":
     for lint, (scope, classes) in LINTS.items():
@@ -75,7 +110,11 @@ if os.environ.get("INF_LINT_RULES") == "1":
     sys.exit(0)
 API_LINTS = {lint for lint in LINTS if lint.startswith("disallowed_")}
 CELL_DIRS = [Path(p) for p in os.environ["INF_CELL_DIRS"].splitlines()]
-ITEM = re.compile(r"^\s*(pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|mod|trait|struct|enum|type|use|const|static|fn)\b")
+ITEM = re.compile(r"^\s*(pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(impl|mod|trait|struct|enum|type|use|const|static|fn)\b")
+IMPL = re.compile(r"^\s*(?:unsafe\s+)?impl\b")
+TRAIT = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Za-z_][A-Za-z_0-9]*)")
+NAMED = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(struct|enum|union|const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z_0-9]*)")
+USE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+(.*)$")
 SCOPES = os.environ["INF_SCOPES"]
 GROUPS = ("clippy::pedantic", "clippy::restriction", "clippy::style", "clippy::all", "warnings")
 ROOT_ATTR = re.compile(
@@ -85,6 +124,9 @@ ROOT_ATTR = re.compile(
 REASON = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
 
 errors, oks, deny_sites, api_sites = [], [], [], []
+# (file, first line, last line, item key, record, site) per `container:` allow
+container_sites = []
+production_of = {}  # cell file -> its production lines (test modules blanked)
 
 
 def next_item_at(lines, at):
@@ -104,6 +146,88 @@ def next_item(lines, at):
     return lines[next_item_at(lines, at)]
 
 
+def impl_type(header):
+    """`Type` of an `impl<…> [Trait<…> for] path::Type<…> … {` header."""
+    s = re.sub(r"^\s*(?:unsafe\s+)?impl\s*", "", header)
+    if s.startswith("<"):
+        depth = 0
+        for k, ch in enumerate(s):
+            depth += (ch == "<") - (ch == ">")
+            if depth == 0:
+                s = s[k + 1:]
+                break
+    s = s.split("{", 1)[0]
+    s = re.split(r"\s+for\s+", s, maxsplit=1)[-1].strip()
+    m = re.match(r"[A-Za-z_][A-Za-z_0-9:]*", s)
+    return m.group(0).rsplit("::", 1)[-1] if m else s
+
+
+def item_key(lines, at, last):
+    """The container table's key of the item at `lines[at]` (ADR-0163 D2):
+    the keyword and name; a method qualified by its `impl` (or trait) type;
+    a `use` by its path text, a brace group written `{…}` so a path added to
+    the group is a higher count on the same row, not a new row."""
+    text = lines[at]
+    fn = FN.match(text)
+    if fn:
+        for i in range(at - 1, -1, -1):
+            owner = TRAIT.match(lines[i])
+            if not (owner or IMPL.match(lines[i])):
+                continue
+            end = scope_table._body_end(lines, i)
+            if end is not None and end >= at:
+                name = owner.group(1) if owner else impl_type(" ".join(lines[i:i + 8]))
+                return f"fn {name}::{fn.group(9)}"
+        return f"fn {fn.group(9)}"
+    use = USE.match(text)
+    if use:
+        path = re.sub(r"\s+", " ", " ".join([use.group(1)] + lines[at + 1:last + 1]))
+        path = re.sub(r"\{.*\}", "{…}", path).split(";", 1)[0].strip()
+        return f"use {path}"
+    named = NAMED.match(text)
+    return f"{named.group(1)} {named.group(2)}" if named else text.strip()
+
+
+def production_lines(path):
+    key = str(path)
+    if key not in production_of:
+        stripper = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
+        production_of[key] = subprocess.check_output(["awk", "-f", stripper, key], text=True).split("\n")
+    return production_of[key]
+
+
+def container_names(lines, first, last):
+    """(line, column) of each banned name in code (not strings or comments)
+    of 1-based lines first..last: the text census of a file this host does
+    not compile."""
+    code = {(i, j) for i, j, _ in scope_table.code_chars(lines)}
+    return {(i + 1, m.start() + 1)
+            for i in range(first - 1, min(last, len(lines)))
+            for m in CONTAINER_NAME.finditer(lines[i]) if (i, m.start()) in code}
+
+
+def host_gated(file):
+    """The `target_os` this module file is declared under, if any: its
+    `mod` item's attributes in the parent file (one level, as the tree
+    declares `kqueue` and `uring`)."""
+    p = Path(file)
+    stem = p.parent.name if p.name == "mod.rs" else p.stem
+    here = p.parent.parent if p.name == "mod.rs" else p.parent
+    parents = [here / n for n in ("lib.rs", "main.rs", "mod.rs")] + [here.with_suffix(".rs")]
+    for parent in parents:
+        if not parent.is_file() or parent == p:
+            continue
+        lines = parent.read_text(encoding="utf-8", errors="replace").split("\n")
+        for i, line in enumerate(lines):
+            if re.match(rf"^\s*(pub(\([^)]*\))?\s+)?mod\s+{re.escape(stem)}\s*;", line):
+                j = i
+                while j > 0 and lines[j - 1].strip().startswith("#["):
+                    j -= 1
+                m = re.search(r'target_os\s*=\s*"([A-Za-z0-9_]+)"', " ".join(lines[j:i]))
+                return m.group(1) if m else None
+    return None
+
+
 def audit(path, exempt_sites):
     lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
     cell = any(path.is_relative_to(root) for root in CELL_DIRS)
@@ -114,6 +238,14 @@ def audit(path, exempt_sites):
         if "unterminated" in report:
             errors.append(f"{path}: test-only module never closed; API audit cannot establish scope")
         production = subprocess.check_output(["awk", "-f", stripper, str(path)], text=True).split("\n")
+        production_of[str(path)] = production
+        if path.name != "limits.rs" and "Cap::entries" in "\n".join(production):
+            code = {(n, c) for n, c, _ in scope_table.code_chars(production)}
+            for n, line in enumerate(production):
+                for m in re.finditer(r"\bCap::entries\b", line):
+                    if (n, m.start()) in code:
+                        errors.append(f"{path}:{n + 1}: `Cap::entries` outside a `limits.rs` — a cap is a "
+                                      "named const of its crate's `limits` module (ADR-0163 D2)")
     i = 0
     while i < len(lines):
         s = lines[i].strip()
@@ -166,7 +298,8 @@ def audit(path, exempt_sites):
                     if scope == "statement" and (fn or ITEM.match(item)) and not (fn and why.startswith("clock:")):
                         errors.append(f"{site}: {lint} needs a statement; only clock: permits a function")
                         valid = False
-                    if scope == "item" and (not ITEM.match(item) or re.search(r"\b(impl|mod|trait|type)\b", item)):
+                    kind = ITEM.match(item)
+                    if scope == "item" and not fn and (not kind or kind.group(2) in ("impl", "mod", "trait", "type")):
                         errors.append(f"{site}: {lint} needs a narrow item, never a module, impl, trait or alias")
                         valid = False
                 if valid:
@@ -179,6 +312,10 @@ def audit(path, exempt_sites):
                             errors.append(f"{site}: API allow has no narrow scope the audit can close")
                         else:
                             api_sites.append((str(path), first + 1, last + 1, api, why.split(":", 1)[0]))
+                            if "disallowed_types" in api and why.startswith("container:"):
+                                record = why.partition(":")[2].strip()
+                                key = item_key(lines, first, last)
+                                container_sites.append((str(path), first + 1, last + 1, key, record, site))
                     if why.startswith("ADR-0143:") and fn:
                         exempt_sites.append((str(path), fn.group(9), why.split("column", 1)[-1].strip()))
 
@@ -287,6 +424,7 @@ denied_n, ratchet_n = len(scopes_tbl.families("deny")), len(scopes_tbl.families(
 # existing JSON passes. --force-warn exposes even allowed calls, so a clock:
 # allow cannot hide a file acquisition, nor a boot: allow an ambient clock.
 diagnostics = os.environ.get("INF_LINT_API_DIAGNOSTICS")
+container_spans = set()  # (file, line, column) of the three paths, cell production code
 if diagnostics:
     completed, resolved, in_build = 0, set(), set()
     expected = {lint for _, _, _, lints, _ in api_sites for lint in lints}
@@ -318,7 +456,9 @@ if diagnostics:
         clock = path.startswith(("std::time::", "core::arch::")) or path in {
             "libc::clock_gettime", "libc::gettimeofday", "libc::time"
         }
-        classes = {"fs-seam", "boot", "control-thread"} if fs else ({"clock"} if clock else set())
+        container = code == "disallowed_types" and path in CONTAINER_PATHS
+        classes = ({"fs-seam", "boot", "control-thread"} if fs else
+                   {"clock"} if clock else {"container"} if container else set())
         for span in d["spans"]:
             file, line = span["file_name"], span["line_start"]
             if Path(file).is_absolute() and Path(file).is_relative_to(Path.cwd()):
@@ -326,6 +466,8 @@ if diagnostics:
             if not span.get("is_primary") or not any(Path(file).is_relative_to(root) for root in CELL_DIRS):
                 continue
             resolved.add((file, line, code, path))
+            if container:
+                container_spans.add((file, line, span["column_start"]))
             in_build.add(code)
             if not any(file == f and first <= line <= last and code in lints and cls in classes
                        for f, first, last, lints, cls in api_sites):
@@ -337,6 +479,45 @@ if diagnostics:
     if not resolved:
         errors.append("API audit saw no resolved call; a missing force-warn carrier is not a clean audit")
     print(f"API call-class audit: {len(resolved)} resolved production sites, {completed} completed builds")
+
+# ---- ADR-0163 D2: the container census. A `container:` allow covers the
+# distinct primary spans (file, line, column) of the three paths inside its
+# item; a span inside two allowed items belongs to the narrower. A file this
+# host does not compile (a `mod` under another `target_os`) is counted from
+# its text instead, and disclosed.
+census, text_counted = {}, {}
+if diagnostics:
+    for f, _, _, key, _, _ in container_sites:
+        census[(f, key)] = 0
+    spans_of = {}
+    for f, line, column in container_spans:
+        spans_of.setdefault(f, set()).add((line, column))
+    for f in sorted({site[0] for site in container_sites}):
+        gate_os = host_gated(f)
+        if gate_os and gate_os != HOST_OS:
+            text_counted[f] = gate_os
+            spans_of[f] = set()
+            for _, first, last, _, _, _ in (s for s in container_sites if s[0] == f):
+                spans_of[f] |= container_names(production_lines(f), first, last)
+    for f, spans in spans_of.items():
+        sites = [s for s in container_sites if s[0] == f]
+        for line, _ in spans:
+            holders = [s for s in sites if s[1] <= line <= s[2]]
+            if holders:
+                census[(f, min(holders, key=lambda s: s[2] - s[1])[3])] += 1
+if CENSUS:
+    if not diagnostics:
+        print("LINT-SCOPES SCOPE ERROR: the container census needs the ratchet's passes")
+        sys.exit(1)
+    record_of = {(s[0], s[3]): s[4] for s in container_sites}
+    rows = [(f, key, n, record_of[(f, key)]) for (f, key), n in sorted(census.items())
+            if record_of[(f, key)] != BACKING]
+    for row in rows:
+        print("\t".join(str(col) for col in row))
+    gated = "".join(f"; {f} counted from its text (compiled only on {os_name})"
+                    for f, os_name in sorted(text_counted.items()))
+    print(f"# container census: {len(rows)} rows, sum {sum(r[2] for r in rows)}{gated}")
+    sys.exit(0)
 
 # ---- D1: the frozen exemption table
 if not Path(EXEMPTIONS).is_file():
@@ -388,12 +569,151 @@ for label, ref in copies:
         if row not in approved and was not in approved:
             errors.append(f"{EXEMPTIONS}: row {row[0]} {row[1]} is not in the {label}'s table — the table only shrinks (a renamed file keeps its row once the rename is staged)")
 
+# ---- ADR-0163 D2: the container exemption table.
+# Columns: file, item, count, record, expiry. The first four are the
+# census's; the expiry is assigned by hand and only moves earlier.
+DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+GATE_MAX = re.compile(r"^CONTAINER_EXEMPTIONS_MAX=([0-9]+)[ \t]*$", re.M)
+
+
+def container_rows(text, label):
+    rows = {}
+    for n, line in enumerate(text.split("\n"), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        at = f"{label}:{n}"
+        if len(cols) != 5 or not all(cols):
+            errors.append(f"{at}: malformed row (file<TAB>item<TAB>count<TAB>record<TAB>expiry)")
+            continue
+        file, item, count, record, expiry = cols
+        if not re.fullmatch(r"[1-9][0-9]*", count):
+            errors.append(f"{at}: count `{count}` is not a positive integer")
+            continue
+        if record not in RECORDS:
+            errors.append(f"{at}: record `{record}` is not a site record ({' '.join(RECORDS)})")
+            continue
+        try:
+            due = datetime.date.fromisoformat(expiry) if DATE.match(expiry) else None
+        except ValueError:
+            due = None
+        if due is None:
+            errors.append(f"{at}: expiry `{expiry}` is not a date (YYYY-MM-DD)")
+            continue
+        if (file, item) in rows:
+            errors.append(f"{at}: {file} `{item}` is listed twice")
+            continue
+        rows[(file, item)] = (int(count), record, due)
+    return rows
+
+
+if not Path(CONTAINERS).is_file():
+    print(f"LINT-SCOPES SCOPE ERROR: {CONTAINERS} is missing")
+    sys.exit(1)
+crows = container_rows(Path(CONTAINERS).read_text(), CONTAINERS)
+backing = [s for s in container_sites if s[4] == BACKING]
+if len(backing) != BACKING_SITES:
+    where = ", ".join(s[5] for s in backing) or "none"
+    errors.append(f"{len(backing)} `container: {BACKING}` allow(s) ({where}); the gate wants exactly "
+                  f"{BACKING_SITES}: the one sanctioned holder's backing (ADR-0151 D6)")
+exempt = [s for s in container_sites if s[4] != BACKING]
+keys = {}
+for f, _, _, key, record, site in exempt:
+    if record not in RECORDS:
+        errors.append(f"{site}: `container: {record}` names no site record ({' '.join(RECORDS)}) "
+                      f"and is not `{BACKING}`")
+    keys.setdefault((f, key), []).append(site)
+for (f, key), sites in sorted(keys.items()):
+    if len(sites) > 1:
+        errors.append(f"{f}: {len(sites)} `container:` allows share the item key `{key}` "
+                      f"({', '.join(sites)}) — the table cannot tell them apart")
+today = datetime.date.today()
+for (f, key), (count, record, due) in sorted(crows.items()):
+    sites = [s for s in exempt if (s[0], s[3]) == (f, key)]
+    if not sites:
+        errors.append(f"{CONTAINERS}: row {f} `{key}` has no `container:` allow — delete it")
+    elif sites[0][4] != record:
+        errors.append(f"{sites[0][5]}: `container: {sites[0][4]}` but its row says record {record}")
+    if due < today:
+        errors.append(f"{CONTAINERS}: row {f} `{key}` expired on {due} — migrate its site")
+    if diagnostics and sites:
+        n = census.get((f, key), 0)
+        if n == 0:
+            errors.append(f"{sites[0][5]}: the allow on `{key}` covers no container — delete it and its row")
+        elif n > count:
+            errors.append(f"{f}: `{key}` holds {n} container span(s), its row says {count} — a container "
+                          "added to an exempt item is red: use a capped type")
+        elif n < count:
+            errors.append(f"{f}: `{key}` holds {n} container span(s), its row says {count} — lower the row to {n}")
+for f, _, _, key, record, site in exempt:
+    if (f, key) not in crows:
+        errors.append(f"{site}: `container: {record}` allow on `{key}` has no row in {CONTAINERS} — "
+                      "new exemptions are closed")
+csum = sum(count for count, _, _ in crows.values())
+if csum > CONTAINER_MAX:
+    errors.append(f"{CONTAINERS}: counts sum to {csum}, above CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX}")
+
+# approved copies: per file and record the counts only shrink, a pair the
+# copy lacks is red, a date only moves earlier, the maximum only falls. A
+# copy whose gate has no CONTAINER_EXEMPTIONS_MAX predates the container gate
+# (bootstrap); one whose gate has it and no table is red.
+cintro = git("log", "--diff-filter=A", "--format=%H", "--", CONTAINERS).stdout.split()
+ccopies = [("HEAD", "HEAD"), ("base tip", BASE_REF)] + ([("introducing commit", cintro[-1])] if cintro else [])
+csums = {}
+for (f, _), (count, record, _) in crows.items():
+    csums[(f, record)] = csums.get((f, record), 0) + count
+for label, ref in ccopies:
+    if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").returncode != 0:
+        continue  # an unresolvable base tip is already a scope error above
+    gate = git("show", f"{ref}:{SELF}")
+    copy_max = GATE_MAX.search(gate.stdout) if gate.returncode == 0 else None
+    if not copy_max:
+        notes.append(f"{label} predates the container gate (bootstrap)")
+        continue
+    if CONTAINER_MAX > int(copy_max.group(1)):
+        errors.append(f"CONTAINER_EXEMPTIONS_MAX = {CONTAINER_MAX} is above the {label}'s "
+                      f"{copy_max.group(1)} — only a lower number may replace it")
+    shown = git("show", f"{ref}:{CONTAINERS}")
+    if shown.returncode != 0:
+        errors.append(f"{label} ({ref}) has the container gate and no {CONTAINERS} — a deleted table "
+                      "is not a bootstrap")
+        continue
+    approved = container_rows(shown.stdout, f"{label}:{CONTAINERS}")
+    renames = {}
+    for line in git("diff", "--name-status", "-M", ref, "--").stdout.split("\n"):
+        cols = line.split("\t")
+        if len(cols) == 3 and cols[0].startswith("R"):
+            renames[cols[2]] = cols[1]
+    approved_sums, approved_dates = {}, {}
+    for (f, key), (count, record, due) in approved.items():
+        approved_sums[(f, record)] = approved_sums.get((f, record), 0) + count
+        approved_dates[(f, key, record)] = due
+        approved_dates[(f, "", record)] = max(due, approved_dates.get((f, "", record), due))
+    for (f, record), n in sorted(csums.items()):
+        was = approved_sums.get((renames.get(f, f), record))
+        if was is None:
+            errors.append(f"{CONTAINERS}: {f} has record {record} rows and the {label}'s table has none — "
+                          "an exemption never moves to a new file or record")
+        elif n > was:
+            errors.append(f"{CONTAINERS}: {f} record {record} counts sum to {n}, above the {label}'s {was} — "
+                          "the table only shrinks")
+    for (f, key), (_, record, due) in sorted(crows.items()):
+        old = renames.get(f, f)
+        was = approved_dates.get((old, key, record), approved_dates.get((old, "", record)))
+        if was is not None and due > was:
+            errors.append(f"{CONTAINERS}: row {f} `{key}` expiry {due} is later than the {label}'s {was} — "
+                          "a date only moves earlier")
+
 if errors:
     for e in errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
 scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted"
+scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
+          f"{len(backing)}/{BACKING_SITES} capped-backing, "
+          + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass"))
+scope += "".join(f"; {f} counted from its text (compiled only on {os_name})" for f, os_name in sorted(text_counted.items()))
 if notes:
     scope += "; " + "; ".join(notes)
 print(f"lint-scopes OK: {scope}")

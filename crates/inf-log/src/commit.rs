@@ -100,6 +100,7 @@
 //! at the queue; frames are found by ordinal arithmetic, never a scan.
 
 use core::fmt;
+#[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
 
 use inf_foundation::LogHistogram;
@@ -298,6 +299,7 @@ struct PendingFsync<File> {
 /// The group-commit engine of one cell. Single-threaded by design (L1);
 /// time is injected (`now` parameters — L7); generic over the segment-file
 /// tier only to hold [`SealHandoff`]s until their sync completes.
+#[allow(clippy::disallowed_types, reason = "container: T")]
 pub struct GroupCommit<File> {
     /// An fsync is due this iteration (everysec tick fired, or `always`
     /// traffic staged). Cleared by the registration that covers it.
@@ -394,6 +396,7 @@ impl<File: SegmentFile> GroupCommit<File> {
     /// Outside `1..=2` — the pipeline is bounded by construction, never a
     /// queue.
     #[must_use]
+    #[allow(clippy::disallowed_types, reason = "container: T")]
     pub fn with_flush_bound(bound: usize) -> GroupCommit<File> {
         assert!((1..=2).contains(&bound), "FLUSH-class bound is 1 or 2, never a queue");
         GroupCommit {

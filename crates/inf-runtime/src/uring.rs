@@ -33,6 +33,7 @@
 //! Conformance suite green on Linux 7.0 in probed and `INF_URING_FORCE_DEGRADED`
 //! modes (2026-06-11); kernel-matrix CI legs and reference-box performance.
 
+#[allow(clippy::disallowed_types, reason = "container: D")]
 use std::collections::{HashMap, VecDeque};
 use std::io;
 
@@ -171,6 +172,7 @@ struct CloseWait {
 }
 
 /// io_uring [`BackendDriver`]. See module docs.
+#[allow(clippy::disallowed_types, reason = "container: D")]
 pub struct UringDriver {
     ring: IoUring,
     caps: Capabilities,
@@ -229,6 +231,7 @@ impl UringDriver {
     ///
     /// # Errors
     /// Only if no io_uring at all can be created (kernel too old, seccomp).
+    #[allow(clippy::disallowed_types, reason = "container: D")]
     pub fn new(entries: u32) -> io::Result<UringDriver> {
         let force_degraded = std::env::var_os("INF_URING_FORCE_DEGRADED").is_some();
 
@@ -1107,6 +1110,7 @@ impl UringDriver {
     /// `arm` is the recv arm only when the CQE's op is the one it names; a
     /// predecessor's stream on a recycled number delivers its payload but
     /// never pauses the successor's arm.
+    #[allow(clippy::disallowed_types, reason = "container: D")]
     fn handle_recv_payload(
         provided: &mut HashMap<u16, BufferId, BuildIntHasher>,
         arm: Option<&mut RecvArm>,

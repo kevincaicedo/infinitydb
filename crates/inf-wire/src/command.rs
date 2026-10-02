@@ -610,6 +610,7 @@ pub fn arity_ok(meta: &CommandMeta, argc: usize) -> bool {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     use super::*;

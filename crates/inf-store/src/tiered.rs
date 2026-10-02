@@ -23,6 +23,7 @@ pub mod compact;
 pub mod promote;
 pub mod shadow;
 
+#[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::{HashMap, VecDeque};
 
 use inf_foundation::{BuildIntHasher, KeyHasher, LogicalAddr};
@@ -103,6 +104,7 @@ impl<'a> RecordParts<'a> {
 const NO_MARK_PAGE: u64 = u64::MAX;
 
 /// One durable-tiered namespace's record table on one cell (L1).
+#[allow(clippy::disallowed_types, reason = "container: R")]
 pub struct TieredTable {
     /// The key hash's secret (ADR-0094) — the node's one value, injected.
     hasher: KeyHasher,
@@ -255,6 +257,7 @@ pub struct FlushSliceOutcome {
 impl TieredTable {
     /// `None` when the ring reservation fails (namespace creation surfaces
     /// it typed).
+    #[allow(clippy::disallowed_types, reason = "container: R")]
     pub fn new(
         config: AddressSpaceConfig,
         demote: DemotionConfig,

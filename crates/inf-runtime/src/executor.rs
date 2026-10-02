@@ -27,6 +27,7 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::alloc::{alloc, dealloc, handle_alloc_error};
+#[allow(clippy::disallowed_types, reason = "container: E")]
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -67,6 +68,7 @@ enum TaskState {
 }
 
 /// Per-task shared state. Wakers are `Rc<TaskHeader>` behind a raw vtable.
+#[allow(clippy::disallowed_types, reason = "container: E")]
 struct TaskHeader {
     state: Cell<TaskState>,
     slot: Cell<u32>,
@@ -252,6 +254,7 @@ struct TaskEntry {
 }
 
 /// Single-threaded task executor for one cell. See module docs.
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct CellExecutor {
     entries: Vec<Option<TaskEntry>>,
     free: Vec<u32>,
@@ -268,6 +271,7 @@ impl CellExecutor {
     /// `capacity` reserves slab and queue space up front; the slab may still
     /// grow beyond it at M0 (a hard cap with backpressure arrives with the
     /// connection budget work).
+    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(capacity: usize) -> CellExecutor {
         CellExecutor {
             entries: Vec::with_capacity(capacity),

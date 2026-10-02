@@ -2074,6 +2074,7 @@ pub fn stall_request(argv: &[&[u8]]) -> Option<Nanos> {
     Some(Nanos((secs * 1e9) as u64))
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     use super::*;

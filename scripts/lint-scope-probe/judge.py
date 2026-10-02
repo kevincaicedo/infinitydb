@@ -42,15 +42,14 @@ def container(path):
 
 
 cfg = tomllib.loads(config.read_text())
-# (config key, lint, family, its name, the exact count or None). The container
-# family's count is whatever the config holds: every entry needs a plant and
-# every plant an entry, in the shipped probe and under a fixture config alike.
+# (config key, lint, family, its name, the exact count): every entry needs a
+# plant naming its path and every plant an entry (ADR-0144 D5, ADR-0163 D2).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
-          ("disallowed-types", "disallowed_types", container, "container", None))
+          ("disallowed-types", "disallowed_types", container, "container", 3))
 for key, lint, family, label, count in CENSUS:
     paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
-    if (count is not None and len(paths) != count) or len(set(paths)) != len(paths):
+    if len(paths) != count or len(set(paths)) != len(paths):
         errors.append(f"config needs {count} distinct {label} {key}, found {len(paths)}")
     witnesses = {path for code, path in plants.values()
                  if code == f"clippy::{lint}" and path and family(path)}
@@ -110,8 +109,8 @@ for at in sorted(controls):
 for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
-if len(plants) < 52:  # nine decoder/enum plants, 41 stable APIs, two alias/UFCS bypasses
-    errors.append(f"{len(plants)} plants; expected at least 52")
+if len(plants) < 63:  # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers
+    errors.append(f"{len(plants)} plants; expected at least 63")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -179,6 +178,7 @@ if errors:
         print(f"LINT-SCOPES violation: {error}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
-      f"{len(controls)} clean controls; 36 stable filesystem methods and five types covered")
+      f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types and "
+      "three containers covered")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

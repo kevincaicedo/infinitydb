@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M0-S14/S15 AC: CellStore vs an in-memory reference model — random op
 //! sequences over a small hot keyspace with TTLs and a virtual clock must
 //! agree on every reply, and memory accounting must reconcile to zero after

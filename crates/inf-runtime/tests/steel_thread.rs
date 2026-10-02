@@ -1,4 +1,8 @@
 #![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
+#![allow(
     clippy::disallowed_methods,
     reason = "test target: harness deadlines and timings, not cell code"
 )]

@@ -34,6 +34,7 @@
 //! Memory-mode namespaces have **no** `AddressSpace` (ADR-0051): the
 //! degenerate case is the absence of this object, not a branch inside it.
 
+#[allow(clippy::disallowed_types, reason = "container: R")]
 use std::collections::VecDeque;
 
 use inf_alloc::{Region, RegionConfig};
@@ -160,6 +161,7 @@ pub struct AddressSpaceReport {
 /// One namespace's logical address space on one cell (L1: single owner,
 /// no shared state — `Region` holds a raw pointer, so this is `!Send` by
 /// construction).
+#[allow(clippy::disallowed_types, reason = "container: R")]
 pub struct AddressSpace {
     region: Region,
     /// `R − 1` — the resolve mask (ADR-0052 D1).
@@ -227,6 +229,7 @@ impl AddressSpace {
     /// # Panics
     /// Panics on config violations (non-power-of-two ring, ring smaller
     /// than four pages) — programmer errors.
+    #[allow(clippy::disallowed_types, reason = "container: R")]
     pub fn new(config: AddressSpaceConfig) -> Option<AddressSpace> {
         assert!(config.reserve_bytes.is_power_of_two(), "ring must be a power of two");
         assert!(config.reserve_bytes >= 4 * config.page_bytes, "ring smaller than four pages");

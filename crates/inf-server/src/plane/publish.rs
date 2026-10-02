@@ -12,6 +12,7 @@ use super::*;
 /// anywhere reaches it. PUBLISH routes to the channel's owner; PUBSUB is an
 /// introspection program over the owner views.
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column pubsub")]
+#[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) async fn dispatch_pubsub<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,

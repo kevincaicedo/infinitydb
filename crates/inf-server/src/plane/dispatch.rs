@@ -111,6 +111,7 @@ enum FastDispatch {
 /// fabric-credit exhaustion. Guard order mirrors `dispatch_one`'s match
 /// arms exactly; every other shape falls back to it
 /// (`deasync_dispatch_matches_pump_semantics` pins the equivalence).
+#[allow(clippy::disallowed_types, reason = "container: A")]
 fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
@@ -250,6 +251,7 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 /// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
 /// order. Suspends only on the front reply's gate and on fabric credits;
 /// out-of-order completions park in the gate until their turn.
+#[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     key: ConnKey,
@@ -486,6 +488,7 @@ fn is_ns_ddl_sub(sub: Option<&[u8]>) -> bool {
 /// per key; RENAME/RENAMENX/COPY across two owners and keyspace-wide
 /// commands run as inline fabric programs (M1-S02). Returns `false` when
 /// the connection is gone.
+#[allow(clippy::disallowed_types, reason = "container: A")]
 async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
@@ -1025,6 +1028,7 @@ fn unavailable_default_reply(proto: Protocol) -> Vec<u8> {
 /// and the de-async fast path (ADR-0030 D4). Returns `false` when the
 /// connection is gone.
 #[allow(clippy::too_many_arguments)] // internal dispatch funnel
+#[allow(clippy::disallowed_types, reason = "container: A")]
 fn dispatch_mirror<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,

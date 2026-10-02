@@ -13,6 +13,11 @@ disallowed-types = [
     { path = "std::fs::ReadDir", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
     { path = "std::fs::DirEntry", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
     { path = "std::fs::DirBuilder", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    # ADR-0163 D2: a cell site not migrated yet holds a `container: <record>`
+    # allow counted by docs/container-exemptions.tsv, which only shrinks.
+    { path = "std::collections::HashMap", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
+    { path = "std::collections::HashSet", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
+    { path = "std::collections::VecDeque", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
 ]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },

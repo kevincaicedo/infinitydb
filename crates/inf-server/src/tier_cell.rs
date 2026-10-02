@@ -22,6 +22,7 @@
 //! iteration into `IoOp::TierRead`, and complete through the custody
 //! table.
 
+#[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -80,6 +81,7 @@ const EXTENT_RECLAIM_PER_SLICE: usize = 8;
 const UNLINKS_PER_SLICE: usize = 8;
 
 /// One tiered namespace's plane-side state.
+#[allow(clippy::disallowed_types, reason = "container: T")]
 pub(crate) struct TierNs<F: SegmentFs> {
     pub ns: NsId,
     pub flush: TierFlush<F>,
@@ -488,6 +490,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "container: T")]
     fn create_ns(&mut self, ns: NsId, spec: &TierSpec) {
         if self.cold.is_none() {
             let qd = usize::from(spec.cold_read_qd);

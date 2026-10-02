@@ -19,7 +19,9 @@
 //! over unread bytes with RST, and the consumer that stopped reading owes
 //! its peer a FIN (lane L11 N19, ADR-0124 D2).
 
+#[allow(clippy::disallowed_types, reason = "container: D")]
 use std::collections::HashMap;
+#[allow(clippy::disallowed_types, reason = "container: D")]
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -55,6 +57,7 @@ struct PendingSend {
 /// them (or its `EV_ADD` queued). The entry lives exactly as long as the
 /// filter: a drained queue removes both.
 #[derive(Default)]
+#[allow(clippy::disallowed_types, reason = "container: D")]
 struct SendQueue {
     pending: VecDeque<PendingSend>,
     armed: bool,
@@ -70,6 +73,7 @@ struct AcceptState {
 }
 
 /// kqueue-backed [`BackendDriver`]. See module docs for tier caveats.
+#[allow(clippy::disallowed_types, reason = "container: D")]
 pub struct KqueueDriver {
     kq: RawFd,
     pending_ops: Vec<IoOp>,
@@ -85,6 +89,7 @@ pub struct KqueueDriver {
 impl KqueueDriver {
     /// # Errors
     /// Fails only if the kernel refuses a kqueue (fd exhaustion).
+    #[allow(clippy::disallowed_types, reason = "container: D")]
     pub fn new() -> io::Result<KqueueDriver> {
         // SAFETY: plain syscall, no pointers.
         let kq = unsafe { libc::kqueue() };
@@ -563,6 +568,7 @@ impl core::fmt::Debug for KqueueDriver {
 /// Write the queue head(s) until drained, blocked, or errored. Returns
 /// whether the queue is now empty. A hard error fails the queue whole (a
 /// broken stream cannot carry later sends).
+#[allow(clippy::disallowed_types, reason = "container: D")]
 fn drain_sends(
     fd: RawFd,
     queue: &mut VecDeque<PendingSend>,
@@ -604,6 +610,7 @@ fn drain_sends(
 
 /// Terminal failure of a whole queue: the head with `errno`, the rest
 /// `ECANCELED` — every buffer returned (the contract's "ALWAYS").
+#[allow(clippy::disallowed_types, reason = "container: D")]
 fn fail_queue(queue: VecDeque<PendingSend>, errno: i32, out: &mut Vec<Completion>) {
     let mut errno = errno;
     for p in queue {

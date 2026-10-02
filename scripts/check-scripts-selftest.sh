@@ -1429,6 +1429,7 @@ ls_scopes() {
     mkdir -p "$1/crates/fake/fuzz/fuzz_targets" "$1/docs"
     printf '// fuzz\n' >"$1/crates/fake/fuzz/fuzz_targets/t.rs"
     printf 'fake/t\tnone: the fixture target enters no decoder\t-\t-\n' >"$1/docs/lint-scopes.tsv"
+    printf '# file\titem\tcount\trecord\texpiry\n' >"$1/docs/container-exemptions.tsv"
 }
 ls_root() {
     local root="$work/$1"
@@ -1691,6 +1692,263 @@ git -C "$root" branch -q -f base-tip HEAD
 git -C "$root" rm -q -f docs/lint-exemptions.tsv
 expect red "lint-scopes: a table deleted from under the gate is not a bootstrap" ls_run "$root"
 
+# ADR-0163 D2: the container exemption table. The fixture's compiler output
+# is synthesized from its source (one `disallowed_types` span per banned
+# name outside comments, in two completed builds), so these cases judge the
+# table; the probe below proves clippy's own spans. Each red names its cause.
+LC_MAX=$(sed -n 's/^CONTAINER_EXEMPTIONS_MAX=\([0-9][0-9]*\)$/\1/p' "$LINTSCOPES")
+[ -n "$LC_MAX" ] || { echo "selftest: no CONTAINER_EXEMPTIONS_MAX in $LINTSCOPES" >&2; exit 2; }
+LC_A=crates/fake/src/a.rs
+LC_T=docs/container-exemptions.tsv
+lc_diag() {
+    python3 - "$1" <<'PY'
+import json, re, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+rows = []
+for _ in range(2):
+    for f in sorted((root / "crates").rglob("*.rs")):
+        if f.name == "gated.rs":  # a module this host does not compile
+            continue
+        rel = f.relative_to(root).as_posix()
+        for n, line in enumerate(f.read_text().split("\n"), 1):
+            for m in re.finditer(r"\b(HashMap|HashSet|VecDeque)\b", line.split("//", 1)[0]):
+                rows.append({"reason": "compiler-message", "message": {
+                    "code": {"code": "clippy::disallowed_types"},
+                    "message": f"use of a disallowed type `std::collections::{m.group(1)}`",
+                    "spans": [{"is_primary": True, "file_name": rel, "line_start": n,
+                               "column_start": m.start() + 1}]}})
+    rows.append({"reason": "build-finished", "success": True})
+(root / "api.json").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+PY
+}
+lc_run() {
+    lc_diag "$1"
+    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" "$LINTSCOPES"
+}
+lc_census() {
+    lc_diag "$1"
+    env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_API_DIAGNOSTICS="$1/api.json" \
+        INF_CONTAINER_CENSUS=1 "$LINTSCOPES"
+}
+lc_row() { printf '%s\t%s\t%s\t%s\t%s\n' "$@" >>"$root/$LC_T"; }
+lc_table() {
+    printf '# file\titem\tcount\trecord\texpiry\n' >"$root/$LC_T"
+    lc_row "$LC_A" 'use std::collections::{…}' 2 T 2099-12-31
+    lc_row "$LC_A" 'struct Exempt' 1 T 2099-12-31
+    lc_row "$LC_A" 'fn Owner::build' 2 E 2099-12-31
+}
+lc_source() {
+    printf '%s\n' \
+        '#[allow(clippy::disallowed_types, reason = "container: T")]' \
+        'use std::collections::{HashMap, VecDeque};' \
+        '' \
+        '#[allow(clippy::disallowed_types, reason = "container: T")]' \
+        'pub struct Exempt {' \
+        '    pub queue: VecDeque<u8>,' \
+        '}' \
+        '' \
+        'pub struct Owner;' \
+        '' \
+        'impl Owner {' \
+        '    #[allow(clippy::disallowed_types, reason = "container: E")]' \
+        '    pub fn build() -> usize {' \
+        '        let map: HashMap<u8, u8> = HashMap::new();' \
+        '        map.len()' \
+        '    }' \
+        '}' >"$root/$LC_A"
+}
+lc_append() { printf '%s\n' "$@" >>"$root/$LC_A"; }
+lc_edit() { sed -i.bak "$1" "$root/$2" && rm -f "$root/$2.bak"; }
+lc_reset() {
+    git -C "$root" reset -q --hard HEAD && git -C "$root" clean -fdq
+    for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
+        mkdir -p "$root/${entry%%|*}"  # git keeps no empty directory
+    done
+}
+root=$(ls_root ls-containers)
+printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
+printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$LC_MAX" >"$root/scripts/check-lint-scopes.sh"
+lc_source
+lc_table
+ls_commit "$root" containers
+git -C "$root" branch -q -f base-tip HEAD
+expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
+expect_output "lint-scopes: containers — the census prints file, item, count, record" \
+    "$(printf 'fn Owner::build\t2\tE')" lc_census "$root"
+expect_output "lint-scopes: containers — the OK line discloses the table" \
+    "container exemptions: 3 row(s), counts 5/$LC_MAX, 0/0 capped-backing" lc_run "$root"
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n    pub second: HashMap<u8, u8>,|' "$LC_A"
+expect_red_because "lint-scopes: containers — a second HashMap field in an exempt struct" \
+    "\`struct Exempt\` holds 2 container span(s), its row says 1" lc_run "$root"
+lc_edit 's|^\(crates/fake/src/a.rs.struct Exempt.\)1|\12|' "$LC_T"
+expect_red_because "lint-scopes: containers — raising the row with it is red against HEAD" \
+    "record T counts sum to 4, above the HEAD's 3" lc_run "$root"
+lc_reset
+lc_edit 's|        map.len()|        let more: VecDeque<u8> = VecDeque::new();\n        map.len()|' "$LC_A"
+expect_red_because "lint-scopes: containers — a second deque local in an exempt fn" \
+    "\`fn Owner::build\` holds 4 container span(s), its row says 2" lc_run "$root"
+lc_reset
+lc_edit 's|use std::collections::{HashMap, VecDeque};|use std::collections::{HashMap, HashSet, VecDeque};|' "$LC_A"
+expect_red_because "lint-scopes: containers — a third path on an exempt use" \
+    "holds 3 container span(s), its row says 2" lc_run "$root"
+lc_reset
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: (VecDeque<u8>, VecDeque<u8>),|' "$LC_A"
+expect_red_because "lint-scopes: containers — a second container on a line that holds one" \
+    "\`struct Exempt\` holds 2 container span(s), its row says 1" lc_run "$root"
+lc_reset
+lc_append '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub struct Fresh {' \
+    '    pub queue: VecDeque<u8>,' '}'
+expect_red_because "lint-scopes: containers — an allow with no row" \
+    "allow on \`struct Fresh\` has no row in $LC_T" lc_run "$root"
+lc_row "$LC_A" 'struct Fresh' 1 T 2099-12-31
+expect_red_because "lint-scopes: containers — a file and record sum above an approved copy's" \
+    "record T counts sum to 4, above the HEAD's 3" lc_run "$root"
+lc_reset
+lc_append 'pub struct Bare {' '    pub queue: VecDeque<u8>,' '}'
+expect_red_because "lint-scopes: containers — a new container with no allow" \
+    "std::collections::VecDeque lacks a narrow allow of its own API class" lc_run "$root"
+lc_reset
+lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
+expect_red_because "lint-scopes: containers — a row with no allow" \
+    "row $LC_A \`struct Exempt\` has no \`container:\` allow" lc_run "$root"
+lc_reset
+lc_append 'pub trait Build {' '    fn build() -> usize;' '}' 'impl Build for Owner {' \
+    '    #[allow(clippy::disallowed_types, reason = "container: E")]' '    fn build() -> usize {' \
+    '        let set: std::collections::HashSet<u8> = Default::default();' '        set.len()' '    }' '}'
+expect_red_because "lint-scopes: containers — two allows in one file with one key" \
+    "2 \`container:\` allows share the item key \`fn Owner::build\`" lc_run "$root"
+lc_reset
+lc_edit 's|reason = "container: E"|reason = "container: M"|' "$LC_A"
+lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t2\tM\t|' "$LC_T"
+expect_red_because "lint-scopes: containers — a file and record pair the copy lacks" \
+    "has record M rows and the HEAD's table has none" lc_run "$root"
+lc_reset
+lc_edit 's|reason = "container: E"|reason = "container: X"|' "$LC_A"
+lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t2\tX\t|' "$LC_T"
+expect_red_because "lint-scopes: containers — an unknown record letter" \
+    "record \`X\` is not a site record" lc_run "$root"
+lc_reset
+lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2000-01-01|' "$LC_T"
+expect_red_because "lint-scopes: containers — an expired row" \
+    "\`struct Exempt\` expired on 2000-01-01" lc_run "$root"
+lc_reset
+lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2100-01-01|' "$LC_T"
+expect_red_because "lint-scopes: containers — a date moved later" \
+    "a date only moves earlier" lc_run "$root"
+lc_reset
+lc_edit 's|\tstruct Exempt\t1\tT\t2099-12-31|\tstruct Exempt\t1\tT\t2099-01-01|' "$LC_T"
+expect green "lint-scopes: containers — a date moved earlier (control)" lc_run "$root"
+lc_reset
+printf '# gate\nCONTAINER_EXEMPTIONS_MAX=%s\n' "$((LC_MAX - 1))" >"$root/scripts/check-lint-scopes.sh"
+ls_commit "$root" "a lower maximum"
+expect_red_because "lint-scopes: containers — a raised maximum" \
+    "CONTAINER_EXEMPTIONS_MAX = $LC_MAX is above the HEAD's $((LC_MAX - 1))" lc_run "$root"
+git -C "$root" reset -q --hard HEAD~1
+lc_append '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub mod inner {' \
+    '    pub struct Q(pub std::collections::VecDeque<u8>);' '}'
+expect_red_because "lint-scopes: containers — an allow on a mod" \
+    "disallowed_types needs a narrow item, never a module, impl, trait or alias" lc_run "$root"
+lc_reset
+lc_append 'pub struct S;' '#[allow(clippy::disallowed_types, reason = "container: T")]' 'impl S {' \
+    '    pub fn q() -> std::collections::VecDeque<u8> { Default::default() }' '}'
+expect_red_because "lint-scopes: containers — an allow on an impl" \
+    "disallowed_types needs a narrow item, never a module, impl, trait or alias" lc_run "$root"
+lc_reset
+lc_append '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub type Q = VecDeque<u8>;'
+expect_red_because "lint-scopes: containers — an alias under an allow" \
+    "disallowed_types needs a narrow item, never a module, impl, trait or alias" lc_run "$root"
+lc_reset
+lc_append '#[allow(clippy::disallowed_types, reason = "container: capped-backing")]' \
+    'pub struct CappedDeque<T> {' '    inner: VecDeque<T>,' '}'
+expect_red_because "lint-scopes: containers — a capped-backing allow past CAPPED_BACKING_SITES" \
+    "1 \`container: capped-backing\` allow(s)" lc_run "$root"
+lc_reset
+lc_append 'pub const CAP: u32 = Cap::entries("x", 1);'
+expect_red_because "lint-scopes: containers — Cap::entries outside a limits.rs" \
+    "\`Cap::entries\` outside a \`limits.rs\`" lc_run "$root"
+lc_reset
+printf '%s\n' 'pub const CAP: u32 = Cap::entries("x", 1);' >"$root/crates/fake/src/limits.rs"
+expect green "lint-scopes: containers — Cap::entries in a limits.rs (control)" lc_run "$root"
+lc_reset
+lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
+expect_red_because "lint-scopes: containers — fewer than the row" \
+    "\`fn Owner::build\` holds 1 container span(s), its row says 2 — lower the row to 1" lc_run "$root"
+lc_edit 's|\tfn Owner::build\t2\tE\t|\tfn Owner::build\t1\tE\t|' "$LC_T"
+expect green "lint-scopes: containers — a lowered count (control)" lc_run "$root"
+lc_reset
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: Vec<u8>,|' "$LC_A"
+expect_red_because "lint-scopes: containers — an allow that covers no container" \
+    "the allow on \`struct Exempt\` covers no container" lc_run "$root"
+lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
+lc_edit '/\tstruct Exempt\t/d' "$LC_T"
+expect green "lint-scopes: containers — a removed row (control)" lc_run "$root"
+lc_reset
+git -C "$root" mv "$LC_A" crates/fake/src/moved.rs
+lc_edit 's|^crates/fake/src/a.rs\t|crates/fake/src/moved.rs\t|' "$LC_T"
+lc_edit 's|^pub mod a;|pub mod moved;|' crates/fake/src/lib.rs
+git -C "$root" add -A
+expect green "lint-scopes: containers — a renamed file keeps its rows (control)" lc_run "$root"
+lc_reset
+lc_edit 's|pub struct Exempt {|pub struct Kept {|' "$LC_A"
+lc_edit 's|\tstruct Exempt\t|\tstruct Kept\t|' "$LC_T"
+expect green "lint-scopes: containers — a renamed item (control)" lc_run "$root"
+lc_reset
+lc_edit 's|        let map: HashMap<u8, u8> = HashMap::new();|        let map: HashMap<u8, u8> = Default::default();|' "$LC_A"
+lc_append 'impl Exempt {' '    #[allow(clippy::disallowed_types, reason = "container: E")]' \
+    '    pub fn fresh() -> HashMap<u8, u8> {' '        Default::default()' '    }' '}'
+lc_edit 's|\tfn Owner::build\t2\tE\t2099-12-31|\tfn Owner::build\t1\tE\t2099-12-31|' "$LC_T"
+lc_row "$LC_A" 'fn Exempt::fresh' 1 E 2099-12-31
+expect green "lint-scopes: containers — a split item, the same file and record sum (control)" lc_run "$root"
+lc_reset
+mkdir -p "$root/crates/fake/src/two"
+printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub struct Moved {' \
+    '    pub queue: VecDeque<u8>,' '}' >"$root/crates/fake/src/two/other.rs"
+lc_edit '/^#\[allow(clippy::disallowed_types, reason = "container: T")\]$/{N;/pub struct Exempt/s|^[^\n]*\n||;}' "$LC_A"
+lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: Vec<u8>,|' "$LC_A"
+lc_edit '/\tstruct Exempt\t/d' "$LC_T"
+lc_row crates/fake/src/two/other.rs 'struct Moved' 1 T 2099-12-31
+expect_red_because "lint-scopes: containers — an exempt item moved to another file" \
+    "crates/fake/src/two/other.rs has record T rows and the HEAD's table has none" lc_run "$root"
+lc_reset
+printf '%s\n' '#[cfg(target_os = "windows")]' 'mod gated;' >>"$root/crates/fake/src/lib.rs"
+printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: D")]' 'pub struct Gated {' \
+    '    pub map: std::collections::HashMap<u8, u8>,' '}' >"$root/crates/fake/src/gated.rs"
+lc_row crates/fake/src/gated.rs 'struct Gated' 1 D 2099-12-31
+ls_commit "$root" "a host-gated module"
+git -C "$root" branch -q -f base-tip HEAD
+expect_output "lint-scopes: containers — a module this host does not compile is counted from its text" \
+    "crates/fake/src/gated.rs counted from its text (compiled only on windows)" lc_run "$root"
+lc_edit 's|    pub map: std::collections::HashMap<u8, u8>,|    pub map: (std::collections::HashMap<u8, u8>, std::collections::HashSet<u8>),|' \
+    crates/fake/src/gated.rs
+expect_red_because "lint-scopes: containers — the text census sees a second container there" \
+    "\`struct Gated\` holds 2 container span(s), its row says 1" lc_run "$root"
+lc_reset
+git -C "$root" rm -q "$LC_T"
+ls_commit "$root" "the table deleted"
+lc_table
+lc_row crates/fake/src/gated.rs 'struct Gated' 1 D 2099-12-31
+expect_red_because "lint-scopes: containers — the table deleted at a ref whose gate has the maximum" \
+    "has the container gate and no $LC_T — a deleted table is not a bootstrap" lc_run "$root"
+# first landing: every copy predates the container gate (bootstrap) and the
+# maximum alone bounds the sum
+root=$(ls_root ls-containers-first)
+printf '%s\npub mod a;\n' "$LS_ATTR" >"$root/crates/fake/src/lib.rs"
+lc_source
+lc_table
+expect green "lint-scopes: containers — the first landing (no copy has the gate) is the bootstrap" \
+    lc_run "$root"
+expect_output "lint-scopes: containers — the first landing discloses the bootstrap" \
+    "predates the container gate (bootstrap)" lc_run "$root"
+{
+    printf '%s\n' '#[allow(clippy::disallowed_types, reason = "container: T")]' 'pub struct Wide {'
+    for lc_i in $(seq 0 "$LC_MAX"); do printf '    pub f%s: VecDeque<u8>,\n' "$lc_i"; done
+    printf '%s\n' '}'
+} >>"$root/$LC_A"
+lc_row "$LC_A" 'struct Wide' "$((LC_MAX + 1))" T 2099-12-31
+expect_red_because "lint-scopes: containers — until a copy exists the maximum bounds the sum" \
+    "above CONTAINER_EXEMPTIONS_MAX = $LC_MAX" lc_run "$root"
+
 # the probe's judge: a plant that compiles clean, and a plant that fails
 # for an unrelated reason, are both red (ADR-0144 D5's probe rule).
 root=$(ls_root ls-probe)
@@ -1735,38 +1993,26 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-extra"
 cp "$work/probe-unstable-extra/unstable/set_times.rs" "$work/probe-unstable-extra/unstable/extra.rs"
 expect red "lint-scopes: the unstable census cannot grow" ls_probe "$work/probe-unstable-extra"
 
-# ADR-0163 D2: the container plants under a fixture config, the production
-# config plus the three paths the ban adds. Each plant draws its lint naming
-# its path, the backing needs its one allow, and two containers on one line
-# are two spans (the census's unit).
-ls_container_probe() {
-    local dir="$work/$1"
-    cp -R "$SCRIPT_DIR/lint-scope-probe" "$dir"
-    cp "$dir/fixtures/containers.rs" "$dir/src/containers.rs"
-    printf 'pub mod containers;\n' >>"$dir/src/lib.rs"
-    python3 - "$SCRIPT_DIR/../clippy.toml" "$dir/clippy.toml" <<'PY'
-import sys
-text, anchor = open(sys.argv[1]).read(), "disallowed-types = [\n"
-assert text.count(anchor) == 1, "clippy.toml: one disallowed-types table"
-entries = "".join(f'    {{ path = "std::collections::{name}", reason = "fixture" }},\n'
-                  for name in ("HashMap", "HashSet", "VecDeque"))
-open(sys.argv[2], "w").write(text.replace(anchor, anchor + entries, 1))
-PY
-}
-ls_container_probe probe-containers
-expect green "lint-scopes: container plants draw their lint and path under the fixture config" ls_probe "$work/probe-containers"
-ls_container_probe probe-containers-unconfigured
-rm "$work/probe-containers-unconfigured/clippy.toml"
-expect_red_because "lint-scopes: container plants under a config without the paths compile clean" \
-    "did NOT draw clippy::disallowed_types std::collections::VecDeque" ls_probe "$work/probe-containers-unconfigured"
-ls_container_probe probe-containers-backing
+# ADR-0163 D2: the shipped probe's container plants draw their lint naming
+# their path under the production config (the green case above). A config
+# that loses a path, the backing without its one allow, and a two-span plant
+# over a line holding one container are each red for their own reason.
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-unconfigured"
+grep -v 'path = "std::collections::VecDeque"' clippy.toml >"$work/probe-containers-unconfigured/clippy.toml"
+expect_red_because "lint-scopes: a config without one container path" \
+    "config needs 3 distinct container disallowed-types, found 2" ls_probe "$work/probe-containers-unconfigured"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-backing"
 sed -i.bak '/reason = "container: capped-backing"/d' "$work/probe-containers-backing/src/containers.rs"
 expect_red_because "lint-scopes: the backing without its one allow draws on its field" \
     "control drew \[('clippy::disallowed_types', 'std::collections::VecDeque')\]" ls_probe "$work/probe-containers-backing"
-ls_container_probe probe-containers-one-span
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-one-span"
 sed -i.bak 's|(std::collections::VecDeque<u8>, std::collections::VecDeque<u8>)|(std::collections::VecDeque<u8>, u8)|; s|pair.1.capacity()|usize::from(pair.1)|' "$work/probe-containers-one-span/src/containers.rs"
 expect_red_because "lint-scopes: a two-span plant over a line that holds one container" \
     "wants 2 distinct spans of clippy::disallowed_types" ls_probe "$work/probe-containers-one-span"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-new"
+printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}\n' >>"$work/probe-containers-new/src/containers.rs"
+expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
+    "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
 
 # ADR-0164: the parent doc gates state their scope — a standalone checkout
 # skips out loud; a parent whose gates are missing is red, not a skip.

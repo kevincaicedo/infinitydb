@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M1-E2 acceptance shapes: the TTL wheel + budgeted expiry slices.
 //!
 //! - Active expiry works with ZERO reads (the wheel, not the lazy path).

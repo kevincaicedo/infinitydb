@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! Mesh + credit flow control (M0-S09): exact producer-side bounds, credit
 //! return via replies, doorbell signaling, reserved reply headroom, and a
 //! threaded all-to-all smoke (the 10⁷-op DST deadlock battery proper lands
