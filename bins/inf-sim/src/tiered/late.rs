@@ -41,11 +41,12 @@ fn rebuilt_value(tag: u8, i: u64) -> Vec<u8> {
 
 /// Runs phases 7c through 10b in order; `total_keys` is phase 7b's DBSIZE.
 pub(super) fn run(cx: &mut Late<'_>, node: Node, audit: MiniClient, total_keys: u64) -> Verdict {
-    // Phase 7c's shadow rows stand on its pre-cut keys being cold again;
-    // in the replay-above-window class no checkpoint publishes in the run,
-    // so those newest records replay into the window and the rows do not
-    // run (`rebuilt_rows` stays false — disclosed).
-    let (mut node, mut audit) = if cx.scenario.replay_above_window && cx.scenario.shadow {
+    // Phase 7c's rows stand on its pre-cut collision keys being cold when
+    // its writes and its reboot meet them; in the replay-above-window class
+    // no checkpoint publishes in the run, so each reboot replays the whole
+    // log and where those records land is the demotion's, not the row's:
+    // the phase does not run (`rebuilt_rows` stays false — disclosed).
+    let (mut node, mut audit) = if cx.scenario.replay_above_window {
         (node, audit)
     } else {
         phase_7c(cx, node, audit, total_keys)?

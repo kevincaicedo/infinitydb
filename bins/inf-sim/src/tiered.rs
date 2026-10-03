@@ -193,8 +193,9 @@ pub struct TieredScenario {
     /// stale value, or an unattributed fault is a violation. Seeds ≡ 7
     /// (mod 8); `--plant tier-read-eio` forces it.
     pub tier_read_fault: bool,
-    /// The replay-above-window seed class (ADR-0174 D1), seeds ≡ 2 or 3
-    /// (mod 8) — the second with the double cut: no automatic checkpoint
+    /// The replay-above-window seed class (ADR-0174 D1), seeds ≡ 2 or 11
+    /// (mod 16) — the second with the double cut (≡ 3 mod 8), the other
+    /// double-cut seeds staying plain: no automatic checkpoint
     /// runs and phase 2 writes [`REGIME_OPS_FACTOR`] times
     /// its usual volume, so at least one cell's acknowledged tiered
     /// records since the last `begin` exceed its window and the reboot
@@ -238,7 +239,7 @@ impl TieredScenario {
             tier_read_fault: seed % 8 == 7,
             replay_above_window: false,
         };
-        if matches!(seed % 8, 2 | 3) { scenario.with_replay_above_window() } else { scenario }
+        if matches!(seed % 16, 2 | 11) { scenario.with_replay_above_window() } else { scenario }
     }
 
     /// The replay-above-window class's knobs: the interval above any run
