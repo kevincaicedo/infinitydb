@@ -1,5 +1,6 @@
-//! Cold-key window fuzz (FCR-STTIER-01, ADR-0174 D3, L9): the settle
-//! read's `parse` step. `ColdKey::from_window` is the one constructor a
+//! Cold-key window fuzz (ADR-0174 D3: a boot settle keeps or removes a
+//! slot only on a record whose key hashes to the slot's hash; L9): the
+//! settle read's `parse` step. `ColdKey::from_window` is the one constructor a
 //! boot settle answers from, so it is total over arbitrary bytes and
 //! answers `Ok` exactly when the five checks, recomputed here from the
 //! record format alone, hold: the window holds the fixed header, the

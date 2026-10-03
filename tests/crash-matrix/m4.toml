@@ -65,7 +65,8 @@
 #                         append-rewind discipline: nothing claimable
 #                         was dropped, nothing misaligned)
 #   boot-refuses-typed-then-recovers — a boot settle read that fails
-#                         (ADR-0174 D3; DRR FCR-STTIER-01 §2) is the
+#                         (ADR-0174 D3: a settle that cannot read or
+#                         verify its slot refuses the boot) is the
 #                         typed refusal: a DEL whose read failed has
 #                         changed nothing, the boot stops typed, and a
 #                         later boot with the fault cleared recovers
