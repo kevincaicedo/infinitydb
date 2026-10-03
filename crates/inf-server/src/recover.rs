@@ -1058,11 +1058,6 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // Bound: one recovery per tiered namespace of the catalog.
         for (ns, spec) in tiered {
             let named = manifest.and_then(|m| m.tier_ns(ns.0));
-            // The planted canary breaks D4: a namespace no section names
-            // gets no machine and keeps its dead-life files, as before it.
-            if cfg!(inf_canary_replay_no_section_gc) && named.is_none() {
-                continue;
-            }
             let empty =
                 inf_log::manifest::TierNsManifest { ns: ns.0, flushed: 0, files: Vec::new() };
             let section = named.unwrap_or(&empty);

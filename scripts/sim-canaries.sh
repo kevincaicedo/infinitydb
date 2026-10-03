@@ -237,6 +237,11 @@ rows=(
   # dead-life tier files, and the first flush after the boot fails on the
   # existing file (tier creation is `create_new`).
   "inf_canary_replay_no_section_gc crate-test inf-server test:recover_no_section a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the_first_flush AlreadyExists"
+  # The same plant under a power cut of a demoting boot: the cut boot's
+  # files outlive it and the next boot's first demote step refuses on one
+  # (ADR-0174 D5: a crash during a demoting boot changes nothing the next
+  # boot recovers).
+  "inf_canary_replay_no_section_gc crate-test inf-server test:recover_replay_steps a_demoting_boot_cut_at_each_point_once_or_twice_recovers_the_uncut_boot the next boot refused"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

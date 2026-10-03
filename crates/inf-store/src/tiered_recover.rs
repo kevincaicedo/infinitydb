@@ -194,6 +194,12 @@ pub fn recover_tiered_ns<F: SegmentFs>(
             continue;
         }
         let Some(id) = parse_tier_file_name(&name) else { continue };
+        // The planted canary breaks ADR-0174 D4: a namespace recovered
+        // through the empty section keeps its dead-life tier files.
+        let empty_section = tier.flushed == 0 && tier.files.is_empty();
+        if cfg!(inf_canary_replay_no_section_gc) && empty_section {
+            continue;
+        }
         if tier.files.iter().all(|f| f.id != id) {
             fs.remove_file(&cold_dir.join(name))?;
             stats.files_removed += 1;

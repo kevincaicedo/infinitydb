@@ -435,3 +435,137 @@ fn step_under_budget(budget: u64) {
     assert!(ram > 0 && cold > 0, "VACUOUS: {ram} RAM and {cold} cold keys");
     assert_model(&served, &unit.model, &format!("after a boot at a {budget}-byte budget"));
 }
+
+/// Where a power cut lands in a demoting boot (record §6, "power cuts").
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Cut {
+    /// Mid-replay, right after the first demote step made a boot tier file.
+    AfterFirstDemote,
+    /// Inside the end settle with records unsettled: a settle step yielded.
+    InsideSettle,
+    /// After E13's hand-over, before the cell serves: the boot completed.
+    AfterHandOver,
+}
+
+/// What a boot left that a later boot must reproduce exactly: the tiered
+/// table's digest (every slot's address and hash, every RAM record's
+/// bytes), the namespace's tier files by name and bytes, and what every
+/// key of the model serves.
+#[derive(Debug, PartialEq, Eq)]
+struct BootState {
+    table: inf_store::StateDigest,
+    files: Vec<(String, Vec<u8>)>,
+    served: Model,
+}
+
+/// Boots the cell on `disk` under `budget` until `cut` lands, asserting
+/// it landed there, and drops every handle — the process dies; the
+/// caller cuts the power.
+fn boot_cut(disk: &inf_server::SimDisk, cfg: &DurableConfig, budget: u64, cut: Cut) {
+    use inf_server::RecoverPhase;
+    let mut ks = tiered_keyspace();
+    let mut recovery = Recovery::new(disk.clone(), CELL, cfg, anchor(), now());
+    let mut finish_steps = 0u64;
+    let cold = cold_dir(cfg);
+    // Bound: the boot's own steps — every step progresses (above).
+    for _ in 0..1_000_000u64 {
+        let phase = recovery.phase();
+        let progress = recovery.step(&mut ks, budget).expect("a cut boot's step");
+        let landed = match cut {
+            Cut::AfterFirstDemote => {
+                let files = disk.list_dir(&cold).unwrap_or_default();
+                phase == RecoverPhase::Replay
+                    && files.iter().any(|name| parse_tier_file_name(name).is_some())
+                    && recovery.phase() == RecoverPhase::Replay
+            }
+            Cut::InsideSettle => {
+                finish_steps += u64::from(phase == RecoverPhase::Finish);
+                finish_steps >= 3 && recovery.phase() == RecoverPhase::Finish
+            }
+            Cut::AfterHandOver => progress == RecoveryProgress::Complete,
+        };
+        if landed {
+            return;
+        }
+        assert!(
+            progress == RecoveryProgress::Working,
+            "VACUOUS: the boot completed before the cut {cut:?} landed"
+        );
+    }
+    panic!("the boot never reached the cut {cut:?}");
+}
+
+/// Boots the cell on `disk` to the end under `budget` and reads its state.
+fn boot_whole(
+    disk: &inf_server::SimDisk,
+    cfg: &DurableConfig,
+    budget: u64,
+    model: &Model,
+) -> std::io::Result<BootState> {
+    let mut ks = tiered_keyspace();
+    let mut recovery = Recovery::new(disk.clone(), CELL, cfg, anchor(), now());
+    while recovery.step(&mut ks, budget)? == RecoveryProgress::Working {}
+    let (_rotor, stats, _seed) = recovery.finish();
+    assert!(stats.tier_replay.counters.demote_steps > 0, "VACUOUS: the boot did not demote");
+    let table = ks.tiered_store(TIER_NS).expect("tiered").simulation_digest();
+    let cold = cold_dir(cfg);
+    let mut names = disk.list_dir(&cold).expect("cold dir");
+    names.sort();
+    let files = names
+        .into_iter()
+        .map(|name| {
+            let bytes = disk.contents(&cold.join(&name)).expect("a listed file");
+            (name, bytes)
+        })
+        .collect();
+    let (served, _, _) = read_back(disk, cfg, &mut ks, model);
+    Ok(BootState { table, files, served })
+}
+
+/// A demoting boot cut by a power loss — after its first demote step,
+/// inside its end settle, or after its hand-over before the cell serves —
+/// once, or twice in a row, leaves unmanifested tier files the next boot
+/// removes before any flush (ADR-0174 D4, D5); the boot that completes
+/// reproduces the uncut boot of the same unit exactly: the table's digest,
+/// the tier files byte for byte, and every key of the model. Each cut
+/// asserts it landed where it says (`VACUOUS` otherwise), on the
+/// simulated disk, which tears what no barrier covered.
+#[test]
+fn a_demoting_boot_cut_at_each_point_once_or_twice_recovers_the_uncut_boot() {
+    const BUDGET: u64 = 256 << 10;
+    let cfg = step_cfg();
+    let disk = inf_server::SimDisk::new();
+    let unit = write_unit(&disk, &cfg, 3);
+    let uncut = boot_whole(&disk, &cfg, BUDGET, &unit.model).expect("the uncut boot");
+    assert_model(&uncut.served, &unit.model, "the uncut boot");
+    assert!(!uncut.files.is_empty(), "VACUOUS: the uncut boot sealed no tier file");
+    let rows: [&[Cut]; 6] = [
+        &[Cut::AfterFirstDemote],
+        &[Cut::InsideSettle],
+        &[Cut::AfterHandOver],
+        &[Cut::AfterFirstDemote, Cut::InsideSettle],
+        &[Cut::InsideSettle, Cut::AfterHandOver],
+        &[Cut::AfterHandOver, Cut::AfterFirstDemote],
+    ];
+    for (row, cuts) in rows.iter().enumerate() {
+        let disk = inf_server::SimDisk::new();
+        let unit = write_unit(&disk, &cfg, 3);
+        for (i, &cut) in cuts.iter().enumerate() {
+            boot_cut(&disk, &cfg, BUDGET, cut);
+            disk.power_cut(0xC07_5EED ^ ((row as u64) << 8) ^ i as u64);
+        }
+        let state = match boot_whole(&disk, &cfg, BUDGET, &unit.model) {
+            Ok(state) => state,
+            Err(err) => panic!("the cuts {cuts:?}: the next boot refused: {err}"),
+        };
+        assert_model(&state.served, &unit.model, &format!("after the cuts {cuts:?}"));
+        assert!(
+            state.table == uncut.table,
+            "the cuts {cuts:?}: the table differs from the uncut boot's"
+        );
+        assert!(
+            state.files == uncut.files,
+            "the cuts {cuts:?}: the tier files differ from the uncut boot's"
+        );
+    }
+}
