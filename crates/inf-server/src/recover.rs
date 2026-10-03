@@ -272,10 +272,12 @@ pub struct RecoverStats {
 /// What boot replay of the tiered namespaces did on one cell (ADR-0174
 /// D6): the replay machines' counters summed over the cell's recovered
 /// tiered namespaces, D4's dead-life tier files removed, and the largest
-/// boot I/O charge one recovery step took. Every counter but
-/// `counters.markers_skipped` and `dead_life_files_removed` is zero on a
-/// boot that did not demote (the zero set). `INFO persistence` renders
-/// the node fold of these ([`TierReplayStats::fold`]).
+/// boot I/O charge one recovery step took. The zero set — every counter
+/// but `counters.markers_skipped` — is zero on a boot that did not demote;
+/// outside it are the markers skipped, `dead_life_files_removed`, and the
+/// gauge, which also prices the settle reads of ADR-0093's rebuild on any
+/// boot. `INFO persistence` renders the node fold of these
+/// ([`TierReplayStats::fold`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TierReplayStats {
     /// The machines' counters, summed over the cell's namespaces.

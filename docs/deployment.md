@@ -166,8 +166,12 @@ takes longer by about one sequential write of those bytes; a crash during it
 leaves files the next boot removes before it replays again. `INFO
 persistence` reports what the last boot did, summed over the cells, in the
 `recover_node_tier_` lines: the demote steps, the tier bytes written, the
-barriers, the files sealed, the settle reads and the largest step charge.
-They stay zero on a boot whose replay fits every window.
+barriers, the files sealed, the settle reads and the largest step charge
+(the largest over the cells). The demote steps, pads, tier bytes, barriers,
+files sealed, settle reads, settles, verified deletes and blob releases stay
+zero on a boot whose replay fits every window; the largest step charge, the
+markers skipped and the dead-life files removed are outside that set and can
+move on any boot.
 
 ## Configuration
 
