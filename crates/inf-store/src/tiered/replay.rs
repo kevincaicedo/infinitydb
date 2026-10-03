@@ -306,6 +306,9 @@ pub struct TierReplay<F: SegmentFs> {
     twins: Vec<LogicalAddr>,
     /// Scratch: a `DEL`'s verified same-key cold slots, `(address, len)`.
     doomed: Vec<(LogicalAddr, u32)>,
+    /// Scratch: the chained addresses the end of the checkpoint releases,
+    /// in address order (bounded by the origin map's entries).
+    released: Vec<u64>,
     /// Scratch: the key of the record being settled (its RAM bytes may
     /// move under the settle).
     key: Vec<u8>,
@@ -326,6 +329,7 @@ impl<F: SegmentFs> TierReplay<F> {
             work: ReplayWork::default(),
             twins: Vec::new(),
             doomed: Vec::new(),
+            released: Vec::new(),
             key: Vec::with_capacity(crate::record::MAX_KEY_LEN),
         }
     }
@@ -632,16 +636,23 @@ impl<F: SegmentFs> TierReplay<F> {
             return;
         }
         // Bound: one pass over the origin map, once per boot — at most the
-        // refs settled during image load, each a map lookup.
-        let mut released = 0u64;
+        // refs settled during image load, each a map lookup — into the
+        // scratch, sorted: the map's iteration order must not choose the
+        // order the reclaim queue takes the deaths in.
+        self.released.clear();
         for origins in table.reloc_origins.values() {
-            for &(addr, _) in origins {
-                if table.extents.reference_at(addr).is_some() {
-                    table.extents.note_death(addr);
-                    released += 1;
-                }
+            self.released.extend(origins.iter().map(|&(addr, _)| addr));
+        }
+        self.released.sort_unstable();
+        debug_assert!(self.released.windows(2).all(|w| w[0] < w[1]), "no address chained twice");
+        let mut released = 0u64;
+        for &addr in &self.released {
+            if table.extents.reference_at(addr).is_some() {
+                table.extents.note_death(addr);
+                released += 1;
             }
         }
+        self.released.clear();
         self.counters.blob_releases += released;
     }
 
@@ -1195,6 +1206,31 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("8192") && text.contains("4096"), "{text}");
         assert_eq!(table.space().tail(), LogicalAddr::ZERO, "nothing placed");
+    }
+
+    /// The end of the checkpoint releases the settled refs' blob
+    /// references in address order, whatever order the origin map holds
+    /// them in: the reclaim queue takes the deaths in that order.
+    #[test]
+    fn the_end_of_the_checkpoint_releases_blob_references_in_address_order() {
+        let fs = MemFs::new();
+        let mut table = table();
+        let mut replay = machine(&fs);
+        // Three settled refs chained into one survivor, the origin list in
+        // descending address order; each names its own extent.
+        let refs = [(3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
+        for &(addr, extent_id) in &refs {
+            table.extents.register(addr, extent_id, 4096);
+        }
+        let origins: Vec<(u64, u64)> = refs.iter().map(|&(addr, _)| (addr, 1)).collect();
+        table.reloc_origins.insert((7, 1 << 20), origins);
+        replay.end_of_checkpoint(&mut table);
+        assert_eq!(replay.counters().blob_releases, 3);
+        let seeded = table.extents.sweep_seed(&[], &[]);
+        assert!(seeded.is_empty());
+        let order: Vec<u64> =
+            table.extents.reclaim_work(0, 8).iter().map(|c| c.extent_id).collect();
+        assert_eq!(order, vec![10, 20, 30], "released in address order");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file
