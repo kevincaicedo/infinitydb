@@ -170,6 +170,18 @@ pub struct RecoveryScenario {
     pub lives: u64,
     /// Mutations per life phase.
     pub ops_per_phase: u64,
+    /// The seed's class ([`SeedClass::of_seed`], or the one a flag forces).
+    pub class: SeedClass,
+}
+
+/// `m4-recovery`'s seed classes: each seed runs exactly one. The default
+/// rotation is [`SeedClass::of_seed`]; `--replay-above-window` or
+/// `--spec-variant` forces one on any seed, and the two together are an
+/// argument error.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SeedClass {
+    /// The scenario's own spec and op mix, with no fill before a cut.
+    Plain,
     /// The replay-above-window seed class (ADR-0174 D1), one seed in
     /// four: before each cut, tiered writes fill the tail until the bytes
     /// the next boot re-appends reach a multiple of the window, so the
@@ -183,7 +195,7 @@ pub struct RecoveryScenario {
     /// seed; a run in it that never exceeded a window, whose boots never
     /// demoted, or whose two-crash row settled no ref or whose second boot
     /// did not fit, reports `VACUOUS`.
-    pub replay_above_window: bool,
+    ReplayAboveWindow,
     /// The spec-variant seed class (ADR-0174 D2 rule 6), one seed in four,
     /// the variant by seed ([`SpecVariant::of_seed`]): every boot recovers
     /// at a window below its ring, and before each cut the fill
@@ -194,7 +206,29 @@ pub struct RecoveryScenario {
     /// two-crash row. `--spec-variant ring-top|page` forces it on any seed;
     /// a run whose boots placed no pad or made no demote step reports
     /// `VACUOUS`.
-    pub spec_variant: Option<SpecVariant>,
+    SpecVariant(SpecVariant),
+}
+
+impl SeedClass {
+    /// The seed's class in the default rotation: one seed in four each for
+    /// the two fill classes, the rest plain.
+    #[must_use]
+    pub fn of_seed(seed: u64) -> SeedClass {
+        match seed % 4 {
+            1 => SeedClass::ReplayAboveWindow,
+            3 => SeedClass::SpecVariant(SpecVariant::of_seed(seed)),
+            _ => SeedClass::Plain,
+        }
+    }
+
+    /// The variant whose spec the class runs at; `None` runs the
+    /// scenario's own.
+    fn spec_variant(self) -> Option<SpecVariant> {
+        match self {
+            SeedClass::SpecVariant(variant) => Some(variant),
+            SeedClass::Plain | SeedClass::ReplayAboveWindow => None,
+        }
+    }
 }
 
 impl RecoveryScenario {
@@ -210,26 +244,14 @@ impl RecoveryScenario {
             keys: 800,
             lives: 4,
             ops_per_phase: 480,
-            replay_above_window: seed % 4 == 1,
-            spec_variant: (seed % 4 == 3).then(|| SpecVariant::of_seed(seed)),
+            class: SeedClass::of_seed(seed),
         }
     }
 
-    /// The spec-variant class forced on this seed, in place of any other
-    /// class.
+    /// `class` forced on this seed, in place of the rotation's.
     #[must_use]
-    pub fn with_spec_variant(mut self, variant: SpecVariant) -> RecoveryScenario {
-        self.replay_above_window = false;
-        self.spec_variant = Some(variant);
-        self
-    }
-
-    /// The replay-above-window class forced on this seed, at the
-    /// scenario's own spec.
-    #[must_use]
-    pub fn with_replay_above_window(mut self) -> RecoveryScenario {
-        self.replay_above_window = true;
-        self.spec_variant = None;
+    pub fn with_class(mut self, class: SeedClass) -> RecoveryScenario {
+        self.class = class;
         self
     }
 }
@@ -2178,7 +2200,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     let disk = SimDisk::new();
     let shard = PathBuf::from("node/shard-0");
     disk.create_dir_all(&shard).expect("shard dir");
-    let spec = Spec::of(scenario.spec_variant);
+    let spec = Spec::of(scenario.class.spec_variant());
     let mut run = Run {
         spec,
         disk: disk.clone(),
@@ -2277,9 +2299,8 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // tail prefix covered by this checkpoint is truncated only if
         // the publish lands (cut-before-publish keeps it — D7).
         // The class's last life carries the two-crash row: it publishes.
-        let two_crash_life = scenario.replay_above_window
-            && spec.variant.is_none()
-            && life_index + 1 == scenario.lives;
+        let two_crash_life =
+            scenario.class == SeedClass::ReplayAboveWindow && life_index + 1 == scenario.lives;
         let cut_before_publish =
             life_index > 0 && rng.next_u64().is_multiple_of(4) && !two_crash_life;
         let covered = run.tail.len();
@@ -2472,7 +2493,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         } else {
             run.report.cut_before_publish += 1;
         }
-        if scenario.replay_above_window || spec.variant.is_some() {
+        if scenario.class != SeedClass::Plain {
             // The two-crash life's unit lies just above the window, so its
             // boot demotes and the second boot fits the raised one.
             let fixed = two_crash_life.then_some(spec.window() + 16 * PAGE);
@@ -2675,7 +2696,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.trace_hash,
         );
     }
-    if scenario.replay_above_window && spec.variant.is_none() {
+    if scenario.class == SeedClass::ReplayAboveWindow {
         run.two_crash_coda(life, hasher, scenario.seed);
     }
     // The class's engagement, per seed: a life above the window, a boot
@@ -2687,7 +2708,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     // store-tier row is the evidence.
     let replay = run.report.boot_replay;
     let deletes_owed = run.report.replay_unit_windows_max >= 3;
-    if scenario.replay_above_window
+    if scenario.class == SeedClass::ReplayAboveWindow
         && (run.report.replay_above_window_lives == 0
             || run.report.demoting_boots == 0
             || replay.settle_reads == 0

@@ -20,7 +20,7 @@ use inf_sim::{
     CombinedScenario, DurableScenario, Scenario, run_combined_scenario, run_durable_scenario,
     run_scenario,
 };
-use inf_sim::{RecoveryScenario, SpecVariant};
+use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
 
 fn parse_seed(text: &str) -> Result<u64, String> {
     let text = text.trim();
@@ -159,6 +159,19 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // The two flags each force one of m4-recovery's seed classes, which a
+    // seed runs one of: together they are refused, never one dropped.
+    let forced_class = match (replay_above_window, spec_variant) {
+        (true, Some(_)) => {
+            eprintln!(
+                "inf-sim: --replay-above-window and --spec-variant force two seed classes; give \
+                 one"
+            );
+            std::process::exit(2);
+        }
+        (true, None) => Some(SeedClass::ReplayAboveWindow),
+        (false, variant) => variant.map(SeedClass::SpecVariant),
+    };
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
@@ -385,11 +398,8 @@ fn main() {
     if scenario_name == "m4-recovery" {
         let run_one = |seed: u64| {
             let mut scenario = RecoveryScenario::m4_recovery(seed);
-            if replay_above_window {
-                scenario = scenario.with_replay_above_window();
-            }
-            if let Some(variant) = spec_variant {
-                scenario = scenario.with_spec_variant(variant);
+            if let Some(class) = forced_class {
+                scenario = scenario.with_class(class);
             }
             inf_sim::run_recovery_scenario(&scenario)
         };

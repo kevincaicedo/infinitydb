@@ -87,7 +87,7 @@ pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};
 pub use pressure::{PressureReport, PressureScenario, run_pressure_scenario};
 pub use recovery::{
-    RecoveryReport, RecoveryScenario, SealCensus, SpecVariant, run_recovery_scenario,
+    RecoveryReport, RecoveryScenario, SealCensus, SeedClass, SpecVariant, run_recovery_scenario,
 };
 pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
