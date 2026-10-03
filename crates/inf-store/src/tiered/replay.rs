@@ -190,9 +190,11 @@ impl core::fmt::Display for ReplayRefusal {
             ReplayRefusal::End { len } => {
                 write!(f, "no room for {len} bytes: the 48-bit end of the address space")
             }
-            ReplayRefusal::RoomAsks { len, asks } => {
-                write!(f, "room asked {asks} times for {len} bytes (ADR-0174 D2 rule 1 bounds 4)")
-            }
+            ReplayRefusal::RoomAsks { len, asks } => write!(
+                f,
+                "room asked {asks} times for {len} bytes \
+                 (ADR-0174 D2 rule 1 bounds {REPLAY_ROOM_ASKS_MAX})"
+            ),
             ReplayRefusal::NoPipeline { need } => write!(
                 f,
                 "the namespace has no boot pipeline and the record needs {need:?} (ADR-0174 D4)"
