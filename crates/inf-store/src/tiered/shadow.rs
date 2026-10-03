@@ -197,15 +197,15 @@ impl SettleCase {
     /// The boot settle's case, decided once from the slot's address
     /// (ADR-0174 R8): below the life origin a ref — counted, stamped,
     /// chained, no bytes; at or above it a record this boot demoted —
-    /// its exact death, origins inherited. E5, E10 and E12 pass what this
-    /// answers and never pick a variant themselves.
+    /// its exact death, origins inherited. The seal and end settles (R7,
+    /// R10) pass what this answers and never pick a variant themselves.
     pub(super) fn at_boot(cold: LogicalAddr, origin: LogicalAddr, record_len: u32) -> SettleCase {
         if cold >= origin {
             return SettleCase::ThisLife { len: record_len };
         }
         if cfg!(inf_canary_replay_ref_settle_charges) {
-            // The planted canary (DRR FCR-STTIER-01 §6): the ref arm
-            // charges the record's bytes to the recovered file.
+            // The planted canary breaks R8: the ref arm charges the
+            // record's bytes to the recovered file.
             return SettleCase::Exact { len: record_len };
         }
         SettleCase::RefAtBoot
@@ -1096,7 +1096,7 @@ impl TieredTable {
         debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
         let cold = LogicalAddr::from_raw(c).expect("48-bit");
         let own = self.reloc_origins.get(&(hash, c)).map_or(0, Vec::len);
-        // The planted canary (DRR FCR-STTIER-01 §6): a boot's ref settle
+        // The planted canary breaks ADR-0174 R8: a boot's ref settle
         // chains nothing, so the next delete stages no marker for it.
         let dropped = cfg!(inf_canary_replay_origin_drop) && case == SettleCase::RefAtBoot;
         let chains_self = !matches!(case, SettleCase::ThisLife { .. }) && !dropped;

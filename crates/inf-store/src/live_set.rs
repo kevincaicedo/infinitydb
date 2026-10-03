@@ -180,7 +180,7 @@ impl LiveSet {
     /// entry naming no catalog file is legal (a filed-but-unconfirmed
     /// file the manifest did not name) and restores nothing.
     pub fn restore_entry(&mut self, entry: &LiveSetFileEntry) {
-        // The planted canary (DRR FCR-STTIER-01 §6): the `recovered` test
+        // The planted canary breaks ADR-0174 R11: the `recovered` test
         // skipped, so an entry naming a boot file overwrites its counters.
         let unguarded = cfg!(inf_canary_replay_restore_unguarded);
         let Some(file) =

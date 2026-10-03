@@ -458,7 +458,7 @@ pub struct Recovery<F: SegmentFs> {
 
 /// One recovered tiered namespace while replay runs: its boot machine
 /// (the pipeline under the barrier claim rule, the held handles, the
-/// counters — ADR-0174; DRR FCR-STTIER-01 I11) and the extent sweep seed.
+/// counters — ADR-0174 D5) and the extent sweep seed.
 struct RecoveringTierNs<F: SegmentFs> {
     ns: inf_log::NsId,
     replay: inf_store::TierReplay<F>,

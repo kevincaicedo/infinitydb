@@ -1,15 +1,16 @@
-//! Boot replay of one tiered namespace on one cell (ADR-0174; DRR
-//! FCR-STTIER-01 §1): the replay state machine, the demote step that
-//! makes room when the RAM window fills (D2), the settle walk that keeps
-//! a sealed record from leaving a same-key cold slot behind (D3 R7), the
-//! end-of-replay cursor (R10), the end-of-checkpoint blob release (R9)
-//! and the hand-over to the plane. Every replay append and delete enters
-//! through [`TieredTable::replay_upsert`], [`replay_upsert_extent`]
+//! Boot replay of one tiered namespace on one cell (ADR-0174): the replay
+//! state machine, the demote step that makes room when the RAM window
+//! fills (D2), the settle walk that keeps a sealed record from leaving a
+//! same-key cold slot behind (D3 R7), the end-of-replay cursor (R10), the
+//! end-of-checkpoint blob release (R9) and the hand-over to the plane.
+//! Every replay append and delete enters through
+//! [`TieredTable::replay_upsert`], [`replay_upsert_extent`]
 //! (TieredTable::replay_upsert_extent) and [`TieredTable::replay_delete`],
 //! which hold the demote machinery: no tiered replay append exists outside
-//! them (I2), the window's refusal is a [`Room`], never an error variant,
-//! and every boot settle answers from a [`ColdKey`] read through a held
-//! handle (I17, I18).
+//! them (D1), the window's refusal is a [`Room`], never an error variant,
+//! and every boot settle answers from a [`ColdKey`] — a key that hashes
+//! to the slot's hash — read through the file's held creation-mode handle
+//! (D3).
 //!
 //! The machine is one [`TierReplay`] per recovered namespace, owned by
 //! the recovery driver and lent to the keyspace's replay arms through the
@@ -29,9 +30,8 @@ use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
 
-/// Where the machine stands (DRR FCR-STTIER-01 §1). `Serving` is the
-/// machine consumed by [`TierReplay::hand_over`]; `Refused` the error that
-/// dropped it.
+/// Where the machine stands. Handed over is the machine consumed by
+/// [`TierReplay::hand_over`]; refused, the error that dropped it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ReplayState {
     /// Recovered through its manifest section (or the empty one): files
@@ -61,9 +61,9 @@ pub enum ReplayPhase {
 /// is the zero set: zero on a boot that did not demote.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ReplayCounters {
-    /// Demote steps (E1d).
+    /// Demote steps (D2).
     pub demote_steps: u64,
-    /// Pads placed (E1p).
+    /// Pads placed (D2 rule 6).
     pub pads_placed: u64,
     /// Record bytes replay appended to tier files.
     pub tier_bytes: u64,
@@ -71,22 +71,23 @@ pub struct ReplayCounters {
     pub barriers: u64,
     /// Files the boot pipeline sealed (not the `Recovered` reseal).
     pub files_sealed: u64,
-    /// Settle reads of E5, E10 and E12.
+    /// Settle reads of a replayed `DEL` (R6) and of the seal and end
+    /// settles (R7, R10) — not the rebuild's.
     pub settle_reads: u64,
     /// Slots those reads settled as the same key.
     pub settled_same_key: u64,
     /// Slots those reads kept as a distinct key.
     pub settled_distinct: u64,
-    /// Cold slots a replayed `DEL` verified and removed (E5).
+    /// Cold slots a replayed `DEL` verified and removed (R6).
     pub deletes_verified: u64,
-    /// Blob references released by a replay settle (E10, E14).
+    /// Blob references released by a replay settle (R8, R9).
     pub blob_releases: u64,
-    /// Markers naming an address at or above the life origin (E7) —
+    /// Markers naming an address at or above the life origin (R4) —
     /// outside the zero set: a fitting boot counts them too.
     pub markers_skipped: u64,
 }
 
-/// Boot I/O one replay call did (DRR FCR-STTIER-01 §3, §5): what the
+/// Boot I/O the machine did since its owner last drained it: what the
 /// recovery driver charges to its step budget at its own prices.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ReplayWork {
@@ -137,14 +138,14 @@ impl ReplaySpill for NoSpill {
     }
 }
 
-/// A typed boot refusal from replay (DRR FCR-STTIER-01 §2): the recovery
-/// fail-stop class, naming the check. Nothing of the refusing record was
-/// applied; a refusal from inside a demote step leaves the table exact
-/// (the boundary and the cursor never passed an unread record).
+/// A typed boot refusal from replay: the recovery fail-stop class, naming
+/// the check. Nothing of the refusing record was applied; a refusal from
+/// inside a demote step leaves the table exact (the boundary and the
+/// cursor never passed an unread record).
 #[derive(Debug)]
 pub enum ReplayRefusal {
-    /// A length refusal `append` makes (E1): the key, the value, the blob
-    /// threshold or half the ring.
+    /// A length refusal `append` makes, before room (D1): the key, the
+    /// value, the blob threshold or half the ring.
     TooLarge,
     /// `room` answered `End`: the 48-bit end of the space.
     End { len: usize },
@@ -162,7 +163,7 @@ pub enum ReplayRefusal {
     /// no barrier covers yet; `handles_held` the catalogue handles the
     /// pipeline holds.
     Flush { cause: TierFlushError, unplaced_bytes: u64, handles_held: usize },
-    /// A settle read failed (E5, E10, E12).
+    /// A settle read failed (R6, R7, R10).
     SettleRead { addr: LogicalAddr, cause: SettleReadError },
     /// Settle bytes do not parse into a verified record of the slot's
     /// hash — never "distinct".
@@ -173,7 +174,7 @@ pub enum ReplayRefusal {
     ReplayNotEnded,
     /// A record or a `DEL` after the end of replay was declared.
     ReplayEnded,
-    /// A hand-over with RAM records unsettled (I16).
+    /// A hand-over with RAM records unsettled (R10).
     Unsettled { cursor: Option<LogicalAddr>, tail: LogicalAddr },
     /// The store refused the placement after `room` answered `Fits` —
     /// disk admission is open at boot and the window was just made, so
@@ -184,7 +185,7 @@ pub enum ReplayRefusal {
 impl core::fmt::Display for ReplayRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ReplayRefusal::TooLarge => write!(f, "record exceeds a length bound (ADR-0174 E1)"),
+            ReplayRefusal::TooLarge => write!(f, "record exceeds a length bound (ADR-0174 D1)"),
             ReplayRefusal::End { len } => {
                 write!(f, "no room for {len} bytes: the 48-bit end of the address space")
             }
@@ -243,7 +244,7 @@ impl core::fmt::Display for ReplayRefusal {
 
 impl std::error::Error for ReplayRefusal {}
 
-/// What a marker did (E6, E7).
+/// What a marker did (R3, R4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Displaced {
     /// The exact pair below the origin was slotted and is removed.
@@ -255,8 +256,9 @@ pub enum Displaced {
     AboveOrigin,
 }
 
-/// The settle walk's receipt (I5): the boundary advances only to the end
-/// of a span whose every live record was settled against its cold twins.
+/// The settle walk's receipt (R7): the boundary advances only to the end
+/// of a span whose every live record was settled against its cold twins,
+/// so no RAM record below it has a same-key cold slot.
 #[must_use = "a settled span is what the boundary may advance to"]
 pub struct SettledSpan {
     end: LogicalAddr,
@@ -281,7 +283,7 @@ enum WalkEnd {
     Stopped,
 }
 
-/// What one end-of-replay settle step reports (E12).
+/// What one end-of-replay settle step reports (R10).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SettleProgress {
     /// The cursor stopped at the budget; call again.
@@ -367,7 +369,7 @@ impl<F: SegmentFs> TierReplay<F> {
         self.lead
     }
 
-    /// The settle read for ADR-0093's rebuild (E13): the key window of
+    /// The settle read for ADR-0093's rebuild (R10): the key window of
     /// the record at `addr` through the held handle, as replay's own
     /// settles read it.
     ///
@@ -415,9 +417,9 @@ impl<F: SegmentFs> TierReplay<F> {
                 self.note_flush(outcome);
             }
             if cfg!(inf_canary_replay_stall_seal) {
-                // The planted canary (DRR FCR-STTIER-01 §6): the step
-                // seals the file to free the partial frame, as the live
-                // stall seal does — a boot file with the stall reason.
+                // The planted canary breaks D2 rule 5: the step seals the
+                // file to free the partial frame, as the live stall seal
+                // does — a boot file with the stall reason.
                 let planted = self.flush.seal_stall_planted();
                 planted.map_err(|cause| self.flush_refusal(table, cause))?;
             }
@@ -448,7 +450,7 @@ impl<F: SegmentFs> TierReplay<F> {
     }
 
     /// Walks the records from `from`, settling every live one against
-    /// its exact-hash cold slots (E10), to where `to` says: a demote
+    /// its exact-hash cold slots (R7), to where `to` says: a demote
     /// step's seal walk stops at the first record start at or above its
     /// target; an end-of-replay step yields after the record whose charge
     /// — the bytes walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle
@@ -487,8 +489,8 @@ impl<F: SegmentFs> TierReplay<F> {
                 let parts = table.record(here);
                 (parts.encoded_len as u64, table.hash_key(parts.key))
             };
-            // The planted canary (DRR FCR-STTIER-01 §6): E10 skipped at
-            // the seal — a sealed record leaves its same-key cold slot.
+            // The planted canary breaks R7 at the seal: a sealed record
+            // leaves its same-key cold slot.
             let skip = matches!(to, WalkTo::Seal { .. }) && cfg!(inf_canary_replay_seal_no_settle);
             if !skip && self.collect_twins(table, here, hash) {
                 self.key.clear();
@@ -530,7 +532,7 @@ impl<F: SegmentFs> TierReplay<F> {
         live && !self.twins.is_empty()
     }
 
-    /// E10 for the live RAM record at `winner` (its key in `self.key`,
+    /// R7 for the live RAM record at `winner` (its key in `self.key`,
     /// its cold siblings in `twins`): each is read through the held
     /// handle, parsed into a `ColdKey` under the slot's hash, and settled
     /// when it carries the winner's key — as a ref (counted, stamped,
@@ -567,11 +569,11 @@ impl<F: SegmentFs> TierReplay<F> {
         Ok(())
     }
 
-    /// E5's reads for a `DEL` of `key`: every exact-hash cold slot at or
+    /// R6's reads for a `DEL` of `key`: every exact-hash cold slot at or
     /// above the life origin — a record this boot demoted — is read and
     /// parsed; the ones carrying the key are remembered with their exact
     /// length for the removal that follows the marker drain. Refs below
-    /// the origin are the markers' (E6).
+    /// the origin are the markers' (R3).
     fn verify_cold_for_delete(
         &mut self,
         table: &TieredTable,
@@ -580,7 +582,8 @@ impl<F: SegmentFs> TierReplay<F> {
     ) -> Result<(), ReplayRefusal> {
         self.doomed.clear();
         if cfg!(inf_canary_replay_del_no_verify) {
-            // The planted canary (DRR FCR-STTIER-01 §6): E5 skipped.
+            // The planted canary breaks R6: the DEL reads nothing and its
+            // key's demoted copy stays.
             return Ok(());
         }
         self.twins.clear();
@@ -613,13 +616,14 @@ impl<F: SegmentFs> TierReplay<F> {
 
     // ---- the end of the checkpoint, the end of replay, the hand-over ----
 
-    /// R9 (E14), at the end of the checkpoint and before the tail: every
+    /// R9, at the end of the checkpoint and before the tail: every
     /// address a boot settle chained releases its blob reference, now
     /// that the 0x05 section has registered the entries the settles
     /// preceded. Nothing for an address with no entry.
     pub fn end_of_checkpoint(&mut self, table: &mut TieredTable) {
         if cfg!(inf_canary_replay_blob_release_skip) {
-            // The planted canary (DRR FCR-STTIER-01 §6): E14 skipped.
+            // The planted canary breaks R9: a settled ref's blob
+            // reference stays with no slot.
             return;
         }
         if table.reloc_origins.is_empty() {
@@ -639,13 +643,14 @@ impl<F: SegmentFs> TierReplay<F> {
         self.counters.blob_releases += released;
     }
 
-    /// R10's first half (E12): replay has ended. A machine that demoted
+    /// R10's first half: replay has ended. A machine that demoted
     /// enters `Settling` with its cursor at `ro`; one that did not is
     /// ready to hand over.
     pub fn end_of_replay(&mut self, table: &TieredTable) {
         if self.state == ReplayState::Spilling {
             let cursor = if cfg!(inf_canary_replay_no_end_settle) {
-                // The planted canary (DRR FCR-STTIER-01 §6): E12 skipped.
+                // The planted canary breaks R10: no end settle, so the
+                // rebuild finds same-key pairs in a namespace that demoted.
                 table.space.tail()
             } else {
                 table.space.ro_boundary()
@@ -654,7 +659,7 @@ impl<F: SegmentFs> TierReplay<F> {
         }
     }
 
-    /// One end-of-replay settle step (E12): E10 on every live record of
+    /// One end-of-replay settle step (R10): R7 on every live record of
     /// `[cursor, tail)`, by address, until the step's charge — bytes
     /// walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle read — reaches
     /// `budget_bytes`, or the tail. `ro` does not move.
@@ -680,14 +685,14 @@ impl<F: SegmentFs> TierReplay<F> {
         })
     }
 
-    /// R10's last half (E13): a table that demoted drains its flush and
+    /// R10's last half: a table that demoted drains its flush and
     /// seals its active file; the machine hands the plane a pipeline
     /// under the live claim rule with a handle for every sealed
     /// catalogue file, and returns its final counters and the I/O since
     /// the last [`take_work`](Self::take_work) — the drain's seal and
     /// barrier included, which counters read before the hand-over
     /// would miss. Only a machine with every RAM record settled gets
-    /// here (I16): `Spilling` has no arm, `Settling` only at the tail.
+    /// here (R10): `Spilling` has no arm, `Settling` only at the tail.
     ///
     /// # Errors
     /// `Unsettled`, or the drain's flush error.
@@ -738,15 +743,15 @@ pub struct BootHandedOver<F: SegmentFs> {
 }
 
 impl TieredTable {
-    // ---- the replay entries (ADR-0174 D1, D3; DRR FCR-STTIER-01 E1–E5) ----
+    // ---- the replay entries (ADR-0174 D1, D3) ----
 
     /// Replays one checkpoint image or tail `SET` (R5): the typed length
     /// refusals first, then the room question until it answers `Fits` —
     /// a demote step or a pad per answer, at most four asks — then the
-    /// parked markers (E6, E7), then the blind key-verified upsert: a RAM
+    /// parked markers (R3, R4), then the blind key-verified upsert: a RAM
     /// record of the key is overwritten in place of its slot with its
-    /// origins moved to the new record (E2); none inserts at the tail,
-    /// cold exact-hash slots untouched and unread (E3).
+    /// origins moved to the new record; none inserts at the tail, cold
+    /// exact-hash slots untouched and unread (R5).
     ///
     /// # Errors
     /// [`ReplayRefusal`] — the boot's typed refusal; nothing of this
@@ -809,7 +814,7 @@ impl TieredTable {
     }
 
     /// Replays one tail `DEL` (R6): the settle read of each exact-hash
-    /// cold slot this boot demoted first (E5), then the parked markers,
+    /// cold slot this boot demoted first, then the parked markers,
     /// then the RAM record of the key — with its origins — and the read
     /// slots whose key matched, each with its exact death. Returns
     /// whether anything of the key was removed. A cold slot at or above
@@ -837,7 +842,7 @@ impl TieredTable {
     }
 
     /// [`replay_delete`](Self::replay_delete) once a demote step began:
-    /// E5's reads before anything changes, then the drain, the RAM
+    /// R6's reads before anything changes, then the drain, the RAM
     /// delete and the verified cold slots' removal.
     fn replay_delete_spilling<F: SegmentFs>(
         &mut self,
@@ -865,12 +870,12 @@ impl TieredTable {
         Ok(removed)
     }
 
-    /// Replays one checkpoint address reference (R1, E8): insert unless
+    /// Replays one checkpoint address reference (R1): insert unless
     /// the exact `(hash, addr)` pair is slotted (the walker's at-least-once
     /// re-emission may duplicate a ref). Counts the slot into its file
     /// exactly once per surviving slot (ADR-0058 D4). Live-byte
     /// accounting is untouched: a ref's length is unknown without a read.
-    /// E9 — a ref section after a record of this life — is
+    /// R2 — a ref section after a record of this life — is
     /// `apply_ref_section`'s, over the section's facts.
     ///
     /// # Panics
@@ -890,9 +895,9 @@ impl TieredTable {
 
     /// Replays one `ColdDisplace` marker (R3, R4): below the life origin
     /// the exact pair is removed if present — its file uncounted and
-    /// stamped, its blob reference released (E6); absence is a legal
+    /// stamped, its blob reference released (R3); absence is a legal
     /// interleaving. At or above the origin the marker names a
-    /// crashed-life address, nothing in this life: no-op (E7) — the
+    /// crashed-life address, nothing in this life: no-op (R4) — the
     /// paired mutation resolves by key.
     pub fn replay_displace(&mut self, hash: u64, old: LogicalAddr) -> Displaced {
         if old >= self.space.life_origin() {
@@ -907,7 +912,7 @@ impl TieredTable {
         Displaced::Removed
     }
 
-    /// E1's room question, asked until it answers `Fits`: `Demote` runs
+    /// D2 rule 1's room question, asked until it answers `Fits`: `Demote` runs
     /// the step, `Pad` moves the tail, `End` and a fifth ask refuse typed.
     /// The record that fits — every record of a boot that fits — asks
     /// once and leaves; the loop is the out-of-line rest. The two hints
@@ -949,8 +954,8 @@ impl TieredTable {
                 Room::End => return Err(ReplayRefusal::End { len }),
                 Room::Demote(target) => {
                     if cfg!(inf_canary_replay_no_demote) {
-                        // The planted canary (DRR FCR-STTIER-01 §6): the
-                        // refusal HEAD made.
+                        // The planted canary breaks D1: the window's
+                        // refusal fails the boot.
                         return Err(ReplayRefusal::Store(OpError::OutOfMemory));
                     }
                     let Some(r) = replay.as_deref_mut() else {
@@ -972,7 +977,8 @@ impl TieredTable {
         }
     }
 
-    /// The marker drain, after E1 and E5 and before the mutation: each
+    /// The marker drain, after the room question and a `DEL`'s reads and
+    /// before the mutation: each
     /// parked marker names a slot of the mutation's own key (ADR-0057
     /// D4: markers precede their mutation in its frame), so the pair's
     /// hash is the mutation's.
@@ -995,7 +1001,7 @@ impl TieredTable {
         }
     }
 
-    /// The boundary's one boot advance (I5): to the end of a settled span.
+    /// The boundary's one boot advance (R7): to the end of a settled span.
     fn seal_settled(&mut self, span: SettledSpan) {
         let from = self.space.ro_boundary().to_raw();
         if span.end.to_raw() > from {
@@ -1062,7 +1068,7 @@ mod tests {
         assert_eq!(replay.phase(), ReplayPhase::Spilling);
     }
 
-    /// I16: a machine that demoted is handed over only with every RAM
+    /// R10: a machine that demoted is handed over only with every RAM
     /// record settled — `Spilling` has no arm, `Settling` only at the
     /// tail; a settle step before the end of replay is declared is a
     /// typed refusal too.

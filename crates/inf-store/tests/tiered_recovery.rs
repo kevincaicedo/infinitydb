@@ -384,12 +384,12 @@ fn unified_recovery_round_trips_all_classes() {
     assert_eq!(info.ckpt_id, ckpt_id);
     assert_eq!(info.begin_lsn, begin_lsn);
     replay_tail(&mut ks, &mut spill, &tail);
-    // A boot that fits (I9): nothing of the zero set moved.
+    // A boot that fits (ADR-0174 D5): nothing of the zero set moved.
     let replay = spill.machine(NS);
     assert_eq!(replay.phase(), ReplayPhase::Fitting, "the tail fits the window");
     let zero = replay.counters();
     assert_eq!(zero.demote_steps + zero.pads_placed + zero.tier_bytes + zero.settle_reads, 0);
-    assert!(zero.markers_skipped > 0, "moved overwrites of RAM records staged markers (E7)");
+    assert!(zero.markers_skipped > 0, "moved overwrites of RAM records staged markers (R4)");
 
     // Live-set reconciliation oracle (M4-S14, ADR-0058 D4): by
     // replay-complete, every recovered file's slot count equals the
@@ -398,7 +398,7 @@ fn unified_recovery_round_trips_all_classes() {
     assert_live_set_reconciled(ks.tiered_store_mut(NS).expect("materialized"), &tier);
     let (flush, handles) = handed(finish_boot(&mut ks, &mut spill, NS));
     let table = take_table(&mut ks, NS);
-    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
+    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (D5)");
 
     // The recovered rig serves every byte — cold through the recovered
     // catalog, RAM through the re-appended new life.
@@ -682,7 +682,7 @@ fn write_checkpoint_two_pass(rig: &Rig, writer: &mut SyncIckWriter<MemFs>, w: u6
     (refs_emitted, images_emitted)
 }
 
-/// FCR-STTIER-01 (ADR-0174 D1), the store tier's red: a tail of three
+/// ADR-0174 D1 at the store tier: a tail of three
 /// windows of distinct keys written after the checkpoint began replays
 /// into the recovered table, which demotes through the replay seam
 /// instead of refusing at the window. Red at engine `b5cae02`: the
@@ -781,10 +781,10 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
     assert!(counters.tier_bytes >= 2 * window, "at least two windows of records left RAM");
     assert_eq!(spill.machine(NS).phase(), ReplayPhase::Spilling);
     let committed = ks.tiered_store(NS).expect("materialized").space().report().committed_bytes;
-    assert!(committed <= window, "I1: committed RAM {committed} within the window {window}");
+    assert!(committed <= window, "committed RAM {committed} within the window {window} (D1)");
     let (flush, handles) = handed(finish_boot(&mut ks, &mut spill, NS));
     let table = take_table(&mut ks, NS);
-    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
+    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (D5)");
     assert!(flush.active().is_none(), "the hand-over sealed the boot's active file");
     let mut recovered_rig = Rig { table, fs, flush, model, tail: Vec::new(), begun: false };
     recovered_rig.audit();

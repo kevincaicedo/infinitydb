@@ -67,7 +67,7 @@
 //! - `replay_settle_read_fail` — `BootFlush::read_key_window` (the boot settle read of a cold
 //!   record's key window, ADR-0174 D3) — typed I/O error on the held handle: the boot refuses
 //!   typed, naming the namespace and the address; no boundary or cursor passed the unread record
-//!   and a `DEL` has changed nothing (DRR FCR-STTIER-01 §2)
+//!   and a `DEL` has changed nothing
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the

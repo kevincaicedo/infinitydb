@@ -1,4 +1,5 @@
-//! FCR-STTIER-01 at the store tier (ADR-0174; DRR FCR-STTIER-01 §6):
+//! Boot replay of a tiered tail above the RAM window, at the store tier
+//! (ADR-0174):
 //! boot replay of a tiered tail above the RAM window through the replay
 //! machine — the window rows, the rewrite and delete rows, the shadow
 //! pair settled at the seal, the charged-death and unmanifested-file
@@ -7,7 +8,7 @@
 //! row, the forced 64-bit collision, the blob census with the
 //! end-of-checkpoint release, the pad rows, and the fault row.
 //!
-//! The oracles (§6): a `BTreeMap` model of the acknowledged history, read
+//! The oracles: a `BTreeMap` model of the acknowledged history, read
 //! back after recovery through RAM or the test's own tier-file reader;
 //! the **key census** over every slot (keys read from RAM or the tier
 //! bytes, never through the index's hash); the **dead-byte census** per
@@ -528,8 +529,8 @@ impl Boot {
         progress
     }
 
-    /// E12, the extent sweep seed, ADR-0093's rebuild through the
-    /// machine's settle read, E13.
+    /// R10: the end settle, the extent sweep seed, ADR-0093's rebuild
+    /// through the machine's settle read, the hand-over.
     fn finish(mut self) -> Ready {
         self.end_of_replay();
         while self.settle_step(PAGE).expect("settle step") == SettleProgress::More {}
@@ -635,7 +636,7 @@ impl Ready {
         }
     }
 
-    /// The key census (§6): (a) the keys and values equal the model's;
+    /// The key census: (a) the keys and values equal the model's;
     /// (b) no two cold slots carry one key; (c) a RAM slot and a cold
     /// slot of one key only where an open ticket names the pair, the
     /// RAM record `Open`; (d) no such pair at all in a namespace that
@@ -694,7 +695,7 @@ impl Ready {
         }
     }
 
-    /// The dead-byte census (§6, I13): per catalogue file, the bytes the
+    /// The dead-byte census (R8, R11): per catalogue file, the bytes the
     /// slots name read from tier bytes; a recovered file's `dead_bytes`
     /// never exceeds `data_len −` that sum, a boot-sealed file is
     /// byte-exact with equality.
@@ -712,18 +713,18 @@ impl Ready {
             if f.recovered {
                 assert!(
                     f.dead_bytes <= truth,
-                    "recovered file {} over-counts dead: {} > {truth} (I13)",
+                    "recovered file {} over-counts dead: {} > {truth} (R8)",
                     f.id,
                     f.dead_bytes
                 );
             } else {
-                assert!(f.byte_exact, "boot file {} is byte-exact (I14)", f.id);
+                assert!(f.byte_exact, "boot file {} is byte-exact (R11)", f.id);
                 assert_eq!(f.dead_bytes, truth, "boot file {} dead bytes are exact", f.id);
             }
         }
     }
 
-    /// The blob census (§6, I12): the reference map's addresses equal
+    /// The blob census (R9): the reference map's addresses equal
     /// the slotted extent-typed records'.
     fn blob_census(&self) {
         let slotted: BTreeSet<u64> = self
@@ -736,7 +737,7 @@ impl Ready {
         assert_eq!(mapped, slotted, "the reference map names exactly the slotted extent records");
     }
 
-    /// The seal-reason census (§6): every boot file's footer carries a
+    /// The seal-reason census (D2 rule 5): every boot file's footer carries a
     /// reason the live flush or the hand-over gives — never the stall
     /// reason, never `Recovered`.
     fn seal_reason_census(&self) {
@@ -761,7 +762,7 @@ impl Ready {
         self.flush.sealed().iter().filter(|m| !self.manifested.contains(&m.id)).collect()
     }
 
-    /// Every census, plus the handle count (I11).
+    /// Every census, plus the handle count (D5).
     fn audit(&self, model: &BTreeMap<Vec<u8>, Expect>, demoted: bool) {
         self.key_census(model, demoted);
         self.dead_byte_census();
@@ -774,9 +775,8 @@ impl Ready {
 
 /// A budget lowered between lives (`INF.NS SET … MEM-BUDGET` on the
 /// running node, then a stop): the images alone exceed the new window,
-/// so image load itself demotes (DRR FCR-STTIER-01 §6's extent-typed
-/// twin row; the shape every row that needs a seal during image load
-/// uses).
+/// so image load itself demotes (the extent-typed twin row's shape, and
+/// every row's that needs a seal during image load).
 fn lowered() -> DemotionConfig {
     DemotionConfig::for_budget(BUDGET / 4, PAGE)
 }
@@ -819,10 +819,10 @@ fn life_with_tail(n: u64, value_len: usize) -> (Durable, u64) {
     (life.crash(), record_len)
 }
 
-// ---- §6 row 1: committed pages at the end of replay ------------------------
+// ---- committed pages at the end of replay --------------------------------
 
 /// Window − 1 page and window: a boot that fits — zero demote steps, the
-/// zero set at zero, no tier file created, no record byte appended (I9);
+/// zero set at zero, no tier file created, no record byte appended (D5);
 /// window + 1 page, 3 × and 16 ×: at least one. Every boot serves the
 /// model.
 #[test]
@@ -851,13 +851,16 @@ fn committed_pages_around_the_window_decide_whether_the_boot_demotes() {
             assert!(counters.demote_steps >= 1, "{target}: the boot demoted");
             assert_eq!(boot.machine().phase(), ReplayPhase::Spilling);
         } else {
-            assert_eq!(zero_set(counters), 0, "{target}: the zero set is zero (I9)");
+            assert_eq!(zero_set(counters), 0, "{target}: the zero set is zero (D6)");
             assert_eq!(boot.machine().phase(), ReplayPhase::Fitting);
             assert_eq!(boot.machine().sealed().len(), files_before, "{target}: no tier file");
             assert!(boot.machine().active().is_none(), "{target}: no record byte appended");
             assert_eq!(boot.table().space().report().committed_bytes, target);
         }
-        assert!(boot.table().space().report().committed_bytes <= window, "I1 at {target}");
+        assert!(
+            boot.table().space().report().committed_bytes <= window,
+            "the window bounds committed RAM at {target} (D1)"
+        );
         let ready = boot.finish();
         ready.audit(&durable.model, demotes);
         // The hand-over's drain seals the active file: the counters the
@@ -870,7 +873,7 @@ fn committed_pages_around_the_window_decide_whether_the_boot_demotes() {
     }
 }
 
-// ---- §6 row: record length and slice ----------------------------------------
+// ---- record length and slice ----------------------------------------------
 
 /// A durable unit whose checkpoint names nothing, then a tail placed by
 /// hand: `n` records from `record(i)`, the model their last values.
@@ -990,7 +993,7 @@ fn record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal() {
     assert!(gaps_seen > 0, "VACUOUS: no arm crossed a ring-top gap");
 }
 
-// ---- §6 rows: rewrite distance, rewrites still open, deletes -----------
+// ---- rewrite distance, rewrites still open, deletes ---------------------
 
 /// Rewrites of one key under a window, over a window, and a tail that is
 /// one key rewritten throughout: one slot, the newest value.
@@ -1049,7 +1052,7 @@ fn a_rewritten_key_keeps_one_slot_with_the_newest_value() {
 }
 
 /// More than 4 096 keys demoted by the boot, then rewritten inside the
-/// last window: the end-of-replay settle (E12) removes every demoted
+/// last window: the end-of-replay settle (R10) removes every demoted
 /// twin, so the rebuild tickets nothing, the census holds, and the first
 /// `SET` after `Ready` is admitted (through MAINTAIN when the window is
 /// full, never a pinned stall). Red under `inf_canary_replay_no_end_settle`:
@@ -1105,7 +1108,7 @@ fn rewrites_still_open_at_the_end_of_replay_are_settled_before_ready() {
     assert!(steps > 1, "the end settle yields at the step budget");
     assert!(
         after.settled_same_key - before.settled_same_key >= keys,
-        "E12 settled every rewritten key's demoted twin"
+        "the end settle removed every rewritten key's demoted twin"
     );
     let mut ready = ready;
     let hash = Ready::hash(b"after-ready");
@@ -1121,7 +1124,7 @@ fn rewrites_still_open_at_the_end_of_replay_are_settled_before_ready() {
 
 /// A `DEL` of a demoted key, `DEL` then `SET`, `SET` then `DEL`: absent
 /// or present as the model says; the verified delete counted. Red under
-/// `inf_canary_replay_del_no_verify` (E5 skipped): the deleted key's
+/// `inf_canary_replay_del_no_verify` (R6's reads skipped): the deleted key's
 /// demoted copy serves.
 #[test]
 fn deletes_in_the_tail_resolve_against_demoted_copies() {
@@ -1154,7 +1157,7 @@ fn deletes_in_the_tail_resolve_against_demoted_copies() {
     boot.replay_tail(&durable.tail);
     let counters = boot.machine().counters();
     let ready = boot.finish();
-    // The oracle first: census (a) finds a deleted key present when E5
+    // The oracle first: census (a) finds a deleted key present when R6
     // skipped its reads.
     ready.audit(&durable.model, true);
     assert!(counters.demote_steps > 0);
@@ -1170,12 +1173,12 @@ fn deletes_in_the_tail_resolve_against_demoted_copies() {
     assert!(ready.slots().iter().any(|s| s.key == b"del-then-set" && s.value == b"back"));
 }
 
-// ---- §6 rows: the shadow pair in the unit, the charged death ----------------
+// ---- the shadow pair in the unit, the charged death ------------------------
 
 /// A shadow pair in the unit — the twin a ref, the winner an image, no
-/// marker — with the winner sealed by the boot: E10 settles the ref at
+/// marker — with the winner sealed by the boot: R7 settles the ref at
 /// the seal, one slot survives, the ref's address rides the survivor's
-/// origins (I10). Red under `inf_canary_replay_seal_no_settle`: census
+/// origins (R8). Red under `inf_canary_replay_seal_no_settle`: census
 /// (b), two cold slots with one key.
 #[test]
 fn a_shadow_pair_in_the_unit_settles_at_the_sealed_winner() {
@@ -1221,7 +1224,7 @@ fn a_shadow_pair_in_the_unit_settles_at_the_sealed_winner() {
     // winner's seal, and the ref's address rides the survivor's origins.
     assert!(after_images.demote_steps > 0, "image load demoted under the lowered budget");
     assert!(after_images.settled_same_key >= 1, "the ref settled against its sealed winner");
-    assert_eq!(origins, 1, "the ref's address rides the survivor's origins (I10)");
+    assert_eq!(origins, 1, "the ref's address rides the survivor's origins (R8)");
 }
 
 /// A death the crashed life already charged: a verified overwrite of a
@@ -1423,9 +1426,9 @@ fn a_death_the_crashed_life_charged_by_a_del_of_a_blind_set_pair_is_not_charged_
     next.checkpoint(2, |_| {});
 }
 
-// ---- §6 row: a live-set entry for an unmanifested file (E15) -----------------
+// ---- a live-set entry for an unmanifested file (R11) -----------------------
 
-/// ADR-0174 R11 (E15) at its narrowest: a live-set entry whose id names
+/// ADR-0174 R11 at its narrowest: a live-set entry whose id names
 /// a file this boot's flush created — equal length and all — restores
 /// nothing: a boot file's counters are its own. Red before the rule, and
 /// red under `inf_canary_replay_restore_unguarded`: the entry overwrote
@@ -1509,10 +1512,10 @@ fn an_unmanifested_file_reused_by_the_boot_stays_byte_exact() {
     assert!(reused.byte_exact && !reused.recovered, "the boot file's counters are its own (R11)");
 }
 
-// ---- §6 rows: input no engine writes; the identity row --------------------
+// ---- input no engine writes; the identity row -----------------------------
 
 /// Four refs of one key under one sealed winner: the fourth same-key
-/// settle has no origin room — the typed refusal of E10, never a panic,
+/// settle has no origin room — the typed refusal of R8, never a panic,
 /// the first three settled exactly.
 #[test]
 fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
@@ -1618,7 +1621,7 @@ fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
 /// A hand-built manifested file whose refs point at: another key's
 /// record, a record with a type tag of 0, a header whose length runs
 /// past the file, and a record shorter than the key window at the file's
-/// end. At the seal (E10) and at the end settle (E12) the first three
+/// end. At the seal (R7) and at the end settle (R10) the first three
 /// are the typed identity refusal naming the check, never "distinct";
 /// the last settles.
 #[test]
@@ -1828,11 +1831,11 @@ fn settle_to_the_tail(boot: &mut Boot) -> Result<(), ReplayRefusal> {
     Ok(())
 }
 
-// ---- §6 row: a cold record in the active file's partial tail frame ----------
+// ---- a cold record in the active file's partial tail frame ----------------
 
 /// A `DEL` of a key whose record lies in the last frame the boot flushed,
 /// applied after a release passed that record and before the next flush
-/// (E5 reads the active file's partial tail frame through the writer's
+/// (R6 reads the active file's partial tail frame through the writer's
 /// handle); the next step extends the frame, and a second key of that
 /// frame is deleted: both reads parse and both keys are gone.
 #[test]
@@ -1907,7 +1910,7 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
     assert!(frame_start > 0);
     let reads = boot.machine().counters().settle_reads;
     boot.apply(&RecordView::Delete { ns: NS, key: &in_frame[0] })
-        .expect("E5 reads the partial frame");
+        .expect("the DEL reads the partial frame");
     assert_eq!(
         boot.machine().counters().settle_reads,
         reads + 1,
@@ -1927,7 +1930,8 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
         more += 1;
     }
     assert!(more > 0);
-    boot.apply(&RecordView::Delete { ns: NS, key: &in_frame[1] }).expect("E5 after the rewrite");
+    boot.apply(&RecordView::Delete { ns: NS, key: &in_frame[1] })
+        .expect("the DEL reads it after the rewrite");
     assert_eq!(boot.machine().counters().deletes_verified, 2);
     model.remove(&in_frame[1]);
     // The rest of the tail, then the audit against the adjusted model.
@@ -1940,14 +1944,14 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
     ready.audit(&model, true);
 }
 
-// ---- §6 row: two crashes (I10) ------------------------------------------
+// ---- two crashes (R8) ------------------------------------------------------
 
 /// Boot 1 settles a shadow pair's ref into its sealed winner (no marker
 /// anywhere names the ref: the pair was a ticket); after `Ready` the key
 /// is deleted live, and the origin marker boot 1 chained rides the
 /// delete; crash; boot 2 with the budget raised fits: that marker names
 /// the ref below the origin and finds the pair present, and the key
-/// stays deleted. Red under `inf_canary_replay_origin_drop` (E10 chains
+/// stays deleted. Red under `inf_canary_replay_origin_drop` (R8 chains
 /// nothing): no marker names the ref, it survives boot 2 and the key
 /// resurrects.
 #[test]
@@ -1977,7 +1981,7 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
     }
     let durable = life.crash();
     // Boot 1 under a lowered budget: image load seals the winner, so the
-    // ref settles at the seal (E10) and rides the survivor's origins.
+    // ref settles at the seal (R7) and rides the survivor's origins.
     // Then the live DEL.
     let mut boot = durable.boot_with(lowered(), |_| {});
     assert!(boot.machine().counters().settled_same_key >= 1, "boot 1 settled the ref at a seal");
@@ -2036,13 +2040,13 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
     );
     // Then the engagement: boot 1 chained the ref, boot 2 fit, its marker
     // removed the ref below the origin and skipped the this-life one.
-    assert_eq!(chained, 1, "boot 1 chained the ref (I10)");
+    assert_eq!(chained, 1, "boot 1 chained the ref (R8)");
     assert_eq!(counters2.demote_steps, 0, "boot 2 fits");
-    assert!(!ref_present, "the marker removed the ref (E6)");
-    assert!(counters2.markers_skipped >= 1, "the this-life marker was skipped (E7)");
+    assert!(!ref_present, "the marker removed the ref (R3)");
+    assert!(counters2.markers_skipped >= 1, "the this-life marker was skipped (R4)");
 }
 
-// ---- §6 row: forced 64-bit collisions ----------------------------------------
+// ---- forced 64-bit collisions -----------------------------------------------
 
 /// Two keys with one 64-bit hash, one demoted by the boot: both survive;
 /// the pair is the one ticket a demoted namespace holds at `Ready`.
@@ -2077,7 +2081,7 @@ fn a_colliding_pair_with_one_demoted_survives_as_the_one_ticket() {
     assert!(ready.counters.settled_distinct >= 1, "k2's seal or end settle read k1 as distinct");
 }
 
-// ---- §6 row: an extent-typed twin and the blob census (E14) -----------------
+// ---- an extent-typed twin and the blob census (R9) ------------------------
 
 /// A blob key's cold record under an open shadow ticket at the walk:
 /// the twin is a ref (pass 0), the winner an image (pass 1, ADR-0093
@@ -2127,7 +2131,7 @@ fn a_blob_ref_settled_during_image_load_is_released_at_the_end_of_the_checkpoint
     assert_eq!(counters.blob_releases, 1, "the end of the checkpoint released the ref's entry");
 }
 
-// ---- §6 row: a window below its ring, records at the inline maximum -------
+// ---- a window below its ring, records at the inline maximum ---------------
 
 /// Case (a): `MEM-BUDGET 4mb BLOB-THRESHOLD 3mb` with records of 2.9 MiB;
 /// case (b): `4mb + 64kb` with the largest threshold the ring allows and
@@ -2154,7 +2158,7 @@ fn a_window_below_its_ring_pads_the_tail_for_records_at_the_inline_maximum() {
         assert!(record < life.table.blob_config().threshold_bytes as usize, "inline");
         life.checkpoint(1, |_| {});
         // The tail placed by hand (the live path parks on a stall target
-        // above the tail for these records — FCR-STTIER-N4): eight
+        // above the tail for these records): eight
         // records at the inline maximum, acknowledged by the crashed life.
         let value = vec![0x5A; record];
         let mut model = BTreeMap::new();
@@ -2172,14 +2176,14 @@ fn a_window_below_its_ring_pads_the_tail_for_records_at_the_inline_maximum() {
         assert!(counters.pads_placed > 0, "VACUOUS: no pad placed in this arm");
         let ready = boot.finish();
         ready.audit(&durable.model, true);
-        assert!(ready.boot_files().len() <= 8 + 2 + 1, "files sealed within §3's sum");
+        assert!(ready.boot_files().len() <= 8 + 2 + 1, "files sealed within the boot's bound");
     }
 }
 
-// ---- §2 row: the settle read fails (`replay_settle_read_fail`) --------------
+// ---- the settle read fails (`replay_settle_read_fail`) ----------------------
 
 /// The injected settle-read failure: a `DEL` whose read fails is the
-/// typed refusal and has changed nothing (I3); the seal's read failing
+/// typed refusal and has changed nothing (D1); the seal's read failing
 /// leaves the boundary where it was; a later boot with the fault cleared
 /// recovers the same unit.
 #[test]
@@ -2225,9 +2229,9 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         fault::disarm_all();
         assert!(matches!(err, ReplayError::Replay(ReplayRefusal::SettleRead { .. })), "{err:?}");
         assert!(matches!(boot.table().lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
-        assert_eq!(boot.table().len(), slots_before, "no slot moved (I3)");
+        assert_eq!(boot.table().len(), slots_before, "no slot moved (D1)");
         assert_eq!(boot.table().space().ro_boundary(), before);
-        assert_eq!(boot.ks.displace_register_len(), parked, "the markers stay parked (I3)");
+        assert_eq!(boot.ks.displace_register_len(), parked, "the markers stay parked (D1)");
         // The same boot, the fault cleared: the DEL applies, its markers
         // drained with it.
         boot.apply(&record).expect("verified");
@@ -2340,7 +2344,7 @@ fn recovered_at_one_mib() -> TieredTable {
     t
 }
 
-/// ADR-0174 R4 (E7): a crashed-life marker whose address numerically
+/// ADR-0174 R4: a crashed-life marker whose address numerically
 /// equals this life's slot of *another* key with the same 64-bit hash
 /// names nothing in this life — a no-op, counted. Red before: the exact
 /// pair matched and the other key's slot was removed.
@@ -2362,7 +2366,7 @@ fn a_marker_at_or_above_the_origin_removes_nothing() {
     assert!(matches!(t.lookup(&k2, hash, &[]), TieredLookup::Ram(_)));
 }
 
-/// ADR-0174 R5 (E2): a replayed image over a RAM record moves that
+/// ADR-0174 R5: a replayed image over a RAM record moves that
 /// record's relocation origins to the new address. Red before: the
 /// settled ref's origin stayed keyed by the dead address.
 #[test]
@@ -2395,7 +2399,7 @@ fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
     assert_eq!(t.displacement_origins_len(hash, a), 0, "and left the dead address");
 }
 
-/// ADR-0174 R6 (E5): a replayed `DEL` of a key whose only record this
+/// ADR-0174 R6: a replayed `DEL` of a key whose only record this
 /// boot demoted reads the cold slot and deletes it. Red before: the
 /// RAM-only delete found nothing and the key stayed.
 #[test]

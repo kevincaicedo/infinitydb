@@ -66,7 +66,7 @@ pub struct RecoveredTier<F: SegmentFs> {
     /// boot *unreconciled* for the cold set (S14's lazy rebuild owns
     /// them).
     pub table: TieredTable,
-    /// The replay machine (ADR-0174; DRR FCR-STTIER-01 §1), `Seeded`:
+    /// The replay machine (ADR-0174), `Seeded`:
     /// the boot pipeline — catalog seeded with the manifested files,
     /// `next_id` above every named id, the creation-mode handle of every
     /// manifested file held, the barrier claim rule — and the counters.
@@ -193,7 +193,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     extents_listed.sort_unstable();
     extents_quarantined.sort_unstable();
     let next_id = tier.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
-    // The held handles (ADR-0054 D1; DRR FCR-STTIER-01 I18): one per
+    // The held handles (ADR-0054 D1; ADR-0174 D3, D5): one per
     // manifested file in its creation mode, opened here and held by the
     // boot pipeline — the settle read opens nothing, and the plane's
     // cold-read table inherits them at the hand-over.
@@ -336,7 +336,7 @@ mod tests {
         table
     }
 
-    /// ADR-0174 R2, the reader half (E9): a ref section for a namespace
+    /// ADR-0174 R2, the reader half: a ref section for a namespace
     /// whose table already holds a record of this life is a typed boot
     /// refusal naming the namespace; the reverse order applies. Red
     /// before the law: the refs applied beside the image.

@@ -1402,8 +1402,9 @@ mod tests {
         (cases, pads.0, pads.1)
     }
 
-    /// The room property, exhaustive at a 4-unit page (DRR FCR-STTIER-01
-    /// §6, I15; ADR-0174 D2 rule 6): every tail offset of the ring,
+    /// The room property, exhaustive at a 4-unit page (ADR-0174 D2 rules
+    /// 1 and 6: `Fits` within four asks, every `Demote(H)` at or below the
+    /// tail): every tail offset of the ring,
     /// every length up to half the ring.
     #[test]
     fn room_reaches_fits_in_four_asks_exhaustively_at_a_four_unit_page() {
@@ -1441,7 +1442,7 @@ mod tests {
         assert!(cases > 5_000, "the boundary arm ran {cases} cases");
     }
 
-    /// The hostile specs of DRR FCR-STTIER-01 §6 at the real 1 MiB
+    /// The hostile specs of ADR-0174 D2 rule 6 at the real 1 MiB
     /// commit page: a window below its ring with records at the inline
     /// maximum — `MEM-BUDGET 4mb BLOB-THRESHOLD 3mb` (a 5 MiB window, an
     /// 8 MiB ring, 2.9 MiB records), `4mb + 64kb` (a 4 MiB window, half

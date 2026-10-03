@@ -956,7 +956,7 @@ impl<F: SegmentFs> SeamFlush for TierFlush<F> {
     }
 }
 
-// ---- the boot pipeline (ADR-0174 D2 rule 4, D5; DRR FCR-STTIER-01 I11, I18) ----
+// ---- the boot pipeline (ADR-0174 D2 rule 4, D3, D5) ----
 
 /// A tiered namespace's flush pipeline during boot replay: the recovered
 /// [`TierFlush`] under the barrier claim rule, holding the open
@@ -997,8 +997,8 @@ pub struct SettleWindow<'a> {
     pub left: u64,
 }
 
-/// Why a settle read did not answer (DRR FCR-STTIER-01 §2, the
-/// `REPLAY_SETTLE_READ_FAIL` row): each a typed boot refusal for the
+/// Why a settle read did not answer (the `replay_settle_read_fail`
+/// point's failure among them): each a typed boot refusal for the
 /// caller, naming the address; never "distinct".
 #[derive(Debug)]
 pub enum SettleReadError {
@@ -1073,7 +1073,8 @@ impl<F: SegmentFs> BootFlush<F> {
     /// covering `min(TIER_KEY_WINDOW_BYTES, left)` bytes at `addr` — one,
     /// or two when the window crosses a frame — by one blocking read on
     /// the covering file's **held** handle into the aligned buffer, every
-    /// frame's CRC checked. Opens nothing (I18).
+    /// frame's CRC checked. Opens nothing: a file this boot writes is
+    /// never open a second way (ADR-0054 D1).
     ///
     /// # Errors
     /// [`SettleReadError`], each a typed boot refusal: no covering
@@ -1116,7 +1117,7 @@ impl<F: SegmentFs> BootFlush<F> {
     }
 
     /// The boot's exit (ADR-0174 D5, R10): the active file sealed — a
-    /// no-op once the store's drain sealed it (E13); a pipeline handed
+    /// no-op once the store's drain sealed it; a pipeline handed
     /// over with barrier-claimed bytes in a rewritable frame would be
     /// the live hazard the rule exists for, so the exit itself closes
     /// that door — the claim rule back to full frames, and the pipeline
@@ -1129,7 +1130,7 @@ impl<F: SegmentFs> BootFlush<F> {
         self.flush.seal_shutdown()?;
         self.flush.claim = ClaimRule::FullFrames;
         let handles = if cfg!(inf_canary_replay_handles_dropped) {
-            // The planted canary (DRR FCR-STTIER-01 §6): the boot-sealed
+            // The planted canary breaks ADR-0174 D5: the boot-sealed
             // handles are closed instead of returned.
             Vec::new()
         } else {
@@ -1156,16 +1157,16 @@ impl<F: SegmentFs> BootFlush<F> {
         self.flush.disk_bytes()
     }
 
-    /// Handles held: one per sealed catalogue file (tests, I11).
+    /// Handles held: one per sealed catalogue file (ADR-0174 D5).
     #[must_use]
     pub fn held_handles(&self) -> usize {
         self.flush.sealed_handles.len()
     }
 
-    /// The planted canary's stall seal (DRR FCR-STTIER-01 §6,
-    /// `inf_canary_replay_stall_seal`): a boot pipeline never seals a
-    /// file to free a partial frame (ADR-0174 D2 rule 5); the seal-reason
-    /// census is what sees one that does.
+    /// The planted canary's stall seal (`inf_canary_replay_stall_seal`):
+    /// a boot pipeline never seals a file to free a partial frame
+    /// (ADR-0174 D2 rule 5); the seal-reason census is what sees one that
+    /// does.
     ///
     /// # Errors
     /// As any seal.

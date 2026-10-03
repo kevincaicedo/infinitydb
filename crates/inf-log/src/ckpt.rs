@@ -2960,7 +2960,7 @@ mod tests {
 
     /// ADR-0174 R2, the writer half: a ref for a namespace that has
     /// staged an image is refused at staging, so no writer can emit what
-    /// the reader refuses (E9). Red before the law: the ref staged.
+    /// the reader refuses. Red before the law: the ref staged.
     #[test]
     #[should_panic(expected = "a ref section after an image of its namespace (ADR-0174 R2)")]
     fn a_ref_after_an_image_of_its_namespace_is_refused_at_staging() {

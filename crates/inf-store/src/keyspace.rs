@@ -1169,8 +1169,8 @@ impl Keyspace {
     /// ADR-0011 D4. Records naming an unregistered id (dropped namespace)
     /// or a reserved one are skipped and counted, never an error: the
     /// catalog is authoritative and foreign logs must not wedge recovery.
-    /// `spill` lends a tiered namespace's boot replay machine (ADR-0174;
-    /// the seam of DRR FCR-STTIER-01 §7) and takes the I/O it did.
+    /// `spill` lends a tiered namespace's boot replay machine (ADR-0174
+    /// D1, D2); the machine keeps the I/O it did for the seam's owner.
     ///
     /// `ExpireAt` deadlines convert from record Unix-ms through `anchor`;
     /// a deadline too far in the future for the internal clock clamps to
@@ -1340,7 +1340,7 @@ impl Keyspace {
     /// The tiered replay arms (ADR-0174 D3; register bound by ADR-0059
     /// D9): each record enters the table's replay entry with its parked
     /// markers, so the room question and a `DEL`'s reads precede the
-    /// marker drain (DRR FCR-STTIER-01 E1, E4). Returns `None` when the
+    /// marker drain (ADR-0174 D1, R6). Returns `None` when the
     /// record is not tiered-routed — the caller's CellStore arms own it.
     ///
     /// # Errors
@@ -1728,9 +1728,9 @@ pub enum ReplayOutcome {
 #[derive(Debug)]
 pub enum ReplayError {
     Store(OpError),
-    /// A tiered namespace's typed boot refusal (ADR-0174; DRR
-    /// FCR-STTIER-01 §2): the window's refusal is no longer here — it is
-    /// a `Room` the entry answers with a demote step.
+    /// A tiered namespace's typed boot refusal (ADR-0174 D1): the
+    /// window's refusal is never one — it is a `Room` the entry answers
+    /// with a demote step.
     Replay(ReplayRefusal),
     /// Displacement-marker stream violation (ADR-0057 D4 pairing /
     /// ADR-0059 D9 bound) — corrupt or truncated tiered replay input.

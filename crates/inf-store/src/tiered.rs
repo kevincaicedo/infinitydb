@@ -844,13 +844,13 @@ impl TieredTable {
     // ---- recovery replay arms (ADR-0057 D4 as ADR-0174 D3 states them) ----
     //
     // The entries are `replay::TieredTable::replay_*`, which hold the
-    // demote seam (DRR FCR-STTIER-01 I2); these are their arms.
+    // demote seam (ADR-0174 D1); these are their arms.
 
     /// Blind key-verified RAM upsert (R5) — checkpoint image and tail-SET
     /// replay, after the entry made room: a RAM record of the key is
     /// overwritten (copy to tail, slot repointed, the old record dead)
-    /// and its relocation origins move to the new record (E2); none
-    /// inserts at the tail (E3). A cold candidate is neither read nor
+    /// and its relocation origins move to the new record; none inserts at
+    /// the tail. A cold candidate is neither read nor
     /// touched: a same-key cold slot settles at the record's seal or at
     /// the end of replay (R7).
     ///
@@ -895,7 +895,7 @@ impl TieredTable {
         false
     }
 
-    /// E2's origin move: the slot `(hash, old)` was repointed to `new`
+    /// R5's origin move: the slot `(hash, old)` was repointed to `new`
     /// by a replayed overwrite, and the addresses un-superseded
     /// checkpoints may still name it by stay attached to the live record
     /// (ADR-0059 D9; ADR-0174 R5).
@@ -1131,7 +1131,7 @@ impl TieredTable {
     }
 
     /// The typed length refusals of an inline placement (the one copy —
-    /// `append` and boot replay's E1 both ask), answering the record's
+    /// `append` and boot replay's entry both ask), answering the record's
     /// encoded length: the key and value bounds; values at or above the
     /// blob threshold must take the extent path (M4-S17, ADR-0061 D1 —
     /// the inline refusal is what makes the plane's routing a checked

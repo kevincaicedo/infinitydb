@@ -113,7 +113,7 @@ impl TieredTable {
     /// `blob_user_bytes`. The extent's device bytes arrive via
     /// [`note_blob_bytes`](Self::note_blob_bytes).
     /// The typed length refusals of an extent-reference placement (the
-    /// one copy — `append_extent` and boot replay's E1 both ask),
+    /// one copy — `append_extent` and boot replay's entry both ask),
     /// answering the record's encoded length: the key bound and the blob
     /// maximum; half the ring (ADR-0102 D3 — unreachable with a legal
     /// key). The admission cost's representability is
@@ -298,8 +298,8 @@ impl TieredTable {
     /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
     /// record (ADR-0174 R5 over the extent kind — the arm of
     /// `replay_upsert_extent`, after the entry made room): blind
-    /// key-verified RAM upsert, the origins moved with an overwrite
-    /// (E2); a cold candidate is neither read nor touched.
+    /// key-verified RAM upsert, the origins moved with an overwrite; a
+    /// cold candidate is neither read nor touched.
     ///
     /// # Errors
     /// Space refusals from the store (the entry answered `Fits`).

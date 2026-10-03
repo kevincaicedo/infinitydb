@@ -214,7 +214,7 @@ impl TieredTable {
     }
 
     /// Drains the flush completely (shutdown, tests, DST quiesce, the
-    /// boot hand-over's E13): runs slices until nothing appends, then
+    /// boot hand-over, ADR-0174 R10): runs slices until nothing appends, then
     /// seals the active file so the partial tail frame becomes
     /// claimable, and confirms `flushed` up to the sealed end (=
     /// `ro_boundary` when the space had no pending gap at the very end).

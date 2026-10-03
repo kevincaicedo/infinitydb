@@ -1144,7 +1144,7 @@ fn rebuild_walks_a_displaced_chain_and_settles_mid_chain() {
     assert_eq!(t.len(), PAIRS + 2, "24 keys + the two colliding keys");
 }
 
-/// ADR-0174 D3 (the settle read's identity, DRR FCR-STTIER-01 §6): a
+/// ADR-0174 D3 (the settle read's identity): a
 /// rebuilt slot whose bytes are another key's record, carry a type tag
 /// of 0, or claim a length past the file's end is a **typed** refusal
 /// naming the check — never "distinct", never a settle; a record shorter

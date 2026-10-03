@@ -362,8 +362,9 @@ impl<'a> ColdKey<'a> {
         let bits = window[0] >> 4;
         let kind = match TypeTag::from_bits(bits) {
             Some(kind) => kind,
-            // The planted canary (DRR FCR-STTIER-01 §6): a constructor
-            // that checks nothing takes an unknown tag for a string.
+            // The planted canary breaks ADR-0174 D3's identity check: a
+            // constructor that checks nothing takes an unknown tag for a
+            // string.
             None if cfg!(inf_canary_replay_settle_unchecked) => TypeTag::String,
             None => return Err(ColdKeyError::TypeTag { bits }),
         };
