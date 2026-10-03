@@ -38,11 +38,12 @@
 //!   freezes (§8.4 applies to tier files)
 //! - `tier_footer_torn` — `TierWriter::seal` — crash between data durability and footer durability:
 //!   the file recovers as *unsealed* at the manifested watermark, the seal is redone by rule
-//! - `tier_dir_open_fail` — `TierFlush::create_file_queued` (the reactor drive's directory holds) —
-//!   typed I/O error (`EMFILE` physics) before the new file's header write is staged: the round
-//!   keeps
-//!   only ops whose handles the pipeline owns, the creation retries next slice (review 2026-08-30,
-//!   F-L01-02)
+//! - `tier_dir_open_fail` — `TierFlush::create_file_queued` (the reactor drive's directory holds)
+//!   and `TierFlush::create_file` (the seam drive's create) — typed I/O error (`EMFILE` physics)
+//!   before the new file exists: on the reactor drive before its header write is staged, so the
+//!   round keeps only ops whose handles the pipeline owns and the creation retries next slice; on
+//!   the seam drive the create refuses with no file left behind — at boot, the demote step's typed
+//!   refusal (ADR-0174 D5)
 //! - `tier_unlink_fail` — `flush::unlink_tier_file` — typed I/O error, **non-fatal and counted**
 //!   (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never
 //!   durability; the retry and the boot GC both re-drive it

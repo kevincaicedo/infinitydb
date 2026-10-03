@@ -859,6 +859,15 @@ impl<F: SegmentFs> TierFlush<F> {
 
     fn create_file(&mut self, base: LogicalAddr) -> Result<(), TierFlushError> {
         let id = self.next_id;
+        // `tier_dir_open_fail` on the seam drive: the create refused before
+        // the file exists (EMFILE physics) — the boot demote step's create
+        // refusal (ADR-0174 D5), typed, with no file left behind.
+        if inf_foundation::fault::fire(crate::fault::TIER_DIR_OPEN_FAIL) {
+            return Err(TierFlushError::Io {
+                path: self.config.shard_dir.join("cold"),
+                source: crate::fault::injected(crate::fault::TIER_DIR_OPEN_FAIL),
+            });
+        }
         let writer = TierWriter::create_with_capacity(
             &self.fs,
             &self.config.shard_dir,
@@ -1846,6 +1855,27 @@ mod boot_tests {
         assert_eq!(handles.len(), 1, "one held handle per sealed catalogue file");
         assert_eq!(flush.claim, ClaimRule::FullFrames, "the plane's rule");
         assert!(flush.active().is_none());
+    }
+
+    /// `tier_dir_open_fail` on the seam drive: the create is refused
+    /// before the file exists — typed, no file left behind, the id not
+    /// consumed — and the retry creates it. This is the boot pipeline's
+    /// create (ADR-0174 D5's EMFILE row).
+    #[test]
+    fn a_refused_seam_create_leaves_no_file_and_the_retry_creates() {
+        use inf_foundation::fault::FaultSpec;
+        let fs = MemFs::new();
+        let mut boot = BootFlush::new(TierFlush::new(fs.clone(), config(1 << 20), 0), Vec::new());
+        inf_foundation::fault::arm(crate::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+        let err = boot.append_range(LogicalAddr::ZERO, &[0x11; 64]).expect_err("refused");
+        inf_foundation::fault::disarm_all();
+        assert!(matches!(err, TierFlushError::Io { .. }), "{err}");
+        assert!(boot.active().is_none(), "no file is active");
+        assert_eq!(boot.next_file_id(), 0, "the id is not consumed");
+        let cold = Path::new("shard-0/cold");
+        assert!(fs.list_dir(cold).unwrap_or_default().is_empty(), "no file left behind");
+        boot.append_range(LogicalAddr::ZERO, &[0x11; 64]).expect("the retry creates");
+        assert_eq!(boot.next_file_id(), 1);
     }
 
     /// The injected read failure (`replay_settle_read_fail`) answers
