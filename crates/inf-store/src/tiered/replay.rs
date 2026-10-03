@@ -452,14 +452,14 @@ impl<F: SegmentFs> TierReplay<F> {
             }
             let (len, hash) = {
                 let parts = table.record(here);
-                self.key.clear();
-                self.key.extend_from_slice(parts.key);
                 (parts.encoded_len as u64, table.hash_key(parts.key))
             };
             // The planted canary (DRR FCR-STTIER-01 §6): E10 skipped at
             // the seal — a sealed record leaves its same-key cold slot.
             let settle_here = stop.is_none() || !cfg!(inf_canary_replay_seal_no_settle);
-            if settle_here && table.index.contains_pair(hash, here) {
+            if settle_here && self.collect_twins(table, here, hash) {
+                self.key.clear();
+                self.key.extend_from_slice(table.record(here).key);
                 self.settle_twins(table, here, hash)?;
             }
             at += len;
@@ -473,26 +473,36 @@ impl<F: SegmentFs> TierReplay<F> {
         Ok((SettledSpan { end }, at >= tail))
     }
 
-    /// E10 for the live RAM record at `winner` (its key in `self.key`):
-    /// each exact-hash cold slot is read through the held handle, parsed
-    /// into a `ColdKey` under the slot's hash, and settled when it
-    /// carries the winner's key — as a ref (counted, stamped, chained,
-    /// no bytes) below the origin, with its exact death above it (R8);
-    /// a distinct key stays.
+    /// One pass over the exact-hash group of the record at `here`: whether
+    /// the record is slotted (live), with its cold siblings collected
+    /// into `twins`. True when a live record has a cold sibling to settle.
+    fn collect_twins(&mut self, table: &TieredTable, here: LogicalAddr, hash: u64) -> bool {
+        self.twins.clear();
+        let mut live = false;
+        let space = &table.space;
+        let twins = &mut self.twins;
+        table.index.each_exact(hash, |sibling| {
+            if sibling == here {
+                live = true;
+            } else if space.resolve(sibling) == AddrClass::Cold {
+                twins.push(sibling);
+            }
+        });
+        live && !self.twins.is_empty()
+    }
+
+    /// E10 for the live RAM record at `winner` (its key in `self.key`,
+    /// its cold siblings in `twins`): each is read through the held
+    /// handle, parsed into a `ColdKey` under the slot's hash, and settled
+    /// when it carries the winner's key — as a ref (counted, stamped,
+    /// chained, no bytes) below the origin, with its exact death above it
+    /// (R8); a distinct key stays.
     fn settle_twins(
         &mut self,
         table: &mut TieredTable,
         winner: LogicalAddr,
         hash: u64,
     ) -> Result<(), ReplayRefusal> {
-        self.twins.clear();
-        let space = &table.space;
-        let twins = &mut self.twins;
-        table.index.each_exact(hash, |sibling| {
-            if space.resolve(sibling) == AddrClass::Cold {
-                twins.push(sibling);
-            }
-        });
         for i in 0..self.twins.len() {
             let cold = self.twins[i];
             let window = self
