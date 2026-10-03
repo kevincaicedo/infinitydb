@@ -72,6 +72,92 @@ const FILE_CAPACITY: u64 = 48 << 10;
 /// every inline value the op generator emits, below every blob value.
 const BLOB_THRESHOLD: u32 = 256;
 
+/// The spec-variant seed class (ADR-0174 D2 rule 6; the record's §6
+/// second row, at the harness's 4 KiB commit page): each boot recovers at
+/// a window below its 8-page ring, with records up to the inline maximum,
+/// so a record's need can lie above the boot's tail and replay pads.
+/// Every live life runs at the whole ring and lowers `MEM-BUDGET` to the
+/// variant's before its cut (a lowered budget keeps the ring, so live and
+/// boot share one ring; ADR-0062 D3), and raises it back after the boot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpecVariant {
+    /// Case (a), `MEM-BUDGET 4mb BLOB-THRESHOLD 3mb` scaled: a 4-page
+    /// budget and a 1-page slice (a 5-page window), a 3-page threshold,
+    /// records from 2.125 pages to the threshold's longest, just above 3
+    /// — where a ring-top hole's pages and the record's exceed the window,
+    /// the tail pads to the ring top.
+    RingTop,
+    /// Case (b), `MEM-BUDGET 4mb MAINTAIN-SLICE 64kb` scaled: a 4-page
+    /// budget and a quarter-page slice (a window of half the ring), the
+    /// largest threshold the ring allows, records of 3 to 4 pages and of
+    /// exactly half the ring — from an unaligned tail such a record spans
+    /// more pages than the window, so the tail pads to the next page.
+    Page,
+}
+
+impl SpecVariant {
+    /// The seed's variant, one of the two.
+    #[must_use]
+    pub fn of_seed(seed: u64) -> SpecVariant {
+        if (seed >> 2).is_multiple_of(2) { SpecVariant::RingTop } else { SpecVariant::Page }
+    }
+}
+
+/// The tier spec a run's lives and boots use: the boot's (what the spec
+/// holds at a cut), the live lives', and the blob threshold of both.
+#[derive(Copy, Clone, Debug)]
+struct Spec {
+    boot: DemotionConfig,
+    live: DemotionConfig,
+    blob_threshold: u32,
+    variant: Option<SpecVariant>,
+}
+
+impl Spec {
+    fn of(variant: Option<SpecVariant>) -> Spec {
+        let Some(variant) = variant else {
+            let boot = demote();
+            return Spec { boot, live: boot, blob_threshold: BLOB_THRESHOLD, variant: None };
+        };
+        let ring = 8 * PAGE;
+        let (slice_bytes, blob_threshold) = match variant {
+            SpecVariant::RingTop => (PAGE, u32::try_from(3 * PAGE).expect("three pages")),
+            SpecVariant::Page => (PAGE / 4, TierSpec::blob_threshold_max(ring)),
+        };
+        let boot = DemotionConfig { mem_budget_bytes: 4 * PAGE, mutable_permille: 40, slice_bytes };
+        let spec = Spec { boot, live: raise(boot), blob_threshold, variant: Some(variant) };
+        debug_assert_eq!(spec.ring(), ring, "both variants reserve an 8-page ring");
+        spec
+    }
+
+    /// The ring both the live table and the boot reserve.
+    fn ring(&self) -> u64 {
+        u64::try_from(self.boot.ring_reserve_bytes().expect("valid budget")).expect("u64")
+    }
+
+    /// The boot's window: `MEM-BUDGET + MAINTAIN-SLICE` in whole pages.
+    fn window(&self) -> u64 {
+        (self.boot.mem_budget_bytes + self.boot.slice_bytes) / PAGE * PAGE
+    }
+
+    /// The slack a replay unit leaves the boot's window to fit by
+    /// construction: the page rounding at both ends and a ring-top hole
+    /// under the longest record the mix places — an inline value under the
+    /// blob threshold and a key of at most 64 bytes, or, in a variant, a
+    /// record of half the ring.
+    fn fit_margin(&self) -> u64 {
+        match self.variant {
+            None => 2 * PAGE + 1024,
+            Some(_) => 2 * PAGE + self.ring() / 2,
+        }
+    }
+
+    /// A blob configuration at the spec's threshold.
+    fn blob(&self) -> BlobConfig {
+        BlobConfig { threshold_bytes: self.blob_threshold, max_bytes: 1 << 20 }
+    }
+}
+
 /// Scenario knobs — the DSL v0 shape (a struct, not a language).
 #[derive(Debug)]
 pub struct RecoveryScenario {
@@ -96,6 +182,17 @@ pub struct RecoveryScenario {
     /// demoted, or whose two-crash row settled no ref or whose second boot
     /// did not fit, reports `VACUOUS`.
     pub replay_above_window: bool,
+    /// The spec-variant seed class (ADR-0174 D2 rule 6), one seed in four,
+    /// the variant by seed ([`SpecVariant::of_seed`]): every boot recovers
+    /// at a window below its ring, and before each cut the fill
+    /// (`Run::fill_replay_unit`) writes records up to the inline maximum
+    /// until the unit reaches a multiple of that window drawn as the class
+    /// above draws it. Live writes run at the whole ring; a long record
+    /// the live window cannot place yet is written short instead. No
+    /// two-crash row. `--spec-variant ring-top|page` forces it on any seed;
+    /// a run whose boots placed no pad or made no demote step reports
+    /// `VACUOUS`.
+    pub spec_variant: Option<SpecVariant>,
 }
 
 impl RecoveryScenario {
@@ -112,7 +209,26 @@ impl RecoveryScenario {
             lives: 4,
             ops_per_phase: 480,
             replay_above_window: seed % 4 == 1,
+            spec_variant: (seed % 4 == 3).then(|| SpecVariant::of_seed(seed)),
         }
+    }
+
+    /// The spec-variant class forced on this seed, in place of any other
+    /// class.
+    #[must_use]
+    pub fn with_spec_variant(mut self, variant: SpecVariant) -> RecoveryScenario {
+        self.replay_above_window = false;
+        self.spec_variant = Some(variant);
+        self
+    }
+
+    /// The replay-above-window class forced on this seed, at the
+    /// scenario's own spec.
+    #[must_use]
+    pub fn with_replay_above_window(mut self) -> RecoveryScenario {
+        self.replay_above_window = true;
+        self.spec_variant = None;
+        self
     }
 }
 
@@ -219,6 +335,13 @@ pub struct RecoveryReport {
     /// the tail since) already lay past the raised window, so the second
     /// boot could not fit it — disclosed, never a pass on its own.
     pub two_crash_unit_past_window: u64,
+    /// The spec-variant class (ADR-0174 D2 rule 6): the run's variant, the
+    /// long records the fill wrote (from the case's shortest: 2.125 pages,
+    /// or the window less a page), and those the live window could not
+    /// place yet, written short instead (engagement, disclosed).
+    pub spec_variant: Option<SpecVariant>,
+    pub long_records_written: u64,
+    pub long_records_shortened: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -279,7 +402,15 @@ struct Booting {
 }
 
 impl Booting {
-    fn new(table: TieredTable, machine: TierReplay<SimDisk>, hasher: KeyHasher) -> Booting {
+    fn new(
+        mut table: TieredTable,
+        machine: TierReplay<SimDisk>,
+        hasher: KeyHasher,
+        spec: &Spec,
+    ) -> Booting {
+        // The spec's threshold holds during replay, as the catalog's does
+        // at a server's boot: a value at or above it is a typed refusal.
+        table.set_blob_config(spec.blob());
         let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
         ks.ns_create(NsSpec {
             id: NS,
@@ -398,14 +529,15 @@ impl Booting {
         let Booting { mut ks, lent } = self;
         let table = ks.tiered_store_mut(NS).expect("materialized");
         let done = lent.machine.hand_over(table).map_err(|e| format!("hand-over: {e}"))?;
-        let table = std::mem::replace(table, tiered_table(0, table.hasher()));
+        let table = std::mem::replace(table, tiered_table(&Spec::of(None), 0, table.hasher()));
         Ok((table, done.handed, done.counters))
     }
 }
 
-fn tiered_table(origin: u64, hasher: KeyHasher) -> TieredTable {
-    let mut table = TieredTable::new(space_config(origin), demote(), 1024, hasher).expect("ring");
-    table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
+fn tiered_table(spec: &Spec, origin: u64, hasher: KeyHasher) -> TieredTable {
+    let mut table =
+        TieredTable::new(space_config(spec, origin), spec.live, 1024, hasher).expect("ring");
+    table.set_blob_config(spec.blob());
     // The shadow arm (M4.5-S37, ADR-0093 D8) runs on in this harness —
     // the store-level DST's authority over the mechanism.
     table.set_shadow_enabled(true);
@@ -429,11 +561,17 @@ fn demote() -> DemotionConfig {
     DemotionConfig { mem_budget_bytes: BUDGET, mutable_permille: 40, slice_bytes: PAGE }
 }
 
-/// The two-crash row's raised window: `MEM-BUDGET` up to the ring
-/// `demote()` reserved (a window above the ring is refused, ADR-0062 D3).
+/// `boot` raised to its whole ring: `MEM-BUDGET` up to the ring `boot`
+/// reserved (a window above the ring is refused, ADR-0062 D3) — the
+/// two-crash row's second window, and a variant's live one.
+fn raise(boot: DemotionConfig) -> DemotionConfig {
+    let ring = u64::try_from(boot.ring_reserve_bytes().expect("valid budget")).expect("u64");
+    DemotionConfig { mem_budget_bytes: ring - boot.slice_bytes, ..boot }
+}
+
+/// The two-crash row's raised window, at the scenario's own spec.
 fn raised() -> DemotionConfig {
-    let ring = u64::try_from(demote().ring_reserve_bytes().expect("valid budget")).expect("u64");
-    DemotionConfig { mem_budget_bytes: ring - demote().slice_bytes, ..demote() }
+    raise(demote())
 }
 
 /// Every address a displacement marker of `tail` names.
@@ -451,9 +589,9 @@ fn tail_marker_addrs(tail: &[u8]) -> BTreeSet<u64> {
     addrs
 }
 
-fn space_config(origin: u64) -> AddressSpaceConfig {
+fn space_config(spec: &Spec, origin: u64) -> AddressSpaceConfig {
     AddressSpaceConfig {
-        reserve_bytes: demote().ring_reserve_bytes().expect("valid budget"),
+        reserve_bytes: spec.boot.ring_reserve_bytes().expect("valid budget"),
         page_bytes: PAGE as usize,
         life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
     }
@@ -534,11 +672,11 @@ fn crafted_keys(seed: u64) -> Vec<[u8; 48]> {
 /// Tag spread for the crafted pairs (four unrelated pairs per seed).
 const P_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The slack a replay unit leaves the window for the boot to fit by
-/// construction: the page rounding at both ends and a ring-top hole under
-/// the longest record the op mix places (an inline value under the blob
-/// threshold, a key of at most 64 bytes).
-const FIT_MARGIN_BYTES: u64 = 2 * PAGE + 1024;
+/// Long records a spec variant's fill writes per life at least
+/// (`Run::fill_replay_unit`), within `LONG_OPS_PAST_TARGET` ops past its
+/// target: the class's engagement, each a chance for the boot to pad.
+const LONG_RECORDS_PER_LIFE: u64 = 8;
+const LONG_OPS_PAST_TARGET: u64 = 256;
 
 /// Maintain rounds a parked live write waits through before the harness
 /// calls it refused: each round demotes until it makes no progress, so
@@ -546,6 +684,8 @@ const FIT_MARGIN_BYTES: u64 = 2 * PAGE + 1024;
 const PARK_ROUNDS_MAX: u32 = 4;
 
 struct Run {
+    /// The run's tier spec: the scenario's constants, or a variant's.
+    spec: Spec,
     disk: SimDisk,
     shard: PathBuf,
     model: BTreeMap<Vec<u8>, Expect>,
@@ -973,8 +1113,12 @@ impl Run {
                 self.report.shadow_held_rows += 1;
                 // The row's premise: the winner is sealed and flushed
                 // **before** the walk. Twice the mutable window of plain
-                // writes on fresh keys pushes it out, then a maintain
-                // round seals and flushes it (release stops at the pin).
+                // writes on fresh keys — and at least the mutable window
+                // and two tier frames, since a live flush claims full
+                // frames only (ADR-0056 D5) — pushes it out, then a
+                // maintain round seals and flushes it (release stops at
+                // the pin); a page more of them per round until it does,
+                // where a variant's long records hold the frame back.
                 // Asserted — a winner still above `flushed` would be
                 // imaged by watermark alone and the row would prove
                 // nothing.
@@ -984,17 +1128,29 @@ impl Run {
                     .find(|t| t.cold == cold)
                     .map(|t| t.winner)
                     .expect("the ticket just opened");
-                let want = 2 * demote().mutable_target_bytes();
+                let mutable = self.spec.live.mutable_target_bytes();
+                let mut want = (2 * mutable).max(mutable + 2 * TIER_FRAME_BYTES as u64);
+                // Bound: a live budget of filler past the first `want`,
+                // a page more per round until the winner is flushed.
+                let cap = want + self.spec.live.mem_budget_bytes;
                 let mut written = 0u64;
                 let mut i = 0u64;
-                while written < want {
-                    let filler = format!("held:{}:{i}", self.report.shadow_held_rows).into_bytes();
-                    // Inline-sized (below `BLOB_THRESHOLD`): a plain SET.
-                    self.apply_op(life, &filler, Op::Set(vec![(rng.next_u64() % 251) as u8; 200]));
-                    written += 232;
-                    i += 1;
+                loop {
+                    while written < want {
+                        let filler =
+                            format!("held:{}:{i}", self.report.shadow_held_rows).into_bytes();
+                        // Inline-sized (below `BLOB_THRESHOLD`): a plain SET.
+                        let value = vec![(rng.next_u64() % 251) as u8; 200];
+                        self.apply_op(life, &filler, Op::Set(value));
+                        written += 232;
+                        i += 1;
+                    }
+                    self.maintain(life);
+                    if life.table.space().flushed() > winner || want >= cap {
+                        break;
+                    }
+                    want += PAGE;
                 }
-                self.maintain(life);
                 if life.table.space().flushed() <= winner {
                     self.report.violations.push(format!(
                         "HELD ROW VACUOUS: the winner at {} is still above the flushed watermark \
@@ -1045,7 +1201,10 @@ impl Run {
     /// from the record-length row (a 1-byte key and value, a typical value,
     /// the inline maximum), rewrites of fill keys at distances under and
     /// over a window, deletes, and shadow writes over demoted keys. Counts
-    /// the life when the unit exceeds the window.
+    /// the life when the unit exceeds the window. In a spec variant the
+    /// window is the boot's, three writes in four are long
+    /// ([`fill_op_long`](Self::fill_op_long)) and the fill writes
+    /// [`LONG_RECORDS_PER_LIFE`] long records at least.
     fn fill_replay_unit(
         &mut self,
         life: &mut Life,
@@ -1053,7 +1212,7 @@ impl Run {
         life_index: u64,
         fixed_target: Option<u64>,
     ) {
-        let window = demote().mem_budget_bytes + demote().slice_bytes;
+        let window = self.spec.window();
         let drawn = match rng.next_u64() % 8 {
             0 => window - PAGE,
             1 => window,
@@ -1070,16 +1229,36 @@ impl Run {
         let mut unit = self.replay_unit_bytes();
         let mut fill: Vec<Vec<u8>> = Vec::new();
         let mut i = 0u64;
+        // A variant's fill also writes its long records: a boot pads only
+        // where one lands, and a unit already above its target may hold
+        // none (the checkpoint's images and the phase's tail alone).
+        let long_before = self.report.long_records_written;
+        let long_owed = if self.spec.variant.is_some() { LONG_RECORDS_PER_LIFE } else { 0 };
+        let mut past_target = 0u64;
         // Bound: each op appends a record or deletes one of the fill's
         // keys; one op in eight deletes, so the unit grows by at least a
-        // record per eight ops until it reaches the target.
-        while unit < target {
+        // record per eight ops until it reaches the target; past it, at
+        // most `LONG_OPS_PAST_TARGET` ops for the long records owed.
+        while unit < target
+            || (self.report.long_records_written - long_before < long_owed
+                && past_target < LONG_OPS_PAST_TARGET)
+        {
+            past_target += u64::from(unit >= target);
             let before = self.tail.len();
-            let (key, op) = fill_op(rng, &fill, life_index, i);
+            let (key, op) = match self.spec.variant {
+                None => fill_op(rng, &fill, life_index, i, self.spec.blob_threshold),
+                Some(variant) => self.fill_op_long(life, rng, &fill, (life_index, i), variant),
+            };
             if !fill.contains(&key) {
                 fill.push(key.clone());
             }
+            let violations = self.report.violations.len();
             self.apply_op(life, &key, op);
+            if self.report.violations.len() > violations {
+                // A live write found no room: the run is red already, and
+                // a write that appends nothing would not end the fill.
+                break;
+            }
             unit += tail_record_bytes(&self.tail[before..]);
             i += 1;
             if i.is_multiple_of(64) {
@@ -1097,6 +1276,109 @@ impl Run {
             self.report.replay_unit_windows_max.max(unit.div_ceil(window));
         if unit > window {
             self.report.replay_above_window_lives += 1;
+        }
+    }
+
+    /// One op of a spec variant's fill (ADR-0174 D2 rule 6; the record's
+    /// §6 second row): [`fill_op`]'s mix at the spec's threshold, with
+    /// three writes in four long — a third each of the case's record
+    /// (case (a): 2.9 pages; case (b): 3.9 pages), the longest the
+    /// threshold and half the ring admit (in case (a) just above three
+    /// pages, so the record spans four), and a length drawn between the
+    /// case's shortest (case (a): 2.125 pages; case (b): the window less a
+    /// page) and that longest — and, in case (b), one op in eight a fresh
+    /// key of the longest length whose record is exactly half the ring.
+    /// A write the live window cannot place after
+    /// [`PARK_ROUNDS_MAX`] maintain rounds is written short instead: the
+    /// live path would park on it until its stall timeout (at a need above
+    /// the tail, FCR-STTIER-N4's shape) and acknowledge nothing.
+    fn fill_op_long(
+        &mut self,
+        life: &mut Life,
+        rng: &mut SplitMix64,
+        fill: &[Vec<u8>],
+        (life_index, i): (u64, u64),
+        variant: SpecVariant,
+    ) -> (Vec<u8>, Op) {
+        let header = TieredTable::RECORD_HEADER_LEN as u64;
+        let half_ring = self.spec.ring() / 2;
+        let exact_half = variant == SpecVariant::Page && rng.next_u64().is_multiple_of(8);
+        let (key, op) = if exact_half {
+            let mut key = format!("half:{life_index:02}:{i:06}:").into_bytes();
+            key.resize(inf_store::MAX_KEY_LEN, b'h');
+            (key, Op::Set(Vec::new()))
+        } else {
+            fill_op(rng, fill, life_index, i, self.spec.blob_threshold)
+        };
+        let shadow = matches!(op, Op::SetShadow(_));
+        let drawn = match op {
+            Op::Set(value) | Op::SetShadow(value) => value,
+            other @ (Op::Del | Op::SetBlob(_)) => return (key, other),
+        };
+        let key_len = key.len() as u64;
+        let longest = (header + key_len + u64::from(self.spec.blob_threshold) - 1).min(half_ring);
+        let (typical, shortest) = match variant {
+            SpecVariant::RingTop => (29 * PAGE / 10, 2 * PAGE + PAGE / 8),
+            SpecVariant::Page => (39 * PAGE / 10, self.spec.window() - PAGE + 1),
+        };
+        let len = if exact_half {
+            half_ring
+        } else if rng.next_u64() % 4 < 3 {
+            match rng.next_u64() % 3 {
+                0 => typical.min(longest),
+                1 => longest,
+                _ => shortest + rng.next_u64() % (longest - shortest + 1),
+            }
+        } else {
+            header + key_len + drawn.len() as u64
+        };
+        let byte = (rng.next_u64() % 251) as u8;
+        let value = if !self.placeable(life, usize::try_from(len).expect("half a ring")) {
+            self.report.long_records_shortened += 1;
+            vec![byte; 24 + (rng.next_u64() % 140) as usize]
+        } else if len >= shortest {
+            self.report.long_records_written += 1;
+            vec![byte; usize::try_from(len - header - key_len).expect("half a ring")]
+        } else {
+            drawn
+        };
+        (key, if shadow { Op::SetShadow(value) } else { Op::Set(value) })
+    }
+
+    /// Whether the live window places `len` bytes within
+    /// [`PARK_ROUNDS_MAX`] maintain rounds — [`park_for_room`]'s rounds,
+    /// asked before the write is chosen, so a no is no violation: the
+    /// generator writes something else.
+    ///
+    /// [`park_for_room`]: Self::park_for_room
+    fn placeable(&mut self, life: &mut Life, len: usize) -> bool {
+        for round in 0..PARK_ROUNDS_MAX {
+            if matches!(life.table.space().room(len), Room::Fits) {
+                return true;
+            }
+            self.park_round(life, round, len, "fill");
+        }
+        matches!(life.table.space().room(len), Room::Fits)
+    }
+
+    /// One round of the park on a full window: the reconciler from the
+    /// second round on (a pinned twin holds release back, ADR-0093 D3),
+    /// then demotion. A spec variant's live window holds two long records,
+    /// so a write that still does not fit can wait on the partial-frame
+    /// holdback alone: the barrier seal under backpressure (ADR-0056 D8)
+    /// makes it claimable and demotion runs again. The scenario's own
+    /// window, 257 pages, never waits on one frame.
+    fn park_round(&mut self, life: &mut Life, round: u32, len: usize, when: &str) {
+        if round > 0 {
+            self.reconcile(life, 16, when);
+        }
+        self.maintain(life);
+        if self.spec.variant.is_some()
+            && !matches!(life.table.space().room(len), Room::Fits)
+            && life.flush.append_cursor().is_some()
+        {
+            life.table.flush_barrier(&mut life.flush).expect("sim barrier seal");
+            self.maintain(life);
         }
     }
 
@@ -1118,12 +1400,7 @@ impl Run {
                 return true;
             }
             self.report.writer_parks += 1;
-            // A pinned twin holds release back (ADR-0093 D3): the
-            // reconciler resolves open tickets before demotion runs.
-            if round > 0 {
-                self.reconcile(life, 16, "park");
-            }
-            self.maintain(life);
+            self.park_round(life, round, len, "park");
         }
         if matches!(life.table.space().room(len), Room::Fits) {
             return true;
@@ -1175,14 +1452,15 @@ impl Run {
     /// page rounding and a ring-top hole must leave the zero set at zero.
     /// Folded into the report and the trace.
     fn note_boot(&mut self, counters: &ReplayCounters, unit: u64, life_index: u64) {
-        let window = demote().mem_budget_bytes + demote().slice_bytes;
+        let window = self.spec.window();
+        let fits = unit + self.spec.fit_margin() <= window;
         if unit > window && counters.demote_steps == 0 {
             self.report.violations.push(format!(
                 "life {life_index}: a replay unit of {unit} bytes above the {window}-byte window \
                  booted without a demote step ({counters:?})"
             ));
         }
-        if unit + FIT_MARGIN_BYTES <= window && !counters.zero_set_is_zero() {
+        if fits && !counters.zero_set_is_zero() {
             self.report.violations.push(format!(
                 "life {life_index}: a replay unit of {unit} bytes fits the {window}-byte window \
                  but the zero set moved ({counters:?})"
@@ -1190,7 +1468,7 @@ impl Run {
         }
         let r = &mut self.report;
         r.demoting_boots += u64::from(counters.demote_steps > 0);
-        r.fitting_boots_checked += u64::from(unit + FIT_MARGIN_BYTES <= window);
+        r.fitting_boots_checked += u64::from(fits);
         r.boot_replay.absorb(*counters);
         r.trace_hash = hash64(
             &[counters.demote_steps.to_le_bytes(), counters.tier_bytes.to_le_bytes()].concat(),
@@ -1213,7 +1491,7 @@ impl Run {
         // The second boot must fit the raised window, or it would settle
         // the refs itself: a unit already past it cannot carry the row.
         let window = raised().mem_budget_bytes + raised().slice_bytes;
-        if self.replay_unit_bytes() + ROW_BYTES_MAX + FIT_MARGIN_BYTES > window {
+        if self.replay_unit_bytes() + ROW_BYTES_MAX + self.spec.fit_margin() > window {
             self.report.two_crash_unit_past_window += 1;
             return;
         }
@@ -1299,7 +1577,7 @@ impl Run {
         };
         let unit = self.replay_unit_bytes();
         let window = raised().mem_budget_bytes + raised().slice_bytes;
-        if unit + FIT_MARGIN_BYTES > window || !counters.zero_set_is_zero() {
+        if unit + self.spec.fit_margin() > window || !counters.zero_set_is_zero() {
             self.report.violations.push(format!(
                 "TWO-CRASH VACUOUS: the second boot does not fit its {window}-byte window \
                  (unit {unit}, {counters:?})"
@@ -1349,13 +1627,13 @@ impl Run {
             &tier,
             manifest.ckpt_id,
             flush_config(&self.shard),
-            space_config(0),
+            space_config(&self.spec, 0),
             raised(),
             1024,
             hasher,
         )
         .map_err(|e| format!("tier recovery: {e}"))?;
-        let mut node = Booting::new(recovered.table, recovered.replay, hasher);
+        let mut node = Booting::new(recovered.table, recovered.replay, hasher, &self.spec);
         let ick = self.shard.join(ick_file_name(manifest.ckpt_id));
         node.load_checkpoint(&self.disk, &ick, tier.flushed)?;
         node.table_mut().set_shadow_enabled(true);
@@ -1960,11 +2238,18 @@ fn tail_record_bytes(tail: &[u8]) -> u64 {
 /// One op of the replay-above-window fill: a fresh key (one in sixteen a
 /// 1-byte key) or, once the fill has keys, a rewrite of a recent one (a
 /// distance under a window), a rewrite or a shadow write of an early one
-/// (over a window: demoted by now), or a delete.
-fn fill_op(rng: &mut SplitMix64, fill: &[Vec<u8>], life_index: u64, i: u64) -> (Vec<u8>, Op) {
+/// (over a window: demoted by now), or a delete. Values from the
+/// record-length row: 1 byte, typical, and the longest under `threshold`.
+fn fill_op(
+    rng: &mut SplitMix64,
+    fill: &[Vec<u8>],
+    life_index: u64,
+    i: u64,
+    threshold: u32,
+) -> (Vec<u8>, Op) {
     let value_len = match rng.next_u64() % 8 {
         0 => 1,
-        1 => BLOB_THRESHOLD as usize - 1,
+        1 => threshold as usize - 1,
         _ => 24 + (rng.next_u64() % 140) as usize,
     };
     let value = vec![(rng.next_u64() % 251) as u8; value_len];
@@ -1982,13 +2267,13 @@ fn fill_op(rng: &mut SplitMix64, fill: &[Vec<u8>], life_index: u64, i: u64) -> (
     }
 }
 
-fn seeded_op(rng: &mut SplitMix64) -> Op {
+fn seeded_op(rng: &mut SplitMix64, threshold: u32) -> Op {
     match rng.next_u64() % 8 {
         0 => Op::Del,
         // The blob leg (M4-S17): values at or above the threshold, small
         // enough that the extent lifecycle churns at DST scale.
         1 => {
-            let len = BLOB_THRESHOLD as usize + (rng.next_u64() % 300) as usize;
+            let len = threshold as usize + (rng.next_u64() % 300) as usize;
             Op::SetBlob(vec![(rng.next_u64() % 251) as u8; len])
         }
         // The shadow leg (M4.5-S37): a quarter of the inline SETs.
@@ -2013,7 +2298,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     let disk = SimDisk::new();
     let shard = PathBuf::from("node/shard-0");
     disk.create_dir_all(&shard).expect("shard dir");
+    let spec = Spec::of(scenario.spec_variant);
     let mut run = Run {
+        spec,
         disk: disk.clone(),
         shard: shard.clone(),
         model: BTreeMap::new(),
@@ -2026,10 +2313,10 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         walk_refs: Vec::new(),
         published_refs: Vec::new(),
         two_crash: Vec::new(),
-        report: RecoveryReport::default(),
+        report: RecoveryReport { spec_variant: spec.variant, ..RecoveryReport::default() },
     };
     let mut life = Life {
-        table: tiered_table(0, hasher),
+        table: tiered_table(&spec, 0, hasher),
         flush: TierFlush::new(disk.clone(), flush_config(&shard), 0),
         ring: StagingRing::new(StagingConfig::default()),
         flush_lag: false,
@@ -2053,7 +2340,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 run.hold_a_ticket(&mut life, &mut rng);
             }
             let key = seeded_key(&mut rng, scenario.keys, &pairs);
-            let op = seeded_op(&mut rng);
+            let op = seeded_op(&mut rng, run.spec.blob_threshold);
             run.apply_op(&mut life, &key, op);
             if !life.flush_lag && rng.next_u64().is_multiple_of(32) {
                 run.maintain(&mut life);
@@ -2070,7 +2357,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             // ever resolve; the boot sweep must reclaim it.
             if rng.next_u64().is_multiple_of(48) {
                 let orphan_id = ExtentId(life.table.allocate_extent_id());
-                let len = BLOB_THRESHOLD as usize + (rng.next_u64() % 64) as usize;
+                let len = run.spec.blob_threshold as usize + (rng.next_u64() % 64) as usize;
                 let mut w = ExtentWriter::create(
                     &run.disk,
                     &run.shard,
@@ -2110,7 +2397,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // tail prefix covered by this checkpoint is truncated only if
         // the publish lands (cut-before-publish keeps it — D7).
         // The class's last life carries the two-crash row: it publishes.
-        let two_crash_life = scenario.replay_above_window && life_index + 1 == scenario.lives;
+        let two_crash_life = scenario.replay_above_window
+            && spec.variant.is_none()
+            && life_index + 1 == scenario.lives;
         let cut_before_publish =
             life_index > 0 && rng.next_u64().is_multiple_of(4) && !two_crash_life;
         let covered = run.tail.len();
@@ -2195,7 +2484,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 }
                 for _ in 0..4 {
                     let key = seeded_key(&mut rng, scenario.keys, &pairs);
-                    let op = seeded_op(&mut rng);
+                    let op = seeded_op(&mut rng, run.spec.blob_threshold);
                     run.apply_op(&mut life, &key, op);
                 }
                 if !life.flush_lag && rng.next_u64().is_multiple_of(4) {
@@ -2294,7 +2583,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             // Post-publish tail ops.
             for _ in 0..scenario.ops_per_phase / 4 {
                 let key = seeded_key(&mut rng, scenario.keys, &pairs);
-                let op = seeded_op(&mut rng);
+                let op = seeded_op(&mut rng, run.spec.blob_threshold);
                 run.apply_op(&mut life, &key, op);
             }
             if !life.flush_lag {
@@ -2303,16 +2592,19 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         } else {
             run.report.cut_before_publish += 1;
         }
-        if scenario.replay_above_window {
+        if scenario.replay_above_window || spec.variant.is_some() {
             // The two-crash life's unit lies just above the window, so its
             // boot demotes and the second boot fits the raised one.
-            let window = demote().mem_budget_bytes + demote().slice_bytes;
-            let fixed = two_crash_life.then_some(window + 16 * PAGE);
+            let fixed = two_crash_life.then_some(spec.window() + 16 * PAGE);
             run.fill_replay_unit(&mut life, &mut rng, life_index, fixed);
         }
         if two_crash_life {
             run.open_two_crash_rows(&mut life);
         }
+        // `MEM-BUDGET` lowered to the boot's before the cut (a variant's;
+        // the scenario's own spec is its live one): the ring stays, so the
+        // next boot recovers at the lowered window over the same ring.
+        life.table.set_demotion(spec.boot).expect("the boot's window is inside its ring");
 
         // Tickets deliberately left open across the cut (ADR-0093 D5):
         // recovery must re-form them from the checkpoint/tail.
@@ -2354,8 +2646,8 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             &tier,
             manifest.ckpt_id,
             flush_config(&shard),
-            space_config(0),
-            demote(),
+            space_config(&spec, 0),
+            spec.boot,
             1024,
             hasher,
         ) {
@@ -2368,7 +2660,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         };
         let extents_listed = recovered.extents_listed;
         let replay_unit = run.replay_unit_bytes();
-        let mut node = Booting::new(recovered.table, recovered.replay, hasher);
+        let mut node = Booting::new(recovered.table, recovered.replay, hasher, &spec);
         let booted = node
             .load_checkpoint(&disk, &shard.join(ick_file_name(manifest.ckpt_id)), tier.flushed)
             .and_then(|()| {
@@ -2405,7 +2697,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             &mut run.report,
             life_index,
         );
-        table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
+        table.set_blob_config(spec.blob());
+        // A variant's `MEM-BUDGET` raised back to its ring for the live life.
+        table.set_demotion(spec.live).expect("the live window is the ring");
         life = Life {
             table,
             flush: handed.flush,
@@ -2492,7 +2786,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.trace_hash,
         );
     }
-    if scenario.replay_above_window {
+    if scenario.replay_above_window && spec.variant.is_none() {
         run.two_crash_coda(life, hasher, scenario.seed);
     }
     // The class's engagement, per seed: a life above the window, a boot
@@ -2518,6 +2812,25 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.demoting_boots,
             replay.settle_reads,
             replay.deletes_verified
+        ));
+    }
+    // The spec-variant class's engagement, per seed (ADR-0174 D2 rule 6):
+    // a life above the boot's window, a boot that demoted, and a pad
+    // placed — the case the class exists to reach.
+    if let Some(variant) = spec.variant
+        && (run.report.replay_above_window_lives == 0
+            || replay.demote_steps == 0
+            || replay.pads_placed == 0)
+    {
+        run.report.violations.push(format!(
+            "SPEC-VARIANT VACUOUS ({variant:?}): {} lives above the {}-byte window, {} demote \
+             steps, {} pads placed, {} long records written ({} written short)",
+            run.report.replay_above_window_lives,
+            spec.window(),
+            replay.demote_steps,
+            replay.pads_placed,
+            run.report.long_records_written,
+            run.report.long_records_shortened
         ));
     }
     run.report.state_hash = run.report.state.value();

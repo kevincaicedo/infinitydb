@@ -15,12 +15,12 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
-use inf_sim::RecoveryScenario;
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, Scenario, run_combined_scenario, run_durable_scenario,
     run_scenario,
 };
+use inf_sim::{RecoveryScenario, SpecVariant};
 
 fn parse_seed(text: &str) -> Result<u64, String> {
     let text = text.trim();
@@ -71,6 +71,10 @@ fn main() {
     // m4-recovery and m4-tiered — the tail replay must demote; a run in it
     // that never exceeded a window is VACUOUS.
     let mut replay_above_window = false;
+    // ADR-0174 D2 rule 6: force m4-recovery's spec-variant class on any
+    // seed — every boot recovers at a window below its ring, with records
+    // up to the inline maximum; a run that placed no pad is VACUOUS.
+    let mut spec_variant: Option<SpecVariant> = None;
     let mut ops_override: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
@@ -114,6 +118,13 @@ fn main() {
                 "--replay-canary" => replay_canary = true,
                 "--lift-regime" => lift_regime = true,
                 "--replay-above-window" => replay_above_window = true,
+                "--spec-variant" => {
+                    spec_variant = Some(match take("--spec-variant")?.as_str() {
+                        "ring-top" => SpecVariant::RingTop,
+                        "page" => SpecVariant::Page,
+                        other => return Err(format!("unknown spec variant {other}")),
+                    });
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -124,7 +135,8 @@ fn main() {
                         "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
-                         [--replay-canary] [--lift-regime] [--replay-above-window] [--cells N] \
+                         [--replay-canary] [--lift-regime] [--replay-above-window] \
+                         [--spec-variant ring-top|page] [--cells N] \
                          [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
@@ -373,7 +385,12 @@ fn main() {
     if scenario_name == "m4-recovery" {
         let run_one = |seed: u64| {
             let mut scenario = RecoveryScenario::m4_recovery(seed);
-            scenario.replay_above_window |= replay_above_window;
+            if replay_above_window {
+                scenario = scenario.with_replay_above_window();
+            }
+            if let Some(variant) = spec_variant {
+                scenario = scenario.with_spec_variant(variant);
+            }
             inf_sim::run_recovery_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
@@ -418,6 +435,10 @@ fn main() {
             let mut writer_parks = 0u64;
             let mut two_crash_removed = 0u64;
             let mut two_crash_skipped = 0u64;
+            // ADR-0174 D2 rule 6: the spec-variant seeds and their long
+            // records (the pads are `boot_replay.pads_placed`).
+            let mut variant_seeds = 0u64;
+            let mut long_records = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -427,6 +448,8 @@ fn main() {
                 writer_parks += report.writer_parks;
                 two_crash_removed += report.two_crash_markers_removed;
                 two_crash_skipped += report.two_crash_unit_past_window;
+                variant_seeds += u64::from(report.spec_variant.is_some());
+                long_records += report.long_records_written;
                 if verify {
                     let twin = run_one(seed);
                     verify_hashes(
@@ -496,14 +519,16 @@ fn main() {
                  {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
                  releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
                  removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
-                 window)",
+                 window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
+                 pads placed",
                 boot_replay.demote_steps,
                 boot_replay.tier_bytes,
                 boot_replay.settle_reads,
                 boot_replay.settled_same_key,
                 boot_replay.settled_distinct,
                 boot_replay.deletes_verified,
-                boot_replay.blob_releases
+                boot_replay.blob_releases,
+                boot_replay.pads_placed
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -551,7 +576,9 @@ fn main() {
              replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
              deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
              released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
-             refs removed by a marker ({} skipped: unit past the raised window), trace {:#x}",
+             refs removed by a marker ({} skipped: unit past the raised window), spec \
+             variant {:?}: {} pads placed, {} long records written ({} written short), trace \
+             {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -600,6 +627,10 @@ fn main() {
             report.two_crash_rows_settled,
             report.two_crash_markers_removed,
             report.two_crash_unit_past_window,
+            report.spec_variant,
+            report.boot_replay.pads_placed,
+            report.long_records_written,
+            report.long_records_shortened,
             report.trace_hash
         );
         if verify {
