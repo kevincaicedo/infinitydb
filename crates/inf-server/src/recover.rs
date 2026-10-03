@@ -619,6 +619,10 @@ impl<F: SegmentFs> RecoveringTiers<F> {
 /// Saturating: a yield test and a gauge, never an account that balances.
 fn boot_io_charge(work: inf_store::ReplayWork) -> u64 {
     use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_TIER_BYTE_CHARGE};
+    if cfg!(inf_canary_replay_charge_dropped) {
+        // The planted canary charges no boot I/O to the step budget.
+        return 0;
+    }
     work.tier_bytes
         .saturating_mul(REPLAY_TIER_BYTE_CHARGE)
         .saturating_add(work.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
@@ -1624,7 +1628,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     // unit (OD-1).
                     self.drain_boot_io();
                     let consumed = u64::from(reader.offset()) - start_offset;
-                    if consumed.saturating_add(self.step_charge) >= budget_bytes {
+                    // The planted canary leaves the charge out of the yield.
+                    let charge =
+                        if cfg!(inf_canary_replay_yield_uncharged) { 0 } else { self.step_charge };
+                    if consumed.saturating_add(charge) >= budget_bytes {
                         self.bytes_done += consumed;
                         self.bytes_consumed += consumed;
                         self.phase = Phase::Replay { idx, reader: Some(reader) };

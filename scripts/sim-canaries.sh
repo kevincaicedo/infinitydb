@@ -257,6 +257,11 @@ rows=(
   # walks the whole open span and the last step's charge passes its
   # budget, one record's unit and the hand-over's drain.
   "inf_canary_replay_settle_unbudgeted crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
+  # The same oracle's other two rules: a frame's yield that leaves the
+  # charge out (at 8 MiB a step spans several demote steps), and a driver
+  # that charges no boot I/O (a step wrote tier bytes uncharged).
+  "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one frame's unit"
+  "inf_canary_replay_charge_dropped crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget tier files grew under a charge of 0"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

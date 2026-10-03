@@ -345,10 +345,12 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// - the D6 gauge equals the largest step's charge.
 ///
 /// A settle step past its budget is a `SETTLE BUDGET VIOLATION`. Red on a
-/// driver that leaves the charge out of the yield test (at the 8 MiB
-/// budget a step's bytes span several demote steps), on one that charges
-/// nothing (a step that wrote tier bytes charged no barrier), and on one
-/// that settles without a budget (`inf_canary_replay_settle_unbudgeted`).
+/// driver that leaves the charge out of a frame's yield test (at the
+/// 8 MiB budget a step's bytes span several demote steps,
+/// `inf_canary_replay_yield_uncharged`), on one that charges nothing (a
+/// step that wrote tier bytes charged no barrier,
+/// `inf_canary_replay_charge_dropped`), and on one that settles without a
+/// budget (`inf_canary_replay_settle_unbudgeted`).
 #[test]
 fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
     for budget in [256 << 10, 8 << 20] {
