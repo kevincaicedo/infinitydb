@@ -2107,6 +2107,124 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
     assert!(counters2.markers_skipped >= 1, "the this-life marker was skipped (R4)");
 }
 
+/// A ref under two tail copies of its key, blind of it (the first a
+/// shadow write, so no marker names the ref; the second its rewrite), the
+/// first copy dead below the second and both sealed by boot 1: the seal
+/// walk settles the ref against the live copy only (R7 settles a live
+/// record) and chains it into that survivor's origins (R8), never a dead
+/// copy's. After `Ready` the key is deleted live and that origin rides the
+/// delete as a marker; crash; boot 2 fits: the marker removes the ref and
+/// the key stays deleted. A walk that settled at the dead copy chains the
+/// ref where no delete finds it, and the key resurrects from the ref on
+/// boot 2 — census (a); so does `inf_canary_replay_origin_drop`.
+#[test]
+fn a_ref_settles_into_the_live_tail_copy_not_the_dead_one_below_it() {
+    let small = DemotionConfig::for_budget(BUDGET, PAGE);
+    let mut life = Life::new(small);
+    life.table.set_shadow_enabled(true);
+    life.set(b"twice", &[0x77; 400]);
+    for i in 0..600u64 {
+        life.set(&format!("cold:{i:05}").into_bytes(), &[0x11; 900]);
+        if i.is_multiple_of(64) {
+            life.maintain();
+        }
+    }
+    life.maintain();
+    assert!(matches!(
+        life.table.lookup(b"twice", Life::hash(b"twice"), &[]),
+        TieredLookup::Cold(_)
+    ));
+    life.checkpoint(1, |_| {});
+    life.shadow_set(b"twice", &[0x88; 400]);
+    life.set(b"twice", &[0x99; 500]);
+    for i in 0..400u64 {
+        life.set(&format!("tail:{i:06}").into_bytes(), &[0x22; 900]);
+    }
+    let durable = life.crash();
+    // Boot 1 under a lowered budget: the tail's demote steps seal both
+    // copies. Each copy's address is read as its record applies.
+    let hash = Life::hash(b"twice");
+    let mut boot = durable.boot_with(lowered(), |_| {});
+    let mut copies: Vec<LogicalAddr> = Vec::new();
+    let mut rest: &[u8] = &durable.tail;
+    while !rest.is_empty() {
+        let (record, consumed) = inf_log::decode_record(rest).expect("tail records decode");
+        rest = &rest[consumed..];
+        let copy = matches!(record, RecordView::StringPostImage { key, .. } if key == b"twice");
+        boot.apply(&record).expect("replays");
+        if copy {
+            let TieredLookup::Ram(at) = boot.table().lookup(b"twice", hash, &[]) else {
+                panic!("a replayed copy is placed in RAM");
+            };
+            copies.push(at);
+        }
+    }
+    assert_eq!(boot.ks.displace_register_len(), 0, "every marker met its mutation");
+    let ro = boot.table().space().ro_boundary();
+    let counters = boot.machine().counters();
+    let ready = boot.finish();
+    ready.audit(&durable.model, true);
+    let Ready { fs, table, flush, .. } = ready;
+    let mut life2 = Life {
+        fs,
+        demote: lowered(),
+        table,
+        flush,
+        model: durable.model.clone(),
+        tail: durable.tail.clone(),
+        begun: true,
+        lens: BTreeMap::new(),
+    };
+    let live = match life2.table.lookup(b"twice", hash, &[]) {
+        TieredLookup::Ram(a) | TieredLookup::Cold(a) => a,
+        TieredLookup::Miss => panic!("live"),
+    };
+    let chained = life2.table.displacement_origins_len(hash, live);
+    let chained_dead = copies.first().map(|&a| life2.table.displacement_origins_len(hash, a));
+    life2.del(b"twice");
+    let durable2 = life2.crash();
+    // Boot 2 under a raised budget: the same unit, a longer tail, fits.
+    let raised = DemotionConfig::for_budget(4 * BUDGET, PAGE);
+    let mut boot2 = durable2.boot_with(raised, |_| {});
+    let origin = boot2.table().space().life_origin();
+    let ref_addr = {
+        let mut found = None;
+        let mut cursor = 0u64;
+        loop {
+            cursor = boot2.table().scan_slots(cursor, 256, |h, a| {
+                if h == hash && a < origin {
+                    found = Some(a);
+                }
+            });
+            if cursor == 0 {
+                break found.expect("the ref is restored again");
+            }
+        }
+    };
+    boot2.replay_tail(&durable2.tail);
+    let counters2 = boot2.machine().counters();
+    let ref_present = boot2.table().contains_pair(hash, ref_addr);
+    let ready2 = boot2.finish();
+    // The oracle first: the key resurrects from the ref when boot 1's
+    // settle chained it anywhere but the live copy.
+    ready2.audit(&durable2.model, false);
+    assert!(
+        matches!(ready2.table.lookup(b"twice", hash, &[]), TieredLookup::Miss),
+        "stays deleted"
+    );
+    // Then the engagement: two copies, the dead one below, both sealed;
+    // the ref settled once, into the live copy's origins alone.
+    assert_eq!(copies.len(), 2, "two tail copies of the key");
+    assert!(copies[0] < copies[1], "the dead copy lies below the live one");
+    assert!(copies[1] < ro, "boot 1's demote steps sealed both copies");
+    assert_eq!(live, copies[1], "the live copy survives at its address");
+    assert!(counters.settled_same_key >= 1, "boot 1 settled the ref at a seal");
+    assert_eq!(chained, 1, "the ref rides the live copy's origins (R8)");
+    assert_eq!(chained_dead, Some(0), "and no dead copy's");
+    assert_eq!(counters2.demote_steps, 0, "boot 2 fits");
+    assert!(!ref_present, "the marker removed the ref (R3)");
+}
+
 // ---- forced 64-bit collisions -----------------------------------------------
 
 /// Two keys with one 64-bit hash, one demoted by the boot: both survive;

@@ -211,6 +211,9 @@ rows=(
   # delete stages no marker for it and the key resurrects on the second
   # boot — census (a).
   "inf_canary_replay_origin_drop crate-test inf-store test:tiered_replay a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash (a)"
+  # The same rule where a dead tail copy of the key lies below the live
+  # one: the ref must ride the live copy's origins, or it resurrects.
+  "inf_canary_replay_origin_drop crate-test inf-store test:tiered_replay a_ref_settles_into_the_live_tail_copy_not_the_dead_one_below_it (a)"
   # ADR-0174 D3 R9 skipped: the settled ref's blob reference stays
   # with no slot — the blob census.
   "inf_canary_replay_blob_release_skip crate-test inf-store test:tiered_replay a_blob_ref_settled_during_image_load_is_released_at_the_end_of_the_checkpoint reference"
