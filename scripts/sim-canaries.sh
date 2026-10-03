@@ -253,6 +253,10 @@ rows=(
   # (ADR-0174 D5: a crash during a demoting boot changes nothing the next
   # boot recovers).
   "inf_canary_replay_no_section_gc crate-test inf-server test:recover_replay_steps a_demoting_boot_cut_at_each_point_once_or_twice_recovers_the_uncut_boot the next boot refused"
+  # ADR-0174 R10: the driver hands the end settle no budget, so one step
+  # walks the whole open span and the last step's charge passes its
+  # budget, one record's unit and the hand-over's drain.
+  "inf_canary_replay_settle_unbudgeted crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

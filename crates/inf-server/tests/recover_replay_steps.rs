@@ -318,8 +318,8 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
         .sum()
 }
 
-/// The step budget's charge for boot I/O (ADR-0174 D2 rule 4), judged
-/// step by step at two budgets over a unit of four windows.
+/// The recovery step budget's charge for boot I/O (ADR-0174 R10, D6's
+/// gauge), judged step by step at two budgets over a unit of four windows.
 /// The prices are the server's and the store's `limits` consts; the
 /// charge each step took is `Recovery::step_charge_bytes`, and the tier
 /// writes are read from the filesystem:
@@ -328,17 +328,27 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 ///   barrier every flush that appends makes;
 /// - a replay step still inside its segment yielded at its budget: its
 ///   bytes read plus its charge reach it;
-/// - and passed it by at most one frame's non-yielding unit — the frame's
-///   bytes, one demote step's tier bytes (a lead and a page past the
-///   need, plus a record), two barriers (the flush, one seal), and the
+/// - and passed it by at most one frame's non-yielding unit (OD-1) — the
+///   frame's bytes, one demote step's tier bytes (a lead and a page past
+///   the need, plus a record), two barriers (the flush, one seal), and the
 ///   settle reads the unit's rewrites and deletes can make;
 /// - an end-settle step that yields charged its budget, by at most one
-///   record and its twins' reads; the last adds the hand-over's drain;
+///   record and its twins' reads;
+/// - the last one adds only the hand-over's drain (E13): what the last
+///   demote step sealed and did not append (at most a lead, a page and a
+///   record), a barrier when the drain appends, one for the active file's
+///   seal (the drain seals no other), and the settle reads of ADR-0093's
+///   rebuild, read from the stats;
+/// - the end settle walks its open span `[ro, tail)` at one budget byte a
+///   byte and a step charges at most its budget and one record's unit, so
+///   it takes at least ⌈span ÷ (budget + unit)⌉ steps;
 /// - the D6 gauge equals the largest step's charge.
 ///
-/// Red on a driver that leaves the charge out of the yield test (at the
-/// 8 MiB budget a step's bytes span several demote steps), and on one that
-/// charges nothing (a step that wrote tier bytes charged no barrier).
+/// A settle step past its budget is a `SETTLE BUDGET VIOLATION`. Red on a
+/// driver that leaves the charge out of the yield test (at the 8 MiB
+/// budget a step's bytes span several demote steps), on one that charges
+/// nothing (a step that wrote tier bytes charged no barrier), and on one
+/// that settles without a budget (`inf_canary_replay_settle_unbudgeted`).
 #[test]
 fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
     for budget in [256 << 10, 8 << 20] {
@@ -361,15 +371,17 @@ fn step_under_budget(budget: u64) {
     let frame_unit = FRAME_BYTES_MAX + lead + page + record + 2 * barrier;
     let late_unit = frame_unit + unit.late_records * read_price;
     let settle_unit = record + 4 * read_price;
-    let drain_unit = WINDOW + lead + 3 * barrier;
+    let drain_unit =
+        |rebuild_reads: u64| lead + page + record + 2 * barrier + rebuild_reads * read_price;
 
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
-    let (mut largest, mut settle_steps, mut finished) = (0u64, 0u64, false);
+    let (mut largest, mut settle_steps, mut open_span) = (0u64, 0u64, None);
     loop {
         let phase = recovery.phase();
         let segments_before = recovery.segments_progress().0;
         let consumed_before = recovery.bytes_consumed();
+        let rebuild_reads_before = recovery.stats().shadow_settle_reads;
         let tier_before = tier_bytes_on_disk(&fs, &cfg);
         let progress = recovery.step(&mut ks, budget).expect("a step");
         if progress == RecoveryProgress::Complete {
@@ -398,15 +410,31 @@ fn step_under_budget(budget: u64) {
                      frame's unit ({unit_bytes})"
                 );
             }
-            RecoverPhase::Finish if !finished => finished = true, // the lift decision
+            // The lift decision: replay has ended, and the end settle's
+            // cursor starts at `ro`.
+            RecoverPhase::Finish if open_span.is_none() => {
+                let space = ks.tiered_store(TIER_NS).expect("tiered").space();
+                open_span = Some(space.tail().to_raw() - space.ro_boundary().to_raw());
+            }
             RecoverPhase::Finish => {
                 settle_steps += 1;
+                let violation = format!("{at}: SETTLE BUDGET VIOLATION");
                 if recovery.phase() == RecoverPhase::Finish {
-                    assert!(charge >= budget, "{at}: the settle yielded at a charge of {charge}");
-                    assert!(charge < budget + settle_unit, "{at}: a settle step charged {charge}");
+                    assert!(
+                        charge >= budget,
+                        "{violation}: a step yielded at a charge of {charge}"
+                    );
+                    let bound = budget + settle_unit;
+                    assert!(charge < bound, "{violation}: a step charged {charge}, over {bound}");
                 } else {
-                    let bound = budget + settle_unit + drain_unit;
-                    assert!(charge < bound, "{at}: the last settle step charged {charge}");
+                    let rebuild_reads = recovery.stats().shadow_settle_reads - rebuild_reads_before;
+                    let drain = drain_unit(rebuild_reads);
+                    let bound = budget + settle_unit + drain;
+                    assert!(
+                        charge < bound,
+                        "{violation}: the last step charged {charge}, over its budget, one \
+                         record's unit ({settle_unit}) and the hand-over's drain ({drain})"
+                    );
                 }
             }
             RecoverPhase::Start
@@ -420,16 +448,29 @@ fn step_under_budget(budget: u64) {
     let (_rotor, stats, _seed) = recovery.finish();
     assert_eq!(stats.tier_replay.step_charge_bytes_max, largest, "the gauge is the largest step");
     let replay = stats.tier_replay.counters;
+    let open_span = open_span.expect("the boot reached the lift decision");
+    // The span holds at most one ring top (it is under a window, and the
+    // window under the ring), whose hole is shorter than the record that
+    // did not fit there; the walk passes a hole without charging it.
+    let walked_min = open_span.saturating_sub(record) * inf_store::limits::SETTLE_WALK_BYTE_CHARGE;
+    let steps_min = walked_min.div_ceil(budget + settle_unit);
     eprintln!(
-        "budget {budget}: gauge {largest} bytes, {settle_steps} settle steps, {} demote steps, \
-         {} settle reads, {} deletes verified",
+        "budget {budget}: gauge {largest} bytes, open span {open_span} bytes, {settle_steps} \
+         settle steps (at least {steps_min}), {} demote steps, {} settle reads, {} deletes \
+         verified",
         replay.demote_steps, replay.settle_reads, replay.deletes_verified
+    );
+    assert!(
+        settle_steps >= steps_min,
+        "SETTLE BUDGET VIOLATION: a {open_span}-byte open span settled in {settle_steps} \
+         step(s) at a {budget}-byte budget, under the {steps_min} its walk needs"
     );
     assert!(replay.demote_steps > 1, "VACUOUS: {replay:?}");
     assert!(replay.settle_reads > 0, "VACUOUS: no settle read ({replay:?})");
     assert!(replay.deletes_verified > 0, "VACUOUS: no delete verified ({replay:?})");
     if budget < WINDOW {
-        assert!(settle_steps > 1, "VACUOUS: the end settle took {settle_steps} step(s)");
+        // The unit's shape, not the driver: the span must outgrow a step.
+        assert!(steps_min > 1, "VACUOUS: a {open_span}-byte open span fits one settle step");
     }
     let (served, ram, cold) = read_back(&fs, &cfg, &mut ks, &unit.model);
     assert!(ram > 0 && cold > 0, "VACUOUS: {ram} RAM and {cold} cold keys");
