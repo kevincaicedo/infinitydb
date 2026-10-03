@@ -25,7 +25,9 @@ bin=target/release/inf-sim
 # F-L19-03: the m2 device/mode/window/recycle oracles and the three
 # m2 fill/hold/pending scenarios ran in no automated lane.
 # ADR-0174 D1: the replay-above-window seed class forced on the smoke
-# seed — a boot whose tiered replay exceeds the window demotes.
+# seed — a boot whose tiered replay exceeds the window demotes. D2 rule
+# 6: m4-recovery's spec-variant class, each case forced — a boot at a
+# window below its ring pads.
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
@@ -54,6 +56,8 @@ rows=(
   "m4-cold"
   "m4-recovery"
   "m4-recovery --replay-above-window --verify-determinism"
+  "m4-recovery --spec-variant ring-top --verify-determinism"
+  "m4-recovery --spec-variant page --verify-determinism"
   "m4-diskfull"
   "m4-tiered"
   "m4-tiered --plant tier-read-eio"
