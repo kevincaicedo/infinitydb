@@ -1,11 +1,12 @@
-//! FCR-STTIER-01 (ADR-0174 D1), the binary arm: a four-cell node under
-//! `MEM-BUDGET 3mb` (a 4 MiB window per cell) takes 64 MiB of tiered
-//! `SET`s with rewrites and deletes at distances under and over a window,
-//! is killed, and boots again — replay demotes the tail that does not fit
-//! instead of failing the boot. Two arms, `FSYNC always` and `everysec`;
-//! `TIER-IO-MODE direct` (the default) on a disk filesystem, the
-//! workspace `target/` directory. Red at engine `b5cae02`: the restarted
-//! process exits non-zero (`replay apply failed … OutOfMemory`).
+//! The binary arm of ADR-0174 D1: a four-cell node under `MEM-BUDGET
+//! 3mb` (a 4 MiB window per cell) takes 64 MiB of tiered `SET`s with
+//! rewrites and deletes at distances under and over a window, is killed,
+//! and boots again — replay demotes the tail that does not fit instead of
+//! failing the boot, and every acknowledged key answers its bytes. Two
+//! arms, `FSYNC always` and `everysec`; `TIER-IO-MODE direct` (the
+//! default) on a disk filesystem, the workspace `target/` directory. Red
+//! before the replay seam: the restarted process exits non-zero (`replay
+//! apply failed … OutOfMemory`).
 //!
 //! The `everysec` arm's durability point is a barrier, not a sleep:
 //! every load key carries one of 64 hash tags, and after the last load
@@ -352,6 +353,39 @@ fn run_arm(fsync: &str) {
     };
     let mut c = Client::connect(server.port);
     c.ok(&[b"INF.NS", b"USE", b"t"]);
+    // Engagement (ADR-0174 D6, the node fold in `INFO persistence`): the
+    // restart demoted, wrote tier bytes and sealed files of its own.
+    // The fold is taken once every cell is ready, on the serving cell's
+    // first look at the board: wait for `loading:0` on this cell.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let info = loop {
+        let info = String::from_utf8_lossy(&c.call(&[b"INFO", b"persistence"])).into_owned();
+        if info.contains("loading:0") {
+            break info;
+        }
+        assert!(Instant::now() < deadline, "still loading after 120 s: {info}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let field = |name: &str| -> u64 {
+        info.lines()
+            .find_map(|line| line.strip_prefix(name).and_then(|rest| rest.strip_prefix(':')))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("INFO persistence has no {name}: {info}"))
+    };
+    let demoted = field("recover_node_tier_demote_steps");
+    eprintln!(
+        "replay_spill arm {fsync}: {demoted} demote steps, {} tier bytes, {} barriers, {} files \
+         sealed, {} settle reads, {} deletes verified, step charge max {} bytes",
+        field("recover_node_tier_bytes_written"),
+        field("recover_node_tier_barriers"),
+        field("recover_node_tier_files_sealed"),
+        field("recover_node_tier_settle_reads"),
+        field("recover_node_tier_deletes_verified"),
+        field("recover_node_tier_step_charge_max_bytes"),
+    );
+    assert!(demoted > 0, "VACUOUS (arm {fsync}): the restart did not demote: {info}");
+    assert!(field("recover_node_tier_bytes_written") > 0, "{info}");
+    assert!(field("recover_node_tier_files_sealed") > 0, "{info}");
     let dbsize = c.call(&[b"DBSIZE"]);
     assert_eq!(dbsize, format!(":{}\r\n", model.len()).into_bytes(), "DBSIZE after the restart");
     let keys: Vec<&Vec<u8>> = model.keys().collect();
@@ -372,13 +406,11 @@ fn run_arm(fsync: &str) {
 }
 
 #[test]
-#[ignore = "FCR-STTIER-01 stage 3 (ADR-0174 D1): red at b5cae02 until boot replay demotes"]
 fn a_tail_above_every_cells_window_boots_under_fsync_always() {
     run_arm("always");
 }
 
 #[test]
-#[ignore = "FCR-STTIER-01 stage 3 (ADR-0174 D1): red at b5cae02 until boot replay demotes"]
 fn a_tail_above_every_cells_window_boots_under_fsync_everysec() {
     run_arm("everysec");
 }
