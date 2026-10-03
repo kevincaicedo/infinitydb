@@ -248,13 +248,18 @@ pub enum SeedClass {
     /// The spec-variant seed class (ADR-0174 D2 rule 6), one seed in four,
     /// the variant by seed ([`SpecVariant::of_seed`]): every boot recovers
     /// at a window below its ring, and before each cut the fill
-    /// (`Run::fill_replay_unit`) writes records up to the inline maximum
-    /// until the unit reaches a multiple of that window drawn as the class
-    /// above draws it. Live writes run at the whole ring; a long record
-    /// the live window cannot place yet is written short instead. No
-    /// two-crash row. `--spec-variant ring-top|page` forces it on any seed;
-    /// a run whose boots placed no pad or made no demote step reports
-    /// `VACUOUS`.
+    /// (`Run::fill_replay_unit`) writes `LONG_RECORDS_PER_LIFE` records
+    /// up to the inline maximum, and more toward a multiple of that window
+    /// drawn as the class above draws it. A life's own phases write units
+    /// of several windows at this spec, so most draws are passed before the
+    /// fill begins and only the largest, 16 windows, adds fill. Live writes
+    /// run at the whole ring; a long record the live window cannot place
+    /// yet is written short instead. No two-crash row, and no boot of the
+    /// class fits its window (`Spec::fit_margin`, two pages and half the
+    /// ring, is above both windows), so the zero set's fitting-boot check
+    /// runs in the other two classes only. `--spec-variant ring-top|page`
+    /// forces it on any seed; a run whose boots made no demote step or
+    /// placed no pad of the case's kind reports `VACUOUS`.
     SpecVariant(SpecVariant),
 }
 
@@ -396,7 +401,7 @@ pub struct RecoveryReport {
     pub held_released_by_park: u64,
     /// Boot-sealed files the dead-byte census read (engagement).
     pub boot_files_censused: u64,
-    /// The boot-file census ([`census_boot_files`]), every boot's summed.
+    /// The boot-file census (`census_boot_files`), every boot's summed.
     pub seal_census: SealCensus,
     /// The two-crash row (ADR-0174 I10, the class's last life): keys a
     /// shadow write left beside the ref the checkpoint names them by, the
@@ -942,8 +947,10 @@ impl Run {
     /// over a window, deletes, and shadow writes over demoted keys. Counts
     /// the life when the unit exceeds the window. In a spec variant the
     /// window is the boot's, three writes in four are long
-    /// ([`fill_op_long`](Self::fill_op_long)) and the fill writes
-    /// [`LONG_RECORDS_PER_LIFE`] long records at least.
+    /// ([`fill_op_long`](Self::fill_op_long)), and the fill writes
+    /// [`LONG_RECORDS_PER_LIFE`] long records whether or not the unit is
+    /// already past its target, as it usually is (see
+    /// [`SeedClass::SpecVariant`]).
     fn fill_replay_unit(
         &mut self,
         life: &mut Life,
@@ -1029,8 +1036,9 @@ impl Run {
     /// key of the longest length whose record is exactly half the ring.
     /// A write the live window cannot place after
     /// [`PARK_ROUNDS_MAX`] maintain rounds is written short instead: the
-    /// live path would park on it until its stall timeout (at a need above
-    /// the tail, FCR-STTIER-N4's shape) and acknowledge nothing.
+    /// live path would park on it until its stall timeout and acknowledge
+    /// nothing: where the need lies above the tail, no demotion reaches it,
+    /// and only boot replay pads (ADR-0174 D2 rule 6).
     fn fill_op_long(
         &mut self,
         life: &mut Life,
@@ -1972,7 +1980,7 @@ struct BootFile {
     reason: SealReason,
 }
 
-/// What the boot-file census read ([`census_boot_files`]), summed over the
+/// What the boot-file census read (`census_boot_files`), summed over the
 /// boots: the files the boots sealed, by the seal that made each, and the
 /// page pads their flushes crossed (engagement, disclosed).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
