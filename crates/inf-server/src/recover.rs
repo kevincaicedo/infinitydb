@@ -608,21 +608,19 @@ impl<F: SegmentFs> RecoveringTiers<F> {
 }
 
 /// The step budget's charge for a machine's drained boot I/O (ADR-0174
-/// D2 rule 4): tier bytes written and bytes the end settle walked at
+/// D2 rule 4): tier bytes written at
 /// [`REPLAY_TIER_BYTE_CHARGE`](crate::limits::REPLAY_TIER_BYTE_CHARGE),
 /// barriers at [`REPLAY_BARRIER_CHARGE_BYTES`](crate::limits::REPLAY_BARRIER_CHARGE_BYTES),
-/// settle reads at the store's
-/// [`SETTLE_READ_CHARGE_BYTES`](inf_store::limits::SETTLE_READ_CHARGE_BYTES).
+/// and the settle reads and walked bytes at the store's prices, which its
+/// end settle walk yields on
+/// ([`settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 /// Saturating: a yield test and a gauge, never an account that balances.
 fn boot_io_charge(work: inf_store::ReplayWork) -> u64 {
     use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_TIER_BYTE_CHARGE};
-    let bytes = work.tier_bytes.saturating_add(work.walked_bytes);
-    bytes
+    work.tier_bytes
         .saturating_mul(REPLAY_TIER_BYTE_CHARGE)
         .saturating_add(work.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
-        .saturating_add(
-            work.settle_reads.saturating_mul(inf_store::limits::SETTLE_READ_CHARGE_BYTES),
-        )
+        .saturating_add(work.settle_charge_bytes())
 }
 
 /// One recovered tiered namespace's plane-side pieces (M4-S26), as the

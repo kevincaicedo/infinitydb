@@ -26,7 +26,7 @@ use super::*;
 use inf_log::flush::{BootFlush, HandedOver, SeamFlush, SettleReadError, SettleWindow};
 
 use crate::address_space::{Room, WindowFull};
-use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
+use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES, SETTLE_WALK_BYTE_CHARGE};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
 
@@ -88,9 +88,11 @@ pub struct ReplayCounters {
 }
 
 /// Boot I/O the machine did since its owner last drained it: what the
-/// recovery driver charges to its step budget — the settle reads at
-/// [`SETTLE_READ_CHARGE_BYTES`], the price's one home, the rest at the
-/// driver's own prices.
+/// recovery driver charges to its step budget — the settle reads and the
+/// bytes the end settle walked at
+/// [`settle_charge_bytes`](Self::settle_charge_bytes), the prices' one
+/// home, which the walk yields on too; the tier bytes and barriers at the
+/// driver's prices.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ReplayWork {
     /// Record bytes appended to tier files.
@@ -108,6 +110,17 @@ impl ReplayWork {
     #[must_use]
     pub fn is_zero(self) -> bool {
         self == ReplayWork::default()
+    }
+
+    /// The settle reads and the walked bytes at their prices,
+    /// [`SETTLE_READ_CHARGE_BYTES`] and [`SETTLE_WALK_BYTE_CHARGE`]: what
+    /// the end settle walk yields on and what the recovery driver charges
+    /// for them. Saturating: a yield test, never an account.
+    #[must_use]
+    pub fn settle_charge_bytes(self) -> u64 {
+        self.walked_bytes
+            .saturating_mul(SETTLE_WALK_BYTE_CHARGE)
+            .saturating_add(self.settle_reads.saturating_mul(SETTLE_READ_CHARGE_BYTES))
     }
 }
 
@@ -504,8 +517,9 @@ impl<F: SegmentFs> TierReplay<F> {
     /// its exact-hash cold slots (R7), to where `to` says: a demote
     /// step's seal walk stops at the first record start at or above its
     /// target; an end-of-replay step yields after the record whose charge
-    /// — the bytes walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle
-    /// read — reaches its budget. Either ends at the tail. A hole is
+    /// — its walked bytes and settle reads at
+    /// [`ReplayWork::settle_charge_bytes`] — reaches its budget. Either
+    /// ends at the tail. A hole is
     /// passed whole by its mark. Returns the span settled and how the
     /// walk ended.
     ///
@@ -551,9 +565,10 @@ impl<F: SegmentFs> TierReplay<F> {
             at += len;
             walked += len;
             if let WalkTo::Settle { budget_bytes } = to {
-                let reads = self.counters.settle_reads - reads_before;
-                let charge = walked.saturating_add(reads.saturating_mul(SETTLE_READ_CHARGE_BYTES));
-                if charge >= budget_bytes {
+                let settle_reads = self.counters.settle_reads - reads_before;
+                let walk =
+                    ReplayWork { walked_bytes: walked, settle_reads, ..ReplayWork::default() };
+                if walk.settle_charge_bytes() >= budget_bytes {
                     break if at >= tail { WalkEnd::Tail } else { WalkEnd::Stopped };
                 }
             }
@@ -718,9 +733,9 @@ impl<F: SegmentFs> TierReplay<F> {
     }
 
     /// One end-of-replay settle step (R10): R7 on every live record of
-    /// `[cursor, tail)`, by address, until the step's charge — bytes
-    /// walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle read — reaches
-    /// `budget_bytes`, or the tail. `ro` does not move.
+    /// `[cursor, tail)`, by address, until the step's charge — its walked
+    /// bytes and settle reads at [`ReplayWork::settle_charge_bytes`] —
+    /// reaches `budget_bytes`, or the tail. `ro` does not move.
     ///
     /// # Errors
     /// A settle read or identity refusal; `ReplayNotEnded` in `Spilling`.

@@ -44,10 +44,17 @@ pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
 /// record's key window, ADR-0174 D3): 128 KiB, about 100 µs of a device
 /// that moves 1 GiB/s, so a read is charged as the bytes the step could
 /// have moved meanwhile. Owner: the end-of-replay settle walk, which adds
-/// it per read to the bytes it walked. Crossing: the walk yields after
-/// the record whose combined charge reaches the step's budget, and the
-/// next step resumes at its cursor.
+/// it per read to the bytes it walked (`ReplayWork::settle_charge_bytes`,
+/// the one function the walk's yield and the recovery driver's charge
+/// both price by). Crossing: the walk yields after the record whose
+/// combined charge reaches the step's budget, and the next step resumes
+/// at its cursor.
 pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
+
+/// The recovery step budget's price of one byte the end-of-replay settle
+/// walks (ADR-0174 D2 rule 4): one budget byte, a byte of the RAM window
+/// the walk passes. Owner and crossing: as [`SETTLE_READ_CHARGE_BYTES`].
+pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices

@@ -9,21 +9,20 @@
 pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 
 /// The recovery step budget's price of one byte a tiered boot replay
-/// machine wrote to a tier file or walked at its end settle (ADR-0174
-/// D2 rule 4): one budget byte, the device bytes the step moved. Owner: the
-/// recovery driver (`RecoverConfig::step_bytes` is the budget it charges).
-/// Crossing: a step whose bytes read plus its charge reach the budget
-/// yields at the next frame or checkpoint section, or after the settle
-/// step that reached it.
+/// machine wrote to a tier file (ADR-0174 D2 rule 4): one budget byte,
+/// the device bytes the step moved. Owner: the recovery driver
+/// (`RecoverConfig::step_bytes` is the budget it charges). Crossing: a
+/// step whose bytes read plus its charge reach the budget yields at the
+/// next frame or checkpoint section, or after the settle step that
+/// reached it. The bytes the end settle walks and its reads are priced by
+/// the store, whose walk yields on them
+/// ([`ReplayWork::settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
 pub const REPLAY_TIER_BYTE_CHARGE: u64 = 1;
 
 /// The recovery step budget's price of one boot barrier (a demote step's
 /// flush, a gap or capacity seal, the hand-over's drain — ADR-0174 D2
 /// rule 4): 4 MiB, about 4 ms of the flush barrier a device that moves
-/// 1 GiB/s pays. Owner and crossing: as [`REPLAY_TIER_BYTE_CHARGE`]. The
-/// settle read's price is the store's
-/// [`SETTLE_READ_CHARGE_BYTES`](inf_store::limits::SETTLE_READ_CHARGE_BYTES),
-/// which its end settle walk yields on too.
+/// 1 GiB/s pays. Owner and crossing: as [`REPLAY_TIER_BYTE_CHARGE`].
 pub const REPLAY_BARRIER_CHARGE_BYTES: u64 = 4 << 20;
 
 /// Bytes read by the process supervisor for one CPU sample. An oversized
