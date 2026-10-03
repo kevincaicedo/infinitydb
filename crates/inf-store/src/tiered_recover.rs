@@ -217,9 +217,8 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // and tail replay run; byte counters restore when the `.ick` 0x04
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);
-    let page_bytes = table.space().page_bytes();
     let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog);
-    let replay = TierReplay::new(BootFlush::new(flush, handles), demote.slice_bytes, page_bytes);
+    let replay = TierReplay::new(BootFlush::new(flush, handles), &table);
     Ok(RecoveredTier { table, replay, extents_listed, extents_quarantined, stats })
 }
 

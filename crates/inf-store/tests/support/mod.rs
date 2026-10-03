@@ -12,8 +12,8 @@ use inf_foundation::time::Nanos;
 use inf_log::ckpt::{IckApplyError, IckInfo, IckReaderConfig};
 use inf_log::fs::mem::{MemFile, MemFs};
 use inf_log::{
-    BootFlush, FsyncClass, HandedOver, NsId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
-    TierIoMode, decode_record, tier_extract, tier_frame_offset, tier_frame_span,
+    FsyncClass, HandedOver, NsId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode,
+    decode_record, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_log::{IckSummary, read_ick_hybrid};
 use inf_store::{
@@ -88,13 +88,6 @@ pub fn read_cold(flush: &TierFlush<MemFs>, fs: &MemFs, addr: u64, len: usize) ->
     let mut out = Vec::new();
     tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
     Some(out)
-}
-
-/// A boot replay machine over a fresh pipeline — the empty-section shape
-/// (ADR-0174 D4): no catalogue, no handles, file ids from 0.
-pub fn boot(fs: &MemFs, ns: NsId, file_capacity: u64) -> TierReplay<MemFs> {
-    let flush = TierFlush::new(fs.clone(), flush_config(ns, file_capacity), 0);
-    TierReplay::new(BootFlush::new(flush, Vec::new()), PAGE, PAGE)
 }
 
 /// The replay clock and wall anchor (tiered records carry no expiry).

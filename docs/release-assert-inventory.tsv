@@ -727,7 +727,6 @@ C	2	crates/inf-store/src/tiered/extent.rs	expect	walk not begun	`crates/inf-serv
 C	1	crates/inf-store/src/tiered/flush.rs	expect	walk not begun	`crates/inf-server/src/durable/ckpt.rs:tier_walk_step` runs only between `begin_walk` and `end_walk`
 I	7	crates/inf-store/src/tiered/flush.rs	expect	watermarks stay 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	2	crates/inf-store/src/tiered/replay.rs	expect	watermarks stay 48-bit	the settle walk's cursor: record starts and hole ends between `ro` and `tail`, both 48-bit `LogicalAddr` watermarks of the table's own space
-I	1	crates/inf-store/src/tiered/replay.rs	assert	commit pages are powers of two	`page_bytes` is the table's own `AddressSpace::page_bytes` (a power of two by `AddressSpace::new`), read by `recover_tiered_ns` from the table it just built
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	a boot settle under a pinned walk	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_rebuild_next` hands out only cold, slotted, un-ticketed slots, and boot settle runs before any walk begins (`crates/inf-server/src/recover.rs`)
 C	1	crates/inf-store/src/tiered/shadow.rs	assert	a cold address carries one ticket	`crates/inf-store/src/tiered/shadow.rs:TieredTable::shadow_admit` resolves both classes and both index pairs before a producer registers (ADR-0093 D1)
 I	1	crates/inf-store/src/tiered/shadow.rs	assert	a pinned winner went cold	shadow ticket tables are one structure (by_cold ⇄ by_winner; the record pin holds every winner above head — ADR-0093)

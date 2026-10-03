@@ -317,12 +317,15 @@ pub struct TierReplay<F: SegmentFs> {
 }
 
 impl<F: SegmentFs> TierReplay<F> {
-    /// A machine over a recovered boot pipeline, `Seeded`. `slice_bytes`
-    /// is the namespace's `MAINTAIN-SLICE`, `page_bytes` the commit page.
+    /// A machine over a recovered boot pipeline, `Seeded`, for `table`:
+    /// `lead` is the table's `MAINTAIN-SLICE` in whole commit pages of its
+    /// own space, read here, so no caller hands the machine a page or a
+    /// slice the table it demotes does not have.
     #[must_use]
-    pub fn new(flush: BootFlush<F>, slice_bytes: u64, page_bytes: u64) -> TierReplay<F> {
-        assert!(page_bytes.is_power_of_two(), "commit pages are powers of two");
-        let lead = slice_bytes.div_ceil(page_bytes).max(1) * page_bytes;
+    pub fn new(flush: BootFlush<F>, table: &TieredTable) -> TierReplay<F> {
+        let page_bytes = table.space.page_bytes();
+        debug_assert!(page_bytes.is_power_of_two(), "the space's commit page");
+        let lead = table.demotion().slice_bytes.div_ceil(page_bytes).max(1) * page_bytes;
         TierReplay {
             state: ReplayState::Seeded,
             flush,
@@ -1052,7 +1055,7 @@ mod tests {
         .expect("ring")
     }
 
-    fn machine(fs: &MemFs) -> TierReplay<MemFs> {
+    fn machine(fs: &MemFs, table: &TieredTable) -> TierReplay<MemFs> {
         let flush = TierFlush::new(
             fs.clone(),
             TierFlushConfig {
@@ -1065,7 +1068,7 @@ mod tests {
             },
             0,
         );
-        TierReplay::new(BootFlush::new(flush, Vec::new()), PAGE, PAGE)
+        TierReplay::new(BootFlush::new(flush, Vec::new()), table)
     }
 
     /// Two windows of records through the entry: the machine demotes.
@@ -1088,13 +1091,13 @@ mod tests {
     fn hand_over_refuses_a_table_that_demoted_until_its_end_settle_reached_the_tail() {
         let fs = MemFs::new();
         let mut table = table();
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         spill(&mut table, &mut replay);
         assert!(matches!(replay.settle_step(&mut table, PAGE), Err(ReplayRefusal::ReplayNotEnded)));
         let Err(err) = replay.hand_over(&mut table) else { panic!("Spilling has no arm") };
         assert!(matches!(err, ReplayRefusal::Unsettled { cursor: None, .. }), "{err}");
         let mut table = table_after(&fs);
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         spill(&mut table, &mut replay);
         replay.end_of_replay(&table);
         assert_eq!(replay.phase(), ReplayPhase::Settling);
@@ -1105,7 +1108,7 @@ mod tests {
             "{err}"
         );
         let mut table = table_after(&fs);
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         spill(&mut table, &mut replay);
         replay.end_of_replay(&table);
         while replay.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
@@ -1124,7 +1127,7 @@ mod tests {
     fn a_record_after_the_end_of_replay_refuses_typed_and_changes_nothing() {
         let fs = MemFs::new();
         let mut table = table();
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         spill(&mut table, &mut replay);
         replay.end_of_replay(&table);
         let (tail, len, counters) = (table.space().tail(), table.len(), replay.counters());
@@ -1158,7 +1161,7 @@ mod tests {
     fn an_end_settle_step_yields_at_its_charge_of_reads_and_bytes() {
         let fs = MemFs::new();
         let mut table = table();
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         spill(&mut table, &mut replay);
         // Rewrite the demoted keys inside the last window: each rewrite is
         // an `Open` record with a cold twin when replay ends.
@@ -1194,7 +1197,7 @@ mod tests {
         let mut table = table();
         table
             .set_blob_config(crate::extents::BlobConfig { threshold_bytes: 1024, max_bytes: 4096 });
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         let hash = table.hash_key(b"big");
         let err = table
             .replay_upsert(Some(&mut replay), &[], b"big", &[0x5A; 1024], hash)
@@ -1217,7 +1220,7 @@ mod tests {
     fn the_end_of_the_checkpoint_releases_blob_references_in_address_order() {
         let fs = MemFs::new();
         let mut table = table();
-        let mut replay = machine(&fs);
+        let mut replay = machine(&fs, &table);
         // Three settled refs chained into one survivor, the origin list in
         // descending address order; each names its own extent.
         let refs = [(3 << 12, 30), (2 << 12, 20), (1 << 12, 10)];
