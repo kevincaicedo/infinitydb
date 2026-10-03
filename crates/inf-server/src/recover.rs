@@ -532,10 +532,11 @@ pub struct Recovery<F: SegmentFs> {
     /// handed over at the end of replay into `recovered_tiers`.
     recovering_tiers: RecoveringTiers<F>,
     /// The boot I/O the replay machines did inside the current step, in
-    /// step-budget bytes (ADR-0174 D2 rule 4's barrier, the tier bytes,
-    /// the settle reads, the bytes the end settle walked): drained per
-    /// frame, per checkpoint section and per settle step, and added to the
-    /// bytes read when the step decides whether to yield.
+    /// bytes of the recovery step budget (ADR-0174 R10; D6's gauge reads
+    /// its largest): the barriers, the tier bytes, the settle reads, the
+    /// bytes the end settle walked. Drained per frame, per checkpoint
+    /// section and per settle step, and added to the bytes read when the
+    /// step decides whether to yield.
     step_charge: u64,
     /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
     /// flush pipeline + open sealed-file handles + the extent sweep
@@ -608,8 +609,8 @@ impl<F: SegmentFs> RecoveringTiers<F> {
     }
 }
 
-/// The step budget's charge for a machine's drained boot I/O (ADR-0174
-/// D2 rule 4): tier bytes written at
+/// The recovery step budget's charge for a machine's drained boot I/O
+/// (ADR-0174 R10; D6's gauge): tier bytes written at
 /// [`REPLAY_TIER_BYTE_CHARGE`](crate::limits::REPLAY_TIER_BYTE_CHARGE),
 /// barriers at [`REPLAY_BARRIER_CHARGE_BYTES`](crate::limits::REPLAY_BARRIER_CHARGE_BYTES),
 /// and the settle reads and walked bytes at the store's prices, which its
@@ -788,10 +789,11 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &self.stats
     }
 
-    /// The boot I/O charge the last [`step`](Self::step) took, in
-    /// step-budget bytes (ADR-0174 D2 rule 4): the tier bytes, barriers,
-    /// settle reads and end-settle bytes its replay machines drained, at
-    /// their prices. ADR-0174 D6's gauge is the largest of these.
+    /// The boot I/O charge the last [`step`](Self::step) took, in bytes
+    /// of the recovery step budget (ADR-0174 R10): the tier bytes,
+    /// barriers, settle reads and end-settle bytes its replay machines
+    /// drained, at their prices. ADR-0174 D6's gauge is the largest of
+    /// these.
     #[must_use]
     pub fn step_charge_bytes(&self) -> u64 {
         self.step_charge
@@ -1467,7 +1469,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_done += bytes;
                     self.bytes_consumed += bytes;
                     // The section's boot I/O is the step's too (ADR-0174
-                    // D2 rule 4): it yields at the next section boundary.
+                    // R10's step budget): it yields at the next section
+                    // boundary, a section being the non-yielding unit (OD-1).
                     self.drain_boot_io();
                     if spent.saturating_add(self.step_charge) >= budget_bytes {
                         self.phase = Phase::Ick { reader };
@@ -1615,9 +1618,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             }
                         }
                     }
-                    // The frame's boot I/O is the step's too (ADR-0174 D2
-                    // rule 4): a step that demotes yields at the next frame
-                    // boundary.
+                    // The frame's boot I/O is the step's too (ADR-0174
+                    // R10's step budget): a step that demotes yields at the
+                    // next frame boundary, a frame being the non-yielding
+                    // unit (OD-1).
                     self.drain_boot_io();
                     let consumed = u64::from(reader.offset()) - start_offset;
                     if consumed.saturating_add(self.step_charge) >= budget_bytes {

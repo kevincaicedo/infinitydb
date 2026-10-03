@@ -40,8 +40,8 @@ pub const BRACKET_KEY_BYTES_MAX: usize = 32 << 20;
 /// input.
 pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
 
-/// The recovery step budget's price of one boot settle read (a cold
-/// record's key window, ADR-0174 D3): 128 KiB, about 100 µs of a device
+/// The recovery step budget's price (ADR-0174 R10) of one boot settle
+/// read (a cold record's key window, D3): 128 KiB, about 100 µs of a device
 /// that moves 1 GiB/s, so a read is charged as the bytes the step could
 /// have moved meanwhile. Owner: the end-of-replay settle walk, which adds
 /// it per read to the bytes it walked (`ReplayWork::settle_charge_bytes`,
@@ -52,7 +52,7 @@ pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
 pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
 
 /// The recovery step budget's price of one byte the end-of-replay settle
-/// walks (ADR-0174 D2 rule 4): one budget byte, a byte of the RAM window
+/// walks (ADR-0174 R10): one budget byte, a byte of the RAM window
 /// the walk passes. Owner and crossing: as [`SETTLE_READ_CHARGE_BYTES`].
 pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
 
