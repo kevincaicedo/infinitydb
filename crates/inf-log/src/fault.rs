@@ -63,6 +63,10 @@
 //!   (M4-S21, ADR-0063 D4): the extent is abandoned typed (`DISKFULL` at the caller), never latched
 //!   —
 //!   the next attempt is its own recovery probe
+//! - `replay_settle_read_fail` — `BootFlush::read_key_window` (the boot settle read of a cold
+//!   record's key window, ADR-0174 D3) — typed I/O error on the held handle: the boot refuses
+//!   typed, naming the namespace and the address; no boundary or cursor passed the unread record
+//!   and a `DEL` has changed nothing (DRR FCR-STTIER-01 §2)
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the
@@ -100,6 +104,7 @@ pub const BLOB_FSYNC_ERR: &str = "blob_fsync_err";
 pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
 pub const TIER_WRITE_NOSPACE: &str = "tier_write_nospace";
 pub const BLOB_WRITE_NOSPACE: &str = "blob_write_nospace";
+pub const REPLAY_SETTLE_READ_FAIL: &str = "replay_settle_read_fail";
 
 /// Inventory for the CI coverage check and the S18 sim-disk scheduler.
 pub const ALL: &[&str] = &[
@@ -122,6 +127,7 @@ pub const ALL: &[&str] = &[
     BLOB_UNLINK_FAIL,
     TIER_WRITE_NOSPACE,
     BLOB_WRITE_NOSPACE,
+    REPLAY_SETTLE_READ_FAIL,
 ];
 
 /// The injected error a firing point surfaces (named, greppable).

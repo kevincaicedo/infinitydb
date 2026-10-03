@@ -29,8 +29,7 @@ use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
     CkptConfig, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingConfig, StagingRing,
-    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid,
-    write_manifest,
+    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, read_ick_hybrid, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -39,6 +38,8 @@ use inf_store::{
     recover_tiered_ns,
 };
 use proptest::prelude::*;
+
+mod support;
 
 const NS: NsId = NsId(51);
 const SHARD: &str = "shard-0";
@@ -686,6 +687,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         "the listing collected the orphan (names only)"
     );
     let table = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(stored.ckpt_id));
     read_ick_hybrid(
         &fs,
@@ -694,19 +696,18 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         |record| {
             match record {
                 RecordView::StringPostImage { key, value, .. } => {
+                    let hash = KeyHasher::default().hash(key);
                     table
                         .borrow_mut()
-                        .apply_image(key, value, KeyHasher::default().hash(key))
+                        .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                         .expect("fits");
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
+                    let hash = KeyHasher::default().hash(key);
+                    let ext = inf_store::ExtentRef { extent_id, offset, len };
                     table
                         .borrow_mut()
-                        .apply_extent_image(
-                            key,
-                            KeyHasher::default().hash(key),
-                            inf_store::ExtentRef { extent_id, offset, len },
-                        )
+                        .replay_upsert_extent(Some(&mut *replay.borrow_mut()), &[], key, hash, ext)
                         .expect("fits");
                 }
                 _ => panic!("unexpected image class in this checkpoint"),
@@ -730,7 +731,10 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
     )
     .expect("hybrid load");
     let mut table = table.into_inner();
-    replay_tail(&mut table, &tail);
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut table);
+    support::replay_tail(&mut table, &mut replay, &tail);
+    let (_flush, _handles) = support::finish_boot(&mut table, replay);
     // The sweep (ADR-0096): orphans dispose through ordinary slices —
     // the header-valid orphan quarantines (rename, bytes survive the
     // life), and only the next boot's second verdict unlinks; nothing
@@ -868,46 +872,4 @@ fn reclaim_gates_on_the_deaths_durability() {
     rig.table.extent_reclaim_done(ext);
     let on_disk = list_extent_ids(&rig.fs, Path::new(SHARD)).expect("listing");
     assert!(!on_disk.contains(&ExtentId(ext)), "reclaimed after the gate");
-}
-
-/// Replays one modeled WAL tail through the ADR-0057 D4 rules plus the
-/// tag-9 arm (the `tiered_recovery.rs` replayer with the extent kind).
-fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
-    let mut rest = tail;
-    let mut pending: Vec<u64> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                pending.push(old_addr);
-                assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table
-                    .apply_extent_image(key, hash, inf_store::ExtentRef { extent_id, offset, len })
-                    .expect("fits");
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_delete(key, hash);
-            }
-            _ => panic!("unexpected record class in the modeled tail"),
-        }
-        rest = &rest[consumed..];
-    }
-    assert!(pending.is_empty(), "a displace marker with no paired mutation");
 }

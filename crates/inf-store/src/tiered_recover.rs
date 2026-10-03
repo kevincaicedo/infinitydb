@@ -19,8 +19,11 @@
 //! 3. The caller then loads the checkpoint (images re-append at the new
 //!    tail; ref sections apply through [`apply_ref_section`] with the
 //!    manifested-watermark cross-check) and replays the WAL tail through
-//!    the `TieredTable::apply_*` rules (ADR-0057 D4) — zero disk reads
-//!    in either step.
+//!    the replay machine ([`TierReplay`]) and the table's `replay_*`
+//!    entries (ADR-0174 D3): a record the window cannot hold demotes
+//!    through the boot pipeline instead of failing the boot (D1), and a
+//!    record sealed by that step is settled against its cold twins by
+//!    an identity-checked read through a held handle (R7).
 //!
 //! Fail-stop philosophy: the manifest is the only authority — a named
 //! file that is missing, mis-identified, or shorter than its manifested
@@ -31,7 +34,7 @@ use std::io;
 use inf_foundation::{KeyHasher, LogicalAddr};
 use inf_log::blob::parse_extent_file_name;
 use inf_log::ckpt::{IckBlobRefSection, IckLiveSetSection, IckRefSection};
-use inf_log::flush::{TierFileMeta, TierFlush, TierFlushConfig};
+use inf_log::flush::{BootFlush, TierFileMeta, TierFlush, TierFlushConfig};
 use inf_log::fs::SegmentFs;
 use inf_log::manifest::TierNsManifest;
 use inf_log::tier::{
@@ -41,6 +44,7 @@ use inf_log::tier::{
 use crate::address_space::AddressSpaceConfig;
 use crate::demote::DemotionConfig;
 use crate::tiered::TieredTable;
+use crate::tiered::replay::TierReplay;
 
 /// Boot facts for the log line and the ledger (counts, not policy).
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -54,17 +58,20 @@ pub struct TierRecoverStats {
     pub files_removed: u32,
 }
 
-/// One recovered tiered namespace: the new-life table, the seeded flush
-/// pipeline, and the boot facts.
+/// One recovered tiered namespace: the new-life table, its boot replay
+/// machine over the seeded flush pipeline, and the boot facts.
 pub struct RecoveredTier<F: SegmentFs> {
     /// New life at `life_origin = manifested flushed`; watermarks all at
     /// the origin (RAM starts cold — disclosed, L10). Live/dead counters
     /// boot *unreconciled* for the cold set (S14's lazy rebuild owns
     /// them).
     pub table: TieredTable,
-    /// Catalog seeded with the manifested files; `next_id` above every
-    /// named id.
-    pub flush: TierFlush<F>,
+    /// The replay machine (ADR-0174; DRR FCR-STTIER-01 §1), `Seeded`:
+    /// the boot pipeline — catalog seeded with the manifested files,
+    /// `next_id` above every named id, the creation-mode handle of every
+    /// manifested file held, the barrier claim rule — and the counters.
+    /// Its `hand_over` is the plane's pipeline and the handles.
+    pub replay: TierReplay<F>,
     /// Blob-extent ids present on disk (names only — no content reads;
     /// M4-S17, ADR-0061 D6). The caller hands this to
     /// [`TieredTable::extent_sweep_seed`] **after** checkpoint + tail
@@ -186,6 +193,14 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     extents_listed.sort_unstable();
     extents_quarantined.sort_unstable();
     let next_id = tier.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
+    // The held handles (ADR-0054 D1; DRR FCR-STTIER-01 I18): one per
+    // manifested file in its creation mode, opened here and held by the
+    // boot pipeline — the settle read opens nothing, and the plane's
+    // cold-read table inherits them at the hand-over.
+    let mut handles = Vec::with_capacity(catalog.len());
+    for meta in &catalog {
+        handles.push((meta.id, fs.open_tier(&meta.path, flush_config.mode)?));
+    }
     let mut table = TieredTable::new(
         AddressSpaceConfig {
             life_origin: LogicalAddr::from_raw(tier.flushed)
@@ -202,8 +217,10 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // and tail replay run; byte counters restore when the `.ick` 0x04
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);
+    let page_bytes = table.space().page_bytes();
     let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog);
-    Ok(RecoveredTier { table, flush, extents_listed, extents_quarantined, stats })
+    let replay = TierReplay::new(BootFlush::new(flush, handles), demote.slice_bytes, page_bytes);
+    Ok(RecoveredTier { table, replay, extents_listed, extents_quarantined, stats })
 }
 
 /// Applies one validated `.ick` address-reference section (ADR-0057 D6
@@ -251,7 +268,7 @@ fn apply_refs(
         )));
     }
     for (hash, addr) in refs {
-        table.apply_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
+        table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
     }
     Ok(())
 }
@@ -287,6 +304,7 @@ fn invalid(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use inf_foundation::KeyHasher;
+    use inf_log::fs::mem::MemFs;
 
     use super::*;
 
@@ -329,7 +347,7 @@ mod tests {
         let refs = [(hash, 4096u64)];
         let mut t = table();
         apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed).expect("refs first");
-        t.apply_image(b"k", b"v", hash).expect("fits");
+        t.replay_upsert::<MemFs>(None, &[], b"k", b"v", hash).expect("fits");
         assert_eq!(t.len(), 2, "two slots: the ref and this life's record (no rebuild yet)");
         let err = apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed)
             .expect_err("a ref section after an image of its namespace");
@@ -337,7 +355,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("ns 41") && text.contains("ADR-0174 R2"), "{text}");
         let mut fresh = table();
-        fresh.apply_image(b"k", b"v", hash).expect("fits");
+        fresh.replay_upsert::<MemFs>(None, &[], b"k", b"v", hash).expect("fits");
         let err = apply_refs(&mut fresh, 41, flushed, refs.iter().copied(), flushed)
             .expect_err("the first ref section after an image refuses too");
         assert!(err.to_string().contains("ADR-0174 R2"));

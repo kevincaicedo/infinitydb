@@ -112,15 +112,40 @@ impl TieredTable {
     /// into `user_bytes`; the **blob leg** (the value length) into
     /// `blob_user_bytes`. The extent's device bytes arrive via
     /// [`note_blob_bytes`](Self::note_blob_bytes).
+    /// The typed length refusals of an extent-reference placement (the
+    /// one copy — `append_extent` and boot replay's E1 both ask),
+    /// answering the record's encoded length: the key bound and the blob
+    /// maximum; half the ring (ADR-0102 D3 — unreachable with a legal
+    /// key); the admission cost's representability.
+    pub(super) fn admit_extent(&self, key: &[u8], ext: ExtentRef) -> Result<usize, OpError> {
+        if key.len() > crate::record::MAX_KEY_LEN || ext.len > self.blob.max_bytes {
+            return Err(OpError::TooLarge);
+        }
+        let value = ext.encode();
+        let spec = RecordSpec {
+            key,
+            value: &value,
+            version: 0, // length-only: the version never changes encoded_len
+            expire_at_ms: None,
+            kind: RecordKind::StringExtent,
+        };
+        let len = spec.encoded_len();
+        if len > self.inline_record_max() {
+            return Err(OpError::TooLarge);
+        }
+        inf_log::blob::extent_device_bytes(ext.len)
+            .checked_add(len as u64)
+            .ok_or(OpError::TooLarge)?;
+        Ok(len)
+    }
+
     fn append_extent(
         &mut self,
         key: &[u8],
         ext: ExtentRef,
         version: u32,
     ) -> Result<LogicalAddr, OpError> {
-        if key.len() > crate::record::MAX_KEY_LEN || ext.len > self.blob.max_bytes {
-            return Err(OpError::TooLarge);
-        }
+        let len = self.admit_extent(key, ext)?;
         debug_assert!(ext.len > 0, "an extent reference names at least one byte");
         let value = ext.encode();
         let spec = RecordSpec {
@@ -130,10 +155,7 @@ impl TieredTable {
             expire_at_ms: None,
             kind: RecordKind::StringExtent,
         };
-        let len = spec.encoded_len();
-        if len > self.inline_record_max() {
-            return Err(OpError::TooLarge); // ADR-0102 D3 — unreachable with a legal key
-        }
+        debug_assert_eq!(spec.encoded_len(), len, "the admitted length is the record's");
         // M4-S21 disk admission (ADR-0063 D1/D2): the reference record
         // plus the extent's device bytes — the blob is already on disk
         // (`SealedExtent`), so this is the budget catching up with it;
@@ -267,13 +289,14 @@ impl TieredTable {
     }
 
     /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
-    /// record (ADR-0057 D4 rule 2 over the extent kind): blind
-    /// key-verified RAM upsert; a cold candidate is deliberately
-    /// ignored (no boot-path cold read).
+    /// record (ADR-0174 R5 over the extent kind — the arm of
+    /// `replay_upsert_extent`, after the entry made room): blind
+    /// key-verified RAM upsert, the origins moved with an overwrite
+    /// (E2); a cold candidate is neither read nor touched.
     ///
     /// # Errors
-    /// Space refusals from the store (recovery fail-stop at the caller).
-    pub fn apply_extent_image(
+    /// Space refusals from the store (the entry answered `Fits`).
+    pub(super) fn apply_extent_image(
         &mut self,
         key: &[u8],
         hash: u64,
@@ -285,6 +308,7 @@ impl TieredTable {
             let new_addr = self.append_extent(key, ext, version.wrapping_add(1))?;
             self.index.replace(hash, addr, new_addr);
             self.note_death(addr, len as u64);
+            self.move_origins(hash, addr, new_addr);
             return Ok(new_addr);
         }
         if self.index.needs_grow() {

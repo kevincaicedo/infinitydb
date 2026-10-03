@@ -168,18 +168,26 @@ impl LiveSet {
         self.ckpt_begun = boot_ckpt_id;
     }
 
-    /// Restores one serialized byte-counter entry (ADR-0058 D5). The
-    /// entry applies only when its `data_len` equals the manifested
+    /// Restores one serialized byte-counter entry (ADR-0058 D5; ADR-0174
+    /// R11). The entry applies only to a **recovered** file — an id this
+    /// boot's own flush created (a demotion during image load reusing a
+    /// dead-life id the manifest did not name) restores nothing: a file
+    /// this boot wrote is byte-exact and no checkpoint entry writes its
+    /// counters — and only when its `data_len` equals the manifested
     /// length — a mismatch means part of the serialized aggregate covers
     /// bytes recovery re-appended, and keeping any of it could over-count
     /// dead inside the durable range (the one forbidden direction). An
     /// entry naming no catalog file is legal (a filed-but-unconfirmed
     /// file the manifest did not name) and restores nothing.
     pub fn restore_entry(&mut self, entry: &LiveSetFileEntry) {
-        let Some(file) = self.files.iter_mut().find(|f| f.id == entry.file_id) else {
+        // The planted canary (DRR FCR-STTIER-01 §6): the `recovered` test
+        // skipped, so an entry naming a boot file overwrites its counters.
+        let unguarded = cfg!(inf_canary_replay_restore_unguarded);
+        let Some(file) =
+            self.files.iter_mut().find(|f| f.id == entry.file_id && (f.recovered || unguarded))
+        else {
             return;
         };
-        debug_assert!(file.recovered, "restore targets catalog files only");
         if entry.data_len != file.data_len {
             return;
         }

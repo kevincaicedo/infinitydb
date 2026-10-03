@@ -437,6 +437,11 @@ pub struct Recovery<F: SegmentFs> {
     /// segment when it holds data, else the last data-bearing segment.
     last_data: usize,
     finished: Option<(SegmentRotor<F>, Option<RecoveredManifest>)>,
+    /// Recovered tiered namespaces during replay (ADR-0174): each one's
+    /// boot replay machine, holding its pipeline and the creation-mode
+    /// handles, plus the extent sweep seed. Handed over at the end of
+    /// replay into `recovered_tiers`.
+    recovering_tiers: Vec<RecoveringTierNs<F>>,
     /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
     /// flush pipeline + open sealed-file handles + the extent sweep
     /// seed — installed into the plane's tier state at completion.
@@ -451,17 +456,24 @@ pub struct Recovery<F: SegmentFs> {
     sidecar: Option<inf_store::SidecarLoader>,
 }
 
-/// One recovered tiered namespace's plane-side pieces (M4-S26).
+/// One recovered tiered namespace while replay runs: its boot machine
+/// (the pipeline under the barrier claim rule, the held handles, the
+/// counters — ADR-0174; DRR FCR-STTIER-01 I11) and the extent sweep seed.
+struct RecoveringTierNs<F: SegmentFs> {
+    ns: inf_log::NsId,
+    replay: inf_store::TierReplay<F>,
+    extents_listed: Vec<u64>,
+    extents_quarantined: Vec<u64>,
+}
+
+/// One recovered tiered namespace's plane-side pieces (M4-S26), as the
+/// boot machine handed them over (ADR-0174 R10).
 pub(crate) struct RecoveredTierNs<F: SegmentFs> {
     pub ns: inf_log::NsId,
     pub flush: inf_log::TierFlush<F>,
-    /// Creation-mode fds for the manifested files (ADR-0054: one fd,
-    /// one mode) — the cold-read table inherits them.
+    /// Creation-mode fds for every sealed catalogue file (ADR-0054: one
+    /// fd, one mode) — the cold-read table inherits them.
     pub files: Vec<(u32, F::File)>,
-    pub extents_listed: Vec<u64>,
-    /// `.quarantine`-named ids (ADR-0096 D3) — swept for the second
-    /// verdict; referenced ids revive before the node serves.
-    pub extents_quarantined: Vec<u64>,
 }
 
 impl<F: SegmentFs + Clone> Recovery<F> {
@@ -507,6 +519,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             hole: None,
             last_data: 0,
             finished: None,
+            recovering_tiers: Vec::new(),
             recovered_tiers: Vec::new(),
             tier_replay_checked: false,
             #[cfg(feature = "doc")]
@@ -867,15 +880,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 ks.hasher(),
             )?;
             ks.install_recovered_tiered(ns, recovered.table);
-            let mut files = Vec::with_capacity(recovered.flush.sealed().len());
-            for meta in recovered.flush.sealed() {
-                let handle = self.fs().open_tier(&meta.path, spec.tier_io_mode)?;
-                files.push((meta.id, handle));
-            }
-            self.recovered_tiers.push(RecoveredTierNs {
+            // The manifested files' creation-mode handles are the boot
+            // machine's (ADR-0054 D1; opened by `recover_tiered_ns`), and
+            // the hand-over at the end of replay returns them.
+            self.recovering_tiers.push(RecoveringTierNs {
                 ns,
-                flush: recovered.flush,
-                files,
+                replay: recovered.replay,
                 extents_listed: recovered.extents_listed,
                 extents_quarantined: recovered.extents_quarantined,
             });
@@ -934,7 +944,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 ks.displace_register_len()
             )));
         }
-        for tier in &self.recovered_tiers {
+        for mut tier in std::mem::take(&mut self.recovering_tiers) {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
                 let revive =
                     table.extent_sweep_seed(&tier.extents_listed, &tier.extents_quarantined);
@@ -964,25 +974,28 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 // An unreadable or unsettleable slot is a recovery
                 // fail-stop (corrupt input, ADR-0057's posture).
                 // The settle answers from a `ColdKey` (ADR-0174 D3): the
-                // read hands back the record and the bytes it occupies,
-                // and the table verifies the key against the slot's hash.
+                // read is the boot machine's settle read — the slot's key
+                // window through the held creation-mode handle, with the
+                // bytes left to its file's end — and the table verifies
+                // the key against the slot's hash.
                 let ns = tier.ns;
                 let stats = &mut self.stats;
+                let replay = &mut tier.replay;
                 table
                     .rebuild_shadow_tickets(|slot| -> io::Result<inf_store::KeyWindow> {
-                        let addr = slot.cold.to_raw();
-                        let read = |len: usize| -> io::Result<Vec<u8>> {
-                            tier.flush.read_span_blocking(addr, len)?.ok_or_else(|| {
-                                io_msg("lies in no catalogued tier range".to_owned())
-                            })
-                        };
-                        let head = read(inf_store::TieredTable::RECORD_HEADER_LEN)?;
-                        let len = inf_store::TieredTable::record_len_from_header(&head);
-                        let image = read(len)?;
+                        let window = replay.read_key_window(slot.cold).map_err(io_invalid)?;
                         stats.shadow_settle_reads += 1;
-                        Ok(inf_store::KeyWindow { left: image.len() as u64, bytes: image })
+                        Ok(inf_store::KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
                     })
                     .map_err(|err| io_msg(format!("ns {}: {err} (ADR-0093 A4′)", ns.0)))?;
+                // The hand-over (ADR-0174 R10): the pipeline under the live
+                // claim rule, with a handle for every sealed file.
+                let handed = tier.replay.hand_over(table).map_err(io_invalid)?;
+                self.recovered_tiers.push(RecoveredTierNs {
+                    ns,
+                    flush: handed.flush,
+                    files: handed.handles,
+                });
             }
         }
         Ok(())
@@ -1026,6 +1039,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// Hands the recovered tiered plane halves to the caller (the plane
     /// installs them into its tier state at completion — M4-S26).
     pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
+        debug_assert!(self.recovering_tiers.is_empty(), "every boot machine handed over");
         std::mem::take(&mut self.recovered_tiers)
     }
 
@@ -1066,7 +1080,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 .next_step_hybrid(
                     |record| {
                         ks.borrow_mut()
-                            .apply_record(&record, now, anchor)
+                            .apply_record(&record, now, anchor, &mut inf_store::NoSpill)
                             .map(|_| ())
                             .map_err(io_invalid)
                     },
@@ -1270,7 +1284,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             continue;
                         }
                         let outcome = ks
-                            .apply_record(&record, self.now, self.anchor)
+                            .apply_record(&record, self.now, self.anchor, &mut inf_store::NoSpill)
                             .map_err(io_invalid)
                             .map_err(|error| replay_apply_failed(at, &error))?;
                         match outcome {

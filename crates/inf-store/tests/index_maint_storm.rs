@@ -27,6 +27,7 @@ use inf_doc::path::{EvalLimits, compile, eval, resolve};
 use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_store::KeyHasher;
+use inf_store::NoSpill;
 use inf_store::{
     CellStore, EvictBudget, EvictionPolicy, ExpiryBudget, IndexId, IndexKeyBuf, IndexKeyType,
     IndexScalar, IndexSpec, IndexState, Keyspace, NsId, OrderedCursor, PressureConfig, SetOptions,
@@ -718,7 +719,7 @@ fn replay_maintenance_matches_live() {
         let idoc = parse(json);
         let lineage = DocLineage::new(u64::from(version)).expect("nonzero");
         let rec = RecordView::DocFull { ns, key, lineage, version, idoc: &idoc };
-        replayed.apply_record(&rec, now, anchor).expect("replay");
+        replayed.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
     }
     let rec = RecordView::DocFull {
         ns,
@@ -727,8 +728,10 @@ fn replay_maintenance_matches_live() {
         version: 9,
         idoc: &overwrite,
     };
-    replayed.apply_record(&rec, now, anchor).expect("replay");
-    replayed.apply_record(&RecordView::Delete { ns, key: b"k2" }, now, anchor).expect("replay");
+    replayed.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
+    replayed
+        .apply_record(&RecordView::Delete { ns, key: b"k2" }, now, anchor, &mut NoSpill)
+        .expect("replay");
     for &(id, ..) in INDEXES {
         assert_eq!(
             tree_entries(&live, ns, IndexId(id)),
@@ -741,7 +744,7 @@ fn replay_maintenance_matches_live() {
     let idoc = parse(docs[0].1);
     let lineage = DocLineage::new(7).expect("nonzero");
     let rec = RecordView::DocFull { ns, key: b"k9", lineage, version: 1, idoc: &idoc };
-    cold.apply_record(&rec, now, anchor).expect("replay");
+    cold.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
     for &(id, ..) in INDEXES {
         assert!(
             tree_entries(&cold, ns, IndexId(id)).is_empty(),

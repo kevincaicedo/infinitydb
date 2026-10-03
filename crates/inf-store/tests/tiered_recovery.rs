@@ -18,12 +18,12 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
-    decode_record, read_ick_hybrid, read_manifest, write_manifest,
+    read_ick_hybrid, read_manifest, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
-    DemotionConfig, FileLiveSet, LogicalAddr, TieredLookup, TieredTable, apply_live_set_section,
-    apply_ref_section, recover_tiered_ns,
+    DemotionConfig, Displaced, FileLiveSet, LogicalAddr, ReplayPhase, TieredLookup, TieredTable,
+    apply_live_set_section, apply_ref_section, recover_tiered_ns,
 };
 
 mod support;
@@ -184,38 +184,6 @@ impl Rig {
             );
         }
     }
-}
-
-/// Replays one modeled WAL tail through the ADR-0057 D4 rules.
-fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
-    let mut rest = tail;
-    let mut pending_displace: Option<u64> = None;
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail records decode");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                assert!(pending_displace.is_none(), "displace markers never stack");
-                pending_displace = Some(old_addr);
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                if let Some(old) = pending_displace.take() {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                if let Some(old) = pending_displace.take() {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_delete(key, hash);
-            }
-            other => panic!("modeled tail carries no {other:?}"),
-        }
-        rest = &rest[consumed..];
-    }
-    assert!(pending_displace.is_none(), "a trailing displace marker is a stream error");
 }
 
 /// The full picture: fuzzy hybrid checkpoint + manifest v2 + crash +
@@ -409,6 +377,7 @@ fn unified_recovery_round_trips_all_classes() {
     assert!(recovered.stats.files_sealed + recovered.stats.files_resealed > 0);
 
     let table = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick_path = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(ckpt_id));
     let (info, _summary) = read_ick_hybrid(
         &fs,
@@ -416,9 +385,10 @@ fn unified_recovery_round_trips_all_classes() {
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
             if let RecordView::StringPostImage { key, value, .. } = record {
+                let hash = KeyHasher::default().hash(key);
                 table
                     .borrow_mut()
-                    .apply_image(key, value, KeyHasher::default().hash(key))
+                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -443,18 +413,26 @@ fn unified_recovery_round_trips_all_classes() {
     assert_eq!(info.ckpt_id, ckpt_id);
     assert_eq!(info.begin_lsn, begin_lsn);
     let mut table = table.into_inner();
-    replay_tail(&mut table, &tail);
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut table);
+    replay_tail(&mut table, &mut replay, &tail);
+    // A boot that fits (I9): nothing of the zero set moved.
+    assert_eq!(replay.phase(), ReplayPhase::Fitting, "the tail fits the window");
+    let zero = replay.counters();
+    assert_eq!(zero.demote_steps + zero.pads_placed + zero.tier_bytes + zero.settle_reads, 0);
+    assert!(zero.markers_skipped > 0, "moved overwrites of RAM records staged markers (E7)");
 
     // Live-set reconciliation oracle (M4-S14, ADR-0058 D4): by
     // replay-complete, every recovered file's slot count equals the
     // index's ground truth, and restored byte counters obey the
     // sound-direction rule (dead only ever under-counts).
     assert_live_set_reconciled(&mut table, &tier);
+    let (flush, handles) = finish_boot(&mut table, replay);
+    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
 
     // The recovered rig serves every byte — cold through the recovered
     // catalog, RAM through the re-appended new life.
-    let mut recovered_rig =
-        Rig { table, fs, flush: recovered.flush, model, tail: Vec::new(), begun: false };
+    let mut recovered_rig = Rig { table, fs, flush, model, tail: Vec::new(), begun: false };
     recovered_rig.audit();
 
     // Post-recovery cold mutations (M4-S14): overwrite and delete
@@ -627,15 +605,16 @@ fn ref_apply_idempotent_and_displace_exact() {
     let addr = LogicalAddr::from_raw(4096).expect("48-bit");
     let twin = LogicalAddr::from_raw(8192).expect("48-bit");
     let hash = 0xFEED_F00D_u64;
-    table.apply_ref(hash, addr);
-    table.apply_ref(hash, addr); // the walker's at-least-once duplicate
-    table.apply_ref(hash, twin); // a full-hash coincidence: both live
+    table.replay_ref(hash, addr);
+    table.replay_ref(hash, addr); // the walker's at-least-once duplicate
+    table.replay_ref(hash, twin); // a full-hash coincidence: both live
     assert_eq!(table.len(), 2, "duplicate refs collapse; distinct addrs coexist");
     assert_eq!(table.live_set().files()[0].live_count, 2, "counts follow actual inserts");
-    assert!(!table.apply_displace(hash, LogicalAddr::from_raw(12288).expect("48-bit")));
+    let absent = LogicalAddr::from_raw(12288).expect("48-bit");
+    assert_eq!(table.replay_displace(hash, absent), Displaced::Absent);
     assert_eq!(table.live_set().files()[0].live_count, 2, "absent removal moves no counter");
-    assert!(table.apply_displace(hash, addr), "exact removal by (hash, addr)");
-    assert!(!table.apply_displace(hash, addr), "second removal is absent");
+    assert_eq!(table.replay_displace(hash, addr), Displaced::Removed, "exact removal by pair");
+    assert_eq!(table.replay_displace(hash, addr), Displaced::Absent, "second removal is absent");
     assert_eq!(table.len(), 1, "the twin survives — displacement is per-address");
     assert_eq!(table.live_set().files()[0].live_count, 1, "counts follow actual removals");
 }
@@ -668,7 +647,7 @@ fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
     // One recovered ref slot for key J at a fixed pre-life address.
     let hash_j = KeyHasher::default().hash(b"victim-key");
     let addr = LogicalAddr::from_raw(4096).expect("48-bit");
-    table.apply_ref(hash_j, addr);
+    table.replay_ref(hash_j, addr);
     assert_eq!(table.len(), 1);
     // 10k foreign hashes name J's exact address: enough trials that the
     // pre-fix (tag, addr) match collides with near-certainty, and none
@@ -679,8 +658,9 @@ fn displacement_never_removes_a_foreign_key_at_a_colliding_address() {
         if hash_k == hash_j {
             continue; // a genuine 2⁻⁶⁴ coincidence would be legal removal
         }
-        assert!(
-            !table.apply_displace(hash_k, addr),
+        assert_eq!(
+            table.replay_displace(hash_k, addr),
+            Displaced::Absent,
             "foreign hash {i} removed the victim's slot (exact-pair discipline broken)"
         );
     }
@@ -738,9 +718,10 @@ fn write_checkpoint_two_pass(rig: &Rig, writer: &mut SyncIckWriter<MemFs>, w: u6
 /// instead of refusing at the window. Red at engine `b5cae02`: the
 /// replay's `apply_image(..).expect("fits")` panics on `OutOfMemory`
 /// once the re-appended tail commits more pages than
-/// `MEM-BUDGET + MAINTAIN-SLICE`.
+/// `MEM-BUDGET + MAINTAIN-SLICE`. Red again under
+/// `inf_canary_replay_no_demote`, where the entry answers a `Demote`
+/// with HEAD's refusal.
 #[test]
-#[ignore = "FCR-STTIER-01 stage 3 (ADR-0174 D1): red at b5cae02 until boot replay demotes"]
 fn a_tail_of_three_windows_replays_into_the_recovered_table() {
     let mut rig = Rig::new();
     let demote = DemotionConfig::for_budget(BUDGET, PAGE);
@@ -821,6 +802,7 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
     )
     .expect("tier recovery");
     let table = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick_path = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(ckpt_id));
     read_ick_hybrid(
         &fs,
@@ -828,9 +810,10 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
             if let RecordView::StringPostImage { key, value, .. } = record {
+                let hash = KeyHasher::default().hash(key);
                 table
                     .borrow_mut()
-                    .apply_image(key, value, KeyHasher::default().hash(key))
+                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -852,8 +835,18 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
     )
     .expect("hybrid load");
     let mut table = table.into_inner();
-    replay_tail(&mut table, &tail);
-    let mut recovered_rig =
-        Rig { table, fs, flush: recovered.flush, model, tail: Vec::new(), begun: false };
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut table);
+    replay_tail(&mut table, &mut replay, &tail);
+    let counters = replay.counters();
+    assert!(counters.demote_steps > 0, "the regime engaged: the boot demoted");
+    assert!(counters.tier_bytes >= 2 * window, "at least two windows of records left RAM");
+    assert_eq!(replay.phase(), ReplayPhase::Spilling);
+    let committed = table.space().report().committed_bytes;
+    assert!(committed <= window, "I1: committed RAM {committed} within the window {window}");
+    let (flush, handles) = finish_boot(&mut table, replay);
+    assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
+    assert!(flush.active().is_none(), "the hand-over sealed the boot's active file");
+    let mut recovered_rig = Rig { table, fs, flush, model, tail: Vec::new(), begun: false };
     recovered_rig.audit();
 }

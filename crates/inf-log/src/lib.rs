@@ -61,8 +61,9 @@ pub use commit::{
 };
 pub use effect::MutationEffect;
 pub use flush::{
-    PendingSealView, TIER_FILE_CAPACITY_DEFAULT, TierDrive, TierFileMeta, TierFlush,
-    TierFlushConfig, TierFlushError,
+    BootFlush, HandedOver, PendingSealView, SeamFlush, SettleReadError, SettleWindow,
+    TIER_FILE_CAPACITY_DEFAULT, TierDrive, TierFileMeta, TierFlush, TierFlushConfig,
+    TierFlushError,
 };
 pub use frame::{
     DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FRAME_HEADER_LEN, FRAME_HEADER_LEN_V1, FRAME_MAGIC,

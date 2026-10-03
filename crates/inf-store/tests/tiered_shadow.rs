@@ -27,16 +27,23 @@ use inf_log::{
 };
 use inf_store::KeyHasher;
 use inf_store::{
-    AddrClass, AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, Index,
-    KeyWindow, LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleError, SettleOutcome,
-    SettleReason, SettleSlot, ShadowProbe, ShadowRebuildError, ShadowRefusal, ShadowVerdict,
-    TieredLookup, TieredMode, TieredTable, forced_collision_pair, forced_collision_triple,
+    AddrClass, AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, Displaced,
+    Index, KeyWindow, LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleError,
+    SettleOutcome, SettleReason, SettleSlot, ShadowProbe, ShadowRebuildError, ShadowRefusal,
+    ShadowVerdict, TieredLookup, TieredMode, TieredTable, forced_collision_pair,
+    forced_collision_triple,
 };
 
 /// A rebuild driver for tables whose walk must hand back nothing: any
 /// settle slot is a test failure.
 fn no_settle(slot: &SettleSlot) -> Result<KeyWindow, String> {
     Err(format!("unexpected settle slot {slot:?}"))
+}
+
+/// A replayed image on a table whose boot fits (ADR-0174 R5 through the
+/// replay entry, no boot pipeline behind it): the key-verified upsert.
+fn image(t: &mut TieredTable, key: &[u8], value: &[u8], hash: u64) -> LogicalAddr {
+    t.replay_upsert::<MemFs>(None, &[], key, value, hash).expect("fits")
 }
 
 /// The settle read's answer for a whole record image: the window is the
@@ -693,18 +700,18 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
         seed(&mut t);
         let b = match order {
             0 => {
-                t.apply_ref(hash, pre_life);
-                t.apply_image(b"k", b"v2", hash).expect("fits")
+                t.replay_ref(hash, pre_life);
+                image(&mut t, b"k", b"v2", hash)
             }
             1 => {
-                let b = t.apply_image(b"k", b"v2", hash).expect("fits");
-                t.apply_ref(hash, pre_life);
+                let b = image(&mut t, b"k", b"v2", hash);
+                t.replay_ref(hash, pre_life);
                 b
             }
             _ => {
-                let b = t.apply_image(b"k", b"v2", hash).expect("fits");
-                t.apply_ref(hash, pre_life);
-                t.apply_ref(hash, pre_life); // the walker's at-least-once
+                let b = image(&mut t, b"k", b"v2", hash);
+                t.replay_ref(hash, pre_life);
+                t.replay_ref(hash, pre_life); // the walker's at-least-once
                 b
             }
         };
@@ -721,9 +728,9 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
     // rebuild then finds no pair.
     let mut t = make();
     seed(&mut t);
-    let b = t.apply_image(b"k", b"v2", hash).expect("fits");
-    t.apply_ref(hash, pre_life);
-    assert!(t.apply_displace(hash, pre_life));
+    let b = image(&mut t, b"k", b"v2", hash);
+    t.replay_ref(hash, pre_life);
+    assert_eq!(t.replay_displace(hash, pre_life), Displaced::Removed);
     t.rebuild_shadow_tickets(no_settle).expect("no pair");
     assert_eq!(t.shadow_pending(), 0, "the twin's slot is gone");
     assert_eq!(t.space().record_pin(), None);
@@ -733,9 +740,9 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
     // crashed life told apart as a collision key stays slotted, unpaired).
     let mut t = make();
     seed(&mut t);
-    let _b = t.apply_image(b"k", b"v2", hash).expect("fits");
-    t.apply_ref(hash, pre_life);
-    assert!(t.apply_delete(b"k", hash));
+    let _b = image(&mut t, b"k", b"v2", hash);
+    t.replay_ref(hash, pre_life);
+    assert!(t.replay_delete::<MemFs>(None, &[], b"k", hash).expect("no cold reads"));
     t.rebuild_shadow_tickets(no_settle).expect("no pair");
     assert_eq!(t.shadow_pending(), 0);
     assert!(t.contains_pair(hash, pre_life), "the twin stays slotted, unpaired");
@@ -961,9 +968,9 @@ fn rebuild_settles_an_ambiguous_twin_against_its_true_owner() {
     let pre_life = LogicalAddr::from_raw(4096).expect("fits");
     for (twin_key, twin_value) in [(&k1, &b"one-old"[..]), (&k2, &b"two-old"[..])] {
         let mut t = recovered_table();
-        t.apply_ref(hash, pre_life);
-        let b1 = t.apply_image(&k1, b"one", hash).expect("fits");
-        let b2 = t.apply_image(&k2, b"two", hash).expect("fits");
+        t.replay_ref(hash, pre_life);
+        let b1 = image(&mut t, &k1, b"one", hash);
+        let b2 = image(&mut t, &k2, b"two", hash);
         let mut handed: Vec<SettleSlot> = Vec::new();
         let image = record_image(twin_key, twin_value);
         t.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
@@ -995,9 +1002,9 @@ fn rebuild_settles_an_ambiguous_twin_against_its_true_owner() {
     }
     // A third key's record under the same hash: distinct, untouched.
     let mut t = recovered_table();
-    t.apply_ref(hash, pre_life);
-    t.apply_image(&k1, b"one", hash).expect("fits");
-    t.apply_image(&k2, b"two", hash).expect("fits");
+    t.replay_ref(hash, pre_life);
+    image(&mut t, &k1, b"one", hash);
+    image(&mut t, &k2, b"two", hash);
     let [_, _, k3] = forced_collision_triple(6);
     assert_eq!(KeyHasher::default().hash(&k3), hash, "a third key with the same hash");
     let image = record_image(&k3, b"three");
@@ -1030,9 +1037,9 @@ fn rebuild_sends_pairs_beyond_the_cap_to_the_boot_settle_one_at_a_time() {
         let key = format!("cap:{i}").into_bytes();
         let hash = KeyHasher::default().hash(&key);
         let pre = LogicalAddr::from_raw(addr).expect("fits");
-        t.apply_ref(hash, pre);
+        t.replay_ref(hash, pre);
         images.insert(addr, record_image(&key, b"old"));
-        t.apply_image(&key, b"new", hash).expect("fits");
+        image(&mut t, &key, b"new", hash);
         addr += 64;
     }
     let mut rebuild = t.begin_shadow_rebuild();
@@ -1103,9 +1110,9 @@ fn rebuild_walks_a_displaced_chain_and_settles_mid_chain() {
     let mut place = |t: &mut TieredTable, key: &[u8], old: &[u8], new: &[u8]| {
         let hash = KeyHasher::default().hash(key);
         let pre = LogicalAddr::from_raw(addr).expect("fits");
-        t.apply_ref(hash, pre);
+        t.replay_ref(hash, pre);
         images.insert(addr, record_image(key, old));
-        t.apply_image(key, new, hash).expect("fits");
+        image(t, key, new, hash);
         addr += 64;
     };
     // Interleave the triple among the pairs so its settle lands mid-walk.
@@ -1114,7 +1121,7 @@ fn rebuild_walks_a_displaced_chain_and_settles_mid_chain() {
         if i == PAIRS / 2 {
             place(&mut t, &k1, b"one-old", b"one");
             let hash = KeyHasher::default().hash(&k2);
-            t.apply_image(&k2, b"two", hash).expect("fits");
+            image(&mut t, &k2, b"two", hash);
         }
     }
     assert_eq!(t.index_group_count() - 1, mask, "no growth");
@@ -1169,9 +1176,9 @@ fn a_rebuilt_slot_settles_only_on_a_verified_record_of_its_hash() {
         let (k1, k2) = collision_pair(6);
         let hash = KeyHasher::default().hash(&k1);
         let mut t = recovered_table();
-        t.apply_ref(hash, pre_life);
-        t.apply_image(&k1, b"one", hash).expect("fits");
-        t.apply_image(&k2, b"two", hash).expect("fits");
+        t.replay_ref(hash, pre_life);
+        image(&mut t, &k1, b"one", hash);
+        image(&mut t, &k2, b"two", hash);
         let err = t
             .rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> { Ok(window.clone()) })
             .expect_err(name);
@@ -1192,9 +1199,9 @@ fn a_rebuilt_slot_settles_only_on_a_verified_record_of_its_hash() {
     let (k1, k2) = collision_pair(6);
     let hash = KeyHasher::default().hash(&k1);
     let mut t = recovered_table();
-    t.apply_ref(hash, pre_life);
-    let b1 = t.apply_image(&k1, b"one", hash).expect("fits");
-    t.apply_image(&k2, b"two", hash).expect("fits");
+    t.replay_ref(hash, pre_life);
+    let b1 = image(&mut t, &k1, b"one", hash);
+    image(&mut t, &k2, b"two", hash);
     let short = record_image(&k1, b"v");
     assert!(short.len() < TieredTable::KEY_PREFIX_LEN, "shorter than the key window");
     let mut handed = 0usize;
@@ -1223,10 +1230,10 @@ fn a_fourth_same_key_twin_at_boot_is_a_typed_settle_error() {
     let twins: Vec<LogicalAddr> =
         (1..=4u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
     for twin in &twins {
-        t.apply_ref(hash, *twin);
+        t.replay_ref(hash, *twin);
     }
-    let b1 = t.apply_image(&k1, b"one", hash).expect("fits");
-    t.apply_image(&k2, b"two", hash).expect("fits");
+    let b1 = image(&mut t, &k1, b"one", hash);
+    image(&mut t, &k2, b"two", hash);
     let image = record_image(&k1, b"one-old");
     let err = t
         .rebuild_shadow_tickets(|_| -> Result<KeyWindow, String> { Ok(window_of(&image)) })
@@ -1257,8 +1264,8 @@ fn registering_at_the_cap_panics() {
         let key = format!("cap:{i}").into_bytes();
         let hash = KeyHasher::default().hash(&key);
         let pre = LogicalAddr::from_raw(addr).expect("fits");
-        t.apply_ref(hash, pre);
-        let winner = t.apply_image(&key, b"new", hash).expect("fits");
+        t.replay_ref(hash, pre);
+        let winner = image(&mut t, &key, b"new", hash);
         t.register_shadow(hash, pre, winner);
         addr += 64;
     }
@@ -1323,9 +1330,9 @@ fn a_full_origin_list_defers_the_settle_until_the_winner_moves() {
     let twins: Vec<LogicalAddr> =
         (1..=4u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
     for twin in &twins {
-        t.apply_ref(hash, *twin);
+        t.replay_ref(hash, *twin);
     }
-    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    let winner = image(&mut t, &key, b"new", hash);
     t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: four tickets");
     assert_eq!(t.shadow_pending(), 4);
     let image = record_image(&key, b"old");
@@ -1371,9 +1378,9 @@ fn deferred_settles_run_in_registry_order_not_hash_order() {
         let twins: Vec<LogicalAddr> =
             (1..=4u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
         for twin in &twins {
-            t.apply_ref(hash, *twin);
+            t.replay_ref(hash, *twin);
         }
-        let winner = t.apply_image(&key, b"new", hash).expect("fits");
+        let winner = image(&mut t, &key, b"new", hash);
         t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: four tickets");
         assert_eq!(t.shadow_pending(), 4);
         let image = record_image(&key, b"old");
@@ -1567,9 +1574,9 @@ fn a_winner_lists_every_ticket_naming_it_in_cold_order() {
     let twins: Vec<LogicalAddr> =
         (1..=3u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
     for twin in &twins {
-        t.apply_ref(hash, *twin);
+        t.replay_ref(hash, *twin);
     }
-    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    let winner = image(&mut t, &key, b"new", hash);
     t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: three tickets");
     let listed = t.shadow_tickets_of_winner(winner);
     assert_eq!(listed.iter().map(|t| t.cold).collect::<Vec<_>>(), twins, "every twin, in order");
@@ -1614,9 +1621,9 @@ fn the_delete_cursor_visits_every_ticket_of_a_winner_in_cold_order() {
     let twins: Vec<LogicalAddr> =
         (1..=3u64).map(|i| LogicalAddr::from_raw(i * 4096).expect("fits")).collect();
     for twin in &twins {
-        t.apply_ref(hash, *twin);
+        t.replay_ref(hash, *twin);
     }
-    let winner = t.apply_image(&key, b"new", hash).expect("fits");
+    let winner = image(&mut t, &key, b"new", hash);
     t.rebuild_shadow_tickets(no_settle).expect("one RAM sibling: three tickets");
     let mut walked = Vec::new();
     let mut cursor = None;

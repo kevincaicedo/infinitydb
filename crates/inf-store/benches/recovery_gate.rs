@@ -85,7 +85,8 @@ fn bench_images(n: u64, value_len: usize) {
             IckReaderConfig::default(),
             |record| {
                 if let RecordView::StringPostImage { key, value, .. } = record {
-                    table.apply_image(key, value, KeyHasher::default().hash(key)).expect("fits");
+                    let hash = KeyHasher::default().hash(key);
+                    table.replay_upsert::<MemFs>(None, &[], key, value, hash).expect("fits");
                 }
                 Ok::<(), std::convert::Infallible>(())
             },
@@ -177,7 +178,7 @@ fn bench_refs(n: u64) {
             |_| Ok::<(), std::convert::Infallible>(()),
             |section| {
                 for (hash, addr) in section.iter() {
-                    table.apply_ref(hash, LogicalAddr::from_raw(addr).expect("48-bit"));
+                    table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("48-bit"));
                 }
                 Ok(())
             },

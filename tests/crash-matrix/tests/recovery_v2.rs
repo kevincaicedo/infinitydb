@@ -116,9 +116,13 @@ fn publish(fs: &MemFs, table: &TieredTable, flush: &TierFlush<MemFs>, ckpt_id: u
 
 /// Reads one manifested cold range through the recovered catalog and
 /// CRC-verifies it (`tier_extract`).
-fn read_manifested(fs: &MemFs, flush: &TierFlush<MemFs>, addr: u64, len: usize) -> Option<Vec<u8>> {
-    let meta = flush
-        .sealed()
+fn read_manifested(
+    fs: &MemFs,
+    sealed: &[inf_log::TierFileMeta],
+    addr: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let meta = sealed
         .iter()
         .find(|m| addr >= m.base.to_raw() && addr + len as u64 <= m.base.to_raw() + m.data_len)?;
     let image = fs.contents(&meta.path)?;
@@ -193,7 +197,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(
-            read_manifested(&fs, &recovered.flush, range.base, len).is_some(),
+            read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some(),
             "manifested range {}..{} readable",
             range.base,
             range.end()
@@ -273,7 +277,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
     assert!(recovered.stats.files_removed <= 1, "only a zero-confirmed trailing file may go");
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
     receipt::verified("dir_fsync_fail", "unit-resolves");
 }
@@ -334,7 +338,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
     // The manifested catalog carries exactly the manifested ranges, and
     // every one reads back CRC-clean; the resealed file's footer sits at
     // its manifested length.
-    for (range, meta) in tier.files.iter().zip(recovered.flush.sealed()) {
+    for (range, meta) in tier.files.iter().zip(recovered.replay.sealed()) {
         assert_eq!(meta.id, range.id);
         assert_eq!(meta.data_len, range.durable_len, "catalog carries manifested lengths");
         if meta.reason == SealReason::Recovered {
@@ -344,7 +348,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
             assert_eq!(summary.first_bad_frame, None, "every retained frame verifies");
         }
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
     // Recovery of recovery: running it again from the same durable state
     // is a no-op fast path (the reseal is terminal and idempotent).
@@ -420,8 +424,9 @@ fn kill_cold_prefix(
         if addr.to_raw() >= file.base + file.data_len {
             continue;
         }
-        let head = read_manifested(fs, flush, addr.to_raw(), TieredTable::RECORD_HEADER_LEN)
-            .expect("record header readable");
+        let head =
+            read_manifested(fs, flush.sealed(), addr.to_raw(), TieredTable::RECORD_HEADER_LEN)
+                .expect("record header readable");
         let len = TieredTable::record_len_from_header(&head);
         table.delete(hash, addr, len);
         dead += len as u64;
@@ -439,8 +444,8 @@ fn compact_to_idle(fs: &MemFs, table: &mut TieredTable, flush: &TierFlush<MemFs>
     while let CompactionWork::Read { file_id, addr, len } =
         table.compaction_work(flush, false, budget)
     {
-        let chunk =
-            read_manifested(fs, flush, addr.to_raw(), len as usize).expect("scan chunk readable");
+        let chunk = read_manifested(fs, flush.sealed(), addr.to_raw(), len as usize)
+            .expect("scan chunk readable");
         let applied = table.compaction_apply(file_id, addr, &chunk);
         relocated += u64::from(applied.relocated);
         budget = if applied.need > 0 { applied.need } else { PAGE * 2 };
@@ -519,7 +524,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(
-            read_manifested(&fs, &recovered.flush, range.base, len).is_some(),
+            read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some(),
             "manifested range of file {} reads back",
             range.id
         );
@@ -587,7 +592,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
     assert!(fs.contents(&first_path).is_none(), "the orphan's bytes are gone");
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
     receipt::verified("dir_fsync_fail", "unit-resolves");
 }

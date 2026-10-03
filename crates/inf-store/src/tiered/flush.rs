@@ -3,6 +3,8 @@
 
 use super::*;
 
+use inf_log::flush::SeamFlush;
+
 /// A reactor-drive stage refused part-way (ADR-0084 D2): the round keeps
 /// what was staged before the refusal and is issued like any other, so
 /// the device budget settles the round's grant against `staged_bytes`,
@@ -104,7 +106,26 @@ impl TieredTable {
         &mut self,
         flush: &mut TierFlush<F>,
     ) -> Result<FlushSliceOutcome, TierFlushError> {
-        let res = self.flush_slice_inner(flush);
+        let budget = flush.slice_bytes();
+        self.flush_span(flush, budget)
+    }
+
+    /// The flush body over a byte budget, on either seam pipeline: the
+    /// live slice ([`flush_slice`](Self::flush_slice), the slice budget)
+    /// and boot replay's demote step (ADR-0174 D2 rule 4 — the sealed
+    /// span as the budget, every chunk up to the cut appended, one
+    /// barrier the boot pipeline claims whole). A `StorageFull`-class
+    /// failure latches the device leg here as the slice does; at boot
+    /// the latch dies with the refused process.
+    ///
+    /// # Errors
+    /// As [`flush_slice`](Self::flush_slice).
+    pub fn flush_span<P: SeamFlush>(
+        &mut self,
+        flush: &mut P,
+        budget: u64,
+    ) -> Result<FlushSliceOutcome, TierFlushError> {
+        let res = self.flush_span_inner(flush, budget);
         if let Err(e) = &res
             && e.is_storage_full()
         {
@@ -113,11 +134,11 @@ impl TieredTable {
         res
     }
 
-    fn flush_slice_inner<F: SegmentFs>(
+    fn flush_span_inner<P: SeamFlush>(
         &mut self,
-        flush: &mut TierFlush<F>,
+        flush: &mut P,
+        budget: u64,
     ) -> Result<FlushSliceOutcome, TierFlushError> {
-        let budget = flush.slice_bytes();
         let flushed0 = self.space.flushed().to_raw();
         let sealed0 = flush.sealed().len();
         let mut outcome = FlushSliceOutcome::default();
@@ -192,20 +213,28 @@ impl TieredTable {
         Ok(outcome)
     }
 
-    /// Drains the flush completely (shutdown, tests, DST quiesce): runs
-    /// slices until nothing appends, then seals the active file so the
-    /// partial tail frame becomes claimable, and confirms `flushed` up
-    /// to the sealed end (= `ro_boundary` when the space had no pending
-    /// gap at the very end).
+    /// Drains the flush completely (shutdown, tests, DST quiesce, the
+    /// boot hand-over's E13): runs slices until nothing appends, then
+    /// seals the active file so the partial tail frame becomes
+    /// claimable, and confirms `flushed` up to the sealed end (=
+    /// `ro_boundary` when the space had no pending gap at the very end).
+    /// Returns the drain's folded outcome (bytes, gaps and files sealed,
+    /// the shutdown seal included).
     ///
     /// # Errors
     /// As [`flush_slice`](Self::flush_slice).
-    pub fn flush_drain<F: SegmentFs>(
+    pub fn flush_drain<P: SeamFlush>(
         &mut self,
-        flush: &mut TierFlush<F>,
-    ) -> Result<(), TierFlushError> {
+        flush: &mut P,
+    ) -> Result<FlushSliceOutcome, TierFlushError> {
+        let mut total = FlushSliceOutcome::default();
+        let sealed0 = flush.sealed().len();
         loop {
-            let outcome = self.flush_slice(flush)?;
+            let budget = self.demote.slice_bytes;
+            let outcome = self.flush_span(flush, budget)?;
+            total.appended_bytes += outcome.appended_bytes;
+            total.gaps_crossed += outcome.gaps_crossed;
+            total.confirmed_bytes += outcome.confirmed_bytes;
             if outcome.appended_bytes == 0 && outcome.gaps_crossed == 0 {
                 break;
             }
@@ -217,14 +246,17 @@ impl TieredTable {
                 self.space
                     .advance_flushed(LogicalAddr::from_raw(limit).expect("watermarks stay 48-bit"));
                 self.space.note_flush_slice(limit - before);
+                total.confirmed_bytes += limit - before;
             }
             let now_flushed = self.space.flushed().to_raw();
             while self.flush_ends.front().is_some_and(|&e| e <= now_flushed) {
                 self.flush_ends.pop_front();
             }
         }
+        total.files_sealed =
+            u32::try_from(flush.sealed().len() - sealed0).expect("seals per drain fit u32");
         self.charge_flush_device(flush);
-        Ok(())
+        Ok(total)
     }
 
     /// Barrier seal under backpressure (M4-S11, ADR-0056 D8): call when
@@ -275,7 +307,7 @@ impl TieredTable {
     /// claimable bound covers, pruning confirmed candidates (the shared
     /// confirm of the seam slice and the reactor round — ADR-0056 D5's
     /// claim rule in one place).
-    fn confirm_to_claimable<F: SegmentFs>(&mut self, flush: &TierFlush<F>) {
+    fn confirm_to_claimable<P: SeamFlush>(&mut self, flush: &P) {
         let Some(limit) = flush.confirmable_end() else { return };
         let confirm = self.flush_ends.iter().copied().filter(|&e| e <= limit).max().unwrap_or(0);
         if confirm > self.space.flushed().to_raw() {
@@ -382,7 +414,7 @@ impl TieredTable {
     /// cursor — bytes may be staged ahead of `flushed` (partial-frame
     /// holdback), and they must never be re-appended — else the flushed
     /// watermark.
-    fn flush_start_cursor<F: SegmentFs>(&self, flush: &TierFlush<F>) -> u64 {
+    pub(super) fn flush_start_cursor<P: SeamFlush>(&self, flush: &P) -> u64 {
         flush.append_cursor().unwrap_or(self.space.flushed().to_raw())
     }
 

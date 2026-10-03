@@ -13,6 +13,7 @@ use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{CkptConfig, Lsn, RecordView, SegmentId};
+use inf_store::NoSpill;
 use inf_store::{
     FsyncClass, Keyspace, NsCatalog, NsId, NsMode, NsSpec, ReplayOutcome, StoreConfig, WallAnchor,
 };
@@ -153,7 +154,8 @@ proptest! {
             &dir.join(ick_file_name(1)),
             IckReaderConfig::default(),
             |view| {
-                let outcome = recovered.apply_record(&view, NOW, ANCHOR).expect("apply");
+                let outcome =
+                    recovered.apply_record(&view, NOW, ANCHOR, &mut NoSpill).expect("apply");
                 assert!(matches!(outcome, ReplayOutcome::Applied), "checkpoint records apply");
                 Ok::<(), ()>(())
             },

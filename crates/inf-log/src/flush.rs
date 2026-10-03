@@ -22,7 +22,7 @@
 //! caller may catch and continue past it.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use inf_foundation::LogicalAddr;
 use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
@@ -30,8 +30,8 @@ use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
 use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
 use crate::tier::{
-    QueuedSeal, RoundEffect, SealReason, TierOpView, TierRound, TierWriteFailure, TierWriter,
-    WindowPool,
+    FrameStaging, QueuedSeal, RoundEffect, SealReason, TIER_FRAME_DATA, TierOpView, TierRound,
+    TierWriteFailure, TierWriter, WindowPool, tier_extract, tier_frame_offset, tier_frame_span,
 };
 
 /// How a pipeline's I/O reaches the device (M4.5-S31, ADR-0084 D1).
@@ -49,6 +49,63 @@ pub enum TierDrive {
 /// Default file-capacity target: 1 GiB of data bytes (ADR-0056 D2 —
 /// knob joins S19's `INF.NS` ADR; construction parameter until then).
 pub const TIER_FILE_CAPACITY_DEFAULT: u64 = 1 << 30;
+
+/// What an unsealed active file lets `flushed` claim (ADR-0056 D5; the
+/// boot value ADR-0174 D2 rule 4). One field of the pipeline, read by
+/// [`TierFlush::confirmable_end`] alone; [`BootFlush`] is the only
+/// constructor of `Barrier` and its one exit restores `FullFrames`, so
+/// the plane never receives a pipeline carrying the boot value.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ClaimRule {
+    /// Full, final frames only: the partial tail frame is rewritten in
+    /// place as appends extend it, and a torn rewrite after a crash
+    /// would destroy bytes `flushed` claimed once the covering log is
+    /// truncated.
+    FullFrames,
+    /// Every byte the barrier covered, the partial tail frame included:
+    /// no manifest names a boot-written byte before the next checkpoint
+    /// publishes, that publication is what truncates the log, and the
+    /// pipeline reaches the plane only after its active file is sealed
+    /// — neither half of the hazard exists for a boot pipeline.
+    Barrier,
+}
+
+/// The seam drive's file side (ADR-0084 D1): what the store's flush body
+/// drives with blocking calls — the live pipeline between MAINTAIN
+/// rounds and the boot pipeline during replay. The body is written once
+/// against this surface; neither wrapper hands out the other's handles.
+pub trait SeamFlush {
+    /// Files sealed so far, in seal order.
+    fn sealed(&self) -> &[TierFileMeta];
+    /// The active file: `(id, base, data_len, durable_len, path)`.
+    fn active(&self) -> Option<(u32, LogicalAddr, u64, u64, &Path)>;
+    /// The next append address while a file is active.
+    fn append_cursor(&self) -> Option<u64>;
+    /// The highest address the drive may confirm right now.
+    fn confirmable_end(&self) -> Option<u64>;
+    /// Device bytes handed over this boot life (monotone).
+    fn device_bytes(&self) -> u64;
+    /// Appends one record-aligned range at the write cursor.
+    ///
+    /// # Errors
+    /// [`TierFlushError`]; nothing is claimable beyond the last barrier.
+    fn append_range(&mut self, addr: LogicalAddr, bytes: &[u8]) -> Result<(), TierFlushError>;
+    /// Seals the active file ahead of a sealed-dead interval.
+    ///
+    /// # Errors
+    /// [`TierFlushError`]: the gap is not yet crossable.
+    fn seal_for_gap(&mut self) -> Result<(), TierFlushError>;
+    /// The slice barrier.
+    ///
+    /// # Errors
+    /// [`TierFlushError::Fsync`] is fatal (§8.4).
+    fn sync(&mut self) -> Result<(), TierFlushError>;
+    /// Seals the active file for an orderly close.
+    ///
+    /// # Errors
+    /// [`TierFlushError`] as for any seal.
+    fn seal_shutdown(&mut self) -> Result<(), TierFlushError>;
+}
 
 /// One sealed tier file — the MANIFEST v2 entry's input (S12) and the
 /// per-file live-counter key (S14): the file's exact logical range is
@@ -217,6 +274,9 @@ pub struct TierFlush<F: SegmentFs> {
     /// the confirmed prefix and the file stays manifest-visible as an
     /// unsealed range. Empty whenever no round is in flight.
     pending_seals: std::collections::VecDeque<PendingSeal<F>>,
+    /// The claim rule for the unsealed active file (ADR-0056 D5 live,
+    /// ADR-0174 D2 rule 4 at boot).
+    claim: ClaimRule,
 }
 
 /// A seal staged but not yet completion-committed (ADR-0084 D2).
@@ -298,6 +358,7 @@ impl<F: SegmentFs> TierFlush<F> {
             round: None,
             round_dir_holds: Vec::new(),
             pending_seals: std::collections::VecDeque::new(),
+            claim: ClaimRule::FullFrames,
         }
     }
 
@@ -667,70 +728,6 @@ impl<F: SegmentFs> TierFlush<F> {
             .map(|w| (self.active_id, w.base(), w.data_len(), w.durable_len(), w.path()))
     }
 
-    /// Reads `len` bytes at `addr` straight from the tier bytes through
-    /// this catalog — sealed files, or the active file's durable prefix
-    /// — with a **blocking** read on a fresh buffered handle, CRC-verified
-    /// frame by frame (M4.5-S37, ADR-0093 A4: the recovery boot's settle
-    /// reads, before the cell serves; the DST harnesses' oracle reads —
-    /// the caller sizes the record from its header window first). Never
-    /// a serving-path primitive: the plane reads cold records through
-    /// `ColdReads`. `Ok(None)` when no catalogued range covers the whole
-    /// span (a retired file, or a hole).
-    ///
-    /// # Errors
-    /// The filesystem's; a frame that fails its CRC (`InvalidData`); a
-    /// file shorter than its catalogued range (`UnexpectedEof`).
-    pub fn read_span_blocking(&self, addr: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
-        use crate::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
-        let covers =
-            |base: u64, data_len: u64| addr >= base && addr + len as u64 <= base + data_len;
-        // The catalog ascends by base (asserted at `with_catalog`, kept by
-        // in-order seals and id-keyed detaches): the only file that can
-        // cover `addr` is the last one based at or below it — a bisection,
-        // not a scan (L04 perf row; the S37 rebuild calls this per slot).
-        let at = self.sealed.partition_point(|m| {
-            note_span_locate_step();
-            m.base.to_raw() <= addr
-        });
-        let located = at
-            .checked_sub(1)
-            .map(|i| &self.sealed[i])
-            .inspect(|_| note_span_locate_step())
-            .filter(|m| covers(m.base.to_raw(), m.data_len))
-            .map(|m| (m.base.to_raw(), m.path.clone()))
-            .or_else(|| {
-                let (_, base, _, durable_len, path) = self.active()?;
-                covers(base.to_raw(), durable_len).then(|| (base.to_raw(), path.to_path_buf()))
-            });
-        let Some((base, path)) = located else { return Ok(None) };
-        let file = self.fs.open_read(&path)?;
-        let (first, count, skip) = tier_frame_span(addr - base, len);
-        let from = tier_frame_offset(first);
-        let span = usize::try_from(count)
-            .ok()
-            .and_then(|frames| frames.checked_mul(TIER_FRAME_BYTES))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "cold read span overflows")
-            })?;
-        let mut window = vec![0u8; span];
-        let mut done = 0usize;
-        while done < span {
-            let n = file.read_at(from + done as u64, &mut window[done..])?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("tier file {} ends inside the span at {addr}", path.display()),
-                ));
-            }
-            done += n;
-        }
-        let mut out = Vec::with_capacity(len);
-        tier_extract(&window, skip, len, &mut out).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("tier frame at {addr}: {e:?}"))
-        })?;
-        Ok(Some(out))
-    }
-
     /// The next append address, when a file is active — the drive loop's
     /// resume cursor (bytes staged ahead of `flushed` must never be
     /// re-appended). `None` when no file is active (fresh pipeline, or
@@ -841,14 +838,20 @@ impl<F: SegmentFs> TierFlush<F> {
     }
 
     /// The highest address the drive loop may confirm right now: the
-    /// active file's claimable end (full, final frames only — the
-    /// partial tail frame is claimable at seal, ADR-0056 D5), or the
-    /// last sealed file's exact end when no file is active. `None`
-    /// before anything was written.
+    /// active file's claimable end under the pipeline's claim rule —
+    /// full, final frames only on the live rule (the partial tail frame
+    /// is claimable at seal, ADR-0056 D5), every barrier-covered byte on
+    /// a boot pipeline (ADR-0174 D2 rule 4) — or the last sealed file's
+    /// exact end when no file is active. `None` before anything was
+    /// written.
     #[must_use]
     pub fn confirmable_end(&self) -> Option<u64> {
         if let Some(w) = &self.writer {
-            return Some(w.base().to_raw() + w.confirmable_len());
+            let claimed = match self.claim {
+                ClaimRule::FullFrames => w.confirmable_len(),
+                ClaimRule::Barrier => w.durable_len(),
+            };
+            return Some(w.base().to_raw() + claimed);
         }
         self.sealed.last().map(|m| m.base.to_raw() + m.data_len)
     }
@@ -905,6 +908,326 @@ fn classify(failure: TierWriteFailure, path: PathBuf) -> TierFlushError {
     }
 }
 
+impl<F: SegmentFs> SeamFlush for TierFlush<F> {
+    fn sealed(&self) -> &[TierFileMeta] {
+        TierFlush::sealed(self)
+    }
+
+    fn active(&self) -> Option<(u32, LogicalAddr, u64, u64, &Path)> {
+        TierFlush::active(self)
+    }
+
+    fn append_cursor(&self) -> Option<u64> {
+        TierFlush::append_cursor(self)
+    }
+
+    fn confirmable_end(&self) -> Option<u64> {
+        TierFlush::confirmable_end(self)
+    }
+
+    fn device_bytes(&self) -> u64 {
+        TierFlush::device_bytes(self)
+    }
+
+    fn append_range(&mut self, addr: LogicalAddr, bytes: &[u8]) -> Result<(), TierFlushError> {
+        TierFlush::append_range(self, addr, bytes)
+    }
+
+    fn seal_for_gap(&mut self) -> Result<(), TierFlushError> {
+        TierFlush::seal_for_gap(self)
+    }
+
+    fn sync(&mut self) -> Result<(), TierFlushError> {
+        TierFlush::sync(self)
+    }
+
+    fn seal_shutdown(&mut self) -> Result<(), TierFlushError> {
+        TierFlush::seal_shutdown(self)
+    }
+}
+
+// ---- the boot pipeline (ADR-0174 D2 rule 4, D5; DRR FCR-STTIER-01 I11, I18) ----
+
+/// A tiered namespace's flush pipeline during boot replay: the recovered
+/// [`TierFlush`] under the barrier claim rule, holding the open
+/// creation-mode handle of every sealed catalogue file (the manifested
+/// ones, opened at recovery; the boot-sealed ones, as the pipeline seals
+/// them) and one aligned two-frame buffer for the settle read. It drives
+/// like the live pipeline through [`SeamFlush`]; its one exit is
+/// [`hand_over`](Self::hand_over), the only path from a boot pipeline to
+/// a `TierFlush` and to the handles — so the plane never installs a
+/// pipeline that carries the boot value, and a boot-demoted key is
+/// readable by the first command after `Ready`.
+pub struct BootFlush<F: SegmentFs> {
+    flush: TierFlush<F>,
+    /// The settle read's window: two aligned frames, the most a
+    /// [`TIER_FRAME_DATA`]-bounded key window can span.
+    window: FrameStaging,
+    /// The extracted key window (≤ the window length a read asks for;
+    /// allocated once).
+    extracted: Vec<u8>,
+}
+
+/// What the boot's exit hands the plane (ADR-0174 D5): the pipeline
+/// under the live claim rule, with no open writer, and the creation-mode
+/// handle of every sealed file in its catalogue.
+pub struct HandedOver<F: SegmentFs> {
+    pub flush: TierFlush<F>,
+    pub handles: Vec<(u32, F::File)>,
+}
+
+/// The settle read's answer (ADR-0174 D3, the `read` step): the record's
+/// key window, borrowed from the pipeline's buffer, and `left`, the bytes
+/// from the record's address to its file's claimed end, which bounds the
+/// record's length. The caller parses it under the slot's hash.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SettleWindow<'a> {
+    /// The window's bytes: `min(asked, left)` of them.
+    pub bytes: &'a [u8],
+    /// Bytes from the address to the file's claimed end.
+    pub left: u64,
+}
+
+/// Why a settle read did not answer (DRR FCR-STTIER-01 §2, the
+/// `REPLAY_SETTLE_READ_FAIL` row): each a typed boot refusal for the
+/// caller, naming the address; never "distinct".
+#[derive(Debug)]
+pub enum SettleReadError {
+    /// No catalogued file covers the address: a retired range, a hole,
+    /// or an address past the active file's claimed end.
+    NoRange { addr: u64 },
+    /// The catalogue names the file but the pipeline holds no handle
+    /// for it — a construction defect, answered typed.
+    NoHandle { addr: u64, id: u32 },
+    /// The handle's read failed (the device, or the injected point).
+    Io { addr: u64, path: PathBuf, source: io::Error },
+    /// The file ends inside the window the catalogue says it covers.
+    Short { addr: u64, path: PathBuf },
+    /// A frame of the window fails its CRC.
+    Corrupt { addr: u64, path: PathBuf, frame: u64 },
+}
+
+impl core::fmt::Display for SettleReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SettleReadError::NoRange { addr } => {
+                write!(f, "settle read at {addr}: no catalogued tier range covers it")
+            }
+            SettleReadError::NoHandle { addr, id } => {
+                write!(f, "settle read at {addr}: no held handle for tier file {id}")
+            }
+            SettleReadError::Io { addr, path, source } => {
+                write!(f, "settle read at {addr} on {}: {source}", path.display())
+            }
+            SettleReadError::Short { addr, path } => {
+                write!(f, "settle read at {addr}: {} ends inside the key window", path.display())
+            }
+            SettleReadError::Corrupt { addr, path, frame } => {
+                write!(f, "settle read at {addr}: frame {frame} of {} fails CRC", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for SettleReadError {}
+
+impl<F: SegmentFs> BootFlush<F> {
+    /// Puts a recovered pipeline under the boot claim rule. `handles`
+    /// are the open creation-mode handles of its sealed catalogue files,
+    /// in catalogue order — one per file; the boot adds its own as it
+    /// seals, and the settle read answers from these alone.
+    #[must_use]
+    pub fn new(mut flush: TierFlush<F>, handles: Vec<(u32, F::File)>) -> BootFlush<F> {
+        debug_assert!(
+            flush.sealed.iter().map(|m| m.id).eq(handles.iter().map(|(id, _)| *id)),
+            "one held handle per sealed catalogue file, in order"
+        );
+        debug_assert!(flush.sealed_handles.is_empty(), "a recovered pipeline sealed nothing yet");
+        debug_assert_eq!(flush.drive, TierDrive::Seam, "boot drives the seam");
+        flush.sealed_handles = handles;
+        flush.claim = ClaimRule::Barrier;
+        BootFlush { flush, window: FrameStaging::new(2), extracted: Vec::new() }
+    }
+
+    /// The settle read's locate and read steps (ADR-0174 D3): the frames
+    /// covering `min(window_len, left)` bytes at `addr` — one, or two
+    /// when the window crosses a frame — by one blocking read on the
+    /// covering file's **held** handle into the aligned buffer, every
+    /// frame's CRC checked. Opens nothing (I18). `window_len` is the
+    /// caller's key-window bound, at most one frame's payload.
+    ///
+    /// # Errors
+    /// [`SettleReadError`], each a typed boot refusal: no covering
+    /// range, no held handle, the read's failure (or the injected
+    /// `replay_settle_read_fail`), a short file, a CRC failure.
+    ///
+    /// # Panics
+    /// Panics on an empty window bound or one above a frame's payload.
+    pub fn read_key_window(
+        &mut self,
+        addr: u64,
+        window_len: usize,
+    ) -> Result<SettleWindow<'_>, SettleReadError> {
+        assert!(window_len > 0, "empty key window");
+        assert!(window_len <= TIER_FRAME_DATA, "a key window spans at most two frames");
+        let (base, end, file, path) = locate_held(&self.flush, addr)?;
+        let left = end - addr;
+        let len = usize::try_from(left).map_or(window_len, |l| l.min(window_len));
+        let (first, count, skip) = tier_frame_span(addr - base, len);
+        debug_assert!(count <= 2, "a key window fits the two-frame buffer");
+        let frames = self.window.frames_mut(count as usize);
+        if inf_foundation::fault::fire(crate::fault::REPLAY_SETTLE_READ_FAIL) {
+            return Err(SettleReadError::Io {
+                addr,
+                path: path.to_path_buf(),
+                source: crate::fault::injected(crate::fault::REPLAY_SETTLE_READ_FAIL),
+            });
+        }
+        let from = tier_frame_offset(first);
+        let mut done = 0usize;
+        while done < frames.len() {
+            let n = file
+                .read_at(from + done as u64, &mut frames[done..])
+                .map_err(|source| SettleReadError::Io { addr, path: path.to_path_buf(), source })?;
+            if n == 0 {
+                return Err(SettleReadError::Short { addr, path: path.to_path_buf() });
+            }
+            done += n;
+        }
+        tier_extract(frames, skip, len, &mut self.extracted).map_err(|e| {
+            SettleReadError::Corrupt {
+                addr,
+                path: path.to_path_buf(),
+                frame: first + u64::from(e.window_frame),
+            }
+        })?;
+        Ok(SettleWindow { bytes: &self.extracted, left })
+    }
+
+    /// The boot's exit (ADR-0174 D5, R10): the active file sealed — a
+    /// no-op once the store's drain sealed it (E13); a pipeline handed
+    /// over with barrier-claimed bytes in a rewritable frame would be
+    /// the live hazard the rule exists for, so the exit itself closes
+    /// that door — the claim rule back to full frames, and the pipeline
+    /// with every handle it held, one per sealed catalogue file, for the
+    /// plane's `install_recovered`.
+    ///
+    /// # Errors
+    /// [`TierFlushError`] from the seal, as for any seal.
+    pub fn hand_over(mut self) -> Result<HandedOver<F>, TierFlushError> {
+        self.flush.seal_shutdown()?;
+        self.flush.claim = ClaimRule::FullFrames;
+        let handles = if cfg!(inf_canary_replay_handles_dropped) {
+            // The planted canary (DRR FCR-STTIER-01 §6): the boot-sealed
+            // handles are closed instead of returned.
+            Vec::new()
+        } else {
+            self.flush.take_sealed_handles()
+        };
+        Ok(HandedOver { flush: self.flush, handles })
+    }
+
+    /// The next file id this pipeline would create.
+    #[must_use]
+    pub fn next_file_id(&self) -> u32 {
+        self.flush.next_file_id()
+    }
+
+    /// The per-slice byte budget of the recovered configuration.
+    #[must_use]
+    pub fn slice_bytes(&self) -> u64 {
+        self.flush.slice_bytes()
+    }
+
+    /// On-disk bytes the pipeline's files hold right now.
+    #[must_use]
+    pub fn disk_bytes(&self) -> u64 {
+        self.flush.disk_bytes()
+    }
+
+    /// Handles held: one per sealed catalogue file (tests, I11).
+    #[must_use]
+    pub fn held_handles(&self) -> usize {
+        self.flush.sealed_handles.len()
+    }
+}
+
+impl<F: SegmentFs> SeamFlush for BootFlush<F> {
+    fn sealed(&self) -> &[TierFileMeta] {
+        self.flush.sealed()
+    }
+
+    fn active(&self) -> Option<(u32, LogicalAddr, u64, u64, &Path)> {
+        self.flush.active()
+    }
+
+    fn append_cursor(&self) -> Option<u64> {
+        self.flush.append_cursor()
+    }
+
+    fn confirmable_end(&self) -> Option<u64> {
+        self.flush.confirmable_end()
+    }
+
+    fn device_bytes(&self) -> u64 {
+        self.flush.device_bytes()
+    }
+
+    fn append_range(&mut self, addr: LogicalAddr, bytes: &[u8]) -> Result<(), TierFlushError> {
+        self.flush.append_range(addr, bytes)
+    }
+
+    fn seal_for_gap(&mut self) -> Result<(), TierFlushError> {
+        self.flush.seal_for_gap()
+    }
+
+    fn sync(&mut self) -> Result<(), TierFlushError> {
+        self.flush.sync()
+    }
+
+    fn seal_shutdown(&mut self) -> Result<(), TierFlushError> {
+        self.flush.seal_shutdown()
+    }
+}
+
+/// The settle read's locate step: the catalogue file holding `addr`, by
+/// bisection over the ascending catalogue (the L04 perf row: the rebuild
+/// asks once per slot against thousands of files), with its held handle
+/// and its claimed end — a sealed file's exact end, the active file's
+/// barrier-covered end (the boot claim rule).
+#[allow(clippy::type_complexity)] // one locate answer: base, end, handle, path
+fn locate_held<F: SegmentFs>(
+    flush: &TierFlush<F>,
+    addr: u64,
+) -> Result<(u64, u64, &F::File, &Path), SettleReadError> {
+    let at = flush.sealed.partition_point(|m| {
+        note_span_locate_step();
+        m.base.to_raw() <= addr
+    });
+    if let Some(meta) = at.checked_sub(1).map(|i| &flush.sealed[i])
+        && addr < meta.base.to_raw() + meta.data_len
+    {
+        note_span_locate_step();
+        // Handles ascend by id like the catalogue (manifested in catalogue
+        // order, then the boot's seals above every manifested id).
+        let h = flush.sealed_handles.partition_point(|(id, _)| *id < meta.id);
+        return match flush.sealed_handles.get(h) {
+            Some((id, file)) if *id == meta.id => {
+                Ok((meta.base.to_raw(), meta.base.to_raw() + meta.data_len, file, &meta.path))
+            }
+            _ => Err(SettleReadError::NoHandle { addr, id: meta.id }),
+        };
+    }
+    if let Some(w) = &flush.writer {
+        let base = w.base().to_raw();
+        let end = base + w.durable_len();
+        if addr >= base && addr < end {
+            return Ok((base, end, w.file(), w.path()));
+        }
+    }
+    Err(SettleReadError::NoRange { addr })
+}
+
 /// Unlinks a retired tier file (M4-S15, ADR-0059 D3) — the last step of
 /// the retirement pipeline, executed by the plane only after the
 /// covering MANIFEST swap landed **and** the file's read pins drained
@@ -926,7 +1249,7 @@ pub fn unlink_tier_file<F: SegmentFs>(fs: &F, meta: &TierFileMeta) -> std::io::R
 
 #[cfg(test)]
 thread_local! {
-    /// Catalog entries `read_span_blocking` examined to locate a span —
+    /// Catalog entries the settle read examined to locate an address —
     /// the L04 perf-row witness (O(log n), not O(n)).
     static SPAN_LOCATE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -1366,12 +1689,16 @@ mod tests {
         }
         assert_eq!(flush.pool_outstanding(), 0, "every window a round carries is the pool's");
         assert_eq!(flush.confirmable_end(), Some(2 * TIER_FRAME_DATA as u64));
-        let back = flush
-            .read_span_blocking(0, 2 * TIER_FRAME_DATA)
-            .expect("read")
-            .expect("both frames are on the file");
-        assert!(back.iter().all(|&b| b == 0xA5), "both frames landed");
+        let (_, _, _, _, path) = flush.active().expect("active");
+        let back = image(&disk, path);
+        let span = 2 * crate::tier::TIER_FRAME_BYTES;
+        let frames = &back[TIER_HEADER_BYTES_TEST..TIER_HEADER_BYTES_TEST + span];
+        let mut out = Vec::new();
+        tier_extract(frames, 0, 2 * TIER_FRAME_DATA, &mut out).expect("both frames verify");
+        assert!(out.iter().all(|&b| b == 0xA5), "both frames landed");
     }
+
+    const TIER_HEADER_BYTES_TEST: usize = crate::tier::TIER_HEADER_BYTES;
 
     /// F-L04-13: the switch refuses staged, unflushed seam frames — a
     /// second named cause, so the pool never inherits half a batch.
@@ -1386,61 +1713,149 @@ mod tests {
 }
 
 #[cfg(test)]
-mod locate_tests {
+mod boot_tests {
     use std::path::Path;
 
     use super::*;
     use crate::fs::mem::MemFs;
-    use crate::tier::tier_file_name;
+    use crate::tier::{TIER_FRAME_DATA, tier_file_name};
 
     fn steps() -> u64 {
         SPAN_LOCATE_STEPS.with(|c| c.replace(0))
     }
 
-    fn catalog(files: u32) -> TierFlush<MemFs> {
-        let sealed = (0..files)
-            .map(|id| TierFileMeta {
-                id,
-                base: LogicalAddr::ZERO.advanced(u64::from(id) * 1000).expect("fits"),
-                data_len: 1000,
-                reason: SealReason::Capacity,
-                path: Path::new("shard-0/cold").join(tier_file_name(id)),
-            })
-            .collect();
-        TierFlush::with_catalog(
-            MemFs::new(),
-            TierFlushConfig {
-                shard_dir: Path::new("shard-0").to_path_buf(),
-                cell: 0,
-                ns: NsId(17),
-                mode: TierIoMode::Buffered,
-                file_capacity: 1000,
-                slice_bytes: 4096,
-            },
-            files,
-            sealed,
-        )
+    fn config(capacity: u64) -> TierFlushConfig {
+        TierFlushConfig {
+            shard_dir: Path::new("shard-0").to_path_buf(),
+            cell: 0,
+            ns: NsId(17),
+            mode: TierIoMode::Buffered,
+            file_capacity: capacity,
+            slice_bytes: 4096,
+        }
     }
 
-    /// L04 perf row: the S37 rebuild path calls this once per unpaired
-    /// slot against a catalog of thousands — locating the covering file
-    /// is a bisection over the ascending catalog, never a scan.
+    /// A catalogue of `files` manifested files, 900 bytes each at 1000-byte
+    /// bases (a range gap after every file), with a handle per file (the
+    /// files exist, empty: the locate cost is what is measured; a read
+    /// past the header fails short).
+    fn catalog(files: u32) -> BootFlush<MemFs> {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("shard-0/cold")).expect("dir");
+        let mut sealed = Vec::with_capacity(files as usize);
+        let mut handles = Vec::with_capacity(files as usize);
+        for id in 0..files {
+            let path = Path::new("shard-0/cold").join(tier_file_name(id));
+            handles.push((id, fs.create_segment(&path, 0).expect("create")));
+            sealed.push(TierFileMeta {
+                id,
+                base: LogicalAddr::ZERO.advanced(u64::from(id) * 1000).expect("fits"),
+                data_len: 900,
+                reason: SealReason::Capacity,
+                path,
+            });
+        }
+        BootFlush::new(TierFlush::with_catalog(fs, config(1000), files, sealed), handles)
+    }
+
+    /// L04 perf row: the rebuild and the replay settles ask once per
+    /// slot against a catalogue of thousands — locating the covering
+    /// file and its handle is a bisection, never a scan.
     #[test]
-    fn locating_a_span_bisects_the_catalog() {
-        let flush = catalog(10_000);
+    fn locating_a_key_window_bisects_the_catalogue() {
+        let mut boot = catalog(10_000);
         steps();
-        // A hit in the last file: the open then fails (no bytes on the
-        // fs) — the locate cost is what is measured.
-        let err = flush.read_span_blocking(9_999 * 1000 + 10, 100).expect_err("no file bytes");
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // A hit in the last file: the file is empty, so the read is short
+        // — the locate cost is what is measured.
+        let err = boot.read_key_window(9_999 * 1000 + 10, 100).expect_err("no file bytes");
+        assert!(matches!(err, SettleReadError::Short { addr: 9_999_010, .. }), "{err}");
         let hit = steps();
-        // A miss past every file, and one in a range gap.
-        assert!(flush.read_span_blocking(10_000_000, 1).expect("miss").is_none());
+        let err = boot.read_key_window(10_000_000, 1).expect_err("past every file");
+        assert!(matches!(err, SettleReadError::NoRange { addr: 10_000_000 }), "{err}");
         let miss_past = steps();
-        assert!(flush.read_span_blocking(4_999 * 1000 + 990, 100).expect("gap").is_none());
+        let err = boot.read_key_window(4_999 * 1000 + 950, 100).expect_err("in a range gap");
+        assert!(matches!(err, SettleReadError::NoRange { addr: 4_999_950 }), "{err}");
         let miss_gap = steps();
         for (what, n) in [("hit", hit), ("miss past", miss_past), ("miss in a gap", miss_gap)] {
-            assert!(n <= 16, "{what}: examined {n} catalog entries for 10 000 files");
+            assert!(n <= 16, "{what}: examined {n} catalogue entries for 10 000 files");
         }
+    }
+
+    /// ADR-0174 D2 rule 4: a boot pipeline claims every byte its barrier
+    /// covered, the partial tail frame included; the settle read answers
+    /// from that frame through the writer's own handle before and after
+    /// the frame is rewritten in place; and the one exit restores the
+    /// live rule, returning a handle per sealed file.
+    #[test]
+    fn a_boot_pipeline_claims_the_barrier_and_reads_its_own_tail_frame() {
+        let fs = MemFs::new();
+        let mut boot = BootFlush::new(TierFlush::new(fs.clone(), config(1 << 20), 0), Vec::new());
+        let payload = vec![0x5B; TIER_FRAME_DATA + 100];
+        boot.append_range(LogicalAddr::ZERO, &payload).expect("append");
+        assert_eq!(boot.confirmable_end(), Some(0), "nothing durable before the barrier");
+        boot.sync().expect("barrier");
+        assert_eq!(
+            boot.confirmable_end(),
+            Some(payload.len() as u64),
+            "the barrier claim covers the partial tail frame (ADR-0174 D2 rule 4)"
+        );
+        // A read inside the partial tail frame, through the held writer.
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10, 64).expect("reads");
+        assert_eq!(window.left, 90, "left is the claimed end less the address");
+        assert_eq!(window.bytes.len(), 64);
+        assert!(window.bytes.iter().all(|&b| b == 0x5B));
+        // The next step extends the same frame in place; both the old
+        // and the new bytes read back under the new CRC.
+        let next = LogicalAddr::ZERO.advanced(payload.len() as u64).expect("fits");
+        boot.append_range(next, &[0x6C; 200]).expect("append");
+        boot.sync().expect("barrier");
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10, 64).expect("reads");
+        assert_eq!(window.left, 290);
+        assert!(window.bytes.iter().all(|&b| b == 0x5B));
+        let window = boot.read_key_window(next.to_raw(), 300).expect("reads");
+        assert_eq!(window.bytes.len(), 200, "clamped to the claimed end");
+        assert!(window.bytes.iter().all(|&b| b == 0x6C));
+        // A window that crosses a frame boundary: two frames, one read.
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 - 10, 30).expect("reads");
+        assert_eq!(&window.bytes[..10], &[0x5B; 10]);
+        assert_eq!(&window.bytes[10..], &[0x5B; 20]);
+        // Beyond the claimed end: no range.
+        let err = boot.read_key_window(next.to_raw() + 200, 1).expect_err("unclaimed");
+        assert!(matches!(err, SettleReadError::NoRange { .. }), "{err}");
+        // The exit seals the open file, restores the live rule and hands
+        // over one handle per sealed file.
+        let HandedOver { flush, handles } = boot.hand_over().expect("seals and hands over");
+        assert_eq!(flush.sealed().len(), 1);
+        assert_eq!(flush.sealed()[0].reason, SealReason::Shutdown);
+        assert_eq!(handles.len(), 1, "one held handle per sealed catalogue file");
+        assert_eq!(flush.claim, ClaimRule::FullFrames, "the plane's rule");
+        assert!(flush.active().is_none());
+    }
+
+    /// The injected read failure (`replay_settle_read_fail`) answers
+    /// typed, naming the address; a CRC failure answers typed too.
+    #[test]
+    fn a_failed_or_corrupt_settle_read_is_typed() {
+        use inf_foundation::fault::FaultSpec;
+        let fs = MemFs::new();
+        let mut boot = BootFlush::new(TierFlush::new(fs.clone(), config(1 << 20), 0), Vec::new());
+        boot.append_range(LogicalAddr::ZERO, &[0x11; 500]).expect("append");
+        boot.sync().expect("barrier");
+        inf_foundation::fault::arm(crate::fault::REPLAY_SETTLE_READ_FAIL, FaultSpec::Nth(1));
+        let err = boot.read_key_window(100, 64).expect_err("the injected read failure");
+        assert!(matches!(err, SettleReadError::Io { addr: 100, .. }), "{err}");
+        assert!(err.to_string().contains("replay_settle_read_fail"), "{err}");
+        inf_foundation::fault::disarm_all();
+        boot.read_key_window(100, 64).expect("the next read answers");
+        // Flip a payload byte on disk: the frame's CRC refuses.
+        let (_, _, _, _, path) = boot.active().expect("active");
+        let path = path.to_path_buf();
+        let at = crate::tier::TIER_HEADER_BYTES as u64 + 7;
+        let mut planted = [0u8; 1];
+        let mut corruptor = fs.open_write(&path).expect("the test's own handle");
+        assert_eq!(corruptor.read_at(at, &mut planted).expect("read"), 1);
+        corruptor.write_at(at, &[planted[0] ^ 0xFF]).expect("flip one payload byte");
+        let err = boot.read_key_window(100, 64).expect_err("CRC");
+        assert!(matches!(err, SettleReadError::Corrupt { addr: 100, frame: 0, .. }), "{err}");
     }
 }

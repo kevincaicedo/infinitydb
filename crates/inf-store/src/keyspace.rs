@@ -53,6 +53,7 @@ use crate::store::{
 };
 use crate::tiered::TieredTable;
 use crate::tiered::promote::PromotionCounters;
+use crate::tiered::replay::{ReplayRefusal, ReplaySpill, TierReplay};
 use crate::tiered::shadow::ShadowCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
@@ -200,6 +201,9 @@ pub struct Keyspace {
     /// drains them. Non-empty at end-of-log is a decode error the
     /// recovery driver checks via [`displace_register_len`](Self::displace_register_len).
     pending_displace: Vec<(NsId, u64)>,
+    /// The parked markers as addresses, handed to the replay entry with
+    /// their paired mutation (capacity retained: no allocation per record).
+    displace_scratch: Vec<LogicalAddr>,
     /// Per-cell index registry (M4.5-S03, ADR-0075/ADR-0072 D2):
     /// declarations replicated by the DDL fan, this cell's trees and
     /// machine states beside them. Consulted at DDL/MAINTAIN rate only —
@@ -226,6 +230,24 @@ pub struct Keyspace {
     /// written before the rule); reported on the boot line, never
     /// silent.
     seed_normalized_thresholds: u32,
+}
+
+/// A tiered namespace's replayed mutation (ADR-0174 D3 R5, R6), the
+/// shape the three tiered arms hand to the one replay call.
+enum TieredMutation<'a> {
+    Image { key: &'a [u8], value: &'a [u8] },
+    Delete { key: &'a [u8] },
+    Extent { key: &'a [u8], ext: ExtentRef },
+}
+
+impl TieredMutation<'_> {
+    fn key(&self) -> &[u8] {
+        match self {
+            TieredMutation::Image { key, .. }
+            | TieredMutation::Delete { key }
+            | TieredMutation::Extent { key, .. } => key,
+        }
+    }
 }
 
 /// Whether `rec` may follow an armed displacement marker of `pending_ns`:
@@ -267,6 +289,7 @@ impl Keyspace {
             tier_shadow: false,
             tier_shadow_reconcile: true,
             pending_displace: Vec::new(),
+            displace_scratch: Vec::with_capacity(DISPLACE_REGISTER_CAP),
             indexes: IndexRegistry::default(),
             backfill: Vec::new(),
             backfill_docs_total: 0,
@@ -1164,6 +1187,8 @@ impl Keyspace {
     /// ADR-0011 D4. Records naming an unregistered id (dropped namespace)
     /// or a reserved one are skipped and counted, never an error: the
     /// catalog is authoritative and foreign logs must not wedge recovery.
+    /// `spill` lends a tiered namespace's boot replay machine (ADR-0174;
+    /// the seam of DRR FCR-STTIER-01 §7) and takes the I/O it did.
     ///
     /// `ExpireAt` deadlines convert from record Unix-ms through `anchor`;
     /// a deadline too far in the future for the internal clock clamps to
@@ -1171,19 +1196,21 @@ impl Keyspace {
     /// deadlines to the past would expire keys that should live).
     ///
     /// # Errors
-    /// Arena/bounds failures from the store (recovery fail-stop).
+    /// Arena/bounds failures from the store and the typed replay refusals
+    /// of a tiered namespace (recovery fail-stop).
     pub fn apply_record(
         &mut self,
         rec: &LogRecordView<'_>,
         now: Nanos,
         anchor: WallAnchor,
+        spill: &mut impl ReplaySpill,
     ) -> Result<ReplayOutcome, ReplayError> {
         // Tiered namespaces own their records' replay (ADR-0057 D4,
         // routed by M4-S26) — intercepted before the CellStore arms
         // because a tiered namespace also materializes a named CellStore
         // shell, and applying a tiered record there would build state the
         // tiered index never serves (invisible until the first restart).
-        if let Some(outcome) = self.apply_record_tiered(rec)? {
+        if let Some(outcome) = self.apply_record_tiered(rec, spill)? {
             return Ok(outcome);
         }
         match *rec {
@@ -1328,16 +1355,19 @@ impl Keyspace {
         }
     }
 
-    /// The tiered replay arms (ADR-0057 D4 rules 1–3; register bound by
-    /// ADR-0059 D9). Returns `None` when the record is not tiered-routed
-    /// — the caller's CellStore arms own it.
+    /// The tiered replay arms (ADR-0174 D3; register bound by ADR-0059
+    /// D9): each record enters the table's replay entry with its parked
+    /// markers, so the room question and a `DEL`'s reads precede the
+    /// marker drain (DRR FCR-STTIER-01 E1, E4). Returns `None` when the
+    /// record is not tiered-routed — the caller's CellStore arms own it.
     ///
     /// # Errors
-    /// Register overflow, marker adjacency violations, and store space
-    /// refusals — all recovery fail-stop at the caller.
+    /// Register overflow, marker adjacency violations, and the replay
+    /// entry's typed refusals — all recovery fail-stop at the caller.
     fn apply_record_tiered(
         &mut self,
         rec: &LogRecordView<'_>,
+        spill: &mut impl ReplaySpill,
     ) -> Result<Option<ReplayOutcome>, ReplayError> {
         // Strict marker adjacency (ADR-0057 D4: markers stage in the same
         // frame immediately before their mutation): while the register is
@@ -1366,28 +1396,18 @@ impl Keyspace {
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::StringPostImage { ns, key, value } if self.is_tiered(ns) => {
-                let hash = self.cfg.hasher.hash(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table.apply_image(key, value, hash).map_err(ReplayError::Store)?;
+                self.replay_tiered(ns, TieredMutation::Image { key, value }, spill)?;
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
-                let hash = self.cfg.hasher.hash(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table.apply_delete(key, hash);
+                self.replay_tiered(ns, TieredMutation::Delete { key }, spill)?;
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
                 if self.is_tiered(ns) =>
             {
-                let hash = self.cfg.hasher.hash(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table
-                    .apply_extent_image(key, hash, ExtentRef { extent_id, offset, len })
-                    .map_err(ReplayError::Store)?;
+                let ext = ExtentRef { extent_id, offset, len };
+                self.replay_tiered(ns, TieredMutation::Extent { key, ext }, spill)?;
                 Ok(Some(ReplayOutcome::Applied))
             }
             // Tiered namespaces carry no expiry and no documents in M4
@@ -1411,24 +1431,71 @@ impl Keyspace {
         }
     }
 
-    /// Applies every parked marker with the paired mutation's key hash
-    /// (D4 rule 1): exact `(hash, old_addr)` removal, zero disk reads.
-    fn drain_displace(&mut self, ns: NsId, hash: u64) -> Result<(), ReplayError> {
-        if self.pending_displace.is_empty() {
-            return Ok(());
-        }
-        let pending = core::mem::take(&mut self.pending_displace);
-        let table = self.tiered_store_mut(ns).expect("caller checked tiered");
-        for &(marker_ns, old_addr) in &pending {
+    /// One tiered mutation through the table's replay entry (ADR-0174
+    /// D3), with its parked markers: the entry's room question and a
+    /// `DEL`'s reads precede the drain; the seam takes the I/O after.
+    fn replay_tiered(
+        &mut self,
+        ns: NsId,
+        mutation: TieredMutation<'_>,
+        spill: &mut impl ReplaySpill,
+    ) -> Result<(), ReplayError> {
+        let key = mutation.key();
+        let hash = self.cfg.hasher.hash(key);
+        let markers = self.take_markers(ns)?;
+        let table = self.tiered_store_mut(ns).expect("is_tiered checked");
+        let machine = spill.replay_mut(ns);
+        let applied = match mutation {
+            TieredMutation::Image { key, value } => {
+                table.replay_upsert(machine, &markers, key, value, hash).map(|_| ())
+            }
+            TieredMutation::Delete { key } => {
+                table.replay_delete(machine, &markers, key, hash).map(|_| ())
+            }
+            TieredMutation::Extent { key, ext } => {
+                table.replay_upsert_extent(machine, &markers, key, hash, ext).map(|_| ())
+            }
+        };
+        self.return_markers(markers);
+        applied.map_err(ReplayError::Replay)?;
+        Self::charge_spill(spill, ns);
+        Ok(())
+    }
+
+    /// Takes the parked markers for the paired mutation of `ns` as
+    /// addresses (D4 rule 1): the register empties, and the replay entry
+    /// drains them exactly — by `(hash, old_addr)` — after its room
+    /// question and a `DEL`'s reads (ADR-0174 R3, R4, R6).
+    fn take_markers(&mut self, ns: NsId) -> Result<Vec<LogicalAddr>, ReplayError> {
+        let mut markers = core::mem::take(&mut self.displace_scratch);
+        markers.clear();
+        for &(marker_ns, old_addr) in &self.pending_displace {
             debug_assert_eq!(marker_ns, ns, "adjacency check pinned the namespace");
             let Some(addr) = LogicalAddr::from_raw(old_addr) else {
+                self.displace_scratch = markers;
                 return Err(ReplayError::Displacement(
                     "displacement address exceeds the 48-bit logical space",
                 ));
             };
-            table.apply_displace(hash, addr);
+            markers.push(addr);
         }
-        Ok(())
+        self.pending_displace.clear();
+        Ok(markers)
+    }
+
+    /// Returns the marker scratch after the entry consumed it.
+    fn return_markers(&mut self, markers: Vec<LogicalAddr>) {
+        self.displace_scratch = markers;
+    }
+
+    /// Hands the seam the I/O its machine did for this record.
+    fn charge_spill(spill: &mut impl ReplaySpill, ns: NsId) {
+        let work = spill.replay_mut(ns).map(TierReplay::take_work);
+        if let Some(work) = work
+            && !work.is_zero()
+        {
+            spill.charge(work);
+        }
     }
 
     /// Parked displacement markers awaiting their paired mutation — the
@@ -1704,6 +1771,10 @@ pub enum ReplayOutcome {
 #[derive(Debug)]
 pub enum ReplayError {
     Store(OpError),
+    /// A tiered namespace's typed boot refusal (ADR-0174; DRR
+    /// FCR-STTIER-01 §2): the window's refusal is no longer here — it is
+    /// a `Room` the entry answers with a demote step.
+    Replay(ReplayRefusal),
     /// Displacement-marker stream violation (ADR-0057 D4 pairing /
     /// ADR-0059 D9 bound) — corrupt or truncated tiered replay input.
     Displacement(&'static str),
@@ -1723,6 +1794,7 @@ pub enum ReplayError {
 mod tests {
     use super::*;
     use crate::store::{SetExpire, SetOptions, StoreConfig};
+    use crate::tiered::replay::NoSpill;
 
     fn now() -> Nanos {
         Nanos(1_000_000)
@@ -2174,14 +2246,20 @@ mod tests {
         let set = LogRecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v1" };
         for _ in 0..2 {
             // Double apply: replay from an older checkpoint re-covers records.
-            assert_eq!(ks.apply_record(&set, now, anchor).expect("apply"), ReplayOutcome::Applied);
+            assert_eq!(
+                ks.apply_record(&set, now, anchor, &mut NoSpill).expect("apply"),
+                ReplayOutcome::Applied
+            );
         }
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
 
         // ExpireAt in the future keeps the key; a past deadline kills it.
         let future_unix = anchor.unix_from_internal(Nanos::from_millis(60_000));
         let exp = LogRecordView::ExpireAt { ns: NsId(16), at_unix_ms: future_unix, key: b"k" };
-        assert_eq!(ks.apply_record(&exp, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        assert_eq!(
+            ks.apply_record(&exp, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::Applied
+        );
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
         assert_eq!(
             ks.ns_store_mut(NsId(16)).expect("live").get(b"k", Nanos::from_millis(61_000)),
@@ -2190,22 +2268,25 @@ mod tests {
         );
 
         let del = LogRecordView::Delete { ns: NsId(16), key: b"gone" };
-        assert_eq!(ks.apply_record(&del, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        assert_eq!(
+            ks.apply_record(&del, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::Applied
+        );
 
         // Unknown / reserved ids skip, never error (dropped-ns tolerance).
         let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&foreign, now, anchor).expect("apply"),
+            ks.apply_record(&foreign, now, anchor, &mut NoSpill).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(99))
         );
         let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&reserved, now, anchor).expect("apply"),
+            ks.apply_record(&reserved, now, anchor, &mut NoSpill).expect("apply"),
             ReplayOutcome::SkippedUnknownNs(NsId(3))
         );
         let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
         assert_eq!(
-            ks.apply_record(&nsop, now, anchor).expect("apply"),
+            ks.apply_record(&nsop, now, anchor, &mut NoSpill).expect("apply"),
             ReplayOutcome::SkippedReserved
         );
     }

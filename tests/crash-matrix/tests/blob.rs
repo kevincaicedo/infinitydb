@@ -399,6 +399,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     .expect("recovery");
     assert!(recovered.extents_listed.contains(&orphan_id), "the listing saw the orphan");
     let cell = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(stored.ckpt_id));
     read_ick_hybrid(
         &fs,
@@ -407,17 +408,16 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         |record| {
             match record {
                 RecordView::StringPostImage { key, value, .. } => {
+                    let hash = KeyHasher::default().hash(key);
                     cell.borrow_mut()
-                        .apply_image(key, value, KeyHasher::default().hash(key))
+                        .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                         .expect("fits");
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
+                    let hash = KeyHasher::default().hash(key);
+                    let ext = ExtentRef { extent_id, offset, len };
                     cell.borrow_mut()
-                        .apply_extent_image(
-                            key,
-                            KeyHasher::default().hash(key),
-                            ExtentRef { extent_id, offset, len },
-                        )
+                        .replay_upsert_extent(Some(&mut *replay.borrow_mut()), &[], key, hash, ext)
                         .expect("fits");
                 }
                 _ => panic!("unexpected image class"),
@@ -440,23 +440,24 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     )
     .expect("hybrid load");
     let mut t = cell.into_inner();
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut t);
     // Tail replay: the referenced twin's frame survived the crash.
     let mut rest: &[u8] = &tail;
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail decodes");
         match record {
             RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                t.apply_extent_image(
-                    key,
-                    KeyHasher::default().hash(key),
-                    ExtentRef { extent_id, offset, len },
-                )
-                .expect("fits");
+                let hash = KeyHasher::default().hash(key);
+                let ext = ExtentRef { extent_id, offset, len };
+                t.replay_upsert_extent(Some(&mut replay), &[], key, hash, ext).expect("fits");
             }
             _ => panic!("only the blob SET rides this tail"),
         }
         rest = &rest[consumed..];
     }
+    replay.end_of_replay(&t);
+    replay.hand_over(&mut t).expect("a fitting boot hands over");
 
     // Never served: no reference to the orphan exists anywhere.
     assert_eq!(t.extent_refcount(orphan_id), 0, "nothing references the orphan");

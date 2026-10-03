@@ -17,7 +17,7 @@ use std::path::Path;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
-    decode_record, read_ick_hybrid, read_manifest, write_manifest,
+    read_ick_hybrid, read_manifest, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -640,6 +640,7 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     )
     .expect("recovery");
     let table = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
     read_ick_hybrid(
         &fs,
@@ -647,9 +648,10 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
             if let RecordView::StringPostImage { key, value, .. } = record {
+                let hash = KeyHasher::default().hash(key);
                 table
                     .borrow_mut()
-                    .apply_image(key, value, KeyHasher::default().hash(key))
+                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -670,27 +672,10 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     )
     .expect("hybrid load");
     let mut table = table.into_inner();
-    // D4 replay with the D9 bounded displace register.
-    let mut rest: &[u8] = &tail;
-    let mut pending: Vec<u64> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                pending.push(old_addr);
-                assert!(pending.len() <= 4, "register within the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            other => panic!("modeled tail carries {other:?}"),
-        }
-        rest = &rest[consumed..];
-    }
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut table);
+    replay_tail(&mut table, &mut replay, &tail);
+    let (flush, _handles) = finish_boot(&mut table, replay);
 
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
@@ -713,15 +698,8 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
 
     // Demote the fresh copies and re-audit content — the corruption
     // window a stale twin would win.
-    let mut rig = Rig {
-        table,
-        fs,
-        flush: recovered.flush,
-        model,
-        tail: Vec::new(),
-        begun: false,
-        emit_origins: true,
-    };
+    let mut rig =
+        Rig { table, fs, flush, model, tail: Vec::new(), begun: false, emit_origins: true };
     rig.maintain();
     rig.audit();
 }

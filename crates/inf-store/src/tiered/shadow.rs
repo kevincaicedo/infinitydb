@@ -182,17 +182,34 @@ pub(super) enum SettleCase {
     /// stamp) and its blob reference released, **no bytes charged** —
     /// the crashed life may have charged this death already; the address
     /// is chained into the survivor's origins.
-    #[allow(dead_code, reason = "FCR-STTIER-01 stage 2 builds the boot settles that pass it")]
     RefAtBoot,
     /// A slot this boot's replay demoted, at or above the origin: the
     /// exact death (this life's file is byte-exact); the survivor takes
     /// the slot's origins and gains none — the address names nothing an
     /// older checkpoint references.
-    #[allow(dead_code, reason = "FCR-STTIER-01 stage 2 builds the boot settles that pass it")]
     ThisLife { len: u32 },
     /// The live settle and the rebuild: the exact death; the address and
     /// its own origins chain into the survivor's.
     Exact { len: u32 },
+}
+
+impl SettleCase {
+    /// The boot settle's case, decided once from the slot's address
+    /// (ADR-0174 R8): below the life origin a ref — counted, stamped,
+    /// chained, no bytes; at or above it a record this boot demoted —
+    /// its exact death, origins inherited. E5, E10 and E12 pass what this
+    /// answers and never pick a variant themselves.
+    pub(super) fn at_boot(cold: LogicalAddr, origin: LogicalAddr, record_len: u32) -> SettleCase {
+        if cold >= origin {
+            return SettleCase::ThisLife { len: record_len };
+        }
+        if cfg!(inf_canary_replay_ref_settle_charges) {
+            // The planted canary (DRR FCR-STTIER-01 §6): the ref arm
+            // charges the record's bytes to the recovered file.
+            return SettleCase::Exact { len: record_len };
+        }
+        SettleCase::RefAtBoot
+    }
 }
 
 /// The reconciler's verdict on one read (D4).
@@ -1435,7 +1452,7 @@ mod tests {
         );
         let hash = t.hash_key(b"k");
         let cold = LogicalAddr::from_raw(4096).expect("48-bit");
-        t.apply_ref(hash, cold);
+        t.replay_ref(hash, cold);
         let winner = t.insert(b"k", &[0x11; 100], hash).expect("fits");
         let dead_before = t.space().report().dead_bytes;
         t.live.note_ckpt_begun(9);

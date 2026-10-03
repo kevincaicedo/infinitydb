@@ -44,7 +44,8 @@ mod wheel;
 mod write_accounting;
 
 pub use address_space::{
-    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, TieringCounters,
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, Room, TieringCounters,
+    WindowFull,
 };
 pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
 pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
@@ -112,6 +113,10 @@ pub use store::{
 };
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
+pub use tiered::replay::{
+    Displaced, NoSpill, REPLAY_ROOM_ASKS_MAX, ReplayCounters, ReplayPhase, ReplayRefusal,
+    ReplaySpill, ReplayWork, SettleProgress, TierReplay,
+};
 pub use tiered::shadow::{
     COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
     SHADOW_TICKETS_CAP, SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowCounters,

@@ -723,6 +723,16 @@ impl AddressSpace {
         cursor < self.ro_boundary
     }
 
+    /// The length of the sealed-dead interval that starts exactly at
+    /// `addr`, if one does — how a record walk above `flushed` passes a
+    /// ring-top hole or a pad whole (ADR-0174 D2 rule 2: a hole has no
+    /// record start, so the boot's seal walk never lands inside one).
+    #[must_use]
+    pub fn hole_at(&self, addr: LogicalAddr) -> Option<u64> {
+        let a = addr.to_raw();
+        self.hole_marks.iter().find(|&&(start, _)| start == a).map(|&(_, len)| len)
+    }
+
     /// The next unit of flush work at `cursor`, bounded by `max_bytes` —
     /// a pure query; the pipeline appends/seals, fdatasyncs, then
     /// confirms via [`advance_flushed`](Self::advance_flushed). `cursor`

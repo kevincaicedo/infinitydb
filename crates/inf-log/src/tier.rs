@@ -298,8 +298,21 @@ impl FrameStaging {
 
     /// The aligned prefix of `count` filled slots (the device write).
     pub(crate) fn filled(&self, count: usize) -> &[u8] {
+        &self.raw[self.span(count)]
+    }
+
+    /// The aligned window of the first `count` slots, writable (a read
+    /// target: an `O_DIRECT` read needs the destination aligned as a
+    /// write needs its source — ADR-0054 D2).
+    pub(crate) fn frames_mut(&mut self, count: usize) -> &mut [u8] {
+        let span = self.span(count);
+        &mut self.raw[span]
+    }
+
+    /// The raw range of the first `count` slots.
+    fn span(&self, count: usize) -> core::ops::Range<usize> {
         debug_assert!(count <= self.frames, "count inside the window");
-        &self.raw[self.at..self.at + count * TIER_FRAME_BYTES]
+        self.at..self.at + count * TIER_FRAME_BYTES
     }
 }
 
@@ -835,6 +848,13 @@ impl<F: SegmentFs> TierWriter<F> {
     #[must_use]
     pub fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         self.file.raw_fd()
+    }
+
+    /// The open file in its creation mode — the boot settle read's
+    /// handle for the active file (ADR-0054 D1: one file, one mode; a
+    /// file with a writer is never opened a second way).
+    pub(crate) fn file(&self) -> &F::File {
+        &self.file
     }
 
     /// The file's path (test observability).

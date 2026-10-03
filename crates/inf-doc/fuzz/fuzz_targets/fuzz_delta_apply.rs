@@ -74,6 +74,7 @@ fuzz_target!(|data: &[u8]| {
         },
         NOW,
         ANCHOR,
+        &mut inf_store::NoSpill,
     )
     .expect("accepted/fallback document loads");
     let before_digest = ks.state_digest(NOW);
@@ -93,6 +94,7 @@ fuzz_target!(|data: &[u8]| {
         },
         NOW,
         ANCHOR,
+        &mut inf_store::NoSpill,
     );
     let (domain, applied_is_canonical) = {
         let store = ks.ns_store_mut(NS).expect("materialized");

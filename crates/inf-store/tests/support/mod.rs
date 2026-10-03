@@ -8,12 +8,15 @@
 
 use std::path::Path;
 
-use inf_log::fs::mem::MemFs;
+use inf_log::fs::mem::{MemFile, MemFs};
 use inf_log::{
-    NsId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, tier_extract,
-    tier_frame_offset, tier_frame_span,
+    BootFlush, HandedOver, NsId, RecordView, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    TierIoMode, decode_record, tier_extract, tier_frame_offset, tier_frame_span,
 };
-use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, TieredTable};
+use inf_store::{
+    AddressSpaceConfig, DemotionConfig, ExtentRef, LogicalAddr, SettleProgress, TierReplay,
+    TieredTable,
+};
 
 pub const PAGE: u64 = 4 << 10;
 pub const BUDGET: u64 = 1 << 20;
@@ -80,4 +83,63 @@ pub fn read_cold(flush: &TierFlush<MemFs>, fs: &MemFs, addr: u64, len: usize) ->
     let mut out = Vec::new();
     tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
     Some(out)
+}
+
+/// A boot replay machine over a fresh pipeline — the empty-section shape
+/// (ADR-0174 D4): no catalogue, no handles, file ids from 0.
+pub fn boot(fs: &MemFs, ns: NsId, file_capacity: u64) -> TierReplay<MemFs> {
+    let flush = TierFlush::new(fs.clone(), flush_config(ns, file_capacity), 0);
+    TierReplay::new(BootFlush::new(flush, Vec::new()), PAGE, PAGE)
+}
+
+/// Replays one modeled WAL tail of record-v1 encodings through the
+/// replay entries (ADR-0174 D3): markers park and hand to their paired
+/// mutation (ADR-0059 D9 bounds them at 4).
+pub fn replay_tail(table: &mut TieredTable, replay: &mut TierReplay<MemFs>, tail: &[u8]) {
+    let hasher = table.hasher();
+    let mut rest = tail;
+    let mut markers: Vec<LogicalAddr> = Vec::new();
+    while !rest.is_empty() {
+        let (record, consumed) = decode_record(rest).expect("tail records decode");
+        match record {
+            RecordView::ColdDisplace { old_addr, .. } => {
+                markers.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
+                assert!(markers.len() <= 4, "displace register exceeds the D9 bound");
+            }
+            RecordView::StringPostImage { key, value, .. } => {
+                let hash = hasher.hash(key);
+                table.replay_upsert(Some(replay), &markers, key, value, hash).expect("replays");
+                markers.clear();
+            }
+            RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
+                let hash = hasher.hash(key);
+                let ext = ExtentRef { extent_id, offset, len };
+                table
+                    .replay_upsert_extent(Some(replay), &markers, key, hash, ext)
+                    .expect("replays");
+                markers.clear();
+            }
+            RecordView::Delete { key, .. } => {
+                let hash = hasher.hash(key);
+                table.replay_delete(Some(replay), &markers, key, hash).expect("replays");
+                markers.clear();
+            }
+            other => panic!("modeled tail carries no {other:?}"),
+        }
+        rest = &rest[consumed..];
+    }
+    assert!(markers.is_empty(), "a trailing displace marker is a stream error");
+}
+
+/// The boot's end as the recovery driver plays it (DRR FCR-STTIER-01
+/// E12, E13): the end of replay, the settle steps to the tail, the
+/// hand-over. Returns the plane's pipeline and the held handles.
+pub fn finish_boot(
+    table: &mut TieredTable,
+    mut replay: TierReplay<MemFs>,
+) -> (TierFlush<MemFs>, Vec<(u32, MemFile)>) {
+    replay.end_of_replay(table);
+    while replay.settle_step(table, PAGE).expect("settle step") == SettleProgress::More {}
+    let HandedOver { flush, handles } = replay.hand_over(table).expect("hands over");
+    (flush, handles)
 }

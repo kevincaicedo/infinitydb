@@ -23,8 +23,8 @@ use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TIER_FRAME_BYTES,
-    TierFlush, TierFlushConfig, decode_record, read_ick_hybrid, read_manifest, tier_extract,
-    tier_frame_offset, tier_frame_span, write_manifest,
+    TierFlush, TierFlushConfig, read_ick_hybrid, read_manifest, tier_extract, tier_frame_offset,
+    tier_frame_span, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -736,6 +736,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     )
     .expect("recovery");
     let table = std::cell::RefCell::new(recovered.table);
+    let replay = std::cell::RefCell::new(recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
     read_ick_hybrid(
         &fs,
@@ -743,9 +744,10 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
             if let RecordView::StringPostImage { key, value, .. } = record {
+                let hash = KeyHasher::default().hash(key);
                 table
                     .borrow_mut()
-                    .apply_image(key, value, KeyHasher::default().hash(key))
+                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
                     .expect("fits");
             }
             Ok::<(), std::convert::Infallible>(())
@@ -766,34 +768,10 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     )
     .expect("hybrid load");
     let mut table = table.into_inner();
-    // D4 replay with the D9 bounded displace register.
-    let mut rest: &[u8] = &tail;
-    let mut pending: Vec<u64> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                pending.push(old_addr);
-                assert!(pending.len() <= 4, "register within the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_delete(key, hash);
-            }
-            other => panic!("modeled tail carries {other:?}"),
-        }
-        rest = &rest[consumed..];
-    }
+    let mut replay = replay.into_inner();
+    replay.end_of_checkpoint(&mut table);
+    replay_tail(&mut table, &mut replay, &tail);
+    let (flush, _handles) = finish_boot(&mut table, replay);
 
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
@@ -822,7 +800,7 @@ fn replay_and_check_d9(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
     let mut rig = Rig {
         table,
         fs,
-        flush: recovered.flush,
+        flush,
         model,
         tail: Vec::new(),
         begun: false,

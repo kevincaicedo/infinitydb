@@ -7,11 +7,12 @@
 //! compared, never addresses (§3.1).
 
 use inf_foundation::time::Nanos;
+use inf_log::fs::mem::MemFs;
 use inf_log::{FsyncClass, NsId, RecordView};
 use inf_store::KeyHasher;
 use inf_store::{
-    Keyspace, NsMode, NsSpec, ReplayError, ReplayOutcome, StoreConfig, TierSpec, TieredLookup,
-    TieredTable, WallAnchor,
+    Displaced, Keyspace, NoSpill, NsMode, NsSpec, ReplayError, ReplayOutcome, StoreConfig,
+    TierSpec, TieredLookup, TieredTable, WallAnchor,
 };
 
 const NS: NsId = NsId(41);
@@ -47,7 +48,7 @@ fn ram_addr(ks: &mut Keyspace, key: &[u8]) -> inf_store::LogicalAddr {
 fn tiered_records_route_to_the_table_not_the_shell() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
     let addr = ram_addr(&mut ks, b"k");
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.record(addr).value, b"v1");
@@ -62,15 +63,21 @@ fn tiered_records_route_to_the_table_not_the_shell() {
 fn displace_drains_at_its_paired_mutation() {
     let mut ks = tiered_keyspace();
     let set = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    ks.apply_record(&set, NOW, ANCHOR).expect("seed");
+    ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill).expect("seed");
     let old = ram_addr(&mut ks, b"k").to_raw();
 
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: old };
-    assert!(matches!(ks.apply_record(&marker, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill),
+        Ok(ReplayOutcome::Applied)
+    ));
     assert_eq!(ks.displace_register_len(), 1, "the marker parks until its mutation");
 
     let set2 = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v2" };
-    assert!(matches!(ks.apply_record(&set2, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        ks.apply_record(&set2, NOW, ANCHOR, &mut NoSpill),
+        Ok(ReplayOutcome::Applied)
+    ));
     assert_eq!(ks.displace_register_len(), 0, "the mutation drained the register");
     let addr = ram_addr(&mut ks, b"k");
     let table = ks.tiered_store_mut(NS).expect("materialized");
@@ -83,13 +90,13 @@ fn displace_drains_at_its_paired_mutation() {
 fn displace_delete_pairing_removes_the_key() {
     let mut ks = tiered_keyspace();
     let set = RecordView::StringPostImage { ns: NS, key: b"k", value: b"v1" };
-    ks.apply_record(&set, NOW, ANCHOR).expect("seed");
+    ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill).expect("seed");
     let old = ram_addr(&mut ks, b"k").to_raw();
 
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: old };
-    ks.apply_record(&marker, NOW, ANCHOR).expect("marker");
+    ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("marker");
     let del = RecordView::Delete { ns: NS, key: b"k" };
-    assert!(matches!(ks.apply_record(&del, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(ks.apply_record(&del, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
     assert_eq!(ks.displace_register_len(), 0);
     let table = ks.tiered_store_mut(NS).expect("materialized");
     let hash = KeyHasher::default().hash(b"k");
@@ -103,9 +110,12 @@ fn displace_delete_pairing_removes_the_key() {
 fn orphan_marker_is_a_decode_error() {
     let mut ks = tiered_keyspace();
     let marker = RecordView::ColdDisplace { ns: NS, old_addr: 4096 };
-    ks.apply_record(&marker, NOW, ANCHOR).expect("marker parks");
+    ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("marker parks");
     let foreign = RecordView::StringPostImage { ns: NsId(0), key: b"k", value: b"v" };
-    assert!(matches!(ks.apply_record(&foreign, NOW, ANCHOR), Err(ReplayError::Displacement(_))));
+    assert!(matches!(
+        ks.apply_record(&foreign, NOW, ANCHOR, &mut NoSpill),
+        Err(ReplayError::Displacement(_))
+    ));
 }
 
 /// More markers than one mutation can stage (ADR-0059 D9 bounds the
@@ -115,10 +125,13 @@ fn displace_register_overflow_is_a_decode_error() {
     let mut ks = tiered_keyspace();
     for i in 0..4u64 {
         let marker = RecordView::ColdDisplace { ns: NS, old_addr: 4096 + i * 64 };
-        ks.apply_record(&marker, NOW, ANCHOR).expect("within the D9 bound");
+        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("within the D9 bound");
     }
     let fifth = RecordView::ColdDisplace { ns: NS, old_addr: 9999 };
-    assert!(matches!(ks.apply_record(&fifth, NOW, ANCHOR), Err(ReplayError::Displacement(_))));
+    assert!(matches!(
+        ks.apply_record(&fifth, NOW, ANCHOR, &mut NoSpill),
+        Err(ReplayError::Displacement(_))
+    ));
 }
 
 /// A marker naming a namespace with no tiered table (dropped, or a
@@ -129,7 +142,7 @@ fn marker_for_unknown_namespace_skips() {
     let mut ks = tiered_keyspace();
     let marker = RecordView::ColdDisplace { ns: NsId(99), old_addr: 4096 };
     assert!(matches!(
-        ks.apply_record(&marker, NOW, ANCHOR),
+        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill),
         Ok(ReplayOutcome::SkippedUnknownNs(_))
     ));
     assert_eq!(ks.displace_register_len(), 0);
@@ -142,7 +155,10 @@ fn marker_for_unknown_namespace_skips() {
 fn expiry_on_tiered_namespace_skips_reserved() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::ExpireAt { ns: NS, at_unix_ms: 1_750_000_000_000, key: b"k" };
-    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR), Ok(ReplayOutcome::SkippedReserved)));
+    assert!(matches!(
+        ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill),
+        Ok(ReplayOutcome::SkippedReserved)
+    ));
 }
 
 /// A tail `StringExtentRef` routes to the extent applier: the reference
@@ -151,7 +167,7 @@ fn expiry_on_tiered_namespace_skips_reserved() {
 fn extent_ref_routes_to_the_extent_applier() {
     let mut ks = tiered_keyspace();
     let rec = RecordView::StringExtentRef { ns: NS, key: b"big", extent_id: 7, offset: 0, len: 64 };
-    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(ks.apply_record(&rec, NOW, ANCHOR, &mut NoSpill), Ok(ReplayOutcome::Applied)));
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.extent_refcount(7), 1, "the reference map counts the replayed ref");
 }
@@ -167,22 +183,31 @@ fn extent_ref_routes_to_the_extent_applier() {
 fn in_place_set_replays_without_its_displacement_marker() {
     let mut ks = tiered_keyspace();
     let insert = RecordView::StringPostImage { ns: NS, key: b"k", value: b"aaaa" };
-    assert!(matches!(ks.apply_record(&insert, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        ks.apply_record(&insert, NOW, ANCHOR, &mut NoSpill),
+        Ok(ReplayOutcome::Applied)
+    ));
     // The live path rewrote in place and staged only the post-image;
     // replay sees exactly this record next. Its applier is the rule-2
     // key-verified upsert — addresses are never compared across lives
     // (§3.1), only content and slot cardinality.
     let update = RecordView::StringPostImage { ns: NS, key: b"k", value: b"bbbb" };
-    assert!(matches!(ks.apply_record(&update, NOW, ANCHOR), Ok(ReplayOutcome::Applied)));
+    assert!(matches!(
+        ks.apply_record(&update, NOW, ANCHOR, &mut NoSpill),
+        Ok(ReplayOutcome::Applied)
+    ));
     let addr_after = ram_addr(&mut ks, b"k");
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert_eq!(table.record(addr_after).value, b"bbbb", "the final value wins");
-    // No second slot: displacing the sole address empties the key.
+    // No second slot: one key, one slot, and a marker naming this life's
+    // own address — a crashed-life coordinate at replay — names nothing
+    // (ADR-0174 R4), so the key keeps serving its final value.
     let hash = KeyHasher::default().hash(b"k");
-    assert!(table.apply_displace(hash, addr_after), "exactly one slot existed");
+    assert_eq!(table.len(), 1, "exactly one slot exists");
+    assert_eq!(table.replay_displace(hash, addr_after), Displaced::AboveOrigin);
     assert!(
-        matches!(table.lookup(b"k", hash, &[]), TieredLookup::Miss),
-        "no stale duplicate slot survived the marker-less replay"
+        matches!(table.lookup(b"k", hash, &[]), TieredLookup::Ram(_)),
+        "no stale duplicate slot survived the marker-less replay, and the key serves"
     );
 }
 
@@ -221,9 +246,13 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
     // Repaired half: ref → origin marker → image ⇒ one RAM slot.
     let hash_a = KeyHasher::default().hash(b"relocated");
     let cold_a = LogicalAddr::from_raw(0x100).expect("fits");
-    table.apply_ref(hash_a, cold_a);
-    assert!(table.apply_displace(hash_a, cold_a), "the origin marker kills the cold ref");
-    table.apply_image(b"relocated", b"v2", hash_a).expect("fits");
+    table.replay_ref(hash_a, cold_a);
+    assert_eq!(
+        table.replay_displace(hash_a, cold_a),
+        Displaced::Removed,
+        "the origin marker kills"
+    );
+    table.replay_upsert::<MemFs>(None, &[], b"relocated", b"v2", hash_a).expect("fits");
     assert!(
         matches!(table.lookup(b"relocated", hash_a, &[]), TieredLookup::Ram(_)),
         "one RAM slot, no cold residue"
@@ -233,10 +262,11 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
     // leaves the stale cold slot alive next to the new RAM slot.
     let hash_b = KeyHasher::default().hash(b"leaky");
     let cold_b = LogicalAddr::from_raw(0x900).expect("fits");
-    table.apply_ref(hash_b, cold_b);
-    table.apply_image(b"leaky", b"v2", hash_b).expect("fits");
-    assert!(
-        table.apply_displace(hash_b, cold_b),
+    table.replay_ref(hash_b, cold_b);
+    table.replay_upsert::<MemFs>(None, &[], b"leaky", b"v2", hash_b).expect("fits");
+    assert_eq!(
+        table.replay_displace(hash_b, cold_b),
+        Displaced::Removed,
         "the stale cold slot survived — the marker is load-bearing for \
          cold-displacing overwrites, so the rider keeps it there"
     );

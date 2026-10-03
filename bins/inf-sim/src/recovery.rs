@@ -55,8 +55,9 @@ use inf_log::{
 };
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, EXTENT_REF_LEN, ExtentRef,
-    KeyHasher, KeyWindow, LogicalAddr, TieredLookup, TieredTable, apply_blob_ref_section,
-    apply_live_set_section, apply_ref_section, forced_collision_pair, recover_tiered_ns,
+    KeyHasher, KeyWindow, LogicalAddr, SettleProgress, TieredLookup, TieredTable,
+    apply_blob_ref_section, apply_live_set_section, apply_ref_section, forced_collision_pair,
+    recover_tiered_ns,
 };
 
 const NS: NsId = NsId(88);
@@ -1700,6 +1701,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
         };
         let table = std::cell::RefCell::new(recovered.table);
+        let replay = std::cell::RefCell::new(recovered.replay);
         let ick = shard.join(ick_file_name(manifest.ckpt_id));
         let loaded = read_ick_hybrid(
             &disk,
@@ -1708,15 +1710,23 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             |record| {
                 match record {
                     RecordView::StringPostImage { key, value, .. } => {
-                        table.borrow_mut().apply_image(key, value, hasher.hash(key)).expect("fits");
-                    }
-                    RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
+                        let hash = hasher.hash(key);
                         table
                             .borrow_mut()
-                            .apply_extent_image(
+                            .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
+                            .expect("fits");
+                    }
+                    RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
+                        let hash = hasher.hash(key);
+                        let ext = ExtentRef { extent_id, offset, len };
+                        table
+                            .borrow_mut()
+                            .replay_upsert_extent(
+                                Some(&mut *replay.borrow_mut()),
+                                &[],
                                 key,
-                                hasher.hash(key),
-                                ExtentRef { extent_id, offset, len },
+                                hash,
+                                ext,
                             )
                             .expect("fits");
                     }
@@ -1751,43 +1761,43 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             return run.report;
         }
         let mut table = table.into_inner();
+        let mut replay = replay.into_inner();
+        replay.end_of_checkpoint(&mut table);
         run.report.state.number(b"checkpoint-loaded", life_index);
         run.report.state.digest(table.simulation_digest());
         table.set_shadow_enabled(true);
-        // D4 tail replay: displacement markers pair with their mutation
-        // — a bounded list since ADR-0059 D9 (origin markers stack atop
-        // the ordinary one; each removal is exact-pair).
+        // D3 tail replay (ADR-0174): displacement markers pair with their
+        // mutation — a bounded list since ADR-0059 D9 (origin markers
+        // stack atop the ordinary one) — and hand to the replay entry,
+        // which drains them after its room question and a `DEL`'s reads.
         let mut rest: &[u8] = &run.tail;
-        let mut pending: Vec<u64> = Vec::new();
+        let mut pending: Vec<LogicalAddr> = Vec::new();
         while !rest.is_empty() {
             let (record, consumed) = decode_record(rest).expect("tail records decode");
             match record {
                 RecordView::ColdDisplace { old_addr, .. } => {
-                    pending.push(old_addr);
+                    pending.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
                     assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
                 }
                 RecordView::StringPostImage { key, value, .. } => {
                     let hash = table.hash_key(key);
-                    for old in pending.drain(..) {
-                        table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                    }
-                    table.apply_image(key, value, hash).expect("fits");
+                    table
+                        .replay_upsert(Some(&mut replay), &pending, key, value, hash)
+                        .expect("fits");
+                    pending.clear();
                 }
                 RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
                     let hash = table.hash_key(key);
-                    for old in pending.drain(..) {
-                        table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                    }
+                    let ext = ExtentRef { extent_id, offset, len };
                     table
-                        .apply_extent_image(key, hash, ExtentRef { extent_id, offset, len })
+                        .replay_upsert_extent(Some(&mut replay), &pending, key, hash, ext)
                         .expect("fits");
+                    pending.clear();
                 }
                 RecordView::Delete { key, .. } => {
                     let hash = table.hash_key(key);
-                    for old in pending.drain(..) {
-                        table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                    }
-                    table.apply_delete(key, hash);
+                    table.replay_delete(Some(&mut replay), &pending, key, hash).expect("fits");
+                    pending.clear();
                 }
                 other @ (RecordView::ExpireAt { .. }
                 | RecordView::NsOp { .. }
@@ -1808,17 +1818,42 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // by construction (two RAM keys with one hash beside a cold
         // twin) or beyond the cap, read and settled by their full key
         // before the life serves.
+        // The end of replay (ADR-0174 R10): a boot that demoted settles
+        // every RAM record it has not sealed before the rebuild; the
+        // rebuild's settle read is the machine's (the held handle, the
+        // key window); then the hand-over.
+        replay.end_of_replay(&table);
+        loop {
+            match replay.settle_step(&mut table, PAGE) {
+                Ok(SettleProgress::More) => {}
+                Ok(SettleProgress::Done) => break,
+                Err(err) => {
+                    run.report.violations.push(format!("life {life_index}: end settle: {err}"));
+                    run.report.state_hash = run.report.state.value();
+                    return run.report;
+                }
+            }
+        }
         let settled_at_boot = &mut run.report.shadow_settled_at_boot;
         if let Err(err) = table.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
-            let image = read_cold_record(&disk, &recovered.flush, slot.cold.to_raw())
-                .ok_or_else(|| "unreadable while its slot is live".to_owned())?;
+            let window = replay
+                .read_key_window(slot.cold)
+                .map_err(|e| format!("unreadable while its slot is live: {e}"))?;
             *settled_at_boot += 1;
-            Ok(KeyWindow { left: image.len() as u64, bytes: image })
+            Ok(KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
         }) {
             run.report.violations.push(format!("life {life_index}: {err}"));
             run.report.state_hash = run.report.state.value();
             return run.report;
         }
+        let handed = match replay.hand_over(&mut table) {
+            Ok(handed) => handed,
+            Err(err) => {
+                run.report.violations.push(format!("life {life_index}: hand-over: {err}"));
+                run.report.state_hash = run.report.state.value();
+                return run.report;
+            }
+        };
         run.report.state.number(b"recovered-life", life_index);
         run.report.state.digest(table.simulation_digest());
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
@@ -1830,7 +1865,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
         life = Life {
             table,
-            flush: recovered.flush,
+            flush: handed.flush,
             ring: StagingRing::new(StagingConfig::default()),
             flush_lag: false,
         };

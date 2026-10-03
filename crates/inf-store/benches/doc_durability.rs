@@ -21,6 +21,7 @@ use inf_doc::path::{EvalLimits, PathProgram, compile};
 use inf_doc::{CanonicalDoc, TapeDoc};
 use inf_foundation::time::Nanos;
 use inf_log::{DocLineage, FsyncClass, NsId, RecordView};
+use inf_store::NoSpill;
 use inf_store::{
     CellStore, JsonLogDecision, JsonScalarPatch, JsonSetOptions, Keyspace, NsMode, NsSpec,
     ReplayOutcome, StoreConfig, WallAnchor,
@@ -168,6 +169,7 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
                 &RecordView::DocFull { ns: NS, key: &key, lineage: LINEAGE, version: 1, idoc },
                 NOW,
                 ANCHOR,
+                &mut NoSpill,
             )
             .expect("initial full");
         assert_eq!(outcome, ReplayOutcome::Applied);
@@ -195,6 +197,7 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
                     },
                     NOW,
                     ANCHOR,
+                    &mut NoSpill,
                 )
                 .expect("valid sequential delta");
             assert_eq!(outcome, ReplayOutcome::Applied);

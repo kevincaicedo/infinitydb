@@ -587,7 +587,7 @@ fn reactor_sealed_file_beyond_the_manifest_is_clamped_inert() {
         KeyHasher::default(),
     )
     .expect("recovery keeps the sealed file");
-    let metas = recovered.flush.sealed();
+    let metas = recovered.replay.sealed();
     assert_eq!(metas.len(), 1, "the sealed file survives");
     assert_eq!(
         metas[0].data_len, manifested,

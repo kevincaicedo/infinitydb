@@ -556,7 +556,7 @@ pub fn reference_replay(fs: &MemFs, class: FsyncClass) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor()).expect("apply");
+                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });
