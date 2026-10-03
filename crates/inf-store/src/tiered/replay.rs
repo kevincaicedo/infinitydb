@@ -799,12 +799,13 @@ impl TieredTable {
                     };
                     r.demote(self, target)?;
                 }
-                Room::Pad(to) => {
+                Room::Pad(target) => {
                     let Some(r) = replay.as_deref_mut() else {
-                        return Err(ReplayRefusal::NoPipeline { need: Room::Pad(to) });
+                        return Err(ReplayRefusal::NoPipeline { need: Room::Pad(target) });
                     };
+                    let to = target.to();
                     self.space
-                        .pad_tail(to)
+                        .pad_tail(target)
                         .map_err(|WindowFull| ReplayRefusal::PadRefused { to })?;
                     r.counters.pads_placed += 1;
                 }

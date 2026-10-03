@@ -111,7 +111,7 @@ struct Prospect {
 /// answered as a [`Pad`](Room::Pad) instead (D2 rule 6), and a record
 /// no window state can hold is [`End`](Room::End) — so a demote step
 /// always has a reachable target.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Room {
     /// The allocation fits now: [`AddressSpace::alloc`] places it.
     Fits,
@@ -119,11 +119,11 @@ pub enum Room {
     /// head, at or below the tail — before the allocation fits: the
     /// demote step's target.
     Demote(LogicalAddr),
-    /// The need lies above the tail: pad the tail to this address first
-    /// ([`AddressSpace::pad_tail`] — the ring top when the record needs
-    /// a ring-top hole, else the next commit-page boundary), then ask
-    /// again. The next answer is `Demote` or `Fits`.
-    Pad(LogicalAddr),
+    /// The need lies above the tail: pad the tail first
+    /// ([`AddressSpace::pad_tail`] — to the ring top when the record
+    /// needs a ring-top hole, else to the next commit-page boundary),
+    /// then ask again. The next answer is `Demote` or `Fits`.
+    Pad(PadTarget),
     /// No watermark progress places it: the 48-bit end of the space, or
     /// a record longer than the window. The second cause exists only on
     /// the live path, where a budget shrink keeps the ring and the
@@ -131,6 +131,38 @@ pub enum Room {
     /// and relocation re-appends one; at boot the ring is the spec's,
     /// so every record the length refusals admit is at most the window.
     End,
+}
+
+/// A pad target (ADR-0174 D2 rule 6) — the ring top the record's hole
+/// would make, or the next commit-page boundary — answered by
+/// [`AddressSpace::room`] for the tail of that moment and consumed by
+/// [`AddressSpace::pad_tail`], which checks that tail. Only `room`
+/// constructs one and the value does not copy, so a stale or invented
+/// pad target is unrepresentable: `pad_tail` asserts about the space's
+/// own state, never about its caller.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PadTarget {
+    to: LogicalAddr,
+    /// The tail the answer was computed for.
+    tail: LogicalAddr,
+    kind: PadKind,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PadKind {
+    /// To the ring top: the ring-top seal the record would have made.
+    RingTop,
+    /// To the next commit-page boundary: commits nothing.
+    Page,
+}
+
+impl PadTarget {
+    /// Where the tail moves.
+    #[inline]
+    #[must_use]
+    pub fn to(&self) -> LogicalAddr {
+        self.to
+    }
 }
 
 /// A [`AddressSpace::pad_tail`] refusal: the pages the pad would commit
@@ -544,18 +576,21 @@ impl AddressSpace {
         if cfg!(inf_canary_replay_no_pad) {
             return Room::Demote(self.addr_at(rel_tail));
         }
+        let tail = self.tail();
         if prospect.hole > 0 {
             let pad = self.prospect(prospect.hole);
             debug_assert_eq!(pad.start_rel, rel_tail, "a ring-top pad starts at the tail");
             debug_assert_eq!(pad.top_rel, prospect.start_rel, "and ends at the ring top");
             if self.fits(pad) {
-                return Room::Pad(self.addr_at(prospect.start_rel));
+                let to = self.addr_at(prospect.start_rel);
+                return Room::Pad(PadTarget { to, tail, kind: PadKind::RingTop });
             }
             let pad_need_rel = pad.top_rel - self.window_limit;
             debug_assert!(pad_need_rel <= rel_tail, "a ring-top pad's need is reachable");
             return Room::Demote(self.addr_at(pad_need_rel));
         }
-        Room::Pad(self.addr_at(self.page_ceil(rel_tail)))
+        let to = self.addr_at(self.page_ceil(rel_tail));
+        Room::Pad(PadTarget { to, tail, kind: PadKind::Page })
     }
 
     /// Allocates `len` bytes at the tail, committing ring pages as
@@ -596,9 +631,9 @@ impl AddressSpace {
         Some(addr)
     }
 
-    /// Pads the tail to `to`, a [`Room::Pad`] answer (ADR-0174 D2 rule
-    /// 6): the ring top when the next record needs a ring-top hole, else
-    /// the next commit-page boundary. The skipped span is a sealed-dead
+    /// Pads the tail to a [`Room::Pad`] answer (ADR-0174 D2 rule 6): the
+    /// ring top when the next record needs a ring-top hole, else the
+    /// next commit-page boundary. The skipped span is a sealed-dead
     /// interval (ADR-0052 D2): counted dead, a hole mark, no record; the
     /// flush crosses it as a gap after the preceding file's seal. A
     /// ring-top pad is the ring-top seal the record would have made and
@@ -615,21 +650,15 @@ impl AddressSpace {
     /// not; this is that arithmetic's pair check.
     ///
     /// # Panics
-    /// Panics when `to` is not a pad target of the current tail: at or
-    /// below it, or neither the ring top within half a ring (a hole is
-    /// shorter than the record that needs it) nor the next page
-    /// boundary — a stale or invented answer, a programmer error.
-    pub fn pad_tail(&mut self, to: LogicalAddr) -> Result<(), WindowFull> {
-        let t = to.to_raw();
-        assert!(t > self.tail, "pad at or below the tail");
-        let rel_tail = self.tail - self.life_origin;
+    /// Panics when the target was answered for another tail — the
+    /// space's own state against the answer it gave (a `PadTarget` is
+    /// `room`'s alone and does not copy, so this is the one way an
+    /// answer can be stale).
+    pub fn pad_tail(&mut self, target: PadTarget) -> Result<(), WindowFull> {
+        assert_eq!(target.tail.to_raw(), self.tail, "pad answered for another tail");
+        let t = target.to.to_raw();
         let to_rel = t - self.life_origin;
         let pad_len = t - self.tail;
-        let ring_top = (to_rel & self.ring_mask) == 0 && pad_len < self.ring_bytes() / 2;
-        assert!(
-            ring_top || to_rel == self.page_ceil(rel_tail),
-            "pad target is neither the ring top nor the next page"
-        );
         let pad = self.prospect(pad_len);
         debug_assert_eq!(pad.hole, 0, "a pad makes no hole");
         debug_assert_eq!(pad.top_rel, to_rel, "a pad's committed top is its target");
@@ -640,7 +669,7 @@ impl AddressSpace {
             self.commit_rel_pages(self.commit_top_rel, pad.top_rel);
             self.commit_top_rel = pad.top_rel;
         }
-        if ring_top {
+        if target.kind == PadKind::RingTop {
             self.counters.seal_holes += 1;
             self.counters.seal_hole_bytes += pad_len;
         }
@@ -1313,7 +1342,8 @@ mod tests {
                     sp.advance_flushed(sp.tail());
                     sp.advance_head(LogicalAddr::from_raw(h).expect("48-bit"));
                 }
-                Room::Pad(to) => {
+                Room::Pad(target) => {
+                    let to = target.to();
                     if to.to_raw() % ring == 0 {
                         pads.0 += 1;
                     } else {
@@ -1321,7 +1351,7 @@ mod tests {
                     }
                     assert!(pads.0 + pads.1 <= 1, "a second pad for one record (len {len})");
                     assert!(to.to_raw() > sp.tail().to_raw(), "a pad above the tail");
-                    sp.pad_tail(to).expect("room answered Pad: the pad fits");
+                    sp.pad_tail(target).expect("room answered Pad: the pad fits");
                 }
                 Room::End => unreachable!("far below the 48-bit end"),
             }
@@ -1491,10 +1521,14 @@ mod tests {
         let mut sp = space_at(ring as usize, page as usize, 8 * page, 10 * page, 4 * page);
         let before = (sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len());
         let ring_top = LogicalAddr::from_raw(ring).expect("48-bit");
-        assert_eq!(sp.pad_tail(ring_top), Err(WindowFull));
+        // The pair check's input, built in the module: `room` answers no
+        // such pad (it answers the `Demote` for the pad's own pages).
+        let pad = || PadTarget { to: ring_top, tail: sp.tail(), kind: PadKind::RingTop };
+        assert_eq!(sp.pad_tail(pad()), Err(WindowFull));
         assert_eq!((sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len()), before);
         sp.advance_head(LogicalAddr::from_raw(8 * page).expect("48-bit"));
-        assert_eq!(sp.pad_tail(ring_top), Ok(()));
+        let pad = PadTarget { to: ring_top, tail: sp.tail(), kind: PadKind::RingTop };
+        assert_eq!(sp.pad_tail(pad), Ok(()));
         assert_eq!(sp.tail(), ring_top);
         assert_eq!(sp.counters().seal_holes, 1, "a ring-top pad is the seal the record would make");
         assert_eq!(sp.counters().seal_hole_bytes, 6 * page);
@@ -1502,22 +1536,23 @@ mod tests {
         assert_eq!(sp.report().committed_bytes, 8 * page, "the pad's pages, within the window");
     }
 
+    /// A pad target is `room`'s answer for one tail: placed after the
+    /// tail moved, it is a stale answer the space refuses on its own
+    /// state (a target at or below the tail, or one that is neither the
+    /// ring top nor the next page, cannot be written: `room` alone
+    /// constructs one).
     #[test]
-    #[should_panic(expected = "pad at or below the tail")]
-    fn a_pad_at_the_tail_panics() {
-        let mut sp = space(1 << 16, 1 << 12);
+    #[should_panic(expected = "pad answered for another tail")]
+    fn a_pad_answered_for_another_tail_panics() {
+        let page = 1u64 << 12;
+        // Window 4 of 8 pages, three pages resident above a floor at
+        // four and the tail one page below the ring top: a record over
+        // three pages needs a hole, its need lies above the tail, and
+        // the 1-page pad fits.
+        let mut sp = space_at(8 * page as usize, page as usize, 4 * page, 7 * page, 4 * page);
+        let Room::Pad(target) = sp.room(3 * page as usize + 1) else { panic!("a ring-top pad") };
         sp.alloc(100).expect("fits");
-        let _ = sp.pad_tail(sp.tail());
-    }
-
-    /// A ring multiple a whole ring above a ring-aligned tail is no pad
-    /// target: no record makes a hole there (it would start at the
-    /// tail), and a pad is shorter than the record that needs it.
-    #[test]
-    #[should_panic(expected = "pad target is neither the ring top nor the next page")]
-    fn a_pad_of_a_whole_ring_panics() {
-        let mut sp = space(1 << 16, 1 << 12);
-        let _ = sp.pad_tail(LogicalAddr::from_raw(1 << 16).expect("48-bit"));
+        let _ = sp.pad_tail(target);
     }
 
     /// The 48-bit end (ADR-0174 D2 rule 1's `End`): a life whose origin

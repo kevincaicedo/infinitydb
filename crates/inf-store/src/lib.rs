@@ -44,8 +44,8 @@ mod wheel;
 mod write_accounting;
 
 pub use address_space::{
-    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, Room, TieringCounters,
-    WindowFull,
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, PadTarget, Room,
+    TieringCounters, WindowFull,
 };
 pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
 pub use demote::{DemoteStats, DemotionConfig, EvictionPressure, MUTABLE_PERMILLE_DEFAULT};
