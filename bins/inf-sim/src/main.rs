@@ -67,9 +67,9 @@ fn main() {
     // F-L14-01 (batch 20): force the m2 lift regime on any seed — the
     // arm on a seed known to lift (the sweep discloses which).
     let mut lift_regime = false;
-    // FCR-STTIER-01 (ADR-0174 D1): force the replay-above-window regime
-    // on any seed of m4-recovery and m4-tiered — the tail replay must
-    // demote; a run under it that never exceeded a window is VACUOUS.
+    // ADR-0174 D1: force the replay-above-window seed class on any seed of
+    // m4-recovery and m4-tiered — the tail replay must demote; a run in it
+    // that never exceeded a window is VACUOUS.
     let mut replay_above_window = false;
     let mut ops_override: Option<u64> = None;
 
@@ -410,9 +410,19 @@ fn main() {
             let mut shadow_held_rows = 0u64;
             let mut shadow_held_reformed = 0u64;
             let mut shadow_held_not_restored = 0u64;
+            // ADR-0174 D6: the boots that demoted, the fitting boots the
+            // zero set was checked on, and boot replay's counters.
+            let mut demoting_boots = 0u64;
+            let mut fitting_boots = 0u64;
+            let mut boot_replay = inf_store::ReplayCounters::default();
+            let mut writer_parks = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                demoting_boots += report.demoting_boots;
+                fitting_boots += report.fitting_boots_checked;
+                boot_replay.absorb(report.boot_replay);
+                writer_parks += report.writer_parks;
                 if verify {
                     let twin = run_one(seed);
                     verify_hashes(
@@ -477,7 +487,17 @@ fn main() {
                  {shadow_twin_origin_rows} ({shadow_twin_origins_covered} origins covered by \
                  DEL markers), held-across-the-walk rows {shadow_held_rows} \
                  ({shadow_held_reformed} re-formed at boot, {shadow_held_not_restored} not \
-                 restored by an older manifest)"
+                 restored by an older manifest); boots {demoting_boots} demoting / \
+                 {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
+                 {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
+                 releases, {writer_parks} writer parks",
+                boot_replay.demote_steps,
+                boot_replay.tier_bytes,
+                boot_replay.settle_reads,
+                boot_replay.settled_same_key,
+                boot_replay.settled_distinct,
+                boot_replay.deletes_verified,
+                boot_replay.blob_releases
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -521,7 +541,10 @@ fn main() {
              cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
              {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
              origins covered, {} held rows / {} re-formed / {} not restored, {} lives above the \
-             window (largest unit {} windows), trace {:#x}",
+             window (largest unit {} windows), boots {} demoting / {} fitting checked, boot \
+             replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
+             deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
+             released), {} boot files censused, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -554,6 +577,18 @@ fn main() {
             report.shadow_held_not_restored,
             report.replay_above_window_lives,
             report.replay_unit_windows_max,
+            report.demoting_boots,
+            report.fitting_boots_checked,
+            report.boot_replay.demote_steps,
+            report.boot_replay.tier_bytes,
+            report.boot_replay.settle_reads,
+            report.boot_replay.settled_same_key,
+            report.boot_replay.deletes_verified,
+            report.boot_replay.markers_skipped,
+            report.writer_parks,
+            report.writes_parked_past_a_walk,
+            report.held_released_by_park,
+            report.boot_files_censused,
             report.trace_hash
         );
         if verify {
@@ -839,8 +874,9 @@ fn main() {
              DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
              (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
              / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
-             unit above the window on {} cell(s) (acked record bytes per cell {:?}), trace \
-             {} bytes, hash {:#018x}",
+             unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
+             tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
+             deletes verified, step charge max), trace {} bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -885,6 +921,7 @@ fn main() {
             report.scan_cold_reads,
             report.replay_above_window_cells,
             report.acked_record_bytes_per_cell,
+            report.boot_tier,
             report.trace.len(),
             report.trace_hash
         );

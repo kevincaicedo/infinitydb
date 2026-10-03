@@ -129,6 +129,16 @@ const BLOB_THRESHOLD: &[u8] = b"4kb";
 /// The same threshold as the generator reads it (a value at or above it
 /// stores out of line and re-appends as a 24-byte reference at replay).
 const BLOB_THRESHOLD_BYTES: usize = 4 << 10;
+/// Each cell's replay window, `MEM-BUDGET` + `MAINTAIN-SLICE` (3 MiB +
+/// 1 MiB, the smallest legal pair): a boot whose re-appended records
+/// exceed it must demote during replay (ADR-0174 D1).
+const WINDOW_BYTES: u64 = 4 << 20;
+/// The replay-above-window seed class's phase-2 volume, in multiples of
+/// the plain seeds': the plain volume puts about 2.3 MiB of records on
+/// each cell (the sizing note on [`TieredScenario::m4_tiered`]), so three
+/// times it is about 7 MiB, past the window with margin on both cells of
+/// an uneven hash split.
+const REGIME_OPS_FACTOR: u64 = 3;
 /// `TIER-IO-MODE buffered`: the simulated disk models a buffered device
 /// (every store-tier sim scenario runs Buffered; the plane's `Direct`
 /// default is a real-NVMe posture the sim cannot honor).
@@ -183,13 +193,14 @@ pub struct TieredScenario {
     /// stale value, or an unattributed fault is a violation. Seeds ≡ 7
     /// (mod 8); `--plant tier-read-eio` forces it.
     pub tier_read_fault: bool,
-    /// FCR-STTIER-01 (ADR-0174 D1): the replay-above-window regime — the
-    /// checkpoint interval lies above the run and phase 2 writes three
-    /// times its usual volume, so at least one cell's acknowledged tiered
-    /// records since the last `begin` exceed its window
-    /// (`MEM-BUDGET + MAINTAIN-SLICE`) and the reboot must demote during
-    /// replay. `--replay-above-window` forces it; a run under it where no
-    /// cell exceeded its window is VACUOUS.
+    /// The replay-above-window seed class (ADR-0174 D1), seeds ≡ 2 or 3
+    /// (mod 8) — the second with the double cut: no automatic checkpoint
+    /// runs and phase 2 writes [`REGIME_OPS_FACTOR`] times
+    /// its usual volume, so at least one cell's acknowledged tiered
+    /// records since the last `begin` exceed its window and the reboot
+    /// must demote during replay. `--replay-above-window` forces it on any
+    /// seed; a run in it where no cell exceeded its window, or whose boot
+    /// did not demote, is VACUOUS.
     pub replay_above_window: bool,
 }
 
@@ -203,7 +214,7 @@ impl TieredScenario {
         // page marks → two chunk ends, the earlier one confirmable).
         // 0.55 × ops × ~3.5 KiB ≈ 4.6 MiB per phase, hash-split across
         // two cells ≈ 2.3 MiB/cell, clears it in both lives.
-        TieredScenario {
+        let scenario = TieredScenario {
             seed,
             cells: 2,
             writers: 6,
@@ -226,15 +237,26 @@ impl TieredScenario {
             ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
             tier_read_fault: seed % 8 == 7,
             replay_above_window: false,
-        }
+        };
+        if matches!(seed % 8, 2 | 3) { scenario.with_replay_above_window() } else { scenario }
     }
 
-    /// The regime's knobs (FCR-STTIER-01): the interval above any run,
-    /// three times the phase-2 volume. Applied by the binary's flag.
+    /// The replay-above-window class's knobs: the interval above any run
+    /// — `0`, the manual-only floor, since a large interval still leaves
+    /// the record cap's trigger (ADR-0088 D4) — and [`REGIME_OPS_FACTOR`]
+    /// times the phase-2 volume. The two arms whose engagement needs a
+    /// checkpoint walk inside the run — the `EINVAL` downgrade and the
+    /// section bound — are off: the run has none. Applied by the seed
+    /// class and by the binary's flag.
     pub fn with_replay_above_window(mut self) -> TieredScenario {
+        if self.replay_above_window {
+            return self;
+        }
         self.replay_above_window = true;
-        self.ckpt_interval_bytes = 1 << 30;
-        self.ops_per_writer *= 3;
+        self.ckpt_interval_bytes = 0;
+        self.ops_per_writer *= REGIME_OPS_FACTOR;
+        self.ckpt_direct_refused_after = None;
+        self.ckpt_section_bound = None;
         self
     }
 
@@ -308,12 +330,16 @@ pub struct TieredNodeReport {
     pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
-    /// FCR-STTIER-01 (ADR-0174 D1): per cell, the record bytes of the
-    /// tiered `SET`s acknowledged in phase 2 (header + key + value — what
-    /// the reboot re-appends when no checkpoint publishes in the run),
-    /// and the cells whose sum exceeded the window at the cut.
+    /// ADR-0174 D1: per cell, the record bytes of the tiered `SET`s
+    /// acknowledged in phase 2 (header + key + value — what the reboot
+    /// re-appends when no checkpoint publishes in the run), and the cells
+    /// whose sum exceeded the window at the cut.
     pub acked_record_bytes_per_cell: Vec<u64>,
     pub replay_above_window_cells: u64,
+    /// ADR-0174 D6 from the reboot's `INFO persistence` node fold: demote
+    /// steps, tier bytes written, barriers, files sealed, settle reads,
+    /// deletes verified, and the largest step charge.
+    pub boot_tier: [u64; 7],
     /// The reboot refused with the ADR-0018 taxonomy error — legal
     /// (§8.4 prefers refusing to serve over truncating possibly-covered
     /// data), counted, and the run ends early with phases 5–9 skipped.
@@ -773,7 +799,17 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     // The cut window starts after the fill typically demotes and extends
     // past typical completion — early-cut and post-completion-cut seeds
     // both exist in the corpus (their coverage counters disclose which).
+    // In the replay-above-window class the cut lands once one cell's
+    // acknowledged records reach a volume drawn from the window's hostile
+    // row — one page above it, twice it, three times it — or when the
+    // writers finish, whichever is first.
     let cut_step = 600 + rng.next_below(total_ops * 6);
+    let regime_target = scenario.replay_above_window.then(|| match rng.next_below(3) {
+        0 => WINDOW_BYTES + (1 << 20),
+        1 => 2 * WINDOW_BYTES,
+        _ => 3 * WINDOW_BYTES,
+    });
+    let cut_step = if regime_target.is_some() { total_ops * 12 + 600 } else { cut_step };
     let mut blob_sets = 0u64;
     let mut idle_steps = 0u64;
     for _ in 0..cut_step {
@@ -784,6 +820,13 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         }
         let progress =
             pump_writers(&mut node, &mut writers, scenario, &clock, &mut report, &mut blob_sets);
+        if let Some(target) = regime_target {
+            let most = report.acked_record_bytes_per_cell.iter().copied().max().unwrap_or(0);
+            let done = writers.iter().all(|w| w.sent >= w.quota && w.replied >= w.sent);
+            if most >= target || done {
+                break;
+            }
+        }
         if progress == 0 {
             idle_steps += 1;
             if idle_steps >= STALL_STEPS && writers.iter().any(|w| w.replied < w.sent) {
@@ -807,11 +850,11 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         }
     }
     report.blob_sets = blob_sets;
-    // FCR-STTIER-01: the regime's engagement — which cells the reboot
-    // must demote for (the window is the smallest legal one, 4 MiB).
-    let window: u64 = 4 << 20;
+    // ADR-0174 D1: the class's engagement — which cells the reboot must
+    // demote for.
     report.replay_above_window_cells =
-        report.acked_record_bytes_per_cell.iter().filter(|&&bytes| bytes > window).count() as u64;
+        report.acked_record_bytes_per_cell.iter().filter(|&&bytes| bytes > WINDOW_BYTES).count()
+            as u64;
     if scenario.replay_above_window && report.replay_above_window_cells == 0 {
         let message = format!(
             "REPLAY-ABOVE-WINDOW VACUOUS: no cell's acknowledged tiered records exceeded the \
@@ -964,6 +1007,28 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             Ok(_) => {}
             Err(err) => fail(&mut report, format!("post-boot knob scrape: {err}")),
         }
+    }
+    // ADR-0174 D6: the reboot's tiered replay, folded over the node. In
+    // the replay-above-window class no checkpoint publishes in the run,
+    // so a cell whose acknowledged records exceed the window re-appends
+    // more than it and must have demoted.
+    match support::boot_tier_fold(&mut audit, &mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(fold) => report.boot_tier = fold,
+        Err(err) => {
+            fail(&mut report, format!("post-boot INFO persistence: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    let cells_above = report.replay_above_window_cells;
+    if cells_above > 0 && scenario.replay_above_window && report.boot_tier[0] == 0 {
+        fail(
+            &mut report,
+            format!(
+                "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: {cells_above} cell(s) above the \
+                 window and the reboot made no demote step"
+            ),
+        );
+        return finish(report, &observer, &clock);
     }
     // Observed post-recovery replies, kept for the phase-7 cold sweep
     // (phases 6–8 never touch phase-2 keys, so equality stays exact).
@@ -1358,8 +1423,11 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     // (`Ticketed` → synchronous), a `DBSIZE` whose twin read is made to
     // fail (the typed error, relayed through the scatter) and `DEL` of a
     // collision winner run against them. Every row asserts its own
-    // coverage — a vacuous row is a violation, not a disclosure.
-    if scenario.shadow {
+    // coverage — a vacuous row is a violation, not a disclosure. The rows
+    // stand on keys written pre-cut being cold again; in the
+    // replay-above-window class no checkpoint publishes in the run, so
+    // those newest records replay into the window and the rows do not run.
+    if scenario.shadow && !scenario.replay_above_window {
         report.open_rows = true;
         macro_rules! bail {
             ($($arg:tt)*) => {{

@@ -59,6 +59,26 @@ fn next_tiered_command(
     }
 }
 
+/// The bytes a reboot re-appends for one acknowledged record (ADR-0174
+/// D1): the inline header, key and value; a blob record re-appends its
+/// reference — on the cell that owns the key, which replays it (the node's
+/// contiguous slot router), not the cell the writer's connection reached.
+fn note_acked_record(report: &mut TieredNodeReport, cells: u16, key: &[u8], value: &[u8]) {
+    let owner = inf_store::SlotRouter::new_contiguous(cells)
+        .cell_of(inf_store::SlotRouter::slot_of(key))
+        .as_usize();
+    if report.acked_record_bytes_per_cell.len() < usize::from(cells) {
+        report.acked_record_bytes_per_cell.resize(usize::from(cells), 0);
+    }
+    let inline = if value.len() >= super::BLOB_THRESHOLD_BYTES {
+        inf_store::EXTENT_REF_LEN
+    } else {
+        value.len()
+    };
+    let record = inf_store::TieredTable::RECORD_HEADER_LEN + key.len() + inline;
+    report.acked_record_bytes_per_cell[owner] += record as u64;
+}
+
 /// One traffic pump round for every writer on `node`: drain replies
 /// (asserting exact expectations + recording acks), then send the next
 /// command where a slot is free. Returns delivered-byte+send progress
@@ -106,20 +126,7 @@ pub(super) fn pump_writers(
                 let rec = ops.last_mut().expect("sent op has a ledger entry");
                 rec.acked_at = Some(clock.now());
                 if let Some(value) = &pending.state_after {
-                    // FCR-STTIER-01: the bytes a reboot re-appends for
-                    // this acknowledged record (the inline header, key
-                    // and value; a blob record re-appends its reference).
-                    if report.acked_record_bytes_per_cell.len() <= writer.cell {
-                        report.acked_record_bytes_per_cell.resize(writer.cell + 1, 0);
-                    }
-                    let inline = if value.len() >= super::BLOB_THRESHOLD_BYTES {
-                        inf_store::EXTENT_REF_LEN
-                    } else {
-                        value.len()
-                    };
-                    let record =
-                        inf_store::TieredTable::RECORD_HEADER_LEN + pending.key.len() + inline;
-                    report.acked_record_bytes_per_cell[writer.cell] += record as u64;
+                    note_acked_record(report, scenario.cells, &pending.key, value);
                 }
             }
             writer.replied += 1;
@@ -488,6 +495,31 @@ pub(super) fn info_field(text: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// ADR-0174 D6's node fold of the reboot's tiered replay, from one cell's
+/// `INFO persistence` (the `recover_node_tier_` lines are the node's, so
+/// one cell answers for all): demote steps, tier bytes written, barriers,
+/// files sealed, settle reads, deletes verified, the largest step charge.
+pub(super) fn boot_tier_fold(
+    client: &mut MiniClient,
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &TieredScenario,
+) -> Result<[u64; 7], String> {
+    let text = info_section(client, node, rng, clock, disk, scenario.step_ns_max, b"persistence")?;
+    Ok([
+        "recover_node_tier_demote_steps",
+        "recover_node_tier_bytes_written",
+        "recover_node_tier_barriers",
+        "recover_node_tier_files_sealed",
+        "recover_node_tier_settle_reads",
+        "recover_node_tier_deletes_verified",
+        "recover_node_tier_step_charge_max_bytes",
+    ]
+    .map(|field| info_field(&text, field)))
+}
+
 /// `INFO tiering` through a [`MiniClient`], bulk payload decoded to text.
 #[allow(clippy::too_many_arguments)] // one call site's plumbing, like MiniClient::call
 pub(super) fn info_tiering(
@@ -498,12 +530,27 @@ pub(super) fn info_tiering(
     disk: &inf_server::SimDisk,
     step_ns_max: u64,
 ) -> Result<String, String> {
+    info_section(client, node, rng, clock, disk, step_ns_max, b"tiering")
+}
+
+/// One `INFO` section through a [`MiniClient`], decoded to text.
+#[allow(clippy::too_many_arguments)] // one call site's plumbing, like MiniClient::call
+pub(super) fn info_section(
+    client: &mut MiniClient,
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &inf_server::SimDisk,
+    step_ns_max: u64,
+    section: &[u8],
+) -> Result<String, String> {
+    let name = String::from_utf8_lossy(section).into_owned();
     let reply = client
-        .call(node, rng, clock, disk, step_ns_max, &[b"INFO", b"tiering"])
-        .map_err(|e| format!("INFO tiering: {e}"))?
-        .ok_or_else(|| "INFO tiering stalled".to_string())?;
+        .call(node, rng, clock, disk, step_ns_max, &[b"INFO", section])
+        .map_err(|e| format!("INFO {name}: {e}"))?
+        .ok_or_else(|| format!("INFO {name} stalled"))?;
     if !reply.starts_with(b"$") {
-        return Err(format!("INFO tiering answered {}", preview(&reply)));
+        return Err(format!("INFO {name} answered {}", preview(&reply)));
     }
     let header =
         reply.windows(2).position(|w| w == b"\r\n").ok_or_else(|| "INFO framing".to_string())?;

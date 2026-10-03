@@ -24,6 +24,8 @@ bin=target/release/inf-sim
 # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply.
 # F-L19-03: the m2 device/mode/window/recycle oracles and the three
 # m2 fill/hold/pending scenarios ran in no automated lane.
+# ADR-0174 D1: the replay-above-window seed class forced on the smoke
+# seed — a boot whose tiered replay exceeds the window demotes.
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
@@ -51,9 +53,11 @@ rows=(
   "m4-pressure"
   "m4-cold"
   "m4-recovery"
+  "m4-recovery --replay-above-window --verify-determinism"
   "m4-diskfull"
   "m4-tiered"
   "m4-tiered --plant tier-read-eio"
+  "m4-tiered --replay-above-window --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )
