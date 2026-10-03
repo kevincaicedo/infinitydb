@@ -287,75 +287,54 @@ pub struct TierReplayStats {
     pub dead_life_files_removed: u64,
     /// The gauge: the largest boot I/O charge one recovery step took, in
     /// step-budget bytes (`boot_io_charge`).
-    pub step_charge_max_bytes: u64,
+    pub step_charge_bytes_max: u64,
 }
 
 /// [`TierReplayStats`]' fields in `INFO` order, the one order the
 /// recovery board stores them in.
 pub const TIER_REPLAY_FIELDS: usize = 13;
 
+/// One `INFO persistence` line of the node fold: its name, and the field
+/// of [`TierReplayStats`] it prints and the recovery board restores.
+pub type TierReplayField = (&'static str, fn(&mut TierReplayStats) -> &mut u64);
+
 impl TierReplayStats {
-    /// The `INFO persistence` names of the node fold, in board order: the
-    /// `recover_node_tier_` prefix names the population — every cell's
-    /// recovered tiered namespaces, summed; the step-charge gauge is the
-    /// largest over the cells.
-    pub const NAMES: [&'static str; TIER_REPLAY_FIELDS] = [
-        "recover_node_tier_demote_steps",
-        "recover_node_tier_pads_placed",
-        "recover_node_tier_bytes_written",
-        "recover_node_tier_barriers",
-        "recover_node_tier_files_sealed",
-        "recover_node_tier_settle_reads",
-        "recover_node_tier_settled_same_key",
-        "recover_node_tier_settled_distinct",
-        "recover_node_tier_deletes_verified",
-        "recover_node_tier_blob_releases",
-        "recover_node_tier_markers_skipped",
-        "recover_node_tier_dead_life_files_removed",
-        "recover_node_tier_step_charge_max_bytes",
+    /// The one table of the node fold's `INFO persistence` lines, in board
+    /// order, each name beside the field it reads: the `recover_node_tier_`
+    /// prefix names the population — every cell's recovered tiered
+    /// namespaces, summed; the step-charge gauge is the largest over the
+    /// cells.
+    pub const FIELDS: [TierReplayField; TIER_REPLAY_FIELDS] = [
+        ("recover_node_tier_demote_steps", |s| &mut s.counters.demote_steps),
+        ("recover_node_tier_pads_placed", |s| &mut s.counters.pads_placed),
+        ("recover_node_tier_bytes_written", |s| &mut s.counters.tier_bytes),
+        ("recover_node_tier_barriers", |s| &mut s.counters.barriers),
+        ("recover_node_tier_files_sealed", |s| &mut s.counters.files_sealed),
+        ("recover_node_tier_settle_reads", |s| &mut s.counters.settle_reads),
+        ("recover_node_tier_settled_same_key", |s| &mut s.counters.settled_same_key),
+        ("recover_node_tier_settled_distinct", |s| &mut s.counters.settled_distinct),
+        ("recover_node_tier_deletes_verified", |s| &mut s.counters.deletes_verified),
+        ("recover_node_tier_blob_releases", |s| &mut s.counters.blob_releases),
+        ("recover_node_tier_markers_skipped", |s| &mut s.counters.markers_skipped),
+        ("recover_node_tier_dead_life_files_removed", |s| &mut s.dead_life_files_removed),
+        ("recover_node_tier_step_charge_bytes_max", |s| &mut s.step_charge_bytes_max),
     ];
 
-    /// The fields in [`NAMES`](Self::NAMES) order.
+    /// The fields in [`FIELDS`](Self::FIELDS) order.
     #[must_use]
     pub fn to_array(self) -> [u64; TIER_REPLAY_FIELDS] {
-        let c = &self.counters;
-        [
-            c.demote_steps,
-            c.pads_placed,
-            c.tier_bytes,
-            c.barriers,
-            c.files_sealed,
-            c.settle_reads,
-            c.settled_same_key,
-            c.settled_distinct,
-            c.deletes_verified,
-            c.blob_releases,
-            c.markers_skipped,
-            self.dead_life_files_removed,
-            self.step_charge_max_bytes,
-        ]
+        let mut stats = self;
+        std::array::from_fn(|i| *(Self::FIELDS[i].1)(&mut stats))
     }
 
     /// The inverse of [`to_array`](Self::to_array).
     #[must_use]
-    pub fn from_array(a: [u64; TIER_REPLAY_FIELDS]) -> TierReplayStats {
-        TierReplayStats {
-            counters: inf_store::ReplayCounters {
-                demote_steps: a[0],
-                pads_placed: a[1],
-                tier_bytes: a[2],
-                barriers: a[3],
-                files_sealed: a[4],
-                settle_reads: a[5],
-                settled_same_key: a[6],
-                settled_distinct: a[7],
-                deletes_verified: a[8],
-                blob_releases: a[9],
-                markers_skipped: a[10],
-            },
-            dead_life_files_removed: a[11],
-            step_charge_max_bytes: a[12],
+    pub fn from_array(values: [u64; TIER_REPLAY_FIELDS]) -> TierReplayStats {
+        let mut stats = TierReplayStats::default();
+        for ((_, field), value) in Self::FIELDS.iter().zip(values) {
+            *field(&mut stats) = value;
         }
+        stats
     }
 
     /// The fold of two cells (or namespaces): counters sum, the gauge
@@ -365,7 +344,7 @@ impl TierReplayStats {
         self.counters.absorb(other.counters);
         self.dead_life_files_removed =
             self.dead_life_files_removed.saturating_add(other.dead_life_files_removed);
-        self.step_charge_max_bytes = self.step_charge_max_bytes.max(other.step_charge_max_bytes);
+        self.step_charge_bytes_max = self.step_charge_bytes_max.max(other.step_charge_bytes_max);
         self
     }
 }
@@ -841,7 +820,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Complete => Ok(RecoveryProgress::Complete),
         };
         // ADR-0174 D6's gauge: the largest boot I/O charge one step took.
-        let gauge = &mut self.stats.tier_replay.step_charge_max_bytes;
+        let gauge = &mut self.stats.tier_replay.step_charge_bytes_max;
         *gauge = (*gauge).max(self.step_charge);
         progress
     }
@@ -2158,4 +2137,53 @@ fn io_invalid(err: impl std::fmt::Debug) -> io::Error {
 
 fn io_msg(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `INFO persistence` line prints the field its name says: every
+    /// field set by name to a distinct value, the expected lines written
+    /// out by hand. A name paired with another field in
+    /// [`TierReplayStats::FIELDS`] is red here, not a mislabelled line.
+    #[test]
+    fn every_tier_replay_field_prints_under_its_own_name() {
+        let stats = TierReplayStats {
+            counters: inf_store::ReplayCounters {
+                demote_steps: 1,
+                pads_placed: 2,
+                tier_bytes: 3,
+                barriers: 4,
+                files_sealed: 5,
+                settle_reads: 6,
+                settled_same_key: 7,
+                settled_distinct: 8,
+                deletes_verified: 9,
+                blob_releases: 10,
+                markers_skipped: 11,
+            },
+            dead_life_files_removed: 12,
+            step_charge_bytes_max: 13,
+        };
+        let names = TierReplayStats::FIELDS.iter().map(|(name, _)| *name);
+        let printed: Vec<(&str, u64)> = names.zip(stats.to_array()).collect();
+        let expected = [
+            ("recover_node_tier_demote_steps", 1),
+            ("recover_node_tier_pads_placed", 2),
+            ("recover_node_tier_bytes_written", 3),
+            ("recover_node_tier_barriers", 4),
+            ("recover_node_tier_files_sealed", 5),
+            ("recover_node_tier_settle_reads", 6),
+            ("recover_node_tier_settled_same_key", 7),
+            ("recover_node_tier_settled_distinct", 8),
+            ("recover_node_tier_deletes_verified", 9),
+            ("recover_node_tier_blob_releases", 10),
+            ("recover_node_tier_markers_skipped", 11),
+            ("recover_node_tier_dead_life_files_removed", 12),
+            ("recover_node_tier_step_charge_bytes_max", 13),
+        ];
+        assert_eq!(printed, expected);
+        assert_eq!(TierReplayStats::from_array(stats.to_array()), stats, "the board round-trips");
+    }
 }

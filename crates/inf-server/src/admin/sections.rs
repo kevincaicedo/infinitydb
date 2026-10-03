@@ -666,7 +666,8 @@ fn recover_gauge_lines(text: &mut String, node: &NodeInfo) {
     // cell's tiered boot replay folded — the zero set, then the markers
     // skipped, the dead-life files removed and the step-charge gauge.
     let tier = node.recover_tier_replay.get();
-    for (field, value) in crate::recover::TierReplayStats::NAMES.iter().zip(tier.to_array()) {
+    let names = crate::recover::TierReplayStats::FIELDS.iter().map(|(name, _)| name);
+    for (field, value) in names.zip(tier.to_array()) {
         push(text, &format!("{field}:{value}"));
     }
 }

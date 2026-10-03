@@ -418,7 +418,7 @@ fn step_under_budget(budget: u64) {
         }
     }
     let (_rotor, stats, _seed) = recovery.finish();
-    assert_eq!(stats.tier_replay.step_charge_max_bytes, largest, "the gauge is the largest step");
+    assert_eq!(stats.tier_replay.step_charge_bytes_max, largest, "the gauge is the largest step");
     let replay = stats.tier_replay.counters;
     eprintln!(
         "budget {budget}: gauge {largest} bytes, {settle_steps} settle steps, {} demote steps, \

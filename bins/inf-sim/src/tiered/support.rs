@@ -638,7 +638,7 @@ pub(super) fn boot_tier_fold(
         "recover_node_tier_files_sealed",
         "recover_node_tier_settle_reads",
         "recover_node_tier_deletes_verified",
-        "recover_node_tier_step_charge_max_bytes",
+        "recover_node_tier_step_charge_bytes_max",
     ]
     .map(|field| info_field(&text, field)))
 }

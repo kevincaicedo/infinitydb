@@ -444,7 +444,7 @@ fn run_arm(fsync: &str, leg: Leg) {
         field("recover_node_tier_settle_reads"),
         field("recover_node_tier_deletes_verified"),
         field("recover_node_tier_markers_skipped"),
-        field("recover_node_tier_step_charge_max_bytes"),
+        field("recover_node_tier_step_charge_bytes_max"),
         model.len(),
         deleted.len(),
     );

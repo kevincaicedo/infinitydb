@@ -96,7 +96,7 @@ pub struct CellRecoverySlot {
     phase_ns: [AtomicU64; 5],
     phase_bytes: [AtomicU64; 3],
     /// ADR-0174 D6: this cell's boot replay of its tiered namespaces, in
-    /// [`TierReplayStats::NAMES`](crate::recover::TierReplayStats::NAMES)
+    /// [`TierReplayStats::FIELDS`](crate::recover::TierReplayStats::FIELDS)
     /// order — `INFO persistence` renders the node fold.
     tier_replay: [AtomicU64; crate::recover::TIER_REPLAY_FIELDS],
     /// Recovery phase about to run (M2.5-S01): published *before* each
