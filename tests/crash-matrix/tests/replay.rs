@@ -25,17 +25,19 @@ mod receipt;
 use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
+use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
+    CkptConfig, FsyncClass, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
     TierFlushConfig, TierFlushError, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
     write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, LogicalAddr, RecoveredTier, ReplayRefusal, SettleProgress,
-    TierReplay, TieredLookup, TieredTable, apply_live_set_section, apply_ref_section,
+    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsMode, NsSpec, RecoveredTier,
+    ReplayError, ReplayRefusal, ReplaySpill, SettleProgress, StoreConfig, TierReplay, TierSpec,
+    TieredLookup, TieredTable, WallAnchor, apply_live_set_section, apply_ref_section,
     recover_tiered_ns,
 };
 
@@ -43,6 +45,8 @@ const NS: NsId = NsId(31);
 const PAGE: u64 = 4 << 10;
 const BUDGET: u64 = 1 << 20;
 const SHARD: &str = "shard-0";
+const NOW: Nanos = Nanos(1_000_000);
+const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
 
 fn flush_config() -> TierFlushConfig {
     TierFlushConfig {
@@ -139,7 +143,36 @@ fn crashed_life() -> (MemFs, Vec<u8>) {
     (fs, tail)
 }
 
-fn boot(fs: &MemFs) -> (TieredTable, TierReplay<MemFs>) {
+/// The seam the recovery driver lends: the namespace's boot machine.
+struct Lent(TierReplay<MemFs>);
+
+impl ReplaySpill for Lent {
+    type Fs = MemFs;
+
+    fn replay_mut(&mut self, ns: NsId) -> Option<&mut TierReplay<MemFs>> {
+        (ns == NS).then_some(&mut self.0)
+    }
+}
+
+/// One booting cell as the recovery driver holds it: the recovered table
+/// inside the keyspace, the machine lent through the seam, every record
+/// through `Keyspace::apply_record`.
+struct Node {
+    ks: Keyspace,
+    spill: Lent,
+}
+
+impl Node {
+    fn table(&self) -> &TieredTable {
+        self.ks.tiered_store(NS).expect("materialized")
+    }
+
+    fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
+        self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ())
+    }
+}
+
+fn boot(fs: &MemFs) -> Node {
     let manifest = read_manifest(fs, Path::new(SHARD)).expect("read").expect("present");
     let tier = manifest.tier_ns(NS.0).expect("tier section").clone();
     let RecoveredTier { table, replay, .. } = recover_tiered_ns(
@@ -153,7 +186,19 @@ fn boot(fs: &MemFs) -> (TieredTable, TierReplay<MemFs>) {
         KeyHasher::default(),
     )
     .expect("tier recovery");
-    let table = std::cell::RefCell::new(table);
+    let mut ks = Keyspace::new(StoreConfig::default());
+    ks.ns_create(NsSpec {
+        id: NS,
+        name: b"tiered".to_vec(),
+        mode: NsMode::Durable,
+        fsync: Some(FsyncClass::Everysec),
+        policy: None,
+        maxmemory: None,
+        tier: Some(TierSpec::for_budget(4 << 20)),
+    })
+    .expect("create the tiered namespace");
+    *ks.tiered_store_mut(NS).expect("materialized") = table;
+    let table = std::cell::RefCell::new(ks);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
     read_ick_hybrid(
         fs,
@@ -161,124 +206,21 @@ fn boot(fs: &MemFs) -> (TieredTable, TierReplay<MemFs>) {
         inf_log::ckpt::IckReaderConfig::default(),
         |_| Ok::<(), std::convert::Infallible>(()),
         |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
+            let mut ks = table.borrow_mut();
+            let t = ks.tiered_store_mut(NS).expect("materialized");
+            apply_ref_section(t, &section, tier.flushed).expect("refs");
             Ok(())
         },
         |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
+            let mut ks = table.borrow_mut();
+            apply_live_set_section(ks.tiered_store_mut(NS).expect("materialized"), &section);
             Ok(())
         },
         |_| Ok(()),
         |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
-    (table.into_inner(), replay)
-}
-
-/// Replays the tail; `on_delete` runs the `DEL` (the row's fault lands
-/// there) and reports whether it applied.
-fn replay(
-    table: &mut TieredTable,
-    machine: &mut TierReplay<MemFs>,
-    tail: &[u8],
-    mut on_delete: impl FnMut(&mut TieredTable, &mut TierReplay<MemFs>, &[LogicalAddr]) -> bool,
-) -> bool {
-    let hasher = KeyHasher::default();
-    let mut rest = tail;
-    let mut markers: Vec<LogicalAddr> = Vec::new();
-    let mut deleted = false;
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        rest = &rest[consumed..];
-        match record {
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = hasher.hash(key);
-                table.replay_upsert(Some(&mut *machine), &markers, key, value, hash).expect("fits");
-                markers.clear();
-            }
-            RecordView::ColdDisplace { old_addr, .. } => {
-                markers.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
-            }
-            RecordView::Delete { key, .. } => {
-                assert_eq!(key, b"victim");
-                deleted = on_delete(table, machine, &markers);
-                markers.clear();
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-    deleted
-}
-
-/// Row: `replay_settle_read_fail` → boot-refuses-typed-then-recovers.
-#[test]
-fn replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers() {
-    let (fs, tail) = crashed_life();
-    let hash = KeyHasher::default().hash(b"victim");
-    // Boot 1: the DEL's settle read fails — typed, nothing changed; the
-    // machine is dropped (the boot's refusal).
-    let (mut table, mut machine) = boot(&fs);
-    let refused = std::cell::Cell::new(false);
-    let deleted = replay(&mut table, &mut machine, &tail, |table, machine, markers| {
-        let ro = table.space().ro_boundary();
-        let slots = table.len();
-        fault::arm("replay_settle_read_fail", FaultSpec::Nth(1));
-        let err = table
-            .replay_delete(Some(machine), markers, b"victim", hash)
-            .expect_err("the injected read failure refuses typed");
-        fault::disarm_all();
-        assert!(matches!(err, ReplayRefusal::SettleRead { .. }), "{err}");
-        assert!(matches!(table.lookup(b"victim", hash, &[]), TieredLookup::Cold(_)), "unchanged");
-        assert_eq!(table.len(), slots, "no slot moved");
-        assert_eq!(table.space().ro_boundary(), ro, "the boundary stayed");
-        refused.set(true);
-        false
-    });
-    assert!(refused.get() && !deleted);
-    assert!(machine.counters().demote_steps > 0, "the unit is above the window");
-    drop((table, machine));
-    // Boot 2, the fault cleared: the same unit recovers and the DEL
-    // applies.
-    let (mut table, mut machine) = boot(&fs);
-    let deleted = replay(&mut table, &mut machine, &tail, |table, machine, markers| {
-        table.replay_delete(Some(machine), markers, b"victim", hash).expect("verified")
-    });
-    assert!(deleted, "the DEL verified and removed the demoted copy");
-    assert!(machine.counters().deletes_verified >= 1);
-    machine.end_of_replay(&table);
-    while machine.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
-    let handed = machine.hand_over(&mut table).expect("hands over").handed;
-    assert_eq!(handed.handles.len(), handed.flush.sealed().len());
-    assert!(matches!(table.lookup(b"victim", hash, &[]), TieredLookup::Miss));
-    receipt::verified("replay_settle_read_fail", "boot-refuses-typed-then-recovers");
-}
-
-/// Applies one tail record through the replay entries; markers park
-/// until their mutation.
-fn apply_one(
-    table: &mut TieredTable,
-    machine: &mut TierReplay<MemFs>,
-    record: RecordView<'_>,
-    markers: &mut Vec<LogicalAddr>,
-) -> Result<(), ReplayRefusal> {
-    let hasher = KeyHasher::default();
-    match record {
-        RecordView::StringPostImage { key, value, .. } => {
-            let hash = hasher.hash(key);
-            table.replay_upsert(Some(machine), markers, key, value, hash)?;
-        }
-        RecordView::ColdDisplace { old_addr, .. } => {
-            markers.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
-            return Ok(());
-        }
-        RecordView::Delete { key, .. } => {
-            let hash = hasher.hash(key);
-            table.replay_delete(Some(machine), markers, key, hash)?;
-        }
-        other => panic!("{other:?}"),
-    }
-    markers.clear();
-    Ok(())
+    Node { ks: table.into_inner(), spill: Lent(replay) }
 }
 
 /// The tier files in the namespace's directory that the manifest does
@@ -309,10 +251,9 @@ fn unmanifested(fs: &MemFs) -> Vec<(String, usize)> {
 /// and the hand-over returns a handle per sealed file.
 fn the_next_boot_recovers(fs: &MemFs, tail: &[u8]) {
     let hash = KeyHasher::default().hash(b"victim");
-    let (mut table, mut machine) = boot(fs);
+    let mut node = boot(fs);
     assert!(unmanifested(fs).is_empty(), "the next boot removed the unmanifested files");
     let mut rest = tail;
-    let mut markers = Vec::new();
     let mut keys = std::collections::BTreeSet::new();
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail decodes");
@@ -326,15 +267,59 @@ fn the_next_boot_recovers(fs: &MemFs, tail: &[u8]) {
             }
             _ => {}
         }
-        apply_one(&mut table, &mut machine, record, &mut markers).expect("replays");
+        node.apply(&record).expect("replays");
     }
+    assert_eq!(node.ks.displace_register_len(), 0, "every marker met its mutation");
+    let Node { mut ks, spill: Lent(mut machine) } = node;
+    let table = ks.tiered_store_mut(NS).expect("materialized");
     assert!(machine.counters().demote_steps > 0, "the unit is above the window");
-    machine.end_of_replay(&table);
-    while machine.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
-    let handed = machine.hand_over(&mut table).expect("hands over").handed;
+    assert!(machine.counters().deletes_verified >= 1, "the DEL verified its demoted copy");
+    machine.end_of_replay(table);
+    while machine.settle_step(table, PAGE).expect("settle") == SettleProgress::More {}
+    let handed = machine.hand_over(table).expect("hands over").handed;
     assert_eq!(handed.handles.len(), handed.flush.sealed().len());
     assert!(matches!(table.lookup(b"victim", hash, &[]), TieredLookup::Miss));
     assert_eq!(table.len(), keys.len(), "every acknowledged key, and no other");
+}
+
+/// Row: `replay_settle_read_fail` → boot-refuses-typed-then-recovers.
+#[test]
+fn replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers() {
+    let (fs, tail) = crashed_life();
+    let hash = KeyHasher::default().hash(b"victim");
+    // Boot 1: the DEL's settle read fails — typed, nothing changed (its
+    // marker stays parked); the node is dropped (the boot's refusal).
+    let mut node = boot(&fs);
+    let mut rest: &[u8] = &tail;
+    let mut refused = false;
+    while !rest.is_empty() {
+        let (record, consumed) = decode_record(rest).expect("tail decodes");
+        rest = &rest[consumed..];
+        let RecordView::Delete { key, .. } = record else {
+            node.apply(&record).expect("replays");
+            continue;
+        };
+        assert_eq!(key, b"victim");
+        let ro = node.table().space().ro_boundary();
+        let slots = node.table().len();
+        let parked = node.ks.displace_register_len();
+        fault::arm("replay_settle_read_fail", FaultSpec::Nth(1));
+        let err = node.apply(&record).expect_err("the injected read failure refuses typed");
+        fault::disarm_all();
+        assert!(matches!(err, ReplayError::Replay(ReplayRefusal::SettleRead { .. })), "{err:?}");
+        assert!(matches!(node.table().lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
+        assert_eq!(node.table().len(), slots, "no slot moved");
+        assert_eq!(node.table().space().ro_boundary(), ro, "the boundary stayed");
+        assert_eq!(node.ks.displace_register_len(), parked, "the marker stays parked");
+        refused = true;
+        break;
+    }
+    assert!(refused, "the DEL refused");
+    drop(node);
+    // Boot 2, the fault cleared: the same unit recovers and the DEL
+    // applies.
+    the_next_boot_recovers(&fs, &tail);
+    receipt::verified("replay_settle_read_fail", "boot-refuses-typed-then-recovers");
 }
 
 /// One tier fault point fired inside a boot demote step: armed before
@@ -346,36 +331,35 @@ fn demote_step_refuses_typed_then_recovers(
     cause: fn(&TierFlushError) -> bool,
 ) {
     let (fs, tail) = crashed_life();
-    let (mut table, mut machine) = boot(&fs);
+    let mut node = boot(&fs);
     fault::arm(point, FaultSpec::Nth(1));
     let mut rest: &[u8] = &tail;
-    let mut markers = Vec::new();
     let (refusal, flushed_before) = loop {
         assert!(!rest.is_empty(), "{point}: VACUOUS — no demote step reached the point");
         let (record, consumed) = decode_record(rest).expect("tail decodes");
         rest = &rest[consumed..];
-        let flushed = table.space().flushed();
-        if let Err(refusal) = apply_one(&mut table, &mut machine, record, &mut markers) {
+        let flushed = node.table().space().flushed();
+        if let Err(refusal) = node.apply(&record) {
             break (refusal, flushed);
         }
     };
     let fired = fault::fired(point);
     fault::disarm_all();
     assert_eq!(fired, 1, "{point}: the refusal is the point's");
-    assert_eq!(table.space().flushed(), flushed_before, "{point}: flushed unmoved");
+    assert_eq!(node.table().space().flushed(), flushed_before, "{point}: flushed unmoved");
     match &refusal {
-        ReplayRefusal::Flush { cause: c, unplaced_bytes, handles_held } => {
+        ReplayError::Replay(ReplayRefusal::Flush { cause: c, unplaced_bytes, handles_held }) => {
             assert!(cause(c), "{point}: {c}");
             assert!(*unplaced_bytes > 0, "{point}: the step's sealed bytes are named");
-            assert_eq!(*handles_held, machine.sealed().len(), "{point}: the handles held");
+            assert_eq!(*handles_held, node.spill.0.sealed().len(), "{point}: the handles held");
         }
-        other => panic!("{point}: {other}"),
+        other => panic!("{point}: {other:?}"),
     }
-    assert!(machine.counters().demote_steps > 0, "{point}: inside a demote step");
+    assert!(node.spill.0.counters().demote_steps > 0, "{point}: inside a demote step");
     for (name, len) in unmanifested(&fs) {
         assert!(point != inf_log::fault::TIER_DIR_OPEN_FAIL || len == 0, "{point}: {name}");
     }
-    drop((table, machine));
+    drop(node);
     the_next_boot_recovers(&fs, &tail);
     receipt::verified(point, "demote-step-refuses-typed-then-recovers");
 }
@@ -432,20 +416,19 @@ fn tier_dir_open_fail_in_a_boot_demote_step_refuses_typed_and_the_next_boot_reco
 fn tier_torn_frame_in_a_boot_demote_step_is_cut_and_the_next_boot_recovers() {
     let point = inf_log::fault::TIER_TORN_FRAME;
     let (fs, tail) = crashed_life();
-    let (mut table, mut machine) = boot(&fs);
+    let mut node = boot(&fs);
     fault::arm(point, FaultSpec::Nth(1));
     let mut rest: &[u8] = &tail;
-    let mut markers = Vec::new();
     while fault::fired(point) == 0 {
         assert!(!rest.is_empty(), "VACUOUS — no demote step wrote a tier frame");
         let (record, consumed) = decode_record(rest).expect("tail decodes");
         rest = &rest[consumed..];
-        apply_one(&mut table, &mut machine, record, &mut markers).expect("a torn write succeeds");
+        node.apply(&record).expect("a torn write succeeds");
     }
     fault::disarm_all();
-    assert!(machine.counters().demote_steps > 0, "the torn write was a demote step's");
+    assert!(node.spill.0.counters().demote_steps > 0, "the torn write was a demote step's");
     assert!(!unmanifested(&fs).is_empty(), "the cut leaves the boot's file behind");
-    drop((table, machine));
+    drop(node);
     the_next_boot_recovers(&fs, &tail);
     receipt::verified(point, "demote-step-cut-then-recovers");
 }

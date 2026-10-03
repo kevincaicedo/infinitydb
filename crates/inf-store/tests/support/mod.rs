@@ -8,14 +8,19 @@
 
 use std::path::Path;
 
+use inf_foundation::time::Nanos;
+use inf_log::ckpt::{IckApplyError, IckInfo, IckReaderConfig};
 use inf_log::fs::mem::{MemFile, MemFs};
 use inf_log::{
-    BootFlush, HandedOver, NsId, RecordView, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    BootFlush, FsyncClass, HandedOver, NsId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, decode_record, tier_extract, tier_frame_offset, tier_frame_span,
 };
+use inf_log::{IckSummary, read_ick_hybrid};
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, ExtentRef, LogicalAddr, SettleProgress, TierReplay,
-    TieredTable,
+    AddressSpaceConfig, BootHandedOver, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsMode,
+    NsSpec, ReplayError, ReplaySpill, ReplayWork, SettleProgress, StoreConfig, TierReplay,
+    TierSpec, TieredTable, WallAnchor, apply_blob_ref_section, apply_live_set_section,
+    apply_ref_section,
 };
 
 pub const PAGE: u64 = 4 << 10;
@@ -92,54 +97,182 @@ pub fn boot(fs: &MemFs, ns: NsId, file_capacity: u64) -> TierReplay<MemFs> {
     TierReplay::new(BootFlush::new(flush, Vec::new()), PAGE, PAGE)
 }
 
-/// Replays one modeled WAL tail of record-v1 encodings through the
-/// replay entries (ADR-0174 D3): markers park and hand to their paired
-/// mutation (ADR-0059 D9 bounds them at 4).
-pub fn replay_tail(table: &mut TieredTable, replay: &mut TierReplay<MemFs>, tail: &[u8]) {
-    let hasher = table.hasher();
-    let mut rest = tail;
-    let mut markers: Vec<LogicalAddr> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail records decode");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                markers.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
-                assert!(markers.len() <= 4, "displace register exceeds the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = hasher.hash(key);
-                table.replay_upsert(Some(replay), &markers, key, value, hash).expect("replays");
-                markers.clear();
-            }
-            RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                let hash = hasher.hash(key);
-                let ext = ExtentRef { extent_id, offset, len };
-                table
-                    .replay_upsert_extent(Some(replay), &markers, key, hash, ext)
-                    .expect("replays");
-                markers.clear();
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = hasher.hash(key);
-                table.replay_delete(Some(replay), &markers, key, hash).expect("replays");
-                markers.clear();
-            }
-            other => panic!("modeled tail carries no {other:?}"),
-        }
-        rest = &rest[consumed..];
-    }
-    assert!(markers.is_empty(), "a trailing displace marker is a stream error");
+/// The replay clock and wall anchor (tiered records carry no expiry).
+pub const NOW: Nanos = Nanos(1_000_000);
+pub const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
+
+/// The replay seam the tests lend through `Keyspace::apply_record`: one
+/// boot machine per namespace, as the recovery driver holds them, and
+/// the log of the work the seam's owner drained from them.
+pub struct TestSpill {
+    machines: Vec<(NsId, TierReplay<MemFs>)>,
+    /// One entry per non-empty drain, in order.
+    pub drained: Vec<ReplayWork>,
 }
 
-/// The boot's end as the recovery driver plays it (DRR FCR-STTIER-01
-/// E12, E13): the end of replay, the settle steps to the tail, the
-/// hand-over. Returns the plane's pipeline and the held handles.
-pub fn finish_boot(
-    table: &mut TieredTable,
-    mut replay: TierReplay<MemFs>,
-) -> (TierFlush<MemFs>, Vec<(u32, MemFile)>) {
-    replay.end_of_replay(table);
-    while replay.settle_step(table, PAGE).expect("settle step") == SettleProgress::More {}
-    let HandedOver { flush, handles } = replay.hand_over(table).expect("hands over").handed;
+impl ReplaySpill for TestSpill {
+    type Fs = MemFs;
+
+    fn replay_mut(&mut self, ns: NsId) -> Option<&mut TierReplay<MemFs>> {
+        self.machines.iter_mut().find(|(id, _)| *id == ns).map(|(_, m)| m)
+    }
+}
+
+impl TestSpill {
+    pub fn new(ns: NsId, machine: TierReplay<MemFs>) -> TestSpill {
+        TestSpill { machines: vec![(ns, machine)], drained: Vec::new() }
+    }
+
+    pub fn machine(&self, ns: NsId) -> &TierReplay<MemFs> {
+        self.machines.iter().find(|(id, _)| *id == ns).map(|(_, m)| m).expect("lent machine")
+    }
+
+    pub fn machine_mut(&mut self, ns: NsId) -> &mut TierReplay<MemFs> {
+        self.replay_mut(ns).expect("lent machine")
+    }
+
+    /// The machine back from the seam (for its hand-over).
+    pub fn take(&mut self, ns: NsId) -> TierReplay<MemFs> {
+        let i = self.machines.iter().position(|(id, _)| *id == ns).expect("lent machine");
+        self.machines.swap_remove(i).1
+    }
+
+    /// The seam owner's drain at a frame or step boundary: each machine's
+    /// work since the last, logged when there was any.
+    pub fn drain(&mut self) {
+        for (_, machine) in &mut self.machines {
+            let work = machine.take_work();
+            if !work.is_zero() {
+                self.drained.push(work);
+            }
+        }
+    }
+
+    /// Everything drained so far.
+    pub fn charged(&self) -> ReplayWork {
+        let mut sum = ReplayWork::default();
+        for w in &self.drained {
+            sum.tier_bytes += w.tier_bytes;
+            sum.barriers += w.barriers;
+            sum.settle_reads += w.settle_reads;
+            sum.walked_bytes += w.walked_bytes;
+        }
+        sum
+    }
+}
+
+/// A keyspace whose tiered namespace `ns` holds `table` — the recovery
+/// driver's shape: the catalog materializes the namespace, the recovered
+/// table takes its place (the driver's `install_recovered_tiered` also
+/// applies the catalog's knobs; the tests keep the table's own).
+pub fn keyspace_with(ns: NsId, table: TieredTable) -> Keyspace {
+    let mut ks = Keyspace::new(StoreConfig::default());
+    ks.ns_create(NsSpec {
+        id: ns,
+        name: format!("tiered-{}", ns.0).into_bytes(),
+        mode: NsMode::Durable,
+        fsync: Some(FsyncClass::Everysec),
+        policy: None,
+        maxmemory: None,
+        tier: Some(TierSpec::for_budget(4 << 20)),
+    })
+    .expect("create the tiered namespace");
+    *ks.tiered_store_mut(ns).expect("materialized") = table;
+    ks
+}
+
+/// The recovered table out of the keyspace, after the dispatcher's work
+/// (a placeholder takes its slot).
+pub fn take_table(ks: &mut Keyspace, ns: NsId) -> TieredTable {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let placeholder =
+        TieredTable::new(space_config(demote, 0), demote, 1, KeyHasher::default()).expect("ring");
+    std::mem::replace(ks.tiered_store_mut(ns).expect("materialized"), placeholder)
+}
+
+/// Loads a hybrid checkpoint the recovery driver's way: every image
+/// through the shipped dispatcher with the namespace's machine lent (the
+/// seam's owner draining per image), the ref, live-set and
+/// blob-reference sections to the table, then the end of the checkpoint
+/// (ADR-0174 R9). A replay refusal is the load's typed error.
+pub fn load_checkpoint(
+    fs: &MemFs,
+    path: &Path,
+    ks: &mut Keyspace,
+    spill: &mut TestSpill,
+    ns: NsId,
+    manifested_flushed: u64,
+) -> Result<(IckInfo, IckSummary), IckApplyError<ReplayError>> {
+    let parts = std::cell::RefCell::new((&mut *ks, &mut *spill));
+    let loaded = read_ick_hybrid(
+        fs,
+        path,
+        IckReaderConfig::default(),
+        |record| {
+            let mut guard = parts.borrow_mut();
+            let (ks, spill) = &mut *guard;
+            let applied = ks.apply_record(&record, NOW, ANCHOR, &mut **spill);
+            spill.drain();
+            applied.map(|_| ())
+        },
+        |section| {
+            let mut guard = parts.borrow_mut();
+            let table = guard.0.tiered_store_mut(ns).expect("materialized");
+            apply_ref_section(table, &section, manifested_flushed).expect("refs inside the unit");
+            Ok(())
+        },
+        |section| {
+            let mut guard = parts.borrow_mut();
+            apply_live_set_section(guard.0.tiered_store_mut(ns).expect("materialized"), &section);
+            Ok(())
+        },
+        |section| {
+            let mut guard = parts.borrow_mut();
+            apply_blob_ref_section(guard.0.tiered_store_mut(ns).expect("materialized"), &section);
+            Ok(())
+        },
+        |_| panic!("no index-sidecar sections in this image"),
+    );
+    if loaded.is_ok() {
+        let table = ks.tiered_store_mut(ns).expect("materialized");
+        spill.machine_mut(ns).end_of_checkpoint(table);
+    }
+    loaded
+}
+
+/// Replays one modeled WAL tail of record-v1 encodings through the
+/// shipped dispatcher, `Keyspace::apply_record` (markers park in its
+/// register for their mutation — ADR-0059 D9), the seam's owner draining
+/// once per record.
+pub fn replay_tail(ks: &mut Keyspace, spill: &mut TestSpill, tail: &[u8]) {
+    let mut rest = tail;
+    while !rest.is_empty() {
+        let (record, consumed) = decode_record(rest).expect("tail records decode");
+        ks.apply_record(&record, NOW, ANCHOR, spill).expect("replays");
+        spill.drain();
+        rest = &rest[consumed..];
+    }
+    assert_eq!(ks.displace_register_len(), 0, "a trailing displace marker is a stream error");
+}
+
+/// The boot's end as the recovery driver plays it (ADR-0174 R10): the
+/// end of replay, the settle steps to the tail (drained each), the
+/// hand-over. Returns the plane's pipeline, the held handles and the
+/// machine's final counters.
+pub fn finish_boot(ks: &mut Keyspace, spill: &mut TestSpill, ns: NsId) -> BootHandedOver<MemFs> {
+    let table = ks.tiered_store_mut(ns).expect("materialized");
+    spill.machine_mut(ns).end_of_replay(table);
+    while spill.machine_mut(ns).settle_step(table, PAGE).expect("settle step")
+        == SettleProgress::More
+    {
+        spill.drain();
+    }
+    spill.drain();
+    spill.take(ns).hand_over(table).expect("hands over")
+}
+
+/// The pipeline and handles of a hand-over.
+pub fn handed(done: BootHandedOver<MemFs>) -> (TierFlush<MemFs>, Vec<(u32, MemFile)>) {
+    let HandedOver { flush, handles } = done.handed;
     (flush, handles)
 }

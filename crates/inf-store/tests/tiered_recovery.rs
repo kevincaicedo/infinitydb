@@ -18,12 +18,12 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
-    read_ick_hybrid, read_manifest, write_manifest,
+    read_manifest, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
     DemotionConfig, Displaced, FileLiveSet, LogicalAddr, ReplayPhase, TieredLookup, TieredTable,
-    apply_live_set_section, apply_ref_section, recover_tiered_ns,
+    recover_tiered_ns,
 };
 
 mod support;
@@ -376,47 +376,16 @@ fn unified_recovery_round_trips_all_classes() {
     );
     assert!(recovered.stats.files_sealed + recovered.stats.files_resealed > 0);
 
-    let table = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    let mut ks = keyspace_with(NS, recovered.table);
+    let mut spill = TestSpill::new(NS, recovered.replay);
     let ick_path = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(ckpt_id));
-    let (info, _summary) = read_ick_hybrid(
-        &fs,
-        &ick_path,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            if let RecordView::StringPostImage { key, value, .. } = record {
-                let hash = KeyHasher::default().hash(key);
-                table
-                    .borrow_mut()
-                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                    .expect("fits");
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed)
-                .expect("refs inside the unit");
-            Ok(())
-        },
-        |section| {
-            assert_eq!(section.ns, NS.0);
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |_| panic!("no index-sidecar sections in this image"),
-    )
-    .expect("hybrid load");
+    let (info, _summary) = load_checkpoint(&fs, &ick_path, &mut ks, &mut spill, NS, tier.flushed)
+        .expect("hybrid load");
     assert_eq!(info.ckpt_id, ckpt_id);
     assert_eq!(info.begin_lsn, begin_lsn);
-    let mut table = table.into_inner();
-    let mut replay = replay.into_inner();
-    replay.end_of_checkpoint(&mut table);
-    replay_tail(&mut table, &mut replay, &tail);
+    replay_tail(&mut ks, &mut spill, &tail);
     // A boot that fits (I9): nothing of the zero set moved.
+    let replay = spill.machine(NS);
     assert_eq!(replay.phase(), ReplayPhase::Fitting, "the tail fits the window");
     let zero = replay.counters();
     assert_eq!(zero.demote_steps + zero.pads_placed + zero.tier_bytes + zero.settle_reads, 0);
@@ -426,8 +395,9 @@ fn unified_recovery_round_trips_all_classes() {
     // replay-complete, every recovered file's slot count equals the
     // index's ground truth, and restored byte counters obey the
     // sound-direction rule (dead only ever under-counts).
-    assert_live_set_reconciled(&mut table, &tier);
-    let (flush, handles) = finish_boot(&mut table, replay);
+    assert_live_set_reconciled(ks.tiered_store_mut(NS).expect("materialized"), &tier);
+    let (flush, handles) = handed(finish_boot(&mut ks, &mut spill, NS));
+    let table = take_table(&mut ks, NS);
     assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
 
     // The recovered rig serves every byte — cold through the recovered
@@ -801,50 +771,19 @@ fn a_tail_of_three_windows_replays_into_the_recovered_table() {
         KeyHasher::default(),
     )
     .expect("tier recovery");
-    let table = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    let mut ks = keyspace_with(NS, recovered.table);
+    let mut spill = TestSpill::new(NS, recovered.replay);
     let ick_path = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(ckpt_id));
-    read_ick_hybrid(
-        &fs,
-        &ick_path,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            if let RecordView::StringPostImage { key, value, .. } = record {
-                let hash = KeyHasher::default().hash(key);
-                table
-                    .borrow_mut()
-                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                    .expect("fits");
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed)
-                .expect("refs inside the unit");
-            Ok(())
-        },
-        |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |_| panic!("no index-sidecar sections in this image"),
-    )
-    .expect("hybrid load");
-    let mut table = table.into_inner();
-    let mut replay = replay.into_inner();
-    replay.end_of_checkpoint(&mut table);
-    replay_tail(&mut table, &mut replay, &tail);
-    let counters = replay.counters();
+    load_checkpoint(&fs, &ick_path, &mut ks, &mut spill, NS, tier.flushed).expect("hybrid load");
+    replay_tail(&mut ks, &mut spill, &tail);
+    let counters = spill.machine(NS).counters();
     assert!(counters.demote_steps > 0, "the regime engaged: the boot demoted");
     assert!(counters.tier_bytes >= 2 * window, "at least two windows of records left RAM");
-    assert_eq!(replay.phase(), ReplayPhase::Spilling);
-    let committed = table.space().report().committed_bytes;
+    assert_eq!(spill.machine(NS).phase(), ReplayPhase::Spilling);
+    let committed = ks.tiered_store(NS).expect("materialized").space().report().committed_bytes;
     assert!(committed <= window, "I1: committed RAM {committed} within the window {window}");
-    let (flush, handles) = finish_boot(&mut table, replay);
+    let (flush, handles) = handed(finish_boot(&mut ks, &mut spill, NS));
+    let table = take_table(&mut ks, NS);
     assert_eq!(handles.len(), flush.sealed().len(), "one held handle per sealed file (I11)");
     assert!(flush.active().is_none(), "the hand-over sealed the boot's active file");
     let mut recovered_rig = Rig { table, fs, flush, model, tail: Vec::new(), begun: false };

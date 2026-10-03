@@ -35,9 +35,9 @@ use inf_store::KeyHasher;
 use inf_store::{
     BlobConfig, ColdKeyError, DemotionConfig, LogicalAddr, RecoveredTier, ReplayCounters,
     ReplayPhase, ReplayRefusal, SettleProgress, TierReplay, TieredLookup, TieredTable, TypeTag,
-    apply_blob_ref_section, apply_live_set_section, apply_ref_section, forced_collision_pair,
-    recover_tiered_ns,
+    apply_ref_section, forced_collision_pair, recover_tiered_ns,
 };
+use inf_store::{Keyspace, ReplayError};
 
 mod support;
 use support::*;
@@ -422,11 +422,14 @@ struct Durable {
     tail: Vec<u8>,
 }
 
-/// The boot, up to the end of the checkpoint (E14 applied).
+/// The boot, up to the end of the checkpoint (R9 applied): the recovery
+/// driver's shape — the recovered table inside a keyspace, every record
+/// through `Keyspace::apply_record` with the namespace's machine lent by
+/// the seam.
 struct Boot {
     fs: MemFs,
-    table: TieredTable,
-    replay: TierReplay<MemFs>,
+    ks: Keyspace,
+    spill: TestSpill,
     extents_listed: Vec<u64>,
     extents_quarantined: Vec<u64>,
     tier: inf_log::TierNsManifest,
@@ -455,105 +458,107 @@ impl Durable {
                 KeyHasher::default(),
             )
             .expect("tier recovery");
-        let mut table = table;
-        blob(&mut table);
-        let table = std::cell::RefCell::new(table);
-        let replay = std::cell::RefCell::new(replay);
+        let mut ks = keyspace_with(NS, table);
+        blob(ks.tiered_store_mut(NS).expect("materialized"));
+        let mut spill = TestSpill::new(NS, replay);
         let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
-        read_ick_hybrid(
-            &self.fs,
-            &ick,
-            inf_log::ckpt::IckReaderConfig::default(),
-            |record| {
-                match record {
-                    RecordView::StringPostImage { key, value, .. } => {
-                        let hash = Life::hash(key);
-                        table
-                            .borrow_mut()
-                            .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                            .expect("replays");
-                    }
-                    RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                        let hash = Life::hash(key);
-                        let ext = inf_store::ExtentRef { extent_id, offset, len };
-                        table
-                            .borrow_mut()
-                            .replay_upsert_extent(
-                                Some(&mut *replay.borrow_mut()),
-                                &[],
-                                key,
-                                hash,
-                                ext,
-                            )
-                            .expect("replays");
-                    }
-                    other => panic!("no {other:?} in this checkpoint"),
-                }
-                Ok::<(), std::convert::Infallible>(())
-            },
-            |section| {
-                apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
-                Ok(())
-            },
-            |section| {
-                apply_live_set_section(&mut table.borrow_mut(), &section);
-                Ok(())
-            },
-            |section| {
-                apply_blob_ref_section(&mut table.borrow_mut(), &section);
-                Ok(())
-            },
-            |_| panic!("no index-sidecar sections in this image"),
-        )
-        .expect("hybrid load");
-        let mut table = table.into_inner();
-        let mut replay = replay.into_inner();
-        replay.end_of_checkpoint(&mut table);
-        Boot { fs: self.fs.clone(), table, replay, extents_listed, extents_quarantined, tier }
+        load_checkpoint(&self.fs, &ick, &mut ks, &mut spill, NS, tier.flushed)
+            .expect("hybrid load");
+        Boot { fs: self.fs.clone(), ks, spill, extents_listed, extents_quarantined, tier }
     }
 }
 
 /// The node at `Ready`: the table, the plane's pipeline and handles, the
-/// boot's counters.
+/// boot's counters and the work its seam drained.
 struct Ready {
     fs: MemFs,
     table: TieredTable,
     flush: TierFlush<MemFs>,
     handles: Vec<(u32, MemFile)>,
     counters: ReplayCounters,
+    /// The boot I/O the seam's owner drained, the hand-over's included.
+    charged: inf_store::ReplayWork,
     /// The manifested catalogue the boot started from.
     manifested: Vec<u32>,
 }
 
 impl Boot {
-    fn replay(&mut self, tail: &[u8]) {
-        replay_tail(&mut self.table, &mut self.replay, tail);
+    fn table(&self) -> &TieredTable {
+        self.ks.tiered_store(NS).expect("materialized")
+    }
+
+    fn table_mut(&mut self) -> &mut TieredTable {
+        self.ks.tiered_store_mut(NS).expect("materialized")
+    }
+
+    fn machine(&self) -> &TierReplay<MemFs> {
+        self.spill.machine(NS)
+    }
+
+    /// One record through the shipped dispatcher, the seam's owner
+    /// draining after it.
+    fn apply(&mut self, record: &RecordView<'_>) -> Result<(), ReplayError> {
+        let applied = self.ks.apply_record(record, NOW, ANCHOR, &mut self.spill).map(|_| ());
+        self.spill.drain();
+        applied
+    }
+
+    /// A replayed `SET`; a refusal is the replay's.
+    fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), ReplayRefusal> {
+        match self.apply(&RecordView::StringPostImage { ns: NS, key, value }) {
+            Ok(()) => Ok(()),
+            Err(ReplayError::Replay(refusal)) => Err(refusal),
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+
+    fn replay_tail(&mut self, tail: &[u8]) {
+        replay_tail(&mut self.ks, &mut self.spill, tail);
+    }
+
+    fn end_of_replay(&mut self) {
+        let table = self.ks.tiered_store(NS).expect("materialized");
+        self.spill.machine_mut(NS).end_of_replay(table);
+    }
+
+    fn settle_step(&mut self, budget_bytes: u64) -> Result<SettleProgress, ReplayRefusal> {
+        let table = self.ks.tiered_store_mut(NS).expect("materialized");
+        let progress = self.spill.machine_mut(NS).settle_step(table, budget_bytes);
+        self.spill.drain();
+        progress
     }
 
     /// E12, the extent sweep seed, ADR-0093's rebuild through the
     /// machine's settle read, E13.
     fn finish(mut self) -> Ready {
-        self.replay.end_of_replay(&self.table);
-        while self.replay.settle_step(&mut self.table, PAGE).expect("settle step")
-            == SettleProgress::More
-        {}
-        let revive = self.table.extent_sweep_seed(&self.extents_listed, &self.extents_quarantined);
+        self.end_of_replay();
+        while self.settle_step(PAGE).expect("settle step") == SettleProgress::More {}
+        let table = self.ks.tiered_store_mut(NS).expect("materialized");
+        let revive = table.extent_sweep_seed(&self.extents_listed, &self.extents_quarantined);
         assert!(revive.is_empty(), "nothing quarantined in these lives");
-        let replay = &mut self.replay;
-        self.table
+        let replay = self.spill.machine_mut(NS);
+        table
             .rebuild_shadow_tickets(|slot| -> Result<inf_store::KeyWindow, String> {
                 let window = replay.read_key_window(slot.cold).map_err(|e| e.to_string())?;
                 Ok(inf_store::KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
             })
             .expect("rebuild");
+        self.spill.drain();
         let manifested = self.tier.files.iter().map(|f| f.id).collect();
-        let done = self.replay.hand_over(&mut self.table).expect("hands over");
+        let done = self.spill.take(NS).hand_over(table).expect("hands over");
+        let mut charged = self.spill.charged();
+        charged.tier_bytes += done.work.tier_bytes;
+        charged.barriers += done.work.barriers;
+        charged.settle_reads += done.work.settle_reads;
+        charged.walked_bytes += done.work.walked_bytes;
+        let table = take_table(&mut self.ks, NS);
         Ready {
             fs: self.fs,
-            table: self.table,
+            table,
             flush: done.handed.flush,
             handles: done.handed.handles,
             counters: done.counters,
+            charged,
             manifested,
         }
     }
@@ -839,20 +844,20 @@ fn committed_pages_around_the_window_decide_whether_the_boot_demotes() {
         assert_eq!(page_ceil(n * record), target, "the tail commits exactly the target pages");
         let (durable, _) = life_with_tail(n, 1000 - 20);
         let mut boot = durable.boot();
-        let files_before = boot.replay.sealed().len();
-        boot.replay(&durable.tail);
-        let counters = boot.replay.counters();
+        let files_before = boot.machine().sealed().len();
+        boot.replay_tail(&durable.tail);
+        let counters = boot.machine().counters();
         if demotes {
             assert!(counters.demote_steps >= 1, "{target}: the boot demoted");
-            assert_eq!(boot.replay.phase(), ReplayPhase::Spilling);
+            assert_eq!(boot.machine().phase(), ReplayPhase::Spilling);
         } else {
             assert_eq!(zero_set(counters), 0, "{target}: the zero set is zero (I9)");
-            assert_eq!(boot.replay.phase(), ReplayPhase::Fitting);
-            assert_eq!(boot.replay.sealed().len(), files_before, "{target}: no tier file");
-            assert!(boot.replay.active().is_none(), "{target}: no record byte appended");
-            assert_eq!(boot.table.space().report().committed_bytes, target);
+            assert_eq!(boot.machine().phase(), ReplayPhase::Fitting);
+            assert_eq!(boot.machine().sealed().len(), files_before, "{target}: no tier file");
+            assert!(boot.machine().active().is_none(), "{target}: no record byte appended");
+            assert_eq!(boot.table().space().report().committed_bytes, target);
         }
-        assert!(boot.table.space().report().committed_bytes <= window, "I1 at {target}");
+        assert!(boot.table().space().report().committed_bytes <= window, "I1 at {target}");
         let ready = boot.finish();
         ready.audit(&durable.model, demotes);
         // The hand-over's drain seals the active file: the counters the
@@ -938,7 +943,7 @@ fn record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal() {
             // the `tier_footer_torn` site once. Armed never to fire.
             fault::arm(inf_log::fault::TIER_FSYNC_ERR, FaultSpec::Nth(u64::MAX));
             fault::arm(inf_log::fault::TIER_FOOTER_TORN, FaultSpec::Nth(u64::MAX));
-            boot.replay(&durable.tail);
+            boot.replay_tail(&durable.tail);
             let ready = boot.finish();
             let barriers_reached = fault::occurrences(inf_log::fault::TIER_FSYNC_ERR);
             let seals_reached = fault::occurrences(inf_log::fault::TIER_FOOTER_TORN);
@@ -948,6 +953,11 @@ fn record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal() {
             assert!(c.demote_steps > 0, "{arm}: VACUOUS — the boot did not demote");
             assert_eq!(c.barriers, barriers_reached, "{arm}: the counter is the writer's barriers");
             assert_eq!(c.files_sealed, seals_reached, "{arm}: the counter is the writer's seals");
+            // What the seam's owner drained is the I/O the counters hold —
+            // the rebuild's settle reads beside replay's own.
+            assert_eq!(ready.charged.tier_bytes, c.tier_bytes, "{arm}: tier bytes charged");
+            assert_eq!(ready.charged.barriers, c.barriers, "{arm}: barriers charged");
+            assert!(ready.charged.settle_reads >= c.settle_reads, "{arm}: settle reads charged");
             let syncs = c.barriers - c.files_sealed;
             assert!(syncs >= 1, "{arm}: a demote step flushed");
             assert!(
@@ -1008,8 +1018,8 @@ fn a_rewritten_key_keeps_one_slot_with_the_newest_value() {
         life.maintain();
         let durable = life.crash();
         let mut boot = durable.boot();
-        boot.replay(&durable.tail);
-        let demoted = boot.replay.counters().demote_steps > 0;
+        boot.replay_tail(&durable.tail);
+        let demoted = boot.machine().counters().demote_steps > 0;
         assert_eq!(demoted, distance > window, "the regime engages above the window");
         let ready = boot.finish();
         ready.audit(&durable.model, demoted);
@@ -1031,8 +1041,8 @@ fn a_rewritten_key_keeps_one_slot_with_the_newest_value() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
-    assert!(boot.replay.counters().demote_steps > 0, "three windows of one key demote");
+    boot.replay_tail(&durable.tail);
+    assert!(boot.machine().counters().demote_steps > 0, "three windows of one key demote");
     let ready = boot.finish();
     ready.audit(&durable.model, true);
     assert_eq!(ready.slots().len(), 1, "one slot");
@@ -1077,15 +1087,15 @@ fn rewrites_still_open_at_the_end_of_replay_are_settled_before_ready() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
-    assert!(boot.replay.counters().demote_steps > 0);
-    boot.replay.end_of_replay(&boot.table);
-    let before = boot.replay.counters();
+    boot.replay_tail(&durable.tail);
+    assert!(boot.machine().counters().demote_steps > 0);
+    boot.end_of_replay();
+    let before = boot.machine().counters();
     let mut steps = 0u32;
-    while boot.replay.settle_step(&mut boot.table, PAGE).expect("settle") == SettleProgress::More {
+    while boot.settle_step(PAGE).expect("settle") == SettleProgress::More {
         steps += 1;
     }
-    let after = boot.replay.counters();
+    let after = boot.machine().counters();
     let ready = boot.finish();
     // The oracle first: census (d) finds the ticketed same-key pairs of a
     // namespace that demoted when the end settle was skipped.
@@ -1141,8 +1151,8 @@ fn deletes_in_the_tail_resolve_against_demoted_copies() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
-    let counters = boot.replay.counters();
+    boot.replay_tail(&durable.tail);
+    let counters = boot.machine().counters();
     let ready = boot.finish();
     // The oracle first: census (a) finds a deleted key present when E5
     // skipped its reads.
@@ -1195,13 +1205,13 @@ fn a_shadow_pair_in_the_unit_settles_at_the_sealed_winner() {
     let durable = life.crash();
     let mut boot = durable.boot_with(lowered(), |_| {});
     let hash = Life::hash(b"paired");
-    let after_images = boot.replay.counters();
-    boot.replay(&durable.tail);
-    let winner = match boot.table.lookup(b"paired", hash, &[]) {
+    let after_images = boot.machine().counters();
+    boot.replay_tail(&durable.tail);
+    let winner = match boot.table().lookup(b"paired", hash, &[]) {
         TieredLookup::Ram(a) | TieredLookup::Cold(a) => a,
         TieredLookup::Miss => panic!("paired is live"),
     };
-    let origins = boot.table.displacement_origins_len(hash, winner);
+    let origins = boot.table().displacement_origins_len(hash, winner);
     let ready = boot.finish();
     // The oracle first: the census sees two cold slots with one key when
     // the seal skipped its settle.
@@ -1260,12 +1270,12 @@ fn a_death_the_crashed_life_charged_is_not_charged_again() {
     let durable = life.crash();
     let hash = Life::hash(b"charged");
     let mut boot = durable.boot_with(lowered(), |_| {});
-    let origin = boot.table.space().life_origin();
+    let origin = boot.table().space().life_origin();
     let pre_life_before = {
         let mut n = 0;
         let mut cursor = 0u64;
         loop {
-            cursor = boot.table.scan_slots(cursor, 256, |h, a| {
+            cursor = boot.table().scan_slots(cursor, 256, |h, a| {
                 if h == hash && a < origin {
                     n += 1;
                 }
@@ -1277,15 +1287,15 @@ fn a_death_the_crashed_life_charged_is_not_charged_again() {
     };
     assert_eq!(pre_life_before, 1, "the ref survived image load: the image was placed last");
     let charged_file = boot
-        .table
+        .table()
         .live_set()
         .files()
         .iter()
         .find(|f| f.recovered && f.dead_bytes > 0)
         .map(|f| (f.id, f.dead_bytes))
         .expect("the live-set entry restored the crashed life's charge");
-    boot.replay(&durable.tail);
-    let counters = boot.replay.counters();
+    boot.replay_tail(&durable.tail);
+    let counters = boot.machine().counters();
     let ready = boot.finish();
     // The oracle first: the dead-byte census finds a recovered file above
     // its true dead bytes when the settle charged the death again.
@@ -1369,9 +1379,9 @@ fn a_death_the_crashed_life_charged_by_a_del_of_a_blind_set_pair_is_not_charged_
     assert!(tail_markers.contains(&twin.to_raw()), "the twin's marker is in the tail");
     let durable = life.crash();
     let mut boot = durable.boot_with(lowered(), |_| {});
-    assert!(boot.table.contains_pair(hash, twin), "the ref survived image load: placed last");
+    assert!(boot.table().contains_pair(hash, twin), "the ref survived image load: placed last");
     let charged_file = boot
-        .table
+        .table()
         .live_set()
         .files()
         .iter()
@@ -1379,8 +1389,8 @@ fn a_death_the_crashed_life_charged_by_a_del_of_a_blind_set_pair_is_not_charged_
         .map(|f| (f.id, f.dead_bytes))
         .expect("the twin's file is recovered");
     assert!(charged_file.1 > 0, "the live set restored the crashed life's charge");
-    boot.replay(&durable.tail);
-    let counters = boot.replay.counters();
+    boot.replay_tail(&durable.tail);
+    let counters = boot.machine().counters();
     let ready = boot.finish();
     // The oracle first: the dead-byte census finds the twin's file above
     // its true dead bytes when the ref's settle charged the death again.
@@ -1434,11 +1444,11 @@ fn a_live_set_entry_naming_a_boot_file_restores_nothing() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
-    assert!(boot.replay.counters().demote_steps > 0, "the boot filed a file of its own");
+    boot.replay_tail(&durable.tail);
+    assert!(boot.machine().counters().demote_steps > 0, "the boot filed a file of its own");
     let boot_file =
-        boot.table.live_set().files().iter().find(|f| !f.recovered).cloned().expect("filed");
-    boot.table.restore_live_entry(&inf_log::LiveSetFileEntry {
+        boot.table().live_set().files().iter().find(|f| !f.recovered).cloned().expect("filed");
+    boot.table_mut().restore_live_entry(&inf_log::LiveSetFileEntry {
         file_id: boot_file.id,
         data_len: boot_file.data_len,
         dead_bytes: boot_file.data_len / 2,
@@ -1487,10 +1497,10 @@ fn an_unmanifested_file_reused_by_the_boot_stays_byte_exact() {
     let tier = manifest.tier_ns(NS.0).expect("section");
     assert!(tier.files.iter().all(|f| f.id != unnamed_id), "the manifest does not name it");
     let boot = durable.boot_with(lowered(), |_| {});
-    assert!(boot.replay.counters().demote_steps > 0, "the images demoted");
+    assert!(boot.machine().counters().demote_steps > 0, "the images demoted");
     assert!(
-        boot.replay.sealed().iter().any(|m| m.id == unnamed_id)
-            || boot.replay.active().is_some_and(|(id, ..)| id == unnamed_id),
+        boot.machine().sealed().iter().any(|m| m.id == unnamed_id)
+            || boot.machine().active().is_some_and(|(id, ..)| id == unnamed_id),
         "the boot reused the dead-life id"
     );
     let ready = boot.finish();
@@ -1572,22 +1582,20 @@ fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
     assert_eq!(
         copies
             .iter()
-            .filter(|&&a| boot.table.contains_pair(hash, LogicalAddr::from_raw(a).expect("48-bit")))
+            .filter(|&&a| boot
+                .table()
+                .contains_pair(hash, LogicalAddr::from_raw(a).expect("48-bit")))
             .count(),
         4
     );
-    let hasher = KeyHasher::default();
     let mut rest: &[u8] = &durable.tail;
     let mut refused = None;
     while !rest.is_empty() {
         let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
         let RecordView::StringPostImage { key, value, .. } = record else { panic!() };
-        match boot.table.replay_upsert(Some(&mut boot.replay), &[], key, value, hasher.hash(key)) {
-            Ok(_) => {}
-            Err(err) => {
-                refused = Some(err);
-                break;
-            }
+        if let Err(err) = boot.set(key, value) {
+            refused = Some(err);
+            break;
         }
         rest = &rest[consumed..];
     }
@@ -1595,11 +1603,13 @@ fn four_refs_of_one_key_under_one_sealed_winner_refuse_typed() {
         ReplayRefusal::OriginRoom { cold, .. } => assert!(copies.contains(&cold.to_raw())),
         other => panic!("{other}"),
     }
-    assert_eq!(boot.replay.counters().settled_same_key, 3, "three settled, exactly");
+    assert_eq!(boot.machine().counters().settled_same_key, 3, "three settled, exactly");
     assert_eq!(
         copies
             .iter()
-            .filter(|&&a| boot.table.contains_pair(hash, LogicalAddr::from_raw(a).expect("48-bit")))
+            .filter(|&&a| boot
+                .table()
+                .contains_pair(hash, LogicalAddr::from_raw(a).expect("48-bit")))
             .count(),
         1
     );
@@ -1698,7 +1708,7 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
             let durable = Durable { fs, demote, model: BTreeMap::new(), tail: Vec::new() };
             let mut boot = durable.boot();
             let zero = LogicalAddr::ZERO;
-            assert!(boot.table.contains_pair(hash, zero));
+            assert!(boot.table().contains_pair(hash, zero));
             // At the seal: k1's record first, then two windows of filler,
             // so a demote step seals it. At the end: the filler first (the
             // boot demotes), then k1, still `Open` when replay ends.
@@ -1708,24 +1718,19 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
                 let mut i = 0u64;
                 while written < 2 * window {
                     let key = format!("tail:{i:06}").into_bytes();
-                    let h = KeyHasher::default().hash(&key);
-                    boot.table.replay_upsert(Some(&mut boot.replay), &[], &key, &filler, h)?;
+                    boot.set(&key, &filler)?;
                     written += 920;
                     i += 1;
                 }
                 Ok(())
             };
             let outcome: Result<(), ReplayRefusal> = if at_seal {
-                boot.table
-                    .replay_upsert(Some(&mut boot.replay), &[], &k1, b"winner", hash)
-                    .expect("fits");
+                boot.set(&k1, b"winner").expect("fits");
                 fill(&mut boot)
             } else {
                 fill(&mut boot).expect("no settle without a twin");
-                boot.table
-                    .replay_upsert(Some(&mut boot.replay), &[], &k1, b"winner", hash)
-                    .expect("fits");
-                boot.replay.end_of_replay(&boot.table);
+                boot.set(&k1, b"winner").expect("fits");
+                boot.end_of_replay();
                 settle_to_the_tail(&mut boot)
             };
             match outcome.expect_err(name) {
@@ -1735,9 +1740,9 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
                 }
                 other => panic!("{name} at seal {at_seal}: {other}"),
             }
-            assert!(boot.table.contains_pair(hash, zero), "{name}: the slot stays, unsettled");
-            assert_eq!(boot.replay.counters().settled_distinct, 0, "{name}: never distinct");
-            assert_eq!(boot.replay.counters().settled_same_key, 0, "{name}: never settled");
+            assert!(boot.table().contains_pair(hash, zero), "{name}: the slot stays, unsettled");
+            assert_eq!(boot.machine().counters().settled_distinct, 0, "{name}: never distinct");
+            assert_eq!(boot.machine().counters().settled_same_key, 0, "{name}: never settled");
         }
     }
     // The legal short window: k1's record shorter than the key window at
@@ -1794,27 +1799,32 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
     let mut i = 0u64;
     while written < 2 * window {
         let key = format!("tail:{i:06}").into_bytes();
-        let h = KeyHasher::default().hash(&key);
-        boot.table.replay_upsert(Some(&mut boot.replay), &[], &key, &filler, h).expect("fits");
+        boot.set(&key, &filler).expect("fits");
         written += 920;
         i += 1;
     }
     // k2 walks first: its read finds k1's record a distinct key; then k1
     // settles it.
-    boot.table.replay_upsert(Some(&mut boot.replay), &[], &k2, b"two", hash).expect("fits");
-    let winner =
-        boot.table.replay_upsert(Some(&mut boot.replay), &[], &k1, b"new", hash).expect("fits");
-    boot.replay.end_of_replay(&boot.table);
+    boot.set(&k2, b"two").expect("fits");
+    boot.set(&k1, b"new").expect("fits");
+    let TieredLookup::Ram(winner) = boot.table().lookup(&k1, hash, &[]) else {
+        panic!("k1's record is in RAM");
+    };
+    boot.end_of_replay();
     settle_to_the_tail(&mut boot).expect("a verified short record settles");
-    assert!(!boot.table.contains_pair(hash, LogicalAddr::ZERO), "settled");
-    assert_eq!(boot.table.displacement_origins_len(hash, winner), 1, "chained into its owner");
-    assert_eq!(boot.replay.counters().settled_same_key, 1);
-    assert_eq!(boot.replay.counters().settled_distinct, 1, "k2's read found k1's record distinct");
+    assert!(!boot.table().contains_pair(hash, LogicalAddr::ZERO), "settled");
+    assert_eq!(boot.table().displacement_origins_len(hash, winner), 1, "chained into its owner");
+    assert_eq!(boot.machine().counters().settled_same_key, 1);
+    assert_eq!(
+        boot.machine().counters().settled_distinct,
+        1,
+        "k2's read found k1's record distinct"
+    );
 }
 
 /// End-of-replay settle steps until the cursor reaches the tail.
 fn settle_to_the_tail(boot: &mut Boot) -> Result<(), ReplayRefusal> {
-    while boot.replay.settle_step(&mut boot.table, 1 << 20)? == SettleProgress::More {}
+    while boot.settle_step(1 << 20)? == SettleProgress::More {}
     Ok(())
 }
 
@@ -1862,18 +1872,16 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
     let mut in_frame: Vec<Vec<u8>> = Vec::new();
     let mut frame_start = 0u64;
     for _ in 0..64 {
-        let steps = boot.replay.counters().demote_steps;
-        while boot.replay.counters().demote_steps == steps {
+        let steps = boot.machine().counters().demote_steps;
+        while boot.machine().counters().demote_steps == steps {
             let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
-            let RecordView::StringPostImage { key, value, .. } = record else { panic!() };
-            boot.table
-                .replay_upsert(Some(&mut boot.replay), &[], key, value, hasher.hash(key))
-                .expect("fits");
+            let RecordView::StringPostImage { key, .. } = record else { panic!() };
+            boot.apply(&record).expect("fits");
             applied.push(key.to_vec());
             rest = &rest[consumed..];
         }
         let (_, base, data_len, durable_len, _) =
-            boot.replay.active().expect("the step left a file open");
+            boot.machine().active().expect("the step left a file open");
         assert_eq!(data_len, durable_len, "the barrier claimed every appended byte");
         if data_len % TIER_FRAME_DATA as u64 == 0 {
             continue;
@@ -1881,11 +1889,11 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
         frame_start = base.to_raw() + (data_len / TIER_FRAME_DATA as u64) * TIER_FRAME_DATA as u64;
         // A release passed the frame's records (the step released to its
         // target; the row's release goes to the barrier-claimed end).
-        while boot.table.release_slice() > 0 {}
-        assert_eq!(boot.table.space().head(), boot.table.space().flushed());
+        while boot.table_mut().release_slice() > 0 {}
+        assert_eq!(boot.table().space().head(), boot.table().space().flushed());
         in_frame = applied
             .iter()
-            .filter(|k| match boot.table.lookup(k, hasher.hash(k), &[]) {
+            .filter(|k| match boot.table().lookup(k, hasher.hash(k), &[]) {
                 TieredLookup::Cold(a) => a.to_raw() >= frame_start,
                 _ => false,
             })
@@ -1897,40 +1905,35 @@ fn a_del_reads_the_active_files_partial_tail_frame_before_and_after_its_rewrite(
     }
     assert!(in_frame.len() >= 2, "VACUOUS: no step left two records in the partial tail frame");
     assert!(frame_start > 0);
-    let reads = boot.replay.counters().settle_reads;
-    boot.table
-        .replay_delete(Some(&mut boot.replay), &[], &in_frame[0], hasher.hash(&in_frame[0]))
+    let reads = boot.machine().counters().settle_reads;
+    boot.apply(&RecordView::Delete { ns: NS, key: &in_frame[0] })
         .expect("E5 reads the partial frame");
-    assert_eq!(boot.replay.counters().settle_reads, reads + 1, "one read covered the tail frame");
-    assert_eq!(boot.replay.counters().deletes_verified, 1);
+    assert_eq!(
+        boot.machine().counters().settle_reads,
+        reads + 1,
+        "one read covered the tail frame"
+    );
+    assert_eq!(boot.machine().counters().deletes_verified, 1);
     // Extend the frame with the next records (the next step rewrites it
     // in place), then delete the second key of that frame.
     let mut model = durable.model.clone();
     model.remove(&in_frame[0]);
     let mut more = 0;
-    let steps = boot.replay.counters().demote_steps;
-    while boot.replay.counters().demote_steps == steps {
+    let steps = boot.machine().counters().demote_steps;
+    while boot.machine().counters().demote_steps == steps {
         let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
-        let RecordView::StringPostImage { key, value, .. } = record else { panic!() };
-        boot.table
-            .replay_upsert(Some(&mut boot.replay), &[], key, value, hasher.hash(key))
-            .expect("fits");
+        boot.apply(&record).expect("fits");
         rest = &rest[consumed..];
         more += 1;
     }
     assert!(more > 0);
-    boot.table
-        .replay_delete(Some(&mut boot.replay), &[], &in_frame[1], hasher.hash(&in_frame[1]))
-        .expect("E5 after the rewrite");
-    assert_eq!(boot.replay.counters().deletes_verified, 2);
+    boot.apply(&RecordView::Delete { ns: NS, key: &in_frame[1] }).expect("E5 after the rewrite");
+    assert_eq!(boot.machine().counters().deletes_verified, 2);
     model.remove(&in_frame[1]);
     // The rest of the tail, then the audit against the adjusted model.
     while !rest.is_empty() {
         let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
-        let RecordView::StringPostImage { key, value, .. } = record else { panic!() };
-        boot.table
-            .replay_upsert(Some(&mut boot.replay), &[], key, value, hasher.hash(key))
-            .expect("fits");
+        boot.apply(&record).expect("fits");
         rest = &rest[consumed..];
     }
     let ready = boot.finish();
@@ -1977,8 +1980,8 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
     // ref settles at the seal (E10) and rides the survivor's origins.
     // Then the live DEL.
     let mut boot = durable.boot_with(lowered(), |_| {});
-    assert!(boot.replay.counters().settled_same_key >= 1, "boot 1 settled the ref at a seal");
-    boot.replay(&durable.tail);
+    assert!(boot.machine().counters().settled_same_key >= 1, "boot 1 settled the ref at a seal");
+    boot.replay_tail(&durable.tail);
     let ready = boot.finish();
     ready.audit(&durable.model, true);
     let Ready { fs, table, flush, .. } = ready;
@@ -2005,12 +2008,12 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
     // Boot 2 under a raised budget: the same unit, a longer tail, fits.
     let raised = DemotionConfig::for_budget(4 * BUDGET, PAGE);
     let mut boot2 = durable2.boot_with(raised, |_| {});
-    let origin = boot2.table.space().life_origin();
+    let origin = boot2.table().space().life_origin();
     let ref_addr = {
         let mut found = None;
         let mut cursor = 0u64;
         loop {
-            cursor = boot2.table.scan_slots(cursor, 256, |h, a| {
+            cursor = boot2.table().scan_slots(cursor, 256, |h, a| {
                 if h == hash && a < origin {
                     found = Some(a);
                 }
@@ -2020,9 +2023,9 @@ fn a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash() {
             }
         }
     };
-    boot2.replay(&durable2.tail);
-    let counters2 = boot2.replay.counters();
-    let ref_present = boot2.table.contains_pair(hash, ref_addr);
+    boot2.replay_tail(&durable2.tail);
+    let counters2 = boot2.machine().counters();
+    let ref_present = boot2.table().contains_pair(hash, ref_addr);
     let ready2 = boot2.finish();
     // The oracle first: the key resurrects from the ref when boot 1's
     // settle chained nothing.
@@ -2066,8 +2069,8 @@ fn a_colliding_pair_with_one_demoted_survives_as_the_one_ticket() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
-    assert!(boot.replay.counters().demote_steps > 0);
+    boot.replay_tail(&durable.tail);
+    assert!(boot.machine().counters().demote_steps > 0);
     let ready = boot.finish();
     ready.audit(&durable.model, true);
     assert_eq!(ready.table.shadow_pending(), 1, "the colliding pair is the one ticket");
@@ -2112,8 +2115,8 @@ fn a_blob_ref_settled_during_image_load_is_released_at_the_end_of_the_checkpoint
     life.checkpoint_ordered(1, |_| {}, &[b"blobby"], &[]);
     let durable = life.crash();
     let mut boot = durable.boot_with(lowered(), |table| table.set_blob_config(blob));
-    let counters = boot.replay.counters();
-    boot.replay(&durable.tail);
+    let counters = boot.machine().counters();
+    boot.replay_tail(&durable.tail);
     let ready = boot.finish();
     // The oracle first: the blob census finds a reference with no slot
     // when the end of the checkpoint released nothing.
@@ -2163,8 +2166,8 @@ fn a_window_below_its_ring_pads_the_tail_for_records_at_the_inline_maximum() {
         }
         let durable = Durable { fs: life.fs.clone(), demote, model, tail };
         let mut boot = durable.boot_with(demote, |table| table.set_blob_config(blob));
-        boot.replay(&durable.tail);
-        let counters = boot.replay.counters();
+        boot.replay_tail(&durable.tail);
+        let counters = boot.machine().counters();
         assert!(counters.demote_steps > 0, "the regime engaged");
         assert!(counters.pads_placed > 0, "VACUOUS: no pad placed in this arm");
         let ready = boot.finish();
@@ -2200,48 +2203,36 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
     life.del(b"victim");
     life.maintain();
     let durable = life.crash();
-    // The DEL's read fails: nothing changed, the key still resolves cold.
-    let hasher = KeyHasher::default();
-    let hash = hasher.hash(b"victim");
+    // The DEL's read fails: nothing changed, the key still resolves cold
+    // and its markers stay parked in the keyspace's register.
+    let hash = KeyHasher::default().hash(b"victim");
     let mut boot = durable.boot();
     let mut rest: &[u8] = &durable.tail;
-    let mut markers: Vec<LogicalAddr> = Vec::new();
     loop {
         let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
         rest = &rest[consumed..];
-        match record {
-            RecordView::StringPostImage { key, value, .. } => {
-                boot.table
-                    .replay_upsert(Some(&mut boot.replay), &markers, key, value, hasher.hash(key))
-                    .expect("fits");
-                markers.clear();
-            }
-            RecordView::ColdDisplace { old_addr, .. } => {
-                markers.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
-            }
-            RecordView::Delete { key, .. } => {
-                assert_eq!(key, b"victim");
-                let before = boot.table.space().ro_boundary();
-                let slots_before = boot.table.len();
-                fault::arm(inf_log::fault::REPLAY_SETTLE_READ_FAIL, FaultSpec::Nth(1));
-                let err = boot
-                    .table
-                    .replay_delete(Some(&mut boot.replay), &markers, key, hash)
-                    .expect_err("the injected read failure refuses");
-                fault::disarm_all();
-                assert!(matches!(err, ReplayRefusal::SettleRead { .. }), "{err}");
-                assert!(matches!(boot.table.lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
-                assert_eq!(boot.table.len(), slots_before, "no slot moved (I3)");
-                assert_eq!(boot.table.space().ro_boundary(), before);
-                // The same boot, the fault cleared: the DEL applies.
-                boot.table
-                    .replay_delete(Some(&mut boot.replay), &markers, key, hash)
-                    .expect("verified");
-                markers.clear();
-                break;
-            }
-            other => panic!("{other:?}"),
-        }
+        let RecordView::Delete { key, .. } = record else {
+            boot.apply(&record).expect("replays");
+            continue;
+        };
+        assert_eq!(key, b"victim");
+        let parked = boot.ks.displace_register_len();
+        assert!(parked >= 1, "the DEL of a demoted key has its marker");
+        let before = boot.table().space().ro_boundary();
+        let slots_before = boot.table().len();
+        fault::arm(inf_log::fault::REPLAY_SETTLE_READ_FAIL, FaultSpec::Nth(1));
+        let err = boot.apply(&record).expect_err("the injected read failure refuses");
+        fault::disarm_all();
+        assert!(matches!(err, ReplayError::Replay(ReplayRefusal::SettleRead { .. })), "{err:?}");
+        assert!(matches!(boot.table().lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
+        assert_eq!(boot.table().len(), slots_before, "no slot moved (I3)");
+        assert_eq!(boot.table().space().ro_boundary(), before);
+        assert_eq!(boot.ks.displace_register_len(), parked, "the markers stay parked (I3)");
+        // The same boot, the fault cleared: the DEL applies, its markers
+        // drained with it.
+        boot.apply(&record).expect("verified");
+        assert_eq!(boot.ks.displace_register_len(), 0);
+        break;
     }
     assert!(rest.is_empty());
     let ready = boot.finish();
@@ -2285,8 +2276,9 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         KeyHasher::default(),
     )
     .expect("tier recovery");
-    let table = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    let ks = keyspace_with(NS, recovered.table);
+    let spill = TestSpill::new(NS, recovered.replay);
+    let parts = std::cell::RefCell::new((ks, spill));
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
     let mut refused = false;
     let loaded = read_ick_hybrid(
@@ -2294,27 +2286,24 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         &ick,
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
-            let RecordView::StringPostImage { key, value, .. } = record else { panic!() };
-            let ro = table.borrow().space().ro_boundary();
-            let placed = table.borrow_mut().replay_upsert(
-                Some(&mut *replay.borrow_mut()),
-                &[],
-                key,
-                value,
-                hasher.hash(key),
-            );
-            match placed {
+            let mut guard = parts.borrow_mut();
+            let (ks, spill) = &mut *guard;
+            let ro = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
+            match ks.apply_record(&record, NOW, ANCHOR, spill) {
                 Ok(_) => Ok(()),
-                Err(ReplayRefusal::SettleRead { .. }) => {
-                    assert_eq!(table.borrow().space().ro_boundary(), ro, "the boundary stayed");
+                Err(ReplayError::Replay(ReplayRefusal::SettleRead { .. })) => {
+                    let after = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
+                    assert_eq!(after, ro, "the boundary stayed");
                     refused = true;
                     Err(())
                 }
-                Err(other) => panic!("{other}"),
+                Err(other) => panic!("{other:?}"),
             }
         },
         |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
+            let mut guard = parts.borrow_mut();
+            let table = guard.0.tiered_store_mut(NS).expect("materialized");
+            apply_ref_section(table, &section, tier.flushed).expect("refs");
             Ok(())
         },
         |_| Ok(()),
@@ -2323,9 +2312,9 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
     );
     fault::disarm_all();
     assert!(loaded.is_err() && refused, "the seal's read refused typed during image load");
-    drop((table, replay));
+    drop(parts);
     let mut again = durable.boot_with(lowered(), |_| {});
-    again.replay(&durable.tail);
+    again.replay_tail(&durable.tail);
     let ready = again.finish();
     ready.audit(&durable.model, true);
 }
@@ -2430,19 +2419,15 @@ fn a_replayed_del_of_a_demoted_key_removes_its_cold_slot() {
     life.maintain();
     let durable = life.crash();
     let mut boot = durable.boot();
-    boot.replay(&durable.tail);
+    boot.replay_tail(&durable.tail);
     let hash = Life::hash(b"demoted");
-    assert!(matches!(boot.table.lookup(b"demoted", hash, &[]), TieredLookup::Cold(_)), "demoted");
-    let removed = boot
-        .table
-        .replay_delete(Some(&mut boot.replay), &[], b"demoted", hash)
-        .expect("the read parses");
-    assert!(removed, "the DEL removed the key's cold slot (R6)");
+    assert!(matches!(boot.table().lookup(b"demoted", hash, &[]), TieredLookup::Cold(_)), "demoted");
+    boot.apply(&RecordView::Delete { ns: NS, key: b"demoted" }).expect("the read parses");
     assert!(
-        matches!(boot.table.lookup(b"demoted", hash, &[]), TieredLookup::Miss),
-        "a deleted key is absent"
+        matches!(boot.table().lookup(b"demoted", hash, &[]), TieredLookup::Miss),
+        "the DEL removed the key's cold slot (R6)"
     );
-    assert_eq!(boot.replay.counters().deletes_verified, 1);
+    assert_eq!(boot.machine().counters().deletes_verified, 1);
     let mut model = durable.model.clone();
     model.remove(b"demoted".as_slice());
     let ready = boot.finish();

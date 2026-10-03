@@ -29,13 +29,12 @@ use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
     CkptConfig, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingConfig, StagingRing,
-    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, read_ick_hybrid, write_manifest,
+    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredLookup,
-    TieredTable, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
-    recover_tiered_ns,
+    TieredTable, recover_tiered_ns,
 };
 use proptest::prelude::*;
 
@@ -686,55 +685,14 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         recovered.extents_listed.contains(&orphan_id.0),
         "the listing collected the orphan (names only)"
     );
-    let table = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    let mut ks = support::keyspace_with(NS, recovered.table);
+    let mut spill = support::TestSpill::new(NS, recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(stored.ckpt_id));
-    read_ick_hybrid(
-        &fs,
-        &ick,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            match record {
-                RecordView::StringPostImage { key, value, .. } => {
-                    let hash = KeyHasher::default().hash(key);
-                    table
-                        .borrow_mut()
-                        .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                        .expect("fits");
-                }
-                RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                    let hash = KeyHasher::default().hash(key);
-                    let ext = inf_store::ExtentRef { extent_id, offset, len };
-                    table
-                        .borrow_mut()
-                        .replay_upsert_extent(Some(&mut *replay.borrow_mut()), &[], key, hash, ext)
-                        .expect("fits");
-                }
-                _ => panic!("unexpected image class in this checkpoint"),
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
-            Ok(())
-        },
-        |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            assert_eq!(section.ns, NS.0);
-            apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |_| panic!("no index-sidecar sections in this image"),
-    )
-    .expect("hybrid load");
-    let mut table = table.into_inner();
-    let mut replay = replay.into_inner();
-    replay.end_of_checkpoint(&mut table);
-    support::replay_tail(&mut table, &mut replay, &tail);
-    let (_flush, _handles) = support::finish_boot(&mut table, replay);
+    support::load_checkpoint(&fs, &ick, &mut ks, &mut spill, NS, tier.flushed)
+        .expect("hybrid load");
+    support::replay_tail(&mut ks, &mut spill, &tail);
+    let (_flush, _handles) = support::handed(support::finish_boot(&mut ks, &mut spill, NS));
+    let mut table = support::take_table(&mut ks, NS);
     // The sweep (ADR-0096): orphans dispose through ordinary slices —
     // the header-valid orphan quarantines (rename, bytes survive the
     // life), and only the next boot's second verdict unlinks; nothing

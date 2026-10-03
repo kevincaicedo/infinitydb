@@ -17,13 +17,10 @@ use std::path::Path;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
-    read_ick_hybrid, read_manifest, write_manifest,
+    read_manifest, write_manifest,
 };
 use inf_store::KeyHasher;
-use inf_store::{
-    DemotionConfig, LogicalAddr, TieredLookup, TieredTable, apply_live_set_section,
-    apply_ref_section, recover_tiered_ns,
-};
+use inf_store::{DemotionConfig, LogicalAddr, TieredLookup, TieredTable, recover_tiered_ns};
 
 mod support;
 use support::*;
@@ -639,43 +636,13 @@ fn replay_and_check(rig: Rig, overwritten: &[Vec<u8>], markers: bool) {
         KeyHasher::default(),
     )
     .expect("recovery");
-    let table = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    let mut ks = keyspace_with(NS, recovered.table);
+    let mut spill = TestSpill::new(NS, recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
-    read_ick_hybrid(
-        &fs,
-        &ick,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            if let RecordView::StringPostImage { key, value, .. } = record {
-                let hash = KeyHasher::default().hash(key);
-                table
-                    .borrow_mut()
-                    .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                    .expect("fits");
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
-            Ok(())
-        },
-        |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            inf_store::apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |_| panic!("no index-sidecar sections in this image"),
-    )
-    .expect("hybrid load");
-    let mut table = table.into_inner();
-    let mut replay = replay.into_inner();
-    replay.end_of_checkpoint(&mut table);
-    replay_tail(&mut table, &mut replay, &tail);
-    let (flush, _handles) = finish_boot(&mut table, replay);
+    load_checkpoint(&fs, &ick, &mut ks, &mut spill, NS, tier.flushed).expect("hybrid load");
+    replay_tail(&mut ks, &mut spill, &tail);
+    let (flush, _handles) = handed(finish_boot(&mut ks, &mut spill, NS));
+    let table = take_table(&mut ks, NS);
 
     if markers {
         assert_eq!(table.len(), model.len(), "exactly one slot per live key — no stale twins");
