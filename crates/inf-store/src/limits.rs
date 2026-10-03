@@ -33,6 +33,15 @@ pub const IDX_ALIAS_GROUP_MAX: usize = 8;
 /// it); a death hook ⇒ the index degrades (a death cannot refuse).
 pub const BRACKET_KEY_BYTES_MAX: usize = 32 << 20;
 
+/// The recovery step budget's price of one boot settle read (a cold
+/// record's key window, ADR-0174 D3): 128 KiB, about 100 µs of a device
+/// that moves 1 GiB/s, so a read is charged as the bytes the step could
+/// have moved meanwhile. Owner: the end-of-replay settle walk, which adds
+/// it per read to the bytes it walked. Crossing: the walk yields after
+/// the record whose combined charge reaches the step's budget, and the
+/// next step resumes at its cursor.
+pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
+
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
 /// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte

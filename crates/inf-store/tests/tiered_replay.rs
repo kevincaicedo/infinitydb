@@ -1726,7 +1726,7 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
                     .replay_upsert(Some(&mut boot.replay), &[], &k1, b"winner", hash)
                     .expect("fits");
                 boot.replay.end_of_replay(&boot.table);
-                boot.replay.settle_step(&mut boot.table, 1 << 20).map(|_| ())
+                settle_to_the_tail(&mut boot)
             };
             match outcome.expect_err(name) {
                 ReplayRefusal::SettleIdentity { addr, cause } => {
@@ -1805,11 +1805,17 @@ fn a_settle_keeps_or_removes_only_on_a_verified_record_of_its_hash() {
     let winner =
         boot.table.replay_upsert(Some(&mut boot.replay), &[], &k1, b"new", hash).expect("fits");
     boot.replay.end_of_replay(&boot.table);
-    boot.replay.settle_step(&mut boot.table, 1 << 20).expect("a verified short record settles");
+    settle_to_the_tail(&mut boot).expect("a verified short record settles");
     assert!(!boot.table.contains_pair(hash, LogicalAddr::ZERO), "settled");
     assert_eq!(boot.table.displacement_origins_len(hash, winner), 1, "chained into its owner");
     assert_eq!(boot.replay.counters().settled_same_key, 1);
     assert_eq!(boot.replay.counters().settled_distinct, 1, "k2's read found k1's record distinct");
+}
+
+/// End-of-replay settle steps until the cursor reaches the tail.
+fn settle_to_the_tail(boot: &mut Boot) -> Result<(), ReplayRefusal> {
+    while boot.replay.settle_step(&mut boot.table, 1 << 20)? == SettleProgress::More {}
+    Ok(())
 }
 
 // ---- §6 row: a cold record in the active file's partial tail frame ----------

@@ -25,6 +25,7 @@ use super::*;
 use inf_log::flush::{BootFlush, HandedOver, SeamFlush, SettleReadError, SettleWindow};
 
 use crate::address_space::{Room, WindowFull};
+use crate::limits::SETTLE_READ_CHARGE_BYTES;
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
 
@@ -266,6 +267,25 @@ pub struct SettledSpan {
     end: LogicalAddr,
 }
 
+/// Where a settle walk goes: a demote step's seal walk to a target
+/// address, or one end-of-replay step to a budget.
+#[derive(Copy, Clone, Debug)]
+enum WalkTo {
+    /// To the first record start at or above `stop` (D2 rule 2).
+    Seal { stop: u64 },
+    /// Until the step's charge reaches `budget_bytes` (R10).
+    Settle { budget_bytes: u64 },
+}
+
+/// How a settle walk ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum WalkEnd {
+    /// At the tail: every record from the walk's start is settled.
+    Tail,
+    /// At its stop or its budget, short of the tail.
+    Stopped,
+}
+
 /// What one end-of-replay settle step reports (E12).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SettleProgress {
@@ -383,7 +403,7 @@ impl<F: SegmentFs> TierReplay<F> {
         if table.space.flushed() < target {
             let stop = target.to_raw().saturating_add(self.lead);
             let from = table.space.ro_boundary();
-            let (span, _) = self.settle_walk(table, from, Some(stop), None)?;
+            let (span, _) = self.settle_walk(table, from, WalkTo::Seal { stop })?;
             table.seal_settled(span);
             let cut = table.space.ro_boundary().to_raw();
             let cursor = table.flush_start_cursor(&self.flush);
@@ -425,30 +445,41 @@ impl<F: SegmentFs> TierReplay<F> {
         self.work.barriers += barriers;
     }
 
-    /// Walks the records of `[from, stop)` — `stop` a target address
-    /// (the first record start at or above it ends the walk), else the
-    /// tail — settling every live one against its exact-hash cold slots
-    /// (E10). A hole is passed whole by its mark. With a byte `budget`
-    /// the walk yields after the record that exhausts it. Returns the
-    /// span settled and whether the walk reached the tail.
+    /// Walks the records from `from`, settling every live one against
+    /// its exact-hash cold slots (E10), to where `to` says: a demote
+    /// step's seal walk stops at the first record start at or above its
+    /// target; an end-of-replay step yields after the record whose charge
+    /// — the bytes walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle
+    /// read — reaches its budget. Either ends at the tail. A hole is
+    /// passed whole by its mark. Returns the span settled and how the
+    /// walk ended.
+    ///
+    /// Bound per call: a seal walk passes `H + lead − ro` bytes plus one
+    /// record; an end-of-replay step charges at most its budget plus one
+    /// record's bytes and its twins' reads (an exact-hash group).
     fn settle_walk(
         &mut self,
         table: &mut TieredTable,
         from: LogicalAddr,
-        stop: Option<u64>,
-        budget: Option<u64>,
-    ) -> Result<(SettledSpan, bool), ReplayRefusal> {
+        to: WalkTo,
+    ) -> Result<(SettledSpan, WalkEnd), ReplayRefusal> {
         let tail = table.space.tail().to_raw();
         let mut at = from.to_raw();
         let mut walked = 0u64;
-        while at < tail {
+        let reads_before = self.counters.settle_reads;
+        let end = loop {
+            if at >= tail {
+                break WalkEnd::Tail;
+            }
             let here = LogicalAddr::from_raw(at).expect("watermarks stay 48-bit");
             if let Some(hole) = table.space.hole_at(here) {
                 at += hole;
                 continue;
             }
-            if stop.is_some_and(|s| at >= s) {
-                break;
+            if let WalkTo::Seal { stop } = to
+                && at >= stop
+            {
+                break WalkEnd::Stopped;
             }
             let (len, hash) = {
                 let parts = table.record(here);
@@ -456,21 +487,27 @@ impl<F: SegmentFs> TierReplay<F> {
             };
             // The planted canary (DRR FCR-STTIER-01 §6): E10 skipped at
             // the seal — a sealed record leaves its same-key cold slot.
-            let settle_here = stop.is_none() || !cfg!(inf_canary_replay_seal_no_settle);
-            if settle_here && self.collect_twins(table, here, hash) {
+            let skip = matches!(to, WalkTo::Seal { .. }) && cfg!(inf_canary_replay_seal_no_settle);
+            if !skip && self.collect_twins(table, here, hash) {
                 self.key.clear();
                 self.key.extend_from_slice(table.record(here).key);
                 self.settle_twins(table, here, hash)?;
             }
             at += len;
             walked += len;
-            if budget.is_some_and(|b| walked >= b) {
-                break;
+            if let WalkTo::Settle { budget_bytes } = to {
+                let reads = self.counters.settle_reads - reads_before;
+                let charge = walked.saturating_add(reads.saturating_mul(SETTLE_READ_CHARGE_BYTES));
+                if charge >= budget_bytes {
+                    break if at >= tail { WalkEnd::Tail } else { WalkEnd::Stopped };
+                }
             }
+        };
+        if matches!(to, WalkTo::Settle { .. }) {
+            self.work.walked_bytes += walked;
         }
-        self.work.walked_bytes += walked;
-        let end = LogicalAddr::from_raw(at).expect("watermarks stay 48-bit");
-        Ok((SettledSpan { end }, at >= tail))
+        let end_addr = LogicalAddr::from_raw(at).expect("watermarks stay 48-bit");
+        Ok((SettledSpan { end: end_addr }, end))
     }
 
     /// One pass over the exact-hash group of the record at `here`: whether
@@ -611,8 +648,9 @@ impl<F: SegmentFs> TierReplay<F> {
     }
 
     /// One end-of-replay settle step (E12): E10 on every live record of
-    /// `[cursor, tail)`, by address, until `budget_bytes` were walked or
-    /// the tail is reached. `ro` does not move.
+    /// `[cursor, tail)`, by address, until the step's charge — bytes
+    /// walked plus [`SETTLE_READ_CHARGE_BYTES`] per settle read — reaches
+    /// `budget_bytes`, or the tail. `ro` does not move.
     ///
     /// # Errors
     /// A settle read or identity refusal; `ReplayNotEnded` in `Spilling`.
@@ -626,9 +664,13 @@ impl<F: SegmentFs> TierReplay<F> {
             ReplayState::Spilling => return Err(ReplayRefusal::ReplayNotEnded),
             ReplayState::Settling { cursor } => cursor,
         };
-        let (span, at_tail) = self.settle_walk(table, cursor, None, Some(budget_bytes.max(1)))?;
+        let budget_bytes = budget_bytes.max(1);
+        let (span, end) = self.settle_walk(table, cursor, WalkTo::Settle { budget_bytes })?;
         self.state = ReplayState::Settling { cursor: span.end };
-        Ok(if at_tail { SettleProgress::Done } else { SettleProgress::More })
+        Ok(match end {
+            WalkEnd::Tail => SettleProgress::Done,
+            WalkEnd::Stopped => SettleProgress::More,
+        })
     }
 
     /// R10's last half (E13): a table that demoted drains its flush and
@@ -1081,6 +1123,42 @@ mod tests {
         assert_eq!(table.len(), len, "no slot moved");
         assert_eq!(replay.counters(), counters, "no step, read or delete counted");
         assert_eq!(replay.phase(), ReplayPhase::Settling, "the cursor is kept");
+    }
+
+    /// One end-of-replay settle step charges each settle read its price
+    /// beside the bytes it walks, and yields after the record whose charge
+    /// reaches the budget: over a span where every record has a cold twin,
+    /// a step reads at most ⌈budget ÷ price⌉ plus one record's twins.
+    #[test]
+    fn an_end_settle_step_yields_at_its_charge_of_reads_and_bytes() {
+        let fs = MemFs::new();
+        let mut table = table();
+        let mut replay = machine(&fs);
+        spill(&mut table, &mut replay);
+        // Rewrite the demoted keys inside the last window: each rewrite is
+        // an `Open` record with a cold twin when replay ends.
+        let value = vec![0x6B; 900];
+        for i in 0..56u32 {
+            let key = format!("k:{i:04}").into_bytes();
+            let hash = table.hash_key(&key);
+            table.replay_upsert(Some(&mut replay), &[], &key, &value, hash).expect("replays");
+        }
+        replay.end_of_replay(&table);
+        let budget: u64 = 64 << 10;
+        let bound = budget.div_ceil(crate::limits::SETTLE_READ_CHARGE_BYTES) + 1;
+        let mut steps = 0u64;
+        loop {
+            let reads = replay.counters().settle_reads;
+            let progress = replay.settle_step(&mut table, budget).expect("settles");
+            let read = replay.counters().settle_reads - reads;
+            assert!(read <= bound, "step {steps}: {read} settle reads against a bound of {bound}");
+            steps += 1;
+            if progress == SettleProgress::Done {
+                break;
+            }
+        }
+        assert!(replay.counters().settled_same_key >= 56, "every rewrite's twin settled");
+        assert!(steps >= 28, "VACUOUS: the walk did not yield on its reads ({steps} steps)");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file
