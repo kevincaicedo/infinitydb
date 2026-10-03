@@ -11,7 +11,7 @@
 //! is a named L5 term bounded by `disk_budget / blob_threshold` entries.
 //!
 //! Lifecycle sites (ADR-0061 D4): births at `insert_extent`/
-//! `update_extent`/`apply_extent_image`; deaths ride the `note_death`
+//! `update_extent`/`replay_upsert_extent`; deaths ride the `note_death`
 //! routing (the S06/S14 choke point) on its unconditional side;
 //! compaction **moves** the entry before the old address dies — the
 //! count never dips or spikes across a relocation. Reclaim gates on the
@@ -236,7 +236,7 @@ impl ExtentRefs {
         // displace-then-reapply pairing transiently zeroes the extent's
         // count between the two. A park latched at the dip must revoke at
         // re-registration or the boot sweep reclaims a live extent — the
-        // same at-least-once physics that makes `apply_ref` idempotent
+        // same at-least-once physics that makes `replay_ref` idempotent
         // (D4 rule 3), applied to the reclaim queue.
         self.parked.retain(|&(id, _)| id != extent_id);
         self.dequeue(extent_id);

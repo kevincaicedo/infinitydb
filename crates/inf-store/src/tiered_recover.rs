@@ -213,7 +213,7 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "tier ring reservation failed"))?;
     // Live-set seeding (M4-S14, ADR-0058 D4): counts start at zero and
-    // reconstruct through `apply_ref`/`apply_displace` as the checkpoint
+    // reconstruct through `replay_ref`/`replay_displace` as the checkpoint
     // and tail replay run; byte counters restore when the `.ick` 0x04
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);

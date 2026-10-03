@@ -106,12 +106,6 @@ impl TieredTable {
         Ok(new_addr)
     }
 
-    /// Places one extent-referencing record at the tail and registers
-    /// its reference. Charges split per ADR-0061 D8: the **record leg**
-    /// (key + 24-byte reference — what flows through WAL and flush)
-    /// into `user_bytes`; the **blob leg** (the value length) into
-    /// `blob_user_bytes`. The extent's device bytes arrive via
-    /// [`note_blob_bytes`](Self::note_blob_bytes).
     /// The typed length refusals of an extent-reference placement (the
     /// one copy — `append_extent` and boot replay's entry both ask),
     /// answering the record's encoded length: the key bound and the blob
@@ -166,6 +160,12 @@ impl TieredTable {
         })
     }
 
+    /// Places one extent-referencing record at the tail and registers
+    /// its reference. Charges split per ADR-0061 D8: the **record leg**
+    /// (key + 24-byte reference — what flows through WAL and flush)
+    /// into `user_bytes`; the **blob leg** (the value length) into
+    /// `blob_user_bytes`. The extent's device bytes arrive via
+    /// [`note_blob_bytes`](Self::note_blob_bytes).
     fn append_extent(
         &mut self,
         key: &[u8],

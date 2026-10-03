@@ -11,11 +11,11 @@
 //! row joins the S22/S24 campaign per the dev-tier evidence rule):
 //!
 //! - **image row** — a v2 `.ick` of string post-images streamed through
-//!   `read_ick_hybrid` → `TieredTable::apply_image` (decode + CRC +
+//!   `read_ick_hybrid` → `TieredTable::replay_upsert` (decode + CRC +
 //!   re-append + index insert): GB/s over file bytes, the M2 gate's
 //!   currency.
 //! - **ref row** — addr-ref sections streamed through the same loader →
-//!   `apply_ref` (idempotency probe + insert, zero record bytes):
+//!   `replay_ref` (idempotency probe + insert, zero record bytes):
 //!   entries/s. The L4 hypothesis from the ledger: ≥ 20 M entries/s —
 //!   at 14 B/entry the cold *index* of a 10× RAM namespace recovers in
 //!   seconds without touching the cold tier.
@@ -156,7 +156,7 @@ fn bench_refs(n: u64) {
             KeyHasher::default(),
         )
         .expect("ring");
-        // One manifested file covering every ref (M4-S14): `apply_ref`
+        // One manifested file covering every ref (M4-S14): `replay_ref`
         // counts each slot into its containing file, so the bench seeds
         // the catalog the way recovery does — the measured row includes
         // the live-set count maintenance, honestly.

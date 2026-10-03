@@ -18,8 +18,8 @@
 //! identity, not an approximation.
 //!
 //! Recovery (ADR-0058 D4 — revising the plan's lazy-walk sketch): counts
-//! reconstruct exactly *during* recovery — `apply_ref` increments on
-//! actual insert, `apply_displace` decrements on actual removal — and
+//! reconstruct exactly *during* recovery — `replay_ref` increments on
+//! actual insert, `replay_displace` decrements on actual removal — and
 //! serialized byte counters restore under the D5 clamp rules, which only
 //! ever under-count dead. The deletion predicate [`FileLiveSet::is_dead`]
 //! is therefore sound at first serve: it errs toward retention, never
