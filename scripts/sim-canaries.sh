@@ -192,9 +192,13 @@ rows=(
   "inf_canary_replay_no_pad crate-test inf-store lib room_pads_the_hostile_specs_at_the_commit_page"
   # The same plant in the DST's spec-variant class (m4-recovery): a boot
   # at a window below its ring meets a need above its tail and, unpadded,
-  # asks a fifth time — each case (a ring-top pad, a page pad) red.
+  # asks a fifth time. Case (a)'s window is above half its ring, where no
+  # page pad is placed, so this row is red on a ring-top need.
   "inf_canary_replay_no_pad m4-recovery RoomAsks --spec-variant ring-top"
-  "inf_canary_replay_no_pad m4-recovery RoomAsks --spec-variant page"
+  # Case (b)'s answer alone removed — a page pad's need demotes to the
+  # tail, the ring-top pad kept: the page case asks a fifth time on a page
+  # need.
+  "inf_canary_replay_no_page_pad m4-recovery RoomAsks --spec-variant page"
   # ADR-0174 D3: `ColdKey`'s constructor checks nothing — another key's
   # record, a type tag of 0 and a length past the file each parse, and the
   # rebuild answers "distinct" (or `lookup`'s own hash check, in debug)

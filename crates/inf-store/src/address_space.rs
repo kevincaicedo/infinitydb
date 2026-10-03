@@ -589,6 +589,11 @@ impl AddressSpace {
             debug_assert!(pad_need_rel <= rel_tail, "a ring-top pad's need is reachable");
             return Room::Demote(self.addr_at(pad_need_rel));
         }
+        if cfg!(inf_canary_replay_no_page_pad) {
+            // The planted canary removes case (b)'s answer alone: a page
+            // pad's need is answered as a demote to the tail.
+            return Room::Demote(self.addr_at(rel_tail));
+        }
         let to = self.addr_at(self.page_ceil(rel_tail));
         Room::Pad(PadTarget { to, tail, kind: PadKind::Page })
     }
