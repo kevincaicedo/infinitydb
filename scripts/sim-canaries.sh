@@ -249,6 +249,11 @@ rows=(
   # The same plant breaks the barrier arithmetic: a seal the writer made
   # that the boot pipeline's counters do not hold.
   "inf_canary_replay_stall_seal crate-test inf-store test:tiered_replay record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal the counter is the writer's"
+  # The same plant in the DST's spec-variant class, each case: m4-recovery's
+  # boot-file census reads every boot file's footer from the tier directory
+  # — a boot file with the stall reason.
+  "inf_canary_replay_stall_seal m4-recovery SEAL-REASON --spec-variant ring-top"
+  "inf_canary_replay_stall_seal m4-recovery SEAL-REASON --spec-variant page"
   # ADR-0174 D4 skipped: a namespace no manifest section names keeps its
   # dead-life tier files, and the first flush after the boot fails on the
   # existing file (tier creation is `create_new`).

@@ -439,6 +439,7 @@ fn main() {
             // records (the pads are `boot_replay.pads_placed`).
             let mut variant_seeds = 0u64;
             let mut long_records = 0u64;
+            let mut seal_census = inf_sim::SealCensus::default();
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -450,6 +451,7 @@ fn main() {
                 two_crash_skipped += report.two_crash_unit_past_window;
                 variant_seeds += u64::from(report.spec_variant.is_some());
                 long_records += report.long_records_written;
+                seal_census.absorb(report.seal_census);
                 if verify {
                     let twin = run_one(seed);
                     verify_hashes(
@@ -520,7 +522,8 @@ fn main() {
                  releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
                  removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
                  window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
-                 pads placed",
+                 pads placed; boot files censused {} (capacity {} / gap {} / shutdown {} \
+                 seals), {} page pads crossed",
                 boot_replay.demote_steps,
                 boot_replay.tier_bytes,
                 boot_replay.settle_reads,
@@ -528,7 +531,12 @@ fn main() {
                 boot_replay.settled_distinct,
                 boot_replay.deletes_verified,
                 boot_replay.blob_releases,
-                boot_replay.pads_placed
+                boot_replay.pads_placed,
+                seal_census.files,
+                seal_census.capacity_seals,
+                seal_census.gap_seals,
+                seal_census.shutdown_seals,
+                seal_census.page_pads
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -577,8 +585,9 @@ fn main() {
              deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
              released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
              refs removed by a marker ({} skipped: unit past the raised window), spec \
-             variant {:?}: {} pads placed, {} long records written ({} written short), trace \
-             {:#x}",
+             variant {:?}: {} pads placed, {} long records written ({} written short), boot \
+             files censused {} (capacity {} / gap {} / shutdown {} seals), {} page pads \
+             crossed, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -631,6 +640,11 @@ fn main() {
             report.boot_replay.pads_placed,
             report.long_records_written,
             report.long_records_shortened,
+            report.seal_census.files,
+            report.seal_census.capacity_seals,
+            report.seal_census.gap_seals,
+            report.seal_census.shutdown_seals,
+            report.seal_census.page_pads,
             report.trace_hash
         );
         if verify {

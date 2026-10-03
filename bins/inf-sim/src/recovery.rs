@@ -50,10 +50,10 @@ use inf_log::fs::SegmentFs;
 use inf_log::fs::sim::SimDisk;
 use inf_log::manifest::TierNsManifest;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentId, StagingConfig,
-    StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode,
-    decode_record, read_ick_hybrid, read_manifest, tier_extract, tier_frame_offset,
-    tier_frame_span, write_manifest,
+    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SealReason, SegmentId,
+    StagingConfig, StagingRing, SyncIckWriter, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    TierIoMode, decode_record, parse_tier_file_name, probe_tier_file, read_ick_hybrid,
+    read_manifest, tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, EXTENT_REF_LEN, ExtentRef,
@@ -325,6 +325,8 @@ pub struct RecoveryReport {
     pub held_released_by_park: u64,
     /// Boot-sealed files the dead-byte census read (engagement).
     pub boot_files_censused: u64,
+    /// The boot-file census ([`census_boot_files`]), every boot's summed.
+    pub seal_census: SealCensus,
     /// The two-crash row (ADR-0174 I10, the class's last life): keys a
     /// shadow write left beside the ref the checkpoint names them by, the
     /// rows whose ref the demoting boot settled (R8: removed, chained into
@@ -1871,6 +1873,204 @@ fn check_file(
     );
 }
 
+/// One boot-sealed tier file, as its header and footer state it.
+struct BootFile {
+    id: u32,
+    base: u64,
+    len: u64,
+    reason: SealReason,
+}
+
+/// What the boot-file census read ([`census_boot_files`]), summed over the
+/// boots: the files the boots sealed, by the seal that made each, and the
+/// page pads their flushes crossed (engagement, disclosed).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SealCensus {
+    pub files: u64,
+    pub capacity_seals: u64,
+    pub gap_seals: u64,
+    pub shutdown_seals: u64,
+    pub page_pads: u64,
+}
+
+impl SealCensus {
+    /// Adds `other` field by field (a sweep's fold of its seeds).
+    pub fn absorb(&mut self, other: SealCensus) {
+        let SealCensus { files, capacity_seals, gap_seals, shutdown_seals, page_pads } = other;
+        self.files += files;
+        self.capacity_seals += capacity_seals;
+        self.gap_seals += gap_seals;
+        self.shutdown_seals += shutdown_seals;
+        self.page_pads += page_pads;
+    }
+}
+
+/// The boot-file census, per boot (ADR-0174 D2 rules 5 and 6; the record's
+/// §6 second row and §8's seal-reason clause). It reads the tier directory
+/// and each file's header and footer, not the pipeline's catalogue or
+/// counters: every tier file no manifest section names is this boot's, as
+/// the boot removed the dead life's before it wrote (D4). Their count must
+/// be the pipeline's `files_sealed`, and each is judged by the seal that
+/// made it ([`judge_boot_files`]). Returns what it read.
+fn census_boot_files(
+    (disk, shard): (&SimDisk, &Path),
+    tier: &TierNsManifest,
+    space: &inf_store::AddressSpace,
+    counters: &ReplayCounters,
+    report: &mut RecoveryReport,
+    life_index: u64,
+) -> SealCensus {
+    let cold = shard.join("cold");
+    let names = match disk.list_dir(&cold) {
+        Ok(names) => names,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            report.violations.push(format!("life {life_index}: tier directory unreadable: {e}"));
+            return SealCensus::default();
+        }
+    };
+    let mut census = SealCensus::default();
+    let mut files: Vec<BootFile> = Vec::new();
+    for name in names {
+        let Some(id) = parse_tier_file_name(&name) else { continue };
+        if tier.files.iter().any(|m| m.id == id) {
+            continue;
+        }
+        census.files += 1;
+        match probe_tier_file(disk, &cold.join(&name)) {
+            Ok((header, Some(footer))) => files.push(BootFile {
+                id,
+                base: header.identity.base.to_raw(),
+                len: footer.data_len,
+                reason: footer.reason,
+            }),
+            Ok((_, None)) => report.violations.push(format!(
+                "life {life_index}: boot file {id} is not sealed after the hand-over"
+            )),
+            Err(e) => {
+                report
+                    .violations
+                    .push(format!("life {life_index}: boot file {id} unreadable: {e}"));
+            }
+        }
+    }
+    judge_boot_files(&mut files, space, &mut census, report, life_index);
+    if census.files != counters.files_sealed {
+        report.violations.push(format!(
+            "life {life_index}: FILES-SEALED VIOLATION: the tier directory holds {} boot \
+             files, the boot pipeline counted {} sealed",
+            census.files, counters.files_sealed
+        ));
+    }
+    report.trace_hash = hash64(
+        &[census.files.to_le_bytes(), census.page_pads.to_le_bytes()].concat(),
+        report.trace_hash,
+    );
+    census
+}
+
+/// Judges a boot's sealed files in address order, each by the seal that
+/// made it ([`judge_boot_file`]), and counts the page pads among the gaps:
+/// a gap that does not end at a ring top. A ring-top hole or pad ends at
+/// one, a page pad at a page boundary below it, and neither follows the
+/// other (D2 rule 6's proof), so the count is exact for the pads the flush
+/// crossed; a pad still in RAM at the hand-over sealed nothing. The gap
+/// seals are at most ⌈D ÷ ring⌉ + page pads for `D` the span the boot
+/// flushed: one per ring top crossed, one per page pad.
+fn judge_boot_files(
+    files: &mut [BootFile],
+    space: &inf_store::AddressSpace,
+    census: &mut SealCensus,
+    report: &mut RecoveryReport,
+    life_index: u64,
+) {
+    files.sort_unstable_by_key(|f| f.base);
+    let origin = space.life_origin().to_raw();
+    let flushed = space.flushed().to_raw();
+    let ring = space.ring_bytes();
+    let mut end = origin;
+    // Bound: one visit per boot file, then the gap that may end the span.
+    for (i, file) in files.iter().enumerate() {
+        if file.base < end {
+            report.violations.push(format!(
+                "life {life_index}: boot file {} at {} overlaps the range ending at {end}",
+                file.id, file.base
+            ));
+        } else if file.base > end && !(file.base - origin).is_multiple_of(ring) {
+            census.page_pads += 1;
+        }
+        end = file.base + file.len;
+        judge_boot_file(file, files.get(i + 1), flushed, census, report, life_index);
+    }
+    if flushed > end && !(flushed - origin).is_multiple_of(ring) {
+        census.page_pads += 1;
+    }
+    let gap_bound = (flushed - origin).div_ceil(ring) + census.page_pads;
+    if census.gap_seals > gap_bound {
+        report.violations.push(format!(
+            "life {life_index}: FILES-SEALED VIOLATION: {} gap seals, above ⌈{} ÷ {ring}⌉ + {} \
+             page pads",
+            census.gap_seals,
+            flushed - origin,
+            census.page_pads
+        ));
+    }
+}
+
+/// One boot file against its seal. The reason is one the live flush gives
+/// (D2 rule 5): never the stall seal, nor the reseal of a manifested file.
+/// A capacity seal comes before a range that would overflow the file, which
+/// the writer puts at once in a new file at the sealed one's end
+/// (`TierFlush::append_range`): so the successor starts there and the two
+/// hold more than one capacity. A file sealed so may hold as little as a
+/// byte when the range is a whole demote step's span, which is why the
+/// seals are judged pairwise, not as ⌊D ÷ capacity⌋. A gap seal is followed
+/// by a gap; the shutdown seal is the hand-over's, on the last file.
+fn judge_boot_file(
+    file: &BootFile,
+    next: Option<&BootFile>,
+    flushed: u64,
+    census: &mut SealCensus,
+    report: &mut RecoveryReport,
+    life_index: u64,
+) {
+    let (id, end) = (file.id, file.base + file.len);
+    let broken = match file.reason {
+        SealReason::Capacity => {
+            census.capacity_seals += 1;
+            let overflowed =
+                next.is_some_and(|n| n.base == end && file.len + n.len > FILE_CAPACITY);
+            (!overflowed).then(|| {
+                format!(
+                    "boot file {id} sealed at capacity with {} bytes, and no successor at {end} \
+                     took a range that would overflow {FILE_CAPACITY} bytes",
+                    file.len
+                )
+            })
+        }
+        SealReason::RingTopGap => {
+            census.gap_seals += 1;
+            let gap_follows = next.map_or(flushed > end, |n| n.base > end);
+            (!gap_follows)
+                .then(|| format!("boot file {id} sealed for a gap, and none follows {end}"))
+        }
+        SealReason::Shutdown => {
+            census.shutdown_seals += 1;
+            next.map(|_| format!("boot file {id} sealed at the hand-over, below another"))
+        }
+        reason @ (SealReason::Recovered | SealReason::Stall) => {
+            report.violations.push(format!(
+                "life {life_index}: SEAL-REASON VIOLATION: boot file {id} sealed {reason:?}; a \
+                 boot seals only at the capacity target, before a gap and at the hand-over"
+            ));
+            None
+        }
+    };
+    if let Some(broken) = broken {
+        report.violations.push(format!("life {life_index}: FILES-SEALED VIOLATION: {broken}"));
+    }
+}
+
 /// The record bytes boot replay re-appends from a modeled tail: one
 /// record per image or extent reference (header + key + value bytes),
 /// nothing for a marker or a delete.
@@ -2343,6 +2543,15 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
         };
         run.note_boot(&counters, replay_unit, life_index);
+        let census = census_boot_files(
+            (&disk, &shard),
+            &tier,
+            table.space(),
+            &counters,
+            &mut run.report,
+            life_index,
+        );
+        run.report.seal_census.absorb(census);
         if two_crash_life {
             run.settle_two_crash_rows(&table);
         }
