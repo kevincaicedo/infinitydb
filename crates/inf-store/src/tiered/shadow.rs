@@ -1105,6 +1105,29 @@ impl TieredTable {
         if existing + incoming > super::RELOC_ORIGIN_CAP {
             return false;
         }
+        let mut origins = self.remove_cold_slot(hash, cold, case);
+        if chains_self {
+            origins.push((c, self.live.ckpt_begun()));
+        }
+        if !origins.is_empty() {
+            self.reloc_origins.entry((hash, w)).or_default().extend(origins);
+        }
+        true
+    }
+
+    /// Removes the cold slot `(hash, cold)` and attributes its death as
+    /// `case` says (ADR-0174 R8): a ref below the life origin is counted
+    /// and stamped and its blob reference released, no bytes charged; any
+    /// other slot takes its exact death. Returns the slot's own relocation
+    /// origins, which the caller moves to a survivor (a settle) or drops
+    /// with the key (a replayed `DEL`). The one removal both paths share.
+    pub(super) fn remove_cold_slot(
+        &mut self,
+        hash: u64,
+        cold: LogicalAddr,
+        case: SettleCase,
+    ) -> Vec<(u64, u64)> {
+        let c = cold.to_raw();
         self.index.remove(hash, cold);
         match case {
             SettleCase::RefAtBoot => {
@@ -1118,14 +1141,10 @@ impl TieredTable {
             }
             SettleCase::Exact { len } => self.note_death(cold, u64::from(len)),
         }
-        let mut origins = self.reloc_origins.remove(&(hash, c)).unwrap_or_default();
-        if chains_self {
-            origins.push((c, self.live.ckpt_begun()));
+        if self.reloc_origins.is_empty() {
+            return Vec::new();
         }
-        if !origins.is_empty() {
-            self.reloc_origins.entry((hash, w)).or_default().extend(origins);
-        }
-        true
+        self.reloc_origins.remove(&(hash, c)).unwrap_or_default()
     }
 
     /// A slot at `addr` was removed by a verified path (delete,

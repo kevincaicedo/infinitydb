@@ -856,12 +856,9 @@ impl TieredTable {
         let mut removed = self.apply_delete(key, hash);
         for i in 0..r.doomed.len() {
             let (cold, len) = r.doomed[i];
-            self.index.remove(hash, cold);
             self.shadow_note_removed(cold);
-            self.note_death(cold, u64::from(len));
-            if !self.reloc_origins.is_empty() {
-                self.reloc_origins.remove(&(hash, cold.to_raw()));
-            }
+            // The key is deleted: the slot's origins go with it (R6).
+            let _dropped = self.remove_cold_slot(hash, cold, SettleCase::ThisLife { len });
             r.counters.deletes_verified += 1;
             r.counters.settled_same_key += 1;
             removed = true;
