@@ -1142,6 +1142,22 @@ impl Run {
         );
     }
 
+    /// A boot's file census, folded into the report: a page pad where the
+    /// boot's window is not half its ring is a violation, since ADR-0174 D2
+    /// rule 6 needs a record longer than the window less a page, which only
+    /// a window of half the ring admits.
+    fn note_census(&mut self, census: SealCensus, life_index: u64) {
+        let (window, ring) = (self.spec.window(), self.spec.ring());
+        if census.page_pads > 0 && 2 * window != ring {
+            self.report.violations.push(format!(
+                "life {life_index}: {} page pads at a {window}-byte window under a {ring}-byte \
+                 ring: a page pad needs a window of half the ring (ADR-0174 D2 rule 6)",
+                census.page_pads
+            ));
+        }
+        self.report.seal_census.absorb(census);
+    }
+
     /// The two-crash row's first half (ADR-0174 I10): up to eight keys the
     /// published checkpoint names by a ref, still slotted at that ref,
     /// take a shadow write — the record appends with no marker and the ref
@@ -2551,7 +2567,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             &mut run.report,
             life_index,
         );
-        run.report.seal_census.absorb(census);
+        run.note_census(census, life_index);
         if two_crash_life {
             run.settle_two_crash_rows(&table);
         }
@@ -2687,24 +2703,31 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             replay.deletes_verified
         ));
     }
-    // The spec-variant class's engagement, per seed (ADR-0174 D2 rule 6):
-    // a life above the boot's window, a boot that demoted, and a pad
-    // placed — the case the class exists to reach.
-    if let Some(variant) = spec.variant
-        && (run.report.replay_above_window_lives == 0
-            || replay.demote_steps == 0
-            || replay.pads_placed == 0)
-    {
-        run.report.violations.push(format!(
-            "SPEC-VARIANT VACUOUS ({variant:?}): {} lives above the {}-byte window, {} demote \
-             steps, {} pads placed, {} long records written ({} written short)",
-            run.report.replay_above_window_lives,
-            spec.window(),
-            replay.demote_steps,
-            replay.pads_placed,
-            run.report.long_records_written,
-            run.report.long_records_shortened
-        ));
+    // The spec-variant class's engagement, per seed and per case (ADR-0174
+    // D2 rule 6): a life above the boot's window, a boot that demoted, and
+    // a pad of the case's own kind. Case (b)'s are the page pads the
+    // boot-file census found among the gaps the flushes crossed. Case (a)'s
+    // window is above half its ring, where `note_census` refuses a page
+    // pad, so every pad it placed is a ring-top pad.
+    if let Some(variant) = spec.variant {
+        let own_pads = match variant {
+            SpecVariant::RingTop => replay.pads_placed,
+            SpecVariant::Page => run.report.seal_census.page_pads,
+        };
+        if run.report.replay_above_window_lives == 0 || replay.demote_steps == 0 || own_pads == 0 {
+            run.report.violations.push(format!(
+                "SPEC-VARIANT VACUOUS ({variant:?}): {} lives above the {}-byte window, {} \
+                 demote steps, {own_pads} pads of the case's kind ({} pads placed, {} page pads \
+                 crossed), {} long records written ({} written short)",
+                run.report.replay_above_window_lives,
+                spec.window(),
+                replay.demote_steps,
+                replay.pads_placed,
+                run.report.seal_census.page_pads,
+                run.report.long_records_written,
+                run.report.long_records_shortened
+            ));
+        }
     }
     run.report.state_hash = run.report.state.value();
     run.report
