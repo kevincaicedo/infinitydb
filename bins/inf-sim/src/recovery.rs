@@ -41,8 +41,10 @@ use std::path::{Path, PathBuf};
 
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::time::Nanos;
 use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, open_extent, unlink_extent_file};
 use inf_log::ckpt::{IckReaderConfig, ick_file_name};
+use inf_log::flush::HandedOver;
 use inf_log::flush::{TierFileMeta, unlink_tier_file};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::sim::SimDisk;
@@ -55,9 +57,10 @@ use inf_log::{
 };
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, EXTENT_REF_LEN, ExtentRef,
-    KeyHasher, KeyWindow, LogicalAddr, SettleProgress, TieredLookup, TieredTable,
-    apply_blob_ref_section, apply_live_set_section, apply_ref_section, forced_collision_pair,
-    recover_tiered_ns,
+    FsyncClass, KeyHasher, KeyWindow, Keyspace, LogicalAddr, NsMode, NsSpec, ReplayCounters,
+    ReplaySpill, Room, SettleProgress, StoreConfig, TierReplay, TierSpec, TieredLookup,
+    TieredTable, WallAnchor, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
+    forced_collision_pair, recover_tiered_ns,
 };
 
 const NS: NsId = NsId(88);
@@ -79,12 +82,13 @@ pub struct RecoveryScenario {
     pub lives: u64,
     /// Mutations per life phase.
     pub ops_per_phase: u64,
-    /// FCR-STTIER-01 (ADR-0174 D1): before each cut, fill the tail with
-    /// distinct keys until the bytes replay re-appends reach a multiple
-    /// of the window drawn from DRR FCR-STTIER-01 §6's first row, so the
-    /// boot must demote during replay. `--replay-above-window` forces the
-    /// regime on any seed; a run under it that never exceeded a window
-    /// reports `VACUOUS`.
+    /// The replay-above-window seed class (ADR-0174 D1), one seed in
+    /// four: before each cut, tiered writes fill the tail until the bytes
+    /// the next boot re-appends reach a multiple of the window, so the
+    /// boot must demote during replay (`Run::fill_replay_unit`).
+    /// `--replay-above-window` forces the class on any seed; a run in it
+    /// that never exceeded a window, or whose boots never demoted, reports
+    /// `VACUOUS`.
     pub replay_above_window: bool,
 }
 
@@ -101,7 +105,7 @@ impl RecoveryScenario {
             keys: 800,
             lives: 4,
             ops_per_phase: 480,
-            replay_above_window: false,
+            replay_above_window: seed % 4 == 1,
         }
     }
 }
@@ -177,11 +181,26 @@ pub struct RecoveryReport {
     /// lives): legitimately absent after the boot, the key serves its
     /// image — disclosed, never a pass on its own.
     pub shadow_held_not_restored: u64,
-    /// FCR-STTIER-01 (ADR-0174 D1): lives whose replay unit — the tail's
-    /// record bytes since the last publish — exceeded the RAM window, and
-    /// the largest such unit in window multiples (engagement, disclosed).
+    /// ADR-0174 D1: lives whose replay unit — the published checkpoint's
+    /// images and the tail's records — exceeded the RAM window, and the
+    /// largest unit in window multiples (engagement, disclosed).
     pub replay_above_window_lives: u64,
     pub replay_unit_windows_max: u64,
+    /// Boots that demoted, boots whose unit fit by construction (each
+    /// checked to leave the zero set at zero), boot replay's counters
+    /// summed over every boot, and the live writes that parked on MAINTAIN
+    /// because the window was full (ADR-0174 D6, §2).
+    pub demoting_boots: u64,
+    pub fitting_boots_checked: u64,
+    pub boot_replay: ReplayCounters,
+    pub writer_parks: u64,
+    /// Parked writes a checkpoint walk's release pin kept waiting past the
+    /// harness's walk slice — dropped unacknowledged.
+    pub writes_parked_past_a_walk: u64,
+    /// Held tickets whose injected read error a parked write cleared.
+    pub held_released_by_park: u64,
+    /// Boot-sealed files the dead-byte census read (engagement).
+    pub boot_files_censused: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -210,6 +229,160 @@ struct Life {
     ring: StagingRing,
     /// Suppress demotion during the walk (the flush-lag class).
     flush_lag: bool,
+}
+
+/// The replay clock and wall anchor at boot (tiered records carry no
+/// expiry, so neither decides anything here).
+const BOOT_NOW: Nanos = Nanos(1);
+const BOOT_ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
+
+/// The seam the recovery driver lends (ADR-0174 D1): the namespace's
+/// boot machine, reached by `Keyspace::apply_record` only.
+struct Lent {
+    machine: TierReplay<SimDisk>,
+}
+
+impl ReplaySpill for Lent {
+    type Fs = SimDisk;
+
+    fn replay_mut(&mut self, ns: NsId) -> Option<&mut TierReplay<SimDisk>> {
+        (ns == NS).then_some(&mut self.machine)
+    }
+}
+
+/// One booting cell as the server's recovery driver holds it: the
+/// recovered table inside a keyspace and the namespace's machine lent
+/// through the seam, so every checkpoint image and tail record enters
+/// through `Keyspace::apply_record` — the shipped dispatcher, never a
+/// copy of it.
+struct Booting {
+    ks: Keyspace,
+    lent: Lent,
+}
+
+impl Booting {
+    fn new(table: TieredTable, machine: TierReplay<SimDisk>, hasher: KeyHasher) -> Booting {
+        let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
+        ks.ns_create(NsSpec {
+            id: NS,
+            name: b"tiered-88".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Everysec),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(4 << 20)),
+        })
+        .expect("create the tiered namespace");
+        // The harness's table keeps its own knobs (budget, blob, shadow).
+        *ks.tiered_store_mut(NS).expect("materialized") = table;
+        Booting { ks, lent: Lent { machine } }
+    }
+
+    fn table(&self) -> &TieredTable {
+        self.ks.tiered_store(NS).expect("materialized")
+    }
+
+    fn table_mut(&mut self) -> &mut TieredTable {
+        self.ks.tiered_store_mut(NS).expect("materialized")
+    }
+
+    /// The checkpoint (ADR-0057 D6 step 3): images through the dispatcher,
+    /// the ref, live-set and blob-reference sections onto the table, then
+    /// the end of the checkpoint (ADR-0174 R9).
+    fn load_checkpoint(&mut self, disk: &SimDisk, ick: &Path, flushed: u64) -> Result<(), String> {
+        let node = std::cell::RefCell::new(&mut *self);
+        read_ick_hybrid(
+            disk,
+            ick,
+            IckReaderConfig::default(),
+            |record| {
+                let mut node = node.borrow_mut();
+                let Booting { ks, lent } = &mut **node;
+                ks.apply_record(&record, BOOT_NOW, BOOT_ANCHOR, lent)
+                    .map(|_| ())
+                    .map_err(|e| format!("image: {e:?}"))
+            },
+            |section| {
+                apply_ref_section(node.borrow_mut().table_mut(), &section, flushed)
+                    .map_err(|e| format!("refs: {e}"))
+            },
+            |section| {
+                apply_live_set_section(node.borrow_mut().table_mut(), &section);
+                Ok(())
+            },
+            |section| {
+                apply_blob_ref_section(node.borrow_mut().table_mut(), &section);
+                Ok(())
+            },
+            |_| Err("an index-sidecar section in this image".to_owned()),
+        )
+        .map_err(|e| format!("checkpoint load failed: {e:?}"))?;
+        let Booting { ks, lent } = self;
+        lent.machine.end_of_checkpoint(ks.tiered_store_mut(NS).expect("materialized"));
+        Ok(())
+    }
+
+    /// The tail (ADR-0174 D3): every record through the dispatcher — the
+    /// keyspace parks each marker until its mutation, which drains it
+    /// after the room question and a `DEL`'s reads.
+    fn replay_tail(&mut self, tail: &[u8]) -> Result<(), String> {
+        let mut rest = tail;
+        while !rest.is_empty() {
+            let (record, consumed) = decode_record(rest).expect("tail records decode");
+            match record {
+                RecordView::ColdDisplace { .. }
+                | RecordView::StringPostImage { .. }
+                | RecordView::StringExtentRef { .. }
+                | RecordView::Delete { .. } => {}
+                other @ (RecordView::ExpireAt { .. }
+                | RecordView::NsOp { .. }
+                | RecordView::CkptBegin { .. }
+                | RecordView::DocDelta { .. }
+                | RecordView::DocFull { .. }) => {
+                    return Err(format!("modeled tail carries {other:?}"));
+                }
+            }
+            self.ks
+                .apply_record(&record, BOOT_NOW, BOOT_ANCHOR, &mut self.lent)
+                .map_err(|e| format!("tail record: {e:?}"))?;
+            rest = &rest[consumed..];
+        }
+        match self.ks.displace_register_len() {
+            0 => Ok(()),
+            n => Err(format!("the tail ends with {n} unpaired displacement markers")),
+        }
+    }
+
+    /// The end of replay (ADR-0174 R10): a boot that demoted settles every
+    /// RAM record it has not sealed; ADR-0093's rebuild settles through
+    /// the machine's read (the held handle, the key window); then the
+    /// hand-over, and the table leaves the keyspace for the life.
+    fn finish(
+        mut self,
+        settled_at_boot: &mut u64,
+    ) -> Result<(TieredTable, HandedOver<SimDisk>, ReplayCounters), String> {
+        let Booting { ks, lent } = &mut self;
+        let table = ks.tiered_store_mut(NS).expect("materialized");
+        let machine = &mut lent.machine;
+        machine.end_of_replay(table);
+        while machine.settle_step(table, PAGE).map_err(|e| format!("end settle: {e}"))?
+            == SettleProgress::More
+        {}
+        table
+            .rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
+                let window = machine
+                    .read_key_window(slot.cold)
+                    .map_err(|e| format!("unreadable while its slot is live: {e}"))?;
+                *settled_at_boot += 1;
+                Ok(KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
+            })
+            .map_err(|e| e.to_string())?;
+        let Booting { mut ks, lent } = self;
+        let table = ks.tiered_store_mut(NS).expect("materialized");
+        let done = lent.machine.hand_over(table).map_err(|e| format!("hand-over: {e}"))?;
+        let table = std::mem::replace(table, tiered_table(0, table.hasher()));
+        Ok((table, done.handed, done.counters))
+    }
 }
 
 fn tiered_table(origin: u64, hasher: KeyHasher) -> TieredTable {
@@ -321,6 +494,17 @@ fn crafted_keys(seed: u64) -> Vec<[u8; 48]> {
 /// Tag spread for the crafted pairs (four unrelated pairs per seed).
 const P_TAG: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// The slack a replay unit leaves the window for the boot to fit by
+/// construction: the page rounding at both ends and a ring-top hole under
+/// the longest record the op mix places (an inline value under the blob
+/// threshold, a key of at most 64 bytes).
+const FIT_MARGIN_BYTES: u64 = 2 * PAGE + 1024;
+
+/// Maintain rounds a parked live write waits through before the harness
+/// calls it refused: each round demotes until it makes no progress, so
+/// one frees the window above the budget; the rest are margin.
+const PARK_ROUNDS_MAX: u32 = 4;
+
 struct Run {
     disk: SimDisk,
     shard: PathBuf,
@@ -340,6 +524,12 @@ struct Run {
     held_twin: Option<u64>,
     /// The held ticket's key and hash (diagnostics for the A12 row).
     held_key: Option<(Vec<u8>, u64)>,
+    /// The record bytes of the images the last published checkpoint
+    /// holds, and of the walk in progress: with the tail's, the bytes the
+    /// next boot re-appends — the harness's own measure of the replay
+    /// unit, independent of the table (ADR-0174 D6's control leg).
+    published_image_bytes: u64,
+    walk_image_bytes: u64,
     report: RecoveryReport,
 }
 
@@ -800,16 +990,16 @@ impl Run {
         read_cold(&self.disk, flush, addr, usize::try_from(len).expect("chunk fits"))
     }
 
-    /// One live-path mutation, recorded into the modeled tail with its
-    /// displacement marker (ADR-0057 D4 — unconditional for displacing
-    /// mutations).
-    /// FCR-STTIER-01 (ADR-0174 D1): the replay-above-window regime. Fills
-    /// the tail with distinct inline keys (values under the harness's
-    /// blob threshold), demoted live as a running node would, until the
-    /// record bytes replay re-appends from the tail reach a multiple of
-    /// the window drawn from DRR FCR-STTIER-01 §6's first row (window −
-    /// 1 page, the window, window + 1 page, 3 ×, 16 ×); counts the life
-    /// when the unit exceeds the window.
+    /// The replay-above-window seed class (ADR-0174 D1): before the cut,
+    /// tiered writes fill the tail until the record bytes the next boot
+    /// re-appends — the published checkpoint's images and the tail's
+    /// records — reach a multiple of the window drawn from the hostile row
+    /// (window − 1 page, the window, window + 1 page, 3 ×, 16 ×), demoted
+    /// live as a running node would. The mix: fresh keys with values drawn
+    /// from the record-length row (a 1-byte key and value, a typical value,
+    /// the inline maximum), rewrites of fill keys at distances under and
+    /// over a window, deletes, and shadow writes over demoted keys. Counts
+    /// the life when the unit exceeds the window.
     fn fill_replay_unit(&mut self, life: &mut Life, rng: &mut SplitMix64, life_index: u64) {
         let window = demote().mem_budget_bytes + demote().slice_bytes;
         let target = match rng.next_u64() % 8 {
@@ -819,23 +1009,35 @@ impl Run {
             4..=6 => 3 * window,
             _ => 16 * window,
         };
-        let value = vec![0xF1u8; BLOB_THRESHOLD as usize - 56];
-        let mut unit = tail_record_bytes(&self.tail);
+        // The held ticket's injected read error clears: its winner pins
+        // release (ADR-0093 D3), and a window's worth of writes behind a
+        // pin the reconciler can never lift would stall every writer, as
+        // the plane's would until its stall timeout.
+        self.held_twin = None;
+        let mut unit = self.replay_unit_bytes();
+        let mut fill: Vec<Vec<u8>> = Vec::new();
         let mut i = 0u64;
+        // Bound: each op appends a record or deletes one of the fill's
+        // keys; one op in eight deletes, so the unit grows by at least a
+        // record per eight ops until it reaches the target.
         while unit < target {
-            let key = format!("spill:{life_index:02}:{i:06}").into_bytes();
-            unit += (TieredTable::RECORD_HEADER_LEN + key.len() + value.len()) as u64;
-            self.apply_op(life, &key, Op::Set(value.clone()));
+            let before = self.tail.len();
+            let (key, op) = fill_op(rng, &fill, life_index, i);
+            if !fill.contains(&key) {
+                fill.push(key.clone());
+            }
+            self.apply_op(life, &key, op);
+            unit += tail_record_bytes(&self.tail[before..]);
             i += 1;
             if i.is_multiple_of(64) {
                 self.maintain(life);
             }
         }
         self.maintain(life);
-        debug_assert_eq!(unit, tail_record_bytes(&self.tail), "the fill's own count");
+        debug_assert_eq!(unit, self.replay_unit_bytes(), "the fill's own count");
         eprintln!(
             "inf-sim: m4-recovery life {life_index}: replay unit {unit} bytes, {} window(s) of \
-             {window} (target {target})",
+             {window} (target {target}, {i} ops)",
             unit.div_ceil(window)
         );
         self.report.replay_unit_windows_max =
@@ -845,7 +1047,118 @@ impl Run {
         }
     }
 
+    /// One live-path mutation, recorded into the modeled tail with its
+    /// displacement marker (ADR-0057 D4 — unconditional for displacing
+    /// mutations).
+    /// The plane's park on a full window, played here: a write the
+    /// window cannot place waits for MAINTAIN's cycle — the reconciler,
+    /// then demotion — and is then retried; the shape every live write
+    /// meets after a boot that demoted, whose window is full by
+    /// construction (ADR-0174 §2). The harness asks before it resolves,
+    /// so nothing of the op is staged while it waits. Under a checkpoint
+    /// walk release stops at the walk's watermark, so a write that still
+    /// finds no room waits for the walk's end: the harness, which runs the
+    /// walk's slices itself, drops the op unacknowledged (the model never
+    /// saw it). Outside a walk, no room after [`PARK_ROUNDS_MAX`] rounds is
+    /// a violation (the live path would answer its stall timeout). Returns
+    /// whether the op may proceed.
+    fn park_for_room(&mut self, life: &mut Life, len: usize) -> bool {
+        for round in 0..PARK_ROUNDS_MAX {
+            if matches!(life.table.space().room(len), Room::Fits) {
+                return true;
+            }
+            self.report.writer_parks += 1;
+            // A pinned twin holds release back (ADR-0093 D3): the
+            // reconciler resolves open tickets before demotion runs.
+            if round > 0 {
+                self.reconcile(life, 16, "park");
+            }
+            self.maintain(life);
+        }
+        if matches!(life.table.space().room(len), Room::Fits) {
+            return true;
+        }
+        // The held ticket's injected read error clears: its winner pins
+        // release, and a full window behind a pin the reconciler can
+        // never lift would stall every writer (the plane's, until its
+        // stall timeout). The held row counts only a ticket open at the
+        // cut, so this life's row reports nothing.
+        if self.held_twin.take().is_some() {
+            self.report.held_released_by_park += 1;
+            // Rounds, not `reconcile_all`: under a pinned walk a verified
+            // ticket settles only once the walk ends (ADR-0093 D5).
+            for _ in 0..PARK_ROUNDS_MAX {
+                self.reconcile(life, 16, "park");
+            }
+            self.maintain(life);
+            if matches!(life.table.space().room(len), Room::Fits) {
+                return true;
+            }
+        }
+        if life.table.space().walk_watermark().is_some() {
+            self.report.writes_parked_past_a_walk += 1;
+            return false;
+        }
+        let space = life.table.space();
+        self.report.violations.push(format!(
+            "a live write of {len} bytes found no room after {PARK_ROUNDS_MAX} maintain rounds \
+             ({:?}; head {} flushed {} tail {}, pin {:?}, {} tickets open)",
+            space.room(len),
+            space.head().to_raw(),
+            space.flushed().to_raw(),
+            space.tail().to_raw(),
+            space.record_pin(),
+            life.table.shadow_pending()
+        ));
+        false
+    }
+
+    /// The bytes the next boot re-appends: the published checkpoint's
+    /// images and the tail's records (no bytes for a marker or a delete).
+    fn replay_unit_bytes(&self) -> u64 {
+        self.published_image_bytes + tail_record_bytes(&self.tail)
+    }
+
+    /// A boot's ADR-0174 D6 counters against the unit the harness knows
+    /// it replayed — the control leg of the falsifier, both directions: a
+    /// unit above the window must demote; one that fits with room for the
+    /// page rounding and a ring-top hole must leave the zero set at zero.
+    /// Folded into the report and the trace.
+    fn note_boot(&mut self, counters: &ReplayCounters, unit: u64, life_index: u64) {
+        let window = demote().mem_budget_bytes + demote().slice_bytes;
+        if unit > window && counters.demote_steps == 0 {
+            self.report.violations.push(format!(
+                "life {life_index}: a replay unit of {unit} bytes above the {window}-byte window \
+                 booted without a demote step ({counters:?})"
+            ));
+        }
+        if unit + FIT_MARGIN_BYTES <= window && !counters.zero_set_is_zero() {
+            self.report.violations.push(format!(
+                "life {life_index}: a replay unit of {unit} bytes fits the {window}-byte window \
+                 but the zero set moved ({counters:?})"
+            ));
+        }
+        let r = &mut self.report;
+        r.demoting_boots += u64::from(counters.demote_steps > 0);
+        r.fitting_boots_checked += u64::from(unit + FIT_MARGIN_BYTES <= window);
+        r.boot_replay.absorb(*counters);
+        r.trace_hash = hash64(
+            &[counters.demote_steps.to_le_bytes(), counters.tier_bytes.to_le_bytes()].concat(),
+            r.trace_hash,
+        );
+    }
+
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
+        let record_len = TieredTable::RECORD_HEADER_LEN
+            + key.len()
+            + match &op {
+                Op::Set(value) | Op::SetShadow(value) => value.len(),
+                Op::SetBlob(_) => EXTENT_REF_LEN,
+                Op::Del => 0,
+            };
+        if !matches!(op, Op::Del) && !self.park_for_room(life, record_len) {
+            return;
+        }
         let hash = life.table.hash_key(key);
         if key.starts_with(inf_store::COLLISION_KEY_PREFIX) {
             self.report.shadow_collide_ops += 1;
@@ -1246,32 +1559,54 @@ fn check_blob_refs(run: &mut Run, life: &mut Life, listed: &[u64], life_index: u
 }
 
 /// The M4-S14 post-recovery consistency oracle: enumerate the recovered
-/// index through a pinned walk (nothing has flushed in the new life, so
-/// every pre-life slot emits as a ref), bucket slots by manifested file,
-/// and require the live-set counts to match exactly; byte counters obey
-/// the sound-direction rule (`dead ≤ len`; byte-exact means fully dead).
+/// index through a pinned walk (every slot below the walk watermark emits
+/// as a ref) and bucket the slots by catalogue file. A recovered file's
+/// slot count must equal its bucket exactly, and its byte counters obey the
+/// sound-direction rule (`dead ≤ len`; restored byte-exact means fully
+/// dead). A file a demoting boot sealed (ADR-0174 D5) answers by bytes:
+/// byte-exact, its live bytes equal to the lengths of the records its
+/// slots name, read from the tier bytes — the dead-byte census. A boot
+/// that wrote no tier file walks from the manifested watermark; one that
+/// demoted, from at or above it.
 fn check_live_set(
     table: &mut TieredTable,
     tier: &TierNsManifest,
+    (disk, flush): (&SimDisk, &TierFlush<SimDisk>),
     walk_id: u64,
     report: &mut RecoveryReport,
     life_index: u64,
 ) {
-    let mut truth: BTreeMap<u32, u64> = BTreeMap::new();
+    let catalogue = flush.sealed();
+    let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut live_bytes: BTreeMap<u32, u64> = BTreeMap::new();
     let w = table.begin_ckpt_walk(walk_id).to_raw();
-    if w != tier.flushed {
-        report.violations.push(format!("life {life_index}: new life not at the watermark"));
+    let boot_files = catalogue.iter().any(|f| tier.files.iter().all(|m| m.id != f.id));
+    if (!boot_files && w != tier.flushed) || w < tier.flushed {
+        report.violations.push(format!(
+            "life {life_index}: new life walks from {w}, the manifested watermark is {} (boot \
+             files: {boot_files})",
+            tier.flushed
+        ));
     }
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<u64> = Vec::new();
         cursor = table.ckpt_walk_slice(cursor, 256, |_, addr| refs.push(addr.to_raw()), |_| {});
         for addr in refs {
-            match tier.files.iter().find(|f| addr >= f.base && addr < f.base + f.durable_len) {
-                Some(range) => *truth.entry(range.id).or_default() += 1,
-                None => report
+            let base = |f: &TierFileMeta| f.base.to_raw();
+            let Some(file) =
+                catalogue.iter().find(|f| addr >= base(f) && addr < base(f) + f.data_len)
+            else {
+                report
                     .violations
-                    .push(format!("life {life_index}: slot {addr} outside every manifested file")),
+                    .push(format!("life {life_index}: slot {addr} outside every catalogue file"));
+                continue;
+            };
+            *counts.entry(file.id).or_default() += 1;
+            if tier.files.iter().all(|m| m.id != file.id) {
+                let head = read_cold(disk, flush, addr, TieredTable::RECORD_HEADER_LEN);
+                let len = head.map_or(0, |h| TieredTable::record_len_from_header(&h) as u64);
+                *live_bytes.entry(file.id).or_default() += len;
             }
         }
         if cursor == 0 {
@@ -1280,17 +1615,30 @@ fn check_live_set(
     }
     table.end_ckpt_walk();
     for f in table.live_set().files() {
-        let want = truth.get(&f.id).copied().unwrap_or(0);
+        check_file(f, &counts, &live_bytes, report, life_index);
+    }
+}
+
+/// One live-set file against the walk's buckets (see [`check_live_set`]).
+fn check_file(
+    f: &inf_store::FileLiveSet,
+    counts: &BTreeMap<u32, u64>,
+    live_bytes: &BTreeMap<u32, u64>,
+    report: &mut RecoveryReport,
+    life_index: u64,
+) {
+    let want = counts.get(&f.id).copied().unwrap_or(0);
+    if f.dead_bytes > f.data_len {
+        report.violations.push(format!(
+            "life {life_index}: file {} dead {} exceeds its {} bytes",
+            f.id, f.dead_bytes, f.data_len
+        ));
+    }
+    if f.recovered {
         if f.live_count != want {
             report.violations.push(format!(
                 "life {life_index}: file {} live count {} but the index holds {want}",
                 f.id, f.live_count
-            ));
-        }
-        if f.dead_bytes > f.data_len {
-            report.violations.push(format!(
-                "life {life_index}: file {} dead {} exceeds its {} bytes",
-                f.id, f.dead_bytes, f.data_len
             ));
         }
         if f.byte_exact && f.dead_bytes != f.data_len {
@@ -1299,16 +1647,24 @@ fn check_live_set(
                 f.id
             ));
         }
-        report.trace_hash = hash64(
-            &[
-                u64::from(f.id).to_le_bytes(),
-                f.live_count.to_le_bytes(),
-                f.dead_bytes.to_le_bytes(),
-            ]
-            .concat(),
-            report.trace_hash,
-        );
+    } else {
+        let live = live_bytes.get(&f.id).copied().unwrap_or(0);
+        if !f.byte_exact || f.data_len - f.dead_bytes.min(f.data_len) != live {
+            report.violations.push(format!(
+                "life {life_index}: boot file {} (byte-exact {}) has {} live bytes by its \
+                 counters, {live} by its slots",
+                f.id,
+                f.byte_exact,
+                f.data_len - f.dead_bytes.min(f.data_len)
+            ));
+        }
+        report.boot_files_censused += 1;
     }
+    report.trace_hash = hash64(
+        &[u64::from(f.id).to_le_bytes(), f.live_count.to_le_bytes(), f.dead_bytes.to_le_bytes()]
+            .concat(),
+        report.trace_hash,
+    );
 }
 
 /// The record bytes boot replay re-appends from a modeled tail: one
@@ -1337,6 +1693,31 @@ fn tail_record_bytes(tail: &[u8]) -> u64 {
         rest = &rest[consumed..];
     }
     bytes
+}
+
+/// One op of the replay-above-window fill: a fresh key (one in sixteen a
+/// 1-byte key) or, once the fill has keys, a rewrite of a recent one (a
+/// distance under a window), a rewrite or a shadow write of an early one
+/// (over a window: demoted by now), or a delete.
+fn fill_op(rng: &mut SplitMix64, fill: &[Vec<u8>], life_index: u64, i: u64) -> (Vec<u8>, Op) {
+    let value_len = match rng.next_u64() % 8 {
+        0 => 1,
+        1 => BLOB_THRESHOLD as usize - 1,
+        _ => 24 + (rng.next_u64() % 140) as usize,
+    };
+    let value = vec![(rng.next_u64() % 251) as u8; value_len];
+    let count = fill.len() as u64;
+    let recent =
+        |rng: &mut SplitMix64| fill[(count - 1 - rng.next_u64() % count.min(32)) as usize].clone();
+    let early = |rng: &mut SplitMix64| fill[(rng.next_u64() % count.div_ceil(4)) as usize].clone();
+    match rng.next_u64() % 16 {
+        0 | 1 if count > 0 => (early(rng), Op::Del),
+        2 | 3 if count > 0 => (recent(rng), Op::Set(value)),
+        4 | 5 if count > 64 => (early(rng), Op::SetShadow(value)),
+        6 if count > 64 => (early(rng), Op::Set(value)),
+        7 => (vec![b'!' + (rng.next_u64() % 64) as u8], Op::Set(vec![0x31])),
+        _ => (format!("spill:{life_index:02}:{i:06}").into_bytes(), Op::Set(value)),
+    }
 }
 
 fn seeded_op(rng: &mut SplitMix64) -> Op {
@@ -1378,6 +1759,8 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         pending_unlink: Vec::new(),
         held_twin: None,
         held_key: None,
+        published_image_bytes: 0,
+        walk_image_bytes: 0,
         report: RecoveryReport::default(),
     };
     let mut life = Life {
@@ -1463,6 +1846,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // the publish lands (cut-before-publish keeps it — D7).
         let cut_before_publish = life_index > 0 && rng.next_u64().is_multiple_of(4);
         let covered = run.tail.len();
+        run.walk_image_bytes = 0;
         let w = life.table.begin_ckpt_walk(ckpt_id + 1).to_raw();
         let begin_lsn = Lsn::new(SegmentId(u32::try_from(life_index + 1).expect("small")), 64);
         let mut writer = SyncIckWriter::create_v2(
@@ -1511,6 +1895,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                     run.report.refs_emitted += 1;
                 }
                 for (key, value, ext) in images {
+                    let value_len = ext.map_or(value.len(), |_| EXTENT_REF_LEN);
+                    run.walk_image_bytes +=
+                        (TieredTable::RECORD_HEADER_LEN + key.len() + value_len) as u64;
                     match ext {
                         // M4-S17 (ADR-0061 D2): resident extent records
                         // image as tag-9 — the reference, never the value.
@@ -1628,6 +2015,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
             // WAL truncation (D7): drop exactly the covered prefix.
             run.tail.drain(..covered);
+            run.published_image_bytes = run.walk_image_bytes;
             // In-life dangling oracle: every model key still serves with
             // the retired files gone (a slot naming a detached file
             // surfaces here as a read failure, before any crash).
@@ -1700,160 +2088,27 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 return run.report;
             }
         };
-        let table = std::cell::RefCell::new(recovered.table);
-        let replay = std::cell::RefCell::new(recovered.replay);
-        let ick = shard.join(ick_file_name(manifest.ckpt_id));
-        let loaded = read_ick_hybrid(
-            &disk,
-            &ick,
-            IckReaderConfig::default(),
-            |record| {
-                match record {
-                    RecordView::StringPostImage { key, value, .. } => {
-                        let hash = hasher.hash(key);
-                        table
-                            .borrow_mut()
-                            .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                            .expect("fits");
-                    }
-                    RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                        let hash = hasher.hash(key);
-                        let ext = ExtentRef { extent_id, offset, len };
-                        table
-                            .borrow_mut()
-                            .replay_upsert_extent(
-                                Some(&mut *replay.borrow_mut()),
-                                &[],
-                                key,
-                                hash,
-                                ext,
-                            )
-                            .expect("fits");
-                    }
-                    RecordView::Delete { .. }
-                    | RecordView::ExpireAt { .. }
-                    | RecordView::NsOp { .. }
-                    | RecordView::CkptBegin { .. }
-                    | RecordView::DocDelta { .. }
-                    | RecordView::DocFull { .. }
-                    | RecordView::ColdDisplace { .. } => {}
-                }
-                Ok::<(), std::convert::Infallible>(())
-            },
-            |section| {
-                apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed)
-                    .expect("refs inside the unit");
-                Ok(())
-            },
-            |section| {
-                apply_live_set_section(&mut table.borrow_mut(), &section);
-                Ok(())
-            },
-            |section| {
-                apply_blob_ref_section(&mut table.borrow_mut(), &section);
-                Ok(())
-            },
-            |_| panic!("no index-sidecar sections in this image"),
-        );
-        if let Err(e) = loaded {
-            run.report.violations.push(format!("checkpoint load failed: {e:?}"));
-            run.report.state_hash = run.report.state.value();
-            return run.report;
-        }
-        let mut table = table.into_inner();
-        let mut replay = replay.into_inner();
-        replay.end_of_checkpoint(&mut table);
-        run.report.state.number(b"checkpoint-loaded", life_index);
-        run.report.state.digest(table.simulation_digest());
-        table.set_shadow_enabled(true);
-        // D3 tail replay (ADR-0174): displacement markers pair with their
-        // mutation — a bounded list since ADR-0059 D9 (origin markers
-        // stack atop the ordinary one) — and hand to the replay entry,
-        // which drains them after its room question and a `DEL`'s reads.
-        let mut rest: &[u8] = &run.tail;
-        let mut pending: Vec<LogicalAddr> = Vec::new();
-        while !rest.is_empty() {
-            let (record, consumed) = decode_record(rest).expect("tail records decode");
-            match record {
-                RecordView::ColdDisplace { old_addr, .. } => {
-                    pending.push(LogicalAddr::from_raw(old_addr).expect("48-bit"));
-                    assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
-                }
-                RecordView::StringPostImage { key, value, .. } => {
-                    let hash = table.hash_key(key);
-                    table
-                        .replay_upsert(Some(&mut replay), &pending, key, value, hash)
-                        .expect("fits");
-                    pending.clear();
-                }
-                RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                    let hash = table.hash_key(key);
-                    let ext = ExtentRef { extent_id, offset, len };
-                    table
-                        .replay_upsert_extent(Some(&mut replay), &pending, key, hash, ext)
-                        .expect("fits");
-                    pending.clear();
-                }
-                RecordView::Delete { key, .. } => {
-                    let hash = table.hash_key(key);
-                    table.replay_delete(Some(&mut replay), &pending, key, hash).expect("fits");
-                    pending.clear();
-                }
-                other @ (RecordView::ExpireAt { .. }
-                | RecordView::NsOp { .. }
-                | RecordView::CkptBegin { .. }
-                | RecordView::DocDelta { .. }
-                | RecordView::DocFull { .. }) => {
-                    run.report.violations.push(format!("modeled tail carries {other:?}"));
-                    run.report.state_hash = run.report.state.value();
-                    return run.report;
-                }
-            }
-            rest = &rest[consumed..];
-        }
-        // M4.5-S37 (ADR-0093 D5/A4): the shadow ticket set is rebuilt
-        // from the finished index at recovery-complete — the plane's
-        // `finish_tier_replay` does this; the harness plays it here,
-        // including the settle list: the slots the rebuild cannot pair
-        // by construction (two RAM keys with one hash beside a cold
-        // twin) or beyond the cap, read and settled by their full key
-        // before the life serves.
-        // The end of replay (ADR-0174 R10): a boot that demoted settles
-        // every RAM record it has not sealed before the rebuild; the
-        // rebuild's settle read is the machine's (the held handle, the
-        // key window); then the hand-over.
-        replay.end_of_replay(&table);
-        loop {
-            match replay.settle_step(&mut table, PAGE) {
-                Ok(SettleProgress::More) => {}
-                Ok(SettleProgress::Done) => break,
-                Err(err) => {
-                    run.report.violations.push(format!("life {life_index}: end settle: {err}"));
-                    run.report.state_hash = run.report.state.value();
-                    return run.report;
-                }
-            }
-        }
-        let settled_at_boot = &mut run.report.shadow_settled_at_boot;
-        if let Err(err) = table.rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
-            let window = replay
-                .read_key_window(slot.cold)
-                .map_err(|e| format!("unreadable while its slot is live: {e}"))?;
-            *settled_at_boot += 1;
-            Ok(KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
-        }) {
-            run.report.violations.push(format!("life {life_index}: {err}"));
-            run.report.state_hash = run.report.state.value();
-            return run.report;
-        }
-        let handed = match replay.hand_over(&mut table) {
-            Ok(done) => done.handed,
+        let extents_listed = recovered.extents_listed;
+        let replay_unit = run.replay_unit_bytes();
+        let mut node = Booting::new(recovered.table, recovered.replay, hasher);
+        let booted = node
+            .load_checkpoint(&disk, &shard.join(ick_file_name(manifest.ckpt_id)), tier.flushed)
+            .and_then(|()| {
+                run.report.state.number(b"checkpoint-loaded", life_index);
+                run.report.state.digest(node.table().simulation_digest());
+                node.table_mut().set_shadow_enabled(true);
+                node.replay_tail(&run.tail)
+            })
+            .and_then(|()| node.finish(&mut run.report.shadow_settled_at_boot));
+        let (mut table, handed, counters) = match booted {
+            Ok(done) => done,
             Err(err) => {
-                run.report.violations.push(format!("life {life_index}: hand-over: {err}"));
+                run.report.violations.push(format!("life {life_index}: boot: {err}"));
                 run.report.state_hash = run.report.state.value();
                 return run.report;
             }
         };
+        run.note_boot(&counters, replay_unit, life_index);
         run.report.state.number(b"recovered-life", life_index);
         run.report.state.digest(table.simulation_digest());
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
@@ -1861,7 +2116,14 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // and byte counters never over-count dead — asserted per life,
         // folded into the determinism trace. The ground-truth walk uses
         // the id the next real checkpoint would (monotone past boot).
-        check_live_set(&mut table, &tier, manifest.ckpt_id + 1, &mut run.report, life_index);
+        check_live_set(
+            &mut table,
+            &tier,
+            (&disk, &handed.flush),
+            manifest.ckpt_id + 1,
+            &mut run.report,
+            life_index,
+        );
         table.set_blob_config(BlobConfig { threshold_bytes: BLOB_THRESHOLD, max_bytes: 1 << 20 });
         life = Life {
             table,
@@ -1918,7 +2180,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // live until the twin is verified — while the model already
         // holds the key's inline winner (ADR-0093 D4: the death, and the
         // refcount decrement, happen at the verdict).
-        check_blob_refs(&mut run, &mut life, &recovered.extents_listed, life_index);
+        check_blob_refs(&mut run, &mut life, &extents_listed, life_index);
         run.audit(&life, &format!("life {life_index}"));
         run.report.state.number(b"audited-life", life_index);
         run.report.state.digest(life.table.simulation_digest());
@@ -1949,11 +2211,15 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.trace_hash,
         );
     }
-    if scenario.replay_above_window && run.report.replay_above_window_lives == 0 {
+    if scenario.replay_above_window
+        && (run.report.replay_above_window_lives == 0 || run.report.demoting_boots == 0)
+    {
         run.report.violations.push(format!(
-            "REPLAY-ABOVE-WINDOW VACUOUS: no life's replay unit exceeded the window (largest {} \
-             windows)",
-            run.report.replay_unit_windows_max
+            "REPLAY-ABOVE-WINDOW VACUOUS: {} lives above the window (largest {} windows), {} \
+             boots demoted",
+            run.report.replay_above_window_lives,
+            run.report.replay_unit_windows_max,
+            run.report.demoting_boots
         ));
     }
     run.report.state_hash = run.report.state.value();

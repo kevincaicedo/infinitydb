@@ -86,7 +86,7 @@ fn bench_images(n: u64, value_len: usize) {
             |record| {
                 if let RecordView::StringPostImage { key, value, .. } = record {
                     let hash = KeyHasher::default().hash(key);
-                    table.replay_upsert::<MemFs>(None, &[], key, value, hash).expect("fits");
+                    table.replay_upsert(&[], key, value, hash).expect("fits");
                 }
                 Ok::<(), std::convert::Infallible>(())
             },

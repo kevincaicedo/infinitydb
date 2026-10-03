@@ -2536,11 +2536,11 @@ fn a_marker_at_or_above_the_origin_removes_nothing() {
     let hash = KeyHasher::default().hash(&k1);
     assert_eq!(hash, KeyHasher::default().hash(&k2));
     let mut t = recovered_at_one_mib();
-    let a = t.replay_upsert::<MemFs>(None, &[], &k1, b"one", hash).expect("fits");
+    let a = t.replay_upsert(&[], &k1, b"one", hash).expect("fits");
     assert!(a >= t.space().life_origin());
     // The crashed life's marker for k2's displacement names k1's address.
     assert_eq!(t.replay_displace(hash, a), inf_store::Displaced::AboveOrigin);
-    t.replay_upsert::<MemFs>(None, &[], &k2, b"two", hash).expect("fits");
+    t.replay_upsert(&[], &k2, b"two", hash).expect("fits");
     assert!(
         matches!(t.lookup(&k1, hash, &[]), TieredLookup::Ram(_)),
         "the other key with the same hash survives the marker (R4)"
@@ -2558,8 +2558,8 @@ fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
     let hash = KeyHasher::default().hash(&k1);
     let mut t = recovered_at_one_mib();
     t.replay_ref(hash, pre_life);
-    let a = t.replay_upsert::<MemFs>(None, &[], &k1, b"one", hash).expect("fits");
-    t.replay_upsert::<MemFs>(None, &[], &k2, b"two", hash).expect("fits");
+    let a = t.replay_upsert(&[], &k1, b"one", hash).expect("fits");
+    t.replay_upsert(&[], &k2, b"two", hash).expect("fits");
     // The rebuild settles the ref into k1's record (the pre-life bytes
     // are k1's older record).
     let image = {
@@ -2575,7 +2575,7 @@ fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
     })
     .expect("settles");
     assert_eq!(t.displacement_origins_len(hash, a), 1, "the ref is chained into k1's record");
-    let b = t.replay_upsert::<MemFs>(None, &[], &k1, b"one-newer-and-longer", hash).expect("fits");
+    let b = t.replay_upsert(&[], &k1, b"one-newer-and-longer", hash).expect("fits");
     assert_ne!(a, b, "the overwrite copied to the tail");
     assert_eq!(t.displacement_origins_len(hash, b), 1, "the origins moved with the record (R5)");
     assert_eq!(t.displacement_origins_len(hash, a), 0, "and left the dead address");

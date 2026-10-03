@@ -7,7 +7,6 @@
 //! compared, never addresses (§3.1).
 
 use inf_foundation::time::Nanos;
-use inf_log::fs::mem::MemFs;
 use inf_log::{FsyncClass, NsId, RecordView};
 use inf_store::KeyHasher;
 use inf_store::{
@@ -282,7 +281,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
         Displaced::Removed,
         "the origin marker kills"
     );
-    table.replay_upsert::<MemFs>(None, &[], b"relocated", b"v2", hash_a).expect("fits");
+    table.replay_upsert(&[], b"relocated", b"v2", hash_a).expect("fits");
     assert!(
         matches!(table.lookup(b"relocated", hash_a, &[]), TieredLookup::Ram(_)),
         "one RAM slot, no cold residue"
@@ -293,7 +292,7 @@ fn origin_marker_repairs_the_cold_ref_and_its_absence_leaks() {
     let hash_b = KeyHasher::default().hash(b"leaky");
     let cold_b = LogicalAddr::from_raw(0x900).expect("fits");
     table.replay_ref(hash_b, cold_b);
-    table.replay_upsert::<MemFs>(None, &[], b"leaky", b"v2", hash_b).expect("fits");
+    table.replay_upsert(&[], b"leaky", b"v2", hash_b).expect("fits");
     assert_eq!(
         table.replay_displace(hash_b, cold_b),
         Displaced::Removed,

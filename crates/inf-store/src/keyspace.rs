@@ -1392,7 +1392,7 @@ impl Keyspace {
                 let machine = spill.replay_mut(ns);
                 entry
                     .table
-                    .replay_upsert(machine, entry.markers, key, value, entry.hash)
+                    .replay_upsert_lent(machine, entry.markers, key, value, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
@@ -1402,7 +1402,7 @@ impl Keyspace {
                 let machine = spill.replay_mut(ns);
                 entry
                     .table
-                    .replay_delete(machine, entry.markers, key, entry.hash)
+                    .replay_delete_lent(machine, entry.markers, key, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
@@ -1413,7 +1413,7 @@ impl Keyspace {
                 let machine = spill.replay_mut(ns);
                 entry
                     .table
-                    .replay_upsert_extent(machine, entry.markers, key, entry.hash, ext)
+                    .replay_upsert_extent_lent(machine, entry.markers, key, entry.hash, ext)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))

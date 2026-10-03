@@ -3,11 +3,11 @@
 //! fills (D2), the settle walk that keeps a sealed record from leaving a
 //! same-key cold slot behind (D3 R7), the end-of-replay cursor (R10), the
 //! end-of-checkpoint blob release (R9) and the hand-over to the plane.
-//! Every replay append and delete enters through
-//! [`TieredTable::replay_upsert`], [`replay_upsert_extent`]
-//! (TieredTable::replay_upsert_extent) and [`TieredTable::replay_delete`],
-//! which hold the demote machinery: no tiered replay append exists outside
-//! them (D1), the window's refusal is a [`Room`], never an error variant,
+//! Every replay append and delete enters through the table's `replay_*`
+//! entries, which hold the demote machinery: no tiered replay append
+//! exists outside them (D1); a machine reaches them only through
+//! `Keyspace::apply_record`'s [`ReplaySpill`] seam, the lent forms being
+//! crate-private; the window's refusal is a [`Room`], never an error variant,
 //! and every boot settle answers from a [`ColdKey`] — a key that hashes
 //! to the slot's hash — read through the file's held creation-mode handle
 //! (D3).
@@ -815,6 +815,38 @@ pub struct BootHandedOver<F: SegmentFs> {
 impl TieredTable {
     // ---- the replay entries (ADR-0174 D1, D3) ----
 
+    /// [`replay_upsert_lent`](Self::replay_upsert_lent) with no machine:
+    /// a single replay rule on a table no boot pipeline backs — a record
+    /// that needs room refuses `NoPipeline`, typed. A machine reaches a
+    /// replay entry only through `Keyspace::apply_record`'s seam, the
+    /// shipped dispatcher, so no harness keeps a copy of it.
+    ///
+    /// # Errors
+    /// As [`replay_upsert_lent`](Self::replay_upsert_lent).
+    pub fn replay_upsert(
+        &mut self,
+        markers: &[LogicalAddr],
+        key: &[u8],
+        value: &[u8],
+        hash: u64,
+    ) -> Result<LogicalAddr, ReplayRefusal> {
+        self.replay_upsert_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, value, hash)
+    }
+
+    /// [`replay_delete_lent`](Self::replay_delete_lent) with no machine,
+    /// as [`replay_upsert`](Self::replay_upsert): reads no cold slot.
+    ///
+    /// # Errors
+    /// As [`replay_delete_lent`](Self::replay_delete_lent).
+    pub fn replay_delete(
+        &mut self,
+        markers: &[LogicalAddr],
+        key: &[u8],
+        hash: u64,
+    ) -> Result<bool, ReplayRefusal> {
+        self.replay_delete_lent::<<NoSpill as ReplaySpill>::Fs>(None, markers, key, hash)
+    }
+
     /// Replays one checkpoint image or tail `SET` (R5): the typed length
     /// refusals first, then the room question until it answers `Fits` —
     /// a demote step or a pad per answer, at most four asks — then the
@@ -826,7 +858,7 @@ impl TieredTable {
     /// # Errors
     /// [`ReplayRefusal`] — the boot's typed refusal; nothing of this
     /// record was applied.
-    pub fn replay_upsert<F: SegmentFs>(
+    pub(crate) fn replay_upsert_lent<F: SegmentFs>(
         &mut self,
         replay: Option<&mut TierReplay<F>>,
         markers: &[LogicalAddr],
@@ -838,12 +870,12 @@ impl TieredTable {
         self.replay_place(replay, markers, hash, admitted.len(), |t| t.apply_image(admitted, hash))
     }
 
-    /// [`replay_upsert`](Self::replay_upsert) for a tag-9 image or a tail
+    /// [`replay_upsert_lent`](Self::replay_upsert_lent) for a tag-9 image or a tail
     /// `StringExtentRef` (R5 over the extent kind).
     ///
     /// # Errors
-    /// As [`replay_upsert`](Self::replay_upsert).
-    pub fn replay_upsert_extent<F: SegmentFs>(
+    /// As [`replay_upsert_lent`](Self::replay_upsert_lent).
+    pub(crate) fn replay_upsert_extent_lent<F: SegmentFs>(
         &mut self,
         replay: Option<&mut TierReplay<F>>,
         markers: &[LogicalAddr],
@@ -893,7 +925,7 @@ impl TieredTable {
     ///
     /// # Errors
     /// A settle read or identity refusal; nothing changed.
-    pub fn replay_delete<F: SegmentFs>(
+    pub(crate) fn replay_delete_lent<F: SegmentFs>(
         &mut self,
         mut replay: Option<&mut TierReplay<F>>,
         markers: &[LogicalAddr],
@@ -911,7 +943,7 @@ impl TieredTable {
         Ok(self.apply_delete(key, hash))
     }
 
-    /// [`replay_delete`](Self::replay_delete) once a demote step began:
+    /// [`replay_delete_lent`](Self::replay_delete_lent) once a demote step began:
     /// R6's reads before anything changes, then the drain, the RAM
     /// delete and the verified cold slots' removal.
     fn replay_delete_spilling<F: SegmentFs>(
@@ -1129,7 +1161,7 @@ mod tests {
         for i in 0..160u32 {
             let key = format!("k:{i:04}").into_bytes();
             let hash = table.hash_key(&key);
-            table.replay_upsert(Some(replay), &[], &key, &value, hash).expect("replays");
+            table.replay_upsert_lent(Some(replay), &[], &key, &value, hash).expect("replays");
         }
         assert!(replay.counters().demote_steps > 0);
         assert_eq!(replay.phase(), ReplayPhase::Spilling);
@@ -1186,17 +1218,17 @@ mod tests {
         let value = vec![0x5A; 900];
         let hash = table.hash_key(b"late");
         let err = table
-            .replay_upsert(Some(&mut replay), &[], b"late", &value, hash)
+            .replay_upsert_lent(Some(&mut replay), &[], b"late", &value, hash)
             .expect_err("a SET after the end of replay");
         assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
         let ext = ExtentRef { extent_id: 1, offset: 0, len: 4096 };
         let err = table
-            .replay_upsert_extent(Some(&mut replay), &[], b"late", hash, ext)
+            .replay_upsert_extent_lent(Some(&mut replay), &[], b"late", hash, ext)
             .expect_err("an extent reference after the end of replay");
         assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
         let old = table.hash_key(b"k:0000");
         let err = table
-            .replay_delete(Some(&mut replay), &[], b"k:0000", old)
+            .replay_delete_lent(Some(&mut replay), &[], b"k:0000", old)
             .expect_err("a DEL after the end of replay");
         assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
         assert_eq!(table.space().tail(), tail, "nothing placed");
@@ -1221,7 +1253,7 @@ mod tests {
         for i in 0..56u32 {
             let key = format!("k:{i:04}").into_bytes();
             let hash = table.hash_key(&key);
-            table.replay_upsert(Some(&mut replay), &[], &key, &value, hash).expect("replays");
+            table.replay_upsert_lent(Some(&mut replay), &[], &key, &value, hash).expect("replays");
         }
         replay.end_of_replay(&table);
         let budget: u64 = 64 << 10;
@@ -1252,13 +1284,13 @@ mod tests {
         let mut replay = machine(&fs, &table);
         let hash = table.hash_key(b"big");
         let err = table
-            .replay_upsert(Some(&mut replay), &[], b"big", &[0x5A; 1024], hash)
+            .replay_upsert_lent(Some(&mut replay), &[], b"big", &[0x5A; 1024], hash)
             .expect_err("a value at the blob threshold is not inline");
         let text = err.to_string();
         assert!(text.contains("BLOB-THRESHOLD") && text.contains("1024"), "{text}");
         let ext = ExtentRef { extent_id: 1, offset: 0, len: 8192 };
         let err = table
-            .replay_upsert_extent(Some(&mut replay), &[], b"big", hash, ext)
+            .replay_upsert_extent_lent(Some(&mut replay), &[], b"big", hash, ext)
             .expect_err("an extent above the blob maximum");
         let text = err.to_string();
         assert!(text.contains("8192") && text.contains("4096"), "{text}");
@@ -1310,7 +1342,7 @@ mod tests {
         let refused = loop {
             let key = format!("k:{placed:04}").into_bytes();
             let hash = table.hash_key(&key);
-            match table.replay_upsert::<MemFs>(None, &[], &key, &value, hash) {
+            match table.replay_upsert(&[], &key, &value, hash) {
                 Ok(_) => placed += 1,
                 Err(err) => break err,
             }

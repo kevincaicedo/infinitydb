@@ -303,7 +303,6 @@ fn invalid(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use inf_foundation::KeyHasher;
-    use inf_log::fs::mem::MemFs;
 
     use super::*;
 
@@ -346,7 +345,7 @@ mod tests {
         let refs = [(hash, 4096u64)];
         let mut t = table();
         apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed).expect("refs first");
-        t.replay_upsert::<MemFs>(None, &[], b"k", b"v", hash).expect("fits");
+        t.replay_upsert(&[], b"k", b"v", hash).expect("fits");
         assert_eq!(t.len(), 2, "two slots: the ref and this life's record (no rebuild yet)");
         let err = apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed)
             .expect_err("a ref section after an image of its namespace");
@@ -354,7 +353,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("ns 41") && text.contains("ADR-0174 R2"), "{text}");
         let mut fresh = table();
-        fresh.replay_upsert::<MemFs>(None, &[], b"k", b"v", hash).expect("fits");
+        fresh.replay_upsert(&[], b"k", b"v", hash).expect("fits");
         let err = apply_refs(&mut fresh, 41, flushed, refs.iter().copied(), flushed)
             .expect_err("the first ref section after an image refuses too");
         assert!(err.to_string().contains("ADR-0174 R2"));

@@ -43,7 +43,7 @@ fn no_settle(slot: &SettleSlot) -> Result<KeyWindow, String> {
 /// A replayed image on a table whose boot fits (ADR-0174 R5 through the
 /// replay entry, no boot pipeline behind it): the key-verified upsert.
 fn image(t: &mut TieredTable, key: &[u8], value: &[u8], hash: u64) -> LogicalAddr {
-    t.replay_upsert::<MemFs>(None, &[], key, value, hash).expect("fits")
+    t.replay_upsert(&[], key, value, hash).expect("fits")
 }
 
 /// The settle read's answer for a whole record image: the window is the
@@ -742,7 +742,7 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
     seed(&mut t);
     let _b = image(&mut t, b"k", b"v2", hash);
     t.replay_ref(hash, pre_life);
-    assert!(t.replay_delete::<MemFs>(None, &[], b"k", hash).expect("no cold reads"));
+    assert!(t.replay_delete(&[], b"k", hash).expect("no cold reads"));
     t.rebuild_shadow_tickets(no_settle).expect("no pair");
     assert_eq!(t.shadow_pending(), 0);
     assert!(t.contains_pair(hash, pre_life), "the twin stays slotted, unpaired");
