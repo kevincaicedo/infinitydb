@@ -1383,7 +1383,7 @@ impl Keyspace {
                 let machine = spill.replay_mut(ns);
                 table
                     .replay_upsert(machine, markers, key, value, hash)
-                    .map_err(ReplayError::Replay)?;
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
@@ -1391,7 +1391,9 @@ impl Keyspace {
                 let hash = self.cfg.hasher.hash(key);
                 let (table, markers) = self.tiered_entry(ns)?;
                 let machine = spill.replay_mut(ns);
-                table.replay_delete(machine, markers, key, hash).map_err(ReplayError::Replay)?;
+                table
+                    .replay_delete(machine, markers, key, hash)
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
@@ -1404,7 +1406,7 @@ impl Keyspace {
                 let machine = spill.replay_mut(ns);
                 table
                     .replay_upsert_extent(machine, markers, key, hash, ext)
-                    .map_err(ReplayError::Replay)?;
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
@@ -1728,10 +1730,13 @@ pub enum ReplayOutcome {
 #[derive(Debug)]
 pub enum ReplayError {
     Store(OpError),
-    /// A tiered namespace's typed boot refusal (ADR-0174 D1): the
-    /// window's refusal is never one — it is a `Room` the entry answers
-    /// with a demote step.
-    Replay(ReplayRefusal),
+    /// A tiered namespace's typed boot refusal (ADR-0174 D1), naming the
+    /// namespace: the window's refusal is never one — it is a `Room` the
+    /// entry answers with a demote step.
+    Replay {
+        ns: NsId,
+        refusal: ReplayRefusal,
+    },
     /// Displacement-marker stream violation (ADR-0057 D4 pairing /
     /// ADR-0059 D9 bound) — corrupt or truncated tiered replay input.
     Displacement(&'static str),

@@ -157,7 +157,10 @@ fn a_refused_tiered_record_leaves_its_markers_parked() {
         i += 1;
         assert!(i < 100_000, "an 8 MiB window refuses far sooner");
     };
-    assert!(matches!(refusal, ReplayError::Replay(_)), "{refusal:?}");
+    assert!(
+        matches!(refusal, ReplayError::Replay { ns: NS, .. }),
+        "names the namespace: {refusal:?}"
+    );
     assert_eq!(ks.displace_register_len(), 1, "the refused record's marker stays parked");
 }
 

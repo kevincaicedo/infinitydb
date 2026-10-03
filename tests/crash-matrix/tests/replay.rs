@@ -306,7 +306,10 @@ fn replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers() {
         fault::arm("replay_settle_read_fail", FaultSpec::Nth(1));
         let err = node.apply(&record).expect_err("the injected read failure refuses typed");
         fault::disarm_all();
-        assert!(matches!(err, ReplayError::Replay(ReplayRefusal::SettleRead { .. })), "{err:?}");
+        assert!(
+            matches!(err, ReplayError::Replay { refusal: ReplayRefusal::SettleRead { .. }, .. }),
+            "{err:?}"
+        );
         assert!(matches!(node.table().lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
         assert_eq!(node.table().len(), slots, "no slot moved");
         assert_eq!(node.table().space().ro_boundary(), ro, "the boundary stayed");
@@ -348,7 +351,10 @@ fn demote_step_refuses_typed_then_recovers(
     assert_eq!(fired, 1, "{point}: the refusal is the point's");
     assert_eq!(node.table().space().flushed(), flushed_before, "{point}: flushed unmoved");
     match &refusal {
-        ReplayError::Replay(ReplayRefusal::Flush { cause: c, unplaced_bytes, handles_held }) => {
+        ReplayError::Replay {
+            ns: NS,
+            refusal: ReplayRefusal::Flush { cause: c, unplaced_bytes, handles_held },
+        } => {
             assert!(cause(c), "{point}: {c}");
             assert!(*unplaced_bytes > 0, "{point}: the step's sealed bytes are named");
             assert_eq!(*handles_held, node.spill.0.sealed().len(), "{point}: the handles held");

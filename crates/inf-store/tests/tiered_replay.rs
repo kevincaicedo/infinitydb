@@ -508,7 +508,7 @@ impl Boot {
     fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), ReplayRefusal> {
         match self.apply(&RecordView::StringPostImage { ns: NS, key, value }) {
             Ok(()) => Ok(()),
-            Err(ReplayError::Replay(refusal)) => Err(refusal),
+            Err(ReplayError::Replay { refusal, .. }) => Err(refusal),
             Err(other) => panic!("{other:?}"),
         }
     }
@@ -2227,7 +2227,10 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
         fault::arm(inf_log::fault::REPLAY_SETTLE_READ_FAIL, FaultSpec::Nth(1));
         let err = boot.apply(&record).expect_err("the injected read failure refuses");
         fault::disarm_all();
-        assert!(matches!(err, ReplayError::Replay(ReplayRefusal::SettleRead { .. })), "{err:?}");
+        assert!(
+            matches!(err, ReplayError::Replay { refusal: ReplayRefusal::SettleRead { .. }, .. }),
+            "{err:?}"
+        );
         assert!(matches!(boot.table().lookup(b"victim", hash, &[]), TieredLookup::Cold(_)));
         assert_eq!(boot.table().len(), slots_before, "no slot moved (D1)");
         assert_eq!(boot.table().space().ro_boundary(), before);
@@ -2295,7 +2298,7 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
             let ro = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
             match ks.apply_record(&record, NOW, ANCHOR, spill) {
                 Ok(_) => Ok(()),
-                Err(ReplayError::Replay(ReplayRefusal::SettleRead { .. })) => {
+                Err(ReplayError::Replay { refusal: ReplayRefusal::SettleRead { .. }, .. }) => {
                     let after = ks.tiered_store(NS).expect("materialized").space().ro_boundary();
                     assert_eq!(after, ro, "the boundary stayed");
                     refused = true;
