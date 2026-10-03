@@ -19,6 +19,9 @@
 #[path = "../receipt.rs"]
 mod receipt;
 
+#[path = "../boot_seam.rs"]
+mod boot_seam;
+
 use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
@@ -31,9 +34,11 @@ use inf_log::{
     read_manifest, write_manifest,
 };
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, ExtentRef, LogicalAddr, TieredTable,
+    AddressSpaceConfig, DemotionConfig, ExtentRef, LogicalAddr, ReplayError, TieredTable,
     apply_blob_ref_section, apply_live_set_section, apply_ref_section, recover_tiered_ns,
 };
+
+use boot_seam::{ANCHOR, Lent, NOW};
 
 use inf_store::KeyHasher;
 
@@ -398,66 +403,55 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     )
     .expect("recovery");
     assert!(recovered.extents_listed.contains(&orphan_id), "the listing saw the orphan");
-    let cell = std::cell::RefCell::new(recovered.table);
-    let replay = std::cell::RefCell::new(recovered.replay);
+    // The recovery driver's shape: the recovered table inside the keyspace,
+    // the machine lent through the seam, every image and tail record
+    // through `Keyspace::apply_record`.
+    let mut ks = boot_seam::keyspace_with(NS, recovered.table);
+    let mut spill = Lent { ns: NS, machine: recovered.replay };
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(stored.ckpt_id));
+    let parts = std::cell::RefCell::new((&mut ks, &mut spill));
     read_ick_hybrid(
         &fs,
         &ick,
         inf_log::ckpt::IckReaderConfig::default(),
         |record| {
-            match record {
-                RecordView::StringPostImage { key, value, .. } => {
-                    let hash = KeyHasher::default().hash(key);
-                    cell.borrow_mut()
-                        .replay_upsert(Some(&mut *replay.borrow_mut()), &[], key, value, hash)
-                        .expect("fits");
-                }
-                RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                    let hash = KeyHasher::default().hash(key);
-                    let ext = ExtentRef { extent_id, offset, len };
-                    cell.borrow_mut()
-                        .replay_upsert_extent(Some(&mut *replay.borrow_mut()), &[], key, hash, ext)
-                        .expect("fits");
-                }
-                _ => panic!("unexpected image class"),
-            }
-            Ok::<(), std::convert::Infallible>(())
+            let mut guard = parts.borrow_mut();
+            let (ks, spill) = &mut *guard;
+            ks.apply_record(&record, NOW, ANCHOR, &mut **spill).map(|_| ())
         },
         |section| {
-            apply_ref_section(&mut cell.borrow_mut(), &section, tier.flushed).expect("refs");
+            let mut guard = parts.borrow_mut();
+            let t = guard.0.tiered_store_mut(NS).expect("materialized");
+            apply_ref_section(t, &section, tier.flushed).expect("refs");
+            Ok::<(), ReplayError>(())
+        },
+        |section| {
+            let mut guard = parts.borrow_mut();
+            apply_live_set_section(guard.0.tiered_store_mut(NS).expect("materialized"), &section);
             Ok(())
         },
         |section| {
-            apply_live_set_section(&mut cell.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            apply_blob_ref_section(&mut cell.borrow_mut(), &section);
+            let mut guard = parts.borrow_mut();
+            apply_blob_ref_section(guard.0.tiered_store_mut(NS).expect("materialized"), &section);
             Ok(())
         },
         |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
-    let mut t = cell.into_inner();
-    let mut replay = replay.into_inner();
-    replay.end_of_checkpoint(&mut t);
+    spill.machine.end_of_checkpoint(ks.tiered_store_mut(NS).expect("materialized"));
     // Tail replay: the referenced twin's frame survived the crash.
     let mut rest: &[u8] = &tail;
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                let hash = KeyHasher::default().hash(key);
-                let ext = ExtentRef { extent_id, offset, len };
-                t.replay_upsert_extent(Some(&mut replay), &[], key, hash, ext).expect("fits");
-            }
-            _ => panic!("only the blob SET rides this tail"),
-        }
+        ks.apply_record(&record, NOW, ANCHOR, &mut spill).expect("replays");
         rest = &rest[consumed..];
     }
-    replay.end_of_replay(&t);
-    replay.hand_over(&mut t).expect("a fitting boot hands over");
+    assert_eq!(ks.displace_register_len(), 0, "every marker met its mutation");
+    let recovered_table = ks.tiered_store_mut(NS).expect("materialized");
+    let Lent { mut machine, .. } = spill;
+    machine.end_of_replay(recovered_table);
+    machine.hand_over(recovered_table).expect("a fitting boot hands over");
+    let mut t = std::mem::replace(recovered_table, table(0));
 
     // Never served: no reference to the orphan exists anywhere.
     assert_eq!(t.extent_refcount(orphan_id), 0, "nothing references the orphan");

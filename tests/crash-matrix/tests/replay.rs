@@ -22,31 +22,32 @@
 #[path = "../receipt.rs"]
 mod receipt;
 
+#[path = "../boot_seam.rs"]
+mod boot_seam;
+
 use std::path::Path;
 
 use inf_foundation::fault::{self, FaultSpec};
-use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, FsyncClass, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
+    CkptConfig, Lsn, Manifest, NsId, RecordView, SegmentId, SyncIckWriter, TierFlush,
     TierFlushConfig, TierFlushError, TierIoMode, decode_record, read_ick_hybrid, read_manifest,
     write_manifest,
 };
 use inf_store::KeyHasher;
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsMode, NsSpec, RecoveredTier,
-    ReplayError, ReplayRefusal, ReplaySpill, SettleProgress, StoreConfig, TierReplay, TierSpec,
-    TieredLookup, TieredTable, WallAnchor, apply_live_set_section, apply_ref_section,
-    recover_tiered_ns,
+    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, RecoveredTier, ReplayError,
+    ReplayRefusal, SettleProgress, TieredLookup, TieredTable, apply_live_set_section,
+    apply_ref_section, recover_tiered_ns,
 };
+
+use boot_seam::{ANCHOR, Lent, NOW};
 
 const NS: NsId = NsId(31);
 const PAGE: u64 = 4 << 10;
 const BUDGET: u64 = 1 << 20;
 const SHARD: &str = "shard-0";
-const NOW: Nanos = Nanos(1_000_000);
-const ANCHOR: WallAnchor = WallAnchor { internal_ms: 0, unix_ms: 0 };
 
 fn flush_config() -> TierFlushConfig {
     TierFlushConfig {
@@ -143,17 +144,6 @@ fn crashed_life() -> (MemFs, Vec<u8>) {
     (fs, tail)
 }
 
-/// The seam the recovery driver lends: the namespace's boot machine.
-struct Lent(TierReplay<MemFs>);
-
-impl ReplaySpill for Lent {
-    type Fs = MemFs;
-
-    fn replay_mut(&mut self, ns: NsId) -> Option<&mut TierReplay<MemFs>> {
-        (ns == NS).then_some(&mut self.0)
-    }
-}
-
 /// One booting cell as the recovery driver holds it: the recovered table
 /// inside the keyspace, the machine lent through the seam, every record
 /// through `Keyspace::apply_record`.
@@ -186,19 +176,7 @@ fn boot(fs: &MemFs) -> Node {
         KeyHasher::default(),
     )
     .expect("tier recovery");
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"tiered".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Everysec),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(4 << 20)),
-    })
-    .expect("create the tiered namespace");
-    *ks.tiered_store_mut(NS).expect("materialized") = table;
-    let table = std::cell::RefCell::new(ks);
+    let table = std::cell::RefCell::new(boot_seam::keyspace_with(NS, table));
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
     read_ick_hybrid(
         fs,
@@ -220,7 +198,7 @@ fn boot(fs: &MemFs) -> Node {
         |_| panic!("no index-sidecar sections in this image"),
     )
     .expect("hybrid load");
-    Node { ks: table.into_inner(), spill: Lent(replay) }
+    Node { ks: table.into_inner(), spill: Lent { ns: NS, machine: replay } }
 }
 
 /// The tier files in the namespace's directory that the manifest does
@@ -270,7 +248,7 @@ fn the_next_boot_recovers(fs: &MemFs, tail: &[u8]) {
         node.apply(&record).expect("replays");
     }
     assert_eq!(node.ks.displace_register_len(), 0, "every marker met its mutation");
-    let Node { mut ks, spill: Lent(mut machine) } = node;
+    let Node { mut ks, spill: Lent { mut machine, .. } } = node;
     let table = ks.tiered_store_mut(NS).expect("materialized");
     assert!(machine.counters().demote_steps > 0, "the unit is above the window");
     assert!(machine.counters().deletes_verified >= 1, "the DEL verified its demoted copy");
@@ -357,11 +335,15 @@ fn demote_step_refuses_typed_then_recovers(
         } => {
             assert!(cause(c), "{point}: {c}");
             assert!(*unplaced_bytes > 0, "{point}: the step's sealed bytes are named");
-            assert_eq!(*handles_held, node.spill.0.sealed().len(), "{point}: the handles held");
+            assert_eq!(
+                *handles_held,
+                node.spill.machine.sealed().len(),
+                "{point}: the handles held"
+            );
         }
         other => panic!("{point}: {other:?}"),
     }
-    assert!(node.spill.0.counters().demote_steps > 0, "{point}: inside a demote step");
+    assert!(node.spill.machine.counters().demote_steps > 0, "{point}: inside a demote step");
     for (name, len) in unmanifested(&fs) {
         assert!(point != inf_log::fault::TIER_DIR_OPEN_FAIL || len == 0, "{point}: {name}");
     }
@@ -432,7 +414,7 @@ fn tier_torn_frame_in_a_boot_demote_step_is_cut_and_the_next_boot_recovers() {
         node.apply(&record).expect("a torn write succeeds");
     }
     fault::disarm_all();
-    assert!(node.spill.0.counters().demote_steps > 0, "the torn write was a demote step's");
+    assert!(node.spill.machine.counters().demote_steps > 0, "the torn write was a demote step's");
     assert!(!unmanifested(&fs).is_empty(), "the cut leaves the boot's file behind");
     drop(node);
     the_next_boot_recovers(&fs, &tail);
