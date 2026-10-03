@@ -43,6 +43,17 @@ use crate::record::NsId;
 pub const TIER_FRAME_BYTES: usize = 4096;
 /// Payload bytes per frame (the rest is the CRC32C trailer).
 pub const TIER_FRAME_DATA: usize = TIER_FRAME_BYTES - 4;
+/// Bytes from a tier record's start that always hold its key — the
+/// record's fixed header, its TTL extension and the longest key, which
+/// `inf-store`'s record layout keeps inside this prefix (asserted there
+/// at compile time). The one bound of a key-window read: the boot settle
+/// read returns this many bytes, clamped to the record's file, and the
+/// store's cold-prefix readers ask for it. Crossing: none — a key always
+/// ends inside the window; bytes that do not hold a whole key fail the
+/// store's parse, a typed refusal.
+pub const TIER_KEY_WINDOW_BYTES: usize = 268;
+// A window of at most one frame's payload spans at most two frames.
+const _: () = assert!(TIER_KEY_WINDOW_BYTES <= TIER_FRAME_DATA);
 /// Header block size (magic + identity, zero-padded to one frame).
 pub const TIER_HEADER_BYTES: usize = 4096;
 /// Footer block size (sealed files only — ADR-0056 D1).

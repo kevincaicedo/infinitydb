@@ -34,6 +34,9 @@ pub const MAX_VAL_LEN: usize = (1 << 24) - 1;
 
 pub(crate) const HEADER_LEN: usize = 8;
 pub(crate) const TTL_EXT_LEN: usize = 5;
+// The tier format's key window holds every record's key: the fixed
+// header, the TTL extension and the longest key end inside it.
+const _: () = assert!(HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN <= inf_log::TIER_KEY_WINDOW_BYTES);
 const FLAG_TTL: u8 = 0b0001;
 /// String was produced by a byte-surgery mutation (APPEND/SETRANGE) — drives
 /// `OBJECT ENCODING`'s `raw` answer the way Redis's `sds` conversion does

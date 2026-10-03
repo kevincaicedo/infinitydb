@@ -358,7 +358,7 @@ impl<F: SegmentFs> TierReplay<F> {
         addr: LogicalAddr,
     ) -> Result<SettleWindow<'_>, SettleReadError> {
         self.work.settle_reads += 1;
-        self.flush.read_key_window(addr.to_raw(), TieredTable::KEY_PREFIX_LEN)
+        self.flush.read_key_window(addr.to_raw())
     }
 
     // ---- the demote step (ADR-0174 D2) ----
@@ -498,7 +498,7 @@ impl<F: SegmentFs> TierReplay<F> {
             let cold = self.twins[i];
             let window = self
                 .flush
-                .read_key_window(cold.to_raw(), TieredTable::KEY_PREFIX_LEN)
+                .read_key_window(cold.to_raw())
                 .map_err(|cause| ReplayRefusal::SettleRead { addr: cold, cause })?;
             self.counters.settle_reads += 1;
             self.work.settle_reads += 1;
@@ -545,7 +545,7 @@ impl<F: SegmentFs> TierReplay<F> {
             let cold = self.twins[i];
             let window = self
                 .flush
-                .read_key_window(cold.to_raw(), TieredTable::KEY_PREFIX_LEN)
+                .read_key_window(cold.to_raw())
                 .map_err(|cause| ReplayRefusal::SettleRead { addr: cold, cause })?;
             self.counters.settle_reads += 1;
             self.work.settle_reads += 1;

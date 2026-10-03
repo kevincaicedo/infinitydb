@@ -426,10 +426,11 @@ impl TieredTable {
     /// can size the full fetch).
     pub const RECORD_HEADER_LEN: usize = crate::record::HEADER_LEN;
 
-    /// Bytes from a record's start that always hold its key: fixed header
-    /// + TTL extension + the longest key (`key_from_prefix`'s bound).
-    pub const KEY_PREFIX_LEN: usize =
-        crate::record::HEADER_LEN + crate::record::TTL_EXT_LEN + crate::record::MAX_KEY_LEN;
+    /// Bytes from a record's start that always hold its key: the fixed
+    /// header, the TTL extension and the longest key (`key_from_prefix`'s
+    /// bound). The tier format's one key-window bound: the boot settle
+    /// read returns it and the cold-prefix readers ask for it.
+    pub const KEY_PREFIX_LEN: usize = inf_log::TIER_KEY_WINDOW_BYTES;
 
     /// Decodes just the key from a record *prefix* (the SCAN cold-read
     /// window): `Some` when the prefix covers the header, the TTL

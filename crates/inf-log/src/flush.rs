@@ -30,8 +30,9 @@ use inf_foundation::limits::FILE_OFFSET_BYTES_MAX;
 use crate::fs::{SegmentFile, SegmentFs, TierIoMode};
 use crate::record::NsId;
 use crate::tier::{
-    FrameStaging, QueuedSeal, RoundEffect, SealReason, TIER_FRAME_DATA, TierOpView, TierRound,
-    TierWriteFailure, TierWriter, WindowPool, tier_extract, tier_frame_offset, tier_frame_span,
+    FrameStaging, QueuedSeal, RoundEffect, SealReason, TIER_KEY_WINDOW_BYTES, TierOpView,
+    TierRound, TierWriteFailure, TierWriter, WindowPool, tier_extract, tier_frame_offset,
+    tier_frame_span,
 };
 
 /// How a pipeline's I/O reaches the device (M4.5-S31, ADR-0084 D1).
@@ -960,8 +961,7 @@ impl<F: SegmentFs> SeamFlush for TierFlush<F> {
 /// readable by the first command after `Ready`.
 pub struct BootFlush<F: SegmentFs> {
     flush: TierFlush<F>,
-    /// The settle read's window: two aligned frames, the most a
-    /// [`TIER_FRAME_DATA`]-bounded key window can span.
+    /// The settle read's window: [`SETTLE_WINDOW_FRAMES`] aligned frames.
     window: FrameStaging,
     /// The extracted key window (≤ the window length a read asks for;
     /// allocated once).
@@ -1031,6 +1031,13 @@ impl core::fmt::Display for SettleReadError {
 
 impl std::error::Error for SettleReadError {}
 
+/// Aligned frames the settle read's buffer holds: a key window of
+/// [`TIER_KEY_WINDOW_BYTES`] — at most one frame's payload — starts in
+/// one frame and ends in the next at the latest. Owner: [`BootFlush`]'s
+/// buffer, allocated once. Crossing: unreachable — the const assert on
+/// the window bound beside it.
+pub const SETTLE_WINDOW_FRAMES: usize = 2;
+
 impl<F: SegmentFs> BootFlush<F> {
     /// Puts a recovered pipeline under the boot claim rule. `handles`
     /// are the open creation-mode handles of its sealed catalogue files,
@@ -1046,35 +1053,30 @@ impl<F: SegmentFs> BootFlush<F> {
         debug_assert_eq!(flush.drive, TierDrive::Seam, "boot drives the seam");
         flush.sealed_handles = handles;
         flush.claim = ClaimRule::Barrier;
-        BootFlush { flush, window: FrameStaging::new(2), extracted: Vec::new() }
+        BootFlush {
+            flush,
+            window: FrameStaging::new(SETTLE_WINDOW_FRAMES),
+            extracted: Vec::with_capacity(TIER_KEY_WINDOW_BYTES),
+        }
     }
 
     /// The settle read's locate and read steps (ADR-0174 D3): the frames
-    /// covering `min(window_len, left)` bytes at `addr` — one, or two
-    /// when the window crosses a frame — by one blocking read on the
-    /// covering file's **held** handle into the aligned buffer, every
-    /// frame's CRC checked. Opens nothing (I18). `window_len` is the
-    /// caller's key-window bound, at most one frame's payload.
+    /// covering `min(TIER_KEY_WINDOW_BYTES, left)` bytes at `addr` — one,
+    /// or two when the window crosses a frame — by one blocking read on
+    /// the covering file's **held** handle into the aligned buffer, every
+    /// frame's CRC checked. Opens nothing (I18).
     ///
     /// # Errors
     /// [`SettleReadError`], each a typed boot refusal: no covering
     /// range, no held handle, the read's failure (or the injected
     /// `replay_settle_read_fail`), a short file, a CRC failure.
-    ///
-    /// # Panics
-    /// Panics on an empty window bound or one above a frame's payload.
-    pub fn read_key_window(
-        &mut self,
-        addr: u64,
-        window_len: usize,
-    ) -> Result<SettleWindow<'_>, SettleReadError> {
-        assert!(window_len > 0, "empty key window");
-        assert!(window_len <= TIER_FRAME_DATA, "a key window spans at most two frames");
+    pub fn read_key_window(&mut self, addr: u64) -> Result<SettleWindow<'_>, SettleReadError> {
         let (base, end, file, path) = locate_held(&self.flush, addr)?;
         let left = end - addr;
-        let len = usize::try_from(left).map_or(window_len, |l| l.min(window_len));
+        let len =
+            usize::try_from(left).map_or(TIER_KEY_WINDOW_BYTES, |l| l.min(TIER_KEY_WINDOW_BYTES));
         let (first, count, skip) = tier_frame_span(addr - base, len);
-        debug_assert!(count <= 2, "a key window fits the two-frame buffer");
+        debug_assert!(count as usize <= SETTLE_WINDOW_FRAMES, "the buffer covers the window");
         let frames = self.window.frames_mut(count as usize);
         if inf_foundation::fault::fire(crate::fault::REPLAY_SETTLE_READ_FAIL) {
             return Err(SettleReadError::Io {
@@ -1778,13 +1780,13 @@ mod boot_tests {
         steps();
         // A hit in the last file: the file is empty, so the read is short
         // — the locate cost is what is measured.
-        let err = boot.read_key_window(9_999 * 1000 + 10, 100).expect_err("no file bytes");
+        let err = boot.read_key_window(9_999 * 1000 + 10).expect_err("no file bytes");
         assert!(matches!(err, SettleReadError::Short { addr: 9_999_010, .. }), "{err}");
         let hit = steps();
-        let err = boot.read_key_window(10_000_000, 1).expect_err("past every file");
+        let err = boot.read_key_window(10_000_000).expect_err("past every file");
         assert!(matches!(err, SettleReadError::NoRange { addr: 10_000_000 }), "{err}");
         let miss_past = steps();
-        let err = boot.read_key_window(4_999 * 1000 + 950, 100).expect_err("in a range gap");
+        let err = boot.read_key_window(4_999 * 1000 + 950).expect_err("in a range gap");
         assert!(matches!(err, SettleReadError::NoRange { addr: 4_999_950 }), "{err}");
         let miss_gap = steps();
         for (what, n) in [("hit", hit), ("miss past", miss_past), ("miss in a gap", miss_gap)] {
@@ -1811,27 +1813,30 @@ mod boot_tests {
             "the barrier claim covers the partial tail frame (ADR-0174 D2 rule 4)"
         );
         // A read inside the partial tail frame, through the held writer.
-        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10, 64).expect("reads");
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10).expect("reads");
         assert_eq!(window.left, 90, "left is the claimed end less the address");
-        assert_eq!(window.bytes.len(), 64);
+        assert_eq!(window.bytes.len(), 90, "clamped to the claimed end");
         assert!(window.bytes.iter().all(|&b| b == 0x5B));
         // The next step extends the same frame in place; both the old
         // and the new bytes read back under the new CRC.
         let next = LogicalAddr::ZERO.advanced(payload.len() as u64).expect("fits");
         boot.append_range(next, &[0x6C; 200]).expect("append");
         boot.sync().expect("barrier");
-        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10, 64).expect("reads");
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 + 10).expect("reads");
         assert_eq!(window.left, 290);
-        assert!(window.bytes.iter().all(|&b| b == 0x5B));
-        let window = boot.read_key_window(next.to_raw(), 300).expect("reads");
+        assert_eq!(window.bytes.len(), TIER_KEY_WINDOW_BYTES, "the whole window");
+        assert!(window.bytes[..90].iter().all(|&b| b == 0x5B));
+        assert!(window.bytes[90..].iter().all(|&b| b == 0x6C));
+        let window = boot.read_key_window(next.to_raw()).expect("reads");
         assert_eq!(window.bytes.len(), 200, "clamped to the claimed end");
         assert!(window.bytes.iter().all(|&b| b == 0x6C));
         // A window that crosses a frame boundary: two frames, one read.
-        let window = boot.read_key_window(TIER_FRAME_DATA as u64 - 10, 30).expect("reads");
-        assert_eq!(&window.bytes[..10], &[0x5B; 10]);
-        assert_eq!(&window.bytes[10..], &[0x5B; 20]);
+        let window = boot.read_key_window(TIER_FRAME_DATA as u64 - 10).expect("reads");
+        assert_eq!(window.bytes.len(), TIER_KEY_WINDOW_BYTES);
+        assert!(window.bytes[..110].iter().all(|&b| b == 0x5B), "both frames' bytes");
+        assert!(window.bytes[110..].iter().all(|&b| b == 0x6C));
         // Beyond the claimed end: no range.
-        let err = boot.read_key_window(next.to_raw() + 200, 1).expect_err("unclaimed");
+        let err = boot.read_key_window(next.to_raw() + 200).expect_err("unclaimed");
         assert!(matches!(err, SettleReadError::NoRange { .. }), "{err}");
         // The exit seals the open file, restores the live rule and hands
         // over one handle per sealed file.
@@ -1853,11 +1858,11 @@ mod boot_tests {
         boot.append_range(LogicalAddr::ZERO, &[0x11; 500]).expect("append");
         boot.sync().expect("barrier");
         inf_foundation::fault::arm(crate::fault::REPLAY_SETTLE_READ_FAIL, FaultSpec::Nth(1));
-        let err = boot.read_key_window(100, 64).expect_err("the injected read failure");
+        let err = boot.read_key_window(100).expect_err("the injected read failure");
         assert!(matches!(err, SettleReadError::Io { addr: 100, .. }), "{err}");
         assert!(err.to_string().contains("replay_settle_read_fail"), "{err}");
         inf_foundation::fault::disarm_all();
-        boot.read_key_window(100, 64).expect("the next read answers");
+        boot.read_key_window(100).expect("the next read answers");
         // Flip a payload byte on disk: the frame's CRC refuses.
         let (_, _, _, _, path) = boot.active().expect("active");
         let path = path.to_path_buf();
@@ -1866,7 +1871,7 @@ mod boot_tests {
         let mut corruptor = fs.open_write(&path).expect("the test's own handle");
         assert_eq!(corruptor.read_at(at, &mut planted).expect("read"), 1);
         corruptor.write_at(at, &[planted[0] ^ 0xFF]).expect("flip one payload byte");
-        let err = boot.read_key_window(100, 64).expect_err("CRC");
+        let err = boot.read_key_window(100).expect_err("CRC");
         assert!(matches!(err, SettleReadError::Corrupt { addr: 100, frame: 0, .. }), "{err}");
     }
 }

@@ -102,8 +102,8 @@ pub use staging::{
 pub use tail::{LogCorruption, RegionEvidence, RegionScan, scan_region, scan_region_evidence};
 pub use tier::{
     RoundEffect, SealOutcome, SealReason, TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA,
-    TIER_HEADER_BYTES, TierCorruption, TierDecodeError, TierFooterV1, TierHeaderV1, TierIdentity,
-    TierOpView, TierSummary, TierWriteFailure, TierWriter, inspect_tier_bytes,
-    parse_tier_file_name, parse_tier_footer, parse_tier_header, probe_tier_file, tier_extract,
-    tier_file_name, tier_frame_offset, tier_frame_span,
+    TIER_HEADER_BYTES, TIER_KEY_WINDOW_BYTES, TierCorruption, TierDecodeError, TierFooterV1,
+    TierHeaderV1, TierIdentity, TierOpView, TierSummary, TierWriteFailure, TierWriter,
+    inspect_tier_bytes, parse_tier_file_name, parse_tier_footer, parse_tier_header,
+    probe_tier_file, tier_extract, tier_file_name, tier_frame_offset, tier_frame_span,
 };
