@@ -1081,7 +1081,7 @@ impl<F: SegmentFs> BootFlush<F> {
     /// range, no held handle, the read's failure (or the injected
     /// `replay_settle_read_fail`), a short file, a CRC failure.
     pub fn read_key_window(&mut self, addr: u64) -> Result<SettleWindow<'_>, SettleReadError> {
-        let (base, end, file, path) = locate_held(&self.flush, addr)?;
+        let Located { base, end, file, path } = locate_held(&self.flush, addr)?;
         let left = end - addr;
         let len =
             usize::try_from(left).map_or(TIER_KEY_WINDOW_BYTES, |l| l.min(TIER_KEY_WINDOW_BYTES));
@@ -1166,10 +1166,11 @@ impl<F: SegmentFs> BootFlush<F> {
     /// The planted canary's stall seal (`inf_canary_replay_stall_seal`):
     /// a boot pipeline never seals a file to free a partial frame
     /// (ADR-0174 D2 rule 5); the seal-reason census is what sees one that
-    /// does.
+    /// does. Compiled only into the canary's build.
     ///
     /// # Errors
     /// As any seal.
+    #[cfg(inf_canary_replay_stall_seal)]
     pub fn seal_stall_planted(&mut self) -> Result<(), TierFlushError> {
         self.flush.seal_stall()
     }
@@ -1213,16 +1214,25 @@ impl<F: SegmentFs> SeamFlush for BootFlush<F> {
     }
 }
 
+/// Where the settle read's locate step found an address: the covering
+/// file's base and claimed end (both logical addresses), its held handle
+/// and its path.
+struct Located<'a, File> {
+    base: u64,
+    end: u64,
+    file: &'a File,
+    path: &'a Path,
+}
+
 /// The settle read's locate step: the catalogue file holding `addr`, by
-/// bisection over the ascending catalogue (the L04 perf row: the rebuild
-/// asks once per slot against thousands of files), with its held handle
-/// and its claimed end — a sealed file's exact end, the active file's
-/// barrier-covered end (the boot claim rule).
-#[allow(clippy::type_complexity)] // one locate answer: base, end, handle, path
+/// bisection over the ascending catalogue (the rebuild asks once per slot
+/// against thousands of files), with its held handle and its claimed end
+/// — a sealed file's exact end, the active file's barrier-covered end
+/// (the boot claim rule).
 fn locate_held<F: SegmentFs>(
     flush: &TierFlush<F>,
     addr: u64,
-) -> Result<(u64, u64, &F::File, &Path), SettleReadError> {
+) -> Result<Located<'_, F::File>, SettleReadError> {
     let at = flush.sealed.partition_point(|m| {
         note_span_locate_step();
         m.base.to_raw() <= addr
@@ -1235,9 +1245,12 @@ fn locate_held<F: SegmentFs>(
         // order, then the boot's seals above every manifested id).
         let h = flush.sealed_handles.partition_point(|(id, _)| *id < meta.id);
         return match flush.sealed_handles.get(h) {
-            Some((id, file)) if *id == meta.id => {
-                Ok((meta.base.to_raw(), meta.base.to_raw() + meta.data_len, file, &meta.path))
-            }
+            Some((id, file)) if *id == meta.id => Ok(Located {
+                base: meta.base.to_raw(),
+                end: meta.base.to_raw() + meta.data_len,
+                file,
+                path: &meta.path,
+            }),
             _ => Err(SettleReadError::NoHandle { addr, id: meta.id }),
         };
     }
@@ -1245,7 +1258,7 @@ fn locate_held<F: SegmentFs>(
         let base = w.base().to_raw();
         let end = base + w.durable_len();
         if addr >= base && addr < end {
-            return Ok((base, end, w.file(), w.path()));
+            return Ok(Located { base, end, file: w.file(), path: w.path() });
         }
     }
     Err(SettleReadError::NoRange { addr })

@@ -416,10 +416,11 @@ impl<F: SegmentFs> TierReplay<F> {
                     .map_err(|cause| self.flush_refusal(table, cause))?;
                 self.note_flush(outcome);
             }
-            if cfg!(inf_canary_replay_stall_seal) {
-                // The planted canary breaks D2 rule 5: the step seals the
-                // file to free the partial frame, as the live stall seal
-                // does — a boot file with the stall reason.
+            // The planted canary breaks D2 rule 5: the step seals the file
+            // to free the partial frame, as the live stall seal does — a
+            // boot file with the stall reason.
+            #[cfg(inf_canary_replay_stall_seal)]
+            {
                 let planted = self.flush.seal_stall_planted();
                 planted.map_err(|cause| self.flush_refusal(table, cause))?;
             }
