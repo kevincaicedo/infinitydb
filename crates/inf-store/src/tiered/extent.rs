@@ -119,9 +119,18 @@ impl TieredTable {
     /// key). The admission cost's representability is
     /// [`extent_admission_cost`](Self::extent_admission_cost)'s, which
     /// the placement computes once.
-    pub(super) fn admit_extent(&self, key: &[u8], ext: ExtentRef) -> Result<usize, OpError> {
-        if key.len() > crate::record::MAX_KEY_LEN || ext.len > self.blob.max_bytes {
-            return Err(OpError::TooLarge);
+    pub(super) fn admit_extent(&self, key: &[u8], ext: ExtentRef) -> Result<usize, LengthRefusal> {
+        if key.len() > crate::record::MAX_KEY_LEN {
+            let max = crate::record::MAX_KEY_LEN as u64;
+            return Err(LengthRefusal {
+                bound: LengthBound::Key,
+                len: key.len() as u64,
+                limit: max,
+            });
+        }
+        if ext.len > self.blob.max_bytes {
+            let max = self.blob.max_bytes;
+            return Err(LengthRefusal { bound: LengthBound::BlobMax, len: ext.len, limit: max });
         }
         let spec = RecordSpec {
             key,
@@ -134,7 +143,12 @@ impl TieredTable {
         };
         let len = spec.encoded_len();
         if len > self.inline_record_max() {
-            return Err(OpError::TooLarge);
+            let max = self.inline_record_max() as u64;
+            return Err(LengthRefusal {
+                bound: LengthBound::InlineRecord,
+                len: len as u64,
+                limit: max,
+            });
         }
         Ok(len)
     }
@@ -144,8 +158,12 @@ impl TieredTable {
     /// when it is not representable. Boot replay asks it beside the
     /// length refusals, before it asks for room; a live placement asks
     /// it once, where it admits the disk.
-    pub(super) fn extent_admission_cost(ext: ExtentRef, len: usize) -> Result<u64, OpError> {
-        inf_log::blob::extent_device_bytes(ext.len).checked_add(len as u64).ok_or(OpError::TooLarge)
+    pub(super) fn extent_admission_cost(ext: ExtentRef, len: usize) -> Result<u64, LengthRefusal> {
+        inf_log::blob::extent_device_bytes(ext.len).checked_add(len as u64).ok_or(LengthRefusal {
+            bound: LengthBound::AdmissionCost,
+            len: ext.len,
+            limit: u64::MAX - len as u64,
+        })
     }
 
     fn append_extent(

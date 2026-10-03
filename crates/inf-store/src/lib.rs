@@ -125,7 +125,10 @@ pub use tiered::shadow::{
 };
 #[cfg(feature = "collision-oracle")]
 pub use tiered::shadow::{forced_collision_pair, forced_collision_triple};
-pub use tiered::{RELOC_ORIGIN_CAP, RecordParts, StageFailed, TieredLookup, TieredTable};
+pub use tiered::{
+    LengthBound, LengthRefusal, RELOC_ORIGIN_CAP, RecordParts, StageFailed, TieredLookup,
+    TieredTable,
+};
 pub use tiered_recover::{
     RecoveredTier, TierRecoverStats, apply_blob_ref_section, apply_live_set_section,
     apply_ref_section, recover_tiered_ns,

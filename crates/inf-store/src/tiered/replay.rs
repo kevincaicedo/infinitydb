@@ -144,9 +144,10 @@ impl ReplaySpill for NoSpill {
 /// cursor never passed an unread record).
 #[derive(Debug)]
 pub enum ReplayRefusal {
-    /// A length refusal `append` makes, before room (D1): the key, the
-    /// value, the blob threshold or half the ring.
-    TooLarge,
+    /// A length refusal `append` makes, before room (D1), naming the
+    /// bound: the key, the value, the blob threshold, half the ring, the
+    /// blob maximum or the admission cost.
+    TooLarge(LengthRefusal),
     /// `room` answered `End`: the 48-bit end of the space.
     End { len: usize },
     /// A fifth room ask for one record.
@@ -185,7 +186,7 @@ pub enum ReplayRefusal {
 impl core::fmt::Display for ReplayRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ReplayRefusal::TooLarge => write!(f, "record exceeds a length bound (ADR-0174 D1)"),
+            ReplayRefusal::TooLarge(refusal) => write!(f, "{refusal}"),
             ReplayRefusal::End { len } => {
                 write!(f, "no room for {len} bytes: the 48-bit end of the address space")
             }
@@ -765,7 +766,7 @@ impl TieredTable {
         value: &[u8],
         hash: u64,
     ) -> Result<LogicalAddr, ReplayRefusal> {
-        let admitted = self.admit_inline(key, value).map_err(|_| ReplayRefusal::TooLarge)?;
+        let admitted = self.admit_inline(key, value).map_err(ReplayRefusal::TooLarge)?;
         self.replay_place(replay, markers, hash, admitted.len(), |t| t.apply_image(admitted, hash))
     }
 
@@ -782,8 +783,8 @@ impl TieredTable {
         hash: u64,
         ext: ExtentRef,
     ) -> Result<LogicalAddr, ReplayRefusal> {
-        let len = self.admit_extent(key, ext).map_err(|_| ReplayRefusal::TooLarge)?;
-        TieredTable::extent_admission_cost(ext, len).map_err(|_| ReplayRefusal::TooLarge)?;
+        let len = self.admit_extent(key, ext).map_err(ReplayRefusal::TooLarge)?;
+        TieredTable::extent_admission_cost(ext, len).map_err(ReplayRefusal::TooLarge)?;
         self.replay_place(replay, markers, hash, len, |t| t.apply_extent_image(key, hash, ext))
     }
 
@@ -1170,6 +1171,30 @@ mod tests {
         }
         assert!(replay.counters().settled_same_key >= 56, "every rewrite's twin settled");
         assert!(steps >= 28, "VACUOUS: the walk did not yield on its reads ({steps} steps)");
+    }
+
+    /// A length refusal names the bound it crossed, the length and the
+    /// bound's value — before the record asks for room.
+    #[test]
+    fn a_length_refusal_names_its_bound() {
+        let fs = MemFs::new();
+        let mut table = table();
+        table
+            .set_blob_config(crate::extents::BlobConfig { threshold_bytes: 1024, max_bytes: 4096 });
+        let mut replay = machine(&fs);
+        let hash = table.hash_key(b"big");
+        let err = table
+            .replay_upsert(Some(&mut replay), &[], b"big", &[0x5A; 1024], hash)
+            .expect_err("a value at the blob threshold is not inline");
+        let text = err.to_string();
+        assert!(text.contains("BLOB-THRESHOLD") && text.contains("1024"), "{text}");
+        let ext = ExtentRef { extent_id: 1, offset: 0, len: 8192 };
+        let err = table
+            .replay_upsert_extent(Some(&mut replay), &[], b"big", hash, ext)
+            .expect_err("an extent above the blob maximum");
+        let text = err.to_string();
+        assert!(text.contains("8192") && text.contains("4096"), "{text}");
+        assert_eq!(table.space().tail(), LogicalAddr::ZERO, "nothing placed");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file

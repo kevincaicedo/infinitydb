@@ -241,6 +241,68 @@ pub const RELOC_ORIGIN_CAP: usize = 3;
 /// Cap on retained unconfirmed flush-chunk ends (~32 KiB worst case).
 const FLUSH_ENDS_CAP: usize = 4096;
 
+/// Which length bound refused a placement — the typed length refusals of
+/// `append` and of boot replay's entries (ADR-0174 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LengthBound {
+    /// The key is longer than `MAX_KEY_LEN`.
+    Key,
+    /// The value is longer than `MAX_VAL_LEN`.
+    Value,
+    /// An inline value at or above `BLOB-THRESHOLD`: it takes the extent
+    /// path (ADR-0061 D1).
+    BlobThreshold,
+    /// The record is longer than half the ring (ADR-0102 D3).
+    InlineRecord,
+    /// The extent is longer than the blob maximum.
+    BlobMax,
+    /// The extent's disk admission cost is not representable.
+    AdmissionCost,
+}
+
+/// A length refusal: the bound, the length that crossed it and the
+/// bound's value, all in bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LengthRefusal {
+    pub bound: LengthBound,
+    pub len: u64,
+    pub limit: u64,
+}
+
+impl LengthRefusal {
+    fn new(bound: LengthBound, len: usize, limit: usize) -> LengthRefusal {
+        LengthRefusal { bound, len: len as u64, limit: limit as u64 }
+    }
+
+    /// Refuses `len` above `limit`.
+    fn check(bound: LengthBound, len: usize, limit: usize) -> Result<(), LengthRefusal> {
+        if len > limit {
+            return Err(LengthRefusal::new(bound, len, limit));
+        }
+        Ok(())
+    }
+}
+
+impl From<LengthRefusal> for OpError {
+    fn from(_: LengthRefusal) -> OpError {
+        OpError::TooLarge
+    }
+}
+
+impl core::fmt::Display for LengthRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (what, bound) = match self.bound {
+            LengthBound::Key => ("key", "the longest key"),
+            LengthBound::Value => ("value", "the longest value"),
+            LengthBound::BlobThreshold => ("inline value", "BLOB-THRESHOLD"),
+            LengthBound::InlineRecord => ("record", "half the ring"),
+            LengthBound::BlobMax => ("extent", "the blob maximum"),
+            LengthBound::AdmissionCost => ("extent", "the representable admission cost"),
+        };
+        write!(f, "a {}-byte {what} crosses {bound} ({} bytes)", self.len, self.limit)
+    }
+}
+
 /// An inline placement the length refusals admitted — `admit_inline`'s
 /// one product: the key and value with the record's encoded length, so
 /// a placement writes what was admitted and checks nothing twice.
@@ -1143,12 +1205,12 @@ impl TieredTable {
         &self,
         key: &'a [u8],
         value: &'a [u8],
-    ) -> Result<AdmittedInline<'a>, OpError> {
-        if key.len() > crate::record::MAX_KEY_LEN || value.len() > crate::record::MAX_VAL_LEN {
-            return Err(OpError::TooLarge);
-        }
-        if value.len() >= self.blob.threshold_bytes as usize {
-            return Err(OpError::TooLarge);
+    ) -> Result<AdmittedInline<'a>, LengthRefusal> {
+        LengthRefusal::check(LengthBound::Key, key.len(), crate::record::MAX_KEY_LEN)?;
+        LengthRefusal::check(LengthBound::Value, value.len(), crate::record::MAX_VAL_LEN)?;
+        let threshold = self.blob.threshold_bytes as usize;
+        if value.len() >= threshold {
+            return Err(LengthRefusal::new(LengthBound::BlobThreshold, value.len(), threshold));
         }
         let spec = RecordSpec {
             key,
@@ -1158,9 +1220,7 @@ impl TieredTable {
             kind: RecordKind::String { raw: false },
         };
         let len = spec.encoded_len();
-        if len > self.inline_record_max() {
-            return Err(OpError::TooLarge);
-        }
+        LengthRefusal::check(LengthBound::InlineRecord, len, self.inline_record_max())?;
         Ok(AdmittedInline { key, value, len })
     }
 
