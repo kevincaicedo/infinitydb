@@ -1150,6 +1150,17 @@ impl<F: SegmentFs> BootFlush<F> {
     pub fn held_handles(&self) -> usize {
         self.flush.sealed_handles.len()
     }
+
+    /// The planted canary's stall seal (DRR FCR-STTIER-01 §6,
+    /// `inf_canary_replay_stall_seal`): a boot pipeline never seals a
+    /// file to free a partial frame (ADR-0174 D2 rule 5); the seal-reason
+    /// census is what sees one that does.
+    ///
+    /// # Errors
+    /// As any seal.
+    pub fn seal_stall_planted(&mut self) -> Result<(), TierFlushError> {
+        self.flush.seal_stall()
+    }
 }
 
 impl<F: SegmentFs> SeamFlush for BootFlush<F> {

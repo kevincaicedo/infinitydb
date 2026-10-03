@@ -1096,7 +1096,10 @@ impl TieredTable {
         debug_assert!(self.space.walk_watermark().is_none(), "settle under a pinned walk");
         let cold = LogicalAddr::from_raw(c).expect("48-bit");
         let own = self.reloc_origins.get(&(hash, c)).map_or(0, Vec::len);
-        let chains_self = !matches!(case, SettleCase::ThisLife { .. });
+        // The planted canary (DRR FCR-STTIER-01 §6): a boot's ref settle
+        // chains nothing, so the next delete stages no marker for it.
+        let dropped = cfg!(inf_canary_replay_origin_drop) && case == SettleCase::RefAtBoot;
+        let chains_self = !matches!(case, SettleCase::ThisLife { .. }) && !dropped;
         let incoming = own + usize::from(chains_self);
         let existing = self.reloc_origins.get(&(hash, w)).map_or(0, Vec::len);
         if existing + incoming > super::RELOC_ORIGIN_CAP {

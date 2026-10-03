@@ -383,6 +383,12 @@ impl<F: SegmentFs> TierReplay<F> {
                     .map_err(ReplayRefusal::Flush)?;
                 self.note_flush(outcome);
             }
+            if cfg!(inf_canary_replay_stall_seal) {
+                // The planted canary (DRR FCR-STTIER-01 §6): the step
+                // seals the file to free the partial frame, as the live
+                // stall seal does — a boot file with the stall reason.
+                self.flush.seal_stall_planted().map_err(ReplayRefusal::Flush)?;
+            }
         }
         while table.space.head() < target {
             if table.release_slice() == 0 {
@@ -432,7 +438,10 @@ impl<F: SegmentFs> TierReplay<F> {
                 self.key.extend_from_slice(parts.key);
                 (parts.encoded_len as u64, table.hash_key(parts.key))
             };
-            if table.index.contains_pair(hash, here) {
+            // The planted canary (DRR FCR-STTIER-01 §6): E10 skipped at
+            // the seal — a sealed record leaves its same-key cold slot.
+            let settle_here = stop.is_none() || !cfg!(inf_canary_replay_seal_no_settle);
+            if settle_here && table.index.contains_pair(hash, here) {
                 self.settle_twins(table, here, hash)?;
             }
             at += len;

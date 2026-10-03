@@ -64,6 +64,12 @@
 #                         step, zero corruption (the retained-batch +
 #                         append-rewind discipline: nothing claimable
 #                         was dropped, nothing misaligned)
+#   boot-refuses-typed-then-recovers — a boot settle read that fails
+#                         (ADR-0174 D3; DRR FCR-STTIER-01 §2) is the
+#                         typed refusal: a DEL whose read failed has
+#                         changed nothing, the boot stops typed, and a
+#                         later boot with the fault cleared recovers
+#                         the same unit
 
 schema = 1
 milestone = "m4"
@@ -179,6 +185,14 @@ point = "tier_dir_open_fail"
 tier = "node"
 test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
 expect = "creation-retried-round-owned"
+
+# ADR-0174 D3 (FCR-STTIER-01): the boot settle read's one fault point —
+# a cold twin's key window unreadable at a replayed DEL.
+[[row]]
+point = "replay_settle_read_fail"
+tier = "node"
+test = "crash-matrix::replay::replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers"
+expect = "boot-refuses-typed-then-recovers"
 
 # ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
 

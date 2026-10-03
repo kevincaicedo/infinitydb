@@ -195,6 +195,37 @@ rows=(
   # rebuild answers "distinct" (or `lookup`'s own hash check, in debug)
   # where the identity refusal is expected.
   "inf_canary_replay_settle_unchecked crate-test inf-store test:tiered_shadow a_rebuilt_slot_settles_only_on_a_verified_record_of_its_hash"
+  # ADR-0174 D1: the replay entry answers a `Demote` with the refusal HEAD
+  # made — a tail above the window fails the boot again.
+  "inf_canary_replay_no_demote crate-test inf-store test:tiered_recovery a_tail_of_three_windows_replays_into_the_recovered_table Store(OutOfMemory)"
+  # ADR-0174 D3 R7 (E10) skipped at the seal: a sealed winner leaves its
+  # same-key cold twin, which the lookup serves — the key census.
+  "inf_canary_replay_seal_no_settle crate-test inf-store test:tiered_replay a_shadow_pair_in_the_unit_settles_at_the_sealed_winner (a)"
+  # ADR-0174 D3 R10 (E12) skipped: the rebuild tickets same-key pairs in a
+  # namespace that demoted — census (d).
+  "inf_canary_replay_no_end_settle crate-test inf-store test:tiered_replay rewrites_still_open_at_the_end_of_replay_are_settled_before_ready (d)"
+  # ADR-0174 D3 R6 (E5) skipped: a replayed DEL leaves the key's demoted
+  # copy, which serves — census (a).
+  "inf_canary_replay_del_no_verify crate-test inf-store test:tiered_replay deletes_in_the_tail_resolve_against_demoted_copies (a)"
+  # ADR-0174 D3 R8: the boot's ref settle chains nothing, so the next
+  # delete stages no marker for it and the key resurrects on the second
+  # boot — census (a).
+  "inf_canary_replay_origin_drop crate-test inf-store test:tiered_replay a_ref_settled_by_boot_one_stays_deleted_across_a_second_crash (a)"
+  # ADR-0174 D3 R9 (E14) skipped: the settled ref's blob reference stays
+  # with no slot — the blob census.
+  "inf_canary_replay_blob_release_skip crate-test inf-store test:tiered_replay a_blob_ref_settled_during_image_load_is_released_at_the_end_of_the_checkpoint reference"
+  # ADR-0174 D3 R8: the ref arm charges the record's bytes — a recovered
+  # file above its true dead bytes (the dead-byte census, I13).
+  "inf_canary_replay_ref_settle_charges crate-test inf-store test:tiered_replay a_death_the_crashed_life_charged_is_not_charged_again over-counts"
+  # ADR-0174 D3 R11 (E15) skipped: a live-set entry names a boot file and
+  # overwrites its counters — a boot file that is not byte-exact.
+  "inf_canary_replay_restore_unguarded crate-test inf-store test:tiered_replay a_live_set_entry_naming_a_boot_file_restores_nothing byte-exact"
+  # ADR-0174 D5 (I11): the hand-over closes the boot-sealed handles instead
+  # of returning them — fewer handles than sealed files.
+  "inf_canary_replay_handles_dropped crate-test inf-store test:tiered_replay committed_pages_around_the_window_decide_whether_the_boot_demotes one handle per sealed file"
+  # ADR-0174 D2 rule 5: the step seals the file to free the partial frame
+  # — a boot file with the stall reason (the seal-reason census).
+  "inf_canary_replay_stall_seal crate-test inf-store test:tiered_replay a_rewritten_key_keeps_one_slot_with_the_newest_value Stall"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
