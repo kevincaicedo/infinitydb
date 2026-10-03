@@ -464,11 +464,10 @@ impl AddressSpace {
     /// # Panics
     /// Panics on an empty allocation or one above half the ring —
     /// programmer errors, bounded by the record and blob limits.
-    fn prospect(&self, len: usize) -> Prospect {
+    fn prospect(&self, len: u64) -> Prospect {
         assert!(len > 0, "empty allocation");
         let ring = self.ring_mask + 1;
-        assert!((len as u64) <= ring / 2, "allocation exceeds half the ring");
-        let len = len as u64;
+        assert!(len <= ring / 2, "allocation exceeds half the ring");
         let rel_tail = self.tail - self.life_origin;
         let ring_offset = rel_tail & self.ring_mask;
         let hole = if ring_offset + len > ring { ring - ring_offset } else { 0 };
@@ -516,7 +515,7 @@ impl AddressSpace {
     /// # Panics
     /// As [`alloc`](Self::alloc).
     pub fn room(&self, len: usize) -> Room {
-        self.classify(self.prospect(len))
+        self.classify(self.prospect(len as u64))
     }
 
     /// Classifies a prospect against the window and the tail (D2 rules 1
@@ -545,7 +544,7 @@ impl AddressSpace {
             return Room::Demote(self.addr_at(rel_tail));
         }
         if prospect.hole > 0 {
-            let pad = self.prospect(prospect.hole as usize);
+            let pad = self.prospect(prospect.hole);
             debug_assert_eq!(pad.start_rel, rel_tail, "a ring-top pad starts at the tail");
             debug_assert_eq!(pad.top_rel, prospect.start_rel, "and ends at the ring top");
             if self.fits(pad) {
@@ -574,7 +573,7 @@ impl AddressSpace {
     /// hole bytes are dead on arrival, counted, and tripwired. No state
     /// changes on refusal.
     pub fn alloc(&mut self, len: usize) -> Option<LogicalAddr> {
-        let prospect = self.prospect(len);
+        let prospect = self.prospect(len as u64);
         if !self.fits(prospect) {
             return None;
         }
@@ -604,41 +603,48 @@ impl AddressSpace {
     /// ring-top pad is the ring-top seal the record would have made and
     /// counts as one; a page pad commits nothing.
     ///
+    /// The pad is the [`Prospect`] of its own length — the one
+    /// arithmetic (D2 rule 1): a ring-top pad is `prospect(hole)`, which
+    /// starts at the tail and tops at the ring top, exactly what `room`
+    /// classified; a page pad tops at the committed top of today.
+    ///
     /// # Errors
     /// [`WindowFull`] when the pages the pad commits would exceed the
     /// window — nothing changed. `room` answers `Pad` only where they do
     /// not; this is that arithmetic's pair check.
     ///
     /// # Panics
-    /// Panics when `to` is not a pad target of the current tail (at or
-    /// below it, or neither the ring top nor the next page boundary) —
-    /// a stale or invented answer, a programmer error.
+    /// Panics when `to` is not a pad target of the current tail: at or
+    /// below it, or neither the ring top within half a ring (a hole is
+    /// shorter than the record that needs it) nor the next page
+    /// boundary — a stale or invented answer, a programmer error.
     pub fn pad_tail(&mut self, to: LogicalAddr) -> Result<(), WindowFull> {
         let t = to.to_raw();
         assert!(t > self.tail, "pad at or below the tail");
         let rel_tail = self.tail - self.life_origin;
-        let ring = self.ring_mask + 1;
-        let ring_top_rel = rel_tail + (ring - (rel_tail & self.ring_mask));
         let to_rel = t - self.life_origin;
+        let pad_len = t - self.tail;
+        let ring_top = (to_rel & self.ring_mask) == 0 && pad_len < self.ring_bytes() / 2;
         assert!(
-            to_rel == ring_top_rel || to_rel == self.page_ceil(rel_tail),
+            ring_top || to_rel == self.page_ceil(rel_tail),
             "pad target is neither the ring top nor the next page"
         );
-        let top_rel = self.page_ceil(to_rel).max(self.commit_top_rel);
-        if top_rel - self.commit_floor_rel > self.window_limit {
+        let pad = self.prospect(pad_len);
+        debug_assert_eq!(pad.hole, 0, "a pad makes no hole");
+        debug_assert_eq!(pad.top_rel, to_rel, "a pad's committed top is its target");
+        if !self.fits(pad) {
             return Err(WindowFull);
         }
-        if top_rel > self.commit_top_rel {
-            self.commit_rel_pages(self.commit_top_rel, top_rel);
-            self.commit_top_rel = top_rel;
+        if pad.top_rel > self.commit_top_rel {
+            self.commit_rel_pages(self.commit_top_rel, pad.top_rel);
+            self.commit_top_rel = pad.top_rel;
         }
-        let pad = t - self.tail;
-        if to_rel == ring_top_rel {
+        if ring_top {
             self.counters.seal_holes += 1;
-            self.counters.seal_hole_bytes += pad;
+            self.counters.seal_hole_bytes += pad_len;
         }
-        self.dead_bytes += pad;
-        self.hole_marks.push_back((self.tail, pad));
+        self.dead_bytes += pad_len;
+        self.hole_marks.push_back((self.tail, pad_len));
         debug_assert!(self.hole_marks.len() <= 3, "two ring tops and one pad at most");
         self.tail = t;
         self.assert_watermark_order();
@@ -664,7 +670,7 @@ impl AddressSpace {
     /// path's answer to that case is its own finding, FCR-STTIER-N4;
     /// boot replay asks [`room`](Self::room) instead.
     pub fn stall_target(&self, len: usize) -> Option<LogicalAddr> {
-        let prospect = self.prospect(len);
+        let prospect = self.prospect(len as u64);
         if self.fits(prospect) {
             return None; // fits now — the caller's alloc will succeed.
         }
@@ -1457,6 +1463,49 @@ mod tests {
             Room::Demote(h) => assert_eq!(h, sp.tail(), "a record of the window demotes"),
             other => panic!("a record of the window demotes: {other:?}"),
         }
+    }
+
+    /// `pad_tail`'s pair check (ADR-0174 D2 rule 6): a ring-top pad whose
+    /// pages the window cannot commit — the committed floor too low —
+    /// answers `WindowFull` and changes nothing: tail, counters, dead
+    /// bytes, hole marks. Released to where the pages fit, the same pad
+    /// places: the ring top is the tail and the hole counts as a seal.
+    #[test]
+    fn a_ring_top_pad_the_window_cannot_commit_is_refused_without_mutation() {
+        let page = 1u64 << 12;
+        let ring = 16 * page;
+        // Six resident pages at a window of eight, the floor at four and
+        // the tail six pages below the ring top: the pad needs twelve.
+        let mut sp = space_at(ring as usize, page as usize, 8 * page, 10 * page, 4 * page);
+        let before = (sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len());
+        let ring_top = LogicalAddr::from_raw(ring).expect("48-bit");
+        assert_eq!(sp.pad_tail(ring_top), Err(WindowFull));
+        assert_eq!((sp.tail(), sp.counters(), sp.report(), sp.hole_marks.len()), before);
+        sp.advance_head(LogicalAddr::from_raw(8 * page).expect("48-bit"));
+        assert_eq!(sp.pad_tail(ring_top), Ok(()));
+        assert_eq!(sp.tail(), ring_top);
+        assert_eq!(sp.counters().seal_holes, 1, "a ring-top pad is the seal the record would make");
+        assert_eq!(sp.counters().seal_hole_bytes, 6 * page);
+        assert_eq!(sp.report().dead_bytes, 6 * page);
+        assert_eq!(sp.report().committed_bytes, 8 * page, "the pad's pages, within the window");
+    }
+
+    #[test]
+    #[should_panic(expected = "pad at or below the tail")]
+    fn a_pad_at_the_tail_panics() {
+        let mut sp = space(1 << 16, 1 << 12);
+        sp.alloc(100).expect("fits");
+        let _ = sp.pad_tail(sp.tail());
+    }
+
+    /// A ring multiple a whole ring above a ring-aligned tail is no pad
+    /// target: no record makes a hole there (it would start at the
+    /// tail), and a pad is shorter than the record that needs it.
+    #[test]
+    #[should_panic(expected = "pad target is neither the ring top nor the next page")]
+    fn a_pad_of_a_whole_ring_panics() {
+        let mut sp = space(1 << 16, 1 << 12);
+        let _ = sp.pad_tail(LogicalAddr::from_raw(1 << 16).expect("48-bit"));
     }
 
     /// The 48-bit end (ADR-0174 D2 rule 1's `End`): a life whose origin
