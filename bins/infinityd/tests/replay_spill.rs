@@ -1,12 +1,17 @@
 //! The binary arm of ADR-0174 D1: a four-cell node under `MEM-BUDGET
 //! 3mb` (a 4 MiB window per cell) takes 64 MiB of tiered `SET`s with
-//! rewrites and deletes at distances under and over a window, is killed,
-//! and boots again — replay demotes the tail that does not fit instead of
-//! failing the boot, and every acknowledged key answers its bytes. Two
-//! arms, `FSYNC always` and `everysec`; `TIER-IO-MODE direct` (the
-//! default) on a disk filesystem, the workspace `target/` directory. Red
-//! before the replay seam: the restarted process exits non-zero (`replay
-//! apply failed … OutOfMemory`).
+//! rewrites at distances under and over a window, deletes of recent keys
+//! and of keys written over a window ago, and a delete then a `SET`, and a
+//! `SET` then a delete, of such keys; it is killed and boots again —
+//! replay demotes the tail that does not fit instead of failing the boot,
+//! a replayed delete verifies and removes the copy the boot demoted (R6),
+//! and every acknowledged key answers its bytes. Two arms, `FSYNC always`
+//! and `everysec`; `TIER-IO-MODE direct` (the default) on a disk
+//! filesystem, the workspace `target/` directory. Red before the replay
+//! seam: the restarted process exits non-zero (`replay apply failed …
+//! OutOfMemory`). The control leg is the same load under `MEM-BUDGET
+//! 64mb`, inside every cell's window: the restart must not demote, and
+//! every counter of the zero set reads zero in `INFO` (D6).
 //!
 //! The `everysec` arm's durability point is a barrier, not a sleep:
 //! every load key carries one of 64 hash tags, and after the last load
@@ -17,7 +22,7 @@
 //! write is under a completed barrier and both arms compare exactly.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -230,6 +235,9 @@ impl Client {
     }
 }
 
+/// The acknowledged key → value state of the load.
+type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
 fn key(tag: u64, ordinal: u64) -> Vec<u8> {
     format!("{{{tag:02}}}:k:{ordinal:07}").into_bytes()
 }
@@ -241,15 +249,24 @@ fn value(ordinal: u64, generation: u32) -> Vec<u8> {
     v
 }
 
-/// The load: distinct keys, a rewrite of a key written under a window
-/// ago every 7th op, one from over a window ago every 11th, a delete of
-/// a recent key every 13th. Returns the model after the load.
-fn load(c: &mut Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+/// The load: distinct keys; a delete of a recent key every 13th op; a
+/// delete of a key written over a window ago every 17th, the last of
+/// those written again every 19th; the last key rewritten from over a
+/// window ago deleted every 23rd; a rewrite of a key written over a
+/// window ago every 11th, and of one under a window ago every 7th.
+/// "Over a window" is six windows of node ops, a window and a half of
+/// each cell's: by the restart's replay of that delete or rewrite, the
+/// boot has demoted the key's copy. Returns the model after the load and
+/// the keys whose last acknowledged op was a delete.
+fn load(c: &mut Client) -> (Model, BTreeSet<Vec<u8>>) {
+    let mut model = Model::new();
+    let mut deleted: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut generation: BTreeMap<u64, u32> = BTreeMap::new();
     let mut bytes = 0u64;
     let mut ordinal = 0u64;
     let per_window_ops = (4u64 << 20) / VALUE_LEN as u64; // per cell ≈ 1 365 of its ops
+    let old = 6 * per_window_ops;
+    let (mut old_deleted, mut old_rewritten): (Option<u64>, Option<u64>) = (None, None);
     while bytes < LOAD_BYTES {
         let mut batch: Vec<Vec<Vec<u8>>> = Vec::with_capacity(PIPELINE);
         let mut expect: Vec<Vec<u8>> = Vec::with_capacity(PIPELINE);
@@ -257,8 +274,20 @@ fn load(c: &mut Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
             let op = ordinal;
             let target = if op % 13 == 12 && op > 3 {
                 Some((op - 3, true))
-            } else if op % 11 == 10 && op > 6 * per_window_ops {
-                Some((op - 6 * per_window_ops, false))
+            } else if op % 17 == 16 && op > old {
+                old_deleted = Some(op - old);
+                Some((op - old, true))
+            } else if op % 19 == 18
+                && let Some(victim) = old_deleted.take()
+            {
+                Some((victim, false))
+            } else if op % 23 == 22
+                && let Some(victim) = old_rewritten.take()
+            {
+                Some((victim, true))
+            } else if op % 11 == 10 && op > old {
+                old_rewritten = Some(op - old);
+                Some((op - old, false))
             } else if op % 7 == 6 && op > per_window_ops / 4 {
                 Some((op - per_window_ops / 4, false))
             } else {
@@ -268,6 +297,7 @@ fn load(c: &mut Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
                 Some((victim, true)) => {
                     let k = key(victim % TAGS, victim);
                     let present = model.remove(&k).is_some();
+                    deleted.insert(k.clone());
                     batch.push(vec![b"DEL".to_vec(), k]);
                     expect.push(if present { b":1\r\n".to_vec() } else { b":0\r\n".to_vec() });
                 }
@@ -277,6 +307,7 @@ fn load(c: &mut Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
                     *g += 1;
                     let v = value(victim, *g);
                     bytes += (k.len() + v.len()) as u64;
+                    deleted.remove(&k);
                     model.insert(k.clone(), v.clone());
                     batch.push(vec![b"SET".to_vec(), k, v]);
                     expect.push(b"+OK\r\n".to_vec());
@@ -304,12 +335,39 @@ fn load(c: &mut Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
             );
         }
     }
-    model
+    (model, deleted)
 }
 
-fn run_arm(fsync: &str) {
+/// Which leg a run is: the window below every cell's share of the load,
+/// so the restart must demote, or above it — the control leg, the same
+/// load, where the restart must not.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Leg {
+    /// `MEM-BUDGET 3mb`: a 4 MiB window per cell under its 16 MiB.
+    Demote,
+    /// `MEM-BUDGET 64mb`: a 65 MiB window per cell over its 16 MiB.
+    Fit,
+}
+
+/// ADR-0174 D6's zero set in `INFO persistence`: every counter a boot
+/// whose replay fits every window leaves at zero. Outside it: the markers
+/// skipped, the dead-life files removed and the step-charge gauge.
+const ZERO_SET: [&str; 10] = [
+    "recover_node_tier_demote_steps",
+    "recover_node_tier_pads_placed",
+    "recover_node_tier_bytes_written",
+    "recover_node_tier_barriers",
+    "recover_node_tier_files_sealed",
+    "recover_node_tier_settle_reads",
+    "recover_node_tier_settled_same_key",
+    "recover_node_tier_settled_distinct",
+    "recover_node_tier_deletes_verified",
+    "recover_node_tier_blob_releases",
+];
+
+fn run_arm(fsync: &str, leg: Leg) {
     let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = data_root(&format!("spill-{fsync}"));
+    let dir = data_root(&format!("spill-{fsync}-{leg:?}"));
     let kind = fs_type(&dir);
     assert!(
         kind != "tmpfs",
@@ -327,10 +385,13 @@ fn run_arm(fsync: &str) {
         b"FSYNC",
         fsync.as_bytes(),
         b"MEM-BUDGET",
-        b"3mb",
+        match leg {
+            Leg::Demote => b"3mb",
+            Leg::Fit => b"64mb",
+        },
     ]);
     c.ok(&[b"INF.NS", b"USE", b"t"]);
-    let model = load(&mut c);
+    let (model, deleted) = load(&mut c);
     assert!(model.len() > 10_000, "the load left {} keys", model.len());
     // The durability point (both arms): one `always` write per hash tag,
     // behind every load write of that tag's cell in its FIFO log.
@@ -374,20 +435,19 @@ fn run_arm(fsync: &str) {
     };
     let demoted = field("recover_node_tier_demote_steps");
     eprintln!(
-        "replay_spill arm {fsync}: {demoted} demote steps, {} tier bytes, {} barriers, {} files \
-         sealed, {} settle reads, {} deletes verified, step charge max {} bytes",
+        "replay_spill arm {fsync} {leg:?}: {demoted} demote steps, {} tier bytes, {} barriers, {} \
+         files sealed, {} settle reads, {} deletes verified, {} markers skipped, step charge max \
+         {} bytes; {} keys, {} deleted",
         field("recover_node_tier_bytes_written"),
         field("recover_node_tier_barriers"),
         field("recover_node_tier_files_sealed"),
         field("recover_node_tier_settle_reads"),
         field("recover_node_tier_deletes_verified"),
+        field("recover_node_tier_markers_skipped"),
         field("recover_node_tier_step_charge_max_bytes"),
+        model.len(),
+        deleted.len(),
     );
-    assert!(demoted > 0, "VACUOUS (arm {fsync}): the restart did not demote: {info}");
-    assert!(field("recover_node_tier_bytes_written") > 0, "{info}");
-    assert!(field("recover_node_tier_files_sealed") > 0, "{info}");
-    let dbsize = c.call(&[b"DBSIZE"]);
-    assert_eq!(dbsize, format!(":{}\r\n", model.len()).into_bytes(), "DBSIZE after the restart");
     let keys: Vec<&Vec<u8>> = model.keys().collect();
     for chunk in keys.chunks(PIPELINE) {
         let gets: Vec<Vec<Vec<u8>>> =
@@ -400,6 +460,45 @@ fn run_arm(fsync: &str) {
             assert!(reply == bulk, "GET {} differs after the restart", String::from_utf8_lossy(k));
         }
     }
+    // A deleted key stays deleted: a replayed delete removed the copy the
+    // boot demoted (R6), or the key returns.
+    let gone: Vec<&Vec<u8>> = deleted.iter().collect();
+    for chunk in gone.chunks(PIPELINE) {
+        let gets: Vec<Vec<Vec<u8>>> =
+            chunk.iter().map(|k| vec![b"GET".to_vec(), (*k).clone()]).collect();
+        for (reply, k) in c.pipeline(&gets).into_iter().zip(chunk) {
+            assert!(
+                reply == b"$-1\r\n",
+                "DELETED KEY PRESENT: GET {} answers after the restart",
+                String::from_utf8_lossy(k)
+            );
+        }
+    }
+    let dbsize = c.call(&[b"DBSIZE"]);
+    assert_eq!(dbsize, format!(":{}\r\n", model.len()).into_bytes(), "DBSIZE after the restart");
+    // Engagement after the content oracle, so a planted violation the
+    // oracle must see is read there first.
+    match leg {
+        Leg::Demote => {
+            // Engagement: the restart demoted, wrote and sealed tier files
+            // of its own, settled records against their demoted copies and
+            // verified deletes against them (R6) — VACUOUS otherwise.
+            assert!(demoted > 0, "VACUOUS (arm {fsync}): the restart did not demote: {info}");
+            assert!(field("recover_node_tier_bytes_written") > 0, "{info}");
+            assert!(field("recover_node_tier_files_sealed") > 0, "{info}");
+            let reads = field("recover_node_tier_settle_reads");
+            assert!(reads > 0, "VACUOUS (arm {fsync}): no settle read: {info}");
+            let verified = field("recover_node_tier_deletes_verified");
+            assert!(verified > 0, "VACUOUS (arm {fsync}): no delete verified: {info}");
+        }
+        Leg::Fit => {
+            // The control leg: a boot that fits every window demotes
+            // nothing and leaves the zero set at zero.
+            for name in ZERO_SET {
+                assert_eq!(field(name), 0, "{name} moved on a boot that fits: {info}");
+            }
+        }
+    }
     drop(c);
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
@@ -407,10 +506,15 @@ fn run_arm(fsync: &str) {
 
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_always() {
-    run_arm("always");
+    run_arm("always", Leg::Demote);
 }
 
 #[test]
 fn a_tail_above_every_cells_window_boots_under_fsync_everysec() {
-    run_arm("everysec");
+    run_arm("everysec", Leg::Demote);
+}
+
+#[test]
+fn the_same_load_inside_every_cells_window_boots_without_demoting() {
+    run_arm("always", Leg::Fit);
 }

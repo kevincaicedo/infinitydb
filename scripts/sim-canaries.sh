@@ -207,6 +207,9 @@ rows=(
   # ADR-0174 D3 R6's reads skipped: a replayed DEL leaves the key's demoted
   # copy, which serves — census (a).
   "inf_canary_replay_del_no_verify crate-test inf-store test:tiered_replay deletes_in_the_tail_resolve_against_demoted_copies (a)"
+  # The same plant at the shipped topology: the four-cell binary's replayed
+  # deletes of keys written over a window ago leave the demoted copies.
+  "inf_canary_replay_del_no_verify crate-test infinityd test:replay_spill a_tail_above_every_cells_window_boots_under_fsync_always DELETED KEY PRESENT"
   # ADR-0174 D3 R8: the boot's ref settle chains nothing, so the next
   # delete stages no marker for it and the key resurrects on the second
   # boot — census (a).
