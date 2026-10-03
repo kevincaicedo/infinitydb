@@ -73,6 +73,44 @@ const FILE_CAPACITY: u64 = 48 << 10;
 /// Out-of-line threshold for the blob leg (M4-S17, ADR-0061) — above
 /// every inline value the op generator emits, below every blob value.
 const BLOB_THRESHOLD: u32 = 256;
+/// The share of the budget kept for mutable records: small, so all three
+/// residency classes are in play at this corpus size.
+const MUTABLE_PERMILLE: u32 = 40;
+
+/// The default class rotation ([`SeedClass::of_seed`]): a seed's class is
+/// `seed mod 4` — the replay-above-window class at 1, the spec-variant
+/// class at 3, the plain class otherwise — and a variant seed's case is
+/// the next bit, `(seed ÷ 4) mod 2` ([`SpecVariant::of_seed`]).
+const SEED_CLASS_ROTATION: u64 = 4;
+const REPLAY_ABOVE_WINDOW_RESIDUE: u64 = 1;
+const SPEC_VARIANT_RESIDUE: u64 = 3;
+
+// The spec-variant class's parameters: the record's §6 second row states
+// its specs at the 1 MiB commit page, and the harness runs them at its own
+// 4 KiB `PAGE` — one MiB of the record is one `PAGE` here, so every bound
+// that ADR-0174 D2 rule 6 states in pages holds unchanged.
+/// `MEM-BUDGET 4mb`, both cases: 4 pages.
+const VARIANT_BUDGET: u64 = 4 * PAGE;
+/// The ring both cases reserve, `next_pow2(MEM-BUDGET + MAINTAIN-SLICE)`:
+/// the record's 8 MiB, 8 pages.
+const VARIANT_RING: u64 = 8 * PAGE;
+/// Case (a)'s `MAINTAIN-SLICE`, the default 1 MiB: one page, so a 5-page
+/// window, above half the ring.
+const RING_TOP_SLICE: u64 = PAGE;
+/// Case (a)'s `BLOB-THRESHOLD 3mb`: 3 pages.
+const RING_TOP_THRESHOLD: u64 = 3 * PAGE;
+/// Case (a)'s record of 2.9 MiB: 2.9 pages.
+const RING_TOP_RECORD: u64 = 29 * PAGE / 10;
+/// Case (a)'s shortest long record, 2.125 pages: above two pages, so its
+/// three pages and a ring-top hole of more than two exceed the 5-page
+/// window (rule 6, case (a)).
+const RING_TOP_RECORD_MIN: u64 = 2 * PAGE + PAGE / 8;
+/// Case (b)'s `MAINTAIN-SLICE 64kb`: 256 B at this scale. Any slice under a
+/// page gives the same 4-page window, half the ring, and a one-page lead;
+/// the harness runs a quarter page.
+const PAGE_SLICE: u64 = PAGE / 4;
+/// Case (b)'s record of 3.9 MiB: 3.9 pages.
+const PAGE_RECORD: u64 = 39 * PAGE / 10;
 
 /// The spec-variant seed class (ADR-0174 D2 rule 6; the record's §6
 /// second row, at the harness's 4 KiB commit page): each boot recovers at
@@ -101,7 +139,11 @@ impl SpecVariant {
     /// The seed's variant, one of the two.
     #[must_use]
     pub fn of_seed(seed: u64) -> SpecVariant {
-        if (seed >> 2).is_multiple_of(2) { SpecVariant::RingTop } else { SpecVariant::Page }
+        if (seed / SEED_CLASS_ROTATION).is_multiple_of(2) {
+            SpecVariant::RingTop
+        } else {
+            SpecVariant::Page
+        }
     }
 }
 
@@ -121,14 +163,21 @@ impl Spec {
             let boot = demote();
             return Spec { boot, live: boot, blob_threshold: BLOB_THRESHOLD, variant: None };
         };
-        let ring = 8 * PAGE;
         let (slice_bytes, blob_threshold) = match variant {
-            SpecVariant::RingTop => (PAGE, u32::try_from(3 * PAGE).expect("three pages")),
-            SpecVariant::Page => (PAGE / 4, TierSpec::blob_threshold_max(ring)),
+            SpecVariant::RingTop => {
+                (RING_TOP_SLICE, u32::try_from(RING_TOP_THRESHOLD).expect("three pages"))
+            }
+            SpecVariant::Page => (PAGE_SLICE, TierSpec::blob_threshold_max(VARIANT_RING)),
         };
-        let boot = DemotionConfig { mem_budget_bytes: 4 * PAGE, mutable_permille: 40, slice_bytes };
+        let boot = DemotionConfig {
+            mem_budget_bytes: VARIANT_BUDGET,
+            mutable_permille: MUTABLE_PERMILLE,
+            slice_bytes,
+        };
         let spec = Spec { boot, live: raise(boot), blob_threshold, variant: Some(variant) };
-        debug_assert_eq!(spec.ring(), ring, "both variants reserve an 8-page ring");
+        // Release: every bound of the class (the threshold, the record
+        // lengths, half the ring) is derived from this ring.
+        assert_eq!(spec.ring(), VARIANT_RING, "both variants reserve an 8-page ring");
         spec
     }
 
@@ -214,9 +263,9 @@ impl SeedClass {
     /// the two fill classes, the rest plain.
     #[must_use]
     pub fn of_seed(seed: u64) -> SeedClass {
-        match seed % 4 {
-            1 => SeedClass::ReplayAboveWindow,
-            3 => SeedClass::SpecVariant(SpecVariant::of_seed(seed)),
+        match seed % SEED_CLASS_ROTATION {
+            REPLAY_ABOVE_WINDOW_RESIDUE => SeedClass::ReplayAboveWindow,
+            SPEC_VARIANT_RESIDUE => SeedClass::SpecVariant(SpecVariant::of_seed(seed)),
             _ => SeedClass::Plain,
         }
     }
@@ -582,9 +631,11 @@ fn flush_config(shard: &Path) -> TierFlushConfig {
 }
 
 fn demote() -> DemotionConfig {
-    // A small mutable fraction keeps all three residency classes in
-    // play at this corpus size.
-    DemotionConfig { mem_budget_bytes: BUDGET, mutable_permille: 40, slice_bytes: PAGE }
+    DemotionConfig {
+        mem_budget_bytes: BUDGET,
+        mutable_permille: MUTABLE_PERMILLE,
+        slice_bytes: PAGE,
+    }
 }
 
 /// `boot` raised to its whole ring: `MEM-BUDGET` up to the ring `boot`
@@ -1006,8 +1057,10 @@ impl Run {
         let key_len = key.len() as u64;
         let longest = (header + key_len + u64::from(self.spec.blob_threshold) - 1).min(half_ring);
         let (typical, shortest) = match variant {
-            SpecVariant::RingTop => (29 * PAGE / 10, 2 * PAGE + PAGE / 8),
-            SpecVariant::Page => (39 * PAGE / 10, self.spec.window() - PAGE + 1),
+            SpecVariant::RingTop => (RING_TOP_RECORD, RING_TOP_RECORD_MIN),
+            // Case (b) needs a record longer than the window less a page
+            // (rule 6), the window being half the ring.
+            SpecVariant::Page => (PAGE_RECORD, self.spec.window() - PAGE + 1),
         };
         let len = if exact_half {
             half_ring
