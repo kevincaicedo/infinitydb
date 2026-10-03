@@ -561,30 +561,50 @@ struct RecoveringTierNs<F: SegmentFs> {
     replay: inf_store::TierReplay<F>,
     extents_listed: Vec<u64>,
     extents_quarantined: Vec<u64>,
+    /// Lent through the seam since the last drain (its index is in
+    /// [`RecoveringTiers::lent`] once).
+    lent: bool,
 }
 
 /// The replay seam over the recovered pipelines (ADR-0174 D1): lends a
-/// namespace's boot machine to the keyspace's tiered replay arms, one
-/// lookup per record among the cell's tiered namespaces. The machines
-/// keep the I/O they did; the driver drains it with
-/// [`take_charge`](Self::take_charge) where it decides whether to yield.
-struct RecoveringTiers<F: SegmentFs>(Vec<RecoveringTierNs<F>>);
+/// namespace's boot machine to the keyspace's tiered replay arms — one
+/// binary search per record among the cell's tiered namespaces, kept in
+/// namespace order. The machines keep the I/O they did; the driver
+/// drains it with [`take_charge`](Self::take_charge) where it decides
+/// whether to yield, from the machines lent since the last drain only.
+struct RecoveringTiers<F: SegmentFs> {
+    /// The machines, ordered by namespace id.
+    tiers: Vec<RecoveringTierNs<F>>,
+    /// Indices into `tiers` lent since the last drain, each once: a frame
+    /// or section drains O(machines it lent), not O(tiered namespaces).
+    lent: Vec<usize>,
+}
 
 impl<F: SegmentFs> inf_store::ReplaySpill for RecoveringTiers<F> {
     type Fs = F;
 
     fn replay_mut(&mut self, ns: inf_log::NsId) -> Option<&mut inf_store::TierReplay<F>> {
-        self.0.iter_mut().find(|tier| tier.ns == ns).map(|tier| &mut tier.replay)
+        let index = self.tiers.binary_search_by_key(&ns, |tier| tier.ns).ok()?;
+        let tier = &mut self.tiers[index];
+        if !tier.lent {
+            tier.lent = true;
+            self.lent.push(index);
+        }
+        Some(&mut tier.replay)
     }
 }
 
 impl<F: SegmentFs> RecoveringTiers<F> {
-    /// The boot I/O every machine did since the last drain, in step-budget
-    /// bytes (bound: one pass over the cell's tiered namespaces).
+    /// The boot I/O the machines lent since the last drain did, in
+    /// step-budget bytes (bound: the machines lent, each once).
     fn take_charge(&mut self) -> u64 {
-        self.0.iter_mut().fold(0u64, |charge, tier| {
-            charge.saturating_add(boot_io_charge(tier.replay.take_work()))
-        })
+        let mut charge = 0u64;
+        for index in self.lent.drain(..) {
+            let tier = &mut self.tiers[index];
+            tier.lent = false;
+            charge = charge.saturating_add(boot_io_charge(tier.replay.take_work()));
+        }
+        charge
     }
 }
 
@@ -657,7 +677,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             hole: None,
             last_data: 0,
             finished: None,
-            recovering_tiers: RecoveringTiers(Vec::new()),
+            recovering_tiers: RecoveringTiers { tiers: Vec::new(), lent: Vec::new() },
             step_charge: 0,
             recovered_tiers: Vec::new(),
             tier_replay_checked: false,
@@ -1005,7 +1025,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 ks.displace_register_len()
             )));
         }
-        for tier in &mut self.recovering_tiers.0 {
+        for tier in &mut self.recovering_tiers.tiers {
             if let Some(table) = ks.tiered_store(tier.ns) {
                 tier.replay.end_of_replay(table);
             }
@@ -1017,7 +1037,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// boot settle chained during image load releases its blob reference,
     /// now that the blob-reference sections have registered them.
     fn end_of_checkpoint(&mut self, ks: &mut Keyspace) {
-        for tier in &mut self.recovering_tiers.0 {
+        for tier in &mut self.recovering_tiers.tiers {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
                 tier.replay.end_of_checkpoint(table);
             }
@@ -1045,6 +1065,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             let ckpt_id = manifest.map_or(0, |m| m.ckpt_id);
             self.recover_tier_ns(ks, ns, &spec, section, ckpt_id)?;
         }
+        // The seam finds a record's machine by binary search.
+        self.recovering_tiers.tiers.sort_unstable_by_key(|tier| tier.ns);
         Ok(())
     }
 
@@ -1122,11 +1144,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // The manifested files' creation-mode handles are the boot
         // machine's (ADR-0054 D1; opened by `recover_tiered_ns`), and the
         // hand-over at the end of replay returns them.
-        self.recovering_tiers.0.push(RecoveringTierNs {
+        self.recovering_tiers.tiers.push(RecoveringTierNs {
             ns,
             replay: recovered.replay,
             extents_listed: recovered.extents_listed,
             extents_quarantined: recovered.extents_quarantined,
+            lent: false,
         });
         Ok(())
     }
@@ -1168,7 +1191,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// its pipeline and handles; its counters fold into the cell's D6
     /// stats and the hand-over's own drain into this step's charge.
     fn finish_tier_replay(&mut self, ks: &mut Keyspace) -> io::Result<()> {
-        for mut tier in std::mem::take(&mut self.recovering_tiers.0) {
+        debug_assert!(self.recovering_tiers.lent.is_empty(), "every lent machine drained");
+        for mut tier in std::mem::take(&mut self.recovering_tiers.tiers) {
             if let Some(table) = ks.tiered_store_mut(tier.ns) {
                 let revive =
                     table.extent_sweep_seed(&tier.extents_listed, &tier.extents_quarantined);
@@ -1238,13 +1262,13 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // A step yields only once it charged something (L6: progress is
         // explicit): at a budget it never spent — a zero budget — the
         // first settle walks one record (`settle_step`'s floor).
-        for i in 0..self.recovering_tiers.0.len() {
+        for i in 0..self.recovering_tiers.tiers.len() {
             let left = budget_bytes.saturating_sub(self.step_charge);
             if left == 0 && self.step_charge > 0 {
                 self.phase = Phase::Settle;
                 return Ok(());
             }
-            let tier = &mut self.recovering_tiers.0[i];
+            let tier = &mut self.recovering_tiers.tiers[i];
             let ns = tier.ns;
             let table = ks
                 .tiered_store_mut(ns)
@@ -1253,7 +1277,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 .replay
                 .settle_step(table, left)
                 .map_err(|refusal| replay_refused(ns, &refusal))?;
-            self.drain_boot_io();
+            let charge = boot_io_charge(tier.replay.take_work());
+            self.step_charge = self.step_charge.saturating_add(charge);
             if progress == inf_store::SettleProgress::More {
                 self.phase = Phase::Settle;
                 return Ok(());
@@ -1302,7 +1327,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// Hands the recovered tiered plane halves to the caller (the plane
     /// installs them into its tier state at completion — M4-S26).
     pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
-        debug_assert!(self.recovering_tiers.0.is_empty(), "every boot machine handed over");
+        debug_assert!(self.recovering_tiers.tiers.is_empty(), "every boot machine handed over");
         std::mem::take(&mut self.recovered_tiers)
     }
 
