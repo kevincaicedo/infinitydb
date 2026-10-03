@@ -26,7 +26,7 @@ use super::*;
 use inf_log::flush::{BootFlush, HandedOver, SeamFlush, SettleReadError, SettleWindow};
 
 use crate::address_space::{Room, WindowFull};
-use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
+use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
 
@@ -106,6 +106,58 @@ impl ReplayWork {
     #[must_use]
     pub fn is_zero(self) -> bool {
         self == ReplayWork::default()
+    }
+
+    /// The recovery step budget's charge for this work, in budget bytes:
+    /// the tier bytes written and the bytes the end settle walked, plus
+    /// [`SETTLE_READ_CHARGE_BYTES`] per settle read and
+    /// [`REPLAY_BARRIER_CHARGE_BYTES`] per barrier — the one price list,
+    /// which the end settle's own yield uses too. Saturating: a gauge and
+    /// a yield test, never an account that must balance.
+    #[must_use]
+    pub fn charge_bytes(self) -> u64 {
+        self.tier_bytes
+            .saturating_add(self.walked_bytes)
+            .saturating_add(self.settle_reads.saturating_mul(SETTLE_READ_CHARGE_BYTES))
+            .saturating_add(self.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
+    }
+}
+
+impl ReplayCounters {
+    /// Adds `other` field by field — the recovery driver's fold of a
+    /// cell's namespaces (ADR-0174 D6). Saturating: counters, not money.
+    pub fn absorb(&mut self, other: ReplayCounters) {
+        let ReplayCounters {
+            demote_steps,
+            pads_placed,
+            tier_bytes,
+            barriers,
+            files_sealed,
+            settle_reads,
+            settled_same_key,
+            settled_distinct,
+            deletes_verified,
+            blob_releases,
+            markers_skipped,
+        } = other;
+        self.demote_steps = self.demote_steps.saturating_add(demote_steps);
+        self.pads_placed = self.pads_placed.saturating_add(pads_placed);
+        self.tier_bytes = self.tier_bytes.saturating_add(tier_bytes);
+        self.barriers = self.barriers.saturating_add(barriers);
+        self.files_sealed = self.files_sealed.saturating_add(files_sealed);
+        self.settle_reads = self.settle_reads.saturating_add(settle_reads);
+        self.settled_same_key = self.settled_same_key.saturating_add(settled_same_key);
+        self.settled_distinct = self.settled_distinct.saturating_add(settled_distinct);
+        self.deletes_verified = self.deletes_verified.saturating_add(deletes_verified);
+        self.blob_releases = self.blob_releases.saturating_add(blob_releases);
+        self.markers_skipped = self.markers_skipped.saturating_add(markers_skipped);
+    }
+
+    /// Whether every counter of the zero set is zero — a boot that did
+    /// not demote (D6); `markers_skipped` is outside the set.
+    #[must_use]
+    pub fn zero_set_is_zero(&self) -> bool {
+        ReplayCounters { markers_skipped: 0, ..*self } == ReplayCounters::default()
     }
 }
 

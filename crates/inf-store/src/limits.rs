@@ -49,6 +49,15 @@ pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
 /// next step resumes at its cursor.
 pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
 
+/// The recovery step budget's price of one boot barrier (a demote step's
+/// flush or a gap or capacity seal, ADR-0174 D2 rule 4): 4 MiB, about
+/// 4 ms of the flush barrier a device that moves 1 GiB/s pays. Owner: the
+/// recovery driver, which charges a step the replay machine's drained
+/// work at [`ReplayWork::charge_bytes`](crate::ReplayWork::charge_bytes).
+/// Crossing: a replay step yields at the next frame or checkpoint-section
+/// boundary once its charge reaches the step budget.
+pub const REPLAY_BARRIER_CHARGE_BYTES: u64 = 4 << 20;
+
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
 /// are `0..NIL` — a count of 2²⁴ − 1. This is the width bound, not a byte
