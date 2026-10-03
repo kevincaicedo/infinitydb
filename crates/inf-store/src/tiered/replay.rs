@@ -728,6 +728,7 @@ impl TieredTable {
         ext: ExtentRef,
     ) -> Result<LogicalAddr, ReplayRefusal> {
         let len = self.admit_extent(key, ext).map_err(|_| ReplayRefusal::TooLarge)?;
+        TieredTable::extent_admission_cost(ext, len).map_err(|_| ReplayRefusal::TooLarge)?;
         self.replay_place(replay, markers, hash, len, |t| t.apply_extent_image(key, hash, ext))
     }
 

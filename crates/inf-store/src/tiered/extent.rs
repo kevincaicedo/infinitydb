@@ -116,16 +116,19 @@ impl TieredTable {
     /// one copy — `append_extent` and boot replay's E1 both ask),
     /// answering the record's encoded length: the key bound and the blob
     /// maximum; half the ring (ADR-0102 D3 — unreachable with a legal
-    /// key); the admission cost's representability.
+    /// key). The admission cost's representability is
+    /// [`extent_admission_cost`](Self::extent_admission_cost)'s, which
+    /// the placement computes once.
     pub(super) fn admit_extent(&self, key: &[u8], ext: ExtentRef) -> Result<usize, OpError> {
         if key.len() > crate::record::MAX_KEY_LEN || ext.len > self.blob.max_bytes {
             return Err(OpError::TooLarge);
         }
-        let value = ext.encode();
         let spec = RecordSpec {
             key,
-            value: &value,
-            version: 0, // length-only: the version never changes encoded_len
+            // Length-only: a reference encodes to exactly this many bytes,
+            // and the version never changes encoded_len.
+            value: &[0; crate::record::EXTENT_REF_LEN],
+            version: 0,
             expire_at_ms: None,
             kind: RecordKind::StringExtent,
         };
@@ -133,10 +136,16 @@ impl TieredTable {
         if len > self.inline_record_max() {
             return Err(OpError::TooLarge);
         }
-        inf_log::blob::extent_device_bytes(ext.len)
-            .checked_add(len as u64)
-            .ok_or(OpError::TooLarge)?;
         Ok(len)
+    }
+
+    /// The disk admission cost of an admitted extent placement — the
+    /// reference record plus the extent's device bytes — or `TooLarge`
+    /// when it is not representable. Boot replay asks it beside the
+    /// length refusals, before it asks for room; a live placement asks
+    /// it once, where it admits the disk.
+    pub(super) fn extent_admission_cost(ext: ExtentRef, len: usize) -> Result<u64, OpError> {
+        inf_log::blob::extent_device_bytes(ext.len).checked_add(len as u64).ok_or(OpError::TooLarge)
     }
 
     fn append_extent(
@@ -162,9 +171,7 @@ impl TieredTable {
         // the wiring-time gate consults [`disk_full`](Self::disk_full)
         // *before* `ExtentWriter::create` so a full device is not
         // probed with a doomed file per attempt.
-        let cost = inf_log::blob::extent_device_bytes(ext.len)
-            .checked_add(len as u64)
-            .ok_or(OpError::TooLarge)?;
+        let cost = Self::extent_admission_cost(ext, len)?;
         self.disk_admit_check(cost)?;
         let addr = self.space.alloc(len).ok_or(OpError::OutOfMemory)?;
         self.shadow_note_alloc();
