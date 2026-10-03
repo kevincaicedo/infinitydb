@@ -643,7 +643,6 @@ I	1	crates/inf-store/src/index_sidecar.rs	expect	a seeded index is Backfilling; 
 I	1	crates/inf-store/src/index_sidecar.rs	unreachable	finish_load discarded every open stream	sidecar loader state machine / registry edges (ADR-0075 D3)
 C	1	crates/inf-store/src/keyspace.rs	assert	db index validated at the command layer	`crates/inf-server/src/admin.rs:default_db_index` (SELECT / COPY DB / MOVE parse n < DEFAULT_DBS); the connection's selected db is stored only from it
 C	1	crates/inf-store/src/keyspace.rs	expect	catalog decode validated the record	`crates/inf-store/src/catalog.rs:decode_index_record` runs `validate_index_program` on every decoded index record
-I	1	crates/inf-store/src/keyspace.rs	expect	is_tiered checked	same-function sequencing: the entry was materialized / checked in the preceding statement
 I	1	crates/inf-store/src/keyspace.rs	expect	just created	same-function sequencing: the entry was materialized / checked in the preceding statement
 I	1	crates/inf-store/src/keyspace/index.rs	expect	just rebuilt	same-function sequencing: the entry was materialized / checked in the preceding statement
 I	1	crates/inf-store/src/keyspace.rs	expect	just updated	same-function sequencing: the entry was materialized / checked in the preceding statement

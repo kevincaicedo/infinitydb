@@ -249,6 +249,16 @@ fn follows_displace_marker(rec: &LogRecordView<'_>, pending_ns: NsId) -> bool {
     }
 }
 
+/// One tiered replay entry's inputs (ADR-0174 D3): the namespace's table,
+/// its parked markers as addresses and the record key's hash — answered
+/// only for a namespace that is tiered here, so no arm reaches a table it
+/// did not find.
+struct TieredEntry<'a> {
+    table: &'a mut TieredTable,
+    markers: &'a [LogicalAddr],
+    hash: u64,
+}
+
 impl Keyspace {
     /// `cfg.evict_seed` seeds the per-db eviction streams (vary it per cell
     /// — L7: all randomness is injected).
@@ -1377,35 +1387,33 @@ impl Keyspace {
                 self.pending_displace.push((ns, old_addr));
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::StringPostImage { ns, key, value } if self.is_tiered(ns) => {
-                let hash = self.cfg.hasher.hash(key);
-                let (table, markers) = self.tiered_entry(ns)?;
+            LogRecordView::StringPostImage { ns, key, value } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                table
-                    .replay_upsert(machine, markers, key, value, hash)
+                entry
+                    .table
+                    .replay_upsert(machine, entry.markers, key, value, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
-                let hash = self.cfg.hasher.hash(key);
-                let (table, markers) = self.tiered_entry(ns)?;
+            LogRecordView::Delete { ns, key } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let machine = spill.replay_mut(ns);
-                table
-                    .replay_delete(machine, markers, key, hash)
+                entry
+                    .table
+                    .replay_delete(machine, entry.markers, key, entry.hash)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
-                if self.is_tiered(ns) =>
-            {
+            LogRecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
                 let ext = ExtentRef { extent_id, offset, len };
-                let hash = self.cfg.hasher.hash(key);
-                let (table, markers) = self.tiered_entry(ns)?;
                 let machine = spill.replay_mut(ns);
-                table
-                    .replay_upsert_extent(machine, markers, key, hash, ext)
+                entry
+                    .table
+                    .replay_upsert_extent(machine, entry.markers, key, entry.hash, ext)
                     .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
                 self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
@@ -1420,29 +1428,32 @@ impl Keyspace {
             {
                 Ok(Some(ReplayOutcome::SkippedReserved))
             }
-            LogRecordView::StringPostImage { .. }
-            | LogRecordView::Delete { .. }
-            | LogRecordView::ExpireAt { .. }
+            LogRecordView::ExpireAt { .. }
             | LogRecordView::NsOp { .. }
             | LogRecordView::CkptBegin { .. }
             | LogRecordView::DocDelta { .. }
-            | LogRecordView::DocFull { .. }
-            | LogRecordView::StringExtentRef { .. } => Ok(None),
+            | LogRecordView::DocFull { .. } => Ok(None),
         }
     }
 
-    /// The table of `ns` and its parked markers as addresses (D4 rule 1),
-    /// for one replay entry: the entry drains them exactly — by `(hash,
-    /// old_addr)` — after its room question and a `DEL`'s reads (ADR-0174
-    /// R3, R4, R6). The register stays armed until the entry succeeds, so
-    /// a refused record leaves the keyspace as it found it. An empty
-    /// register — every record but a displacing one's mutation — copies
-    /// nothing.
+    /// The tiered replay entry of a record of `ns` keyed `key`, from one
+    /// lookup: `None` when `ns` names no tiered table here — the caller's
+    /// CellStore arms own the record. Otherwise the table, its parked
+    /// markers as addresses (D4 rule 1) and the key's hash: the entry
+    /// drains the markers exactly — by `(hash, old_addr)` — after its room
+    /// question and a `DEL`'s reads (ADR-0174 R3, R4, R6). The register
+    /// stays armed until the entry succeeds, so a refused record leaves the
+    /// keyspace as it found it. An empty register — every record but a
+    /// displacing one's mutation — copies nothing.
     fn tiered_entry(
         &mut self,
         ns: NsId,
-    ) -> Result<(&mut TieredTable, &[LogicalAddr]), ReplayError> {
-        let Keyspace { tiered_stores, pending_displace, displace_scratch, .. } = self;
+        key: &[u8],
+    ) -> Result<Option<TieredEntry<'_>>, ReplayError> {
+        let Keyspace { tiered_stores, pending_displace, displace_scratch, cfg, .. } = self;
+        let Some((_, table)) = tiered_stores.iter_mut().find(|(id, _)| *id == ns) else {
+            return Ok(None);
+        };
         displace_scratch.clear();
         for &(marker_ns, old_addr) in pending_displace.iter() {
             debug_assert_eq!(marker_ns, ns, "adjacency check pinned the namespace");
@@ -1453,8 +1464,11 @@ impl Keyspace {
             };
             displace_scratch.push(addr);
         }
-        let i = tiered_stores.iter().position(|(id, _)| *id == ns).expect("is_tiered checked");
-        Ok((tiered_stores[i].1.as_mut(), displace_scratch.as_slice()))
+        Ok(Some(TieredEntry {
+            table: table.as_mut(),
+            markers: displace_scratch.as_slice(),
+            hash: cfg.hasher.hash(key),
+        }))
     }
 
     /// Parked displacement markers awaiting their paired mutation — the
