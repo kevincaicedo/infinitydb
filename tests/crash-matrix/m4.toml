@@ -186,13 +186,53 @@ tier = "node"
 test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
 expect = "creation-retried-round-owned"
 
-# ADR-0174 D3 (FCR-STTIER-01): the boot settle read's one fault point —
-# a cold twin's key window unreadable at a replayed DEL.
+# ADR-0174 D3: the boot settle read's one fault point — a cold twin's
+# key window unreadable at a replayed DEL.
 [[row]]
 point = "replay_settle_read_fail"
 tier = "node"
 test = "crash-matrix::replay::replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers"
 expect = "boot-refuses-typed-then-recovers"
+
+# ADR-0174 D2, D5: the tier fault points fired inside a boot demote step —
+# the step refuses typed with `flushed` unmoved and at most an
+# unmanifested file left; the next boot removes it and recovers the unit.
+# The torn write succeeds (its physics), so its boot is cut, not refused.
+[[row]]
+point = "tier_short_write"
+tier = "node"
+test = "crash-matrix::replay::tier_short_write_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_write_nospace"
+tier = "node"
+test = "crash-matrix::replay::tier_write_nospace_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_fsync_err"
+tier = "node"
+test = "crash-matrix::replay::tier_fsync_err_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_footer_torn"
+tier = "node"
+test = "crash-matrix::replay::tier_footer_torn_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_dir_open_fail"
+tier = "node"
+test = "crash-matrix::replay::tier_dir_open_fail_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "crash-matrix::replay::tier_torn_frame_in_a_boot_demote_step_is_cut_and_the_next_boot_recovers"
+expect = "demote-step-cut-then-recovers"
 
 # ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
 
