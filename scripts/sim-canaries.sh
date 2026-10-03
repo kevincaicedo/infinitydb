@@ -233,6 +233,10 @@ rows=(
   # The same plant breaks the barrier arithmetic: a seal the writer made
   # that the boot pipeline's counters do not hold.
   "inf_canary_replay_stall_seal crate-test inf-store test:tiered_replay record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal the counter is the writer's"
+  # ADR-0174 D4 skipped: a namespace no manifest section names keeps its
+  # dead-life tier files, and the first flush after the boot fails on the
+  # existing file (tier creation is `create_new`).
+  "inf_canary_replay_no_section_gc crate-test inf-server test:recover_no_section a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the_first_flush AlreadyExists"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }

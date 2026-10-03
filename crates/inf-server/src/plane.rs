@@ -909,6 +909,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         self.shared.node.recover_replay_records.set(stats.records_applied);
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
+                            slot.publish_tier_replay(stats.tier_replay);
                             slot.mark_ready(
                                 stats.ckpt_records + stats.records_applied,
                                 stats.torn_truncated_at,

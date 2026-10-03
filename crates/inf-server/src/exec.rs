@@ -275,6 +275,10 @@ pub struct NodeState {
     /// Tail records applied after the checkpoint's begin (ADR-0124 D4's
     /// observable: a boot after a clean stop replays nothing).
     pub recover_replay_records: Cell<u64>,
+    /// ADR-0174 D6: the node fold of every cell's tiered boot replay
+    /// (summed; the step-charge gauge the largest), taken once when every
+    /// cell is ready — zero without a recovery board.
+    pub recover_tier_replay: Cell<crate::recover::TierReplayStats>,
     /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
     /// ceiling arm wrote blind over a cold candidate.
     #[cfg(feature = "bench-diagnostics")]

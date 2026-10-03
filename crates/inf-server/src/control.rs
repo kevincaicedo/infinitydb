@@ -95,6 +95,10 @@ pub struct CellRecoverySlot {
     /// decomposition.
     phase_ns: [AtomicU64; 5],
     phase_bytes: [AtomicU64; 3],
+    /// ADR-0174 D6: this cell's boot replay of its tiered namespaces, in
+    /// [`TierReplayStats::NAMES`](crate::recover::TierReplayStats::NAMES)
+    /// order — `INFO persistence` renders the node fold.
+    tier_replay: [AtomicU64; crate::recover::TIER_REPLAY_FIELDS],
     /// Recovery phase about to run (M2.5-S01): published *before* each
     /// step so a step stalled inside the kernel names itself — the
     /// ADR-0022 D7 wedge was invisible precisely because nothing was
@@ -139,6 +143,22 @@ impl CellRecoverySlot {
             slot.store(bytes, Ordering::Relaxed);
         }
         self.state.store(1, Ordering::Release);
+    }
+
+    /// Publishes this cell's tiered boot replay facts (owning cell, once,
+    /// before [`mark_ready`](Self::mark_ready), whose release store makes
+    /// them visible to a reader that saw the cell ready).
+    pub fn publish_tier_replay(&self, stats: crate::recover::TierReplayStats) {
+        for (slot, value) in self.tier_replay.iter().zip(stats.to_array()) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// This cell's tiered boot replay facts, valid once ready.
+    pub fn tier_replay(&self) -> crate::recover::TierReplayStats {
+        crate::recover::TierReplayStats::from_array(std::array::from_fn(|i| {
+            self.tier_replay[i].load(Ordering::Relaxed)
+        }))
     }
 
     /// The boot's phase decomposition (M4.5-S39d), valid once ready:
@@ -271,6 +291,16 @@ impl RecoveryBoard {
     #[must_use]
     pub fn cell_count(&self) -> u64 {
         self.cells.len() as u64
+    }
+
+    /// The node fold of the cells' tiered boot replay facts (ADR-0174
+    /// D6): counters summed, the step-charge gauge the largest — valid
+    /// once [`all_ready`](Self::all_ready). Bound: one pass over the cells.
+    #[must_use]
+    pub fn tier_replay_totals(&self) -> crate::recover::TierReplayStats {
+        self.cells.iter().fold(crate::recover::TierReplayStats::default(), |total, slot| {
+            total.fold(slot.tier_replay())
+        })
     }
 
     /// Aggregate (done, total) bytes across cells.

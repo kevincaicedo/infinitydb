@@ -75,7 +75,7 @@ fn_length	3	crates/inf-server/src/plane.rs
 fn_length	2	crates/inf-server/src/plane/shared.rs
 fn_length	2	crates/inf-server/src/plane/tiered.rs
 fn_length	1	crates/inf-server/src/plane/tiered/write.rs
-fn_length	4	crates/inf-server/src/recover.rs
+fn_length	3	crates/inf-server/src/recover.rs
 fn_length	1	crates/inf-server/src/tier_cell.rs
 fn_length	1	crates/inf-store/src/doc.rs
 fn_length	1	crates/inf-store/src/evict.rs

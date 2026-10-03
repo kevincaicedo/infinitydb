@@ -1,12 +1,11 @@
-//! FCR-STTIER-N1 (ADR-0174 D4), the red: a tiered namespace that no
-//! MANIFEST section names — a crash before its first checkpoint
-//! publishes, after one tier flush — must recover through the empty
-//! section: its dead-life tier files removed before any flush, so the
-//! first flush after `Ready` creates `tier-000000.itier` again. Red by
-//! reading at engine `b5cae02` and by this test on `8674af4`: boot
-//! removes tier files only for `manifest.tiers`, the next life's
-//! pipeline starts at file id 0, and tier creation is `create_new`, so
-//! the first flush fails on the existing file.
+//! ADR-0174 D4: a tiered namespace that no MANIFEST section names — a
+//! crash before its first checkpoint publishes, after one tier flush —
+//! recovers through the empty section: its dead-life tier files removed
+//! before any flush, so the first flush after `Ready` creates
+//! `tier-000000.itier` again. Red before D4: boot removed tier files only
+//! for `manifest.tiers`, the next life's pipeline starts at file id 0, and
+//! tier creation is `create_new`, so the first flush failed on the
+//! existing file.
 
 use std::path::Path;
 
@@ -56,8 +55,6 @@ fn fresh_pipeline(fs: &inf_log::fs::mem::MemFs) -> TierFlush<inf_log::fs::mem::M
 }
 
 #[test]
-#[ignore = "FCR-STTIER-01 stage 3 (ADR-0174 D4): red until every tiered namespace recovers \
-            through a manifest section"]
 fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the_first_flush() {
     let fs = inf_log::fs::mem::MemFs::new();
     let mut log = LogBuilder::new(&fs, &cfg());
@@ -104,7 +101,8 @@ fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the
     // section (ADR-0174 D4) — its dead-life files removed before any
     // flush — and replays its tail.
     let mut ks = tiered_keyspace();
-    recover(&fs, &mut ks).expect("the boot recovers the sectionless namespace");
+    let (_rotor, stats) =
+        recover(&fs, &mut ks).expect("the boot recovers the sectionless namespace");
     for key in &keys {
         let hash = ks.hasher().hash(key);
         let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
@@ -121,4 +119,8 @@ fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the
         fs.list_dir(&cold).expect("cold dir").iter().any(|name| name == "tier-000000.itier"),
         "the boot removed the dead-life file (ADR-0174 D4) and the flush created this life's"
     );
+    // The removal is counted outside the zero set; the boot fit its
+    // window, so the zero set is zero.
+    assert_eq!(stats.tier_replay.dead_life_files_removed, 1, "the dead-life file is D4's");
+    assert!(stats.tier_replay.counters.zero_set_is_zero(), "a boot that fits demotes nothing");
 }
