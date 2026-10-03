@@ -2026,3 +2026,122 @@ fn a_failed_settle_read_refuses_typed_and_changes_nothing() {
     let ready = again.finish();
     ready.audit(&durable.model, true);
 }
+
+// ---- the per-rule reds of the stage, under their recorded names -------------
+
+/// A table recovered at origin 1 MiB with one manifested file below it
+/// (a ref must name a file's range).
+fn recovered_at_one_mib() -> TieredTable {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let mut t = TieredTable::new(space_config(demote, 1 << 20), demote, 64, KeyHasher::default())
+        .expect("ring");
+    t.seed_recovered_files(
+        &[TierFileMeta {
+            id: 0,
+            base: LogicalAddr::ZERO,
+            data_len: 1 << 20,
+            reason: SealReason::Capacity,
+            path: Path::new("shard-0/cold/tier-000000.itier").to_path_buf(),
+        }],
+        1,
+    );
+    t
+}
+
+/// ADR-0174 R4 (E7): a crashed-life marker whose address numerically
+/// equals this life's slot of *another* key with the same 64-bit hash
+/// names nothing in this life — a no-op, counted. Red before: the exact
+/// pair matched and the other key's slot was removed.
+#[test]
+fn a_marker_at_or_above_the_origin_removes_nothing() {
+    let (k1, k2) = forced_collision_pair(3);
+    let hash = KeyHasher::default().hash(&k1);
+    assert_eq!(hash, KeyHasher::default().hash(&k2));
+    let mut t = recovered_at_one_mib();
+    let a = t.replay_upsert::<MemFs>(None, &[], &k1, b"one", hash).expect("fits");
+    assert!(a >= t.space().life_origin());
+    // The crashed life's marker for k2's displacement names k1's address.
+    assert_eq!(t.replay_displace(hash, a), inf_store::Displaced::AboveOrigin);
+    t.replay_upsert::<MemFs>(None, &[], &k2, b"two", hash).expect("fits");
+    assert!(
+        matches!(t.lookup(&k1, hash, &[]), TieredLookup::Ram(_)),
+        "the other key with the same hash survives the marker (R4)"
+    );
+    assert!(matches!(t.lookup(&k2, hash, &[]), TieredLookup::Ram(_)));
+}
+
+/// ADR-0174 R5 (E2): a replayed image over a RAM record moves that
+/// record's relocation origins to the new address. Red before: the
+/// settled ref's origin stayed keyed by the dead address.
+#[test]
+fn a_replayed_overwrite_moves_the_origins_to_the_new_record() {
+    let pre_life = LogicalAddr::from_raw(4096).expect("fits");
+    let (k1, k2) = forced_collision_pair(6);
+    let hash = KeyHasher::default().hash(&k1);
+    let mut t = recovered_at_one_mib();
+    t.replay_ref(hash, pre_life);
+    let a = t.replay_upsert::<MemFs>(None, &[], &k1, b"one", hash).expect("fits");
+    t.replay_upsert::<MemFs>(None, &[], &k2, b"two", hash).expect("fits");
+    // The rebuild settles the ref into k1's record (the pre-life bytes
+    // are k1's older record).
+    let image = {
+        let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+        let mut s = TieredTable::new(space_config(demote, 0), demote, 64, KeyHasher::default())
+            .expect("ring");
+        let addr = s.insert(&k1, b"one-old", hash).expect("fits");
+        let len = s.record(addr).encoded_len;
+        s.record_bytes(addr, len).to_vec()
+    };
+    t.rebuild_shadow_tickets(|_| -> Result<inf_store::KeyWindow, String> {
+        Ok(inf_store::KeyWindow { left: image.len() as u64, bytes: image.clone() })
+    })
+    .expect("settles");
+    assert_eq!(t.displacement_origins_len(hash, a), 1, "the ref is chained into k1's record");
+    let b = t.replay_upsert::<MemFs>(None, &[], &k1, b"one-newer-and-longer", hash).expect("fits");
+    assert_ne!(a, b, "the overwrite copied to the tail");
+    assert_eq!(t.displacement_origins_len(hash, b), 1, "the origins moved with the record (R5)");
+    assert_eq!(t.displacement_origins_len(hash, a), 0, "and left the dead address");
+}
+
+/// ADR-0174 R6 (E5): a replayed `DEL` of a key whose only record this
+/// boot demoted reads the cold slot and deletes it. Red before: the
+/// RAM-only delete found nothing and the key stayed.
+#[test]
+fn a_replayed_del_of_a_demoted_key_removes_its_cold_slot() {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let window = demote.mem_budget_bytes + demote.slice_bytes;
+    let mut life = Life::new(demote);
+    life.checkpoint(1, |_| {});
+    life.set(b"demoted", &[0x11; 500]);
+    let mut written = 0u64;
+    let mut i = 0u64;
+    while written < 2 * window {
+        let key = format!("filler:{i:06}").into_bytes();
+        life.set(&key, &[0x22; 900]);
+        written += life.lens[&key].0 as u64;
+        i += 1;
+        if i.is_multiple_of(64) {
+            life.maintain();
+        }
+    }
+    life.maintain();
+    let durable = life.crash();
+    let mut boot = durable.boot();
+    boot.replay(&durable.tail);
+    let hash = Life::hash(b"demoted");
+    assert!(matches!(boot.table.lookup(b"demoted", hash, &[]), TieredLookup::Cold(_)), "demoted");
+    let removed = boot
+        .table
+        .replay_delete(Some(&mut boot.replay), &[], b"demoted", hash)
+        .expect("the read parses");
+    assert!(removed, "the DEL removed the key's cold slot (R6)");
+    assert!(
+        matches!(boot.table.lookup(b"demoted", hash, &[]), TieredLookup::Miss),
+        "a deleted key is absent"
+    );
+    assert_eq!(boot.replay.counters().deletes_verified, 1);
+    let mut model = durable.model.clone();
+    model.remove(b"demoted".as_slice());
+    let ready = boot.finish();
+    ready.audit(&model, true);
+}
