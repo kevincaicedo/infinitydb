@@ -1847,7 +1847,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             return run.report;
         }
         let handed = match replay.hand_over(&mut table) {
-            Ok(handed) => handed,
+            Ok(done) => done.handed,
             Err(err) => {
                 run.report.violations.push(format!("life {life_index}: hand-over: {err}"));
                 run.report.state_hash = run.report.state.value();

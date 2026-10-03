@@ -990,7 +990,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     .map_err(|err| io_msg(format!("ns {}: {err} (ADR-0093 A4′)", ns.0)))?;
                 // The hand-over (ADR-0174 R10): the pipeline under the live
                 // claim rule, with a handle for every sealed file.
-                let handed = tier.replay.hand_over(table).map_err(io_invalid)?;
+                let handed = tier.replay.hand_over(table).map_err(io_invalid)?.handed;
                 self.recovered_tiers.push(RecoveredTierNs {
                     ns,
                     flush: handed.flush,

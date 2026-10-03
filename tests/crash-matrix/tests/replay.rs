@@ -234,7 +234,7 @@ fn replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers() {
     assert!(machine.counters().deletes_verified >= 1);
     machine.end_of_replay(&table);
     while machine.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
-    let handed = machine.hand_over(&mut table).expect("hands over");
+    let handed = machine.hand_over(&mut table).expect("hands over").handed;
     assert_eq!(handed.handles.len(), handed.flush.sealed().len());
     assert!(matches!(table.lookup(b"victim", hash, &[]), TieredLookup::Miss));
     receipt::verified("replay_settle_read_fail", "boot-refuses-typed-then-recovers");

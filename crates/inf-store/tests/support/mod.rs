@@ -140,6 +140,6 @@ pub fn finish_boot(
 ) -> (TierFlush<MemFs>, Vec<(u32, MemFile)>) {
     replay.end_of_replay(table);
     while replay.settle_step(table, PAGE).expect("settle step") == SettleProgress::More {}
-    let HandedOver { flush, handles } = replay.hand_over(table).expect("hands over");
+    let HandedOver { flush, handles } = replay.hand_over(table).expect("hands over").handed;
     (flush, handles)
 }

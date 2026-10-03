@@ -499,15 +499,14 @@ impl Boot {
                 Ok(inf_store::KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
             })
             .expect("rebuild");
-        let counters = self.replay.counters();
         let manifested = self.tier.files.iter().map(|f| f.id).collect();
-        let handed = self.replay.hand_over(&mut self.table).expect("hands over");
+        let done = self.replay.hand_over(&mut self.table).expect("hands over");
         Ready {
             fs: self.fs,
             table: self.table,
-            flush: handed.flush,
-            handles: handed.handles,
-            counters,
+            flush: done.handed.flush,
+            handles: done.handed.handles,
+            counters: done.counters,
             manifested,
         }
     }
@@ -790,6 +789,13 @@ fn committed_pages_around_the_window_decide_whether_the_boot_demotes() {
         assert!(boot.table.space().report().committed_bytes <= window, "I1 at {target}");
         let ready = boot.finish();
         ready.audit(&durable.model, demotes);
+        // The hand-over's drain seals the active file: the counters the
+        // boot reports include that seal and its barrier.
+        assert_eq!(
+            ready.counters.files_sealed,
+            ready.boot_files().len() as u64,
+            "{target}: every boot file is counted, the hand-over's seal included"
+        );
     }
 }
 

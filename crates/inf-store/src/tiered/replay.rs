@@ -625,12 +625,18 @@ impl<F: SegmentFs> TierReplay<F> {
     /// R10's last half (E13): a table that demoted drains its flush and
     /// seals its active file; the machine hands the plane a pipeline
     /// under the live claim rule with a handle for every sealed
-    /// catalogue file. Only a machine with every RAM record settled gets
+    /// catalogue file, and returns its final counters and the I/O since
+    /// the last [`take_work`](Self::take_work) — the drain's seal and
+    /// barrier included, which counters read before the hand-over
+    /// would miss. Only a machine with every RAM record settled gets
     /// here (I16): `Spilling` has no arm, `Settling` only at the tail.
     ///
     /// # Errors
     /// `Unsettled`, or the drain's flush error.
-    pub fn hand_over(mut self, table: &mut TieredTable) -> Result<HandedOver<F>, ReplayRefusal> {
+    pub fn hand_over(
+        mut self,
+        table: &mut TieredTable,
+    ) -> Result<BootHandedOver<F>, ReplayRefusal> {
         let tail = table.space.tail();
         match self.state {
             ReplayState::Seeded | ReplayState::Fitting => {}
@@ -645,11 +651,24 @@ impl<F: SegmentFs> TierReplay<F> {
         let sealed_before = self.flush.sealed().len();
         let drained = table.flush_drain(&mut self.flush).map_err(ReplayRefusal::Flush)?;
         self.note_flush(drained);
-        let hand = self.flush.hand_over().map_err(ReplayRefusal::Flush)?;
-        let sealed_now = hand.flush.sealed().len() - sealed_before;
+        let handed = self.flush.hand_over().map_err(ReplayRefusal::Flush)?;
+        let sealed_now = handed.flush.sealed().len() - sealed_before;
         debug_assert!(sealed_now <= 1, "the drain seals at most the active file");
-        Ok(hand)
+        Ok(BootHandedOver { handed, counters: self.counters, work: self.work })
     }
+}
+
+/// What the boot's exit returns (ADR-0174 R10, D6): the plane's pipeline
+/// and handles, and the machine's final counters and unread I/O — the
+/// hand-over's own drain seal and barrier included.
+pub struct BootHandedOver<F: SegmentFs> {
+    /// The pipeline under the live claim rule, with every handle.
+    pub handed: HandedOver<F>,
+    /// Replay's counters, final.
+    pub counters: ReplayCounters,
+    /// The I/O since the last [`TierReplay::take_work`], the drain's
+    /// included.
+    pub work: ReplayWork,
 }
 
 impl TieredTable {
@@ -952,9 +971,12 @@ mod tests {
         spill(&mut table, &mut replay);
         replay.end_of_replay(&table);
         while replay.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
-        let handed = replay.hand_over(&mut table).expect("settled to the tail");
+        let done = replay.hand_over(&mut table).expect("settled to the tail");
+        let handed = done.handed;
         assert_eq!(handed.handles.len(), handed.flush.sealed().len());
         assert!(handed.flush.active().is_none());
+        assert_eq!(done.counters.files_sealed, handed.flush.sealed().len() as u64);
+        assert!(done.work.barriers >= 1, "the drain's barrier is the hand-over's work");
     }
 
     /// A record or a `DEL` after the end of replay was declared: the
