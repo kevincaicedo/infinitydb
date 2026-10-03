@@ -32,6 +32,9 @@ const RECORDS_PER_FRAME: usize = 12;
 /// One segment holds the whole unit, so a replay step ends at its budget,
 /// never at a segment's end.
 const SEGMENT_BYTES: u32 = 32 << 20;
+/// The largest log frame the unit writes (asserted as each is staged):
+/// twelve records of a 4 KiB value and their framing.
+const FRAME_BYTES_MAX: u64 = 64 << 10;
 
 fn step_cfg() -> DurableConfig {
     cfg_with(SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() })
@@ -68,6 +71,14 @@ fn value(i: u64, generation: u8) -> Vec<u8> {
 /// The acknowledged state: every key the unit wrote, `None` once deleted.
 type Model = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
+/// The recovery unit as written: the model, and the records of its
+/// distinct-key prefix and of its last window's rewrites and deletes.
+struct Unit {
+    model: Model,
+    distinct_records: u64,
+    late_records: u64,
+}
+
 /// A cell log written through the real rotor and staging ring on any
 /// filesystem, one frame per call (the shape of `support::LogBuilder`).
 struct Log<F: SegmentFs> {
@@ -87,7 +98,9 @@ impl<F: SegmentFs + Clone> Log<F> {
             self.ring.stage(effect).expect("stage");
         }
         self.rotor.maintain(0).expect("maintain");
-        let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
+        let frame_len = self.ring.pending_frame_len();
+        assert!(u64::from(frame_len) <= FRAME_BYTES_MAX, "a {frame_len}-byte frame");
+        let slot = self.rotor.begin_frame(frame_len, 0).expect("reserve");
         let covered = slot.base().to_u64();
         let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
         let frame = self.ring.leased_frame(&lease).to_vec();
@@ -102,7 +115,7 @@ impl<F: SegmentFs + Clone> Log<F> {
 /// 11th of the rest of them. Their first copies are demoted by then, so a
 /// rewrite is a record with a cold twin (settled at its seal, E10, or at
 /// the end of replay, E12) and a delete verifies a demoted copy (E5).
-fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -> Model {
+fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -> Unit {
     let mut log = Log::new(fs, cfg);
     let mut model = Model::new();
     let mut bytes = 0u64;
@@ -138,12 +151,13 @@ fn write_unit<F: SegmentFs + Clone>(fs: &F, cfg: &DurableConfig, windows: u64) -
             .collect();
         log.frame(&effects);
     }
+    let late_records = late.len() as u64;
     for (key, value) in late {
         model.insert(key, value);
     }
     drop(log);
     make_durable(fs, cfg);
-    model
+    Unit { model, distinct_records: next, late_records }
 }
 
 /// Every log file's bytes and name under a barrier (the sim disk tears
@@ -268,7 +282,7 @@ fn assert_model(served: &Model, model: &Model, when: &str) {
 fn a_zero_step_budget_completes_a_demoting_boot() {
     let fs = MemFs::new();
     let cfg = step_cfg();
-    let model = write_unit(&fs, &cfg, 3);
+    let model = write_unit(&fs, &cfg, 3).model;
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
     // Bound: each step applies at least one frame or settles at least one
@@ -290,4 +304,134 @@ fn a_zero_step_budget_completes_a_demoting_boot() {
     let (served, ram, cold) = read_back(&fs, &cfg, &mut ks, &model);
     assert!(ram > 0 && cold > 0, "VACUOUS: {ram} RAM and {cold} cold keys");
     assert_model(&served, &model, "after a zero-budget boot");
+}
+
+/// Bytes the namespace's tier files hold on disk — the boot's tier
+/// writes, seen from the filesystem rather than from its counters.
+fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
+    let cold = cold_dir(cfg);
+    fs.list_dir(&cold)
+        .unwrap_or_default()
+        .iter()
+        .filter(|name| parse_tier_file_name(name).is_some())
+        .map(|name| fs.open_read(&cold.join(name)).expect("open").file_size().expect("size"))
+        .sum()
+}
+
+/// The step budget's charge for boot I/O (ADR-0174 D2 rule 4; record
+/// §3), judged step by step at two budgets over a unit of four windows.
+/// The prices are the server's and the store's `limits` consts; the
+/// charge each step took is `Recovery::step_charge_bytes`, and the tier
+/// writes are read from the filesystem:
+///
+/// - a step during which the tier files grew charged at least the one
+///   barrier every flush that appends makes;
+/// - a replay step still inside its segment yielded at its budget: its
+///   bytes read plus its charge reach it;
+/// - and passed it by at most one frame's non-yielding unit — the frame's
+///   bytes, one demote step's tier bytes (a lead and a page past the
+///   need, plus a record), two barriers (the flush, one seal), and the
+///   settle reads the unit's rewrites and deletes can make;
+/// - an end-settle step that yields charged its budget, by at most one
+///   record and its twins' reads; the last adds the hand-over's drain;
+/// - the D6 gauge equals the largest step's charge.
+///
+/// Red on a driver that leaves the charge out of the yield test (at the
+/// 8 MiB budget a step's bytes span several demote steps), and on one that
+/// charges nothing (a step that wrote tier bytes charged no barrier).
+#[test]
+fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
+    for budget in [256 << 10, 8 << 20] {
+        step_under_budget(budget);
+    }
+}
+
+fn step_under_budget(budget: u64) {
+    use inf_server::RecoverPhase;
+    let barrier = inf_server::limits::REPLAY_BARRIER_CHARGE_BYTES;
+    let read_price = inf_store::limits::SETTLE_READ_CHARGE_BYTES;
+    let page = inf_alloc::REGION_PAGE_BYTES as u64;
+    let lead = 1u64 << 20; // `MAINTAIN-SLICE` at this budget, a whole page
+    let record = (TieredTable::RECORD_HEADER_LEN + key(0).len() + VALUE_LEN) as u64;
+    let fs = MemFs::new();
+    let cfg = step_cfg();
+    let unit = write_unit(&fs, &cfg, 4);
+    // One frame's non-yielding unit before the last window's records
+    // apply (no record has a cold twin yet), and after.
+    let frame_unit = FRAME_BYTES_MAX + lead + page + record + 2 * barrier;
+    let late_unit = frame_unit + unit.late_records * read_price;
+    let settle_unit = record + 4 * read_price;
+    let drain_unit = WINDOW + lead + 3 * barrier;
+
+    let mut ks = tiered_keyspace();
+    let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());
+    let (mut largest, mut settle_steps, mut finished) = (0u64, 0u64, false);
+    loop {
+        let phase = recovery.phase();
+        let segments_before = recovery.segments_progress().0;
+        let consumed_before = recovery.bytes_consumed();
+        let tier_before = tier_bytes_on_disk(&fs, &cfg);
+        let progress = recovery.step(&mut ks, budget).expect("a step");
+        if progress == RecoveryProgress::Complete {
+            break;
+        }
+        let read = recovery.bytes_consumed() - consumed_before;
+        let charge = recovery.step_charge_bytes();
+        let applied = recovery.stats().records_applied;
+        largest = largest.max(charge);
+        let at = format!("budget {budget}, a {phase:?} step, {applied} records applied");
+        if tier_bytes_on_disk(&fs, &cfg) > tier_before {
+            assert!(charge >= barrier, "{at}: tier files grew under a charge of {charge}");
+        }
+        match phase {
+            RecoverPhase::Replay => {
+                let unit_bytes =
+                    if applied <= unit.distinct_records { frame_unit } else { late_unit };
+                if recovery.phase() == RecoverPhase::Replay
+                    && recovery.segments_progress().0 == segments_before
+                {
+                    assert!(read + charge >= budget, "{at}: yielded at {read} read + {charge}");
+                }
+                assert!(
+                    read + charge < budget + unit_bytes,
+                    "{at}: {read} read + {charge} charged passes the budget by more than one \
+                     frame's unit ({unit_bytes})"
+                );
+            }
+            RecoverPhase::Finish if !finished => finished = true, // the lift decision
+            RecoverPhase::Finish => {
+                settle_steps += 1;
+                if recovery.phase() == RecoverPhase::Finish {
+                    assert!(charge >= budget, "{at}: the settle yielded at a charge of {charge}");
+                    assert!(charge < budget + settle_unit, "{at}: a settle step charged {charge}");
+                } else {
+                    let bound = budget + settle_unit + drain_unit;
+                    assert!(charge < bound, "{at}: the last settle step charged {charge}");
+                }
+            }
+            RecoverPhase::Start
+            | RecoverPhase::Ckpt
+            | RecoverPhase::Audit
+            | RecoverPhase::Complete => {
+                assert_eq!(charge, 0, "{at}: no boot I/O outside replay and the settle");
+            }
+        }
+    }
+    let (_rotor, stats, _seed) = recovery.finish();
+    assert_eq!(stats.tier_replay.step_charge_max_bytes, largest, "the gauge is the largest step");
+    let replay = stats.tier_replay.counters;
+    eprintln!(
+        "budget {budget}: gauge {largest} bytes, {settle_steps} settle steps, {} demote steps, \
+         {} settle reads, {} deletes verified",
+        replay.demote_steps, replay.settle_reads, replay.deletes_verified
+    );
+    assert!(replay.demote_steps > 1, "VACUOUS: {replay:?}");
+    assert!(replay.settle_reads > 0, "VACUOUS: no settle read ({replay:?})");
+    assert!(replay.deletes_verified > 0, "VACUOUS: no delete verified ({replay:?})");
+    if budget < WINDOW {
+        assert!(settle_steps > 1, "VACUOUS: the end settle took {settle_steps} step(s)");
+    }
+    let (served, ram, cold) = read_back(&fs, &cfg, &mut ks, &unit.model);
+    assert!(ram > 0 && cold > 0, "VACUOUS: {ram} RAM and {cold} cold keys");
+    assert_model(&served, &unit.model, &format!("after a boot at a {budget}-byte budget"));
 }

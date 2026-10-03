@@ -787,6 +787,15 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &self.stats
     }
 
+    /// The boot I/O charge the last [`step`](Self::step) took, in
+    /// step-budget bytes (ADR-0174 D2 rule 4): the tier bytes, barriers,
+    /// settle reads and end-settle bytes its replay machines drained, at
+    /// their prices. ADR-0174 D6's gauge is the largest of these.
+    #[must_use]
+    pub fn step_charge_bytes(&self) -> u64 {
+        self.step_charge
+    }
+
     fn fs(&self) -> &F {
         self.fs.as_ref().expect("fs present until finish")
     }
