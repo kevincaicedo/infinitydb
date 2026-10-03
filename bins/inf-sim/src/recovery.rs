@@ -36,7 +36,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use inf_foundation::hash64;
@@ -85,10 +85,16 @@ pub struct RecoveryScenario {
     /// The replay-above-window seed class (ADR-0174 D1), one seed in
     /// four: before each cut, tiered writes fill the tail until the bytes
     /// the next boot re-appends reach a multiple of the window, so the
-    /// boot must demote during replay (`Run::fill_replay_unit`).
-    /// `--replay-above-window` forces the class on any seed; a run in it
-    /// that never exceeded a window, or whose boots never demoted, reports
-    /// `VACUOUS`.
+    /// boot must demote during replay (`Run::fill_replay_unit`). Its last
+    /// life carries the two-crash row (ADR-0174 I10, `Run::two_crash_coda`):
+    /// that life publishes, shadow-writes keys its checkpoint names by a
+    /// ref, and fills just past the window; after the boot settles those
+    /// refs, the window rises to its ring, the keys are deleted live, the
+    /// power is cut again, and the second boot must remove each ref by the
+    /// `DEL`'s marker. `--replay-above-window` forces the class on any
+    /// seed; a run in it that never exceeded a window, whose boots never
+    /// demoted, or whose two-crash row settled no ref or whose second boot
+    /// did not fit, reports `VACUOUS`.
     pub replay_above_window: bool,
 }
 
@@ -201,6 +207,14 @@ pub struct RecoveryReport {
     pub held_released_by_park: u64,
     /// Boot-sealed files the dead-byte census read (engagement).
     pub boot_files_censused: u64,
+    /// The two-crash row (ADR-0174 I10, the class's last life): keys a
+    /// shadow write left beside the ref the checkpoint names them by, the
+    /// rows whose ref the demoting boot settled (R8: removed, chained into
+    /// the record's origins), and the refs the second boot found slotted
+    /// after the checkpoint and saw a marker of the live `DEL` remove.
+    pub two_crash_rows_opened: u64,
+    pub two_crash_rows_settled: u64,
+    pub two_crash_markers_removed: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -411,6 +425,28 @@ fn demote() -> DemotionConfig {
     DemotionConfig { mem_budget_bytes: BUDGET, mutable_permille: 40, slice_bytes: PAGE }
 }
 
+/// The two-crash row's raised window: `MEM-BUDGET` up to the ring
+/// `demote()` reserved (a window above the ring is refused, ADR-0062 D3).
+fn raised() -> DemotionConfig {
+    let ring = u64::try_from(demote().ring_reserve_bytes().expect("valid budget")).expect("u64");
+    DemotionConfig { mem_budget_bytes: ring - demote().slice_bytes, ..demote() }
+}
+
+/// Every address a displacement marker of `tail` names.
+fn tail_marker_addrs(tail: &[u8]) -> BTreeSet<u64> {
+    let mut addrs = BTreeSet::new();
+    let mut rest = tail;
+    // Bound: one decode per tail record.
+    while !rest.is_empty() {
+        let (record, consumed) = decode_record(rest).expect("tail records decode");
+        if let RecordView::ColdDisplace { old_addr, .. } = record {
+            addrs.insert(old_addr);
+        }
+        rest = &rest[consumed..];
+    }
+    addrs
+}
+
 fn space_config(origin: u64) -> AddressSpaceConfig {
     AddressSpaceConfig {
         reserve_bytes: demote().ring_reserve_bytes().expect("valid budget"),
@@ -530,6 +566,12 @@ struct Run {
     /// unit, independent of the table (ADR-0174 D6's control leg).
     published_image_bytes: u64,
     walk_image_bytes: u64,
+    /// The refs the walk in progress emitted, and those of the published
+    /// checkpoint: the two-crash row takes its keys from the latter.
+    walk_refs: Vec<(u64, u64)>,
+    published_refs: Vec<(u64, u64)>,
+    /// The two-crash row's keys: (key, hash, the ref's address).
+    two_crash: Vec<(Vec<u8>, u64, u64)>,
     report: RecoveryReport,
 }
 
@@ -1000,15 +1042,22 @@ impl Run {
     /// the inline maximum), rewrites of fill keys at distances under and
     /// over a window, deletes, and shadow writes over demoted keys. Counts
     /// the life when the unit exceeds the window.
-    fn fill_replay_unit(&mut self, life: &mut Life, rng: &mut SplitMix64, life_index: u64) {
+    fn fill_replay_unit(
+        &mut self,
+        life: &mut Life,
+        rng: &mut SplitMix64,
+        life_index: u64,
+        fixed_target: Option<u64>,
+    ) {
         let window = demote().mem_budget_bytes + demote().slice_bytes;
-        let target = match rng.next_u64() % 8 {
+        let drawn = match rng.next_u64() % 8 {
             0 => window - PAGE,
             1 => window,
             2 | 3 => window + PAGE,
             4..=6 => 3 * window,
             _ => 16 * window,
         };
+        let target = fixed_target.unwrap_or(drawn);
         // The held ticket's injected read error clears: its winner pins
         // release (ADR-0093 D3), and a window's worth of writes behind a
         // pin the reconciler can never lift would stall every writer, as
@@ -1143,6 +1192,177 @@ impl Run {
             &[counters.demote_steps.to_le_bytes(), counters.tier_bytes.to_le_bytes()].concat(),
             r.trace_hash,
         );
+    }
+
+    /// The two-crash row's first half (ADR-0174 I10): up to eight keys the
+    /// published checkpoint names by a ref, still slotted at that ref,
+    /// take a shadow write — the record appends with no marker and the ref
+    /// stays its twin — so the boot that demotes settles the ref against
+    /// the record and chains it into the record's origins (R8).
+    fn open_two_crash_rows(&mut self, life: &mut Life) {
+        const ROWS_MAX: usize = 8;
+        let refs = std::mem::take(&mut self.published_refs);
+        // Bound: one cold read per ref of the published checkpoint, at
+        // most until eight rows are open.
+        for &(hash, addr) in &refs {
+            if self.two_crash.len() == ROWS_MAX {
+                break;
+            }
+            let Some(bytes) = read_cold_record(&self.disk, &life.flush, addr) else { continue };
+            let key = TieredTable::decode_record(&bytes).key.to_vec();
+            let at = LogicalAddr::from_raw(addr).expect("48-bit");
+            let slotted =
+                matches!(life.table.lookup(&key, hash, &[]), TieredLookup::Cold(a) if a == at);
+            if key.starts_with(inf_store::COLLISION_KEY_PREFIX) || !slotted {
+                continue;
+            }
+            self.apply_op(life, &key, Op::SetShadow(vec![0x2C; 48]));
+            if life.table.shadow_tickets().any(|ticket| ticket.cold == at) {
+                self.two_crash.push((key, hash, addr));
+            }
+        }
+        self.published_refs = refs;
+        self.report.two_crash_rows_opened = self.two_crash.len() as u64;
+    }
+
+    /// The two-crash row after the boot that demoted: a row whose ref the
+    /// boot removed while no marker of the tail named it was settled by
+    /// the boot (R7, R8) and stays a row; the rest leave it.
+    fn settle_two_crash_rows(&mut self, table: &TieredTable) {
+        let markers = tail_marker_addrs(&self.tail);
+        self.two_crash.retain(|(_, hash, addr)| {
+            let at = LogicalAddr::from_raw(*addr).expect("48-bit");
+            !table.contains_pair(*hash, at) && !markers.contains(addr)
+        });
+        self.report.two_crash_rows_settled = self.two_crash.len() as u64;
+    }
+
+    /// The two-crash row (ADR-0174 I10): after the boot that settled the
+    /// rows' refs, the window rises to its ring, each row's key is deleted
+    /// live — its `DEL` stages a marker for every origin, the settled ref
+    /// among them — and the power is cut before a checkpoint publishes.
+    /// The second boot replays the same checkpoint and the whole tail
+    /// inside the raised window, so it settles nothing and only the
+    /// marker can remove the ref. The oracle: every row's ref is slotted
+    /// once the checkpoint loads and gone once the tail replays, and its
+    /// key misses. Engagement: settled rows and a second boot that fits,
+    /// else `VACUOUS`.
+    fn two_crash_coda(&mut self, mut life: Life, hasher: KeyHasher, seed: u64) {
+        if self.two_crash.is_empty() {
+            self.report.violations.push(format!(
+                "TWO-CRASH VACUOUS: {} rows opened, none settled by the boot that demoted",
+                self.report.two_crash_rows_opened
+            ));
+            return;
+        }
+        life.table.set_demotion(raised()).expect("the raised window is the ring");
+        let rows = std::mem::take(&mut self.two_crash);
+        for (key, _, _) in &rows {
+            if self.model.contains_key(key) {
+                self.apply_op(&mut life, key, Op::Del);
+            }
+        }
+        self.report.state.number(b"two-crash-cut", rows.len() as u64);
+        self.disk.power_cut(seed ^ 0x2C2C_0000);
+        drop(life);
+        let booted = self.two_crash_boot(&rows, hasher);
+        let (table, handed, counters) = match booted {
+            Ok(done) => done,
+            Err(err) => {
+                self.report.violations.push(format!("two-crash boot 2: {err}"));
+                return;
+            }
+        };
+        let unit = self.replay_unit_bytes();
+        let window = raised().mem_budget_bytes + raised().slice_bytes;
+        if unit + FIT_MARGIN_BYTES > window || !counters.zero_set_is_zero() {
+            self.report.violations.push(format!(
+                "TWO-CRASH VACUOUS: the second boot does not fit its {window}-byte window \
+                 (unit {unit}, {counters:?})"
+            ));
+        }
+        self.report.state.digest(table.simulation_digest());
+        let life = Life {
+            table,
+            flush: handed.flush,
+            ring: StagingRing::new(StagingConfig::default()),
+            flush_lag: false,
+        };
+        for (key, hash, _) in &rows {
+            let resurrected = match life.table.lookup(key, *hash, &[]) {
+                TieredLookup::Miss => false,
+                TieredLookup::Ram(_) => true,
+                TieredLookup::Cold(addr) => {
+                    read_cold_record(&self.disk, &life.flush, addr.to_raw()).is_some_and(|bytes| {
+                        TieredTable::decode_record(&bytes).key == key.as_slice()
+                    })
+                }
+            };
+            if resurrected {
+                self.report.violations.push(format!(
+                    "TWO-CRASH VIOLATION: the deleted key {} serves after the second boot",
+                    String::from_utf8_lossy(key)
+                ));
+            }
+        }
+        self.audit(&life, "two-crash boot 2");
+    }
+
+    /// The second boot of the two-crash row, through the raised window:
+    /// each row's ref must be slotted after the checkpoint (engagement)
+    /// and gone after the tail (a marker of the live `DEL` removed it).
+    fn two_crash_boot(
+        &mut self,
+        rows: &[(Vec<u8>, u64, u64)],
+        hasher: KeyHasher,
+    ) -> Result<(TieredTable, HandedOver<SimDisk>, ReplayCounters), String> {
+        let manifest = read_manifest(&self.disk, &self.shard)
+            .map_err(|e| format!("manifest unreadable: {e}"))?
+            .ok_or("published manifest lost")?;
+        let tier = manifest.tier_ns(NS.0).cloned().ok_or("manifest lost its tier section")?;
+        let recovered = recover_tiered_ns(
+            self.disk.clone(),
+            &tier,
+            manifest.ckpt_id,
+            flush_config(&self.shard),
+            space_config(0),
+            raised(),
+            1024,
+            hasher,
+        )
+        .map_err(|e| format!("tier recovery: {e}"))?;
+        let mut node = Booting::new(recovered.table, recovered.replay, hasher);
+        let ick = self.shard.join(ick_file_name(manifest.ckpt_id));
+        node.load_checkpoint(&self.disk, &ick, tier.flushed)?;
+        node.table_mut().set_shadow_enabled(true);
+        let pair = |table: &TieredTable, &(_, hash, addr): &(Vec<u8>, u64, u64)| {
+            table.contains_pair(hash, LogicalAddr::from_raw(addr).expect("48-bit"))
+        };
+        let slotted: Vec<bool> = rows.iter().map(|row| pair(node.table(), row)).collect();
+        node.replay_tail(&self.tail)?;
+        for (row, &was) in rows.iter().zip(&slotted) {
+            if !was {
+                continue;
+            }
+            if pair(node.table(), row) {
+                self.report.violations.push(format!(
+                    "TWO-CRASH VIOLATION: the ref at {} of {} the first boot settled outlived the \
+                     second boot's tail — no marker of the live DEL named it (I10)",
+                    row.2,
+                    String::from_utf8_lossy(&row.0)
+                ));
+            } else {
+                self.report.two_crash_markers_removed += 1;
+            }
+        }
+        if self.report.two_crash_markers_removed == 0 {
+            self.report.violations.push(format!(
+                "TWO-CRASH VACUOUS: none of {} settled refs was slotted after the second boot's \
+                 checkpoint",
+                rows.len()
+            ));
+        }
+        node.finish(&mut self.report.shadow_settled_at_boot)
     }
 
     /// One live-path mutation, recorded into the modeled tail with its
@@ -1761,6 +1981,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         held_key: None,
         published_image_bytes: 0,
         walk_image_bytes: 0,
+        walk_refs: Vec::new(),
+        published_refs: Vec::new(),
+        two_crash: Vec::new(),
         report: RecoveryReport::default(),
     };
     let mut life = Life {
@@ -1844,9 +2067,13 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         // The fuzzy hybrid walk, slice-interleaved with mutations. The
         // tail prefix covered by this checkpoint is truncated only if
         // the publish lands (cut-before-publish keeps it — D7).
-        let cut_before_publish = life_index > 0 && rng.next_u64().is_multiple_of(4);
+        // The class's last life carries the two-crash row: it publishes.
+        let two_crash_life = scenario.replay_above_window && life_index + 1 == scenario.lives;
+        let cut_before_publish =
+            life_index > 0 && rng.next_u64().is_multiple_of(4) && !two_crash_life;
         let covered = run.tail.len();
         run.walk_image_bytes = 0;
+        run.walk_refs.clear();
         let w = life.table.begin_ckpt_walk(ckpt_id + 1).to_raw();
         let begin_lsn = Lsn::new(SegmentId(u32::try_from(life_index + 1).expect("small")), 64);
         let mut writer = SyncIckWriter::create_v2(
@@ -1893,6 +2120,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
                 for (hash, addr) in refs {
                     writer.append_ref(NS.0, w, hash, addr).expect("ref");
                     run.report.refs_emitted += 1;
+                    run.walk_refs.push((hash, addr));
                 }
                 for (key, value, ext) in images {
                     let value_len = ext.map_or(value.len(), |_| EXTENT_REF_LEN);
@@ -2016,6 +2244,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             // WAL truncation (D7): drop exactly the covered prefix.
             run.tail.drain(..covered);
             run.published_image_bytes = run.walk_image_bytes;
+            run.published_refs = std::mem::take(&mut run.walk_refs);
             // In-life dangling oracle: every model key still serves with
             // the retired files gone (a slot naming a detached file
             // surfaces here as a read failure, before any crash).
@@ -2033,7 +2262,14 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             run.report.cut_before_publish += 1;
         }
         if scenario.replay_above_window {
-            run.fill_replay_unit(&mut life, &mut rng, life_index);
+            // The two-crash life's unit lies just above the window, so its
+            // boot demotes and the second boot fits the raised one.
+            let window = demote().mem_budget_bytes + demote().slice_bytes;
+            let fixed = two_crash_life.then_some(window + 16 * PAGE);
+            run.fill_replay_unit(&mut life, &mut rng, life_index, fixed);
+        }
+        if two_crash_life {
+            run.open_two_crash_rows(&mut life);
         }
 
         // Tickets deliberately left open across the cut (ADR-0093 D5):
@@ -2109,6 +2345,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             }
         };
         run.note_boot(&counters, replay_unit, life_index);
+        if two_crash_life {
+            run.settle_two_crash_rows(&table);
+        }
         run.report.state.number(b"recovered-life", life_index);
         run.report.state.digest(table.simulation_digest());
         // The M4-S14 oracle (ADR-0058 D4): by replay-complete, every
@@ -2210,6 +2449,9 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             .concat(),
             run.report.trace_hash,
         );
+    }
+    if scenario.replay_above_window {
+        run.two_crash_coda(life, hasher, scenario.seed);
     }
     if scenario.replay_above_window
         && (run.report.replay_above_window_lives == 0 || run.report.demoting_boots == 0)

@@ -416,6 +416,7 @@ fn main() {
             let mut fitting_boots = 0u64;
             let mut boot_replay = inf_store::ReplayCounters::default();
             let mut writer_parks = 0u64;
+            let mut two_crash_removed = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -423,6 +424,7 @@ fn main() {
                 fitting_boots += report.fitting_boots_checked;
                 boot_replay.absorb(report.boot_replay);
                 writer_parks += report.writer_parks;
+                two_crash_removed += report.two_crash_markers_removed;
                 if verify {
                     let twin = run_one(seed);
                     verify_hashes(
@@ -490,7 +492,8 @@ fn main() {
                  restored by an older manifest); boots {demoting_boots} demoting / \
                  {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
                  {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
-                 releases, {writer_parks} writer parks",
+                 releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
+                 removed by a marker",
                 boot_replay.demote_steps,
                 boot_replay.tier_bytes,
                 boot_replay.settle_reads,
@@ -544,7 +547,8 @@ fn main() {
              window (largest unit {} windows), boots {} demoting / {} fitting checked, boot \
              replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
              deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
-             released), {} boot files censused, trace {:#x}",
+             released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
+             refs removed by a marker, trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -589,6 +593,9 @@ fn main() {
             report.writes_parked_past_a_walk,
             report.held_released_by_park,
             report.boot_files_censused,
+            report.two_crash_rows_opened,
+            report.two_crash_rows_settled,
+            report.two_crash_markers_removed,
             report.trace_hash
         );
         if verify {
