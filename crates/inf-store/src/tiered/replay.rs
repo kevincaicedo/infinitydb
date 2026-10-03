@@ -789,6 +789,11 @@ impl<F: SegmentFs> TierReplay<F> {
             Ok(drained) => drained,
             Err(cause) => return Err(self.flush_refusal(table, cause)),
         };
+        // The drain is the active file's seal alone: every demote step
+        // appended up to its cut (D2 rule 4) and the end settle moves no
+        // boundary (R10), so nothing below `ro` is left to append or cross.
+        debug_assert_eq!(drained.appended_bytes, 0, "the hand-over's drain appends nothing");
+        debug_assert_eq!(drained.gaps_crossed, 0, "the hand-over's drain crosses no gap");
         self.note_flush(drained);
         let handles_held = self.flush.held_handles();
         let handed = self.flush.hand_over().map_err(|cause| ReplayRefusal::Flush {
