@@ -237,6 +237,37 @@ impl Life {
         self.model.insert(key.to_vec(), Expect { value: value.to_vec(), extent: None });
     }
 
+    /// The forced `DEL` of a shadow winner (ADR-0093 A10, the plane's
+    /// `stage_delete_run` by hand): the ticket's cold twin is read and
+    /// verified the same key, then the twin — its origins' markers and
+    /// its own first, its death charged to its file — and the winner
+    /// are deleted, and the `DEL` record follows the markers.
+    fn del_shadow_pair(&mut self, key: &[u8]) {
+        let hash = Self::hash(key);
+        let TieredLookup::Ram(winner) = self.table.lookup(key, hash, &[]) else {
+            panic!("the winner is in RAM");
+        };
+        let ticket = self.table.shadow_of_winner(winner).expect("an open ticket");
+        let head = read_cold(&self.flush, &self.fs, ticket.cold.to_raw(), 8).expect("header");
+        let len = TieredTable::record_len_from_header(&head);
+        let image = read_cold(&self.flush, &self.fs, ticket.cold.to_raw(), len).expect("twin");
+        assert_eq!(
+            self.table.verify_shadow(hash, ticket.cold, &image),
+            inf_store::ShadowVerdict::SameKey,
+            "the twin is the key's"
+        );
+        self.stage_markers(key, ticket.cold);
+        self.table.delete(hash, ticket.cold, len);
+        let winner_len = self.table.record(winner).encoded_len;
+        self.stage_markers(key, winner);
+        self.table.delete(hash, winner, winner_len);
+        if self.begun {
+            RecordView::Delete { ns: NS, key }.encode_into(&mut self.tail);
+        }
+        self.model.remove(key);
+        self.lens.remove(key);
+    }
+
     fn del(&mut self, key: &[u8]) {
         let hash = Self::hash(key);
         if let Some((addr, len, _)) = self.displaced(key) {
@@ -267,6 +298,21 @@ impl Life {
         mutate_mid_walk: impl FnOnce(&mut Life),
         front: &[&[u8]],
         back: &[&[u8]],
+    ) {
+        self.checkpoint_staged(ckpt_id, mutate_mid_walk, front, back, |_| {});
+    }
+
+    /// [`checkpoint_ordered`](Self::checkpoint_ordered) with a second
+    /// hook, `after_images`, between pass 1 and pass 2: a mutation there
+    /// is in the tail, absent from the images and charged in the live
+    /// set.
+    fn checkpoint_staged(
+        &mut self,
+        ckpt_id: u64,
+        mutate_mid_walk: impl FnOnce(&mut Life),
+        front: &[&[u8]],
+        back: &[&[u8]],
+        after_images: impl FnOnce(&mut Life),
     ) {
         self.begun = true;
         let w = self.table.begin_ckpt_walk(ckpt_id).to_raw();
@@ -334,6 +380,7 @@ impl Life {
                     .expect("image"),
             }
         }
+        after_images(self);
         for f in self.table.live_set().files().to_vec() {
             writer
                 .append_live_set(NS.0, f.id, f.data_len, f.dead_bytes, f.byte_exact)
@@ -1120,6 +1167,116 @@ fn a_death_the_crashed_life_charged_is_not_charged_again() {
     );
     assert_eq!(ready.slots().iter().filter(|s| s.key == b"charged").count(), 1, "one slot");
     let _ = origin;
+}
+
+/// The charged-death row's second half: the crashed life's `DEL` ends
+/// a blind-`SET` pair between pass 1 and pass 2 — the cold twin is a ref
+/// (pass 0), the winner an image (pass 1), the twin's death is charged to
+/// its file in the live set (pass 2), and the tail holds half a window
+/// of records, then the twin's marker, the winner's and the `DEL`. The
+/// boot places the winner's image last and seals it during the tail,
+/// after the live set restored the charge: the ref settles at the seal
+/// (counted, stamped, no bytes), the twin's marker then finds the pair
+/// absent, and the `DEL` removes the boot's demoted copy of the winner
+/// by its verified read. The key is absent, the dead-byte census holds
+/// and the next checkpoint's pass 2 completes. Red under
+/// `inf_canary_replay_ref_settle_charges`: the twin's file above its true
+/// dead bytes.
+#[test]
+fn a_death_the_crashed_life_charged_by_a_del_of_a_blind_set_pair_is_not_charged_again() {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let window = demote.mem_budget_bytes + demote.slice_bytes;
+    let mut life = Life::new(demote);
+    life.table.set_shadow_enabled(true);
+    life.set(b"pair", &[0x77; 400]);
+    for i in 0..600u64 {
+        life.set(&format!("cold:{i:05}").into_bytes(), &[0x11; 900]);
+        if i.is_multiple_of(64) {
+            life.maintain();
+        }
+    }
+    life.maintain();
+    let hash = Life::hash(b"pair");
+    let TieredLookup::Cold(twin) = life.table.lookup(b"pair", hash, &[]) else {
+        panic!("the key's record is cold");
+    };
+    life.shadow_set(b"pair", &[0x88; 400]);
+    life.checkpoint_staged(
+        1,
+        |_| {},
+        &[],
+        &[b"pair"],
+        |life| {
+            // Half a window of tail records fits beside the pinned walk's RAM,
+            // then the DEL: its markers follow them in the tail.
+            let mut written = 0u64;
+            let mut i = 0u64;
+            while written < window / 2 {
+                let key = format!("tail:{i:06}").into_bytes();
+                life.set(&key, &[0x22; 900]);
+                written += life.lens[&key].0 as u64;
+                i += 1;
+            }
+            life.del_shadow_pair(b"pair");
+        },
+    );
+    let tail_markers: Vec<u64> = {
+        let mut rest: &[u8] = &life.tail;
+        let mut out = Vec::new();
+        while !rest.is_empty() {
+            let (record, consumed) = inf_log::decode_record(rest).expect("decodes");
+            if let RecordView::ColdDisplace { old_addr, .. } = record {
+                out.push(old_addr);
+            }
+            rest = &rest[consumed..];
+        }
+        out
+    };
+    assert!(tail_markers.contains(&twin.to_raw()), "the twin's marker is in the tail");
+    let durable = life.crash();
+    let mut boot = durable.boot_with(lowered(), |_| {});
+    assert!(boot.table.contains_pair(hash, twin), "the ref survived image load: placed last");
+    let charged_file = boot
+        .table
+        .live_set()
+        .files()
+        .iter()
+        .find(|f| f.recovered && f.base <= twin.to_raw() && twin.to_raw() < f.base + f.data_len)
+        .map(|f| (f.id, f.dead_bytes))
+        .expect("the twin's file is recovered");
+    assert!(charged_file.1 > 0, "the live set restored the crashed life's charge");
+    boot.replay(&durable.tail);
+    let counters = boot.replay.counters();
+    let ready = boot.finish();
+    // The oracle first: the dead-byte census finds the twin's file above
+    // its true dead bytes when the ref's settle charged the death again.
+    ready.audit(&durable.model, true);
+    let after =
+        ready.table.live_set().files().iter().find(|f| f.id == charged_file.0).expect("file");
+    assert_eq!(after.dead_bytes, charged_file.1, "no byte charged twice (R8)");
+    assert!(
+        matches!(ready.table.lookup(b"pair", hash, &[]), TieredLookup::Miss),
+        "the deleted key is absent"
+    );
+    // Then the engagement: the tail sealed the winner and settled the ref
+    // there, before the twin's marker; the DEL verified and removed the
+    // boot's demoted copy.
+    assert!(counters.demote_steps > 0, "the boot demoted");
+    assert!(counters.settled_same_key >= 1, "the ref settled at the winner's seal");
+    assert!(counters.deletes_verified >= 1, "the DEL removed the demoted winner");
+    // The next checkpoint's pass 2 completes over the recovered counters.
+    let Ready { fs, table, flush, .. } = ready;
+    let mut next = Life {
+        fs,
+        demote: lowered(),
+        table,
+        flush,
+        model: durable.model.clone(),
+        tail: Vec::new(),
+        begun: false,
+        lens: BTreeMap::new(),
+    };
+    next.checkpoint(2, |_| {});
 }
 
 // ---- §6 row: a live-set entry for an unmanifested file (E15) -----------------

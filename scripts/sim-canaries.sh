@@ -217,6 +217,7 @@ rows=(
   # ADR-0174 D3 R8: the ref arm charges the record's bytes — a recovered
   # file above its true dead bytes (the dead-byte census, I13).
   "inf_canary_replay_ref_settle_charges crate-test inf-store test:tiered_replay a_death_the_crashed_life_charged_is_not_charged_again over-counts"
+  "inf_canary_replay_ref_settle_charges crate-test inf-store test:tiered_replay a_death_the_crashed_life_charged_by_a_del_of_a_blind_set_pair_is_not_charged_again over-counts"
   # ADR-0174 D3 R11 (E15) skipped: a live-set entry names a boot file and
   # overwrites its counters — a boot file that is not byte-exact.
   "inf_canary_replay_restore_unguarded crate-test inf-store test:tiered_replay a_live_set_entry_naming_a_boot_file_restores_nothing byte-exact"
