@@ -865,6 +865,121 @@ fn committed_pages_around_the_window_decide_whether_the_boot_demotes() {
     }
 }
 
+// ---- §6 row: record length and slice ----------------------------------------
+
+/// A durable unit whose checkpoint names nothing, then a tail placed by
+/// hand: `n` records from `record(i)`, the model their last values.
+fn hand_tail(
+    demote: DemotionConfig,
+    n: u64,
+    record: impl Fn(u64) -> (Vec<u8>, Vec<u8>),
+) -> Durable {
+    let mut life = Life::new(demote);
+    life.checkpoint(1, |_| {});
+    let mut model = BTreeMap::new();
+    let mut tail = Vec::new();
+    for i in 0..n {
+        let (key, value) = record(i);
+        RecordView::StringPostImage { ns: NS, key: &key, value: &value }.encode_into(&mut tail);
+        model.insert(key, Expect { value, extent: None });
+    }
+    Durable { fs: life.fs.clone(), demote, model, tail }
+}
+
+/// Record lengths from a 1 B key and value to 16 KiB — one frame's
+/// payload less one byte, exactly and plus one among them — at slices of
+/// 64 KiB, 1 MiB and 64 MiB (the 64 MiB slice with the 16 KiB records
+/// alone: its window is 65 MiB, which the shorter records would need
+/// tens of thousands to millions of replays to fill in a debug test).
+/// Each boot demotes, carries no stall seal, and makes one barrier per
+/// demote step that flushed, one per seal and no other: the barrier
+/// counter equals the barriers the tier writer reached, counted by the
+/// fault registry at its two barrier sites, and the seals equal the boot
+/// files' footers by reason.
+#[test]
+fn record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal() {
+    use inf_log::TIER_FRAME_DATA;
+    let kib = 1u64 << 10;
+    let header = TieredTable::RECORD_HEADER_LEN as u64;
+    let lens: [(&str, Option<u64>); 5] = [
+        ("1 B key and value", None),
+        ("one frame - 1 B", Some(TIER_FRAME_DATA as u64 - 1)),
+        ("one frame", Some(TIER_FRAME_DATA as u64)),
+        ("one frame + 1 B", Some(TIER_FRAME_DATA as u64 + 1)),
+        ("16 KiB", Some(16 * kib)),
+    ];
+    let mut gaps_seen = 0u64;
+    for slice in [64 * kib, 1 << 20, 64 << 20] {
+        for &(name, encoded) in &lens {
+            if slice == 64 << 20 && encoded != Some(16 * kib) {
+                continue;
+            }
+            let demote =
+                DemotionConfig { slice_bytes: slice, ..DemotionConfig::for_budget(BUDGET, PAGE) };
+            let window = demote.mem_budget_bytes + demote.slice_bytes;
+            let laps = if slice == 64 << 20 { 2 } else { 3 };
+            let durable = match encoded {
+                None => {
+                    let n = laps * window / (header + 2);
+                    hand_tail(demote, n, |i| (vec![i as u8], vec![(i >> 8) as u8]))
+                }
+                Some(len) => {
+                    let n = laps * window / len;
+                    hand_tail(demote, n, |i| {
+                        let key = format!("k:{i:06}").into_bytes();
+                        let value = vec![0x5A; (len - header) as usize - key.len()];
+                        (key, value)
+                    })
+                }
+            };
+            let mut boot = durable.boot();
+            // The instrument: every barrier the tier writer reaches passes
+            // the `tier_fsync_err` site once (a sync or a seal), every seal
+            // the `tier_footer_torn` site once. Armed never to fire.
+            fault::arm(inf_log::fault::TIER_FSYNC_ERR, FaultSpec::Nth(u64::MAX));
+            fault::arm(inf_log::fault::TIER_FOOTER_TORN, FaultSpec::Nth(u64::MAX));
+            boot.replay(&durable.tail);
+            let ready = boot.finish();
+            let barriers_reached = fault::occurrences(inf_log::fault::TIER_FSYNC_ERR);
+            let seals_reached = fault::occurrences(inf_log::fault::TIER_FOOTER_TORN);
+            fault::disarm_all();
+            let arm = format!("{name} at a {slice}-byte slice");
+            let c = ready.counters;
+            assert!(c.demote_steps > 0, "{arm}: VACUOUS — the boot did not demote");
+            assert_eq!(c.barriers, barriers_reached, "{arm}: the counter is the writer's barriers");
+            assert_eq!(c.files_sealed, seals_reached, "{arm}: the counter is the writer's seals");
+            let syncs = c.barriers - c.files_sealed;
+            assert!(syncs >= 1, "{arm}: a demote step flushed");
+            assert!(
+                syncs <= c.demote_steps,
+                "{arm}: one barrier per step that flushed: {syncs} > {} steps",
+                c.demote_steps
+            );
+            assert!(
+                syncs <= c.tier_bytes.div_ceil(PAGE),
+                "{arm}: at most one barrier per commit page of demoted input"
+            );
+            let mut by_reason = BTreeMap::new();
+            for meta in ready.boot_files() {
+                let (_, footer) = probe_tier_file(&ready.fs, &meta.path).expect("probe");
+                *by_reason
+                    .entry(format!("{:?}", footer.expect("sealed").reason))
+                    .or_insert(0u64) += 1;
+            }
+            let reason = |r: &str| by_reason.get(r).copied().unwrap_or(0);
+            assert_eq!(
+                reason("Capacity") + reason("RingTopGap") + reason("Shutdown"),
+                c.files_sealed,
+                "{arm}: every seal is a capacity, gap or hand-over seal ({by_reason:?})"
+            );
+            assert!(reason("Shutdown") <= 1, "{arm}: one hand-over seal at most");
+            gaps_seen += reason("RingTopGap");
+            ready.audit(&durable.model, true);
+        }
+    }
+    assert!(gaps_seen > 0, "VACUOUS: no arm crossed a ring-top gap");
+}
+
 // ---- §6 rows: rewrite distance, rewrites still open, deletes -----------
 
 /// Rewrites of one key under a window, over a window, and a tail that is

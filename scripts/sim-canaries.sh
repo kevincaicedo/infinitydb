@@ -227,6 +227,9 @@ rows=(
   # ADR-0174 D2 rule 5: the step seals the file to free the partial frame
   # — a boot file with the stall reason (the seal-reason census).
   "inf_canary_replay_stall_seal crate-test inf-store test:tiered_replay a_rewritten_key_keeps_one_slot_with_the_newest_value Stall"
+  # The same plant breaks the barrier arithmetic: a seal the writer made
+  # that the boot pipeline's counters do not hold.
+  "inf_canary_replay_stall_seal crate-test inf-store test:tiered_replay record_lengths_and_slices_demote_with_one_barrier_per_step_and_per_seal the counter is the writer's"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
