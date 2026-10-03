@@ -162,9 +162,12 @@ pub enum ReplayRefusal {
     PadRefused { to: LogicalAddr },
     /// The demote step's release could not reach its target.
     DemoteStalled { head: LogicalAddr, target: LogicalAddr },
-    /// The boot pipeline's flush or seal failed (step 3, the hand-over
-    /// drain): short or torn write, device full, a barrier.
-    Flush(TierFlushError),
+    /// The boot pipeline's flush, seal or create failed (the demote
+    /// step, the hand-over drain): a short write, the device full, a
+    /// barrier, a create refused. `unplaced_bytes` are the sealed bytes
+    /// no barrier covers yet; `handles_held` the catalogue handles the
+    /// pipeline holds.
+    Flush { cause: TierFlushError, unplaced_bytes: u64, handles_held: usize },
     /// A settle read failed (E5, E10, E12).
     SettleRead { addr: LogicalAddr, cause: SettleReadError },
     /// Settle bytes do not parse into a verified record of the slot's
@@ -207,7 +210,11 @@ impl core::fmt::Display for ReplayRefusal {
                 head.to_raw(),
                 target.to_raw()
             ),
-            ReplayRefusal::Flush(e) => write!(f, "boot tier flush: {e}"),
+            ReplayRefusal::Flush { cause, unplaced_bytes, handles_held } => write!(
+                f,
+                "boot tier flush: {cause} ({unplaced_bytes} bytes unplaced, \
+                 {handles_held} tier-file handles held)"
+            ),
             ReplayRefusal::SettleRead { addr, cause } => {
                 write!(f, "settle read of the slot at {}: {cause}", addr.to_raw())
             }
@@ -385,14 +392,15 @@ impl<F: SegmentFs> TierReplay<F> {
             if cut > cursor {
                 let outcome = table
                     .flush_span(&mut self.flush, cut - cursor)
-                    .map_err(ReplayRefusal::Flush)?;
+                    .map_err(|cause| self.flush_refusal(table, cause))?;
                 self.note_flush(outcome);
             }
             if cfg!(inf_canary_replay_stall_seal) {
                 // The planted canary (DRR FCR-STTIER-01 §6): the step
                 // seals the file to free the partial frame, as the live
                 // stall seal does — a boot file with the stall reason.
-                self.flush.seal_stall_planted().map_err(ReplayRefusal::Flush)?;
+                let planted = self.flush.seal_stall_planted();
+                planted.map_err(|cause| self.flush_refusal(table, cause))?;
             }
         }
         while table.space.head() < target {
@@ -415,6 +423,13 @@ impl<F: SegmentFs> TierReplay<F> {
                 Ok(())
             }
         }
+    }
+
+    /// The typed refusal for a boot pipeline failure: what is sealed but
+    /// not under a barrier, and the handles the pipeline holds.
+    fn flush_refusal(&self, table: &TieredTable, cause: TierFlushError) -> ReplayRefusal {
+        let unplaced_bytes = table.space.ro_boundary().to_raw() - table.space.flushed().to_raw();
+        ReplayRefusal::Flush { cause, unplaced_bytes, handles_held: self.flush.held_handles() }
     }
 
     fn note_flush(&mut self, outcome: FlushSliceOutcome) {
@@ -649,9 +664,17 @@ impl<F: SegmentFs> TierReplay<F> {
             }
         }
         let sealed_before = self.flush.sealed().len();
-        let drained = table.flush_drain(&mut self.flush).map_err(ReplayRefusal::Flush)?;
+        let drained = match table.flush_drain(&mut self.flush) {
+            Ok(drained) => drained,
+            Err(cause) => return Err(self.flush_refusal(table, cause)),
+        };
         self.note_flush(drained);
-        let handed = self.flush.hand_over().map_err(ReplayRefusal::Flush)?;
+        let handles_held = self.flush.held_handles();
+        let handed = self.flush.hand_over().map_err(|cause| ReplayRefusal::Flush {
+            cause,
+            unplaced_bytes: 0,
+            handles_held,
+        })?;
         let sealed_now = handed.flush.sealed().len() - sealed_before;
         debug_assert!(sealed_now <= 1, "the drain seals at most the active file");
         Ok(BootHandedOver { handed, counters: self.counters, work: self.work })
