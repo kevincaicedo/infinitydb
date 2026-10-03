@@ -2495,15 +2495,29 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
     if scenario.replay_above_window {
         run.two_crash_coda(life, hasher, scenario.seed);
     }
+    // The class's engagement, per seed: a life above the window, a boot
+    // that demoted, settle reads (the seal's, the end settle's and the
+    // deletes', one D6 counter) and — once a unit reached three windows,
+    // where the fill's deletes of its early keys meet demoted copies —
+    // verified deletes. The two-crash row asserts its own above; blob
+    // releases (R9) are not reached by this generator, and their
+    // store-tier row is the evidence.
+    let replay = run.report.boot_replay;
+    let deletes_owed = run.report.replay_unit_windows_max >= 3;
     if scenario.replay_above_window
-        && (run.report.replay_above_window_lives == 0 || run.report.demoting_boots == 0)
+        && (run.report.replay_above_window_lives == 0
+            || run.report.demoting_boots == 0
+            || replay.settle_reads == 0
+            || (deletes_owed && replay.deletes_verified == 0))
     {
         run.report.violations.push(format!(
             "REPLAY-ABOVE-WINDOW VACUOUS: {} lives above the window (largest {} windows), {} \
-             boots demoted",
+             boots demoted, {} settle reads, {} deletes verified",
             run.report.replay_above_window_lives,
             run.report.replay_unit_windows_max,
-            run.report.demoting_boots
+            run.report.demoting_boots,
+            replay.settle_reads,
+            replay.deletes_verified
         ));
     }
     run.report.state_hash = run.report.state.value();
