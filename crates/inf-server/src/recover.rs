@@ -1250,9 +1250,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_settle(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<()> {
         // Bound: one settle step per namespace still settling, each under
         // the budget left; a machine that did not demote answers `Done`.
+        // A step yields only once it charged something (L6: progress is
+        // explicit): at a budget it never spent — a zero budget — the
+        // first settle walks one record (`settle_step`'s floor).
         for i in 0..self.recovering_tiers.0.len() {
             let left = budget_bytes.saturating_sub(self.step_charge);
-            if left == 0 {
+            if left == 0 && self.step_charge > 0 {
                 self.phase = Phase::Settle;
                 return Ok(());
             }
