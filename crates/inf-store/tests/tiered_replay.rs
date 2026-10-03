@@ -434,6 +434,40 @@ struct Boot {
     extents_listed: Vec<u64>,
     extents_quarantined: Vec<u64>,
     tier: inf_log::TierNsManifest,
+    /// What the end-of-replay settle walks, read when replay ended.
+    end_walk: EndWalk,
+}
+
+/// The span the end-of-replay settle (R10) walks, read from the table at
+/// the end of replay: `[ro, tail)` of a machine that demoted, empty for
+/// one that did not.
+#[derive(Copy, Clone, Default)]
+struct EndWalk {
+    /// `tail − ro`.
+    span: u64,
+    /// The bytes of the records in the span, live or dead — a hole is
+    /// passed by its mark, not walked.
+    record_bytes: u64,
+}
+
+impl EndWalk {
+    fn of(table: &TieredTable) -> EndWalk {
+        let space = table.space();
+        let (ro, tail) = (space.ro_boundary().to_raw(), space.tail().to_raw());
+        let mut at = ro;
+        let mut record_bytes = 0u64;
+        while at < tail {
+            let here = LogicalAddr::from_raw(at).expect("48-bit");
+            if let Some(hole) = space.hole_at(here) {
+                at += hole;
+                continue;
+            }
+            let len = table.record(here).encoded_len as u64;
+            record_bytes += len;
+            at += len;
+        }
+        EndWalk { span: tail - ro, record_bytes }
+    }
 }
 
 impl Durable {
@@ -465,7 +499,15 @@ impl Durable {
         let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(manifest.ckpt_id));
         load_checkpoint(&self.fs, &ick, &mut ks, &mut spill, NS, tier.flushed)
             .expect("hybrid load");
-        Boot { fs: self.fs.clone(), ks, spill, extents_listed, extents_quarantined, tier }
+        Boot {
+            fs: self.fs.clone(),
+            ks,
+            spill,
+            extents_listed,
+            extents_quarantined,
+            tier,
+            end_walk: EndWalk::default(),
+        }
     }
 }
 
@@ -481,6 +523,8 @@ struct Ready {
     charged: inf_store::ReplayWork,
     /// The manifested catalogue the boot started from.
     manifested: Vec<u32>,
+    /// What the end-of-replay settle walked, read when replay ended.
+    end_walk: EndWalk,
 }
 
 impl Boot {
@@ -519,6 +563,9 @@ impl Boot {
 
     fn end_of_replay(&mut self) {
         let table = self.ks.tiered_store(NS).expect("materialized");
+        if self.spill.machine(NS).phase() == ReplayPhase::Spilling {
+            self.end_walk = EndWalk::of(table);
+        }
         self.spill.machine_mut(NS).end_of_replay(table);
     }
 
@@ -561,6 +608,7 @@ impl Boot {
             counters: done.counters,
             charged,
             manifested,
+            end_walk: self.end_walk,
         }
     }
 }
@@ -770,6 +818,19 @@ impl Ready {
         self.seal_reason_census();
         assert_eq!(self.handles.len(), self.flush.sealed().len(), "one handle per sealed file");
         assert!(self.flush.active().is_none(), "the hand-over sealed the active file");
+        // The step budget is charged the bytes the end-of-replay settle
+        // walked and no other walk's: a seal walk's bytes are charged once,
+        // as the tier bytes its flush appends (the boot I/O charge, R10).
+        assert!(
+            self.charged.walked_bytes <= self.end_walk.span,
+            "walked bytes {} exceed tail − ro {} at the end of replay",
+            self.charged.walked_bytes,
+            self.end_walk.span
+        );
+        assert_eq!(
+            self.charged.walked_bytes, self.end_walk.record_bytes,
+            "walked bytes are the end settle's records, never a seal walk's"
+        );
     }
 }
 
