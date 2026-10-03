@@ -1833,6 +1833,24 @@ fn check_live_set(
             break;
         }
     }
+    // A ticket's winner is imaged by the walk even below its watermark
+    // (ADR-0093 A12), so the slots above never name it. In a namespace
+    // that demoted, the rebuild tickets two distinct keys with one hash
+    // (ADR-0174 D3) and the winner can lie in a boot file: its bytes are
+    // live there.
+    let mut winners: Vec<u64> = table.shadow_tickets().map(|t| t.winner.to_raw()).collect();
+    winners.sort_unstable();
+    winners.dedup();
+    for addr in winners {
+        let in_file =
+            |f: &&TierFileMeta| addr >= f.base.to_raw() && addr < f.base.to_raw() + f.data_len;
+        let Some(file) = catalogue.iter().find(in_file) else { continue };
+        if addr < w && tier.files.iter().all(|m| m.id != file.id) {
+            let head = read_cold(disk, flush, addr, TieredTable::RECORD_HEADER_LEN);
+            let len = head.map_or(0, |h| TieredTable::record_len_from_header(&h) as u64);
+            *live_bytes.entry(file.id).or_default() += len;
+        }
+    }
     table.end_ckpt_walk();
     for f in table.live_set().files() {
         check_file(f, &counts, &live_bytes, report, life_index);
