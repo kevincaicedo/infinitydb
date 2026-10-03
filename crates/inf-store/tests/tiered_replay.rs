@@ -576,8 +576,27 @@ impl Ready {
     }
 
     /// Every slot, read from RAM or the tier bytes — never through the
-    /// index's hash path.
+    /// index's hash path. Each catalogue file's bytes are read once.
     fn slots(&self) -> Vec<Slot> {
+        let files: Vec<(u64, u64, Vec<u8>)> = self
+            .flush
+            .sealed()
+            .iter()
+            .map(|m| (m.base.to_raw(), m.data_len, self.fs.contents(&m.path).expect("file")))
+            .collect();
+        let read = |addr: u64, len: usize| -> Option<Vec<u8>> {
+            let at = files.partition_point(|(base, _, _)| *base <= addr).checked_sub(1)?;
+            let (base, data_len, image) = &files[at];
+            if addr + len as u64 > base + data_len {
+                return None;
+            }
+            let (first, count, skip) = inf_log::tier_frame_span(addr - base, len);
+            let from = inf_log::tier_frame_offset(first) as usize;
+            let to = from + count as usize * inf_log::TIER_FRAME_BYTES;
+            let mut out = Vec::new();
+            inf_log::tier_extract(image.get(from..to)?, skip, len, &mut out).ok()?;
+            Some(out)
+        };
         let mut out = Vec::new();
         let mut cursor = 0u64;
         loop {
@@ -586,10 +605,10 @@ impl Ready {
             for addr in batch {
                 let cold = addr < self.table.space().head();
                 let bytes = if cold {
-                    let head = read_cold(&self.flush, &self.fs, addr.to_raw(), 8)
+                    let head = read(addr.to_raw(), 8)
                         .expect("a cold slot's header lies in a catalogued file");
                     let len = TieredTable::record_len_from_header(&head);
-                    read_cold(&self.flush, &self.fs, addr.to_raw(), len)
+                    read(addr.to_raw(), len)
                         .expect("a cold slot's record lies in a catalogued file")
                 } else {
                     let len = self.table.record(addr).encoded_len;
