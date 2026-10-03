@@ -59,14 +59,129 @@ fn next_tiered_command(
     }
 }
 
+/// The cell that owns `key` and replays its records (the node's
+/// contiguous slot router), not the cell a writer's connection reached.
+fn owner_cell(cells: u16, key: &[u8]) -> usize {
+    inf_store::SlotRouter::new_contiguous(cells)
+        .cell_of(inf_store::SlotRouter::slot_of(key))
+        .as_usize()
+}
+
+/// The age, in its owning cell's acknowledged record bytes, past which an
+/// aged key's copy is demoted when the reboot replays the op that retires
+/// it: a demote step releases the head to the need, a whole page at or
+/// above the tail less the window, and the replay appends at least every
+/// acknowledged record (the phase-1 ones and those in flight too) — so
+/// the window and one page of margin.
+const AGED_BYTES_MIN: u64 = WINDOW_BYTES + (1 << 20);
+
+/// The replay-above-window class's aged keys (ADR-0174 R6, R7), one
+/// ledger per phase-2 writer: keys written once early in the phase and
+/// retired once their owning cell has acknowledged [`AGED_BYTES_MIN`] of
+/// records since — deleted (a replayed `DEL` verifies the demoted copy,
+/// E5), rewritten (the new record settles against it, E10 or E12), or
+/// deleted and written again; a rewritten key is then deleted (a `SET`
+/// then a `DEL`). Every op is an ordinary writer command, so the ledger,
+/// the audit and the canaries see them as any other.
+#[derive(Default)]
+pub(super) struct AgedKeys {
+    /// Written, not yet retired, oldest first: the key, its owning cell,
+    /// and that cell's acknowledged record bytes when the write was sent.
+    written: Vec<(Vec<u8>, usize, u64)>,
+    /// `written[..retired]` are retired.
+    retired: usize,
+    /// The last key deleted for a later `SET`, and the last rewritten one
+    /// for a later `DEL`.
+    deleted: Option<Vec<u8>>,
+    rewritten: Option<Vec<u8>>,
+}
+
+impl AgedKeys {
+    /// The writer's next command when the aged schedule owns this slot —
+    /// one in sixteen of the writer's commands each writes a new aged key
+    /// (in the first half of its quota), retires the oldest one old
+    /// enough, or follows up a retirement — else `None`.
+    fn next_command(
+        &mut self,
+        writer: &mut Writer,
+        report: &TieredNodeReport,
+        cells: u16,
+    ) -> Option<(Vec<u8>, Pending)> {
+        let acked =
+            |cell: usize| report.acked_record_bytes_per_cell.get(cell).copied().unwrap_or(0);
+        match writer.sent % 16 {
+            5 if writer.sent < writer.quota / 2 => {
+                let key = format!("k:{}:a:{}", writer.id, self.written.len()).into_bytes();
+                let cell = owner_cell(cells, &key);
+                self.written.push((key.clone(), cell, acked(cell)));
+                Some(aged_set(writer, key))
+            }
+            13 => {
+                let (key, cell, at) = self.written.get(self.retired)?.clone();
+                if acked(cell) < at + AGED_BYTES_MIN {
+                    return None;
+                }
+                self.retired += 1;
+                match self.retired % 3 {
+                    1 => {
+                        self.deleted = Some(key.clone());
+                        Some(aged_del(writer, key))
+                    }
+                    2 => {
+                        self.rewritten = Some(key.clone());
+                        Some(aged_set(writer, key))
+                    }
+                    _ => Some(aged_del(writer, key)),
+                }
+            }
+            9 => match (self.deleted.take(), self.rewritten.take()) {
+                (Some(key), rewritten) => {
+                    self.rewritten = rewritten;
+                    Some(aged_set(writer, key))
+                }
+                (None, Some(key)) => Some(aged_del(writer, key)),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// An aged key's `SET`: an inline value whose length rides the writer's
+/// command count, so the writer's own random stream is untouched.
+fn aged_set(writer: &Writer, key: Vec<u8>) -> (Vec<u8>, Pending) {
+    let value = value_bytes(b'a', writer.id, writer.sent, 3072 + (writer.sent % 1024) as usize);
+    let wire = encode(&[b"SET", &key, &value]);
+    let pending = Pending {
+        key,
+        state_after: Some(value),
+        expect: b"+OK\r\n".to_vec(),
+        mutates: true,
+        taints: false,
+    };
+    (wire, pending)
+}
+
+/// An aged key's `DEL`, its reply exact from the writer's ledger.
+fn aged_del(writer: &Writer, key: Vec<u8>) -> (Vec<u8>, Pending) {
+    let expect = if writer.last_state(&key).is_some() { b":1\r\n" } else { b":0\r\n" };
+    let wire = encode(&[b"DEL", &key]);
+    (
+        wire,
+        Pending { key, state_after: None, expect: expect.to_vec(), mutates: true, taints: false },
+    )
+}
+
+/// Whether `key` is an aged key's (`k:<writer>:a:<n>`).
+fn is_aged_key(key: &[u8]) -> bool {
+    key.windows(3).any(|w| w == b":a:")
+}
+
 /// The bytes a reboot re-appends for one acknowledged record (ADR-0174
 /// D1): the inline header, key and value; a blob record re-appends its
-/// reference — on the cell that owns the key, which replays it (the node's
-/// contiguous slot router), not the cell the writer's connection reached.
+/// reference — on the cell that owns the key, which replays it.
 fn note_acked_record(report: &mut TieredNodeReport, cells: u16, key: &[u8], value: &[u8]) {
-    let owner = inf_store::SlotRouter::new_contiguous(cells)
-        .cell_of(inf_store::SlotRouter::slot_of(key))
-        .as_usize();
+    let owner = owner_cell(cells, key);
     if report.acked_record_bytes_per_cell.len() < usize::from(cells) {
         report.acked_record_bytes_per_cell.resize(usize::from(cells), 0);
     }
@@ -81,18 +196,20 @@ fn note_acked_record(report: &mut TieredNodeReport, cells: u16, key: &[u8], valu
 
 /// One traffic pump round for every writer on `node`: drain replies
 /// (asserting exact expectations + recording acks), then send the next
-/// command where a slot is free. Returns delivered-byte+send progress
-/// (the stall detector's currency).
+/// command where a slot is free — the aged schedule's, when `aged` holds
+/// one ledger per writer and owns the slot. Returns delivered-byte+send
+/// progress (the stall detector's currency).
 pub(super) fn pump_writers(
     node: &mut Node,
     writers: &mut [Writer],
+    mut aged: Option<&mut [AgedKeys]>,
     scenario: &TieredScenario,
     clock: &Rc<VirtualClock>,
     report: &mut TieredNodeReport,
     blob_sets: &mut u64,
 ) -> u64 {
     let mut progress = 0u64;
-    for writer in writers.iter_mut() {
+    for (index, writer) in writers.iter_mut().enumerate() {
         let mut net = node.nets[writer.cell].borrow_mut();
         let bytes = net.client_recv(writer.fd);
         progress += bytes.len() as u64;
@@ -127,6 +244,8 @@ pub(super) fn pump_writers(
                 rec.acked_at = Some(clock.now());
                 if let Some(value) = &pending.state_after {
                     note_acked_record(report, scenario.cells, &pending.key, value);
+                } else if reply == b":1\r\n" && is_aged_key(&pending.key) {
+                    report.aged_deletes_acked += 1;
                 }
             }
             writer.replied += 1;
@@ -135,7 +254,11 @@ pub(super) fn pump_writers(
         if writer.setup || writer.inflight.is_some() || writer.sent >= writer.quota {
             continue;
         }
-        let (wire, pending) = next_tiered_command(writer, scenario, blob_sets);
+        let planned = aged
+            .as_deref_mut()
+            .and_then(|aged| aged[index].next_command(writer, report, scenario.cells));
+        let (wire, pending) =
+            planned.unwrap_or_else(|| next_tiered_command(writer, scenario, blob_sets));
         if pending.mutates {
             writer.ledger.entry(pending.key.clone()).or_default().push(OpRec {
                 state_after: pending.state_after.clone(),

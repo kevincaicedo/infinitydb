@@ -207,6 +207,10 @@ rows=(
   # ADR-0174 D3 R6's reads skipped: a replayed DEL leaves the key's demoted
   # copy, which serves — census (a).
   "inf_canary_replay_del_no_verify crate-test inf-store test:tiered_replay deletes_in_the_tail_resolve_against_demoted_copies (a)"
+  # The same plant in the DST: m4-tiered's class deletes aged keys whose
+  # copies the reboot demoted; a resurrected one is outside the admissible
+  # set (the smoke seed draws three windows, so its keys age).
+  "inf_canary_replay_del_no_verify m4-tiered DURABILITY --replay-above-window"
   # The same plant at the shipped topology: the four-cell binary's replayed
   # deletes of keys written over a window ago leave the demoted copies.
   "inf_canary_replay_del_no_verify crate-test infinityd test:replay_spill a_tail_above_every_cells_window_boots_under_fsync_always DELETED KEY PRESENT"

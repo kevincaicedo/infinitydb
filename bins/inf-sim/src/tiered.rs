@@ -84,9 +84,9 @@ mod late;
 mod support;
 
 use support::{
-    ckpt_witness, dbsize_sum, finish, info_field, info_sum, info_tiering, note_ckpt_witness,
-    ns_watermarks, preview, pump_writers, reboot_until_ready, scan_all_keys, tier_read_fault_probe,
-    tier_residue_files, value_bytes,
+    AgedKeys, ckpt_witness, dbsize_sum, finish, info_field, info_sum, info_tiering,
+    note_ckpt_witness, ns_watermarks, preview, pump_writers, reboot_until_ready, scan_all_keys,
+    tier_read_fault_probe, tier_residue_files, value_bytes,
 };
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
@@ -199,9 +199,14 @@ pub struct TieredScenario {
     /// runs and phase 2 writes [`REGIME_OPS_FACTOR`] times
     /// its usual volume, so at least one cell's acknowledged tiered
     /// records since the last `begin` exceed its window and the reboot
-    /// must demote during replay. `--replay-above-window` forces it on any
-    /// seed; a run in it where no cell exceeded its window, or whose boot
-    /// did not demote, is VACUOUS.
+    /// must demote during replay; its writers also age keys past a window
+    /// and then delete, rewrite, or delete and rewrite them
+    /// (`support::AgedKeys`), so the replay verifies deletes and settles
+    /// against copies it demoted. `--replay-above-window` forces it on any
+    /// seed; a run in it where no cell exceeded its window, whose boot did
+    /// not demote, or — on a draw of twice or three times the window — that
+    /// acknowledged no aged delete or whose reboot verified none, is
+    /// VACUOUS.
     pub replay_above_window: bool,
 }
 
@@ -344,6 +349,10 @@ pub struct TieredNodeReport {
     /// steps, tier bytes written, barriers, files sealed, settle reads,
     /// deletes verified, and the largest step charge.
     pub boot_tier: [u64; 7],
+    /// The replay-above-window class's aged keys (`support::AgedKeys`):
+    /// deletes of them acknowledged with `:1` before the cut — each one a
+    /// `DEL` the reboot replays against a copy it demoted.
+    pub aged_deletes_acked: u64,
     /// The reboot refused with the ADR-0018 taxonomy error — legal
     /// (§8.4 prefers refusing to serve over truncating possibly-covered
     /// data), counted, and the run ends early with phases 5–9 skipped.
@@ -805,14 +814,23 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
     // both exist in the corpus (their coverage counters disclose which).
     // In the replay-above-window class the cut lands once one cell's
     // acknowledged records reach a volume drawn from the window's hostile
-    // row — one page above it, twice it, three times it — or when the
-    // writers finish, whichever is first.
+    // row — one page above it, twice it, three times it, by the seed — or
+    // when the writers finish, whichever is first. The two larger volumes
+    // let an aged key's owning cell acknowledge `AGED_BYTES_MIN` past it,
+    // so the class's aged deletes and rewrites replay against demoted
+    // copies (R6, R7); one page above the window cannot.
     let cut_step = 600 + rng.next_below(total_ops * 6);
-    let regime_target = scenario.replay_above_window.then(|| match rng.next_below(3) {
+    let drawn_target = match (scenario.seed >> 4) % 3 {
         0 => WINDOW_BYTES + (1 << 20),
         1 => 2 * WINDOW_BYTES,
         _ => 3 * WINDOW_BYTES,
-    });
+    };
+    let regime_target = scenario.replay_above_window.then_some(drawn_target);
+    let mut aged: Vec<AgedKeys> = if scenario.replay_above_window {
+        (0..writers.len()).map(|_| AgedKeys::default()).collect()
+    } else {
+        Vec::new()
+    };
     let cut_step = if regime_target.is_some() { total_ops * 12 + 600 } else { cut_step };
     let mut blob_sets = 0u64;
     let mut idle_steps = 0u64;
@@ -822,8 +840,16 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             fail(&mut report, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
         }
-        let progress =
-            pump_writers(&mut node, &mut writers, scenario, &clock, &mut report, &mut blob_sets);
+        let aged_ledgers = scenario.replay_above_window.then_some(aged.as_mut_slice());
+        let progress = pump_writers(
+            &mut node,
+            &mut writers,
+            aged_ledgers,
+            scenario,
+            &clock,
+            &mut report,
+            &mut blob_sets,
+        );
         if let Some(target) = regime_target {
             let most = report.acked_record_bytes_per_cell.iter().copied().max().unwrap_or(0);
             let done = writers.iter().all(|w| w.sent >= w.quota && w.replied >= w.sent);
@@ -1073,6 +1099,26 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             observed.insert(key.clone(), reply);
         }
     }
+    // The class's aged-key engagement (R6, R7), after the audit so a
+    // planted violation is read there first: on a draw whose volume ages a
+    // key past its window, aged deletes were acknowledged, and the reboot
+    // read and verified deletes against the copies it demoted.
+    if scenario.replay_above_window {
+        let (reads, verified) = (report.boot_tier[4], report.boot_tier[5]);
+        let aged_deletes = report.aged_deletes_acked;
+        let ages = regime_target.is_some_and(|target| target >= 2 * WINDOW_BYTES);
+        if (ages && aged_deletes == 0) || (aged_deletes > 0 && (reads == 0 || verified == 0)) {
+            fail(
+                &mut report,
+                format!(
+                    "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: target {regime_target:?}, {} aged \
+                     deletes acknowledged, the reboot made {reads} settle reads and verified \
+                     {verified} deletes",
+                    aged_deletes
+                ),
+            );
+        }
+    }
 
     // ---- phase 6: re-pressure + MAINTAIN flush liveness ------------------
     // Clamp the mutable fraction first (hot-reload): the ~30 KiB target
@@ -1124,6 +1170,7 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
         let progress = pump_writers(
             &mut node,
             &mut post_writers,
+            None,
             scenario,
             &clock,
             &mut report,

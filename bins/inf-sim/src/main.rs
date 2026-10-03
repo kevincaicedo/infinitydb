@@ -876,7 +876,8 @@ fn main() {
              / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
              unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
              tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
-             deletes verified, step charge max), trace {} bytes, hash {:#018x}",
+             deletes verified, step charge max), {} aged deletes acked, trace {} bytes, hash \
+             {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -922,6 +923,7 @@ fn main() {
             report.replay_above_window_cells,
             report.acked_record_bytes_per_cell,
             report.boot_tier,
+            report.aged_deletes_acked,
             report.trace.len(),
             report.trace_hash
         );
