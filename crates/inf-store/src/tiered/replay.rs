@@ -26,7 +26,7 @@ use super::*;
 use inf_log::flush::{BootFlush, HandedOver, SeamFlush, SettleReadError, SettleWindow};
 
 use crate::address_space::{Room, WindowFull};
-use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
+use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
 
@@ -88,7 +88,9 @@ pub struct ReplayCounters {
 }
 
 /// Boot I/O the machine did since its owner last drained it: what the
-/// recovery driver charges to its step budget at its own prices.
+/// recovery driver charges to its step budget — the settle reads at
+/// [`SETTLE_READ_CHARGE_BYTES`], the price's one home, the rest at the
+/// driver's own prices.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct ReplayWork {
     /// Record bytes appended to tier files.
@@ -106,20 +108,6 @@ impl ReplayWork {
     #[must_use]
     pub fn is_zero(self) -> bool {
         self == ReplayWork::default()
-    }
-
-    /// The recovery step budget's charge for this work, in budget bytes:
-    /// the tier bytes written and the bytes the end settle walked, plus
-    /// [`SETTLE_READ_CHARGE_BYTES`] per settle read and
-    /// [`REPLAY_BARRIER_CHARGE_BYTES`] per barrier — the one price list,
-    /// which the end settle's own yield uses too. Saturating: a gauge and
-    /// a yield test, never an account that must balance.
-    #[must_use]
-    pub fn charge_bytes(self) -> u64 {
-        self.tier_bytes
-            .saturating_add(self.walked_bytes)
-            .saturating_add(self.settle_reads.saturating_mul(SETTLE_READ_CHARGE_BYTES))
-            .saturating_add(self.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
     }
 }
 

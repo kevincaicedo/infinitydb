@@ -284,7 +284,7 @@ pub struct TierReplayStats {
     /// (ADR-0174 D4) — outside the zero set.
     pub dead_life_files_removed: u64,
     /// The gauge: the largest boot I/O charge one recovery step took, in
-    /// step-budget bytes ([`inf_store::ReplayWork::charge_bytes`]).
+    /// step-budget bytes (`boot_io_charge`).
     pub step_charge_max_bytes: u64,
 }
 
@@ -600,9 +600,27 @@ impl<F: SegmentFs> RecoveringTiers<F> {
     /// bytes (bound: one pass over the cell's tiered namespaces).
     fn take_charge(&mut self) -> u64 {
         self.0.iter_mut().fold(0u64, |charge, tier| {
-            charge.saturating_add(tier.replay.take_work().charge_bytes())
+            charge.saturating_add(boot_io_charge(tier.replay.take_work()))
         })
     }
+}
+
+/// The step budget's charge for a machine's drained boot I/O (ADR-0174
+/// §3): tier bytes written and bytes the end settle walked at
+/// [`REPLAY_TIER_BYTE_CHARGE`](crate::limits::REPLAY_TIER_BYTE_CHARGE),
+/// barriers at [`REPLAY_BARRIER_CHARGE_BYTES`](crate::limits::REPLAY_BARRIER_CHARGE_BYTES),
+/// settle reads at the store's
+/// [`SETTLE_READ_CHARGE_BYTES`](inf_store::limits::SETTLE_READ_CHARGE_BYTES).
+/// Saturating: a yield test and a gauge, never an account that balances.
+fn boot_io_charge(work: inf_store::ReplayWork) -> u64 {
+    use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_TIER_BYTE_CHARGE};
+    let bytes = work.tier_bytes.saturating_add(work.walked_bytes);
+    bytes
+        .saturating_mul(REPLAY_TIER_BYTE_CHARGE)
+        .saturating_add(work.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
+        .saturating_add(
+            work.settle_reads.saturating_mul(inf_store::limits::SETTLE_READ_CHARGE_BYTES),
+        )
 }
 
 /// One recovered tiered namespace's plane-side pieces (M4-S26), as the
@@ -1214,7 +1232,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 let done =
                     tier.replay.hand_over(table).map_err(|refusal| replay_refused(ns, &refusal))?;
                 self.stats.tier_replay.counters.absorb(done.counters);
-                self.step_charge = self.step_charge.saturating_add(done.work.charge_bytes());
+                self.step_charge = self.step_charge.saturating_add(boot_io_charge(done.work));
                 self.recovered_tiers.push(RecoveredTierNs {
                     ns,
                     flush: done.handed.flush,

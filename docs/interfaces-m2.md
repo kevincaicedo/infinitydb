@@ -1330,9 +1330,11 @@ per episode). A drained cell always seals — never slower than K = 1.
   the seam drive: seal one `MAINTAIN-SLICE` past the need, one flush with
   one barrier the boot pipeline claims whole, release), padding the tail
   to the ring top or the next commit page when the need lies above it; it
-  never fails the boot. The recovery driver charges each step the boot
-  I/O the machines did (`ReplayWork::charge_bytes`: tier bytes, the bytes
-  the end settle walked, 128 KiB per settle read, 4 MiB per barrier) and
+  never fails the boot. The recovery driver drains each machine's
+  `ReplayWork` and charges each step the boot I/O it did (tier bytes and
+  the bytes the end settle walked at one budget byte each, 4 MiB per
+  barrier — `inf-server` `limits` — and 128 KiB per settle read, the
+  store's `SETTLE_READ_CHARGE_BYTES`, on which the end settle yields) and
   yields at the next frame or checkpoint section once the charge and the
   bytes read reach the step budget. At the end of the checkpoint each
   address a settle chained releases its blob reference. Once the finish
