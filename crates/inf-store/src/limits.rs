@@ -33,6 +33,13 @@ pub const IDX_ALIAS_GROUP_MAX: usize = 8;
 /// it); a death hook ⇒ the index degrades (a death cannot refuse).
 pub const BRACKET_KEY_BYTES_MAX: usize = 32 << 20;
 
+/// Asks of `AddressSpace::room` one replayed record may make (ADR-0174 D2
+/// rule 1: `Demote`, `Pad`, `Demote`, `Fits`). Owner: boot replay's room
+/// loop. Crossing: a fifth ask is the typed boot refusal `RoomAsks`,
+/// naming the length — by the room arithmetic's proof a defect, never
+/// input.
+pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
+
 /// The recovery step budget's price of one boot settle read (a cold
 /// record's key window, ADR-0174 D3): 128 KiB, about 100 µs of a device
 /// that moves 1 GiB/s, so a read is charged as the bytes the step could

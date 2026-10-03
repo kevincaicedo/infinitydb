@@ -25,14 +25,9 @@ use super::*;
 use inf_log::flush::{BootFlush, HandedOver, SeamFlush, SettleReadError, SettleWindow};
 
 use crate::address_space::{Room, WindowFull};
-use crate::limits::SETTLE_READ_CHARGE_BYTES;
+use crate::limits::{REPLAY_ROOM_ASKS_MAX, SETTLE_READ_CHARGE_BYTES};
 use crate::record::{ColdKey, ColdKeyError};
 use crate::tiered::shadow::SettleCase;
-
-/// Asks of [`AddressSpace::room`] one record may make (ADR-0174 D2 rule
-/// 1: `Demote`, `Pad`, `Demote`, `Fits`). A fifth is a typed boot refusal
-/// — by I15 a defect, never input.
-pub const REPLAY_ROOM_ASKS_MAX: u32 = 4;
 
 /// Where the machine stands (DRR FCR-STTIER-01 §1). `Serving` is the
 /// machine consumed by [`TierReplay::hand_over`]; `Refused` the error that
@@ -403,10 +398,16 @@ impl<F: SegmentFs> TierReplay<F> {
         if table.space.flushed() < target {
             let stop = target.to_raw().saturating_add(self.lead);
             let from = table.space.ro_boundary();
+            // Bound: `H + lead − ro` bytes walked, plus one record.
             let (span, _) = self.settle_walk(table, from, WalkTo::Seal { stop })?;
             table.seal_settled(span);
             let cut = table.space.ro_boundary().to_raw();
             let cursor = table.flush_start_cursor(&self.flush);
+            // One span, one barrier, one more per gap or capacity seal it
+            // crosses. Files sealed per boot have no limit of their own:
+            // ⌊D ÷ file capacity⌋ + ⌈D ÷ ring⌉ + page pads + the hand-over's
+            // one, for `D` bytes demoted — the device and the handle limit
+            // bound them (a typed refusal at a create).
             if cut > cursor {
                 let outcome = table
                     .flush_span(&mut self.flush, cut - cursor)
@@ -421,6 +422,7 @@ impl<F: SegmentFs> TierReplay<F> {
                 planted.map_err(|cause| self.flush_refusal(table, cause))?;
             }
         }
+        // Bound: ⌈(target − head) ÷ slice⌉ releases, whole pages each.
         while table.space.head() < target {
             if table.release_slice() == 0 {
                 return Err(ReplayRefusal::DemoteStalled { head: table.space.head(), target });
@@ -540,6 +542,8 @@ impl<F: SegmentFs> TierReplay<F> {
         winner: LogicalAddr,
         hash: u64,
     ) -> Result<(), ReplayRefusal> {
+        // Bound: one read per cold slot of the exact-hash group — under the
+        // keyed hash no client grows the group (ADR-0094).
         for i in 0..self.twins.len() {
             let cold = self.twins[i];
             let window = self
@@ -587,6 +591,7 @@ impl<F: SegmentFs> TierReplay<F> {
                 twins.push(sibling);
             }
         });
+        // Bound: one read per this-life cold slot of the exact-hash group.
         for i in 0..self.twins.len() {
             let cold = self.twins[i];
             let window = self
@@ -620,6 +625,8 @@ impl<F: SegmentFs> TierReplay<F> {
         if table.reloc_origins.is_empty() {
             return;
         }
+        // Bound: one pass over the origin map, once per boot — at most the
+        // refs settled during image load, each a map lookup.
         let mut released = 0u64;
         for origins in table.reloc_origins.values() {
             for &(addr, _) in origins {

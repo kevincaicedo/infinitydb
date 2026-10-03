@@ -114,8 +114,8 @@ pub use store::{
 pub use tiered::compact::{CompactionApplied, CompactionConfig, CompactionWork};
 pub use tiered::promote::PromotionCounters;
 pub use tiered::replay::{
-    BootHandedOver, Displaced, NoSpill, REPLAY_ROOM_ASKS_MAX, ReplayCounters, ReplayPhase,
-    ReplayRefusal, ReplaySpill, ReplayWork, SettleProgress, TierReplay,
+    BootHandedOver, Displaced, NoSpill, ReplayCounters, ReplayPhase, ReplayRefusal, ReplaySpill,
+    ReplayWork, SettleProgress, TierReplay,
 };
 pub use tiered::shadow::{
     COLLISION_KEY_PREFIX, KeyWindow, SHADOW_PIN_CAP_DIVISOR, SHADOW_READS_IN_FLIGHT,
