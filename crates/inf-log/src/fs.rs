@@ -570,6 +570,11 @@ pub mod mem {
         /// `StorageFull` kind). `Some(libc::EDQUOT)` models a quota'd
         /// filesystem (F-L04-03).
         exhaustion_errno: Option<i32>,
+        /// The errno a `create_dir_all` that would add a directory
+        /// reports (`None` = mkdir succeeds): a full or over-quota device
+        /// has no block for a new directory, while an existing one is no
+        /// change and succeeds.
+        mkdir_errno: Option<i32>,
         /// Cap on bytes one `read_at` returns (`None` = unlimited): the
         /// partial-read model every reader must loop over (F-L04-10).
         read_cap: Option<usize>,
@@ -639,6 +644,13 @@ pub mod mem {
         /// `StorageFull` kind (`libc::EDQUOT` = a quota'd filesystem).
         pub fn set_exhaustion_errno(&self, errno: Option<i32>) {
             self.state.borrow_mut().exhaustion_errno = errno;
+        }
+
+        /// Every `create_dir_all` that would add a directory fails with
+        /// this raw errno from now on (`libc::ENOSPC`, `libc::EDQUOT`);
+        /// one whose directories all exist still succeeds. `None` lifts it.
+        pub fn set_mkdir_errno(&self, errno: Option<i32>) {
+            self.state.borrow_mut().mkdir_errno = errno;
         }
 
         /// Every `read_at` returns at most `cap` bytes (partial reads).
@@ -774,6 +786,11 @@ pub mod mem {
             // Charged like the sim tier's: a crash-at-step index means the
             // same op on both (L04 style row).
             state.tick_op()?;
+            if let Some(errno) = state.mkdir_errno
+                && !state.dirs.contains(dir)
+            {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             let mut current = PathBuf::new();
             for part in dir.components() {
                 current.push(part);

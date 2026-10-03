@@ -111,8 +111,12 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     hasher: KeyHasher,
 ) -> io::Result<RecoveredTier<F>> {
     assert_eq!(flush_config.ns.0, tier.ns, "manifest section vs pipeline namespace");
+    // The directory is not created here: a namespace that never flushed
+    // has none, the pipeline creates it with its first tier file, and a
+    // boot that fits writes nothing for the namespace (ADR-0174 D5) — a
+    // full device refuses a mkdir. A section that names files needs it,
+    // and their probes refuse typed when it is missing.
     let cold_dir = flush_config.shard_dir.join("cold");
-    fs.create_dir_all(&cold_dir)?;
     let mut stats = TierRecoverStats::default();
     let mut catalog: Vec<TierFileMeta> = Vec::with_capacity(tier.files.len());
     for range in &tier.files {
@@ -175,7 +179,12 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // the post-replay sweep decides.
     let mut extents_listed: Vec<u64> = Vec::new();
     let mut extents_quarantined: Vec<u64> = Vec::new();
-    for name in fs.list_dir(&cold_dir)? {
+    let names = match fs.list_dir(&cold_dir) {
+        Ok(names) => names,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    for name in names {
         if let Some(extent_id) = parse_extent_file_name(&name) {
             extents_listed.push(extent_id.0);
             continue;

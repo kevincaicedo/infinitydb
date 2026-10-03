@@ -124,3 +124,59 @@ fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the
     assert_eq!(stats.tier_replay.dead_life_files_removed, 1, "the dead-life file is D4's");
     assert!(stats.tier_replay.counters.zero_set_is_zero(), "a boot that fits demotes nothing");
 }
+
+/// ADR-0174 D5: a boot whose replay fits every window writes nothing for
+/// a tiered namespace — no tier file and no directory. A namespace that
+/// never flushed has no `ns-N/cold`: the live path creates it with its
+/// first tier file, and on a full or over-quota device a mkdir fails, so
+/// a boot that made it would refuse where D5 says the node serves reads
+/// until space frees. The first flush after the device frees creates the
+/// directory and file 0. Red before the boot treated a missing directory
+/// as an empty listing: `recover_tiered_ns` created it for every
+/// catalogued namespace and the boot refused with `ENOSPC`.
+#[test]
+fn a_fitting_boot_of_a_never_flushed_namespace_makes_no_directory_on_a_full_device() {
+    let fs = inf_log::fs::mem::MemFs::new();
+    let mut log = LogBuilder::new(&fs, &cfg());
+    let value = vec![0x5Au8; 512];
+    let keys: Vec<Vec<u8>> = (0..64).map(|i| format!("k:{i:04}").into_bytes()).collect();
+    let effects: Vec<MutationEffect<'_>> = keys
+        .iter()
+        .map(|key| MutationEffect::StringSet { ns: TIER_NS, key, value: &value })
+        .collect();
+    log.frame(&effects);
+    drop(log);
+    let ns_dir = Path::new("data").join(format!("shard-{CELL}")).join("ns-17");
+    let cold = ns_dir.join("cold");
+    assert!(fs.list_dir(&cold).is_err(), "the namespace never flushed: no cold directory");
+
+    // The device is full: a mkdir of a new directory fails; the cell's
+    // own directories exist since its first boot and need none.
+    fs.set_mkdir_errno(Some(libc::ENOSPC));
+    let mut ks = tiered_keyspace();
+    let (_rotor, stats) = match recover(&fs, &mut ks) {
+        Ok(recovered) => recovered,
+        Err(err) => panic!("a boot that fits its window refused on a full device: {err}"),
+    };
+    for key in &keys {
+        let hash = ks.hasher().hash(key);
+        let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+        assert!(matches!(table.lookup(key, hash, &[]), TieredLookup::Ram(_)));
+    }
+    assert!(fs.list_dir(&ns_dir).is_err(), "the boot created no directory for the namespace");
+    assert_eq!(stats.tier_replay.dead_life_files_removed, 0);
+    assert!(stats.tier_replay.counters.zero_set_is_zero(), "a boot that fits demotes nothing");
+
+    // Space frees; the first flush creates the directory and file 0.
+    fs.set_mkdir_errno(None);
+    let mut flush = fresh_pipeline(&fs);
+    let table = ks.tiered_store_mut(TIER_NS).expect("tiered");
+    let tail = table.space().tail();
+    table.space_mut().advance_ro_boundary(tail);
+    let outcome = table.flush_slice(&mut flush).expect("the first flush after space frees");
+    assert!(outcome.appended_bytes > 0, "the flush appended the replayed records");
+    assert!(
+        fs.list_dir(&cold).expect("cold dir").iter().any(|name| name == "tier-000000.itier"),
+        "the first flush created the directory and this life's first file"
+    );
+}
