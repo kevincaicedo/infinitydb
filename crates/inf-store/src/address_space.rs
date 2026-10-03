@@ -107,8 +107,9 @@ struct Prospect {
 /// The room question's answer (ADR-0174 D2 rule 1): what must happen
 /// before an allocation of `len` bytes can be placed. The need it
 /// carries is never above the tail — a need that would lie above it is
-/// answered as a [`Pad`](Room::Pad) instead (D2 rule 6), so a demote
-/// step always has a reachable target.
+/// answered as a [`Pad`](Room::Pad) instead (D2 rule 6), and a record
+/// no window state can hold is [`End`](Room::End) — so a demote step
+/// always has a reachable target.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Room {
     /// The allocation fits now: [`AddressSpace::alloc`] places it.
@@ -122,7 +123,12 @@ pub enum Room {
     /// a ring-top hole, else the next commit-page boundary), then ask
     /// again. The next answer is `Demote` or `Fits`.
     Pad(LogicalAddr),
-    /// The 48-bit end of the space: no watermark progress places it.
+    /// No watermark progress places it: the 48-bit end of the space, or
+    /// a record longer than the window. The second cause exists only on
+    /// the live path, where a budget shrink keeps the ring and the
+    /// records placed under the old budget (`TieredTable::set_demotion`)
+    /// and relocation re-appends one; at boot the ring is the spec's,
+    /// so every record the length refusals admit is at most the window.
     End,
 }
 
@@ -490,8 +496,10 @@ impl AddressSpace {
     /// The room question (ADR-0174 D2 rule 1): what must happen before
     /// `len` bytes can be placed at the tail. Pure; mutates nothing.
     /// Boot replay asks it at most four times per record (`Demote`,
-    /// `Pad`, `Demote`, `Fits` — D2 rule 6's proof), and the live path
-    /// consumes the same arithmetic through [`alloc`](Self::alloc) and
+    /// `Pad`, `Demote`, `Fits` — D2 rule 6's proof, whose premise is a
+    /// window of at least half the ring: the ring is derived from the
+    /// spec at every boot), and the live path consumes the same
+    /// arithmetic through [`alloc`](Self::alloc) and
     /// [`stall_target`](Self::stall_target).
     ///
     /// # Panics
@@ -501,20 +509,21 @@ impl AddressSpace {
     }
 
     /// Classifies a prospect against the window and the tail (D2 rules 1
-    /// and 6). A need below or at the tail is a `Demote`; one above it is
+    /// and 6). A record longer than the window is `End` before any need
+    /// is computed, so every need below is one of a record the window
+    /// holds. A need below or at the tail is a `Demote`; one above it is
     /// unreachable by any release — the tail pads first: in case (a), a
     /// ring-top hole, to the ring top the hole would make, which may need
     /// room of its own, always at or below the tail (the hole is shorter
-    /// than the record, and a record is at most half the ring, at most
-    /// the window); in case (b) to the next commit-page boundary, which
-    /// commits nothing.
+    /// than the record, which is at most the window); in case (b) to the
+    /// next commit-page boundary, which commits nothing.
     fn classify(&self, prospect: Prospect) -> Room {
         let inside = self
             .life_origin
             .checked_add(prospect.start_rel)
             .and_then(|start| start.checked_add(prospect.len))
             .is_some_and(|end| end <= LogicalAddr::MAX_RAW);
-        if !inside {
+        if !inside || prospect.len > self.window_limit {
             return Room::End;
         }
         if self.fits(prospect) {
@@ -1406,6 +1415,37 @@ mod tests {
                 rel_tail += 64 << 10;
             }
             assert!(pads_placed > 0, "VACUOUS: no pad at window {window} ring {ring}");
+        }
+    }
+
+    /// A record longer than the window has no placing answer (ADR-0174
+    /// D2 rule 1's `End`: no watermark progress places it). The state is
+    /// the live path's after a budget shrink: the ring stays, the window
+    /// falls to four pages, and a record placed under the old budget —
+    /// up to half the ring — comes back through relocation. With the
+    /// tail within `hole > window` of the ring top, `room` answers `End`,
+    /// `alloc` answers `None` and nothing changes; the stall target still
+    /// reports the need as it stands. A record of the window itself keeps
+    /// a reachable `Demote`.
+    #[test]
+    fn a_record_longer_than_the_window_answers_end() {
+        let page = 1u64 << 12;
+        let ring = 16 * page;
+        // Placed under a window of half the ring: two resident pages,
+        // the tail six pages below the ring top.
+        let mut sp = space_at(ring as usize, page as usize, 8 * page, 10 * page, 8 * page);
+        sp.set_window_limit(4 * page);
+        let before = (sp.tail(), sp.counters(), sp.report());
+        // Seven pages: a ring-top hole of six, both above the window.
+        let len = (7 * page) as usize;
+        assert_eq!(sp.room(len), Room::End);
+        assert_eq!(sp.alloc(len), None);
+        assert_eq!((sp.tail(), sp.counters(), sp.report()), before, "refusal mutates nothing");
+        let target = sp.stall_target(len).expect("the need as it stands");
+        assert_eq!(target.to_raw(), 19 * page, "the live target, above the tail");
+        match sp.room((4 * page) as usize) {
+            Room::Demote(h) => assert_eq!(h, sp.tail(), "a record of the window demotes"),
+            other => panic!("a record of the window demotes: {other:?}"),
         }
     }
 
