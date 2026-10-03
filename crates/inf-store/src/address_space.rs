@@ -85,9 +85,10 @@ pub enum FlushChunk {
 /// What one tail allocation would do to the space — the one computation
 /// of the ring-top hole, the start and the committed top an allocation
 /// of `len` bytes needs (ADR-0174 D2 rule 1). [`AddressSpace::alloc`],
-/// [`AddressSpace::stall_target`] and [`AddressSpace::room`] consume it;
-/// none carries a copy of the arithmetic (two copies are how the stall
-/// target came to answer a need above the tail).
+/// [`AddressSpace::stall_target`], [`AddressSpace::room`] and
+/// [`AddressSpace::pad_tail`] consume it; none carries a copy of the
+/// arithmetic — a second copy is one decision in two places (L13), equal
+/// only while a test keeps it so.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Prospect {
     /// The record's length.
@@ -666,9 +667,10 @@ impl AddressSpace {
     /// window_limit)`. Both terms are page multiples, so once `flushed`
     /// reaches the target and the release slice runs, the retried
     /// allocation fits by construction (no spurious wakes). The target
-    /// is reported as it stands, above the tail included — the live
-    /// path's answer to that case is its own finding, FCR-STTIER-N4;
-    /// boot replay asks [`room`](Self::room) instead.
+    /// is reported as it stands, above the tail included: the live path
+    /// parks on it as built, and the pad of ADR-0174 D2 rule 6 is boot
+    /// replay's answer to that case, which asks [`room`](Self::room)
+    /// instead.
     pub fn stall_target(&self, len: usize) -> Option<LogicalAddr> {
         let prospect = self.prospect(len as u64);
         if self.fits(prospect) {
