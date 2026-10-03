@@ -334,11 +334,11 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 ///   settle reads the unit's rewrites and deletes can make;
 /// - an end-settle step that yields charged its budget, by at most one
 ///   record and its twins' reads;
-/// - the last one adds only the hand-over's drain (E13): what the last
-///   demote step sealed and did not append (at most a lead, a page and a
-///   record), a barrier when the drain appends, one for the active file's
-///   seal (the drain seals no other), and the settle reads of ADR-0093's
-///   rebuild, read from the stats;
+/// - the last one adds only the hand-over's drain (E13): one barrier, the
+///   active file's seal, and the settle reads of ADR-0093's rebuild, read
+///   from the stats. The drain appends nothing: every demote step appends
+///   up to its cut, and the end settle seals nothing (`ro` does not move),
+///   which `TierReplay::hand_over` asserts;
 /// - the end settle walks its open span `[ro, tail)` at one budget byte a
 ///   byte and a step charges at most its budget and one record's unit, so
 ///   it takes at least ⌈span ÷ (budget + unit)⌉ steps;
@@ -349,8 +349,10 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
 /// 8 MiB budget a step's bytes span several demote steps,
 /// `inf_canary_replay_yield_uncharged`), on one that charges nothing (a
 /// step that wrote tier bytes charged no barrier,
-/// `inf_canary_replay_charge_dropped`), and on one that settles without a
-/// budget (`inf_canary_replay_settle_unbudgeted`).
+/// `inf_canary_replay_charge_dropped`), on one that settles without a
+/// budget (`inf_canary_replay_settle_unbudgeted`), and on one that settles
+/// at twice its budget (`inf_canary_replay_settle_doubled`: at 8 MiB the
+/// whole settle is the last step, which only the drain's bound judges).
 #[test]
 fn every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget() {
     for budget in [256 << 10, 8 << 20] {
@@ -373,8 +375,7 @@ fn step_under_budget(budget: u64) {
     let frame_unit = FRAME_BYTES_MAX + lead + page + record + 2 * barrier;
     let late_unit = frame_unit + unit.late_records * read_price;
     let settle_unit = record + 4 * read_price;
-    let drain_unit =
-        |rebuild_reads: u64| lead + page + record + 2 * barrier + rebuild_reads * read_price;
+    let drain_unit = |rebuild_reads: u64| barrier + rebuild_reads * read_price;
 
     let mut ks = tiered_keyspace();
     let mut recovery = Recovery::new(fs.clone(), CELL, &cfg, anchor(), now());

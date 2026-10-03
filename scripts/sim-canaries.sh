@@ -257,6 +257,10 @@ rows=(
   # walks the whole open span and the last step's charge passes its
   # budget, one record's unit and the hand-over's drain.
   "inf_canary_replay_settle_unbudgeted crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
+  # The same rule at twice the budget: at 8 MiB the whole settle is the
+  # last step, so the hand-over's drain bound (one barrier and the
+  # rebuild's reads) is what sees it.
+  "inf_canary_replay_settle_doubled crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
   # The same oracle's other two rules: a frame's yield that leaves the
   # charge out (at 8 MiB a step spans several demote steps), and a driver
   # that charges no boot I/O (a step wrote tier bytes uncharged).

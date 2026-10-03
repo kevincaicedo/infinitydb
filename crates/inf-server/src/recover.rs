@@ -1274,9 +1274,11 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 self.phase = Phase::Settle;
                 return Ok(());
             }
-            // The planted canary breaks R10's budget: the end settle walks
-            // its whole open span in one step.
+            // The planted canaries break R10's budget: the end settle walks
+            // its whole open span in one step, or settles at twice its budget.
             let left = if cfg!(inf_canary_replay_settle_unbudgeted) { u64::MAX } else { left };
+            let left =
+                if cfg!(inf_canary_replay_settle_doubled) { left.saturating_mul(2) } else { left };
             let tier = &mut self.recovering_tiers.tiers[i];
             let ns = tier.ns;
             let table = ks
