@@ -485,9 +485,20 @@ impl AddressSpace {
         prospect.top_rel - self.commit_floor_rel <= self.window_limit
     }
 
+    /// The 48-bit end check, in one place for [`alloc`](Self::alloc) and
+    /// [`room`](Self::room): the prospect's start address when the
+    /// record's end lies inside the space, else `None` — the space is
+    /// monotonic for a namespace's whole existence and never wraps.
+    #[inline]
+    fn start_inside(&self, prospect: Prospect) -> Option<LogicalAddr> {
+        let start = LogicalAddr::from_raw(self.life_origin.checked_add(prospect.start_rel)?)?;
+        start.advanced(prospect.len)?;
+        Some(start)
+    }
+
     /// An address of this life from its relative offset. Every offset
     /// classified by [`room`](Self::room) lies at or below a record end
-    /// the 48-bit check admitted.
+    /// [`start_inside`](Self::start_inside) admitted.
     #[inline]
     fn addr_at(&self, rel: u64) -> LogicalAddr {
         LogicalAddr::from_raw(self.life_origin + rel).expect("watermarks stay 48-bit")
@@ -518,12 +529,7 @@ impl AddressSpace {
     /// than the record, which is at most the window); in case (b) to the
     /// next commit-page boundary, which commits nothing.
     fn classify(&self, prospect: Prospect) -> Room {
-        let inside = self
-            .life_origin
-            .checked_add(prospect.start_rel)
-            .and_then(|start| start.checked_add(prospect.len))
-            .is_some_and(|end| end <= LogicalAddr::MAX_RAW);
-        if !inside || prospect.len > self.window_limit {
+        if self.start_inside(prospect).is_none() || prospect.len > self.window_limit {
             return Room::End;
         }
         if self.fits(prospect) {
@@ -553,22 +559,26 @@ impl AddressSpace {
     }
 
     /// Allocates `len` bytes at the tail, committing ring pages as
-    /// needed, only where [`room`](Self::room) answers [`Room::Fits`]:
+    /// needed, exactly where [`room`](Self::room) answers [`Room::Fits`]:
     /// `None` when the RAM window (in whole pages) would exceed the
     /// admission bound (the budget window — ADR-0053 D1; the ring by
     /// default) — the backpressure signal S07 turns into
     /// suspend-on-flushed-progress — or at the 48-bit end of the space.
+    /// Both decide on one [`Prospect`] by the same two predicates,
+    /// [`fits`](Self::fits) and [`start_inside`](Self::start_inside);
+    /// `alloc` never classifies a refusal, whose reason is
+    /// [`stall_target`](Self::stall_target)'s or `room`'s to tell, so
+    /// the placing path pays the arithmetic once and makes no call.
     ///
     /// May advance the tail past a ring-top hole first (ADR-0052 D2);
     /// hole bytes are dead on arrival, counted, and tripwired. No state
     /// changes on refusal.
     pub fn alloc(&mut self, len: usize) -> Option<LogicalAddr> {
         let prospect = self.prospect(len);
-        match self.classify(prospect) {
-            Room::Fits => {}
-            Room::Demote(_) | Room::Pad(_) | Room::End => return None,
+        if !self.fits(prospect) {
+            return None;
         }
-        let addr = self.addr_at(prospect.start_rel);
+        let addr = self.start_inside(prospect)?;
         if prospect.top_rel > self.commit_top_rel {
             self.commit_rel_pages(self.commit_top_rel, prospect.top_rel);
             self.commit_top_rel = prospect.top_rel;
@@ -1447,6 +1457,31 @@ mod tests {
             Room::Demote(h) => assert_eq!(h, sp.tail(), "a record of the window demotes"),
             other => panic!("a record of the window demotes: {other:?}"),
         }
+    }
+
+    /// The 48-bit end (ADR-0174 D2 rule 1's `End`): a life whose origin
+    /// lies within one ring of the end of the space answers `End` from
+    /// `room` and `None` from `alloc` for a record that would cross it,
+    /// changing nothing, and the stall target names no watermark; a
+    /// record ending exactly at the last address places.
+    #[test]
+    fn the_forty_eight_bit_end_answers_end() {
+        let page = 1u64 << 12;
+        let origin = LogicalAddr::from_raw(LogicalAddr::MAX_RAW + 1 - 2 * page).expect("48-bit");
+        let mut sp = AddressSpace::new(AddressSpaceConfig {
+            reserve_bytes: 1 << 16,
+            page_bytes: page as usize,
+            life_origin: origin,
+        })
+        .expect("reservation");
+        assert_eq!(sp.alloc(page as usize), Some(origin), "one page below the end fits");
+        let before = (sp.tail(), sp.counters(), sp.report());
+        assert_eq!(sp.room(page as usize), Room::End, "the next page would cross the end");
+        assert_eq!(sp.alloc(page as usize), None);
+        assert_eq!((sp.tail(), sp.counters(), sp.report()), before, "refusal mutates nothing");
+        assert_eq!(sp.stall_target(page as usize), None, "no watermark progress helps");
+        let last = sp.alloc((page - 1) as usize).expect("ends exactly at the last address");
+        assert_eq!(last.to_raw() + page - 1, LogicalAddr::MAX_RAW);
     }
 
     #[test]
