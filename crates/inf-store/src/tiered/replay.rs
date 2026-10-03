@@ -174,6 +174,8 @@ pub enum ReplayRefusal {
     OriginRoom { winner: LogicalAddr, cold: LogicalAddr },
     /// A settle step before the end of replay was declared.
     ReplayNotEnded,
+    /// A record or a `DEL` after the end of replay was declared.
+    ReplayEnded,
     /// A hand-over with RAM records unsettled (I16).
     Unsettled { cursor: Option<LogicalAddr>, tail: LogicalAddr },
     /// The store refused the placement after `room` answered `Fits` —
@@ -223,6 +225,9 @@ impl core::fmt::Display for ReplayRefusal {
             ),
             ReplayRefusal::ReplayNotEnded => {
                 write!(f, "a settle step before the end of replay was declared")
+            }
+            ReplayRefusal::ReplayEnded => {
+                write!(f, "a replayed record after the end of replay was declared")
             }
             ReplayRefusal::Unsettled { cursor, tail } => write!(
                 f,
@@ -396,6 +401,20 @@ impl<F: SegmentFs> TierReplay<F> {
             }
         }
         Ok(())
+    }
+
+    /// The state table's `Settling` column holds no record or `DEL` row:
+    /// once the end of replay is declared, the entries refuse before they
+    /// ask for room or read, so a driver that interleaves a record after
+    /// the declaration is caught at the record, named, with nothing
+    /// changed.
+    fn accepts_records(replay: Option<&TierReplay<F>>) -> Result<(), ReplayRefusal> {
+        match replay.map(|r| r.state) {
+            Some(ReplayState::Settling { .. }) => Err(ReplayRefusal::ReplayEnded),
+            Some(ReplayState::Seeded | ReplayState::Fitting | ReplayState::Spilling) | None => {
+                Ok(())
+            }
+        }
     }
 
     fn note_flush(&mut self, outcome: FlushSliceOutcome) {
@@ -655,6 +674,7 @@ impl TieredTable {
         value: &[u8],
         hash: u64,
     ) -> Result<LogicalAddr, ReplayRefusal> {
+        TierReplay::accepts_records(replay.as_deref())?;
         let len = self.admit_inline(key, value).map_err(|_| ReplayRefusal::TooLarge)?;
         self.make_room(replay.as_deref_mut(), len)?;
         self.drain_markers(replay.as_deref_mut(), markers, hash);
@@ -680,6 +700,7 @@ impl TieredTable {
         hash: u64,
         ext: ExtentRef,
     ) -> Result<LogicalAddr, ReplayRefusal> {
+        TierReplay::accepts_records(replay.as_deref())?;
         let len = self.admit_extent(key, ext).map_err(|_| ReplayRefusal::TooLarge)?;
         self.make_room(replay.as_deref_mut(), len)?;
         self.drain_markers(replay.as_deref_mut(), markers, hash);
@@ -707,6 +728,7 @@ impl TieredTable {
         key: &[u8],
         hash: u64,
     ) -> Result<bool, ReplayRefusal> {
+        TierReplay::accepts_records(replay.as_deref())?;
         if let Some(r) = replay.as_deref_mut() {
             r.verify_cold_for_delete(self, key, hash)?;
         }
@@ -933,6 +955,39 @@ mod tests {
         let handed = replay.hand_over(&mut table).expect("settled to the tail");
         assert_eq!(handed.handles.len(), handed.flush.sealed().len());
         assert!(handed.flush.active().is_none());
+    }
+
+    /// A record or a `DEL` after the end of replay was declared: the
+    /// machine refuses typed in `Settling` before it asks for room or
+    /// reads, so nothing changes and the cursor stays where it was.
+    #[test]
+    fn a_record_after_the_end_of_replay_refuses_typed_and_changes_nothing() {
+        let fs = MemFs::new();
+        let mut table = table();
+        let mut replay = machine(&fs);
+        spill(&mut table, &mut replay);
+        replay.end_of_replay(&table);
+        let (tail, len, counters) = (table.space().tail(), table.len(), replay.counters());
+        let value = vec![0x5A; 900];
+        let hash = table.hash_key(b"late");
+        let err = table
+            .replay_upsert(Some(&mut replay), &[], b"late", &value, hash)
+            .expect_err("a SET after the end of replay");
+        assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
+        let ext = ExtentRef { extent_id: 1, offset: 0, len: 4096 };
+        let err = table
+            .replay_upsert_extent(Some(&mut replay), &[], b"late", hash, ext)
+            .expect_err("an extent reference after the end of replay");
+        assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
+        let old = table.hash_key(b"k:0000");
+        let err = table
+            .replay_delete(Some(&mut replay), &[], b"k:0000", old)
+            .expect_err("a DEL after the end of replay");
+        assert!(matches!(err, ReplayRefusal::ReplayEnded), "{err}");
+        assert_eq!(table.space().tail(), tail, "nothing placed");
+        assert_eq!(table.len(), len, "no slot moved");
+        assert_eq!(replay.counters(), counters, "no step, read or delete counted");
+        assert_eq!(replay.phase(), ReplayPhase::Settling, "the cursor is kept");
     }
 
     /// A fresh table in a fresh directory of the same `MemFs` (the file
