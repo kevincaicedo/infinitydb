@@ -112,19 +112,19 @@ impl ReplayWork {
     }
 }
 
-/// The replay seam (DRR FCR-STTIER-01 §7): lends a namespace's boot
-/// machine to the keyspace's tiered replay arms and takes the I/O they
-/// did. `None` is a namespace with no machine: until every tiered
-/// namespace recovers through a manifest section (ADR-0174 D4), the
-/// replay of such a namespace places what fits and refuses typed where
-/// a demote would be needed — a dated deviation in the story's ticket.
+/// The replay seam: lends a namespace's boot machine to the keyspace's
+/// tiered replay arms, one lookup per record. The machine accumulates
+/// the boot I/O it does ([`ReplayWork`]); the seam's owner drains it with
+/// [`TierReplay::take_work`] where it decides whether to yield — at a
+/// frame or section boundary, and per end-of-replay settle step — so no
+/// record pays for the charge. `None` is a namespace with no machine:
+/// its replay places what fits and refuses typed where a demote would be
+/// needed (ADR-0174 D4 gives every tiered namespace a machine).
 pub trait ReplaySpill {
     /// The pipelines' filesystem.
     type Fs: SegmentFs;
     /// The namespace's machine, if it has one.
     fn replay_mut(&mut self, ns: inf_log::NsId) -> Option<&mut TierReplay<Self::Fs>>;
-    /// Boot I/O the arm just did.
-    fn charge(&mut self, work: ReplayWork);
 }
 
 /// A seam with no machine behind it — keyspaces whose tiered namespaces
@@ -139,8 +139,6 @@ impl ReplaySpill for NoSpill {
     fn replay_mut(&mut self, _ns: inf_log::NsId) -> Option<&mut TierReplay<Self::Fs>> {
         None
     }
-
-    fn charge(&mut self, _work: ReplayWork) {}
 }
 
 /// A typed boot refusal from replay (DRR FCR-STTIER-01 §2): the recovery
@@ -409,20 +407,6 @@ impl<F: SegmentFs> TierReplay<F> {
             }
         }
         Ok(())
-    }
-
-    /// The state table's `Settling` column holds no record or `DEL` row:
-    /// once the end of replay is declared, the entries refuse before they
-    /// ask for room or read, so a driver that interleaves a record after
-    /// the declaration is caught at the record, named, with nothing
-    /// changed.
-    fn accepts_records(replay: Option<&TierReplay<F>>) -> Result<(), ReplayRefusal> {
-        match replay.map(|r| r.state) {
-            Some(ReplayState::Settling { .. }) => Err(ReplayRefusal::ReplayEnded),
-            Some(ReplayState::Seeded | ReplayState::Fitting | ReplayState::Spilling) | None => {
-                Ok(())
-            }
-        }
     }
 
     /// The typed refusal for a boot pipeline failure: what is sealed but
@@ -710,23 +694,14 @@ impl TieredTable {
     /// record was applied.
     pub fn replay_upsert<F: SegmentFs>(
         &mut self,
-        mut replay: Option<&mut TierReplay<F>>,
+        replay: Option<&mut TierReplay<F>>,
         markers: &[LogicalAddr],
         key: &[u8],
         value: &[u8],
         hash: u64,
     ) -> Result<LogicalAddr, ReplayRefusal> {
-        TierReplay::accepts_records(replay.as_deref())?;
-        let len = self.admit_inline(key, value).map_err(|_| ReplayRefusal::TooLarge)?;
-        self.make_room(replay.as_deref_mut(), len)?;
-        self.drain_markers(replay.as_deref_mut(), markers, hash);
-        let placed = self.apply_image(key, value, hash).map_err(ReplayRefusal::Store)?;
-        if let Some(r) = replay
-            && r.state == ReplayState::Seeded
-        {
-            r.state = ReplayState::Fitting;
-        }
-        Ok(placed)
+        let admitted = self.admit_inline(key, value).map_err(|_| ReplayRefusal::TooLarge)?;
+        self.replay_place(replay, markers, hash, admitted.len(), |t| t.apply_image(admitted, hash))
     }
 
     /// [`replay_upsert`](Self::replay_upsert) for a tag-9 image or a tail
@@ -736,20 +711,38 @@ impl TieredTable {
     /// As [`replay_upsert`](Self::replay_upsert).
     pub fn replay_upsert_extent<F: SegmentFs>(
         &mut self,
-        mut replay: Option<&mut TierReplay<F>>,
+        replay: Option<&mut TierReplay<F>>,
         markers: &[LogicalAddr],
         key: &[u8],
         hash: u64,
         ext: ExtentRef,
     ) -> Result<LogicalAddr, ReplayRefusal> {
-        TierReplay::accepts_records(replay.as_deref())?;
         let len = self.admit_extent(key, ext).map_err(|_| ReplayRefusal::TooLarge)?;
+        self.replay_place(replay, markers, hash, len, |t| t.apply_extent_image(key, hash, ext))
+    }
+
+    /// The placement sequence both upserts share, after their length
+    /// refusals: the state (no record after the end of replay), the room
+    /// question, the parked markers, the arm, and `Seeded` → `Fitting` —
+    /// one read of the state, one ask of `room` for a record that fits.
+    fn replay_place<F: SegmentFs>(
+        &mut self,
+        mut replay: Option<&mut TierReplay<F>>,
+        markers: &[LogicalAddr],
+        hash: u64,
+        len: usize,
+        arm: impl FnOnce(&mut TieredTable) -> Result<LogicalAddr, OpError>,
+    ) -> Result<LogicalAddr, ReplayRefusal> {
+        let seeded = match replay.as_deref().map(|r| r.state) {
+            Some(ReplayState::Settling { .. }) => return Err(ReplayRefusal::ReplayEnded),
+            Some(ReplayState::Seeded) => true,
+            Some(ReplayState::Fitting | ReplayState::Spilling) | None => false,
+        };
         self.make_room(replay.as_deref_mut(), len)?;
         self.drain_markers(replay.as_deref_mut(), markers, hash);
-        let placed = self.apply_extent_image(key, hash, ext).map_err(ReplayRefusal::Store)?;
-        if let Some(r) = replay
-            && r.state == ReplayState::Seeded
-        {
+        let placed = arm(self).map_err(ReplayRefusal::Store)?;
+        if seeded && let Some(r) = replay {
+            debug_assert_eq!(r.state, ReplayState::Seeded, "a seeded table's first record fits");
             r.state = ReplayState::Fitting;
         }
         Ok(placed)
@@ -759,7 +752,9 @@ impl TieredTable {
     /// cold slot this boot demoted first (E5), then the parked markers,
     /// then the RAM record of the key — with its origins — and the read
     /// slots whose key matched, each with its exact death. Returns
-    /// whether anything of the key was removed.
+    /// whether anything of the key was removed. A cold slot at or above
+    /// the origin exists only once a demote step began, so `Seeded` and
+    /// `Fitting` read and probe nothing.
     ///
     /// # Errors
     /// A settle read or identity refusal; nothing changed.
@@ -770,27 +765,43 @@ impl TieredTable {
         key: &[u8],
         hash: u64,
     ) -> Result<bool, ReplayRefusal> {
-        TierReplay::accepts_records(replay.as_deref())?;
         if let Some(r) = replay.as_deref_mut() {
-            r.verify_cold_for_delete(self, key, hash)?;
-        }
-        self.drain_markers(replay.as_deref_mut(), markers, hash);
-        let mut removed = self.apply_delete(key, hash);
-        if let Some(r) = replay {
-            for i in 0..r.doomed.len() {
-                let (cold, len) = r.doomed[i];
-                self.index.remove(hash, cold);
-                self.shadow_note_removed(cold);
-                self.note_death(cold, u64::from(len));
-                if !self.reloc_origins.is_empty() {
-                    self.reloc_origins.remove(&(hash, cold.to_raw()));
-                }
-                r.counters.deletes_verified += 1;
-                r.counters.settled_same_key += 1;
-                removed = true;
+            match r.state {
+                ReplayState::Settling { .. } => return Err(ReplayRefusal::ReplayEnded),
+                ReplayState::Spilling => return self.replay_delete_spilling(r, markers, key, hash),
+                ReplayState::Seeded | ReplayState::Fitting => {}
             }
-            r.doomed.clear();
         }
+        self.drain_markers(replay, markers, hash);
+        Ok(self.apply_delete(key, hash))
+    }
+
+    /// [`replay_delete`](Self::replay_delete) once a demote step began:
+    /// E5's reads before anything changes, then the drain, the RAM
+    /// delete and the verified cold slots' removal.
+    fn replay_delete_spilling<F: SegmentFs>(
+        &mut self,
+        r: &mut TierReplay<F>,
+        markers: &[LogicalAddr],
+        key: &[u8],
+        hash: u64,
+    ) -> Result<bool, ReplayRefusal> {
+        r.verify_cold_for_delete(self, key, hash)?;
+        self.drain_markers(Some(&mut *r), markers, hash);
+        let mut removed = self.apply_delete(key, hash);
+        for i in 0..r.doomed.len() {
+            let (cold, len) = r.doomed[i];
+            self.index.remove(hash, cold);
+            self.shadow_note_removed(cold);
+            self.note_death(cold, u64::from(len));
+            if !self.reloc_origins.is_empty() {
+                self.reloc_origins.remove(&(hash, cold.to_raw()));
+            }
+            r.counters.deletes_verified += 1;
+            r.counters.settled_same_key += 1;
+            removed = true;
+        }
+        r.doomed.clear();
         Ok(removed)
     }
 
@@ -838,18 +849,42 @@ impl TieredTable {
 
     /// E1's room question, asked until it answers `Fits`: `Demote` runs
     /// the step, `Pad` moves the tail, `End` and a fifth ask refuse typed.
+    /// The record that fits — every record of a boot that fits — asks
+    /// once and leaves; the loop is the out-of-line rest. The two hints
+    /// are measured: without them a replayed `SET` through a lent machine
+    /// costs 26 more instructions (the fitting-boot replay A/B).
+    #[inline]
     fn make_room<F: SegmentFs>(
+        &mut self,
+        replay: Option<&mut TierReplay<F>>,
+        len: usize,
+    ) -> Result<(), ReplayRefusal> {
+        let first = self.space.room(len);
+        if matches!(first, Room::Fits) {
+            return Ok(());
+        }
+        self.make_room_after(replay, len, first)
+    }
+
+    /// [`make_room`](Self::make_room) from its first answer that did not
+    /// fit.
+    #[cold]
+    #[inline(never)]
+    fn make_room_after<F: SegmentFs>(
         &mut self,
         mut replay: Option<&mut TierReplay<F>>,
         len: usize,
+        first: Room,
     ) -> Result<(), ReplayRefusal> {
+        let mut answer = Some(first);
         let mut asks = 0u32;
         loop {
             asks += 1;
             if asks > REPLAY_ROOM_ASKS_MAX {
                 return Err(ReplayRefusal::RoomAsks { len, asks });
             }
-            match self.space.room(len) {
+            let room = answer.take().unwrap_or_else(|| self.space.room(len));
+            match room {
                 Room::Fits => return Ok(()),
                 Room::End => return Err(ReplayRefusal::End { len }),
                 Room::Demote(target) => {
@@ -893,7 +928,9 @@ impl TieredTable {
                 skipped += 1;
             }
         }
-        if let Some(r) = replay {
+        if skipped > 0
+            && let Some(r) = replay
+        {
             r.counters.markers_skipped += skipped;
         }
     }

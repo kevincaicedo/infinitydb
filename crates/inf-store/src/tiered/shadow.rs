@@ -1479,7 +1479,8 @@ mod tests {
         let hash = t.hash_key(b"k");
         let old = t.insert(b"k", &[0x22; 100], hash).expect("fits");
         let old_len = t.record(old).encoded_len;
-        let newer = t.append(b"k", &[0x33; 100], 1).expect("fits");
+        let admitted = t.admit_inline(b"k", &[0x33; 100]).expect("admitted");
+        let newer = t.append(admitted, 1).expect("fits");
         t.index.insert(hash, newer);
         t.reloc_origins.insert((hash, old.to_raw()), vec![(7, 1)]);
         let dead_before = t.space().report().dead_bytes;
@@ -1494,7 +1495,8 @@ mod tests {
         );
 
         // At the cap with nothing to inherit: `ThisLife` settles, `Exact` refuses.
-        let third = t.append(b"k", &[0x44; 100], 2).expect("fits");
+        let admitted = t.admit_inline(b"k", &[0x44; 100]).expect("admitted");
+        let third = t.append(admitted, 2).expect("fits");
         t.index.insert(hash, third);
         t.reloc_origins.insert((hash, third.to_raw()), vec![(1, 1), (2, 1), (3, 1)]);
         let newer_len = u32::try_from(t.record(newer).encoded_len).expect("fits");

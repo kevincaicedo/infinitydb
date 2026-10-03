@@ -241,6 +241,23 @@ pub const RELOC_ORIGIN_CAP: usize = 3;
 /// Cap on retained unconfirmed flush-chunk ends (~32 KiB worst case).
 const FLUSH_ENDS_CAP: usize = 4096;
 
+/// An inline placement the length refusals admitted — `admit_inline`'s
+/// one product: the key and value with the record's encoded length, so
+/// a placement writes what was admitted and checks nothing twice.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AdmittedInline<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+    len: usize,
+}
+
+impl AdmittedInline<'_> {
+    /// The record's encoded length.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
 /// What one [`TieredTable::flush_slice`] round did (observability; the
 /// storm/DST oracles assert against these).
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -472,13 +489,24 @@ impl TieredTable {
                 .is_none(),
             "insert of a RAM-verified present key"
         );
+        let admitted = self.admit_inline(key, value)?;
+        self.insert_admitted(admitted, hash)
+    }
+
+    /// [`insert`](Self::insert) of a record the length refusals already
+    /// admitted (boot replay admits before it asks for room).
+    pub(super) fn insert_admitted(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        hash: u64,
+    ) -> Result<LogicalAddr, OpError> {
         if self.index.needs_grow() {
             // Sidecar-only re-placement: cold-addressed slots re-place
             // without a record read (§3.3 — the closure has no record
             // access, so this is structural, not reviewed-for).
             self.index.grow(|_, ext| ext);
         }
-        let addr = self.append(key, value, 0)?;
+        let addr = self.append(admitted, 0)?;
         self.index.insert(hash, addr);
         Ok(addr)
     }
@@ -550,7 +578,21 @@ impl TieredTable {
         old_len: usize,
         old_version: u32,
     ) -> Result<LogicalAddr, OpError> {
-        let new_addr = self.append(key, value, old_version.wrapping_add(1))?;
+        let admitted = self.admit_inline(key, value)?;
+        self.overwrite_admitted(admitted, hash, old, old_len, old_version)
+    }
+
+    /// [`overwrite`](Self::overwrite) of a record the length refusals
+    /// already admitted.
+    pub(super) fn overwrite_admitted(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        hash: u64,
+        old: LogicalAddr,
+        old_len: usize,
+        old_version: u32,
+    ) -> Result<LogicalAddr, OpError> {
+        let new_addr = self.append(admitted, old_version.wrapping_add(1))?;
         self.index.replace(hash, old, new_addr);
         self.shadow_note_moved(hash, old, new_addr);
         self.note_death(old, old_len as u64);
@@ -817,18 +859,17 @@ impl TieredTable {
     /// window refusal here names a defect).
     pub(super) fn apply_image(
         &mut self,
-        key: &[u8],
-        value: &[u8],
+        admitted: AdmittedInline<'_>,
         hash: u64,
     ) -> Result<LogicalAddr, OpError> {
-        if let TieredLookup::Ram(addr) = self.lookup(key, hash, &[]) {
+        if let TieredLookup::Ram(addr) = self.lookup(admitted.key, hash, &[]) {
             let parts = self.record(addr);
             let (len, version) = (parts.encoded_len, parts.version);
-            let new_addr = self.overwrite(key, value, hash, addr, len, version)?;
+            let new_addr = self.overwrite_admitted(admitted, hash, addr, len, version)?;
             self.move_origins(hash, addr, new_addr);
             return Ok(new_addr);
         }
-        self.insert(key, value, hash)
+        self.insert_admitted(admitted, hash)
     }
 
     /// Tail-`DEL` replay's RAM half (R6): the RAM record of the key is
@@ -1098,7 +1139,11 @@ impl TieredTable {
     /// (ADR-0102 D3) — refused typed before the space's release assert
     /// can see it (the threshold clamp makes this unreachable through
     /// the plane's routing; a direct caller gets the same typed answer).
-    pub(super) fn admit_inline(&self, key: &[u8], value: &[u8]) -> Result<usize, OpError> {
+    pub(super) fn admit_inline<'a>(
+        &self,
+        key: &'a [u8],
+        value: &'a [u8],
+    ) -> Result<AdmittedInline<'a>, OpError> {
         if key.len() > crate::record::MAX_KEY_LEN || value.len() > crate::record::MAX_VAL_LEN {
             return Err(OpError::TooLarge);
         }
@@ -1116,11 +1161,15 @@ impl TieredTable {
         if len > self.inline_record_max() {
             return Err(OpError::TooLarge);
         }
-        Ok(len)
+        Ok(AdmittedInline { key, value, len })
     }
 
-    fn append(&mut self, key: &[u8], value: &[u8], version: u32) -> Result<LogicalAddr, OpError> {
-        let len = self.admit_inline(key, value)?;
+    fn append(
+        &mut self,
+        admitted: AdmittedInline<'_>,
+        version: u32,
+    ) -> Result<LogicalAddr, OpError> {
+        let AdmittedInline { key, value, len } = admitted;
         let spec = RecordSpec {
             key,
             value,
