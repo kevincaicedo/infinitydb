@@ -156,6 +156,19 @@ Leave these files alone; `INFO tiering` discloses them
 revived counter going nonzero means a wrong orphan verdict healed and is
 worth reporting).
 
+A boot after a crash replays each tiered namespace's records since its last
+checkpoint began. When they re-append more than the namespace's RAM window
+(`MEM-BUDGET` + `MAINTAIN-SLICE`) on a cell, the boot demotes the excess to
+tier files as the running node would, instead of refusing to start
+(ADR-0174). Such a boot needs device space for the bytes it demotes — a full
+device refuses the boot with a typed message naming the namespace — and
+takes longer by about one sequential write of those bytes; a crash during it
+leaves files the next boot removes before it replays again. `INFO
+persistence` reports what the last boot did, summed over the cells, in the
+`recover_node_tier_` lines: the demote steps, the tier bytes written, the
+barriers, the files sealed, the settle reads and the largest step charge.
+They stay zero on a boot whose replay fits every window.
+
 ## Configuration
 
 Configuration uses the Redis `CONFIG` command surface. The most relevant keys
