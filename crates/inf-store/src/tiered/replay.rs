@@ -843,3 +843,129 @@ impl TieredTable {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use inf_foundation::KeyHasher;
+    use inf_log::fs::mem::MemFs;
+    use inf_log::{TierFlush, TierFlushConfig, TierIoMode};
+
+    use super::*;
+    use crate::address_space::AddressSpaceConfig;
+    use crate::demote::DemotionConfig;
+
+    const PAGE: u64 = 4 << 10;
+
+    fn table() -> TieredTable {
+        let demote = DemotionConfig::for_budget(64 << 10, PAGE);
+        TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: demote.ring_reserve_bytes().expect("valid"),
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::ZERO,
+            },
+            demote,
+            64,
+            KeyHasher::default(),
+        )
+        .expect("ring")
+    }
+
+    fn machine(fs: &MemFs) -> TierReplay<MemFs> {
+        let flush = TierFlush::new(
+            fs.clone(),
+            TierFlushConfig {
+                shard_dir: Path::new("shard-0").to_path_buf(),
+                cell: 0,
+                ns: inf_log::NsId(9),
+                mode: TierIoMode::Buffered,
+                file_capacity: 1 << 20,
+                slice_bytes: PAGE,
+            },
+            0,
+        );
+        TierReplay::new(BootFlush::new(flush, Vec::new()), PAGE, PAGE)
+    }
+
+    /// Two windows of records through the entry: the machine demotes.
+    fn spill(table: &mut TieredTable, replay: &mut TierReplay<MemFs>) {
+        let value = vec![0x5A; 900];
+        for i in 0..160u32 {
+            let key = format!("k:{i:04}").into_bytes();
+            let hash = table.hash_key(&key);
+            table.replay_upsert(Some(replay), &[], &key, &value, hash).expect("replays");
+        }
+        assert!(replay.counters().demote_steps > 0);
+        assert_eq!(replay.phase(), ReplayPhase::Spilling);
+    }
+
+    /// I16: a machine that demoted is handed over only with every RAM
+    /// record settled — `Spilling` has no arm, `Settling` only at the
+    /// tail; a settle step before the end of replay is declared is a
+    /// typed refusal too.
+    #[test]
+    fn hand_over_refuses_a_table_that_demoted_until_its_end_settle_reached_the_tail() {
+        let fs = MemFs::new();
+        let mut table = table();
+        let mut replay = machine(&fs);
+        spill(&mut table, &mut replay);
+        assert!(matches!(replay.settle_step(&mut table, PAGE), Err(ReplayRefusal::ReplayNotEnded)));
+        let Err(err) = replay.hand_over(&mut table) else { panic!("Spilling has no arm") };
+        assert!(matches!(err, ReplayRefusal::Unsettled { cursor: None, .. }), "{err}");
+        let mut table = table_after(&fs);
+        let mut replay = machine(&fs);
+        spill(&mut table, &mut replay);
+        replay.end_of_replay(&table);
+        assert_eq!(replay.phase(), ReplayPhase::Settling);
+        let ro = table.space().ro_boundary();
+        let Err(err) = replay.hand_over(&mut table) else { panic!("Settling below the tail") };
+        assert!(
+            matches!(err, ReplayRefusal::Unsettled { cursor: Some(c), .. } if c == ro),
+            "{err}"
+        );
+        let mut table = table_after(&fs);
+        let mut replay = machine(&fs);
+        spill(&mut table, &mut replay);
+        replay.end_of_replay(&table);
+        while replay.settle_step(&mut table, PAGE).expect("settle") == SettleProgress::More {}
+        let handed = replay.hand_over(&mut table).expect("settled to the tail");
+        assert_eq!(handed.handles.len(), handed.flush.sealed().len());
+        assert!(handed.flush.active().is_none());
+    }
+
+    /// A fresh table in a fresh directory of the same `MemFs` (the file
+    /// ids restart at 0, so the earlier machine's files must not collide).
+    fn table_after(fs: &MemFs) -> TieredTable {
+        for name in fs.list_dir(Path::new("shard-0/cold")).unwrap_or_default() {
+            fs.remove_file(&Path::new("shard-0/cold").join(name)).expect("remove");
+        }
+        table()
+    }
+
+    /// A namespace with no boot machine (the pre-D4 shape): the entry
+    /// places what fits and refuses typed, nothing changed, where a
+    /// demote would be needed.
+    #[test]
+    fn a_namespace_without_a_machine_places_what_fits_and_refuses_the_rest_typed() {
+        let mut table = table();
+        let value = vec![0x5A; 900];
+        let mut placed = 0u32;
+        let refused = loop {
+            let key = format!("k:{placed:04}").into_bytes();
+            let hash = table.hash_key(&key);
+            match table.replay_upsert::<MemFs>(None, &[], &key, &value, hash) {
+                Ok(_) => placed += 1,
+                Err(err) => break err,
+            }
+            assert!(placed < 10_000, "a 64 KiB window admits far fewer");
+        };
+        assert!(
+            matches!(refused, ReplayRefusal::NoPipeline { need: Room::Demote(_) }),
+            "{refused}"
+        );
+        assert_eq!(table.len() as u32, placed, "the refused record placed nothing");
+        assert!(table.space().report().committed_bytes <= (64 << 10) + PAGE);
+    }
+}
