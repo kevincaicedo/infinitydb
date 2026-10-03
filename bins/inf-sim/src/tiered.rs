@@ -1049,6 +1049,17 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
             return finish(report, &observer, &clock);
         }
     }
+    // ADR-0174 I9 at the shipped recovery driver, on every seed: a reboot
+    // that made no demote step leaves the rest of the fold's zero set at
+    // zero — no tier bytes, barriers, files sealed, settle reads or
+    // verified deletes (each needs a demote step first).
+    let fold = report.boot_tier;
+    if fold[0] == 0 && fold[1..6].iter().any(|&value| value != 0) {
+        let message = format!(
+            "ZERO-SET VIOLATION: the reboot made no demote step, yet its fold reads {fold:?}"
+        );
+        fail(&mut report, message);
+    }
     let cells_above = report.replay_above_window_cells;
     if cells_above > 0 && scenario.replay_above_window && report.boot_tier[0] == 0 {
         fail(
