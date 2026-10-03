@@ -247,8 +247,10 @@ impl TieredScenario {
     /// the record cap's trigger (ADR-0088 D4) — and [`REGIME_OPS_FACTOR`]
     /// times the phase-2 volume. The two arms whose engagement needs a
     /// checkpoint walk inside the run — the `EINVAL` downgrade and the
-    /// section bound — are off: the run has none. Applied by the seed
-    /// class and by the binary's flag.
+    /// section bound — are off: the run has none; so is the tier-read
+    /// fault arm, whose probe stands on the audited keys being cold again
+    /// at phase 6a, where a reboot that replays the whole log leaves them
+    /// in the window. Applied by the seed class and by the binary's flag.
     pub fn with_replay_above_window(mut self) -> TieredScenario {
         if self.replay_above_window {
             return self;
@@ -258,6 +260,7 @@ impl TieredScenario {
         self.ops_per_writer *= REGIME_OPS_FACTOR;
         self.ckpt_direct_refused_after = None;
         self.ckpt_section_bound = None;
+        self.tier_read_fault = false;
         self
     }
 
