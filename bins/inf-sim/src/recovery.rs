@@ -189,7 +189,7 @@ pub struct RecoveryReport {
     /// Boots that demoted, boots whose unit fit by construction (each
     /// checked to leave the zero set at zero), boot replay's counters
     /// summed over every boot, and the live writes that parked on MAINTAIN
-    /// because the window was full (ADR-0174 D6, §2).
+    /// because the window was full (ADR-0174 D5, D6).
     pub demoting_boots: u64,
     pub fitting_boots_checked: u64,
     pub boot_replay: ReplayCounters,
@@ -1047,14 +1047,11 @@ impl Run {
         }
     }
 
-    /// One live-path mutation, recorded into the modeled tail with its
-    /// displacement marker (ADR-0057 D4 — unconditional for displacing
-    /// mutations).
     /// The plane's park on a full window, played here: a write the
     /// window cannot place waits for MAINTAIN's cycle — the reconciler,
     /// then demotion — and is then retried; the shape every live write
-    /// meets after a boot that demoted, whose window is full by
-    /// construction (ADR-0174 §2). The harness asks before it resolves,
+    /// meets after a boot that demoted, whose window holds the newest
+    /// replayed records (ADR-0174 D5). The harness asks before it resolves,
     /// so nothing of the op is staged while it waits. Under a checkpoint
     /// walk release stops at the walk's watermark, so a write that still
     /// finds no room waits for the walk's end: the harness, which runs the
@@ -1148,6 +1145,9 @@ impl Run {
         );
     }
 
+    /// One live-path mutation, recorded into the modeled tail with its
+    /// displacement marker (ADR-0057 D4 — unconditional for displacing
+    /// mutations).
     fn apply_op(&mut self, life: &mut Life, key: &[u8], op: Op) {
         let record_len = TieredTable::RECORD_HEADER_LEN
             + key.len()

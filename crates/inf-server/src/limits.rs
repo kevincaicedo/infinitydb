@@ -10,7 +10,7 @@ pub const CKPT_BOARD_VISITS_PER_TURN: usize = 64;
 
 /// The recovery step budget's price of one byte a tiered boot replay
 /// machine wrote to a tier file or walked at its end settle (ADR-0174
-/// §3): one budget byte, the device bytes the step moved. Owner: the
+/// D2 rule 4): one budget byte, the device bytes the step moved. Owner: the
 /// recovery driver (`RecoverConfig::step_bytes` is the budget it charges).
 /// Crossing: a step whose bytes read plus its charge reach the budget
 /// yields at the next frame or checkpoint section, or after the settle

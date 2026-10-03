@@ -318,8 +318,8 @@ fn tier_bytes_on_disk<F: SegmentFs>(fs: &F, cfg: &DurableConfig) -> u64 {
         .sum()
 }
 
-/// The step budget's charge for boot I/O (ADR-0174 D2 rule 4; record
-/// §3), judged step by step at two budgets over a unit of four windows.
+/// The step budget's charge for boot I/O (ADR-0174 D2 rule 4), judged
+/// step by step at two budgets over a unit of four windows.
 /// The prices are the server's and the store's `limits` consts; the
 /// charge each step took is `Recovery::step_charge_bytes`, and the tier
 /// writes are read from the filesystem:
@@ -436,7 +436,7 @@ fn step_under_budget(budget: u64) {
     assert_model(&served, &unit.model, &format!("after a boot at a {budget}-byte budget"));
 }
 
-/// Where a power cut lands in a demoting boot (record §6, "power cuts").
+/// Where a power cut lands in a demoting boot (ADR-0174 D5).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Cut {
     /// Mid-replay, right after the first demote step made a boot tier file.

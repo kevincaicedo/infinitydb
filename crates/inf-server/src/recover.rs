@@ -560,7 +560,9 @@ pub struct Recovery<F: SegmentFs> {
     /// flush pipeline + open sealed-file handles + the extent sweep
     /// seed — installed into the plane's tier state at completion.
     recovered_tiers: Vec<RecoveredTierNs<F>>,
-    /// End-of-replay tiered checks ran (once, on entering the audit).
+    /// Replay has ended: set once by `end_replay`, at the finish step
+    /// that declines the lift; its debug assertion that replay ends once
+    /// reads it.
     tier_replay_checked: bool,
     /// Sidecar boot loader (M4.5-S06, ADR-0078 D6): consumes tag-0x06
     /// sections during the ick phase, arms `CatchUp` for the tail, and
@@ -606,7 +608,7 @@ impl<F: SegmentFs> RecoveringTiers<F> {
 }
 
 /// The step budget's charge for a machine's drained boot I/O (ADR-0174
-/// §3): tier bytes written and bytes the end settle walked at
+/// D2 rule 4): tier bytes written and bytes the end settle walked at
 /// [`REPLAY_TIER_BYTE_CHARGE`](crate::limits::REPLAY_TIER_BYTE_CHARGE),
 /// barriers at [`REPLAY_BARRIER_CHARGE_BYTES`](crate::limits::REPLAY_BARRIER_CHARGE_BYTES),
 /// settle reads at the store's
@@ -825,9 +827,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
             Phase::Audit { idx } => self.step_audit(idx),
-            // Replay is not over while a hole can still be lifted
-            // (F-L14-01): the end-of-replay checks run inside the finish
-            // step, once the lift is declined — never at a probe.
+            // Replay is not over while a hole can still be lifted: the
+            // end-of-replay checks run inside the finish step, once the
+            // lift is declined — never at a probe, which precedes segments
+            // a lift replays.
             Phase::Probe { idx } => self.step_probe(idx),
             Phase::Finish => self.step_finish(ks),
             // The last settle step reports `Working` and the *next* step
@@ -1007,10 +1010,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
 
     /// The end of replay (ADR-0174 R10's first half), once the finish
     /// step declined a lift — after the last replayed record, which a
-    /// lifted hole moves past the probed segments (review F-L14-01: run
-    /// at the first probe step, the checks audited an empty displacement
-    /// register and froze the index/shadow projections before the lifted
-    /// segments applied). A non-empty displacement register means the log
+    /// lifted hole moves past the probed segments: the checks must see the
+    /// displacement register and the index after every record a lift
+    /// replays, never before. A non-empty displacement register means the log
     /// ended between a marker and its paired mutation — corrupt input by
     /// the ADR-0057 D4 same-frame rule (fail-stop, never a skip); then
     /// every tiered machine declares the end of replay, and one that
@@ -1458,7 +1460,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_done += bytes;
                     self.bytes_consumed += bytes;
                     // The section's boot I/O is the step's too (ADR-0174
-                    // §3): it yields at the next section boundary.
+                    // D2 rule 4): it yields at the next section boundary.
                     self.drain_boot_io();
                     if spent.saturating_add(self.step_charge) >= budget_bytes {
                         self.phase = Phase::Ick { reader };
@@ -1606,8 +1608,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             }
                         }
                     }
-                    // The frame's boot I/O is the step's too (ADR-0174 §3):
-                    // a step that demotes yields at the next frame boundary.
+                    // The frame's boot I/O is the step's too (ADR-0174 D2
+                    // rule 4): a step that demotes yields at the next frame
+                    // boundary.
                     self.drain_boot_io();
                     let consumed = u64::from(reader.offset()) - start_offset;
                     if consumed.saturating_add(self.step_charge) >= budget_bytes {
@@ -1908,7 +1911,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 return Ok(RecoveryProgress::Working);
             }
         }
-        // No lift: the last replayed record is behind us (F-L14-01). The
+        // No lift: the last replayed record is behind us. The
         // unpaired-marker check, then the end settle, the hand-over and the
         // sidecar commit — each sees the finished keyspace.
         self.end_replay(ks)?;
@@ -2144,7 +2147,7 @@ fn replay_apply_failed(at: Lsn, error: &io::Error) -> io::Error {
 }
 
 /// A tiered boot machine's typed refusal as the recovery fail-stop,
-/// naming the namespace and the check (ADR-0174 §2).
+/// naming the namespace and the check (ADR-0174 D1).
 fn replay_refused(ns: inf_log::NsId, refusal: &inf_store::ReplayRefusal) -> io::Error {
     io_msg(format!("tiered ns {}: boot replay refused: {refusal}", ns.0))
 }
