@@ -1384,6 +1384,7 @@ impl Keyspace {
                 table
                     .replay_upsert(machine, markers, key, value, hash)
                     .map_err(ReplayError::Replay)?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
@@ -1391,6 +1392,7 @@ impl Keyspace {
                 let (table, markers) = self.tiered_entry(ns)?;
                 let machine = spill.replay_mut(ns);
                 table.replay_delete(machine, markers, key, hash).map_err(ReplayError::Replay)?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
             LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
@@ -1403,6 +1405,7 @@ impl Keyspace {
                 table
                     .replay_upsert_extent(machine, markers, key, hash, ext)
                     .map_err(ReplayError::Replay)?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
             // Tiered namespaces carry no expiry and no documents in M4
@@ -1429,8 +1432,10 @@ impl Keyspace {
     /// The table of `ns` and its parked markers as addresses (D4 rule 1),
     /// for one replay entry: the entry drains them exactly — by `(hash,
     /// old_addr)` — after its room question and a `DEL`'s reads (ADR-0174
-    /// R3, R4, R6). An empty register — every record but a displacing
-    /// one's mutation — copies nothing.
+    /// R3, R4, R6). The register stays armed until the entry succeeds, so
+    /// a refused record leaves the keyspace as it found it. An empty
+    /// register — every record but a displacing one's mutation — copies
+    /// nothing.
     fn tiered_entry(
         &mut self,
         ns: NsId,
@@ -1446,7 +1451,6 @@ impl Keyspace {
             };
             displace_scratch.push(addr);
         }
-        pending_displace.clear();
         let i = tiered_stores.iter().position(|(id, _)| *id == ns).expect("is_tiered checked");
         Ok((tiered_stores[i].1.as_mut(), displace_scratch.as_slice()))
     }

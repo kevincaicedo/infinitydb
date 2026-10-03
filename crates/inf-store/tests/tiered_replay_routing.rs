@@ -134,6 +134,33 @@ fn displace_register_overflow_is_a_decode_error() {
     ));
 }
 
+/// A refused record leaves the keyspace as it found it: the markers
+/// parked for it stay armed (the refusal is the boot's, terminal; the
+/// register is the keyspace's part of "nothing changed"). Here the seam
+/// lends no machine, so the first record that needs room refuses typed.
+#[test]
+fn a_refused_tiered_record_leaves_its_markers_parked() {
+    let mut ks = tiered_keyspace();
+    let value = vec![0x5A; 4 << 10];
+    let mut i = 0u64;
+    let refusal = loop {
+        // A crashed-life marker at or above the origin: a no-op when its
+        // mutation applies (ADR-0174 R4).
+        let marker = RecordView::ColdDisplace { ns: NS, old_addr: (1 << 40) + i };
+        ks.apply_record(&marker, NOW, ANCHOR, &mut NoSpill).expect("parks");
+        let key = format!("k:{i:06}").into_bytes();
+        let set = RecordView::StringPostImage { ns: NS, key: &key, value: &value };
+        match ks.apply_record(&set, NOW, ANCHOR, &mut NoSpill) {
+            Ok(_) => assert_eq!(ks.displace_register_len(), 0, "the mutation drained it"),
+            Err(refusal) => break refusal,
+        }
+        i += 1;
+        assert!(i < 100_000, "an 8 MiB window refuses far sooner");
+    };
+    assert!(matches!(refusal, ReplayError::Replay(_)), "{refusal:?}");
+    assert_eq!(ks.displace_register_len(), 1, "the refused record's marker stays parked");
+}
+
 /// A marker naming a namespace with no tiered table (dropped, or a
 /// foreign log) skips without arming the register — its paired mutation
 /// skips the same way, so the pairing cannot desync.
