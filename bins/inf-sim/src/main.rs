@@ -417,6 +417,7 @@ fn main() {
             let mut boot_replay = inf_store::ReplayCounters::default();
             let mut writer_parks = 0u64;
             let mut two_crash_removed = 0u64;
+            let mut two_crash_skipped = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
@@ -425,6 +426,7 @@ fn main() {
                 boot_replay.absorb(report.boot_replay);
                 writer_parks += report.writer_parks;
                 two_crash_removed += report.two_crash_markers_removed;
+                two_crash_skipped += report.two_crash_unit_past_window;
                 if verify {
                     let twin = run_one(seed);
                     verify_hashes(
@@ -493,7 +495,8 @@ fn main() {
                  {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
                  {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
                  releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
-                 removed by a marker",
+                 removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
+                 window)",
                 boot_replay.demote_steps,
                 boot_replay.tier_bytes,
                 boot_replay.settle_reads,
@@ -548,7 +551,7 @@ fn main() {
              replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
              deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
              released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
-             refs removed by a marker, trace {:#x}",
+             refs removed by a marker ({} skipped: unit past the raised window), trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -596,6 +599,7 @@ fn main() {
             report.two_crash_rows_opened,
             report.two_crash_rows_settled,
             report.two_crash_markers_removed,
+            report.two_crash_unit_past_window,
             report.trace_hash
         );
         if verify {

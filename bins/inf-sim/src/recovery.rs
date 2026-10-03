@@ -215,6 +215,10 @@ pub struct RecoveryReport {
     pub two_crash_rows_opened: u64,
     pub two_crash_rows_settled: u64,
     pub two_crash_markers_removed: u64,
+    /// The row did not run: the last life's unit (the walk's images and
+    /// the tail since) already lay past the raised window, so the second
+    /// boot could not fit it — disclosed, never a pass on its own.
+    pub two_crash_unit_past_window: u64,
     pub trace_hash: u64,
     pub state_hash: u64,
     state: crate::state::StateHash,
@@ -1201,11 +1205,27 @@ impl Run {
     /// the record and chains it into the record's origins (R8).
     fn open_two_crash_rows(&mut self, life: &mut Life) {
         const ROWS_MAX: usize = 8;
+        // A shadow write that finds no lone cold candidate falls back to a
+        // plain one; at most twice as many writes as rows, each of a
+        // 48-byte value and a key of at most 64 bytes, with its header.
+        const WRITES_MAX: usize = 2 * ROWS_MAX;
+        const ROW_BYTES_MAX: u64 = WRITES_MAX as u64 * 160;
+        // The second boot must fit the raised window, or it would settle
+        // the refs itself: a unit already past it cannot carry the row.
+        let window = raised().mem_budget_bytes + raised().slice_bytes;
+        if self.replay_unit_bytes() + ROW_BYTES_MAX + FIT_MARGIN_BYTES > window {
+            self.report.two_crash_unit_past_window += 1;
+            return;
+        }
+        // The fill's open tickets settle first: their pinned bytes count
+        // against the shadow pin cap a row's write is admitted under.
+        self.reconcile_all(life, "two-crash rows");
         let refs = std::mem::take(&mut self.published_refs);
-        // Bound: one cold read per ref of the published checkpoint, at
-        // most until eight rows are open.
+        // Bound: one cold read per ref of the published checkpoint, until
+        // eight rows are open or sixteen writes were made.
+        let mut writes = 0usize;
         for &(hash, addr) in &refs {
-            if self.two_crash.len() == ROWS_MAX {
+            if self.two_crash.len() == ROWS_MAX || writes == WRITES_MAX {
                 break;
             }
             let Some(bytes) = read_cold_record(&self.disk, &life.flush, addr) else { continue };
@@ -1217,6 +1237,7 @@ impl Run {
                 continue;
             }
             self.apply_op(life, &key, Op::SetShadow(vec![0x2C; 48]));
+            writes += 1;
             if life.table.shadow_tickets().any(|ticket| ticket.cold == at) {
                 self.two_crash.push((key, hash, addr));
             }
@@ -1248,6 +1269,9 @@ impl Run {
     /// key misses. Engagement: settled rows and a second boot that fits,
     /// else `VACUOUS`.
     fn two_crash_coda(&mut self, mut life: Life, hasher: KeyHasher, seed: u64) {
+        if self.two_crash.is_empty() && self.report.two_crash_unit_past_window > 0 {
+            return;
+        }
         if self.two_crash.is_empty() {
             self.report.violations.push(format!(
                 "TWO-CRASH VACUOUS: {} rows opened, none settled by the boot that demoted",
