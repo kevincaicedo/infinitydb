@@ -174,9 +174,9 @@ WantedBy=multi-user.target</code></pre>
   <p>Runtime configuration uses the Redis <code>CONFIG</code> surface (<code>maxmemory</code>, <code>maxmemory-policy</code>, and friends &mdash; see the <a href="compat.html">compatibility matrix</a>); per-namespace durability and eviction are set at <code>INF.NS CREATE</code> time (see <a href="durability.html">namespaces &amp; durability</a>).</p>
 
   <h2>Upgrades &amp; downgrades</h2>
-  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing), written as v3 on segments opened for direct I/O: the same layout, with each frame&rsquo;s successor page-aligned. The rules, stated plainly:</p>
+  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing). In the <code>fua</code> barrier class (direct I/O), which the device probe selects when direct write-through beats a cache flush on the device and <code>--barrier-class fua</code> forces, segments opened for direct I/O take v3: the same layout, with each frame&rsquo;s successor page-aligned. The boot line <code>log barrier class &hellip;</code> names the class in use. The rules, stated plainly:</p>
   <ul>
-    <li><strong>Reading is forever:</strong> every build reads frame formats v1, v2 and v3. A log written by an older build remains readable by every later build.</li>
+    <li><strong>Reading is forever:</strong> the current build reads frame formats v1, v2 and v3; a log written by an older build stays readable by every later build.</li>
     <li><strong>Writing is v2 or v3 only</strong> &mdash; there is no write-v1 mode. The first time a current binary appends to a log, that log contains v2 or v3 frames.</li>
     <li><strong>No downgrade after the first write:</strong> a binary older than a frame format cannot read it, so once a current binary has appended, rolling back the binary means restoring the data directory from a pre-upgrade backup as well. Recovery additionally treats a v1 frame appearing <em>after</em> a v2 frame as a named refusal &mdash; no honest writer can produce that ordering.</li>
     <li>Format changes are recorded design decisions, not patches: each one lands with fuzzing of both formats, a crash-matrix re-run, and a fresh simulation sweep (law L9).</li>
