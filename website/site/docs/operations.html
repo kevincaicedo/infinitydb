@@ -86,10 +86,8 @@
     <li><strong>A v1-format frame beyond a gap</strong> &mdash; pre-v2 frames carry no attestation, so the conservative rule holds for them: refuse rather than guess. This class ages out as v1 frames leave the retained log.</li>
     <li><strong>A frame-format downgrade signature</strong> (a v1 frame after a v2 frame) &mdash; unreachable by any honest writer.</li>
   </ul>
-  <p>A refusal looks like this on stderr (the corruption class, the file, the offsets, and the evidence are always named):</p>
-<pre><code>infinityd: cell 2 recovery failed (fail-stop, &sect;8.4): log corruption in seg-000004<!-- doc-link-allow(d) @kevincaicedo 2026-10-14: infinityd's stderr, quoted verbatim; it goes when the engine's fail-stop message drops the section number -->
-at 0x3f2c0: &lt;what the bytes looked like&gt;; a validating frame follows at seg-000004
-offset 0x40000 &mdash; interior data would be lost by truncation, refusing to start (&sect;8.4)</code></pre><!-- doc-link-allow(d) @kevincaicedo 2026-10-14: infinityd's stderr, quoted verbatim; it goes when the engine's fail-stop message drops the section number -->
+  <p>A refusal is one line on stderr that names the cell and the evidence. Here cell 2&rsquo;s log ends below the position its MANIFEST starts replay from:</p>
+<pre><code>infinityd: cell 2 boot failed (fail-stop): the log's valid data ends at seg-000000:00064000, below the MANIFEST begin-LSN seg-000000:00064028: fsync-covered bytes are missing &mdash; refusing to start</code></pre>
   <p>The process exits with code 1 and the whole node stops &mdash; a half-recovered node must never serve.</p>
 
   <div class="callout">
