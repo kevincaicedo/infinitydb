@@ -7,7 +7,9 @@
 # workspace's `check-cfg` list has no row here.
 # Three row kinds:
 #   `<cfg> <scenario> <expected violation substring> [flags…]` — an
-#     `inf-sim` scenario (a sweep where one seed may not reach the rule);
+#     `inf-sim` scenario (a sweep where one seed may not reach the rule).
+#     A row whose flags carry their own `--seed` runs at that seed whatever
+#     the lane's (`inf-sim` takes the last one): a named regression seed;
 #   `<cfg> crate-test <package> <lib|test:NAME> <test name> [witness…]` —
 #     a crate's own test, for a rule whose oracle lives below the simulator
 #     (the store-tier index rows, ADR-0139). The planted build must report
@@ -280,6 +282,24 @@ rows=(
   # that charges no boot I/O (a step wrote tier bytes uncharged).
   "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one frame's unit"
   "inf_canary_replay_charge_dropped crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget tier files grew under a charge of 0"
+  # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
+  # (a ticket winner below the watermark, ADR-0093 A12) — the boot
+  # registers the extent at both addresses and its count stays one above
+  # its slots (the blob census).
+  "inf_canary_ckpt_image_listed crate-test inf-store test:tiered_replay an_imaged_ticket_winner_is_not_also_a_blob_reference_entry its refcount is the slots that name it"
+  # The same plant in the DST, on the two seeds of m4-recovery's
+  # spec-variant class that first met the shape: the refcount oracle.
+  "inf_canary_ckpt_image_listed m4-recovery refcount --spec-variant page --seed 0xD5EE000D"
+  "inf_canary_ckpt_image_listed m4-recovery refcount --spec-variant ring-top --seed 0xD5EE0024"
+  # The same plant from the wire: the published checkpoint read back, and
+  # the extents live after the restart's `DEL` of the key.
+  "inf_canary_ckpt_image_listed crate-test inf-server test:node_e2e a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone the 0x05 section lists the imaged winner's extent"
+  # ADR-0093 A12: a walk fixes each record's form when it begins.
+  # Unlatched, a ticket that ends between the passes leaves its winner in
+  # neither (the key census), and one that ends after the images puts the
+  # winner's entry in the 0x05 section too (the blob census).
+  "inf_canary_ckpt_form_unlatched crate-test inf-store test:tiered_replay a_ticket_that_ends_before_the_images_keeps_its_winner_imaged (a)"
+  "inf_canary_ckpt_form_unlatched crate-test inf-store test:tiered_replay a_ticket_that_ends_after_the_images_keeps_its_blob_entry_out_of_the_section its refcount is the slots that name it"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
@@ -392,7 +412,7 @@ for row in "${rows[@]}"; do
   RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$target"
   planted="$target/release/inf-sim"
-  echo "== canary $cfg: $name (seed $seed) on the planted build must go red"
+  echo "== canary $cfg: $name ${flags[*]} (lane seed $seed) on the planted build must go red"
   if "$planted" --scenario "$name" --seed "$seed" "${flags[@]}" > "$log" 2>&1; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
@@ -403,7 +423,7 @@ for row in "${rows[@]}"; do
   else
     echo "   caught: $(grep -m1 -- "$expect" "$log" | cut -c1-160)"
   fi
-  echo "== canary $cfg: $name on the plain build must stay green"
+  echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
   "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi

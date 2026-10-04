@@ -391,9 +391,12 @@ impl TieredTable {
         resume: u64,
     ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         let latch = self.walk_latch();
+        // The planted canary lists every entry below the watermark, an
+        // imaged winner's with them: the double count of ADR-0061 D6.
+        let lists_images = cfg!(inf_canary_ckpt_image_listed);
         self.extents
             .entries_from(resume, latch.watermark())
-            .filter(move |(addr, _, _)| latch.form(*addr) == flush::WalkForm::Ref)
+            .filter(move |(addr, _, _)| lists_images || latch.form(*addr) == flush::WalkForm::Ref)
     }
 
     /// Takes the relocation origins of the record at `addr` (M4-S15,

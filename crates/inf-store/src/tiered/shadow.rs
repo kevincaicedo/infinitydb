@@ -1431,6 +1431,12 @@ impl TieredTable {
             if entry.verified_len.is_none() {
                 self.shadow.unverified -= 1;
             }
+            // The planted canary unlatches the winner of a ticket that
+            // ends under a pinned walk (ADR-0093 A12): the walk's later
+            // passes then take it for a record no ticket named.
+            if cfg!(inf_canary_ckpt_form_unlatched) {
+                self.walk_images.retain(|winner| *winner != entry.winner);
+            }
         }
         self.shadow.in_flight.retain(|c| *c != cold);
         self.sync_shadow_pin();

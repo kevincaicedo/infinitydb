@@ -2046,7 +2046,8 @@ The reactor-drive flush state machine (`TierFlush` round state in
   reference_entry`, `a_ticket_that_ends_before_the_images_keeps_its_
   winner_imaged`, `a_ticket_that_ends_after_the_images_keeps_its_blob_
   entry_out_of_the_section` and `a_walk_keeps_the_record_pin_it_began_
-  under_as_its_release_floor`.
+  under_as_its_release_floor`; canaries `inf_canary_ckpt_image_listed`
+  and `inf_canary_ckpt_form_unlatched`.
 - **Nothing is removed on hash evidence** — the only slot removal the
   module performs (`resolve_shadow`, same key) follows
   `decode_record(image).key == record(winner).key` on the verbatim cold
