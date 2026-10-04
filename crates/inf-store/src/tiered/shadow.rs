@@ -885,16 +885,6 @@ impl TieredTable {
         self.shadow_winner_tickets(winner).collect()
     }
 
-    /// Whether an open ticket names `addr` as its winner (the checkpoint
-    /// walk consults this below its watermark — A12). RAM-resident by
-    /// the pin whenever true.
-    #[inline]
-    #[must_use]
-    pub fn is_shadow_winner(&self, addr: LogicalAddr) -> bool {
-        !self.shadow.by_winner.is_empty()
-            && self.shadow.winner_tickets(addr.to_raw()).next().is_some()
-    }
-
     /// Whether `addr` is a ticket's cold address (compaction, promotion
     /// and the write path consult this — D6, A2).
     #[inline]

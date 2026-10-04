@@ -2368,7 +2368,10 @@ fn blob_winner_below_the_watermark(life: &mut Life, key: &[u8], margin: u64) -> 
         panic!("VACUOUS: the winner is not in RAM");
     };
     flush_past(life, winner, margin);
-    assert!(life.table.is_shadow_winner(winner), "VACUOUS: the ticket ended before the walk");
+    assert!(
+        !life.table.shadow_tickets_of_winner(winner).is_empty(),
+        "VACUOUS: the ticket ended before the walk"
+    );
     assert!(
         life.table.extent_reference_at(winner).is_some(),
         "VACUOUS: the winner holds no blob reference"
