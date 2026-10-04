@@ -3330,6 +3330,153 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A blob `SET` of a key whose shadow ticket is open leaves an
+/// extent-typed winner (the reconciler paused keeps the ticket open), and
+/// filler flushes it below the watermark the next walk latches. The walk
+/// images that winner (ADR-0093 A12), so the 0x05 section does not list
+/// its extent (ADR-0061 D6): a boot that registered the reference from the
+/// image and from the section would hold the extent after its last key is
+/// deleted. Two oracles: the published checkpoint read back from the
+/// directory, and the extents live after the restart's `DEL`.
+#[test]
+fn a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone() {
+    let dir = temp_data_dir("blob-winner-imaged");
+    let blob = vec![0xB7u8; 8 << 10]; // 8 KiB ≥ the 4 KiB threshold
+    let filler = vec![b'f'; 3000];
+    let bulk = |v: &[u8]| {
+        let mut e = format!("${}\r\n", v.len()).into_bytes();
+        e.extend_from_slice(v);
+        e.extend_from_slice(b"\r\n");
+        e
+    };
+    let ok = |c: &mut TcpStream, parts: &[&[u8]]| {
+        c.write_all(&cmd(parts)).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    };
+    let tiering = |c: &mut TcpStream, field: &str| scrape_u64(c, b"tiering", field);
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        ok(
+            &mut c,
+            &[
+                b"INF.NS",
+                b"CREATE",
+                b"t",
+                b"MODE",
+                b"durable",
+                b"MEM-BUDGET",
+                b"3mb",
+                b"BLOB-THRESHOLD",
+                b"4kb",
+                b"MUTABLE-FRACTION",
+                b"200",
+            ],
+        );
+        // Promotion off: the cold `GET` below is a witness, never a
+        // relocation. The shadow path on, its reconciler paused.
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"]);
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"]);
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"no"]);
+        ok(&mut c, &[b"INF.NS", b"USE", b"t"]);
+        ok(&mut c, &[b"SET", b"victim", &[b'0'; 1500]]);
+        for i in 0..2400u32 {
+            ok(&mut c, &[b"SET", format!("fill:{i:04}").as_bytes(), &filler]);
+        }
+        wait_demoted(&mut c, 3 << 20);
+        let cold = tiering(&mut c, "tiering_cold_resolves:");
+        c.write_all(&cmd(&[b"GET", b"victim"])).expect("write");
+        read_exactly(&mut c, &bulk(&[b'0'; 1500]));
+        assert!(
+            tiering(&mut c, "tiering_cold_resolves:") > cold,
+            "VACUOUS: the key is not cold before its shadow write"
+        );
+        // The shadow write, then the blob write that moves the open ticket
+        // to an extent-typed winner.
+        let created = tiering(&mut c, "tiering_shadow_created:");
+        ok(&mut c, &[b"SET", b"victim", &[b'1'; 1400]]);
+        assert_eq!(
+            tiering(&mut c, "tiering_shadow_created:"),
+            created + 1,
+            "VACUOUS: the inline write did not take the shadow path"
+        );
+        ok(&mut c, &[b"SET", b"victim", &blob]);
+        assert_eq!(tiering(&mut c, "tiering_shadow_pending:"), 1, "VACUOUS: no ticket is open");
+        // `flushed` past the winner's end: both gauges count from the
+        // life's origin, and the node holds this one tiered table.
+        let winner_end = tiering(&mut c, "tiering_allocated_bytes:");
+        let mut batch = 0u32;
+        while tiering(&mut c, "tiering_flush_confirmed_bytes:") <= winner_end {
+            // Under the 3 MiB window: release is pinned at the winner.
+            assert!(batch < 40, "VACUOUS: 1.9 MiB of filler never flushed the winner");
+            for i in 0..16u32 {
+                ok(&mut c, &[b"SET", format!("late:{batch:02}:{i:02}").as_bytes(), &filler]);
+            }
+            batch += 1;
+        }
+        assert_eq!(
+            tiering(&mut c, "tiering_shadow_pending:"),
+            1,
+            "VACUOUS: the ticket ended before the walk"
+        );
+        ok(&mut c, &[b"INF.CKPT", b"WAIT"]);
+        drop(c);
+        node.stop();
+    }
+    let listed_too = {
+        let ckpt_dir = dir.join("shard-0").join("ckpt");
+        let ick = std::fs::read_dir(&ckpt_dir)
+            .expect("checkpoint directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ick"))
+            .max()
+            .expect("a published checkpoint");
+        let mut imaged: Option<u64> = None;
+        let mut listed: Vec<u64> = Vec::new();
+        let _ = inf_log::ckpt::read_ick_hybrid(
+            &inf_log::fs::StdSegmentFs,
+            &ick,
+            inf_log::ckpt::IckReaderConfig::default(),
+            |record| {
+                if let inf_log::RecordView::StringExtentRef { key: b"victim", extent_id, .. } =
+                    record
+                {
+                    imaged = Some(extent_id);
+                }
+                Ok::<(), ()>(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+            |section| {
+                listed.extend(section.iter().map(|entry| entry.extent_id));
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("the published checkpoint validates");
+        let imaged = imaged.expect("VACUOUS: the checkpoint holds no image of the blob winner");
+        listed.contains(&imaged)
+    };
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    ok(&mut c, &[b"INF.NS", b"USE", b"t"]);
+    c.write_all(&cmd(&[b"GET", b"victim"])).expect("write");
+    read_exactly(&mut c, &bulk(&blob));
+    assert_eq!(tiering(&mut c, "tiering_blob_extents_live:"), 1, "the key's one extent");
+    c.write_all(&cmd(&[b"DEL", b"victim"])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    let live_after_del = tiering(&mut c, "tiering_blob_extents_live:");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    // Both oracles in one verdict, so a red names each.
+    assert_eq!(
+        (listed_too, live_after_del),
+        (false, 0),
+        "the 0x05 section lists the imaged winner's extent, extents live after the key's DEL"
+    );
+}
+
 /// Review of 2026-08-30 (C2′ / F-L06-04 + F-L06-02's BUSY leg): a
 /// failed cold read is a **typed error on every read command** — never
 /// "the key is not there". Before the fix, `MGET` rendered
