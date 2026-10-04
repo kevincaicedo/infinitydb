@@ -1828,8 +1828,9 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "`+OK`; null when NX/XX skips",
         legacy: "same as `$` mode",
         resp3: NULLS,
-        notes: "a missing key takes a root path only; with no match, only a final child name \
-                creates, in every matched object parent (others skipped; ADR-0041 D6); root sets \
+        notes: "a missing key takes a root path only (another path answers `-ERR new objects \
+                must be created at the root`); with no match, only a final child name creates, \
+                in every matched object parent (others skipped; ADR-0041 D6); root sets \
                 preserve TTL",
     },
     ReplyShape {
