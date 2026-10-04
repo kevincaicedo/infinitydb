@@ -73,9 +73,9 @@ impl BufferPool {
     pub fn staged(&self) -> usize;  pub fn available(&self) -> usize;
 }
 
-// ADR-0161 supersedes allocating Arena::new with checked, fallible
-// preparation. The signature below is the existing implementation;
-// the replacement mechanism remains subject to design review.
+// ADR-0161 replaces allocating Arena::new with checked, fallible
+// preparation. The signature below is the implemented shape; the
+// replacement is not built.
 // Record arena (M0-S13): size-class slabs over anonymous-mmap chunks.
 // Classes: 16..=256 in 8 B steps, then ×1.25 geometric to chunk_size/4;
 // larger allocations get dedicated page-rounded mappings (unmap on free).
