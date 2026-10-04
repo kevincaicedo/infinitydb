@@ -140,8 +140,7 @@ resumable commands, and variable-size inputs.
   caller that loops it — never a self-call, and its encoder and printer
   take the same shape (ADR-0125 A4). Its fuzz target lands **in the same
   PR** (L9). Recursion elsewhere needs a proven bound and a reviewer who
-  agrees; the census's remaining rows and their classification are in
-  ADR-0125 A4.
+  agrees (ADR-0125 A4).
 - **Function limit: 70 code lines.** Split by responsibility, keeping the
   transition visible and the helper contract meaningful. ADR-0125 defines
   the mechanical scope:
@@ -203,8 +202,7 @@ addresses, lifetime-cumulative offsets, generation bits) states its
 exhaustion policy where it is declared. One `const` owns each on-disk or
 wire bound and both encoder and decoder consume it — a writer that can
 emit what the reader refuses is a defect at default flags. Until the
-workspace `limits` table exists (its ADR is owed; the scattered
-constants are an open finding), a new bound is a named `const` in its
+workspace `limits` table exists, a new bound is a named `const` in its
 crate's `limits` module with the crossing behavior in its doc comment —
 never a literal at the use site.
 

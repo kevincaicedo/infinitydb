@@ -110,9 +110,17 @@ impl Arena {
 > `KeyedGate<K, V, Cleanup>` reserves routing and holder capacity before
 > request publication; completed values retain their payload ownership.
 > `IoGate<Cleanup>` keeps its name with an explicit terminal-cleanup
-> policy. The ADR owns the new admissions, transitions and failure rules.
-> The complete resource proof and independent review remain owed; the old
-> signatures below do not establish that the replacement is built.
+> policy. Admission: `reserve` answers Granted, Full, Closed, identity
+> exhaustion or a foreign class, no refusal owns the future or its
+> factory, and a producer reserves before it dequeues work or causes an
+> effect. Transitions: a class slot is Free, Reserved, Active or Retired;
+> a completed future is dropped once, and its slot returns only when no
+> external waker remains (Reserved + Active + Retired ≤ the class's
+> slots). Failure: a construction refusal releases partial backing and
+> takes part in the all-cells boot barrier, and task-identity exhaustion
+> is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
+> signatures below are the implemented shape; the replacement above is
+> not built.
 
 > **Accepted 2026-09-22, implementation open — ADR-0151:**
 > fixed storage and bounded cell maps
@@ -120,8 +128,12 @@ impl Arena {
 > adapter and `WaitList` keys to the foundation's sealed key domain.
 > Fabric and I/O gates retain their current key types and every identity
 > bit. Admission, terminal cleanup and the 5 ns executor gate are unchanged.
-> The ADR owns the representation contract; complete backing and owner
-> proofs and independent review still precede implementation.
+> A key is a sealed, fixed-width exact representation (an integer of at
+> most 128 bits, a pair of `u64`s, the unit key or a foundation ID with an
+> exact integer form), compared with constant work and never through a
+> caller's `Hash` or comparison. A map answers `Occupied`, `Vacant` or
+> `Full`, and a vacant slot fixes the key and every tree position before
+> the payload is built (ADR-0151 D1, D2).
 
 > **Accepted 2026-09-22, implementation open — ADR-0154:**
 > fixed timer ownership and bounded callback delivery
@@ -133,10 +145,14 @@ impl Arena {
 > 64 callbacks per native turn and one successor after consumption.
 > LoopCx exposes admitted owner/arm operations, not unbounded advance or
 > allowance reset. The runtime retains the terminal receipt; a raw route
-> key cannot authorize callback delivery to a replacement owner. The ADR
-> owns this replacement contract; the complete Rust surface/resource/host
-> proof and independent mechanism review are still owed. The old
-> implemented sketch is not evidence that the accepted replacement exists.
+> key cannot authorize callback delivery to a replacement owner. A full
+> set refuses before publication and never allocates or drops a wake;
+> arming an owner during its delivery answers Busy; a stale owner, arm or
+> receipt gets a typed stale result; and close wins over a successor. A
+> deadline is normalized to no earlier than the next millisecond after the
+> current turn, and clock-range exhaustion is a typed error before arming
+> (ADR-0154 D1–D3). The sketch below is the implemented shape; the
+> replacement above is not built.
 > The ten phases, one backend entry and existing gates remain unchanged.
 
 > **Accepted 2026-09-22, implementation open — ADR-0147:**
@@ -145,12 +161,19 @@ impl Arena {
 > `IoOp::AcceptPark { listener: RawFd, token: CompletionToken }`,
 > `CompletionResult::AcceptParked`, and the routing classes
 > `TokenClass::RefusalSend` / `TokenClass::RefusalClose`; the token layout
-> is unchanged. The ADR owns generation checks, terminal custody, limits
-> and error/explicit-park precedence. `AcceptParked` settles both original
-> accept and cancellation completions, not just the cancel request.
-> The complete design review, implementation and churn evidence are still
-> owed. The implemented sketch below remains the earlier shape until
-> that build; it is not evidence that these accepted additions exist.
+> is unchanged. A stale generation never retargets a successor listener,
+> and an exhausted generation retires its identity instead of wrapping. A
+> native socket stays counted from delivery until a reserved connection
+> slot, a fabric handoff or its terminal close takes it. Each listener has
+> at most 16 one-shot accept attempts (`ACCEPT_ATTEMPTS_PER_LISTENER`) and
+> each cell at most 64 native custodies
+> (`NATIVE_ACCEPT_CUSTODIES_PER_CELL`): a cell parks at 48 and resumes only
+> after `AcceptParked`, with at most 32 left. An accept error parks
+> production too, and neither its retry timer nor an unrelated close
+> clears an explicit park (ADR-0147 D1–D3). `AcceptParked` settles both
+> original accept and cancellation completions, not just the cancel
+> request. The sketch below is the implemented shape; these additions are
+> not built.
 
 > (edition-2024 keyword), the Pin-sound `PollImmediate` shape,
 > `FabricGate<V>`, `submit_stats()`/`performance_tier`, fallible
@@ -242,17 +265,23 @@ impl Arena {
 > prevents parking.
 > Device receipt returns QD, while file/buffer custody remains through
 > final value drop. Routing and holder storage cover deferred delivery;
-> latency includes that delay. The ADR owns the exact transitions and
-> observables. Complete design review still precedes implementation;
-> the old source is not evidence that this accepted replacement is built.
+> latency includes that delay. A window goes Free → Issued (it owns the
+> buffer, its member prefix and every file pin) → Ready at the device
+> receipt → one member per budgeted step, and back to Free only when no
+> unvisited member or delivered value remains; a cancelled member costs a
+> step like an orphan. `cold_reads_inflight` keeps counting reads that
+> await the device; pending-delivery members and windows and delivery
+> work get their own counters; and `cold_read_p99_us` samples at logical
+> delivery, with device-to-delivery delay observed apart (ADR-0152 D3,
+> D4). The `on_completion` fan-out above is the implemented shape; this
+> replacement is not built.
 
 > **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional early executor
 > pass precedes `parse_execute`. The
 > A1 correction
 > adds a default-no-op `CellPlane::before_execute` hook after FABRIC-IN
 > and before both scheduled executor passes, borrowing one native-turn
-> cold budget from `LoopCx`. The owner independently accepted the seam;
-> complete design review still precedes its implementation.
+> cold budget from `LoopCx`.
 
 > **Accepted 2026-09-22, implementation open — ADR-0152 A2:**
 > bounded preparation
@@ -262,10 +291,15 @@ impl Arena {
 > adds typed progress/cancellation notification with one retry timer.
 > Both `drain` and `drain_budgeted` receive `&mut ColdPreparationBudget`
 > and return `ColdPreparationProgress`; `has_ready_preparation() -> bool`
-> reads stored readiness. The ADR owns the exact work/member bounds,
-> progress reasons, permanent identity refusal and ColdWait notification
-> contract. The owner independently accepted them; complete design
-> review still precedes implementation.
+> reads stored readiness. A turn spends at most
+> `COLD_PREPARATION_WORK_PER_TURN` = 64 work units (a head inspection one,
+> any other candidate two), so a cohort holds at most 31 members. The
+> drain reports `Idle`, `CpuPending`, `WaitDevice`, `WaitPool` or
+> `WaitIoBudget`, and only `CpuPending` asks for another immediate turn.
+> An exhausted identity pair is the permanent
+> `ColdRefused::IdentityExhausted`, answered before any queue, gate or
+> pin is published. A cancelled `ColdWait` notifies the cold owner after
+> the gate restores custody (ADR-0152 A2).
 
 > **Accepted 2026-09-22, implementation open — ADR-0153:**
 > cold-pool construction and native registration
@@ -273,9 +307,14 @@ impl Arena {
 > lifecycle. Registration remains on the issuer, with a ring-owned sparse
 > table and bounded native batches/terminal tags. It replaces the borrowed
 > register_tier_pool method with owned ColdPoolBind/ColdPoolClose operations
-> and ColdPoolReady/ColdPoolReleased receipts under the ADR's identity,
-> admission and cleanup rules. The owner independently accepted the seam;
-> complete design review remains required before implementation.
+> and ColdPoolReady/ColdPoolReleased receipts. A binding reserves a
+> non-wrapping pool identity and its native resource IDs before any
+> effect, and an old, duplicate or foreign receipt never releases current
+> backing. No cold read is admitted before the binding answers
+> `ReadyFixed` or `ReadyPlain`, and a serving turn makes at most one
+> registration call of at most 16 entries and 64 KiB. On failure or close
+> the installed prefix is kept, reads and held values are joined, and the
+> registrations are removed by the same bounded protocol (ADR-0153 D2–D4).
 
 ```rust
 pub struct CompletionToken(u64);           // {class:8, slot:24, gen:32}
@@ -419,11 +458,17 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > adds `Outcome::StreamReady`, `Op::StreamStep` and `Op::StreamResult`.
 > Separate progress credits carry chunk pulls and terminal cancellation;
 > returning the opening request's data credit does not release its stream
-> resources. The ADR owns the encodings, identity lifetimes, chunk limits
-> and revised ring/headroom equation. The complete source/resource proof
-> and independent review are still owed. The implemented codec and
-> data-credit sketch below do not establish these additions or a complete
-> retained-reply byte bound.
+> resources. `StreamReady` is outcome tag 6 carrying the stream's request
+> token and owner generation; `StreamStep` (opcode 8) and `StreamResult`
+> (opcode 9) carry a progress token, the stream, a sequence and an action
+> or result, little-endian; generation zero, an unknown tag or an
+> oversized chunk is a decode error. Owner generations and sequences
+> never wrap: exhaustion refuses before any effect. A chunk is at most
+> `REPLY_CHUNK_BYTES_MAX` = 65,536 encoded bytes and fits one frame, and a
+> ring needs `capacity >= 2 × (data_credits + progress_credits)`, one
+> progress credit per ring (ADR-0150 D3, D4, A1). The codec and
+> data-credit sketch below are the implemented shape: these additions
+> are not built, and it bounds no retained reply's bytes.
 
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
@@ -511,8 +556,8 @@ Ordinary connections start with `program = false`. `CmdFlags::INTERNAL`
 commands are refused as unknown before arity checks on client execution,
 and hidden by client `COMMAND` introspection. Pre-registry program verbs
 are intercepted only for marked execution. This is an execution class
-between cells in one process, not authentication or an ACL capability.
-See ADR-0115.
+between cells in one process, not authentication or an ACL capability
+(ADR-0115).
 
 ## 5. `inf-wire` — RESP port + command metadata (implemented — the code is the spec)
 
@@ -622,11 +667,18 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest orac
 > Keyspace materializers shown in this historical sketch. Checked plans
 > and private owners prepare children, destination and cleanup capacity
 > before one allocation-free publication; installed lookup cannot allocate.
-> The ADR owns replacement/clear capacity, LFU policy preparation, recovery
-> life selection and the store-resource error. SELECT publishes its binding
-> only after preparation succeeds. Concrete factories and complete resource
-> proofs remain open; independent mechanism review precedes
-> production implementation. The signatures below do not claim otherwise.
+> A replacement holds the old owners' cleanup slots and all new backing
+> before one atomic swap, and a clear admits its empty representation and
+> cleanup headroom with the store's capacity, never allocating after it
+> releases the old contents. LFU sketches are prepared before the policy
+> is published; a refusal keeps the old policy. Boot picks each tier's
+> recovery life (the manifested watermark, or a fresh life) before it
+> builds that tier's one table. A store resource refusal answers
+> `-OOM store reservation refused` and changes neither the command's
+> effects nor the connection's selection (ADR-0161 D3–D5, ADR-0172 D3).
+> SELECT publishes its binding only after preparation succeeds. The
+> signatures below are the implemented shape; the replacement above is
+> not built.
 
 > Deviations from the original sketch: the
 > "8 B fixed" header is honored by
@@ -702,10 +754,16 @@ impl SlotRouter {
 > §6c's whole-reply observer input with bounded begin/chunk/end or abort
 > events. Existing buffered writer rollback remains for bounded callers;
 > streaming JSON measures its immutable source before publishing headers.
-> The ADR owns admission, framing, ordering and terminal cleanup. These
-> replacements are unbuilt, and their source/resource mechanisms and
-> independent review remain owed; the sketches below show the earlier
-> execution and observer interfaces.
+> A reply grant is reserved before the command's effects, and a result of
+> unknown size never upgrades its grant after a mutation. An array header
+> fixes the cardinality; each bulk header is measured from the same
+> immutable source emission reads; an I/O failure after output starts
+> closes the connection rather than send a partial reply. Command and
+> effect order, argv order and PUBLISH's reply before its self-push stay.
+> A stream frees its slot only when every custody is terminal, and a
+> waiter's drop is not a cancellation acknowledgement (ADR-0150 D1, D2,
+> D4, D5). These replacements are not built; the sketches below are the
+> implemented execution and observer interfaces.
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
@@ -832,8 +890,7 @@ shapes unchanged). Additive deltas: `OpError` + `NotFloat | NanOrInf`;
 `KeySpec::{TWO, PAIRS, SECOND}`; `NodeInfo` + wall-clock anchor / RNG state /
 client registry / CONFIG store; new `inf-store` inherent methods for the
 M1-E1 ops and `expire_tick` (M1-E2). Deadlines past the u40-ms record bound
-now clamp (previously a latent panic). See ADR-0008 (M1-E1 interface
-extensions; internal decision record).
+now clamp (previously a latent panic; ADR-0008).
 
 **M1-S04 expiry schedule note (2026-09-30, ADR-0008 A1):** one wheel node
 per key hash with a deadline, and a key the node budget refuses is swept,
@@ -859,9 +916,8 @@ changed shape — `execute(...)` and `ServerPlane::new(...)` now take
 `inf_store::Keyspace` (one cell's slice of every namespace: 16 lazily
 materialized default dbs + named-ns registry + pressure driver) instead of
 `CellStore`, whose own frozen method set was unchanged behind
-`Keyspace::db_mut(n)` at M1. Accepted ADR-0161 now supersedes that
-implicit construction crossing as recorded in §6; implementation remains
-open. `ConnCx` gains `db: u16`. Additive deltas: registry
+`Keyspace::db_mut(n)` at M1. §6's replacement of that implicit
+construction crossing (ADR-0161) is not built. `ConnCx` gains `db: u16`. Additive deltas: registry
 57 → 58 (`INF.NS`); `CmdFlags::DENYOOM` (the M1-S07 OOM gate enters through
 metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
 `StoreConfig` + `evict_seed`; new `inf-store` types `Keyspace` /
@@ -869,8 +925,8 @@ metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
 `NsMode` / `NsSpec` / `NsError`; `Index::live_walk` (read-only clock-hand
 iteration). The fabric codec is unchanged; `Op::Apply`'s `cmd` byte packs
 `{db:4 | proto:4}` (old encodings decode as db 0). The record header's two
-spare flag bits became the CLOCK reference counter (layout untouched). See
-ADR-0009 (M1-E3/E4 keyspace + eviction; internal decision record).
+spare flag bits became the CLOCK reference counter (layout untouched;
+ADR-0009).
 
 **M1-E5 extension note (2026-06-12, ADR-0010):** all deltas additive. The
 registry grew 58 → 64 (SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/
@@ -884,8 +940,7 @@ designed). `RespWriter` + `push_header` (RESP3 push / RESP2 array).
 unchanged: the pub/sub fan-out vocabulary (`INF.PUB`/`INF.PUBFAN`/
 `INF.SUBD`/`INF.PUBSUB`) rides `Op::Apply` as unregistered argv programs
 intercepted by the plane ahead of `execute` — invisible to clients,
-reserved names for the fabric. See ADR-0010 (M1-E5 pub/sub plane; internal
-decision record). **ADR-0101 (2026-09-01):** `INF.PUB`
+reserved names for the fabric (ADR-0010). **ADR-0101 (2026-09-01):** `INF.PUB`
 and the owner's `INF.PUBFAN` leg *to the origin cell* carry two optional
 trailing arguments — the publisher tag `conn seq` (the origin's packed
 connection key and its remote-publish sequence, decimal, opaque to the

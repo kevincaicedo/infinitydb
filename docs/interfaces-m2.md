@@ -527,10 +527,18 @@ the `SegmentFs` seam (→ `BackendDriver` at S05):
 - `ReaderConfig{chunk_bytes = 1 MiB, max_frame_len}`; window grows only
   when a frame exceeds it (bounded by `max_frame_len`).
 
-These are reader facts; recovery owns tail policy under
-ADR-0018 and
-ADR-0090 D2. B18-23-R11 propagates the implemented contract; no decoder,
-format or recovery policy changes with this documentation update.
+These are reader facts; recovery decides from them. A validating frame
+beyond a segment's data end marks a hole. Recovery refuses to start, with
+a `LogCorruption` naming the corruption point and the evidence, when a
+frame beyond the hole is format v1 or a surviving frame attests fsync
+coverage past it; otherwise it truncates at the hole and counts the
+frames it discards. Frames whose epochs all sit below the replayed
+prefix's, or whose own `first_lsn.segment` is not the segment they were
+read from, are residue of a discarded or recycled life, never a hole.
+Non-validating residue at the resume point is a torn tail (the tail
+pointer moves back; no byte is rewritten); behind it, residue is
+tolerated and counted. A log that ends below the MANIFEST's begin-LSN
+refuses to start (ADR-0018 D2/D5, ADR-0031 D4/D5, ADR-0090 D2).
 
 ## Driver file ops (`inf-runtime`, M2-S05, ADR-0013 D1)
 
@@ -1480,12 +1488,21 @@ per episode). A drained cell always seals — never slower than K = 1.
   amends the namespace DDL contract below. The catalog writer reserves a
   tiered lifetime grant before publication; `CreateApplied` does not
   return it. Durable removal plus every cell's terminal-cleanup receipt
-  permits reuse. The ADR owns the capacity/refusal, namespace-ID exhaustion,
-  startup admission and origin-failure/cancellation contracts. The existing
-  nine-argument fan and durable formats remain. These changes are not yet
-  implemented; the complete resource/producer proofs and independent
-  review precede code. The historical implementation descriptions below do not
-  establish those new obligations.
+  permits reuse. A node admits at most 64 tiered namespace lifetimes
+  (`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`; reserved, declared and
+  retiring alike). At capacity a tiered `CREATE` reserves nothing and
+  answers `-TRYAGAIN tiered namespace capacity in use` while a grant is
+  retiring, else `-ERR tiered namespace limit reached`. Namespace IDs
+  never repeat: allocation answers `ERR namespace identity space exhausted`
+  before the `u32` counter wraps. Boot refuses a catalog with more than 64
+  live tiered definitions with a typed startup error and serves none of
+  it. After `META` publishes a create, an origin that fails to construct
+  rolls back as a refused peer does (durable withdrawal, a `DROP` fan, the
+  grant held to terminal cleanup), and a disconnect after the persist
+  request cannot abandon the create (ADR-0148 D1, D4, D5, A1; ADR-0172
+  D3). The existing nine-argument fan and durable formats remain. These
+  changes are not built; the descriptions below are the implemented
+  contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
@@ -1495,8 +1512,10 @@ per episode). A drained cell always seals — never slower than K = 1.
      → wait `persisted(epoch)` → read the `CreateVerdict` → apply
      locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
      `create_applied(id)` → `+OK`*. No cell names a namespace before
-     `META` does. `SET` keeps *apply → fan → persist → ack*; `DROP`
-     follows ADR-0100 D4.
+     `META` does. `SET` keeps *apply → fan → persist → ack*. `DROP`
+     requests its persist before the fan, and the fan carries that
+     persist's epoch (ADR-0100 D4): *apply → request persist → wait
+     durable → fan → request a node checkpoint + stamp → `+OK`*.
   2. **The writer's pending-create set** (`inf-server::control`,
      ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
      CreateVerdict)`; the writer merges every pending spec the payload
@@ -1604,11 +1623,12 @@ per episode). A drained cell always seals — never slower than K = 1.
   2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
      the persist epoch of the swap that drops the namespace; peers park
      their tier-file teardown until `ControlHandle::persisted(epoch)`
-     (ADR-0100 D5). `DROP` itself runs *apply → request persist → fan →
-     wait → request checkpoint + `StampDrop` → `+OK`* (ADR-0100 D4);
-     `CREATE`/`SET` keep the ADR-0015 D3 order. `Keyspace::ns_drop`
-     returns the dropped `NsSpec`; `ns_tombstoned`/`ns_tombstones`
-     expose the boot snapshot to recovery.
+     (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait →
+     fan → request checkpoint + `StampDrop` → `+OK`*; `CREATE` persists
+     before it serves (item 1 of the `CREATE` choreography above) and
+     `SET` runs *apply → fan → persist → ack* (ADR-0015 D3).
+     `Keyspace::ns_drop` returns the dropped `NsSpec`;
+     `ns_tombstoned`/`ns_tombstones` expose the boot snapshot to recovery.
   3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
      tier section naming an id the catalog does not know is skipped and
      its `shard-k/ns-N/cold` files unlinked **iff the id is tombstoned**
@@ -1894,12 +1914,9 @@ call sites after the split).
 **Open conformance gap (2026-09-22):** one in-flight round does not
 bound its staged bytes/operations. A production-API coarse-cut witness
 reaches the operation assertion with validated geometry. The existing
-token/custody/durability contracts remain binding; complete pre-effect
-admission and full-host reachability proof remain open.
-ADR-0155 (accepted
-2026-09-22) supersedes the affected round/preparation/issue contract. Its
-replacement is unbuilt. The full container mechanism
-remains Draft and needs independent review before production changes.
+token/custody/durability contracts remain binding. ADR-0155 (accepted
+2026-09-22) supersedes the affected round/preparation/issue contract;
+its replacement is not built.
 
 The reactor-drive flush state machine (`TierFlush` round state in
 `inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell.rs`):

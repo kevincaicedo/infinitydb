@@ -14,26 +14,28 @@ Status column tracks arrival.
 | Index catalog persistence (namespace-catalog payload **v3**; v2 byte-identical while pristine) | `inf-store` (encoding) / `inf-server` (swap) | implemented (M4.5-S03, ADR-0075 D2 — index records + never-regressing id/generation counters ride the `META` swap; `fuzz_catalog` in the same PR) |
 | Declaration lifecycle {declared → backfilling → ready → dropping} + fleet-readiness aggregation | `inf-store` / `inf-server::control` | implemented (M4.5-S03, ADR-0075 D3–D5 — explicit invalid-transition rejection; `IndexBoard` per-cell × per-slot ready generations; catalog `ready` ⟺ every cell reports the exact generation) |
 | Cursor/compile binding gate `{ns, index id, generation}` | `inf-store` | implemented (M4.5-S03, ADR-0075 D7 — `IndexRegistry::validate_binding`, typed `{UnknownIndex, StaleGeneration, NotReady}`; S09/S11 consult it) |
-| At-mutation maintenance hook (the ADR-0072 bracket + removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04; mechanics ADR-0139 — alias-group identity, coverage by entry point and full key, bounded enumeration; attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
+| At-mutation maintenance hook (a bracket around each indexed write — pre-image evaluation and node reservation before the mutation applies, post-image diff and tree ops after its effect stages, ADR-0072 D3 — plus the record-death removal sites) | `inf-store`/`inf-server` | implemented (M4.5-S04; mechanics ADR-0139 — alias-group identity, coverage by entry point and full key, bounded enumeration; attach-block custody, the keyed-hash pk ref (`KeyHasher`, ADR-0094 — `hash64(key)` before 2026-08-28), the numbered-db funnel bracket, death hook + truncate + replay arm) |
 | Backfill state machine (MAINTAIN slices, resumable watermark) | `inf-store` | implemented (M4.5-S05, ADR-0077 — store-resident walk, volatile resume-only watermark (crash ⇒ restart), per-index jobs, slot = id-rank, MAINTAIN-edge catalog flip) |
-| Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078 under the ADR-0073 constraints — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
+| Index checkpoint sidecar v1 (`.ick` v2 tag 0x06) | `inf-log` | implemented (M4.5-S06, ADR-0078; tag 0x06 on `.ick` v2, framed `{tag, body_len, entry_count}` before the footer like every section, CRCs in the footer's digest chain, outside the per-namespace entry counts, one namespace per section, each body bound to `{index id, generation}` and the key-encoding version, ADR-0073 — 36-byte self-describing body meta `{ns, index id, generation, key-encoding version, key scheme, flags, entries_before, total_entries}` + strictly-ascending `(typed key bytes, entry_ref)` pairs, FINAL-closed streams; the only *soft* body class: damage rebuilds one projection, never refuses a boot) |
 | Access-program form v1 | `inf-query` | implemented (M4.5-S09, ADR-0080 — `access::AccessProgram`: one access step + residual + page spec, serialized/versioned, `from_bytes` trust boundary; EXPLAIN rendering golden-pinned) |
 | PartiQL subset v1 (grammar + total compiler + statement cache) | `inf-query` | implemented (M4.5-S09, ADR-0080 — `partiql::compile`/`StatementCache`/`CatalogView`; contract: `docs/partiql-subset.md` + the 303-case golden suite) |
 | Predicate VM bytecode v1 | `inf-query` | implemented (M4.5-S07/S08, ADR-0079 — `predicate::PredicateProgram` + `PredicateVm`; this row lagged those stories and is corrected at S09) |
 | `QueryOp` codec (fabric v1.2) | `inf-fabric` | pending (M4.5-S11) |
 | Cursor wire format (opaque, CRC + version + shape + {index id, generation} binding) | `inf-server` | pending (M4.5-S11 — the binding half exists as `validate_binding`, S03) |
 
-## Registration surface (M4.5-S03, ADR-0075 — the ADR-0072 D2 contract as-built)
+## Registration surface (M4.5-S03; ADR-0075, ADR-0072 D2)
 
 - **Per-cell registry:** `Keyspace::idx_create / idx_drop_finish /
   idx_registry[_mut] / ns_has_indexes` in `inf-store`. DDL-rate only; the
   mutation path consults a cached per-namespace flag (S04 wires it) —
   never the registry.
 - **Lifecycle:** `IndexRegistry::set_catalog_state / set_cell_state /
-  rebuild` enforce the ADR-0075 D3 edge set; `Keyspace::idx_rebuild`
-  bumps the generation and resets the owning store's tree in one
-  transition. Catalog state is the planning authority; per-cell state
-  is backfill progress.
+  rebuild` admit declared → backfilling → ready, ready → backfilling
+  only as a rebuild with a fresh generation, and declared, backfilling or
+  ready → dropping; every other edge is a typed `InvalidTransition`
+  (ADR-0075 D3). `Keyspace::idx_rebuild` bumps the generation and resets
+  the owning store's tree in one transition. Catalog state is the
+  planning authority; per-cell state is backfill progress.
 - **Persistence:** declarations ride the namespace catalog (payload v3)
   through the existing control-thread `META` swap — persist-then-ack
   unchanged; `ControlHandle` allocates index ids and generations
@@ -185,7 +187,7 @@ Status column tracks arrival.
   renders `idx_backfill_*`; per-index rendering rides S10's
   `INF.IDX LIST`. DST: `inf-sim --scenario m45-backfill`.
 
-## Sidecar surface (M4.5-S06, ADR-0078 — the ADR-0073 constraints as-built)
+## Sidecar surface (M4.5-S06; ADR-0078, ADR-0073)
 
 - **Writer:** the checkpoint's sidecar phase runs after `walk_done`
   (derived data last) — `Keyspace::idx_sidecar_candidates` captures the
@@ -237,7 +239,7 @@ Status column tracks arrival.
   the S05 machine rebuilds. DST: `inf-sim --scenario m45-sidecar`;
   crash rows: `tests/crash-matrix/tests/sidecar.rs`.
 
-## Compiler surface (M4.5-S09, ADR-0080 — the ADR-0024 D2 fence as-built)
+## Compiler surface (M4.5-S09; ADR-0080, ADR-0024 D2)
 
 - **Total compilation:** `inf_query::partiql::compile[_with_max_bytes]`
   — statement text → `CompiledStatement { program, access, vm }`, or a
@@ -261,8 +263,11 @@ Status column tracks arrival.
   at compile); `{index id, generation, key type}` ride the program and
   re-assert at the executing cell via `validate_binding`.
 - **Range bounds (ADR-0080 D3):** constructed against the S02 encoding
-  — `begins_with` on the ADR-0074 D2 prefix property
-  (`index_key_escape_prefix`, new in `inf-store::index_key`, owns the
+  — `begins_with` on the string encoding's prefix property: `s` starts
+  with `p` exactly when `enc(s)` starts with `escape(p)` (`enc(p)` without
+  its terminator), so the bounds are `escape(p)` and `escape(p)` with its
+  last non-0xFF byte incremented (ADR-0074 D2;
+  `index_key_escape_prefix`, new in `inf-store::index_key`, owns the
   escape image), cross-numeric bounds via integral tightening (i64
   index) and encoded-word neighbor stepping (f64 index), reversed/
   contradictory ranges compile empty (never an error). Proven by the
