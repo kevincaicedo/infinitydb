@@ -300,6 +300,11 @@ rows=(
   # winner's entry in the 0x05 section too (the blob census).
   "inf_canary_ckpt_form_unlatched crate-test inf-store test:tiered_replay a_ticket_that_ends_before_the_images_keeps_its_winner_imaged (a)"
   "inf_canary_ckpt_form_unlatched crate-test inf-store test:tiered_replay a_ticket_that_ends_after_the_images_keeps_its_blob_entry_out_of_the_section its refcount is the slots that name it"
+  # The same plant in the DST, on a seed of m4-recovery's spec-variant
+  # class where a collision ticket ends between the two index passes and
+  # the cut comes before the key is written again: the checkpoint holds
+  # the winner in neither pass, so the boot loses an acknowledged key.
+  "inf_canary_ckpt_form_unlatched m4-recovery never-none --spec-variant page --seed 0xC11E8F"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
@@ -421,7 +426,9 @@ for row in "${rows[@]}"; do
     tail -5 "$log"
     fail=1
   else
-    echo "   caught: $(grep -m1 -- "$expect" "$log" | cut -c1-160)"
+    # A violation line may quote a key's raw bytes: read the log as text
+    # and drop the control bytes, or the catch prints nothing.
+    echo "   caught: $(grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160)"
   fi
   echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
   "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
