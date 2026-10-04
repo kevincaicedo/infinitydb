@@ -1842,7 +1842,7 @@ fn control_main(
                     // persistence, checkpoint epochs, and delegated
                     // unlinks silently dead (the ADR-0026 D2
                     // swallowed-death class; M2.5-S16 audit fix).
-                    eprintln!("FATAL: catalog META swap failed (fail-stop, §8.4): {err}");
+                    eprintln!("FATAL: catalog META swap failed (fail-stop): {err}");
                     std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
                 }
                 persisted.store(epoch, Ordering::Release);

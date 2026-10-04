@@ -1428,7 +1428,7 @@ impl<F: SegmentFs> DurableCell<F> {
     /// M2-S17, ADR-0020 D3).
     pub fn fail_stop(&mut self, what: &str, detail: &str) -> ! {
         self.failed = true;
-        eprintln!("durable-path {what} failed (fail-stop, §8.4): {detail}");
+        eprintln!("durable-path {what} failed (fail-stop): {detail}");
         std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
     }
 

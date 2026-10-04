@@ -169,7 +169,7 @@ impl fmt::Display for LogCorruption {
         write!(
             f,
             "log corruption in {} at {:#x}: {}; a validating frame follows at {} offset {:#x} — \
-             interior data would be lost by truncation, refusing to start (§8.4)",
+             interior data would be lost by truncation, refusing to start",
             self.segment, self.offset, self.detail, self.evidence_segment, self.evidence_offset
         )
     }

@@ -942,8 +942,8 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         m.note(format!(
             "data root is {root_fstype} (memory-backed): the durable rows measure the page \
              cache, not a device — dev-tier smoke only; the everysec row writes ~13 GB with \
-             truncation disabled and a 16 GB tmpfs exhausts mid-row (engine fail-stops per \
-             §8.4). Pass --data-root on the filesystem under test."
+             truncation disabled and a 16 GB tmpfs exhausts mid-row (the engine \
+             fail-stops). Pass --data-root on the filesystem under test."
         ));
     }
     if !reference_box {

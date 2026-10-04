@@ -2063,7 +2063,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         {
             return Err(io_msg(format!(
                 "the log's valid data ends at {resume}, below the MANIFEST begin-LSN {begin}: \
-                 fsync-covered bytes are missing — refusing to start (§8.4)"
+                 fsync-covered bytes are missing — refusing to start"
             )));
         }
         if torn {

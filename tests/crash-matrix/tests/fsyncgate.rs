@@ -115,7 +115,7 @@ fn start_node(
         while !stop.load(Ordering::Relaxed) {
             cell_loop.run_iteration(&mut plane).expect("iteration");
             if let Some(err) = plane.take_boot_error() {
-                panic!("recovery failed (fail-stop, §8.4): {err}");
+                panic!("recovery failed (fail-stop): {err}");
             }
         }
     });
@@ -266,7 +266,7 @@ fn fsyncgate_fail_stop() {
     let mut stderr = String::new();
     child.stderr.take().expect("piped").read_to_string(&mut stderr).expect("stderr");
     assert!(
-        stderr.contains("fail-stop, §8.4") && stderr.contains("errno 5"),
+        stderr.contains("(fail-stop)") && stderr.contains("errno 5"),
         "typed fail-stop line missing from stderr: {stderr}"
     );
 

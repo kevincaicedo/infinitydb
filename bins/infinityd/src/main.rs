@@ -918,7 +918,7 @@ fn main() {
         let catalog = match inf_server::load_catalog(&dir) {
             Ok(catalog) => catalog,
             Err(e) => {
-                eprintln!("infinityd: catalog load failed (fail-stop, §8.4): {e}");
+                eprintln!("infinityd: catalog load failed (fail-stop): {e}");
                 std::process::exit(1);
             }
         };
@@ -1425,7 +1425,7 @@ fn cell_main(
         if let Some(err) = plane.take_boot_error() {
             // §8.4 fail-stop: recovery refused — the whole node stops,
             // immediately (a half-recovered node must never serve).
-            eprintln!("infinityd: cell {cell} boot failed (fail-stop, §8.4): {err}");
+            eprintln!("infinityd: cell {cell} boot failed (fail-stop): {err}");
             std::process::exit(1);
         }
         if deadline.is_none() && wiring.stop.load(std::sync::atomic::Ordering::Acquire) {

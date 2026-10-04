@@ -105,7 +105,7 @@ fn interior_corruption_refuses_to_start_naming_segment_and_offset() {
     let err = recover(&fs, &mut ks).expect_err("interior corruption is fail-stop");
     let msg = err.to_string();
     assert!(msg.contains("seg-000000"), "names the segment: {msg}");
-    assert!(msg.contains("refusing to start"), "explicit refusal: {msg}");
+    assert!(msg.ends_with("refusing to start"), "explicit refusal: {msg}");
     assert!(msg.contains("validating frame follows"), "names the evidence: {msg}");
 }
 
@@ -483,7 +483,9 @@ fn torn_tail_below_the_manifest_begin_lsn_refuses_to_start() {
 
     let mut ks = fresh_keyspace();
     let err = recover(&fs, &mut ks).expect_err("truncation below begin is lost covered state");
-    assert!(err.to_string().contains("below the MANIFEST begin-LSN"), "{}", err.to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("below the MANIFEST begin-LSN"), "{msg}");
+    assert!(msg.ends_with("fsync-covered bytes are missing — refusing to start"), "{msg}");
 }
 
 #[test]

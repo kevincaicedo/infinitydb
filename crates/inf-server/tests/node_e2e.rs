@@ -641,7 +641,7 @@ impl Node {
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
                     if let Some(err) = plane.take_boot_error() {
-                        panic!("cell {i} recovery failed (fail-stop, §8.4): {err}");
+                        panic!("cell {i} recovery failed (fail-stop): {err}");
                     }
                     if graceful.load(Ordering::Relaxed) {
                         plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
@@ -693,7 +693,7 @@ impl Node {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !control.recovery_board().all_ready() {
                 // A cell thread that exited during recovery panicked on
-                // its boot error (fail-stop, §8.4): report that now, with
+                // its boot error (fail-stop): report that now, with
                 // the refusal on stderr, instead of a 30 s timeout.
                 assert!(
                     !node.handles.iter().any(std::thread::JoinHandle::is_finished),
@@ -4838,7 +4838,7 @@ fn large_values_checkpoint_within_the_loader_bound_and_reboot() {
     assert!(ick[0] > 70 << 20, "the checkpoint carries every image ({} B)", ick[0]);
 
     // Pre-fix the harness panicked here: `cell 0 recovery failed
-    // (fail-stop, §8.4): ... SectionTooLarge`.
+    // (fail-stop): ... SectionTooLarge`.
     let node = Node::start_durable(1, &dir);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"USE", b"big"])).expect("write");
