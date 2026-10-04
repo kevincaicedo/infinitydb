@@ -2040,14 +2040,15 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `WalkLatch::form` is the one producer of a `WalkForm`; the walk's two
   index passes (`ckpt_walk_slice_bounded`) and its 0x05 pass
   (`extent_ckpt_entries_from`) read nothing else, in every writer. The
-  walk pin holds release at the lowest latched winner until the walk
-  ends, so a ticket that ends mid-walk leaves its winner imaged and
-  RAM-resident. Pinned by `an_imaged_ticket_winner_is_not_also_a_blob_
+  walk pin holds release at the lowest latched winner, which the table
+  hands it from the latch as the walk begins, until the walk ends, so a
+  ticket that ends mid-walk leaves its winner imaged and RAM-resident.
+  Pinned by `an_imaged_ticket_winner_is_not_also_a_blob_
   reference_entry`, `a_ticket_that_ends_before_the_images_keeps_its_
   winner_imaged`, `a_ticket_that_ends_after_the_images_keeps_its_blob_
-  entry_out_of_the_section` and `a_walk_keeps_the_record_pin_it_began_
-  under_as_its_release_floor`; canaries `inf_canary_ckpt_image_listed`
-  and `inf_canary_ckpt_form_unlatched`.
+  entry_out_of_the_section` and
+  `a_walk_pins_release_at_its_lowest_image_until_it_ends`; canaries
+  `inf_canary_ckpt_image_listed` and `inf_canary_ckpt_form_unlatched`.
 - **Nothing is removed on hash evidence** — the only slot removal the
   module performs (`resolve_shadow`, same key) follows
   `decode_record(image).key == record(winner).key` on the verbatim cold

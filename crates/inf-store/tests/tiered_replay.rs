@@ -2441,6 +2441,11 @@ fn a_ticket_ends_mid_walk(ends: TicketEnds) {
             life.table.space().walk_watermark().is_some_and(|w| winner < w),
             "VACUOUS: the winner is not below a pinned walk's watermark"
         );
+        assert_eq!(
+            life.table.space().release_ceiling(),
+            winner.to_raw(),
+            "the walk holds release at its lowest image after the ticket's own pin lifted"
+        );
         life.maintain();
     };
     match ends {

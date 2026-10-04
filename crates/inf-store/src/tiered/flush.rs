@@ -538,14 +538,21 @@ impl TieredTable {
     pub fn begin_ckpt_walk(&mut self, ckpt_id: u64) -> LogicalAddr {
         self.live.note_ckpt_begun(ckpt_id);
         self.walk_ckpt_id = Some(ckpt_id);
-        let watermark = self.space.begin_walk();
-        debug_assert!(self.walk_images.is_empty(), "a walk ended with its images latched");
-        self.walk_images.extend(self.shadow.winners_below(watermark.to_raw()));
+        let flushed = self.space.flushed().to_raw();
+        // Emptied here as well as at the walk's end: the latch is searched
+        // in order, so it holds this walk's winners and nothing else.
+        self.walk_images.clear();
+        self.walk_images.extend(self.shadow.winners_below(flushed));
         debug_assert!(self.walk_images.len() <= shadow::SHADOW_TICKETS_CAP);
-        debug_assert!(
-            self.walk_images.first().is_none_or(|lowest| self.space.release_ceiling() <= *lowest),
-            "release may pass a winner the walk images"
-        );
+        debug_assert!(self.walk_images.is_sorted_by(|a, b| a < b), "the latch ascends strictly");
+        // The pin's floor is the latch's lowest winner, handed over: what
+        // the walk reads from RAM and what release holds are one set.
+        let lowest_image = self
+            .walk_images
+            .first()
+            .map(|winner| LogicalAddr::from_raw(*winner).expect("latched winners are 48-bit"));
+        let watermark = self.space.begin_walk(lowest_image);
+        debug_assert_eq!(watermark.to_raw(), flushed, "the latch and the pin share one watermark");
         watermark
     }
 

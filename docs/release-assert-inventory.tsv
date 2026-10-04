@@ -719,6 +719,7 @@ I	2	crates/inf-store/src/tiered/flush.rs	assert	flush cursor behind the watermar
 I	2	crates/inf-store/src/tiered/flush.rs	expect	append_range leaves a file active	TierFlush postcondition: `append_range` creates the file it appends to
 I	1	crates/inf-store/src/tiered/flush.rs	expect	below flushed	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	2	crates/inf-store/src/tiered/flush.rs	expect	chunk fits usize	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
+I	1	crates/inf-store/src/tiered/flush.rs	expect	latched winners are 48-bit	the walk latch is filled from the table's own ticket registry, whose winners enter as `LogicalAddr` values (48-bit by type)
 I	1	crates/inf-store/src/tiered/flush.rs	expect	marks are 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	1	crates/inf-store/src/tiered/flush.rs	expect	seals per round fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	1	crates/inf-store/src/tiered/flush.rs	expect	seals per slice fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)

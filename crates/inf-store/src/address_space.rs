@@ -314,8 +314,9 @@ pub struct AddressSpace {
 struct WalkPin {
     /// `W`, the flushed watermark as the walk began.
     watermark: u64,
-    /// The walk's release floor: `W`, or the record pin as the walk began
-    /// where that lay below `W` (ADR-0093 A12). Never above `W`.
+    /// The walk's release floor: `W`, or the lowest record below `W` the
+    /// walk images, as its caller latched it (ADR-0093 A12). Never above
+    /// `W`.
     release: u64,
 }
 
@@ -366,21 +367,28 @@ impl AddressSpace {
     // ---- checkpoint-walk pin (M4-S12, ADR-0057 D2) ----
 
     /// Latches the walk watermark `W` = the current flushed watermark
-    /// and pins page release for the walk's duration: at `W`, or at the
-    /// record pin where that lies below it. An entry at or above `W`
-    /// images, and so does an open ticket's winner below it (ADR-0093
-    /// A12), the lowest of which the record pin names as the walk begins;
-    /// the walk pin keeps that floor until [`end_walk`](Self::end_walk),
-    /// whatever becomes of the ticket, so every image is structurally
-    /// RAM-resident (`addr ≥ floor ≥ head`).
+    /// and pins page release for the walk's duration: at `W`, or at
+    /// `lowest_image` — the lowest record below `W` that the walk images
+    /// (an open ticket's winner, ADR-0093 A12), `None` when it images
+    /// none there. The floor is the caller's latch, not the record pin
+    /// read again: the two agree as the walk begins, and only the latch
+    /// says what the walk reads from RAM. The walk pin keeps the floor
+    /// until [`end_walk`](Self::end_walk), whatever becomes of the
+    /// ticket, so every image is structurally RAM-resident
+    /// (`addr ≥ floor ≥ head`).
     ///
     /// # Panics
     /// Panics when a walk is already pinned (one checkpoint in flight
-    /// per cell, ever — ADR-0016 D7).
-    pub fn begin_walk(&mut self) -> LogicalAddr {
+    /// per cell, ever — ADR-0016 D7). Debug-panics on a `lowest_image`
+    /// at or above `W`, or below the head (an image that already went
+    /// cold — the state the floor exists to prevent).
+    pub fn begin_walk(&mut self, lowest_image: Option<LogicalAddr>) -> LogicalAddr {
         assert!(self.walk_pin.is_none(), "one checkpoint walk in flight per cell");
         let watermark = self.flushed;
-        let release = self.record_pin.map_or(watermark, |pin| pin.min(watermark));
+        let floor = lowest_image.map(LogicalAddr::to_raw);
+        debug_assert!(floor.is_none_or(|f| f < watermark), "a walk floor at or above W");
+        debug_assert!(floor.is_none_or(|f| f >= self.head), "a walk floor below the head");
+        let release = floor.map_or(watermark, |f| f.min(watermark));
         self.walk_pin = Some(WalkPin { watermark, release });
         LogicalAddr::from_raw(watermark).expect("watermarks stay 48-bit")
     }
@@ -1149,29 +1157,32 @@ mod tests {
         assert_eq!(space.counters().cold_resolves, 1);
     }
 
-    /// A walk that begins with the record pin below its watermark keeps
-    /// release at that record after the pin lifts (ADR-0093 A12: the walk
-    /// images it), and gives the floor back when it ends.
+    /// A walk given its lowest image below the watermark holds release
+    /// at that record until it ends (ADR-0093 A12), with no record pin and
+    /// whatever the record pin does meanwhile: the floor is the walk's
+    /// own. A walk given none pins at `W`.
     #[test]
-    fn a_walk_keeps_the_record_pin_it_began_under_as_its_release_floor() {
+    fn a_walk_pins_release_at_its_lowest_image_until_it_ends() {
         let mut space = space(1 << 16, 1 << 12);
         let _first = space.alloc(600).expect("fits");
         let winner = space.alloc(600).expect("fits");
-        let _later = space.alloc(600).expect("fits");
+        let later = space.alloc(600).expect("fits");
         let end = space.alloc(1).expect("fits");
         space.advance_ro_boundary(end);
         space.advance_flushed(end);
-        space.set_record_pin(Some(winner));
-        assert_eq!(space.begin_walk(), end, "W is the flushed watermark");
-        assert_eq!(space.release_ceiling(), winner.to_raw());
-        space.set_record_pin(None);
+        assert_eq!(space.begin_walk(Some(winner)), end, "W is the flushed watermark");
         assert_eq!(space.release_ceiling(), winner.to_raw(), "the walk holds what it images");
+        space.set_record_pin(Some(later));
+        assert_eq!(space.release_ceiling(), winner.to_raw(), "a record pin above it moves nothing");
+        space.set_record_pin(None);
+        assert_eq!(space.release_ceiling(), winner.to_raw(), "nor does its lifting");
         space.end_walk();
-        assert_eq!(space.release_ceiling(), end.to_raw());
-        // A pin above the watermark is no floor: the walk pins at `W`.
+        assert_eq!(space.release_ceiling(), end.to_raw(), "the floor ends with the walk");
+        // No image below `W`: the walk pins at `W`, and a record pin above
+        // `W` is no floor of its.
         let above = space.alloc(600).expect("fits");
         space.set_record_pin(Some(above));
-        assert_eq!(space.begin_walk(), end);
+        assert_eq!(space.begin_walk(None), end);
         space.set_record_pin(None);
         assert_eq!(space.release_ceiling(), end.to_raw());
         space.end_walk();
