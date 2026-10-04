@@ -43,3 +43,13 @@ m45-sidecar 0xC0FFEE
 # served surface and the stored content (values, deadlines), seeded flushes.
 m0-surface 0xC0FFEE
 m0-surface 0x5CA1AB1E
+# ADR-0061 D6 with ADR-0093 A12: a checkpoint that images a ticket winner
+# below its watermark leaves the winner's entry out of the 0x05 section.
+# Each seed met an imaged winner listed there too, and its boot's refcount
+# oracle saw the extent counted twice — on 0xC103D7 an entry that outlived
+# its key. The first three run the spec-variant class by rotation, the
+# last the plain class.
+m4-recovery 0xC10073
+m4-recovery 0xC10093
+m4-recovery 0xC103D7
+m4-recovery 0xC11D7E

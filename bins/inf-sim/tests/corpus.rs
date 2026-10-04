@@ -3,10 +3,10 @@
 //! at full scenario size via the CLI.
 
 use inf_sim::{
-    BackfillScenario, BootStormScenario, CombinedScenario, DurableScenario, Scenario,
-    SidecarScenario, TieredScenario, run_backfill_scenario, run_boot_storm_scenario,
-    run_combined_scenario, run_durable_scenario, run_scenario, run_sidecar_scenario,
-    run_tiered_scenario,
+    BackfillScenario, BootStormScenario, CombinedScenario, DurableScenario, RecoveryScenario,
+    Scenario, SidecarScenario, TieredScenario, run_backfill_scenario, run_boot_storm_scenario,
+    run_combined_scenario, run_durable_scenario, run_recovery_scenario, run_scenario,
+    run_sidecar_scenario, run_tiered_scenario,
 };
 
 fn parse_seed(text: &str) -> u64 {
@@ -67,6 +67,18 @@ fn corpus_seeds_replay_green() {
                 report.ok(),
                 "corpus seed {line} regressed: stalled={} violations={:?}",
                 report.stalled,
+                report.violations
+            );
+            ran += 1;
+            continue;
+        }
+        // The tiered recovery power-cut chain, at the class the seed has
+        // in the default rotation (`SeedClass::of_seed`).
+        if name == "m4-recovery" {
+            let report = run_recovery_scenario(&RecoveryScenario::m4_recovery(seed));
+            assert!(
+                report.ok(),
+                "corpus seed {line} regressed: violations={:?}",
                 report.violations
             );
             ran += 1;
