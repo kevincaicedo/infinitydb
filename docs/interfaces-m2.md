@@ -978,8 +978,8 @@ direct label, ADR-0054 D3) from `Block` buffers whose content base is
 4 KiB-aligned (the `FrameBuilder` shape; every growth re-bases). The sync
 tier (`SyncIckWriter`) drives the same `IckStream` and produces
 byte-identical v3 files (tests). v1/v2 files stay readable; no tool
-writes them except tests and the sync tier on request. `ckpt_padding_
-bytes` discloses the cost (≤ 4095 per block, ≤ 1.6 % at the 256 KiB
+writes them except tests and the sync tier on request.
+`ckpt_padding_bytes` discloses the cost (≤ 4095 per block, ≤ 1.6 % at the 256 KiB
 target). The release path shrinks an over-grown staging buffer back to
 its nominal capacity (the v0.4.0 soak's 4× `ckpt_buffer_bytes` ratchet).
 
@@ -999,8 +999,8 @@ checkpoint the estimate is the cell's live record + document bytes
 (an over-estimate for tiered cells delays the first checkpoint toward
 the cap, which bounds recovery); `derive_interval` release-asserts
 `floor ≤ interval ≤ cap`. INFO: `ckpt_interval_bytes`,
-`ckpt_records_since_begin`, `ckpt_bytes_total/last`, `ckpt_padding_
-bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
+`ckpt_records_since_begin`, `ckpt_bytes_total/last`,
+`ckpt_padding_bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
 `write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
 
 ## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0178)
@@ -1505,8 +1505,8 @@ per episode). A drained cell always seals — never slower than K = 1.
      `persisted_epoch` publishes), and retires an entry on
      `CreateApplied { id }` or on any `DROP` of the id
      (`request_persist_drop(catalog, id, tombstone)`). Bound
-     `PENDING_CREATE_MAX = 256` (gauge `ControlHandle::pending_
-     creates`; the origin answers `BUSY` at the cap). Empty at boot —
+     `PENDING_CREATE_MAX = 256` (gauge
+     `ControlHandle::pending_creates`; the origin answers `BUSY` at the cap). Empty at boot —
      `META` already holds every accepted create. The sim's inline
      inbox runs the same state.
   3. **Recovery verifier** (`inf-store::keyspace`, `inf-server::
@@ -1558,11 +1558,11 @@ per episode). A drained cell always seals — never slower than K = 1.
   gauntlet.**
   1. **`TierSpec::validate`** gains the four-page floor (`MEM-BUDGET +
      MAINTAIN-SLICE ≥ 4mb`, `RING_WINDOW_MIN_BYTES`) and the half-ring
-     inline bound (`blob_threshold_bytes ≤ TierSpec::blob_threshold_
-     max(R)` = `R/2 − HEADER_LEN − MAX_KEY_LEN + 1`, `R` derived from
+     inline bound (`blob_threshold_bytes ≤
+     TierSpec::blob_threshold_max(R)` = `R/2 − HEADER_LEN − MAX_KEY_LEN + 1`, `R` derived from
      the spec). `for_budget` and the `INF.NS CREATE` parser derive an
-     absent `BLOB-THRESHOLD` as `min(16mb, R/4)` (`TierSpec::with_
-     default_blob_threshold`); an explicit value is honoured or
+     absent `BLOB-THRESHOLD` as `min(16mb, R/4)`
+     (`TierSpec::with_default_blob_threshold`); an explicit value is honoured or
      refused, never clamped.
   2. **`TieredTable`** enforces the bound structurally: the effective
      `BlobConfig` threshold is clamped to `blob_threshold_max(R)` at
@@ -1968,8 +1968,8 @@ The reactor-drive flush state machine (`TierFlush` round state in
   refunded in full leaves credit, debt, pool, rest state and `spent` as
   they were (the receipt; the rest state written by refill alone), and a
   tier round with nothing to stage makes no offer.
-- **Progress** — the class oracle `no_background_offer_waits_past_its_
-  bound`: every background class × seven hostile offers (1, cap − 1, cap,
+- **Progress** — the class oracle
+  `no_background_offer_waits_past_its_bound`: every background class × seven hostile offers (1, cap − 1, cap,
   cap + 1, cap + pool, cap + pool + 1, the largest producer offer) × five
   shares × three refill intervals × seven regimes (idle, pool drained,
   foreground at 10× the share, foreground at the keep-up crossover, a
@@ -2002,8 +2002,8 @@ The reactor-drive flush state machine (`TierFlush` round state in
   (else the run is vacuous) and every checkpoint block issued within
   `T_ckpt` of its first offer (`ckpt_block_wait_ns_max`); on the other
   seeds no class counts one (the control leg).
-- **Determinism** — pinned by `two_budgets_fed_the_same_sequence_agree_
-  exactly`; the sim's trace hash under `--verify-determinism`.
+- **Determinism** — pinned by
+  `two_budgets_fed_the_same_sequence_agree_exactly`; the sim's trace hash under `--verify-determinism`.
 - **Seal pace never defers a drained cell** — by-construction (the LOG
   step asks only when `!staging.drained()`); pinned by
   `seal_pace_paces_a_pipelined_cell_and_never_a_drained_one`.
@@ -2051,11 +2051,11 @@ The reactor-drive flush state machine (`TierFlush` round state in
   stops counting those bytes when the last ticket ends and no gauge
   names the walk's hold: it is part of `flushed − head` on the
   namespace's `tiering_ns<id>` line.
-  Pinned by `an_imaged_ticket_winner_is_not_also_a_blob_
-  reference_entry`, `a_ticket_that_ends_before_the_images_keeps_its_
-  winner_imaged`, `a_ticket_that_ends_after_the_images_keeps_its_blob_
-  entry_out_of_the_section` and
-  `a_walk_pins_release_at_its_lowest_image_until_it_ends`; canaries
+  Pinned by
+  `an_imaged_ticket_winner_is_not_also_a_blob_reference_entry`,
+  `a_ticket_that_ends_before_the_images_keeps_its_winner_imaged`,
+  `a_ticket_that_ends_after_the_images_keeps_its_blob_entry_out_of_the_section`
+  and `a_walk_pins_release_at_its_lowest_image_until_it_ends`; canaries
   `inf_canary_ckpt_image_listed` and `inf_canary_ckpt_form_unlatched`.
 - **Nothing is removed on hash evidence** — the only slot removal the
   module performs (`resolve_shadow`, same key) follows
@@ -2075,8 +2075,8 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `apply_delete` ends the ticket instead (the crashed life's `DEL`
   already carried the same-key twin's marker, or told it apart as a
   collision) — pinned by `deleting_a_winner_with_an_open_ticket_panics`
-  and the collision half of `recovery_appliers_reform_pairs_in_both_
-  orders`.
+  and the collision half of
+  `recovery_appliers_reform_pairs_in_both_orders`.
 - **A ticket's cold slot is never relocated** — `compaction_apply`
   defers it (blocks finalization), `try_promote` skips it; pinned by
   `compaction_defers_a_tickets_cold_slot_until_resolution` and
@@ -2085,8 +2085,8 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `apply_image`/`apply_extent_image` (RAM insert over exact cold slots)
   and `apply_ref` (cold ref beside an exact RAM slot), dropped by every
   slot removal (`shadow_note_removed`) and retargeted by every repoint
-  (`shadow_note_moved`); pinned by `recovery_appliers_reform_pairs_in_
-  both_orders`, the `m4-recovery` cardinality oracle (`len() ==
+  (`shadow_note_moved`); pinned by
+  `recovery_appliers_reform_pairs_in_both_orders`, the `m4-recovery` cardinality oracle (`len() ==
   model.len()` at quiescence) and the `m4-tiered` quiescence oracle
   (Σcells `DBSIZE` == model live keys; `live + dead == allocated`).
 - **Release runs during boot replay (ADR-0174 D3)**, so a replayed
