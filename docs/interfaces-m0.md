@@ -111,7 +111,7 @@ impl Arena {
 > publication; completed values retain their payload ownership.
 > `IoGate<Cleanup>` keeps its name with an explicit terminal-cleanup
 > policy. Admission: `reserve` answers Granted, Full, Closed, identity
-> exhaustion or a foreign class, no refusal owns the future or its
+> exhaustion or a foreign class; no refusal owns the future or its
 > factory, and a producer reserves before it dequeues work or causes an
 > effect. Transitions: a class slot is Free, Reserved, Active or Retired;
 > a completed future is dropped once, and its slot returns only when no
@@ -461,7 +461,7 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > bytes and fits one frame, and a ring needs `capacity >= 2 ×
 > (data_credits + progress_credits)`, one progress credit per ring
 > (ADR-0150 D3, D4, A1). The codec and data-credit sketch below are the
-> implemented shape: these additions are not built, and it bounds no
+> implemented shape: these additions are not built, and they bound no
 > retained reply's bytes.
 
 ```rust
@@ -909,16 +909,17 @@ changed shape — `execute(...)` and `ServerPlane::new(...)` now take
 materialized default dbs + named-ns registry + pressure driver) instead of
 `CellStore`, whose own frozen method set was unchanged behind
 `Keyspace::db_mut(n)` at M1. §6's replacement of that implicit
-construction crossing (ADR-0161) is not built. `ConnCx` gains `db: u16`. Additive deltas: registry
-57 → 58 (`INF.NS`); `CmdFlags::DENYOOM` (the M1-S07 OOM gate enters through
-metadata); `MemoryReport` + `evict_bytes`; `StoreStats` + `evicted_keys`;
-`StoreConfig` + `evict_seed`; new `inf-store` types `Keyspace` /
-`PressureConfig` / `EvictBudget` / `EvictionPolicy` / `EvictStats` /
-`NsMode` / `NsSpec` / `NsError`; `Index::live_walk` (read-only clock-hand
-iteration). The fabric codec is unchanged; `Op::Apply`'s `cmd` byte packs
-`{db:4 | proto:4}` (old encodings decode as db 0). The record header's two
-spare flag bits became the CLOCK reference counter (layout untouched;
-ADR-0009).
+construction crossing (ADR-0161) is not built. `ConnCx` gains `db: u16`.
+Additive deltas: registry 57 → 58 (`INF.NS`); `CmdFlags::DENYOOM` (the
+M1-S07 OOM gate enters through metadata); `MemoryReport` +
+`evict_bytes`; `StoreStats` + `evicted_keys`; `StoreConfig` +
+`evict_seed`; new `inf-store` types `Keyspace` / `PressureConfig` /
+`EvictBudget` / `EvictionPolicy` / `EvictStats` / `NsMode` / `NsSpec` /
+`NsError`; `Index::live_walk` (read-only clock-hand iteration). The
+fabric codec is unchanged; `Op::Apply`'s `cmd` byte packs
+`{db:4 | proto:4}` (old encodings decode as db 0). The record header's
+two spare flag bits became the CLOCK reference counter (layout
+untouched; ADR-0009).
 
 **M1-E5 extension note (2026-06-12, ADR-0010):** all deltas additive. The
 registry grew 58 → 64 (SUBSCRIBE/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE/

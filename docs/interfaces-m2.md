@@ -1496,7 +1496,7 @@ per episode). A drained cell always seals — never slower than K = 1.
   reserved, declared and retiring alike). At capacity a tiered `CREATE`
   reserves nothing and answers `-TRYAGAIN tiered namespace capacity in
   use` while a grant is retiring, else `-ERR tiered namespace limit
-  reached`. Namespace IDs never repeat: allocation answers `ERR namespace
+  reached`. Namespace IDs never repeat: allocation answers `-ERR namespace
   identity space exhausted` before the `u32` counter wraps. Boot refuses a
   catalog with more than 64 live tiered definitions with a typed startup
   error and serves none of it. After `META` publishes a create, an origin
@@ -1515,10 +1515,8 @@ per episode). A drained cell always seals — never slower than K = 1.
      → wait `persisted(epoch)` → read the `CreateVerdict` → apply
      locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
      `create_applied(id)` → `+OK`*. No cell names a namespace before
-     `META` does. `SET` keeps *apply → fan → persist → ack*. `DROP`
-     requests its persist before the fan, and the fan carries that
-     persist's epoch (ADR-0100 D4): *apply → request persist → wait
-     durable → fan → request a node checkpoint + stamp → `+OK`*.
+     `META` does. `SET` keeps *apply → fan → persist → ack*. `DROP`'s
+     order is drawn once, at `INF.NSFAN DROP` below.
   2. **The writer's pending-create set** (`inf-server::control`,
      ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
      CreateVerdict)`; the writer merges every pending spec the payload
@@ -1626,10 +1624,12 @@ per episode). A drained cell always seals — never slower than K = 1.
   2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
      the persist epoch of the swap that drops the namespace; peers park
      their tier-file teardown until `ControlHandle::persisted(epoch)`
-     (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait →
-     fan → request checkpoint + `StampDrop` → `+OK`*; `CREATE` persists
-     before it serves (item 1 of the `CREATE` choreography above) and
-     `SET` runs *apply → fan → persist → ack* (ADR-0015 D3).
+     (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait
+     `persisted(epoch)` → fan → request a node checkpoint + `StampDrop` →
+     `+OK`*: the persist is requested before the fan, and the fan carries
+     its epoch (ADR-0100 D4). `CREATE` persists before it serves (item 1
+     of the `CREATE` choreography above) and `SET` runs *apply → fan →
+     persist → ack* (ADR-0015 D3).
      `Keyspace::ns_drop` returns the dropped `NsSpec`;
      `ns_tombstoned`/`ns_tombstones` expose the boot snapshot to recovery.
   3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
