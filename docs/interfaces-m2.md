@@ -313,8 +313,9 @@ ignores its unaddressable suffix.
   — zero acks for the affected batch, proven by the child-process
   fsyncgate test).
 - Append protocol: `begin_frame(len, now) -> FrameSlot` (rotates if
-  needed, reserves the base LSN) → `FrameBuilder::finalize(slot.
-  first_record_lsn())` → `commit_frame(slot, bytes) -> Lsn`.
+  needed, reserves the base LSN) →
+  `FrameBuilder::finalize(slot.first_record_lsn())` → `commit_frame(slot,
+  bytes) -> Lsn`.
 
 ## `SegmentFs` injection seam (`inf-log::fs`)
 
@@ -838,10 +839,10 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   0x02 footer · 0x03 addr-refs · 0x04 reserved (S14 live-set counters) ·
   0x05+ reserved (M4.5 index sidecars). Readers: `read_ick_hybrid` /
   `IckReader::next_step_hybrid` (per-section `IckRefSection` dispatch);
-  writers: `IckStream::new_v2` + `stage_addr_ref`, `SyncIckWriter::
-  create_v2` + `append_ref` (sections homogeneous by class, sealed at
-  class/ns/watermark boundaries). Record tag **8 = `ColdDisplace {ns,
-  old_addr: u48}`**: stages immediately before a tiered-namespace
+  writers: `IckStream::new_v2` + `stage_addr_ref`,
+  `SyncIckWriter::create_v2` + `append_ref` (sections homogeneous by class,
+  sealed at class/ns/watermark boundaries). Record tag **8 = `ColdDisplace
+  {ns, old_addr: u48}`**: stages immediately before a tiered-namespace
   mutation that displaced a record; replay removes exactly the slot
   `(hash, old_addr)` then applies the mutation (zero disk reads — the
   hash-repoint and deferred-reconcile alternatives are rejected in the
@@ -1066,11 +1067,11 @@ rounded once, with one remainder carried (ADR-0178 D2).
 Producers match `Issue` and nothing else; the three outcomes and the
 overrun are resolved in `offer`, once. Consult sites: zero-fill
 (`next_zero_slice` peek → offer → push), tier flush (a round offers its
-slice only when the stage has a chunk to take — `TieredTable::
-flush_pending` — before `stage_flush_round`, then settles the grant
-against the record bytes it staged: the unstaged part refunded, the bytes
-past the slice charged, since a chunk takes at least one seal cut past
-its cursor; a stage refused part-way settles what it staged first —
+slice only when the stage has a chunk to take —
+`TieredTable::flush_pending` — before `stage_flush_round`, then settles the
+grant against the record bytes it staged: the unstaged part refunded, the
+bytes past the slice charged, since a chunk takes at least one seal cut
+past its cursor; a stage refused part-way settles what it staged first —
 ADR-0170 A2),
 checkpoint (header/section/footer block at its padded length, before the
 seal; completion fdatasync charged as one op), cold-read drain
@@ -1139,13 +1140,13 @@ per episode). A drained cell always seals — never slower than K = 1.
   determinism sweep and S14 taxonomy suite prove the stepped machine.
   `IckReader` is the pull-based `.ick` loader (`read_ick` reimplemented
   on it; same audit, same fuzz target).
-- The node boots cells directly into their reactor loops: `ServerPlane::
-  begin_recovery` (requires `set_control`) drives steps from MAINTAIN
-  (`RecoverConfig{step_bytes: 8 MiB, throttle_bytes_per_sec: None}` —
-  the throttle is test-only, metered on **consumed** bytes, never the
-  prealloc-slack credits progress also carries). Unthrottled boots never
-  park (`before_park`); recovery failure surfaces via `take_boot_error`
-  → the assembly fail-stops the process.
+- The node boots cells directly into their reactor loops:
+  `ServerPlane::begin_recovery` (requires `set_control`) drives steps from
+  MAINTAIN (`RecoverConfig{step_bytes: 8 MiB, throttle_bytes_per_sec:
+  None}` — the throttle is test-only, metered on **consumed** bytes, never
+  the prealloc-slack credits progress also carries). Unthrottled boots
+  never park (`before_park`); recovery failure surfaces via
+  `take_boot_error` → the assembly fail-stops the process.
 - **`-LOADING` gate (wire layer):** `CmdFlags::LOADING` in the command
   registry — membership pinned to *observed* Redis 8.0.5 behavior
   (captured 2026-07-03; notably **PING is gated** there). While `RecoveryBoard::all_ready()`
@@ -1509,12 +1510,13 @@ per episode). A drained cell always seals — never slower than K = 1.
      `ControlHandle::pending_creates`; the origin answers `BUSY` at the cap). Empty at boot —
      `META` already holds every accepted create. The sim's inline
      inbox runs the same state.
-  3. **Recovery verifier** (`inf-store::keyspace`, `inf-server::
-     recover`, ADR-0103 D4): `ReplayOutcome::SkippedUnknownNs(NsId)`
-     carries the id; `RecoverStats::records_skipped_unknown_ns`
-     counts the skips whose id no drop tombstone explains (the
-     `RecoveryBoard` slot exposes it; the boot line prints it when
-     nonzero). Zero on every honest boot — the DST asserts it.
+  3. **Recovery verifier** (`inf-store::keyspace`,
+     `inf-server::recover`, ADR-0103 D4):
+     `ReplayOutcome::SkippedUnknownNs(NsId)` carries the id;
+     `RecoverStats::records_skipped_unknown_ns` counts the skips whose id
+     no drop tombstone explains (the `RecoveryBoard` slot exposes it; the
+     boot line prints it when nonzero). Zero on every honest boot — the DST
+     asserts it.
   4. **Fault point** `ns_create_after_meta` (crash-matrix row
      `namespace-seeded-from-meta`): the restart seeds the namespace
      from `META` and serves it.
@@ -1546,12 +1548,12 @@ per episode). A drained cell always seals — never slower than K = 1.
      `create-rolled-back`): no cell serves the namespace before or
      after a restart. DST `m2-ns-ddl-race` (two crossing rounds with a
      frozen origin, the refused-leg round, cuts and audits).
-  5. **Connection-level commands on any binding** (`inf_wire::
-     keyspace_scope`, `plane::keyspace_level`): a command with no key
-     position that is not a scatter program (`PING`, `ECHO`, `HELLO`,
-     `QUIT`, `CLIENT`, `COMMAND`, `LOLWUT`, `DEBUG SLEEP`, …) executes
-     through the ordinary path on a tiered-bound connection — on the
-     connection's cell and on the `ApplyNs` owner side alike — and the
+  5. **Connection-level commands on any binding**
+     (`inf_wire::keyspace_scope`, `plane::keyspace_level`): a command with
+     no key position that is not a scatter program (`PING`, `ECHO`,
+     `HELLO`, `QUIT`, `CLIENT`, `COMMAND`, `LOLWUT`, `DEBUG SLEEP`, …)
+     executes through the ordinary path on a tiered-bound connection — on
+     the connection's cell and on the `ApplyNs` owner side alike — and the
      planeless `execute` refuses a tiered namespace only for a command
      that addresses it.
 - **ADR-0102 amendment (2026-09-01) — tier ring invariants at the
@@ -2070,10 +2072,10 @@ The reactor-drive flush state machine (`TierFlush` round state in
   the store suite) and chains the twin plus its own origins into the
   winner's list, release-asserted `≤ RELOC_ORIGIN_CAP` (admission
   refuses a candidate whose list has no room — `fallback_origin`).
-- **A winner is never deleted under an open ticket** — `TieredTable::
-  delete` release-asserts no ticket names the address; the plane's
-  `delete_one` resolves first (a Foreground read of the twin); replay's
-  `apply_delete` ends the ticket instead (the crashed life's `DEL`
+- **A winner is never deleted under an open ticket** —
+  `TieredTable::delete` release-asserts no ticket names the address; the
+  plane's `delete_one` resolves first (a Foreground read of the twin);
+  replay's `apply_delete` ends the ticket instead (the crashed life's `DEL`
   already carried the same-key twin's marker, or told it apart as a
   collision) — pinned by `deleting_a_winner_with_an_open_ticket_panics`
   and the collision half of
