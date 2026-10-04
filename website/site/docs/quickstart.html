@@ -101,7 +101,7 @@ docker run --rm -p 127.0.0.1:6379:6379 \
   <h2>First durable namespace</h2>
   <p>Durability in InfinityDB is a property of the <em>namespace</em>, not the server, and a durable namespace needs a data directory. The numbered databases behind <code>SELECT 0..15</code> are always memory-only (pure cache semantics). Stop the Path A server (Ctrl-C), then start it again with a data directory outside the clone:</p>
 <pre><code>./target/release/infinityd --port 6379 --data-dir ~/infinity-data</code></pre>
-  <p>The first boot of a new directory spends 10 to 15 seconds measuring the device before it accepts connections (<code>--device-probe off</code> skips it, with conservative write settings). Meanwhile the server prints progress lines such as <code>control: cell 0 not ready &mdash; in spawned</code>: that is the probe at work, not a hang. The server is ready when it prints <code>control: recovery complete</code>.</p>
+  <p>The first boot of a new directory measures the device before it accepts connections: about 12 seconds on an NVMe device, longer on a slow one (<code>--device-probe off</code> skips it, with conservative write settings). Meanwhile the server prints progress lines such as <code>control: cell 0 not ready &mdash; in spawned</code>: that is the probe at work, not a hang. The server is ready when it prints <code>control: recovery complete</code>.</p>
   <p>In another terminal, create a durable namespace, write to it and take a checkpoint. <code>INF.NS USE</code> selects a namespace for the connection (like <code>SELECT</code>), so the commands go through one <code>redis-cli</code> connection:</p>
 <pre><code>printf '%s\n' \
   'INF.NS CREATE orders MODE durable FSYNC always' \

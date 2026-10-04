@@ -66,6 +66,7 @@
 1 gib           # non-claim: BLOB-MAX default and Redis query-buffer limit in the generated compat matrix
 256 mib         # config defaults (--segment-bytes / --ckpt-interval-bytes) on the deployment page — configuration values, not measurements
 2048 mb         # config example in the landing terminal (INF.NS ... MEM-BUDGET 2048mb) — a knob value, not a measurement
+12 s            # non-claim: the first-boot device probe on one NVMe device (quickstart and deployment pages) — rows × --probe-seconds plus a 256 MiB pre-write; an observation, not a performance claim
 
 # --- v0.4.0-alpha campaign, walked 2026-08-16 ---------------------------
 # --- ledger C31 (Allowed): 24 h memory flatness, three planes -----------

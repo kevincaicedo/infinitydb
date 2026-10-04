@@ -57,9 +57,9 @@ Docker build context):
 ./target/release/infinityd --port 6379 --data-dir ~/infinity-data
 ```
 
-The first boot of a new directory spends 10 to 15 seconds measuring the
-device before it accepts connections (`--device-probe off` skips it, with
-conservative write settings). Meanwhile the server prints progress lines such
+The first boot of a new directory measures the device before it accepts
+connections: about 12 seconds on an NVMe device, longer on a slow one
+(`--device-probe off` skips it, with conservative write settings). Meanwhile the server prints progress lines such
 as `control: cell 0 not ready — in spawned`: that is the probe at work, not a
 hang. The server is ready when it prints `control: recovery complete`.
 
