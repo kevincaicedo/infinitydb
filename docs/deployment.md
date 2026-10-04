@@ -118,10 +118,11 @@ infinityd [--port 6379] [--cells 4] [--pin-start CORE] [--pin-stride 2]
 ```
 
 The table covers the flags an operator sets. `infinityd --help` lists the
-others, except `--park-us N`: the longest an idle cell with no timer due
-parks before it checks again, in microseconds (500 with more than one cell,
-5000 with one). The others tune the write path or the idle loop, or select an
-experiment arm, and their defaults are the ones to run with.
+others. `--park-us N` is the longest an idle cell parks before it checks
+again, in microseconds (500 with more than one cell, 5000 with one; a timer
+due sooner wakes it earlier). The others tune the write path or the idle
+loop, or select an experiment arm, and their defaults are the ones to run
+with.
 
 | Flag | Meaning |
 |---|---|

@@ -453,7 +453,7 @@ fn parse_args() -> Result<Args, String> {
                      [--flush-group-window-us 250] [--device-probe auto|off] \
                      [--probe-seconds 1] [--log-staging-mib 4] \
                      [--shutdown-timeout-ms 10000] [--shutdown-checkpoint on|off] \
-                     [--accept-handoff on|off] \
+                     [--accept-handoff on|off] [--park-us N] \
                      [--early-fabric-flush] \
                      [--remote-first-execute] \
                      [--fabric-apply-prefetch|--no-fabric-apply-prefetch] \
