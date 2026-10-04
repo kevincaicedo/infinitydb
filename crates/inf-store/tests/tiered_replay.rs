@@ -772,15 +772,30 @@ impl Ready {
         }
     }
 
-    /// The blob census (R9): the reference map's addresses equal
-    /// the slotted extent-typed records'.
+    /// The blob census (R9, I12): each extent's count equals the slots
+    /// whose record bytes name it, and the reference map's addresses are
+    /// the slotted extent-typed records' (ADR-0061 D6). The count first:
+    /// an extent a checkpoint named twice fails both, and the address
+    /// half alone is what a reference with no slot fails.
     fn blob_census(&self) {
-        let slotted: BTreeSet<u64> = self
+        let extent_slots: Vec<(u64, u64)> = self
             .slots()
             .iter()
             .filter(|s| s.tag == TypeTag::StringExtent)
-            .map(|s| s.addr.to_raw())
+            .map(|s| (s.addr.to_raw(), inf_store::ExtentRef::decode(&s.value).extent_id))
             .collect();
+        let mut named: BTreeMap<u64, u64> = BTreeMap::new();
+        for (_, extent_id) in &extent_slots {
+            *named.entry(*extent_id).or_default() += 1;
+        }
+        for (extent_id, slots) in named {
+            assert_eq!(
+                self.table.extent_refcount(extent_id),
+                slots,
+                "extent {extent_id}: its refcount is the slots that name it"
+            );
+        }
+        let slotted: BTreeSet<u64> = extent_slots.iter().map(|(addr, _)| *addr).collect();
         let mapped: BTreeSet<u64> = self.table.extent_references().map(|(a, _, _)| a).collect();
         assert_eq!(mapped, slotted, "the reference map names exactly the slotted extent records");
     }
@@ -2308,6 +2323,152 @@ fn a_blob_ref_settled_during_image_load_is_released_at_the_end_of_the_checkpoint
     assert!(counters.demote_steps > 0, "image load demoted");
     assert!(counters.settled_same_key >= 1, "the ref settled at a seal during image load");
     assert_eq!(counters.blob_releases, 1, "the end of the checkpoint released the ref's entry");
+}
+
+/// Writes `key`'s inline record, then 600 filler records with MAINTAIN
+/// rounds, so the record is cold; returns its address.
+fn demote_one(life: &mut Life, key: &[u8]) -> LogicalAddr {
+    life.set(key, &[0x44; 300]);
+    for i in 0..600u64 {
+        life.set(&format!("cold:{i:05}").into_bytes(), &[0x11; 900]);
+        if i.is_multiple_of(64) {
+            life.maintain();
+        }
+    }
+    life.maintain();
+    let TieredLookup::Cold(cold) = life.table.lookup(key, Life::hash(key), &[]) else {
+        panic!("VACUOUS: the key's record is not cold");
+    };
+    cold
+}
+
+/// Filler until the flushed watermark lies `margin` bytes past `winner`
+/// (release stays pinned at the winner while its ticket is open,
+/// ADR-0093 D3).
+fn flush_past(life: &mut Life, winner: LogicalAddr, margin: u64) {
+    let mut i = 0u64;
+    while life.table.space().flushed().to_raw() <= winner.to_raw() + margin {
+        for _ in 0..16 {
+            life.set(&format!("fill:{i:05}").into_bytes(), &[0x22; 900]);
+            i += 1;
+        }
+        life.maintain();
+        assert!(i < 4096, "VACUOUS: the winner never flushed");
+    }
+}
+
+/// The winner of an open ticket rewritten as a blob and flushed below
+/// the walk watermark: its address and its reference-map entry both lie
+/// below the watermark the next walk latches.
+fn blob_winner_below_the_watermark(life: &mut Life, key: &[u8], margin: u64) -> LogicalAddr {
+    life.shadow_set(key, b"inline-now");
+    life.set_blob(key, &[0x99; 4096]);
+    assert_eq!(life.table.shadow_pending(), 1, "VACUOUS: no ticket over the blob winner");
+    let TieredLookup::Ram(winner) = life.table.lookup(key, Life::hash(key), &[]) else {
+        panic!("VACUOUS: the winner is not in RAM");
+    };
+    flush_past(life, winner, margin);
+    assert!(life.table.is_shadow_winner(winner), "VACUOUS: the ticket ended before the walk");
+    assert!(
+        life.table.extent_reference_at(winner).is_some(),
+        "VACUOUS: the winner holds no blob reference"
+    );
+    winner
+}
+
+/// An extent-typed ticket winner below the walk watermark is imaged
+/// (ADR-0093 A12), so its reference-map entry is not a 0x05 entry
+/// (ADR-0061 D6): a boot that registered both would hold the extent one
+/// above its slots forever (the blob census). The boot fits its window:
+/// the double count is in the checkpoint the writer emits.
+#[test]
+fn an_imaged_ticket_winner_is_not_also_a_blob_reference_entry() {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let blob = BlobConfig { threshold_bytes: 2048, max_bytes: 1 << 20 };
+    let mut life = Life::new(demote);
+    life.table.set_blob_config(blob);
+    life.table.set_shadow_enabled(true);
+    demote_one(&mut life, b"victim");
+    blob_winner_below_the_watermark(&mut life, b"victim", 0);
+    life.checkpoint(1, |_| {});
+    let durable = life.crash();
+    let mut boot = durable.boot_with(demote, |table| table.set_blob_config(blob));
+    boot.replay_tail(&durable.tail);
+    let counters = boot.machine().counters();
+    let ready = boot.finish();
+    ready.audit(&durable.model, false);
+    assert_eq!(counters.demote_steps, 0, "VACUOUS: the boot demoted; this row needs one that fits");
+}
+
+/// Where in the walk a ticket ends.
+#[derive(Copy, Clone)]
+enum TicketEnds {
+    /// Between the reference pass and the image pass.
+    BeforeTheImages,
+    /// Between the image pass and the live-set and 0x05 passes.
+    AfterTheImages,
+}
+
+/// A ticket whose blob winner lies below the watermark ends mid-walk on
+/// a collision verdict, and a MAINTAIN round follows; then the crash and
+/// a boot that fits. The walk keeps the form it latched when it began
+/// (ADR-0057 D1, ADR-0093 A12): the winner imaged, never referenced, its
+/// blob entry out of the 0x05 section, its page held until the walk ends.
+fn a_ticket_ends_mid_walk(ends: TicketEnds) {
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let blob = BlobConfig { threshold_bytes: 2048, max_bytes: 1 << 20 };
+    let (k1, k2) = forced_collision_pair(31);
+    let mut life = Life::new(demote);
+    life.table.set_blob_config(blob);
+    life.table.set_shadow_enabled(true);
+    let cold = demote_one(&mut life, &k1);
+    let hash = Life::hash(&k2);
+    assert_eq!(hash, Life::hash(&k1), "VACUOUS: the pair does not collide");
+    // Two pages past the winner, so the release that follows the verdict
+    // would pass the winner's page were it not held.
+    let winner = blob_winner_below_the_watermark(&mut life, &k2, 2 * PAGE);
+    let end_ticket = move |life: &mut Life| {
+        let head = read_cold(&life.flush, &life.fs, cold.to_raw(), 8).expect("header");
+        let len = TieredTable::record_len_from_header(&head);
+        let image = read_cold(&life.flush, &life.fs, cold.to_raw(), len).expect("twin");
+        assert_eq!(
+            life.table.verify_shadow(hash, cold, &image),
+            inf_store::ShadowVerdict::Collision,
+            "VACUOUS: the verdict did not end the ticket"
+        );
+        assert_eq!(life.table.shadow_pending(), 0, "VACUOUS: a ticket is still open");
+        assert!(
+            life.table.space().walk_watermark().is_some_and(|w| winner < w),
+            "VACUOUS: the winner is not below a pinned walk's watermark"
+        );
+        life.maintain();
+    };
+    match ends {
+        TicketEnds::BeforeTheImages => life.checkpoint(1, end_ticket),
+        TicketEnds::AfterTheImages => life.checkpoint_staged(1, |_| {}, &[], &[], end_ticket),
+    }
+    let durable = life.crash();
+    let mut boot = durable.boot_with(demote, |table| table.set_blob_config(blob));
+    boot.replay_tail(&durable.tail);
+    let ready = boot.finish();
+    ready.audit(&durable.model, false);
+}
+
+/// The ticket ends after the reference pass skipped its winner: the image
+/// pass still emits it. A form decided again from the open tickets names
+/// the record in neither pass, and the boot loses the key (census (a)).
+#[test]
+fn a_ticket_that_ends_before_the_images_keeps_its_winner_imaged() {
+    a_ticket_ends_mid_walk(TicketEnds::BeforeTheImages);
+}
+
+/// The ticket ends after the image pass emitted its winner: the 0x05 pass
+/// still leaves the winner's entry out. A form decided again from the
+/// open tickets lists it, and the boot counts the extent twice (the blob
+/// census).
+#[test]
+fn a_ticket_that_ends_after_the_images_keeps_its_blob_entry_out_of_the_section() {
+    a_ticket_ends_mid_walk(TicketEnds::AfterTheImages);
 }
 
 // ---- a window below its ring, records at the inline maximum ---------------

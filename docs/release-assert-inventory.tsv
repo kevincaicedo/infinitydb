@@ -723,7 +723,6 @@ I	1	crates/inf-store/src/tiered/flush.rs	expect	marks are 48-bit	the table's own
 I	1	crates/inf-store/src/tiered/flush.rs	expect	seals per round fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	1	crates/inf-store/src/tiered/flush.rs	expect	seals per slice fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	1	crates/inf-store/src/tiered/flush.rs	expect	seals per drain fit u32	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per drain ≪ u32)
-C	2	crates/inf-store/src/tiered/extent.rs	expect	walk not begun	`crates/inf-server/src/durable/ckpt.rs:tier_walk_step` runs only between `begin_walk` and `end_walk`
 C	1	crates/inf-store/src/tiered/flush.rs	expect	walk not begun	`crates/inf-server/src/durable/ckpt.rs:tier_walk_step` runs only between `begin_walk` and `end_walk`
 I	7	crates/inf-store/src/tiered/flush.rs	expect	watermarks stay 48-bit	the table's own watermarks / flush cursor (48-bit `LogicalAddr`, seals per slice ≪ u32)
 I	2	crates/inf-store/src/tiered/replay.rs	expect	watermarks stay 48-bit	the settle walk's cursor: record starts and hole ends between `ro` and `tail`, both 48-bit `LogicalAddr` watermarks of the table's own space

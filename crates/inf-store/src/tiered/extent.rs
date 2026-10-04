@@ -364,23 +364,24 @@ impl TieredTable {
         self.extents.register(addr, extent_id, len);
     }
 
-    /// The checkpoint 0x05 emission set: reference-map entries strictly
-    /// below the pinned walk watermark, ascending — cold records only
-    /// (RAM-resident extent records ride tag-9 images; both would be a
-    /// double count at restore).
+    /// The checkpoint 0x05 emission set (ADR-0061 D6): the reference-map
+    /// entries of the records the pinned walk names by reference,
+    /// ascending. A record the walk images — at or above the watermark,
+    /// or a latched ticket winner below it (ADR-0093 A12) — registers its
+    /// reference when recovery appends the image, so an entry here too
+    /// would count its extent twice.
     ///
     /// # Panics
     /// Panics when no walk is pinned ([`begin_ckpt_walk`]
     /// (Self::begin_ckpt_walk) first).
     pub fn extent_ckpt_entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
-        self.extents.entries_below(w)
+        self.extent_ckpt_entries_from(0)
     }
 
     /// [`extent_ckpt_entries`](Self::extent_ckpt_entries) resumed at the
-    /// address cursor `resume` — the pass-3 slice form (review of
-    /// 2026-08-30, C4): stable under mid-walk removals below the cursor,
-    /// which the ordinal `.skip` resume it replaces was not.
+    /// address cursor `resume` — the pass-3 slice form: stable under
+    /// mid-walk removals below the cursor, which an ordinal resume is
+    /// not. One [`WalkLatch::form`] per entry below the watermark.
     ///
     /// # Panics
     /// Panics when no walk is pinned ([`begin_ckpt_walk`]
@@ -389,8 +390,10 @@ impl TieredTable {
         &self,
         resume: u64,
     ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
-        self.extents.entries_from(resume, w)
+        let latch = self.walk_latch();
+        self.extents
+            .entries_from(resume, latch.watermark())
+            .filter(move |(addr, _, _)| latch.form(*addr) == flush::WalkForm::Ref)
     }
 
     /// Takes the relocation origins of the record at `addr` (M4-S15,

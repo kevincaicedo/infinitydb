@@ -68,7 +68,8 @@ pub const SHADOW_READS_IN_FLIGHT: usize = 4;
 /// is the committed window, where writes park).
 pub const SHADOW_PIN_CAP_DIVISOR: u64 = 8;
 /// Approximate bytes per open ticket across the two maps (the L5 term
-/// `shadow_bytes` reports `pending × this`): a `BTreeMap<(u64, u64), ()>`
+/// `shadow_bytes` reports `pending × this`, plus the checkpoint walk's
+/// latch of winners at its capacity): a `BTreeMap<(u64, u64), ()>`
 /// entry plus a `HashMap<u64, ColdEntry>` entry with their overheads.
 const SHADOW_TICKET_BYTES: u64 = 104;
 
@@ -550,6 +551,16 @@ impl ShadowSet {
         self.by_winner.keys().next().map(|(winner, _)| *winner)
     }
 
+    /// The winners below `watermark`, ascending, each once however many
+    /// tickets name it (the checkpoint walk's latch, ADR-0093 A12).
+    pub(super) fn winners_below(&self, watermark: u64) -> impl Iterator<Item = u64> + '_ {
+        let mut last = None;
+        self.by_winner
+            .range(..(watermark, 0))
+            .map(|((winner, _), ())| *winner)
+            .filter(move |winner| last.replace(*winner) != Some(*winner))
+    }
+
     fn winner_tickets(&self, winner: u64) -> impl Iterator<Item = u64> + '_ {
         self.by_winner.range((winner, 0)..=(winner, u64::MAX)).map(|((_, cold), ())| *cold)
     }
@@ -654,7 +665,8 @@ impl TieredTable {
         counters.pinned_bytes = self.shadow_pinned_bytes();
         counters.pinned_bytes_peak = counters.pinned_bytes_peak.max(counters.pinned_bytes);
         counters.pin_cap_bytes = self.shadow_pin_cap_bytes();
-        counters.bytes = counters.pending * SHADOW_TICKET_BYTES;
+        counters.bytes = counters.pending * SHADOW_TICKET_BYTES
+            + (self.walk_images.capacity() * size_of::<u64>()) as u64;
         counters.scan_twins_emitted = self.shadow.scan_twins.get();
         counters.enabled = u64::from(self.shadow.enabled);
         counters.reconcile_paused = u64::from(!self.shadow.reconcile);

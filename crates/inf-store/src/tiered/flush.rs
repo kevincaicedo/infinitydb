@@ -18,6 +18,52 @@ pub struct StageFailed {
     pub error: TierFlushError,
 }
 
+/// How a pinned checkpoint walk names one index entry (ADR-0057 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum WalkForm {
+    /// `{hash, addr}`: recovery reads the record from its tier file, and
+    /// an extent record's reference rides the 0x05 section (ADR-0061 D6).
+    Ref,
+    /// The record's bytes, read from RAM: recovery appends them under a
+    /// new address, where an extent record registers its reference.
+    Image,
+}
+
+/// What a checkpoint walk fixed when it began, and the one choice made
+/// from it (ADR-0057 D1, ADR-0093 A12): an entry at or above the
+/// watermark is an image, and so is the winner of a ticket that was open
+/// as the walk began; every other entry is a reference. A function of the
+/// address alone for the whole walk — a ticket that ends between two
+/// passes does not move its winner from one form to the other, which
+/// would name the record in neither pass or its extent in two sections.
+#[derive(Copy, Clone)]
+pub(super) struct WalkLatch<'a> {
+    watermark: u64,
+    images: &'a [u64],
+}
+
+impl WalkLatch<'_> {
+    /// `W`: no reference lies at or above it.
+    pub(super) fn watermark(self) -> u64 {
+        self.watermark
+    }
+
+    /// The form of the entry at `addr`: a comparison, and a search of the
+    /// latched winners (at most `SHADOW_TICKETS_CAP`, contiguous) only
+    /// below the watermark of a walk that latched one.
+    #[inline]
+    pub(super) fn form(self, addr: u64) -> WalkForm {
+        if addr >= self.watermark {
+            return WalkForm::Image;
+        }
+        if !self.images.is_empty() && self.images.binary_search(&addr).is_ok() {
+            WalkForm::Image
+        } else {
+            WalkForm::Ref
+        }
+    }
+}
+
 impl TieredTable {
     /// One seal step (ADR-0053 D2/D3): advances the ro-boundary toward
     /// `tail − mutable_target`, landing only on a recorded record-start
@@ -479,18 +525,28 @@ impl TieredTable {
     // ---- hybrid checkpoint walk (M4-S12, ADR-0057 D1/D2) ----
 
     /// Latches this walk's watermark `W` (= the current flushed
-    /// watermark) and pins page release beneath it — every entry below
-    /// `W` refs, every entry at or above it images, and the pin makes
-    /// the image half structurally RAM-resident for the whole walk.
-    /// One walk in flight per cell, ever. `ckpt_id` is the id the
-    /// publication this walk feeds will manifest — subsequent
-    /// slot-removals stamp their file with it, which is what lets a
-    /// later checkpoint prove it emitted no reference into an emptied
-    /// file (M4-S15, ADR-0059 D3).
+    /// watermark) and the winners of the open tickets below it, and pins
+    /// page release beneath the lowest of them all — every entry at or
+    /// above `W` and every latched winner images (ADR-0093 A12), every
+    /// other entry refs, and the pin makes the image half structurally
+    /// RAM-resident for the whole walk. O(tickets open below `W`), at
+    /// most `SHADOW_TICKETS_CAP`, once per walk. One walk in flight per
+    /// cell, ever. `ckpt_id` is the id the publication this walk feeds
+    /// will manifest — subsequent slot-removals stamp their file with
+    /// it, which is what lets a later checkpoint prove it emitted no
+    /// reference into an emptied file (M4-S15, ADR-0059 D3).
     pub fn begin_ckpt_walk(&mut self, ckpt_id: u64) -> LogicalAddr {
         self.live.note_ckpt_begun(ckpt_id);
         self.walk_ckpt_id = Some(ckpt_id);
-        self.space.begin_walk()
+        let watermark = self.space.begin_walk();
+        debug_assert!(self.walk_images.is_empty(), "a walk ended with its images latched");
+        self.walk_images.extend(self.shadow.winners_below(watermark.to_raw()));
+        debug_assert!(self.walk_images.len() <= shadow::SHADOW_TICKETS_CAP);
+        debug_assert!(
+            self.walk_images.first().is_none_or(|lowest| self.space.release_ceiling() <= *lowest),
+            "release may pass a winner the walk images"
+        );
+        watermark
     }
 
     /// The checkpoint id the latest walk began under (`None` before the
@@ -502,17 +558,29 @@ impl TieredTable {
         self.walk_ckpt_id
     }
 
-    /// Releases the walk pin; the held-back release debt drains in the
-    /// next MAINTAIN slices.
+    /// Releases the walk pin and its latched images; the held-back
+    /// release debt drains in the next MAINTAIN slices.
     pub fn end_ckpt_walk(&mut self) {
         self.space.end_walk();
+        self.walk_images.clear();
+    }
+
+    /// The pinned walk's latch: the one source of a record's form for the
+    /// walk's two index passes and its 0x05 pass, in every writer.
+    ///
+    /// # Panics
+    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
+    /// (Self::begin_ckpt_walk) first).
+    pub(super) fn walk_latch(&self) -> WalkLatch<'_> {
+        let watermark = self.space.walk_watermark().expect("walk not begun").to_raw();
+        WalkLatch { watermark, images: &self.walk_images }
     }
 
     /// One bounded slice of the hybrid walk (ADR-0057 D1): resize-stable
     /// home-group enumeration **from the index sidecar** — the cold
     /// majority emits `{hash, addr}` with zero record touches; entries
-    /// at or above the walk watermark emit full images from RAM
-    /// (structurally: `addr ≥ W ≥ head` while pinned — the walker never
+    /// the walk's latch images emit full images from RAM (structurally:
+    /// at or above the pinned release floor — the walker never
     /// resolves a cold address, so `cold_resolves` is flat across a
     /// walk, asserted by the checkpoint-under-load storm). Inherits the
     /// SCAN guarantee: every entry present for the whole walk is emitted
@@ -551,7 +619,7 @@ impl TieredTable {
         mut emit_ref: impl FnMut(u64, LogicalAddr),
         mut emit_image: impl FnMut(RecordParts<'_>) -> bool,
     ) -> bool {
-        let w = self.space.walk_watermark().expect("walk not begun").to_raw();
+        let latch = self.walk_latch();
         let mask = self.index.group_count() as u64 - 1;
         let mut group = cursor.group & mask;
         let mut resume = cursor.chain.take();
@@ -562,21 +630,22 @@ impl TieredTable {
                 group as usize,
                 resume.take(),
                 |addr, hash, _pos| {
-                    // ADR-0093 A12 (batch 23): a ticket's winner is imaged
-                    // even below the flushed watermark — sealing and
-                    // flushing pass it (D3), only release is pinned, so it
-                    // is RAM-resident here; a ref would restore it as a
-                    // second cold slot of its key with no RAM sibling for
-                    // the rebuild to pair (a stale read and a phantom key
-                    // after recovery).
-                    if addr.to_raw() < w && !self.is_shadow_winner(addr) {
-                        emit_ref(hash, addr);
-                    } else {
-                        let head = space.bytes(addr, crate::record::HEADER_LEN);
-                        let full_len = crate::record::encoded_len_from_header(head);
-                        let parts = RecordParts::of(RecordView::new(space.bytes(addr, full_len)));
-                        if !emit_image(parts) {
-                            return false;
+                    match latch.form(addr.to_raw()) {
+                        WalkForm::Ref => emit_ref(hash, addr),
+                        // ADR-0093 A12: a latched winner lies below the
+                        // flushed watermark — sealing and flushing pass it
+                        // (D3), only release is pinned, so it is
+                        // RAM-resident here; a ref would restore it as a
+                        // second cold slot of its key with no RAM sibling
+                        // for the rebuild to pair (a stale read and a
+                        // phantom key after recovery).
+                        WalkForm::Image => {
+                            let head = space.bytes(addr, crate::record::HEADER_LEN);
+                            let full_len = crate::record::encoded_len_from_header(head);
+                            let bytes = space.bytes(addr, full_len);
+                            if !emit_image(RecordParts::of(RecordView::new(bytes))) {
+                                return false;
+                            }
                         }
                     }
                     emitted += 1;

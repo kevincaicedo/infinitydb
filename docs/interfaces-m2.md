@@ -2031,6 +2031,22 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `the_record_pin_clamps_release_until_resolution` and
   `a_shadowed_winner_never_goes_cold`; `resolve_shadow` release-asserts
   the winner is not cold when it runs.
+- **A checkpoint walk fixes each record's form when it begins** — an
+  entry at or above the walk watermark is an image, and so is the winner
+  of a ticket open as the walk began (the walk latches those winners);
+  every other entry is a reference, and the 0x05 section lists the
+  references' entries only, so an imaged extent record is registered
+  once, when recovery appends its image (ADR-0061 D6, ADR-0093 A12).
+  `WalkLatch::form` is the one producer of a `WalkForm`; the walk's two
+  index passes (`ckpt_walk_slice_bounded`) and its 0x05 pass
+  (`extent_ckpt_entries_from`) read nothing else, in every writer. The
+  walk pin holds release at the lowest latched winner until the walk
+  ends, so a ticket that ends mid-walk leaves its winner imaged and
+  RAM-resident. Pinned by `an_imaged_ticket_winner_is_not_also_a_blob_
+  reference_entry`, `a_ticket_that_ends_before_the_images_keeps_its_
+  winner_imaged`, `a_ticket_that_ends_after_the_images_keeps_its_blob_
+  entry_out_of_the_section` and `a_walk_keeps_the_record_pin_it_began_
+  under_as_its_release_floor`.
 - **Nothing is removed on hash evidence** — the only slot removal the
   module performs (`resolve_shadow`, same key) follows
   `decode_record(image).key == record(winner).key` on the verbatim cold

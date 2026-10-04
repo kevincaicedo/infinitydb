@@ -291,13 +291,12 @@ pub struct AddressSpace {
     /// boundaries.
     flush_cuts: VecDeque<u64>,
     /// Active checkpoint-walk pin (M4-S12, ADR-0057 D2): while a hybrid
-    /// walk is in flight, the head must not pass the walk watermark — a
-    /// release past it would strand an image-class record (`addr ≥ W`)
-    /// on disk mid-walk, forcing the walker to choose between a cold
-    /// read and a lie. One walk per cell, ever (the ADR-0016 D7
-    /// posture); flush and seal stay unpinned, so backpressure targets
-    /// keep waking.
-    walk_pin: Option<u64>,
+    /// walk is in flight, the head must not pass a record the walk
+    /// images — a release past one would strand it on disk mid-walk,
+    /// forcing the walker to choose between a cold read and a lie. One
+    /// walk per cell, ever (the ADR-0016 D7 posture); flush and seal
+    /// stay unpinned, so backpressure targets keep waking.
+    walk_pin: Option<WalkPin>,
     /// Record-release pin (M4.5-S37, ADR-0093 D3): while a shadow ticket
     /// is open, the head must not pass its winner — the RAM-resident
     /// record whose key-verified slot outranks the unverified cold
@@ -308,6 +307,16 @@ pub struct AddressSpace {
     counters: TieringCounters,
     /// Interior-mutable: the resolver is `&self` on the hottest path.
     cold_resolves: LocalCounter,
+}
+
+/// A pinned checkpoint walk (ADR-0057 D2), fixed when the walk begins.
+#[derive(Copy, Clone, Debug)]
+struct WalkPin {
+    /// `W`, the flushed watermark as the walk began.
+    watermark: u64,
+    /// The walk's release floor: `W`, or the record pin as the walk began
+    /// where that lay below `W` (ADR-0093 A12). Never above `W`.
+    release: u64,
 }
 
 /// Cap on retained flush cuts (~32 KiB worst case). One cut per seal
@@ -357,18 +366,23 @@ impl AddressSpace {
     // ---- checkpoint-walk pin (M4-S12, ADR-0057 D2) ----
 
     /// Latches the walk watermark `W` = the current flushed watermark
-    /// and pins page release beneath it for the walk's duration. Every
-    /// entry below `W` refs, every entry at or above it images — and the
-    /// pin makes the image half structurally RAM-resident (`addr ≥ W ≥
-    /// head` holds until [`end_walk`](Self::end_walk)).
+    /// and pins page release for the walk's duration: at `W`, or at the
+    /// record pin where that lies below it. An entry at or above `W`
+    /// images, and so does an open ticket's winner below it (ADR-0093
+    /// A12), the lowest of which the record pin names as the walk begins;
+    /// the walk pin keeps that floor until [`end_walk`](Self::end_walk),
+    /// whatever becomes of the ticket, so every image is structurally
+    /// RAM-resident (`addr ≥ floor ≥ head`).
     ///
     /// # Panics
     /// Panics when a walk is already pinned (one checkpoint in flight
     /// per cell, ever — ADR-0016 D7).
     pub fn begin_walk(&mut self) -> LogicalAddr {
         assert!(self.walk_pin.is_none(), "one checkpoint walk in flight per cell");
-        self.walk_pin = Some(self.flushed);
-        LogicalAddr::from_raw(self.flushed).expect("watermarks stay 48-bit")
+        let watermark = self.flushed;
+        let release = self.record_pin.map_or(watermark, |pin| pin.min(watermark));
+        self.walk_pin = Some(WalkPin { watermark, release });
+        LogicalAddr::from_raw(watermark).expect("watermarks stay 48-bit")
     }
 
     /// Releases the walk pin (walk complete or aborted — either way the
@@ -383,7 +397,8 @@ impl AddressSpace {
     /// The active walk's watermark, if one is pinned.
     #[must_use]
     pub fn walk_watermark(&self) -> Option<LogicalAddr> {
-        self.walk_pin.map(|w| LogicalAddr::from_raw(w).expect("watermarks stay 48-bit"))
+        self.walk_pin
+            .map(|pin| LogicalAddr::from_raw(pin.watermark).expect("watermarks stay 48-bit"))
     }
 
     /// How far the head may advance right now: `flushed`, clamped to the
@@ -392,7 +407,7 @@ impl AddressSpace {
     /// Release drivers step toward this, never toward `flushed` directly.
     #[must_use]
     pub fn release_ceiling(&self) -> u64 {
-        let ceiling = self.walk_pin.map_or(self.flushed, |w| w.min(self.flushed));
+        let ceiling = self.walk_pin.map_or(self.flushed, |pin| pin.release.min(self.flushed));
         self.record_pin.map_or(ceiling, |p| p.min(ceiling))
     }
 
@@ -915,9 +930,9 @@ impl AddressSpace {
     /// # Panics
     /// Panics unless `head ≤ to ≤ flushed`: pages never release above
     /// `flushed` — dropping unflushed bytes is data loss (§3.1). With a
-    /// checkpoint walk pinned, additionally `to ≤` the walk watermark
-    /// (ADR-0057 D2 — releasing past it would strand an image-class
-    /// record on disk mid-walk).
+    /// checkpoint walk pinned, additionally `to ≤` the walk's release
+    /// floor (ADR-0057 D2 — releasing past it would strand a record the
+    /// walk images on disk mid-walk).
     pub fn advance_head(&mut self, to: LogicalAddr) {
         let t = to.to_raw();
         assert!(t >= self.head, "head retreat");
@@ -1132,6 +1147,34 @@ mod tests {
         space.advance_head(b);
         assert_eq!(space.resolve(a), AddrClass::Cold);
         assert_eq!(space.counters().cold_resolves, 1);
+    }
+
+    /// A walk that begins with the record pin below its watermark keeps
+    /// release at that record after the pin lifts (ADR-0093 A12: the walk
+    /// images it), and gives the floor back when it ends.
+    #[test]
+    fn a_walk_keeps_the_record_pin_it_began_under_as_its_release_floor() {
+        let mut space = space(1 << 16, 1 << 12);
+        let _first = space.alloc(600).expect("fits");
+        let winner = space.alloc(600).expect("fits");
+        let _later = space.alloc(600).expect("fits");
+        let end = space.alloc(1).expect("fits");
+        space.advance_ro_boundary(end);
+        space.advance_flushed(end);
+        space.set_record_pin(Some(winner));
+        assert_eq!(space.begin_walk(), end, "W is the flushed watermark");
+        assert_eq!(space.release_ceiling(), winner.to_raw());
+        space.set_record_pin(None);
+        assert_eq!(space.release_ceiling(), winner.to_raw(), "the walk holds what it images");
+        space.end_walk();
+        assert_eq!(space.release_ceiling(), end.to_raw());
+        // A pin above the watermark is no floor: the walk pins at `W`.
+        let above = space.alloc(600).expect("fits");
+        space.set_record_pin(Some(above));
+        assert_eq!(space.begin_walk(), end);
+        space.set_record_pin(None);
+        assert_eq!(space.release_ceiling(), end.to_raw());
+        space.end_walk();
     }
 
     /// Flush chunks (M4-S11): cut-bounded within the budget, minimum one
