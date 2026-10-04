@@ -528,13 +528,15 @@ the `SegmentFs` seam (→ `BackendDriver` at S05):
   when a frame exceeds it (bounded by `max_frame_len`).
 
 These are reader facts; recovery decides from them. A validating frame
-beyond a segment's data end marks a hole. Recovery refuses to start, with
-a `LogCorruption` naming the corruption point and the evidence, when a
-frame beyond the hole is format v1 or a surviving frame attests fsync
-coverage past it; otherwise it truncates at the hole and counts the
-frames it discards. Frames whose epochs all sit below the replayed
-prefix's, or whose own `first_lsn.segment` is not the segment they were
-read from, are residue of a discarded or recycled life, never a hole.
+beyond a segment's data end marks a hole (ADR-0087 D6). Recovery refuses
+to start, with a `LogCorruption` naming the corruption point and the
+evidence, when a frame beyond the hole is format v1 or a surviving frame
+attests fsync coverage past it; otherwise it truncates at the hole and
+counts the frames it discards. Frames whose epochs all sit below the
+replayed prefix's or below a life observed beyond the hole, or whose own
+`first_lsn.segment` is not the segment they were read from, are residue
+of a discarded or recycled life, never a hole; when the epoch beyond the
+hole decides it, the segments probed beyond the hole are replayed.
 Non-validating residue at the resume point is a torn tail (the tail
 pointer moves back; no byte is rewritten); behind it, residue is
 tolerated and counted. A log that ends below the MANIFEST's begin-LSN
