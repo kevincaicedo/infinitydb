@@ -556,6 +556,10 @@ impl TieredTable {
             .walk_image_addrs
             .first()
             .map(|winner| LogicalAddr::from_raw(*winner).expect("latched winners are 48-bit"));
+        // The planted canary hands nothing, so the walk pins at its
+        // watermark alone and release may pass a latched winner whose
+        // ticket ends under the walk.
+        let lowest_image = if cfg!(inf_canary_ckpt_pin_at_watermark) { None } else { lowest_image };
         let watermark = self.space.begin_walk(lowest_image);
         debug_assert_eq!(watermark.to_raw(), flushed, "the latch and the pin share one watermark");
         watermark

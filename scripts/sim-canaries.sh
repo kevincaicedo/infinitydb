@@ -305,6 +305,10 @@ rows=(
   # the cut comes before the key is written again: the checkpoint holds
   # the winner in neither pass, so the boot loses an acknowledged key.
   "inf_canary_ckpt_form_unlatched m4-recovery never-none --spec-variant page --seed 0xC11E8F"
+  # ADR-0093 A12: the walk holds release at its lowest latched winner
+  # until it ends. Pinned at the watermark alone, a winner whose ticket
+  # ends under the walk loses the hold the moment its own pin lifts.
+  "inf_canary_ckpt_pin_at_watermark crate-test inf-store test:tiered_replay a_ticket_that_ends_before_the_images_keeps_its_winner_imaged the walk holds release at its lowest image"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
