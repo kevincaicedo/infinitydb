@@ -346,7 +346,7 @@ fn a_lifted_log_with_a_paired_marker_boots_and_serves_the_lifted_records() {
         ],
     );
     let (server, stderr) = spawn(&dir).expect("a paired marker is legal");
-    assert!(!stderr.contains("recovery failed"), "{stderr}");
+    assert!(!stderr.contains("boot failed"), "{stderr}");
     let mut c = Client::connect(server.port);
     c.ok(&[b"INF.NS", b"USE", b"hot"]);
     for i in 0..4u32 {
