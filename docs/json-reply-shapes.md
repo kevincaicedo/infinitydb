@@ -23,7 +23,7 @@ M3-S17's `DocDelta`/`DocFull` path (ADR-0043).
 
 | Command | Kind | `$` path | Legacy path | RESP3 delta | Notes |
 |---|---|---|---|---|---|
-| `JSON.SET` | write | `+OK`; null when NX/XX skips | same as `$` mode | nulls are `_` instead of `$-1` | parent-creation rules per ADR-0041 D6; root sets preserve TTL |
+| `JSON.SET` | write | `+OK`; null when NX/XX skips | same as `$` mode | nulls are `_` instead of `$-1` | a missing key takes a root path only; with no match, only a final child name creates, in every matched object parent (others skipped; ADR-0041 D6); root sets preserve TTL |
 | `JSON.GET` | read | bulk JSON text: array of matches; multi-path wraps an object keyed by the path strings as given | bulk JSON text: first match, unwrapped; zero matches error | nulls are `_` instead of `$-1` | `INDENT`/`NEWLINE`/`SPACE` honored; missing key is null in both modes |
 | `JSON.MGET` | read | array: per key, bulk JSON match-array or null | array: per key, bulk first match or null | nulls are `_` instead of `$-1` | per-key atomicity only — no cross-cell snapshot (ADR-0041 D9) |
 | `JSON.DEL` | write | integer: matches removed | integer: matches removed | identical | root path deletes the key (kernel-owned lifecycle) |

@@ -332,8 +332,11 @@ pub static DECLARED: &[Declared] = &[
         "INF.NS",
         Status::Extension,
         "M1",
-        "namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; \
-         M4-S26 lifts the D8 `USE` refusal — the string family, `SCAN`, and `DBSIZE` serve \
+        "namespace registry (M2 durability seam; M4-S19 adds SET and the tiering keys \
+         `MEM-BUDGET`, `DISK-BUDGET`, `MUTABLE-FRACTION`, `MAINTAIN-SLICE`, `COLD-READ-QD`, \
+         `COMPACTION-DEAD-RATIO`, `COMPACTION-SLICE`, `BLOB-THRESHOLD`, `TIER-IO-MODE` and \
+         `TAIL-STALL-TIMEOUT` (ADR-0062); M4-S26 lifts the refusal of `USE` on a tiered \
+         namespace — the string family, `SCAN`, and `DBSIZE` serve \
          tiered namespaces; two extension error classes are live on their writes: `DISKFULL …` \
          (ADR-0063 — disk budget or device full; new-tier-byte placements only) and \
          `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \

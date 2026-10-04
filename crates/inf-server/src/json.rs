@@ -1828,7 +1828,9 @@ pub static JSON_REPLY_SHAPES: &[ReplyShape] = &[
         dollar: "`+OK`; null when NX/XX skips",
         legacy: "same as `$` mode",
         resp3: NULLS,
-        notes: "parent-creation rules per ADR-0041 D6; root sets preserve TTL",
+        notes: "a missing key takes a root path only; with no match, only a final child name \
+                creates, in every matched object parent (others skipped; ADR-0041 D6); root sets \
+                preserve TTL",
     },
     ReplyShape {
         name: "JSON.GET",
