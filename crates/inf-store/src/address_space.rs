@@ -314,10 +314,10 @@ pub struct AddressSpace {
 struct WalkPin {
     /// `W`, the flushed watermark as the walk began.
     watermark: u64,
-    /// The walk's release floor: `W`, or the lowest record below `W` the
-    /// walk images, as its caller latched it (ADR-0093 A12). Never above
-    /// `W`.
-    release: u64,
+    /// The walk's term of the release ceiling: `W`, or the lowest record
+    /// below `W` the walk images, as its caller latched it (ADR-0093
+    /// A12). Never above `W`.
+    release_ceiling: u64,
 }
 
 /// Cap on retained flush cuts (~32 KiB worst case). One cut per seal
@@ -370,26 +370,27 @@ impl AddressSpace {
     /// and pins page release for the walk's duration: at `W`, or at
     /// `lowest_image` — the lowest record below `W` that the walk images
     /// (an open ticket's winner, ADR-0093 A12), `None` when it images
-    /// none there. The floor is the caller's latch, not the record pin
-    /// read again: the two agree as the walk begins, and only the latch
-    /// says what the walk reads from RAM. The walk pin keeps the floor
-    /// until [`end_walk`](Self::end_walk), whatever becomes of the
-    /// ticket, so every image is structurally RAM-resident
-    /// (`addr ≥ floor ≥ head`).
+    /// none there. That address is the walk's term of the release
+    /// ceiling, and it is the caller's latch, not the record pin read
+    /// again: the two agree as the walk begins, and only the latch says
+    /// what the walk reads from RAM. The walk pin keeps it until
+    /// [`end_walk`](Self::end_walk), whatever becomes of the ticket, so
+    /// every image is structurally RAM-resident
+    /// (`addr ≥ release ceiling ≥ head`).
     ///
     /// # Panics
     /// Panics when a walk is already pinned (one checkpoint in flight
     /// per cell, ever — ADR-0016 D7). Debug-panics on a `lowest_image`
     /// at or above `W`, or below the head (an image that already went
-    /// cold — the state the floor exists to prevent).
+    /// cold — the state the pin exists to prevent).
     pub fn begin_walk(&mut self, lowest_image: Option<LogicalAddr>) -> LogicalAddr {
         assert!(self.walk_pin.is_none(), "one checkpoint walk in flight per cell");
         let watermark = self.flushed;
-        let floor = lowest_image.map(LogicalAddr::to_raw);
-        debug_assert!(floor.is_none_or(|f| f < watermark), "a walk floor at or above W");
-        debug_assert!(floor.is_none_or(|f| f >= self.head), "a walk floor below the head");
-        let release = floor.map_or(watermark, |f| f.min(watermark));
-        self.walk_pin = Some(WalkPin { watermark, release });
+        let lowest = lowest_image.map(LogicalAddr::to_raw);
+        debug_assert!(lowest.is_none_or(|a| a < watermark), "a walk's lowest image is below W");
+        debug_assert!(lowest.is_none_or(|a| a >= self.head), "a walk's lowest image is in RAM");
+        let release_ceiling = lowest.map_or(watermark, |a| a.min(watermark));
+        self.walk_pin = Some(WalkPin { watermark, release_ceiling });
         LogicalAddr::from_raw(watermark).expect("watermarks stay 48-bit")
     }
 
@@ -415,7 +416,8 @@ impl AddressSpace {
     /// Release drivers step toward this, never toward `flushed` directly.
     #[must_use]
     pub fn release_ceiling(&self) -> u64 {
-        let ceiling = self.walk_pin.map_or(self.flushed, |pin| pin.release.min(self.flushed));
+        let ceiling =
+            self.walk_pin.map_or(self.flushed, |pin| pin.release_ceiling.min(self.flushed));
         self.record_pin.map_or(ceiling, |p| p.min(ceiling))
     }
 
@@ -939,8 +941,8 @@ impl AddressSpace {
     /// Panics unless `head ≤ to ≤ flushed`: pages never release above
     /// `flushed` — dropping unflushed bytes is data loss (§3.1). With a
     /// checkpoint walk pinned, additionally `to ≤` the walk's release
-    /// floor (ADR-0057 D2 — releasing past it would strand a record the
-    /// walk images on disk mid-walk).
+    /// ceiling (ADR-0057 D2 — releasing past it would strand a record
+    /// the walk images on disk mid-walk).
     pub fn advance_head(&mut self, to: LogicalAddr) {
         let t = to.to_raw();
         assert!(t >= self.head, "head retreat");
@@ -1159,7 +1161,7 @@ mod tests {
 
     /// A walk given its lowest image below the watermark holds release
     /// at that record until it ends (ADR-0093 A12), with no record pin and
-    /// whatever the record pin does meanwhile: the floor is the walk's
+    /// whatever the record pin does meanwhile: the walk pin is the walk's
     /// own. A walk given none pins at `W`.
     #[test]
     fn a_walk_pins_release_at_its_lowest_image_until_it_ends() {
@@ -1177,9 +1179,9 @@ mod tests {
         space.set_record_pin(None);
         assert_eq!(space.release_ceiling(), winner.to_raw(), "nor does its lifting");
         space.end_walk();
-        assert_eq!(space.release_ceiling(), end.to_raw(), "the floor ends with the walk");
+        assert_eq!(space.release_ceiling(), end.to_raw(), "the pin ends with the walk");
         // No image below `W`: the walk pins at `W`, and a record pin above
-        // `W` is no floor of its.
+        // `W` does not lower it.
         let above = space.alloc(600).expect("fits");
         space.set_record_pin(Some(above));
         assert_eq!(space.begin_walk(None), end);

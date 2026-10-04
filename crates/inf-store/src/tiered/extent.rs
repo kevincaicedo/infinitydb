@@ -372,8 +372,8 @@ impl TieredTable {
     /// would count its extent twice.
     ///
     /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
+    /// Panics when no walk is pinned
+    /// ([`begin_ckpt_walk`](Self::begin_ckpt_walk) first).
     pub fn extent_ckpt_entries(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         self.extent_ckpt_entries_from(0)
     }
@@ -381,11 +381,11 @@ impl TieredTable {
     /// [`extent_ckpt_entries`](Self::extent_ckpt_entries) resumed at the
     /// address cursor `resume` — the pass-3 slice form: stable under
     /// mid-walk removals below the cursor, which an ordinal resume is
-    /// not. One [`WalkLatch::form`] per entry below the watermark.
+    /// not. One `WalkLatch::form` per entry below the watermark.
     ///
     /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
+    /// Panics when no walk is pinned
+    /// ([`begin_ckpt_walk`](Self::begin_ckpt_walk) first).
     pub fn extent_ckpt_entries_from(
         &self,
         resume: u64,

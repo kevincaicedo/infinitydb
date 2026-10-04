@@ -113,12 +113,12 @@ pub struct TieredTable {
     space: AddressSpace,
     /// The id the latest checkpoint walk began under (F-L03-04 witness).
     walk_ckpt_id: Option<u64>,
-    /// The pinned walk's images below its watermark (ADR-0093 A12): the
-    /// winners of the tickets open as the walk began, ascending. Written
-    /// by `begin_ckpt_walk` and emptied by `end_ckpt_walk`; at most
-    /// `SHADOW_TICKETS_CAP` addresses (32 KiB, counted in the ticket
-    /// registry's bytes).
-    walk_images: Vec<u64>,
+    /// The addresses below its watermark that the pinned walk images
+    /// (ADR-0093 A12): the winners of the tickets open as the walk began,
+    /// ascending. Written by `begin_ckpt_walk` and emptied by
+    /// `end_ckpt_walk`; at most `SHADOW_TICKETS_CAP` addresses (32 KiB,
+    /// counted in the ticket registry's bytes).
+    walk_image_addrs: Vec<u64>,
     live_bytes: u64,
     demote: DemotionConfig,
     /// Record-start addresses the ro-boundary may seal to (ADR-0053 D2):
@@ -364,7 +364,7 @@ impl TieredTable {
             index: Index::with_capacity(initial_keys.max(64)),
             space,
             walk_ckpt_id: None,
-            walk_images: Vec::new(),
+            walk_image_addrs: Vec::new(),
             live_bytes: 0,
             demote,
             seal_marks: VecDeque::new(),

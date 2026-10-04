@@ -666,7 +666,7 @@ impl TieredTable {
         counters.pinned_bytes_peak = counters.pinned_bytes_peak.max(counters.pinned_bytes);
         counters.pin_cap_bytes = self.shadow_pin_cap_bytes();
         counters.bytes = counters.pending * SHADOW_TICKET_BYTES
-            + (self.walk_images.capacity() * size_of::<u64>()) as u64;
+            + (self.walk_image_addrs.capacity() * size_of::<u64>()) as u64;
         counters.scan_twins_emitted = self.shadow.scan_twins.get();
         counters.enabled = u64::from(self.shadow.enabled);
         counters.reconcile_paused = u64::from(!self.shadow.reconcile);
@@ -1425,7 +1425,7 @@ impl TieredTable {
             // ends under a pinned walk (ADR-0093 A12): the walk's later
             // passes then take it for a record no ticket named.
             if cfg!(inf_canary_ckpt_form_unlatched) {
-                self.walk_images.retain(|winner| *winner != entry.winner);
+                self.walk_image_addrs.retain(|winner| *winner != entry.winner);
             }
         }
         self.shadow.in_flight.retain(|c| *c != cold);

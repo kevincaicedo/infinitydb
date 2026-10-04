@@ -39,7 +39,8 @@ pub(super) enum WalkForm {
 #[derive(Copy, Clone)]
 pub(super) struct WalkLatch<'a> {
     watermark: u64,
-    images: &'a [u64],
+    /// The addresses below the watermark that the walk images, ascending.
+    image_addrs: &'a [u64],
 }
 
 impl WalkLatch<'_> {
@@ -56,7 +57,7 @@ impl WalkLatch<'_> {
         if addr >= self.watermark {
             return WalkForm::Image;
         }
-        if !self.images.is_empty() && self.images.binary_search(&addr).is_ok() {
+        if !self.image_addrs.is_empty() && self.image_addrs.binary_search(&addr).is_ok() {
             WalkForm::Image
         } else {
             WalkForm::Ref
@@ -112,12 +113,13 @@ impl TieredTable {
     }
 
     /// One release step (ADR-0053 D3): advances the head toward the
-    /// release ceiling — the flushed watermark, clamped to the walk
-    /// watermark while a hybrid checkpoint walk is pinned (M4-S12,
-    /// ADR-0057 D2) — at most `slice_bytes` per call, decommitting
-    /// whole pages beneath it (RSS returns to the OS, ADR-0052 D3). The
-    /// §3.1 order (`head ≤ flushed`) is structural in `advance_head`.
-    /// Returns the bytes released.
+    /// release ceiling — the flushed watermark, clamped to the walk pin
+    /// while a hybrid checkpoint walk is in flight (its watermark, or its
+    /// lowest image below that: ADR-0057 D2, ADR-0093 A12) and to the
+    /// record pin while a shadow ticket is open (ADR-0093 D3) — at most
+    /// `slice_bytes` per call, decommitting whole pages beneath it (RSS
+    /// returns to the OS, ADR-0052 D3). The §3.1 order (`head ≤ flushed`)
+    /// is structural in `advance_head`. Returns the bytes released.
     pub fn release_slice(&mut self) -> u64 {
         let head = self.space.head().to_raw();
         let flushed = self.space.release_ceiling();
@@ -541,14 +543,17 @@ impl TieredTable {
         let flushed = self.space.flushed().to_raw();
         // Emptied here as well as at the walk's end: the latch is searched
         // in order, so it holds this walk's winners and nothing else.
-        self.walk_images.clear();
-        self.walk_images.extend(self.shadow.winners_below(flushed));
-        debug_assert!(self.walk_images.len() <= shadow::SHADOW_TICKETS_CAP);
-        debug_assert!(self.walk_images.is_sorted_by(|a, b| a < b), "the latch ascends strictly");
-        // The pin's floor is the latch's lowest winner, handed over: what
-        // the walk reads from RAM and what release holds are one set.
+        self.walk_image_addrs.clear();
+        self.walk_image_addrs.extend(self.shadow.winners_below(flushed));
+        debug_assert!(self.walk_image_addrs.len() <= shadow::SHADOW_TICKETS_CAP);
+        debug_assert!(
+            self.walk_image_addrs.is_sorted_by(|a, b| a < b),
+            "the latch ascends strictly"
+        );
+        // The walk pin is the latch's lowest winner, handed over: what the
+        // walk reads from RAM and what release holds are one set.
         let lowest_image = self
-            .walk_images
+            .walk_image_addrs
             .first()
             .map(|winner| LogicalAddr::from_raw(*winner).expect("latched winners are 48-bit"));
         let watermark = self.space.begin_walk(lowest_image);
@@ -565,29 +570,29 @@ impl TieredTable {
         self.walk_ckpt_id
     }
 
-    /// Releases the walk pin and its latched images; the held-back
+    /// Releases the walk pin and empties the latch; the held-back
     /// release debt drains in the next MAINTAIN slices.
     pub fn end_ckpt_walk(&mut self) {
         self.space.end_walk();
-        self.walk_images.clear();
+        self.walk_image_addrs.clear();
     }
 
     /// The pinned walk's latch: the one source of a record's form for the
     /// walk's two index passes and its 0x05 pass, in every writer.
     ///
     /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
+    /// Panics when no walk is pinned
+    /// ([`begin_ckpt_walk`](Self::begin_ckpt_walk) first).
     pub(super) fn walk_latch(&self) -> WalkLatch<'_> {
         let watermark = self.space.walk_watermark().expect("walk not begun").to_raw();
-        WalkLatch { watermark, images: &self.walk_images }
+        WalkLatch { watermark, image_addrs: &self.walk_image_addrs }
     }
 
     /// One bounded slice of the hybrid walk (ADR-0057 D1): resize-stable
     /// home-group enumeration **from the index sidecar** — the cold
     /// majority emits `{hash, addr}` with zero record touches; entries
     /// the walk's latch images emit full images from RAM (structurally:
-    /// at or above the pinned release floor — the walker never
+    /// at or above the walk's release ceiling — the walker never
     /// resolves a cold address, so `cold_resolves` is flat across a
     /// walk, asserted by the checkpoint-under-load storm). Inherits the
     /// SCAN guarantee: every entry present for the whole walk is emitted
@@ -596,8 +601,8 @@ impl TieredTable {
     /// cursor (0 = done).
     ///
     /// # Panics
-    /// Panics when no walk is pinned ([`begin_ckpt_walk`]
-    /// (Self::begin_ckpt_walk) first).
+    /// Panics when no walk is pinned
+    /// ([`begin_ckpt_walk`](Self::begin_ckpt_walk) first).
     pub fn ckpt_walk_slice(
         &self,
         cursor: u64,
