@@ -98,17 +98,17 @@ impl Arena {
 
 ## 3. `inf-runtime` — backend driver + executor + loop (implemented core; pending changes marked)
 
-> **Accepted 2026-09-22, implementation open — ADR-0149:**
-> reserved executor and gate capacity
-> replaces the executor/gate part of the implemented sketch below.
-> Fallible boot construction yields fixed task classes; `reserve(class)`
-> returns an exclusive permit whose `poll_immediate`/`spawn_local` methods
-> accept a factory only after admission. Ready publishes no runnable task;
-> retained waker headers still own capacity. `run_ready` returns
-> `ExecutorProgress { tasks_polled, slots_reclaimed }`, charging both
-> against the slice budget. `live_tasks` alone is not a leak proof.
-> `KeyedGate<K, V, Cleanup>` reserves routing and holder capacity before
-> request publication; completed values retain their payload ownership.
+> **Accepted 2026-09-22, implementation open — ADR-0149:** reserved
+> executor and gate capacity replaces the executor/gate part of the
+> implemented sketch below. Fallible boot construction yields fixed task
+> classes; `reserve(class)` returns an exclusive permit whose
+> `poll_immediate`/`spawn_local` methods accept a factory only after
+> admission. Ready publishes no runnable task; retained waker headers
+> still own capacity. `run_ready` returns `ExecutorProgress {
+> tasks_polled, slots_reclaimed }`, charging both against the slice
+> budget. `live_tasks` alone is not a leak proof. `KeyedGate<K, V,
+> Cleanup>` reserves routing and holder capacity before request
+> publication; completed values retain their payload ownership.
 > `IoGate<Cleanup>` keeps its name with an explicit terminal-cleanup
 > policy. Admission: `reserve` answers Granted, Full, Closed, identity
 > exhaustion or a foreign class, no refusal owns the future or its
@@ -119,57 +119,55 @@ impl Arena {
 > slots). Failure: a construction refusal releases partial backing and
 > takes part in the all-cells boot barrier, and task-identity exhaustion
 > is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
-> signatures below are the implemented shape; the replacement above is
-> not built.
+> signatures below are the implemented shape; the replacement above is not
+> built.
 
-> **Accepted 2026-09-22, implementation open — ADR-0151:**
-> fixed storage and bounded cell maps
-> narrows `KeyedGate` keys to the runtime's sealed, exact fixed-width
-> adapter and `WaitList` keys to the foundation's sealed key domain.
-> Fabric and I/O gates retain their current key types and every identity
-> bit. Admission, terminal cleanup and the 5 ns executor gate are unchanged.
-> A key is a sealed, fixed-width exact representation (an integer of at
-> most 128 bits, a pair of `u64`s, the unit key or a foundation ID with an
-> exact integer form), compared with constant work and never through a
-> caller's `Hash` or comparison. A map answers `Occupied`, `Vacant` or
-> `Full`, and a vacant slot fixes the key and every tree position before
-> the payload is built (ADR-0151 D1, D2).
+> **Accepted 2026-09-22, implementation open — ADR-0151:** fixed storage
+> and bounded cell maps narrows `KeyedGate` keys to the runtime's sealed,
+> exact fixed-width adapter and `WaitList` keys to the foundation's sealed
+> key domain. Fabric and I/O gates retain their current key types and
+> every identity bit. Admission, terminal cleanup and the 5 ns executor
+> gate are unchanged. A key is a sealed, fixed-width exact representation
+> (an integer of at most 128 bits, a pair of `u64`s, the unit key or a
+> foundation ID with an exact integer form), compared with constant work
+> and never through a caller's `Hash` or comparison. A map answers
+> `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
+> every tree position before the payload is built (ADR-0151 D1, D2).
 
-> **Accepted 2026-09-22, implementation open — ADR-0154:**
-> fixed timer ownership and bounded callback delivery
-> replaces TimerWheel/TimerId and the raw-key on_timer contract below.
-> Fallible boot construction admits fixed TimerSet owner positions and
-> an indexed minimum heap. Cancel/replace physically removes the prior
-> entry; owner/arm identities are checked and do not wrap. Delivery keeps
-> the position through synchronous callback consumption, with at most
-> 64 callbacks per native turn and one successor after consumption.
-> LoopCx exposes admitted owner/arm operations, not unbounded advance or
-> allowance reset. The runtime retains the terminal receipt; a raw route
-> key cannot authorize callback delivery to a replacement owner. A full
-> set refuses before publication and never allocates or drops a wake;
-> arming an owner during its delivery answers Busy; a stale owner, arm or
-> receipt gets a typed stale result; and close wins over a successor. A
-> deadline is normalized to no earlier than the next millisecond after the
-> current turn, and clock-range exhaustion is a typed error before arming
-> (ADR-0154 D1–D3). The sketch below is the implemented shape; the
-> replacement above is not built.
-> The ten phases, one backend entry and existing gates remain unchanged.
+> **Accepted 2026-09-22, implementation open — ADR-0154:** fixed timer
+> ownership and bounded callback delivery replaces TimerWheel/TimerId and
+> the raw-key on_timer contract below. Fallible boot construction admits
+> fixed TimerSet owner positions and an indexed minimum heap.
+> Cancel/replace physically removes the prior entry; owner/arm identities
+> are checked and do not wrap. Delivery keeps the position through
+> synchronous callback consumption, with at most 64 callbacks per native
+> turn and one successor after consumption. LoopCx exposes admitted
+> owner/arm operations, not unbounded advance or allowance reset. The
+> runtime retains the terminal receipt; a raw route key cannot authorize
+> callback delivery to a replacement owner. A full set refuses before
+> publication and never allocates or drops a wake; arming an owner during
+> its delivery answers Busy; a stale owner, arm or receipt gets a typed
+> stale result; and close wins over a successor. A deadline is normalized
+> to no earlier than the next millisecond after the current turn, and
+> clock-range exhaustion is a typed error before arming (ADR-0154 D1–D3).
+> The sketch below is the implemented shape; the replacement above is not
+> built. The ten phases, one backend entry and existing gates remain
+> unchanged.
 
-> **Accepted 2026-09-22, implementation open — ADR-0147:**
-> bounded accept admission and terminal parking
-> replaces native multishot accept with bounded batches. It adds
-> `IoOp::AcceptPark { listener: RawFd, token: CompletionToken }`,
-> `CompletionResult::AcceptParked`, and the routing classes
-> `TokenClass::RefusalSend` / `TokenClass::RefusalClose`; the token layout
-> is unchanged. A stale generation never retargets a successor listener,
-> and an exhausted generation retires its identity instead of wrapping. A
-> native socket stays counted from delivery until a reserved connection
-> slot, a fabric handoff or its terminal close takes it. Each listener has
-> at most 16 one-shot accept attempts (`ACCEPT_ATTEMPTS_PER_LISTENER`) and
-> each cell at most 64 native custodies
-> (`NATIVE_ACCEPT_CUSTODIES_PER_CELL`): a cell parks at 48 and resumes only
-> after `AcceptParked`, with at most 32 left. An accept error parks
-> production too, and neither its retry timer nor an unrelated close
+> **Accepted 2026-09-22, implementation open — ADR-0147:** bounded accept
+> admission and terminal parking replaces native multishot accept with
+> bounded batches. It adds `IoOp::AcceptPark { listener: RawFd, token:
+> CompletionToken }`, `CompletionResult::AcceptParked`, and the routing
+> classes `TokenClass::RefusalSend` / `TokenClass::RefusalClose`; the
+> token layout is unchanged. A stale generation never retargets a
+> successor listener, and an exhausted generation retires its identity
+> instead of wrapping. A native socket stays counted from delivery until a
+> reserved connection slot, a fabric handoff or its terminal close takes
+> it. Each listener has at most 16 one-shot accept attempts
+> (`ACCEPT_ATTEMPTS_PER_LISTENER`) and each cell at most 64 native
+> custodies (`NATIVE_ACCEPT_CUSTODIES_PER_CELL`): a cell parks at 48 and
+> resumes only after `AcceptParked`, with at most 32 left. An accept error
+> parks production too, and neither its retry timer nor an unrelated close
 > clears an explicit park (ADR-0147 D1–D3). `AcceptParked` settles both
 > original accept and cancellation completions, not just the cancel
 > request. The sketch below is the implemented shape; these additions are
@@ -254,60 +252,56 @@ impl Arena {
 > buffer above `DRIVER_OP_BYTES_MAX` (`u32::MAX`). A merged read's span
 > end is `bytes_after(len)`, and a union stays within `buf_size`.
 
-> **Accepted 2026-09-22, implementation open — ADR-0152:**
-> bounded cold-read result delivery
-> replaces the implemented full `on_completion -> delivered_count`
-> fan-out above with `record_completion(token, result, now_us) -> ()`,
-> `deliver_ready(&mut ColdDeliveryBudget, now_us) -> ColdDeliveryProgress`
-> and `has_ready_delivery() -> bool`. One host-turn allowance covers at
-> most 64 logical deliveries, including orphan cleanup. The cell's
-> execute prelude specified by A1 below services it; pending delivery
-> prevents parking.
-> Device receipt returns QD, while file/buffer custody remains through
-> final value drop. Routing and holder storage cover deferred delivery;
-> latency includes that delay. A window goes Free → Issued (it owns the
-> buffer, its member prefix and every file pin) → Ready at the device
-> receipt → one member per budgeted step, and back to Free only when no
-> unvisited member or delivered value remains; a cancelled member costs a
-> step like an orphan. `cold_reads_inflight` keeps counting reads that
-> await the device; pending-delivery members and windows and delivery
-> work get their own counters; and `cold_read_p99_us` samples at logical
-> delivery, with device-to-delivery delay observed apart (ADR-0152 D3,
-> D4). The `on_completion` fan-out above is the implemented shape; this
-> replacement is not built.
+> **Accepted 2026-09-22, implementation open — ADR-0152:** bounded
+> cold-read result delivery replaces the implemented full `on_completion
+> -> delivered_count` fan-out above with `record_completion(token, result,
+> now_us) -> ()`, `deliver_ready(&mut ColdDeliveryBudget, now_us) ->
+> ColdDeliveryProgress` and `has_ready_delivery() -> bool`. One host-turn
+> allowance covers at most 64 logical deliveries, including orphan
+> cleanup. The cell's execute prelude specified by A1 below services it;
+> pending delivery prevents parking. Device receipt returns QD, while
+> file/buffer custody remains through final value drop. Routing and holder
+> storage cover deferred delivery; latency includes that delay. A window
+> goes Free → Issued (it owns the buffer, its member prefix and every file
+> pin) → Ready at the device receipt → one member per budgeted step, and
+> back to Free only when no unvisited member or delivered value remains; a
+> cancelled member costs a step like an orphan. `cold_reads_inflight`
+> keeps counting reads that await the device; pending-delivery members and
+> windows and delivery work get their own counters; and `cold_read_p99_us`
+> samples at logical delivery, with device-to-delivery delay observed
+> apart (ADR-0152 D3, D4). The `on_completion` fan-out above is the
+> implemented shape; this replacement is not built.
 
-> **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional early executor
-> pass precedes `parse_execute`. The
-> A1 correction
-> adds a default-no-op `CellPlane::before_execute` hook after FABRIC-IN
-> and before both scheduled executor passes, borrowing one native-turn
-> cold budget from `LoopCx`.
+> **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional
+> early executor pass precedes `parse_execute`. The A1 correction adds a
+> default-no-op `CellPlane::before_execute` hook after FABRIC-IN and
+> before both scheduled executor passes, borrowing one native-turn cold
+> budget from `LoopCx`.
 
-> **Accepted 2026-09-22, implementation open — ADR-0152 A2:**
-> bounded preparation
-> adds a separate host-turn preparation budget to both cold drain calls
-> and lends it through LoopCx. It forms complete bounded cohorts, keeps
-> unexamined requests queued, reserves identity pairs at enqueue and
-> adds typed progress/cancellation notification with one retry timer.
-> Both `drain` and `drain_budgeted` receive `&mut ColdPreparationBudget`
-> and return `ColdPreparationProgress`; `has_ready_preparation() -> bool`
-> reads stored readiness. A turn spends at most
-> `COLD_PREPARATION_WORK_PER_TURN` = 64 work units (a head inspection one,
-> any other candidate two), so a cohort holds at most 31 members. The
-> drain reports `Idle`, `CpuPending`, `WaitDevice`, `WaitPool` or
-> `WaitIoBudget`, and only `CpuPending` asks for another immediate turn.
-> An exhausted identity pair is the permanent
-> `ColdRefused::IdentityExhausted`, answered before any queue, gate or
-> pin is published. A cancelled `ColdWait` notifies the cold owner after
-> the gate restores custody (ADR-0152 A2).
+> **Accepted 2026-09-22, implementation open — ADR-0152 A2:** bounded
+> preparation adds a separate host-turn preparation budget to both cold
+> drain calls and lends it through LoopCx. It forms complete bounded
+> cohorts, keeps unexamined requests queued, reserves identity pairs at
+> enqueue and adds typed progress/cancellation notification with one retry
+> timer. Both `drain` and `drain_budgeted` receive `&mut
+> ColdPreparationBudget` and return `ColdPreparationProgress`;
+> `has_ready_preparation() -> bool` reads stored readiness. A turn spends
+> at most `COLD_PREPARATION_WORK_PER_TURN` = 64 work units (a head
+> inspection one, any other candidate two), so a cohort holds at most 31
+> members. The drain reports `Idle`, `CpuPending`, `WaitDevice`,
+> `WaitPool` or `WaitIoBudget`, and only `CpuPending` asks for another
+> immediate turn. An exhausted identity pair is the permanent
+> `ColdRefused::IdentityExhausted`, answered before any queue, gate or pin
+> is published. A cancelled `ColdWait` notifies the cold owner after the
+> gate restores custody (ADR-0152 A2).
 
-> **Accepted 2026-09-22, implementation open — ADR-0153:**
-> cold-pool construction and native registration
-> establishes a fallible chunked pool and owned driver binding/release
-> lifecycle. Registration remains on the issuer, with a ring-owned sparse
-> table and bounded native batches/terminal tags. It replaces the borrowed
-> register_tier_pool method with owned ColdPoolBind/ColdPoolClose operations
-> and ColdPoolReady/ColdPoolReleased receipts. A binding reserves a
+> **Accepted 2026-09-22, implementation open — ADR-0153:** cold-pool
+> construction and native registration establishes a fallible chunked pool
+> and owned driver binding/release lifecycle. Registration remains on the
+> issuer, with a ring-owned sparse table and bounded native
+> batches/terminal tags. It replaces the borrowed register_tier_pool
+> method with owned ColdPoolBind/ColdPoolClose operations and
+> ColdPoolReady/ColdPoolReleased receipts. A binding reserves a
 > non-wrapping pool identity and its native resource IDs before any
 > effect, and an old, duplicate or foreign receipt never releases current
 > backing. No cold read is admitted before the binding answers
@@ -453,22 +447,22 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 
 ## 4. `inf-fabric` — ring, mesh, credits, codec v0
 
-> **Accepted 2026-09-22, implementation open — ADR-0150:**
-> bounded, resumable reply emission
-> adds `Outcome::StreamReady`, `Op::StreamStep` and `Op::StreamResult`.
-> Separate progress credits carry chunk pulls and terminal cancellation;
-> returning the opening request's data credit does not release its stream
-> resources. `StreamReady` is outcome tag 6 carrying the stream's request
-> token and owner generation; `StreamStep` (opcode 8) and `StreamResult`
-> (opcode 9) carry a progress token, the stream, a sequence and an action
-> or result, little-endian; generation zero, an unknown tag or an
-> oversized chunk is a decode error. Owner generations and sequences
-> never wrap: exhaustion refuses before any effect. A chunk is at most
-> `REPLY_CHUNK_BYTES_MAX` = 65,536 encoded bytes and fits one frame, and a
-> ring needs `capacity >= 2 × (data_credits + progress_credits)`, one
-> progress credit per ring (ADR-0150 D3, D4, A1). The codec and
-> data-credit sketch below are the implemented shape: these additions
-> are not built, and it bounds no retained reply's bytes.
+> **Accepted 2026-09-22, implementation open — ADR-0150:** bounded,
+> resumable reply emission adds `Outcome::StreamReady`, `Op::StreamStep`
+> and `Op::StreamResult`. Separate progress credits carry chunk pulls and
+> terminal cancellation; returning the opening request's data credit does
+> not release its stream resources. `StreamReady` is outcome tag 6
+> carrying the stream's request token and owner generation; `StreamStep`
+> (opcode 8) and `StreamResult` (opcode 9) carry a progress token, the
+> stream, a sequence and an action or result, little-endian; generation
+> zero, an unknown tag or an oversized chunk is a decode error. Owner
+> generations and sequences never wrap: exhaustion refuses before any
+> effect. A chunk is at most `REPLY_CHUNK_BYTES_MAX` = 65,536 encoded
+> bytes and fits one frame, and a ring needs `capacity >= 2 ×
+> (data_credits + progress_credits)`, one progress credit per ring
+> (ADR-0150 D3, D4, A1). The codec and data-credit sketch below are the
+> implemented shape: these additions are not built, and it bounds no
+> retained reply's bytes.
 
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
@@ -561,12 +555,12 @@ between cells in one process, not authentication or an ACL capability
 
 ## 5. `inf-wire` — RESP port + command metadata (implemented — the code is the spec)
 
-> Deviation from the original sketch:
-> `FrameIter` is a **lending** iterator —
-> `next(&mut self) -> Option<Parsed<'_>>`, items borrow the iterator. The
-> sketched plain `Iterator` was unsound: accumulator-backed frames could
-> outlive accumulator maintenance. The lending shape also compiler-enforces
-> the "frames never outlive EXECUTE unless copied" retention rule.
+> Deviation from the original sketch: `FrameIter` is a **lending**
+> iterator — `next(&mut self) -> Option<Parsed<'_>>`, items borrow the
+> iterator. The sketched plain `Iterator` was unsound: accumulator-backed
+> frames could outlive accumulator maintenance. The lending shape also
+> compiler-enforces the "frames never outlive EXECUTE unless copied"
+> retention rule.
 
 ```rust
 // Parser: resumable per-connection state over borrowed input; bounded
@@ -661,34 +655,32 @@ pub fn scalar_scan_crlf(buf: &[u8]) -> CrlfPositions;       // the proptest orac
 
 ## 6. `inf-store` — records, index, ops, router (implemented — the code is the spec)
 
-> **Accepted 2026-09-24, implementation open — ADR-0161:**
-> fallible store construction and prepared materialization
-> replaces the allocating Arena/CellStore constructors and implicit
-> Keyspace materializers shown in this historical sketch. Checked plans
-> and private owners prepare children, destination and cleanup capacity
-> before one allocation-free publication; installed lookup cannot allocate.
-> A replacement holds the old owners' cleanup slots and all new backing
-> before one atomic swap, and a clear admits its empty representation and
-> cleanup headroom with the store's capacity, never allocating after it
-> releases the old contents. LFU sketches are prepared before the policy
-> is published; a refusal keeps the old policy. Boot picks each tier's
-> recovery life (the manifested watermark, or a fresh life) before it
-> builds that tier's one table. A store resource refusal answers
-> `-OOM store reservation refused` and changes neither the command's
-> effects nor the connection's selection (ADR-0161 D3–D5, ADR-0172 D3).
-> SELECT publishes its binding only after preparation succeeds. The
-> signatures below are the implemented shape; the replacement above is
-> not built.
+> **Accepted 2026-09-24, implementation open — ADR-0161:** fallible store
+> construction and prepared materialization replaces the allocating
+> Arena/CellStore constructors and implicit Keyspace materializers shown
+> in this historical sketch. Checked plans and private owners prepare
+> children, destination and cleanup capacity before one allocation-free
+> publication; installed lookup cannot allocate. A replacement holds the
+> old owners' cleanup slots and all new backing before one atomic swap,
+> and a clear admits its empty representation and cleanup headroom with
+> the store's capacity, never allocating after it releases the old
+> contents. LFU sketches are prepared before the policy is published; a
+> refusal keeps the old policy. Boot picks each tier's recovery life (the
+> manifested watermark, or a fresh life) before it builds that tier's one
+> table. A store resource refusal answers `-OOM store reservation refused`
+> and changes neither the command's effects nor the connection's selection
+> (ADR-0161 D3–D5, ADR-0172 D3). SELECT publishes its binding only after
+> preparation succeeds. The signatures below are the implemented shape;
+> the replacement above is not built.
 
-> Deviations from the original sketch: the
-> "8 B fixed" header is honored by
-> narrowing `version` to **u24** (the sketch's field list summed to 72
-> bits — it never fit u64; the 8 B header is load-bearing: the (16 B, 64 B)
-> gate record lands exactly in the 88 B size class with zero slack, putting
-> measured overhead at 18.7 B/key). Mutating ops return
-> `Result<_, OpError>` — arena-budget exhaustion (`OutOfMemory`) is
-> backpressure the command layer must surface, never a panic. `append`
-> returns `u64`, `strlen` returns `u64`.
+> Deviations from the original sketch: the "8 B fixed" header is honored
+> by narrowing `version` to **u24** (the sketch's field list summed to 72
+> bits — it never fit u64; the 8 B header is load-bearing: the (16 B, 64
+> B) gate record lands exactly in the 88 B size class with zero slack,
+> putting measured overhead at 18.7 B/key). Mutating ops return `Result<_,
+> OpError>` — arena-budget exhaustion (`OutOfMemory`) is backpressure the
+> command layer must surface, never a panic. `append` returns `u64`,
+> `strlen` returns `u64`.
 
 ```rust
 // RecordHeader v0 — layout frozen:
@@ -747,23 +739,23 @@ impl SlotRouter {
 
 ## 6b. `inf-server` — command execution (M0-S15; implemented core; pending changes marked)
 
-> **Accepted 2026-09-22, implementation open — ADR-0150:**
-> bounded, resumable reply emission
-> replaces complete-buffer production replies with an admitted `ReplyPlan`:
-> a proven bounded inline result or a continuation. It also replaces
-> §6c's whole-reply observer input with bounded begin/chunk/end or abort
-> events. Existing buffered writer rollback remains for bounded callers;
-> streaming JSON measures its immutable source before publishing headers.
-> A reply grant is reserved before the command's effects, and a result of
-> unknown size never upgrades its grant after a mutation. An array header
-> fixes the cardinality; each bulk header is measured from the same
-> immutable source emission reads; an I/O failure after output starts
-> closes the connection rather than send a partial reply. Command and
-> effect order, argv order and PUBLISH's reply before its self-push stay.
-> A stream frees its slot only when every custody is terminal, and a
-> waiter's drop is not a cancellation acknowledgement (ADR-0150 D1, D2,
-> D4, D5). These replacements are not built; the sketches below are the
-> implemented execution and observer interfaces.
+> **Accepted 2026-09-22, implementation open — ADR-0150:** bounded,
+> resumable reply emission replaces complete-buffer production replies
+> with an admitted `ReplyPlan`: a proven bounded inline result or a
+> continuation. It also replaces §6c's whole-reply observer input with
+> bounded begin/chunk/end or abort events. Existing buffered writer
+> rollback remains for bounded callers; streaming JSON measures its
+> immutable source before publishing headers. A reply grant is reserved
+> before the command's effects, and a result of unknown size never
+> upgrades its grant after a mutation. An array header fixes the
+> cardinality; each bulk header is measured from the same immutable source
+> emission reads; an I/O failure after output starts closes the connection
+> rather than send a partial reply. Command and effect order, argv order
+> and PUBLISH's reply before its self-push stay. A stream frees its slot
+> only when every custody is terminal, and a waiter's drop is not a
+> cancellation acknowledgement (ADR-0150 D1, D2, D4, D5). These
+> replacements are not built; the sketches below are the implemented
+> execution and observer interfaces.
 
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state

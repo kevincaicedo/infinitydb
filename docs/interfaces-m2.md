@@ -1211,11 +1211,11 @@ per episode). A drained cell always seals — never slower than K = 1.
   row per point (runner-enforced). Node rows name an exact
   `package::target::test_function`; the runner executes it and requires
   a fresh point/verdict receipt after its assertions (ADR-0020 amendment).
-  Missing, ignored and empty carriers fail. The M2-S18 sim disk consumes the same
-  registry for power-cut scheduling (arm a point → observe the typed
-  error → `cut_after_ops`/`power_cut`); reactor-tier write/fsync
-  failures are injected by the ScriptedDriver, the sim disk's dead
-  switch, and `durable_fsync_eio`.
+  Missing, ignored and empty carriers fail. The M2-S18 sim disk consumes
+  the same registry for power-cut scheduling (arm a point → observe the
+  typed error → `cut_after_ops`/`power_cut`); reactor-tier write/fsync
+  failures are injected by the ScriptedDriver, the sim disk's dead switch,
+  and `durable_fsync_eio`.
 
 ## MANIFEST schema v1 (`inf-log::manifest`, M2-S11 — ADR-0017)
 
@@ -1225,19 +1225,21 @@ per episode). A drained cell always seals — never slower than K = 1.
   protocol shared with the catalog; the reader refuses any envelope file
   over `MAX_ENVELOPE_LEN` = 64 MiB **by inode length, before allocating**).
 
-  > **Accepted 2026-09-23, implementation open — ADR-0158:**
-  > reserved catalog publication and recovery headroom
-  > gives META its own envelope bound, `CATALOG_ENVELOPE_BYTES_MAX` =
-  > 70,837,137 B, owned by one byte-limit table in `inf-log::meta` and
-  > selected by envelope kind, not by caller or filename. MANIFEST keeps
-  > the 64 MiB bound above. Ordinary growth still ends at or below 64 MiB;
-  > the extra band holds legacy normalization and required cleanup. A
-  > META above 64 MiB is refused by binaries built before ADR-0158. Payload: magic `INFMAN1\0`,
-  `epoch: u32 = 1`, `ckpt_id: u64`, packed `begin: u64`, count + u32
-  segment ids (strictly ascending; `segments[0] == begin.segment` = the
-  truncation floor). Canonical decode: trailing bytes / empty or
-  non-ascending sets / floor mismatch are named errors. v1 writes the
-  contiguous `floor..=active`; decode admits holes (M5/M7 publish them).
+  > **Accepted 2026-09-23, implementation open — ADR-0158:** reserved
+  > catalog publication and recovery headroom gives META its own envelope
+  > bound, `CATALOG_ENVELOPE_BYTES_MAX` = 70,837,137 B, owned by one
+  > byte-limit table in `inf-log::meta` and selected by envelope kind, not
+  > by caller or filename. MANIFEST keeps the 64 MiB bound above. Ordinary
+  > growth still ends at or below 64 MiB; the extra band holds legacy
+  > normalization and required cleanup. A META above 64 MiB is refused by
+  > binaries built before ADR-0158.
+
+  Payload: magic `INFMAN1\0`, `epoch: u32 = 1`, `ckpt_id: u64`, packed
+  `begin: u64`, count + u32 segment ids (strictly ascending; `segments[0]
+  == begin.segment` = the truncation floor). Canonical decode: trailing
+  bytes / empty or non-ascending sets / floor mismatch are named errors.
+  v1 writes the contiguous `floor..=active`; decode admits holes (M5/M7
+  publish them).
 - Swap = write-new + fdatasync + rename + dir-fsync, always. On the
   reactor tier the fsync-class steps ride `BackendDriver` as
   `TokenClass::ManifestSync` barriers (one in flight per cell) and the
@@ -1363,13 +1365,13 @@ per episode). A drained cell always seals — never slower than K = 1.
   distinct settles, deletes verified, blob releases (the zero set);
   markers skipped and dead-life files removed (outside it); the largest
   step charge (a gauge, the largest over the cells).
-- > **Accepted 2026-09-23, implementation open — ADR-0156:**
-  > bounded, acknowledged tier-file retirement
-  > replaces the plane-layer unlink below with an owned cell→control job:
-  > eight positions per cell cover request, worker and unconsumed result;
-  > the worker closes the final handle then unlinks; `Unlinked` and
-  > `AlreadyAbsent` are terminal, `Retry` returns the owner for paced
-  > retry; one 64-visit allowance per turn. Eligibility is unchanged.
+- > **Accepted 2026-09-23, implementation open — ADR-0156:** bounded,
+  > acknowledged tier-file retirement replaces the plane-layer unlink
+  > below with an owned cell→control job: eight positions per cell cover
+  > request, worker and unconsumed result; the worker closes the final
+  > handle then unlinks; `Unlinked` and `AlreadyAbsent` are terminal,
+  > `Retry` returns the owner for paced retry; one 64-visit allowance per
+  > turn. Eligibility is unchanged.
 - **M4-S15 amendment (ADR-0059) — retirement + unlink lifecycle.** The
   deletion conjunction made mechanical, staged around the MANIFEST
   swap: `TieredTable::begin_ckpt_walk(ckpt_id: u64)` (signature grew
@@ -1483,26 +1485,25 @@ per episode). A drained cell always seals — never slower than K = 1.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
-- **Accepted 2026-09-22, implementation open — ADR-0148:**
-  bounded tiered namespace lifetimes
-  amends the namespace DDL contract below. The catalog writer reserves a
-  tiered lifetime grant before publication; `CreateApplied` does not
-  return it. Durable removal plus every cell's terminal-cleanup receipt
-  permits reuse. A node admits at most 64 tiered namespace lifetimes
-  (`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`; reserved, declared and
-  retiring alike). At capacity a tiered `CREATE` reserves nothing and
-  answers `-TRYAGAIN tiered namespace capacity in use` while a grant is
-  retiring, else `-ERR tiered namespace limit reached`. Namespace IDs
-  never repeat: allocation answers `ERR namespace identity space exhausted`
-  before the `u32` counter wraps. Boot refuses a catalog with more than 64
-  live tiered definitions with a typed startup error and serves none of
-  it. After `META` publishes a create, an origin that fails to construct
-  rolls back as a refused peer does (durable withdrawal, a `DROP` fan, the
-  grant held to terminal cleanup), and a disconnect after the persist
-  request cannot abandon the create (ADR-0148 D1, D4, D5, A1; ADR-0172
-  D3). The existing nine-argument fan and durable formats remain. These
-  changes are not built; the descriptions below are the implemented
-  contract.
+- **Accepted 2026-09-22, implementation open — ADR-0148:** bounded tiered
+  namespace lifetimes amends the namespace DDL contract below. The catalog
+  writer reserves a tiered lifetime grant before publication;
+  `CreateApplied` does not return it. Durable removal plus every cell's
+  terminal-cleanup receipt permits reuse. A node admits at most 64 tiered
+  namespace lifetimes (`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`;
+  reserved, declared and retiring alike). At capacity a tiered `CREATE`
+  reserves nothing and answers `-TRYAGAIN tiered namespace capacity in
+  use` while a grant is retiring, else `-ERR tiered namespace limit
+  reached`. Namespace IDs never repeat: allocation answers `ERR namespace
+  identity space exhausted` before the `u32` counter wraps. Boot refuses a
+  catalog with more than 64 live tiered definitions with a typed startup
+  error and serves none of it. After `META` publishes a create, an origin
+  that fails to construct rolls back as a refused peer does (durable
+  withdrawal, a `DROP` fan, the grant held to terminal cleanup), and a
+  disconnect after the persist request cannot abandon the create (ADR-0148
+  D1, D4, D5, A1; ADR-0172 D3). The existing nine-argument fan and durable
+  formats remain. These changes are not built; the descriptions below are
+  the implemented contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
