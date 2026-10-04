@@ -124,6 +124,7 @@ WantedBy=multi-user.target</code></pre>
   <h2>The data directory</h2>
   <p>With <code>--data-dir</code> set, the node owns this directory tree. Its metadata files (the catalog, each MANIFEST, each checkpoint) are CRC-protected and swap-published atomically (write-new + fsync + rename + directory-fsync); log segments are CRC-framed and append-only:</p>
 <pre><code>&lt;data-dir&gt;/
+&#9500;&#9472; LOCK                     <span class="c"># the directory&rsquo;s owner lock: a second process on it is refused at boot</span>
 &#9500;&#9472; topology.toml            <span class="c"># the --cells count, stamped at the first boot; another count is refused</span>
 &#9500;&#9472; io-properties.toml       <span class="c"># the device probe&rsquo;s result, bound to this filesystem and device</span>
 &#9500;&#9472; key-hash.toml            <span class="c"># the key-hash secret: back it up with the directory, never copy it to another</span>
@@ -132,7 +133,7 @@ WantedBy=multi-user.target</code></pre>
 &#9474;  &#9500;&#9472; MANIFEST              <span class="c"># the recovery unit: checkpoint id, begin-LSN, live segment set</span>
 &#9474;  &#9500;&#9472; log/
 &#9474;  &#9474;  &#9500;&#9472; seg-000000.ilog    <span class="c"># log segments — sealed at --segment-bytes, then immutable</span>
-&#9474;  &#9474;  &#9492;&#9472; seg-000001.ilog
+&#9474;  &#9474;  &#9492;&#9472; seg-000001.ilog    <span class="c"># a new directory&rsquo;s first two; a checkpoint retires older ones, so the lowest id grows</span>
 &#9474;  &#9492;&#9472; ckpt/
 &#9474;     &#9492;&#9472; ckpt-000001.ick    <span class="c"># fuzzy checkpoint (a materialized log prefix)</span>
 &#9500;&#9472; shard-1/
@@ -160,24 +161,24 @@ WantedBy=multi-user.target</code></pre>
         <tr><td><code>--data-dir</code></td><td><em>unset</em></td><td>Durable-plane root. Absent = memory-only node: the durable machinery is not just idle but absent from the hot path (measured, ledger row C15).</td></tr>
         <tr><td><code>--ckpt-interval-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Bytes-appended checkpoint trigger, per cell. <code>0</code> = manual only (<code>INF.CKPT</code> / <code>BGSAVE</code>).</td></tr>
         <tr><td><code>--segment-bytes</code></td><td><code>268435456</code> (256 MiB)</td><td>Log segment prealloc/seal size.</td></tr>
-        <tr><td><code>--device-probe</code></td><td><code>auto</code></td><td>At the first boot of a data directory, measure the device for about ten seconds and record the write model in <code>io-properties.toml</code>. <code>off</code> skips the probe and runs with conservative write settings.</td></tr>
+        <tr><td><code>--device-probe</code></td><td><code>auto</code></td><td>At the first boot of a data directory, measure the device for 10 to 15 seconds, before accepting connections, and record the write model in <code>io-properties.toml</code>. The <code>control: cell N not ready</code> lines printed meanwhile are the probe at work, not a hang; the node serves once it prints <code>control: recovery complete</code>. Every boot of a data directory answers <code>-LOADING</code> until recovery completes; clients retry. <code>off</code> skips the probe and runs with conservative write settings.</td></tr>
         <tr><td><code>--shutdown-timeout-ms</code></td><td><code>10000</code></td><td>Bound on the graceful stop&rsquo;s drain; when it expires the node exits 1, naming the phase it was in.</td></tr>
         <tr><td><code>--buffers</code> / <code>--buf-size</code></td><td><code>4096</code> / <code>4096</code></td><td>io_uring provided-buffer pool: buffer count and per-buffer bytes.</td></tr>
-        <tr><td><code>--pin-start</code></td><td><em>unset</em></td><td>First core index to pin cells to; cell <em>i</em> pins to <code>pin-start + 2i</code> (every other logical core, leaving SMT siblings free). Unset = no pinning.</td></tr>
+        <tr><td><code>--pin-start</code> / <code>--pin-stride</code></td><td><em>unset</em> / <code>2</code></td><td>First core index to pin cells to, and the step between cells: cell <em>i</em> pins to <code>pin-start + i &times; pin-stride</code> (the default 2 is every other logical core, leaving SMT siblings free). Unset start = no pinning.</td></tr>
         <tr><td><code>--route-local-only</code></td><td><em>off</em></td><td>Treat every key as local to the accepting cell &mdash; benchmark/diagnostic mode, not for real data.</td></tr>
         <tr><td><code>--version</code></td><td></td><td>Print version, git SHA, and build target, then exit.</td></tr>
       </tbody>
     </table>
   </div>
-  <p class="muted" style="font-size:14px">The remaining flags in <code>--help</code> (the write-path tuning, fabric-flush, execute-order, and prefetch toggles) are measured A/B levers whose defaults carry the winning arm &mdash; leave them alone unless you are reproducing an experiment.</p>
+  <p class="muted" style="font-size:14px">The remaining flags in <code>--help</code> tune the write path, the idle loop and the fabric, or select an experiment arm (the fabric-flush, execute-order and prefetch toggles); their defaults are the ones to run with &mdash; leave them alone unless you are reproducing an experiment. One of them, <code>--park-us</code>, is the longest an idle cell parks before it checks again, in microseconds: 500 with more than one cell, 5000 with one.</p>
   <p>Runtime configuration uses the Redis <code>CONFIG</code> surface (<code>maxmemory</code>, <code>maxmemory-policy</code>, and friends &mdash; see the <a href="compat.html">compatibility matrix</a>); per-namespace durability and eviction are set at <code>INF.NS CREATE</code> time (see <a href="durability.html">namespaces &amp; durability</a>).</p>
 
   <h2>Upgrades &amp; downgrades</h2>
-  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing). The rules, stated plainly:</p>
+  <p>The on-disk log uses <strong>batch frame format v2</strong> (per-frame sequencing), written as v3 on segments opened for direct I/O: the same layout, with each frame&rsquo;s successor page-aligned. The rules, stated plainly:</p>
   <ul>
-    <li><strong>Reading is forever:</strong> the v0.2 line reads both frame format v1 and v2. A log written by an older alpha binary remains readable on every later alpha binary.</li>
-    <li><strong>Writing is v2 only</strong> &mdash; there is no write-v1 mode. The first time a v2 binary appends to a log, that log contains v2 frames.</li>
-    <li><strong>No downgrade after the first v2 write:</strong> pre-v2 binaries cannot read v2 frames, so once a v2 binary has appended, rolling back the binary means restoring the data directory from a pre-upgrade backup as well. Recovery additionally treats a v1 frame appearing <em>after</em> a v2 frame as a named refusal &mdash; no honest writer can produce that ordering.</li>
+    <li><strong>Reading is forever:</strong> every build reads frame formats v1, v2 and v3. A log written by an older build remains readable by every later build.</li>
+    <li><strong>Writing is v2 or v3 only</strong> &mdash; there is no write-v1 mode. The first time a current binary appends to a log, that log contains v2 or v3 frames.</li>
+    <li><strong>No downgrade after the first write:</strong> a binary older than a frame format cannot read it, so once a current binary has appended, rolling back the binary means restoring the data directory from a pre-upgrade backup as well. Recovery additionally treats a v1 frame appearing <em>after</em> a v2 frame as a named refusal &mdash; no honest writer can produce that ordering.</li>
     <li>Format changes are recorded design decisions, not patches: each one lands with fuzzing of both formats, a crash-matrix re-run, and a fresh simulation sweep (law L9).</li>
   </ul>
 

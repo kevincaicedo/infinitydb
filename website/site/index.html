@@ -367,13 +367,13 @@
         <div class="idx">/02</div>
         <h3>Durable KV <span class="pill pill-ship">SHIPPING</span></h3>
         <div class="tagline">TARGETS DYNAMODB-CLASS STORES</div>
-        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering is in dev now (M4).</p>
+        <p>Per-namespace durability &mdash; <code>always</code>, <code>everysec</code>, <code>memory</code> &mdash; group-commit fsync, fuzzy fork-free checkpoints, parallel recovery. Larger-than-RAM tiering is built for string values (M4): a durable namespace created with <code>MEM-BUDGET</code> keeps its hot data in memory and tiers the rest to disk.</p>
       </div>
       <div class="wl-card">
         <div class="idx">/03</div>
         <h3>Documents <span class="pill pill-now">M3 &middot; BUILT &middot; SHIPS IN THE FIRST &alpha;</span></h3>
         <div class="tagline">REDISJSON-COMPATIBLE NOSQL</div>
-        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable by default. Byte-diff-verified against RedisJSON; ships with the first public tag. Typed secondary indexes and a planner-free PartiQL subset follow in M4.</p>
+        <p>JSON as a first-class value: <code>JSON.*</code> + JSONPath over a compact binary tree, mutated by path, durable in a durable namespace. Byte-diff-verified against RedisJSON; ships with the first public tag. Typed secondary indexes and a planner-free PartiQL subset follow in M4.</p>
       </div>
       <div class="wl-card">
         <div class="idx">/04</div>
