@@ -2043,6 +2043,14 @@ The reactor-drive flush state machine (`TierFlush` round state in
   walk pin holds release at the lowest latched winner, which the table
   hands it from the latch as the walk begins, until the walk ends, so a
   ticket that ends mid-walk leaves its winner imaged and RAM-resident.
+  What that holds: the bytes from the lowest latched winner up to the
+  watermark, at most the pinned suffix as the walk began (throttled at
+  `MEM-BUDGET / 8` and bounded by the committed window, ADR-0093 A6),
+  for one walk; a write that finds the window full meanwhile parks on
+  the tail stall, as under any release pin. `tiering_shadow_pinned_bytes`
+  stops counting those bytes when the last ticket ends and no gauge
+  names the walk's hold: it is part of `flushed − head` on the
+  namespace's `tiering_ns<id>` line.
   Pinned by `an_imaged_ticket_winner_is_not_also_a_blob_
   reference_entry`, `a_ticket_that_ends_before_the_images_keeps_its_
   winner_imaged`, `a_ticket_that_ends_after_the_images_keeps_its_blob_
