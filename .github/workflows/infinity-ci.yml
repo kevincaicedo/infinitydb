@@ -325,6 +325,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build infinityd (release)
         run: cargo build --release -p infinityd
+      # A debug cell reaches its first command after its clock's first
+      # millisecond, so this binary test can see a pre-origin deadline served
+      # there only on a release build (the in-process held-clock test pins the
+      # same read in every build).
+      - name: pre-origin deadline sent at connect (release infinityd)
+        run: cargo test --release -p infinityd --test pre_origin_deadline
       - name: start infinityd
         run: |
           ./target/release/infinityd --port 6379 &

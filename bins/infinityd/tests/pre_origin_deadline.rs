@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 /// probability about 0.53⁸ ≈ 0.6 %. A debug binary reaches its first
 /// command after the millisecond has passed (0 of 40 boots served): run
 /// against a debug build, the test checks the answer and cannot see the
-/// regression; `cargo test --release` or `INF_PRE_ORIGIN_BIN` runs it as a
-/// red-capable check.
+/// regression. CI's client-smoke job runs it under `cargo test --release`
+/// (`INF_PRE_ORIGIN_BIN` names another build); `node_e2e`'s held-clock test
+/// pins the same read inside that millisecond in every build.
 const BOOTS: usize = 8;
 const CELLS: &str = "4";
 const PIPELINE: &[u8] = b"*5\r\n$3\r\nSET\r\n$3\r\nsxp\r\n$1\r\nv\r\n$4\r\nEXAT\r\n$1\r\n1\r\n\
