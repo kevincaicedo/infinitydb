@@ -2058,7 +2058,7 @@ The reactor-drive flush state machine (`TierFlush` round state in
   of a ticket open as the walk began (the walk latches those winners);
   every other entry is a reference, and the 0x05 section lists the
   references' entries only, so an imaged extent record is registered
-  once, when recovery appends its image (ADR-0061 D6, ADR-0093 A12).
+  once, when recovery appends its image (ADR-0184 D1–D5).
   `WalkLatch::form` is the one producer of a `WalkForm`; the walk's two
   index passes (`ckpt_walk_slice_bounded`) and its 0x05 pass
   (`extent_ckpt_entries_from`) read nothing else, in every writer. The
