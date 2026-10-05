@@ -475,10 +475,10 @@ impl<F: SegmentFs> TierReplay<F> {
             // pads included) and `C` the file capacity it seals at most
             // ⌊2D ÷ C⌋ + ⌈D ÷ ring⌉ + page pads + 1 files: a capacity-sealed
             // file and the range that overflowed it hold more than `C`, a
-            // file is in at most two such pairs (⌊D ÷ (C − S)⌋ when every
-            // range `S` is below `C`), and ring tops lie a ring apart. No
-            // limit of their own: the device and the handle limit bound
-            // them (a typed refusal at a create).
+            // file is in at most two such pairs (⌊D ÷ (C − S)⌋ when `S`, the
+            // longest range one demote step appends, is below `C`), and ring
+            // tops lie a ring apart. No limit of their own: the device and
+            // the handle limit bound them (a typed refusal at a create).
             if cut > cursor {
                 let outcome = table
                     .flush_span(&mut self.flush, cut - cursor)
