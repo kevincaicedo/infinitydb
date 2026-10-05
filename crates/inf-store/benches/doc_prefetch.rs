@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
+use inf_store::InternalDeadline::At;
 use inf_store::KeyHasher;
 use inf_store::{CellStore, ExpireCond, JsonSetOptions, StoreConfig};
 
@@ -107,7 +108,7 @@ fn run(store: &mut CellStore, keys: &[[u8; 12]], arm: Arm) -> f64 {
 fn run_ttl(store: &mut CellStore, keys: &[[u8; 12]]) -> f64 {
     let started = Instant::now();
     for key in keys {
-        assert!(store.expire(key, Some(Nanos::from_millis(10_000)), ExpireCond::Always, NOW));
+        assert!(store.expire(key, Some(At(Nanos::from_millis(10_000))), ExpireCond::Always, NOW));
         assert!(store.expire(key, None, ExpireCond::Always, NOW));
     }
     (2 * keys.len()) as f64 / started.elapsed().as_secs_f64()

@@ -21,13 +21,14 @@
 use std::collections::HashMap;
 
 use inf_foundation::time::Nanos;
+use inf_store::InternalDeadline::{At, BeforeOrigin};
 use inf_store::limits::{
     EXPIRY_DRAIN_SLICES_MAX, EXPIRY_SWEEP_SLOTS_PER_SLICE, IDX_ALIAS_GROUP_MAX,
 };
 use inf_store::{
     COLLISION_KEY_PREFIX, CellStore, EvictionPolicy, ExpireCond, ExpiryAudit, ExpiryBudget,
-    Keyspace, MAX_EXPIRE_MS, NsId, NsMode, NsSpec, SetExpire, SetOptions, StoreConfig, TtlUpdate,
-    WheelNodesMax,
+    Keyspace, MAX_EXPIRE_MS, NsId, NsMode, NsSpec, SetCond, SetExpire, SetOptions, SetOutcome,
+    StoreConfig, TtlUpdate, WheelNodesMax,
 };
 
 fn ms(v: u64) -> Nanos {
@@ -210,7 +211,7 @@ fn churn_op(
             // 3 extends or moves a deadline; 7 shortens it hard.
             let span = if pick % 9 == 3 { 2_000 } else { 50 };
             let deadline = now_ms + 1 + roll % span;
-            let got = store.expire(key, Some(ms(deadline)), ExpireCond::Always, now);
+            let got = store.expire(key, Some(At(ms(deadline))), ExpireCond::Always, now);
             let want = model.contains_key(key);
             assert_eq!(got, want, "op {op}: EXPIRE disagreed");
             if want {
@@ -236,6 +237,42 @@ fn churn_op(
             let budget = ExpiryBudget { max_fires: 32, max_steps: 512, max_sweep_slots: 64 };
             store.expire_tick(now, budget);
         }
+    }
+}
+
+/// ADR-0111 D2: a deadline before the clock's origin is expired at every
+/// reading of the clock, so every write that receives one leaves no key —
+/// at `now` inside the origin's millisecond too, where a deadline clamped
+/// onto the origin read as live. NX/XX and `GET` keep their meaning.
+#[test]
+fn pre_origin_deadlines_leave_no_key_at_any_now() {
+    for now in [Nanos(1), Nanos(999_999), ms(5_000)] {
+        let mut store = CellStore::new(StoreConfig::default());
+        let before = SetOptions { expire: SetExpire::BeforeOrigin, ..Default::default() };
+        let applied = store.set(b"fresh", b"v", before, now).expect("set");
+        assert_eq!(applied, SetOutcome::Applied { old: None }, "{now}");
+        assert_eq!(store.get_str(b"fresh", now), Ok(None), "SET at {now}");
+        store.set(b"over", b"old", SetOptions::default(), now).expect("set");
+        let get_old = SetOptions { get_old: true, ..before };
+        let replaced = store.set(b"over", b"v", get_old, now).expect("set");
+        assert_eq!(replaced, SetOutcome::Applied { old: Some(b"old".to_vec()) }, "{now}");
+        assert_eq!(store.get_str(b"over", now), Ok(None), "SET .. GET at {now}");
+        let xx = SetOptions { cond: SetCond::IfPresent, ..before };
+        assert_eq!(store.set(b"over", b"v", xx, now), Ok(SetOutcome::Skipped { old: None }));
+        store.set(b"getex", b"v", SetOptions::default(), now).expect("set");
+        let read = store.get_ex(b"getex", TtlUpdate::BeforeOrigin, now);
+        assert_eq!(read.as_deref(), Some(b"v".as_slice()), "GETEX answers first");
+        assert_eq!(store.get_str(b"getex", now), Ok(None), "GETEX at {now}");
+        // LT against a live deadline at `now`'s own millisecond (the
+        // origin itself inside the first one) applies and deletes.
+        let at_now = Nanos::from_millis(now.as_millis());
+        let live = SetOptions { expire: SetExpire::At(at_now), ..Default::default() };
+        store.set(b"lt", b"v", live, now).expect("set");
+        assert_eq!(store.get_str(b"lt", now), Ok(Some(b"v".as_slice())), "live at {now}");
+        let lt = store.expire(b"lt", Some(BeforeOrigin), ExpireCond::IfLess, now);
+        assert!(lt, "LT applies at {now}");
+        assert_eq!(store.get_str(b"lt", now), Ok(None), "EXPIRE LT at {now}");
+        assert_eq!(store.len(), 0, "no record survives at {now}");
     }
 }
 
@@ -539,7 +576,10 @@ fn set_plain(store: &mut CellStore, key: &[u8], now: Nanos) {
 }
 
 fn expire_at(store: &mut CellStore, key: &[u8], deadline_ms: u64, now: Nanos) {
-    assert!(store.expire(key, Some(ms(deadline_ms)), ExpireCond::Always, now), "expire applied");
+    assert!(
+        store.expire(key, Some(At(ms(deadline_ms))), ExpireCond::Always, now),
+        "expire applied"
+    );
 }
 
 fn persist(store: &mut CellStore, key: &[u8], now: Nanos) {
@@ -648,7 +688,7 @@ fn hostile_legs() -> [HostileLeg; 13] {
             keys: 1,
             step: |s, i, now| {
                 s.replay_set(b"k", b"v", now).expect("replay set");
-                s.replay_expire_at(b"k", ms(10_000 + i), now);
+                s.replay_expire_at(b"k", At(ms(10_000 + i)), now);
             },
         },
         HostileLeg {

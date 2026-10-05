@@ -22,8 +22,8 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    CellStore, CopyResult, ExpireCond, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN, OpError, SetCond,
-    SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
+    CellStore, CopyResult, ExpireCond, InternalDeadline, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN,
+    OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
 use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
@@ -885,7 +885,7 @@ fn execute_db(
                 Ok(at) => at,
                 Err(message) => return w.error(&message(&meta.name.to_ascii_lowercase())),
             };
-            let opts = SetOptions { expire: SetExpire::At(at), ..Default::default() };
+            let opts = SetOptions { expire: SetExpire::from(at), ..Default::default() };
             match store.set(argv.arg(1), argv.arg(3), opts, now) {
                 Ok(_) => w.simple("OK"),
                 Err(e) => op_error(e, &mut w),
@@ -1167,26 +1167,28 @@ pub(crate) fn wall_ms(node: &NodeInfo, now: Nanos) -> u64 {
     now.as_millis().saturating_sub(internal_anchor).saturating_add(unix_anchor)
 }
 
-/// The store deadline for a Unix-epoch instant (ADR-0111): pre-anchor
-/// instants are already expired (internal 0), instants past the store's
+/// The store deadline for a Unix-epoch instant (ADR-0111 D2): an instant
+/// before the internal clock's origin is expired at every reading of the
+/// clock, its first millisecond included, and instants past the store's
 /// u40-ms bound saturate to it. Every instant Redis represents in i64 ms
 /// lands somewhere on the internal clock — this never refuses.
-fn absolute_deadline(node: &NodeInfo, unix_ms: i64) -> Nanos {
+fn absolute_deadline(node: &NodeInfo, unix_ms: i64) -> InternalDeadline {
     let (internal_anchor, unix_anchor) = node.wall_anchor.get();
     let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
     let internal =
         unix_ms.saturating_sub(clamp(unix_anchor)).saturating_add(clamp(internal_anchor));
-    inf_store::saturating_deadline(u64::try_from(internal).unwrap_or(0))
+    InternalDeadline::from_internal_ms(internal)
 }
 
 /// The store deadline `ttl_ms` after `now` (ADR-0111). Redis refuses only
 /// when the Unix-ms sum overflows `i64` (`expire.c`: `when > LLONG_MAX -
-/// basetime`); a negative TTL is already expired (internal 0, delete on
-/// apply) and a far-future one saturates to the store bound.
-fn relative_deadline(node: &NodeInfo, now: Nanos, ttl_ms: i64) -> Option<Nanos> {
+/// basetime`); a negative TTL is already expired (delete on apply) and a
+/// far-future one saturates to the store bound.
+fn relative_deadline(node: &NodeInfo, now: Nanos, ttl_ms: i64) -> Option<InternalDeadline> {
     let base = i64::try_from(wall_ms(node, now)).unwrap_or(i64::MAX);
     ttl_ms.checked_add(base)?;
-    Some(inf_store::saturating_deadline(now.as_millis().saturating_add_signed(ttl_ms)))
+    let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
+    Some(InternalDeadline::from_internal_ms(now_ms.saturating_add(ttl_ms)))
 }
 
 /// Unix-epoch milliseconds for an internal deadline (EXPIRETIME family).
@@ -1259,7 +1261,7 @@ fn set(
     // Syntax first, the value after (Redis's order), before any write.
     if let Some((raw, unit)) = expire {
         match set_expire_deadline(node, now, raw, unit) {
-            Ok(at) => opts.expire = SetExpire::At(at),
+            Ok(at) => opts.expire = SetExpire::from(at),
             Err(message) => return w.error(&message("set")),
         }
     }
@@ -1321,7 +1323,7 @@ fn getex(
     }
     if let Some((raw, unit)) = expire {
         match set_expire_deadline(node, now, raw, unit) {
-            Ok(at) => update = TtlUpdate::At(at),
+            Ok(at) => update = TtlUpdate::from(at),
             // Redis reads the value after its lookup: a missing key
             // answers nil and a document WRONGTYPE whatever the value
             // says (oracle-pinned). The probe is on the error path only.
@@ -1869,7 +1871,7 @@ fn inf_move_put(
     };
     let expire = match parse_i64(argv.arg(3)) {
         Ok(-1) => SetExpire::Clear,
-        Ok(unix_ms) if unix_ms > 0 => SetExpire::At(absolute_deadline(node, unix_ms)),
+        Ok(unix_ms) if unix_ms > 0 => SetExpire::from(absolute_deadline(node, unix_ms)),
         _ => return w.error("ERR invalid move snapshot deadline"),
     };
     let opts = SetOptions { cond, expire, get_old: false };
@@ -1992,7 +1994,7 @@ fn set_expire_deadline(
     now: Nanos,
     raw: &[u8],
     unit: ExpireUnit,
-) -> Result<Nanos, fn(&str) -> String> {
+) -> Result<InternalDeadline, fn(&str) -> String> {
     let Ok(value) = parse_i64(raw) else {
         return Err(|_| "ERR value is not an integer or out of range".to_owned());
     };
@@ -3082,6 +3084,56 @@ mod tests {
             b"+OK\r\n"
         );
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"p"]), b"$-1\r\n");
+    }
+
+    /// An instant before the internal clock's origin is expired at every
+    /// reading of that clock, its first millisecond included (ADR-0111
+    /// D2). `infinityd` anchors the wall clock at the origin, and a
+    /// pipeline queued in the listener's backlog runs inside that
+    /// millisecond: an instant clamped onto the origin was served there
+    /// (Redis 8.0.5 answers nil). The control is an instant *at* the
+    /// origin: a real deadline, served through its own millisecond as
+    /// Redis serves `PXAT now`, so a sentinel test on internal 0 is red.
+    #[test]
+    fn pre_origin_instants_are_expired_in_the_clocks_first_millisecond() {
+        let origin_unix_ms: &[u8] = b"1757000000000";
+        for now in [Nanos(1), Nanos(999_999)] {
+            let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+            let mut store = Keyspace::new(StoreConfig::default());
+            // The boot anchor: internal 0 ms == unix 1_757_000_000_000 ms.
+            cx.node.wall_anchor.set((0, 1_757_000_000_000));
+            let mut at = |argv: &[&[u8]]| run_at(&mut cx, &mut store, now, argv);
+            assert_eq!(at(&[b"SET", b"sxp", b"v", b"EXAT", b"1"]), b"+OK\r\n", "{now}");
+            assert_eq!(at(&[b"GET", b"sxp"]), b"$-1\r\n", "SET EXAT 1 at {now}");
+            assert_eq!(at(&[b"TTL", b"sxp"]), b":-2\r\n", "{now}");
+            // The overwrite answers the old value and leaves no key.
+            assert_eq!(at(&[b"SET", b"g", b"old"]), b"+OK\r\n");
+            assert_eq!(at(&[b"SET", b"g", b"v", b"PXAT", b"1", b"GET"]), b"$3\r\nold\r\n");
+            assert_eq!(at(&[b"EXISTS", b"g"]), b":0\r\n", "SET PXAT 1 GET at {now}");
+            // GETEX and EXPIREAT delete on apply.
+            assert_eq!(at(&[b"SET", b"x", b"v"]), b"+OK\r\n");
+            assert_eq!(at(&[b"GETEX", b"x", b"EXAT", b"1"]), b"$1\r\nv\r\n");
+            assert_eq!(at(&[b"EXISTS", b"x"]), b":0\r\n", "GETEX EXAT 1 at {now}");
+            assert_eq!(at(&[b"SET", b"r", b"v"]), b"+OK\r\n");
+            assert_eq!(at(&[b"PEXPIRE", b"r", b"-5"]), b":1\r\n");
+            assert_eq!(at(&[b"EXISTS", b"r"]), b":0\r\n", "PEXPIRE -5 at {now}");
+            // Control: an instant at the origin is live through its
+            // millisecond, and LT against it is the pre-origin instant's
+            // win (Redis: 1 < origin, applied, already expired: deleted).
+            assert_eq!(at(&[b"SET", b"o", b"v", b"PXAT", origin_unix_ms]), b"+OK\r\n");
+            assert_eq!(at(&[b"GET", b"o"]), b"$1\r\nv\r\n", "PXAT origin at {now}");
+            assert_eq!(at(&[b"PEXPIREAT", b"o", b"1", b"GT"]), b":0\r\n");
+            assert_eq!(at(&[b"PEXPIREAT", b"o", b"1", b"LT"]), b":1\r\n", "LT at {now}");
+            assert_eq!(at(&[b"EXISTS", b"o"]), b":0\r\n", "PEXPIREAT 1 LT at {now}");
+            // The cross-cell move's destination put carries a snapshot
+            // deadline through the same seam.
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
+            inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
+            assert_eq!(out, b"+OK\r\n");
+            assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXISTS", b"m"]), b":0\r\n", "{now}");
+        }
     }
 
     #[test]

@@ -46,7 +46,7 @@ use crate::evict::{EvictStats, EvictionPolicy};
 use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
 use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
-use crate::record::ExtentRef;
+use crate::record::{ExtentRef, InternalDeadline};
 use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
     SweepStop,
@@ -1240,7 +1240,8 @@ impl Keyspace {
                 let Some(store) = self.replay_store(ns) else {
                     return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
-                let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(Nanos(u64::MAX));
+                let never = InternalDeadline::At(crate::record::saturating_deadline(u64::MAX));
+                let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(never);
                 store.replay_expire_at(key, at, now);
                 Ok(ReplayOutcome::Applied)
             }

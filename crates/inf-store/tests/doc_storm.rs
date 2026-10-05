@@ -16,6 +16,7 @@ use proptest::prelude::*;
 use inf_doc::CanonicalDoc;
 use inf_doc::model::{self, Value};
 use inf_foundation::time::Nanos;
+use inf_store::InternalDeadline::At;
 use inf_store::{
     CellStore, ExpireCond, ExpiryBudget, JsonSetOptions, JsonSetOutcome, OpError, StoreConfig,
 };
@@ -175,7 +176,7 @@ proptest! {
                     let name = key_name(key);
                     let deadline = Nanos::from_millis(now_ms + 3);
                     let applied =
-                        store.expire(name.as_bytes(), Some(deadline), ExpireCond::Always, now);
+                        store.expire(name.as_bytes(), Some(At(deadline)), ExpireCond::Always, now);
                     let e = &mut expect[key];
                     prop_assert_eq!(applied, e.version.is_some());
                     if let Some(v) = e.version {

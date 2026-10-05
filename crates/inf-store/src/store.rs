@@ -26,8 +26,8 @@ use crate::doc::{self, DocStore};
 use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
 use crate::index::{ChainPos, Index, WalkCursor};
 use crate::record::{
-    HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView,
-    TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
+    HEADER_LEN, InternalDeadline, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec,
+    RecordView, TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
 };
 use lifecycle::RecordIndex;
 
@@ -220,6 +220,18 @@ pub enum SetExpire {
     Keep,
     /// Absolute deadline (`SET .. EX/PX/EXAT/PXAT`).
     At(Nanos),
+    /// A deadline before the clock's origin ([`InternalDeadline`]): the
+    /// write removes the key and stores nothing.
+    BeforeOrigin,
+}
+
+impl From<InternalDeadline> for SetExpire {
+    fn from(deadline: InternalDeadline) -> SetExpire {
+        match deadline {
+            InternalDeadline::At(at) => SetExpire::At(at),
+            InternalDeadline::BeforeOrigin => SetExpire::BeforeOrigin,
+        }
+    }
 }
 
 /// Options for [`CellStore::set`].
@@ -303,6 +315,18 @@ pub enum TtlUpdate {
     Persist,
     /// `GETEX .. EX/PX/EXAT/PXAT` absolute deadline.
     At(Nanos),
+    /// A deadline before the clock's origin ([`InternalDeadline`]): the
+    /// read answers, then the key is deleted.
+    BeforeOrigin,
+}
+
+impl From<InternalDeadline> for TtlUpdate {
+    fn from(deadline: InternalDeadline) -> TtlUpdate {
+        match deadline {
+            InternalDeadline::At(at) => TtlUpdate::At(at),
+            InternalDeadline::BeforeOrigin => TtlUpdate::BeforeOrigin,
+        }
+    }
 }
 
 /// `OBJECT ENCODING` answer for string records (M1-S02). Derived from the
@@ -1021,6 +1045,14 @@ impl CellStore {
             SetExpire::Clear => None,
             SetExpire::Keep => old_deadline,
             SetExpire::At(at) => Some((at.0 / 1_000_000).min(MAX_EXPIRE_MS)),
+            // Expired at every reading of the clock (ADR-0111 D2): no
+            // record could ever serve it, so the overwrite is a delete.
+            SetExpire::BeforeOrigin => {
+                if let Some((addr, len)) = existing {
+                    self.free_record(self.hash_key(key), addr, len);
+                }
+                return Ok(SetOutcome::Applied { old: old_value });
+            }
         };
         let spec = RecordSpec {
             key,
@@ -1169,7 +1201,7 @@ impl CellStore {
 
     /// Replay TTL arm at an absolute internal deadline. Absent keys are a
     /// no-op (idempotent re-apply of a delete-then-expire suffix).
-    pub fn replay_expire_at(&mut self, key: &[u8], at: Nanos, now: Nanos) {
+    pub fn replay_expire_at(&mut self, key: &[u8], at: InternalDeadline, now: Nanos) {
         let _ = self.expire(key, Some(at), ExpireCond::Always, now);
     }
 
@@ -1196,7 +1228,10 @@ impl CellStore {
                 self.expire(key, None, ExpireCond::Always, now);
             }
             TtlUpdate::At(at) => {
-                self.expire(key, Some(at), ExpireCond::Always, now);
+                self.expire(key, Some(InternalDeadline::At(at)), ExpireCond::Always, now);
+            }
+            TtlUpdate::BeforeOrigin => {
+                self.expire(key, Some(InternalDeadline::BeforeOrigin), ExpireCond::Always, now);
             }
         }
         Some(value)
@@ -1561,24 +1596,33 @@ impl CellStore {
 
     /// `EXPIRE`/`PEXPIRE`/`PERSIST` (`at: None` removes the TTL). True if
     /// the deadline was applied/removed.
-    pub fn expire(&mut self, key: &[u8], at: Option<Nanos>, cond: ExpireCond, now: Nanos) -> bool {
+    pub fn expire(
+        &mut self,
+        key: &[u8],
+        at: Option<InternalDeadline>,
+        cond: ExpireCond,
+        now: Nanos,
+    ) -> bool {
         let Some((addr, len)) = self.resolve(key, now) else { return false };
         let view = RecordView::new(self.arena.bytes(addr, len));
         let current = view.expire_at_ms();
-        let new_ms = at.map(|n| (n.0 / 1_000_000).min(MAX_EXPIRE_MS));
+        let ms_of = |at: Nanos| (at.0 / 1_000_000).min(MAX_EXPIRE_MS);
         let applies = match cond {
             ExpireCond::Always => true,
             ExpireCond::IfNoExpiry => current.is_none(),
             ExpireCond::IfHasExpiry => current.is_some(),
             // GT/LT: a missing current TTL counts as infinite (Redis rules):
-            // GT never beats infinity; LT always does.
-            ExpireCond::IfGreater => match (new_ms, current) {
-                (Some(new), Some(cur)) => new > cur,
+            // GT never beats infinity; LT always does. A deadline before
+            // the clock's origin is below every current one.
+            ExpireCond::IfGreater => match (at, current) {
+                (Some(InternalDeadline::At(new)), Some(cur)) => ms_of(new) > cur,
+                (Some(InternalDeadline::BeforeOrigin), Some(_)) => false,
                 (Some(_), None) => false,
                 (None, _) => false, // PERSIST with GT/LT is a command error upstream
             },
-            ExpireCond::IfLess => match (new_ms, current) {
-                (Some(new), Some(cur)) => new < cur,
+            ExpireCond::IfLess => match (at, current) {
+                (Some(InternalDeadline::At(new)), Some(cur)) => ms_of(new) < cur,
+                (Some(InternalDeadline::BeforeOrigin), Some(_)) => true,
                 (Some(_), None) => true,
                 (None, _) => false,
             },
@@ -1587,13 +1631,16 @@ impl CellStore {
             return false;
         }
         // EXPIRE with a deadline at/before `now` deletes the key (Redis
-        // semantics) and still reports success.
-        if let Some(ms) = new_ms
-            && ms <= now.0 / 1_000_000
-        {
-            self.free_record(self.hash_key(key), addr, len);
-            return true;
-        }
+        // `checkAlreadyExpired`) and still reports success; a deadline
+        // before the clock's origin is before every `now`.
+        let new_ms = match at {
+            None => None,
+            Some(InternalDeadline::At(at)) if ms_of(at) > now.0 / 1_000_000 => Some(ms_of(at)),
+            Some(InternalDeadline::At(_) | InternalDeadline::BeforeOrigin) => {
+                self.free_record(self.hash_key(key), addr, len);
+                return true;
+            }
+        };
         // Rewrite with the new TTL-extension state. The ±5-byte extension
         // may cross a size class, so the record borrow must end before the
         // write: copy out (TTL changes are rare; a same-class in-place

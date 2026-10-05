@@ -19,6 +19,7 @@ use inf_log::{
     CkptConfig, Lsn, MutationEffect, ReaderConfig, RecordView, SegmentConfig, SegmentReader,
     SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
 };
+use inf_store::InternalDeadline::At;
 use inf_store::NoSpill;
 use inf_store::{
     FsyncClass, Keyspace, NsCatalog, NsId, NsMode, NsSpec, ReplayOutcome, StoreConfig, WallAnchor,
@@ -88,7 +89,7 @@ fn mutate(ks: &mut Keyspace, staging: &mut StagingRing, rng: &mut SplitMix64) {
                 100_000 + rng.next_u64() % 1_000_000
             };
             store.replay_set(&key, &value, NOW).expect("set");
-            store.replay_expire_at(&key, Nanos::from_millis(at_ms), NOW);
+            store.replay_expire_at(&key, At(Nanos::from_millis(at_ms)), NOW);
             staging
                 .stage(&MutationEffect::StringSet { ns, key: &key, value: &value })
                 .expect("stage");

@@ -71,9 +71,10 @@ fn storm_matches_reference_model() {
                     1 => SetCond::IfAbsent,
                     _ => SetCond::IfPresent,
                 };
-                let expire = match rand() % 4 {
+                let expire = match rand() % 5 {
                     0 => SetExpire::Keep,
                     1 => SetExpire::At(ms(now_ms + 1 + rand() % 100)),
+                    2 => SetExpire::BeforeOrigin,
                     _ => SetExpire::Clear,
                 };
                 let get_old = rand() % 2 == 0;
@@ -89,12 +90,18 @@ fn storm_matches_reference_model() {
                 };
                 let old = if get_old { existing.clone() } else { None };
                 let want = if applies {
+                    // `None`: the write leaves no key.
                     let at = match expire {
-                        SetExpire::Clear => None,
-                        SetExpire::Keep => model.live(&key, now_ms).and_then(|(_, at)| *at),
-                        SetExpire::At(n) => Some(n.0 / 1_000_000),
+                        SetExpire::Clear => Some(None),
+                        SetExpire::Keep => Some(model.live(&key, now_ms).and_then(|(_, at)| *at)),
+                        SetExpire::At(n) => Some(Some(n.0 / 1_000_000)),
+                        // Before every reading of the clock: a delete.
+                        SetExpire::BeforeOrigin => None,
                     };
-                    model.map.insert(key.clone(), (value, at));
+                    match at {
+                        Some(at) => model.map.insert(key.clone(), (value, at)),
+                        None => model.map.remove(&key),
+                    };
                     SetOutcome::Applied { old }
                 } else {
                     SetOutcome::Skipped { old }
@@ -163,7 +170,7 @@ fn storm_matches_reference_model() {
                     };
                     (Some(ms(now_ms + rand() % 200)), cond)
                 };
-                let got = store.expire(&key, at, cond, now);
+                let got = store.expire(&key, at.map(inf_store::InternalDeadline::At), cond, now);
                 let want = {
                     let new_ms = at.map(|n| n.0 / 1_000_000);
                     match model.live(&key, now_ms) {

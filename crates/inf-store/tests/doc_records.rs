@@ -10,6 +10,7 @@ use inf_doc::apply::{ApplyOp, Number};
 use inf_doc::model::{self, Value};
 use inf_doc::path::compile;
 use inf_doc::{CanonicalDoc, JsonParser};
+use inf_store::InternalDeadline::At;
 use inf_store::{
     CellStore, CopyResult, EvictionPolicy, ExpireCond, ExpiryBudget, JsonScalarPatch,
     JsonSetOptions, JsonSetOutcome, Keyspace, OpError, SetCond, SetExpire, SetOptions, StoreConfig,
@@ -397,23 +398,23 @@ fn every_free_site_releases_the_payload() {
 
     // Expire-on-read (lazy) and EXPIRE-in-the-past.
     set(&mut s, b"ttl", &doc_of_size(1024));
-    assert!(s.expire(b"ttl", Some(Nanos::from_millis(5)), ExpireCond::Always, now()));
+    assert!(s.expire(b"ttl", Some(At(Nanos::from_millis(5))), ExpireCond::Always, now()));
     assert!(s.json_get(b"ttl", Nanos::from_millis(6)).expect("ok").is_none(), "lazy reap");
     assert_eq!(s.doc_domain(), inf_store::DocDomain::default());
     set(&mut s, b"ttl2", &tree_doc());
-    assert!(s.expire(b"ttl2", Some(now()), ExpireCond::Always, Nanos::from_millis(2)));
+    assert!(s.expire(b"ttl2", Some(At(now())), ExpireCond::Always, Nanos::from_millis(2)));
     assert_eq!(s.doc_domain(), inf_store::DocDomain::default(), "expire-now releases");
 
     // Wheel slice reap.
     set(&mut s, b"wheel", &doc_of_size(1024));
-    assert!(s.expire(b"wheel", Some(Nanos::from_millis(10)), ExpireCond::Always, now()));
+    assert!(s.expire(b"wheel", Some(At(Nanos::from_millis(10))), ExpireCond::Always, now()));
     let stats = s.expire_tick(Nanos::from_millis(50), ExpiryBudget::default());
     assert_eq!(stats.reaped, 1);
     assert_eq!(s.doc_domain(), inf_store::DocDomain::default(), "wheel releases");
 
     // TTL rewrite carries the handle: the blob survives an EXPIRE.
     set(&mut s, b"keep", &doc_of_size(1024));
-    assert!(s.expire(b"keep", Some(Nanos::from_millis(1_000)), ExpireCond::Always, now()));
+    assert!(s.expire(b"keep", Some(At(Nanos::from_millis(1_000))), ExpireCond::Always, now()));
     let read = s.json_get(b"keep", now()).expect("ok").expect("alive");
     assert_eq!(read.version, 2, "EXPIRE rewrite bumps like any key mutation");
     reconcile(&s);
@@ -421,7 +422,7 @@ fn every_free_site_releases_the_payload() {
 
     // SCAN reap.
     set(&mut s, b"scan", &doc_of_size(1024));
-    assert!(s.expire(b"scan", Some(Nanos::from_millis(5)), ExpireCond::Always, now()));
+    assert!(s.expire(b"scan", Some(At(Nanos::from_millis(5))), ExpireCond::Always, now()));
     let mut seen = 0;
     let mut cursor = 0;
     loop {
@@ -632,7 +633,7 @@ fn same_class_blob_overwrite_rewrites_in_place() {
     let mut s = store();
     let first = doc_of_size(1024);
     set(&mut s, b"doc", &first);
-    assert!(s.expire(b"doc", Some(Nanos::from_millis(1_000)), ExpireCond::Always, now()));
+    assert!(s.expire(b"doc", Some(At(Nanos::from_millis(1_000))), ExpireCond::Always, now()));
     let before = s.doc_domain();
     assert_eq!((before.docs_live, before.inline_docs), (1, 0), "blob tier");
     let version_before = s.json_get(b"doc", now()).expect("ok").expect("present").version;

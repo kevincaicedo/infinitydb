@@ -63,6 +63,33 @@ pub const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
 pub fn saturating_deadline(internal_ms: u64) -> Nanos {
     Nanos::from_millis(internal_ms.min(MAX_EXPIRE_MS))
 }
+
+/// Where an accepted expire instant lands on the internal clock
+/// (ADR-0111 D2). The clock counts milliseconds from its origin, and a
+/// record's deadline is unsigned, so an instant before the origin has no
+/// deadline to carry: clamped onto the origin it would read as live
+/// through the origin's own millisecond (a key expires once `now > at`).
+/// It is its own variant instead, earlier than every reading of the
+/// clock, and every write that receives it removes the key at once.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum InternalDeadline {
+    /// Strictly before the clock's origin: expired at every `now`.
+    BeforeOrigin,
+    /// On the clock, saturated into [`MAX_EXPIRE_MS`].
+    At(Nanos),
+}
+
+impl InternalDeadline {
+    /// The deadline at a signed internal-clock instant in milliseconds:
+    /// a negative instant is before the origin, a large one saturates.
+    #[must_use]
+    pub fn from_internal_ms(internal_ms: i64) -> InternalDeadline {
+        match u64::try_from(internal_ms) {
+            Ok(ms) => InternalDeadline::At(saturating_deadline(ms)),
+            Err(_) => InternalDeadline::BeforeOrigin,
+        }
+    }
+}
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 
@@ -578,6 +605,24 @@ mod tests {
         let mut bytes = ExtentRef { extent_id: 7, offset: 0, len: 16 }.encode();
         bytes[8] = 1;
         let _ = ExtentRef::decode(&bytes);
+    }
+
+    /// ADR-0111 D2: the conversion keeps an instant before the clock's
+    /// origin apart from the origin itself — the origin is a deadline a
+    /// record carries (live through its millisecond), the instant one
+    /// millisecond earlier is expired at every reading of the clock.
+    #[test]
+    fn internal_deadlines_keep_the_origin_apart_from_before_it() {
+        use InternalDeadline::{At, BeforeOrigin};
+        assert_eq!(InternalDeadline::from_internal_ms(i64::MIN), BeforeOrigin);
+        assert_eq!(InternalDeadline::from_internal_ms(-1), BeforeOrigin);
+        assert_eq!(InternalDeadline::from_internal_ms(0), At(Nanos::ZERO));
+        assert_eq!(InternalDeadline::from_internal_ms(1), At(Nanos::from_millis(1)));
+        let bound = i64::try_from(MAX_EXPIRE_MS).expect("u40 fits i64");
+        let max = At(Nanos::from_millis(MAX_EXPIRE_MS));
+        assert_eq!(InternalDeadline::from_internal_ms(bound), max);
+        assert_eq!(InternalDeadline::from_internal_ms(bound + 1), max, "saturates");
+        assert_eq!(InternalDeadline::from_internal_ms(i64::MAX), max, "saturates");
     }
 
     fn roundtrip(spec: RecordSpec<'_>) -> Vec<u8> {

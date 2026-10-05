@@ -588,14 +588,22 @@ impl CellStore {
             return Ok(JsonSetOutcome::Skipped);
         }
         let version = old_view.map_or(1, |v| v.version().wrapping_add(1));
-        let lineage =
-            old_view.map_or_else(|| self.docs.allocate_lineage(), |v| lineage_of(v.value()));
         let old_deadline = old_view.and_then(|v| v.expire_at_ms());
         let expire_at_ms = match opts.expire {
             SetExpire::Clear => None,
             SetExpire::Keep => old_deadline,
             SetExpire::At(at) => Some((at.0 / 1_000_000).min(MAX_EXPIRE_MS)),
+            // Expired at every reading of the clock (ADR-0111 D2): the
+            // overwrite is a delete, and a new key never takes a lineage.
+            SetExpire::BeforeOrigin => {
+                if let Some((addr, len)) = existing {
+                    self.free_record(self.hash_key(key), addr, len);
+                }
+                return Ok(JsonSetOutcome::Applied);
+            }
         };
+        let lineage =
+            old_view.map_or_else(|| self.docs.allocate_lineage(), |v| lineage_of(v.value()));
         self.json_write_value(
             key,
             existing,

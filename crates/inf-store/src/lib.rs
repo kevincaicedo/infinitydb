@@ -99,8 +99,8 @@ pub use ordered::{
     OrderedMapMemory, PkRef, VarKey,
 };
 pub use record::{
-    ColdKey, ColdKeyError, EXTENT_REF_LEN, ExtentRef, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN,
-    TypeTag, saturating_deadline,
+    ColdKey, ColdKeyError, EXTENT_REF_LEN, ExtentRef, InternalDeadline, MAX_EXPIRE_MS, MAX_KEY_LEN,
+    MAX_VAL_LEN, TypeTag, saturating_deadline,
 };
 pub use router::SlotRouter;
 #[cfg(feature = "test-support")]

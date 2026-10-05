@@ -995,4 +995,10 @@ arithmetic at the command seam is ADR-0111: every expire argument is decided
 in i64 Unix milliseconds exactly as Redis decides it, and every accepted
 instant saturates into the record's u40-ms bound (`inf_store::MAX_EXPIRE_MS`,
 `inf_store::saturating_deadline` — now public); the ADR-0008 clamp is the
-declared deviation for read-backs of a saturated deadline.
+declared deviation for read-backs of a saturated deadline. An instant before
+the internal clock's origin has no u40 deadline and is never clamped onto
+the origin, where it would read as live for that millisecond: it converts to
+`inf_store::InternalDeadline::BeforeOrigin`, expired at every reading of the
+clock, and each store write that receives it leaves no key — `SET`'s
+overwrite is a delete, `GETEX` answers and then deletes, the `EXPIRE` family
+deletes, replay deletes.

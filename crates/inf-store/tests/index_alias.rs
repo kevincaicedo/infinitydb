@@ -846,7 +846,7 @@ fn a_key_that_reaches_no_funnel_needs_no_scratch_after_the_pre_half() {
     put(&mut ks, key, r#"{"tags":[1,2,3,4,5,6,7,8]}"#, SetExpire::Keep);
     ks.idx_bracket_begin(NS, &[key], None).expect("pre-half");
     fault::arm(inf_store::fault::IDX_SCRATCH_REFUSE, FaultSpec::Always);
-    let deadline = Some(Nanos(900_000 * 1_000_000));
+    let deadline = Some(inf_store::InternalDeadline::At(Nanos(900_000 * 1_000_000)));
     assert!(ks.db_mut(0).expire(key, deadline, inf_store::ExpireCond::Always, T0));
     ks.idx_bracket_commit(NS, &[key]);
     assert_eq!(fault::fired(inf_store::fault::IDX_SCRATCH_REFUSE), 0, "no growth was attempted");

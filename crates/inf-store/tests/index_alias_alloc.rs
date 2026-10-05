@@ -100,7 +100,7 @@ fn a_never_admitted_keys_commit_half_allocates_only_inside_path_eval() {
     let allowed = reevaluation_allocations(&mut ks, key);
 
     ks.idx_bracket_begin(NS, &[key], None).expect("pre-half");
-    let deadline = Some(Nanos(900_000_000_000));
+    let deadline = Some(inf_store::InternalDeadline::At(Nanos(900_000_000_000)));
     assert!(ks.db_mut(0).expire(key, deadline, ExpireCond::Always, T0));
     let before = ALLOC.thread_allocations();
     ks.idx_bracket_commit(NS, &[key]);
