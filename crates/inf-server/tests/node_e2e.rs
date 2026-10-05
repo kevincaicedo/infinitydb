@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use inf_alloc::BufferPool;
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::CellId;
-use inf_foundation::time::{Clock, StdClock};
+use inf_foundation::time::{Clock, Nanos, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
 use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
@@ -75,6 +75,30 @@ impl CkptTrigger {
                 stream_bytes_per_sec,
                 ..base
             },
+        }
+    }
+}
+
+/// Every cell's clock held at one reading, with internal 0 anchored at
+/// `anchor_unix_ms`: a test reads a moment the wire cannot pin, such as
+/// the clock's first millisecond, in any build. Volatile nodes only.
+#[derive(Clone, Copy)]
+struct HeldClock {
+    internal: Nanos,
+    anchor_unix_ms: u64,
+}
+
+/// A cell loop's clock: the product's monotonic one, or a held reading.
+enum CellClock {
+    Running(StdClock),
+    Held(Nanos),
+}
+
+impl Clock for CellClock {
+    fn now(&self) -> Nanos {
+        match self {
+            CellClock::Running(clock) => clock.now(),
+            CellClock::Held(at) => *at,
         }
     }
 }
@@ -138,6 +162,7 @@ impl Node {
             Default::default(),
             Some(hold),
             None,
+            None,
         )
     }
 
@@ -157,6 +182,27 @@ impl Node {
 
     fn start(cells: u16) -> Node {
         Node::start_with(cells, None, CkptTrigger::Manual)
+    }
+
+    /// A volatile node whose cell clocks all read `held` (see [`HeldClock`]).
+    fn start_held_clock(cells: u16, held: HeldClock) -> Node {
+        Node::start_cfg_default(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            Some(held),
+        )
     }
 
     /// A node with the durable plane enabled (M2-S08): catalog loaded and
@@ -185,6 +231,7 @@ impl Node {
             inf_log::SegmentIoMode::Buffered,
             Some(default_ns.to_vec()),
             Default::default(),
+            None,
             None,
             None,
         )
@@ -217,6 +264,7 @@ impl Node {
             },
             None,
             None,
+            None,
         )
     }
 
@@ -243,6 +291,7 @@ impl Node {
             Default::default(),
             None,
             Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
+            None,
         )
     }
 
@@ -451,6 +500,7 @@ impl Node {
             Default::default(),
             None,
             None,
+            None,
         )
     }
 
@@ -470,7 +520,9 @@ impl Node {
         device: inf_server::DeviceConfig,
         held_catalog: Option<Arc<AtomicBool>>,
         ckpt_headroom: Option<std::num::NonZeroU64>,
+        held_clock: Option<HeldClock>,
     ) -> Node {
+        assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
         let mut process_sampler = inf_server::ProcessSampler::default();
         process_sampler.sample();
@@ -577,10 +629,13 @@ impl Node {
                 *node.conn_default_ns.borrow_mut() = default_ns;
                 // Real wall anchor (the infinityd boot pattern): LASTSAVE/
                 // rdb_last_save_time report true unix seconds (M2-S20).
-                let unix_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let unix_ms = match held_clock {
+                    Some(held) => held.anchor_unix_ms,
+                    None => std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                };
                 node.wall_anchor.set((0, unix_ms));
                 let mut ks = Keyspace::new(StoreConfig::default());
                 let mut durable = None;
@@ -636,7 +691,11 @@ impl Node {
                     park_default: Some(Duration::from_millis(5)),
                     ..Default::default()
                 };
-                let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+                let clock = match held_clock {
+                    Some(held) => CellClock::Held(held.internal),
+                    None => CellClock::Running(StdClock::new()),
+                };
+                let mut cell_loop = CellLoop::new(driver, clock, pool, config);
                 let (mut counted_quiet, mut counted) = (false, false);
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
@@ -1298,6 +1357,46 @@ fn read_bulk(stream: &mut TcpStream) -> Vec<u8> {
 fn info_text(conn: &mut TcpStream, section: &[u8]) -> String {
     conn.write_all(&cmd(&[b"INFO", section])).expect("write");
     String::from_utf8(read_bulk(conn)).expect("ascii")
+}
+
+/// A deadline before the internal clock's origin reads nil inside that
+/// clock's first millisecond, on every cell (ADR-0111 A1). `infinityd`
+/// serves a pipeline queued at connect inside that millisecond, but only a
+/// release build reaches it in time; here every cell's clock is held at
+/// 1 ns, so the read lands there in any build. A deadline clamped onto the
+/// origin was served at this reading. The control, a deadline *at* the
+/// origin, is live through its millisecond as Redis serves `PXAT now`: it
+/// fails unless the clock reads inside millisecond 0.
+#[test]
+fn a_pre_origin_deadline_reads_nil_in_the_clocks_first_millisecond() {
+    const CELLS: u16 = 4;
+    const ANCHOR_UNIX_MS: u64 = 1_757_000_000_000;
+    let node = Node::start_held_clock(
+        CELLS,
+        HeldClock { internal: Nanos(1), anchor_unix_ms: ANCHOR_UNIX_MS },
+    );
+    let mut client = node.connect();
+    let origin = ANCHOR_UNIX_MS.to_string();
+    for cell in 0..CELLS {
+        let at_origin = key_for_cell_prefixed(CELLS, cell, "origin");
+        let fresh = key_for_cell_prefixed(CELLS, cell, "sxp");
+        let live = key_for_cell_prefixed(CELLS, cell, "sxg");
+        let steps: [(Vec<u8>, &[u8]); 7] = [
+            (cmd(&[b"SET", &at_origin, b"v", b"PXAT", origin.as_bytes()]), b"+OK\r\n"),
+            (cmd(&[b"GET", &at_origin]), b"$1\r\nv\r\n"),
+            (cmd(&[b"SET", &fresh, b"v", b"EXAT", b"1"]), b"+OK\r\n"),
+            (cmd(&[b"GET", &fresh]), b"$-1\r\n"),
+            (cmd(&[b"SET", &live, b"old"]), b"+OK\r\n"),
+            (cmd(&[b"SET", &live, b"v", b"PXAT", b"1", b"GET"]), b"$3\r\nold\r\n"),
+            (cmd(&[b"EXISTS", &live]), b":0\r\n"),
+        ];
+        let pipeline: Vec<u8> = steps.iter().flat_map(|(wire, _)| wire.iter().copied()).collect();
+        client.write_all(&pipeline).expect("write");
+        for (_, reply) in &steps {
+            read_exactly(&mut client, reply);
+        }
+    }
+    node.stop();
 }
 
 /// Connects until landing on `cell` (SO_REUSEPORT spreads arbitrarily).
