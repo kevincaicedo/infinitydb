@@ -469,10 +469,16 @@ impl<F: SegmentFs> TierReplay<F> {
             let cut = table.space.ro_boundary().to_raw();
             let cursor = table.flush_start_cursor(&self.flush);
             // One span, one barrier, one more per gap or capacity seal it
-            // crosses. Files sealed per boot have no limit of their own:
-            // ⌊D ÷ file capacity⌋ + ⌈D ÷ ring⌉ + page pads + the hand-over's
-            // one, for `D` bytes demoted — the device and the handle limit
-            // bound them (a typed refusal at a create).
+            // crosses. A boot seals a file at the capacity target, before a
+            // gap and once at the hand-over (ADR-0174 D2 rule 5), so for `D`
+            // the span the boot flushed (`flushed` − life origin, holes and
+            // pads included) and `C` the file capacity it seals at most
+            // ⌊2D ÷ C⌋ + ⌈D ÷ ring⌉ + page pads + 1 files: a capacity-sealed
+            // file and the range that overflowed it hold more than `C`, a
+            // file is in at most two such pairs (⌊D ÷ (C − S)⌋ when every
+            // range `S` is below `C`), and ring tops lie a ring apart. No
+            // limit of their own: the device and the handle limit bound
+            // them (a typed refusal at a create).
             if cut > cursor {
                 let outcome = table
                     .flush_span(&mut self.flush, cut - cursor)
