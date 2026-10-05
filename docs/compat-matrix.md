@@ -15,7 +15,7 @@ both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 672 byte-compared executions · 72 documented deviations · 0 tolerated failures.
+**Corpus:** 677 byte-compared executions · 72 documented deviations · 0 tolerated failures.
 **Surface:** 91 commands — 53 full · 33 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
@@ -38,14 +38,14 @@ live keys.
 | `HELLO` | partial | M0 | fast | -1 | 1 | 0 | the reply's identity fields (server, version, id) are InfinityDB's own, so no handshake case byte-compares (its one compared case is the subscriber-mode refusal, an error path); the protocol switch is proven by the RESP3-keyed cases that follow it |
 | `QUIT` | partial | M1 | fast | 1 | 0 | 0 | replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite |
 | `GET` | full | M0 | readonly fast | 2 | 30 | 22 |  |
-| `SET` | full | M0 | write denyoom | -3 | 105 | 66 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
+| `SET` | full | M0 | write denyoom | -3 | 108 | 69 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122) |
 | `SETNX` | full | M0 | write denyoom fast | 3 | 2 | 2 |  |
 | `SETEX` | full | M0 | write denyoom | 4 | 6 | 2 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PSETEX` | full | M0 | write denyoom | 4 | 4 | 2 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `GETSET` | full | M0 | write denyoom fast | 3 | 2 | 1 |  |
 | `GETDEL` | full | M0 | write fast | 2 | 2 | 1 |  |
 | `DEL` | full | M0 | write | -2 | 4 | 4 |  |
-| `EXISTS` | full | M0 | readonly fast | -2 | 18 | 18 |  |
+| `EXISTS` | full | M0 | readonly fast | -2 | 20 | 20 |  |
 | `TYPE` | full | M0 | readonly fast | 2 | 4 | 4 | only the string type exists until M3 |
 | `INCR` | full | M0 | write denyoom fast | 2 | 8 | 2 |  |
 | `DECR` | full | M0 | write denyoom fast | 2 | 2 | 1 |  |

@@ -448,6 +448,13 @@ pub static MATRIX: &[Case] = &[
     c(&["PEXPIRETIME", "px"]),
     c(&["SET", "sxp", "v", "EXAT", "1"]),
     c(&["GET", "sxp"]),
+    // An instant before any server's clock origin over a live key: the
+    // old value answers and no key stays (ADR-0111 D2).
+    c(&["SET", "sxg", "old"]),
+    c(&["SET", "sxg", "v", "PXAT", "1", "GET"]),
+    c(&["EXISTS", "sxg"]),
+    c(&["SET", "sxn", "v", "NX", "EXAT", "1"]),
+    c(&["EXISTS", "sxn"]),
     c(&["SET", "sx", "v", "EXAT", "notanint"]),
     c(&["SET", "sx", "v", "EX", "10", "EXAT", "2208988800"]),
     // --- SET/GETEX absolute deadlines ≤ 0 (review 2026-08-30, M1 / F-L13-02):
