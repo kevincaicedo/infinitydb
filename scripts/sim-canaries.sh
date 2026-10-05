@@ -404,6 +404,10 @@ loom_test() {
 }
 
 sim_built=0
+# A plain leg is the scenario, its flags and the seed, not the plant: rows
+# that share one share its run (three rows run m4-recovery
+# --replay-above-window at the lane seed, about 34 s each).
+plain_green="|"
 for row in "${rows[@]}"; do
   # shellcheck disable=SC2206
   parts=($row)
@@ -442,8 +446,14 @@ for row in "${rows[@]}"; do
     # and drop the control bytes, or the catch prints nothing.
     echo "   caught: $(grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160)"
   fi
+  leg="$name ${flags[*]}"
+  if [[ "$plain_green" == *"|$leg|"* ]]; then
+    echo "== canary $cfg: $name ${flags[*]} on the plain build: green above, not run again"
+    continue
+  fi
   echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
   "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
+  plain_green+="$leg|"
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
 echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green (seed $seed)"
