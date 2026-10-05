@@ -70,6 +70,9 @@ const PAGE: u64 = 4 << 10;
 const BUDGET: u64 = 1 << 20;
 /// Small tier files so lives span rotations and gaps.
 const FILE_CAPACITY: u64 = 48 << 10;
+/// The files a boot seals at its hand-over: the last one, once (ADR-0174
+/// D2 rule 5), the files-sealed bound's third term.
+const HAND_OVER_SEALS: u64 = 1;
 /// Out-of-line threshold for the blob leg (M4-S17, ADR-0061) — above
 /// every inline value the op generator emits, below every blob value.
 const BLOB_THRESHOLD: u32 = 256;
@@ -479,12 +482,13 @@ impl ReplaySpill for Lent {
 struct Booting {
     ks: Keyspace,
     lent: Lent,
-    /// The longest span one record's apply moved `flushed` across: §3's
-    /// `S` from above. Every demote step appends up to its cut and the
-    /// boot pipeline claims the span whole (ADR-0174 D2 rule 4), so each
-    /// range a step appends lies inside the span its record's apply
-    /// flushed. Read from the space, not the pipeline's counters.
-    longest_flush_span: u64,
+    /// The longest span one record's apply moved `flushed` across: an upper
+    /// bound on the longest range one demote step appends (ADR-0174 D2
+    /// rule 4), the bound's `S`. A demote step appends up to its cut and
+    /// the boot pipeline claims the span whole, so each range a step
+    /// appends lies inside the span its record's apply flushed. Read from
+    /// the space, not the pipeline's counters.
+    longest_range: u64,
 }
 
 impl Booting {
@@ -510,18 +514,18 @@ impl Booting {
         .expect("create the tiered namespace");
         // The harness's table keeps its own knobs (budget, blob, shadow).
         *ks.tiered_store_mut(NS).expect("materialized") = table;
-        Booting { ks, lent: Lent { machine }, longest_flush_span: 0 }
+        Booting { ks, lent: Lent { machine }, longest_range: 0 }
     }
 
     /// One record through the shipped dispatcher, measuring the span its
-    /// apply flushed ([`Booting::longest_flush_span`]).
+    /// apply flushed ([`Booting::longest_range`]).
     fn apply(&mut self, record: &RecordView<'_>) -> Result<(), String> {
         let flushed =
             |ks: &Keyspace| ks.tiered_store(NS).expect("materialized").space().flushed().to_raw();
         let before = flushed(&self.ks);
         let applied = self.ks.apply_record(record, BOOT_NOW, BOOT_ANCHOR, &mut self.lent);
         let span = flushed(&self.ks) - before;
-        self.longest_flush_span = self.longest_flush_span.max(span);
+        self.longest_range = self.longest_range.max(span);
         applied.map(|_| ()).map_err(|e| format!("{e:?}"))
     }
 
@@ -2043,12 +2047,12 @@ impl SealCensus {
 /// the boot removed the dead life's before it wrote (D4). Their count must
 /// be the pipeline's `files_sealed`, each is judged by the seal that made
 /// it ([`judge_boot_files`]), and the count by its bound at the span the
-/// boot flushed and the longest span one record's apply flushed
-/// ([`judge_file_count`]). Returns what it read.
+/// boot flushed and the longest range ([`judge_file_count`]). Returns what
+/// it read.
 fn census_boot_files(
     (disk, shard): (&SimDisk, &Path),
     tier: &TierNsManifest,
-    (space, longest_flush_span): (&inf_store::AddressSpace, u64),
+    (space, longest_range): (&inf_store::AddressSpace, u64),
     counters: &ReplayCounters,
     report: &mut RecoveryReport,
     life_index: u64,
@@ -2087,8 +2091,8 @@ fn census_boot_files(
             }
         }
     }
-    judge_boot_files(&mut files, space, &mut census, report, life_index);
-    judge_file_count(space, longest_flush_span, &mut census, report, life_index);
+    let gap = judge_boot_files(&mut files, space, &mut census, report, life_index);
+    judge_file_count(space, (longest_range, gap), &mut census, report, life_index);
     if census.files != counters.files_sealed {
         report.violations.push(format!(
             "life {life_index}: FILES-SEALED VIOLATION: the tier directory holds {} boot \
@@ -2109,15 +2113,16 @@ fn census_boot_files(
 /// one, a page pad at a page boundary below it, and neither follows the
 /// other (D2 rule 6's proof), so the count is exact for the pads the flush
 /// crossed; a pad still in RAM at the hand-over sealed nothing. The gap
-/// seals are at most ⌈D ÷ ring⌉ + page pads for `D` the span the boot
-/// flushed: one per ring top crossed, one per page pad.
+/// seals are at most the gap term, ⌈D ÷ ring⌉ + page pads for `D` the span
+/// the boot flushed: one per ring top crossed, one per page pad. Returns
+/// the gap term.
 fn judge_boot_files(
     files: &mut [BootFile],
     space: &inf_store::AddressSpace,
     census: &mut SealCensus,
     report: &mut RecoveryReport,
     life_index: u64,
-) {
+) -> u64 {
     files.sort_unstable_by_key(|f| f.base);
     let origin = space.life_origin().to_raw();
     let flushed = space.flushed().to_raw();
@@ -2139,8 +2144,8 @@ fn judge_boot_files(
     if flushed > end && !(flushed - origin).is_multiple_of(ring) {
         census.page_pads += 1;
     }
-    let gap_bound = (flushed - origin).div_ceil(ring) + census.page_pads;
-    if census.gap_seals > gap_bound {
+    let gap = (flushed - origin).div_ceil(ring) + census.page_pads;
+    if census.gap_seals > gap {
         report.violations.push(format!(
             "life {life_index}: FILES-SEALED VIOLATION: {} gap seals, above ⌈{} ÷ {ring}⌉ + {} \
              page pads",
@@ -2149,6 +2154,7 @@ fn judge_boot_files(
             census.page_pads
         ));
     }
+    gap
 }
 
 /// A boot's sealed files against their bound, term by term, every term at
@@ -2156,11 +2162,11 @@ fn judge_boot_files(
 /// pads included. Ring tops lie one ring apart from the life origin, so
 /// the gap term needs the span; the capacity term counts record bytes,
 /// which are at most `D`. Capacity seals are at most [`capacity_term`],
-/// gap seals at most ⌈D ÷ ring⌉ + page pads ([`judge_boot_files`]), and
-/// the hand-over seals one file: the files are at most the sum.
+/// gap seals at most the gap term ([`judge_boot_files`]), and the
+/// hand-over seals [`HAND_OVER_SEALS`]: the files are at most the sum.
 fn judge_file_count(
     space: &inf_store::AddressSpace,
-    longest_range: u64,
+    (longest_range, gap): (u64, u64),
     census: &mut SealCensus,
     report: &mut RecoveryReport,
     life_index: u64,
@@ -2175,11 +2181,11 @@ fn judge_file_count(
             census.capacity_seals
         ));
     }
-    let bound = capacity + span.div_ceil(ring) + census.page_pads + 1;
+    let bound = capacity + gap + HAND_OVER_SEALS;
     if census.files > bound {
         report.violations.push(format!(
             "life {life_index}: FILES-SEALED-BOUND VIOLATION: {} boot files, above {form} + \
-             ⌈{span} ÷ {ring}⌉ + {} page pads + 1 = {bound}",
+             ⌈{span} ÷ {ring}⌉ + {} page pads + {HAND_OVER_SEALS} = {bound}",
             census.files, census.page_pads
         ));
     }
@@ -2187,19 +2193,22 @@ fn judge_file_count(
     census.closest = (census.files > 0).then_some((census.files, bound));
 }
 
-/// The capacity term at the span `d`, the file capacity `c` and the
-/// longest range one demote step appended, `s`, with the form that binds.
-/// A capacity seal comes before a range that would take a non-empty file
-/// past `c`, and that range opens the next file at the sealed one's end,
-/// so the two hold more than `c`; a file is in at most two such pairs:
-/// ⌊2D ÷ C⌋ at any `s`. Where `s < c`, each sealed file holds more than
-/// `c − s`: ⌊D ÷ (C − S)⌋ as well, and the smaller binds.
-fn capacity_term(d: u64, c: u64, s: u64) -> (u64, String) {
-    let pairs = 2 * d / c;
-    if s < c && d / (c - s) < pairs {
-        return (d / (c - s), format!("⌊{d} ÷ ({c} − {s})⌋"));
+/// The capacity term at the span `D`, the file capacity `C` and the
+/// longest range `S`, with the form that binds. A capacity seal comes
+/// before a range that would take a non-empty file past `C`, and that
+/// range opens the next file at the sealed one's end, so the two hold more
+/// than `C`; a file is in at most two such pairs: ⌊2D ÷ C⌋ at any `S`.
+/// Where `S < C`, each sealed file holds more than `C − S`: ⌊D ÷ (C − S)⌋
+/// as well, and the smaller binds.
+fn capacity_term(span: u64, file_capacity: u64, longest_range: u64) -> (u64, String) {
+    let pairs = 2 * span / file_capacity;
+    if longest_range < file_capacity {
+        let ranges = span / (file_capacity - longest_range);
+        if ranges < pairs {
+            return (ranges, format!("⌊{span} ÷ ({file_capacity} − {longest_range})⌋"));
+        }
     }
-    (pairs, format!("⌊2 × {d} ÷ {c}⌋"))
+    (pairs, format!("⌊2 × {span} ÷ {file_capacity}⌋"))
 }
 
 /// One boot file against its seal. The reason is one the live flush gives
@@ -2720,7 +2729,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
             });
         // The end settle moves no boundary and the hand-over's drain
         // appends nothing (ADR-0174 R10): every range is behind us.
-        let longest_flush_span = node.longest_flush_span;
+        let longest_range = node.longest_range;
         let booted = replayed.and_then(|()| node.finish(&mut run.report.shadow_settled_at_boot));
         let (mut table, handed, counters) = match booted {
             Ok(done) => done,
@@ -2734,7 +2743,7 @@ pub fn run_recovery_scenario(scenario: &RecoveryScenario) -> RecoveryReport {
         let census = census_boot_files(
             (&disk, &shard),
             &tier,
-            (table.space(), longest_flush_span),
+            (table.space(), longest_range),
             &counters,
             &mut run.report,
             life_index,
