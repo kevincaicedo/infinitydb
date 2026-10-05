@@ -1374,9 +1374,10 @@ per episode). A drained cell always seals — never slower than K = 1.
   > of one frame or one section stay one unit, bounded by the decoder's
   > cap. The yield sentence above then reads: the driver yields at the next
   > record or entry once the step's charge reaches the budget. A charge is
-  > budget bytes, not elapsed time and not memory, and its walked-byte
-  > price covers the bytes a demote step's seal walk passes as well as the
-  > end settle's. `Keyspace::apply_record` (the tag-8 bullet above) answers
+  > budget bytes, not elapsed time and not memory. From that build, its
+  > walked-byte price covers the bytes a demote step's seal walk passes as
+  > well as the end settle's; until then it covers the end settle's alone.
+  > `Keyspace::apply_record` (the tag-8 bullet above) answers
   > one of three: consumed, consumed after priced boot work, or
   > `NeedsRoom(ns)`; on `NeedsRoom` the record has changed nothing, and the
   > driver runs the demotion under the step budget and presents the record
