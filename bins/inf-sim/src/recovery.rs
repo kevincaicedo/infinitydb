@@ -2026,9 +2026,11 @@ impl SealCensus {
         self.shutdown_seals += shutdown_seals;
         self.page_pads += page_pads;
         self.bound += bound;
-        // Closer: the larger share of its bound, `f₁ ÷ b₁ > f₀ ÷ b₀`.
+        // Closer: the larger share of its bound, `f₁ ÷ b₁ > f₀ ÷ b₀`,
+        // cross-multiplied in u128: each factor is a u64 count.
+        let product = |a: u64, b: u64| u128::from(a) * u128::from(b);
         self.closest = match (self.closest, closest) {
-            (Some((f0, b0)), Some((f1, b1))) if f1 * b0 > f0 * b1 => Some((f1, b1)),
+            (Some((f0, b0)), Some((f1, b1))) if product(f1, b0) > product(f0, b1) => Some((f1, b1)),
             (ours, theirs) => ours.or(theirs),
         };
     }
