@@ -31,12 +31,6 @@ fn parse_seed(text: &str) -> Result<u64, String> {
     }
 }
 
-/// ADR-0107 (review of 2026-08-30, F-L16-01): a simulator built without
-/// its `dst` feature carries no fault registry and no collision oracle —
-/// every armed point would fire `false` and every forced-collision row
-/// would hash two distinct keys, so a "clean" run would prove nothing.
-/// Refuse to run instead of reporting a lie. Exit 2 is the harness's
-/// usage-error code (`run-sweep.sh` treats it as a missing simulator).
 /// The census's closest boot, `files of bound`, or that no boot sealed a
 /// file.
 fn closest_boot(closest: Option<(u64, u64)>) -> String {
@@ -46,6 +40,12 @@ fn closest_boot(closest: Option<(u64, u64)>) -> String {
     )
 }
 
+/// ADR-0107 (review of 2026-08-30, F-L16-01): a simulator built without
+/// its `dst` feature carries no fault registry and no collision oracle —
+/// every armed point would fire `false` and every forced-collision row
+/// would hash two distinct keys, so a "clean" run would prove nothing.
+/// Refuse to run instead of reporting a lie. Exit 2 is the harness's
+/// usage-error code (`run-sweep.sh` treats it as a missing simulator).
 fn require_dst_build() {
     if inf_foundation::fault::COMPILED_IN && inf_foundation::COLLISION_ORACLE {
         return;
