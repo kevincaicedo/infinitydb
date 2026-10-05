@@ -240,7 +240,7 @@ fn churn_op(
     }
 }
 
-/// ADR-0111 D2: a deadline before the clock's origin is expired at every
+/// ADR-0111 A1: a deadline before the clock's origin is expired at every
 /// reading of the clock, so every write that receives one leaves no key —
 /// at `now` inside the origin's millisecond too, where a deadline clamped
 /// onto the origin read as live. NX/XX and `GET` keep their meaning.

@@ -32,7 +32,7 @@ impl WallAnchor {
     }
 
     /// The internal-clock deadline for a Unix-epoch deadline (ADR-0111
-    /// D2): an instant before the internal clock's origin is
+    /// A1): an instant before the internal clock's origin is
     /// [`InternalDeadline::BeforeOrigin`], expired at every reading of
     /// the clock, and a far one saturates into the store bound. `None`
     /// means the i64 arithmetic overflowed — the caller decides the

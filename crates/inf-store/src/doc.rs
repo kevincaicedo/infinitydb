@@ -597,7 +597,7 @@ impl CellStore {
             SetExpire::Clear => None,
             SetExpire::Keep => old_deadline,
             SetExpire::At(at) => Some((at.0 / 1_000_000).min(MAX_EXPIRE_MS)),
-            // Expired at every reading of the clock (ADR-0111 D2): the
+            // Expired at every reading of the clock (ADR-0111 A1): the
             // overwrite is a delete, and a new key never takes a lineage.
             SetExpire::BeforeOrigin => {
                 if let Some((addr, len)) = existing {

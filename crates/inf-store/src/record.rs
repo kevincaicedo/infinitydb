@@ -65,7 +65,7 @@ pub fn saturating_deadline(internal_ms: u64) -> Nanos {
 }
 
 /// Where an accepted expire instant lands on the internal clock
-/// (ADR-0111 D2). The clock counts milliseconds from its origin, and a
+/// (ADR-0111 A1). The clock counts milliseconds from its origin, and a
 /// record's deadline is unsigned, so an instant before the origin has no
 /// deadline to carry: clamped onto the origin it would read as live
 /// through the origin's own millisecond (a key expires once `now > at`).
@@ -607,7 +607,7 @@ mod tests {
         let _ = ExtentRef::decode(&bytes);
     }
 
-    /// ADR-0111 D2: the conversion keeps an instant before the clock's
+    /// ADR-0111 A1: the conversion keeps an instant before the clock's
     /// origin apart from the origin itself — the origin is a deadline a
     /// record carries (live through its millisecond), the instant one
     /// millisecond earlier is expired at every reading of the clock.

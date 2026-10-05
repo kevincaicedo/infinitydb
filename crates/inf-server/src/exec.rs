@@ -1167,7 +1167,7 @@ pub(crate) fn wall_ms(node: &NodeInfo, now: Nanos) -> u64 {
     now.as_millis().saturating_sub(internal_anchor).saturating_add(unix_anchor)
 }
 
-/// The store deadline for a Unix-epoch instant (ADR-0111 D2): an instant
+/// The store deadline for a Unix-epoch instant (ADR-0111 A1): an instant
 /// before the internal clock's origin is expired at every reading of the
 /// clock, its first millisecond included, and instants past the store's
 /// u40-ms bound saturate to it. Every instant Redis represents in i64 ms
@@ -3088,7 +3088,7 @@ mod tests {
 
     /// An instant before the internal clock's origin is expired at every
     /// reading of that clock, its first millisecond included (ADR-0111
-    /// D2). `infinityd` anchors the wall clock at the origin, and a
+    /// A1). `infinityd` anchors the wall clock at the origin, and a
     /// pipeline queued in the listener's backlog runs inside that
     /// millisecond: an instant clamped onto the origin was served there
     /// (Redis 8.0.5 answers nil). The control is an instant *at* the

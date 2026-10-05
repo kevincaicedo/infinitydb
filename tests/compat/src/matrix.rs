@@ -449,7 +449,7 @@ pub static MATRIX: &[Case] = &[
     c(&["SET", "sxp", "v", "EXAT", "1"]),
     c(&["GET", "sxp"]),
     // An instant before any server's clock origin over a live key: the
-    // old value answers and no key stays (ADR-0111 D2).
+    // old value answers and no key stays (ADR-0111 A1).
     c(&["SET", "sxg", "old"]),
     c(&["SET", "sxg", "v", "PXAT", "1", "GET"]),
     c(&["EXISTS", "sxg"]),

@@ -997,12 +997,15 @@ instant saturates into the record's u40-ms bound (`inf_store::MAX_EXPIRE_MS`,
 `inf_store::saturating_deadline` — now public); the ADR-0008 clamp is the
 declared deviation for read-backs of a saturated deadline. An instant before
 the internal clock's origin has no u40 deadline and is never clamped onto
-the origin, where it would read as live for that millisecond: it converts to
-`inf_store::InternalDeadline::BeforeOrigin`, expired at every reading of the
-clock, and each store write that receives it leaves no key — `SET`'s
-overwrite is a delete, `GETEX` answers and then deletes, the `EXPIRE` family
-deletes, replay deletes. A declared counter deviation follows: Redis stores
-such a key from `SET … EXAT`/`PXAT`, unreadable, and counts it in `INFO`
-`expired_keys` when it reaps it, so its `DBSIZE` counts it until then; the
-engine stores nothing and counts no expiry for it (`GETEX` and the `EXPIRE`
-family delete at once and count none in either server).
+the origin, where it would read as live for that millisecond (ADR-0111 A1):
+it converts to `inf_store::InternalDeadline::BeforeOrigin`, expired at every
+reading of the clock, and each store write that receives it leaves no key —
+`SET`'s overwrite is a delete, `GETEX` answers and then deletes, the `EXPIRE`
+family deletes, replay deletes. Two frozen shapes of §6 changed with it:
+`CellStore::expire` takes `Option<InternalDeadline>` where it took
+`Option<Nanos>`, and `SetExpire` gains `BeforeOrigin`, as does `TtlUpdate`.
+A declared counter deviation follows: Redis stores such a key from
+`SET … EXAT`/`PXAT`, unreadable, and counts it in `INFO` `expired_keys`
+when it reaps it, so its `DBSIZE` counts it until then; the engine stores
+nothing and counts no expiry for it (`GETEX` and the `EXPIRE` family delete
+at once and count none in either server).
