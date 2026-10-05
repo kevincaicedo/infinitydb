@@ -260,6 +260,14 @@ rows=(
   # — a boot file with the stall reason.
   "inf_canary_replay_stall_seal m4-recovery SEAL-REASON --spec-variant ring-top"
   "inf_canary_replay_stall_seal m4-recovery SEAL-REASON --spec-variant page"
+  # ADR-0174 D2 rule 5: a boot seals at the capacity target only before a
+  # range that would take its file past it. Planted, the boot pipeline
+  # seals before every range: the census sees a capacity-sealed file whose
+  # successor does not overflow it, and more files than the bound on the
+  # span the boot flushed (⌊2D ÷ C⌋, or ⌊D ÷ (C − S)⌋ under ranges below the
+  # capacity, + ⌈D ÷ ring⌉ + page pads + the hand-over's one).
+  "inf_canary_replay_seal_every_range m4-recovery successor --replay-above-window"
+  "inf_canary_replay_seal_every_range m4-recovery FILES-SEALED-BOUND --replay-above-window"
   # ADR-0174 D4 skipped: a namespace no manifest section names keeps its
   # dead-life tier files, and the first flush after the boot fails on the
   # existing file (tier creation is `create_new`).

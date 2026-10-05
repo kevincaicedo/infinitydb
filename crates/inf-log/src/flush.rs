@@ -838,6 +838,22 @@ impl<F: SegmentFs> TierFlush<F> {
         Ok(())
     }
 
+    /// The planted canary's early seal (`inf_canary_replay_seal_every_range`):
+    /// a non-empty active file sealed at capacity whatever the next range,
+    /// where [`append_range`](Self::append_range) seals only before a range
+    /// that would take it past the capacity target. Compiled only into the
+    /// canary's build.
+    ///
+    /// # Errors
+    /// As any seal.
+    #[cfg(inf_canary_replay_seal_every_range)]
+    pub fn seal_capacity_planted(&mut self) -> Result<(), TierFlushError> {
+        if let Some(writer) = self.writer.take_if(|w| w.data_len() > 0) {
+            self.seal_writer(writer, SealReason::Capacity)?;
+        }
+        Ok(())
+    }
+
     /// The highest address the drive loop may confirm right now: the
     /// active file's claimable end under the pipeline's claim rule —
     /// full, final frames only on the live rule (the partial tail frame
@@ -1198,6 +1214,11 @@ impl<F: SegmentFs> SeamFlush for BootFlush<F> {
     }
 
     fn append_range(&mut self, addr: LogicalAddr, bytes: &[u8]) -> Result<(), TierFlushError> {
+        // The planted canary seals the boot's file before every range, not
+        // only before one that would overflow it: the seal census's rule
+        // for a capacity seal and its count against the files-sealed bound.
+        #[cfg(inf_canary_replay_seal_every_range)]
+        self.flush.seal_capacity_planted()?;
         self.flush.append_range(addr, bytes)
     }
 
