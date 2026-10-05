@@ -1367,6 +1367,31 @@ per episode). A drained cell always seals — never slower than K = 1.
   distinct settles, deletes verified, blob releases (the zero set);
   markers skipped and dead-life files removed (outside it); the largest
   step charge (a gauge, the largest over the cells).
+- > **Accepted 2026-10-04, implementation open — ADR-0174 A1:** recovery
+  > resumes inside a frame and yields after bounded work. A step that has
+  > charged its budget stops at the next record or checkpoint entry, and
+  > the next step resumes there through a typed cursor; the read and audit
+  > of one frame or one section stay one unit, bounded by the decoder's
+  > cap. The yield sentence above then reads: the driver yields at the next
+  > record or entry once the step's charge reaches the budget. A charge is
+  > budget bytes, not elapsed time and not memory, and its walked-byte
+  > price covers the bytes a demote step's seal walk passes as well as the
+  > end settle's. `Keyspace::apply_record` (the tag-8 bullet above) answers
+  > one of three: consumed, consumed after priced boot work, or
+  > `NeedsRoom(ns)`; on `NeedsRoom` the record has changed nothing, and the
+  > driver runs the demotion under the step budget and presents the record
+  > again. The checkpoint reader announces an entered section, and a
+  > handler answers next or park (an entry handler also how many entries
+  > it applied); a parked step keeps its cursor at the item not consumed.
+  > The segment reader re-issues the frame it holds for a cursor its own
+  > record iterator produced; a cursor whose frame is no longer held is a
+  > typed boot refusal. The counter list gains, beside the largest step
+  > charge, the largest work one step did (its charge plus the bytes of the
+  > frame or section it parked in) and the largest loop-clock interval
+  > between two consecutive steps, in nanoseconds, recorded and not gated;
+  > and two liveness counters outside the zero set: the steps taken, and
+  > the yields inside a unit by kind (frame, section, demote step). Not
+  > built.
 - > **Accepted 2026-09-23, implementation open — ADR-0156:** bounded,
   > acknowledged tier-file retirement replaces the plane-layer unlink
   > below with an owned cell→control job: eight positions per cell cover
