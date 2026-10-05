@@ -458,6 +458,12 @@ fn set_root(
             fixed.write(FixedValue::Ok)
         }
         Ok(JsonSetOutcome::Skipped) => fixed.write(FixedValue::Null),
+        // No document is left, so the log takes the key's delete, never a
+        // post-image staging would look for (`SET`'s answer, `+OK`).
+        Ok(JsonSetOutcome::Removed) => {
+            capture_delete(cx);
+            fixed.write(FixedValue::Ok)
+        }
         Err(error) => fixed.decline(ReplyError::Op(error)),
     }
 }
@@ -1651,6 +1657,10 @@ fn merge_create(
             fixed.write(FixedValue::Ok)
         }
         Ok(JsonSetOutcome::Skipped) => unreachable!("unconditional set applies"),
+        Ok(JsonSetOutcome::Removed) => {
+            capture_delete(cx);
+            fixed.write(FixedValue::Ok)
+        }
         Err(error) => fixed.decline(ReplyError::Op(error)),
     }
 }

@@ -496,9 +496,13 @@ pub struct JsonSetOptions {
 #[cfg(feature = "doc")]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum JsonSetOutcome {
+    /// A live document holds the set's value.
     Applied,
     /// NX/XX condition not met.
     Skipped,
+    /// The deadline was before the clock's origin: no document is left, an
+    /// existing one deleted, and a caller logs the key's delete.
+    Removed,
 }
 
 /// Result of the allocation-free scalar patch probe (ADR-0043 D1).
@@ -599,7 +603,7 @@ impl CellStore {
                 if let Some((addr, len)) = existing {
                     self.free_record(self.hash_key(key), addr, len);
                 }
-                return Ok(JsonSetOutcome::Applied);
+                return Ok(JsonSetOutcome::Removed);
             }
         };
         let lineage =

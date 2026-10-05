@@ -581,6 +581,35 @@ fn ingest_failure_aborts_leak_free_and_keeps_the_old_record() {
     reconcile(&s);
 }
 
+/// A deadline before the clock's origin leaves no document, so the root set
+/// answers `Removed`: `Applied` names a live document, and a caller that
+/// stages a post-image for it would find none. An existing document is
+/// freed, blob and all; a fresh key takes nothing; NX/XX keep their meaning.
+#[test]
+fn a_pre_origin_root_set_answers_removed_and_leaves_no_document() {
+    let doc = doc_of_size(1024);
+    let canonical = CanonicalDoc::validate(&doc).expect("canonical fixture");
+    let before = JsonSetOptions { expire: SetExpire::BeforeOrigin, ..JsonSetOptions::default() };
+    for at in [Nanos(1), Nanos(999_999), Nanos::from_millis(5_000)] {
+        let mut s = store();
+        let fresh = s.json_set(b"fresh", &canonical, before, at).expect("set");
+        assert_eq!(fresh, JsonSetOutcome::Removed, "a fresh key at {at}");
+        assert!(s.json_get(b"fresh", at).expect("ok").is_none(), "fresh at {at}");
+        set(&mut s, b"doc", &doc);
+        assert_eq!(s.doc_domain().docs_live, 1, "blob tier");
+        let xx = JsonSetOptions { cond: SetCond::IfPresent, ..before };
+        assert_eq!(s.json_set(b"none", &canonical, xx, at), Ok(JsonSetOutcome::Skipped));
+        let nx = JsonSetOptions { cond: SetCond::IfAbsent, ..before };
+        assert_eq!(s.json_set(b"doc", &canonical, nx, at), Ok(JsonSetOutcome::Skipped));
+        let over = s.json_set(b"doc", &canonical, before, at).expect("set");
+        assert_eq!(over, JsonSetOutcome::Removed, "an overwrite at {at}");
+        assert!(s.json_get(b"doc", at).expect("ok").is_none(), "overwrite at {at}");
+        assert_eq!(s.doc_domain(), inf_store::DocDomain::default(), "blob freed at {at}");
+        reconcile(&s);
+        assert_eq!(s.len(), 0, "no record survives at {at}");
+    }
+}
+
 #[test]
 fn ttl_semantics_ride_json_set_options() {
     let mut s = store();
