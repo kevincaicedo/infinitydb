@@ -1001,4 +1001,8 @@ the origin, where it would read as live for that millisecond: it converts to
 `inf_store::InternalDeadline::BeforeOrigin`, expired at every reading of the
 clock, and each store write that receives it leaves no key — `SET`'s
 overwrite is a delete, `GETEX` answers and then deletes, the `EXPIRE` family
-deletes, replay deletes.
+deletes, replay deletes. A declared counter deviation follows: Redis stores
+such a key from `SET … EXAT`/`PXAT`, unreadable, and counts it in `INFO`
+`expired_keys` when it reaps it, so its `DBSIZE` counts it until then; the
+engine stores nothing and counts no expiry for it (`GETEX` and the `EXPIRE`
+family delete at once and count none in either server).
