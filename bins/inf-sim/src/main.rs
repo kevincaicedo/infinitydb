@@ -37,6 +37,15 @@ fn parse_seed(text: &str) -> Result<u64, String> {
 /// would hash two distinct keys, so a "clean" run would prove nothing.
 /// Refuse to run instead of reporting a lie. Exit 2 is the harness's
 /// usage-error code (`run-sweep.sh` treats it as a missing simulator).
+/// The census's closest boot, `files of bound`, or that no boot sealed a
+/// file.
+fn closest_boot(closest: Option<(u64, u64)>) -> String {
+    closest.map_or_else(
+        || "none sealed a file".to_owned(),
+        |(files, bound)| format!("{files} of {bound}"),
+    )
+}
+
 fn require_dst_build() {
     if inf_foundation::fault::COMPILED_IN && inf_foundation::COLLISION_ORACLE {
         return;
@@ -533,7 +542,7 @@ fn main() {
                  removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
                  window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
                  pads placed; boot files censused {} (capacity {} / gap {} / shutdown {} \
-                 seals), {} page pads crossed",
+                 seals), {} page pads crossed, against a summed bound of {} (closest boot: {})",
                 boot_replay.demote_steps,
                 boot_replay.tier_bytes,
                 boot_replay.settle_reads,
@@ -546,7 +555,9 @@ fn main() {
                 seal_census.capacity_seals,
                 seal_census.gap_seals,
                 seal_census.shutdown_seals,
-                seal_census.page_pads
+                seal_census.page_pads,
+                seal_census.bound,
+                closest_boot(seal_census.closest)
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -597,7 +608,7 @@ fn main() {
              refs removed by a marker ({} skipped: unit past the raised window), spec \
              variant {:?}: {} pads placed, {} long records written ({} written short), boot \
              files censused {} (capacity {} / gap {} / shutdown {} seals), {} page pads \
-             crossed, trace {:#x}",
+             crossed, against a summed bound of {} (closest boot: {}), trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -655,6 +666,8 @@ fn main() {
             report.seal_census.gap_seals,
             report.seal_census.shutdown_seals,
             report.seal_census.page_pads,
+            report.seal_census.bound,
+            closest_boot(report.seal_census.closest),
             report.trace_hash
         );
         if verify {
