@@ -17,7 +17,17 @@ pub struct Candidate {
     store: Keyspace,
     parser: ConnParser,
     cx: ConnCx,
-    epoch: std::time::Instant,
+    clock: CandidateClock,
+}
+
+/// The `now` each command executes at.
+enum CandidateClock {
+    /// The process's monotonic clock from construction: the corpus runs
+    /// beside a live redis-server, whose wall clock moves too.
+    Monotonic(std::time::Instant),
+    /// One instant for every command: a run whose replies cannot depend
+    /// on how fast the corpus reaches a case.
+    Held(Nanos),
 }
 
 impl Default for Candidate {
@@ -28,6 +38,17 @@ impl Default for Candidate {
 
 impl Candidate {
     pub fn new() -> Candidate {
+        Candidate::with_clock(CandidateClock::Monotonic(std::time::Instant::now()))
+    }
+
+    /// A candidate whose clock reads `now` for every command, with the
+    /// same wall anchor as [`Candidate::new`] (internal 0 is the moment
+    /// of construction).
+    pub fn with_clock_held_at(now: Nanos) -> Candidate {
+        Candidate::with_clock(CandidateClock::Held(now))
+    }
+
+    fn with_clock(clock: CandidateClock) -> Candidate {
         let cx = ConnCx::try_default().expect("fixture cache allocation");
         // Wall anchor at the candidate's epoch: EXPIREAT/EXAT/EXPIRETIME
         // convert through the same Unix instants the redis-server oracle
@@ -42,7 +63,7 @@ impl Candidate {
             store: Keyspace::new(StoreConfig::default()),
             parser: ConnParser::new(ParserLimits::default()),
             cx,
-            epoch: std::time::Instant::now(),
+            clock,
         }
     }
 
@@ -51,7 +72,10 @@ impl Candidate {
     /// # Panics
     /// Panics if `wire` is not exactly one complete command — harness bug.
     pub fn execute_wire(&mut self, wire: &[u8]) -> Vec<u8> {
-        let now = Nanos(self.epoch.elapsed().as_nanos() as u64 + 1);
+        let now = match self.clock {
+            CandidateClock::Monotonic(epoch) => Nanos(epoch.elapsed().as_nanos() as u64 + 1),
+            CandidateClock::Held(now) => now,
+        };
         let mut out = Vec::new();
         let mut iter = self.parser.feed(wire);
         let mut executed = 0;

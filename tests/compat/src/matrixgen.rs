@@ -604,8 +604,7 @@ fn is_error_or_null(reply: &[u8]) -> bool {
 /// order (state accumulates): each case's reply classified for the
 /// `full` bar. The candidate's own reply is the conservative choice —
 /// a command that wrongly errors loses its evidence and the bar goes red.
-fn classify_corpus() -> Vec<bool> {
-    let mut candidate = Candidate::new();
+pub fn classify_corpus(mut candidate: Candidate) -> Vec<bool> {
     MATRIX
         .iter()
         .map(|case| {
@@ -626,7 +625,7 @@ pub fn rows() -> Vec<CommandRow> {
         DECLARED.len(),
         "every registry command needs a compat declaration (and vice versa)"
     );
-    let evidence = classify_corpus();
+    let evidence = classify_corpus(Candidate::new());
     let mut no_evidence: Vec<String> = Vec::new();
     let mut rows = Vec::with_capacity(COMMANDS.len());
     for meta in &COMMANDS {

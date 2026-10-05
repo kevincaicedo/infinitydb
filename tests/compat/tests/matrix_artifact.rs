@@ -11,7 +11,10 @@
 
 use std::path::PathBuf;
 
-use compat::matrixgen::{Status, render, rows};
+use compat::candidate::Candidate;
+use compat::matrix::MATRIX;
+use compat::matrixgen::{Status, classify_corpus, render, rows};
+use inf_foundation::time::Nanos;
 
 fn artifact_path() -> PathBuf {
     // tests/compat → tests → Rust workspace → docs/compat-matrix.md.
@@ -79,6 +82,28 @@ fn rendered_matrix_covers_the_json_section() {
     ] {
         assert!(rendered.contains(needle), "rendered matrix lost the JSON section: {needle:?}");
     }
+}
+
+/// The rendered evidence cannot depend on how fast the corpus runs. The
+/// render's candidate reads the process's monotonic clock, so a case
+/// whose value-or-null turns on the millisecond the run reaches it
+/// would make `generated_matrix_is_current` red on an unchanged tree.
+/// Classified with the clock held inside its first millisecond and held
+/// a second later, every case agrees.
+#[test]
+fn corpus_evidence_does_not_depend_on_the_candidate_clock() {
+    let first_ms = classify_corpus(Candidate::with_clock_held_at(Nanos(1)));
+    let later = classify_corpus(Candidate::with_clock_held_at(Nanos::from_millis(1_000)));
+    let differing: Vec<String> = MATRIX
+        .iter()
+        .zip(first_ms.iter().zip(&later))
+        .enumerate()
+        .filter(|(_, (_, (first, then)))| first != then)
+        .map(|(index, (case, (first, then)))| {
+            format!("case {index} {:?}: evidence {first} in the first ms, {then} at 1 s", case.argv)
+        })
+        .collect();
+    assert!(differing.is_empty(), "clock-dependent corpus evidence: {differing:#?}");
 }
 
 #[test]
