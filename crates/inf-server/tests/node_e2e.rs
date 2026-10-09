@@ -24,7 +24,7 @@ use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::CellId;
 use inf_foundation::time::{Clock, Nanos, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
+use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
 use inf_store::{Keyspace, SlotRouter, StoreConfig};
 
@@ -88,16 +88,89 @@ struct HeldClock {
     anchor_unix_ms: u64,
 }
 
-/// A cell loop's clock: the product's monotonic one, or a held reading.
+/// One cell's running clock, which a test may hold (L7: every cell
+/// effect reads injected time). Open, the cell reads the monotonic clock
+/// plus whatever a past hold ran ahead of it. Held, the cell reads a
+/// value only the test advances, so time-paced cell work (the
+/// checkpoint stream's ADR-0017 D6 pace) moves by the test's steps instead
+/// of by the host's speed. Readings never go backwards.
+struct ClockGate {
+    /// Started on the cell thread where the loop is built (the origin
+    /// the wall anchor pairs with).
+    clock: std::sync::OnceLock<StdClock>,
+    /// The held reading in ns; 0 = open (a held reading is never 0).
+    held: std::sync::atomic::AtomicU64,
+    /// Added to the monotonic clock while open: how far holds ran ahead.
+    ahead: std::sync::atomic::AtomicU64,
+    /// The latest reading handed out (the monotonicity floor).
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl ClockGate {
+    fn new() -> ClockGate {
+        ClockGate {
+            clock: std::sync::OnceLock::new(),
+            held: Default::default(),
+            ahead: Default::default(),
+            last: Default::default(),
+        }
+    }
+
+    fn start(self: Arc<Self>) -> Arc<Self> {
+        assert!(self.clock.set(StdClock::new()).is_ok(), "one cell loop per gate");
+        self
+    }
+
+    fn monotonic(&self) -> u64 {
+        self.clock.get().expect("the cell loop started its clock").now().0
+    }
+
+    fn open_reading(&self) -> u64 {
+        self.monotonic().saturating_add(self.ahead.load(Ordering::Acquire))
+    }
+
+    fn read(&self) -> Nanos {
+        let held = self.held.load(Ordering::Acquire);
+        let at = if held == 0 { self.open_reading() } else { held };
+        Nanos(self.last.fetch_max(at, Ordering::AcqRel).max(at))
+    }
+
+    /// Freezes the clock at its current reading.
+    fn hold(&self) {
+        let at = self.open_reading().max(self.last.load(Ordering::Acquire)).max(1);
+        self.held.store(at, Ordering::Release);
+    }
+
+    /// Advances a held clock by `by` (a no-op while open).
+    fn step(&self, by: Duration) {
+        let by = u64::try_from(by.as_nanos()).expect("a test step fits u64 ns");
+        let _ = self.held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            (held != 0).then(|| held.saturating_add(by))
+        });
+    }
+
+    /// Back to the monotonic clock, from wherever the steps left it.
+    fn open(&self) {
+        let held = self.held.load(Ordering::Acquire);
+        if held != 0 {
+            let lag = held.saturating_sub(self.monotonic());
+            self.ahead.fetch_max(lag, Ordering::AcqRel);
+            self.held.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// A cell loop's clock: the product's monotonic one behind a test gate,
+/// or a held reading.
 enum CellClock {
-    Running(StdClock),
+    Running(Arc<ClockGate>),
     Held(Nanos),
 }
 
 impl Clock for CellClock {
     fn now(&self) -> Nanos {
         match self {
-            CellClock::Running(clock) => clock.now(),
+            CellClock::Running(gate) => gate.read(),
             CellClock::Held(at) => *at,
         }
     }
@@ -129,6 +202,8 @@ struct Node {
     catalog_pump: Option<CatalogPump>,
     /// Harness/control owner. No OS sampling runs in the cell test threads.
     process_sampler: std::cell::RefCell<inf_server::ProcessSampler>,
+    /// One per cell, open unless a test holds it (`drive_paced_ckpt_with_pump`).
+    clock_gates: Vec<Arc<ClockGate>>,
 }
 
 struct CatalogPump {
@@ -603,7 +678,10 @@ impl Node {
             None => (None, None, Vec::new()),
         };
         let mut handles = Vec::new();
+        let clock_gates: Vec<Arc<ClockGate>> =
+            (0..cells).map(|_| Arc::new(ClockGate::new())).collect();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
+            let gate = Arc::clone(&clock_gates[i]);
             let process_board = process_sampler.board();
             let stop = Arc::clone(&stop);
             let graceful = Arc::clone(&graceful);
@@ -620,9 +698,12 @@ impl Node {
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
                 }
-                let mut pool = BufferPool::new(256, 4096);
-                let mut driver = UringDriver::new(256).expect("uring");
-                driver.register_pool(&mut pool).expect("register");
+                let pool = BufferPool::new(256, 4096);
+                // No fixed-buffer registration: it is a capability probe no
+                // op consumes, and its pinned pages would hold most of an
+                // 8 MiB RLIMIT_MEMLOCK, so a sibling test node's ring
+                // creation fails with ENOMEM. The rings alone fit.
+                let driver = UringDriver::new(256).expect("uring");
                 let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
                 node.process_board.replace(Some(process_board));
                 node.run_id.set(run_id);
@@ -693,7 +774,7 @@ impl Node {
                 };
                 let clock = match held_clock {
                     Some(held) => CellClock::Held(held.internal),
-                    None => CellClock::Running(StdClock::new()),
+                    None => CellClock::Running(gate.start()),
                 };
                 let mut cell_loop = CellLoop::new(driver, clock, pool, config);
                 let (mut counted_quiet, mut counted) = (false, false);
@@ -742,6 +823,7 @@ impl Node {
             ckpt_host: std::cell::RefCell::new(ckpt_host),
             catalog_pump,
             process_sampler: std::cell::RefCell::new(process_sampler),
+            clock_gates,
         };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
@@ -779,7 +861,7 @@ impl Node {
         loop {
             match TcpStream::connect(("127.0.0.1", self.port)) {
                 Ok(s) => {
-                    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+                    s.set_read_timeout(Some(REPLY_TIMEOUT)).expect("timeout");
                     s.set_nodelay(true).expect("nodelay");
                     return s;
                 }
@@ -872,9 +954,32 @@ fn cmd(parts: &[&[u8]]) -> Vec<u8> {
     wire
 }
 
+/// How long a reply may take before the harness calls it a hang. A
+/// durable node's replies can wait on the device: even an `everysec`
+/// blob `SET`, acked on apply, first runs `write_blob`'s synchronous dir
+/// fsyncs and data writes on the cell thread (ADR-0088's recorded
+/// limitation 2), and a loaded CI runner's disk held one such `SET` past
+/// the former 5 s. The bound turns a hang into a failure; it is not a
+/// device latency budget.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A failed reply read, named: a timeout is a missing reply.
+fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            let bound = stream.read_timeout().ok().flatten();
+            format!("{what}: no reply within {bound:?} — a hang, or a device stall past the bound")
+        }
+        _ => format!("{what}: {err}"),
+    }
+}
+
 fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
     let mut got = vec![0u8; want.len()];
-    stream.read_exact(&mut got).expect("read reply");
+    if let Err(err) = stream.read_exact(&mut got) {
+        let what = format!("read reply {:?}", String::from_utf8_lossy(want));
+        panic!("{}", reply_read_failed(stream, &what, &err));
+    }
     assert_eq!(
         got,
         want,
@@ -1623,7 +1728,9 @@ fn read_line(stream: &mut TcpStream) -> Vec<u8> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        stream.read_exact(&mut byte).expect("read byte");
+        if let Err(err) = stream.read_exact(&mut byte) {
+            panic!("{}", reply_read_failed(stream, "read reply line", &err));
+        }
         line.push(byte[0]);
         if line.ends_with(b"\r\n") {
             return line;
@@ -1867,9 +1974,7 @@ fn durable_namespace_survives_restart() {
     read_exactly(&mut c, b"$3\r\n100\r\n");
     let info = {
         c.write_all(&cmd(&[b"INF.NS", b"INFO", b"ledger"])).expect("write");
-        let mut buf = vec![0u8; 512];
-        let n = c.read(&mut buf).expect("read info");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
     assert!(info.contains("always"), "INFO reports the fsync class: {info}");
     drop(c);
@@ -2615,9 +2720,7 @@ fn tiered_namespace_lifecycle_survives_restart() {
     assert!(tiering.contains("tiering_tables:1"), "re-materialized at boot: {tiering}");
     assert!(tiering.contains("mutable_permille=300"), "the reload persisted: {tiering}");
     c.write_all(&cmd(&[b"INF.NS", b"INFO", b"hot"])).expect("write");
-    let mut buf = vec![0u8; 1024];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = String::from_utf8_lossy(&read_frame(&mut c)).into_owned();
     assert!(info.contains("mem-budget"), "{info}");
     assert!(info.contains("8388608"), "{info}");
     // Teardown: DROP removes the tables on every cell; the zero
@@ -2700,9 +2803,7 @@ fn named_memory_ns_pressure_enforced_and_survives_restart() {
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"INFO", b"cache"])).expect("write");
-    let mut buf = vec![0u8; 1024];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = String::from_utf8_lossy(&read_frame(&mut c)).into_owned();
     assert!(info.contains("allkeys-lfu"), "policy survived restart: {info}");
     assert!(info.contains("1073741824"), "budget survived restart: {info}");
     drop(c);
@@ -3200,7 +3301,7 @@ fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     }
 }
 
-// ---- the paced-checkpoint fixture (Group 0, from the batch-2 traps) ----
+// ---- the paced-checkpoint fixture ----
 
 /// One `INFO` integer field from this connection's cell. Scope caveats
 /// apply: `Memory` is a node fold, `Tiering`/`Persistence` are
@@ -3231,36 +3332,48 @@ fn wait_demoted(c: &mut TcpStream, min_confirmed: u64) {
     panic!("demotion never pushed the records cold (confirmed > {min_confirmed} + decommit)");
 }
 
-/// The reusable paced-checkpoint driver (review remediation batch 2 →
-/// Group 0): requests a checkpoint on every cell, then drives `pump`
-/// between the walk's MAINTAIN slices — 10 ms pacing, because an unpaced
-/// pump exhausts its whole schedule inside pass 0 and never overlaps the
-/// later passes (the batch-2 harness trap this fixture exists to keep).
-/// Returns the number of pump calls that landed inside the walk. The
-/// node must be booted with `CkptTrigger::Paced` (with
-/// `section_bytes == slice_bytes` a section is written per fill slice);
-/// with any other trigger the walk completes inside one MAINTAIN call
-/// and no schedule can interleave.
+/// The reusable paced-checkpoint driver: holds every cell's clock, requests a checkpoint on every
+/// cell, then alternates `pump` with one `step` of cell time. The walk's
+/// pace (ADR-0017 D6: at most `stream_bytes_per_sec × elapsed` streamed,
+/// in injected time) is read from the cell clock, so each step admits one step's worth of
+/// walk bytes and the walk cannot outrun the pump whatever the host's
+/// speed: it spans at least `walk bytes / (pace × step)` pump calls. A
+/// wall-clock pace raced the pump instead — 40 calls per walk here, 13
+/// on a loaded CI runner. The unpaced-pump trap (the pump spends its
+/// whole schedule inside pass 0) stays closed the same way: pass 0
+/// itself needs the steps. Returns the number of pump calls that landed
+/// inside the walk. The node must be booted with `CkptTrigger::Paced`
+/// (with `section_bytes == slice_bytes` a section is written per fill
+/// slice); with any other trigger the walk completes inside one MAINTAIN
+/// call and no schedule can interleave.
 fn drive_paced_ckpt_with_pump(
     node: &Node,
     probe: &mut TcpStream,
+    step: Duration,
     mut pump: impl FnMut(&mut TcpStream),
     timeout: Duration,
 ) -> u32 {
     let before = scrape_u64(probe, b"persistence", "ckpts_completed:");
+    node.clock_gates.iter().for_each(|gate| gate.hold());
     node.request_ckpt_all();
     let deadline = Instant::now() + timeout;
     let mut pumped = 0u32;
-    loop {
+    let completed = loop {
         pump(probe);
         pumped += 1;
-        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        node.clock_gates.iter().for_each(|gate| gate.step(step));
+        // The scrape also gives the cell an iteration on the stepped
+        // clock before the next pump call.
         if scrape_u64(probe, b"persistence", "ckpts_completed:") > before {
-            return pumped;
+            break true;
         }
-        assert!(Instant::now() < deadline, "checkpoint never completed under the pump");
-    }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    node.clock_gates.iter().for_each(|gate| gate.open());
+    assert!(completed, "checkpoint never completed under the pump ({pumped} steps of {step:?})");
+    pumped
 }
 
 /// Review of 2026-08-30 (C4 / F-L03-01 + C7 / F-L04-08, F-L14-02): the
@@ -3276,11 +3389,12 @@ fn drive_paced_ckpt_with_pump(
 /// The walk is paced (1 KiB fill slices) so pass 3 spans many MAINTAIN
 /// calls, and the `DEL` pump runs on the same cell for the whole stream:
 /// deletes land between pass-3 slices at the lowest-ranked addresses —
-/// the exact adversarial schedule. After the fix (address-keyed resume)
-/// the schedule is harmless by construction, so this test is
-/// deterministic-green; before it, each in-window DEL dropped one
-/// surviving key's extent (observed red: GET → ERR blob extent read
-/// failed after reopen).
+/// the exact adversarial schedule. The pace runs on the cell clock the
+/// pump steps one slice per `DEL`, so the schedule is the same on any
+/// host. After the fix (address-keyed resume) the schedule is harmless
+/// by construction, so this test is deterministic-green; before it, each
+/// in-window DEL dropped one surviving key's extent (observed red: GET →
+/// ERR blob extent read failed after reopen).
 #[test]
 fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     let dir = temp_data_dir("blob-ckpt-del-race");
@@ -3289,11 +3403,16 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
     // 4,200 B ≥ 4 KiB threshold
     let blob_value = |i: usize| format!("V{i:04}!").into_bytes().repeat(700);
     let mut deleted = std::collections::BTreeSet::new();
+    let (slice_bytes, stream_bytes_per_sec) = (1u32 << 10, 64u32 << 10);
+    // One slice of pace per pump call (16 ms → 1,048 B ≥ the 1 KiB slice).
+    let step = Duration::from_millis(
+        (u64::from(slice_bytes) * 1000).div_ceil(u64::from(stream_bytes_per_sec)),
+    );
     {
         let node = Node::start_with(
             1,
             Some(dir.clone()),
-            CkptTrigger::Paced { slice_bytes: 1 << 10, stream_bytes_per_sec: 64 << 10 },
+            CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
         );
         let mut c = node.connect();
         c.write_all(&cmd(&[
@@ -3352,6 +3471,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
         let pumped = drive_paced_ckpt_with_pump(
             &node,
             &mut c,
+            step,
             |c| {
                 if next_del < 300 {
                     let key = format!("big:{next_del:04}");
@@ -3367,7 +3487,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
             "walk took {:?}, {next_del} DELs landed during it ({pumped} pump rounds)",
             walk_started.elapsed()
         );
-        assert!(next_del > 20, "the pump barely ran — the walk finished before the schedule");
+        assert!(next_del > 20, "VACUOUS: {next_del} DELs over the walk — the pump barely ran");
         // Let everysec cover the DEL deaths, then stop without a further
         // checkpoint (a second walk would re-emit the intact RAM map and
         // mask the omission).
@@ -3376,6 +3496,7 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
         drop(c);
         node.stop();
     }
+    let mut blob_entries = 0usize;
     {
         // At-least-once floor on the published 0x05 section. The count
         // alone cannot prove correctness (the recorded falsifier run
@@ -3383,7 +3504,6 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
         // 19 live keys skipped, 19 dead/duplicate rows in their place) —
         // the GET sweep below is the contents oracle.
         let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
-        let mut blob_entries = 0usize;
         let _ = inf_log::ckpt::read_ick_hybrid(
             &inf_log::fs::StdSegmentFs,
             &ick,
@@ -3445,6 +3565,15 @@ fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
         blobs - deleted.len(),
         &lost[..lost.len().min(5)]
     );
+    // The schedule reached the hazard, read from what the walk published
+    // (after the contents oracle, which a pre-fix section fails first): a
+    // DEL acked before pass 3 reached its entry kept it out of the
+    // section, one acked behind the cursor left it listed. Those shifted
+    // the pre-fix ordinal resume; the count also takes the one or two
+    // acked between the walk's end and its publication (15–19 measured).
+    let behind_cursor = deleted.len().saturating_sub(blobs - blob_entries.min(blobs));
+    eprintln!("DELs behind the pass-3 cursor: {behind_cursor}");
+    assert!(behind_cursor >= 5, "VACUOUS: {behind_cursor} DELs landed behind the pass-3 cursor");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -3524,16 +3653,46 @@ fn a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone() {
         assert_eq!(tiering(&mut c, "tiering_shadow_pending:"), 1, "VACUOUS: no ticket is open");
         // `flushed` past the winner's end: both gauges count from the
         // life's origin, and the node holds this one tiered table.
+        // `flushed` lands on seal cuts and the frame under the newest cut
+        // is held back until bytes fill it (ADR-0056 D5), so the cut past
+        // the winner confirms with the round of the seal after it. Filler
+        // makes that seal (bytes); the round's barrier is device time. A
+        // fixed filler volume raced the device and lost on loaded runners,
+        // so filler goes in only while no round is in flight.
         let winner_end = tiering(&mut c, "tiering_allocated_bytes:");
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut batch = 0u32;
-        while tiering(&mut c, "tiering_flush_confirmed_bytes:") <= winner_end {
+        loop {
+            let text = info_text(&mut c, b"tiering");
+            let gauge = |field: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(field))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("INFO tiering names {field}"))
+            };
+            let (confirmed, inflight) =
+                (gauge("tiering_flush_confirmed_bytes:"), gauge("tiering_flush_rounds_inflight:"));
+            if confirmed > winner_end {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "flushed stuck at {confirmed} below the winner's end {winner_end} for 30 s \
+                 ({inflight} rounds in flight)"
+            );
+            if inflight > 0 {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             // Under the 3 MiB window: release is pinned at the winner.
-            assert!(batch < 40, "VACUOUS: 1.9 MiB of filler never flushed the winner");
+            assert!(batch < 40, "VACUOUS: 1.9 MiB of filler never sealed past the winner");
             for i in 0..16u32 {
                 ok(&mut c, &[b"SET", format!("late:{batch:02}:{i:02}").as_bytes(), &filler]);
             }
             batch += 1;
         }
+        eprintln!("filler batches to flush past the winner: {batch}");
         assert_eq!(
             tiering(&mut c, "tiering_shadow_pending:"),
             1,
@@ -4255,12 +4414,11 @@ fn mixed_classes_share_one_cell_and_memory_stays_off_the_log() {
     // Zero-cost assert (M2-S09 mechanism): exactly the durable records —
     // one everysec + two always SETs — hit the log; the two memory-ns SETs
     // stayed off it. The gauge flushes via MAINTAIN, so poll briefly.
+    // Whole replies: one 2 KiB `read` took a prefix of the section and
+    // left the rest to desync the next poll.
     let deadline = Instant::now() + Duration::from_secs(5);
     let info = loop {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 2048];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_text(&mut c, b"persistence");
         if info.contains("log_records_appended:3") || Instant::now() > deadline {
             break info;
         }
@@ -4617,7 +4775,7 @@ fn a_checkpoint_requested_on_an_idle_budgeted_node_completes() {
         c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
-    // Idle now. The WAIT must return — the connection's 5 s read timeout
+    // Idle now. The WAIT must return — the connection's 20 s read timeout
     // is the failure.
     c.set_read_timeout(Some(Duration::from_secs(20))).expect("timeout");
     let t0 = Instant::now();
@@ -5161,16 +5319,7 @@ fn ckpt_slice_budget_rehearsal() {
 
     let info_before = {
         c.write_all(&cmd(&[b"INFO"])).expect("write");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            let n = c.read(&mut chunk).expect("read info");
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(2).rev().take(64).any(|w| w == b"\r\n") && n < chunk.len() {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
 
     // Trigger, then hammer GETs and sample per-request latency until the
@@ -5214,9 +5363,7 @@ fn ckpt_slice_budget_rehearsal() {
 
     let info_after = {
         c.write_all(&cmd(&[b"INFO"])).expect("write");
-        let mut buf = vec![0u8; 65536];
-        let n = c.read(&mut buf).expect("read info");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
     let iter_p999 = |s: &str| {
         s.lines()
@@ -6276,7 +6423,7 @@ struct CliffKey {
 }
 
 /// One complete RESP reply, or a named liveness failure when the client's
-/// 5 s read timeout elapses first.
+/// read timeout elapses first.
 #[cfg(feature = "doc")]
 fn cliff_reply(stream: &mut TcpStream, what: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -6289,7 +6436,7 @@ fn cliff_reply(stream: &mut TcpStream, what: &str) -> Vec<u8> {
         match stream.read(&mut chunk) {
             Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
             Ok(_) => panic!("liveness: the connection closed before {what} answered"),
-            Err(error) => panic!("liveness: no reply to {what} within 5 s ({error})"),
+            Err(error) => panic!("liveness: {}", reply_read_failed(stream, what, &error)),
         }
     }
 }
@@ -6829,20 +6976,29 @@ fn split_replies(buf: &[u8]) -> Result<Vec<&[u8]>, String> {
     Ok(out)
 }
 
-/// Everything the server sends until it goes quiet for `quiet`.
-fn read_until_quiet(stream: &mut TcpStream, quiet: Duration) -> Vec<u8> {
-    stream.set_read_timeout(Some(quiet)).expect("timeout");
+/// Everything the server sends before its reply to a sentinel `PING`
+/// written behind the caller's commands. Replies are in order, so the
+/// sentinel's reply proves every earlier one arrived — a quiet window
+/// instead would read a slow host's late reply as a missing one. `Err`
+/// holds what arrived when the server closed before the sentinel.
+fn read_through_ping(stream: &mut TcpStream) -> Result<Vec<u8>, Vec<u8>> {
+    // RESP2 subscriber mode answers `PING` with an array.
+    const PONGS: [&[u8]; 2] = [b"+PONG\r\n", b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"];
+    stream.write_all(&cmd(&[b"PING"])).expect("write");
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        if let Some(pong) = PONGS.iter().find(|pong| buf.ends_with(pong)) {
+            buf.truncate(buf.len() - pong.len());
+            return Ok(buf);
+        }
         match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return Err(buf),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(_) => break, // WouldBlock/TimedOut: the reply is complete
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err(buf),
+            Err(e) => panic!("{}", reply_read_failed(stream, "read through the PING sentinel", &e)),
         }
     }
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
-    buf
 }
 
 /// The review's scenario, end to end on a real node: an application passes
@@ -6866,7 +7022,7 @@ fn a_command_argument_cannot_forge_the_reply_to_the_next_command() {
     pipeline.extend(cmd(&[b"GET", b"session:victim"]));
     client.write_all(&pipeline).expect("write");
 
-    let raw = read_until_quiet(&mut client, Duration::from_millis(400));
+    let raw = read_through_ping(&mut client).expect("the connection stays open");
     let replies = split_replies(&raw)
         .unwrap_or_else(|e| panic!("two commands produced un-framed bytes ({e}): {raw:?}"));
     assert_eq!(
@@ -6953,7 +7109,14 @@ fn no_command_can_split_its_reply_with_hostile_argument_bytes() {
         let parts: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
         let mut client = node.connect();
         client.write_all(&cmd(&parts)).expect("write");
-        let raw = read_until_quiet(&mut client, Duration::from_millis(120));
+        let raw = match read_through_ping(&mut client) {
+            Ok(raw) => raw,
+            Err(raw) => {
+                let raw = String::from_utf8_lossy(&raw);
+                failures.push(format!("{label}: the connection closed after: {raw:?}"));
+                continue;
+            }
+        };
         match split_replies(&raw) {
             Err(e) => failures.push(format!(
                 "{label}: reply is not whole frames ({e}): {:?}",
@@ -6971,14 +7134,11 @@ fn no_command_can_split_its_reply_with_hostile_argument_bytes() {
                 }
             }
         }
-        // The connection must still be usable — sanitization, not closure.
-        // (A `SUBSCRIBE` case leaves RESP2 subscriber mode, where `PING`
-        // answers a two-element array, so assert framing, not bytes.)
-        client.write_all(&cmd(&[b"PING"])).expect("write");
-        let raw = read_until_quiet(&mut client, Duration::from_millis(120));
-        match split_replies(&raw) {
-            Ok(replies) if replies.len() == 1 => {}
-            _ => failures.push(format!(
+        // The connection must still be usable — sanitization, not closure:
+        // a second sentinel answers with nothing ahead of it.
+        match read_through_ping(&mut client) {
+            Ok(raw) if raw.is_empty() => {}
+            Ok(raw) | Err(raw) => failures.push(format!(
                 "{label}: connection unusable after: {:?}",
                 String::from_utf8_lossy(&raw)
             )),
@@ -7904,7 +8064,9 @@ fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
             buf.truncate(len);
             return buf;
         }
-        let n = stream.read(&mut chunk).expect("read frame");
+        let n = stream
+            .read(&mut chunk)
+            .unwrap_or_else(|err| panic!("{}", reply_read_failed(stream, "read frame", &err)));
         assert!(n > 0, "connection closed mid-frame; got {:?}", String::from_utf8_lossy(&buf));
         buf.extend_from_slice(&chunk[..n]);
     }
