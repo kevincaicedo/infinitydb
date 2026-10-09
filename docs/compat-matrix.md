@@ -81,7 +81,7 @@ live keys.
 | `DBSIZE` | full | M1 | readonly fast | 1 | 5 | 5 |  |
 | `KEYS` | full | M1 | readonly | 2 | 5 | 5 | result ordering is engine-defined; the corpus compares the set |
 | `RANDOMKEY` | full | M1 | readonly | 1 | 2 | 1 | two-level random (cell, then key); the corpus compares the draw against the oracle's live keys |
-| `SCAN` | partial | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (ADR-0129 D3), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation; the `TYPE` option compares its argument with the word `string` and never reads a record's type: `TYPE string` returns every key, documents included, and any other type returns none |
+| `SCAN` | partial | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (ADR-0129 D3), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation; outside tiered namespaces the `TYPE` option compares its argument with the word `string` and never reads a record's type: `TYPE string` returns every key, documents included, and any other type returns none; a tiered namespace refuses `MATCH` and `TYPE` with a typed error |
 | `FLUSHDB` | full | M1 | write | -1 | 4 | 3 |  |
 | `FLUSHALL` | partial | M1 | write | -1 | 2 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | 6 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |

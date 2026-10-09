@@ -273,9 +273,10 @@ pub static DECLARED: &[Declared] = &[
         "M1",
         "cursor values are engine-internal; the corpus compares the key set a full cursor \
          walk enumerates (ADR-0129 D3), the store-tier proptest covers \
-         every-resident-key-≥-once under concurrent mutation; the `TYPE` option compares its \
-         argument with the word `string` and never reads a record's type: `TYPE string` \
-         returns every key, documents included, and any other type returns none",
+         every-resident-key-≥-once under concurrent mutation; outside tiered namespaces the \
+         `TYPE` option compares its argument with the word `string` and never reads a \
+         record's type: `TYPE string` returns every key, documents included, and any other \
+         type returns none; a tiered namespace refuses `MATCH` and `TYPE` with a typed error",
     ),
     d("FLUSHDB", Status::Full, "M1", ""),
     d(
