@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::matrix::{Case, Check};
@@ -224,15 +225,39 @@ fn spawn_redis() -> (ProcessGuard, TcpStream) {
 /// macOS box produced 11 mismatches that were all Redis's own changes).
 pub const ORACLE_VERSION: &str = "8.0.5";
 
+/// Serializes every test in a process on the one pinned
+/// `INF_COMPAT_ORACLE_ADDR` server. Tests in a binary run in parallel,
+/// and the scripts write, flush and count one shared keyspace: unlocked,
+/// one test's `FLUSHALL` lands mid-way through another's matrix.
+static SHARED_ORACLE: Mutex<()> = Mutex::new(());
+
+/// Keeps an oracle to its test: a spawned server dies with the guard; the
+/// pinned server stays locked to this test until the guard drops.
+pub struct OracleGuard {
+    _process: Option<ProcessGuard>,
+    _shared: Option<MutexGuard<'static, ()>>,
+}
+
 /// The redis oracle: `INF_COMPAT_ORACLE_ADDR` when pinned (CI), else a
 /// throwaway spawn from PATH. Every caller requires a valid oracle;
 /// missing or wrong-version Redis must never produce a passing test.
+/// Either way the caller owns an empty server until the guard drops.
 ///
 /// # Panics
 /// Redis is unavailable, its version differs, or the address is invalid.
-pub fn oracle() -> (Option<ProcessGuard>, TcpStream) {
+pub fn oracle() -> (OracleGuard, TcpStream) {
     match std::env::var("INF_COMPAT_ORACLE_ADDR") {
         Ok(addr) => {
+            // A test that panicked while holding the lock poisons it. The
+            // FLUSHALL below discards its keys but not a CONFIG SET it left
+            // (maxclients, timeout), so later failures may be its fallout.
+            let shared = SHARED_ORACLE.lock().unwrap_or_else(|poisoned| {
+                eprintln!(
+                    "compat: an earlier test panicked holding the pinned oracle; its server \
+                     config may still be changed, so fix that failure first"
+                );
+                poisoned.into_inner()
+            });
             let mut stream = connect_external(&addr);
             let version = redis_version(&mut stream).unwrap_or_default();
             assert!(
@@ -240,7 +265,12 @@ pub fn oracle() -> (Option<ProcessGuard>, TcpStream) {
                 "INF_COMPAT_ORACLE_ADDR={addr} is redis {version:?}; the matrix is pinned to \
                  {ORACLE_VERSION}"
             );
-            (None, stream)
+            // Start where a spawned oracle starts: an empty keyspace,
+            // whatever the previous holder (or test binary) left.
+            stream.write_all(b"*1\r\n$8\r\nFLUSHALL\r\n").expect("oracle write");
+            let reply = read_frames(&mut stream, &mut Vec::new(), 1);
+            assert_eq!(reply, b"+OK\r\n", "FLUSHALL on the pinned oracle failed");
+            (OracleGuard { _process: None, _shared: Some(shared) }, stream)
         }
         Err(std::env::VarError::NotPresent) => {
             let (guard, mut stream) = spawn_redis();
@@ -250,7 +280,7 @@ pub fn oracle() -> (Option<ProcessGuard>, TcpStream) {
                 "redis-server on PATH is {version:?}; compat requires Redis {ORACLE_VERSION}; \
                  point INF_COMPAT_ORACLE_ADDR at that version"
             );
-            (Some(guard), stream)
+            (OracleGuard { _process: Some(guard), _shared: None }, stream)
         }
         Err(error) => panic!("invalid INF_COMPAT_ORACLE_ADDR: {error}"),
     }

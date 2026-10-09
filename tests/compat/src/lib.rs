@@ -1,6 +1,6 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+    reason = "test-only, not cell code: file fixtures (ADR-0144 D5), oracle lock (ADR-0106 D2)"
 )]
 //! Byte-level compat-diff harness for InfinityDB M0 (story M0-S15).
 //!
