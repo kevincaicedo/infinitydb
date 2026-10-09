@@ -30,10 +30,12 @@ Status column tracks arrival.
   mutation path consults a cached per-namespace flag (S04 wires it) —
   never the registry.
 - **Lifecycle:** `IndexRegistry::set_catalog_state / set_cell_state /
-  rebuild` admit declared → backfilling → ready, ready → backfilling
-  only as a rebuild with a fresh generation, and declared, backfilling or
-  ready → dropping; every other edge is a typed `InvalidTransition`
-  (ADR-0075 D3). `Keyspace::idx_rebuild` bumps the generation and resets
+  rebuild` admit declared → backfilling → ready, ready →
+  backfilling (`rebuild` takes the new generation from its caller and
+  checks that it is greater under `debug_assert!` only;
+  `set_catalog_state` admits the edge without reading the generation),
+  and declared, backfilling or ready → dropping; every other edge is a
+  typed `InvalidTransition` (ADR-0075 D3). `Keyspace::idx_rebuild` bumps the generation and resets
   the owning store's tree in one transition. Catalog state is the
   planning authority; per-cell state is backfill progress. An accepted
   change replaces the `dropping` edge with retirement, a durable catalog
@@ -75,9 +77,11 @@ Status column tracks arrival.
   - *Removal* happens only after a complete enumeration of the group
     found no other member that holds the key; otherwise the entry stays
     (`idx_alias_kept`). `OrderedMap::remove` / `IndexTree::remove` take
-    the enumeration's `&AliasView` as a witness — its only constructor is
-    private to `index_alias` — so a removal decided on the hash alone
-    does not compile.
+    an `&AliasView` beside the entry ref they remove, and a shipping build
+    constructs one only inside `index_alias`; the two are tied by a
+    `debug_assert_eq!`, and the view carries no borrow of the index, so a
+    release build does not check that the view enumerated the ref it
+    removes.
   - *Insertion* finding the pair present is legal iff an alias holds it.
   - **Resolution (rule 5 — the contract S11, S12, S14 consume; not built
     here):** a ref is resolved by enumerating `G(h)` through

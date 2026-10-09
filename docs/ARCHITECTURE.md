@@ -296,8 +296,9 @@ per-process random seed.
 The payoff is the simulator: the whole node, all cells included, runs on one
 thread with a virtual clock, simulated sockets and a simulated disk that
 loses, tears and reorders unsynced writes. The same seed gives the same
-execution, byte for byte, so every failure is a seed you can replay. See
-[How we know it works](#how-we-know-it-works).
+execution, byte for byte, so a violation the simulator reports comes with
+the seed that replays it; a panic inside a sweep is not caught, and its
+seed is lost. See [How we know it works](#how-we-know-it-works).
 
 ### Memory is the product
 
@@ -307,8 +308,10 @@ eviction clock bits live in spare bits of the record's flags byte, so they
 cost nothing. The bytes a cell holds are attributed, at the allocation site,
 to named and counted domains (records, index, TTL wheel, documents,
 secondary indexes, buffers, and so on), and `INFO memory` reports them. The
-exit-gate harness fails a run where the sum of the domains drifts from the
-process RSS by more than 10%.
+exit-gate harness has rows that fail a run when a sum of attributed gauges
+drifts from the process RSS by more than 10%, and a CI test holds one
+document load to the same bar. Each sums a list of gauges of its own, and
+none of the lists includes secondary-index memory.
 
 ### Put a limit on everything
 
@@ -364,8 +367,10 @@ collector. It needs precise control over layout and allocation, and
 zero-cost abstraction over the injected effects. Beyond that, the type system
 carries a lot of the design: `!Send` futures say "this never leaves its core"
 in the signature, lifetimes catch what may not be held across a suspension,
-and newtypes and enums make invalid states hard to write. `unsafe` is
-confined to a few audited modules (see [Safety](#safety)).
+and newtypes and enums make invalid states hard to write. In shipped
+source, `unsafe` is confined to a few audited modules (see
+[Safety](#safety)); integration tests and benchmarks are crate roots of
+their own, and some use it.
 
 ## Inside a cell
 
@@ -466,9 +471,11 @@ Each cell has a fixed pool of network buffers (`--buffers` 4096 of
 grows. Running out is backpressure: the kernel reports that it had data but
 no buffer, receiving pauses, and it resumes as buffers come back.
 
-A received buffer is parsed in place. A request that lies entirely inside one
-buffer is parsed with no copy; a request that spans buffers is copied into
-the connection's accumulator. A small local command (at most 16 arguments
+A received buffer is parsed in place while the connection's accumulator is
+empty, and a request that lies entirely inside it is parsed with no copy. A
+request that spans buffers is copied into the accumulator, and while the
+accumulator holds bytes each later buffer is appended to it whole and parsed
+from there. A small local command (at most 16 arguments
 and 512 bytes of arguments) is then copied once, flat, into the cell's stage
 buffer so it can run in a prefetched batch (step 4 of the walkthrough
 below); a larger one runs inline from the parsed slices. A command handed to
@@ -540,8 +547,13 @@ order. Once a connection has deferred a command, the commands behind it in
 the same stream are deferred too, so a local fast-path reply can never
 overtake an earlier remote one.
 
-The pump dispatches ahead of its replies within a window: at most 32 remote
-operations in flight and 256 replies pending per connection. If a connection
+The pump dispatches ahead of its replies within a window, checked before each
+command: it dispatches while fewer than 32 remote operations are in flight
+and fewer than 256 replies are pending on the connection. One command then
+adds one operation per remote key when it is split across cells (at most
+1,023 under the parser's 1,024-argument cap), or one per other cell it
+reaches, so a connection has at most 31 operations in flight plus one
+command's: at most 1,054 on a node of up to 1,024 cells. If a connection
 has 1,024 commands queued, the cell disarms its receive, so TCP flow control
 pushes back on the client; receiving resumes when the queue drains to 64.
 
@@ -634,8 +646,9 @@ it produced as soon as the drain ends.
 **Parsing.** The parser accepts RESP arrays and inline commands. It is a
 lending iterator: a parsed request borrows from the buffer and cannot outlive
 the parse step. Integer lengths are parsed with SWAR (several digits per
-machine word) and CRLF is checked where the length says it must be; a SIMD
-CRLF search is used only for inline commands. Limits are enforced from the
+machine word) and CRLF is checked where the length says it must be; a CRLF
+search (`inf_simd::find_crlf`, a scalar byte loop) is used only for inline
+commands. Limits are enforced from the
 length line, before any bytes are buffered: a bulk string may be up to
 `proto-max-bulk-len` (16 MiB by default), a whole request up to that plus
 64 KiB, and a request may have at most 1,024 arguments. A protocol error gets
@@ -756,7 +769,10 @@ the right expiry times.
 
 `maxmemory` is a node-wide budget, and each cell enforces its share
 (`maxmemory / cells`); cells own equal slot ranges, so this needs no shared
-state. The write path pays one branch on a cached "over limit" flag. When
+state. Before a write the path tests a cached "over limit" flag; after every
+write the cell refreshes it: the node-wide half is a no-op without a limit,
+and the per-namespace half walks every named store and folds the memory of
+each one that has a budget. When
 over the limit, a write may evict up to 512 keys inline and then answers with
 Redis's out-of-memory error; MAINTAIN then evicts down to a lower target
 (`limit − limit/16`) in budgeted slices.
@@ -981,8 +997,11 @@ chained over every section's CRC. When the file is synced it is renamed to
 `ckpt-NNNNNN.ick` and the directory is synced.
 
 The next checkpoint starts once the log has grown to about twice the size of
-the last checkpoint (with a floor), capped so that replaying the log stays
-inside a fixed recovery-time budget. Checkpoint writes are paced by the
+the last checkpoint (with a floor), capped by the log bytes and the records
+that the replay rates fit into a fixed recovery-time budget. The caps price a
+record by its bytes, not by its replay work, and a delta to a large JSON
+document replays at the cost of the whole document, so replay can take
+longer than the budget. Checkpoint writes are paced by the
 device budget, or at a fixed rate when there is no device model. An
 I/O error during a checkpoint abandons that checkpoint, not the process: the
 previous checkpoint and the log are still valid. `INF.CKPT [CELL k] [WAIT]`
@@ -1323,7 +1342,7 @@ background I/O is not budgeted and checkpoints are paced at a fixed rate.
 | Bulk string / request / arguments | 16 MiB / 16 MiB + 64 KiB / 1,024 | protocol error, connection closed |
 | Key / inline value | 255 B / 16 MiB − 1 | typed error |
 | Queued commands per connection | 1,024 (resume at 64) | stop receiving; TCP pushes back |
-| Remote ops / pending replies per connection | 32 / 256 | pump stops dispatching until replies arrive |
+| Remote ops / pending replies per connection, tested before each command | 32 / 256 | the pump dispatches no further command until replies arrive; one command then adds one op per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's ops are in flight: 1,054 on a node of up to 1,024 cells |
 | Fabric credits per destination | 1,024 | sender waits for a credit |
 | Fabric drain per iteration | about 1,024 messages (checked between 8-slot chunks, so it can overshoot by one chunk) | the rest next iteration |
 | Resumed futures per iteration | 1,024 | the rest next iteration |
@@ -1366,7 +1385,9 @@ backend capabilities and listening port.
 
 ## Safety
 
-**Unsafe code.** Crates default to `#![forbid(unsafe_code)]`. The exceptions
+**Unsafe code.** Library and binary crates default to
+`#![forbid(unsafe_code)]`; integration tests and benchmarks are crate roots
+of their own, and some use `unsafe`. The exceptions
 keep `#![deny(unsafe_code)]` at the crate root and allow it only in named
 modules, each listed with its safety argument in the crate's `SAFETY.md`:
 `inf-runtime` (the io_uring and kqueue backends; the driver, whose stable
@@ -1377,7 +1398,10 @@ signals; sockets; the cold-read buffers), `inf-fabric` (the ring only),
 CRLF search, group probes, JSON classification, UTF-8), one module each in
 `inf-doc` (tape emit), `inf-server` (log byte views) and `inf-probe`, and
 two in the simulator. A script refuses a crate root without the attribute
-and any `allow` that is not on a whole module. The ring is checked with
+and any allow written exactly `allow(unsafe_code)` that is not on a whole
+module; it does not read an allow in another spelling (a reasoned
+`#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
+allow). The ring is checked with
 Loom; the allocator and fabric with Miri. The executor's wakers are
 deliberately not thread-safe: they use no atomics (a CI check inspects the
 waker path for atomic instructions), and command futures are `!Send`, which
@@ -1409,7 +1433,8 @@ log, recovery) on one thread. It uses the real server and loop code, not a
 model of them, over:
 
 - a simulated network with in-memory sockets that split received bytes at
-  seeded random points, which exercises every parser resume path;
+  seeded random points, so frames that span reads exercise the parser's
+  accumulator;
 - a simulated disk that keeps, for every file, what the OS would show and
   what would survive a power cut. Unsynced data is lost on a cut, directory
   operations survive only in a seeded prefix, and pending writes are cut into
@@ -1426,10 +1451,12 @@ pub/sub delivery (in order, no loss, no duplicates); memory accounting and key
 contents at quiescence; no acknowledged `always` write lost across crashes;
 after seeded power cuts, every live key of a tiered namespace serving its
 exact bytes and every deleted key gone; document replay equivalence; index
-backfill and saved-index equivalence. Oracles have canaries, planted bugs
-compiled in only for the canary run that must turn them red
-(`just sim-canaries`). `--verify-determinism` runs a seed twice and compares
-the traces and a hash of the final state, disk included.
+backfill and saved-index equivalence. An oracle's canary is a planted bug
+that must turn it red: a build flag that `just sim-canaries` compiles in, or
+a plant a test arms at run time (the durable scenario's lying `fsync` among
+them). Not every oracle has one: no lane plants a bug for the boot-storm
+scenario's ready-path oracle. `--verify-determinism` runs a seed twice and
+compares the traces and a hash of the final state, disk included.
 
 Every CI run executes every scenario once (`just sim-smoke`); sweeps run
 thousands of seeds per scenario (`just durable-sweep` and friends); a nightly
@@ -1447,11 +1474,13 @@ from the same run, and CI fails if the committed matrix is stale.
 ### Crash matrix
 
 `tests/crash-matrix` kills the process at named fault points on the
-durability path and checks that the point fired, that recovery reaches the
-same state as a reference replay of the surviving log, that the recovery
-outcome is the expected one, that no acknowledged `always` write was lost,
-and that recovering twice gives the same result. Its rows are data files
-anyone can review.
+durability path and, for the rows that arm one, checks that the point
+fired, that recovery reaches the same state as a reference replay of the
+surviving log, that the recovery outcome is the expected one, that no
+acknowledged `always` write was lost, and that recovering twice gives the
+same result. Rows carried by `tests/fua.rs` and `tests/ickv3.rs` build the
+crash image by hand instead and arm no fault point: their `point` names the
+shape the image reproduces. Its rows are data files anyone can review.
 
 ### Fuzzing, Loom and Miri
 
@@ -1472,7 +1501,8 @@ the cell denylist and clock ban, fault-point and `fsync` fail-stop rules,
 the panic policy and the inventory of release assertions, `SAFETY.md`
 inventories and unsafe crate roots, test-only features kept out of shipping
 builds, file length and line width, and lint ratchets. Each script is
-self-tested: a planted violation must make it fail. `just check` also
+self-tested: it must exit non-zero on each of its planted cases, and a case
+that does not name its cause accepts any non-zero exit. `just check` also
 tests the slim `inf-server` library build, and CI builds it and checks that
 its symbols contain no document or query code.
 

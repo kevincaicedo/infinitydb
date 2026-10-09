@@ -74,7 +74,7 @@
 <div class="hl" style="animation-delay:0s">Every key has one owner.</div>
 <div class="hl" style="animation-delay:1.6s">Every write is an append.</div>
 <div class="hl" style="animation-delay:3.2s">Every limit has a number.</div>
-<div class="hl" style="animation-delay:4.8s">Every failure has a seed.</div>
+<div class="hl" style="animation-delay:4.8s">Every violation has a seed.</div>
 <div class="why-end">That's determinism.<span class="sq14 bg-sig" aria-hidden="true"></span></div>
 </div>
 </div>
@@ -198,8 +198,8 @@
 <div class="wrap grid12 feature-in">
 <div class="f-text">
 <div class="f-head"><span class="pix">04</span><span class="eyebrow">Deterministic simulation</span></div>
-<h3>Every failure is a seed.</h3>
-<p class="f-p">The whole database can run inside a simulator where time and chance are controlled. We cut power, tear writes and reorder messages on purpose. When something breaks, one number replays it exactly.</p>
+<h3>Every violation is a seed.</h3>
+<p class="f-p">The whole database can run inside a simulator where time and chance are controlled. We cut power, tear writes and reorder messages on purpose. When an oracle catches a violation, one number replays it exactly.</p>
 <div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">Time, randomness and I/O are injected. Simulated disks lose, tear and reorder unsynced writes. Invariant oracles run continuously, and a nightly fleet runs fresh seeds.</p></div>
 <div class="lawtag mono">L7 · Determinism is a feature</div>
 </div>
@@ -280,7 +280,7 @@
 <div class="lw"><div class="pix">L6</div><div class="lw-t">Commands are resumable.</div><div class="lw-d">Disk, fabric and fsync waits suspend a command, never the core.</div></div>
 <div class="lw"><div class="pix">L7</div><div class="lw-t">Determinism is a feature.</div><div class="lw-d">Same input, same state, same log, byte for byte.</div></div>
 <div class="lw"><div class="pix">L8</div><div class="lw-t">Compatibility is staged.</div><div class="lw-d">Honesty is total: every command marked in a public, generated matrix.</div></div>
-<div class="lw"><div class="pix">L9</div><div class="lw-t">Safety is layered.</div><div class="lw-d">unsafe lives in audited leaf crates, and every decoder is fuzzed.</div></div>
+<div class="lw"><div class="pix">L9</div><div class="lw-t">Safety is layered.</div><div class="lw-d">In shipped code, unsafe lives in audited leaf crates and named modules, and every decoder is fuzzed.</div></div>
 <div class="lw"><div class="pix">L10</div><div class="lw-t">Claims follow evidence.</div><div class="lw-d">No public number without replicates, a clean tree and the rival in the run.</div></div>
 <div class="lw"><div class="pix">L11</div><div class="lw-t">Extend by seam, not fork.</div><div class="lw-d">Engines attach through versioned seams. First-party code gets no shortcut.</div></div>
 <div class="lw"><div class="pix">L12</div><div class="lw-t">Design before code.</div><div class="lw-d">Nothing is built until a reviewed record proves the design.</div></div>

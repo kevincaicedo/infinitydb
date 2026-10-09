@@ -87,7 +87,7 @@
 <h2 id="kept" class="post-h2">What we kept</h2>
 <p>The post-mortem was not a purge. These survived contact with reality and moved into InfinityDB:</p>
 <ul class="dots">
-<li>SIMD RESP parsing, SWAR integer parsing and perfect-hash command dispatch.</li>
+<li>SWAR integer parsing and perfect-hash command dispatch; the SIMD CRLF scanner came along too, and the RESP parser does not call it.</li>
 <li>The io_uring backend's typed buffer lifecycle and completion discipline.</li>
 <li>Crash-point testing, the fault-injection harness and typed durability errors.</li>
 <li>Clock-sweep eviction with a Count-Min Sketch and the hierarchical timing wheel, now per core.</li>

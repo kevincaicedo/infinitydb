@@ -14,7 +14,7 @@ write to a per-cell append-only log. A durable namespace given a memory budget
 keeps its hot data in RAM and tiers the rest to disk (strings only, for now).
 The whole node runs inside a **deterministic simulator** that drives time
 from a virtual clock, splits network reads at seeded points and injects disk
-faults, so every failure replays from a seed.
+faults, so a failure the simulator reports names the seed that replays it.
 
 > [!WARNING]
 > **InfinityDB is alpha software and not ready for production.** Commands,
@@ -126,7 +126,8 @@ Docker's default seccomp profile blocks `io_uring`; the bundled one allows it
   disk for durable namespaces.
 - **Correctness you can replay.** Deterministic simulation with torn and
   reordered writes, lost unsynced data and power cuts; planted-bug canaries
-  (including an fsync that lies) prove the oracles catch what they should; a
+  (including an fsync that lies) turn the oracles they target red, and not
+  every oracle has one; a
   crash matrix, fuzzed decoders, Loom on the inter-cell ring, Miri on the
   allocator and fabric, and byte-for-byte diffs against Redis.
 - **Honest compatibility.** Redis compatibility is declared per command in a
@@ -225,8 +226,10 @@ website/           project website
 ```
 
 Crate dependencies are checked against [docs/dep-dag.toml](docs/dep-dag.toml)
-in CI. `unsafe` code is confined to a few audited crates and modules, each
-documented in a `SAFETY.md`; the compiler rejects it everywhere else.
+in CI. In shipped source, `unsafe` code is confined to a few audited crates
+and modules, each documented in a `SAFETY.md`, and every other library and
+binary crate root forbids it; integration tests and benchmarks are crate
+roots of their own, and some use it.
 
 ## Contributing
 

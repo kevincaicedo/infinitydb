@@ -6,9 +6,13 @@ Implementations may add private detail and additional inherent methods, but
 the shapes below are the contract that `inf-server`, `inf-sim`, and `inf-bench`
 are built against.
 
-Conventions: edition 2024, `#![forbid(unsafe_code)]` everywhere except
-`inf-simd`, `inf-alloc`, `inf-fabric` (ring internals), `inf-runtime`
-(uring/kqueue FFI). No `dyn` on hot paths; generics stay monomorphized.
+Conventions: edition 2024, `#![forbid(unsafe_code)]` at every library and
+binary crate root except eight, which `deny` it and allow it in named
+modules: the leaf crates `inf-simd`, `inf-alloc`, `inf-fabric` (ring
+internals) and `inf-runtime` (the uring/kqueue backends and its
+`affinity`, `cold`, `driver`, `executor`, `net` and `signal` modules),
+and the module-scoped regions of `inf-doc`, `inf-server`, `inf-probe` and
+`inf-sim`. No `dyn` on hot paths; generics stay monomorphized.
 Time and randomness are always injected (`inf_foundation::time`, L7).
 
 ---
@@ -531,8 +535,10 @@ impl CellFabric {
     pub fn drain(&mut self, max: usize, f: impl FnMut(CellId, Op<'_>)) -> usize;
     pub fn doorbell_pending(&self) -> bool;
     pub fn credits(&self, to: CellId) -> u32;       // backpressure probe (E5)
-    pub fn outstanding(&self, to: CellId) -> u32;   // exact memory bound
-    pub fn stats(&self) -> FabricStats;             // spill/orphan/publish tripwires
+    // ops in flight to `to`: a count of frames; their bytes are not bounded
+    pub fn outstanding(&self, to: CellId) -> u32;
+    // always-on counters; outside inf-fabric only drain_skip_streak_max is read
+    pub fn stats(&self) -> FabricStats;
 }
 ```
 
@@ -563,9 +569,11 @@ between cells in one process, not authentication or an ACL capability
 > retention rule.
 
 ```rust
-// Parser: resumable per-connection state over borrowed input; bounded
-// accumulator (hard cap → typed error, the Vortex lesson). Multibulk frames
-// parse with ZERO scanning (length-directed); payload bytes are never read.
+// Parser: per-connection state over borrowed input; a frame that spans feeds
+// accumulates (bounded: hard cap → typed error, the Vortex lesson), and each
+// feed parses the accumulated bytes again from their start. Multibulk frames
+// parse with ZERO scanning (length-directed); payload bytes are copied into
+// the accumulator when a frame spans feeds, and are never inspected.
 pub struct ConnParser;                      // one per connection
 pub enum Parsed<'a> { Command(ArgvRef<'a>), Inline(ArgvRef<'a>), Incomplete, ProtocolError(WireError) }
 pub struct ParserLimits { pub max_bulk_bytes: usize, pub max_frame_bytes: usize, pub max_args: usize }
@@ -634,8 +642,9 @@ pub struct CommandMeta {
     pub flags: CmdFlags,                    // READONLY | WRITE | ADMIN | FAST
     pub keys: KeySpec,                      // { first: u8, last: i8, step: u8 }; 0 = no keys
 }
-pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // case-insensitive perfect hash:
-    // fold+pack one u64, multiply-shift, one probe, one word compare (~5 ns dev-tier)
+pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // perfect hash: clear bit 5
+    // of every byte, pack two u64 words with the length XORed into the high one,
+    // two multiplies, one probe, two word compares
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a>;
 pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec;
     // ADR-0104: the routing truth — `meta.keys`, or the subcommand-scoped row

@@ -44,7 +44,7 @@ padding  zeros up to the next 4 KiB boundary (O_DIRECT segments only)</pre>
 <li>A footer carries per-namespace counts and a digest chained over every section CRC. The file is synced, renamed to <code>.ick</code> and the directory is synced.</li>
 <li>A new <code>MANIFEST</code> names the checkpoint, its begin LSN, the live segments and any tier files. It is written, fsynced, renamed over the old one and the directory fsynced, so a reader sees the old recovery unit or the new one, never a mix.</li>
 </ul>
-<p>A checkpoint starts once the log has grown to about twice the last one, capped so replay stays inside a fixed recovery-time budget. You can also ask for one; <code>BGSAVE</code> maps onto the same checkpoint and writes no RDB file:</p>
+<p>A checkpoint starts once the log has grown to about twice the last one, capped by the log bytes and records that the replay rates fit into a fixed recovery-time budget; a delta to a large JSON document replays at the cost of the whole document, so replay can take longer than the budget. You can also ask for one; <code>BGSAVE</code> maps onto the same checkpoint and writes no RDB file:</p>
 <pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.CKPT WAIT
 OK
 127.0.0.1:6379&gt; BGSAVE

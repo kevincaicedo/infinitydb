@@ -303,8 +303,10 @@ ignores its unaddressable suffix.
   exactly once; a waiting policy never strands a rotation
   (`inline_preallocs = 0`); a wait nothing can feed is never started.
 - ENOSPC discipline: prealloc failure raises `space_exhausted()` *before*
-  writes need the space (the S08 admission hook); appends that outrun it
-  get typed `LogError::NoSpace`. fsync failure is the distinct,
+  writes need the space (the S08 admission hook); on `MemFs` an append that
+  outruns it gets typed `LogError::NoSpace`; on the shipped backend a WAL
+  write that fails, `ENOSPC` included, ends in the cell's fail-stop
+  (`DurableCell::on_log_error`). fsync failure is the distinct,
   non-recoverable `FsyncFailed` type (the fsyncgate rule — enforced
   since S17 by `scripts/check-fsync-fail-stop.sh`: the fsync-error types
   may appear only in the audited allowlist of fail-stop sites; on the
@@ -321,8 +323,8 @@ ignores its unaddressable suffix.
 
 Control-path file operations (create/prealloc, dir-fsync, list, open,
 positional read/write, fdatasync) behind a trait so DST can fault every
-one (L7). Tiers: `StdSegmentFs` (boot/dev; `set_len` prealloc — real
-`fallocate` arrives with the S05 BackendDriver file ops), `fs::mem::MemFs`
+one (L7). Tiers: `StdSegmentFs` (boot/dev; `set_len` prealloc, which
+reserves no blocks: no tier calls `fallocate`), `fs::mem::MemFs`
 (deterministic, fault-injectable test tier — process-KILL physics: every
 completed write survives), `fs::sim::SimDisk` (M2-S18 — power-CUT
 physics: un-fsynced state loses/tears/reorders, see the sim-disk section
@@ -586,8 +588,12 @@ interface-freeze discipline). The token *layout* is unchanged; `TokenClass` gain
   `FrameLease` is the canonical proof (buffers never reallocate; reset only
   on release). Construction lives in the plane; `inf-log` stays
   `#![forbid(unsafe_code)]`. S08 decides `inf-server`'s shape (ADR-0013).
-- `fallocate`/rename/dir-fsync ops were deliberately NOT added (no unused
-  surface); they land with S11/ENOSPC-hardening consumers.
+- `IoOp` has no `fallocate` or rename op and no op of its own for a
+  directory sync: a rename is a `SegmentFs` call; a directory sync is a
+  blocking `SegmentFs::sync_dir` or an `IoOp::Fdatasync` on a directory fd
+  (the boot barriers, the checkpoint directory's sync); no production path
+  reserves blocks with `fallocate` (write-through segments are pre-zeroed
+  instead, ADR-0086 D4).
 
 ### Amendment (2026-08-19, M4.5-S31 — ADR-0084): tier-flush token classes
 
@@ -640,12 +646,14 @@ discipline:
   ledger until `Synced`) and the active segment fd. Boot barriers enter at
   the head of the ledger covering the recovery floor; prealloc barriers
   enter **coverage-neutral** at the tail. The done-prefix rule fences
-  every durable ack (and manifest publication) behind them — boot-ready
-  never blocks on the device. A blocking metadata fsync on a reactor
-  thread is the ADR-0022 D7 wedge mechanism; the boot-storm DST scenario
-  (`inf-sim --scenario boot-storm`) enforces a zero blocking-sync ready
-  path, and `inf-bench boot-storm` is the device-tier spawn-storm
-  regression.
+  every durable ack (and manifest publication) behind them, so these
+  barriers do not hold boot-ready; the checkpoint probe does:
+  `CkptCell::new` runs `probe_direct`, one direct write and one fdatasync
+  on the cell thread during recovery, before the cell is ready. A blocking
+  metadata fsync on a reactor thread is the ADR-0022 D7 wedge mechanism;
+  the boot-storm DST scenario (`inf-sim --scenario boot-storm`) counts
+  blocking `sync_dir` calls on the ready path and fails on any, and
+  `inf-bench boot-storm` is the device-tier spawn-storm regression.
 - **Recovery machine**: `Recovery::deferred_boot_sync()` (loop-resident
   boots), `take_boot_barrier_dirs()`, `phase_code()`; the RecoveryBoard
   slot gains a `phase` published **before** each step plus assembly
@@ -673,7 +681,8 @@ discipline:
   persistence` gain `fsync_group_p50`/`fsync_group_p99` (records newly
   covered per durability-fsync completion — the M2.5 formation gate
   observable); `gate-run m2` emits `tripwire:group_formation_x` and
-  `tripwire:spawn_retries` (must read zero post-S01).
+  `tripwire:spawn_retries` (whether the latest spawn needed its retry, 0
+  or 1; no gate row reads it).
 
 ## Group commit + durability watermark (`inf-log::commit`, M2-S05/S06)
 
@@ -728,8 +737,9 @@ the module docs; `inf-server` adopts it at S08):
   `note_everysec_tick()` (plane-armed injected timer — idle ticks free;
   a tick over staged records is never idle),
   `register_seal_fsync(SealHandoff)` (deferred rotation, ADR-0013 D4).
-- LOG: `frame_fsync_due()` → `note_frame_queued(end, len)` →
-  `register_linked_fsync()` (one sync covers every class due that
+- LOG: `frame_plan(..)` before the seal (a `Wait` holds the frame) →
+  `note_frame_queued(end, len)` → `register_linked_fsync()` when the plan
+  is `LinkedFsync` (one sync covers every class due that
   iteration — group commit); `standalone_fsync_due()` →
   `register_standalone_fsync()` (dirty bytes, no frame; covers
   written-at-submission, never queued).
@@ -1146,8 +1156,10 @@ per episode). A drained cell always seals — never slower than K = 1.
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with
   phases Start → Ick → Replay → Audit → Finish, each `step(ks, budget)`
   bounded by input bytes (one frame/section overshoot). `open_cell_log`
-  is the machine run to completion — one code path, so the S13
-  determinism sweep and S14 taxonomy suite prove the stepped machine.
+  is the machine run to completion — one code path. The determinism
+  sweep and the taxonomy suite run it in one step (a `u64::MAX` budget),
+  so they exercise no yield; the stepped drive is exercised by the
+  server's step tests and the sliced end-to-end tests.
   `IckReader` is the pull-based `.ick` loader (`read_ick` reimplemented
   on it; same audit, same fuzz target).
 - The node boots cells directly into their reactor loops:
@@ -1466,11 +1478,14 @@ per episode). A drained cell always seals — never slower than K = 1.
      group-commit ack is the extent's commit record. `ExtentWriter`
      (chunked appends, 256-frame batched device writes, staging bounded
      by one batch window + one tail frame) → `finish()` fdatasyncs and
-     is the **only** constructor of `SealedExtent` — reference position
-     (`TieredTable::insert_extent`/`update_extent`,
-     `MutationEffect::StringSetExtent`) requires the token, so "extent
-     durable before referencing ack" is structural on the sync tier
-     (the reactor tier's coverage-neutral `GroupCommit` ledger barrier
+     builds a `SealedExtent`, and `finish_deferred` builds one before any
+     sync is issued (its caller owes the barrier).
+     `TieredTable::insert_extent`/`update_extent` take the token;
+     `MutationEffect::StringSetExtent` holds a namespace, the key and
+     three integers, and nothing in its type ties it to a
+     `SealedExtent`, so "extent durable before referencing ack" is kept
+     by the LOG step's extent-seal hold, not by the type (the reactor
+     tier's coverage-neutral `GroupCommit` ledger barrier
      is command wiring's named obligation). Extent **fsync failure is a
      typed abort** (extent abandoned, id quarantined, never retried —
      the one ADR-audited posture narrower than fsync fail-stop; the module is

@@ -8,7 +8,7 @@ chips: In progress · {{now_code}} {{now_name}}
 
 <h2 id="shape">The shape of it</h2>
 <p>InfinityDB is built from scratch on a shared-nothing, thread-per-core design. Each <a href="cells.html">cell</a> is one thread that owns a shard of the keyspace end to end: its network I/O on Linux io_uring, its memory, its data and its log. The data plane has no locks and no shared mutable state.</p>
-<p>Durable namespaces write to a per-cell append-only <a href="log.html">log</a>. A durable namespace given a memory budget keeps its hot data in RAM and <a href="tiering.html">tiers the rest to disk</a>, for strings today. The whole node runs inside a <a href="simulation.html">deterministic simulator</a> that drives time from a virtual clock and injects disk faults, so every failure replays from a seed.</p>
+<p>Durable namespaces write to a per-cell append-only <a href="log.html">log</a>. A durable namespace given a memory budget keeps its hot data in RAM and <a href="tiering.html">tiers the rest to disk</a>, for strings today. The whole node runs inside a <a href="simulation.html">deterministic simulator</a> that drives time from a virtual clock and injects disk faults, so a violation the simulator reports replays from its seed.</p>
 
 <h2 id="today">What works today</h2>
 <ul class="dots">

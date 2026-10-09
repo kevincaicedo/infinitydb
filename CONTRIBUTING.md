@@ -144,8 +144,8 @@ bug in the docs: open an issue (or fix it in your first PR).
    just sim-smoke
    ```
 
-3. One seeded DST replay (~1 min): the debugging workflow — every sim
-   failure is a seed; this is how you replay one exactly.
+3. One seeded DST replay (~1 min): the debugging workflow — a violation the
+   simulator reports names its seed; this is how you replay one exactly.
 
    ```bash
    cargo run --release -p inf-sim --features dst --bin inf-sim -- \
@@ -177,8 +177,10 @@ cargo deny check
 `scripts/` (dependency DAG, cell deny-list, fault points, fsync fail-stop,
 panic policy, release-assert inventory, unsafe inventory and crate roots,
 shipping features, file length and line width, lint ratchet and scopes,
-documentation links); the gates' own self-test, which plants a violation
-in front of each gate and requires it to go red; clippy with `-D warnings`;
+documentation links); the gates' own self-test, which runs each gate on
+planted cases and requires each to exit non-zero (a case written with
+`expect_red_because` also requires its cause in the gate's output); clippy
+with `-D warnings`;
 and the workspace tests. The `check` recipe in the [`justfile`](justfile)
 is the exact list.
 
@@ -245,11 +247,13 @@ mechanically; the rest is enforced in review via the
 ## Unsafe code
 
 `unsafe` is allowed only in the four audited leaf crates (`inf-simd`,
-`inf-alloc`, `inf-fabric`, `inf-runtime`'s backend, affinity and executor
-modules) and in a few named, module-scoped regions listed in
+`inf-alloc`, `inf-fabric`, `inf-runtime`'s `affinity`, `cold`, `driver`,
+`executor`, `net`, `kqueue`, `uring` and `signal` modules) and in a few
+named, module-scoped regions listed in
 [InfinityStyle § Unsafe Rust](docs/INFINITY_STYLE.md#unsafe-rust); every
-other crate root forbids it, and `scripts/check-unsafe-roots.sh` enforces
-the list. If you add or change unsafe code:
+other library and binary crate root forbids it, and
+`scripts/check-unsafe-roots.sh` enforces the list. If you add or change
+unsafe code:
 
 - Add a `// SAFETY:` comment on every `unsafe` block explaining the invariant
   (the `undocumented_unsafe_blocks` clippy lint is denied).

@@ -89,7 +89,7 @@
 <li><strong>Nothing validated before a suspension is valid after it.</strong> No lease, borrow, ring slot, staged record or position crosses an <code>await</code>. A walker resumes through a typed cursor and validates again.</li>
 <li><strong>Every limit has a unit, an owner and a crossing behaviour.</strong> Every loop, queue, cache, batch and retry is bounded, by bytes and work as well as count. Backpressure is credits, budgets, caps and refusals, never an unbounded queue.</li>
 <li><strong>Assertions catch programmer errors.</strong> Assert preconditions, postconditions and invariants; handle operating errors. An assertion about a caller is a debt; move the claim to the type that makes it true. Panics are for violated invariants and sanctioned fail-stops only.</li>
-<li><strong>Unsafe lives in audited leaves.</strong> Safe Rust by default. Every <code>unsafe</code> block has a <code>// SAFETY:</code> argument, a <code>SAFETY.md</code> entry and Miri or Loom coverage where they apply.</li>
+<li><strong>In shipped code, unsafe lives in audited leaf crates and named modules.</strong> Safe Rust by default. Every <code>unsafe</code> block has a <code>// SAFETY:</code> argument, a <code>SAFETY.md</code> entry and Miri or Loom coverage where they apply.</li>
 <li><strong>Decoders are iterative, bounded and total.</strong> No recursion, and the fuzz target lands in the same change.</li>
 </ul>
 

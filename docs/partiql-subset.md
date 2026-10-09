@@ -42,10 +42,12 @@ target := ns | ns . index | ns . SCAN
 part   := bare-name | "quoted-name"
 ```
 
-- A **bare** name uses the namespace charset (`A–Z a–z 0–9 _ . -`)
-  **without dots**; in an unquoted dotted target the first dot splits
-  namespace from suffix. Names that themselves contain dots must be
-  double-quoted: `FROM "my.ns"`, `FROM "my.ns"."idx"`.
+- A **bare** name starts with a letter, `_` or a byte ≥ 0x80 and continues
+  with letters, digits, `_`, `-` and bytes ≥ 0x80: the lexer does not
+  restrict it to the namespace charset. In an unquoted dotted target the
+  first dot splits namespace from suffix. A name that contains a dot, or
+  starts with a digit or `-`, must be double-quoted: `FROM "my.ns"`,
+  `FROM "my.ns"."idx"`.
 - `FROM ns` — access by primary key (`$key`, §4) or by **path
   matching** against the namespace's `ready` indexes (§5).
 - `FROM ns.index` — explicit index naming (the DynamoDB register). The

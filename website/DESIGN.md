@@ -163,7 +163,7 @@ power cuts, in simulation, every night. Eight legs, one for each cell.
 | Idle | polling, blinking now and then |
 | Walk | the reactor loop: two frames, forever |
 | Park | waiting on the next completion (the 404 page) |
-| Seed | every failure is a seed; Moss keeps it |
+| Seed | every violation is a seed; Moss keeps it |
 
 Rules: integer scaling only (1×, 2×, 4×, 8×), never blurred or rotated.
 One signal pixel per pose: the blush or the seed, never both. Ink and paper

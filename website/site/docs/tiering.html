@@ -137,7 +137,7 @@
 <h2 id="today" class="doc-h2">What works today</h2>
 <p>Tiered namespaces serve the string family (<code>GET</code>, <code>SET</code> without expiry options, <code>MGET</code>, <code>MSET</code>, <code>INCR</code> and friends, <code>APPEND</code>, <code>GETRANGE</code>, <code>SETRANGE</code>, <code>DEL</code>, <code>EXISTS</code>), plus <code>SCAN</code> and <code>DBSIZE</code>. Multi-key commands resolve key by key.</p>
 <aside class="callout"><div class="callout-label">Not yet</div><p>Tiered namespaces have no key expiry: the <code>EXPIRE</code> family and <code>SET</code> expiry options are refused, and <code>TTL</code> answers <code>-1</code>. JSON documents, other value types and secondary indexes on tiered namespaces arrive with documents beyond RAM, <a href="roadmap.html#m4">the last phase of M4</a>.</p></aside>
-<p>Memory namespaces, the numbered databases and durable namespaces without a <code>MEM-BUDGET</code> have no hybrid log, and none of this code runs for them.</p>
+<p>Memory namespaces, the numbered databases and durable namespaces without a <code>MEM-BUDGET</code> have no hybrid log. A cell that is not durable runs none of this code; a durable cell runs the tiered maintenance step on every loop iteration, which reconciles its namespace set whether or not one is tiered.</p>
 
 <aside class="law-box"><span class="law-code">L6</span><div><div class="law-title">Every command is a resumable state machine.</div><p>A cold read is the case the rule was written for. The command suspends on a typed gate while the read goes out through the same <code>io_uring</code> ring as everything else, then resumes and validates again, and the in-memory fast path pays nothing for it.</p></div></aside>
 

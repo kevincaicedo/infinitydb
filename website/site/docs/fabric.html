@@ -118,7 +118,7 @@
 <h2 id="credits" class="doc-h2">Credits and backpressure</h2>
 <div class="table-wrap"><table class="doc-table"><thead><tr><th>Bound</th><th>Default</th><th>When crossed</th></tr></thead><tbody>
 <tr><td>Unanswered data operations toward one peer</td><td>1,024 credits</td><td>the sender waits for a credit to return</td></tr>
-<tr><td>Remote operations in flight per connection</td><td>32</td><td>the pump stops dispatching until replies arrive</td></tr>
+<tr><td>Remote operations in flight per connection, tested before each command</td><td>32</td><td>the pump dispatches no further command until replies arrive; one command then adds one operation per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's operations are in flight: 1,054 on a node of up to 1,024 cells</td></tr>
 <tr><td>Pending replies per connection</td><td>256</td><td>the pump stops dispatching until replies drain</td></tr>
 <tr><td>Queued commands per connection</td><td>1,024, resume at 64</td><td>the cell stops receiving; TCP pushes back on the client</td></tr>
 <tr><td>Fabric drain per iteration</td><td>about 1,024 messages</td><td>the rest wait for the next iteration</td></tr>

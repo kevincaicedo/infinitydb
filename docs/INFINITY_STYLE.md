@@ -446,18 +446,22 @@ force multiplier for DST and fuzzing.
 
 ### Unsafe Rust
 
-Safe Rust is the default; `#![forbid(unsafe_code)]` everywhere except the
-audited leaf crates (`inf-simd`, `inf-alloc`, `inf-fabric`, `inf-runtime`'s
-backend/affinity/executor modules) and the module-scoped regions
+Safe Rust is the default; `#![forbid(unsafe_code)]` at every library and
+binary crate root except the audited leaf crates (`inf-simd`, `inf-alloc`,
+`inf-fabric`, `inf-runtime`'s `affinity`, `cold`, `driver`, `executor`,
+`net`, `kqueue`, `uring` and `signal` modules) and the module-scoped regions
 `inf_doc::emit`, `inf_server::log_bytes`, `inf_probe::evict`,
 `inf_sim::{net, steel}` (ADR-0049, ADR-0121 — the crate stays
 `deny(unsafe_code)` at its root with `#[allow(unsafe_code)]` on exactly
 the audited `mod` items, or one whole-file inner allow; never on a
 function or block). The posture is mechanical: `check-unsafe-roots.sh`
 refuses a crate root with no attribute, a `deny` root outside the
-audited leaf set, a listed leaf that went `forbid`, and any allow that
-is not module-scoped — a new unsafe block outside a named module is a
-compile error in every build.
+audited leaf set, a listed leaf that went `forbid`, and any allow written
+exactly `allow(unsafe_code)` that is not module-scoped. It does not read
+an allow in another spelling (a reasoned
+`#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
+allow). A new unsafe block outside an allowed item is a compile error in
+every build.
 Every unsafe block has a concrete `// SAFETY:` argument, an
 entry in the crate's `SAFETY.md` inventory (script-checked), Miri/Loom
 coverage where applicable, and a reviewer who read the argument, not just
@@ -494,7 +498,7 @@ fault-point and fsync-fail-stop greps, the attribution-divergence gate,
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
 release-assert inventory — ADR-0107 D2), `check-unsafe-roots.sh` (every
 crate root governs `unsafe_code`, the deny set is the leaf list,
-allows are module-scoped — ADR-0121) —
+allows written `allow(unsafe_code)` are module-scoped — ADR-0121) —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
 merge; change the law first (ADR) or fix the code. A shell gate is the
 last resort, not the default: when clippy, the type system or a
@@ -613,9 +617,14 @@ useful throughput within latency, memory, and durability contracts.
 ### Memory, caches, and locality
 
 - **Memory is the product (L5).** Every allocation belongs to a named,
-  counted domain; `sum(domains)` vs RSS divergence > 10% fails CI. Measure
-  payloads, indexes, metadata, allocator slack, buffers, connection state,
-  and retained work. Bytes per key/document/entry are release gates.
+  counted domain. CI fails when the attributed gauges miss the RSS growth
+  of one document load by more than 10% (one in-process store and a fixed
+  list of gauges). The gate campaigns' attribution rows compare node-wide
+  sums with RSS at the same bar, each over its own list of gauges, and no
+  CI workflow runs those. The target is that a node-wide `sum(domains)` vs
+  RSS divergence above 10% fails CI. Measure payloads, indexes, metadata,
+  allocator slack, buffers, connection state, and retained work. Bytes per
+  key/document/entry are release gates.
 - Fit the working set to the work: compact records, contiguous storage,
   and separation of hot fields from cold metadata. Compare array-of-structs
   and struct-of-arrays against the actual access pattern. Alignment and
