@@ -466,11 +466,13 @@ allow). In the crates those roots build, a new unsafe block outside an
 allowed item is a compile error in every profile. Build scripts, fuzz
 targets, integration tests and benchmarks are crate roots of their own,
 which the gate does not read, and some tests and benchmarks use `unsafe`.
-Every unsafe block has a concrete `// SAFETY:` argument, an
-entry in the crate's `SAFETY.md` inventory (script-checked), Miri/Loom
+Every unsafe block has a concrete `// SAFETY:` argument, Miri/Loom
 coverage where applicable, and a reviewer who read the argument, not just
-the code. Target: < 2% of LoC. If you can express it safely at equal
-measured cost, the unsafe version is wrong.
+the code. Under `crates/*/src` and `bins/*/src` it also has an entry in
+its crate's `SAFETY.md` inventory, and `check-safety-inventory.sh` checks
+file coverage there: it refuses a file that uses `unsafe` and that the
+inventory does not name. Target: < 2% of LoC. If you can express it
+safely at equal measured cost, the unsafe version is wrong.
 
 - Every `unsafe fn` documents caller obligations in `# Safety`. Explain
   alignment, initialization, bounds, aliasing, provenance, lifetime,

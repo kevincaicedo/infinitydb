@@ -259,7 +259,9 @@ tests and benchmarks use `unsafe`. If you add or change unsafe code:
 
 - Add a `// SAFETY:` comment on every `unsafe` block explaining the invariant
   (the `undocumented_unsafe_blocks` clippy lint is denied).
-- Update the crate's `SAFETY.md` inventory (script-checked).
+- For unsafe code under `crates/*/src` or `bins/*/src`, update the crate's
+  `SAFETY.md` inventory; `scripts/check-safety-inventory.sh` refuses a file
+  there that uses `unsafe` and that the inventory does not name.
 - Add tests, and where applicable run Miri (`cargo +nightly miri test -p <crate>`)
   and the Loom model.
 

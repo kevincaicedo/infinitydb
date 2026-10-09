@@ -32,7 +32,8 @@
 - [ ] Frozen seam / dep-DAG edge / format change → the decision (ADR)
       accepted by maintainers **before** the code
 - [ ] Unsafe touched → `// SAFETY:` on every block, crate `SAFETY.md`
-      inventory updated (script-checked), Miri/Loom run
+      inventory updated for code under `crates/*/src` or `bins/*/src` (a
+      script checks that each file there using `unsafe` is named), Miri/Loom run
 
 ## Reviewer checklist
 
