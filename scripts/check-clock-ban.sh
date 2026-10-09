@@ -93,8 +93,10 @@ else
     # The workspace config must be the one found: no CLIPPY_CONF_DIR, and
     # the copy sits under this root so the walk-up reaches ./clippy.toml.
     diag="$work/diag"
+    # The verdict parses clippy's human-readable lines, so colour is pinned
+    # off: CI sets CARGO_TERM_COLOR=always, whose escapes hide every plant.
     probe_target || { echo "CLOCK-BAN SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
-    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --target "$PROBE_TARGET" --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
+    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
     plants=0
     controls=0
     foreign_plants=0
