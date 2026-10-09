@@ -274,7 +274,16 @@ impl KqueueDriver {
                     // failed sync is the write's error.
                     match sync_file(fd, token, &mut self.stats).result {
                         CompletionResult::Synced => CompletionResult::LogWritten,
-                        failed => failed,
+                        // `sync_file` yields Synced or Error; the rest are
+                        // named for ADR-0144 D1 and pass through unchanged.
+                        failed @ (CompletionResult::Error { .. }
+                        | CompletionResult::Accepted { .. }
+                        | CompletionResult::Recv { .. }
+                        | CompletionResult::RecvDropped
+                        | CompletionResult::Sent { .. }
+                        | CompletionResult::LogWritten
+                        | CompletionResult::TierRead
+                        | CompletionResult::Closed) => failed,
                     }
                 } else {
                     CompletionResult::LogWritten
