@@ -740,8 +740,8 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     // (nothing durable changed; the origin alone lacks the namespace).
     // No persist will ever carry this drop, so the tier files hold
     // until the restart restores the namespace from the intact META,
-    // whole while this cell publishes no checkpoint before the stop:
-    // one would omit the namespace (ADR-0186 D2).
+    // whole while this cell publishes no checkpoint before the node
+    // stops: one would omit the namespace (ADR-0186 D2).
     if inf_foundation::fault::fire(crate::fault::NS_DROP_BEFORE_META) {
         if spec.tier.is_some() {
             shared.ns_drop_releases.borrow_mut().push((spec.id, u64::MAX));

@@ -39,7 +39,8 @@
 //!   already lacking the namespace and nothing durable changed — the on-disk state of a
 //!   power cut at that instant (ADR-0100 D5): a restart restores the namespace whole, its
 //!   tier files intact on every cell (the teardown hold never released), while the origin
-//!   cell publishes no checkpoint before the stop; one would omit the namespace (ADR-0186 D2)
+//!   cell publishes no checkpoint before the node stops; one would omit the namespace
+//!   (ADR-0186 D2)
 //! - `ns_drop_after_meta` — `plane::ns_ddl::program_ns_drop` (after the catalog swap is
 //!   durable, before the fan) — the DDL stops with `META` lacking the namespace and carrying
 //!   its tombstone while each peer's `MANIFEST` still names it (the origin's too, unless it
