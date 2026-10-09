@@ -64,6 +64,8 @@ if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" 
 fi
 # Cell membership has one owner, shared with the runtime safety gates.
 . "$SCRIPT_DIR/cell-crates.sh"
+# The probe's target and its architecture have one owner, shared with the clock ban.
+. "$SCRIPT_DIR/probe-target.sh"
 CELL_DIRS=$(cell_crate_dirs)
 
 for dir in crates bins; do
@@ -1063,11 +1065,22 @@ if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", pin):
 print(pin)
 PY
 )
-(cd "$pwork/probe" && env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target-dir "$pwork/target" \
-    --message-format=json >"$pwork/diag.json" 2>"$pwork/stderr") || true
+# ADR-0106 D18: the probe compiles for an explicit target, so the
+# architecture the judge discloses is the one Clippy resolved against.
+probe_target "$pin" || { echo "LINT-SCOPES SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
+(cd "$pwork/probe" && env -u CLIPPY_CONF_DIR -u RUSTC_BOOTSTRAP cargo +"$pin" clippy --quiet --target "$PROBE_TARGET" \
+    --target-dir "$pwork/target" --message-format=json >"$pwork/diag.json" 2>"$pwork/stderr") || true
+# The unresolved entries probe-target.sh defers to their own leg; the judge
+# fails every other one.
+foreign=
+while IFS= read -r row; do
+    entry=${row#\`}
+    entry=${entry%%\`*}
+    if probe_foreign "$entry"; then foreign="$foreign $entry"; fi
+done < <(grep -o '`[^`]*` does not refer to a reachable' "$pwork/diag.json" | sort -u)
 unstable_exit=0
 env -u RUSTC_BOOTSTRAP rustc +"$pin" --edition=2021 --crate-type=lib --emit=metadata \
     --error-format=json --out-dir "$pwork" "$pwork/probe/unstable/set_times.rs" \
     >"$pwork/unstable.stdout" 2>"$pwork/unstable.json" || unstable_exit=$?
 python3 -B "$SCRIPT_DIR/lint-scope-probe/judge.py" "$pwork/probe/src/lib.rs" \
-    "$pwork/diag.json" "$pwork/probe/clippy.toml" "$pwork/unstable.json" "$unstable_exit"
+    "$pwork/diag.json" "$pwork/probe/clippy.toml" "$pwork/unstable.json" "$unstable_exit" "$PROBE_ARCH" "${foreign# }"

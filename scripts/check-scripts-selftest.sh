@@ -23,13 +23,39 @@ trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 pass=0
 fail=0
 
+# A gate that never ran gives no verdict (ADR-0106 D1): counted as red, a
+# tool the runner lacked passed every planted red of the gate that needed it.
+# Each expect* refuses two shapes, failing the case with the cause.
+# not_runnable <label> <command>: a path that is no executable file, or a name
+# the shell cannot find, is refused before it runs — bash 3.2 under `set -e`
+# reports a failed exec of a path as exit 1, which reads as red.
+not_runnable() {
+    case $2 in
+    */*) [ -f "$2" ] && [ -x "$2" ] && return 1 ;;
+    *) command -v -- "$2" >/dev/null && return 1 ;;
+    esac
+    fail=$((fail + 1))
+    echo "SELFTEST FAIL: '$2' is not a runnable command, so it gives no verdict — $1"
+}
+# no_verdict <status> <label> <log>: a command that ran and exited 126 or 127
+# — env refusing a gate it cannot execute or find, or a gate that died on a
+# tool the runner lacks (both shells keep those codes) — is not a verdict.
+no_verdict() {
+    case $1 in 126 | 127) ;; *) return 1 ;; esac
+    fail=$((fail + 1))
+    echo "SELFTEST FAIL: exit $1 means a command could not be executed or found, not a gate verdict — $2"
+    sed 's/^/    | /' "$3"
+}
+
 # expect <red|green> <label> <command…>: runs the command with stdout+stderr
 # captured; a mismatch prints the captured output.
 expect() {
     local want=$1 label=$2
     shift 2
     local log="$work/log" status=0
+    not_runnable "$label" "$1" && return 0
     "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" && return 0
     if { [ "$want" = red ] && [ "$status" -ne 0 ]; } || { [ "$want" = green ] && [ "$status" -eq 0 ]; }; then
         pass=$((pass + 1))
     else
@@ -44,8 +70,10 @@ expect() {
 expect_output() {
     local label=$1 pattern=$2
     shift 2
-    local log="$work/log"
-    "$@" >"$log" 2>&1 || true
+    local log="$work/log" status=0
+    not_runnable "$label" "$1" && return 0
+    "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" && return 0
     if grep -q -- "$pattern" "$log"; then
         pass=$((pass + 1))
     else
@@ -61,7 +89,9 @@ expect_red_because() {
     local label=$1 pattern=$2 status=0
     shift 2
     local log="$work/log"
+    not_runnable "$label" "$1" && return 0
     "$@" >"$log" 2>&1 || status=$?
+    no_verdict "$status" "$label" "$log" && return 0
     if [ "$status" -ne 0 ] && grep -q -- "$pattern" "$log"; then
         pass=$((pass + 1))
     else
@@ -112,6 +142,30 @@ expect_red_because "self-test: fx_git refuses a root outside the fixture directo
 fx_norepo_canary() (mkdir -p "$work/fx-norepo" && fx_git "$work/fx-norepo" status)
 expect_red_because "self-test: fx_git refuses a fixture directory with no repository of its own" \
     "no repository of its own" fx_norepo_canary
+# The canary of both refusals: every expect* fails, red expectations included,
+# on a gate name the shell cannot find, a gate path that does not exist or is
+# not executable (each by not_runnable, on every shell), a gate that dies on a
+# missing tool (127) and env refusing a gate it cannot execute (126) (each by
+# no_verdict). Its own log directory keeps the inner cases off the outer
+# case's log.
+nv_canary() (
+    work="$work/nv" && mkdir -p "$work" && : >"$work/noexec" && pass=0 && fail=0
+    printf '#!/usr/bin/env bash\nset -e\ninf-selftest-no-such-tool\n' >"$work/tool-missing"
+    chmod +x "$work/tool-missing"
+    expect red "a gate name the shell cannot find" inf-selftest-no-such-gate >"$work/o1"
+    expect_red_because "a gate path that does not exist" "" "$work/no-such-gate" >"$work/o2"
+    expect_output "a gate path that is not executable" "" "$work/noexec" >"$work/o3"
+    expect red "a gate that dies on a missing tool" "$work/tool-missing" >"$work/o4"
+    expect red "env refusing a gate it cannot execute" env "$work/noexec" >"$work/o5"
+    cat "$work"/o[1-5]
+    grep -qF "'inf-selftest-no-such-gate' is not a runnable command" "$work/o1" &&
+        grep -qF "'$work/no-such-gate' is not a runnable command" "$work/o2" &&
+        grep -qF "'$work/noexec' is not a runnable command" "$work/o3" &&
+        grep -qF "exit 127 means a command could not be executed or found" "$work/o4" &&
+        grep -qF "exit 126 means a command could not be executed or found" "$work/o5" &&
+        [ "$pass" -eq 0 ] && [ "$fail" -eq 5 ]
+)
+expect green "self-test: a gate that never ran is never counted as a verdict (canary)" nv_canary
 
 # The gates' crate set (scripts/cell-crates.sh) names exclusions that must
 # exist; a fixture root carries each of them as an empty `src/` so the
@@ -1809,13 +1863,16 @@ lc_census() {
 # lc_census_is_table <root> [via-ratchet]: the census's stdout is a table
 # alone — every row five columns, the rows the root's table's — and a
 # census through the ratchet still prints when the ratchet's verdict is red,
-# which it reports on stderr.
+# which it reports on stderr. The host is pinned as rt_run pins it: the
+# planted row with no site is red only where the baseline is recorded
+# (Linux); elsewhere the ratchet discloses it as not compiled.
 lc_census_is_table() {
     local out="$work/census.out" err="$work/census.err"
     if [ "${2:-}" = via-ratchet ]; then
         lc_diag "$1"
         env INF_CHECK_ROOT="$1" INF_LINT_BASE_REF=base-tip INF_LINT_RATCHET_INPUT="$1/api.json" \
-            INF_CONTAINER_CENSUS=1 "$LS_GATE/scripts/check-lint-ratchet.sh" >"$out" 2>"$err" || return 1
+            INF_LINT_RATCHET_HOST=Linux INF_CONTAINER_CENSUS=1 "$LS_GATE/scripts/check-lint-ratchet.sh" \
+            >"$out" 2>"$err" || return 1
         grep -q 'lint-ratchet FAILED' "$err" || { echo "the ratchet's red verdict is not on stderr"; return 1; }
     else
         lc_census "$1" >"$out" 2>"$err" || return 1
@@ -2499,7 +2556,174 @@ sed -i.bak '/pub fn write/,/^    }/d' "$work/probe-missing-api/src/filesystem.rs
 expect red "lint-scopes: a config entry without a plant is red" ls_probe "$work/probe-missing-api"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unreachable-api"
 sed 's|std::fs::write|std::fs::no_such_fn|' clippy.toml >"$work/probe-unreachable-api/clippy.toml"
-expect red "lint-scopes: an unreachable config entry is red" ls_probe "$work/probe-unreachable-api"
+expect_red_because "lint-scopes: an unreachable config entry is red" \
+    'unresolved config entry: `std::fs::no_such_fn`' ls_probe "$work/probe-unreachable-api"
+# ADR-0106 D18, on whichever leg runs this: an unresolved entry under the
+# probe target's own `core::arch` module (on x86_64, ADR-0106 D7.5's inert
+# `_rdtscp` shape) or under a module no leg compiles for is red; one under
+# the other leg's module is disclosed by name; `allow-invalid` is red.
+# shellcheck source=probe-target.sh
+. "$SCRIPT_DIR/probe-target.sh"
+# probe_target's canary: under stub tools it reports rustc's `target_arch`
+# for two hosts (aarch64 for arm64e, not the triple's prefix; x86_64 under
+# `uname -m` amd64), and returns 1 for a target rustc names no arch for and
+# for a host arch `uname -m` disagrees with.
+mkdir -p "$work/pt-bin"
+IFS= read -r -d '' body <<'EOF' || true
+#!/usr/bin/env bash
+# stub rustc: the host and cfg lines probe-target.sh reads
+for a in "$@"; do
+    [ "$a" = no-such-target ] && { echo "error: could not find specification for target" >&2; exit 1; }
+done
+case " $* " in
+*" -vV "*) echo "host: $PT_HOST" ;;
+*" --print cfg "*) printf 'target_os="none"\ntarget_arch="%s"\n' "$PT_ARCH" ;;
+*) exit 1 ;;
+esac
+EOF
+printf '%s' "$body" >"$work/pt-bin/rustc"
+printf '#!/usr/bin/env bash\n[ "$1" = -m ] && echo "$PT_UNAME_M"\n' >"$work/pt-bin/uname"
+chmod +x "$work/pt-bin/rustc" "$work/pt-bin/uname"
+pt_run() ( # <uname -m> <rustc host> <its target_arch> [<CARGO_BUILD_TARGET>]
+    PATH="$work/pt-bin:$PATH" && PT_UNAME_M=$1 && PT_HOST=$2 && PT_ARCH=$3
+    export PT_UNAME_M PT_HOST PT_ARCH
+    unset CARGO_BUILD_TARGET
+    if [ -n "${4:-}" ]; then CARGO_BUILD_TARGET=$4 && export CARGO_BUILD_TARGET; fi
+    probe_target && echo "target=$PROBE_TARGET arch=$PROBE_ARCH"
+)
+expect_output "probe-target: the arch is rustc's target_arch, not the triple's prefix" \
+    "^target=arm64e-apple-darwin arch=aarch64\$" pt_run arm64 arm64e-apple-darwin aarch64
+expect_output "probe-target: an x86_64 host whose uname -m says amd64" \
+    "^target=x86_64-unknown-freebsd arch=x86_64\$" pt_run amd64 x86_64-unknown-freebsd x86_64
+expect_red_because "probe-target: a host arch uname -m disagrees with is red" \
+    "aarch64, which disagrees with uname -m (x86_64)" pt_run x86_64 arm64e-apple-darwin aarch64
+expect_red_because "probe-target: a target rustc names no arch for is red" \
+    "names no target_arch for target 'no-such-target'" pt_run arm64 arm64e-apple-darwin aarch64 no-such-target
+probe_target || { echo "selftest: the probe's target architecture is unknown" >&2; exit 2; }
+LS_ARCH=$PROBE_ARCH
+LS_OTHER=
+for ls_a in $PROBE_LEG_ARCHES; do
+    if [ "$ls_a" != "$LS_ARCH" ]; then LS_OTHER=$ls_a && break; fi
+done
+ls_arch_probe() { # <name> <entry fields>: the production config plus one entry
+    cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/$1"
+    awk -v row="    { $2 }," '{ print } $0 == "disallowed-methods = [" { print row }' clippy.toml \
+        >"$work/$1/clippy.toml"
+}
+ls_discloses() { # <probe> <pattern>: green, and the verdict names the pattern
+    local out
+    out=$(ls_probe "$1" 2>&1) || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    grep -q -- "$2" <<<"$out"
+}
+ls_arch_probe probe-arch-own "path = \"core::arch::$LS_ARCH::_no_such_intrinsic\", reason = \"plant\""
+expect_red_because "lint-scopes: an unresolved entry under the probe target's own architecture is red" \
+    "unresolved config entry: \`core::arch::$LS_ARCH::_no_such_intrinsic\`" ls_probe "$work/probe-arch-own"
+ls_arch_probe probe-arch-typo 'path = "core::arch::x86_46::_rdtsc", reason = "plant"'
+expect_red_because "lint-scopes: an entry under a module no leg compiles for is red on every leg" \
+    'unresolved config entry: `core::arch::x86_46::_rdtsc`' ls_probe "$work/probe-arch-typo"
+ls_arch_probe probe-arch-other "path = \"core::arch::$LS_OTHER::_no_such_intrinsic\", reason = \"plant\""
+expect green "lint-scopes: an entry under the other leg's architecture is disclosed, not red" \
+    ls_discloses "$work/probe-arch-other" \
+    "not resolvable on $LS_ARCH, enforced on their own architecture's leg: .*core::arch::$LS_OTHER::_no_such_intrinsic"
+ls_arch_probe probe-allow-invalid \
+    "path = \"core::arch::$LS_ARCH::_no_such_intrinsic\", reason = \"plant\", allow-invalid = true"
+expect_red_because "lint-scopes: allow-invalid, which silences an inert entry, is red" \
+    "core::arch::$LS_ARCH::_no_such_intrinsic carries allow-invalid" ls_probe "$work/probe-allow-invalid"
+# probe-target.sh defers an entry under another leg's `core::arch` to that
+# leg, so each architecture of PROBE_LEG_ARCHES needs a build-test matrix leg
+# that runs both probe gates with no `if:` or `continue-on-error:`, and no
+# knob that retargets or skips their probes — else its entries are disclosed
+# everywhere and enforced nowhere. Stdlib python, a line-and-indent parser of
+# this file's layout that fails closed (a shape it does not read is red):
+# PyYAML is not on every runner image.
+legs_cover() { # <workflow>
+    python3 - "$1" "$PROBE_LEG_ARCHES" <<'PY'
+import re, sys
+wf, legs = sys.argv[1], sys.argv[2].split()
+# GitHub-hosted labels and their architecture; an unknown label is red, so a
+# new leg names its architecture here before it counts.
+RUNNER_ARCH = {"ubuntu-24.04": "x86_64", "ubuntu-24.04-arm": "aarch64", "macos-15": "aarch64"}
+GATES = ("./scripts/check-clock-ban.sh", "./scripts/check-lint-scopes.sh")
+lines = open(wf, encoding="utf-8").read().split("\n")
+if "  build-test:" not in lines:
+    sys.exit(f"LEG-COVERAGE: {wf} has no build-test job")
+start = lines.index("  build-test:") + 1
+end = next((i for i in range(start, len(lines)) if re.match(r"  \S", lines[i])), len(lines))
+job, errors = lines[start:end], []
+# Knobs that retarget a probe gate or end it before its probe. Set in the
+# workflow's top-level env or anywhere in the job (a step can export through
+# $GITHUB_ENV), the probe gates inherit them; comments aside.
+KNOBS = re.compile(r"\b(CARGO_BUILD_TARGET|INF_LINT_RULES|INF_LINT_API_DIAGNOSTICS|INF_LINT_PROBE\w*"
+                   r"|INF_CHECK_ROOT|INF_CLOCK_BAN_PROBE)\b")
+if "jobs:" not in lines:
+    errors.append("no top-level `jobs:` line")
+for line in (lines[:lines.index("jobs:")] if "jobs:" in lines else []) + job:
+    knob = KNOBS.search(line.split("#", 1)[0])
+    if knob:
+        errors.append(f"`{knob.group(1)}` is set where the probe gates inherit it: {line.strip()}")
+if "    runs-on: ${{ matrix.os }}" not in job:
+    errors.append("build-test does not run on its matrix")
+for line in job:
+    if re.match(r"    (if|continue-on-error):", line):
+        errors.append(f"the build-test job carries `{line.strip()}`")
+    if re.match(r"\s+(include|exclude):", line):
+        errors.append("a matrix include/exclude is not read by this check")
+steps, step = [], None
+for line in job:
+    if line.startswith("      - "):
+        step = [line[8:]]
+        steps.append(step)
+    elif step is not None and line.startswith("        "):
+        step.append(line[8:])
+    else:
+        step = None
+for gate in GATES:
+    runs = [st for st in steps if f"run: {gate}" in st]
+    if not runs:
+        errors.append(f"no build-test step runs {gate}")
+    for st in runs:
+        for key in ("if", "continue-on-error"):
+            if any(row.startswith(f"{key}:") for row in st):
+                errors.append(f"the step that runs {gate} carries `{key}:`")
+oses = [m.group(1) for line in job for m in [re.fullmatch(r"        os: \[(.*)\]", line)] if m]
+if len(oses) != 1:
+    errors.append("build-test's matrix has no single `os: [...]` list")
+arches = set()
+for label in [x.strip() for x in oses[0].split(",")] if oses else []:
+    if label in RUNNER_ARCH:
+        arches.add(RUNNER_ARCH[label])
+    else:
+        errors.append(f"runner {label} has no architecture in this check")
+for arch in legs:
+    if arch not in arches:
+        errors.append(f"no build-test leg compiles for {arch}, the leg its core::arch entries are deferred to")
+for e in errors:
+    print(f"LEG-COVERAGE: {e}")
+sys.exit(1 if errors else 0)
+PY
+}
+LS_WF=.github/workflows/infinity-ci.yml
+expect green "probe-target: each leg architecture has a build-test leg running both probe gates" \
+    legs_cover "$LS_WF"
+sed 's/^        os: \[ubuntu-24.04, /        os: [/' "$LS_WF" >"$work/wf-no-x86.yml"
+expect_red_because "probe-target: a matrix without its x86_64 leg is red" \
+    "no build-test leg compiles for x86_64" legs_cover "$work/wf-no-x86.yml"
+awk -v row="        if: runner.os == 'Linux'" \
+    '{ print } $0 == "        run: ./scripts/check-lint-scopes.sh" { print row }' "$LS_WF" >"$work/wf-gated.yml"
+expect_red_because "probe-target: a probe gate's step under an if: is red" \
+    'the step that runs ./scripts/check-lint-scopes.sh carries `if:`' legs_cover "$work/wf-gated.yml"
+sed 's/^\(        os: \[.*\)\]$/\1, windows-2025]/' "$LS_WF" >"$work/wf-unknown.yml"
+expect_red_because "probe-target: a runner label with no known architecture is red" \
+    "runner windows-2025 has no architecture" legs_cover "$work/wf-unknown.yml"
+awk -v a="    env:" -v b="      CARGO_BUILD_TARGET: aarch64-unknown-linux-gnu" \
+    '{ print } $0 == "    runs-on: ${{ matrix.os }}" { print a; print b }' "$LS_WF" >"$work/wf-retarget.yml"
+expect_red_because "probe-target: a job env that retargets the probes is red" \
+    "\`CARGO_BUILD_TARGET\` is set where the probe gates inherit it" legs_cover "$work/wf-retarget.yml"
+awk -v a="        env:" -v b='          INF_LINT_RULES: "1"' \
+    '{ print } $0 == "        run: ./scripts/check-lint-scopes.sh" { print a; print b }' "$LS_WF" >"$work/wf-rules.yml"
+expect_red_because "probe-target: a step env that ends lint-scopes before its probe is red" \
+    "\`INF_LINT_RULES\` is set where the probe gates inherit it" legs_cover "$work/wf-rules.yml"
 
 # ADR-0144 A1: keep the unstable refusal distinct from Clippy witnesses.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-unstable-stable"

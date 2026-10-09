@@ -19,22 +19,20 @@
 #      with its path, no CONTROL line may be, the ALLOWED shape must not.
 # Portable bash 3.2. Step 4 runs cargo; a fixture root (INF_CHECK_ROOT)
 # may set INF_CLOCK_BAN_PROBE=off and the scope line says so.
-# The two TSC spellings exist only on x86_64 (ADR-0106 D18): on another
-# architecture (INF_CLOCK_BAN_ARCH, default `uname -m`) clippy cannot
-# resolve them and the probe's `cfg(x86_64)` plants are not compiled —
-# both are disclosed on the scope line, never counted as failures, and
-# the x86_64 legs remain authoritative for those two entries.
+# The two TSC spellings exist only on x86_64 (ADR-0106 D18): when the
+# probe compiles for another architecture (probe-target.sh: the target
+# CARGO_BUILD_TARGET names, else the host) clippy cannot resolve them and
+# the probe's `cfg(x86_64)` plants are not compiled — both are disclosed on
+# the scope line, never counted as failures, and the x86_64 leg remains
+# authoritative for those two entries.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 # shellcheck source=cell-crates.sh
 . "$SCRIPT_DIR/cell-crates.sh"
+# shellcheck source=probe-target.sh
+. "$SCRIPT_DIR/probe-target.sh"
 PROBE_SRC="$SCRIPT_DIR/clock-ban-probe"
-ARCH="${INF_CLOCK_BAN_ARCH:-$(uname -m)}"
-TSC="core::arch::x86_64::_rdtsc core::arch::x86_64::__rdtscp"
-tsc_here=1
-case "$ARCH" in x86_64|amd64) ;; *) tsc_here=0 ;; esac
-is_tsc() { case " $TSC " in *" $1 "*) return 0 ;; esac; return 1; }
 
 fail=0
 # ---- 1. the config ------------------------------------------------------
@@ -68,8 +66,9 @@ done
 # together. Do not add a second reason scan here.
 dirs=$(cell_crate_dirs)
 files=0
+# `find`, as every sibling gate: the CI runners ship no ripgrep.
 while IFS= read -r dir; do
-    n=$(rg --files "$dir" -g '*.rs' | wc -l)
+    n=$(find "$dir" -name '*.rs' | wc -l)
     files=$((files + n))
 done <<< "$dirs"
 if [ "$files" -eq 0 ]; then
@@ -94,16 +93,23 @@ else
     # The workspace config must be the one found: no CLIPPY_CONF_DIR, and
     # the copy sits under this root so the walk-up reaches ./clippy.toml.
     diag="$work/diag"
-    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
+    probe_target || { echo "CLOCK-BAN SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
+    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --target "$PROBE_TARGET" --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
     plants=0
     controls=0
-    tsc_skipped=0
+    foreign_plants=0
+    foreign_entries=0
     # expected: line -> path, from the source markers
     while IFS=$'\t' read -r line kind path; do
         case "$kind" in
             PLANT|PLANT-TYPE)
-                if [ "$tsc_here" -eq 0 ] && is_tsc "$path"; then
-                    tsc_skipped=$((tsc_skipped + 1))
+                if probe_foreign "$path"; then
+                    # Deferred to its own leg only if it really did not compile here.
+                    foreign_plants=$((foreign_plants + 1))
+                    if grep -q "src/lib.rs:$line:" "$diag"; then
+                        echo "CLOCK-BAN violation: probe line $line ($path) was skipped as another leg's, yet compiled for $PROBE_ARCH"
+                        fail=1
+                    fi
                     continue
                 fi
                 plants=$((plants + 1))
@@ -123,8 +129,10 @@ else
         /\/\/ PLANT /      { sub(/^.*\/\/ PLANT /, "");      print NR "\tPLANT\t" $1; next }
         /\/\/ CONTROL$/    { print NR "\tCONTROL\t-"; next }
         /\/\/ ALLOWED$/    { print NR "\tALLOWED\t-"; next }' "$work/probe/src/lib.rs")
-    if [ "$plants" -lt 10 ]; then
-        echo "CLOCK-BAN SCOPE ERROR: probe carries $plants planted lines (expected ≥ 10) — the fixture was edited down"
+    # Exact, so an edited-down fixture is red; a plant added to the probe
+    # changes this number with it.
+    if [ "$((plants + foreign_plants))" -ne 12 ]; then
+        echo "CLOCK-BAN SCOPE ERROR: probe carries $((plants + foreign_plants)) planted lines, expected exactly 12"
         fail=1
     fi
     # An entry that names no reachable item bans nothing: clippy only
@@ -134,7 +142,8 @@ else
     while IFS= read -r row; do
         entry=${row#\`}
         entry=${entry%%\`*}
-        if [ "$tsc_here" -eq 0 ] && is_tsc "$entry"; then
+        if probe_foreign "$entry"; then
+            foreign_entries=$((foreign_entries + 1))
             continue
         fi
         echo "CLOCK-BAN violation: clippy.toml entry does not resolve — $row"
@@ -146,8 +155,8 @@ else
         fail=1
     fi
     probe="$plants planted bypasses red, $controls controls green"
-    if [ "$tsc_here" -eq 0 ]; then
-        probe="$probe; $tsc_skipped TSC plants and 2 TSC entries not resolvable on $ARCH (enforced on x86_64)"
+    if [ "$foreign_plants" -ne 0 ] || [ "$foreign_entries" -ne 0 ]; then
+        probe="$probe; $foreign_plants plants and $foreign_entries entries under another leg's core::arch not resolvable on $PROBE_ARCH (enforced on their own leg)"
     fi
 fi
 

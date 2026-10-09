@@ -1,11 +1,15 @@
 """Judge exact lint/code/path witnesses in the compiler probe (ADR-0144).
 
 usage: judge.py <probe lib.rs> <clippy JSON> <clippy.toml> <rustc JSON> <rustc exit>
+                <target arch> <foreign entries, space-separated>
 
 Every plant must report its own lint and, for disallowed APIs, its resolved
 path. Unrelated errors, unmarked diagnostics and missing config plants fail.
 A plant marked `xN` must draw exactly N distinct spans (columns) on its line:
 the container census counts spans, so two containers on one line are two.
+A config entry that resolves to nothing is red, except one the caller names
+as foreign (scripts/probe-target.sh: under another CI leg's `core::arch`
+module), which is disclosed (ADR-0106 D18).
 """
 import json
 from pathlib import Path
@@ -16,6 +20,10 @@ import tomllib
 src, diag = Path(sys.argv[1]), Path(sys.argv[2])
 config, unstable_diag = Path(sys.argv[3]), Path(sys.argv[4])
 unstable_exit = int(sys.argv[5])
+# ADR-0106 D18: the probe's target architecture, and the unresolved entries
+# probe-target.sh defers to their own leg; the rule has that one owner.
+ARCH, FOREIGN = sys.argv[6], set(sys.argv[7].split())
+foreign = set()
 # This is an exact census, not a fallback for missing Clippy witnesses.
 UNSTABLE = {"std::fs::set_times": ("set_times.rs", "fs_set_times")}
 plants, controls, errors, spans_wanted = {}, set(), [], {}
@@ -42,6 +50,14 @@ def container(path):
 
 
 cfg = tomllib.loads(config.read_text())
+# Clippy's help for an unresolved entry is `allow-invalid = true`, which
+# silences it on every architecture: an inert entry would stay green
+# (ADR-0106 D7.5).
+for key in ("disallowed-methods", "disallowed-types"):
+    for row in cfg.get(key, []):
+        if isinstance(row, dict) and "allow-invalid" in row:
+            errors.append(f"{key} entry {row.get('path')} carries allow-invalid, "
+                          "which hides an entry that resolves to nothing")
 # (config key, lint, family, its name, the exact count): every entry needs a
 # plant naming its path and every plant an entry (ADR-0144 D5, ADR-0163 D2).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
@@ -76,7 +92,11 @@ for raw in diag.read_text().splitlines():
     code = (d.get("code") or {}).get("code")
     text = d["message"]
     if "does not refer to a reachable" in text:
-        errors.append(f"unresolved config entry: {text}")
+        entry = re.match(r"`([^`]+)`", text)
+        if entry and entry.group(1) in FOREIGN:
+            foreign.add(entry.group(1))
+        else:
+            errors.append(f"unresolved config entry: {text}")
     if code is None:
         if d["level"] == "error" and not text.startswith(("aborting due to", "could not compile")):
             errors.append(f"unrelated compiler error: {text}")
@@ -173,12 +193,16 @@ for raw in unstable_diag.read_text().splitlines():
     unstable_seen.add(at)
 if unstable_exit != 1 or len(unstable_seen) != len(UNSTABLE):
     errors.append(f"unstable probe: exit {unstable_exit}, {len(unstable_seen)}/1 exact refusals")
+disclosed = (f"; {len(foreign)} config entries not resolvable on {ARCH}, enforced on their own "
+             f"architecture's leg: {', '.join(sorted(foreign))}" if foreign else "")
 if errors:
     for error in errors:
         print(f"LINT-SCOPES violation: {error}")
+    if disclosed:
+        print(f"lint-scopes probe: {disclosed[2:]}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
       f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types and "
-      "three containers covered")
+      f"three containers covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")
