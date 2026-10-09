@@ -282,8 +282,9 @@ capacity for every small value.
   production `match` names every variant of its enum: a wildcard arm
   silently accepts a new state or error variant, so
   `clippy::wildcard_enum_match_arm` and
-  `clippy::match_wildcard_for_single_variants` are denied at every crate
-  root (ADR-0144 D1; `scripts/check-lint-scopes.sh`). The two reasoned
+  `clippy::match_wildcard_for_single_variants` are denied at every
+  `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root under `crates/` and
+  `bins/` (ADR-0144 D1; `scripts/check-lint-scopes.sh`). The two reasoned
   exceptions are a foreign `#[non_exhaustive]` enum (`foreign:` — say
   what the rest means) and the frozen `CommandId` list that ADR-0143's
   table deletes.
@@ -447,7 +448,8 @@ force multiplier for DST and fuzzing.
 ### Unsafe Rust
 
 Safe Rust is the default; `#![forbid(unsafe_code)]` at every library and
-binary crate root except the audited leaf crates (`inf-simd`, `inf-alloc`,
+binary root of the workspace's packages (`src/lib.rs`, `src/main.rs`,
+`src/bin/*.rs`) except the audited leaf crates (`inf-simd`, `inf-alloc`,
 `inf-fabric`, `inf-runtime`'s `affinity`, `cold`, `driver`, `executor`,
 `net`, `kqueue`, `uring` and `signal` modules) and the module-scoped regions
 `inf_doc::emit`, `inf_server::log_bytes`, `inf_probe::evict`,
@@ -455,13 +457,15 @@ binary crate root except the audited leaf crates (`inf-simd`, `inf-alloc`,
 `deny(unsafe_code)` at its root with `#[allow(unsafe_code)]` on exactly
 the audited `mod` items, or one whole-file inner allow; never on a
 function or block). The posture is mechanical: `check-unsafe-roots.sh`
-refuses a crate root with no attribute, a `deny` root outside the
-audited leaf set, a listed leaf that went `forbid`, and any allow written
-exactly `allow(unsafe_code)` that is not module-scoped. It does not read
-an allow in another spelling (a reasoned
+reads those roots and refuses one with no attribute, a `deny` root
+outside the audited leaf set, a listed leaf that went `forbid`, and any
+allow written exactly `allow(unsafe_code)` that is not module-scoped. It
+does not read an allow in another spelling (a reasoned
 `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
-allow). A new unsafe block outside an allowed item is a compile error in
-every build.
+allow). In the crates those roots build, a new unsafe block outside an
+allowed item is a compile error in every profile. Build scripts, fuzz
+targets, integration tests and benchmarks are crate roots of their own,
+which the gate does not read, and some tests and benchmarks use `unsafe`.
 Every unsafe block has a concrete `// SAFETY:` argument, an
 entry in the crate's `SAFETY.md` inventory (script-checked), Miri/Loom
 coverage where applicable, and a reviewer who read the argument, not just
@@ -497,7 +501,8 @@ fault-point and fsync-fail-stop greps, the attribution-divergence gate,
 `check-shipping-features.sh` (no test/DST feature on a normal dependency
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
 release-assert inventory — ADR-0107 D2), `check-unsafe-roots.sh` (every
-crate root governs `unsafe_code`, the deny set is the leaf list,
+`src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of the workspace
+governs `unsafe_code`, the deny set is the leaf list,
 allows written `allow(unsafe_code)` are module-scoped — ADR-0121) —
 are not bureaucracy; they are laws made cheap. Never weaken a check to
 merge; change the law first (ADR) or fix the code. A shell gate is the

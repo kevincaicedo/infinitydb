@@ -1385,10 +1385,12 @@ backend capabilities and listening port.
 
 ## Safety
 
-**Unsafe code.** Library and binary crates default to
-`#![forbid(unsafe_code)]`; integration tests and benchmarks are crate roots
-of their own, and some use `unsafe`. The exceptions
-keep `#![deny(unsafe_code)]` at the crate root and allow it only in named
+**Unsafe code.** The library and binary roots of the workspace's packages
+(`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`) default to
+`#![forbid(unsafe_code)]`; build scripts, fuzz targets, integration tests
+and benchmarks are crate roots of their own, and some tests and benchmarks
+use `unsafe`. The exceptions keep `#![deny(unsafe_code)]` at the crate
+root and allow it only in named
 modules, each listed with its safety argument in the crate's `SAFETY.md`:
 `inf-runtime` (the io_uring and kqueue backends; the driver, whose stable
 byte views hand log, checkpoint, tier and cold-read buffers to the kernel
@@ -1397,7 +1399,7 @@ signals; sockets; the cold-read buffers), `inf-fabric` (the ring only),
 `inf-alloc` (arena, region, aligned buffers), `inf-simd` (CRC32C,
 CRLF search, group probes, JSON classification, UTF-8), one module each in
 `inf-doc` (tape emit), `inf-server` (log byte views) and `inf-probe`, and
-two in the simulator. A script refuses a crate root without the attribute
+two in the simulator. A script refuses such a root without the attribute
 and any allow written exactly `allow(unsafe_code)` that is not on a whole
 module; it does not read an allow in another spelling (a reasoned
 `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped

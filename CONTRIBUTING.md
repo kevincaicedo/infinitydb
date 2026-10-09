@@ -246,14 +246,16 @@ mechanically; the rest is enforced in review via the
 
 ## Unsafe code
 
-`unsafe` is allowed only in the four audited leaf crates (`inf-simd`,
-`inf-alloc`, `inf-fabric`, `inf-runtime`'s `affinity`, `cold`, `driver`,
-`executor`, `net`, `kqueue`, `uring` and `signal` modules) and in a few
-named, module-scoped regions listed in
+In the crates built from the workspace's `src/lib.rs`, `src/main.rs` and
+`src/bin/*.rs` roots, `unsafe` is allowed only in the four audited leaf
+crates (`inf-simd`, `inf-alloc`, `inf-fabric`, `inf-runtime`'s
+`affinity`, `cold`, `driver`, `executor`, `net`, `kqueue`, `uring` and
+`signal` modules) and in a few named, module-scoped regions listed in
 [InfinityStyle § Unsafe Rust](docs/INFINITY_STYLE.md#unsafe-rust); every
-other library and binary crate root forbids it, and
-`scripts/check-unsafe-roots.sh` enforces the list. If you add or change
-unsafe code:
+other such root forbids it, and `scripts/check-unsafe-roots.sh` enforces
+the list. Build scripts, fuzz targets, integration tests and benchmarks
+are crate roots of their own, which the gate does not read, and some
+tests and benchmarks use `unsafe`. If you add or change unsafe code:
 
 - Add a `// SAFETY:` comment on every `unsafe` block explaining the invariant
   (the `undocumented_unsafe_blocks` clippy lint is denied).

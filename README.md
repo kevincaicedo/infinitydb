@@ -227,9 +227,10 @@ website/           project website
 
 Crate dependencies are checked against [docs/dep-dag.toml](docs/dep-dag.toml)
 in CI. In shipped source, `unsafe` code is confined to a few audited crates
-and modules, each documented in a `SAFETY.md`, and every other library and
-binary crate root forbids it; integration tests and benchmarks are crate
-roots of their own, and some use it.
+and modules, each documented in a `SAFETY.md`, and every other
+`src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of the workspace
+forbids it; build scripts, fuzz targets, integration tests and benchmarks
+are crate roots of their own, and some tests and benchmarks use it.
 
 ## Contributing
 

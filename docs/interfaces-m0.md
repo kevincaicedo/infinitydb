@@ -6,13 +6,16 @@ Implementations may add private detail and additional inherent methods, but
 the shapes below are the contract that `inf-server`, `inf-sim`, and `inf-bench`
 are built against.
 
-Conventions: edition 2024, `#![forbid(unsafe_code)]` at every library and
-binary crate root except eight, which `deny` it and allow it in named
-modules: the leaf crates `inf-simd`, `inf-alloc`, `inf-fabric` (ring
-internals) and `inf-runtime` (the uring/kqueue backends and its
-`affinity`, `cold`, `driver`, `executor`, `net` and `signal` modules),
-and the module-scoped regions of `inf-doc`, `inf-server`, `inf-probe` and
-`inf-sim`. No `dyn` on hot paths; generics stay monomorphized.
+Conventions: edition 2024, `#![forbid(unsafe_code)]` at every
+`src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of the workspace's
+packages except eight, which `deny` it and allow it in named modules: the
+leaf crates `inf-simd`, `inf-alloc`, `inf-fabric` (ring internals) and
+`inf-runtime` (the uring/kqueue backends and its `affinity`, `cold`,
+`driver`, `executor`, `net` and `signal` modules), and the module-scoped
+regions of `inf-doc`, `inf-server`, `inf-probe` and `inf-sim`; build
+scripts, fuzz targets, integration tests and benchmarks are crate roots of
+their own, which carry neither. No `dyn` on hot paths; generics stay
+monomorphized.
 Time and randomness are always injected (`inf_foundation::time`, L7).
 
 ---
