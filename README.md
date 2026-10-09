@@ -127,9 +127,9 @@ Docker's default seccomp profile blocks `io_uring`; the bundled one allows it
 - **Correctness you can replay.** Deterministic simulation with torn and
   reordered writes, lost unsynced data and power cuts; planted-bug canaries
   (including an fsync that lies) turn the oracles they target red, and not
-  every oracle has one; a
-  crash matrix, fuzzed decoders, Loom on the inter-cell ring, Miri on the
-  allocator and fabric, and byte-for-byte diffs against Redis.
+  every oracle has one; a crash matrix, fuzzed decoders, Loom on the
+  inter-cell ring, Miri on the allocator and fabric, and byte-for-byte diffs
+  against Redis.
 - **Honest compatibility.** Redis compatibility is declared per command in a
   generated matrix that lists the deviations recorded for each command, and
   no performance number is published without a reproducible measurement.

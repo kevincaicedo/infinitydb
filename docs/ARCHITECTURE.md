@@ -363,14 +363,14 @@ Redis Stack, Dragonfly and InfinityDB on one machine.
 ### Why Rust
 
 The data plane has latency goals at high percentiles, so no garbage
-collector. It needs precise control over layout and allocation, and
-zero-cost abstraction over the injected effects. Beyond that, the type system
-carries a lot of the design: `!Send` futures say "this never leaves its core"
-in the signature, lifetimes catch what may not be held across a suspension,
-and newtypes and enums make invalid states hard to write. In shipped
-source, `unsafe` is confined to a few audited modules (see
-[Safety](#safety)); integration tests and benchmarks are crate roots of
-their own, and some use it.
+collector. It needs precise control over layout and allocation, and zero-cost
+abstraction over the injected effects. Beyond that, the type system carries a
+lot of the design: `!Send` futures say "this never leaves its core" in the
+signature, lifetimes catch what may not be held across a suspension, and
+newtypes and enums make invalid states hard to write. In shipped source,
+`unsafe` is confined to a few audited modules (see [Safety](#safety));
+integration tests and benchmarks are crate roots of their own, and some use
+it.
 
 ## Inside a cell
 
@@ -475,14 +475,14 @@ A received buffer is parsed in place while the connection's accumulator is
 empty, and a request that lies entirely inside it is parsed with no copy. A
 request that spans buffers is copied into the accumulator, and while the
 accumulator holds bytes each later buffer is appended to it whole and parsed
-from there. A small local command (at most 16 arguments
-and 512 bytes of arguments) is then copied once, flat, into the cell's stage
-buffer so it can run in a prefetched batch (step 4 of the walkthrough
-below); a larger one runs inline from the parsed slices. A command handed to
-the connection's pump is copied into an owned command that the pump keeps
-while it waits. Replies are written into the connection's output buffer
-and, at RESPOND, copied into one pool buffer and sent. A connection has at
-most one send in flight, so a large reply drains over several iterations.
+from there. A small local command (at most 16 arguments and 512 bytes of
+arguments) is then copied once, flat, into the cell's stage buffer so it can
+run in a prefetched batch (step 4 of the walkthrough below); a larger one
+runs inline from the parsed slices. A command handed to the connection's pump
+is copied into an owned command that the pump keeps while it waits. Replies
+are written into the connection's output buffer and, at RESPOND, copied into
+one pool buffer and sent. A connection has at most one send in flight, so a
+large reply drains over several iterations.
 
 ## The life of a request
 
@@ -648,12 +648,12 @@ lending iterator: a parsed request borrows from the buffer and cannot outlive
 the parse step. Integer lengths are parsed with SWAR (several digits per
 machine word) and CRLF is checked where the length says it must be; a CRLF
 search (`inf_simd::find_crlf`, a scalar byte loop) is used only for inline
-commands. Limits are enforced from the
-length line, before any bytes are buffered: a bulk string may be up to
-`proto-max-bulk-len` (16 MiB by default), a whole request up to that plus
-64 KiB, and a request may have at most 1,024 arguments. A protocol error gets
-`-ERR Protocol error: ...` and the connection is closed. `HELLO` switches a
-connection between RESP2 and RESP3.
+commands. Limits are enforced from the length line, before any bytes are
+buffered: a bulk string may be up to `proto-max-bulk-len` (16 MiB by
+default), a whole request up to that plus 64 KiB, and a request may have at
+most 1,024 arguments. A protocol error gets `-ERR Protocol error: ...` and
+the connection is closed. `HELLO` switches a connection between RESP2 and
+RESP3.
 
 **The command table.** The whole wire surface is one static table of 91
 rows. Each row carries the command's name, arity, flags (`READONLY`,
@@ -772,10 +772,9 @@ the right expiry times.
 state. Before a write the path tests a cached "over limit" flag; after every
 write the cell refreshes it: the node-wide half is a no-op without a limit,
 and the per-namespace half walks every named store and folds the memory of
-each one that has a budget. When
-over the limit, a write may evict up to 512 keys inline and then answers with
-Redis's out-of-memory error; MAINTAIN then evicts down to a lower target
-(`limit − limit/16`) in budgeted slices.
+each one that has a budget. When over the limit, a write may evict up to 512
+keys inline and then answers with Redis's out-of-memory error; MAINTAIN then
+evicts down to a lower target (`limit − limit/16`) in budgeted slices.
 
 All eight Redis policies are supported. Recency uses CLOCK, with a 2-bit
 reference counter in the record header: a lookup saturates it to 3, a write
@@ -1000,12 +999,11 @@ The next checkpoint starts once the log has grown to about twice the size of
 the last checkpoint (with a floor), capped by the log bytes and the records
 that the replay rates fit into a fixed recovery-time budget. The caps price a
 record by its bytes, not by its replay work, and a delta to a large JSON
-document replays at the cost of the whole document, so replay can take
-longer than the budget. Checkpoint writes are paced by the
-device budget, or at a fixed rate when there is no device model. An
-I/O error during a checkpoint abandons that checkpoint, not the process: the
-previous checkpoint and the log are still valid. `INF.CKPT [CELL k] [WAIT]`
-and `BGSAVE` request one.
+document replays at the cost of the whole document, so replay can take longer
+than the budget. Checkpoint writes are paced by the device budget, or at a
+fixed rate when there is no device model. An I/O error during a checkpoint
+abandons that checkpoint, not the process: the previous checkpoint and the
+log are still valid. `INF.CKPT [CELL k] [WAIT]` and `BGSAVE` request one.
 
 ### MANIFEST and truncation
 
@@ -1387,27 +1385,25 @@ backend capabilities and listening port.
 
 **Unsafe code.** The library and binary roots of the workspace's packages
 (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`) default to
-`#![forbid(unsafe_code)]`; build scripts, fuzz targets, integration tests
-and benchmarks are crate roots of their own, and some tests and benchmarks
-use `unsafe`. The exceptions keep `#![deny(unsafe_code)]` at the crate
-root and allow it only in named
-modules, each listed with its safety argument in the crate's `SAFETY.md`:
-`inf-runtime` (the io_uring and kqueue backends; the driver, whose stable
-byte views hand log, checkpoint, tier and cold-read buffers to the kernel
-beyond the borrow that made them; the executor and its wakers; thread affinity;
-signals; sockets; the cold-read buffers), `inf-fabric` (the ring only),
-`inf-alloc` (arena, region, aligned buffers), `inf-simd` (CRC32C,
-CRLF search, group probes, JSON classification, UTF-8), one module each in
-`inf-doc` (tape emit), `inf-server` (log byte views) and `inf-probe`, and
-two in the simulator. A script refuses such a root without the attribute
-and any allow written exactly `allow(unsafe_code)` that is not on a whole
-module; it does not read an allow in another spelling (a reasoned
+`#![forbid(unsafe_code)]`; build scripts, fuzz targets, integration tests and
+benchmarks are crate roots of their own, and some tests and benchmarks use
+`unsafe`. The exceptions keep `#![deny(unsafe_code)]` at the crate root and
+allow it only in named modules, each listed with its safety argument in the
+crate's `SAFETY.md`: `inf-runtime` (the io_uring and kqueue backends; the
+driver, whose stable byte views hand log, checkpoint, tier and cold-read
+buffers to the kernel beyond the borrow that made them; the executor and its
+wakers; thread affinity; signals; sockets; the cold-read buffers),
+`inf-fabric` (the ring only), `inf-alloc` (arena, region, aligned buffers),
+`inf-simd` (CRC32C, CRLF search, group probes, JSON classification, UTF-8),
+one module each in `inf-doc` (tape emit), `inf-server` (log byte views) and
+`inf-probe`, and two in the simulator. A script refuses such a root without
+the attribute and any allow written exactly `allow(unsafe_code)` that is not
+on a whole module; it does not read an allow in another spelling (a reasoned
 `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
-allow). The ring is checked with
-Loom; the allocator and fabric with Miri. The executor's wakers are
-deliberately not thread-safe: they use no atomics (a CI check inspects the
-waker path for atomic instructions), and command futures are `!Send`, which
-keeps them on their cell's thread.
+allow). The ring is checked with Loom; the allocator and fabric with Miri.
+The executor's wakers are deliberately not thread-safe: they use no atomics
+(a CI check inspects the waker path for atomic instructions), and command
+futures are `!Send`, which keeps them on their cell's thread.
 
 **Untrusted bytes.** Client requests, fabric messages and every on-disk
 format (log frames, segments, checkpoints, MANIFEST, catalog, tier files,
