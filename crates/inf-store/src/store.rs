@@ -1239,8 +1239,8 @@ impl CellStore {
 
     /// `INCR`/`DECR`/`INCRBY`/`DECRBY` (delta may be negative).
     pub fn incr_by(&mut self, key: &[u8], delta: i64, now: Nanos) -> Result<i64, OpError> {
-        // Typed refusal before the record writer's panic bound (review of
-        // 2026-08-30, C3: a 256-byte key here was a node-wide fail-stop).
+        // Typed refusal before the record writer's panic bound: a 256-byte
+        // key here is a client error, never a node-wide fail-stop.
         check_bounds(key, &[])?;
         let existing = self.resolve(key, now);
         let (current, version, expire_at_ms) = match existing {

@@ -19,9 +19,9 @@ pub fn encode_command(argv: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// The deepest reply nesting the framer accepts (F-L18-07, review of
-/// 2026-08-30): the framer is iterative with an explicit stack and this
-/// explicit depth limit; past it the reply is treated as malformed.
+/// The deepest reply nesting the framer accepts: the framer is iterative
+/// with an explicit stack and this explicit depth limit; past it the reply
+/// is treated as malformed.
 pub const MAX_DEPTH: usize = 32;
 
 /// `Some(n)` when `buf[..n]` is one complete reply; `None` = need more bytes.

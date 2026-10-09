@@ -41,8 +41,8 @@ inf-foundation = { workspace = true, features = ["fault-points", "collision-orac
 # Thread-local allocation counter: the ADR-0139 D10 control that
 # attributes the commit-half's remaining allocations to `path::eval`.
 inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
-# The collision-key builders are behind this crate's own feature (batch
-# 47); the store suite reaches them through the self dev-edge.
+# The collision-key builders are behind this crate's own feature; the
+# store suite reaches them through the self dev-edge.
 inf-store = { path = ".", default-features = false, features = ["collision-oracle", "test-support"] }
 
 [[bench]]

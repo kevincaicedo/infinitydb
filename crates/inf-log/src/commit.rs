@@ -89,8 +89,8 @@
 //! behind an earlier one still in flight stays in the queue until the
 //! prefix reaches it — and its released buffer lets the next frame in.
 //! One wedged plain write at the front with barrier-less frames landing
-//! behind it would therefore grow the queue without bound (the review of
-//! `2cb6074`: memory, a linear completion search, eventually the cell).
+//! behind it would therefore grow the queue without bound (its memory, a
+//! linear completion search, eventually the cell).
 //! The queue is bounded at [`REORDER_WINDOW_FRAMES`] by construction:
 //! [`GroupCommit::frame_plan`] answers `Wait` while the window is full,
 //! so the next frame holds until the front lands (≤ one write latency —

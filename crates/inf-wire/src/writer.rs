@@ -415,11 +415,10 @@ fn utoa(mut magnitude: u64, negative: bool, buf: &mut [u8; 20]) -> &[u8] {
 /// by 307 zeros and 17 digits (a negative near `f64::MIN_POSITIVE`:
 /// `-1.1125369292536007e-308` is 327 bytes); `inf`/`NaN` are short. The
 /// bound is enumerated by `f64_display_never_exceeds_fmtbuf` over every
-/// binary exponent and its neighbours. Before batch 12 of the 2026-08-30
-/// review the buffer was 40 bytes and a RESP3 `JSON.NUMINCRBY` reply of
-/// `1e300` (301 digits) killed the cell — Theme 4's shape: a release
-/// `expect("f64 display fits 40 bytes")` justified by a claim about the
-/// caller that client-supplied numbers falsified.
+/// binary exponent and its neighbours. A buffer below this bound kills the
+/// cell: a RESP3 `JSON.NUMINCRBY` reply of `1e300` is 301 digits, so a
+/// release `expect` that the display fits would be a claim about the
+/// caller that client-supplied numbers falsify.
 pub(crate) const F64_DISPLAY_MAX: usize = 336;
 
 /// `fmt::Write` sink for double formatting: a stack buffer sized to the

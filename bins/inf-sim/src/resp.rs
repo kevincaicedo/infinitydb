@@ -1,10 +1,10 @@
 //! Minimal RESP reply framing for the sim clients: find where one reply
 //! ends. Handles RESP2 + the RESP3 types the M0 surface emits.
 
-/// The deepest reply nesting the sim accepts (F-L18-07, review of
-/// 2026-08-30): the framer is iterative with an explicit stack and this
-/// explicit depth limit; past it the reply is a finding (a panic naming
-/// it), never a stack overflow that aborts the sweep without its seed.
+/// The deepest reply nesting the sim accepts: the framer is iterative with
+/// an explicit stack and this explicit depth limit; past it the reply is a
+/// finding (a panic naming it), never a stack overflow that aborts the
+/// sweep without its seed.
 pub const MAX_DEPTH: usize = 32;
 
 /// Why bytes could not be framed as one RESP reply — the server under

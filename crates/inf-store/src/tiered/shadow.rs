@@ -23,14 +23,13 @@
 //! exactly for a same-64-bit-hash pair of one RAM slot and one cold
 //! slot, so it is rebuilt from the finished index at recovery-complete
 //! ([`TieredTable::rebuild_shadow_tickets`]) and lost tickets lose
-//! nothing. The rebuild is a **resumable cursor** (A4′, review of
-//! 2026-08-28): one 16-slot probe group per step, one settle slot handed
-//! to the caller at a time, no list of anything — its memory is the
-//! group's scratch plus the ticket maps, which never exceed the cap
-//! (`register_shadow` asserts it in release). Every bound is a named
-//! constant with a counter (D7 as amended by A6), and every exhaustion
-//! turns the eligible write back into the synchronous verify — slower,
-//! never less correct.
+//! nothing. The rebuild is a **resumable cursor**: one 16-slot probe
+//! group per step, one settle slot handed to the caller at a time, no
+//! list of anything — its memory is the group's scratch plus the ticket
+//! maps, which never exceed the cap (`register_shadow` asserts it in
+//! release). Every bound is a named constant with a counter (D7 as
+//! amended by A6), and every exhaustion turns the eligible write back into
+//! the synchronous verify — slower, never less correct.
 //!
 //! Invariants this module enforces mechanically (ADR-0093 §Invariants):
 //! a winner is RAM-resident for the ticket's life (the record pin on

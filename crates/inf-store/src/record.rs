@@ -292,9 +292,8 @@ pub(crate) fn bump_version_in_place(bytes: &mut [u8]) {
 /// covers the fixed header, the TTL extension when present, and the whole
 /// key; `None` when it is too short. The key always ends within
 /// `HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN` = 268 bytes of the record's
-/// start, so a cold-read first window always holds it (review of
-/// 2026-08-30, C2: `SCAN`'s cold key resolution must not require the
-/// value's bytes to name a key).
+/// start, so a cold-read first window always holds it: `SCAN`'s cold key
+/// resolution must not require the value's bytes to name a key.
 #[inline]
 pub(crate) fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.len() < HEADER_LEN {

@@ -783,8 +783,8 @@ fn statvfs_confirms_blob_reclaim_returns_disk_to_the_os() {
     assert!(peak_blob_bytes > 0, "the run held real extent bytes at its peak");
     // statvfs: the blocks came back to the OS. Generous slack absorbs
     // unrelated churn on a shared box; the direction is what the AC
-    // names — space returns, not merely accounting (the false pass the
-    // plan's pitfall row warns about).
+    // names — space returns, not merely accounting (a counter alone could
+    // pass while the blocks stay allocated).
     let residual = blob_dir_bytes(&shard);
     let avail_end = avail_bytes(&root);
     let slack = 16u64 << 20;

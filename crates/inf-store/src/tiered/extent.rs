@@ -219,9 +219,9 @@ impl TieredTable {
         self.extents.note_rmw();
     }
 
-    /// Counts one typed cold-read failure served to a client (review of
-    /// 2026-08-30, C2′): the plane's resolve funnel and SCAN's key
-    /// fetch report here — the `note_blob_bytes` seam shape.
+    /// Counts one typed cold-read failure served to a client: the plane's
+    /// resolve funnel and SCAN's key fetch report here — the
+    /// `note_blob_bytes` seam shape.
     #[inline]
     pub fn note_cold_read_error(&mut self) {
         self.space.note_cold_read_error();

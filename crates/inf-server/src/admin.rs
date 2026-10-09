@@ -317,12 +317,11 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
     // count (M4-S27, ADR-0068 D2) — pushed before the pressure config so
     // the flag recompute inside `set_pressure` sees current shares.
     ks.set_budget_shares(cells);
-    // A configured nonzero bound must stay nonzero per cell (review
-    // 2026-09-01, found by the INFINITYD_BIN compat lane): `0` is the
-    // "no limit" sentinel, so flooring `maxmemory < cells` to 0 silently
-    // turned memory protection OFF on every multi-cell node — the
-    // per-namespace fan (`ns_budget_share`) already guarded with
-    // `.max(1)`; this is the same rule applied to the global class.
+    // A configured nonzero bound must stay nonzero per cell: `0` is the
+    // "no limit" sentinel, so flooring `maxmemory < cells` to 0 would
+    // silently turn memory protection OFF on every multi-cell node — the
+    // per-namespace fan (`ns_budget_share`) guards with `.max(1)`; this is
+    // the same rule applied to the global class.
     let cell_share = |bound: u64| if bound == 0 { 0 } else { (bound / cells).max(1) };
     ks.set_pressure(PressureConfig { limit_bytes: cell_share(maxmemory), policy, samples });
     ks.set_tiered_va_limit(cell_share(va_limit));

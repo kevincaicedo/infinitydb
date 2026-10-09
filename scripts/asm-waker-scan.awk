@@ -19,12 +19,12 @@
 # waker while printing OK (review 2026-08-30, F-L20-03).
 #
 # Local labels are ELF's `.L…` and Mach-O's `L…` (no dot: `Lfunc_begin0`,
-# `LBB1_2`, `Ltmp3`). The batch-69 scanner knew only `.L`, so on Mach-O the
-# DWARF `Lfunc_beginN:` right under every symbol became the body's owner
-# and the vtable's four wakers had no body at all — "0 instruction lines
-# scanned, 4 unresolved edges" on every Mach-O host (lane L11 N18, batch
-# 70). The flavor is known before the first body: Mach-O opens with
-# `.section __TEXT,…` / `.build_version`, ELF with `.text` and `@function`.
+# `LBB1_2`, `Ltmp3`). A scanner that knows only `.L` makes the DWARF
+# `Lfunc_beginN:` right under every Mach-O symbol the body's owner, and
+# the vtable's four wakers have no body at all — "0 instruction lines
+# scanned, 4 unresolved edges". The flavor is known before the first
+# body: Mach-O opens with `.section __TEXT,…` / `.build_version`, ELF with
+# `.text` and `@function`.
 #
 # Mnemonics are matched on the instruction's FIRST TWO fields, so an x86
 # `lock` prefix — emitted as its own tab-separated field, `lock<TAB><TAB>

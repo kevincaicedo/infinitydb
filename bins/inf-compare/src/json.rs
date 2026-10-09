@@ -104,9 +104,9 @@ impl Json {
     }
 }
 
-/// The deepest nesting the reader accepts (F-L18-07, review of
-/// 2026-08-30): the parser is iterative with an explicit stack and this
-/// explicit depth limit. memtier's output nests about six deep.
+/// The deepest nesting the reader accepts: the parser is iterative with an
+/// explicit stack and this explicit depth limit. memtier's output nests
+/// about six deep.
 pub const MAX_DEPTH: usize = 32;
 
 /// One container still collecting on the explicit stack; an object also

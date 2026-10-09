@@ -8,8 +8,8 @@
 # first run must verify the tag trigger, GHCR permissions, and the
 # image-size/scan gates.
 #
-# The alpha tag itself stays gated on M0-R2 (reference box) per the master
-# plan; this pipeline existing does not authorize tagging.
+# The alpha tag itself stays gated on M0-R2 (reference box); this
+# pipeline existing does not authorize tagging.
 #
 # REHEARSAL MODE (2026-08-17). Until now the only trigger was a tag push, so
 # the pipeline could not be exercised without performing the release act it

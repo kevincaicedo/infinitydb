@@ -8,10 +8,10 @@
 //! `inf_store::index_key::compare_i64_f64`, so a bug in the production
 //! table cannot vanish into the oracle.
 //!
-//! The generator deliberately emits the adversarial shapes the plan
-//! names: missing paths, cross-type mismatches, the 2^53/2^63 numeric
-//! edges, `-0.0`, explicit nulls, and mixed-type arrays (multi-match
-//! paths where existential semantics and `NE ≢ NOT(EQ)` bite).
+//! The generator deliberately emits the adversarial shapes: missing paths,
+//! cross-type mismatches, the 2^53/2^63 numeric edges, `-0.0`, explicit
+//! nulls, and mixed-type arrays (multi-match paths where existential
+//! semantics and `NE ≢ NOT(EQ)` bite).
 //!
 //! Release AC lane: `PROPTEST_CASES=1000000 cargo test --release
 //! -p inf-query --test predicate_differential`.

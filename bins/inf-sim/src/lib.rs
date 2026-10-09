@@ -93,11 +93,10 @@ pub use sidecar::{SidecarReport, SidecarScenario, run_sidecar_scenario};
 pub use steel::{SteelReport, SteelScenario, run_steel_scenario};
 pub use tiered::{TieredNodeReport, TieredScenario, run_tiered_scenario};
 
-/// Every scenario name the `inf-sim` binary accepts (F-L19-03, review
-/// 2026-08-30): the registry `scripts/sim-smoke.sh` runs once per merge
-/// and `tests/lanes.rs` checks against the CLI dispatch, so a scenario
-/// cannot be born unrun. Add a scenario here, in `main.rs`, and in the
-/// smoke script together.
+/// Every scenario name the `inf-sim` binary accepts: the registry
+/// `scripts/sim-smoke.sh` runs once per merge and `tests/lanes.rs` checks
+/// against the CLI dispatch, so a scenario cannot be born unrun. Add a
+/// scenario here, in `main.rs`, and in the smoke script together.
 pub const SCENARIOS: &[&str] = &[
     "m0-smoke",
     "m0-adversarial",

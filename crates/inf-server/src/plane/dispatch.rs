@@ -620,15 +620,13 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         // `ApplyNs` to the owning cell. Conn-state (SELECT/HELLO/USE) falls
         // through to the mirror arm below. `CONFIG SET`/`RESETSTAT` are
         // node-wide hot-per-cell keys whatever namespace the connection
-        // selected — they belong to the scatter arm below (review of
-        // 2026-08-27, M4.5-S37: a namespace-bound connection applied them
-        // to its own cell only, found by the `m4-tiered` DST's per-cell
-        // witness on `tiered-shadow-overwrite`). `FLUSHALL` is node-wide
-        // whatever the connection selected, for the same reason (review
-        // of 2026-08-30, C1: it replied `+OK` having flushed one cell of
-        // `cells`); `FLUSHDB` stays here — under a named namespace it
-        // means "flush the namespace", which `execute` refuses typed
-        // (ADR-0015). `SCAN`/`KEYS`/`RANDOMKEY` stay here too:
+        // selected — they belong to the scatter arm below (here, a
+        // namespace-bound connection would apply them to its own cell
+        // only). `FLUSHALL` is node-wide whatever the connection selected,
+        // for the same reason (here, it would reply `+OK` having flushed
+        // one cell of `cells`); `FLUSHDB` stays here — under a named
+        // namespace it means "flush the namespace", which `execute` refuses
+        // typed (ADR-0015). `SCAN`/`KEYS`/`RANDOMKEY` stay here too:
         // `dispatch_ns` scatters them namespace-aware.
         Some(meta)
             if well_formed

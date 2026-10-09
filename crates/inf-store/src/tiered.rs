@@ -522,9 +522,8 @@ impl TieredTable {
     /// window): `Some` when the prefix covers the header, the TTL
     /// extension when present, and the whole key — at most 268 bytes
     /// from the record's start, so one cold window always holds it.
-    /// `None` means the prefix stops inside the key (review of
-    /// 2026-08-30, C2: naming a key must never require the value's
-    /// bytes).
+    /// `None` means the prefix stops inside the key: naming a key must
+    /// never require the value's bytes.
     #[must_use]
     pub fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
         crate::record::key_from_prefix(bytes)

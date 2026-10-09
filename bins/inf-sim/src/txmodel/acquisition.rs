@@ -72,8 +72,8 @@ pub struct Rules {
     /// decision (ADR-0114 D1). `false` is validate-and-release.
     pub hold_watch_intents: bool,
     /// A participant's leg writes into a private set published only by
-    /// `UnlockOp{Commit}` (ADR-0116 D5/A4). `false` is the batch-22
-    /// model as written: the leg writes live values at execution.
+    /// `UnlockOp{Commit}` (ADR-0116 D5/A4). `false` is the unstaged model:
+    /// the leg writes live values at execution.
     pub stage_privately: bool,
     pub cancel_until: CancelUntil,
     /// A command whose value or condition crosses owners (`RENAME`,

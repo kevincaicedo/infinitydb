@@ -35,11 +35,10 @@ fn parse_int_line(buf: &[u8]) -> Option<(i64, usize)> {
     Some((s.parse().ok()?, used))
 }
 
-/// The deepest reply nesting the CLI accepts (F-L18-07, review of
-/// 2026-08-30): the parser is iterative with an explicit stack and this
-/// explicit depth limit. No server reply nests past a handful of levels;
-/// past the cap the stream is treated as desynced and reported as a
-/// protocol error that consumes everything buffered.
+/// The deepest reply nesting the CLI accepts: the parser is iterative with
+/// an explicit stack and this explicit depth limit. No server reply nests
+/// past a handful of levels; past the cap the stream is treated as desynced
+/// and reported as a protocol error that consumes everything buffered.
 pub const MAX_DEPTH: usize = 32;
 
 /// One aggregate still collecting its items on the explicit stack.
