@@ -111,6 +111,10 @@ jobs:
         run: cargo build -p inf-sim --features dst
       - name: test (compat runs with its pinned oracles in compat-diff)
         run: cargo test --workspace --exclude compat
+        env:
+          # memlock_boot may skip only where rings are not charged to
+          # RLIMIT_MEMLOCK; on the Linux legs a skip is a failure.
+          INF_MEMLOCK_BOOT_REQUIRE: ${{ runner.os == 'Linux' && '1' || '0' }}
 
   slim-build:
     # L11 / F-L20-09: workspace feature unification hides missing doc guards.

@@ -32,6 +32,25 @@ struct Node {
     child: Child,
 }
 
+impl Node {
+    /// Stops the node and returns its stderr, which names why a boot
+    /// failed (a reset alone does not).
+    fn stderr(&mut self) -> String {
+        // A reset means the node is exiting: let it finish its last line.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut text = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -56,7 +75,12 @@ fn reply_end(buf: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Reads until `count` whole replies have arrived, within `deadline`.
-fn read_replies(stream: &mut TcpStream, count: usize, deadline: Instant) -> Vec<u8> {
+fn read_replies(
+    node: &mut Node,
+    stream: &mut TcpStream,
+    count: usize,
+    deadline: Instant,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -72,8 +96,14 @@ fn read_replies(stream: &mut TcpStream, count: usize, deadline: Instant) -> Vec<
             "replies incomplete: {:?}",
             String::from_utf8_lossy(&buf)
         );
-        let read = stream.read(&mut chunk).expect("read replies");
-        assert!(read > 0, "connection closed: {:?}", String::from_utf8_lossy(&buf));
+        let read = match stream.read(&mut chunk) {
+            Ok(read) if read > 0 => read,
+            outcome => panic!(
+                "read replies: {outcome:?} after {:?}; infinityd stderr: {}",
+                String::from_utf8_lossy(&buf),
+                node.stderr()
+            ),
+        };
         buf.extend_from_slice(&chunk[..read]);
     }
 }
@@ -92,7 +122,7 @@ fn boot_and_connect() -> (Node, TcpStream) {
     let child = Command::new(binary)
         .args(["--port", &port.to_string(), "--cells", CELLS])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn infinityd");
     let mut node = Node { child };
@@ -102,7 +132,7 @@ fn boot_and_connect() -> (Node, TcpStream) {
             return (node, stream);
         }
         if let Some(status) = node.child.try_wait().expect("try_wait") {
-            panic!("infinityd exited during boot: {status}");
+            panic!("infinityd exited during boot: {status}: {}", node.stderr());
         }
         assert!(Instant::now() < deadline, "infinityd never accepted on {port}");
         std::thread::sleep(Duration::from_micros(200));
@@ -113,15 +143,15 @@ fn boot_and_connect() -> (Node, TcpStream) {
 fn a_pre_origin_exat_sent_at_connect_is_nil_on_every_boot() {
     let mut served = Vec::new();
     for boot in 0..BOOTS {
-        let (node, mut stream) = boot_and_connect();
+        let (mut node, mut stream) = boot_and_connect();
         stream.write_all(PIPELINE).expect("send the pipeline");
         let deadline = Instant::now() + Duration::from_secs(30);
         stream.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
-        let replies = read_replies(&mut stream, 2, deadline);
+        let replies = read_replies(&mut node, &mut stream, 2, deadline);
         // The node answering is the one this boot spawned, not a process
         // that took the port between the probe bind and the boot.
         stream.write_all(b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n").expect("send INFO");
-        let info = read_replies(&mut stream, 1, deadline);
+        let info = read_replies(&mut node, &mut stream, 1, deadline);
         let pid = format!("process_id:{}\r\n", node.child.id());
         assert!(String::from_utf8_lossy(&info).contains(&pid), "boot {boot}: another server");
         if replies != b"+OK\r\n$-1\r\n" {

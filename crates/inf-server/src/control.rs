@@ -197,8 +197,8 @@ impl CellRecoverySlot {
 
     /// Human name for a phase code — the stuck-cell narration. Codes
     /// 1–6 are `Recovery::phase_code`; 10+ are the assembly's setup
-    /// steps (published by `cell_main` so a pre-loop stall names itself —
-    /// the 500-cycle storm caught exactly that class).
+    /// steps, labels rather than boot order (published by `cell_main` so a
+    /// pre-loop stall names itself — the 500-cycle storm caught that class).
     #[must_use]
     pub fn phase_name(code: u8) -> &'static str {
         match code {
@@ -216,6 +216,7 @@ impl CellRecoverySlot {
             14 => "setup:keyspace",
             15 => "setup:plane",
             16 => "setup:loop",
+            17 => "setup:ring-barrier",
             _ => "unknown",
         }
     }

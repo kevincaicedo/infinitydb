@@ -793,6 +793,7 @@ fn main() {
         process_board: process_sampler.board(),
         quiet_cells: std::sync::atomic::AtomicU16::new(0),
         drained_cells: std::sync::atomic::AtomicU16::new(0),
+        rings_created: std::sync::Barrier::new(usize::from(args.cells.get())),
         #[cfg(target_os = "linux")]
         park_flags: std::sync::Arc::clone(&park_flags),
     });
@@ -1142,6 +1143,9 @@ struct NodeWiring {
     process_board: std::sync::Arc<inf_server::ProcessBoard>,
     quiet_cells: std::sync::atomic::AtomicU16,
     drained_cells: std::sync::atomic::AtomicU16,
+    /// Every cell's driver exists (`cell_main`): the ring's mandatory
+    /// RLIMIT_MEMLOCK charge precedes any cell's optional registration.
+    rings_created: std::sync::Barrier,
     #[cfg(target_os = "linux")]
     park_flags: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
 }
@@ -1235,16 +1239,19 @@ fn cell_main(
     }
     let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity);
     let node = boot_node_info(config, cache_permit)?;
-    mark(10); // setup:listen
-    let listener = listen_reuseport(args.port)?;
-    if cell == 0 {
-        eprintln!("infinityd: listening on {}", bound_port(&listener)?);
-    }
     mark(11); // setup:pool
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     mark(12); // setup:driver
     let mut driver = make_driver()
         .map_err(|e| std::io::Error::new(e.kind(), format!("driver setup (ring create): {e}")))?;
+    // io_uring charges a ring and its registered buffers to the user's one
+    // RLIMIT_MEMLOCK budget. The registration probe degrades on refusal, but
+    // a refused probe first charges up to the limit, and a sibling creating
+    // its ring inside that window fails with ENOMEM and stops the node. So
+    // the mandatory charge goes first: every ring exists before any cell
+    // registers. A cell that fails before the barrier exits the process.
+    mark(17); // setup:ring-barrier
+    wiring.rings_created.wait();
     mark(13); // setup:register
     driver.register_pool(&mut pool)?;
     #[cfg(target_os = "linux")]
@@ -1255,6 +1262,14 @@ fn cell_main(
     let _ = wake_fd;
     if cell == 0 {
         eprintln!("infinityd: capabilities {:?}", driver.capabilities());
+    }
+    // The listener publishes the cell, so it binds after the ring and pool
+    // are reserved: a boot that fails above refuses a connection instead of
+    // accepting it into a backlog the exiting process then resets.
+    mark(10); // setup:listen
+    let listener = listen_reuseport(args.port)?;
+    if cell == 0 {
+        eprintln!("infinityd: listening on {}", bound_port(&listener)?);
     }
 
     node.process_board.replace(Some(std::sync::Arc::clone(&wiring.process_board)));
