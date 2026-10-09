@@ -1,7 +1,7 @@
 # InfinityDB release pipeline: one tag push produces the whole
 # release — linux x86-64/aarch64 static binaries, SHA256SUMS, SBOM, the
 # multi-arch Docker image on GHCR (scanned), and a GitHub release that links
-# the generated compat matrix and the claim ledger.
+# the generated compat matrix.
 #
 # Layout: the repository root IS the Cargo workspace (no nested `infinitydb/`
 # directory). These jobs have not been exercised against a live runner yet —
@@ -258,6 +258,6 @@ jobs:
             - Compat matrix: `docs/compat-matrix.md` (generated artifact, included in the tarballs)
             - Checksums: `SHA256SUMS`; SBOM: `infinitydb-${{ needs.meta.outputs.version }}.spdx.json`
 
-            This is a draft. Release notes are written by the maintainer, and every
-            performance or comparative claim is verified against the project's
-            published claim ledger before publishing — the draft flag is that gate.
+            This is a draft. Release notes are written by the maintainer, and a
+            performance or comparative number is published only once its claim is
+            Allowed and this release re-validated it — the draft flag is that gate.

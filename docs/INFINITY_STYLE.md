@@ -520,23 +520,22 @@ Documentation identities are checked too (ADR-0106 D15):
 `check-doc-artifacts.sh` requires the one generated compatibility matrix
 and refuses tracked run output; D17 checks this document and
 `docs/ARCHITECTURE.md` for obsolete layout names and landed-ADR
-placeholders. The public documentation is self-contained. A public
-document states a rule instead of pointing into the project's unpublished
-records. An engineering reference may cite a bare decision identifier
-(`ADR-0087 D2`) beside the rule it states, never as a link and never in
-the rule's place. The copy a newcomer reads first carries no decision or
-story identifier, and no published document carries a review, finding or
-batch identifier: a review's result is stated as the rule it produced. The
-published claim-ledger snapshot is an evidence record judged as an
-engineering reference; it is maintained by hand from its source, not
-copied verbatim. The relative-link half is mechanical:
-`check-doc-artifacts.sh` requires every relative link in a published
-Markdown file to resolve to a published file inside this repository, and
-states that scope on its OK line. The pointer and identifier rules are
-review obligations in this repository. The release job checks the matrix
-against its renderer before packaging it. The dependency gate (D16)
-checks active and reserved edges in both directions, requires a row for
-every package and prints dev exemptions.
+placeholders. Published text is self-contained: every document, comment,
+documentation comment, printed message, script and configuration file
+states the rule itself instead of pointing into the project's unpublished
+records. An engineering reference, code and configuration may cite a bare
+decision identifier (`ADR-0087 D2`) beside the rule they state, never as
+a link and never in the rule's place. The copy a newcomer reads first
+carries no decision or story identifier, and nothing published carries a
+review, finding, lane or batch identifier or narrates a review: a
+review's result is stated as the rule it produced. The relative-link half
+is mechanical: `check-doc-artifacts.sh` requires every relative link in a
+published Markdown file to resolve to a published file inside this
+repository, and states that scope on its OK line. The pointer and
+identifier rules are review obligations in this repository. The release
+job checks the matrix against its renderer before packaging it. The
+dependency gate (D16) checks active and reserved edges in both
+directions, requires a row for every package and prints dev exemptions.
 
 ## Performance
 
@@ -747,11 +746,15 @@ they are recurring sources of database defects, not just readability issues.
 - Keep comments concise: a complete sentence for a rationale or invariant,
   a short phrase for an obvious inline label. Explain a nontrivial test's
   trigger, oracle, and expected failure; do not narrate each assertion.
-- **Cite the live rule, not its history.** A comment names the current
-  decision (`ADR-0087 D2`) and the invariant it protects. It never
-  narrates amendments, review batches or finding numbers — that is what
-  the ADR and Git are for. If the current rule cannot be stated without
-  its history, the ADR needs superseding (third amendment ⇒ redesign).
+- **Cite the live rule, not its history.** A comment, a documentation
+  comment, a printed message, and the comments of scripts and
+  configuration state the rule they rely on and the invariant it protects.
+  They may name the current decision bare beside it (`ADR-0087 D2`), never
+  in its place, and they carry no pointer into the project's unpublished
+  records. They never narrate amendments, reviews, batches or finding
+  numbers — that is what the ADR and Git are for. If the current rule
+  cannot be stated without its history, the ADR needs superseding (third
+  amendment ⇒ redesign).
 - Use a short, one-line commit message stating the concrete change. **One
   logical change per commit**, so bisect and the sim A/B diff work at the
   granularity of a decision. Keep detailed reasoning, reproduction
