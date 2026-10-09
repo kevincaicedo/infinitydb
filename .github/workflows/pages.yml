@@ -2,8 +2,9 @@
 #
 # Guarantee enforced before every deploy: website/site is exactly what
 # website/build.py renders from website/src and the generated
-# docs/compat-matrix.md, so the site cannot drift from its sources or from
-# the implementation (L8).
+# docs/compat-matrix.md; the deploy fails when the committed site differs
+# from a fresh build of those sources, and CI's compat-diff job fails when
+# the matrix is stale against the registry and the corpus (L8).
 
 name: website
 

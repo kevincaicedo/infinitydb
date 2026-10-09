@@ -129,7 +129,8 @@ Docker's default seccomp profile blocks `io_uring`; the bundled one allows it
   (including an fsync that lies) prove the oracles catch what they should; a
   crash matrix, fuzzed decoders, Loom on the inter-cell ring, Miri on the
   allocator and fabric, and byte-for-byte diffs against Redis.
-- **Honest compatibility.** Every deviation from Redis is written down, and
+- **Honest compatibility.** Redis compatibility is declared per command in a
+  generated matrix that lists the deviations recorded for each command, and
   no performance number is published without a reproducible measurement.
 
 ## Redis compatibility
@@ -142,10 +143,12 @@ RedisJSON for `JSON.*`) and to InfinityDB, both in-process and as a running
 multi-cell server, and compares the replies byte for byte.
 
 The generated [compatibility matrix](docs/compat-matrix.md) lists every
-command's status and its documented deviations; CI fails if it is stale or if
-a reply differs from Redis without a documented deviation. Hashes, lists,
-sets, sorted sets, transactions, Lua, streams, AUTH/ACL/TLS and cluster mode
-are not implemented yet; see the [roadmap](docs/roadmap.md).
+command's declared status and the deviations recorded for it; CI fails if it
+is stale or if a corpus reply differs from its oracle with no recorded
+deviation for the case. Behaviour the corpus does not exercise is not
+compared. Hashes, lists, sets, sorted sets, transactions, Lua, streams,
+AUTH/ACL/TLS and cluster mode are not implemented yet; see the
+[roadmap](docs/roadmap.md).
 
 ## Architecture
 

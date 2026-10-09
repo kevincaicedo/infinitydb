@@ -26,9 +26,9 @@ Public documentation for InfinityDB. Start with the
 
 ## Reference
 
-- **[Compatibility matrix](compat-matrix.md)** — every command's Redis
-  compatibility status, with documented deviations. *Generated artifact —
-  do not edit by hand.*
+- **[Compatibility matrix](compat-matrix.md)** — every command's declared
+  Redis compatibility status and the deviations recorded for it. *Generated
+  artifact — do not edit by hand.*
 - **[`JSON.*` reply shapes](json-reply-shapes.md)** — the reply shape of every
   document command. *Generated artifact.*
 - **[JSONPath subset](jsonpath-subset.md)** and

@@ -1,11 +1,11 @@
 <!--
 title: Redis compatibility
 description: Per-command Redis compatibility for InfinityDB, rendered from the generated repository artifact.
-lede: Compatibility is declared per command and checked byte for byte against a real Redis in CI. A new difference fails the build until it is written down.
+lede: Compatibility is declared per command. A row marked full has corpus cases that CI compares with its pinned oracle (Redis 8.0.5 for the core surface, a pinned RedisJSON for the JSON commands), and a mismatch that no recorded deviation names fails the build.
 chips: Available · alpha | Law L8
 layout: wide
 -->
-<aside class="callout"><div class="callout-label">Generated tables</div><p>The tables on this page are rendered from <a class="u" href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a>, which the build generates from the command registry and a corpus diffed byte for byte against a real Redis. They are never edited by hand, so they cannot drift from the implementation.</p></aside>
+<aside class="callout"><div class="callout-label">Generated tables</div><p>The tables on this page are rendered from <a class="u" href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a>, which a test of the compat crate regenerates from the command registry and the corpus CI compares with its pinned oracles. They are never edited by hand, and CI fails when the committed page is stale against the matrix or the matrix against the registry and the corpus.</p></aside>
 <div class="stats">{{compat_stats}}</div>
 <p class="doc-note mono">Corpus: {{compat_corpus}} · Surface: {{compat_surface}}</p>
 

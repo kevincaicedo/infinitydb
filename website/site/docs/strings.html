@@ -58,7 +58,7 @@
 <article class="doc">
 <div class="crumb mono"><span>Data models</span><span>/</span><span class="ink">Strings &amp; keys</span></div>
 <h1 class="doc-h1">Strings &amp; keys</h1>
-<p class="doc-lede">The string, key, expiry, pub/sub and server families are the cache core. They are diffed byte for byte against Redis 8.0.5, and every place they differ is written down.</p><div class="chips-s mono"><span class="chip-s"><span class="sq6 bg-ink" aria-hidden="true"></span>Available · alpha</span><span class="chip-s">Law L8</span></div>
+<p class="doc-lede">The string, key, expiry, pub/sub and server families are the cache core. Their corpus cases are compared with Redis 8.0.5, and the compatibility matrix lists the deviations recorded for each command.</p><div class="chips-s mono"><span class="chip-s"><span class="sq6 bg-ink" aria-hidden="true"></span>Available · alpha</span><span class="chip-s">Law L8</span></div>
 <h2 id="families" class="doc-h2">Command families</h2>
 <p>The <a href="compat.html">compatibility matrix</a> is the source of truth for what works today. This is the surface it lists outside the <a href="json.html">JSON commands</a>:</p>
 <div class="table-wrap"><table class="doc-table"><thead><tr><th>Family</th><th>Commands</th></tr></thead><tbody>
@@ -110,7 +110,7 @@
 <h2 id="databases" class="doc-h2">Databases and namespaces</h2>
 <p><code>SELECT 0</code> to <code>15</code> work as in Redis. They are memory namespaces: always memory-only, even on a node with a data directory, and they share the node's <code>maxmemory</code>. Durability, per-namespace budgets and tiering belong to named namespaces created with <code>INF.NS CREATE</code> on a node started with <code>--data-dir</code>; <code>INF.NS USE name</code> binds a connection to one, and <code>INF.NS USE db3</code> is the same as <code>SELECT 3</code>. On a named namespace, <code>FLUSHDB</code> and <code>COPY</code> are refused, and <code>FLUSHALL</code> is refused on any node that has a durable namespace. See <a href="durability.html">Namespaces &amp; durability</a>.</p>
 
-<aside class="law-box"><span class="law-code">L8</span><div><div class="law-title">Compatibility is staged and honest.</div><p>Compatibility is declared per command, in a matrix generated from the command table and a corpus diffed against real Redis. CI fails when the matrix is stale or a reply differs without a written deviation.</p></div></aside>
+<aside class="law-box"><span class="law-code">L8</span><div><div class="law-title">Compatibility is staged and honest.</div><p>Compatibility is declared per command, in a matrix generated from the command table and a corpus diffed against real Redis. CI fails when the matrix is stale or a corpus reply differs from Redis with no recorded deviation for the case.</p></div></aside>
 
 <div class="pns"><a class="pn" href="simulation.html"><span class="mono pn-k">← Previous</span><span class="pn-t">Deterministic simulation</span></a><a class="pn pn-next" href="json.html"><span class="mono pn-k">Next →</span><span class="pn-t">JSON documents</span></a></div>
 </article>

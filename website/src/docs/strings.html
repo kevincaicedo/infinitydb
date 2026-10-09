@@ -2,7 +2,7 @@
 title: Strings & keys
 section: Data models
 description: The Redis string, key, expiry, pub/sub and server commands InfinityDB serves today, with slots, hash tags, expiry, SCAN and size bounds.
-lede: The string, key, expiry, pub/sub and server families are the cache core. They are diffed byte for byte against Redis 8.0.5, and every place they differ is written down.
+lede: The string, key, expiry, pub/sub and server families are the cache core. Their corpus cases are compared with Redis 8.0.5, and the compatibility matrix lists the deviations recorded for each command.
 chips: Available · alpha | Law L8
 -->
 <h2 id="families">Command families</h2>
@@ -55,4 +55,4 @@ OK
 <h2 id="databases">Databases and namespaces</h2>
 <p><code>SELECT 0</code> to <code>15</code> work as in Redis. They are memory namespaces: always memory-only, even on a node with a data directory, and they share the node's <code>maxmemory</code>. Durability, per-namespace budgets and tiering belong to named namespaces created with <code>INF.NS CREATE</code> on a node started with <code>--data-dir</code>; <code>INF.NS USE name</code> binds a connection to one, and <code>INF.NS USE db3</code> is the same as <code>SELECT 3</code>. On a named namespace, <code>FLUSHDB</code> and <code>COPY</code> are refused, and <code>FLUSHALL</code> is refused on any node that has a durable namespace. See <a href="durability.html">Namespaces &amp; durability</a>.</p>
 
-<aside class="law-box"><span class="law-code">L8</span><div><div class="law-title">Compatibility is staged and honest.</div><p>Compatibility is declared per command, in a matrix generated from the command table and a corpus diffed against real Redis. CI fails when the matrix is stale or a reply differs without a written deviation.</p></div></aside>
+<aside class="law-box"><span class="law-code">L8</span><div><div class="law-title">Compatibility is staged and honest.</div><p>Compatibility is declared per command, in a matrix generated from the command table and a corpus diffed against real Redis. CI fails when the matrix is stale or a corpus reply differs from Redis with no recorded deviation for the case.</p></div></aside>

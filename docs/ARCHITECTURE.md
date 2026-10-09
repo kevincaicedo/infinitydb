@@ -19,7 +19,7 @@ Companion documents:
 - [The index and query interfaces](interfaces-m4.5.md): the ordered-index,
   path-program and query seams (draft).
 - [compat-matrix.md](compat-matrix.md): Redis compatibility, command by
-  command, with every deviation written down.
+  command, with the deviations recorded for each command.
 - [deployment.md](deployment.md), [validation.md](validation.md) and
   [roadmap.md](roadmap.md).
 
@@ -342,9 +342,11 @@ Redis compatibility is how people adopt InfinityDB, not the whole of what it
 is. Compatibility is declared per command in
 [compat-matrix.md](compat-matrix.md), which is generated from the command
 table and a test corpus diffed byte for byte against a real `redis-server`
-(8.0.5) and, for `JSON.*`, a pinned RedisJSON. Every difference is a written
-deviation. CI fails if the matrix is stale or a new difference appears
-without being written down.
+(8.0.5) and, for `JSON.*`, a pinned RedisJSON. The matrix records the
+differences the corpus finds and the ones a row's note declares; it does not
+show that no other difference exists. CI fails if the matrix is stale or a
+corpus reply differs from its oracle with no recorded deviation for the
+case.
 
 ### Claims follow evidence
 

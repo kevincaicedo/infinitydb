@@ -42,7 +42,7 @@ excerpt: Every public number needs replicates, a clean tree and the system we co
 <p>And the release itself is not ready. M4 is in progress, and the first public alpha waits on the trust and safety work the <a href="../docs/roadmap.html">roadmap</a> lists as planned. At the other end of the train, M11 re-baselines performance with every public claim measured again.</p>
 
 <h2 id="s5"><span class="num">5</span>What we publish instead.</h2>
-<p>Correctness evidence anyone can rerun from a checkout. The <a href="../docs/compat.html">compatibility matrix</a> is generated from a byte-for-byte reply diff against a pinned Redis 8.0.5, and CI fails when the committed matrix is stale. The <a href="../docs/simulation.html">simulator</a>'s scenarios and seeds are in the repository. The crash matrix's rows are data files anyone can review. Each one comes with the command that produces it, and each one can go red.</p>
+<p>Correctness evidence anyone can rerun from a checkout. The <a href="../docs/compat.html">compatibility matrix</a> is generated from the command registry and a corpus whose replies CI compares with its pinned oracles (Redis 8.0.5 for the core commands, a pinned RedisJSON for <code>JSON.*</code>), and CI fails when the committed matrix is stale. The <a href="../docs/simulation.html">simulator</a>'s scenarios and seeds are in the repository. The crash matrix's rows are data files anyone can review. Each one comes with the command that produces it, and each one can go red.</p>
 <pre class="code" data-label="shell">$ just compat
 $ just sim-smoke
 $ cargo test -p crash-matrix</pre>
