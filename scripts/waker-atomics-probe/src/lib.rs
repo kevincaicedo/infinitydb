@@ -9,12 +9,19 @@
 //!                         reporting it would mean the gate over-reports
 //!
 //! The three planted spellings are the ones a refcount would actually
-//! produce: a CAS retry loop (x86 `lock cmpxchg` / aarch64 `ldaxr`+`stlxr`
-//! or `casal`), a fetch-add (`lock xadd` / `ldaddal`) and a SeqCst store
-//! (`xchg` / `stlr`). The first defeated the pre-ADR gate twice over: it
-//! sat in a second basic block the awk never reached, and the `lock`
-//! prefix is its own tab-separated field, which the mnemonic set could not
-//! match at the line start.
+//! produce, and each target spells them differently:
+//!
+//! | plant | x86_64 | aarch64 Apple | aarch64 Linux |
+//! |---|---|---|---|
+//! | CAS retry loop | `lock cmpxchg` | `casal` | `bl __aarch64_cas8_acq_rel` |
+//! | fetch-add | `lock xadd` | `ldaddal` | `bl __aarch64_ldadd8_acq_rel` |
+//! | SeqCst header-field store | `xchg` | `stlur` | `stlr` |
+//!
+//! The first defeated the pre-ADR gate twice over: it sat in a second basic
+//! block the awk never reached, and the `lock` prefix is its own
+//! tab-separated field, which the mnemonic set could not match at the line
+//! start. The Linux column has no atomic instruction at all — the gate
+//! reads the outline-atomics helper call as the atomic.
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -42,10 +49,20 @@ unsafe fn waker_wake(data: *const ()) {
     }
 }
 
-/// A sequentially consistent store. WAKER-PROBE: expect-atomic waker_wake_by_ref
+/// What a waker's data pointer reaches: a task header whose state is not
+/// at offset 0, so an RCpc core (the Apple M1 the macOS leg compiles for)
+/// stores it with `stlur x8, [x0, #8]`, a spelling `stlr` does not match.
+#[repr(C)]
+pub struct Header {
+    pub tag: usize,
+    pub state: AtomicUsize,
+}
+
+/// A sequentially consistent store to the header's state through the
+/// waker's data pointer. WAKER-PROBE: expect-atomic waker_wake_by_ref
 unsafe fn waker_wake_by_ref(data: *const ()) {
     if !data.is_null() {
-        COUNT.store(data as usize, Ordering::SeqCst);
+        unsafe { (*data.cast::<Header>()).state.store(1, Ordering::SeqCst) };
     }
 }
 

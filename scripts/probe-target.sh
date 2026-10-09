@@ -2,11 +2,19 @@
 # answer to "which target does a planted-bypass probe compile for, and which
 # of the config entries Clippy could not resolve there are deferred to
 # another leg", so the architecture a gate discloses is the one Clippy
-# resolved against. Not executable on its own. Portable bash 3.2.
+# resolved against. check-waker-atomics.sh (ADR-0106 D8) sources it for the
+# one target its tree asm and its probe compile for. Not executable on its
+# own. Portable bash 3.2.
 
 # The architectures a build-test leg of .github/workflows/infinity-ci.yml
 # compiles for; the scripts self-test holds the workflow to this list.
 PROBE_LEG_ARCHES="x86_64 aarch64"
+# The targets the waker gate is enforced on: it runs on the Linux legs only
+# (ADR-0106 D8), and an atomic is spelled per target — aarch64 Linux calls
+# the outline-atomics helpers where Apple inlines LSE — so each needs its
+# own Linux leg; a leg sharing only the architecture does not stand in. The
+# scripts self-test holds the workflow to this list.
+WAKER_LEG_TARGETS="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu"
 
 # probe_target [<toolchain>]: sets PROBE_TARGET (CARGO_BUILD_TARGET, else the
 # toolchain's host) and PROBE_ARCH (rustc's `target_arch` for it — not the

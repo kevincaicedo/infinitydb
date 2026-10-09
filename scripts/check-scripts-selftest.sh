@@ -877,7 +877,8 @@ expect red "clock-ban: a shadow clippy.toml in a crate directory is red" env INF
 # scanned two lines / zero instructions per waker), an x86 `lock` prefix in
 # its own tab-separated field (the old mnemonic set anchored at the line
 # start and could not match it), and the aarch64 pair. The cargo-driven
-# probe is fixture-skipped and disclosed; it always runs on the real tree.
+# probe is fixture-skipped and disclosed; it always runs on the real tree,
+# and its verdict logic is pinned below on fixtures of its asm.
 WAKER=./scripts/check-waker-atomics.sh
 waker_asm() { # <name>: writes a fixture .s from stdin, echoes its path
     local out="$work/$1.s"
@@ -935,13 +936,41 @@ asm=$( { waker_body waker_clone 'movq\t%rdi, %rax' 'je\t.LBB0_2' '.LBB0_2:' 'loc
          for f in waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_vtable; } | waker_asm waker-lock )
 expect red "waker: an x86 lock-prefixed CAS past a local label is red" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
-for insn in 'lock\t\txaddq\t%rax, (%rcx)' 'xchgq\t%rax, (%rcx)' 'mfence' 'ldaxr\tw8, [x0]' 'stlxr\tw9, w8, [x0]' 'casal\tw8, w9, [x0]' 'ldaddal\tw8, w9, [x0]' 'swpal\tw8, w9, [x0]' 'dmb\tish'
+# Atomics are spelled per target, one row each: x86_64; aarch64 LL/SC and LSE;
+# the RCpc-immo forms apple-m1 emits for a field at a nonzero offset (`stlur`,
+# not `stlr`); the `st<op>` alias; and aarch64 Linux's outline-atomics helper
+# calls, called or tail-branched — there the atomic is the CALL (the arm64
+# leg's probe CAS and fetch-add scanned clean).
+for insn in 'lock\t\txaddq\t%rax, (%rcx)' 'xchgq\t%rax, (%rcx)' 'mfence' 'ldaxr\tw8, [x0]' 'stlxr\tw9, w8, [x0]' 'casal\tw8, w9, [x0]' 'ldaddal\tw8, w9, [x0]' 'swpal\tw8, w9, [x0]' 'dmb\tish' \
+    'stlr\tx9, [x8]' 'stlur\tx8, [x0, #8]' 'ldapur\tx0, [x0, #8]' 'staddl\tw8, [x0]' \
+    'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd4_relax' 'bl\t__aarch64_cas16_acq' 'b\t__aarch64_swp1_rel'
 do
     asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
              for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
              waker_vtable; } | waker_asm waker-insn )
     expect red "waker: planted '$insn'" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
+# The helper set is LLVM's libcall table, matched whole: libgcc's cache flush
+# and a near-miss name are calls, and the plain unscaled load and store are
+# not the RCpc forms.
+for insn in 'bl\t__aarch64_sync_cache_range' 'bl\t__aarch64_cas8_acq_rel_shim' 'stur\tx8, [x0, #8]' 'ldur\tx0, [x0, #8]'
+do
+    asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
+             for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             waker_vtable; } | waker_asm waker-insn-clean )
+    expect green "waker: '$insn' is not an atomic" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
+asm=$( { waker_body waker_wake 'cbz\tx0, .LBB1_2' 'bl\t__aarch64_cas8_acq_rel' 'ret'
+         for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
+         waker_vtable; } | waker_asm waker-outline )
+expect_red_because "waker: an outline-atomics call is reported with its helper" \
+    'at waker_wake: [0-9]*:__aarch64_cas8_acq_rel' env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { printf '\t.section\t__TEXT,__text,regular,pure_instructions\n'
+         macho_body waker_wake 'bl\t___aarch64_ldadd8_acq_rel' 'ret'
+         for f in waker_clone waker_wake_by_ref waker_drop; do macho_body "$f" 'ret'; done
+         macho_vtable; } | waker_asm waker-macho-outline )
+expect red "waker: a Mach-O outline-atomics call (one more underscore) is red" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 # An atomic one hop out of a waker is still on the waker path.
 asm=$( { waker_body waker_drop 'callq\thelper_fn' 'retq'
          for f in waker_clone waker_wake waker_wake_by_ref; do waker_body "$f" 'retq'; done
@@ -963,6 +992,95 @@ asm=$( { printf '\t.type\twaker_clone,@function\nwaker_clone:\n.Lfunc_begin_x:\n
          for f in waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_vtable; } | waker_asm waker-empty )
 expect red "waker: a body that scans zero instructions is a scope error" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+# An indirect call leaves the scan for a body no fact names: red, never an
+# unfollowed edge. An indirect jump (x86's jump table `jmpq *%rax`, on the
+# real waker path today) is counted on the scope line, and a call through the
+# GOT — Rust's no-PLT spelling of an extern — is a direct edge.
+for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8'; do
+    asm=$( { waker_body waker_wake 'movq\t%rdi, %rax' "$insn" 'retq'
+             for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+             waker_vtable; } | waker_asm waker-icall )
+    expect_red_because "waker: an indirect call '$insn' on the waker path is red" \
+        "INDIRECT CALL on the waker path: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+done
+asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*ext_fn@GOTPCREL(%rip)' 'retq'
+         for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
+         waker_vtable; } | waker_asm waker-ijump )
+expect_output "waker: an indirect jump is counted on the scope line" \
+    "1 unresolved edges, 1 indirect jumps" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: a call through the GOT is a direct, disclosed edge" \
+    "unfollowed callees (no body in this asm): ext_fn" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+# The probe's contract (scripts/waker-atomics-probe/src/lib.rs) judged against
+# a fixture of its asm. The arm64 Linux shape — CAS and fetch-add as helper
+# calls, the SeqCst store as `stlr` — is green; a fetch-add plant that reports
+# nothing is red although `waker_wake_by_ref`, whose name it prefixes, is
+# atomic, and an atomic `waker_drop` is red although a clean nested
+# `waker_drop::inner` is reachable (a name matches its own symbol only, in
+# legacy and v0 mangling); so is an off-path function whose atomic the
+# scanner cannot see, and a probe whose controls were deleted.
+psym() { # <name>: the probe item's symbol, legacy mangling unless PSYM=v0
+    if [ "${PSYM:-legacy}" = v0 ]; then
+        printf '_RNvCs1a2B3c_19waker_atomics_probe%s%s' "${#1}" "$1"
+    else
+        printf '_ZN19waker_atomics_probe%s%s17h0123456789abcdefE' "${#1}" "$1"
+    fi
+}
+probe_fixture() { # <name> <clone> <wake> <wake_by_ref> <off-path> [<waker_drop insns…>]
+    local name=$1 clone=$2 wake=$3 by_ref=$4 off=$5
+    shift 5
+    [ $# -gt 0 ] || set -- 'strb\tw8, [x0]'
+    { waker_body "$(psym waker_clone)" 'cbz\tx0, .LBB2_3' "$clone" 'ret'
+      waker_body "$(psym waker_wake)" 'cbz\tx0, .LBB1_2' "$wake" 'ret'
+      waker_body "$(psym waker_wake_by_ref)" 'cbz\tx0, .LBB4_2' "$by_ref" 'ret'
+      waker_body "$(psym waker_drop)" 'cbz\tx0, .LBB0_2' "$@" 'ret'
+      waker_body "$(psym off_path_atomic)" "$off" 'ret'
+      printf '%s:\n' "$(psym WAKER_VTABLE)"
+      for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do
+          printf '\t.xword\t%s\n' "$(psym "$f")"
+      done
+      printf '\t.size\t%s, 32\n' "$(psym WAKER_VTABLE)"; } | waker_asm "$name"
+}
+tree=$( { for f in waker_clone waker_wake waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
+          waker_vtable; } | waker_asm waker-tree )
+pasm=$(probe_fixture waker-probe-arm64 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
+    'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
+expect_output "waker probe: the arm64 Linux shape is 3 plants red, 2 controls green" \
+    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+# The controls are exact: a probe copy with both control lines deleted is red.
+mkdir -p "$work/wk/scripts"
+cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh "$work/wk/scripts/"
+cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
+sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
+    "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
+expect_red_because "waker probe: a probe whose controls were deleted is red" \
+    "probe declares 0 clean and 0 off-path controls (expected exactly 1 and 1)" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" "$work/wk/scripts/check-waker-atomics.sh"
+pasm=$(PSYM=v0 probe_fixture waker-probe-v0 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
+    'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
+expect_output "waker probe: v0-mangled names match their own symbols" \
+    "probe: fixture asm, 3 of 3 planted wakers red, 2 of 2 controls green" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+inner=_ZN19waker_atomics_probe10waker_drop5inner17h0123456789abcdefE
+pasm=$(probe_fixture waker-probe-nested 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
+    'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel' "bl\t$inner" 'ldaddal\tw8, w9, [x0]')
+waker_body "$inner" 'ret' >>"$pasm"
+expect_red_because "waker probe: a clean nested waker_drop::inner does not stand in for waker_drop" \
+    "probe waker_drop should scan clean with >0 instructions; it did not" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+pasm=$(probe_fixture waker-probe-prefix 'bl\t__aarch64_cas8_acq_rel' 'mov\tw0, #1' \
+    'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
+expect_red_because "waker probe: a silent plant is red although a name it prefixes is atomic" \
+    "probe waker_wake carries a planted atomic that was NOT reported" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+pasm=$(probe_fixture waker-probe-offpath 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
+    'stlr\tx9, [x8]' 'mov\tx0, x1')
+expect_red_because "waker probe: an off-path atomic the scanner cannot see is a scope error" \
+    "probe off_path_atomic is supposed to carry an atomic the scanner sees" \
+    env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
+expect_red_because "waker probe: the probe-asm hook outside fixture mode is refused" \
+    "INF_WAKER_PROBE_ASM without INF_WAKER_ASM" env INF_WAKER_PROBE_ASM="$pasm" $WAKER
 
 # ------------------------------------------------------- fault points (D9)
 # ADR-0106 second amendment (review 2026-08-30 F-L20-04): "exercised" used
@@ -2632,19 +2750,26 @@ expect_red_because "lint-scopes: allow-invalid, which silences an inert entry, i
     "core::arch::$LS_ARCH::_no_such_intrinsic carries allow-invalid" ls_probe "$work/probe-allow-invalid"
 # probe-target.sh defers an entry under another leg's `core::arch` to that
 # leg, so each architecture of PROBE_LEG_ARCHES needs a build-test matrix leg
-# that runs both probe gates with no `if:` or `continue-on-error:`, and no
+# that runs every probe gate with no `if:` or `continue-on-error:`, and no
 # knob that retargets or skips their probes — else its entries are disclosed
-# everywhere and enforced nowhere. Stdlib python, a line-and-indent parser of
-# this file's layout that fails closed (a shape it does not read is red):
-# PyYAML is not on every runner image.
+# everywhere and enforced nowhere. The waker gate runs on the Linux legs only
+# (ADR-0106 D8): its step may carry exactly `if: runner.os == 'Linux'`, and
+# because atomics are spelled per target, each of WAKER_LEG_TARGETS needs a
+# Linux leg of that triple — macOS shares aarch64 but not the spelling.
+# Stdlib python, a line-and-indent parser of this file's layout that fails
+# closed (a shape it does not read is red): PyYAML is not on every runner image.
 legs_cover() { # <workflow>
-    python3 - "$1" "$PROBE_LEG_ARCHES" <<'PY'
+    python3 - "$1" "$PROBE_LEG_ARCHES" "$WAKER_LEG_TARGETS" <<'PY'
 import re, sys
-wf, legs = sys.argv[1], sys.argv[2].split()
-# GitHub-hosted labels and their architecture; an unknown label is red, so a
-# new leg names its architecture here before it counts.
-RUNNER_ARCH = {"ubuntu-24.04": "x86_64", "ubuntu-24.04-arm": "aarch64", "macos-15": "aarch64"}
-GATES = ("./scripts/check-clock-ban.sh", "./scripts/check-lint-scopes.sh")
+wf, legs, waker_targets = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+# GitHub-hosted labels: architecture, target triple, runner.os. An unknown
+# label is red, so a new leg names all three here before it counts.
+RUNNER = {"ubuntu-24.04": ("x86_64", "x86_64-unknown-linux-gnu", "Linux"),
+          "ubuntu-24.04-arm": ("aarch64", "aarch64-unknown-linux-gnu", "Linux"),
+          "macos-15": ("aarch64", "aarch64-apple-darwin", "macOS")}
+WAKER = "./scripts/check-waker-atomics.sh"
+WAKER_IF = "if: runner.os == 'Linux'"
+GATES = ("./scripts/check-clock-ban.sh", "./scripts/check-lint-scopes.sh", WAKER)
 lines = open(wf, encoding="utf-8").read().split("\n")
 if "  build-test:" not in lines:
     sys.exit(f"LEG-COVERAGE: {wf} has no build-test job")
@@ -2655,7 +2780,7 @@ job, errors = lines[start:end], []
 # workflow's top-level env or anywhere in the job (a step can export through
 # $GITHUB_ENV), the probe gates inherit them; comments aside.
 KNOBS = re.compile(r"\b(CARGO_BUILD_TARGET|INF_LINT_RULES|INF_LINT_API_DIAGNOSTICS|INF_LINT_PROBE\w*"
-                   r"|INF_CHECK_ROOT|INF_CLOCK_BAN_PROBE)\b")
+                   r"|INF_CHECK_ROOT|INF_CLOCK_BAN_PROBE|INF_WAKER_\w+)\b")
 if "jobs:" not in lines:
     errors.append("no top-level `jobs:` line")
 for line in (lines[:lines.index("jobs:")] if "jobs:" in lines else []) + job:
@@ -2684,27 +2809,37 @@ for gate in GATES:
         errors.append(f"no build-test step runs {gate}")
     for st in runs:
         for key in ("if", "continue-on-error"):
-            if any(row.startswith(f"{key}:") for row in st):
+            rows = [row for row in st if row.startswith(f"{key}:")]
+            if gate == WAKER and key == "if" and rows == [WAKER_IF]:
+                continue
+            if rows:
                 errors.append(f"the step that runs {gate} carries `{key}:`")
+waker_linux = any(WAKER_IF in st for st in steps if f"run: {WAKER}" in st)
 oses = [m.group(1) for line in job for m in [re.fullmatch(r"        os: \[(.*)\]", line)] if m]
 if len(oses) != 1:
     errors.append("build-test's matrix has no single `os: [...]` list")
-arches = set()
+arches, waker_legs = set(), set()
 for label in [x.strip() for x in oses[0].split(",")] if oses else []:
-    if label in RUNNER_ARCH:
-        arches.add(RUNNER_ARCH[label])
+    if label in RUNNER:
+        arch, triple, runner_os = RUNNER[label]
+        arches.add(arch)
+        if runner_os == "Linux" or not waker_linux:
+            waker_legs.add(triple)
     else:
         errors.append(f"runner {label} has no architecture in this check")
 for arch in legs:
     if arch not in arches:
         errors.append(f"no build-test leg compiles for {arch}, the leg its core::arch entries are deferred to")
+for triple in waker_targets:
+    if triple not in waker_legs:
+        errors.append(f"no build-test leg runs the waker gate for {triple}")
 for e in errors:
     print(f"LEG-COVERAGE: {e}")
 sys.exit(1 if errors else 0)
 PY
 }
 LS_WF=.github/workflows/infinity-ci.yml
-expect green "probe-target: each leg architecture has a build-test leg running both probe gates" \
+expect green "probe-target: each leg architecture has a build-test leg running every probe gate" \
     legs_cover "$LS_WF"
 sed 's/^        os: \[ubuntu-24.04, /        os: [/' "$LS_WF" >"$work/wf-no-x86.yml"
 expect_red_because "probe-target: a matrix without its x86_64 leg is red" \
@@ -2713,6 +2848,21 @@ awk -v row="        if: runner.os == 'Linux'" \
     '{ print } $0 == "        run: ./scripts/check-lint-scopes.sh" { print row }' "$LS_WF" >"$work/wf-gated.yml"
 expect_red_because "probe-target: a probe gate's step under an if: is red" \
     'the step that runs ./scripts/check-lint-scopes.sh carries `if:`' legs_cover "$work/wf-gated.yml"
+# The waker step's one allowed `if:` is the Linux-only row (ADR-0106 D8).
+awk -v run="        run: ./scripts/check-waker-atomics.sh" -v row="        if: github.event_name == 'push'" \
+    'NR > 1 { line = prev; if ($0 == run && prev ~ /^        if: /) line = row; print line } { prev = $0 } END { print prev }' \
+    "$LS_WF" >"$work/wf-waker-if.yml"
+expect_red_because "probe-target: the waker step under another if: is red" \
+    'the step that runs ./scripts/check-waker-atomics.sh carries `if:`' legs_cover "$work/wf-waker-if.yml"
+# Dropping the arm64 Linux leg leaves aarch64 covered by macOS for the
+# architecture check, but not the waker gate's aarch64-unknown-linux-gnu.
+sed 's/^\(        os: \[.*\), ubuntu-24.04-arm\(.*\]\)$/\1\2/' "$LS_WF" >"$work/wf-no-arm-linux.yml"
+expect_red_because "probe-target: a matrix without the arm64 Linux leg is red for the waker gate" \
+    "no build-test leg runs the waker gate for aarch64-unknown-linux-gnu" legs_cover "$work/wf-no-arm-linux.yml"
+awk -v a="        env:" -v b='          INF_WAKER_PROBE: "off"' \
+    '{ print } $0 == "        run: ./scripts/check-waker-atomics.sh" { print a; print b }' "$LS_WF" >"$work/wf-waker-off.yml"
+expect_red_because "probe-target: a step env that turns the waker probe off is red" \
+    "\`INF_WAKER_PROBE\` is set where the probe gates inherit it" legs_cover "$work/wf-waker-off.yml"
 sed 's/^\(        os: \[.*\)\]$/\1, windows-2025]/' "$LS_WF" >"$work/wf-unknown.yml"
 expect_red_because "probe-target: a runner label with no known architecture is red" \
     "runner windows-2025 has no architecture" legs_cover "$work/wf-unknown.yml"
