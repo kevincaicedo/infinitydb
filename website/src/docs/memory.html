@@ -1,0 +1,56 @@
+<!--
+title: Memory & eviction
+section: Operate
+description: Set maxmemory and an eviction policy, give named namespaces their own budgets, and read how InfinityDB attributes every byte to a named domain.
+lede: Memory is set with the Redis CONFIG surface and enforced per cell. All eight Redis eviction policies are supported, named namespaces can carry their own budgets, and every byte a cell holds is attributed to a named domain.
+chips: Available · alpha | Law L5
+-->
+<h2 id="maxmemory">The node budget</h2>
+<p><code>maxmemory</code> is a node-wide budget, and each cell enforces its share, <code>maxmemory / cells</code>. Cells own equal slot ranges, so this needs no shared state. The default is <code>0</code>, no limit, with the <code>noeviction</code> policy. Both keys change at runtime:</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; CONFIG SET maxmemory 256mb
+OK
+127.0.0.1:6379&gt; CONFIG SET maxmemory-policy allkeys-lfu
+OK
+127.0.0.1:6379&gt; CONFIG GET maxmemory
+1) "maxmemory"
+2) "268435456"</pre>
+<p>Sizes use Redis units: <code>kb</code>, <code>mb</code> and <code>gb</code> are powers of 1024, <code>k</code>, <code>m</code> and <code>g</code> powers of 1000. The write path pays one branch on a cached over-limit flag. Over the limit, a write may evict up to 512 keys inline; if that is not enough, it gets Redis's exact error, <code>OOM command not allowed when used memory &gt; 'maxmemory'.</code> Background slices then evict down to a lower target. Nothing panics under memory pressure: an allocation that cannot be met returns "no memory" and the command gets the error.</p>
+
+<h2 id="policies">Eviction policies</h2>
+<table class="doc-table"><thead><tr><th>Policy</th><th>Candidates</th><th>Order</th></tr></thead><tbody>
+<tr><td><code>noeviction</code></td><td>none</td><td>writes that need memory are refused</td></tr>
+<tr><td><code>allkeys-lru</code> / <code>volatile-lru</code></td><td>all keys / keys with a TTL</td><td>recency, by CLOCK</td></tr>
+<tr><td><code>allkeys-lfu</code> / <code>volatile-lfu</code></td><td>all keys / keys with a TTL</td><td>frequency, by Count-Min Sketch</td></tr>
+<tr><td><code>allkeys-random</code> / <code>volatile-random</code></td><td>all keys / keys with a TTL</td><td>random, from a seeded generator</td></tr>
+<tr><td><code>volatile-ttl</code></td><td>keys with a TTL</td><td>nearest deadline among the sampled keys</td></tr>
+</tbody></table>
+<p>Recency uses CLOCK with a 2-bit reference counter kept in spare bits of the record header, so it costs no extra bytes per key. A read saturates the counter to 3, a write sets it to 1, and the eviction hand decrements it; a record at 0 is a victim. Reads earn more than writes, which lets the hand tell a read-hot set from write churn. Frequency uses a 4 × 2,048 Count-Min Sketch of one-byte Morris counters, 8 KiB per store, allocated only while an LFU policy is active and halved periodically so old popularity ages out. <code>OBJECT FREQ</code> reports that estimate; <code>OBJECT IDLETIME</code> is an honest <code>0</code>, because there is no LRU clock. CLOCK is a sweep; the LFU, TTL and random policies examine <code>maxmemory-samples</code> candidates per step (5 by default). Eviction randomness comes from a seeded generator, so eviction replays exactly in the <a href="simulation.html">simulator</a>.</p>
+
+<h2 id="namespaces">Per-namespace budgets</h2>
+<p>A named memory namespace can carry its own budget and policy. Namespace DDL needs a node started with <code>--data-dir</code>.</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.NS CREATE sessions EVICTION allkeys-lru MAXMEMORY 512mb
+OK
+127.0.0.1:6379&gt; INF.NS SET sessions MAXMEMORY 1gb
+OK
+127.0.0.1:6379&gt; INF.NS SET sessions EVICTION inherit
+OK</pre>
+<ul class="dots">
+<li>With its own <code>MAXMEMORY</code>, a namespace evicts only its own keys and never displaces another's. Its out-of-memory error is the same Redis text, scoped to connections using that namespace. Like <code>maxmemory</code>, the budget divides across cells.</li>
+<li>Its bytes leave the node comparison. <code>maxmemory</code> bounds the pool: the numbered databases plus every namespace without a budget of its own. <code>INFO memory</code> reports that figure as <code>used_memory_pool</code>, so <code>maxmemory − used_memory_pool</code> is the headroom before eviction runs. <code>used_memory</code> counts every namespace and may sit above <code>maxmemory</code>.</li>
+<li><code>EVICTION inherit</code> follows <code>maxmemory-policy</code>; <code>MAXMEMORY 0</code> or <code>inherit</code> removes the budget. Both keys reload without a restart.</li>
+<li>Durable namespaces never evict, because evicting without logging a delete would bring the key back on replay. <code>EVICTION</code> is refused on them, and <code>INF.NS SET</code> refuses both keys. Tiered namespaces refuse both at creation too: <code>MEM-BUDGET</code> is their one budget.</li>
+</ul>
+
+<h2 id="accounting">Memory accounting</h2>
+<p>Every byte a cell holds is attributed, at the allocation site, to a named and counted domain. The arena counts requested bytes, mapped bytes and the slack between them, and the other structures count their own: the hash index, the TTL wheel, the eviction sketch, document tapes, arenas and caches, secondary-index trees, network buffers and connection state, and the reply and command pools.</p>
+<table class="doc-table"><thead><tr><th>Section</th><th>Scope</th><th>Fields</th></tr></thead><tbody>
+<tr><td><code>INFO memory</code></td><td>with <code>--data-dir</code>, the node summed over every cell (<code>memory_scope:node</code>); without one, the serving cell (<code>memory_scope:cell</code>)</td><td><code>used_memory</code>, <code>used_memory_rss</code>, <code>process_rss</code>, <code>used_memory_pool</code>, <code>used_memory_doc_*</code>, <code>used_memory_idx_*</code></td></tr>
+<tr><td><code>INFO tripwires</code></td><td>the cell that served the command (<code>tripwire_scope:cell</code>)</td><td><code>records_live_bytes</code>, <code>records_slack_bytes</code>, <code>index_bytes</code>, <code>wheel_bytes</code>, <code>evict_bytes</code>, <code>wire_buffers_bytes</code>, <code>conn_state_bytes</code></td></tr>
+</tbody></table>
+<p>Mind the scope before you compare: multiply a cell-scope figure by the cell count before setting it against the process. <code>process_rss</code> sits beside the node fold for exactly that comparison.</p>
+<p>The domains are reconciled against what the operating system reports. The project's exit-gate harness fails a run in which the sum of the domains drifts from process RSS beyond its tolerance, and the simulator checks memory accounting against its model at quiescence. An unattributed byte is a finding, not overhead. One pause is known and counted: growing the hash index doubles the table in one step on the write path, and <code>index_grows</code> in <code>INFO stats</code> counts each one.</p>
+
+<h2 id="tiering">Beyond eviction</h2>
+<p>Eviction is the right answer for a cache. When data must not be lost, use a durable namespace with a <code>MEM-BUDGET</code> instead: it answers pressure by demoting cold records to tier files on disk rather than deleting them, and reads them back through a suspending cold read. That works for string values today. See <a href="tiering.html">Beyond RAM</a>.</p>
+
+<aside class="law-box"><span class="law-code">L5</span><div><div class="law-title">Memory is the product.</div><p>For a cache, memory per key is the cost of the product. Records carry an 8-byte header, the index slot is 8 bytes and holds no key, eviction bits live in spare header bits, and attribution against RSS is a gate, not a dashboard.</p></div></aside>

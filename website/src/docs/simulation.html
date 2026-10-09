@@ -1,0 +1,62 @@
+<!--
+title: Deterministic simulation
+section: Concepts
+description: inf-sim runs the whole InfinityDB node on one thread with injected time, randomness, network and disk, so every failure replays from a seed.
+lede: Time, randomness, network and disk are injected, so the whole node, every cell included, runs on one thread inside a simulator. The same seed gives the same execution, byte for byte. Every failure is a seed you can replay.
+chips: Available · alpha | Law L7
+-->
+{{fig:dst}}
+<p class="fig-note">The real cell code, driven by a seeded scheduler over a simulated network, disk and clock, with oracles watching every step.</p>
+
+<h2 id="whole-node">The whole node, one thread</h2>
+<p><code>inf-sim</code> is not a model of InfinityDB. It runs the real server and loop code (every cell, the fabric, the wire protocol, the store, the log and recovery) through a third implementation of the backend driver, beside <code>io_uring</code> and <code>kqueue</code>. A seeded scheduler picks which cell or client runs next and advances a virtual clock in seeded steps.</p>
+<p>This works because the cell code never reaches for the outside world on its own. The loop takes a <code>Clock</code>, randomness comes from seeded <code>SplitMix64</code> streams, sockets and the ring sit behind the <code>BackendDriver</code> trait, and every log and tier file effect goes through a <code>SegmentFs</code> trait. Where iteration order could reach output, cell code uses <code>BTreeMap</code> or a fixed hasher, never a per-process random seed. Because the clock is virtual, a scenario can run a long expiry schedule without waiting for wall time to pass.</p>
+
+<h2 id="faults">Simulated faults</h2>
+<ul class="dots">
+<li><strong>Network.</strong> In-memory sockets split received bytes at seeded points, which drives every resume path of the RESP parser.</li>
+<li><strong>Disk.</strong> For every file the simulated disk keeps what the OS would show and what would survive a power cut. Unsynced data is lost on a cut. Pending writes are cut into sectors that each survive a coin flip and land in a seeded order, so writes tear and reorder. Directory operations survive only in a seeded prefix.</li>
+<li><strong>Power cuts.</strong> Scenarios cut power at seeded points, including during recovery itself, then boot again and audit what survived.</li>
+<li><strong>Fault points.</strong> Named fault points in the storage code are compiled only into test and simulator builds, and a check keeps them out of shipping builds.</li>
+<li><strong>Identity.</strong> The key-hash secret is derived from the seed, so hash placement replays too.</li>
+</ul>
+<p>An armed fault must prove it fired. A scenario whose fault never engaged reports <code>VACUOUS</code>, never a green result.</p>
+
+<h2 id="oracles">Oracles and canaries</h2>
+<p>Oracles watch every run:</p>
+<ul class="dots">
+<li>every key's replies, replayed against a model store in apply order on the same thread;</li>
+<li>an independent shadow model written from Redis's documented semantics, which shares no store code with the server;</li>
+<li>pub/sub delivery: in order, no loss, no duplicates;</li>
+<li>memory accounting and key contents at quiescence, and no leaked connections;</li>
+<li>no acknowledged <code>always</code> write lost across crashes;</li>
+<li>after seeded power cuts, every live key of a tiered namespace serving its exact bytes and every deleted key gone;</li>
+<li>document replay equivalence, index backfill and saved-index equivalence;</li>
+<li>a stall detector that fails a run making no progress, the tripwire for a lost wakeup.</li>
+</ul>
+<p>An oracle that cannot go red proves nothing, so each one has a canary: a planted bug, compiled in only for the canary run, that must turn it red while the plain build stays green. A lying <code>fsync</code> that reports success for data it never made durable must be caught within 1,000 seeds of the durability scenario. A <code>GET</code> that appends one byte to its reply must be caught by the shadow model, because the shared-store replay runs the same code and cannot see it. Other plants include a lost wakeup, an accept error, a tier read that fails with <code>EIO</code> and a log segment's leftover frames from a previous life.</p>
+
+<h2 id="run">Run it</h2>
+<p>The simulator refuses to build without the <code>dst</code> feature. From the repository root:</p>
+<pre class="code" data-label="shell">$ just sim-smoke
+$ cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+    --scenario m2-durable --seed 0xC0FFEE --verify-determinism
+$ just sim-canaries
+$ just durable-sweep 10000 0xD5EE0000</pre>
+<table class="doc-table"><thead><tr><th>Command</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>just sim-smoke</code></td><td>Every scenario the binary accepts, determinism-verified. PR CI runs the same script.</td></tr>
+<tr><td><code>--verify-determinism</code></td><td>Runs a seed twice and compares the traces and a hash of the final state, disk included.</td></tr>
+<tr><td><code>just sim-canaries</code></td><td>Builds each planted bug and requires its scenario to go red.</td></tr>
+<tr><td><code>just durable-sweep [seeds] [base]</code></td><td>Thousands of seeds of the durability scenario, sharded; <code>doc-sweep</code>, <code>budget-sweep</code>, <code>transition-sweep</code>, <code>reorder-sweep</code> and <code>recycle-sweep</code> follow the same shape.</td></tr>
+<tr><td><code>--plant NAME</code></td><td>Injects a known bug by hand: <code>lost-wakeup</code>, <code>fsync-lies</code>, <code>accept-error</code>, <code>tier-read-eio</code> or <code>stop-kill</code>.</td></tr>
+<tr><td><code>--list-scenarios</code></td><td>Prints every scenario name, from <code>m0-smoke</code> to <code>m4-tiered</code> and the index scenarios.</td></tr>
+</tbody></table>
+<p>When you report a simulator failure, the scenario and seed are the whole reproduction.</p>
+
+<h2 id="fleet">Seeds and the nightly fleet</h2>
+<p><a href="https://github.com/kevincaicedo/infinitydb/blob/main/bins/inf-sim/seeds/corpus.txt"><code>bins/inf-sim/seeds/corpus.txt</code></a> records every seed that ever caught a bug, and the corpus replays green on every merge to <code>main</code>. When a fresh seed fails, the fix lands with that seed appended, so the bug cannot quietly return. Every night a fleet replays the corpus at full size, runs fresh seeds derived from the run id, runs the sweeps and the canaries, and runs long expiry campaigns in virtual time. A failure files an issue carrying the scenario, the seed and the commit.</p>
+
+<h2 id="authority">Keeping the simulator's authority</h2>
+<p>One ambient call to the wall clock would make a run unrepeatable, so the rule is mechanical. <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-cell-denylist.sh"><code>scripts/check-cell-denylist.sh</code></a> rejects <code>tokio</code>, standard mutexes, read-write locks, condition variables and channels, thread spawn, sleep and park, <code>Instant::now</code>, <code>SystemTime::now</code> and ambient randomness in every cell crate. Clippy's <code>disallowed-methods</code> backs the clock ban with type resolution, so a renamed import does not slip through. A sanctioned site, such as the injected clock's own origin, carries a <code>denylist-allow:</code> marker with a reason, and the script lists every such site when it passes. Like every gate, it is self-tested inside <code>just check</code>: a planted violation must turn it red.</p>
+
+<aside class="law-box"><span class="law-code">L7</span><div><div class="law-title">Determinism is a feature.</div><p>Every effect a cell has on the world goes through an injected seam. That is what lets the simulator own time, entropy, the network and the disk, and what turns a once-a-week concurrency failure into one seed and an exact trace.</p></div></aside>

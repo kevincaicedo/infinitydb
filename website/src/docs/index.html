@@ -1,0 +1,34 @@
+<!--
+title: Introduction
+description: InfinityDB is a Redis-compatible, multi-model database: a cache, a durable key-value store and JSON documents in one engine, built thread-per-core on a single log.
+lede: InfinityDB is a multi-model database written in Rust. One engine serves an in-memory cache, a durable key-value store and JSON documents, and it speaks the Redis protocol, so the clients and tools you already use connect unchanged.
+chips: In progress · {{now_code}} {{now_name}}
+-->
+<aside class="callout"><div class="callout-label">Alpha software</div><p>InfinityDB is not ready for production. Commands, flags and on-disk formats may change between versions, and no release has been published yet. It has no authentication or TLS: run it only on localhost or a trusted network.</p></aside>
+
+<h2 id="shape">The shape of it</h2>
+<p>InfinityDB is built from scratch on a shared-nothing, thread-per-core design. Each <a href="cells.html">cell</a> is one thread that owns a shard of the keyspace end to end: its network I/O on Linux io_uring, its memory, its data and its log. The data plane has no locks and no shared mutable state.</p>
+<p>Durable namespaces write to a per-cell append-only <a href="log.html">log</a>. A durable namespace given a memory budget keeps its hot data in RAM and <a href="tiering.html">tiers the rest to disk</a>, for strings today. The whole node runs inside a <a href="simulation.html">deterministic simulator</a> that drives time from a virtual clock and injects disk faults, so every failure replays from a seed.</p>
+
+<h2 id="today">What works today</h2>
+<ul class="dots">
+<li>The string, key, expiry and server command families, checked byte for byte against Redis.</li>
+<li>All eight Redis eviction policies, namespaces with their own budgets, and pub/sub with RESP3 push.</li>
+<li>Durable namespaces in <code>memory</code>, <code>everysec</code> or <code>always</code> mode, with checkpoints, truncation and parallel recovery.</li>
+<li>JSON documents through RedisJSON-compatible <code>JSON.*</code> commands, with in-place path updates.</li>
+<li>Datasets beyond RAM for string values, through per-namespace memory and disk budgets.</li>
+</ul>
+<p>The exact per-command status is the generated <a href="compat.html">compatibility matrix</a>. What comes next, and in what order, is on <a href="roadmap.html">Status &amp; roadmap</a>.</p>
+
+<h2 id="docs">How these docs are organised</h2>
+<div class="cards">
+<a class="card" href="quickstart.html"><span class="card-t">Get started →</span><span class="card-d">Run a node, connect, make a namespace durable.</span></a>
+<a class="card" href="cells.html"><span class="card-t">Concepts →</span><span class="card-d">Cells, the fabric, the log, durability, tiering, simulation.</span></a>
+<a class="card" href="strings.html"><span class="card-t">Data models →</span><span class="card-d">Strings and keys, JSON documents, and indexes as they land.</span></a>
+<a class="card" href="configuration.html"><span class="card-t">Operate →</span><span class="card-d">Flags, the data directory, memory, what the node reports.</span></a>
+<a class="card" href="laws.html"><span class="card-t">Engineering →</span><span class="card-d">The design laws and the style every line of code follows.</span></a>
+<a class="card" href="https://github.com/kevincaicedo/infinitydb"><span class="card-t">Source ↗</span><span class="card-d">The repository, its architecture notes and its tests.</span></a>
+</div>
+
+<h2 id="not">What it is not, yet</h2>
+<p>Before 1.0, InfinityDB is not a SQL database (no query planner or joins), not a wire-compatible clone of DynamoDB, MongoDB or Kafka, not multi-region, and not a host for Redis <code>.so</code> modules. The module APIs it supports, such as <code>JSON.*</code>, are native.</p>

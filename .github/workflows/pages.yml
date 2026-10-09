@@ -1,14 +1,9 @@
 # InfinityDB website — GitHub Pages deployment.
 #
-# Guarantees enforced before every deploy:
-#   1. The compat page is regenerated from the repo's generated artifact
-#      (docs/compat-matrix.md) and must match the committed page — the site
-#      can never drift from the implementation (L8).
-#   2. The ledger-copy check scans every HTML page: any performance-shaped
-#      number not covered by an Allowed claim-ledger row fails the build
-#      (L10). The claim ledger is published with the site
-#      (website/site/_ledger-snapshot.md); the release-manager checklist
-#      refreshes it alongside any copy change.
+# Guarantee enforced before every deploy: website/site is exactly what
+# website/build.py renders from website/src and the generated
+# docs/compat-matrix.md, so the site cannot drift from its sources or from
+# the implementation (L8).
 
 name: website
 
@@ -38,28 +33,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Regenerate compat page from the repo artifact
-        run: |
-          python3 website/scripts/gen-compat-page.py \
-            --matrix docs/compat-matrix.md \
-            --out website/site/docs/compat.html \
-            --date "$(date -u +%F)"
-
-      - name: Compat page staleness gate (generated page must be committed)
-        run: |
-          # The --date stamp is the only line allowed to differ.
-          if ! git diff -I'gen-compat-page\.py</code> on [0-9-]*\.' --exit-code website/site/docs/compat.html; then
-            echo "::error::website/site/docs/compat.html is stale — regenerate it with website/scripts/gen-compat-page.py and commit."
-            exit 1
-          fi
-
-      - name: Ledger-copy check (no number without an Allowed row)
-        run: |
-          python3 website/scripts/check-ledger-copy.py \
-            --site website/site \
-            --ledger website/site/_ledger-snapshot.md \
-            --allowlist website/scripts/ledger-allowed-numbers.txt \
-            --print-tokens
+      - name: Site staleness gate (the committed site must match a fresh build)
+        run: python3 website/build.py --check
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

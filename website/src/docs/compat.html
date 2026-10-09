@@ -1,0 +1,30 @@
+<!--
+title: Redis compatibility
+description: Per-command Redis compatibility for InfinityDB, rendered from the generated repository artifact.
+lede: Compatibility is declared per command and checked byte for byte against a real Redis in CI. A new difference fails the build until it is written down.
+chips: Available · alpha | Law L8
+layout: wide
+-->
+<aside class="callout"><div class="callout-label">Generated tables</div><p>The tables on this page are rendered from <a class="u" href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>docs/compat-matrix.md</code></a>, which the build generates from the command registry and a corpus diffed byte for byte against a real Redis. They are never edited by hand, so they cannot drift from the implementation.</p></aside>
+<div class="stats">{{compat_stats}}</div>
+<p class="doc-note mono">Corpus: {{compat_corpus}} · Surface: {{compat_surface}}</p>
+
+<h2 id="vocabulary">Status vocabulary</h2>
+<table class="doc-table"><thead><tr><th>Status</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><span class="st st-full mono">full</span></td><td>Equivalent to Redis by behaviour. Recorded differences are representational only: ordering, identity payloads, opaque cursors.</td></tr>
+<tr><td><span class="st st-partial mono">partial</span></td><td>A documented semantic difference exists. The note says which.</td></tr>
+<tr><td><span class="st st-stub mono">stub</span></td><td>Accepted but inert.</td></tr>
+<tr><td><span class="st st-extension mono">extension</span></td><td>An <code>INF.*</code> command Redis does not have.</td></tr>
+<tr><td><span class="st st-internal mono">internal</span></td><td>A fabric primitive between cells, not a client surface.</td></tr>
+</tbody></table>
+<p><strong>Cases</strong> counts the compared corpus executions. <strong>Evidence</strong> counts the ones that answer neither an error nor a null: a <code>full</code> row needs at least one, so an error-path case alone never makes a command full. A command that is absent from this table is absent from the server.</p>
+
+<h2 id="commands">Commands</h2>
+<div class="chips" role="group" aria-label="Filter commands by status" data-filter-group="#matrix">{{compat_chips}}</div>
+<div class="table-wrap table-wide"><table class="doc-table matrix" id="matrix"><thead><tr><th>Command</th><th>Status</th><th>Since</th><th>Flags</th><th>Arity</th><th>Cases</th><th>Evidence</th><th>Notes</th></tr></thead><tbody>
+{{compat_rows}}
+</tbody></table></div>
+
+<h2 id="deviations">Documented deviations</h2>
+<p>Each entry is a justification from the diff corpus: the reply must still be well-formed RESP, but its bytes differ from Redis by design.</p>
+<div class="devs">{{compat_devs}}</div>

@@ -1,0 +1,57 @@
+<!--
+title: Quickstart
+description: Run InfinityDB locally, connect with redis-cli, then give one namespace real durability and store a JSON document.
+lede: Run InfinityDB locally, connect with the Redis tools you already have, then give one namespace real durability.
+-->
+<aside class="callout"><div class="callout-label">Alpha software</div><p>InfinityDB is single-node and not production-ready. It has no authentication or TLS yet and listens on every interface, so keep it bound to localhost, and keep copies of anything you care about.</p></aside>
+
+<h2 id="run"><span class="num">1</span>Start the server</h2>
+<p>No release has been published yet, so build the image from the repository. It listens on 6379, the Redis default, so existing tools connect unchanged.</p>
+<pre class="code" data-label="shell">$ git clone https://github.com/kevincaicedo/infinitydb &amp;&amp; cd infinitydb
+$ docker build -t infinitydb:dev .
+$ docker run --rm -p 127.0.0.1:6379:6379 \
+    --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+    -v infinitydb-data:/data \
+    infinitydb:dev --data-dir /data</pre>
+<p>The seccomp profile is required: InfinityDB is built on io_uring, and Docker's default profile blocks it. The volume and <code>--data-dir</code> give the node somewhere durable to write. The first boot of a new data directory measures the device before it accepts connections; the node is ready when it prints <code>control: recovery complete</code>.</p>
+<p>On Linux 5.15 or newer with Rust installed, you can run the binary directly instead:</p>
+<pre class="code" data-label="shell">$ cargo build --release -p infinityd
+$ ./target/release/infinityd --port 6379 --data-dir ~/infinity-data</pre>
+
+<h2 id="connect"><span class="num">2</span>Connect with redis-cli</h2>
+<p>Any Redis client works. Start with the basics.</p>
+<pre class="code" data-label="redis-cli">$ redis-cli -p 6379
+127.0.0.1:6379&gt; PING
+PONG
+127.0.0.1:6379&gt; SET greeting "hello" EX 60
+OK</pre>
+
+<h2 id="durable"><span class="num">3</span>Make a namespace durable</h2>
+<p>Durability belongs to the namespace, not the server. Pick the guarantee each workload needs.</p>
+<table class="doc-table"><thead><tr><th>Mode</th><th>Acknowledged</th><th>Lost if the machine dies</th></tr></thead><tbody>
+<tr><td><code>memory</code></td><td>on apply, no log</td><td>everything: cache semantics</td></tr>
+<tr><td><code>everysec</code></td><td>on apply, fsync every second</td><td>up to one second</td></tr>
+<tr><td><code>always</code></td><td>after the group fsync</td><td>nothing, on a single node</td></tr>
+</tbody></table>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.NS CREATE ledger MODE durable FSYNC always
+OK
+127.0.0.1:6379&gt; INF.NS USE ledger
+OK</pre>
+<p><code>INF.NS USE</code> binds this connection to the namespace, the way <code>SELECT</code> binds a database. The numbered databases behind <code>SELECT 0..15</code> are always memory-only, so a connection that never binds writes to a cache. The full contract is on <a href="durability.html">Namespaces &amp; durability</a>.</p>
+
+<h2 id="document"><span class="num">4</span>Store a JSON document</h2>
+<p>Documents are first-class values, mutated by path. Hash tags like <code>{sku9}</code> keep a document and its related keys on the same core.</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; JSON.SET catalog:{sku9} $ '{"name":"Lens","price":4999}'
+OK
+127.0.0.1:6379&gt; JSON.NUMINCRBY catalog:{sku9} $.price -500
+"[4499]"
+127.0.0.1:6379&gt; JSON.GET catalog:{sku9} $.name
+"[\"Lens\"]"</pre>
+<p>Stop the server with Ctrl-C and start it again with the same command. The stop is graceful, the namespace is durable, and the document is still there.</p>
+
+<h2 id="next">Next steps</h2>
+<div class="cards">
+<a class="card" href="cells.html"><span class="card-t">Cells &amp; ownership →</span><span class="card-d">Why every key has exactly one owner.</span></a>
+<a class="card" href="log.html"><span class="card-t">The log spine →</span><span class="card-d">One mechanism for durability, queues and replication.</span></a>
+<a class="card" href="compat.html"><span class="card-t">Compatibility matrix →</span><span class="card-d">Every command, marked full, partial, stub or absent.</span></a>
+</div>

@@ -1,0 +1,65 @@
+<!--
+title: The log spine
+section: Concepts
+description: InfinityDB's per-cell segmented log: CRC32C frames, group commit once per loop, fork-free checkpoints, MANIFEST, truncation and parallel recovery.
+lede: Every durable fact is a log append first. Each cell writes its own segmented log, commits it once per loop iteration, checkpoints it without forking and recovers it in parallel with every other cell.
+chips: Available · alpha | Law L2
+-->
+{{fig:log}}
+<p class="fig-note">One log per cell. A checkpoint is a prefix of that log written out as state; the MANIFEST names it.</p>
+
+<h2 id="one-log">One log, several products</h2>
+<p>The hash index, JSON documents, tier files and secondary indexes are projections of the log: rebuilt from it, or loaded from a checkpoint that is itself a log prefix. That leaves one mechanism to make correct instead of one per feature.</p>
+<table class="doc-table"><thead><tr><th>Product</th><th>What it is</th><th>Status</th></tr></thead><tbody>
+<tr><td>Cache</td><td>The log off. Memory namespaces and the numbered databases never reach it, so they pay nothing for durability.</td><td>Available</td></tr>
+<tr><td>Durable key/value</td><td>The log plus the index, with an fsync policy per namespace.</td><td>Available</td></tr>
+<tr><td>Queue</td><td>The log read forward by consumers.</td><td>Planned · M7</td></tr>
+<tr><td>Replica</td><td>The log shipped to a follower, cell by cell.</td><td>Planned · M9</td></tr>
+</tbody></table>
+
+<h2 id="frames">Records and frames</h2>
+<p>A log record is a varint length, a type, flags, a namespace id and a payload. Strings are logged as their new value, never as the operation, so replay is a blind upsert that never depends on what was there before. Other types carry deletes, absolute expiry times, namespace operations, checkpoint markers and <a href="json.html">document deltas</a>. Unknown types and non-canonical encodings are refused.</p>
+<p>An LSN is a (segment, offset) pair inside one cell's log. There is no global LSN and no cross-cell order to agree on, so each cell recovers on its own. The records staged since the last seal go into one frame, written with one write:</p>
+<pre class="code" data-label="log frame">header   magic · frame length · record count · first LSN
+         · epoch (log life) · seq (frame number in this life)
+         · covered LSN (durable watermark when sealed)
+body     records
+trailer  CRC32C over header and body
+padding  zeros up to the next 4 KiB boundary (O_DIRECT segments only)</pre>
+<p>Recovery uses the epoch, the sequence and the covered LSN to tell a torn tail from lost acknowledged data.</p>
+
+<h2 id="group-commit">Group commit</h2>
+<p>A durable write executes, updates the store and stages its record in a ring of whole-frame buffers, 4 MiB each by default (<code>--log-staging-mib</code>), allocated once. At the LOG step the staged records seal into at most one frame per iteration, and its write rides the next iteration's single <code>io_uring_enter</code>. One durability barrier covers every durable write that is due. The durable watermark advances only when a barrier completes, and only over the longest prefix in which every earlier barrier has completed too.</p>
+<p>Each namespace chooses when the client hears <code>OK</code>: with <code>FSYNC always</code> the reply waits until the watermark covers its record; with <code>FSYNC everysec</code> it is sent as soon as the write executes and a one-second timer makes sure a barrier runs. <a href="durability.html">Namespaces &amp; durability</a> states the loss window of each. When staging is full, durable writes wait for space instead of failing. A record that could never fit one staging buffer is refused up front with <code>ERR write exceeds durable log staging capacity</code>.</p>
+
+<h2 id="segments">Segments and truncation</h2>
+<p>The log is a sequence of segment files, <code>shard-N/log/seg-NNNNNN.ilog</code>, 256 MiB each by default. The next segment is created and preallocated in background slices before the current one fills, so rotation is a pointer swap.</p>
+<p>The begin LSN of the current checkpoint is the truncation floor. Segments below it are covered by the checkpoint. They are deleted by the control thread, so that freeing a large file stays off the data plane, or, when already zero-filled, renamed into place as the next segment instead.</p>
+
+<h2 id="checkpoints">Checkpoints and the MANIFEST</h2>
+<p>A checkpoint is fuzzy and taken by the owning cell in bounded MAINTAIN slices under the checkpoint budget. There is no <code>fork()</code> and no stop-the-world pause.</p>
+<ul class="dots">
+<li>The cell stages a checkpoint-begin marker. Its LSN is where replay will start.</li>
+<li>The cell walks its stores into CRC-protected sections of <code>ckpt-NNNNNN.ick.new</code>, in ordinary log record encodings. A record that changes during the walk is also in the log after the marker.</li>
+<li>A footer carries per-namespace counts and a digest chained over every section CRC. The file is synced, renamed to <code>.ick</code> and the directory is synced.</li>
+<li>A new <code>MANIFEST</code> names the checkpoint, its begin LSN, the live segments and any tier files. It is written, fsynced, renamed over the old one and the directory fsynced, so a reader sees the old recovery unit or the new one, never a mix.</li>
+</ul>
+<p>A checkpoint starts once the log has grown to about twice the last one, capped so replay stays inside a fixed recovery-time budget. You can also ask for one; <code>BGSAVE</code> maps onto the same checkpoint and writes no RDB file:</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.CKPT WAIT
+OK
+127.0.0.1:6379&gt; BGSAVE
+Background saving started</pre>
+<p><code>INF.CKPT [CELL k] [WAIT]</code> needs a node started with <code>--data-dir</code>. An I/O error during a checkpoint abandons that checkpoint, not the process: the previous checkpoint and the log are still valid.</p>
+
+<h2 id="recovery">Recovery</h2>
+<p>Each cell recovers its own log in parallel with the others, in bounded slices. Until every cell has finished, every cell answers <code>-LOADING</code>.</p>
+<ul class="dots">
+<li>Read the MANIFEST. The checkpoint it names must load and the floor segment must exist; anything less stops the boot, never a silent full replay.</li>
+<li>Load the checkpoint, verifying every section CRC before applying it, then the footer's digest and counts.</li>
+<li>Replay from the begin LSN, frame by frame. Each frame is validated (magic, length, CRC, recorded position, epoch and sequence continuity) before any of its records applies.</li>
+<li>Scan past each segment's last valid frame. If a later frame's covered LSN shows that the missing range had been acknowledged as durable, the device lost acknowledged data and the boot stops. Otherwise the gap is an unacknowledged torn tail and the cell continues from it, without rewriting existing bytes.</li>
+<li>Remove leftovers of interrupted work and reopen the log under a new epoch.</li>
+</ul>
+<p>Checkpoint load and tail replay share one idempotent upsert: one recovery path, not two. A graceful stop writes a stop checkpoint, so the next boot replays nothing. An <code>fsync</code> failure on a barrier that protects acknowledged data stops the node, because the page cache can no longer say what reached the disk.</p>
+
+<aside class="law-box"><span class="law-code">L2</span><div><div class="law-title">The log is the database.</div><p>Every projection, from the hash index to tier files and saved secondary indexes, is rebuildable from the log or from a checkpoint that is itself a log prefix. Recovery has one vocabulary, so there is one path to get right.</p></div></aside>

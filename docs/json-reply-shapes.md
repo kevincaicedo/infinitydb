@@ -50,6 +50,5 @@ M3-S17's `DocDelta`/`DocFull` path (ADR-0043).
 
 Compatibility status per command lives in `docs/compat-matrix.md`; this
 artifact pins the *shapes* the corpus executes under both protocols
-(`inf-server/tests/json_commands.rs`). Performance claims live in the
-claim ledger, published as `website/site/_ledger-snapshot.md`, never here
-(L10).
+(`inf-server/tests/json_commands.rs`). Performance claims are never made
+here (L10).

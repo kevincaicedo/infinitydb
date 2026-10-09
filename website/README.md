@@ -1,164 +1,97 @@
 # InfinityDB website
 
-Fully static, multi-page project website for GitHub Pages. Plain HTML/CSS +
-minimal vanilla JS — no framework, no build step for pages. The generated
-pages are the compat matrix and the comparative evidence report (see
-below). The visual system is the dual-accent design (violet #7c5cff + teal
-#3ee6c4 on #06070d — see [DESIGN.md](DESIGN.md), "Two Lamps on
-Near-Black"); product intent is in [PRODUCT.md](PRODUCT.md).
+The static website for InfinityDB: a landing page, the documentation and the
+engineering blog, deployed to GitHub Pages from `site/`. The visual system
+is specified in [DESIGN.md](DESIGN.md).
+
+Plain HTML, one stylesheet and one script, no framework and no
+dependencies. Pages are rendered by `build.py` (Python 3 standard library
+only) and the rendered `site/` is committed, so what is reviewed is exactly
+what is deployed.
 
 ## Layout
 
 ```
-site/                          ← the deployable root (upload this to Pages)
-  index.html                   landing page
-  assets/site.css              the one shared stylesheet
-  _ledger-snapshot.md          the published claim ledger the copy check reads
-  docs/
-    index.html                 docs hub + claims/evidence explainer
-    quickstart.html            source build + Docker-from-repo + seccomp note
-                               + client snippets (redis-py/node-redis/go-redis/Lettuce)
-    durability.html            namespaces, durability classes, loss windows, recovery
-    deployment.html            docker/systemd/seccomp, data-dir layout, flags, upgrades
-    operations.html            -LOADING, refusal taxonomy, INFO persistence, alpha limits
-    architecture.html          the internals tour with animated diagrams
-                               (cell, fabric, group commit, tiering)
-    benchmarks.html            methodology + every Allowed number w/ artifact
-    compat.html                GENERATED — do not edit (see below)
-    roadmap.html               the milestone train
-  evidence/
-    inf-compare.html           GENERATED — the binding comparative campaign
-                               report, rendered verbatim (see below)
-  blog/
-    index.html
-    the-log-is-the-database.html   featured post (discipline model)
-scripts/
-  gen-compat-page.py           renders compat.html from the repo artifact
-  gen-compare-page.py          renders evidence/inf-compare.html from a
-                               BINDING inf-compare report (refuses dev-tier)
-  check-ledger-copy.py         CI: no perf number without an Allowed ledger row
-                               (skips site/evidence/ — generated artifact renders)
-  ledger-allowed-numbers.txt   the allowlist (regenerated from Allowed rows)
+build.py                 renders src/ + ../docs/compat-matrix.md into site/
+src/
+  index.html             landing page body
+  docs/<page>.html       one fragment per docs page (front-matter + HTML)
+  blog/<post>.html       one fragment per post (front-matter + HTML)
+  assets/site.css        the stylesheet: tokens, components, breakpoints
+  assets/site.js         theme, menus, copy, filters, search, pixel field
+site/                    GENERATED, committed, deployed as-is
 ```
 
-The deploy workflow is `.github/workflows/pages.yml`. The claim ledger is
-published with the site as `site/_ledger-snapshot.md`; maintainers refresh
-it with every release and whenever site copy adds, removes or re-words a
-number. The copy check (below) reads it.
+`build.py` owns everything more than one page shows, defined once: the
+milestone train and the current milestone (`NOW`), the docs navigation
+(`DOCS_NAV`), the post list (`POSTS`), the logo and Moss, the post covers,
+the figures, and the page chrome. It also writes the favicon, the RSS feed,
+the sitemap, the search index and the 404 page.
 
-## Preview locally
+## Build and preview
+
+From the repository root:
 
 ```bash
-cd site && python3 -m http.server 8000
-# open http://localhost:8000
+python3 website/build.py            # render site/
+python3 website/build.py --check    # exit 1 if site/ is stale
+cd website/site && python3 -m http.server 8000   # http://localhost:8000
 ```
 
-Everything is self-contained except the Google Fonts links (Archivo +
-JetBrains Mono); the site degrades gracefully to system fonts offline.
+The output is a pure function of the inputs (no dates, seeded art), so
+`--check` is a byte comparison. CI runs it on every pull request
+(`website-gates` in `.github/workflows/infinity-ci.yml`) and again before
+every deploy (`.github/workflows/pages.yml`). Edit `src/`, run the build,
+commit both.
 
-## The compat page is generated — never edit it
+## Common changes
 
-`site/docs/compat.html` is rendered from the repository's own generated
-artifact `docs/compat-matrix.md` (which is itself rendered from the
-`inf-wire` command registry by `tests/compat/src/matrixgen.rs`, with its own
-CI staleness gate). The chain keeps the website incapable of drifting from
-the implementation (law L8). The page is first-read copy: the renderer
-states each note without the matrix's internal decision and story
-identifiers, and folds a story or dot milestone into its milestone; none
-may survive on the page. Regenerate after the matrix changes, from the
-repository root:
+- **The current milestone moves.** Change `NOW` in `build.py`. The
+  announcement bar, alpha badges, roadmap train, docs tags and "Also on the
+  train" row follow. The build also checks that every internal link and
+  `#fragment` resolves.
+- **A docs page.** Add `src/docs/<slug>.html` and its entry in `DOCS_NAV`.
+  A source without an entry, or an entry without a source, fails the
+  build. Front-matter keys: `title`, `description`, `lede`, optional
+  `chips` (`Available · alpha | Law L1`). Every `<h2 id>` becomes an "On
+  this page" entry; `{{fig:<name>}}` inserts a figure.
+- **A blog post.** Add `src/blog/<slug>.html` (front-matter: `title`, `dek`,
+  `date`, `topic`, `group`, `crumb`, `kicker`, `excerpt`) and its entry in
+  `POSTS`, newest first, with a cover `kind` and `seed`.
+- **Code blocks.** `<pre class="code" data-label="shell">`. Lines starting
+  with `$ ` or `127.0.0.1:6379&gt; ` are commands: their prompts are muted
+  and the copy button copies only the commands. Other lines are output.
 
-```bash
-python3 website/scripts/gen-compat-page.py \
-  --matrix docs/compat-matrix.md \
-  --out website/site/docs/compat.html
-```
+## The compatibility page is generated
 
-Commit the regenerated page. The workflow regenerates it and fails the
-build if the committed page is stale (only the date stamp may differ).
+`site/docs/compat.html` is rendered from `docs/compat-matrix.md`, which the
+compat crate generates from the command registry and the corpus diffed
+against Redis (with its own staleness gate). The page states each note
+without citing unpublished records; a citation that survives the rewrite
+fails the build. Never edit the page; regenerate the matrix and rebuild.
 
-## The ledger-copy check
+`bins/infinityd/tests/boot_refusal.rs` reads `site/docs/observability.html`:
+the page quotes the refusal line the binary prints, and the test compares
+the two. Reword one and the test goes red until the other matches.
 
-Project law L10: no number in public copy without an **Allowed** row in the
-claim ledger. `scripts/check-ledger-copy.py` mechanizes the website half of
-that rule: it strips every HTML page to visible text, extracts
-performance-claim-shaped tokens (multipliers `2.7x`, rates `ops/s`,
-bandwidth, latencies, sizes, percentages, `p99 < N` comparisons) and fails
-unless each token is in `scripts/ledger-allowed-numbers.txt`. From the
-repository root:
+## Content rules
 
-```bash
-python3 website/scripts/check-ledger-copy.py --site website/site \
-  --ledger website/site/_ledger-snapshot.md \
-  --allowlist website/scripts/ledger-allowed-numbers.txt --print-tokens
-```
+- InfinityDB is alpha. Shipped work is labelled as shipped; everything else
+  carries its milestone, in copy, figures and terminal examples.
+- No release has been published. No page claims a version, image or
+  binary that does not exist; the quickstart builds from the repository.
+- No performance, latency, throughput or memory numbers. The Evidence
+  section and the "no benchmarks" post explain why.
+- Big milestones only (M0 to M11): no dot milestone, story, decision or
+  review identifier in any page. In a combined checkout `just check` runs
+  the public-docs gate over the site and its sources.
+- Commands and replies are ones the current tree accepts and prints.
 
-- The allowlist is maintained **from the ledger's Allowed rows** — every
-  entry's comment names its row (or documents why it is a non-claim, e.g.
-  the `MAXMEMORY 16gb` config example). Review it whenever the ledger
-  changes.
-- The ledger text is a soft cross-check (a warning when an allowlisted
-  token does not appear in an Allowed row); the allowlist is the hard gate.
-- The check is a tripwire, not a replacement for the release-manager
-  checklist in the ledger (it checks numbers, not wording).
+## Deploying
 
-Current numbers on the site and their coverage: the landing page shows
-the first Allowed measured rows — **C5** (unpipelined 3.21× Redis +
-the 1.72× Dragonfly cross-cell anchor, disclosures in the mono footnote),
-**C7** (0.61× RSS), **C8** (96.19% LFU parity), **C12** (10k-seed sweep),
-**C14** (9.8 s cold boot), **C16** (14.4 MiB checkpoint overhead) — in
-evidence blocks and stat tiles; `docs/benchmarks.html` carries the full
-Allowed set including the document rows (**C21**, **C24–C27**) beside
-the methodology (**C19**'s everysec range came off the page 2026-08-11 —
-its re-read did not reproduce and the row reverted to Evidence-pending;
-the page's absence list tells that story); the durability page cites
-**C12–C16, C21** verbatim with artifacts; the blog cites **C3, C4, C12**.
-Deployment/operations carry only config non-claims (`256 MiB` defaults,
-`16 MiB` bound). `evidence/inf-compare.html` is the generated verbatim
-render of the binding comparative report (excluded from the copy check by
-design — it IS the artifact; the generator refuses non-binding reports).
-Pipelined peaks, `always`-mode write rates, absolute tail-latency claims,
-and all tiered-storage numbers remain absent — Narrowed/Evidence-pending
-rows never render, and both the landing's "what you don't see here"
-callout and the benchmarks page's absence list say so explicitly.
-
-## Deploying to GitHub Pages
-
-1. The workflow is `.github/workflows/pages.yml` (adjust its paths if you
-   relocate `site/`/`scripts/`).
-2. In the GitHub repo: **Settings → Pages → Build and deployment → Source:
-   GitHub Actions.**
-3. Push to `main` (or run the workflow manually). The workflow runs the
-   compat staleness gate + the ledger check, then deploys `site/` via
-   `actions/upload-pages-artifact` + `actions/deploy-pages`.
-4. Optional custom domain: Settings → Pages → Custom domain, then add a
-   `site/CNAME` file containing the domain so deploys keep it.
-
-## Before going live
-
-- [ ] Enable GitHub Pages as described above; verify the deployed URL.
-- [ ] Custom domain, if any (`site/CNAME` + DNS).
-- [ ] Verify the quickstart cold on a clean machine (source build +
-  Docker-from-repo path).
-- [ ] When the first release is tagged: update the quickstart's "no
-  published binaries yet" callout to point at the release artifacts,
-  re-run the ledger check against the release's re-validated ledger, and
-  regenerate `evidence/inf-compare.html` from that release's binding
-  comparative report once its rows are signed.
-
-## Honesty invariants baked into the copy (keep them when editing)
-
-- InfinityDB is alpha. What ships is labeled as shipping; everything else
-  (collections, streams, vectors, compute, high availability) is a roadmap
-  item and every mention carries its milestone label — including terminal
-  commands and diagram nodes.
-- Nothing has been tagged yet; version badges never claim a release that
-  does not exist.
-- The roadmap page mirrors [the repository roadmap](../docs/roadmap.md):
-  the big milestones, in order, with honest status.
-- The Docker quickstart builds from the repo and keeps the io_uring seccomp
-  requirement front and center.
-- The `wait-replica` durability row is labeled with the replication
-  milestone (not shipped).
-- The predecessor project is not named on the site; it survives only as
-  unnamed context in the discipline post.
+The `website` workflow deploys `site/` on every push to `main` that touches
+`website/**` or the compat matrix. In the repository settings, Pages must
+use **GitHub Actions** as its source. `SITE_URL` in `build.py` sets the
+canonical URLs, the feed and the 404 page's links (absolute, because Pages
+serves that page at any missing path). Moving to a custom domain means
+changing it and having the build emit a `CNAME` file.

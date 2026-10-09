@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documents as tape — InfinityDB Blog</title>
+<meta name="description" content="JSON documents now live as a compact tape at every size. The memory gate failed, and the fix was to stop building a representation rather than tune it.">
+<link rel="canonical" href="https://kevincaicedo.github.io/infinitydb/blog/documents-as-tape.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="InfinityDB">
+<meta property="og:title" content="Documents as tape — InfinityDB Blog">
+<meta property="og:description" content="JSON documents now live as a compact tape at every size. The memory gate failed, and the fix was to stop building a representation rather than tune it.">
+<meta property="og:url" content="https://kevincaicedo.github.io/infinitydb/blog/documents-as-tape.html">
+<meta name="theme-color" content="#F4F4F0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0B0B0A" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/rss+xml" title="InfinityDB engineering notes" href="../blog/feed.xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@700;900&family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>try{var t=localStorage.getItem("inf-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip mono" href="#main">Skip to content</a>
+<div class="announce mono">
+<span class="sq8 bg-sig" aria-hidden="true"></span>
+<span>M4 · Tiered storage<span class="m-only"> — in progress</span></span>
+<span class="muted d-only">datasets beyond RAM, indexes and query — in progress</span>
+<a class="d-only u" href="../index.html#roadmap">Follow the build</a>
+</div>
+<header class="nav">
+<div class="wrap nav-in">
+<a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></a>
+<nav class="nav-links mono" aria-label="Primary"><a href="../docs/index.html">Docs</a><a href="../index.html#how">Architecture</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence</a><a href="../blog/index.html" aria-current="page" class="on"><span class="sq6 bg-sig" aria-hidden="true"></span>Blog</a></nav>
+<div class="nav-cta">
+<a class="btn-sm btn-line mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a>
+<a class="btn-sm btn-ink" href="../index.html#start">Get started</a>
+</div>
+<button type="button" class="icon-btn nav-burger" data-menu-open aria-controls="menu" aria-expanded="false" aria-label="Open menu"><svg width="20" height="12" viewBox="0 0 20 12" aria-hidden="true"><rect x="0" y="1" width="20" height="2" fill="currentColor"/><rect x="0" y="9" width="20" height="2" fill="currentColor"/></svg></button>
+</div>
+</header>
+<div class="menu" id="menu" hidden>
+<div class="menu-head"><a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name brand-name-sm">InfinityDB</span></a><button type="button" class="icon-btn" data-menu-close aria-label="Close menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 2L14 14M14 2L2 14" stroke="currentColor" stroke-width="2"/></svg></button></div>
+<nav class="menu-links" aria-label="Mobile"><a href="../docs/index.html">Docs<span aria-hidden="true">→</span></a><a href="../index.html#how">Architecture<span aria-hidden="true">→</span></a><a href="../index.html#roadmap">Roadmap<span aria-hidden="true">→</span></a><a href="../index.html#evidence">Evidence<span aria-hidden="true">→</span></a><a href="../blog/index.html">Blog<span aria-hidden="true">→</span></a><a class="menu-gh mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></nav>
+<div class="menu-foot">
+<div class="theme-seg" role="group" aria-label="Theme"><button type="button" class="mono" data-theme-set="light" aria-pressed="false">Light</button><button type="button" class="mono" data-theme-set="dark" aria-pressed="false">Dark</button></div>
+<a class="btn btn-ink btn-block" href="../index.html#start" data-menu-close>Get started</a>
+<div class="menu-alpha mono"><span class="sq6 bg-sig" aria-hidden="true"></span>Alpha · M4 Tiered storage</div>
+</div>
+</div>
+<main id="main" class="wrap post">
+<a class="back-m mono" href="index.html"><span aria-hidden="true">←</span>All posts</a>
+<header class="post-head">
+<div class="crumb mono"><a href="index.html">Blog</a><span>/</span><span class="ink">Engineering</span></div>
+<div class="kicker-m mono">M3 · JSON documents</div>
+<h1>Documents as tape</h1>
+<p class="dek">The memory gate failed on large documents. The fix was a placement rule, not tuning.</p>
+<div class="post-by"><span class="avatar av36 mono" aria-hidden="true">KC</span><span class="ink">Kevin Caicedo</span><span class="d-only dim">·</span><span class="d-only mono kicker">M3 · JSON documents</span><span class="d-only dim">·</span><span class="d-only mono kicker">2026-07-16</span></div>
+</header>
+<figure class="post-cover" aria-hidden="true"><svg class="px cover" width="1196" height="446" viewBox="0 0 64 24" aria-hidden="true"><path class="f-dim" d="M11.12 2.12h.76v.76h-.76zM12.12 2.12h.76v.76h-.76zM13.12 2.12h.76v.76h-.76zM14.12 2.12h.76v.76h-.76zM14.12 5.12h.76v.76h-.76zM15.12 5.12h.76v.76h-.76zM16.12 5.12h.76v.76h-.76zM17.12 5.12h.76v.76h-.76zM19.12 8.12h.76v.76h-.76zM20.12 8.12h.76v.76h-.76zM21.12 8.12h.76v.76h-.76zM22.12 8.12h.76v.76h-.76zM23.12 8.12h.76v.76h-.76zM24.12 8.12h.76v.76h-.76zM25.12 8.12h.76v.76h-.76zM26.12 8.12h.76v.76h-.76zM27.12 8.12h.76v.76h-.76zM19.12 11.12h.76v.76h-.76zM20.12 11.12h.76v.76h-.76zM21.12 11.12h.76v.76h-.76zM22.12 11.12h.76v.76h-.76zM13.12 14.12h.76v.76h-.76zM14.12 14.12h.76v.76h-.76zM15.12 14.12h.76v.76h-.76zM16.12 14.12h.76v.76h-.76zM17.12 14.12h.76v.76h-.76zM18.12 14.12h.76v.76h-.76zM19.12 14.12h.76v.76h-.76zM20.12 14.12h.76v.76h-.76zM21.12 14.12h.76v.76h-.76zM22.12 14.12h.76v.76h-.76zM17.12 17.12h.76v.76h-.76zM18.12 17.12h.76v.76h-.76zM19.12 17.12h.76v.76h-.76zM20.12 17.12h.76v.76h-.76zM21.12 17.12h.76v.76h-.76zM15.12 20.12h.76v.76h-.76zM16.12 20.12h.76v.76h-.76zM17.12 20.12h.76v.76h-.76zM18.12 20.12h.76v.76h-.76zM19.12 20.12h.76v.76h-.76zM20.12 20.12h.76v.76h-.76zM21.12 20.12h.76v.76h-.76zM22.12 20.12h.76v.76h-.76zM23.12 20.12h.76v.76h-.76z"/><path class="f-ink" d="M4.12 2.12h.76v.76h-.76zM5.12 2.12h.76v.76h-.76zM6.12 2.12h.76v.76h-.76zM7.12 2.12h.76v.76h-.76zM8.12 2.12h.76v.76h-.76zM8.12 5.12h.76v.76h-.76zM9.12 5.12h.76v.76h-.76zM10.12 5.12h.76v.76h-.76zM11.12 5.12h.76v.76h-.76zM12.12 8.12h.76v.76h-.76zM13.12 8.12h.76v.76h-.76zM14.12 8.12h.76v.76h-.76zM15.12 8.12h.76v.76h-.76zM16.12 8.12h.76v.76h-.76zM12.12 11.12h.76v.76h-.76zM13.12 11.12h.76v.76h-.76zM14.12 11.12h.76v.76h-.76zM15.12 11.12h.76v.76h-.76zM8.12 14.12h.76v.76h-.76zM9.12 14.12h.76v.76h-.76zM10.12 14.12h.76v.76h-.76zM12.12 17.12h.76v.76h-.76zM13.12 17.12h.76v.76h-.76zM14.12 17.12h.76v.76h-.76zM8.12 20.12h.76v.76h-.76zM9.12 20.12h.76v.76h-.76zM10.12 20.12h.76v.76h-.76zM11.12 20.12h.76v.76h-.76zM12.12 20.12h.76v.76h-.76z"/><path class="f-sig" d="M18.12 11.12h.76v.76h-.76z"/></svg></figure>
+<div class="post-grid">
+<article class="post-body">
+<p class="lede">M3 makes JSON a first-class value, stored as a compact binary document and mutated by path. Until today a document could take two physical forms, a tape for small documents and a tree of arena nodes for large ones. The development pre-campaign for the memory gate failed on both of its axes, and it failed on the large documents. We did not tune the tree. We stopped building it: every document is now a tape, at every size.</p>
+
+<h2 id="s1" class="post-h2"><span class="pix num">1</span>Two forms, one durable truth.</h2>
+<p>The document format is a tape. Each value starts with a tag, and each container carries a 24-bit skip length, so a traversal can jump over a whole subtree without visiting it. Object keys keep their insertion order end to end. The tape is canonical, and it is what the log and checkpoints carry. Documents up to 512 bytes sit inline in their record; larger ones live in the cell's document arena.</p>
+<p>The second form was a tree: nodes in the arena with references between them, built by a one-way morph once a document crossed a 4 KiB threshold. Freezing a morphed tree gives back the original tape byte for byte, proven by property tests and fuzzing. The bet behind it was that large documents get edited structurally, and that a tree makes structural edits cheap.</p>
+<p>From the client, none of this is visible:</p>
+<div class="codeblock"><div class="codeblock-head mono"><span>redis-cli<span class="m-only"> · scroll →</span></span><button type="button" class="copy" data-copy aria-label="Copy commands"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" stroke="currentColor"/><path d="M9.5 2.5h-7v7" stroke="currentColor"/></svg></button></div><pre class="mono">
+<code><span class="ln ln-cmd"><span class="pr">127.0.0.1:6379&gt;</span> JSON.SET order:7 $ '{"id":7,"items":[{"sku":"a1","qty":2}],"paid":false}'</span>
+<span class="ln ln-out">OK</span>
+<span class="ln ln-cmd"><span class="pr">127.0.0.1:6379&gt;</span> JSON.NUMINCRBY order:7 $.items[0].qty 1</span>
+<span class="ln ln-out">"[3]"</span>
+<span class="ln ln-cmd"><span class="pr">127.0.0.1:6379&gt;</span> JSON.GET order:7 $.items[0].sku</span>
+<span class="ln ln-out">"[\"a1\"]"</span></code></pre></div>
+
+<h2 id="s2" class="post-h2"><span class="pix num">2</span>The gate failed where the tree lived.</h2>
+<p>The memory gate bounds document RSS twice: against the serialized JSON bytes of a reference corpus, and against the comparator loading the same corpus. Both axes failed. By shape, the failures sat exactly where ingest had morphed documents into the tree: large documents and wide arrays.</p>
+<p>Byte accounting from the shipped struct layouts explained the whole gap. The tree paid a full-width reference for every array element, where the tape spends one to three bytes. It paid two references per object entry before any key bytes, and a separate string cell for every key, never shared. Every wide number got its own cell, and the allocator's smallest size class rounded each tiny cell up.</p>
+<aside class="law"><div class="law-label mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Law derived · L5</div><p>Memory is the product. A representation that is pleasant to traverse and expensive to hold has to win end to end, at the wire, or it goes.</p></aside>
+
+<h2 id="s3" class="post-h2"><span class="pix num">3</span>The mutation engine never needed the tree.</h2>
+<p>The decisive fact came from the code, not a benchmark. The scalar fast lane, which patches a number or a boolean of the same width in place, already had a tape arm that allocates nothing. An increment like the one above, where the new value keeps its width, takes that lane. Every structural mutation runs the canonical planner, and the planner works only on tape bytes. So a tree document paid three whole-document passes for each structural edit: freeze to tape, splice, morph back. A tape document paid the splice alone. The tree was strictly worse for the operations it was built to serve.</p>
+<p>The one API that required a tree had no production caller. The tree's one measured read win was taken before root prefetch landed, which hints tapes and does nothing for trees, and the read gate binds on documents too small to have ever been trees.</p>
+
+<h2 id="s4" class="post-h2"><span class="pix num">4</span>Stop building it, rather than tune it.</h2>
+<p>The alternatives, with their arithmetic, were written down first:</p>
+<ul class="dots">
+<li>Densify the tree with narrower references, packed entries and pooled key cells. Even its arithmetic ceiling could not reach the comparator axis: weeks of layout work to fail the gate. Rejected before code.</li>
+<li>Intern repeated keys. It shrinks stored bytes, but its measured read regression stood, and trees never intern. Kept in reserve.</li>
+<li>Morph on edit heat instead of size. It adds policy state before any workload shows a tree winning. Named as the future path, not shipped.</li>
+<li>Narrow the gate. Forbidden by the milestone's own STOP ruling.</li>
+</ul>
+<p>The decision: ingest never builds the tree. A document up to 512 bytes is an inline tape; anything larger, up to the 16 MiB cap, is a tape blob in the arena. The morph threshold remains a configuration key, and its default is now never. The tree code stays, tested and reachable by configuration or an explicit morph, as a policy that must earn its place.</p>
+<p>No durable byte changed: the tape format, record framing, checkpoints and replay are untouched, and recovery simply drops the morph pass. Placement is still a pure function of size and configuration, so simulator runs stay deterministic.</p>
+<aside class="law"><div class="law-label mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Law derived · L4</div><p>Mechanical sympathy is measured, not assumed. The napkin math and the rejected alternatives were recorded before the change, and an A/B checked the arithmetic after it.</p></aside>
+
+<h2 id="s5" class="post-h2"><span class="pix num">5</span>The corpus was wrong too.</h2>
+<p>Checking the arithmetic found a second defect, in the measurement itself. The first harness loaded one generated file per shape into many keys. The comparator stores identical strings across keys at a fraction of their unique cost, and no real workload hands it that redundancy. InfinityDB stores each key's document either way, so the identical-bytes corpus mis-measured the comparator axis by construction.</p>
+<p>The gate corpus is now frozen: six shapes, 71,200 documents, a fixed seed, and a unique document behind every key. The mixed corpus binds the gate; per-shape rows are diagnostics. Every report notes that the load is write-once, so RSS excludes growth slack after ingest, and the protocol records key counts and reported memory on both engines before sampling RSS.</p>
+
+<h2 id="close" class="post-h2">What it settled.</h2>
+<p>Development runs on the frozen corpus are not citable; the reference-box campaign owns the result, and this site will not quote it before that campaign does. What the change settled is the shape: one representation at every size, the same one the log already trusted. See <a href="../docs/json.html">JSON documents</a> for the format and commands, and <a href="../docs/memory.html">memory</a> for how document bytes are attributed.</p>
+
+<div class="author"><span class="avatar av56 mono" aria-hidden="true">KC</span><div class="author-t"><div class="author-n">Kevin Caicedo</div><div class="muted">Building InfinityDB.</div></div><a class="btn-xs btn-line mono" href="https://github.com/kevincaicedo">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></div>
+<a class="next-post" href="durability-belongs-to-the-namespace.html"><div><div class="mono pn-k">Next post</div><div class="next-t">Durability belongs to the namespace</div></div><span aria-hidden="true">→</span></a>
+</article>
+<aside class="post-side">
+<nav aria-label="On this page" class="post-toc"><div class="eyebrow">On this page</div><div class="toc"><a href="#s1" data-toc="s1" class=on><span class="sq5" aria-hidden="true"></span>Two forms, one durable truth.</a><a href="#s2" data-toc="s2"><span class="sq5" aria-hidden="true"></span>The gate failed where the tree lived.</a><a href="#s3" data-toc="s3"><span class="sq5" aria-hidden="true"></span>The mutation engine never needed the tree.</a><a href="#s4" data-toc="s4"><span class="sq5" aria-hidden="true"></span>Stop building it, rather than tune it.</a><a href="#s5" data-toc="s5"><span class="sq5" aria-hidden="true"></span>The corpus was wrong too.</a><a href="#close" data-toc="close"><span class="sq5" aria-hidden="true"></span>What it settled.</a></div></nav>
+<div class="side-card"><div class="eyebrow">The laws, in full</div><p>Each lesson became one of thirteen design laws. Read them with the code rules they produced.</p><a class="btn-sm btn-line" href="../docs/laws.html">Design laws →</a></div>
+<button type="button" class="btn-xs btn-line mono copy-link" data-copy-url><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" stroke="currentColor"/><path d="M9.5 2.5h-7v7" stroke="currentColor"/></svg><span>Copy link</span></button>
+</aside>
+</div>
+</main>
+<footer class="footer">
+<div class="wrap">
+<div class="foot-grid">
+<div class="foot-brand">
+<div class="brand"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></div>
+<p>A Redis-compatible, multi-model database. Deterministic to the core.</p>
+</div>
+<nav aria-label="Product" class="foot-col"><div class="eyebrow">Product</div><a href="../index.html#how">How it works</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence ledger</a><a href="../blog/index.html">Blog</a></nav>
+<nav aria-label="Docs" class="foot-col"><div class="eyebrow">Docs</div><a href="../docs/quickstart.html">Quickstart</a><a href="../docs/cells.html">Concepts</a><a href="../docs/compat.html">Compatibility matrix</a><a href="../docs/style.html">InfinityStyle</a></nav>
+<nav aria-label="Project" class="foot-col"><div class="eyebrow">Project</div><a href="https://github.com/kevincaicedo/infinitydb">GitHub</a><a href="https://github.com/kevincaicedo/infinitydb/releases">Releases</a><a href="https://github.com/kevincaicedo/infinitydb/security">Security</a><a href="https://github.com/kevincaicedo/infinitydb/blob/main/LICENSE">License</a></nav>
+</div>
+<div class="foot-bar mono"><span>© 2026 InfinityDB contributors · Apache 2.0</span><span>Public numbers appear only when the ledger says Allowed.</span></div>
+</div>
+</footer>
+</body>
+</html>

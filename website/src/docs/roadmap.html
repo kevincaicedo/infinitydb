@@ -1,0 +1,51 @@
+<!--
+title: Status & roadmap
+description: The InfinityDB milestone train: what is done, what is in progress and what is planned, scoped by capability rather than by date.
+lede: InfinityDB is built as a sequence of milestones, scoped by capability rather than by date. A milestone is done when its features work from the wire and its exit gates pass, not when a calendar says so.
+chips: In progress · {{now_code}} {{now_name}}
+-->
+<ol class="vrail doc-rail" aria-label="Milestone train">{{train_list}}</ol>
+<p>An exit gate is a pass or fail check the milestone must meet: a correctness test, a simulation or crash sweep, or a measurement against a stated budget. If one fails, feature work halts until the architecture is fixed. No release has been published yet; the first public tag is cut inside M4, after trust and safety. Milestones after the current one may be reordered.</p>
+
+<h2 id="m0">M0 · Skeleton</h2>
+<p>Shard cells, each a thread with its own io_uring event loop. The fabric: a mesh of single-producer, single-consumer rings with credit-based flow control. The RESP protocol, perfect-hash command dispatch and a minimal store, the benchmark harness that measures exit gates, and the deterministic simulator. It ended in an architecture verdict, not a release.</p>
+
+<h2 id="m1">M1 · Cache core</h2>
+<p>The string, key, expiry and server command families, diffed byte for byte against Redis. A hierarchical timer wheel with budgeted active expiry, all eight eviction policies, namespaces, pub/sub across cells with RESP3 push, the generated compatibility matrix in CI, and a release pipeline not yet used for a release.</p>
+
+<h2 id="m2">M2 · Durability</h2>
+<p>A per-cell append-only log with checksummed frames, segments, group commit and a <code>MANIFEST</code>. Durable namespaces in <code>always</code> and <code>everysec</code>, fuzzy checkpoints, truncation and parallel recovery. A crash matrix and simulated disk faults with planted-bug canaries, including an fsync that lies, that the oracles must catch. Then a hardening pass before the feature train: group-commit and replay work, cross-cell overhead, a comparison harness, fuzzing and soundness audits.</p>
+
+<h2 id="m3">M3 · JSON documents</h2>
+<p>JSON as a first-class value stored as a compact binary tape, a SIMD JSON parser, a JSONPath subset compiled to cached path programs, RedisJSON-compatible <code>JSON.*</code> commands with in-place updates, durable documents through delta log records, and per-document memory accounting.</p>
+
+<h2 id="m4">M4 · Tiered storage, indexes and the first public alpha</h2>
+<p>M4 is in progress. It runs in phases:</p>
+<ul class="dots">
+<li><strong>Tiered storage, done for string values.</strong> A per-cell hybrid-log address space: cold reads through io_uring with direct I/O, compaction, large values as blob extents, and per-namespace memory and disk budgets.</li>
+<li><strong>The write path, done.</strong> Barriers chosen by a device probe at first boot, a bounded pipeline of frame writes, a device I/O budget, segment recycling, backpressure instead of errors, and a graceful stop that keeps every acknowledged write.</li>
+<li><strong>Secondary indexes and a PartiQL subset, in progress.</strong> The ordered index, index maintenance and backfill, the predicate VM and the query compiler are built and tested. The command surface, index DDL, queries, <code>EXPLAIN</code> and JSONPath filters, comes next, after the work that bounds and reserves capacity across the engine. See <a href="indexes.html">Indexes &amp; PartiQL</a>.</li>
+<li><strong>Trust and contracts, planned.</strong> Bind-address control with a protected default, <code>AUTH</code> and <code>requirepass</code>, an end-to-end request envelope with output, request-size and work limits and typed refusals, and published format and support matrices. The first public tag follows.</li>
+<li><strong>Documents beyond RAM, planned.</strong> Cold document reads and updates, expiry on tiered namespaces, indexes over cold documents, and queries that touch a single cell, a tenant's keys co-located by hash tag.</li>
+</ul>
+
+<h2 id="m5">M5 · Data types</h2>
+<p>Hashes, lists, sets and sorted sets, with sorted sets reusing the ordered index. Size-adaptive encodings, the <code>SCAN</code> family for every type, <code>OBJECT</code>, <code>MEMORY USAGE</code>, keyspace notifications, sharded pub/sub, <code>SLOWLOG</code> and <code>MONITOR</code>.</p>
+
+<h2 id="m6">M6 · Transactions</h2>
+<p><code>MULTI</code>, <code>EXEC</code> and <code>WATCH</code>, inline on one cell and across cells through deterministic, ordered lock acquisition. A native all-or-nothing transaction, conditional writes on a revision, and Lua scripting with declared keys.</p>
+
+<h2 id="m7">M7 · Streams &amp; queues</h2>
+<p>Topics on the same per-cell log and the Redis Streams surface. Offset consumption, idempotent producers, dead-letter queues, delayed delivery and retention. Client tracking, multi-user ACLs, TLS, RDB import, backup and point-in-time recovery. An agent-memory profile: freshness barriers, fenced worker claims, per-namespace users and work budgets, and adapters for Python and TypeScript agent frameworks. The first beta.</p>
+
+<h2 id="m8">M8 · Vectors</h2>
+<p>Redis-compatible vector sets and native vector collections. Per-cell HNSW with quantization and rescoring, k-NN gathered across cells, filter predicates, and embeddings kept in step with document revisions.</p>
+
+<h2 id="m9">M9 · Replication &amp; HA</h2>
+<p>Per-cell log shipping with state digests, <code>WAIT</code> and read-from-replica, an asynchronous profile and a strong profile over a quorum-replicated log, a metadata-only control plane, fenced failover and a fault harness.</p>
+
+<h2 id="m10">M10 · Compute &amp; embedded</h2>
+<p>WASM reducers that run on the cell that owns their data, with fuel and memory limits and scoped capabilities. An embedded library mode, a shared-memory transport, full ACLs, an audit log and documented extension seams.</p>
+
+<h2 id="m11">M11 · GA hardening</h2>
+<p>No new features: long mixed-workload soaks, broader fuzzing, every public claim measured again, a frozen compatibility matrix and frozen seams, an upgrade path and a third-party security audit. Then 1.0.0.</p>

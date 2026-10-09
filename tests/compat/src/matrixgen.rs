@@ -909,7 +909,6 @@ pub fn render() -> String {
     push("");
     push("---");
     push("");
-    push("Performance claims live in the claim ledger, published as");
-    push("`website/site/_ledger-snapshot.md`, never here (L10).");
+    push("Performance claims are never made here (L10).");
     out
 }

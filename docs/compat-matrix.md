@@ -349,5 +349,4 @@ absent (below).
 
 ---
 
-Performance claims live in the claim ledger, published as
-`website/site/_ledger-snapshot.md`, never here (L10).
+Performance claims are never made here (L10).

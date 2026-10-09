@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why this site has no benchmarks — InfinityDB Blog</title>
+<meta name="description" content="Every public number needs replicates, a clean tree and the system we compare against in the same run. Until the ledger says Allowed, we say nothing.">
+<link rel="canonical" href="https://kevincaicedo.github.io/infinitydb/blog/why-this-site-has-no-benchmarks.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="InfinityDB">
+<meta property="og:title" content="Why this site has no benchmarks — InfinityDB Blog">
+<meta property="og:description" content="Every public number needs replicates, a clean tree and the system we compare against in the same run. Until the ledger says Allowed, we say nothing.">
+<meta property="og:url" content="https://kevincaicedo.github.io/infinitydb/blog/why-this-site-has-no-benchmarks.html">
+<meta name="theme-color" content="#F4F4F0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0B0B0A" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/rss+xml" title="InfinityDB engineering notes" href="../blog/feed.xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@700;900&family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>try{var t=localStorage.getItem("inf-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip mono" href="#main">Skip to content</a>
+<div class="announce mono">
+<span class="sq8 bg-sig" aria-hidden="true"></span>
+<span>M4 · Tiered storage<span class="m-only"> — in progress</span></span>
+<span class="muted d-only">datasets beyond RAM, indexes and query — in progress</span>
+<a class="d-only u" href="../index.html#roadmap">Follow the build</a>
+</div>
+<header class="nav">
+<div class="wrap nav-in">
+<a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></a>
+<nav class="nav-links mono" aria-label="Primary"><a href="../docs/index.html">Docs</a><a href="../index.html#how">Architecture</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence</a><a href="../blog/index.html" aria-current="page" class="on"><span class="sq6 bg-sig" aria-hidden="true"></span>Blog</a></nav>
+<div class="nav-cta">
+<a class="btn-sm btn-line mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a>
+<a class="btn-sm btn-ink" href="../index.html#start">Get started</a>
+</div>
+<button type="button" class="icon-btn nav-burger" data-menu-open aria-controls="menu" aria-expanded="false" aria-label="Open menu"><svg width="20" height="12" viewBox="0 0 20 12" aria-hidden="true"><rect x="0" y="1" width="20" height="2" fill="currentColor"/><rect x="0" y="9" width="20" height="2" fill="currentColor"/></svg></button>
+</div>
+</header>
+<div class="menu" id="menu" hidden>
+<div class="menu-head"><a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name brand-name-sm">InfinityDB</span></a><button type="button" class="icon-btn" data-menu-close aria-label="Close menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 2L14 14M14 2L2 14" stroke="currentColor" stroke-width="2"/></svg></button></div>
+<nav class="menu-links" aria-label="Mobile"><a href="../docs/index.html">Docs<span aria-hidden="true">→</span></a><a href="../index.html#how">Architecture<span aria-hidden="true">→</span></a><a href="../index.html#roadmap">Roadmap<span aria-hidden="true">→</span></a><a href="../index.html#evidence">Evidence<span aria-hidden="true">→</span></a><a href="../blog/index.html">Blog<span aria-hidden="true">→</span></a><a class="menu-gh mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></nav>
+<div class="menu-foot">
+<div class="theme-seg" role="group" aria-label="Theme"><button type="button" class="mono" data-theme-set="light" aria-pressed="false">Light</button><button type="button" class="mono" data-theme-set="dark" aria-pressed="false">Dark</button></div>
+<a class="btn btn-ink btn-block" href="../index.html#start" data-menu-close>Get started</a>
+<div class="menu-alpha mono"><span class="sq6 bg-sig" aria-hidden="true"></span>Alpha · M4 Tiered storage</div>
+</div>
+</div>
+<main id="main" class="wrap post">
+<a class="back-m mono" href="index.html"><span aria-hidden="true">←</span>All posts</a>
+<header class="post-head">
+<div class="crumb mono"><a href="index.html">Blog</a><span>/</span><span class="ink">Evidence</span></div>
+<div class="kicker-m mono">Evidence · claims follow evidence</div>
+<h1>Why this site has no benchmarks</h1>
+<p class="dek">The evidence bar for a public number, and why we have not cleared it yet.</p>
+<div class="post-by"><span class="avatar av36 mono" aria-hidden="true">KC</span><span class="ink">Kevin Caicedo</span><span class="d-only dim">·</span><span class="d-only mono kicker">Evidence · claims follow evidence</span><span class="d-only dim">·</span><span class="d-only mono kicker">2026-10-08</span></div>
+</header>
+<figure class="post-cover" aria-hidden="true"><svg class="px cover" width="1196" height="446" viewBox="0 0 64 24" aria-hidden="true"><path class="f-dim" d="M3.12 3.12h.76v.76h-.76zM4.12 3.12h.76v.76h-.76zM5.12 3.12h.76v.76h-.76zM6.12 3.12h.76v.76h-.76zM7.12 3.12h.76v.76h-.76zM8.12 3.12h.76v.76h-.76zM9.12 3.12h.76v.76h-.76zM10.12 3.12h.76v.76h-.76zM11.12 3.12h.76v.76h-.76zM12.12 3.12h.76v.76h-.76zM13.12 3.12h.76v.76h-.76zM14.12 3.12h.76v.76h-.76zM15.12 3.12h.76v.76h-.76zM16.12 3.12h.76v.76h-.76zM17.12 3.12h.76v.76h-.76zM18.12 3.12h.76v.76h-.76zM19.12 3.12h.76v.76h-.76zM20.12 3.12h.76v.76h-.76zM21.12 3.12h.76v.76h-.76zM22.12 3.12h.76v.76h-.76zM23.12 3.12h.76v.76h-.76zM24.12 3.12h.76v.76h-.76zM25.12 3.12h.76v.76h-.76zM26.12 3.12h.76v.76h-.76zM27.12 3.12h.76v.76h-.76zM28.12 3.12h.76v.76h-.76zM29.12 3.12h.76v.76h-.76zM30.12 3.12h.76v.76h-.76zM31.12 3.12h.76v.76h-.76zM32.12 3.12h.76v.76h-.76zM33.12 3.12h.76v.76h-.76zM34.12 3.12h.76v.76h-.76zM35.12 3.12h.76v.76h-.76zM36.12 3.12h.76v.76h-.76zM37.12 3.12h.76v.76h-.76zM38.12 3.12h.76v.76h-.76zM39.12 3.12h.76v.76h-.76zM40.12 3.12h.76v.76h-.76zM41.12 3.12h.76v.76h-.76zM42.12 3.12h.76v.76h-.76zM43.12 3.12h.76v.76h-.76zM44.12 3.12h.76v.76h-.76zM45.12 3.12h.76v.76h-.76zM46.12 3.12h.76v.76h-.76zM47.12 3.12h.76v.76h-.76zM48.12 3.12h.76v.76h-.76zM49.12 3.12h.76v.76h-.76zM50.12 3.12h.76v.76h-.76zM51.12 3.12h.76v.76h-.76zM52.12 3.12h.76v.76h-.76zM53.12 3.12h.76v.76h-.76zM54.12 3.12h.76v.76h-.76zM55.12 3.12h.76v.76h-.76zM56.12 3.12h.76v.76h-.76zM57.12 3.12h.76v.76h-.76zM58.12 3.12h.76v.76h-.76zM59.12 3.12h.76v.76h-.76zM60.12 3.12h.76v.76h-.76z"/><path class="f-ink" d="M56.12 6.12h.76v.76h-.76zM57.12 6.12h.76v.76h-.76zM58.12 6.12h.76v.76h-.76zM3.12 7.12h.76v.76h-.76zM5.12 7.12h.76v.76h-.76zM7.12 7.12h.76v.76h-.76zM9.12 7.12h.76v.76h-.76zM11.12 7.12h.76v.76h-.76zM13.12 7.12h.76v.76h-.76zM15.12 7.12h.76v.76h-.76zM56.12 7.12h.76v.76h-.76zM58.12 7.12h.76v.76h-.76zM56.12 8.12h.76v.76h-.76zM57.12 8.12h.76v.76h-.76zM58.12 8.12h.76v.76h-.76zM56.12 10.12h.76v.76h-.76zM57.12 10.12h.76v.76h-.76zM58.12 10.12h.76v.76h-.76zM3.12 11.12h.76v.76h-.76zM5.12 11.12h.76v.76h-.76zM7.12 11.12h.76v.76h-.76zM9.12 11.12h.76v.76h-.76zM11.12 11.12h.76v.76h-.76zM13.12 11.12h.76v.76h-.76zM15.12 11.12h.76v.76h-.76zM17.12 11.12h.76v.76h-.76zM19.12 11.12h.76v.76h-.76zM21.12 11.12h.76v.76h-.76zM56.12 11.12h.76v.76h-.76zM58.12 11.12h.76v.76h-.76zM56.12 12.12h.76v.76h-.76zM57.12 12.12h.76v.76h-.76zM58.12 12.12h.76v.76h-.76zM56.12 14.12h.76v.76h-.76zM57.12 14.12h.76v.76h-.76zM58.12 14.12h.76v.76h-.76zM3.12 15.12h.76v.76h-.76zM5.12 15.12h.76v.76h-.76zM7.12 15.12h.76v.76h-.76zM9.12 15.12h.76v.76h-.76zM11.12 15.12h.76v.76h-.76zM13.12 15.12h.76v.76h-.76zM15.12 15.12h.76v.76h-.76zM17.12 15.12h.76v.76h-.76zM19.12 15.12h.76v.76h-.76zM21.12 15.12h.76v.76h-.76zM23.12 15.12h.76v.76h-.76zM56.12 15.12h.76v.76h-.76zM58.12 15.12h.76v.76h-.76zM56.12 16.12h.76v.76h-.76zM57.12 16.12h.76v.76h-.76zM58.12 16.12h.76v.76h-.76zM56.12 18.12h.76v.76h-.76zM57.12 18.12h.76v.76h-.76zM58.12 18.12h.76v.76h-.76zM3.12 19.12h.76v.76h-.76zM5.12 19.12h.76v.76h-.76zM7.12 19.12h.76v.76h-.76zM9.12 19.12h.76v.76h-.76zM11.12 19.12h.76v.76h-.76zM13.12 19.12h.76v.76h-.76zM15.12 19.12h.76v.76h-.76zM17.12 19.12h.76v.76h-.76zM19.12 19.12h.76v.76h-.76zM21.12 19.12h.76v.76h-.76zM23.12 19.12h.76v.76h-.76zM25.12 19.12h.76v.76h-.76zM27.12 19.12h.76v.76h-.76zM56.12 19.12h.76v.76h-.76zM58.12 19.12h.76v.76h-.76zM56.12 20.12h.76v.76h-.76zM57.12 20.12h.76v.76h-.76zM58.12 20.12h.76v.76h-.76z"/><path class="f-sig" d=""/></svg></figure>
+<div class="post-grid">
+<article class="post-body">
+<p class="lede">You will not find a throughput figure on this site. No latency, no memory per key, no chart against another database. The engine has harnesses that measure all of these, and they have produced plenty of output. None of it meets the bar for public copy yet. Vortex, the project before this one, published targets while it shipped something else, and the gap became the story. We would rather say nothing than print a number the next run takes back.</p>
+
+<h2 id="s1" class="post-h2"><span class="pix num">1</span>What a public number needs.</h2>
+<ul class="dots">
+<li>Three to five replicates, with their spread reported and the A/B order stated.</li>
+<li>A clean tree, and the exact baseline and candidate revisions, toolchain and build.</li>
+<li>The environment recorded: kernel, CPU governor and energy policy, raw and effective, thermals, and the server and the load generator on disjoint cores.</li>
+<li>A load generator that was not the thing that saturated.</li>
+<li>The system we compare against on the same box, with the same workload files and published configurations, in the same run. No comparison ships from a run the comparator was not in.</li>
+<li>Tripwire metrics green in the same run. A throughput number from a run where the reactor was not batching is invalid by definition.</li>
+<li>Memory attribution and a flamegraph reviewed, and the command that reproduces the result.</li>
+</ul>
+<p>A claim then gets one status: Allowed, Narrowed to a weaker wording, or Rejected. Evidence-pending is treated as Rejected. The gate harness enforces part of this itself: it refuses to run on a dirty tree, the wrong governor or a throttling CPU unless it is told the result is not citable.</p>
+<aside class="law"><div class="law-label mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Law derived · L10</div><p>Claims follow evidence. A number without replicates, a recorded environment and its comparator in the same run is not a weak claim. It is not a claim.</p></aside>
+
+<h2 id="s2" class="post-h2"><span class="pix num">2</span>A gate that cannot go red is not evidence.</h2>
+<p>Every gate, oracle and claim row names its canary: the planted violation that turns it red, run in the same lane. Every instrument gets a specification before it measures: its estimator and scope, its resolution, a spread budget with a same-binary control leg, and a liveness counter with a planted red. And a run whose saturated resource is not the one the budget named is a finding before it is a number.</p>
+<p>Each rule came from a failure. At M0, fabric hop latency was gated finer than the loop-granularity clock that measured it could resolve. A batching counter divided by enters that submitted nothing, so it measured the idle policy. A sweep recipe ended in a bare <code>wait</code> that returned success whatever its shards reported. None of those could have told us we were wrong.</p>
+
+<h2 id="s3" class="post-h2"><span class="pix num">3</span>The ways a measurement lies.</h2>
+<p>Each of these has happened here:</p>
+<ul class="dots">
+<li>The cheap device. On tmpfs, group commit looked healthy. On a real NVMe drive it was issuing a stream of tiny syncs.</li>
+<li>The convenient corpus. A document corpus that loaded identical bytes into many keys let the comparator deduplicate them, which no real workload allows.</li>
+<li>The layout. Two separately built binaries place the same code at different addresses, and that alone moves timings. A cross-binary timing A/B smaller than that band is no evidence either way, so we count instructions and time both variants inside one binary.</li>
+<li>The lucky rerun. Some rows have two stable modes, or one outlier leg. Re-running such a row until it passes is not a measurement; the repair is declared before the run that uses it.</li>
+</ul>
+
+<h2 id="s4" class="post-h2"><span class="pix num">4</span>Why not yet.</h2>
+<p>No release has been published, and Allowed is per release. Every release re-runs the harness behind each Allowed row, and a row not re-validated for the release being announced reverts to Evidence-pending for that announcement. With no announcement, there is nothing yet to re-validate against.</p>
+<p>Runs on a development box can never back a performance claim; only the reference box can. Its storage device is a disclosed deviation from the class the device-bound gates were written for, so those rows stay pending until a matching device runs them. Run output is not committed either. A claim records revisions, commands, the box and the result, and an old output path is provenance, not current acceptance. A number from an earlier milestone would have to be measured again on the release's own revision before we could quote it.</p>
+<p>And the release itself is not ready. M4 is in progress, and the first public alpha waits on the trust and safety work the <a href="../docs/roadmap.html">roadmap</a> lists as planned. At the other end of the train, M11 re-baselines performance with every public claim measured again.</p>
+
+<h2 id="s5" class="post-h2"><span class="pix num">5</span>What we publish instead.</h2>
+<p>Correctness evidence anyone can rerun from a checkout. The <a href="../docs/compat.html">compatibility matrix</a> is generated from a byte-for-byte reply diff against a pinned Redis 8.0.5, and CI fails when the committed matrix is stale. The <a href="../docs/simulation.html">simulator</a>'s scenarios and seeds are in the repository. The crash matrix's rows are data files anyone can review. Each one comes with the command that produces it, and each one can go red.</p>
+<div class="codeblock"><div class="codeblock-head mono"><span>shell<span class="m-only"> · scroll →</span></span><button type="button" class="copy" data-copy aria-label="Copy commands"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" stroke="currentColor"/><path d="M9.5 2.5h-7v7" stroke="currentColor"/></svg></button></div><pre class="mono">
+<code><span class="ln ln-cmd"><span class="pr">$</span> just compat</span>
+<span class="ln ln-cmd"><span class="pr">$</span> just sim-smoke</span>
+<span class="ln ln-cmd"><span class="pr">$</span> cargo test -p crash-matrix</span></code></pre></div>
+
+<h2 id="close" class="post-h2">When a number appears.</h2>
+<p>The roadmap says it in one line: no performance or memory numbers are published until a reproducible measurement backs them. When the ledger allows one for a release, it will appear with its box, its revision, its spread and the comparator that was in the run. Until then the absence is deliberate. The <a href="../docs/laws.html">laws</a> page states the rule this post follows, and the <a href="../docs/style.html">style</a> page covers the rest of how we test.</p>
+
+<div class="author"><span class="avatar av56 mono" aria-hidden="true">KC</span><div class="author-t"><div class="author-n">Kevin Caicedo</div><div class="muted">Building InfinityDB.</div></div><a class="btn-xs btn-line mono" href="https://github.com/kevincaicedo">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></div>
+<a class="next-post" href="trust-before-the-first-tag.html"><div><div class="mono pn-k">Next post</div><div class="next-t">Trust before the first tag</div></div><span aria-hidden="true">→</span></a>
+</article>
+<aside class="post-side">
+<nav aria-label="On this page" class="post-toc"><div class="eyebrow">On this page</div><div class="toc"><a href="#s1" data-toc="s1" class=on><span class="sq5" aria-hidden="true"></span>What a public number needs.</a><a href="#s2" data-toc="s2"><span class="sq5" aria-hidden="true"></span>A gate that cannot go red is not evidence.</a><a href="#s3" data-toc="s3"><span class="sq5" aria-hidden="true"></span>The ways a measurement lies.</a><a href="#s4" data-toc="s4"><span class="sq5" aria-hidden="true"></span>Why not yet.</a><a href="#s5" data-toc="s5"><span class="sq5" aria-hidden="true"></span>What we publish instead.</a><a href="#close" data-toc="close"><span class="sq5" aria-hidden="true"></span>When a number appears.</a></div></nav>
+<div class="side-card"><div class="eyebrow">The laws, in full</div><p>Each lesson became one of thirteen design laws. Read them with the code rules they produced.</p><a class="btn-sm btn-line" href="../docs/laws.html">Design laws →</a></div>
+<button type="button" class="btn-xs btn-line mono copy-link" data-copy-url><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" stroke="currentColor"/><path d="M9.5 2.5h-7v7" stroke="currentColor"/></svg><span>Copy link</span></button>
+</aside>
+</div>
+</main>
+<footer class="footer">
+<div class="wrap">
+<div class="foot-grid">
+<div class="foot-brand">
+<div class="brand"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></div>
+<p>A Redis-compatible, multi-model database. Deterministic to the core.</p>
+</div>
+<nav aria-label="Product" class="foot-col"><div class="eyebrow">Product</div><a href="../index.html#how">How it works</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence ledger</a><a href="../blog/index.html">Blog</a></nav>
+<nav aria-label="Docs" class="foot-col"><div class="eyebrow">Docs</div><a href="../docs/quickstart.html">Quickstart</a><a href="../docs/cells.html">Concepts</a><a href="../docs/compat.html">Compatibility matrix</a><a href="../docs/style.html">InfinityStyle</a></nav>
+<nav aria-label="Project" class="foot-col"><div class="eyebrow">Project</div><a href="https://github.com/kevincaicedo/infinitydb">GitHub</a><a href="https://github.com/kevincaicedo/infinitydb/releases">Releases</a><a href="https://github.com/kevincaicedo/infinitydb/security">Security</a><a href="https://github.com/kevincaicedo/infinitydb/blob/main/LICENSE">License</a></nav>
+</div>
+<div class="foot-bar mono"><span>© 2026 InfinityDB contributors · Apache 2.0</span><span>Public numbers appear only when the ledger says Allowed.</span></div>
+</div>
+</footer>
+</body>
+</html>

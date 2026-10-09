@@ -8,8 +8,8 @@
 )]
 //! The refusal line an operator reads, at the binary: a log whose valid
 //! data ends below its MANIFEST's begin-LSN stops the node with exit 1
-//! and one stderr line naming the cell and the evidence. The operations
-//! page quotes that line verbatim, so the test compares the page's quote
+//! and one stderr line naming the cell and the evidence. The website's
+//! observability page quotes that line verbatim, so the test compares the page's quote
 //! with the line the binary printed, the run-dependent fields (the cell
 //! index and the two log positions) masked: a reworded message, or a
 //! reworded quote, is red here.
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use inf_log::{Lsn, ReaderConfig, SegmentReader, read_manifest, segment_file_name};
 
 /// The page that quotes the refusal.
-const OPERATIONS_PAGE: &str = include_str!("../../../website/site/docs/operations.html");
+const OBSERVABILITY_PAGE: &str = include_str!("../../../website/site/docs/observability.html");
 
 fn unique() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -238,7 +238,7 @@ fn shape(line: &str) -> String {
 /// is a failure, never a silent mismatch.
 fn quoted_refusal(page: &str) -> String {
     let mut lines = page.lines().filter(|line| line.contains("boot failed"));
-    let line = lines.next().expect("the operations page quotes a refusal");
+    let line = lines.next().expect("the observability page quotes a refusal");
     assert!(lines.next().is_none(), "the page quotes one refusal line");
     let mut text = String::new();
     let mut in_tag = false;
@@ -266,7 +266,7 @@ fn quoted_refusal(page: &str) -> String {
 /// the cell index and the two positions.
 #[test]
 fn the_shape_masks_the_cell_and_the_two_positions_only() {
-    let quoted = shape(&quoted_refusal(OPERATIONS_PAGE));
+    let quoted = shape(&quoted_refusal(OBSERVABILITY_PAGE));
     assert_eq!(quoted.matches("<n>").count(), 1, "{quoted}");
     assert_eq!(quoted.matches("<lsn>").count(), 2, "{quoted}");
     assert_eq!(
@@ -329,6 +329,6 @@ fn a_log_ending_below_the_manifest_begin_refuses_with_the_quoted_line() {
         ),
         "{stderr}"
     );
-    assert_eq!(shape(line), shape(&quoted_refusal(OPERATIONS_PAGE)), "the page's quote");
+    assert_eq!(shape(line), shape(&quoted_refusal(OBSERVABILITY_PAGE)), "the page's quote");
     let _ = std::fs::remove_dir_all(&dir);
 }
