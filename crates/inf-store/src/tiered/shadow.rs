@@ -27,9 +27,9 @@
 //! group per step, one settle slot handed to the caller at a time, no
 //! list of anything — its memory is the group's scratch plus the ticket
 //! maps, which never exceed the cap (`register_shadow` asserts it in
-//! release). Every bound is a named constant with a counter (D7 as
-//! amended by A6), and every exhaustion turns the eligible write back into
-//! the synchronous verify — slower, never less correct.
+//! release). Every bound is a named constant with a counter (ADR-0093 D7,
+//! A6), and every exhaustion turns the eligible write back into the
+//! synchronous verify — slower, never less correct.
 //!
 //! Invariants this module enforces mechanically (ADR-0093 §Invariants):
 //! a winner is RAM-resident for the ticket's life (the record pin on

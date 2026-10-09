@@ -4,10 +4,10 @@
 )]
 //! The real-node compat lanes: the candidate is a spawned multi-cell
 //! `infinityd` behind a TCP socket, not the in-process single-cell
-//! `Keyspace`. Before this lane every `full` declaration in the matrix
-//! was proven in a topology where fan-out is a no-op — the exact
-//! configuration class (cells, named namespaces, tier) where the review's
-//! proven Criticals lived.
+//! `Keyspace`. On a single cell fan-out is a no-op, so a `full`
+//! declaration proven there says nothing about the configurations where
+//! cross-cell behavior differs (several cells, named namespaces, tier);
+//! these lanes prove the declarations on them.
 //!
 //! Two lanes:
 //! - `node_matrix_replies_match_redis`: the whole scripted `MATRIX`,

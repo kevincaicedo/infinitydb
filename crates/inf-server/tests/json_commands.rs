@@ -946,9 +946,9 @@ fn merge_shapes_create_update_and_delete() {
 
 #[test]
 fn strlen_legacy_missing_path_answers_the_path_error() {
-    // Regression: the legacy zero-match arm previously projected match 0
-    // before checking emptiness — a reachable panic, fixed in the shared
-    // `int_read` skeleton.
+    // A legacy path that matches nothing: the shared `int_read` skeleton
+    // must check emptiness before it projects match 0 (projecting first
+    // panics), so the reply is the path error.
     let mut db = Db::new();
     db.run_str(&["JSON.SET", "k", "$", r#"{"s":"x"}"#]);
     assert_reply(&mut db, &["JSON.STRLEN", "k", ".zz"], "-ERR Path '.zz' does not exist\r\n");
