@@ -624,7 +624,10 @@ pub static MATRIX: &[Case] = &[
     // --- DEBUG subset / LOLWUT ---
     skip(
         &["DEBUG", "JMAP"],
-        "removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)",
+        "`DEBUG JMAP` is removed in Redis 8; InfinityDB accepts it and answers `+OK` without \
+         doing anything (`DEBUG SLEEP` and `DEBUG OBJECT` are served, `DEBUG SET-ACTIVE-EXPIRE` \
+         is accepted and ignored, and any other subcommand answers an error: see the `DEBUG` \
+         row)",
     ),
     c(&["DEBUG", "SLEEP", "0"]),
     c(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]),

@@ -90,7 +90,7 @@ comparator = "<="
 unit = "failures (allowlisted deviations excluded, justified per case)"
 tier = "any"
 source = "external:compat json_diff (RESP2 + RESP3)"
-measured_by = "CI oracle diff; S21/S22: 168 executions, 0 failures, 7 full / 15 partial"
+measured_by = "CI oracle diff (RESP2 + RESP3); the 2026-07-16 capture: 168 executions, 0 failures; each command's full or partial status is the generated matrix's"
 
 [[gate]]
 id = "regression_m0_m2_5"

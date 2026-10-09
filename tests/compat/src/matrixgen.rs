@@ -115,7 +115,14 @@ pub static DECLARED: &[Declared] = &[
         "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
     ),
     d("GETSET", Status::Full, "M0", ""),
-    d("GETDEL", Status::Full, "M0", ""),
+    d(
+        "GETDEL",
+        Status::Partial,
+        "M0",
+        "on a tiered namespace with shadow tickets (`tiered-shadow-overwrite yes`, or tickets \
+         rebuilt at boot) the reply can be a value the delete did not remove: a same-length \
+         `SET` during the delete's cold read rewrites the record in place",
+    ),
     d("DEL", Status::Full, "M0", ""),
     d("EXISTS", Status::Full, "M0", ""),
     d("TYPE", Status::Full, "M0", "only the string type exists until M3"),
@@ -152,10 +159,12 @@ pub static DECLARED: &[Declared] = &[
              family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares \
              against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's \
              publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the \
-             worst wheel debt across every store); `# Persistence`/`# Tiering`/`# \
-             Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); \
-             an unknown section name selects nothing (empty body, Redis shape); client-smoke CI \
-             is the open M1-S14 AC",
+             worst wheel debt across every store); `# Tiering` and `# Tripwires` are this \
+             cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); `# Persistence` \
+             is this cell's slice except the values it renders from node state, among them \
+             `loading` and the `loading_*` fields, `ns_drop_tombstones` and the \
+             `recover_node_tier_` fields; an unknown section name selects nothing (empty body, \
+             Redis shape); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -166,20 +175,35 @@ pub static DECLARED: &[Declared] = &[
     d("MGET", Status::Full, "M1", ""),
     d(
         "MSET",
-        Status::Full,
+        Status::Partial,
         "M1",
         "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
              Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
              Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 \
-             KiB (Redis bounds the query buffer separately at 1 GiB)",
+             KiB (Redis bounds the query buffer separately at 1 GiB); a bounds error (a key or a \
+             value over its limit) implies no mutation on a single-cell, non-tiered path only: \
+             a cross-cell `MSET` skips the bounds pre-pass, applies each local pair whose `SET` \
+             succeeds and, when no local pair failed, sends each remote pair to its owner, which \
+             applies or refuses it on its own, and a tiered `MSET` applies pair by pair and \
+             stops at the first error, so either can answer an error after applying some of \
+             the pairs (on a tiered namespace, a prefix); an out-of-memory refusal part-way \
+             keeps the pairs already applied on every path",
     ),
     d(
         "MSETNX",
         Status::Partial,
         "M1",
-        "cross-cell keys are check-then-set until M4 transactions; single-cell exact",
+        "cross-cell keys are check-then-set, and a cross-cell `MSETNX` skips the bounds \
+         pre-pass, so it can answer a bounds error after applying a prefix; single-cell exact",
     ),
-    d("GETRANGE", Status::Full, "M1", ""),
+    d(
+        "GETRANGE",
+        Status::Partial,
+        "M1",
+        "on a tiered namespace an `end` below `-len` is not clamped: `GETRANGE k 0 -100` on an \
+         11-byte value answers an empty string where Redis and a memory namespace answer the \
+         first byte",
+    ),
     d(
         "SETRANGE",
         Status::Full,
@@ -199,10 +223,17 @@ pub static DECLARED: &[Declared] = &[
         "INCRBYFLOAT",
         Status::Partial,
         "M1",
-        "computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision \
-             tails may differ",
+        "computes in f64 (Redis: long double); on a memory namespace formatting matches on the \
+             pinned corpus and precision tails may differ; a tiered namespace renders 17 decimal \
+             places and trims trailing zeros (`10.5 + 0.1` answers `10.59999999999999964` \
+             where Redis answers `10.6`)",
     ),
-    d("SUBSTR", Status::Full, "M1", ""),
+    d(
+        "SUBSTR",
+        Status::Partial,
+        "M1",
+        "as `GETRANGE`: on a tiered namespace an `end` below `-len` is not clamped",
+    ),
     d(
         "RENAME",
         Status::Partial,
@@ -238,11 +269,13 @@ pub static DECLARED: &[Declared] = &[
     ),
     d(
         "SCAN",
-        Status::Full,
+        Status::Partial,
         "M1",
         "cursor values are engine-internal; the corpus compares the key set a full cursor \
          walk enumerates (ADR-0129 D3), the store-tier proptest covers \
-         every-resident-key-≥-once under concurrent mutation",
+         every-resident-key-≥-once under concurrent mutation; the `TYPE` option compares its \
+         argument with the word `string` and never reads a record's type: `TYPE string` \
+         returns every key, documents included, and any other type returns none",
     ),
     d("FLUSHDB", Status::Full, "M1", ""),
     d(
@@ -488,10 +521,11 @@ pub static DECLARED: &[Declared] = &[
     ),
     d(
         "JSON.TOGGLE",
-        Status::Full,
+        Status::Partial,
         "M3",
-        "S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split \
-         matches the pinned oracle (S22 probe)",
+        "S21 RESP2/RESP3 corpus exact; on a non-boolean the modern path skips and the legacy \
+         path errors, as the pinned RedisJSON does; the legacy error text differs from \
+         RedisJSON's in path spelling and wording, and no corpus case compares it",
     ),
     d(
         "JSON.CLEAR",
@@ -764,8 +798,13 @@ pub fn render() -> String {
     push(&format!(
         "**{REDIS_STACK_IMAGE}@{REDIS_STACK_DIGEST}** with ReJSON/{REDISJSON_MODULE_VERSION}."
     ));
-    push("Every covered behavior is byte-diffed under its declared protocol; any new or");
-    push("stale deviation fails CI (L8 — honesty is total).");
+    push("Every compared case is diffed against its oracle under its declared protocol:");
+    push("byte for byte, except where the corpus compares a key set (`KEYS`, `SCAN`), a");
+    push("membership (`RANDOMKEY`) or a time within a tolerance (`TTL`, `PTTL`). A");
+    push("mismatch that no recorded deviation names fails CI. A case recorded as a");
+    push("deviation is held to no bytes: a core deviation is not compared, and a");
+    push("`JSON.*` deviation accepts any reply that differs from the oracle's and is");
+    push("refused as stale only when the two match again.");
     push("Candidates: the in-process executor **and**, since 2026-09-01, a spawned");
     push("**4-cell durable `infinityd`** behind TCP — the core corpus runs against");
     push("both, plus a namespace-bound fan-out/tier lane");
@@ -773,7 +812,7 @@ pub fn render() -> String {
     push("byte-exact there, never silently excused.");
     push("");
     push(&format!(
-        "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 \
+        "**Corpus:** {compared} compared executions · {deviations} documented deviations · 0 \
              tolerated failures.",
     ));
     push(&format!(

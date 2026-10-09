@@ -7,16 +7,21 @@
 
 Oracles: **Redis 8.0.5** for the core surface; RedisJSON uses
 **redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a** with ReJSON/20809.
-Every covered behavior is byte-diffed under its declared protocol; any new or
-stale deviation fails CI (L8 — honesty is total).
+Every compared case is diffed against its oracle under its declared protocol:
+byte for byte, except where the corpus compares a key set (`KEYS`, `SCAN`), a
+membership (`RANDOMKEY`) or a time within a tolerance (`TTL`, `PTTL`). A
+mismatch that no recorded deviation names fails CI. A case recorded as a
+deviation is held to no bytes: a core deviation is not compared, and a
+`JSON.*` deviation accepts any reply that differs from the oracle's and is
+refused as stale only when the two match again.
 Candidates: the in-process executor **and**, since 2026-09-01, a spawned
 **4-cell durable `infinityd`** behind TCP — the core corpus runs against
 both, plus a namespace-bound fan-out/tier lane
 (`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned
 byte-exact there, never silently excused.
 
-**Corpus:** 677 byte-compared executions · 72 documented deviations · 0 tolerated failures.
-**Surface:** 91 commands — 53 full · 33 partial · 0 stub · 2 extension · 3 internal.
+**Corpus:** 677 compared executions · 72 documented deviations · 0 tolerated failures.
+**Surface:** 91 commands — 47 full · 39 partial · 0 stub · 2 extension · 3 internal.
 
 Status vocabulary: `full` = behavior-contract equivalent (recorded deviations
 are representational: ordering, identity payloads, opaque cursors/art);
@@ -43,7 +48,7 @@ live keys.
 | `SETEX` | full | M0 | write denyoom | 4 | 6 | 2 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `PSETEX` | full | M0 | write denyoom | 4 | 4 | 2 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
 | `GETSET` | full | M0 | write denyoom fast | 3 | 2 | 1 |  |
-| `GETDEL` | full | M0 | write fast | 2 | 2 | 1 |  |
+| `GETDEL` | partial | M0 | write fast | 2 | 2 | 1 | on a tiered namespace with shadow tickets (`tiered-shadow-overwrite yes`, or tickets rebuilt at boot) the reply can be a value the delete did not remove: a same-length `SET` during the delete's cold read rewrites the record in place |
 | `DEL` | full | M0 | write | -2 | 4 | 4 |  |
 | `EXISTS` | full | M0 | readonly fast | -2 | 20 | 20 |  |
 | `TYPE` | full | M0 | readonly fast | 2 | 4 | 4 | only the string type exists until M3 |
@@ -58,16 +63,16 @@ live keys.
 | `TTL` | full | M0 | readonly fast | 2 | 23 | 22 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PTTL` | full | M0 | readonly fast | 2 | 3 | 3 | a clamped deadline reads as the u40 bound (ADR-0111) |
 | `PERSIST` | full | M0 | write fast | 2 | 3 | 3 |  |
-| `INFO` | partial | M0 | admin | -1 | 1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store); `# Persistence`/`# Tiering`/`# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
+| `INFO` | partial | M0 | admin | -1 | 1 | 1 | sections + field vocabulary present; every name appears once per reply — `# Memory` and `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the worst wheel debt across every store); `# Tiering` and `# Tripwires` are this cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); `# Persistence` is this cell's slice except the values it renders from node state, among them `loading` and the `loading_*` fields, `ns_drop_tombstones` and the `recover_node_tier_` fields; an unknown section name selects nothing (empty body, Redis shape); client-smoke CI is the open M1-S14 AC |
 | `COMMAND` | partial | M0 | admin | -1 | 3 | 2 | COMMAND DOCS is an honest empty map; the registry covers the implemented surface only |
 | `MGET` | full | M1 | readonly fast | -2 | 4 | 4 |  |
-| `MSET` | full | M1 | write denyoom | -3 | 3 | 1 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB) |
-| `MSETNX` | partial | M1 | write denyoom | -3 | 3 | 3 | cross-cell keys are check-then-set until M4 transactions; single-cell exact |
-| `GETRANGE` | full | M1 | readonly | 4 | 8 | 7 |  |
+| `MSET` | partial | M1 | write denyoom | -3 | 3 | 1 | bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 MiB): a longer one is a protocol error that closes the connection, as in Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 KiB (Redis bounds the query buffer separately at 1 GiB); a bounds error (a key or a value over its limit) implies no mutation on a single-cell, non-tiered path only: a cross-cell `MSET` skips the bounds pre-pass, applies each local pair whose `SET` succeeds and, when no local pair failed, sends each remote pair to its owner, which applies or refuses it on its own, and a tiered `MSET` applies pair by pair and stops at the first error, so either can answer an error after applying some of the pairs (on a tiered namespace, a prefix); an out-of-memory refusal part-way keeps the pairs already applied on every path |
+| `MSETNX` | partial | M1 | write denyoom | -3 | 3 | 3 | cross-cell keys are check-then-set, and a cross-cell `MSETNX` skips the bounds pre-pass, so it can answer a bounds error after applying a prefix; single-cell exact |
+| `GETRANGE` | partial | M1 | readonly | 4 | 8 | 7 | on a tiered namespace an `end` below `-len` is not clamped: `GETRANGE k 0 -100` on an 11-byte value answers an empty string where Redis and a memory namespace answer the first byte |
 | `SETRANGE` | full | M1 | write denyoom | 4 | 4 | 3 | values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty patch is a length read on every path, as in Redis |
 | `GETEX` | full | M1 | write fast | -2 | 25 | 8 | deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111) |
-| `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | 4 | computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ |
-| `SUBSTR` | full | M1 | readonly | 4 | 1 | 1 |  |
+| `INCRBYFLOAT` | partial | M1 | write denyoom fast | 3 | 6 | 4 | computes in f64 (Redis: long double); on a memory namespace formatting matches on the pinned corpus and precision tails may differ; a tiered namespace renders 17 decimal places and trims trailing zeros (`10.5 + 0.1` answers `10.59999999999999964` where Redis answers `10.6`) |
+| `SUBSTR` | partial | M1 | readonly | 4 | 1 | 1 | as `GETRANGE`: on a tiered namespace an `end` below `-len` is not clamped |
 | `RENAME` | partial | M1 | write | 3 | 3 | 2 | cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6 |
 | `RENAMENX` | partial | M1 | write fast | 3 | 5 | 3 | same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 against the leftover destination copy without removing the source |
 | `COPY` | partial | M1 | write denyoom | -3 | 12 | 9 | cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is checked at write; same cross-owner window as RENAME |
@@ -76,7 +81,7 @@ live keys.
 | `DBSIZE` | full | M1 | readonly fast | 1 | 5 | 5 |  |
 | `KEYS` | full | M1 | readonly | 2 | 5 | 5 | result ordering is engine-defined; the corpus compares the set |
 | `RANDOMKEY` | full | M1 | readonly | 1 | 2 | 1 | two-level random (cell, then key); the corpus compares the draw against the oracle's live keys |
-| `SCAN` | full | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (ADR-0129 D3), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation |
+| `SCAN` | partial | M1 | readonly | -2 | 4 | 2 | cursor values are engine-internal; the corpus compares the key set a full cursor walk enumerates (ADR-0129 D3), the store-tier proptest covers every-resident-key-≥-once under concurrent mutation; the `TYPE` option compares its argument with the word `string` and never reads a record's type: `TYPE string` returns every key, documents included, and any other type returns none |
 | `FLUSHDB` | full | M1 | write | -1 | 4 | 3 |  |
 | `FLUSHALL` | partial | M1 | write | -1 | 2 | 2 | atomic per cell, eventually complete across cells within one scatter round (no global pause) |
 | `OBJECT` | partial | M1 | readonly | -2 | 11 | 6 | IDLETIME is an honest 0 (CLOCK recency, no LRU clock); FREQ is the CMS Morris estimate |
@@ -112,7 +117,7 @@ live keys.
 | `JSON.NUMMULTBY` | partial | M3 | write denyoom | 4 | 2 | 2 | same numeric model and deviation classes as JSON.NUMINCRBY; S21 RESP2/RESP3 corpus exact |
 | `JSON.STRAPPEND` | full | M3 | write denyoom | -3 | 4 | 4 | lengths reported in bytes and the implicit legacy root path match the pinned oracle (S21 corpus + S22 probes) |
 | `JSON.STRLEN` | full | M3 | readonly fast | -2 | 6 | 6 | lengths reported in bytes, matching the pinned oracle (S21 corpus + S22 multibyte probe) |
-| `JSON.TOGGLE` | full | M3 | write fast | -2 | 4 | 4 | S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split matches the pinned oracle (S22 probe) |
+| `JSON.TOGGLE` | partial | M3 | write fast | -2 | 4 | 4 | S21 RESP2/RESP3 corpus exact; on a non-boolean the modern path skips and the legacy path errors, as the pinned RedisJSON does; the legacy error text differs from RedisJSON's in path spelling and wording, and no corpus case compares it |
 | `JSON.CLEAR` | full | M3 | write | -2 | 2 | 2 | already-empty containers and zero numbers skip (uncounted), matching the pinned oracle (S21 corpus + S22 probe) |
 | `JSON.ARRAPPEND` | partial | M3 | write denyoom | -3 | 8 | 8 | S21 corpus exact except the composed-depth refusal — an append whose result would nest past 128 containers answers `ERR document nesting too deep` and changes nothing, a permanent product boundary (ADR-0042 A1) — and a 128-level element's refusal text (RedisJSON answers its recursion-limit parse error; both refuse before the key lookup); three-argument form appends one value at the legacy root, a form the pinned RedisJSON rejects with an arity error (S22 probe) |
 | `JSON.ARRINSERT` | partial | M3 | write denyoom | -5 | 8 | 8 | resolved index outside 0..=len aborts the whole command atomically; RedisJSON can mutate an earlier match before a later index error |
@@ -159,7 +164,7 @@ bytes or post-state differ by an understood, reviewed design decision.
 
 ### `DEBUG`
 
-- removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)
+- `DEBUG JMAP` is removed in Redis 8; InfinityDB accepts it and answers `+OK` without doing anything (`DEBUG SLEEP` and `DEBUG OBJECT` are served, `DEBUG SET-ACTIVE-EXPIRE` is accepted and ignored, and any other subcommand answers an error: see the `DEBUG` row)
 - value-address/serialized-length fields are engine-internal
 
 ### `PEXPIRETIME`
