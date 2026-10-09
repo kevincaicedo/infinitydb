@@ -592,9 +592,10 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         Some(meta) if well_formed && pubsub::is_plane_pubsub(meta.id) => {
             return dispatch_pubsub(shared, key, meta.id, argv, proto, pending, inflight).await;
         }
-        // Namespace DDL (M2-S08, ADR-0015 D2/D3): id allocation, local
-        // apply, peer fan, catalog persist — on every node shape (1-cell
-        // included), which is why `needs_fabric` routes all INF.NS here.
+        // Namespace DDL (M2-S08, ADR-0015 D2/D3): each subcommand in its
+        // program's order (`program_ns_ddl`, `program_ns_drop`) — on every
+        // node shape (1-cell included), which is why `needs_fabric` routes
+        // all INF.NS here.
         Some(meta)
             if well_formed
                 && meta.id == CommandId::InfNs

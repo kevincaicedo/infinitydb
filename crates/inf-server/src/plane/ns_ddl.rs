@@ -1,6 +1,7 @@
 //! Namespace DDL and checkpoint programs: `INF.NS CREATE/DROP/SET`, the
-//! catalog fan to every cell with persist-then-fan ordering (ADR-0100/
-//! ADR-0103), rollback, and the apply-send path with its credit wait.
+//! catalog fan to every cell (`CREATE` and `DROP` persist before they
+//! fan, ADR-0103 and ADR-0186 D1; `SET` fans first, ADR-0015 D3),
+//! rollback, and the apply-send path with its credit wait.
 
 use super::*;
 use crate::control::{CkptCredit, CkptTarget};
@@ -483,13 +484,12 @@ async fn wait_for_ckpt<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     }
 }
 
-/// The namespace-DDL program (M2-S08, ADR-0015 D2/D3): parse → allocate id
-/// (CREATE) → apply locally → fan `INF.NSFAN` to every peer (AllOk) →
-/// persist the catalog through the control thread → `+OK` only after the
-/// swap is durable. `DROP` reorders to *apply → request persist → fan
-/// (carrying the persist epoch) → wait → request checkpoint + stamp →
-/// `+OK`* (ADR-0100 D3/D4), so every cell can hold its tier-file teardown
-/// on the swap that makes the drop durable.
+/// The namespace-DDL program (M2-S08), one per node at a time (ADR-0108 D1). `SET`: apply
+/// locally → fan `INF.NSFAN` to every peer (AllOk) → persist the catalog through the control
+/// thread → `+OK` once the swap is durable (ADR-0015 D3). `CREATE`: persist the catalog that
+/// names it → wait for the swap → apply locally → fan → `+OK`, so no cell serves a namespace
+/// the catalog does not hold (ADR-0103); a failed leg rolls it back. `DROP` runs in
+/// `program_ns_drop`.
 pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
@@ -665,11 +665,12 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     if let Some((id, name, cleanup, tiered)) = created {
         if let Some(error) = failure {
             // ADR-0108 D3: a `CREATE` whose fan failed on any peer rolls
-            // back — the origin drops its copy, fans `DROP`, persists the
-            // drop — so the namespace's existence is exactly what the
-            // reply says. Before this the peers that accepted their leg
-            // (and the origin) served it while the client held an error,
-            // and `META` kept naming it until the next persist.
+            // back — the origin drops its copy, persists the drop and
+            // waits for the swap, then fans `DROP` (ADR-0186 D1) — so the
+            // namespace's existence is exactly what the reply says. Before
+            // this the peers that accepted their leg (and the origin)
+            // served it while the client held an error, and `META` kept
+            // naming it until the next persist.
             rollback_create(shared, &control, proto, id, &name, cleanup, tiered).await;
             return error;
         }
@@ -694,14 +695,13 @@ pub(super) async fn program_ns_ddl<O: PlaneObserver + 'static, F: SegmentFs + Cl
     simple_reply(shared, proto, "OK")
 }
 
-/// `INF.NS DROP` (ADR-0100 D3/D4/D5): apply locally → request the catalog
-/// persist that carries the drop (a durable namespace's tombstone joins
-/// the payload) → fan `INF.NSFAN DROP name epoch` so every peer holds its
-/// tier-file teardown on that epoch → wait for the swap → request the
-/// node-wide checkpoint that retires the tombstone and stamp it → `+OK`.
-/// At the tombstone cap the drop first waits for a node-wide checkpoint
-/// (the `INF.CKPT WAIT` machinery) so the persist retires everything
-/// stamped — bounded backpressure, never an unbounded set.
+/// `INF.NS DROP` (ADR-0186 D1; ADR-0100 D3/D5): apply locally → request the catalog persist
+/// that carries the drop (a durable namespace's tombstone joins the payload) → wait for the
+/// swap → fan `INF.NSFAN DROP name epoch`, so no peer drops a namespace the catalog still
+/// lists and every peer parks its tier-file teardown on that epoch → request the node-wide
+/// checkpoint that retires the tombstone and stamp it → `+OK`. At the tombstone cap the drop
+/// first waits for a node-wide checkpoint (the `INF.CKPT WAIT` machinery) so the persist
+/// retires everything stamped — bounded backpressure, never an unbounded set.
 async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     control: &Arc<ControlHandle>,
@@ -736,10 +736,12 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
             return reply;
         }
     };
-    // Crash-matrix point: the on-disk state of a cut before the swap
+    // Crash-matrix point: the on-disk state of a cut at this instant
     // (nothing durable changed; the origin alone lacks the namespace).
     // No persist will ever carry this drop, so the tier files hold
-    // until the restart restores the namespace from the intact META.
+    // until the restart restores the namespace from the intact META,
+    // whole while this cell publishes no checkpoint before the stop:
+    // one would omit the namespace (ADR-0186 D2).
     if inf_foundation::fault::fire(crate::fault::NS_DROP_BEFORE_META) {
         if spec.tier.is_some() {
             shared.ns_drop_releases.borrow_mut().push((spec.id, u64::MAX));
@@ -768,8 +770,9 @@ async fn program_ns_drop<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
         shared.ddl_waiters.wait(0).await;
     }
     // Crash-matrix point: the on-disk state of a cut after the swap
-    // (META lacks the namespace and carries its tombstone; every
-    // MANIFEST still names it).
+    // (META lacks the namespace and carries its tombstone; each peer's
+    // MANIFEST still names it, and this cell's unless it published a
+    // checkpoint during the wait).
     if inf_foundation::fault::fire(crate::fault::NS_DROP_AFTER_META) {
         return error_reply(shared, proto, "ERR fault: ns_drop_after_meta");
     }

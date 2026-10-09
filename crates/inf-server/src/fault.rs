@@ -34,16 +34,16 @@
 //!   so the real refusal runs: `enqueue` answers the permanent `Unrepresentable` (ADR-0167 D3),
 //!   and a cold `GET` and a `SCAN` page over cold keys answer the cold I/O error once, never
 //!   `BUSY`; the refused read changes no cold-read state
-//! - `ns_drop_before_meta` — `plane::program_ns_ddl` (the DROP branch, after the local apply,
-//!   before the catalog persist request) — the DDL stops with the origin's registry already lacking
-//!   the namespace and nothing durable changed — the on-disk state of a power cut before the
-//!   catalog
-//!   swap (ADR-0100 D5): a restart restores the namespace whole, its tier files intact on every
-//!   cell
-//!   (the teardown hold never released)
-//! - `ns_drop_after_meta` — `plane::program_ns_ddl` (the DROP branch, after the catalog swap is
-//!   durable, before the fan) — the DDL stops with `META` lacking the namespace and carrying its
-//!   tombstone while every `MANIFEST` still names it — the on-disk state of a power cut after the
+//! - `ns_drop_before_meta` — `plane::ns_ddl::program_ns_drop` (after the local apply,
+//!   before the catalog persist request) — the DDL stops with the origin's registry
+//!   already lacking the namespace and nothing durable changed — the on-disk state of a
+//!   power cut at that instant (ADR-0100 D5): a restart restores the namespace whole, its
+//!   tier files intact on every cell (the teardown hold never released), while the origin
+//!   cell publishes no checkpoint before the stop; one would omit the namespace (ADR-0186 D2)
+//! - `ns_drop_after_meta` — `plane::ns_ddl::program_ns_drop` (after the catalog swap is
+//!   durable, before the fan) — the DDL stops with `META` lacking the namespace and carrying
+//!   its tombstone while each peer's `MANIFEST` still names it (the origin's too, unless it
+//!   published a checkpoint during the wait) — the on-disk state of a power cut after the
 //!   swap (ADR-0100 D6): a restart boots, sweeps the residue, and the namespace is gone
 //! - `ns_create_after_meta` — `plane::program_ns_ddl` (the CREATE branch, after the catalog swap is
 //!   durable, before the local apply) — the DDL stops with `META` naming a namespace no cell serves
@@ -54,9 +54,9 @@
 //! - `ns_create_fan_refused` — `plane::handle_ns_apply` (a peer's `INF.NSFAN CREATE` leg, before
 //!   its local apply) — the peer refuses the leg with a typed error — the stand-in for the OS
 //!   refusing the tier ring reservation on that cell (ADR-0103 D3's one check the origin cannot run
-//!   ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, fans `DROP` to
-//!   every peer, persists the drop — and answers the leg's error; no cell serves the namespace and
-//!   `META` never names it after the reply
+//!   ahead): the origin rolls the `CREATE` back (ADR-0108 D3) — drops its own copy, persists the
+//!   drop and waits for the swap, then fans `DROP` to every peer (ADR-0186 D1) — and answers the
+//!   leg's error; no cell serves the namespace and `META` never names it after the reply
 //! - `mset_midway_oom` — `exec::mset` + `exec::msetnx` (the apply loops, pairs ≥ 2) — a multi-key
 //!   write fails mid-way after applying a prefix (the deterministic stand-in for arena OOM — review
 //!   of 2026-08-30, H2/F-L17-11, ADR-0098): the reply is the error, and the durable emission gate

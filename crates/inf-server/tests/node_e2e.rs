@@ -7519,11 +7519,14 @@ fn assert_cold_keys_served(conn: &mut TcpStream, keys: u32) {
 
 /// Crash-matrix row `ns_drop_before_meta` (ADR-0100 D5): the DDL stops
 /// after the local apply and before the catalog persist request — the
-/// on-disk state of a cut before the swap. Nothing durable changed and
-/// the teardown hold kept every tier file (the origin cell's registry
-/// alone lacks the namespace, so the origin's own files are the ones
-/// that would have been unlinked pre-ADR). A restart serves the
-/// namespace with every key.
+/// on-disk state of a cut at that instant. Nothing durable changed, the
+/// node's checkpoints are manual and none is requested after the drop,
+/// before the crash-equivalent stop, and the teardown hold kept every
+/// tier file (the origin cell's registry alone lacks the namespace, so
+/// the origin's own files are the ones that would have been unlinked
+/// pre-ADR). A restart serves the namespace with every key. A checkpoint
+/// of the origin cell published after the drop would omit the namespace
+/// (ADR-0186 D2); no row covers it.
 #[test]
 fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
     let dir = temp_data_dir("drop-cut-before");
@@ -7567,7 +7570,7 @@ fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
 /// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
 /// once the catalog swap is durable and before the fan — the on-disk
 /// state of a cut after the swap. `META` lacks the namespace and carries
-/// its tombstone while every `MANIFEST` still names it. The restart
+/// its tombstone while each peer's `MANIFEST` still names it. The restart
 /// boots (the pre-ADR fail-stop refused exactly this state), sweeps the
 /// residue on every cell, and the namespace is gone.
 #[test]

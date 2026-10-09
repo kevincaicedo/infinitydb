@@ -306,11 +306,15 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// (a tiered namespace is a configuration of `MODE durable` —
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
-    /// Dropped namespaces awaiting their catalog persist (ADR-0100 D5):
-    /// `(ns, epoch)` recorded by the DROP program (origin) or the
-    /// `INF.NSFAN DROP` apply (peers) before MAINTAIN parks the tier
-    /// files; consumed by `TierCell::sync_namespaces`. Bounded by DDL
-    /// rate — one entry per drop, consumed at the next MAINTAIN.
+    /// Dropped tiered namespaces whose tier files wait for the catalog
+    /// swap that drops them (ADR-0100 D5): `(ns, epoch)` recorded on the
+    /// origin, before that swap, by the DROP program or a `CREATE`
+    /// rollback, and on a peer, after it, by the `INF.NSFAN DROP` apply
+    /// (ADR-0186 D1). A fault-injected stop at `ns_drop_before_meta`
+    /// records `u64::MAX`, an epoch no swap reaches, so those files hold
+    /// until the restart. Consumed by `TierCell::sync_namespaces`, which
+    /// parks the tier files on the entry's epoch. Bounded by DDL rate —
+    /// one entry per drop, consumed at the next MAINTAIN.
     ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
