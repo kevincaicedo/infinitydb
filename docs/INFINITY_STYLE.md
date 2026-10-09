@@ -496,20 +496,20 @@ All compiler and clippy warnings are errors from day one (`-D warnings`).
 The mechanical checks — `check-dep-dag.sh` (crate boundaries),
 `check-cell-denylist.sh` (no locks/sleep/ambient time in cells) with
 `check-clock-ban.sh` (the type-resolved half of the same rule: clippy's
-`disallowed-methods` for `Instant`/`SystemTime` `now`/`elapsed`, libc
-and the TSC, proven on a planted-bypass probe — ADR-0106 D7; an entry
-the lint cannot resolve is a violation, not a warning),
-fault-point and fsync-fail-stop greps, the attribution-divergence gate,
+`disallowed-methods` for `Instant`/`SystemTime` `now`/`elapsed`, libc and
+the TSC, proven on a planted-bypass probe — ADR-0106 D7; an entry the lint
+cannot resolve is a violation, not a warning), fault-point and
+fsync-fail-stop greps, the attribution-divergence gate,
 `check-shipping-features.sh` (no test/DST feature on a normal dependency
 edge — ADR-0107 D1), `check-release-asserts.sh` (the classified
 release-assert inventory — ADR-0107 D2), `check-unsafe-roots.sh` (every
 `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of the workspace
-governs `unsafe_code`, the deny set is the leaf list,
-allows written `allow(unsafe_code)` are module-scoped — ADR-0121) —
-are not bureaucracy; they are laws made cheap. Never weaken a check to
-merge; change the law first (ADR) or fix the code. A shell gate is the
-last resort, not the default: when clippy, the type system or a
-generated table can carry a rule, move it there and delete the script.
+governs `unsafe_code`, the deny set is the leaf list, allows written
+`allow(unsafe_code)` are module-scoped — ADR-0121) — are not bureaucracy;
+they are laws made cheap. Never weaken a check to merge; change the law
+first (ADR) or fix the code. A shell gate is the last resort, not the
+default: when clippy, the type system or a generated table can carry a
+rule, move it there and delete the script.
 
 A check that silently checks nothing gives false confidence. Every
 `check-*.sh` **asserts its scope** (ADR-0106): a missing directory, an empty

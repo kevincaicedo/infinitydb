@@ -29,20 +29,19 @@ Status column tracks arrival.
   idx_registry[_mut] / ns_has_indexes` in `inf-store`. DDL-rate only; the
   mutation path consults a cached per-namespace flag (S04 wires it) —
   never the registry.
-- **Lifecycle:** `IndexRegistry::set_catalog_state /
-  set_cell_state / rebuild` admit declared → backfilling → ready, ready
-  → backfilling (`rebuild` takes the new generation from its caller and
-  checks that it is greater under `debug_assert!` only;
-  `set_catalog_state` admits the edge without reading the generation),
-  and declared, backfilling or ready → dropping; every other edge is a
-  typed `InvalidTransition` (ADR-0075 D3). `Keyspace::idx_rebuild` bumps
-  the generation and resets the owning store's tree in one transition.
-  Catalog state is the planning authority; per-cell state is backfill
-  progress. An accepted change replaces the `dropping` edge with
-  retirement, a durable catalog write that removes the declaration,
-  followed by per-cell reclamation of the retired `{id, generation}`'s
-  tree in maintenance slices, and admits a rebuild from `backfilling` as
-  well as from `ready` (ADR-0075 A1); it is not built.
+- **Lifecycle:** `IndexRegistry::set_catalog_state / set_cell_state /
+  rebuild` admit declared → backfilling → ready, ready → backfilling
+  (`rebuild` takes the new generation from its caller and checks that it is
+  greater under `debug_assert!` only; `set_catalog_state` admits the edge
+  without reading the generation), and declared, backfilling or ready →
+  dropping; every other edge is a typed `InvalidTransition` (ADR-0075 D3).
+  `Keyspace::idx_rebuild` bumps the generation and resets the owning store's
+  tree in one transition. Catalog state is the planning authority; per-cell
+  state is backfill progress. An accepted change replaces the `dropping`
+  edge with retirement, a durable catalog write that removes the
+  declaration, followed by per-cell reclamation of the retired
+  `{id, generation}`'s tree in maintenance slices, and admits a rebuild from
+  `backfilling` as well as from `ready` (ADR-0075 A1); it is not built.
 - **Persistence:** declarations ride the namespace catalog (payload v3)
   through the existing control-thread `META` swap — persist-then-ack
   unchanged; `ControlHandle` allocates index ids and generations
