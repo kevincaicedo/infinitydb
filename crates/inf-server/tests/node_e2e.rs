@@ -1082,24 +1082,47 @@ fn parse_batch_prefetch_matches_inline_semantics() {
     pipeline.extend(cmd(&[b"GET", b"q"]));
     client.write_all(&pipeline).expect("write");
     read_exactly(&mut client, b"+OK\r\n+OK\r\n");
-    let mut rest = Vec::new();
-    client.read_to_end(&mut rest).expect("server closes after QUIT");
-    assert!(rest.is_empty(), "nothing after QUIT's +OK: {rest:?}");
+    assert_closed(&mut client, "QUIT mid-pipeline");
 
     node.stop();
 }
 
-/// The server closes: the next read is EOF — not a timeout, not bytes.
-fn assert_closed(stream: &mut TcpStream, what: &str) {
-    let mut rest = Vec::new();
-    match stream.read_to_end(&mut rest) {
-        Ok(_) => assert!(
-            rest.is_empty(),
-            "{what}: bytes after the reply: {:?}",
-            String::from_utf8_lossy(&rest)
-        ),
-        Err(e) => panic!("{what}: the server never closed the connection ({e})"),
+/// Reads `stream` until the server closes it, handing `sink` every byte
+/// delivered first. Closed is EOF or `ECONNRESET`: Linux answers a close
+/// with our input still unread (a kill, a refusal) with RST, after the
+/// bytes already sent. A timeout or any other error is "never closed". A
+/// test whose property is "replies flushed before the close" asserts the
+/// FIN itself.
+fn drain_to_close(stream: &mut TcpStream, what: &str, mut sink: impl FnMut(&[u8])) {
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                total += n;
+                sink(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(e) => {
+                panic!("{what}: the server never closed the connection after {total} bytes ({e})")
+            }
+        }
     }
+}
+
+/// Every byte the server delivers before it closes (see `drain_to_close`).
+fn read_to_close(stream: &mut TcpStream, what: &str) -> Vec<u8> {
+    let mut delivered = Vec::new();
+    drain_to_close(stream, what, |bytes| delivered.extend_from_slice(bytes));
+    delivered
+}
+
+/// The server closes with nothing after the replies already read.
+fn assert_closed(stream: &mut TcpStream, what: &str) {
+    let rest = read_to_close(stream, what);
+    assert!(rest.is_empty(), "{what}: bytes after the reply: {:?}", String::from_utf8_lossy(&rest));
 }
 
 /// Batch 46 (review of 2026-08-30, F-L13-08): every command on a
@@ -1288,8 +1311,7 @@ fn hello_switch_and_protocol_error_close() {
     // A protocol error gets an error reply, then the server closes.
     let mut bad = node.connect();
     bad.write_all(b"*1\r\n$NOTANUMBER\r\n").expect("write");
-    let mut reply = Vec::new();
-    bad.read_to_end(&mut reply).expect("read until close");
+    let reply = read_to_close(&mut bad, "a protocol error");
     assert!(reply.starts_with(b"-ERR Protocol error"), "got {:?}", String::from_utf8_lossy(&reply));
 
     node.stop();
@@ -1536,8 +1558,7 @@ fn slow_subscriber_hits_the_output_cap_and_dies() {
 
     // The subscriber is killed by the MAINTAIN sweep: EOF after whatever
     // partial output flushed first.
-    let mut sink = Vec::new();
-    sub.read_to_end(&mut sink).expect("read until close");
+    drain_to_close(&mut sub, "a subscriber past the pubsub hard cap", |_| {});
 
     // Registry unwound (close-path cleanup): no receivers remain.
     publisher.write_all(&cmd(&[b"PUBLISH", &ch, b"after"])).expect("write");
@@ -8415,9 +8436,7 @@ fn proto_max_bulk_len_is_enforced_and_applies_to_live_connections() {
         "{:?}",
         String::from_utf8_lossy(&line)
     );
-    let mut rest = Vec::new();
-    b.read_to_end(&mut rest).expect("read to close");
-    assert!(rest.is_empty(), "a protocol error closes the connection");
+    assert_closed(&mut b, "a bulk length past proto-max-bulk-len");
 
     // The fan reaches cell 1: once its `CONFIG GET` shows the value, the
     // push ran in the same iteration, so a fresh connection there parses
@@ -8670,21 +8689,10 @@ fn maxclients_refuses_the_next_connection_like_redis() {
         break;
     }
     let mut refused = refused.expect("a connection past the per-cell share is refused");
-    assert_closed_or_reset(&mut refused, "refused connection");
+    assert_closed(&mut refused, "refused connection");
     assert!(held.len() <= 2, "{} connections admitted under maxclients 2", held.len());
     drop(held);
     node.stop();
-}
-
-/// Closed by the server — FIN, or RST when the server closed with our
-/// bytes still unread (a refused accept never reads).
-fn assert_closed_or_reset(stream: &mut TcpStream, what: &str) {
-    let mut rest = Vec::new();
-    match stream.read_to_end(&mut rest) {
-        Ok(_) => assert!(rest.is_empty(), "{what}: bytes after the refusal: {rest:?}"),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) => panic!("{what}: the server never closed the connection ({e})"),
-    }
 }
 
 /// Batch 50 (review 2026-08-30, F-L15-05 `timeout`): an idle connection
@@ -8764,15 +8772,9 @@ fn client_output_buffer_limit_normal_kills_a_non_reading_client() {
     for _ in 0..512 {
         victim.write_all(&get).expect("write");
     }
+    // The kill closes with GETs still unread, so the close may be a reset.
     let mut total = 0usize;
-    let mut buf = vec![0u8; 1 << 16];
-    loop {
-        match victim.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) => panic!("the server never closed the connection after {total} bytes ({e})"),
-        }
-    }
+    drain_to_close(&mut victim, "a client past the normal hard cap", |bytes| total += bytes.len());
     let every_reply = 512 * (big.len() + 11);
     assert!(total < every_reply, "every reply was delivered ({total} bytes) — no cap fired");
     let mut probe = node.connect();
@@ -8827,12 +8829,7 @@ fn client_kill_by_id_reaches_the_first_connection_of_a_cell() {
     let mut killer = node.connect();
     killer.write_all(&cmd(&[b"CLIENT", b"KILL", b"ID", id.to_string().as_bytes()])).expect("write");
     read_exactly(&mut killer, b":1\r\n");
-    let mut rest = Vec::new();
-    match first.read_to_end(&mut rest) {
-        Ok(_) => assert!(rest.is_empty(), "bytes after the kill: {rest:?}"),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
-        Err(e) => panic!("the killed connection stayed open ({e})"),
-    }
+    assert_closed(&mut first, "the killed connection");
     node.stop();
 }
 
