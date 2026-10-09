@@ -1499,11 +1499,13 @@ the cell denylist and clock ban, fault-point and `fsync` fail-stop rules,
 the panic policy and the inventory of release assertions, `SAFETY.md`
 inventories and unsafe crate roots, test-only features kept out of shipping
 builds, file length and line width, and lint ratchets. Each script is
-self-tested: it must exit non-zero on each of its planted cases, and a case
-that does not name its cause accepts any non-zero exit but 126 and 127 (a
-command that could not run). `just check` also
-tests the slim `inf-server` library build, and CI builds it and checks that
-its symbols contain no document or query code.
+self-tested: it must exit non-zero on each of its planted cases. The shell
+cases of `scripts/check-scripts-selftest.sh` also fail on exit 126 or 127
+(a command that could not run); the Python fixtures it runs for the
+dependency table, the `SAFETY.md` inventories and the documentation
+artifacts do not check those codes. `just check` also tests the slim
+`inf-server` library build, and CI builds it and checks that its symbols
+contain no document or query code.
 
 ### Exit gates
 
