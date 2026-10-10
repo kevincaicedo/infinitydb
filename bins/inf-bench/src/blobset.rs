@@ -32,6 +32,11 @@
 //!   the run must exit `VACUOUS`; `--plant reply-err` feeds the reply
 //!   path a fixture stream holding one `-ERR`, and the run must exit red.
 //!
+//! - **Both sides of the load.** The generator's own CPU over the window
+//!   (`utime + stime` of this process from `/proc`, in cores) is printed
+//!   beside `X` per leg; a leg whose generator used more than half of the
+//!   CPUs it may run on is marked not server capacity and is no number.
+//!
 //! The report labels its tier: without `--reference-box` every number is
 //! dev-tier, disclosed and never published.
 
@@ -43,7 +48,9 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cli::Flags;
 use crate::envcheck;
 use crate::finehist::FineHistogram;
-use crate::gaterun::{ServerGuard, admit_device_root, env_gate, spawn_infinityd};
+use crate::gaterun::{
+    CLOCK_TICKS_PER_S, ServerGuard, admit_device_root, env_gate, read_proc, spawn_infinityd,
+};
 use crate::resp::{connect, encode_command, reply_len, request};
 
 const FLAGS: (&[&str], &[&str]) = (
@@ -76,6 +83,10 @@ const NAMESPACE: &[u8] = b"blobset";
 const SPREAD_X_PERCENT: f64 = 5.0;
 /// The spread budget on p99 between the two legs' means, in percent.
 const SPREAD_P99_PERCENT: f64 = 10.0;
+/// The generator's CPU bar: a leg whose generator used more than this
+/// share of the CPUs it may run on (in cores over the window) is not
+/// server capacity.
+const GENERATOR_CPU_BAR_PERCENT: f64 = 50.0;
 /// How a server field read beside the curve folds across the node's
 /// cells. The population is named by the fold: a sum is the node's, a
 /// loaded-cell read is that cell's.
@@ -141,10 +152,12 @@ impl Plant {
 
 /// The verdict of one leg, in the order a report reads them: a reply that
 /// was not `+OK` is red before any count is believed; a count the server's
-/// extent counter does not confirm is vacuous; the rest is a measurement.
+/// extent counter does not confirm is vacuous; a leg whose generator was
+/// over its CPU bar is not server capacity; the rest is a measurement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LegVerdict {
     Measured,
+    NotServerCapacity(String),
     Vacuous(String),
     Red(String),
 }
@@ -163,6 +176,10 @@ struct Leg {
     hist_us: FineHistogram,
     /// Every cell's reads, in cell order.
     cells: Vec<CellScrape>,
+    /// The generator's `utime + stime` over the window, in cores.
+    generator_cpu_cores: f64,
+    /// The CPUs the generator may run on (its affinity mask).
+    generator_cpus: usize,
     verdict: LegVerdict,
 }
 
@@ -190,6 +207,11 @@ impl CellScrape {
 impl Leg {
     fn throughput(&self) -> f64 {
         self.acked as f64 / self.window.as_secs_f64()
+    }
+
+    /// The generator's CPU bar in cores: half the CPUs it may run on.
+    fn generator_cpu_bar_cores(&self) -> f64 {
+        self.generator_cpus as f64 * GENERATOR_CPU_BAR_PERCENT / 100.0
     }
 
     /// The extents created on every cell, or `None` when a cell did not
@@ -400,6 +422,14 @@ fn create_namespace(port: u16, cells: u16, threshold: &str) -> Result<(), String
     Ok(())
 }
 
+/// This process's `utime + stime`, in clock ticks: the generator's side
+/// of the load.
+fn generator_cpu_ticks() -> Result<u64, String> {
+    read_proc(std::process::id(), None)
+        .map(|sample| sample.cpu_ticks())
+        .map_err(|e| format!("the generator's /proc/self/stat: {e}"))
+}
+
 /// Boots a fresh node from `bin` on `data_dir` (removed and recreated).
 fn boot(
     bin: &str,
@@ -445,14 +475,24 @@ fn run_leg(
     let start = Instant::now();
     let warmup_end = start + spec.warmup;
     let deadline = warmup_end + spec.window;
-    let results: Vec<Result<ConnResult, String>> = std::thread::scope(|scope| {
+    let (results, cpu_ticks) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..conns)
             .map(|index| {
                 scope.spawn(move || run_conn(port, index, spec.value_size, warmup_end, deadline))
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("connection thread")).collect()
+        // The generator's CPU is read at the window's two ends: the
+        // connections run through the warm-up meanwhile.
+        std::thread::sleep(warmup_end.saturating_duration_since(Instant::now()));
+        let ticks_before = generator_cpu_ticks();
+        let results: Vec<Result<ConnResult, String>> =
+            handles.into_iter().map(|h| h.join().expect("connection thread")).collect();
+        let ticks = ticks_before
+            .and_then(|before| generator_cpu_ticks().map(|after| after.saturating_sub(before)));
+        (results, ticks)
     });
+    let generator_cpu_cores =
+        cpu_ticks? as f64 / CLOCK_TICKS_PER_S as f64 / spec.window.as_secs_f64();
     let mut leg = Leg {
         name,
         conns,
@@ -463,6 +503,8 @@ fn run_leg(
         window: spec.window,
         hist_us: FineHistogram::new(),
         cells: Vec::new(),
+        generator_cpu_cores,
+        generator_cpus: std::thread::available_parallelism().map_or(1, usize::from),
         verdict: LegVerdict::Measured,
     };
     let mut first_error: Option<String> = None;
@@ -521,6 +563,13 @@ fn verdict_of(leg: &Leg, first_error: Option<&str>) -> LegVerdict {
         let risen = per_cell.iter().filter(|&&n| n > 0).count();
         return LegVerdict::Vacuous(format!(
             "the extent counter rose on {risen} cells; the load is scoped to one"
+        ));
+    }
+    // USE on the generator's side: a saturated generator's X is its own.
+    if leg.generator_cpu_cores > leg.generator_cpu_bar_cores() {
+        return LegVerdict::NotServerCapacity(format!(
+            "the generator used {:.2} cores of its {} over the window, above the {}% bar",
+            leg.generator_cpu_cores, leg.generator_cpus, GENERATOR_CPU_BAR_PERCENT
         ));
     }
     LegVerdict::Measured
@@ -582,6 +631,11 @@ fn outcome_of(points: &[Point]) -> Outcome {
             match &leg.verdict {
                 LegVerdict::Red(_) => return Outcome::Red,
                 LegVerdict::Vacuous(_) => outcome = Outcome::Vacuous,
+                LegVerdict::NotServerCapacity(_) => {
+                    if outcome == Outcome::Measured {
+                        outcome = Outcome::EvidencePending;
+                    }
+                }
                 LegVerdict::Measured => {}
             }
         }
@@ -603,9 +657,12 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
          count of `+OK` replies inside the window over its length. The spread column is the \
          two legs' means against each other; a point over 5 % on `X` or 10 % on p99 is \
          Evidence-pending. Counters are node sums of per-cell totals, except a percentile, \
-         read from the loaded cell alone as its lifetime value (boot included).\n\n\
+         read from the loaded cell alone as its lifetime value (boot included). `gen cpu` is \
+         this process's utime+stime over the window, in cores; above half its CPUs the leg \
+         is not server capacity.\n\n\
          | conns | leg | rep | X (SET/s) | p50 us | p99 us | p99.9 us | acked | extents | \
-         counters | verdict |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
+         gen cpu (cores) | counters | verdict |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for point in points {
         for leg in &point.legs {
@@ -619,7 +676,7 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
                 None => "absent".to_string(),
             };
             out.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {:?} |\n",
+                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {:.2} of {} | {} | {:?} |\n",
                 leg.conns,
                 leg.name,
                 leg.replicate,
@@ -629,6 +686,8 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
                 leg.hist_us.percentile(99.9),
                 leg.acked,
                 extents,
+                leg.generator_cpu_cores,
+                leg.generator_cpus,
                 counters.join(" "),
                 leg.verdict
             ));
@@ -726,6 +785,8 @@ fn plant_reply_err() -> Result<(), String> {
         window: Duration::from_secs(1),
         hist_us: result.hist_us,
         cells: vec![one_cell(Some(0), Some(result.acked))],
+        generator_cpu_cores: 0.0,
+        generator_cpus: 1,
         verdict: LegVerdict::Measured,
     };
     match verdict_of(&leg, result.first_error.as_deref()) {
@@ -733,9 +794,9 @@ fn plant_reply_err() -> Result<(), String> {
             println!("blob-set: plant reply-err: red as planted ({why})");
             Err("plant reply-err: the run is red".into())
         }
-        other @ (LegVerdict::Measured | LegVerdict::Vacuous(_)) => {
-            Err(format!("plant reply-err did not go red: {other:?}"))
-        }
+        other @ (LegVerdict::Measured
+        | LegVerdict::NotServerCapacity(_)
+        | LegVerdict::Vacuous(_)) => Err(format!("plant reply-err did not go red: {other:?}")),
     }
 }
 
@@ -833,12 +894,13 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                 let leg = run_leg(&spec, name, c, replicate)?;
                 println!(
                     "blob-set: conns {c} leg {name} rep {replicate}: X {:.2} SET/s, p50 {} us, \
-                     p99 {} us, p99.9 {} us, acked {}, {:?}",
+                     p99 {} us, p99.9 {} us, acked {}, gen cpu {:.2} cores, {:?}",
                     leg.throughput(),
                     leg.hist_us.percentile(50.0),
                     leg.hist_us.percentile(99.0),
                     leg.hist_us.percentile(99.9),
                     leg.acked,
+                    leg.generator_cpu_cores,
                     leg.verdict
                 );
                 let _ = std::fs::remove_dir_all(&data_dir);
@@ -899,8 +961,28 @@ mod tests {
             window: Duration::from_secs(10),
             hist_us: FineHistogram::new(),
             cells: vec![one_cell(before, after)],
+            generator_cpu_cores: 0.0,
+            generator_cpus: 4,
             verdict: LegVerdict::Measured,
         }
+    }
+
+    /// A generator over its CPU bar is not server capacity; a red reply
+    /// and an unconfirmed count are judged before it.
+    #[test]
+    fn a_saturated_generator_is_not_server_capacity() {
+        let mut busy = leg(100, 0, Some(0), Some(100));
+        busy.generator_cpu_cores = 2.5;
+        assert!(matches!(verdict_of(&busy, None), LegVerdict::NotServerCapacity(_)));
+        busy.generator_cpu_cores = 2.0;
+        assert_eq!(verdict_of(&busy, None), LegVerdict::Measured);
+        busy.generator_cpu_cores = 2.5;
+        busy.cells[0] = one_cell(Some(0), Some(99));
+        assert!(matches!(verdict_of(&busy, None), LegVerdict::Vacuous(_)));
+        let mut saturated = Point { conns: 4, legs: vec![leg(100, 0, Some(0), Some(100))] };
+        saturated.legs[0].generator_cpu_cores = 3.0;
+        saturated.legs[0].verdict = verdict_of(&saturated.legs[0], None);
+        assert_eq!(outcome_of(std::slice::from_ref(&saturated)), Outcome::EvidencePending);
     }
 
     /// A percentile field is never summed: the table names it a
