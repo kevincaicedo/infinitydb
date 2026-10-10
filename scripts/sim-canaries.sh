@@ -194,17 +194,19 @@ rows=(
   # The issue visit starts at index 0 and continues past a refusal: at the
   # hostile share the second namespace's group waits past n × T_c.
   "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
-  # The same plant at the two-cell binary: the starved namespace's writer
-  # ends on the tail-stall timeout derived from the fair turn's bound.
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write STALLED"
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write STALLED"
+  # The same plant at the two-cell binary: the starved namespace's ready
+  # group waits past n × T_c, read from INFO beside the replies (its
+  # writer's own bound is four group bounds, so the replies stay +OK).
+  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write a ready group waited"
+  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write a ready group waited"
   # A retry group reaches the driver with no offer: the spend falls below
   # what the disk saw, on the retry arm.
   "inf_canary_tier_retry_ungranted m4-tier-budget TIER-SPEND --tier-leg two-8mb --plant tier-write-eio"
   # The barrier group is offered with a write outstanding: the fsync lands
   # before the write, the round completes, and a cut loses bytes the
-  # watermark covered — the durability audit after the cut.
-  "inf_canary_tier_barrier_early m4-tier-budget DURABILITY --tier-leg two-8mb"
+  # watermark covered — the boot after the cut refuses a tier frame that
+  # fails its CRC below the manifested watermark, before any key audit.
+  "inf_canary_tier_barrier_early m4-tier-budget manifested --tier-leg two-8mb"
   # Every idle namespace with work plans in the same turn: the eight
   # namespaces' per-iteration plan count reads two or more.
   "inf_canary_tier_plan_every_namespace m4-tier-budget TIER-PLAN --tier-leg eight-1mb"
