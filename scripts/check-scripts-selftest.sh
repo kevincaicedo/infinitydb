@@ -2542,6 +2542,26 @@ expect_red_because "lint-scopes: containers — the backing holds no container" 
     "the backing \`struct CappedDeque\` holds 0 container span(s)" lc_run "$root"
 lc_reset
 ls_gate "$LC_MAX" 0
+# ADR-0144 A2: a public type of bounded/ with a lifetime parameter borrows a
+# capped container, so it is an entry of `await-holding-invalid-types`; one
+# that is not is red; a crate-private one, a public one without a lifetime,
+# and a listed one are green.
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" "pub struct Peek<'a>(&'a u8);"
+expect_red_because "lint-scopes: containers — a public lifetime type of bounded/ outside the await ban" \
+    "\`Peek\` has a lifetime parameter" lc_run "$root"
+lc_reset
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" "pub(super) struct Peek<'a>(&'a u8);" 'pub struct Plain<T>(T);'
+expect green "lint-scopes: containers — a crate-private lifetime type and a public one without (control)" \
+    lc_run "$root"
+lc_reset
+mkdir -p "$root/crates/inf-foundation/src/bounded"
+lc_append_to "$LC_B" "pub struct Peek<'a>(&'a u8);"
+lc_edit 's|^await-holding-invalid-types = \[$|await-holding-invalid-types = [ { path = "inf_foundation::bounded::Peek", reason = "fixture" },|' clippy.toml
+expect_output "lint-scopes: containers — a listed lifetime type of bounded/ is counted (control)" \
+    "1 reservation type(s) under the await ban" lc_run "$root"
+lc_reset
 lc_append 'pub const CAP: u32 = Cap::entries("x", 1);'
 expect_red_because "lint-scopes: containers — Cap::entries outside a limits.rs" \
     "\`Cap::entries\` outside a \`limits.rs\`" lc_run "$root"
@@ -2947,19 +2967,30 @@ printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}
 expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
     "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
 
-# ADR-0144 A2: the slot plant draws `await_holding_invalid_type` naming its
-# configured path under the production config (the green case above). A
-# config without the slot type, a plant whose slot is consumed before the
-# await, and a discarded publish that is not discarded are each red for
-# their own reason.
+# ADR-0144 A2: the slot plants draw `await_holding_invalid_type` naming their
+# configured path under the production config (the green case above): the
+# slot, and the answer that carries it, since the lint matches the outermost
+# type of a live local. A config without either slot type, a plant whose slot
+# or answer is consumed before the await, and a discarded publish that is not
+# discarded are each red for their own reason.
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured"
 grep -v 'path = "inf_foundation::bounded::DequeSlot"' clippy.toml >"$work/probe-await-unconfigured/clippy.toml"
 expect_red_because "lint-scopes: a config without the slot type" \
-    "config needs 1 distinct slot type await-holding-invalid-types, found 0" ls_probe "$work/probe-await-unconfigured"
+    "config needs 2 distinct slot type await-holding-invalid-types, found 1" ls_probe "$work/probe-await-unconfigured"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured-answer"
+grep -v 'path = "inf_foundation::bounded::Reserved"' clippy.toml >"$work/probe-await-unconfigured-answer/clippy.toml"
+expect_red_because "lint-scopes: a config without the answer that carries the slot" \
+    "plant path inf_foundation::bounded::Reserved has no config entry" ls_probe "$work/probe-await-unconfigured-answer"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-consumed"
 sed -i.bak 's|            yield_once().await;|            slot.publish(0);|; s|            slot.publish(1);|            yield_once().await;|' "$work/probe-await-consumed/src/awaits.rs"
 expect_red_because "lint-scopes: a slot consumed before the await draws nothing on the plant" \
     "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::DequeSlot" ls_probe "$work/probe-await-consumed"
+# The answer's plant at four columns: the slot's lines above sit at twelve,
+# so the anchored edits reach only the answer's await and its match.
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-answer-matched"
+sed -i.bak 's|^    yield_once().await;$|    publish_one(reserved); // matched first|; s|^    publish_one(reserved);$|    yield_once().await;|' "$work/probe-await-answer-matched/src/awaits.rs"
+expect_red_because "lint-scopes: an answer matched before the await draws nothing on the plant" \
+    "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::Reserved" ls_probe "$work/probe-await-answer-matched"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-discard-published"
 sed -i.bak 's|        let _ = slot.publish(1); // PLANT clippy::let_unit_value|        slot.publish(1); // PLANT clippy::let_unit_value|' "$work/probe-discard-published/src/discards.rs"
 expect_red_because "lint-scopes: a publish that is not discarded draws no discard lint" \

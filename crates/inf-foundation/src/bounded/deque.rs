@@ -82,7 +82,9 @@ pub struct DequeSlot<'a, T> {
 }
 
 /// The answer to `reserve()`: a slot, or `Full`, which took no value and
-/// changed nothing but the row's crossings.
+/// changed nothing but the row's crossings. It carries the slot's borrow, so
+/// it is matched in the step that reserved and cannot cross an `await`
+/// (clippy's `await-holding-invalid-types` names it beside `DequeSlot`).
 #[must_use = "a reservation publishes a value or is dropped; it carries none"]
 pub enum Reserved<'a, T> {
     Slot(DequeSlot<'a, T>),

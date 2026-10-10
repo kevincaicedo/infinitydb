@@ -64,12 +64,15 @@ for key in ("disallowed-methods", "disallowed-types", "await-holding-invalid-typ
                           "which hides an entry that resolves to nothing")
 # (config key, lint, family, its name, the exact count): every entry needs a
 # plant naming its path and every plant an entry (ADR-0144 D5, ADR-0163 D2).
-# A slot type is a reservation of `inf_foundation::bounded`, held across an
-# `await` by its plant (ADR-0144 A2); each type lands with its own plant.
+# A slot type is a reservation of `inf_foundation::bounded`, or the answer
+# that carries one, held across an `await` by its plant (ADR-0144 A2): the
+# lint matches the outermost type of a live local, so each is listed and
+# each lands with its own plant (the lint-scopes gate requires the entry for
+# every public type of `bounded` with a lifetime parameter).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
           ("disallowed-types", "disallowed_types", container, "container", 3),
-          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 1))
+          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 2))
 for key, lint, family, label, count in CENSUS:
     paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
     if len(paths) != count or len(set(paths)) != len(paths):
@@ -138,9 +141,9 @@ for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
 # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
-# one slot across an await, three discarded publishes
-if len(plants) < 67:
-    errors.append(f"{len(plants)} plants; expected at least 67")
+# two slot types across an await, three discarded publishes
+if len(plants) < 68:
+    errors.append(f"{len(plants)} plants; expected at least 68")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -213,6 +216,6 @@ if errors:
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
       f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types, "
-      f"three containers and one slot type across an await covered{disclosed}")
+      f"three containers and two slot types across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

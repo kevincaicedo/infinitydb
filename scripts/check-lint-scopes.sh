@@ -37,6 +37,12 @@
 #     code, comments removed) the audit does not resolve is red: one inside
 #     an inline module, off a line of its own, or with its path in another
 #     attribute than `#[path = "…"]`; so is an `include!` of an expression.
+#   * ADR-0144 A2's await ban: every public type of `inf_foundation::bounded`
+#     with a lifetime parameter borrows a capped container for its step (a
+#     slot, or the answer that carries one), so it is an entry of
+#     clippy.toml's `await-holding-invalid-types`, which the probe plants
+#     one by one; the OK line counts them. The lint matches the outermost
+#     type of a live local, so a wrapper of the caller's own is review's.
 #
 # The lint table below is the one home of "which attribute may silence
 # which lint"; later slices add their lints as rows, not as new scans.
@@ -151,6 +157,17 @@ if not CONTAINER_REASON:
     print("LINT-SCOPES SCOPE ERROR: clippy.toml bans no std::collections path — the container class has no scope")
     sys.exit(1)
 CONTAINER_PATHS = set(CONTAINER_REASON)
+# ADR-0144 A2: `await_holding_invalid_type` matches the outermost type of a
+# local live across an await, so every public type of `inf_foundation::bounded`
+# with a lifetime parameter (a slot, or the answer that carries one: each
+# borrows a capped container for its step) is an entry of clippy.toml's
+# `await-holding-invalid-types`; the probe's judge requires a plant per entry.
+AWAIT_PATHS = {row["path"]
+               for row in tomllib.loads(Path("clippy.toml").read_text()).get("await-holding-invalid-types", [])
+               if isinstance(row, dict) and "path" in row}
+BOUNDED_DIR = Path("crates/inf-foundation/src/bounded")
+RESERVATION = re.compile(r"^\s*pub\s+(?:struct|enum)\s+([A-Za-z_][A-Za-z_0-9]*)\s*<\s*'")
+reservation_types = []  # `inf_foundation::bounded::T` per public lifetime type of bounded/
 CONTAINER_BY_NAME = {path.rsplit("::", 1)[1]: path for path in CONTAINER_PATHS}
 API_LINTS = {lint for lint in LINTS if lint.startswith("disallowed_")}
 CELL_DIRS = [Path(p) for p in os.environ["INF_CELL_DIRS"].splitlines()]
@@ -444,6 +461,17 @@ def audit(path, exempt_sites):
                 m = LOSSY.match(line)
                 if m:
                     lossy_sites.append(f"{path}:{n + 1}: impl Lossy for {m.group(1)}")
+        if path.is_relative_to(BOUNDED_DIR):
+            for n, line in enumerate(blanked(production, literals=True)):
+                m = RESERVATION.match(line)
+                if not m:
+                    continue
+                qualified = f"inf_foundation::bounded::{m.group(1)}"
+                reservation_types.append(qualified)
+                if qualified not in AWAIT_PATHS:
+                    errors.append(f"{path}:{n + 1}: `{m.group(1)}` has a lifetime parameter, so it borrows a capped "
+                                  "container for its step and is an entry of clippy.toml's "
+                                  "`await-holding-invalid-types`, with a plant in the probe (ADR-0144 A2)")
     i = 0
     while i < len(lines):
         s = lines[i].strip()
@@ -1034,7 +1062,7 @@ if errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
-scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted, {len(lossy_sites)} Lossy payload(s)"
+scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted, {len(lossy_sites)} Lossy payload(s), {len(reservation_types)} reservation type(s) under the await ban"
 scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
