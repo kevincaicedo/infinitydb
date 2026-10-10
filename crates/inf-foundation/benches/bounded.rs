@@ -26,7 +26,7 @@
 //! controls, each a leg of this binary, hold:
 //!
 //! - the same binary against itself: A against A and B against B within
-//!   0.05 per op;
+//!   0.05 per op, at a resolution of 0.01 per op at `n` = 10⁷;
 //! - liveness: `vecdeque-plus-one` and `reserve-plus-one`, one `nop` per op
 //!   at the top of the loop body, read A + 1.00 and B + 1.00, ± 0.05;
 //! - the rule's own red: `reserve-plus-four`, four `nop`s, reads B − A + 4:
@@ -37,7 +37,14 @@
 //! cap a third argument of the step: the control that attributes the
 //! bound's own cost, reported beside A.
 //!
+//! One leg, then one leg counted: `perf` wraps the binary that `--no-run`
+//! prints, never `cargo`, whose own instructions would join the count; on a
+//! hybrid CPU `<core>` is a performance core and the `cpu_core` line counts.
+//!
 //!   cargo bench -p inf-foundation --bench bounded -- \
+//!       --variant <v> --cap <c> --ops <n> [--shape <s>]
+//!   cargo bench -p inf-foundation --bench bounded --no-run
+//!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
 //!       --variant <v> --cap <c> --ops <n> [--shape <s>]
 //!
 //! `v` is a leg of `LEGS`; `c` ∈ 16 | 1024; `n` ≥ 0 (0 is the I(0) leg);
