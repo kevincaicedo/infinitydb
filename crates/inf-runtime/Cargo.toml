@@ -29,6 +29,9 @@ proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
 libc.workspace = true
+# The capped containers' allocation census (tests/bounded_alloc.rs) counts
+# through inf-alloc's allocator, so inf-foundation stays dependency-free.
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # M4-S04 steel thread: the integration vertical crosses store/log/alloc.
 # Dev-only — tests may cross layers (dep-dag exemption).
 inf-store.workspace = true
