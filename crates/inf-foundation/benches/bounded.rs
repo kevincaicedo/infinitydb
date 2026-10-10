@@ -8,9 +8,11 @@
 //! exact user-space instructions per op, `(I(n) − I(0)) / n`, read outside
 //! this binary (`perf stat -e instructions:u`, or an instruction-counting
 //! tool when the PMU is closed) on one pinned core, legs A B B A twice. The
-//! liveness leg `reserve-plus-one` adds one instruction per op (a `nop`)
-//! and must read B + 1.00 ± 0.05. The verdict rule: B − A ≤ 6 per push-and-pop
-//! pair.
+//! liveness leg `reserve-plus-one` adds one instruction per op (a `nop`) at
+//! the top of the loop body, where it reads B + 1.00 ± 0.05 at both shapes;
+//! placed after the pop it read B + 2 at the `loop` shape, the `nop` having
+//! changed the loop's own codegen around the high-water branch by one
+//! instruction. The verdict rule: B − A ≤ 6 per push-and-pop pair.
 //!
 //!   cargo bench -p inf-foundation --bench bounded -- \
 //!       --variant <v> --cap <c> --ops <n> [--shape <s>]
@@ -159,10 +161,10 @@ fn calls_reserve<const PLUS_ONE: bool>(cap: Cap, census: &Rc<CapCensus>, ops: u6
     }
     let mut accumulator = 0u64;
     for i in 0..ops {
-        accumulator ^= step_reserve(&mut deque, i);
         if PLUS_ONE {
             plus_one();
         }
+        accumulator ^= step_reserve(&mut deque, i);
     }
     accumulator
 }
@@ -199,7 +201,7 @@ fn leg_vecdeque(cap: Cap, ops: u64) -> u64 {
     accumulator
 }
 
-// `PLUS_ONE` is a const so the liveness leg differs from B by one `add`
+// `PLUS_ONE` is a const so the liveness leg differs from B by one `nop`
 // and not by a select or a branch in both.
 #[inline(never)]
 fn leg_reserve<const PLUS_ONE: bool>(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
@@ -211,14 +213,14 @@ fn leg_reserve<const PLUS_ONE: bool>(cap: Cap, census: &Rc<CapCensus>, ops: u64)
     }
     let mut accumulator = 0u64;
     for i in 0..ops {
+        if PLUS_ONE {
+            plus_one();
+        }
         if let Reserved::Slot(slot) = deque.reserve() {
             slot.publish(Entry(i));
         }
         if let Some(Entry(v)) = deque.pop_front() {
             accumulator ^= v;
-        }
-        if PLUS_ONE {
-            plus_one();
         }
     }
     accumulator
