@@ -517,7 +517,10 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
             ));
         }
     }
-    out.push_str("\n## points\n\n| conns | X a | X b | spread X % | p99 a | p99 b | spread p99 % | point |\n|---|---|---|---|---|---|---|---|\n");
+    out.push_str(
+        "\n## points\n\n| conns | X a | X b | spread X % | p99 a | p99 b | spread p99 % | \
+         point |\n|---|---|---|---|---|---|---|---|\n",
+    );
     for point in points {
         match spread_of(&point.legs) {
             Some(s) => {
