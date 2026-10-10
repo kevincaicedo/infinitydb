@@ -2046,9 +2046,10 @@ The reactor-drive flush state machine (`TierFlush` round state in
   oracle on the sim driver's `ObservedIo`; `refund` keeps it exact.
 - **A tier round issues exactly what it offers, in groups** — type: an
   op reaches the driver only inside a `GrantedGroup`, made only by a
-  `Now` answer to an offer of the group's exact device bytes and ops; a
-  const assertion keeps a group within the tier class's declared slice,
-  so no tier offer is above the cap. Tests: the `tier_cell` producer
+  `Now` answer to an offer of the group's exact device bytes and ops; the
+  tier class's declared byte slice is the group's byte bound itself (one
+  constant, `TIER_GROUP_BYTES_MAX`) and a const assertion keeps a group's
+  ops within the ops slice, so no tier offer is above the cap. Tests: the `tier_cell` producer
   tests over a real budget (an 8 MiB round issues in groups, none above
   the cap; a retry group is offered and charged again; a plan refused
   part-way issues what it staged), the wire tests (`io_budget_bytes_tier_flush`

@@ -714,12 +714,14 @@ impl<F: SegmentFs> DurableCell<F> {
         staging.set_frame_epoch(rotor.resume_epoch());
         let in_flight = VecDeque::with_capacity(usize::from(staging.frames_in_flight()));
         // ADR-0178 D2: each background class's declared slice — its cap
-        // is never below one slice.
+        // is never below one slice. The tier class's byte slice is the
+        // group bound itself (ADR-0178 T1: one const, so a group can
+        // never be above the class cap whatever `MAINTAIN-SLICE` says).
         let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
         slices[IoClass::ZeroFill.index()] =
             ClassSlice { bytes: u64::from(ZERO_FILL_SLICE_BYTES), ops: 1 };
         slices[IoClass::TierFlush.index()] = ClassSlice {
-            bytes: inf_store::TierSpec::for_budget(0).maintain_slice_bytes,
+            bytes: inf_log::limits::TIER_GROUP_BYTES_MAX,
             ops: crate::tier_cell::TIER_ROUND_MAX_OPS,
         };
         slices[IoClass::Checkpoint.index()] = ClassSlice {

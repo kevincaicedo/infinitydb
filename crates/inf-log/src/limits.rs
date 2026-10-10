@@ -5,10 +5,11 @@ use crate::tier::{TIER_BATCH_FRAMES, TIER_FRAME_BYTES};
 /// Device bytes one tier-flush offer carries (ADR-0178 D3's tier row,
 /// ADR-0155 D4): a group of a round's unsent writes, whole writes only,
 /// is at most this, so no offer is above the tier class's cap on the
-/// byte axis — the declared tier slice is this same constant. Owner: the
-/// group builder in the plane's tier cell, and the tier class's declared
-/// slice. Crossing: the group ends before the write that would pass it;
-/// a single write never does (the assertion below).
+/// byte axis — the tier class's declared byte slice, which the durable
+/// cell hands the device budget, is this same constant (ADR-0178 T1).
+/// Owner: the group builder in the plane's tier cell, and the tier
+/// class's declared slice. Crossing: the group ends before the write
+/// that would pass it; a single write never does (the assertion below).
 pub const TIER_GROUP_BYTES_MAX: u64 = 1 << 20;
 
 /// Ops one tier-flush offer carries (ADR-0178 D3's tier row, ADR-0155
