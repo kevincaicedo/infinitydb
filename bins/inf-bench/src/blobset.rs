@@ -76,10 +76,43 @@ const NAMESPACE: &[u8] = b"blobset";
 const SPREAD_X_PERCENT: f64 = 5.0;
 /// The spread budget on p99 between the two legs' means, in percent.
 const SPREAD_P99_PERCENT: f64 = 10.0;
-/// Server counters read beside the curve; an absent one is reported as
-/// absent, never as zero.
-const COUNTERS: &[&str] =
-    &["extent_parks", "frame_waits_extent", "fsync_latency_p99_us", "tiering_blob_extents_created"];
+/// How a server field read beside the curve folds across the node's
+/// cells. The population is named by the fold: a sum is the node's, a
+/// loaded-cell read is that cell's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Fold {
+    /// A per-cell total: the node's value is the cells' sum, which on
+    /// this one-cell load is the loaded cell's.
+    Sum,
+    /// A percentile of one cell's lifetime histogram: read from the
+    /// loaded cell alone and labeled as its lifetime value. A sum of
+    /// percentiles across cells is not a number.
+    LoadedCell,
+}
+
+/// The server fields read beside the curve, each with its fold; an
+/// absent one is reported as absent, never as zero.
+const COUNTERS: &[(&str, Fold)] = &[
+    ("extent_parks", Fold::Sum),
+    ("frame_waits_extent", Fold::Sum),
+    ("fsync_latency_p99_us", Fold::LoadedCell),
+    (EXTENTS_FIELD, Fold::Sum),
+];
+/// The per-cell total of blob extents created: the liveness counter, and
+/// what names the loaded cell (the one whose count rose).
+const EXTENTS_FIELD: &str = "tiering_blob_extents_created";
+
+/// Folds one field's per-cell reads: `Sum` adds every cell that printed
+/// it (`None` when none did); `LoadedCell` reads the loaded cell alone.
+fn fold_counter(values: &[Option<u64>], fold: Fold, loaded: Option<usize>) -> Option<u64> {
+    match fold {
+        Fold::Sum => {
+            let present: Vec<u64> = values.iter().flatten().copied().collect();
+            if present.is_empty() { None } else { Some(present.iter().sum()) }
+        }
+        Fold::LoadedCell => values.get(loaded?).copied().flatten(),
+    }
+}
 
 /// What one plant does to the run (the instrument's planted reds).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -128,15 +161,72 @@ struct Leg {
     errors: u64,
     window: Duration,
     hist_us: FineHistogram,
-    extents_before: Option<u64>,
-    extents_after: Option<u64>,
-    counters: BTreeMap<&'static str, Option<u64>>,
+    /// Every cell's reads, in cell order.
+    cells: Vec<CellScrape>,
     verdict: LegVerdict,
+}
+
+/// One cell's reads of the fields beside the curve, `None` for a field
+/// the cell did not print.
+type CellFields = BTreeMap<&'static str, Option<u64>>;
+
+/// One cell's reads of the fields beside the curve: the extent counter
+/// before the leg, every field after it.
+struct CellScrape {
+    cell: u16,
+    extents_before: Option<u64>,
+    after: CellFields,
+}
+
+impl CellScrape {
+    /// The rise of the extent counter over the leg; `None` when the cell
+    /// did not print it at either read.
+    fn extents_created(&self) -> Option<u64> {
+        let after = self.after.get(EXTENTS_FIELD).copied().flatten()?;
+        Some(after.saturating_sub(self.extents_before?))
+    }
 }
 
 impl Leg {
     fn throughput(&self) -> f64 {
         self.acked as f64 / self.window.as_secs_f64()
+    }
+
+    /// The extents created on every cell, or `None` when a cell did not
+    /// print the counter.
+    fn extents_created(&self) -> Option<Vec<u64>> {
+        self.cells.iter().map(CellScrape::extents_created).collect()
+    }
+
+    /// The index of the one cell whose extent counter rose: the cell
+    /// owning the hash tag. `None` before the verdict names it.
+    fn loaded_cell(&self) -> Option<usize> {
+        let created = self.extents_created()?;
+        let mut loaded = created.iter().enumerate().filter(|&(_, &n)| n > 0).map(|(i, _)| i);
+        let first = loaded.next()?;
+        if loaded.next().is_some() { None } else { Some(first) }
+    }
+
+    /// Each field beside the curve folded over the cells, labeled with
+    /// its population: `field` for a node sum, `field(cell N lifetime)`
+    /// for the loaded cell's percentile.
+    fn counters(&self) -> Vec<(String, Option<u64>)> {
+        let loaded = self.loaded_cell();
+        COUNTERS
+            .iter()
+            .map(|&(field, fold)| {
+                let values: Vec<Option<u64>> =
+                    self.cells.iter().map(|c| c.after.get(field).copied().flatten()).collect();
+                let label = match (fold, loaded) {
+                    (Fold::Sum, _) => field.to_string(),
+                    (Fold::LoadedCell, Some(i)) => {
+                        format!("{field}(cell {} lifetime)", self.cells[i].cell)
+                    }
+                    (Fold::LoadedCell, None) => format!("{field}(loaded cell unknown)"),
+                };
+                (label, fold_counter(&values, fold, loaded))
+            })
+            .collect()
     }
 }
 
@@ -244,13 +334,21 @@ fn run_conn(
     Ok(result)
 }
 
-/// Reads one numeric field across the node's cells, summed; `None` when
-/// no cell prints it (an absent counter is reported as absent, never 0).
-fn scrape_sum(port: u16, cells: u16, field: &str) -> Result<Option<u64>, String> {
+/// Reads every cell's INFO once: `(cell, field → value)` in cell order,
+/// a field absent from a cell's INFO read as `None`.
+fn scrape(port: u16, cells: u16) -> Result<Vec<(u16, CellFields)>, String> {
     let infos = crate::gaterun::scrape_cells(port, cells)?;
-    let values: Vec<u64> =
-        infos.iter().filter_map(|i| i.get(field)).filter_map(|v| v.parse::<u64>().ok()).collect();
-    Ok(if values.is_empty() { None } else { Some(values.iter().sum()) })
+    Ok(infos
+        .iter()
+        .map(|info| {
+            let cell = info.get("cell").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let fields = COUNTERS
+                .iter()
+                .map(|&(field, _)| (field, info.get(field).and_then(|v| v.parse::<u64>().ok())))
+                .collect();
+            (cell, fields)
+        })
+        .collect())
 }
 
 /// Creates the namespace on a fresh node, riding out the boot's
@@ -343,7 +441,7 @@ fn run_leg(
     let server = boot(spec.bin, spec.cells, spec.data_dir, spec.pin_start)?;
     let port = server.port;
     create_namespace(port, spec.cells, spec.threshold)?;
-    let extents_before = scrape_sum(port, spec.cells, "tiering_blob_extents_created")?;
+    let before = scrape(port, spec.cells)?;
     let start = Instant::now();
     let warmup_end = start + spec.warmup;
     let deadline = warmup_end + spec.window;
@@ -364,9 +462,7 @@ fn run_leg(
         errors: 0,
         window: spec.window,
         hist_us: FineHistogram::new(),
-        extents_before,
-        extents_after: None,
-        counters: BTreeMap::new(),
+        cells: Vec::new(),
         verdict: LegVerdict::Measured,
     };
     let mut first_error: Option<String> = None;
@@ -380,10 +476,16 @@ fn run_leg(
             first_error = result.first_error;
         }
     }
-    leg.extents_after = scrape_sum(port, spec.cells, "tiering_blob_extents_created")?;
-    for &field in COUNTERS {
-        leg.counters.insert(field, scrape_sum(port, spec.cells, field)?);
-    }
+    let after = scrape(port, spec.cells)?;
+    leg.cells = before
+        .into_iter()
+        .zip(after)
+        .map(|((cell, before), (_, after))| CellScrape {
+            cell,
+            extents_before: before.get(EXTENTS_FIELD).copied().flatten(),
+            after,
+        })
+        .collect();
     drop(server);
     leg.verdict = verdict_of(&leg, first_error.as_deref());
     Ok(leg)
@@ -398,19 +500,27 @@ fn verdict_of(leg: &Leg, first_error: Option<&str>) -> LegVerdict {
             first_error.unwrap_or("?")
         ));
     }
-    let (Some(before), Some(after)) = (leg.extents_before, leg.extents_after) else {
-        return LegVerdict::Vacuous("tiering_blob_extents_created is absent from INFO".into());
+    let Some(per_cell) = leg.extents_created() else {
+        return LegVerdict::Vacuous(format!("{EXTENTS_FIELD} is absent from a cell's INFO"));
     };
-    let created = after.saturating_sub(before);
     // Every acknowledged SET, the warm-up's included, created an extent;
     // a command whose reply the deadline cut off (at most one per
     // connection) is the slack between the counter and the counts.
+    let created: u64 = per_cell.iter().sum();
     let acknowledged = leg.acked + leg.warmup_acked;
     if created < acknowledged || created > acknowledged + leg.conns as u64 {
         return LegVerdict::Vacuous(format!(
             "extents created {created} does not confirm {acknowledged} acknowledged SETs ({} in \
              the window, {} in the warm-up) within the connections ({})",
             leg.acked, leg.warmup_acked, leg.conns
+        ));
+    }
+    // Scope one cell: the hash tag puts every key on one cell, so the
+    // counter rose on exactly that cell.
+    if leg.loaded_cell().is_none() {
+        let risen = per_cell.iter().filter(|&&n| n > 0).count();
+        return LegVerdict::Vacuous(format!(
+            "the extent counter rose on {risen} cells; the load is scoped to one"
         ));
     }
     LegVerdict::Measured
@@ -492,20 +602,21 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
          Latencies read to the bucket of a 32-per-octave histogram (about 3 %). `X` is the \
          count of `+OK` replies inside the window over its length. The spread column is the \
          two legs' means against each other; a point over 5 % on `X` or 10 % on p99 is \
-         Evidence-pending.\n\n\
+         Evidence-pending. Counters are node sums of per-cell totals, except a percentile, \
+         read from the loaded cell alone as its lifetime value (boot included).\n\n\
          | conns | leg | rep | X (SET/s) | p50 us | p99 us | p99.9 us | acked | extents | \
          counters | verdict |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for point in points {
         for leg in &point.legs {
             let counters: Vec<String> = leg
-                .counters
+                .counters()
                 .iter()
                 .map(|(k, v)| format!("{k}={}", v.map_or("absent".to_string(), |v| v.to_string())))
                 .collect();
-            let extents = match (leg.extents_before, leg.extents_after) {
-                (Some(b), Some(a)) => format!("{}", a.saturating_sub(b)),
-                _ => "absent".to_string(),
+            let extents = match leg.extents_created() {
+                Some(per_cell) => per_cell.iter().sum::<u64>().to_string(),
+                None => "absent".to_string(),
             };
             out.push_str(&format!(
                 "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {:?} |\n",
@@ -587,8 +698,15 @@ fn write_report(root: &str, report: &str) -> Result<String, String> {
     Ok(path)
 }
 
+/// One cell's scrape holding the extent counter alone (the plant's and
+/// the tests' fixture).
+fn one_cell(before: Option<u64>, after: Option<u64>) -> CellScrape {
+    CellScrape { cell: 0, extents_before: before, after: BTreeMap::from([(EXTENTS_FIELD, after)]) }
+}
+
 /// The `reply-err` plant: the reply path over a fixture stream holding
-/// one `-ERR` among `+OK`s. The same classifier the connections use.
+/// one `-ERR` among `+OK`s, through the one reply loop the connections
+/// use.
 fn plant_reply_err() -> Result<(), String> {
     let mut rx = Vec::new();
     for _ in 0..7 {
@@ -607,9 +725,7 @@ fn plant_reply_err() -> Result<(), String> {
         errors: result.errors,
         window: Duration::from_secs(1),
         hist_us: result.hist_us,
-        extents_before: Some(0),
-        extents_after: Some(result.acked),
-        counters: BTreeMap::new(),
+        cells: vec![one_cell(Some(0), Some(result.acked))],
         verdict: LegVerdict::Measured,
     };
     match verdict_of(&leg, result.first_error.as_deref()) {
@@ -782,11 +898,44 @@ mod tests {
             errors,
             window: Duration::from_secs(10),
             hist_us: FineHistogram::new(),
-            extents_before: before,
-            extents_after: after,
-            counters: BTreeMap::new(),
+            cells: vec![one_cell(before, after)],
             verdict: LegVerdict::Measured,
         }
+    }
+
+    /// A percentile field is never summed: the table names it a
+    /// loaded-cell read, and that fold answers one cell's value.
+    #[test]
+    fn a_percentile_field_is_read_from_the_loaded_cell_never_summed() {
+        for &(field, fold) in COUNTERS {
+            let percentile = field.contains("_p50") || field.contains("_p99");
+            assert_eq!(
+                fold == Fold::LoadedCell,
+                percentile,
+                "{field}: a percentile folds by LoadedCell, a total by Sum"
+            );
+        }
+        let reads = [Some(29_126), Some(10), None, Some(7)];
+        assert_eq!(fold_counter(&reads, Fold::LoadedCell, Some(0)), Some(29_126));
+        assert_eq!(fold_counter(&reads, Fold::LoadedCell, Some(2)), None);
+        assert_eq!(fold_counter(&reads, Fold::LoadedCell, None), None);
+        assert_eq!(fold_counter(&reads, Fold::Sum, Some(0)), Some(29_143));
+        assert_eq!(fold_counter(&[None, None], Fold::Sum, None), None);
+    }
+
+    /// The loaded cell is the one whose extent counter rose; a rise on
+    /// two cells, or on none, leaves the load's scope unnamed and the
+    /// leg vacuous.
+    #[test]
+    fn the_loaded_cell_is_the_one_whose_extents_rose() {
+        let mut leg = leg(100, 0, Some(0), Some(100));
+        leg.cells.push(one_cell(Some(5), Some(5)));
+        assert_eq!(leg.loaded_cell(), Some(0));
+        assert_eq!(verdict_of(&leg, None), LegVerdict::Measured);
+        leg.cells[1] = one_cell(Some(5), Some(6));
+        leg.cells[0] = one_cell(Some(0), Some(99));
+        assert_eq!(leg.loaded_cell(), None);
+        assert!(matches!(verdict_of(&leg, None), LegVerdict::Vacuous(_)));
     }
 
     /// The liveness clause: the extent counter confirms the window's and
@@ -808,7 +957,7 @@ mod tests {
         let mut warmed = leg(100, 0, Some(0), Some(130));
         warmed.warmup_acked = 30;
         assert_eq!(verdict_of(&warmed, None), LegVerdict::Measured);
-        warmed.extents_after = Some(100);
+        warmed.cells[0] = one_cell(Some(0), Some(100));
         assert!(matches!(verdict_of(&warmed, None), LegVerdict::Vacuous(_)));
     }
 
