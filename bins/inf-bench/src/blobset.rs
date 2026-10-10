@@ -39,12 +39,20 @@
 //!   beside `X` per leg; a leg whose generator used more than half of the
 //!   CPUs it may run on is marked not server capacity and is no number.
 //!
+//! The data root (`--data-root`) is a directory on the filesystem under
+//! test, never a memory filesystem. Each leg runs on its own directory
+//! under it, `<leg>-c<connections>-r<replicate>`, created fresh and
+//! removed when the leg ends — on success, on an error and on a panic
+//! alike, since a guard value owns it. Only a killed process leaves one
+//! behind, so a run removes every leg directory it finds under the root
+//! before its first leg and prints each.
+//!
 //! The report labels its tier: without `--reference-box` every number is
 //! dev-tier, disclosed and never published.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::Flags;
@@ -80,6 +88,8 @@ const FLAGS: (&[&str], &[&str]) = (
 const CONNECTIONS_DEFAULT: &str = "1,8,16,17,32,64,128";
 /// The namespace every leg creates on a fresh data directory.
 const NAMESPACE: &[u8] = b"blobset";
+/// The two legs of the one binary, interleaved per replicate.
+const LEG_NAMES: [&str; 2] = ["a", "b"];
 /// The spread budget on `X` between the two legs' means, in percent.
 const SPREAD_X_PERCENT: f64 = 5.0;
 /// The spread budget on p99 between the two legs' means, in percent.
@@ -431,15 +441,100 @@ fn generator_cpu_ticks() -> Result<u64, String> {
         .map_err(|e| format!("the generator's /proc/self/stat: {e}"))
 }
 
-/// Boots a fresh node from `binary` on `data_dir` (removed and recreated).
+/// One leg's data directory under the data root, named
+/// `<leg>-c<connections>-r<replicate>`. `create` makes it fresh and the
+/// value removes it when dropped, so a leg that returns through `?` or
+/// unwinds leaves nothing behind; only a killed process can, and
+/// `clear_stale` removes those at the next run's start.
+struct LegDir {
+    path: PathBuf,
+}
+
+impl LegDir {
+    fn name(leg: &str, connections: usize, replicate: usize) -> String {
+        format!("{leg}-c{connections}-r{replicate}")
+    }
+
+    /// The inverse of `name`: `(leg, connections, replicate)` for a name
+    /// this instrument made, `None` for any other directory.
+    fn parse_name(name: &str) -> Option<(&str, usize, usize)> {
+        let (leg, rest) = name.split_once("-c")?;
+        if !LEG_NAMES.contains(&leg) {
+            return None;
+        }
+        let (connections, replicate) = rest.split_once("-r")?;
+        Some((leg, parse_count(connections)?, parse_count(replicate)?))
+    }
+
+    /// Removes whatever `root/<name>` holds and creates it empty.
+    fn create(
+        root: &Path,
+        leg: &str,
+        connections: usize,
+        replicate: usize,
+    ) -> Result<LegDir, String> {
+        let path = root.join(LegDir::name(leg, connections, replicate));
+        remove_tree(&path)?;
+        std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(LegDir { path })
+    }
+
+    /// Removes every leg directory under `root` that an earlier run left
+    /// behind (one a killed process could not remove), creating the root
+    /// when it is absent; returns the names removed, sorted. One pass
+    /// over the root's entries; a symbolic link is not followed.
+    fn clear_stale(root: &Path) -> Result<Vec<String>, String> {
+        let at = |e: std::io::Error| format!("{}: {e}", root.display());
+        std::fs::create_dir_all(root).map_err(at)?;
+        let mut removed = Vec::new();
+        for entry in std::fs::read_dir(root).map_err(at)? {
+            let entry = entry.map_err(at)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if LegDir::parse_name(name).is_none() || !entry.file_type().map_err(at)?.is_dir() {
+                continue;
+            }
+            remove_tree(&entry.path())?;
+            removed.push(name.to_string());
+        }
+        removed.sort();
+        Ok(removed)
+    }
+}
+
+impl Drop for LegDir {
+    fn drop(&mut self) {
+        if let Err(why) = remove_tree(&self.path) {
+            eprintln!("blob-set: {why}");
+        }
+    }
+}
+
+/// A decimal count, digits only: `+1` is not a name of ours.
+fn parse_count(digits: &str) -> Option<usize> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Removes `path` with everything under it; an absent path is nothing to
+/// remove.
+fn remove_tree(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: not removed: {e}", path.display())),
+    }
+}
+
+/// Boots a fresh node from `binary` on `data_dir`, a `LegDir`'s path.
 fn boot(
     binary: &str,
     cells: u16,
     data_dir: &Path,
     pin_start: Option<&str>,
 ) -> Result<ServerGuard, String> {
-    let _ = std::fs::remove_dir_all(data_dir);
-    std::fs::create_dir_all(data_dir).map_err(|e| format!("{}: {e}", data_dir.display()))?;
     let dir = data_dir.display().to_string();
     let mut extra: Vec<&str> = vec!["--data-dir", &dir];
     if let Some(pin) = pin_start {
@@ -452,7 +547,7 @@ fn boot(
 struct LegSpec<'a> {
     binary: &'a str,
     cells: u16,
-    data_dir: &'a Path,
+    data_root: &'a Path,
     pin_start: Option<&'a str>,
     threshold: &'a str,
     value_size: usize,
@@ -469,7 +564,10 @@ fn run_leg(
     connections: usize,
     replicate: usize,
 ) -> Result<Leg, String> {
-    let server = boot(spec.binary, spec.cells, spec.data_dir, spec.pin_start)?;
+    // The directory is declared before the server so it drops after it:
+    // on every exit the node is stopped, then its directory is removed.
+    let data_dir = LegDir::create(spec.data_root, name, connections, replicate)?;
+    let server = boot(spec.binary, spec.cells, &data_dir.path, spec.pin_start)?;
     let port = server.port;
     create_namespace(port, spec.cells, spec.threshold)?;
     let before = scrape(port, spec.cells)?;
@@ -885,27 +983,31 @@ impl BlobSetArgs {
 
 /// Every point of the curve: both legs of the one binary over every
 /// replicate, interleaved `a b` then `b a`, so neither leg always warms
-/// the other; each leg on a fresh data directory, removed after it.
+/// the other; each leg on its own directory under the data root, removed
+/// when the leg ends, after the stale ones a killed run left are removed
+/// and named.
 fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
-    let legs_of_the_binary = ["a", "b"];
+    let data_root = Path::new(&run.data_root);
+    for name in LegDir::clear_stale(data_root)? {
+        println!("blob-set: removed the stale leg directory {}", data_root.join(name).display());
+    }
+    let spec = LegSpec {
+        binary: &run.binary,
+        cells: run.cells,
+        data_root,
+        pin_start: run.pin_start.as_deref(),
+        threshold: &run.threshold,
+        value_size: run.value_size,
+        warmup: run.warmup,
+        window: run.window,
+    };
     let mut points = Vec::new();
     for &c in &run.connections {
         let mut legs = Vec::new();
         for replicate in 0..run.replicates {
             let order: [usize; 2] = if replicate % 2 == 0 { [0, 1] } else { [1, 0] };
             for which in order {
-                let name = legs_of_the_binary[which];
-                let data_dir = Path::new(&run.data_root).join(format!("{name}-c{c}-r{replicate}"));
-                let spec = LegSpec {
-                    binary: &run.binary,
-                    cells: run.cells,
-                    data_dir: &data_dir,
-                    pin_start: run.pin_start.as_deref(),
-                    threshold: &run.threshold,
-                    value_size: run.value_size,
-                    warmup: run.warmup,
-                    window: run.window,
-                };
+                let name = LEG_NAMES[which];
                 let leg = run_leg(&spec, name, c, replicate)?;
                 println!(
                     "blob-set: connections {c} leg {name} replicate {replicate}: X {:.2} SET/s, \
@@ -918,7 +1020,6 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                     leg.generator_cpu_cores,
                     leg.verdict
                 );
-                let _ = std::fs::remove_dir_all(&data_dir);
                 legs.push(leg);
             }
         }
@@ -1121,5 +1222,47 @@ mod tests {
         a.latency_us.record(1000);
         let point = Point { connections: 4, legs: vec![a, even] };
         assert_eq!(outcome_of(std::slice::from_ref(&point)), Outcome::Measured);
+    }
+
+    /// A leg directory's name round-trips through its parser; a name the
+    /// instrument did not make is not ours to remove.
+    #[test]
+    fn a_leg_directory_name_round_trips_and_other_names_are_not_ours() {
+        assert_eq!(LegDir::name("a", 17, 3), "a-c17-r3");
+        assert_eq!(LegDir::parse_name("a-c17-r3"), Some(("a", 17, 3)));
+        assert_eq!(LegDir::parse_name("b-c128-r0"), Some(("b", 128, 0)));
+        let others =
+            ["blob-set", "a-c1", "c-c1-r1", "a-cx-r1", "a-c1-r+1", "a-c1-r1-extra", "a-c-r1"];
+        for other in others {
+            assert_eq!(LegDir::parse_name(other), None, "{other}");
+        }
+    }
+
+    /// The leg directory goes on every exit of the leg — a drop, an error
+    /// returned through `?` — and a stale one, which only a killed run
+    /// leaves, goes before the first leg while a sibling that is not ours
+    /// stays.
+    #[test]
+    fn a_leg_directory_is_removed_on_every_exit_and_stale_ones_before_the_first_leg() {
+        let root = std::env::temp_dir().join(format!("inf-bench-blobset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let stale = root.join("a-c1-r3");
+        std::fs::create_dir_all(stale.join("shard-0")).unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec!["a-c1-r3".to_string()]);
+        assert!(!stale.exists());
+        assert!(root.join("notes").is_dir());
+        let dir = LegDir::create(&root, "a", 1, 0).unwrap();
+        let path = dir.path.clone();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists());
+        let through_an_error = || -> Result<(), String> {
+            let _dir = LegDir::create(&root, "b", 1, 0)?;
+            Err("the leg failed".into())
+        };
+        assert!(through_an_error().is_err());
+        assert!(!root.join("b-c1-r0").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
