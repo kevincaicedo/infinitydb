@@ -1090,7 +1090,9 @@ impl DurableScenario {
         DurableScenario {
             cells,
             // 64 KiB segments hold a frame of several inline tiered
-            // records (≤ 3 KiB each; blobs ride extents).
+            // records: the generator's values are 1 KiB to 10 KiB, every
+            // one inline under the 16 KiB threshold (no blob rides an
+            // extent on this shape).
             segment_bytes: 64 << 10,
             stall: Some(stall),
             device: inf_server::DeviceConfig {
