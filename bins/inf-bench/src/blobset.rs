@@ -49,6 +49,10 @@
 //! names that directory as its `--data-dir` (the orphan a killed run's
 //! node becomes): the sweep keeps that directory and says so, and a leg
 //! that would reuse it is refused, so no run removes a directory in use.
+//! The owners are read from `/proc`, so off Linux no process's arguments
+//! can be read and nothing is proven idle: there the sweep keeps every
+//! leg directory it finds and says so, and a leg refuses an existing one
+//! — the operator removes it by hand.
 //!
 //! The report labels its tier: without `--reference-box` every number is
 //! dev-tier, disclosed and never published.
@@ -462,6 +466,51 @@ enum Swept {
     /// Kept: the `infinityd` with this pid names the directory as its
     /// `--data-dir`.
     InUse(String, u32),
+    /// Kept: this operating system shows the sweep no process's
+    /// arguments, so the directory cannot be proven idle.
+    Unproven(String),
+}
+
+/// The data directories live processes on this box name, as far as the
+/// box shows them: read from `/proc` on Linux; nowhere else, so there no
+/// directory can be proven idle.
+enum Owners {
+    Seen(Vec<(PathBuf, u32)>),
+    Unseen,
+}
+
+/// Who holds one leg directory, as far as this box shows.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    /// The `infinityd` with this pid names it as its `--data-dir`.
+    Live(u32),
+    /// No live process names it.
+    Idle,
+    /// Nothing is shown: it cannot be proven idle.
+    Unknown,
+}
+
+impl Owners {
+    fn read() -> Owners {
+        #[cfg(target_os = "linux")]
+        {
+            Owners::Seen(data_dir_owners())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Owners::Unseen
+        }
+    }
+
+    fn of(&self, dir: &Path) -> Owner {
+        match self {
+            Owners::Seen(owners) => owners
+                .iter()
+                .find(|(owner, _)| owner == dir)
+                .map_or(Owner::Idle, |&(_, pid)| Owner::Live(pid)),
+            Owners::Unseen => Owner::Unknown,
+        }
+    }
 }
 
 impl LegDir {
@@ -483,19 +532,41 @@ impl LegDir {
     }
 
     /// Removes whatever `root/<name>` holds and creates it empty; refused
-    /// while a live `infinityd` names the directory as its data directory.
+    /// while a live `infinityd` names the directory as its data directory,
+    /// and refused where it exists and owners cannot be seen.
     fn create(
         root: &Path,
         leg: &str,
         connections: usize,
         replicate: usize,
     ) -> Result<LegDir, String> {
+        LegDir::create_with(root, leg, connections, replicate, &Owners::read())
+    }
+
+    fn create_with(
+        root: &Path,
+        leg: &str,
+        connections: usize,
+        replicate: usize,
+        owners: &Owners,
+    ) -> Result<LegDir, String> {
         let path = root.join(LegDir::name(leg, connections, replicate));
-        if let Some(pid) = live_owner(&path) {
-            return Err(format!(
-                "{}: in use by the infinityd with pid {pid}; stop it or choose another --data-root",
-                path.display()
-            ));
+        match owners.of(&path) {
+            Owner::Live(pid) => {
+                return Err(format!(
+                    "{}: in use by the infinityd with pid {pid}; stop it or choose another \
+                     --data-root",
+                    path.display()
+                ));
+            }
+            Owner::Unknown if std::fs::symlink_metadata(&path).is_ok() => {
+                return Err(format!(
+                    "{}: exists, and this operating system shows no process's arguments, so it \
+                     cannot be proven idle; remove it or choose another --data-root",
+                    path.display()
+                ));
+            }
+            Owner::Unknown | Owner::Idle => {}
         }
         remove_tree(&path)?;
         std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -507,11 +578,15 @@ impl LegDir {
     /// `infinityd` names as its data directory, creating the root when it
     /// is absent; returns what it did with each, sorted by name. One pass
     /// over the root's entries and one over `/proc`; a symbolic link is
-    /// not followed.
+    /// not followed. Where owners cannot be seen every leg directory is
+    /// kept.
     fn clear_stale(root: &Path) -> Result<Vec<Swept>, String> {
+        LegDir::clear_stale_with(root, &Owners::read())
+    }
+
+    fn clear_stale_with(root: &Path, owners: &Owners) -> Result<Vec<Swept>, String> {
         let at = |e: std::io::Error| format!("{}: {e}", root.display());
         std::fs::create_dir_all(root).map_err(at)?;
-        let owners = data_dir_owners();
         let mut swept = Vec::new();
         for entry in std::fs::read_dir(root).map_err(at)? {
             let entry = entry.map_err(at)?;
@@ -521,9 +596,10 @@ impl LegDir {
                 continue;
             }
             let path = entry.path();
-            match owners.iter().find(|(dir, _)| *dir == path) {
-                Some(&(_, pid)) => swept.push(Swept::InUse(name.to_string(), pid)),
-                None => {
+            match owners.of(&path) {
+                Owner::Live(pid) => swept.push(Swept::InUse(name.to_string(), pid)),
+                Owner::Unknown => swept.push(Swept::Unproven(name.to_string())),
+                Owner::Idle => {
                     remove_tree(&path)?;
                     swept.push(Swept::Removed(name.to_string()));
                 }
@@ -536,7 +612,7 @@ impl LegDir {
 
 fn swept_name(swept: &Swept) -> &str {
     match swept {
-        Swept::Removed(name) | Swept::InUse(name, _) => name,
+        Swept::Removed(name) | Swept::InUse(name, _) | Swept::Unproven(name) => name,
     }
 }
 
@@ -561,17 +637,13 @@ fn parse_count(digits: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-/// The live `infinityd` that names `dir` as its `--data-dir`, by pid, if
-/// one exists: one pass over `/proc`.
-fn live_owner(dir: &Path) -> Option<u32> {
-    data_dir_owners().into_iter().find(|(owner, _)| owner == dir).map(|(_, pid)| pid)
-}
-
 /// Every `(data directory, pid)` a live process on this box names with a
 /// `--data-dir` argument, read from `/proc/<pid>/cmdline` in one pass; a
 /// process that cannot be read (gone, or not ours) is skipped. The data
 /// directory is compared as the argument was given, which is how this
-/// instrument spawns a node (`--data-dir <path>`).
+/// instrument spawns a node (`--data-dir <path>`). Linux's `/proc` alone
+/// shows it; elsewhere `Owners::read` is `Unseen`.
+#[cfg(target_os = "linux")]
 fn data_dir_owners() -> Vec<(PathBuf, u32)> {
     let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
     let mut owners = Vec::new();
@@ -1075,6 +1147,11 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                 "blob-set: kept the leg directory {}: in use by the infinityd with pid {pid}",
                 data_root.join(name).display()
             ),
+            Swept::Unproven(name) => println!(
+                "blob-set: kept the leg directory {}: this operating system shows no process's \
+                 arguments, so it cannot be proven idle; remove it by hand",
+                data_root.join(name).display()
+            ),
         }
     }
     let spec = LegSpec {
@@ -1366,10 +1443,41 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Where owners cannot be seen (off Linux, `Owners::Unseen`) nothing is
+    /// proven idle: the sweep keeps every leg directory it finds and says
+    /// so, a leg refuses an existing directory, and a leg whose directory
+    /// is absent is created.
+    #[test]
+    fn a_leg_directory_is_kept_and_refused_where_owners_cannot_be_seen() {
+        let root =
+            std::env::temp_dir().join(format!("inf-bench-blobset-unseen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let held = root.join("a-c1-r2");
+        std::fs::create_dir_all(held.join("shard-0")).unwrap();
+        assert_eq!(Owners::Unseen.of(&held), Owner::Unknown);
+        assert_eq!(
+            LegDir::clear_stale_with(&root, &Owners::Unseen).unwrap(),
+            vec![Swept::Unproven("a-c1-r2".into())]
+        );
+        assert!(held.join("shard-0").is_dir(), "an unproven directory is never removed");
+        let refused = match LegDir::create_with(&root, "a", 1, 2, &Owners::Unseen) {
+            Ok(_) => panic!("an existing directory is refused where owners cannot be seen"),
+            Err(why) => why,
+        };
+        assert!(refused.contains("cannot be proven idle"), "{refused}");
+        assert!(held.join("shard-0").is_dir(), "a refused create touches nothing");
+        let fresh = LegDir::create_with(&root, "b", 1, 0, &Owners::Unseen).unwrap();
+        assert!(root.join("b-c1-r0").is_dir(), "an absent directory is created");
+        drop(fresh);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A leg directory a live process names as its `--data-dir` (the
     /// orphaned node of a killed run) is kept by the sweep and refused to a
     /// new leg; once that process is gone the sweep removes it. The owner
-    /// here is a shell holding the argument the way `infinityd` is spawned.
+    /// here is a shell holding the argument the way `infinityd` is spawned;
+    /// the owners are read from `/proc`, so the test is Linux's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_leg_directory_a_live_node_names_is_kept_and_refused_until_the_node_is_gone() {
         let root =
@@ -1382,7 +1490,11 @@ mod tests {
             .spawn()
             .expect("a shell holds the directory's name");
         let pid = owner.id();
-        assert_eq!(live_owner(&held), Some(pid), "the holder is found by its argument");
+        assert_eq!(
+            Owners::read().of(&held),
+            Owner::Live(pid),
+            "the holder is found by its argument"
+        );
         assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::InUse("a-c1-r2".into(), pid)]);
         assert!(held.is_dir(), "a directory in use is never removed");
         let refused = match LegDir::create(&root, "a", 1, 2) {
@@ -1393,7 +1505,7 @@ mod tests {
         assert!(held.join("shard-0").is_dir(), "a refused create touches nothing");
         owner.kill().unwrap();
         owner.wait().unwrap();
-        assert_eq!(live_owner(&held), None);
+        assert_eq!(Owners::read().of(&held), Owner::Idle);
         assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::Removed("a-c1-r2".into())]);
         assert!(!held.exists());
         std::fs::remove_dir_all(&root).unwrap();
