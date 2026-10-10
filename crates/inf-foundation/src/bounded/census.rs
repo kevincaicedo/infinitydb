@@ -119,13 +119,14 @@ impl CapCensus {
         );
         self.phase.set(CensusPhase::Serving);
         let mut short: u32 = 0;
-        let mut first = "";
-        for row in self.rows.borrow().iter().flatten() {
+        let mut first = 0;
+        for (index, row) in self.rows.borrow().iter().enumerate() {
+            let Some(row) = row else { continue };
             if row.fill == CapFill::Assembly && row.assembly_live < row.entries_max {
-                short = short.saturating_add(1);
-                if first.is_empty() {
-                    first = row.name;
+                if short == 0 {
+                    first = index;
                 }
+                short = short.saturating_add(1);
             }
         }
         self.note_violations(short, "under-filled at the serve mark", first);
@@ -184,13 +185,15 @@ impl CapCensus {
             }
         };
         let late = cap.fill() == CapFill::Assembly && self.phase.get() != CensusPhase::Assembling;
-        self.note_violations(u32::from(late), "a registration after the serve mark", cap.name());
+        self.note_violations(u32::from(late), "a registration after the serve mark", index);
         Ok(CensusRow { census: Rc::clone(self), index, fill: cap.fill() })
     }
 
-    /// `count` violations of one kind on `name`: counted first, so the count
-    /// is read after the assertion unwinds, then asserted in a debug build.
-    fn note_violations(&self, count: u32, what: &str, name: &str) {
+    /// `count` violations of one kind on the row at `index`: counted first,
+    /// so the count is read after the assertion unwinds, then asserted in a
+    /// debug build. The row's name is read here alone, on a violation: the
+    /// reports stay direct on their common path (`count == 0`).
+    fn note_violations(&self, count: u32, what: &str, index: usize) {
         if count == 0 {
             return;
         }
@@ -198,7 +201,8 @@ impl CapCensus {
         self.cap_assembly_violations.set(total);
         debug_assert!(
             count == 0,
-            "cap-assembly-violated: {what} on cap `{name}` of {} ({count} row(s))",
+            "cap-assembly-violated: {what} on cap `{}` of {} ({count} row(s))",
+            self.name(index),
             self.cell
         );
     }
@@ -233,11 +237,7 @@ impl CensusRow {
             }
         });
         let late = assembly && census.phase.get() != CensusPhase::Assembling;
-        census.note_violations(
-            u32::from(late),
-            "a publish after the serve mark",
-            census.name(index),
-        );
+        census.note_violations(u32::from(late), "a publish after the serve mark", index);
     }
 
     /// An `Assembly` container's live count fell to `live` (a slab's `take`,
@@ -263,11 +263,7 @@ impl CensusRow {
         let (census, index) = (&*self.census, self.index);
         census.with_row(index, |row| row.crossings = row.crossings.saturating_add(1));
         let late = self.fill == CapFill::Assembly && census.phase.get() != CensusPhase::Assembling;
-        census.note_violations(
-            u32::from(late),
-            "a crossing after the serve mark",
-            census.name(index),
-        );
+        census.note_violations(u32::from(late), "a crossing after the serve mark", index);
     }
 }
 
