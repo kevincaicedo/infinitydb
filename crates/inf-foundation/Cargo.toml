@@ -36,3 +36,10 @@ test = false
 name = "key_hash"
 harness = false
 test = false
+
+# The capped deque's A/B by instructions (L4): A is `VecDeque`, B the capped
+# type, both crossings, from one binary; the count is read outside it.
+[[bench]]
+name = "bounded"
+harness = false
+test = false
