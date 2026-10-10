@@ -29,9 +29,12 @@ bin=target/release/inf-sim
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
 # window below its ring pads.
 # m4-tier-budget runs each of its legs (two namespaces at 8mb, eight at
-# 1mb, the one-namespace control, two at 1mb at the hostile share) on its
-# own row, and the retry arm (one tier write fails and is retried) on the
-# 8mb leg: a leg is named, never drawn from the seed.
+# 1mb, the one-namespace control, two at 1mb at the hostile share, one at
+# 64mb with no device model) on its own row, and the retry arm (one tier
+# write fails and is retried) on the 8mb leg and on the no-model leg,
+# where the 64 MiB round is more ops than one turn's visits and the
+# retry group is built behind a run of done writes: a leg is named,
+# never drawn from the seed.
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
@@ -71,6 +74,7 @@ rows=(
   "m4-tier-budget --tier-leg one-1mb --verify-determinism"
   "m4-tier-budget --tier-leg two-1mb-hostile --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --plant tier-write-eio --verify-determinism"
+  "m4-tier-budget --tier-leg one-64mb-no-model --plant tier-write-eio --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )

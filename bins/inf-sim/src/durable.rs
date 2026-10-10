@@ -270,13 +270,14 @@ pub struct DurableScenario {
     pub spin_iters: u32,
     /// The tier-budget shape (`m4-tier-budget`): `Some` runs one or more
     /// tiered `always` namespaces on every cell, each with its own
-    /// closed-loop writers, under the device model, so the tier-flush
-    /// class is offered beside the foreground. The regime reached is the
-    /// leg's ([`TierBudgetLeg`]): a round is issued in groups of at most
-    /// one group's bytes and ops, each offered at its exact size, so an
-    /// `8mb` round waits for refills between its groups; at the hostile
-    /// share the first namespace's load outruns the class and the second
-    /// waits its turn behind it. The lift regime's one tiered namespace
+    /// closed-loop writers, under the device model (or with none), so the
+    /// tier-flush class is offered beside the foreground. The regime
+    /// reached is the leg's ([`TierBudgetLeg`]): a round is issued in
+    /// groups of at most one group's bytes and ops, each offered at its
+    /// exact size, so an `8mb` round waits for refills between its
+    /// groups; at the hostile share the first namespace's load outruns the
+    /// class and the second waits its turn behind it; with no model a
+    /// `64mb` round issues across turns. The lift regime's one tiered namespace
     /// is a different arm. `None` everywhere else: every other trace
     /// stays byte-identical.
     pub tier_budget: Option<TierBudgetShape>,
@@ -328,14 +329,29 @@ pub enum TierBudgetLeg {
     /// the first's — the fair turn's wait-bound oracle's leg, and the
     /// leg on which a whole round offered at once is above the class cap.
     TwoAt1mbHostile,
+    /// One namespace at `64mb` with no device model (the regime of
+    /// `--device-probe off`: every offer is `Now`, nothing waits for a
+    /// refill): a 64 MiB round — 67 writes and 3 barriers — is more ops
+    /// than one turn's 64 descriptor visits, so it issues across turns,
+    /// and with the write-fault plant its retry group is built behind a
+    /// run of done writes: the leg of the group builder's cursor rule.
+    /// The window is 72 MiB with nine tenths mutable, so while the fill
+    /// lasts each seal takes the excess above 64.8 MiB, a page or so;
+    /// once the writers are done the harness drops `MUTABLE-FRACTION` to
+    /// 10 permille, the next seal takes the whole 64 MiB slice and the
+    /// next plan stages the round. The write fault is armed once the
+    /// driver has seen a pass of the turn's 64 ops, so the retry is that
+    /// round's.
+    OneAt64mbNoModel,
 }
 
 impl TierBudgetLeg {
-    pub const ALL: [TierBudgetLeg; 4] = [
+    pub const ALL: [TierBudgetLeg; 5] = [
         TierBudgetLeg::TwoAt8mb,
         TierBudgetLeg::EightAt1mb,
         TierBudgetLeg::OneAt1mb,
         TierBudgetLeg::TwoAt1mbHostile,
+        TierBudgetLeg::OneAt64mbNoModel,
     ];
 
     /// The leg's name on the command line.
@@ -345,6 +361,7 @@ impl TierBudgetLeg {
             TierBudgetLeg::EightAt1mb => "eight-1mb",
             TierBudgetLeg::OneAt1mb => "one-1mb",
             TierBudgetLeg::TwoAt1mbHostile => "two-1mb-hostile",
+            TierBudgetLeg::OneAt64mbNoModel => "one-64mb-no-model",
         }
     }
 
@@ -355,11 +372,13 @@ impl TierBudgetLeg {
 
     /// The leg's device model: the reference box's (489 MB/s, 40,000
     /// ops/s), shared by the node's cells, or that box's rate at the
-    /// share a cell holds among 256, carried by the two cells here.
+    /// share a cell holds among 256, carried by the two cells here; the
+    /// no-model leg has none (`DeviceModel::ABSENT`).
     pub fn model(self) -> inf_runtime::DeviceModel {
         let divisor = match self {
             TierBudgetLeg::TwoAt8mb | TierBudgetLeg::EightAt1mb | TierBudgetLeg::OneAt1mb => 1,
             TierBudgetLeg::TwoAt1mbHostile => 128,
+            TierBudgetLeg::OneAt64mbNoModel => return inf_runtime::DeviceModel::ABSENT,
         };
         inf_runtime::DeviceModel {
             write_bytes_per_s: 489_000_000 / divisor,
@@ -391,6 +410,13 @@ impl TierBudgetLeg {
         matches!(self, TierBudgetLeg::OneAt1mb)
     }
 
+    /// The no-model leg: the budget reads its model absent, every offer
+    /// is `Now`, and the cap and wait-bound oracles have no reading; its
+    /// regime is a round of more ops than one turn's descriptor visits.
+    pub fn model_absent(self) -> bool {
+        matches!(self, TierBudgetLeg::OneAt64mbNoModel)
+    }
+
     /// The leg's shape. On the reference-share legs, 3 writers per
     /// namespace with no think time and a 3 MiB window with a tenth of
     /// it mutable: seal marks land per 1 MiB commit page and a cell seals
@@ -403,7 +429,11 @@ impl TierBudgetLeg {
     /// namespace's one writer, also without think time, writes into an
     /// 8 MiB window at a 64 KiB slice: its small rounds are ready from
     /// early on, each takes its turn between the first's groups, and the
-    /// window holds what the floor cannot drain during the burst.
+    /// window holds what the floor cannot drain during the burst. On the
+    /// no-model leg six writers without think time fill a 72 MiB window
+    /// whose first seal comes at 64.8 MiB: 84,000 commands of about 2 KiB
+    /// each on the tail (two thirds are `SET`s of 1–10 KiB) are 84 MiB a
+    /// cell by key hash, above the seal with a margin.
     fn shape(self) -> TierBudgetShape {
         const ONE: TierBudgetCount = match TierBudgetCount::new(1) {
             Some(count) => count,
@@ -458,6 +488,18 @@ impl TierBudgetLeg {
                     maintain_slice: b"64kb",
                 },
             },
+            TierBudgetLeg::OneAt64mbNoModel => {
+                let load = TierBudgetLoad {
+                    writers: 6,
+                    ops_per_writer: 14_000,
+                    keys_per_writer: 40,
+                    think_ns_max: 0,
+                    mem_budget: b"72mb",
+                    mutable_permille: b"900",
+                    maintain_slice: b"64mb",
+                };
+                TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
+            }
         }
     }
 }
@@ -1195,8 +1237,9 @@ impl DurableScenario {
 
     /// `m4-tier-budget`: the budget scenario's durable shape with one or
     /// more tiered `always` namespaces on both cells, flushing under the
-    /// leg's device model (the sim disk carries the same bandwidth on its
-    /// byte timeline, no stall episodes). The leg names the namespaces,
+    /// leg's device model, or with none (the sim disk carries the
+    /// reference bandwidth on its byte timeline either way, no stall
+    /// episodes). The leg names the namespaces,
     /// their slice, their load and the model ([`TierBudgetLeg`]). Every
     /// value is inline (seal marks land per 1 MiB commit page, so a cell
     /// seals once its namespace's tail is a page past the mutable

@@ -487,6 +487,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut last_progress = 0u64;
     let mut log_oracle = LogOracle::new(scenario.cells);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
+    let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
+    if no_model_leg {
+        tier_oracle.arm_after_the_visits_bound();
+    }
+    let mut epilogue_sent = false;
     for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
@@ -539,6 +544,36 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             if think > 0 {
                 writer.idle_until = clock.now() + Nanos(writer.rng.next_below(think));
             }
+        }
+        // The no-model leg's epilogue: once its tier writers are done, the
+        // namespace's mutable target drops to a hundredth of the window,
+        // so the next seal step takes the whole 64 MiB slice and the next
+        // plan stages a round of more ops than one turn's visits — the
+        // regime the leg's oracles read. Sent through a finished tier
+        // writer, whose reply loop checks the `+OK`.
+        if no_model_leg && !epilogue_sent && tier_fill_done(&writers) {
+            epilogue_sent = true;
+            let writer = writers
+                .iter_mut()
+                .find(|w| matches!(w.class, NsClass::TierBudget(_)))
+                .expect("the no-model leg has tier writers");
+            let wire = encode(&[
+                b"INF.NS",
+                b"SET",
+                NsClass::TierBudget(0).name(),
+                b"MUTABLE-FRACTION",
+                b"10",
+            ]);
+            writer.inflight = Some(Pending {
+                key: Vec::new(),
+                state_after: None,
+                expect: b"+OK\r\n".to_vec(),
+                mutates: false,
+                taints: false,
+            });
+            node.nets[writer.cell].borrow_mut().client_send(writer.fd, &wire);
+            writer.sent += 1;
+            writer.quota += 1;
         }
         // The log must be quiescent too (ADR-0087 D7): an `everysec` ack
         // precedes its frame landing, and under the stall model plain
@@ -1284,9 +1319,10 @@ fn tier_budget_vacuous(
     report: &mut DurableReport,
 ) {
     let (seed, cell) = (scenario.seed, record.cell);
-    if model_absent != 0 {
+    if (model_absent != 0) != shape.leg.model_absent() {
         report.violations.push(format!(
-            "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is absent"
+            "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is {}",
+            if model_absent != 0 { "absent" } else { "present on the no-model leg" }
         ));
     }
     if record.spent_ops + record.deferrals + record.unattainable == 0 {
@@ -1324,7 +1360,8 @@ fn tier_budget_vacuous(
 /// entry's tier bytes within the cap and the pool, every ready group's
 /// wait within `n × T_c` (with the leg's engagement), the spend equal to
 /// the disk's tier bytes and ops with what a cut caught queued, and the
-/// control leg's reads.
+/// control leg's reads. The no-model leg reads its own clauses in place
+/// of the cap's and the wait's ([`tier_no_model_oracles`]).
 fn tier_budget_oracles(
     scenario: &DurableScenario,
     leg: TierBudgetLeg,
@@ -1341,19 +1378,23 @@ fn tier_budget_oracles(
             record.unattainable, record.overrun_bytes
         ));
     }
-    if record.pass_bytes_max > pass_bound {
-        report.violations.push(format!(
-            "TIER-PASS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} B of \
-             tier writes, above the class cap plus the pool, {pass_bound} B from the model",
-            record.pass_bytes_max
-        ));
-    }
-    if record.group_wait_ns_max > bound_ns {
-        report.violations.push(format!(
-            "TIER-TURN VIOLATION seed {seed:#x} cell {cell}: a ready group waited {} ns, past \
-             n × T_c = {bound_ns} ns from the model",
-            record.group_wait_ns_max
-        ));
+    if leg.model_absent() {
+        tier_no_model_oracles(scenario, record, report);
+    } else {
+        if record.pass_bytes_max > pass_bound {
+            report.violations.push(format!(
+                "TIER-PASS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} B \
+                 of tier writes, above the class cap plus the pool, {pass_bound} B from the model",
+                record.pass_bytes_max
+            ));
+        }
+        if record.group_wait_ns_max > bound_ns {
+            report.violations.push(format!(
+                "TIER-TURN VIOLATION seed {seed:#x} cell {cell}: a ready group waited {} ns, \
+                 past n × T_c = {bound_ns} ns from the model",
+                record.group_wait_ns_max
+            ));
+        }
     }
     if leg.expects_contention() && (record.turn_waits == 0 || record.turn_contended == 0) {
         report.violations.push(format!(
@@ -1383,6 +1424,54 @@ fn tier_budget_oracles(
             "TIER-CONTROL VIOLATION seed {seed:#x} cell {cell}: one namespace read \
              tier_turn_contended {} tier_plan_waits {}",
             record.turn_contended, record.plan_waits
+        ));
+    }
+}
+
+/// Whether every tier-budget writer has sent its quota and holds no
+/// reply outstanding: the no-model leg's fill is done.
+fn tier_fill_done(writers: &[Writer]) -> bool {
+    writers
+        .iter()
+        .filter(|w| matches!(w.class, NsClass::TierBudget(_)))
+        .all(|w| !w.setup && w.inflight.is_none() && w.sent >= w.quota)
+}
+
+/// The fewest tier ops one MAINTAIN pass pushes when it spends the
+/// turn's descriptor visits on the no-model leg's round: its writes are
+/// full batch windows, one group each, and a group costs its op plus the
+/// next op examined and refused, two visits — so a pass of half the
+/// visits in ops is a pass that spent them, and a smaller round pushes
+/// every op in one pass below that count.
+fn tier_visits_spent_ops() -> u64 {
+    inf_server::limits::TIER_ISSUE_OPS_PER_TURN as u64 / 2
+}
+
+/// The no-model leg's clauses on one cell: with no model every offer is
+/// `Now`, so nothing is deferred; and the leg's regime — a round of more
+/// ops than one turn's descriptor visits, so the round issues across
+/// turns and a retry group is built behind a run of done writes — is
+/// read from the driver: one MAINTAIN's entry carried a pass that spent
+/// the visits ([`tier_visits_spent_ops`]), else `VACUOUS`.
+fn tier_no_model_oracles(
+    scenario: &DurableScenario,
+    record: &TierBudgetCell,
+    report: &mut DurableReport,
+) {
+    let (seed, cell) = (scenario.seed, record.cell);
+    if record.deferrals != 0 {
+        report.violations.push(format!(
+            "TIER-ABSENT VIOLATION seed {seed:#x} cell {cell}: {} tier offer(s) deferred with no \
+             device model (every offer is Now)",
+            record.deferrals
+        ));
+    }
+    let spent = tier_visits_spent_ops();
+    if record.pass_ops_max < spent {
+        report.violations.push(format!(
+            "TIER-VISITS VACUOUS seed {seed:#x} cell {cell}: one MAINTAIN pass pushed at most {} \
+             tier ops; the leg needs a pass that spent the turn's visits, {spent} ops or more",
+            record.pass_ops_max
         ));
     }
 }
@@ -1426,6 +1515,12 @@ struct TierTurnOracle {
     /// Whether this life arms the write-fault plant (the first life does;
     /// the recovered life's turns are read, never planted).
     arm_faults: bool,
+    /// Arm the plant on a cell only once its driver has carried one pass
+    /// that spent the turn's descriptor visits (`tier_visits_spent_ops`):
+    /// the no-model leg's round of more ops than one turn's visits is
+    /// then issuing, so the fault, and the retry it makes, are that
+    /// round's.
+    arm_after_visits: bool,
     fault_armed: Vec<bool>,
 }
 
@@ -1438,7 +1533,18 @@ impl TierTurnOracle {
         let rounds_planned = (0..usize::from(cells))
             .map(|cell| node.plane(cell).tier_flush_gauges()[G::RoundsPlanned as usize])
             .collect();
-        TierTurnOracle { rounds_planned, arm_faults, fault_armed: vec![false; usize::from(cells)] }
+        TierTurnOracle {
+            rounds_planned,
+            arm_faults,
+            arm_after_visits: false,
+            fault_armed: vec![false; usize::from(cells)],
+        }
+    }
+
+    /// Holds the plant's arming until a cell's driver has seen one pass
+    /// that spent the turn's visits (the no-model leg).
+    fn arm_after_the_visits_bound(&mut self) {
+        self.arm_after_visits = true;
     }
 
     fn sample(
@@ -1464,9 +1570,13 @@ impl TierTurnOracle {
                 ));
             }
             self.rounds_planned[cell] = planned;
+            let visits_seen = !self.arm_after_visits
+                || node.cells[cell].0.driver().observed_io().tier_pass_ops_max
+                    >= tier_visits_spent_ops();
             if self.arm_faults
                 && scenario.plant == crate::net::Plant::TierWriteEio
                 && !self.fault_armed[cell]
+                && visits_seen
             {
                 let keyspace = node.plane(cell).keyspace();
                 let first = keyspace
