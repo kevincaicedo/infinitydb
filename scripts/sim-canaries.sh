@@ -194,10 +194,13 @@ rows=(
   # The issue visit starts at index 0 and continues past a refusal: at the
   # hostile share the second namespace's group waits past n × T_c.
   "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
-  # The same plant at the two-cell binary: the starved namespace's ready
-  # group waits past n × T_c, read from INFO beside the replies (its
-  # writer's own bound is four group bounds, so the replies stay +OK).
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write a ready group waited"
+  # The same plant at the two-cell binary, the light-load leg: the starved
+  # namespace's ready group waits past n × T_c, read from INFO beside the
+  # replies (its writer's own bound is four group bounds, so the replies
+  # stay +OK). The both-backlogged leg is not a row: at the real device
+  # its planted starvation depends on when the light namespace's groups
+  # become ready relative to the heavy one's, so it cannot go red
+  # reliably; it stays a test of the fair build.
   "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write a ready group waited"
   # A retry group reaches the driver with no offer: the spend falls below
   # what the disk saw, on the retry arm.
