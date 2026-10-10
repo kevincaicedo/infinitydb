@@ -29,8 +29,9 @@
 //!   0.05 per op;
 //! - liveness: `vecdeque-plus-one` and `reserve-plus-one`, one `nop` per op
 //!   at the top of the loop body, read A + 1.00 and B + 1.00, ± 0.05;
-//! - the rule's own red: `reserve-plus-four`, four `nop`s, reads over the
-//!   bound (B − A = 11).
+//! - the rule's own red: `reserve-plus-four`, four `nop`s, reads B − A + 4:
+//!   over the bound while B − A ≥ 7. A cheaper B leaves it at the bound or
+//!   under, and the run is invalid until the red is repaired.
 //!
 //! `vecdeque-bounded` (A′) is A with the site's own `len < cap` test, the
 //! cap a third argument of the step: the control that attributes the
