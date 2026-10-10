@@ -16,8 +16,8 @@ fn spec() -> TierSpec {
     TierSpec::for_budget(64 << 20)
 }
 
-/// Batch 14 of the 2026-08-30 review: the op index has 8 token bits.
-/// Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
+/// The op index has 8 token bits, so a wider index is refused, never
+/// masked. Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
 /// 0 — a second op carrying the same completion token.
 #[test]
 #[should_panic(expected = "round op index is 8-bit")]
@@ -25,8 +25,8 @@ fn round_slot_refuses_an_aliasing_index() {
     assert_ne!(round_slot(1, 0), round_slot(1, 256));
 }
 
-/// Batch 12 of the 2026-08-30 review: flush lanes recycle once their
-/// namespace has no op in flight, and the reuser continues the round
+/// Flush lanes recycle once their namespace has no op in flight, and
+/// the reuser continues the round
 /// sequence. Before the fix `next_lane` was monotone: with the counter
 /// at the width this test starts from, the second `CREATE` was the
 /// release assert `tier flush lanes exhausted` (a DDL count over the
@@ -735,7 +735,7 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     let planned = cell.turn(&mut ks, 0, &mut ops, &mut NoBudget);
     inf_foundation::fault::disarm_all();
     assert!(visited.is_ok(), "the visit itself is not refused");
-    let err = planned.expect_err("engagement: the plan's file creation was refused");
+    let err = planned.expect_err("engagement: the plan pass's file creation was refused");
     assert!(!err.is_fatal(), "{err}");
     assert!(cell.namespaces[0].round.is_none(), "nothing staged: the namespace stays idle");
     assert_eq!(cell.namespaces[0].stall_waiters.waiting(), 0, "the parked writer was woken");

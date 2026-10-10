@@ -1034,7 +1034,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         units += used;
                         compact_reads.extend(work);
                     }
-                    // A tier fsync failure (§8.4, ADR-0056 D4) is fatal.
+                    // A tier fsync failure is fatal: fsync failure is
+                    // fail-stop (ADR-0056 D4).
                     Err(err) if err.is_fatal() => {
                         fatal = Some(err.to_string());
                         break;

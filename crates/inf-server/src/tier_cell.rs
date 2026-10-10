@@ -859,7 +859,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// after it, the namespace retrying at its next turn in the order.
     ///
     /// # Errors
-    /// The plan's: file-creation I/O (not fatal) or an unaddressable
+    /// The plan pass's: file-creation I/O (not fatal) or an unaddressable
     /// position (fatal).
     pub fn turn(
         &mut self,
@@ -1243,8 +1243,9 @@ fn reclaim_extents<F: SegmentFs>(fs: &F, table: &mut TieredTable, t: &TierNs<F>)
     units
 }
 
-/// The retirement-unlink leg (§3.3: pins drain first; bounded by
-/// [`UNLINKS_PER_SLICE`]). Returns the units.
+/// The retirement-unlink leg: a file with in-flight cold reads is never
+/// deleted, so the pins drain first; bounded by [`UNLINKS_PER_SLICE`].
+/// Returns the units.
 fn unlink_retired<F: SegmentFs>(fs: &F, cold: Option<&ColdReads>, t: &mut TierNs<F>) -> u32 {
     let mut unlinked = 0;
     let mut u = 0;
@@ -1289,8 +1290,9 @@ fn teardown_files<F: SegmentFs>(gone: &TierNs<F>) -> Vec<TierFileMeta> {
 
 /// Advances one namespace's round on the completions REAP recorded
 /// (M4.5-S31, ADR-0084 D2/D4), making no offer: completes a round whose
-/// barriers all landed, escalates a barrier failure to the §8.4 fatal
-/// class, turns failed writes unsent again byte-identical once every
+/// barriers all landed, escalates a barrier failure to the fatal class
+/// (fsync failure is fail-stop, ADR-0056 D4), turns failed writes unsent
+/// again byte-identical once every
 /// sent op is terminal (the M4-S21 retained-batch retry — ENOSPC latches
 /// admission first; the retry group is offered at the turn), or enters
 /// the barrier phase once every write is done.
