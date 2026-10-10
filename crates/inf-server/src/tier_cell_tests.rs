@@ -144,6 +144,172 @@ fn fill_sealed(table: &mut inf_store::TieredTable, sealed_bytes: u64) -> Vec<Log
     addrs
 }
 
+/// Registers `name` on `ks` as a durable tiered namespace of `id` with
+/// `tier` (the registry entry `sync_namespaces` reads, so the namespace
+/// can later be dropped by name) and materializes its table on 1 MiB
+/// commit pages.
+fn register_tiered(ks: &mut Keyspace, id: NsId, name: &[u8], tier: TierSpec) {
+    let spec = inf_store::NsSpec {
+        id,
+        name: name.to_vec(),
+        mode: inf_store::NsMode::Durable,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: Some(tier),
+    };
+    ks.ns_create(spec).expect("a fresh tiered namespace");
+}
+
+/// A spec whose rounds are 8 MiB (ten writes, three barriers) and whose
+/// first seal comes early: a 16 MiB budget, a tenth of it mutable.
+fn eight_mib_rounds() -> TierSpec {
+    TierSpec {
+        mutable_permille: 100,
+        maintain_slice_bytes: 8 << 20,
+        ..TierSpec::for_budget(16 << 20)
+    }
+}
+
+/// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
+/// real reactor round, the new file's header write first (the
+/// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
+/// no fds.
+fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
+    let mut ks = sealed_backlog(1);
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let flush = &mut cell.namespaces[0].flush;
+    table.stage_flush_round(flush).expect("stage");
+    ks
+}
+
+/// The tier class's budget as the plane wires it: a real
+/// `DeviceBudget`, offered each group at its exact size.
+struct BudgetAdmission(DeviceBudget);
+
+impl FlushAdmission for BudgetAdmission {
+    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
+        self.0.offer(IoClass::TierFlush, bytes, ops)
+    }
+}
+
+/// Admission with no durable plane: every offer `Now`, nothing metered.
+struct NoBudget;
+
+impl FlushAdmission for NoBudget {
+    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
+        Issue::Now
+    }
+}
+
+/// Records every offer made through it, then asks `inner`.
+struct Recording<A: FlushAdmission> {
+    inner: A,
+    offers: Vec<(u64, u64)>,
+}
+
+impl<A: FlushAdmission> FlushAdmission for Recording<A> {
+    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
+        self.offers.push((bytes, ops));
+        self.inner.admit(bytes, ops)
+    }
+}
+
+/// Answers each offer from a script: `Now` where the script says so.
+struct Scripted<S: FnMut(usize) -> bool> {
+    grant: S,
+    offers: usize,
+}
+
+impl<S: FnMut(usize) -> bool> FlushAdmission for Scripted<S> {
+    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
+        let index = self.offers;
+        self.offers += 1;
+        if (self.grant)(index) { Issue::Now } else { Issue::NotThisSlice }
+    }
+}
+
+/// A device budget over `model`'s share at `cells`, with the tier
+/// class's declared slice (one group's bytes, the token op bound), as
+/// the durable cell builds it.
+fn plane_budget(model: DeviceModel, cells: u16) -> BudgetAdmission {
+    let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
+    slices[IoClass::TierFlush.index()] =
+        ClassSlice { bytes: TIER_GROUP_BYTES_MAX, ops: TIER_ROUND_MAX_OPS };
+    BudgetAdmission(DeviceBudget::new(model.share(cells), slices, 2, Nanos(0)))
+}
+
+/// The reference-shape model of the binary's budget tests.
+fn reference_model() -> DeviceModel {
+    DeviceModel {
+        write_bytes_per_s: 40_000_000,
+        write_ops_per_s: 40_000,
+        read_bytes_per_s: 40_000_000,
+        read_ops_per_s: 40_000,
+    }
+}
+
+/// One MAINTAIN's tier pass on `cell`: every round advanced on its
+/// completions, then the cell's turn. Returns the ops pushed.
+fn pass(
+    cell: &mut TierCell<SimDisk>,
+    ks: &mut Keyspace,
+    now_us: u64,
+    admission: &mut impl FlushAdmission,
+) -> Vec<IoOp> {
+    let stats = &mut cell.flush_stats;
+    for t in &mut cell.namespaces {
+        let table = ks.tiered_store_mut(t.ns).expect("materialized");
+        advance_round(table, t, stats, now_us).expect("no barrier failed");
+    }
+    let mut ops = Vec::new();
+    cell.turn(ks, now_us, &mut ops, admission).expect("the plan is not refused");
+    ops
+}
+
+/// Executes `ops` on the cell's sim disk as the driver would and feeds
+/// each completion back: a write lands whole, a barrier flushes; the op
+/// at `fail` (an index into `ops`) fails with `EIO` and lands nothing.
+/// Returns the device bytes the disk was handed, attempts included.
+fn complete_ops_failing(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>, fail: Option<usize>) -> u64 {
+    let disk = cell.fs.clone();
+    let mut bytes = 0u64;
+    for (at, op) in ops.into_iter().enumerate() {
+        match op {
+            IoOp::LogWrite { fd, offset, token, data: _, barrier: _ } => {
+                let lane = token.slot() >> 8;
+                let index = (token.slot() & 0xFF) as usize;
+                let t = cell.namespaces.iter().find(|t| t.lane == lane).expect("lane");
+                let view = t.flush.round_op(index);
+                bytes += view.bytes.len() as u64;
+                if fail == Some(at) {
+                    cell.on_flush_completion(token, Some(EIO));
+                    continue;
+                }
+                disk.driver_write_at(fd, offset, view.bytes).expect("sim write");
+                cell.on_flush_completion(token, None);
+            }
+            IoOp::Fdatasync { fd, token } => {
+                disk.driver_fdatasync(fd).expect("sim barrier");
+                cell.on_flush_completion(token, None);
+            }
+            IoOp::AcceptArm { .. }
+            | IoOp::RecvArm { .. }
+            | IoOp::RecvDisarm { .. }
+            | IoOp::Send { .. }
+            | IoOp::Close { .. }
+            | IoOp::TierRead { .. } => {
+                panic!("a flush round pushes writes and barriers only")
+            }
+        }
+    }
+    bytes
+}
+
+fn complete_ops(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>) -> u64 {
+    complete_ops_failing(cell, ops, None)
+}
+
 /// The round op index an op's token carries.
 fn op_index(op: &IoOp) -> usize {
     match op {
@@ -881,4 +1047,76 @@ fn a_dropped_namespace_drains_from_every_round_state() {
         assert_eq!(cell.free_lanes, vec![(lane, seq)], "{state:?}: the lane recycled");
         assert!(cell.teardown.iter().all(|tn| tn.files.is_empty()), "{state:?}: files unlinked");
     }
+}
+
+/// The design's turn table: a dropped holder releases the turn (holder
+/// ← none), so the next issue pass starts after the namespace served
+/// last, not at the first id above the dropped one. Namespace 16 is
+/// served, 17 has no work, 18 is refused and holds the turn; then 17
+/// gets work and 18 is dropped: the next pass issues 17's group first.
+/// Pre-fix the holder stayed `Some(18)` and the pass started at the
+/// first id above it, wrapping to 16, which was served again before 17.
+#[test]
+fn a_dropped_holder_releases_the_turn_to_the_namespace_after_the_one_served_last() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut ks = Keyspace::new(StoreConfig::default());
+    for (id, name) in [(16, &b"t16"[..]), (17, b"t17"), (18, b"t18")] {
+        register_tiered(&mut ks, NsId(id), name, eight_mib_rounds());
+        cell.create_ns(NsId(id), &eight_mib_rounds());
+    }
+    for id in [16, 18] {
+        fill_sealed(ks.tiered_store_mut(NsId(id)).expect("materialized"), 8 << 20);
+    }
+    let (lane16, lane17) = (cell.namespaces[0].lane, cell.namespaces[1].lane);
+    // Turn 1: 16 plans and its whole round issues (served last: 16).
+    let ops = pass(&mut cell, &mut ks, 0, &mut NoBudget);
+    assert!(lanes_of(&ops).iter().all(|&lane| lane == lane16), "16's groups");
+    complete_ops(&mut cell, ops);
+    assert_eq!(cell.turn.served_last, Some(NsId(16)));
+    // Turn 2: 16's writes are done (its barrier group is ready), 17 has
+    // no work, 18 plans; the pass starts after 16, passes 17 and is
+    // refused at 18, which holds the turn.
+    assert!(pass(&mut cell, &mut ks, 1, &mut Scripted { grant: |_| false, offers: 0 }).is_empty());
+    assert_eq!(cell.turn.holder, Some(NsId(18)), "engagement: 18 holds the turn");
+    assert_eq!(cell.turn.served_last, Some(NsId(16)));
+    // 17 gets work; 18 is dropped while it holds the turn.
+    fill_sealed(ks.tiered_store_mut(NsId(17)).expect("materialized"), 8 << 20);
+    ks.ns_drop(b"t18").expect("registered");
+    cell.sync_namespaces(&ks, &mut vec![(NsId(18), 1)]);
+    assert_eq!(cell.round_drain.len(), 1, "18's prepared round parks");
+    assert_eq!(cell.turn.holder, None, "a dropped holder releases the turn");
+    // Turn 3: 17 plans; the pass starts after 16 and serves 17 first.
+    let ops = pass(&mut cell, &mut ks, 2, &mut NoBudget);
+    assert_eq!(lanes_of(&ops).first(), Some(&lane17), "17, next after the one served last");
+}
+
+/// The design's namespaces row: a namespace dropped while it is
+/// `planned_last` is passed in the order — the next plan goes to the
+/// first id above it, wrapping — and the plan rule holds as before.
+#[test]
+fn a_dropped_planned_last_passes_the_plan_to_the_first_id_above_it() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut ks = Keyspace::new(StoreConfig::default());
+    for (id, name) in [(16, &b"t16"[..]), (17, b"t17"), (18, b"t18")] {
+        register_tiered(&mut ks, NsId(id), name, eight_mib_rounds());
+        cell.create_ns(NsId(id), &eight_mib_rounds());
+        fill_sealed(ks.tiered_store_mut(NsId(id)).expect("materialized"), 8 << 20);
+    }
+    let mut refuse = Scripted { grant: |_| false, offers: 0 };
+    let planned = |cell: &TierCell<SimDisk>| -> Vec<u32> {
+        cell.namespaces.iter().filter(|t| t.round.is_some()).map(|t| t.ns.0).collect()
+    };
+    pass(&mut cell, &mut ks, 0, &mut refuse);
+    pass(&mut cell, &mut ks, 1, &mut refuse);
+    assert_eq!(planned(&cell), vec![16, 17]);
+    assert_eq!(cell.turn.planned_last, Some(NsId(17)));
+    ks.ns_drop(b"t17").expect("registered");
+    cell.sync_namespaces(&ks, &mut vec![(NsId(17), 1)]);
+    assert_eq!(cell.round_drain.len(), 1, "17's prepared round parks");
+    pass(&mut cell, &mut ks, 2, &mut refuse);
+    assert_eq!(planned(&cell), vec![16, 18], "the first id above the dropped one plans");
+    assert_eq!(cell.turn.planned_last, Some(NsId(18)));
+    assert_eq!(cell.flush_stats.rounds_planned, 3);
+    pass(&mut cell, &mut ks, 3, &mut refuse);
+    assert_eq!(cell.flush_stats.rounds_planned, 3, "every live namespace holds a round");
 }

@@ -448,11 +448,15 @@ impl<F: SegmentFs> TierNs<F> {
 
 /// The cell's one turn (ADR-0178 D3's tier row, D4): which namespace
 /// plans, and which offers next. Ids, never indices, so a drop repairs
-/// nothing: a dropped id is simply passed in the order.
+/// nothing: a dropped `served_last` or `planned_last` is passed in the
+/// order (the next visit or plan goes to the first id above it), and a
+/// dropped holder releases the turn (`holder` ← none at the drop), so
+/// the next pass starts after the namespace served last.
 #[derive(Default)]
 struct TierTurn {
     /// The namespace whose group the budget refused last: it ends the
-    /// pass for the tier class and is visited first on the next (T3).
+    /// pass for the tier class and is visited first on the next (ADR-0178
+    /// T3). Cleared by its grant, or by its drop.
     holder: Option<NsId>,
     /// The namespace whose group was granted last: the next issue pass
     /// starts after it when there is no holder.
@@ -668,6 +672,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 continue;
             }
             let mut gone = self.namespaces.remove(i);
+            // A dropped holder releases the turn: no grant of its can
+            // clear it, and the next pass starts after the one served last.
+            if self.turn.holder == Some(gone.ns) {
+                self.turn.holder = None;
+            }
             let release_epoch = match releases.iter().position(|(ns, _)| *ns == gone.ns) {
                 Some(at) => releases.swap_remove(at).1,
                 None => {
