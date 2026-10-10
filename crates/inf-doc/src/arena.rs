@@ -9,10 +9,15 @@
 //! Accounting is exact and cheap (L5): every alloc/free/grow updates the
 //! owning document's `{node_bytes, slack_bytes}` at the call site — the
 //! S19 `doc_arena_bytes`/`doc_slack_bytes` feeds.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use inf_alloc::arena::{Arena, ArenaAddr};
 
-use crate::apply::{ApplyError, ApplyOp, Number, ScalarPatch, number_op};
+use crate::apply::{ApplyError, ApplyOp, Number, ScalarPatch, Unapplied, number_op};
 use crate::build::{BFrame, TapeBuilder};
 use crate::error::DocError;
 use crate::path::{PathProgram, SimpleStep};
@@ -70,7 +75,9 @@ impl DocRef {
 
     fn inline_int(v: i64) -> Option<DocRef> {
         if (INLINE_INT_MIN..=INLINE_INT_MAX).contains(&v) {
-            Some(DocRef(((RefTag::IntInline as u64) << TAG_SHIFT) | ((v as u64) & PAYLOAD_MASK)))
+            Some(DocRef(
+                ((RefTag::IntInline as u64) << TAG_SHIFT) | (v.cast_unsigned() & PAYLOAD_MASK),
+            ))
         } else {
             None
         }
@@ -133,7 +140,7 @@ impl DocRef {
     fn as_inline_int(self) -> i64 {
         debug_assert_eq!(self.tag(), RefTag::IntInline);
         // Sign-extend the i60 payload.
-        ((self.0 << 4) as i64) >> 4
+        (self.0 << 4).cast_signed() >> 4
     }
 }
 
@@ -211,10 +218,12 @@ fn num_bits(arena: &Arena, r: DocRef) -> u64 {
 // ---- allocation helpers (every one accounts at the call site) --------------
 
 fn alloc_str(arena: &mut Arena, s: &[u8], mem: &mut DocMemReport) -> Result<DocRef, DocError> {
+    // The cell's length field is a u32; a longer string is past every document cap.
+    let stored_len = u32::try_from(s.len()).map_err(|_| DocError::TooLarge { bytes: s.len() })?;
     let len = STR_HDR + s.len();
     let addr = arena.alloc(len).ok_or(DocError::ArenaExhausted)?;
     let cell = arena.bytes_mut(addr, len);
-    cell[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+    cell[0..4].copy_from_slice(&stored_len.to_le_bytes());
     cell[4..].copy_from_slice(s);
     mem.node_bytes += len;
     Ok(DocRef::with_addr(RefTag::Str, addr))
@@ -235,7 +244,7 @@ fn alloc_num_cell(
 fn alloc_int(arena: &mut Arena, v: i64, mem: &mut DocMemReport) -> Result<DocRef, DocError> {
     match DocRef::inline_int(v) {
         Some(r) => Ok(r),
-        None => alloc_num_cell(arena, v as u64, RefTag::IntHeap, mem),
+        None => alloc_num_cell(arena, v.cast_unsigned(), RefTag::IntHeap, mem),
     }
 }
 
@@ -249,7 +258,10 @@ fn alloc_node(
     mem: &mut DocMemReport,
 ) -> Result<DocRef, DocError> {
     debug_assert!(matches!(tag, RefTag::Obj | RefTag::Arr));
-    let count = (if slot == OBJ_ENTRY { refs.len() / 2 } else { refs.len() }) as u32;
+    let count = if slot == OBJ_ENTRY { refs.len() / 2 } else { refs.len() };
+    // The node header counts in u32; more children are past every document cap.
+    let count =
+        u32::try_from(count).map_err(|_| DocError::TooLarge { bytes: size_of_val(refs) })?;
     let len = NODE_HDR + refs.len() * 8;
     debug_assert_eq!(len, node_len(count, slot));
     let addr = arena.alloc(len).ok_or(DocError::ArenaExhausted)?;
@@ -452,7 +464,7 @@ impl ArenaDoc {
         op: &ApplyOp<'_>,
     ) -> Result<ScalarPatch, ApplyError> {
         let Some(steps) = program.simple_steps() else {
-            return Ok(ScalarPatch::Unsupported);
+            return Ok(ScalarPatch::Unsupported(Unapplied::new()));
         };
         let Some((slot, current)) = locate_simple_ref(arena, self.root, steps) else {
             return Ok(ScalarPatch::Missing);
@@ -461,16 +473,21 @@ impl ArenaDoc {
             ApplyOp::NumIncrBy(operand) | ApplyOp::NumMultBy(operand) => {
                 let current_number = match current.tag() {
                     RefTag::IntInline => Number::I64(current.as_inline_int()),
-                    RefTag::IntHeap => Number::I64(num_bits(arena, current) as i64),
+                    RefTag::IntHeap => Number::I64(num_bits(arena, current).cast_signed()),
                     RefTag::F64 => Number::F64(f64::from_bits(num_bits(arena, current))),
-                    _ => return Ok(ScalarPatch::Skipped),
+                    RefTag::Null
+                    | RefTag::False
+                    | RefTag::True
+                    | RefTag::Str
+                    | RefTag::Obj
+                    | RefTag::Arr => return Ok(ScalarPatch::Skipped),
                 };
                 let result =
                     number_op(current_number, operand, matches!(op, ApplyOp::NumMultBy(_)))?;
                 if canonical_number_len(current_number) != canonical_number_len(result)
                     || !patch_number_ref(arena, &mut self.root, slot, current, result)
                 {
-                    return Ok(ScalarPatch::Unsupported);
+                    return Ok(ScalarPatch::Unsupported(Unapplied::new()));
                 }
                 Ok(ScalarPatch::Number(result))
             }
@@ -478,12 +495,27 @@ impl ArenaDoc {
                 let toggled = match current.tag() {
                     RefTag::False => true,
                     RefTag::True => false,
-                    _ => return Ok(ScalarPatch::Skipped),
+                    RefTag::Null
+                    | RefTag::IntInline
+                    | RefTag::IntHeap
+                    | RefTag::F64
+                    | RefTag::Str
+                    | RefTag::Obj
+                    | RefTag::Arr => return Ok(ScalarPatch::Skipped),
                 };
                 write_slot(arena, &mut self.root, slot, DocRef::bool_ref(toggled));
                 Ok(ScalarPatch::Toggled(toggled))
             }
-            _ => Ok(ScalarPatch::Unsupported),
+            ApplyOp::SetReplace { .. }
+            | ApplyOp::SetMember { .. }
+            | ApplyOp::Del
+            | ApplyOp::StrAppend(_)
+            | ApplyOp::Clear
+            | ApplyOp::ArrAppend { .. }
+            | ApplyOp::ArrInsert { .. }
+            | ApplyOp::ArrPop { .. }
+            | ApplyOp::ArrTrim { .. }
+            | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported(Unapplied::new())),
         }
     }
 
@@ -597,7 +629,7 @@ fn locate_arr_ref(arena: &Arena, arr: DocRef, index: i64) -> Option<(RefSlot, Do
         return None;
     }
     let bytes = node_len(cap, ARR_SLOT);
-    let offset = NODE_HDR + index as usize * ARR_SLOT;
+    let offset = NODE_HDR + usize::try_from(index).ok()? * ARR_SLOT;
     Some((
         RefSlot::Node { addr: arr.addr(), bytes, offset },
         read_ref_at(arena, arr.addr(), bytes, offset),
@@ -639,7 +671,7 @@ fn patch_number_ref(
             }
             arena
                 .bytes_mut(current.addr(), NUM_CELL)
-                .copy_from_slice(&(value as u64).to_le_bytes());
+                .copy_from_slice(&value.cast_unsigned().to_le_bytes());
             true
         }
         _ => false,
@@ -734,7 +766,7 @@ fn freeze_emit(
         RefTag::False => b.bool(false),
         RefTag::True => b.bool(true),
         RefTag::IntInline => b.i64(r.as_inline_int()),
-        RefTag::IntHeap => b.i64(num_bits(arena, r) as i64),
+        RefTag::IntHeap => b.i64(num_bits(arena, r).cast_signed()),
         RefTag::F64 => b.f64(f64::from_bits(num_bits(arena, r))),
         RefTag::Str => b.str_value(
             str::from_utf8(str_bytes(arena, r))
@@ -890,7 +922,7 @@ pub(crate) fn deref(arena: &Arena, r: DocRef) -> crate::cursor::DocValue<'_> {
         RefTag::False => DocValue::Bool(false),
         RefTag::True => DocValue::Bool(true),
         RefTag::IntInline => DocValue::I64(r.as_inline_int()),
-        RefTag::IntHeap => DocValue::I64(num_bits(arena, r) as i64),
+        RefTag::IntHeap => DocValue::I64(num_bits(arena, r).cast_signed()),
         RefTag::F64 => DocValue::F64(f64::from_bits(num_bits(arena, r))),
         RefTag::Str => DocValue::Str(DocStr(str_bytes(arena, r))),
         RefTag::Obj => {
@@ -1022,5 +1054,27 @@ impl<'a> Iterator for ArrIter<'a> {
         let v = self.arr.index(self.idx as usize).expect("idx < count");
         self.idx += 1;
         Some(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_alloc::ArenaConfig;
+
+    #[test]
+    fn array_ref_lookup_checks_both_signed_edges() {
+        let bytes = crate::JsonParser::new().parse(b"[10,20,30]").unwrap();
+        let tape = TapeDoc::from_bytes(&bytes).unwrap();
+        let mut arena = Arena::new(ArenaConfig::default());
+        let doc = ArenaDoc::from_tape(&tape, &mut arena).unwrap();
+        for index in [2, -1] {
+            let (_, value) = locate_arr_ref(&arena, doc.root_ref(), index).unwrap();
+            assert_eq!(value.as_inline_int(), 30);
+        }
+        for index in [3, -4, i64::MIN, i64::MAX] {
+            assert!(locate_arr_ref(&arena, doc.root_ref(), index).is_none());
+        }
+        doc.free(&mut arena);
     }
 }

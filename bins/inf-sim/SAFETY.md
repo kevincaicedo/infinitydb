@@ -1,6 +1,6 @@
 # inf-sim — unsafe inventory
 
-`inf-sim` is not an unsafe leaf crate (§17.3); it carries exactly two
+`inf-sim` is not an unsafe-leaf crate; it carries exactly two
 audited `unsafe` constructions, following the `inf-server::log_bytes`
 precedent (ADR-0015 D4).
 
@@ -18,8 +18,9 @@ precedent (ADR-0015 D4).
   not escape the call (it is copied into the sim disk's buffers).
 - **Who else does this:** every backend driver executing the op — the
   uring tier passes the pointer to the kernel, the kqueue tier and the
-  `inf-log` test `ScriptedDriver` build the same slice. `StableBytes::
-  as_ptr` is public precisely for out-of-crate drivers (its rustdoc).
+  `inf-log` test `ScriptedDriver` build the same slice.
+  `StableBytes::as_ptr` is public precisely for out-of-crate drivers (its
+  rustdoc).
 - **Tests:** `tests/disk.rs` drives `LogWrite`/`Fdatasync` through the
   sim driver end-to-end (buffered-until-sync semantics, failed-write
   cancels linked sync); the recovery smoke and future S19 sweeps run the

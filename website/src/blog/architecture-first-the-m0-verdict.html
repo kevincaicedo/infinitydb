@@ -1,0 +1,49 @@
+<!--
+title: Architecture first: the M0 verdict
+dek: An end-to-end skeleton, hard STOP gates, and a first verdict of no.
+date: 2026-06-12
+topic: M0 · Engineering
+group: Engineering
+crumb: Engineering
+kicker: M0 · Architecture skeleton
+excerpt: Before a single feature, an end-to-end skeleton had to clear hard STOP gates. The first verdict was no. This is how the gates, and the fabric, changed.
+-->
+<p class="lede">Vortex, the project before this one, validated its components in isolation and learned at the macro level, months later, that the I/O plane was eating most of the CPU and the effective command batch size was one. M0 exists so that never happens again: before any feature, it builds the thinnest end-to-end slice of the architecture and puts it in front of hard STOP gates. On 12 June the first verdict came back: no-go. Feature work stayed closed.</p>
+
+<h2 id="s1"><span class="num">1</span>A skeleton, not a prototype.</h2>
+<p>The skeleton touched every seam at once: shard cells, each a thread with its own io_uring loop (kqueue on macOS for development); a fabric of single-producer, single-consumer rings between every pair of cells, with credits; the RESP parser carried over from Vortex, perfect-hash dispatch over 26 commands and a minimal store; a harness that measures the gates; and a deterministic simulator that drives the real server code, not a fork of it.</p>
+<p>The real kernel earned its place on day one. The first live io_uring run caught three bugs the kqueue tier could not see: the whole buffer pool was staged into the kernel's provided-buffer group, which starved sends; a degraded path reported dropped receives before any data was pending; and a non-blocking wait never ran deferred task work. All three were fixed before the gates ran.</p>
+
+<h2 id="s2"><span class="num">2</span>Gates, not goals.</h2>
+<p>The STOP gates covered the whole node under load: pipelined and unpipelined throughput, submissions per <code>io_uring_enter</code>, fabric hop latency, the cost of keys owned by another cell against all-local placement, tail latency, RSS for a fixed key set and loop iteration time, with syscall CPU share as an informational tripwire. Each needed three to five replicates.</p>
+<p>The rule was blunt. Every gate passes, or feature work does not begin. A gate may not be passed by narrowing it: narrowing requires a recorded amendment first, with evidence attached.</p>
+
+<h2 id="s3"><span class="num">3</span>The first verdict was no.</h2>
+<p>Three gates were rejected: the cross-cell penalty, pipelined node throughput, and submissions per enter under load. Four more trended toward a pass, fabric hop latency could not be measured at all, and none was Allowed. The development box ran a powersave governor, the tree was dirty and the load generator shared the machine, all disclosed, so no citation-grade artifact existed.</p>
+<p>The root cause was architectural. The per-connection pump executed remote commands one fabric hop at a time, so a pipeline of commands for keys on other cells became a chain of round trips.</p>
+<aside class="law"><div class="law-label">Law derived · L3</div><p>Batch every boundary. A fabric hop is paid per batch, never per operation. One hop at a time is the batch of one again, moved from syscalls to the fabric.</p></aside>
+
+<h2 id="s4"><span class="num">4</span>How the fabric changed.</h2>
+<p>Remediation ran inside the buffer week, each step checked against the simulator's deadlock battery and cross-cell ordering oracle before it landed:</p>
+<ul class="dots">
+<li>A windowed pump: commands dispatch in pipeline order with up to 32 remote operations in flight per connection, and replies leave strictly in order. Sends leave only from the pump, so per-key order rides the ring's FIFO.</li>
+<li>Direct owned-argument execution: the owner no longer re-encodes a remote command to RESP and parses it again.</li>
+<li>A zero-allocation owner drain: operations execute over borrowed ring payloads, and replies stage in a reusable buffer.</li>
+<li>Frame packing: one ring slot carries up to 64 encoded operations, sealed at 2 KiB, so one heap spill serves the whole pack. The codec format did not change.</li>
+<li>Flattened defer buffers and pooled reply buffers, which cut allocator work on the hot path.</li>
+<li>Replies published as soon as the fabric drain ends. Hops were latency-bound, and a reply was waiting out most of the owner's loop.</li>
+<li>Eventfd doorbells, so a parked cell wakes when work arrives.</li>
+</ul>
+<p>The simulator's trace hash did not move across the packing work: framing changed, apply order did not. After two passes the verdict still stood at no-go. What was left was not one missing batch. It was many small costs, none large enough to matter alone.</p>
+
+<h2 id="s5"><span class="num">5</span>How the gates changed, and why that is legal.</h2>
+<p>Vortex once rejected shared-nothing on a fabric experiment that production thread-per-core systems contradict. Our rule since then: an internal result is checked against an external reference point before it binds a decision. Applied to our own gate, the question became what a production shared-nothing server does on the identical workload. Two decisions followed:</p>
+<ul class="dots">
+<li>The cross-cell gate is anchored to that comparator: same box, same workload files, equal thread count, interleaved replicates, persistence off on both, and the comparator in the same run. The penalty against all-local placement stays visible as an informational tripwire, owned by M1 with a named mechanism, command-level coalescing.</li>
+<li>Submissions per enter counts only enters that carried a submission. Under <code>DEFER_TASKRUN</code> the spin phase must enter with nothing to submit, only to harvest completions, so counting those enters measured the idle policy, not batching. An operation trickling one submission per enter still counts in full, so a real regression stays visible.</li>
+</ul>
+<p>A third gate stayed open for another reason: a loop-granularity clock could not resolve fabric hop latency at all. An instrument coarser than its gate gives no verdict. Under the amended gates the development campaign had no binding failures, and M1 opened conditionally. The obligation did not move: the reference-box campaign still gated any public claim.</p>
+<aside class="law"><div class="law-label">Law derived · L10</div><p>Claims follow evidence. Changing a gate is an amendment written down with its evidence, and the measurement it replaces stays visible as a tripwire, not deleted.</p></aside>
+
+<h2 id="close">What the verdict bought.</h2>
+<p>The no cost a remediation pass and two written amendments. In exchange the node gained cross-cell execution with its ordering verified in the simulator, a packed fabric with doorbell wakeups, and instrumentation that charges hop time to the fabric only when the fabric spent it. The failure was exactly the kind M0 exists to surface: one found before features were stacked on top of it. The <a href="../docs/fabric.html">fabric</a> and <a href="../docs/cells.html">cells</a> pages describe the design as it stands today.</p>

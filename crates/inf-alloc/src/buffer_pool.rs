@@ -77,7 +77,8 @@ pub struct BufferPool {
 impl BufferPool {
     /// A pool of `count` buffers of `buf_size` bytes each.
     pub fn new(count: usize, buf_size: usize) -> BufferPool {
-        assert!(count > 0 && buf_size > 0, "pool dimensions must be non-zero");
+        assert!(count > 0, "pool count must be non-zero");
+        assert!(buf_size > 0, "pool buffer size must be non-zero");
         assert!(count <= u32::MAX as usize, "buffer count exceeds id space");
         BufferPool {
             storage: (0..count).map(|_| vec![0u8; buf_size].into_boxed_slice()).collect(),

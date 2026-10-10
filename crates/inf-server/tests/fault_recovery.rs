@@ -6,54 +6,16 @@
 //! `inf-log/tests/fault_points.rs`; the crash matrix drives these paths
 //! across policies × workloads at M2-S17.
 
-use std::path::PathBuf;
-
 use inf_foundation::fault::{self, FaultSpec};
-use inf_foundation::time::Nanos;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, Lsn, MutationEffect, NsId, SegmentConfig, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs,
+    FRAME_HEADER_LEN, Lsn, MutationEffect, SegmentConfig, SegmentRotor, StagingRing,
+    create_cell_dirs,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
-fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        sync_pipeline: 1,
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
+mod support;
+use support::*;
 
 struct LogBuilder {
     rotor: SegmentRotor<MemFs>,
@@ -76,10 +38,6 @@ impl LogBuilder {
         self.ring.release(lease);
         Lsn::new(lsn.segment, lsn.offset - FRAME_HEADER_LEN as u32)
     }
-}
-
-fn get(ks: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    ks.ns_store_mut(NS).expect("ns store").get(key, now()).map(<[u8]>::to_vec)
 }
 
 /// `torn_frame` fires on the final write before a crash → the next boot
@@ -116,7 +74,7 @@ fn power_cut_after_seal_recovers_at_the_seal_boundary() {
     fault::disarm_all();
     let fs = MemFs::new();
     let config = DurableConfig {
-        segment: SegmentConfig { segment_bytes: 4096, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes: 4096, ..Default::default() },
         ..cfg()
     };
     let mut log = LogBuilder::new(&fs, &config);

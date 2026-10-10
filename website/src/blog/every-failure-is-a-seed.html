@@ -1,0 +1,47 @@
+<!--
+title: Every violation is a seed
+dek: The whole node runs on one thread inside a simulator, and a violation it reports is one number.
+date: 2026-10-08
+topic: Testing
+group: Testing
+crumb: Testing
+kicker: Testing · deterministic simulation
+excerpt: Time, randomness, disk and network are injected, so the whole node runs inside a simulator. When an oracle catches a violation, one number replays it exactly.
+-->
+<p class="lede">A concurrency bug that reproduces once a week is not a bug report, it is a rumor. InfinityDB treats determinism as a feature so that we never chase one. Time, randomness, disk and network are injected into every cell, which lets <code>inf-sim</code> run the whole node, every cell, the fabric, the wire, the store, the log and recovery, on one thread, over the real server code rather than a model of it. The same seed gives the same execution, byte for byte. When an oracle catches a violation, the seed is the reproduction; a panic inside a sweep is not caught, and its seed is lost.</p>
+
+<h2 id="s1"><span class="num">1</span>Inject every effect.</h2>
+<p>The cell loop takes a clock instead of reading one. Randomness comes from seeded <code>SplitMix64</code> streams. The network and io_uring sit behind one backend trait with three implementations: io_uring in production, kqueue for development on macOS, and the simulator's driver. Every log and tier file effect goes through a file-system trait. Where iteration order could reach output, cell code uses <code>BTreeMap</code>s or a fixed hasher, never a per-process random seed.</p>
+<p>These are not conventions. An ambient <code>Instant::now()</code> or <code>rand::random()</code> in cell code fails a denylist check, and for clocks it is a clippy error under any spelling. The style guide says why: it breaks the simulator's authority over the universe, which is the single most valuable testing asset we own.</p>
+<aside class="law"><div class="law-label">Law derived · L7</div><p>Determinism is a feature. Given the same inputs, a cell produces the same state and the same log, byte for byte, because every effect it depends on is handed to it.</p></aside>
+
+<h2 id="s2"><span class="num">2</span>A world that misbehaves on purpose.</h2>
+<ul class="dots">
+<li>Network: in-memory sockets split received bytes at seeded points, so frames that span reads exercise the RESP parser's accumulator, at the points each seed picks.</li>
+<li>Disk: every file keeps two views, what the OS would show and what would survive a power cut. Unsynced data is lost on a cut, directory operations survive only in a seeded prefix, and pending writes are cut into sectors that each survive a coin flip and land in a seeded order, so writes tear and reorder.</li>
+<li>Power: cuts land at any stage of the write pipeline, and in the durable scenario every eighth seed takes a second cut in the middle of recovery.</li>
+<li>Time: a virtual clock, so one run covers simulated hours of TTL deadlines and checkpoint cycles.</li>
+<li>Faults and hashing: named fault points in the storage code, compiled only into test and simulator builds, and a key-hash secret derived from the seed, so even hash layout replays.</li>
+</ul>
+
+<h2 id="s3"><span class="num">3</span>Oracles, and the canaries that keep them honest.</h2>
+<p>Every run arms oracles: each key's replies replayed against a model store in apply order, an independent model written from Redis's documented semantics, pub/sub delivery in order with no loss or duplicates, memory accounting at quiescence, no acknowledged <code>always</code> write lost across any crash, document replay equivalence, and index backfill equivalence. A stall detector fails the run when the scheduler stops making progress.</p>
+<p>An oracle that never fires might be watching nothing, so an oracle needs a canary: a planted bug that must turn it red, either compiled in by a build flag or armed at run time. Two taught us why.</p>
+<p>One plant makes <code>GET</code> answer the stored value with one extra byte. The replay against the shared store could not see it, because the model and the server ran the same store code and agreed on the wrong answer. Only the independent model caught it. An oracle that shares code with what it checks is not independent.</p>
+<p>Another plants a disk driver that reports a sync it never performed. In the durable scenario it first hid behind refused boots: power-cut reordering legitimately makes some boots fail-stop, and the oracle was not auditing those. The fix audits a refused boot directly against the surviving disk image. Before that audit, the canary escaped on every seed.</p>
+<aside class="law"><div class="law-label">Law derived · L10</div><p>Claims follow evidence, and evidence that cannot go red is not evidence. The rule is that every oracle names the planted violation that turns it red, and that the plant runs in the same lane. The boot-storm scenario's ready-path oracle does not meet it: no lane plants its bug.</p></aside>
+
+<h2 id="s4"><span class="num">4</span>One number replays it.</h2>
+<pre class="code" data-label="shell">$ cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+    --scenario m2-durable --seed 0xC0FFEE --verify-determinism
+$ just sim-smoke
+$ just durable-sweep 10000 0xD5EE0000</pre>
+<p><code>--verify-determinism</code> runs a seed twice and compares the event traces and a hash of the final state, disk included. Every CI run executes every scenario once, and sweeps run thousands of seeds per scenario. A nightly fleet runs fresh seeds derived from the run id and files an issue naming the scenario and the seed of any failure.</p>
+<p>The <a href="https://github.com/kevincaicedo/infinitydb/blob/main/bins/inf-sim/seeds/corpus.txt">seed corpus</a> is the fossil record: when a fresh seed fails, the fix lands with that seed appended, and the corpus replays green on every merge to <code>main</code>. The harness obeys the same rule. A sweep recipe's exit status is the verdict of every shard, each shard's manifest must report zero violations, and the nightly's simulated-seconds lines come from the virtual clocks that actually advanced. An earlier sweep recipe ended in a bare <code>wait</code>, whose status is zero whatever the shards did. It could not go red, so it was not a gate.</p>
+
+<h2 id="s5"><span class="num">5</span>A simulator finds what it models.</h2>
+<p>Determinism is not omniscience. At M2 the reference device caught a group-commit defect the simulator could not: simulated fsyncs completed instantly, so a stream of tiny syncs looked healthy, and the durability sweep stayed byte-identical after the fix. The answer was to model the missing physics. The simulated disk gained a device-stall model, a seeded latency distribution with a heavy tail and stall episodes, and it landed with a planted bug it catches.</p>
+<p>Two rules came out of that. An oracle without a demonstrated catch is decoration, and a model without the physics that hurts gives comfort, not coverage.</p>
+
+<h2 id="close">Why it is worth it.</h2>
+<p>A shared-nothing engine trades locks for messages, and messages reorder. Deterministic simulation keeps that trade trustworthy: the suite explores real interleavings, and a violation the simulator reports becomes a replayable artifact. The <a href="../docs/simulation.html">simulation</a> page lists the scenarios and oracles, and the <a href="https://github.com/kevincaicedo/infinitydb/blob/main/bins/inf-sim/README.md">simulator's README</a> shows how to run one.</p>

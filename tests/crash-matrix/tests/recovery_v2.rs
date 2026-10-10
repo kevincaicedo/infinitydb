@@ -24,9 +24,11 @@
 //!   is typed, counted, and re-driven (retry and boot GC alike); the
 //!   one deliberate non-fail-stop posture in the tier pipeline.
 
+#[path = "../receipt.rs"]
+mod receipt;
+
 use std::path::Path;
 
-use crash_matrix::load_matrix;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
@@ -34,6 +36,7 @@ use inf_log::{
     Lsn, Manifest, NsId, SealReason, SegmentId, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, read_manifest, tier_extract, tier_frame_offset, tier_frame_span, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredTable, recover_tiered_ns,
 };
@@ -70,7 +73,8 @@ fn space_config(origin: u64) -> AddressSpaceConfig {
 
 fn rig(fs: &MemFs) -> (TieredTable, TierFlush<MemFs>) {
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
-    let table = TieredTable::new(space_config(0), demote(), 256).expect("ring");
+    let table =
+        TieredTable::new(space_config(0), demote(), 256, KeyHasher::default()).expect("ring");
     let flush = TierFlush::new(fs.clone(), flush_config(), 0);
     (table, flush)
 }
@@ -81,7 +85,7 @@ fn fill_and_flush(table: &mut TieredTable, flush: &mut TierFlush<MemFs>, batch: 
     for i in 0..keys {
         let key = format!("r:{batch}:{i:04}");
         let value = vec![0x30 + (i % 40) as u8; 120 + (i as usize % 60)];
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &value, hash).expect("fits");
     }
     loop {
@@ -104,6 +108,7 @@ fn publish(fs: &MemFs, table: &TieredTable, flush: &TierFlush<MemFs>, ckpt_id: u
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest swap");
@@ -111,9 +116,13 @@ fn publish(fs: &MemFs, table: &TieredTable, flush: &TierFlush<MemFs>, ckpt_id: u
 
 /// Reads one manifested cold range through the recovered catalog and
 /// CRC-verifies it (`tier_extract`).
-fn read_manifested(fs: &MemFs, flush: &TierFlush<MemFs>, addr: u64, len: usize) -> Option<Vec<u8>> {
-    let meta = flush
-        .sealed()
+fn read_manifested(
+    fs: &MemFs,
+    sealed: &[inf_log::TierFileMeta],
+    addr: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let meta = sealed
         .iter()
         .find(|m| addr >= m.base.to_raw() && addr + len as u64 <= m.base.to_raw() + m.data_len)?;
     let image = fs.contents(&meta.path)?;
@@ -154,6 +163,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
             begin_lsn: Lsn::new(SegmentId(2), 64),
             segments: vec![SegmentId(2)],
             tiers,
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the swap dies at its commit point");
@@ -175,6 +185,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert_eq!(
@@ -186,7 +197,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(
-            read_manifested(&fs, &recovered.flush, range.base, len).is_some(),
+            read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some(),
             "manifested range {}..{} readable",
             range.base,
             range.end()
@@ -208,6 +219,7 @@ fn manifest_v2_rename_fail_keeps_old_unit() {
         "exactly the manifested files survive: {survivors:?}"
     );
     assert!(recovered.stats.files_removed > 0, "the window actually created garbage");
+    receipt::verified("manifest_rename_fail", "unit-resolves");
 }
 
 /// `dir_fsync_fail` at the epoch-2 swap's step 6 — the checkpoint ↔
@@ -234,6 +246,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
             begin_lsn: Lsn::new(SegmentId(2), 64),
             segments: vec![SegmentId(2)],
             tiers,
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the barrier after the rename dies");
@@ -254,6 +267,7 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert_eq!(recovered.table.space().life_origin().to_raw(), new_flushed);
@@ -263,8 +277,9 @@ fn manifest_v2_dir_fsync_crash_resolves_new_unit() {
     assert!(recovered.stats.files_removed <= 1, "only a zero-confirmed trailing file may go");
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
+    receipt::verified("dir_fsync_fail", "unit-resolves");
 }
 
 /// `tier_torn_frame` driven end-to-end through MANIFEST v2 — the
@@ -287,7 +302,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
     fault::arm("tier_torn_frame", FaultSpec::Nth(1));
     for i in 0..200u32 {
         let key = format!("torn:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &[0x77; 200], hash).expect("fits");
     }
     loop {
@@ -313,6 +328,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(
@@ -322,7 +338,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
     // The manifested catalog carries exactly the manifested ranges, and
     // every one reads back CRC-clean; the resealed file's footer sits at
     // its manifested length.
-    for (range, meta) in tier.files.iter().zip(recovered.flush.sealed()) {
+    for (range, meta) in tier.files.iter().zip(recovered.replay.sealed()) {
         assert_eq!(meta.id, range.id);
         assert_eq!(meta.data_len, range.durable_len, "catalog carries manifested lengths");
         if meta.reason == SealReason::Recovered {
@@ -332,7 +348,7 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
             assert_eq!(summary.first_bad_frame, None, "every retained frame verifies");
         }
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
     // Recovery of recovery: running it again from the same durable state
     // is a no-op fast path (the reseal is terminal and idempotent).
@@ -344,10 +360,12 @@ fn tier_torn_frame_reseal_from_manifest_v2() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery is idempotent");
     assert_eq!(again.stats.files_resealed, 0, "second boot takes the sealed fast path");
     assert_eq!(again.stats.files_removed, 0);
+    receipt::verified("tier_torn_frame", "reseal-at-watermark");
 }
 
 /// `tier_fsync_err` with a published unit — the fatal class freezes the
@@ -361,7 +379,7 @@ fn tier_fsync_frozen_watermark_bounds_manifest() {
     let frozen = table.space().flushed().to_raw();
     for i in 0..32u32 {
         let key = format!("f:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         table.insert(key.as_bytes(), &[0x55; 200], hash).expect("fits");
     }
     table.seal_slice();
@@ -377,6 +395,7 @@ fn tier_fsync_frozen_watermark_bounds_manifest() {
         section.files.iter().all(|f| f.end() <= frozen),
         "no manifested range outruns the frozen watermark"
     );
+    receipt::verified("tier_fsync_err", "fail-stop");
 }
 
 /// Deletes a fraction of file 0's cold records through the live path
@@ -398,15 +417,16 @@ fn kill_cold_prefix(
             break;
         }
         let key = format!("r:0:{i:04}");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let inf_store::TieredLookup::Cold(addr) = table.lookup(key.as_bytes(), hash, &[]) else {
             continue;
         };
         if addr.to_raw() >= file.base + file.data_len {
             continue;
         }
-        let head = read_manifested(fs, flush, addr.to_raw(), TieredTable::RECORD_HEADER_LEN)
-            .expect("record header readable");
+        let head =
+            read_manifested(fs, flush.sealed(), addr.to_raw(), TieredTable::RECORD_HEADER_LEN)
+                .expect("record header readable");
         let len = TieredTable::record_len_from_header(&head);
         table.delete(hash, addr, len);
         dead += len as u64;
@@ -424,8 +444,8 @@ fn compact_to_idle(fs: &MemFs, table: &mut TieredTable, flush: &TierFlush<MemFs>
     while let CompactionWork::Read { file_id, addr, len } =
         table.compaction_work(flush, false, budget)
     {
-        let chunk =
-            read_manifested(fs, flush, addr.to_raw(), len as usize).expect("scan chunk readable");
+        let chunk = read_manifested(fs, flush.sealed(), addr.to_raw(), len as usize)
+            .expect("scan chunk readable");
         let applied = table.compaction_apply(file_id, addr, &chunk);
         relocated += u64::from(applied.relocated);
         budget = if applied.need > 0 { applied.need } else { PAGE * 2 };
@@ -474,6 +494,7 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, &flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the covering swap dies at its commit point");
@@ -497,16 +518,18 @@ fn s15_covering_swap_abort_serves_from_prior_unit() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
         assert!(
-            read_manifested(&fs, &recovered.flush, range.base, len).is_some(),
+            read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some(),
             "manifested range of file {} reads back",
             range.id
         );
     }
+    receipt::verified("manifest_rename_fail", "serves-from-prior-unit");
 }
 
 /// The sixth window, landed half (`dir_fsync_fail` over the covering
@@ -539,6 +562,7 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
             begin_lsn: Lsn::new(SegmentId(1), 64),
             segments: vec![SegmentId(1)],
             tiers: vec![table.tier_manifest(NS.0, &flush)],
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect_err("the barrier fails after the rename");
@@ -561,14 +585,16 @@ fn s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims() {
         space_config(0),
         demote(),
         256,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(recovered.stats.files_removed >= 1, "boot GC reclaimed the un-named file");
     assert!(fs.contents(&first_path).is_none(), "the orphan's bytes are gone");
     for range in &tier.files {
         let len = usize::try_from(range.durable_len.min(2048)).expect("fits");
-        assert!(read_manifested(&fs, &recovered.flush, range.base, len).is_some());
+        assert!(read_manifested(&fs, recovered.replay.sealed(), range.base, len).is_some());
     }
+    receipt::verified("dir_fsync_fail", "unit-resolves");
 }
 
 /// `tier_unlink_fail` (`reclaim-deferred-nonfatal`): the unlink of a
@@ -608,37 +634,5 @@ fn s15_unlink_failure_is_nonfatal_and_redriven() {
     // Re-drive 2: a crash before any retry — boot GC (the manifest no
     // longer names the file, ADR-0057 D6-1) — is proven by
     // `s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims`.
-}
-
-/// The S15 rows are well-formed and carried here (self-policing).
-#[test]
-fn s15_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    let expects = ["serves-from-prior-unit", "reclaim-deferred-nonfatal"];
-    for expect in expects {
-        assert!(
-            def.rows.iter().any(|r| r.test == "recovery_v2.rs" && r.expect == expect),
-            "the {expect} row is declared"
-        );
-    }
-    assert!(
-        def.rows.iter().any(|r| r.point == "tier_unlink_fail"),
-        "the new fault point has its row"
-    );
-}
-
-/// The S12 rows are well-formed and carried here (self-policing).
-#[test]
-fn s12_rows_are_carried_here() {
-    let def = load_matrix(&Path::new(env!("CARGO_MANIFEST_DIR")).join("m4.toml"));
-    let here: Vec<_> = def.rows.iter().filter(|r| r.test == "recovery_v2.rs").collect();
-    assert!(here.len() >= 3, "the S12 windows have rows");
-    for row in here {
-        assert_eq!(row.tier, "node");
-        assert!(
-            inf_log::fault::ALL.contains(&row.point.as_str()),
-            "row {:?} names a declared point",
-            row.point
-        );
-    }
+    receipt::verified("tier_unlink_fail", "reclaim-deferred-nonfatal");
 }

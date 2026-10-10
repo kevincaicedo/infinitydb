@@ -1,9 +1,10 @@
 //! `CellStore` (M0-S15 substrate, extended by M1-E1/E2): the
 //! single-threaded, cell-local string engine — records in the
 //! [`Arena`](inf_alloc::Arena), addresses in the
-//! [`Index`](crate::index::Index), expiry lazy on read **plus** the M1
-//! hierarchical [`TtlWheel`](crate::wheel) driven by budgeted
-//! [`expire_tick`](CellStore::expire_tick) MAINTAIN slices.
+//! [`Index`](crate::index::Index), expiry lazy on read **plus** the
+//! expiry schedule (the hierarchical wheel and the sweep, ADR-0008 A1)
+//! driven by budgeted [`expire_tick`](CellStore::expire_tick) MAINTAIN
+//! slices.
 //!
 //! Every operation takes `now: Nanos` from the caller — time is injected
 //! (L7), so the store is deterministic and DST-able. Memory accounting is
@@ -18,27 +19,32 @@
 //! pressure is forbidden by the engineering rules.
 
 use inf_alloc::{Arena, ArenaAddr, ArenaConfig};
-use inf_foundation::hash64;
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 
 use crate::doc::{self, DocStore};
 use crate::evict::{self, EvictState, EvictStats, EvictionPolicy, Tracking};
-use crate::index::Index;
+use crate::index::{ChainPos, Index, WalkCursor};
 use crate::record::{
-    HEADER_LEN, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec, RecordView,
-    TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
+    HEADER_LEN, InternalDeadline, MAX_EXPIRE_MS, MAX_KEY_LEN, MAX_VAL_LEN, RecordKind, RecordSpec,
+    RecordView, TypeTag, flags_ref_decrement, flags_ref_saturate, flags_ref_write,
 };
-use crate::wheel::{ArmOutcome, TtlWheel};
+use lifecycle::RecordIndex;
 
-pub use crate::wheel::ExpiryBudget;
+pub use crate::wheel::{ExpiryBudget, WheelNodesMax, WheelNodesMaxError};
 
-/// Stable hash seed: deterministic across runs and cells (L7; DST oracles
-/// rely on reproducible placement).
-pub(crate) const HASH_SEED: u64 = 0x1AF1_D8A5_0DB5_EED1;
+mod lifecycle;
+mod scan;
+
+// ---- shared data definitions (behaviour lives in the child modules) ----------
 
 /// Configuration for [`CellStore::new`].
 #[derive(Copy, Clone, Debug)]
 pub struct StoreConfig {
+    /// The key hash's secret (ADR-0094): injected — a data directory's
+    /// `key-hash.toml`, a simulator's seed, a test's fixed default — and
+    /// the same value on every store of one node. Never a constant.
+    pub hasher: KeyHasher,
     /// Record arena settings (chunk size, resident budget).
     pub arena: ArenaConfig,
     /// Index pre-sizing (entries before the first rehash).
@@ -61,18 +67,19 @@ pub struct StoreConfig {
     /// Repeated-key interning experiment (ADR-0038) — default off, and off
     /// for the M3 release regardless of the A/B (plan §2 cut line).
     pub doc_intern_keys: bool,
-    /// Maximum JSON nesting depth accepted at document ingest (M3-S07;
-    /// RedisJSON-parity default 128). Configurable downward only — the
-    /// format ceiling (`inf_doc::limits::DEPTH_MAX`) clamps it. Per-
-    /// namespace override rides the S11 command surface (the parser is
-    /// constructed with the namespace's resolved limits there).
+    /// Maximum JSON nesting depth of a stored document, at ingest and after
+    /// every path mutation (M3-S07; ADR-0169 D3). Default and ceiling: the
+    /// format's `inf_doc::limits::DEPTH_MAX`, which clamps it — configurable
+    /// downward only. Per-namespace override rides the S11 command surface
+    /// (the parser is constructed with the namespace's resolved limits).
     pub doc_max_depth: usize,
-    /// Maximum document size at ingest (M3-S07), applied to **both** axes
-    /// of the dual bound: input text bytes (reject before the structural
-    /// index allocates) and encoded idoc bytes (incremental during stage 2
-    /// — small-token documents can encode larger than their text). Default
-    /// = the 16 MiB − 1 format ceiling (record `vlen`, u24 skip lengths);
-    /// configurable downward only.
+    /// Maximum document size (M3-S07), applied to both axes of the dual
+    /// bound: input text bytes (reject before the structural index
+    /// allocates) and encoded body bytes (incremental during stage 2 —
+    /// small-token documents can encode larger than their text). The text
+    /// axis defaults to the 16 MiB − 1 format ceiling; the body axis is
+    /// clamped to `limits::DOC_BODY_BYTES_MAX`, what one `DocFull` carries
+    /// (ADR-0169 D2). Configurable downward only.
     pub doc_max_bytes: usize,
     /// Maximum JSONPath text bytes per command (M3-S11; ADR-0040 D6's
     /// `doc_max_path_bytes`). The S10 program cache enforces it before
@@ -83,11 +90,24 @@ pub struct StoreConfig {
     /// key ADR-0040 D6 named): a declared product limit — the
     /// pathological `$..*` mutation otherwise plans unboundedly.
     pub doc_max_path_matches: u32,
+    /// Maximum RESP bytes of one `JSON.*` command's whole reply, framing
+    /// included (ADR-0099 A1): a reply is not bounded by `doc_max_bytes` —
+    /// path repetition, duplicate union members, `$..*` amplification and
+    /// client-supplied `INDENT`/`NEWLINE`/`SPACE` multiply it. The
+    /// default provably admits every single-document reply (worst
+    /// escape amplification is 6 × (16 MiB − 1) + 2 ≈ 100.7 MB) and cuts
+    /// off only amplified shapes; a crossing answers `ERR reply too large`
+    /// before the command's effect.
+    pub doc_max_reply_bytes: usize,
+    /// Wheel nodes this store may hold (ADR-0008 A1 rule 7). Past it a
+    /// record with a deadline is swept instead of scheduled.
+    pub wheel_nodes_max: WheelNodesMax,
 }
 
 impl Default for StoreConfig {
     fn default() -> StoreConfig {
         StoreConfig {
+            hasher: KeyHasher::default(),
             arena: ArenaConfig::default(),
             initial_keys: 0,
             evict_seed: 0,
@@ -99,6 +119,8 @@ impl Default for StoreConfig {
             doc_max_bytes: DOC_MAX_BYTES_DEFAULT,
             doc_max_path_bytes: DOC_MAX_PATH_BYTES_DEFAULT,
             doc_max_path_matches: DOC_MAX_PATH_MATCHES_DEFAULT,
+            doc_max_reply_bytes: DOC_MAX_REPLY_BYTES_DEFAULT,
+            wheel_nodes_max: WheelNodesMax::MAX,
         }
     }
 }
@@ -110,6 +132,13 @@ const DOC_MAX_DEPTH_DEFAULT: usize = 128;
 const DOC_MAX_BYTES_DEFAULT: usize = 0xFF_FFFF;
 const DOC_MAX_PATH_BYTES_DEFAULT: usize = 4096;
 const DOC_MAX_PATH_MATCHES_DEFAULT: u32 = 65_536;
+const DOC_MAX_REPLY_BYTES_DEFAULT: usize = 128 << 20;
+
+// ADR-0099's admissibility proof pinned as arithmetic: the worst
+// single-document reply (every byte a control character, 6-byte
+// `\u00xx` escapes, plus quotes) fits the default reply budget, so
+// only amplified shapes can ever be refused at the default.
+const _: () = assert!(6 * DOC_MAX_BYTES_DEFAULT + 2 < DOC_MAX_REPLY_BYTES_DEFAULT);
 
 #[cfg(feature = "doc")]
 const _: () = {
@@ -144,6 +173,10 @@ pub enum OpError {
     /// updates proceed. Maps to the `DISKFULL` extension error at the
     /// command layer.
     DiskFull(DiskFullCause),
+    /// The index-maintenance bracket refused the mutation before any
+    /// state changed (M4.5-S04, ADR-0072 D7.1) — plan-then-commit
+    /// reservation or the entry-set cap.
+    IndexMaintenance(crate::index_maint::IdxMaintRefusal),
 }
 
 /// Why disk admission refused (ADR-0063 D1) — the error payload carries
@@ -187,6 +220,18 @@ pub enum SetExpire {
     Keep,
     /// Absolute deadline (`SET .. EX/PX/EXAT/PXAT`).
     At(Nanos),
+    /// A deadline before the clock's origin ([`InternalDeadline`]): the
+    /// write removes the key and stores nothing.
+    BeforeOrigin,
+}
+
+impl From<InternalDeadline> for SetExpire {
+    fn from(deadline: InternalDeadline) -> SetExpire {
+        match deadline {
+            InternalDeadline::At(at) => SetExpire::At(at),
+            InternalDeadline::BeforeOrigin => SetExpire::BeforeOrigin,
+        }
+    }
 }
 
 /// Options for [`CellStore::set`].
@@ -270,6 +315,18 @@ pub enum TtlUpdate {
     Persist,
     /// `GETEX .. EX/PX/EXAT/PXAT` absolute deadline.
     At(Nanos),
+    /// A deadline before the clock's origin ([`InternalDeadline`]): the
+    /// read answers, then the key is deleted.
+    BeforeOrigin,
+}
+
+impl From<InternalDeadline> for TtlUpdate {
+    fn from(deadline: InternalDeadline) -> TtlUpdate {
+        match deadline {
+            InternalDeadline::At(at) => TtlUpdate::At(at),
+            InternalDeadline::BeforeOrigin => TtlUpdate::BeforeOrigin,
+        }
+    }
 }
 
 /// `OBJECT ENCODING` answer for string records (M1-S02). Derived from the
@@ -315,16 +372,127 @@ pub enum CopyResult {
 /// it while foreground latency stays protected.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct ExpiryStats {
-    /// Records actually reaped by this slice.
+    /// Nodes the wheel fired this slice — the unit of `max_fires`. A fire
+    /// is one group walk (ADR-0139 D9's bounds) and at most
+    /// `IDX_ALIAS_GROUP_MAX` reaps, whatever its answer (ADR-0008 A1 rule
+    /// 5). [`fires_charged`](Self::fires_charged) is what a slice spends.
+    pub fired: u64,
+    /// Records the wheel's fires reaped this slice.
     pub reaped: u64,
-    /// Wheel entries that no longer matched a live expired record.
+    /// Fires that found no member of their key hash (ADR-0008 A1 O1: 0).
     pub stale: u64,
     /// Cursor work performed (ms steps + fast-forward jumps).
     pub steps: u32,
     /// Backlog: milliseconds the wheel still trails `now` (0 = caught up).
     pub lag_ms: u64,
-    /// Live wheel entries after the slice.
+    /// Live wheel nodes after the slice — one per scheduled key hash,
+    /// tombstones excluded (per store; summed by the keyspace fold).
     pub armed: u64,
+    /// Fires that re-filed their node at a later deadline (rule 5).
+    pub refiled: u64,
+    /// Records the expiry sweep reaped this slice (rule 6).
+    pub swept: u64,
+    /// Index slots the expiry sweep walked this slice.
+    pub sweep_slots: u32,
+    /// Where the sweep stands after the slice.
+    pub sweep: SweepState,
+    /// Why the sweep stopped this slice (the keyspace rotation parks its
+    /// hand at the first store whose sweep an earlier store's slots
+    /// withheld).
+    pub sweep_stop: SweepStop,
+    /// Tombstone nodes still linked after the slice (rule 4).
+    pub tombstones: u64,
+}
+
+impl ExpiryStats {
+    /// What the slice spent of its fire budget, in the unit the store's
+    /// own wheel and sweep budget: its fires, whatever each reaped, and
+    /// its sweep reaps (ADR-0008 A1 rule 5). The one charge the keyspace
+    /// rotation and the cell's Maintenance class both read.
+    #[must_use]
+    pub fn fires_charged(&self) -> u64 {
+        self.fired + self.swept
+    }
+}
+
+/// The expiry sweep's standing (ADR-0008 A1 rule 6). `Idle` means no
+/// event owes a pass, so every record with a deadline has a wheel node.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SweepState {
+    #[default]
+    Idle,
+    /// A pass is owed: under way since `pass_began_ms`, or (`None`) begins
+    /// at the next slice. `completed_pass_began_ms` is when the last pass
+    /// that vouches for every record began, since the sweep left `Idle`:
+    /// one no index rebuild voided and no owed event but its own refusals
+    /// dirtied. A write refused while a pass walks may sit behind its
+    /// cursor, so that pass completes nothing here.
+    Walking { pass_began_ms: Option<u64>, completed_pass_began_ms: Option<u64> },
+}
+
+impl SweepState {
+    /// The sweep owes nothing a drain frozen at `t_ms` must wait for:
+    /// idle, or its last vouching pass began at or after `t_ms` (it
+    /// visited every record present when it ended).
+    #[must_use]
+    pub fn settled_since(self, t_ms: u64) -> bool {
+        match self {
+            SweepState::Idle => true,
+            SweepState::Walking { completed_pass_began_ms, .. } => {
+                completed_pass_began_ms.is_some_and(|began| began >= t_ms)
+            }
+        }
+    }
+
+    /// The keyspace fold: the least-settled store decides.
+    #[must_use]
+    pub fn fold(self, other: SweepState) -> SweepState {
+        match (self, other) {
+            (SweepState::Idle, other) | (other, SweepState::Idle) => other,
+            (
+                SweepState::Walking { pass_began_ms: a, completed_pass_began_ms: x },
+                SweepState::Walking { pass_began_ms: b, completed_pass_began_ms: y },
+            ) => SweepState::Walking { pass_began_ms: a.min(b), completed_pass_began_ms: x.min(y) },
+        }
+    }
+}
+
+/// What the O(N) schedule audit found (test-support; ADR-0008 A1).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryAudit {
+    /// Live wheel nodes (membership entries).
+    pub armed: u64,
+    /// Tombstone nodes still linked.
+    pub tombstones: u64,
+    /// The most tombstones linked in one wheel list: at most 1 until a
+    /// tick drains or cascades a list (rule 4's per-list-epoch premise).
+    pub list_tombstones_max: u64,
+    /// Records with a deadline (the census).
+    pub ttl_live: u64,
+    /// Membership entries whose node no slot list reaches (O1).
+    pub orphans: u64,
+    /// The sweep owed nothing when the audit ran: the two record checks
+    /// below ran (a walking sweep owes its records a visit, so they are
+    /// idle-scoped and read 0 otherwise).
+    pub sweep_idle: bool,
+    /// Records with a deadline whose hash has no node (I7).
+    pub unscheduled: u64,
+    /// Records with a deadline whose hash's node files after it + 1 (I4).
+    pub late: u64,
+}
+
+/// Why one slice's sweep stopped.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SweepStop {
+    /// Nothing was owed.
+    #[default]
+    NotOwed,
+    /// A pass ended: a slice stops at a pass boundary.
+    PassEnd,
+    /// The sweep-slot or fire budget ran out mid-pass (or before it
+    /// began); the pass resumes at its next slot on a later slice.
+    Budget,
 }
 
 /// Always-on store counters (feeds `INFO stats`/`keyspace` and the M1
@@ -337,14 +505,37 @@ pub struct StoreStats {
     pub expired_lazy: u64,
     /// Reaped by wheel slices.
     pub expired_active: u64,
-    /// Live records currently carrying a TTL (`INFO keyspace` `expires=`).
+    /// Live records currently carrying a TTL (`INFO keyspace` `expires=`) —
+    /// a gauge the expiry schedule owns, filled in by `CellStore::stats`.
     pub ttl_live: u64,
-    /// Wheel entries that fired without a matching expired record.
+    /// Fires whose key hash had no member left (ADR-0008 A1 O1: a node is
+    /// removed with its group's last deadline, so this stays 0).
     pub wheel_stale: u64,
-    /// TTL writes that could not arm the wheel (pool cap) — lazy-only keys.
+    /// Placements refused at the node budget or a refused growth — the
+    /// record is swept (ADR-0008 A1 rule 3).
     pub wheel_fallback: u64,
+    /// Reaped by the expiry sweep (also counted in `expired_active`).
+    pub expired_swept: u64,
+    /// Fires that re-filed their node at a later deadline.
+    pub wheel_refiled: u64,
+    /// Sweep passes an index rebuild voided (ADR-0008 A1 rule 6).
+    pub sweep_passes_voided: u64,
+    /// Alias enumerations the schedule could not finish (ADR-0139 D9
+    /// `Over`): the node was released and the sweep owed.
+    pub expiry_alias_over: u64,
+    /// Tombstone wheel nodes currently linked (a gauge, like `ttl_live`).
+    pub wheel_tombstones: u64,
     /// Records evicted under memory pressure (M1-S06; `INFO evicted_keys`).
     pub evicted_keys: u64,
+    /// Stop-and-copy index grows (M4.5-S40 stall attribution): each one
+    /// re-places every live key on the foreground path — a deterministic
+    /// latency step at every capacity doubling (`INFO index_grows`).
+    pub index_grows: u64,
+    /// Scalar patches the ADR-0043 in-place lane applied (a changed number
+    /// or boolean; replay included). The JSON reply oracle's fast-versus-
+    /// general witness (ADR-0099 A1): it moves by one on a fast command and
+    /// not at all on a general-path one.
+    pub json_scalar_patches_in_place: u64,
 }
 
 /// Frozen memory attribution domains (tripwire names, M0 §3.2; document
@@ -358,7 +549,13 @@ pub struct MemoryReport {
     pub records_slack_bytes: u64,
     pub records_resident_bytes: u64,
     pub index_bytes: u64,
+    /// Wheel resident bytes: pool capacity at 16 B per node, membership
+    /// capacity and the fixed tables (the RSS-side attribution).
     pub wheel_bytes: u64,
+    /// Wheel bytes in use: nodes in use (live + tombstones) at 16 B,
+    /// membership capacity and the fixed tables — the pressure
+    /// comparable's wheel term (ADR-0008 A1 rule 7). ≤ `wheel_bytes`.
+    pub wheel_live_bytes: u64,
     /// Eviction-engine footprint: the 8 KiB CMS while an LFU policy is
     /// selected, 0 otherwise (M1-S06 L5 domain).
     pub evict_bytes: u64,
@@ -373,11 +570,20 @@ pub struct MemoryReport {
     /// Unused tree capacity within `doc_arena_bytes` (diagnostic overlay).
     pub doc_slack_bytes: u64,
     /// Retained parser/ingest/freeze/effect scratch owned by this report's
-    /// store or cell. `CellStore::report` contributes store-local scratch;
-    /// the command plane adds its one-per-cell buffers.
+    /// store or cell, plus the index-maintenance bracket scratch (bounded
+    /// in retention — ADR-0076 A1). `CellStore::report` contributes
+    /// store-local scratch; the command plane adds its one-per-cell
+    /// buffers.
     pub doc_scratch_bytes: u64,
     /// One bounded path-program cache per cell; zero in a store-only report.
     pub doc_path_cache_bytes: u64,
+    /// Index-tree reserved bytes (M4.5-S03 L5 domain, ADR-0075 D6). The
+    /// registry is keyspace-owned, so a store-only report holds zero;
+    /// [`Keyspace::report`](crate::Keyspace::report) folds it in.
+    pub idx_tree_bytes: u64,
+    /// Slack inside `idx_tree_bytes` (diagnostic overlay, like
+    /// `doc_slack_bytes` — never double-counted against RSS).
+    pub idx_slack_bytes: u64,
     pub live_records: u64,
     pub docs_live: u64,
 }
@@ -394,6 +600,7 @@ impl MemoryReport {
             + self.doc_resident_bytes
             + self.doc_scratch_bytes
             + self.doc_path_cache_bytes
+            + self.idx_tree_bytes
     }
 }
 
@@ -401,34 +608,37 @@ impl MemoryReport {
 /// `!Send` arena); all time is injected.
 pub struct CellStore {
     pub(crate) arena: Arena,
-    pub(crate) index: Index,
-    wheel: TtlWheel,
+    /// The record table and its expiry schedule, mutated only through the
+    /// `lifecycle` choke points (ADR-0008 A1 I2, I9).
+    pub(crate) index: RecordIndex,
     pub(crate) stats: StoreStats,
     pub(crate) evict: EvictState,
     /// Document arena + domain counters (ADR-0037; no-op without `doc`).
     pub(crate) docs: DocStore,
+    /// Index attach block (M4.5-S04, ADR-0076 D1): this namespace's live
+    /// indexes and their trees, synced from the registry at DDL
+    /// transitions. A zero-index store pays one cached branch; slim
+    /// builds get the folded-away stub.
+    pub(crate) idx: crate::index_maint::CellIndexes,
     pub(crate) cfg: StoreConfig,
 }
 
 impl CellStore {
-    pub fn new(cfg: StoreConfig) -> CellStore {
-        let evict = EvictState { rng: cfg.evict_seed, ..EvictState::default() };
-        CellStore {
-            arena: Arena::new(cfg.arena),
-            index: Index::with_capacity(cfg.initial_keys.max(64)),
-            // Cursor 0: the first tick fast-forwards to `now` (empty wheel).
-            wheel: TtlWheel::new(0),
-            stats: StoreStats::default(),
-            evict,
-            docs: DocStore::new(&cfg),
-            cfg,
-        }
+    /// The key hash under this store's secret (ADR-0094) — also what the
+    /// batch pipeline computes up front, from the same [`KeyHasher`] the
+    /// plane carries. An instance method: a hash is meaningful only to
+    /// the store whose hasher computed it.
+    #[inline]
+    #[must_use]
+    pub fn hash_key(&self, key: &[u8]) -> u64 {
+        self.cfg.hasher.hash(key)
     }
 
-    /// Stable key hash — also what the batch pipeline computes up front.
+    /// This store's key hasher (the plane copies it at construction).
     #[inline]
-    pub fn hash_key(key: &[u8]) -> u64 {
-        hash64(key, HASH_SEED)
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.cfg.hasher
     }
 
     /// Prefetch the index probe path for a pre-hashed key (PARSE→hash→
@@ -476,54 +686,71 @@ impl CellStore {
         self.index.len() == 0
     }
 
-    /// Always-on counters snapshot.
+    /// Always-on counters snapshot. The gauges (`ttl_live`,
+    /// `wheel_tombstones`) are read from the expiry schedule, which owns
+    /// them; the counters are this store's lifetime tallies.
     #[inline]
     pub fn stats(&self) -> StoreStats {
-        self.stats
+        StoreStats {
+            ttl_live: self.index.schedule().ttl_live(),
+            wheel_tombstones: self.index.schedule().tombstones(),
+            ..self.stats
+        }
     }
 
-    /// `CONFIG RESETSTAT`: zero the lifetime counters; the live-state census
-    /// (`ttl_live`) is structural and survives.
+    /// `CONFIG RESETSTAT`: zero the lifetime counters; the gauges are
+    /// structural and survive (the schedule owns them).
     pub fn reset_stats(&mut self) {
-        let ttl_live = self.stats.ttl_live;
-        self.stats = StoreStats { ttl_live, ..StoreStats::default() };
+        self.stats = StoreStats::default();
     }
 
     /// Byte-exact attribution snapshot (L5).
     pub fn report(&self) -> MemoryReport {
         let arena = self.arena.report();
         let docs = self.docs.report();
+        let idx = self.idx.memory();
         MemoryReport {
             records_live_bytes: arena.live_bytes,
             records_slack_bytes: arena.slack_bytes,
             records_resident_bytes: arena.resident_bytes,
             index_bytes: self.index.memory_bytes() as u64,
-            wheel_bytes: (self.wheel.pool_bytes() + self.wheel.table_bytes()) as u64,
+            wheel_bytes: self.index.schedule().resident_bytes(),
+            wheel_live_bytes: self.index.schedule().live_bytes(),
             evict_bytes: self.evict.bytes() as u64,
             doc_tape_bytes: docs.domain.tape_bytes,
             doc_arena_bytes: docs.domain.arena_bytes,
             doc_resident_bytes: docs.resident_bytes,
             doc_intern_bytes: docs.domain.intern_bytes,
             doc_slack_bytes: docs.domain.slack_bytes,
-            doc_scratch_bytes: docs.scratch_bytes,
+            // The index-maintenance bracket scratch rides the same
+            // retained-scratch domain (ADR-0076 A1: bounded, attributed).
+            doc_scratch_bytes: docs.scratch_bytes + self.idx.scratch_bytes(),
             doc_path_cache_bytes: 0,
+            idx_tree_bytes: idx.idx_tree_bytes,
+            idx_slack_bytes: idx.idx_slack_bytes,
             live_records: arena.live_allocs,
             docs_live: docs.domain.docs_live,
         }
+    }
+
+    /// L5 fold of this store's attached index trees (M4.5-S04, ADR-0076
+    /// D1 — the S03 `idx_*` domains, source moved with tree custody).
+    pub fn idx_memory(&self) -> crate::index_registry::IndexMemory {
+        self.idx.memory()
     }
 
     // ---- reads (expire-on-read makes them `&mut`) ----
 
     /// `GET`.
     pub fn get(&mut self, key: &[u8], now: Nanos) -> Option<&[u8]> {
-        self.get_with_hash(key, Self::hash_key(key), now)
+        self.get_with_hash(key, self.hash_key(key), now)
     }
 
     /// `GET` with a precomputed hash — the batch pipeline path: EXECUTE
     /// hashes and [`prefetch`](Self::prefetch)es a whole parse batch first,
     /// then executes with the hashes it already has (L3/L4).
     pub fn get_with_hash(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<&[u8]> {
-        debug_assert_eq!(hash, Self::hash_key(key));
+        debug_assert_eq!(hash, self.hash_key(key));
         let Some((addr, len)) = self.resolve_hashed(key, hash, now) else {
             self.stats.keyspace_misses += 1;
             return None;
@@ -554,7 +781,18 @@ impl CellStore {
     /// (probe-length histogram artifact, M0-S14 AC).
     pub fn probe_groups(&self, key: &[u8]) -> usize {
         let arena = &self.arena;
-        self.index.probe_groups(Self::hash_key(key), |addr| record_at(arena, addr).key() == key)
+        self.index.probe_groups(self.hash_key(key), |addr| record_at(arena, addr).key() == key)
+    }
+
+    /// Internal string read without client hit/miss accounting (ADR-0110).
+    /// Type checks, access tracking and expire-on-read match `get_str`.
+    pub fn peek_str(&mut self, key: &[u8], now: Nanos) -> Result<Option<&[u8]>, OpError> {
+        let Some((addr, len)) = self.resolve(key, now) else { return Ok(None) };
+        let view = RecordView::new(self.arena.bytes(addr, len));
+        if view.type_tag() != TypeTag::String {
+            return Err(OpError::WrongType);
+        }
+        Ok(Some(view.value()))
     }
 
     /// Batched `GET` — the full §7.3 pipeline. Per 32-key chunk:
@@ -579,7 +817,7 @@ impl CellStore {
         for (chunk_at, chunk) in keys.chunks(CHUNK).enumerate() {
             let base = chunk_at * CHUNK;
             for (i, key) in chunk.iter().enumerate() {
-                hashes[i] = Self::hash_key(key);
+                hashes[i] = self.hash_key(key);
                 self.index.prefetch(hashes[i]);
             }
             for (i, _) in chunk.iter().enumerate() {
@@ -632,19 +870,23 @@ impl CellStore {
                     }
                 };
                 debug_assert!(exact_path);
-                match self.resolve_hashed(key, hashes[i], now) {
-                    Some((addr, len)) => {
+                match self.lookup_hashed(key, hashes[i], now) {
+                    Lookup::Live(addr, len) => {
                         let view = RecordView::new(self.arena.bytes(addr, len));
                         self.stats.keyspace_hits += 1;
                         let value = (view.type_tag() == TypeTag::String).then(|| view.value());
                         out(base + i, value);
                     }
-                    None => {
-                        // The exact path may itself have reaped an expired
-                        // record; invalidate matching later candidates.
-                        if let Some(addr) = candidates[i] {
-                            mark_stale(&mut redo, &candidates, i, addr);
-                        }
+                    Lookup::Reaped(addr) => {
+                        // The exact path reaped this key's own record — not
+                        // `candidates[i]`, which was a fingerprint false
+                        // positive on another key (F-L05-04). A later slot
+                        // whose candidate is the freed address must redo.
+                        mark_stale(&mut redo, &candidates, i, addr);
+                        self.stats.keyspace_misses += 1;
+                        out(base + i, None);
+                    }
+                    Lookup::Absent => {
                         self.stats.keyspace_misses += 1;
                         out(base + i, None);
                     }
@@ -738,6 +980,12 @@ impl CellStore {
         }
         let value = view.value();
         let n = value.len() as i64;
+        // Redis `getrangeCommand`: a wholly-negative inverted range is
+        // empty *before* any clamping (review of 2026-08-30, F-L00-06 —
+        // the clamp-then-compare form returned data for it).
+        if start < 0 && end < 0 && start > end {
+            return Ok(b"");
+        }
         let from = if start < 0 { (n + start).max(0) } else { start };
         let to = if end < 0 { (n + end).max(0) } else { end }.min(n - 1);
         if n == 0 || from > to || from >= n {
@@ -797,6 +1045,14 @@ impl CellStore {
             SetExpire::Clear => None,
             SetExpire::Keep => old_deadline,
             SetExpire::At(at) => Some((at.0 / 1_000_000).min(MAX_EXPIRE_MS)),
+            // Expired at every reading of the clock (ADR-0111 A1): no
+            // record could ever serve it, so the overwrite is a delete.
+            SetExpire::BeforeOrigin => {
+                if let Some((addr, len)) = existing {
+                    self.free_record(self.hash_key(key), addr, len);
+                }
+                return Ok(SetOutcome::Applied { old: old_value });
+            }
         };
         let spec = RecordSpec {
             key,
@@ -806,12 +1062,6 @@ impl CellStore {
             kind: RecordKind::String { raw: false },
         };
         self.write_record(key, existing, spec)?;
-        self.note_ttl(old_deadline.is_some(), expire_at_ms.is_some());
-        if let Some(ms) = expire_at_ms
-            && old_deadline != Some(ms)
-        {
-            self.arm_wheel(Self::hash_key(key), ms);
-        }
         Ok(SetOutcome::Applied { old: old_value })
     }
 
@@ -819,9 +1069,7 @@ impl CellStore {
     pub fn del(&mut self, key: &[u8], now: Nanos) -> bool {
         match self.resolve(key, now) {
             Some((addr, len)) => {
-                let had_ttl = RecordView::new(self.arena.bytes(addr, len)).expire_at_ms().is_some();
-                self.free_record(Self::hash_key(key), addr, len);
-                self.note_ttl(had_ttl, false);
+                self.free_record(self.hash_key(key), addr, len);
                 true
             }
             None => false,
@@ -838,9 +1086,7 @@ impl CellStore {
             return None;
         }
         let value = view.value().to_vec();
-        let had_ttl = view.expire_at_ms().is_some();
-        self.free_record(Self::hash_key(key), addr, len);
-        self.note_ttl(had_ttl, false);
+        self.free_record(self.hash_key(key), addr, len);
         Some(value)
     }
 
@@ -853,7 +1099,7 @@ impl CellStore {
     /// An expired-but-unreaped key reads as absent — correct for emission:
     /// its deadline already passed, so the post-image is "gone".
     pub fn post_image(&self, key: &[u8], now: Nanos) -> Option<PostImage<'_>> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let view = record_at(arena, addr);
@@ -875,7 +1121,7 @@ impl CellStore {
     /// Exact canonical value bytes a full durable image would carry,
     /// resolved once and without access tracking. Used only for admission.
     pub fn log_image_bytes(&self, key: &[u8], now: Nanos) -> Option<usize> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let view = record_at(arena, addr);
@@ -903,7 +1149,7 @@ impl CellStore {
     /// Resolve and materialize the post-command full image once. Document
     /// cadence resets as part of consuming this image for the log.
     pub fn log_full_image(&mut self, key: &[u8], now: Nanos) -> Option<LogFullImage<'_>> {
-        let hash = Self::hash_key(key);
+        let hash = self.hash_key(key);
         let arena = &self.arena;
         let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
         let (_encoded_len, kind, expired) = {
@@ -955,7 +1201,7 @@ impl CellStore {
 
     /// Replay TTL arm at an absolute internal deadline. Absent keys are a
     /// no-op (idempotent re-apply of a delete-then-expire suffix).
-    pub fn replay_expire_at(&mut self, key: &[u8], at: Nanos, now: Nanos) {
+    pub fn replay_expire_at(&mut self, key: &[u8], at: InternalDeadline, now: Nanos) {
         let _ = self.expire(key, Some(at), ExpireCond::Always, now);
     }
 
@@ -982,7 +1228,10 @@ impl CellStore {
                 self.expire(key, None, ExpireCond::Always, now);
             }
             TtlUpdate::At(at) => {
-                self.expire(key, Some(at), ExpireCond::Always, now);
+                self.expire(key, Some(InternalDeadline::At(at)), ExpireCond::Always, now);
+            }
+            TtlUpdate::BeforeOrigin => {
+                self.expire(key, Some(InternalDeadline::BeforeOrigin), ExpireCond::Always, now);
             }
         }
         Some(value)
@@ -990,6 +1239,9 @@ impl CellStore {
 
     /// `INCR`/`DECR`/`INCRBY`/`DECRBY` (delta may be negative).
     pub fn incr_by(&mut self, key: &[u8], delta: i64, now: Nanos) -> Result<i64, OpError> {
+        // Typed refusal before the record writer's panic bound: a 256-byte
+        // key here is a client error, never a node-wide fail-stop.
+        check_bounds(key, &[])?;
         let existing = self.resolve(key, now);
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
@@ -1022,6 +1274,8 @@ impl CellStore {
         delta: f64,
         now: Nanos,
     ) -> Result<Vec<u8>, OpError> {
+        // Same C3 bound as `incr_by`: refuse, never panic the cell.
+        check_bounds(key, &[])?;
         let existing = self.resolve(key, now);
         let (current, version, expire_at_ms) = match existing {
             Some((addr, len)) => {
@@ -1135,22 +1389,23 @@ impl CellStore {
     /// the value bytes move verbatim and the source record frees without a
     /// payload release (ADR-0037 D3) — the one deliberate `free_record`
     /// bypass in the store.
-    pub fn rename(&mut self, src: &[u8], dst: &[u8], now: Nanos) -> Result<bool, OpError> {
-        if src == dst {
-            return Ok(self.exists(src, now));
+    pub fn rename(&mut self, source: &[u8], target: &[u8], now: Nanos) -> Result<bool, OpError> {
+        if source == target {
+            return Ok(self.exists(source, now));
         }
-        let Some((src_addr, src_len)) = self.resolve(src, now) else {
+        let Some((source_addr, source_len)) = self.resolve(source, now) else {
             return Ok(false);
         };
-        let view = RecordView::new(self.arena.bytes(src_addr, src_len));
+        let view = RecordView::new(self.arena.bytes(source_addr, source_len));
         let value = view.value().to_vec();
         #[cfg(feature = "doc")]
         let mut value = value;
         let deadline = view.expire_at_ms();
         let kind = view.kind();
-        check_bounds(dst, &value)?;
-        let dst_existing = self.resolve(dst, now);
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        check_bounds(target, &value)?;
+        let target_existing = self.resolve(target, now);
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         #[cfg(feature = "doc")]
         if matches!(kind, RecordKind::JsonDoc) {
@@ -1159,21 +1414,13 @@ impl CellStore {
                 .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
             doc::write_lineage(&mut value, lineage);
         }
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
-        let spec = RecordSpec { key: dst, value: &value, version, expire_at_ms: deadline, kind };
+        let spec = RecordSpec { key: target, value: &value, version, expire_at_ms: deadline, kind };
         // Releasing: the DESTINATION's old payload dies; the carried source
         // handle inside `value` is untouched by the release.
-        self.write_record_releasing(dst, dst_existing, spec)?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
-        // Source removal: the dst write never moves the src record, and the
-        // payload now belongs to dst — no release.
-        let src_had_ttl = deadline.is_some();
-        self.index.remove(Self::hash_key(src), src_addr);
-        self.arena.free(src_addr, src_len);
-        self.note_ttl(src_had_ttl, false);
-        if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
-        }
+        self.write_record_releasing(target, target_existing, spec)?;
+        // Source removal: the target write never moves the source record, and the
+        // payload now belongs to target — no release.
+        self.remove_renamed_source(self.hash_key(source), source_addr, source_len);
         Ok(true)
     }
 
@@ -1182,44 +1429,73 @@ impl CellStore {
     /// destination (ADR-0037 D3) — handles are never duplicated.
     pub fn copy(
         &mut self,
-        src: &[u8],
-        dst: &[u8],
+        source: &[u8],
+        target: &[u8],
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        let Some((src_addr, src_len)) = self.resolve(src, now) else {
+        let Some((source_addr, source_len)) = self.resolve(source, now) else {
             return Ok(CopyResult::SourceMissing);
         };
-        let view = RecordView::new(self.arena.bytes(src_addr, src_len));
+        // COPY is excluded from the plane brackets (ADR-0139 D3): the
+        // destination may live in another database, so the mini-bracket
+        // runs here, where the owning store is unambiguous. The peek
+        // mutates nothing — `source_addr` stays valid across it. The
+        // bracket commits on **every** outcome: the body resolves its
+        // target inside it and may reap an expired indexed target, whose
+        // entries leave through the diff; an unchanged target evaluates
+        // to `new = old`, a no-op.
+        #[cfg(feature = "doc")]
+        {
+            self.idx_bracket_begin(&[target], None).map_err(OpError::IndexMaintenance)?;
+            let result = self.copy_from_resolved(source_addr, source_len, target, replace, now);
+            #[cfg(inf_canary_copy_abort_after_death)]
+            if !matches!(result, Ok(CopyResult::Copied)) {
+                self.idx_bracket_abort_canary();
+            }
+            self.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
+            result
+        }
+        #[cfg(not(feature = "doc"))]
+        self.copy_from_resolved(source_addr, source_len, target, replace, now)
+    }
+
+    /// The COPY body past source resolution (split out for the S04
+    /// mini-bracket above).
+    fn copy_from_resolved(
+        &mut self,
+        source_addr: ArenaAddr,
+        source_len: usize,
+        target: &[u8],
+        replace: bool,
+        now: Nanos,
+    ) -> Result<CopyResult, OpError> {
+        let view = RecordView::new(self.arena.bytes(source_addr, source_len));
         #[cfg(feature = "doc")]
         if view.type_tag() == TypeTag::JsonDoc {
             let deadline = view.expire_at_ms();
             let plain = self.frozen_bytes_of(view)?;
-            return self.copy_doc_to(dst, &plain, deadline, replace, now);
+            return self.copy_doc_to(target, &plain, deadline, replace, now);
         }
         let value = view.value().to_vec();
         let deadline = view.expire_at_ms();
         let raw = view.is_raw();
-        check_bounds(dst, &value)?;
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        check_bounds(target, &value)?;
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
-            key: dst,
+            key: target,
             value: &value,
             version,
             expire_at_ms: deadline,
             kind: RecordKind::String { raw },
         };
-        self.write_record(dst, dst_existing, spec)?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
-        if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
-        }
+        self.write_record(target, target_existing, spec)?;
         Ok(CopyResult::Copied)
     }
 
@@ -1228,29 +1504,32 @@ impl CellStore {
     #[cfg(feature = "doc")]
     fn copy_doc_to(
         &mut self,
-        dst: &[u8],
+        target: &[u8],
         plain: &[u8],
         deadline: Option<u64>,
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        if dst.len() > MAX_KEY_LEN {
+        if target.len() > MAX_KEY_LEN {
             return Err(OpError::TooLarge);
         }
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        // The frozen source is store-owned, yet the sink takes only a
+        // receipt: one more O(document) walk per document COPY (ADR-0169 D5).
+        let plain = inf_doc::CanonicalDoc::validate(plain).map_err(doc::op_from_doc)?;
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
         let lineage = dst_old
             .filter(|view| view.type_tag() == TypeTag::JsonDoc)
             .map_or_else(|| self.docs.allocate_lineage(), doc::lineage_of_record);
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         self.json_write_value(
-            dst,
-            dst_existing,
-            plain,
+            target,
+            target_existing,
+            &plain,
             doc::DocWriteMeta {
                 lineage,
                 version,
@@ -1258,10 +1537,6 @@ impl CellStore {
                 cadence: doc::DocCadence::default(),
             },
         )?;
-        self.note_ttl(dst_had_ttl, deadline.is_some());
-        if let Some(ms) = deadline {
-            self.arm_wheel(Self::hash_key(dst), ms);
-        }
         Ok(CopyResult::Copied)
     }
 
@@ -1290,59 +1565,64 @@ impl CellStore {
     /// with the source already materialized from another db.
     pub(crate) fn copy_in(
         &mut self,
-        dst: &[u8],
+        target: &[u8],
         rec: &ExportedRecord,
         replace: bool,
         now: Nanos,
     ) -> Result<CopyResult, OpError> {
-        check_bounds(dst, &rec.value)?;
+        check_bounds(target, &rec.value)?;
         #[cfg(feature = "doc")]
         if rec.kind == RecordKind::JsonDoc {
             // Exported documents carry canonical tape bytes; re-tier here.
-            return self.copy_doc_to(dst, &rec.value, rec.expire_at_ms, replace, now);
+            return self.copy_doc_to(target, &rec.value, rec.expire_at_ms, replace, now);
         }
-        let dst_existing = self.resolve(dst, now);
-        if dst_existing.is_some() && !replace {
+        let target_existing = self.resolve(target, now);
+        if target_existing.is_some() && !replace {
             return Ok(CopyResult::DestinationExists);
         }
-        let dst_old = dst_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
+        let dst_old =
+            target_existing.map(|(addr, len)| RecordView::new(self.arena.bytes(addr, len)));
         let version = dst_old.map_or(1, |v| v.version().wrapping_add(1));
-        let dst_had_ttl = dst_old.and_then(|v| v.expire_at_ms()).is_some();
         let spec = RecordSpec {
-            key: dst,
+            key: target,
             value: &rec.value,
             version,
             expire_at_ms: rec.expire_at_ms,
             kind: rec.kind,
         };
-        self.write_record(dst, dst_existing, spec)?;
-        self.note_ttl(dst_had_ttl, rec.expire_at_ms.is_some());
-        if let Some(ms) = rec.expire_at_ms {
-            self.arm_wheel(Self::hash_key(dst), ms);
-        }
+        self.write_record(target, target_existing, spec)?;
         Ok(CopyResult::Copied)
     }
 
     /// `EXPIRE`/`PEXPIRE`/`PERSIST` (`at: None` removes the TTL). True if
     /// the deadline was applied/removed.
-    pub fn expire(&mut self, key: &[u8], at: Option<Nanos>, cond: ExpireCond, now: Nanos) -> bool {
+    pub fn expire(
+        &mut self,
+        key: &[u8],
+        at: Option<InternalDeadline>,
+        cond: ExpireCond,
+        now: Nanos,
+    ) -> bool {
         let Some((addr, len)) = self.resolve(key, now) else { return false };
         let view = RecordView::new(self.arena.bytes(addr, len));
         let current = view.expire_at_ms();
-        let new_ms = at.map(|n| (n.0 / 1_000_000).min(MAX_EXPIRE_MS));
+        let ms_of = |at: Nanos| (at.0 / 1_000_000).min(MAX_EXPIRE_MS);
         let applies = match cond {
             ExpireCond::Always => true,
             ExpireCond::IfNoExpiry => current.is_none(),
             ExpireCond::IfHasExpiry => current.is_some(),
             // GT/LT: a missing current TTL counts as infinite (Redis rules):
-            // GT never beats infinity; LT always does.
-            ExpireCond::IfGreater => match (new_ms, current) {
-                (Some(new), Some(cur)) => new > cur,
+            // GT never beats infinity; LT always does. A deadline before
+            // the clock's origin is below every current one.
+            ExpireCond::IfGreater => match (at, current) {
+                (Some(InternalDeadline::At(new)), Some(cur)) => ms_of(new) > cur,
+                (Some(InternalDeadline::BeforeOrigin), Some(_)) => false,
                 (Some(_), None) => false,
                 (None, _) => false, // PERSIST with GT/LT is a command error upstream
             },
-            ExpireCond::IfLess => match (new_ms, current) {
-                (Some(new), Some(cur)) => new < cur,
+            ExpireCond::IfLess => match (at, current) {
+                (Some(InternalDeadline::At(new)), Some(cur)) => ms_of(new) < cur,
+                (Some(InternalDeadline::BeforeOrigin), Some(_)) => true,
                 (Some(_), None) => true,
                 (None, _) => false,
             },
@@ -1351,14 +1631,16 @@ impl CellStore {
             return false;
         }
         // EXPIRE with a deadline at/before `now` deletes the key (Redis
-        // semantics) and still reports success.
-        if let Some(ms) = new_ms
-            && ms <= now.0 / 1_000_000
-        {
-            self.free_record(Self::hash_key(key), addr, len);
-            self.note_ttl(current.is_some(), false);
-            return true;
-        }
+        // `checkAlreadyExpired`) and still reports success; a deadline
+        // before the clock's origin is before every `now`.
+        let new_ms = match at {
+            None => None,
+            Some(InternalDeadline::At(at)) if ms_of(at) > now.0 / 1_000_000 => Some(ms_of(at)),
+            Some(InternalDeadline::At(_) | InternalDeadline::BeforeOrigin) => {
+                self.free_record(self.hash_key(key), addr, len);
+                return true;
+            }
+        };
         // Rewrite with the new TTL-extension state. The ±5-byte extension
         // may cross a size class, so the record borrow must end before the
         // write: copy out (TTL changes are rare; a same-class in-place
@@ -1376,266 +1658,7 @@ impl CellStore {
         };
         // Carrying, not releasing: the value bytes (a document handle
         // included) move verbatim into the rewritten record (ADR-0037 D3).
-        if self.write_record_carrying(key, Some((addr, len)), spec).is_err() {
-            return false;
-        }
-        self.note_ttl(current.is_some(), new_ms.is_some());
-        if let Some(ms) = new_ms
-            && current != new_ms
-        {
-            self.arm_wheel(Self::hash_key(key), ms);
-        }
-        true
-    }
-
-    // ---- keyspace iteration (M1-S02) ----
-
-    /// `SCAN` over one cell: home-group enumeration in reverse-binary cursor
-    /// order. Guarantee: every key present for the whole scan is emitted at
-    /// least once, across doubling growth and tombstone-recycling rehashes
-    /// (same-capacity rebuilds keep home groups fixed; doublings split a
-    /// home group `g` into `{g, g + groups}` — exactly the split the
-    /// reverse-binary order tolerates). Keys written or removed mid-scan may
-    /// or may not appear (Redis contract). Expired records encountered are
-    /// reaped, never emitted. Returns the next cursor (0 = done).
-    pub fn scan(
-        &mut self,
-        cursor: u64,
-        count: usize,
-        now: Nanos,
-        mut emit: impl FnMut(&[u8]),
-    ) -> u64 {
-        let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
-        let mut emitted = 0usize;
-        let mut batch: Vec<ArenaAddr> = Vec::new();
-        loop {
-            batch.clear();
-            {
-                let arena = &self.arena;
-                self.index.scan_home_group(
-                    cursor as usize,
-                    |addr| Self::hash_key(record_at(arena, addr).key()),
-                    |addr| batch.push(addr),
-                );
-            }
-            for &addr in &batch {
-                let view = record_at(&self.arena, addr);
-                if view.is_expired(now) {
-                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
-                    self.free_record(hash, addr, len);
-                    self.note_reap_lazy();
-                } else {
-                    emit(view.key());
-                    emitted += 1;
-                }
-            }
-            cursor = next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
-            }
-        }
-    }
-
-    /// The fuzzy-checkpoint walk (M2-S10, ADR-0016 D2): the same
-    /// resize-stable home-group enumeration as [`scan`](Self::scan), but
-    /// emitting each live entry's post-image `(key, value, expire_at_ms)`
-    /// instead of the key — expiry deadline in *internal* ms (the caller
-    /// converts through its `WallAnchor` when encoding records). Inherits
-    /// the SCAN guarantee: every entry present for the whole walk is
-    /// emitted at least once across doublings and tombstone rehashes;
-    /// entries written mid-walk may appear zero or more times (harmless —
-    /// checkpoint replay is a blind idempotent upsert and the log tail
-    /// from `ckpt-begin` re-covers them). Expired records encountered are
-    /// reaped, never emitted. No access-tracking side effects on emitted
-    /// entries. Returns the next cursor (0 = done).
-    pub fn scan_post_images(
-        &mut self,
-        cursor: u64,
-        count: usize,
-        now: Nanos,
-        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
-    ) -> u64 {
-        self.scan_checkpoint_images(cursor, count, now, |key, image, expire_at_ms| match image {
-            CheckpointImage::String(value) => emit(key, value, expire_at_ms),
-            #[cfg(feature = "doc")]
-            CheckpointImage::JsonDoc { .. } => {
-                panic!("string-only post-image walker encountered a document")
-            }
-        })
-    }
-
-    /// Type-aware fuzzy-checkpoint walk. It has the same resize/expiry
-    /// guarantees as [`scan_post_images`](Self::scan_post_images), but
-    /// freezes documents into canonical idoc bytes at the store boundary.
-    pub fn scan_checkpoint_images(
-        &mut self,
-        cursor: u64,
-        count: usize,
-        now: Nanos,
-        mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>),
-    ) -> u64 {
-        let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
-        let mut emitted = 0usize;
-        let mut batch: Vec<ArenaAddr> = Vec::new();
-        loop {
-            batch.clear();
-            {
-                let arena = &self.arena;
-                self.index.scan_home_group(
-                    cursor as usize,
-                    |addr| Self::hash_key(record_at(arena, addr).key()),
-                    |addr| batch.push(addr),
-                );
-            }
-            for &addr in &batch {
-                let view = record_at(&self.arena, addr);
-                if view.is_expired(now) {
-                    let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
-                    self.free_record(hash, addr, len);
-                    self.note_reap_lazy();
-                    continue;
-                }
-                match view.type_tag() {
-                    TypeTag::String => {
-                        emit(
-                            view.key(),
-                            CheckpointImage::String(view.value()),
-                            view.expire_at_ms(),
-                        );
-                    }
-                    TypeTag::StringExtent => {
-                        unreachable!("StringExtent records exist only in tiered namespaces")
-                    }
-                    TypeTag::JsonDoc => {
-                        #[cfg(feature = "doc")]
-                        {
-                            let idoc = doc::checkpoint_idoc(&mut self.docs, view)
-                                .expect("store-owned document freezes within its format bound");
-                            emit(
-                                view.key(),
-                                CheckpointImage::JsonDoc {
-                                    lineage: doc::lineage_of_record(view),
-                                    version: view.version(),
-                                    idoc,
-                                },
-                                view.expire_at_ms(),
-                            );
-                        }
-                        #[cfg(not(feature = "doc"))]
-                        unreachable!("JsonDoc records cannot exist without the doc feature");
-                    }
-                }
-                emitted += 1;
-            }
-            cursor = next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
-            }
-        }
-    }
-
-    /// M2-S13: presize the index for `keys` live entries — recovery's
-    /// hint from the `.ick` footer's per-ns counts, applied before the
-    /// bulk replay so it avoids the doubling-rehash storm (each doubling
-    /// is a stop-and-copy over the whole table). Only effective while the
-    /// store is empty; a populated index keeps its geometry (growth on
-    /// insert remains correct either way). The hint is clamped defensively
-    /// — it may come from a damaged file, and a wrong hint may only cost
-    /// memory geometry, never correctness.
-    pub fn reserve_keys(&mut self, keys: usize) {
-        const MAX_RESERVE: usize = 1 << 28;
-        if self.is_empty() && keys > 64 {
-            self.index = Index::with_capacity(keys.min(MAX_RESERVE));
-        }
-    }
-
-    /// M2-S13 (ADR-0018): read-only sibling of
-    /// [`scan_post_images`](Self::scan_post_images) for the recovery state
-    /// digest — emits each live entry's `(key, value, expire_at_ms)`
-    /// **without reaping** expired entries, so the walk performs no
-    /// structural mutation and a full cursor sweep emits every live entry
-    /// exactly once (the digest oracle needs exactly-once; the mutating
-    /// walk guarantees only at-least-once across rehashes). Expired
-    /// entries are skipped: they are logically dead at `now` whatever
-    /// their physical residue.
-    pub fn digest_post_images(
-        &self,
-        cursor: u64,
-        count: usize,
-        now: Nanos,
-        mut emit: impl FnMut(&[u8], &[u8], Option<u64>),
-    ) -> u64 {
-        self.digest_checkpoint_images(cursor, count, now, |key, image, expire_at_ms| match image {
-            CheckpointImage::String(value) => emit(key, value, expire_at_ms),
-            #[cfg(feature = "doc")]
-            CheckpointImage::JsonDoc { .. } => {
-                panic!("string-only digest walker encountered a document")
-            }
-        })
-    }
-
-    /// Type-aware, read-only state-digest walk. Documents contribute
-    /// canonical idoc bytes and their exact logical version; physical form
-    /// and volatile cadence state are intentionally absent.
-    pub fn digest_checkpoint_images(
-        &self,
-        cursor: u64,
-        count: usize,
-        now: Nanos,
-        mut emit: impl FnMut(&[u8], CheckpointImage<'_>, Option<u64>),
-    ) -> u64 {
-        let mask = self.index.group_count() as u64 - 1;
-        let mut cursor = cursor & mask;
-        let mut emitted = 0usize;
-        loop {
-            let arena = &self.arena;
-            self.index.scan_home_group(
-                cursor as usize,
-                |addr| Self::hash_key(record_at(arena, addr).key()),
-                |addr| {
-                    let view = record_at(arena, addr);
-                    if view.is_expired(now) {
-                        return;
-                    }
-                    match view.type_tag() {
-                        TypeTag::String => emit(
-                            view.key(),
-                            CheckpointImage::String(view.value()),
-                            view.expire_at_ms(),
-                        ),
-                        TypeTag::StringExtent => {
-                            unreachable!("StringExtent records exist only in tiered namespaces")
-                        }
-                        TypeTag::JsonDoc => {
-                            #[cfg(feature = "doc")]
-                            {
-                                let idoc = self
-                                    .frozen_bytes_of(view)
-                                    .expect("store-owned document freezes within its format bound");
-                                emit(
-                                    view.key(),
-                                    CheckpointImage::JsonDoc {
-                                        lineage: doc::lineage_of_record(view),
-                                        version: view.version(),
-                                        idoc: &idoc,
-                                    },
-                                    view.expire_at_ms(),
-                                );
-                            }
-                            #[cfg(not(feature = "doc"))]
-                            unreachable!("JsonDoc records cannot exist without the doc feature");
-                        }
-                    }
-                    emitted += 1;
-                },
-            );
-            cursor = next_rev_cursor(cursor, mask);
-            if cursor == 0 || emitted >= count {
-                return cursor;
-            }
-        }
+        self.write_record_carrying(key, Some((addr, len)), spec).is_ok()
     }
 
     /// `RANDOMKEY` probe: first live key at/after a caller-rolled slot
@@ -1648,307 +1671,25 @@ impl CellStore {
             if !view.is_expired(now) {
                 return Some(view.key().to_vec());
             }
-            let (hash, len) = (Self::hash_key(view.key()), view.encoded_len());
+            let (hash, len) = (self.hash_key(view.key()), view.encoded_len());
             self.free_record(hash, addr, len);
             self.note_reap_lazy();
         }
     }
 
     /// `FLUSHDB`/`FLUSHALL` (this cell's slice): drop every record, reset
-    /// the wheel, keep lifetime counters (Redis flush does not reset stats).
+    /// the schedule with the table, keep lifetime counters (Redis flush
+    /// does not reset stats).
     pub fn flush(&mut self, now: Nanos) {
         self.arena = Arena::new(self.cfg.arena);
-        self.index = Index::with_capacity(self.cfg.initial_keys.max(64));
-        self.wheel = TtlWheel::new(now.0 / 1_000_000);
+        self.reset_records(self.cfg.initial_keys.max(64), now.0 / 1_000_000);
         self.docs.reset(&self.cfg);
-        self.stats.ttl_live = 0;
+        // FLUSH* is a removal class (ADR-0072 D6): a bulk replace runs
+        // the whole-namespace index truncate, never N removals.
+        // Declarations survive; an empty namespace projects empty trees.
+        self.idx.truncate_all();
         self.evict.hand = 0;
     }
-
-    // ---- active expiry (M1-E2) ----
-
-    /// One budgeted expiry MAINTAIN slice (M1-S05): advance the wheel toward
-    /// `now`, validating each fired entry against the index and reaping only
-    /// records genuinely expired. Stale entries (TTL changed/persisted/key
-    /// gone) drop with a counter. Bounded by `budget` on both fires and
-    /// cursor steps so a 1M-same-second storm cannot cliff the loop.
-    pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
-        let now_ms = now.0 / 1_000_000;
-        let CellStore { arena, index, wheel, stats, docs, .. } = self;
-        let mut out = ExpiryStats::default();
-        let tick = wheel.tick(now_ms, budget, |hash, _deadline| {
-            // Reap any record on this hash's probe path that is genuinely
-            // expired (full-hash check keeps fingerprint collisions out;
-            // reaping an expired record is correct regardless of which key
-            // armed the entry).
-            let found = index.find(hash, |addr| {
-                let view = record_at(arena, addr);
-                view.is_expired(now) && hash64(view.key(), HASH_SEED) == hash
-            });
-            match found {
-                Some(addr) => {
-                    let len = record_at(arena, addr).encoded_len();
-                    let payload = doc::payload_of(arena, addr, len);
-                    index.remove(hash, addr);
-                    arena.free(addr, len);
-                    docs.release(payload);
-                    stats.expired_active += 1;
-                    stats.ttl_live = stats.ttl_live.saturating_sub(1);
-                    out.reaped += 1;
-                }
-                None => {
-                    stats.wheel_stale += 1;
-                    out.stale += 1;
-                }
-            }
-        });
-        out.steps = tick.steps;
-        out.lag_ms = if tick.caught_up { 0 } else { now_ms.saturating_sub(wheel_cursor(wheel)) };
-        out.armed = wheel.live();
-        out
-    }
-
-    // ---- eviction mechanism (M1-S06; policy logic lives in `evict.rs`) ----
-
-    /// Applies an eviction policy: flips the access-tracking mode and
-    /// allocates/frees the CMS (8 KiB only while LFU is selected).
-    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
-        self.evict.set_policy(policy);
-    }
-
-    #[inline]
-    pub fn eviction_policy(&self) -> EvictionPolicy {
-        self.evict.policy
-    }
-
-    /// Logical bytes this store costs (live records + index + wheel + CMS)
-    /// — what `maxmemory` pressure compares against (M1-S07), the Redis
-    /// `used_memory` shape. Live (not resident) bytes are the comparable:
-    /// slab chunks stay mapped and recycle, so resident is monotone while
-    /// eviction must be able to bring pressure *down*. The RSS story is the
-    /// slack bound: resident ≤ live-at-peak + class slack, asserted by the
-    /// M1-S07 pressure test and gated on the reference box.
-    pub fn used_bytes(&self) -> u64 {
-        let r = self.report();
-        r.records_live_bytes
-            + r.index_bytes
-            + r.wheel_bytes
-            + r.evict_bytes
-            + r.doc_tape_bytes
-            + r.doc_arena_bytes
-    }
-
-    /// Evicts at most one victim under the active policy (bounded candidate
-    /// window, `samples` per selection). The pressure driver loops this.
-    pub fn evict_step(&mut self, samples: u32, now: Nanos) -> EvictStats {
-        evict::evict_one(self, samples, now)
-    }
-
-    /// Periodic eviction maintenance: CMS Morris-counter decay on the
-    /// injected clock (MAINTAIN slice).
-    pub fn evict_maintain(&mut self, now: Nanos) {
-        evict::maybe_decay(&mut self.evict, now);
-    }
-
-    /// `OBJECT FREQ` under an LFU policy: the CMS estimate (Morris-scaled —
-    /// recorded deviation: Redis reports its own log-counter scale).
-    pub fn object_freq(&mut self, key: &[u8], now: Nanos) -> Option<u8> {
-        self.resolve(key, now)?;
-        let hash = Self::hash_key(key);
-        Some(self.evict.cms.as_ref().map_or(0, |cms| cms.estimate(hash)))
-    }
-
-    /// CLOCK aging: drop one reference generation (eviction sweep).
-    pub(crate) fn age_record(&mut self, addr: ArenaAddr) {
-        let head = self.arena.bytes_mut(addr, 1);
-        head[0] = flags_ref_decrement(head[0]);
-    }
-
-    /// Reaps a record the eviction sweep found already expired.
-    pub(crate) fn reap_expired_at(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
-        self.free_record(hash, addr, len);
-        self.note_reap_lazy();
-    }
-
-    /// Removes an eviction victim (counted separately from expirations).
-    pub(crate) fn evict_record(&mut self, hash: u64, addr: ArenaAddr, len: usize, had_ttl: bool) {
-        self.free_record(hash, addr, len);
-        self.note_ttl(had_ttl, false);
-        self.stats.evicted_keys += 1;
-    }
-
-    // ---- internals ----
-
-    /// Free one record completely: index entry, record bytes, and any
-    /// document payload behind it (the ADR-0037 D3 choke point). Every
-    /// reap/delete/evict site funnels here; the only deliberate bypass is
-    /// RENAME's source removal (the handle transferred to the destination).
-    pub(crate) fn free_record(&mut self, hash: u64, addr: ArenaAddr, len: usize) {
-        let payload = doc::payload_of(&self.arena, addr, len);
-        self.index.remove(hash, addr);
-        self.arena.free(addr, len);
-        self.docs.release(payload);
-    }
-
-    pub(crate) fn arm_wheel(&mut self, hash: u64, deadline_ms: u64) {
-        if self.wheel.arm(hash, deadline_ms) == ArmOutcome::PoolFull {
-            self.stats.wheel_fallback += 1;
-        }
-    }
-
-    /// TTL-record census transition (`INFO keyspace` `expires=`).
-    #[inline]
-    pub(crate) fn note_ttl(&mut self, old: bool, new: bool) {
-        match (old, new) {
-            (false, true) => self.stats.ttl_live += 1,
-            (true, false) => self.stats.ttl_live = self.stats.ttl_live.saturating_sub(1),
-            _ => {}
-        }
-    }
-
-    #[inline]
-    fn note_reap_lazy(&mut self) {
-        self.stats.expired_lazy += 1;
-        self.stats.ttl_live = self.stats.ttl_live.saturating_sub(1);
-    }
-
-    /// Index lookup + expire-on-read: returns the live record's address and
-    /// encoded length, reaping it if its deadline passed.
-    pub(crate) fn resolve(&mut self, key: &[u8], now: Nanos) -> Option<(ArenaAddr, usize)> {
-        self.resolve_hashed(key, Self::hash_key(key), now)
-    }
-
-    fn resolve_hashed(&mut self, key: &[u8], hash: u64, now: Nanos) -> Option<(ArenaAddr, usize)> {
-        let arena = &self.arena;
-        let addr = self.index.find(hash, |addr| record_at(arena, addr).key() == key)?;
-        let view = record_at(arena, addr);
-        let len = view.encoded_len();
-        if view.is_expired(now) {
-            self.free_record(hash, addr, len);
-            self.note_reap_lazy();
-            return None;
-        }
-        self.touch_access(hash, addr);
-        Some((addr, len))
-    }
-
-    /// Eviction access tracking (M1-S06): one cached branch when no LRU/LFU
-    /// policy is active (the M1-S07 hot-path rule). CLOCK saturates the
-    /// in-record reference bits (one OR on a line the access already
-    /// pulled); LFU Morris-bumps the CMS with one injected-stream roll.
-    #[inline]
-    fn touch_access(&mut self, hash: u64, addr: ArenaAddr) {
-        match self.evict.tracking {
-            Tracking::None => {}
-            Tracking::Clock => {
-                let head = self.arena.bytes_mut(addr, 1);
-                head[0] = flags_ref_saturate(head[0]);
-            }
-            Tracking::Lfu => {
-                let roll = self.evict.next_roll();
-                if let Some(cms) = self.evict.cms.as_mut() {
-                    cms.touch(hash, roll);
-                }
-            }
-        }
-    }
-
-    fn write_record(
-        &mut self,
-        key: &[u8],
-        existing: Option<(ArenaAddr, usize)>,
-        spec: RecordSpec<'_>,
-    ) -> Result<(), OpError> {
-        self.write_record_releasing(key, existing, spec)
-    }
-
-    /// [`write_record_carrying`](Self::write_record_carrying) plus the
-    /// ADR-0037 D3 overwrite rule: any document payload behind `existing`
-    /// is captured first and released only after the write succeeds — a
-    /// failed write leaves the old record and its payload untouched.
-    pub(crate) fn write_record_releasing(
-        &mut self,
-        key: &[u8],
-        existing: Option<(ArenaAddr, usize)>,
-        spec: RecordSpec<'_>,
-    ) -> Result<(), OpError> {
-        let old_payload = existing.map(|(addr, len)| doc::payload_of(&self.arena, addr, len));
-        self.write_record_carrying(key, existing, spec)?;
-        if let Some(payload) = old_payload {
-            self.docs.release(payload);
-        }
-        Ok(())
-    }
-
-    /// Writes `spec`, reusing `existing`'s slot when the size class allows,
-    /// else alloc-copy-free with an index address swap. **Carries** any
-    /// document payload referenced by both old and new value bytes: no
-    /// release happens here — TTL rewrites move handle bytes verbatim
-    /// (ADR-0037 D3's RENAME/EXPIRE transfer rule; the in-place blob
-    /// overwrite in `doc::json_write_value` relies on the same contract).
-    pub(crate) fn write_record_carrying(
-        &mut self,
-        key: &[u8],
-        existing: Option<(ArenaAddr, usize)>,
-        spec: RecordSpec<'_>,
-    ) -> Result<(), OpError> {
-        let new_len = spec.encoded_len();
-        let hash = Self::hash_key(key);
-        // Writes count as accesses (Redis updates LRU/LFU on write), at
-        // write strength: one CLOCK generation / one CMS baseline bump —
-        // repeated reads are what saturate recency, so churn cannot
-        // impersonate a hot set.
-        match existing {
-            Some((addr, old_len)) if self.arena.resize_in_place(addr, old_len, new_len) => {
-                spec.write(self.arena.bytes_mut(addr, new_len));
-                self.touch_write(hash, addr);
-                Ok(())
-            }
-            Some((addr, old_len)) => {
-                let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
-                spec.write(self.arena.bytes_mut(new_addr, new_len));
-                self.index.replace(hash, addr, new_addr);
-                self.arena.free(addr, old_len);
-                self.touch_write(hash, new_addr);
-                Ok(())
-            }
-            None => {
-                if self.index.needs_grow() {
-                    let arena = &self.arena;
-                    self.index.grow(|addr, _| Self::hash_key(record_at(arena, addr).key()));
-                }
-                let new_addr = self.arena.alloc(new_len).ok_or(OpError::OutOfMemory)?;
-                spec.write(self.arena.bytes_mut(new_addr, new_len));
-                self.index.insert(hash, new_addr);
-                self.touch_write(hash, new_addr);
-                Ok(())
-            }
-        }
-    }
-
-    /// Write-strength access mark (see `write_record_at`).
-    #[inline]
-    fn touch_write(&mut self, hash: u64, addr: ArenaAddr) {
-        match self.evict.tracking {
-            Tracking::None => {}
-            Tracking::Clock => {
-                let head = self.arena.bytes_mut(addr, 1);
-                head[0] = flags_ref_write(head[0]);
-            }
-            Tracking::Lfu => {
-                let roll = self.evict.next_roll();
-                if let Some(cms) = self.evict.cms.as_mut() {
-                    cms.touch(hash, roll);
-                }
-            }
-        }
-    }
-}
-
-/// The wheel cursor in ms (private peek for the lag metric).
-#[inline]
-fn wheel_cursor(wheel: &TtlWheel) -> u64 {
-    wheel.cursor_ms()
 }
 
 /// Reverse-binary cursor increment (the Redis `dictScan` order) over a
@@ -1960,6 +1701,15 @@ pub(crate) fn next_rev_cursor(cursor: u64, mask: u64) -> u64 {
     v = v.reverse_bits();
     v = v.wrapping_add(1);
     v.reverse_bits()
+}
+
+/// What an expire-on-read lookup found: the live record, the address of
+/// the expired record it just freed, or nothing under the key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Lookup {
+    Live(ArenaAddr, usize),
+    Reaped(ArenaAddr),
+    Absent,
 }
 
 /// Reads the record at `addr`: header first (fixed 8 bytes) to learn the

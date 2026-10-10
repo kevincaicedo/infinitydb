@@ -1,9 +1,14 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M3-S19 document-domain attribution: resident partitions reconcile,
 //! diagnostic overlays are not double-counted, and keyspace aggregation is
 //! the exact field-wise sum of per-namespace reports.
 #![cfg(feature = "doc")]
 
-use inf_doc::JsonParser;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
 use inf_log::FsyncClass;
 use inf_store::{
@@ -21,6 +26,8 @@ fn constructed_report_sums_only_disjoint_resident_domains() {
         records_resident_bytes: 3,
         index_bytes: 5,
         wheel_bytes: 7,
+        // A logical overlay of `wheel_bytes`: never summed against RSS.
+        wheel_live_bytes: 59,
         evict_bytes: 11,
         doc_tape_bytes: 13,
         doc_arena_bytes: 17,
@@ -29,10 +36,12 @@ fn constructed_report_sums_only_disjoint_resident_domains() {
         doc_slack_bytes: 29,
         doc_scratch_bytes: 31,
         doc_path_cache_bytes: 37,
+        idx_tree_bytes: 47,
+        idx_slack_bytes: 53,
         live_records: 41,
         docs_live: 43,
     };
-    assert_eq!(report.attributed_bytes(), 3 + 5 + 7 + 11 + 19 + 31 + 37);
+    assert_eq!(report.attributed_bytes(), 3 + 5 + 7 + 11 + 19 + 31 + 37 + 47);
 }
 
 #[test]
@@ -58,10 +67,31 @@ fn keyspace_report_is_the_per_namespace_field_sum() {
         .parse(format!(r#"{{"pad":"{}"}}"#, "x".repeat(5_000)).as_bytes())
         .expect("tree fixture");
 
-    ks.db_mut(0).json_set(b"inline", &inline, JsonSetOptions::default(), NOW).unwrap();
+    ks.db_mut(0)
+        .json_set(
+            b"inline",
+            &CanonicalDoc::validate(&inline).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
     let named = ks.ns_store_mut(NS).expect("namespace store");
-    named.json_set(b"tape", &tape, JsonSetOptions::default(), NOW).unwrap();
-    named.json_set(b"tree", &tree, JsonSetOptions::default(), NOW).unwrap();
+    named
+        .json_set(
+            b"tape",
+            &CanonicalDoc::validate(&tape).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
+    named
+        .json_set(
+            b"tree",
+            &CanonicalDoc::validate(&tree).expect("canonical fixture"),
+            JsonSetOptions::default(),
+            NOW,
+        )
+        .unwrap();
     let _ = named.json_freeze(b"tree", NOW).expect("freeze").expect("document");
 
     let db = ks.db(0).expect("db0").report();
@@ -121,7 +151,8 @@ fn corpus_shape_bytes_per_document_table() {
     // default 2 MiB arena chunk tail without changing production config.
     const TARGET_LIVE_BYTES: usize = 32 << 20;
     eprintln!(
-        "shape          idoc_B   docs  records_B/doc  doc_live_B/doc  doc_res_B/doc  slack_B/doc  index_B/doc  attributed_B/doc  attributed/idoc"
+        "shape          idoc_B   docs  records_B/doc  doc_live_B/doc  doc_res_B/doc  slack_B/doc  \
+             index_B/doc  attributed_B/doc  attributed/idoc"
     );
     let mut parser = JsonParser::new();
     for doc in doc_corpus::generate(doc_corpus::CANONICAL_SEED) {
@@ -132,7 +163,12 @@ fn corpus_shape_bytes_per_document_table() {
             CellStore::new(StoreConfig { initial_keys: documents, ..StoreConfig::default() });
         for index in 0..documents {
             store
-                .json_set(&key_of(index), &idoc, JsonSetOptions::default(), NOW)
+                .json_set(
+                    &key_of(index),
+                    &CanonicalDoc::validate(&idoc).expect("canonical fixture"),
+                    JsonSetOptions::default(),
+                    NOW,
+                )
                 .expect("corpus document stores");
         }
         let report = store.report();
@@ -141,7 +177,8 @@ fn corpus_shape_bytes_per_document_table() {
         assert!(report.doc_resident_bytes >= report.doc_tape_bytes + report.doc_arena_bytes);
         let attributed_per_doc = per_document(report.attributed_bytes(), documents);
         eprintln!(
-            "{name:<14} {:>7} {:>6} {:>14.1} {:>15.1} {:>14.1} {:>12.1} {:>12.1} {:>17.1} {:>16.3}x",
+            "{name:<14} {:>7} {:>6} {:>14.1} {:>15.1} {:>14.1} {:>12.1} {:>12.1} {:>17.1} \
+                 {:>16.3}x",
             idoc.len(),
             documents,
             per_document(report.records_resident_bytes, documents),

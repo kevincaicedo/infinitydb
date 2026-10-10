@@ -9,11 +9,12 @@ use std::io;
 use std::rc::Rc;
 
 use inf_alloc::{BufferPool, LeaseKind};
+use inf_foundation::FileOffset;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_runtime::{
-    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoOp, RawFd,
-    StableBytes, StableBytesMut, SubmitStats, Wait,
+    BackendDriver, Capabilities, Completion, CompletionResult, CompletionToken, IoClass, IoOp,
+    RawFd, StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier,
 };
 use inf_server::SimDisk;
 
@@ -32,6 +33,28 @@ pub enum Plant {
     /// eats acked bytes. Models any path that acks ahead of durable
     /// coverage; the oracle must catch it within 1,000 seeds.
     FsyncLies,
+    /// ADR-0124's teeth: the stop request is a process death instead of
+    /// a drain (the pre-fix `SIGTERM`), so the clean-stop rule — every
+    /// acked `everysec` op required — must go red.
+    StopKill,
+    /// One accept-path error (`EMFILE`) on the listener token while
+    /// connections are queued — the F-L11-05 canary (review 2026-08-30):
+    /// an accept failure is a counter, never connection housekeeping;
+    /// the first client (`ConnKey {0, 0}`) must keep being served. Since
+    /// batch 37 (F-L11-02) the model also PARKS the arm the way the real
+    /// backends do: the queued connections stay in the backlog until the
+    /// plane re-arms (its retry timer) or a `Close` returns an fd — a
+    /// plane that never re-arms strands every later client (`STALL`).
+    AcceptError,
+    /// One `EIO` on the next read of every tier file, armed on the sim
+    /// disk before the cold re-read sweep (`m4-tiered` phase 7; review
+    /// 2026-08-30, F-L04-02 / ADR-0119 D2): a device error under a cold
+    /// read must reach the client as the typed `ERR cold read failed`
+    /// reply and the `tiering_cold_read_errors` counter — one reply per
+    /// fault, never a nil or a stale value (the L06-02 fold). The arm
+    /// lives on the disk, not the net; `m4-tiered` also runs it on every
+    /// seed ≡ 7 (mod 8) without the flag.
+    TierReadEio,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +76,10 @@ pub struct CellNet {
     cell: u16,
     accept_armed: bool,
     accept_token: Option<CompletionToken>,
+    /// Parked after the plant fired: no accepts until `AcceptArm`/`Close`.
+    accept_parked: bool,
+    /// `AcceptArm` ops that resumed a parked arm (the plane's retry witness).
+    accept_resumes: u64,
     backlog: VecDeque<RawFd>,
     conns: BTreeMap<RawFd, SimConn>,
     next_fd: RawFd,
@@ -67,11 +94,28 @@ pub fn listener_fd(cell: u16) -> RawFd {
 }
 
 impl CellNet {
+    /// True once the requested plant has fired (batch 34: a positive
+    /// control that never fires is a vacuous run, not a green one).
+    #[must_use]
+    pub fn plant_fired(&self) -> bool {
+        self.plant_fired
+    }
+
+    /// How many times a parked accept arm was resumed (F-L11-02: the
+    /// plane's retry timer and the driver's close-resume are the only
+    /// two paths; the count is bounded by wall time, never a spin).
+    #[must_use]
+    pub fn accept_resumes(&self) -> u64 {
+        self.accept_resumes
+    }
+
     pub fn new(cell: u16, seed: u64, plant: Plant) -> Rc<RefCell<CellNet>> {
         Rc::new(RefCell::new(CellNet {
             cell,
             accept_armed: false,
             accept_token: None,
+            accept_parked: false,
+            accept_resumes: 0,
             backlog: VecDeque::new(),
             conns: BTreeMap::new(),
             next_fd: 0,
@@ -116,6 +160,16 @@ impl CellNet {
         }
     }
 
+    /// Client side: give up on a refused connection — nothing queued
+    /// toward the server will ever be read (the server closed without
+    /// arming a receive), so it leaves the progress accounting.
+    pub fn client_abandon(&mut self, fd: RawFd) {
+        if let Some(conn) = self.conns.get_mut(&fd) {
+            conn.to_server.clear();
+            conn.client_closed = true;
+        }
+    }
+
     /// True once the server closed its side too (teardown complete).
     pub fn closed(&self, fd: RawFd) -> bool {
         self.conns.get(&fd).is_none_or(|c| c.server_closed)
@@ -147,18 +201,69 @@ pub struct SimDriver {
     pending_syncs: Vec<PendingSync>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
+    /// Bytes/ops observed per class (ADR-0088 D8).
+    observed: ObservedIo,
 }
 
-/// One deferred fsync: flushed AND completed only once the virtual clock
-/// passes `due` — during the service window the bytes stay page-cache
-/// volatile, so a power cut eats them (the honest-stall invariant).
-/// Dir-vs-file routing happens at release time via `driver_fdatasync`,
-/// which already branches on dir fds.
+/// One deferred op: applied AND completed only once the virtual clock
+/// passes `due` — during the service window the bytes stay volatile, so
+/// a power cut eats them (the honest-stall invariant). Dir-vs-file
+/// routing happens at release time via `driver_fdatasync`, which already
+/// branches on dir fds. A write-through barrier (ADR-0086 D8) carries its
+/// payload: the bytes reach the disk at `due`, never earlier — a cut
+/// inside the service window loses the whole frame, exactly the un-acked
+/// shape the oracle must tolerate. A plain write (ADR-0087 D7) lands in
+/// the volatile layer at `due`; its linked fsync, if any, is scheduled on
+/// the flush timeline only then (`IO_LINK`: the sync starts after the
+/// write), so a standalone fdatasync issued *earlier* can run before the
+/// write lands — the coverage hole the drain rule exists for.
 #[derive(Debug)]
 struct PendingSync {
     due: Nanos,
     fd: i32,
     token: CompletionToken,
+    kind: PendingKind,
+}
+
+#[derive(Debug)]
+enum PendingKind {
+    Fsync,
+    WriteThrough {
+        offset: FileOffset,
+        data: StableBytes,
+    },
+    Write {
+        offset: FileOffset,
+        data: StableBytes,
+        linked: Option<CompletionToken>,
+    },
+    /// A tier read under the bandwidth model (ADR-0088 D8): the buffer is
+    /// filled at its due time, never before.
+    Read {
+        offset: FileOffset,
+        buf: StableBytesMut,
+    },
+}
+
+/// Device bytes and ops the driver observed per class (ADR-0088 D8 —
+/// the accounting oracle's other side of `io_budget_bytes_*`). Reads
+/// carry no class in their token: they are counted as `reads`, compared
+/// to the two cold-read classes together.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservedIo {
+    pub bytes: [u64; IoClass::COUNT],
+    pub ops: [u64; IoClass::COUNT],
+    pub read_bytes: u64,
+    pub read_ops: u64,
+}
+
+impl ObservedIo {
+    fn note(&mut self, token: CompletionToken, bytes: u64) {
+        if let Some(class) = IoClass::of(token.class()) {
+            self.bytes[class.index()] = self.bytes[class.index()].saturating_add(bytes);
+            self.ops[class.index()] += 1;
+        }
+    }
 }
 
 impl SimDriver {
@@ -170,6 +275,7 @@ impl SimDriver {
             pending_syncs: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
+            observed: ObservedIo::default(),
         }
     }
 
@@ -195,6 +301,88 @@ impl SimDriver {
         let clock = self.clock.as_ref()?;
         disk.schedule_fsync(clock.now().0).map(Nanos)
     }
+
+    /// Draws a deferred completion time for one write-through barrier
+    /// (ADR-0086 D8), `None` on the inline path.
+    fn schedule_through(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_write_through(clock.now().0, len).map(Nanos)
+    }
+
+    /// Draws a deferred completion time for one plain write (ADR-0087
+    /// D7), `None` on the inline path.
+    fn schedule_write(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_write(clock.now().0, len).map(Nanos)
+    }
+
+    /// Draws a deferred completion time for one tier read (ADR-0088 D8),
+    /// `None` on the inline path (no read bandwidth modeled).
+    fn schedule_read(&self, disk: &SimDisk, len: u64) -> Option<Nanos> {
+        let clock = self.clock.as_ref()?;
+        disk.schedule_read(clock.now().0, len).map(Nanos)
+    }
+
+    /// The per-class device ledger (ADR-0088 D8 oracle input).
+    pub fn observed_io(&self) -> ObservedIo {
+        self.observed
+    }
+}
+
+/// Queue a deferred op in due order. Write-through and plain-write draws
+/// do not ride the serial flush timeline, so they may be due before an
+/// earlier-queued fsync — insert, never append. A free function over the
+/// field so the drain loop's `net` borrow stays disjoint.
+fn defer(pending_syncs: &mut Vec<PendingSync>, pending: PendingSync) {
+    let at = pending_syncs.partition_point(|p| p.due <= pending.due);
+    pending_syncs.insert(at, pending);
+}
+
+/// Execute one write-through barrier against the disk (ADR-0086 D8):
+/// durable at completion. `Plant::FsyncLies` applies — a `LogWritten`
+/// that persisted nothing is the canary the ack-stream oracle must catch.
+fn write_through(
+    disk: &SimDisk,
+    plant: Plant,
+    fd: i32,
+    offset: FileOffset,
+    data: &StableBytes,
+) -> CompletionResult {
+    let result = if plant == Plant::FsyncLies {
+        disk.driver_write_at(fd, offset, stable_slice(data))
+    } else {
+        disk.driver_write_through(fd, offset, stable_slice(data))
+    };
+    match result {
+        Ok(()) => CompletionResult::LogWritten,
+        Err(err) => CompletionResult::Error { errno: write_errno(&err), buf: None },
+    }
+}
+
+/// Execute one deferred plain write against the disk's volatile layer
+/// (ADR-0087 D7): `LogWritten` means reached the file, never durable.
+fn plain_write(
+    disk: &SimDisk,
+    fd: i32,
+    offset: FileOffset,
+    data: &StableBytes,
+) -> CompletionResult {
+    match disk.driver_write_at(fd, offset, stable_slice(data)) {
+        Ok(()) => CompletionResult::LogWritten,
+        Err(err) => CompletionResult::Error { errno: write_errno(&err), buf: None },
+    }
+}
+
+/// The errno a failed sim write reports, as a kernel would: an OS error
+/// the disk raised passes through (`EBADF` on a closed fd — F-L01-02),
+/// the disk's `InvalidInput` (a direct write the filesystem refuses —
+/// ADR-0088 D3 as amended, the checkpoint's in-band downgrade signal)
+/// is `EINVAL`; everything else (the dead switch) is `EIO`.
+fn write_errno(err: &std::io::Error) -> i32 {
+    if let Some(errno) = err.raw_os_error() {
+        return errno;
+    }
+    if err.kind() == std::io::ErrorKind::InvalidInput { libc::EINVAL } else { libc::EIO }
 }
 
 /// Audited unsafe (see `SAFETY.md`): a backend driver executing an op
@@ -245,17 +433,51 @@ impl BackendDriver for SimDriver {
         if !self.pending_syncs.is_empty() {
             let now = self.clock.as_ref().expect("pending syncs imply a stall clock").now();
             while self.pending_syncs.first().is_some_and(|sync| sync.due <= now) {
-                let PendingSync { fd, token, .. } = self.pending_syncs.remove(0);
+                let PendingSync { fd, token, kind, .. } = self.pending_syncs.remove(0);
                 let disk = self.disk.as_ref().expect("pending syncs imply a disk");
-                // Plant::FsyncLies (ADR-0021 D4) holds here too: Synced
-                // without the flush — the canary the oracle must catch.
-                let result = if net.plant == Plant::FsyncLies {
-                    CompletionResult::Synced
-                } else {
-                    match disk.driver_fdatasync(fd) {
+                let result = match kind {
+                    PendingKind::WriteThrough { offset, data } => {
+                        write_through(disk, net.plant, fd, offset, &data)
+                    }
+                    PendingKind::Write { offset, data, linked } => {
+                        let result = plain_write(disk, fd, offset, &data);
+                        // The linked sync starts only now (IO_LINK) —
+                        // and only if the write succeeded (a failed write
+                        // cancels its chain, ADR-0013).
+                        if let Some(sync) = linked {
+                            if matches!(result, CompletionResult::LogWritten) {
+                                let due = disk.schedule_fsync(now.0).map(Nanos).unwrap_or(now);
+                                let pending =
+                                    PendingSync { due, fd, token: sync, kind: PendingKind::Fsync };
+                                defer(&mut self.pending_syncs, pending);
+                            } else {
+                                out.push(Completion {
+                                    token: sync,
+                                    result: CompletionResult::Error {
+                                        errno: libc::ECANCELED,
+                                        buf: None,
+                                    },
+                                });
+                            }
+                        }
+                        result
+                    }
+                    PendingKind::Read { offset, buf } => {
+                        let target = stable_mut_slice(&buf);
+                        match disk.driver_read_at(fd, offset, target) {
+                            Ok(n) if n == target.len() => CompletionResult::TierRead,
+                            Ok(_) | Err(_) => {
+                                CompletionResult::Error { errno: libc::EIO, buf: None }
+                            }
+                        }
+                    }
+                    // Plant::FsyncLies (ADR-0021 D4) holds here too: Synced
+                    // without the flush — the canary the oracle must catch.
+                    PendingKind::Fsync if net.plant == Plant::FsyncLies => CompletionResult::Synced,
+                    PendingKind::Fsync => match disk.driver_fdatasync(fd) {
                         Ok(()) => CompletionResult::Synced,
                         Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
-                    }
+                    },
                 };
                 out.push(Completion { token, result });
             }
@@ -267,6 +489,10 @@ impl BackendDriver for SimDriver {
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
+                    if net.accept_parked {
+                        net.accept_parked = false;
+                        net.accept_resumes += 1;
+                    }
                     net.accept_armed = true;
                     net.accept_token = Some(token);
                 }
@@ -297,16 +523,50 @@ impl BackendDriver for SimDriver {
                         conn.recv_armed = false;
                     }
                     out.push(Completion { token, result: CompletionResult::Closed });
+                    // An fd returned: an exhaustion-parked arm resumes
+                    // (the driver contract's own resume path).
+                    if net.accept_parked {
+                        net.accept_parked = false;
+                        net.accept_resumes += 1;
+                    }
                 }
                 // The simulated disk (M2-S18, ADR-0020 D7). Completion
                 // order is submission order — the group-commit ledger
                 // already tolerates cross-fd reordering (ADR-0013);
                 // *survival* reordering is the disk model's job.
-                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     let disk = self
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    let len = u64::from(data.len());
+                    self.observed.note(token, len);
+                    if let Some(sync) = barrier.fsync_token() {
+                        self.observed.note(sync, 0);
+                    }
+                    if matches!(barrier, WriteBarrier::WriteThrough) {
+                        // Write-through (ADR-0086 D8): the write IS the
+                        // barrier. Under the stall model it lands AND
+                        // completes at its drawn time — nothing reaches
+                        // the disk during the service window.
+                        if let Some(due) = self.schedule_through(disk, len) {
+                            let kind = PendingKind::WriteThrough { offset, data };
+                            defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
+                            continue;
+                        }
+                        let result = write_through(disk, net.plant, fd, offset, &data);
+                        out.push(Completion { token, result });
+                        continue;
+                    }
+                    let fsync_token = barrier.fsync_token();
+                    // Plain write under the stall model (ADR-0087 D7): it
+                    // lands at its own drawn time, independent of every
+                    // other op; its linked sync is scheduled at landing.
+                    if let Some(due) = self.schedule_write(disk, len) {
+                        let kind = PendingKind::Write { offset, data, linked: fsync_token };
+                        defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
+                        continue;
+                    }
                     match disk.driver_write_at(fd, offset, stable_slice(&data)) {
                         Ok(()) => {
                             out.push(Completion { token, result: CompletionResult::LogWritten });
@@ -315,11 +575,15 @@ impl BackendDriver for SimDriver {
                                 // fsync defers to its drawn completion
                                 // time — flush AND CQE together, above.
                                 if let Some(due) = self.schedule_sync(disk) {
-                                    debug_assert!(
-                                        self.pending_syncs.last().is_none_or(|p| p.due <= due),
-                                        "device timeline is FIFO"
+                                    defer(
+                                        &mut self.pending_syncs,
+                                        PendingSync {
+                                            due,
+                                            fd,
+                                            token: sync,
+                                            kind: PendingKind::Fsync,
+                                        },
                                     );
-                                    self.pending_syncs.push(PendingSync { due, fd, token: sync });
                                     continue;
                                 }
                                 // Plant::FsyncLies (ADR-0021 D4): report
@@ -338,13 +602,16 @@ impl BackendDriver for SimDriver {
                                 out.push(Completion { token: sync, result });
                             }
                         }
-                        Err(_) => {
+                        Err(err) => {
                             // Uring linked-chain contract: the failed write
                             // cancels its linked sync — `Synced` can never
                             // cover a failed prefix (ADR-0013).
                             out.push(Completion {
                                 token,
-                                result: CompletionResult::Error { errno: libc::EIO, buf: None },
+                                result: CompletionResult::Error {
+                                    errno: write_errno(&err),
+                                    buf: None,
+                                },
                             });
                             if let Some(sync) = fsync_token {
                                 out.push(Completion {
@@ -363,11 +630,21 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("tiered sim scenarios construct SimDriver::with_disk (M4-S04)");
-                    let dest = stable_mut_slice(&buf);
+                    self.observed.read_bytes += u64::from(buf.len());
+                    self.observed.read_ops += 1;
+                    // Bandwidth model (ADR-0088 D8): the read lands at its
+                    // drawn time; with no read rate it completes inline
+                    // exactly as before.
+                    if let Some(due) = self.schedule_read(disk, u64::from(buf.len())) {
+                        let kind = PendingKind::Read { offset, buf };
+                        defer(&mut self.pending_syncs, PendingSync { due, fd, token, kind });
+                        continue;
+                    }
+                    let target = stable_mut_slice(&buf);
                     // The op contract: `TierRead` means the buffer is
                     // FULL; EOF inside the flushed range is corruption.
-                    let result = match disk.driver_read_at(fd, offset, dest) {
-                        Ok(n) if n == dest.len() => CompletionResult::TierRead,
+                    let result = match disk.driver_read_at(fd, offset, target) {
+                        Ok(n) if n == target.len() => CompletionResult::TierRead,
                         Ok(_) | Err(_) => CompletionResult::Error { errno: libc::EIO, buf: None },
                     };
                     out.push(Completion { token, result });
@@ -377,14 +654,14 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    self.observed.note(token, 0);
                     // Stall device (M2.5-S14): standalone fsyncs (barrier
                     // dirs, everysec ticks) defer exactly like linked ones.
                     if let Some(due) = self.schedule_sync(disk) {
-                        debug_assert!(
-                            self.pending_syncs.last().is_none_or(|p| p.due <= due),
-                            "device timeline is FIFO"
+                        defer(
+                            &mut self.pending_syncs,
+                            PendingSync { due, fd, token, kind: PendingKind::Fsync },
                         );
-                        self.pending_syncs.push(PendingSync { due, fd, token });
                         continue;
                     }
                     let result = if net.plant == Plant::FsyncLies {
@@ -401,11 +678,29 @@ impl BackendDriver for SimDriver {
         }
         self.ops = ops;
 
-        // Accept everything queued (multishot semantics).
-        if net.accept_armed {
+        // Accept everything queued (multishot semantics) — unless parked.
+        if net.accept_armed && !net.accept_parked {
             let token = net.accept_token.expect("armed implies token");
-            while let Some(fd) = net.backlog.pop_front() {
+            // The accept-error plant: the kernel refused a QUEUED accept
+            // (fd limit). The error rides the listener token (the plane
+            // must not route it to a connection, F-L11-05) and the arm
+            // parks with the backlog intact (F-L11-02): only the plane's
+            // re-arm or a `Close` lets the queued clients in.
+            if net.plant == Plant::AcceptError && !net.plant_fired && net.backlog.len() >= 2 {
+                // The limit lands mid-batch: one client is let in first
+                // (F-L11-05's live `{0, 0}`), the rest stay queued.
+                let fd = net.backlog.pop_front().expect("two queued");
                 out.push(Completion { token, result: CompletionResult::Accepted { fd } });
+                net.plant_fired = true;
+                net.accept_parked = true;
+                out.push(Completion {
+                    token,
+                    result: CompletionResult::Error { errno: libc::EMFILE, buf: None },
+                });
+            } else {
+                while let Some(fd) = net.backlog.pop_front() {
+                    out.push(Completion { token, result: CompletionResult::Accepted { fd } });
+                }
             }
         }
 

@@ -189,6 +189,8 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     config: LoopConfig,
     ops: Vec<IoOp>,
     completions: Vec<Completion>,
+    /// Due timer keys, collected then dispatched (reused across iterations).
+    due: Vec<u64>,
     iter_hist_us: LogHistogram,
     spin_left: u32,
     iterations: u64,
@@ -214,8 +216,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             config,
             ops: Vec::with_capacity(256),
             completions: Vec::with_capacity(256),
+            due: Vec::new(),
             iter_hist_us: LogHistogram::new(),
-            spin_left: 0,
+            // The first iteration polls: the plane arms its accept in its
+            // first PARSE, after the wait — a park there is a boot stall of
+            // one `park_default` (batch 61, lane L11).
+            spin_left: config.spin_iters.max(1),
             iterations: 0,
             submits: 0,
             enters_total: 0,
@@ -233,10 +239,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// errors arrive as completions.
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
-        // `before_park` runs only when spin is exhausted: the plane
-        // publishes its parked flag and vetoes the park if a final doorbell
-        // check finds work (the lost-wakeup handshake, M0-R1).
-        let parked = self.spin_left == 0 && !plane.before_park();
+        // A queued task vetoes the park outright (F-L11-07; also what makes
+        // `spin_iters == 0` safe). `before_park` runs only when spin is
+        // exhausted: the plane publishes its parked flag and vetoes the
+        // park if a final doorbell check finds work (the lost-wakeup
+        // handshake, M0-R1).
+        let parked = self.spin_left == 0 && !self.executor.has_ready() && !plane.before_park();
         let wait = if parked { Wait::Park { timeout: self.park_timeout() } } else { Wait::Poll };
         let submitted = self.ops.len() as u64;
         for op in self.ops.drain(..) {
@@ -285,9 +293,10 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
                 plane.on_completion(&mut cx, c);
             }
             // Timers: collect-then-dispatch keeps `cx` exclusive.
-            let mut due = Vec::new();
+            let due = &mut self.due;
+            due.clear();
             cx.timers.advance(start, |key| due.push(key));
-            for key in due {
+            for key in due.drain(..) {
                 plane.on_timer(&mut cx, key);
             }
 
@@ -325,13 +334,16 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             commands = cx.commands;
             fabric_msgs = cx.fabric_msgs;
 
-            // ---- step 10: IDLE policy for the next iteration.
+            // ---- step 10: IDLE policy for the next iteration. A task
+            // woken after run_ready (steps 5–8) is work too: parking on
+            // top of it would delay it a full park timeout (F-L11-07).
             let had_work = reaped > 0
                 || polled > 0
                 || commands > 0
                 || fabric_msgs > 0
                 || fabric_pending
-                || !cx.ops.is_empty();
+                || !cx.ops.is_empty()
+                || cx.executor.has_ready();
             if had_work {
                 self.spin_left = self.config.spin_iters;
             } else {
@@ -365,8 +377,8 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
     }
 
-    /// Always-on iteration histogram (µs). `loop_iter_p999_us` =
-    /// `.percentile(99.9)` — the §6 gate reads this.
+    /// Always-on lifetime iteration histogram (µs). The §6 gate subtracts
+    /// fresh bucket snapshots around each loaded window (ADR-0136).
     pub fn iteration_histogram(&self) -> &LogHistogram {
         &self.iter_hist_us
     }

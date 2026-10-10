@@ -1,18 +1,31 @@
 //! Frame-decoder fuzz target (M2-S01 AC; both formats since M2.5-S12,
-//! ADR-0031). Three oracles on arbitrary bytes:
+//! ADR-0031; v3 since M4.5-S34, ADR-0086 D3). Three oracles on arbitrary
+//! bytes:
 //!
-//! 1. No panic/UB anywhere in frame or record decoding — v1 (`IFR1`) and
-//!    v2 (`IFR2`) headers both explored from raw bytes.
-//! 2. One value, one encoding (L7): any v2 frame that decodes cleanly must
-//!    re-encode byte-identically through `FrameBuilder` (stamp included) —
-//!    the property that caught the non-minimal-varint bug in the fabric
-//!    codec. v1 frames have no writer anymore (read-only format), so the
-//!    oracle checks their decoded stamp is `None` instead.
+//! 1. No panic/UB anywhere in frame or record decoding — v1 (`IFR1`),
+//!    v2 (`IFR2`), and v3 (`IFR3`) headers all explored from raw bytes,
+//!    including v3 frames whose padding region is garbage or truncated
+//!    (the reader skips padding, never validates it).
+//! 2. One value, one encoding (L7): any v2/v3 frame that decodes cleanly
+//!    must re-encode byte-identically through `FrameBuilder` (stamp and
+//!    layout included; a v3 re-encoding compares the frame bytes, not the
+//!    padding) — the property that caught the non-minimal-varint bug in
+//!    the fabric codec. v1 frames have no writer anymore (read-only
+//!    format), so the oracle checks their decoded stamp is `None` instead.
 //! 3. Kernel differential: the dispatched CRC32C must agree with the
 //!    slicing-by-8 oracle on every input the decoder touches.
+//!
+//! The successor invariant rides along: a v3 frame's `padded_len` is the
+//! 4 KiB round-up of its `frame_len`, and `FrameIter` advances by it.
+//!
+//! 4. The `max_frame_len` boundary (review 2026-08-30 F-L02-04): the same
+//!    bytes are walked under the permissive cap `u32::MAX` as well as the
+//!    shipped 64 MiB one — the only way the u32 extent bound (ADR-0126 D1
+//!    as amended) is ever exercised — and every yielded frame's padded
+//!    extent fits below the ceiling from its own base.
 #![no_main]
 
-use inf_log::{DEFAULT_MAX_FRAME_LEN, FrameBuilder, FrameIter};
+use inf_log::{DEFAULT_MAX_FRAME_LEN, FRAME_ALIGN, FrameBuilder, FrameIter, FrameLayout};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -21,6 +34,22 @@ fuzz_target!(|data: &[u8]| {
         inf_simd::scalar_crc32c_update(0, data),
         "CRC32C hardware/software divergence"
     );
+
+    // The permissive cap: every admitted frame's extent from its own
+    // base must fit a u32 segment, and the walk must terminate (a
+    // wrapped `padded_len` once re-decoded the same frame forever).
+    let mut steps = 0usize;
+    for result in FrameIter::new(data, u32::MAX) {
+        steps += 1;
+        assert!(steps <= data.len(), "FrameIter walked more frames than bytes");
+        let Ok((_, frame)) = result else { break };
+        let base = u64::from(frame.first_lsn().offset) - frame.header_len() as u64;
+        assert!(frame.padded_len() >= frame.frame_len(), "padding never shrinks a frame");
+        assert!(
+            base + u64::from(frame.padded_len()) <= u64::from(u32::MAX),
+            "an admitted frame's padded extent crosses the u32 ceiling"
+        );
+    }
 
     let mut builder = FrameBuilder::new();
     for result in FrameIter::new(data, DEFAULT_MAX_FRAME_LEN) {
@@ -46,10 +75,24 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
         }
+        let layout = frame.layout();
+        let frame_len = frame.frame_len();
+        match layout {
+            FrameLayout::Packed => assert_eq!(frame.padded_len(), frame_len),
+            FrameLayout::Aligned => {
+                assert_eq!(frame.padded_len(), frame_len.div_ceil(FRAME_ALIGN) * FRAME_ALIGN);
+                assert_eq!(frame.padded_len() % FRAME_ALIGN, 0);
+            }
+        }
         if clean && builder.record_count() == frame.record_count() {
-            let reencoded = builder.finalize(frame.first_lsn(), stamp);
-            let original = &data[offset..offset + reencoded.len()];
-            assert_eq!(reencoded, original, "decode→encode not byte-identical");
+            let reencoded = builder.finalize(frame.first_lsn(), stamp, layout);
+            let frame_bytes = &reencoded[..frame_len as usize];
+            let original = &data[offset..offset + frame_bytes.len()];
+            assert_eq!(frame_bytes, original, "decode→encode not byte-identical");
+            assert!(
+                reencoded[frame_len as usize..].iter().all(|&b| b == 0),
+                "writer padding is zeroed"
+            );
         }
     }
 });

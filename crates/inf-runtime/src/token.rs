@@ -35,6 +35,23 @@ pub enum TokenClass {
     /// M4-S08). The first consumer of the `IoGate` seam M0 built — a
     /// command suspends on this token while NVMe works (L6).
     TierRead = 10,
+    /// Tier-flush data write (M4.5-S31, ADR-0084 — routing-only: the op
+    /// is an ordinary `LogWrite`). A separate class from `LogWrite`
+    /// because the custody chains differ: log completions release the
+    /// staging frame lease; tier-flush completions advance a per-round
+    /// counter in the tier plane.
+    TierFlushWrite = 11,
+    /// Tier-flush fdatasync barrier (M4.5-S31, ADR-0084 — routing-only:
+    /// the op is an ordinary `Fdatasync`). Never enters the WAL commit
+    /// ledger — flush watermarks advance at this completion, acks never
+    /// wait on it (ADR-0022 D3 untouched).
+    TierFlushSync = 12,
+    /// Zero-fill write on a preallocated next log segment (M4.5-S34,
+    /// ADR-0086 D4 — routing-only: the op is an ordinary `LogWrite` with
+    /// no barrier). A separate class from `LogWrite` because its
+    /// completion advances the rotor's zero cursor, never the staging
+    /// frame lease's custody.
+    ZeroFillWrite = 13,
 }
 
 impl TokenClass {
@@ -51,6 +68,9 @@ impl TokenClass {
             8 => Some(TokenClass::CkptSync),
             9 => Some(TokenClass::ManifestSync),
             10 => Some(TokenClass::TierRead),
+            11 => Some(TokenClass::TierFlushWrite),
+            12 => Some(TokenClass::TierFlushSync),
+            13 => Some(TokenClass::ZeroFillWrite),
             _ => None,
         }
     }
@@ -128,6 +148,9 @@ mod tests {
             TokenClass::CkptSync,
             TokenClass::ManifestSync,
             TokenClass::TierRead,
+            TokenClass::TierFlushWrite,
+            TokenClass::TierFlushSync,
+            TokenClass::ZeroFillWrite,
         ] {
             for (slot, generation) in
                 [(0, 0), (1, u32::MAX), (MAX_SLOT, 7u32), (0xAB_CDEF, 0xDEAD_BEEF)]

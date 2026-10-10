@@ -1,9 +1,9 @@
-# M2 interface freezes — log spine (draft until M2 exit)
+# M2 interface freezes — log spine
 
-Companion to `interfaces-m0.md`, same contract: these interfaces freeze at
-**M2 exit**; changing a frozen one afterwards requires an ADR. Until the
-milestone exits they are *drafts* — changes before exit still record their
-reasoning in the owning ADR. Status column tracks arrival.
+Companion to `interfaces-m0.md`, same contract: these interfaces froze at
+**M2 exit**; changing a frozen one afterwards requires an ADR, and the
+sections below carry each change with the decision that made it. Status
+column tracks arrival.
 
 Formats defined by ADR-0011 unless noted.
 
@@ -12,20 +12,21 @@ Formats defined by ADR-0011 unless noted.
 | Log record format v1 | `inf-log` | implemented (M2-S01) |
 | Batch frame layout v1 | `inf-log` | implemented (M2-S01); **read-only since M2.5-S12** (ADR-0031 — v2 is the written format; v1 accepted forever on the alpha line) |
 | Batch frame layout v2 (per-frame sequencing) | `inf-log` | implemented (M2.5-S12, ADR-0031 — epoch · seq · covered-LSN stamp under the CRC; the tail-scan attestation taxonomy consumes it) |
+| Batch frame layout v3 (aligned successor) | `inf-log` | implemented (M4.5-S34, ADR-0086 D3 — the v2 layout under `IFR3`; successor at the next 4 KiB boundary, zero padding written by the frame; written on `Direct` segments, v2 stays the buffered format) |
 | LSN addressing | `inf-log` | implemented (M2-S01) |
 | Segment naming + lifecycle | `inf-log` | implemented (M2-S02) |
 | `SegmentFs` injection seam | `inf-log` | implemented (M2-S02; extended by S05/S11/S16; sim-disk tier at S18) |
 | `MutationEffect` → record seam | `inf-store` → `inf-log` | implemented (M2-S03/S08, ADR-0012/0015; dep edge + command-layer post-image emission live) |
 | Document record classes + replay contract | `inf-doc`/`inf-store`/`inf-log` | implemented (M3-S17, ADR-0043 — tags 6/7, incarnation lineage, recorded replay witnesses, static opcode registry, modular-u24 replay, checkpoint full images) |
 | Log staging domain (`StagingRing`) | `inf-log` | implemented (M2-S03; reactor wiring at S05) |
-| Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `BackendDriver` reads at S05; S14 tail policy implemented — ADR-0018) |
+| Sequential read path (`SegmentReader`) | `inf-log` | implemented (M2-S04; `ReadStep`/`next_step` make the clean end explicit; S14 tail policy — ADR-0018, foreign-segment classification — ADR-0090 D2) |
 | Durability watermark contract | `inf-log`/`inf-runtime` | implemented (M2-S05/S06/S08, ADR-0013/0015; live on `ServerPlane` — acks seq-keyed, semantics unchanged; sim disk at S18) |
 | Driver file ops (`LogWrite`/`Fdatasync`) | `inf-runtime` | implemented (M2-S05, ADR-0013 D1 — extends the frozen M0 `BackendDriver` contract) |
-| Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1) |
-| Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — the ADR-0009 §4 codec revision, additive opcode 6; `ns ≥ 16` enforced at decode) |
+| Node catalog `META` swap (`inf-log::meta`) | `inf-log` | implemented (M2-S08, ADR-0015 D3 — the S11 MANIFEST protocol class; payload = `inf-store::catalog` v1 → v2 (ADR-0062 D6) → v3 (ADR-0075 D2) → **v4 (ADR-0100 D1, 2026-09-01)**: a drop-tombstone section, written iff non-empty, owned by the catalog writer) |
+| Namespace selection + `Op::ApplyNs` | `inf-server`/`inf-fabric` | implemented (M2-S08, ADR-0015 D1 — additive opcode 6; `ns ≥ 16` enforced at decode; `program: bool` and header bit 0 carry execution origin under ADR-0115 D2–D5, as specified in `interfaces-m0.md` §4) |
 | `.ick` checkpoint format v1 | `inf-log` | implemented (M2-S10, ADR-0016 — record-v1 payload; digest = hash64 chain, recorded deviation from "xxh3") |
 | Checkpoint scheduler group + ckpt token classes | `inf-runtime` | implemented (M2-S10/S11, ADR-0016 D4/D5 + ADR-0017 D3 — `GroupClass::Checkpoint`; `TokenClass::{CkptWrite,CkptSync,ManifestSync}` routing-only extensions of the frozen M0 token contract) |
-| MANIFEST schema v1 | `inf-log` | implemented (M2-S11, ADR-0017 — `INFMAN1\0` payload in the META envelope class; swap steps ride the driver via `TokenClass::ManifestSync` on the reactor tier) |
+| MANIFEST schema (epoch 3) | `inf-log` | implemented (M2-S11, ADR-0017 — `INFMAN1\0` payload in the META envelope class; swap steps ride the driver via `TokenClass::ManifestSync` on the reactor tier). Epoch 2 added tier sections (M4-S12, ADR-0057 D5); **epoch 3 (ADR-0094 D6, 2026-08-30)** adds `key_hash_id: u64` after `begin` and makes `tier_ns_count` always present — the manifest names the key-hash secret that placed its checkpoint's refs, and recovery compares before the checkpoint loads. Epochs 1/2 decode to the typed `PredatesKeyHashBinding` (no migration) |
 | Tail-region scan + corruption taxonomy | `inf-log::tail` | implemented (M2-S14, ADR-0018 — `scan_region`/`RegionScan` facts + `LogCorruption`; policy in `inf-server::recover`) |
 | Recovery state digest | `inf-store` | implemented (M2-S13, ADR-0018 — `Keyspace::state_digest`, order-independent multiset hash; the S18/S19 oracle currency) |
 | Fault-point registry | `inf-foundation`/`inf-log`/`inf-server` | implemented (M2-S16/S17, ADR-0019/0020 — thread-local, feature-gated `fault-points`, deterministic triggers; 8 points wired + CI inventory check across all decl modules) |
@@ -34,7 +35,7 @@ Formats defined by ADR-0011 unless noted.
 | Durable plane over `SegmentFs` (generic) | `inf-server` | implemented (M2-S19, ADR-0021 D1 — `ServerPlane<O, F = StdSegmentFs>`, `DurableCell/CkptCell/ManifestCell/BootRecovery<F>`; `begin_recovery(fs, …)`; monomorphized, zero std-tier change) |
 | Detached control plane (`ControlInbox`) | `inf-server` | implemented (M2-S19, ADR-0021 D2 — `ControlHandle::detached[_with_catalog]` + inline `drain(fs, dir)`: catalog swaps + unlinks inside the deterministic sim loop; `load_catalog_from<F>`) |
 | Durability oracle + sweep (`m2-durable`) | `inf-sim` | implemented (M2-S19, ADR-0021 D3-D5 — ack-stream oracle incl. the survival audit on taxonomy-refused boots; `--sweep/--shard/--out`; 10k-seed gate artifact green; `Plant::FsyncLies` canary) |
-| Checkpoint board (`CkptBoard`/`CkptSlot`) | `inf-server::control` | implemented (M2-S20, ADR-0021 D6 — per-cell request/publication epoch slots; publication at the MANIFEST swap's dir-fsync commit; aborted swaps retry after backoff so `WAIT` cannot hang) |
+| Checkpoint board (`CkptBoard`/`CkptSlot`) | `inf-server::control` | implemented (M2-S20, ADR-0021 D6 — per-cell request/publication epoch slots; publication at the MANIFEST swap's dir-fsync commit; aborted swaps retry after backoff so `WAIT` cannot hang. ADR-0159 A1: an all-cell request word beside the slots, requests issued only by partition credits, cells observe the board through a bounded sweep) |
 | `INF.CKPT`/`BGSAVE`/`LASTSAVE` | `inf-wire`/`inf-server` | implemented (M2-S20 — registry grew to 68 (hash multipliers re-searched); pump-routed `program_ckpt`; compat entries + deviations declared) |
 | Persistence counter set | `inf-log`/`inf-server`/`inf-bench` | implemented (M2-S21, ADR-0021 D7 — `INFO persistence` gains rates/percentiles/ages; the acks-per-fsync grouping tripwire is report-enforced in `gate-run m2` with a canary mode) |
 
@@ -64,7 +65,7 @@ body   := type: u8 · flags: u8 · varint(ns) · payload
   `post-len` are nonzero exact live-acceptance witnesses; zero is a typed
   decode error.
 - `flags`: reserved, v1 defines no bits. Unknown flags and unknown types
-  are **fail-stop** decode errors — replay refuses, never skips (§8.4).
+  are **fail-stop** decode errors — replay refuses, never skips.
 - Public surface: `RecordView<'_>` (borrowing views; invalid records are
   unrepresentable), `RecordView::encode_into(&mut Vec<u8>)` /
   `encoded_len()`, `decode_record(&[u8]) -> (RecordView, consumed)`,
@@ -135,7 +136,44 @@ len-4  4    CRC32C(header·body): u32 LE
   frame in a replay prefix is a named refusal (append order — no
   downgrade after the first v2 frame).
 
-## `first_lsn` bound — post-M2-exit amendment (ADR-0072, 2026-08-17)
+## Batch frame layout v3 (`inf-log::frame`, M4.5-S34 — ADR-0086 D3)
+
+Byte-identical to v2 from offset 4 on; the magic is `"IFR3"` and the
+**successor rule** changes: the next frame begins at
+`align_up(base + frame_len, FRAME_ALIGN = 4096)`, and the bytes between
+`base + frame_len` and that boundary are zeros **written by the frame's
+own write** (the `O_DIRECT` alignment unit — one aligned write-through
+write per frame is the point). `frame_len` excludes the padding;
+`FrameRef::padded_len()` is the reader's advance.
+
+- Readers (`SegmentReader`, `FrameIter`, the tail scanner) round up after
+  a v3 frame and apply the end-of-log rule at the boundary (zero magic ⇒
+  preallocated tail; a torn frame stops the read). The padding bytes are
+  **skipped, never validated** — a padding sector that did not land is
+  not evidence about the frame (the CRC is), and demanding zeros would
+  refuse honest torn tails on 512-byte-sector devices. `ReadEnd::at`
+  is the aligned boundary — the resume offset.
+- Which frames are v3: the writer emits v3 on `Direct` segments
+  (`FrameLayout::Aligned`) and v2 on `Buffered` segments
+  (`FrameLayout::Packed`); `FrameSlot::layout()` carries the choice from
+  the rotor to `StagingRing::seal(first_record_lsn, covered_lsn, layout)`
+  and `FrameBuilder::finalize(first_lsn, stamp, layout)`. v2 and v3 may
+  interleave in either order (a mode change across lives); the "v1 after
+  v2" refusal is unchanged.
+- ADR-0031 D3's continuity rule "frame n+1 begins exactly where frame n
+  ends" reads "at frame n's successor"; seq/epoch/attestation rules and
+  the beyond-data-end audit are otherwise unchanged (the audit scans
+  *from* the aligned data end, so a valid frame's padding is never
+  mistaken for slack).
+- Disclosure: `StagingStats::padding_bytes` (`log_padding_bytes` in
+  INFO) counts every padding byte sealed; the watermark, `queued_up_to`,
+  and the rotor's cursor advance by the padded length.
+- The staging buffers carry `FRAME_ALIGN` slack on both ends and build
+  the frame at an aligned base (`FrameBuilder::with_capacity`, the
+  ADR-0054 D2 `align_offset` shape — no unsafe); `resident_bytes` =
+  2 × (capacity + 8 KiB).
+
+## `first_lsn` bound — post-M2-exit amendment (ADR-0126, 2026-08-17)
 
 Post-exit change to a frozen surface, ADR-gated per the freeze discipline.
 The nightly `frame_decode` campaign found that `first_lsn.offset` was read
@@ -146,15 +184,21 @@ from the header and never bounded: a CRC-valid frame declaring
 - **The derivation is per-version.** `first record = frame base +
   header_len` — 20 for v1, 40 for v2. ADR-0011 D2's text says "frame base
   + 20", which is v1-era wording from before ADR-0031's 40-byte v2 header;
-  ADR-0072 D1 restates it. **Cite `header_len`, never the constant 20.**
+  ADR-0126 D1 restates it. **Cite `header_len`, never the constant 20.**
 - **`decode_frame` bounds the field** where it is read, for both formats:
   `header_len ≤ first_lsn.offset` and `(first_lsn.offset − header_len) +
-  frame_len ≤ u32::MAX`. A frame's first record is never inside its own
-  header, and a frame always fits inside a u32-addressed segment.
+  extent ≤ u32::MAX`, where `extent` is the frame's **on-device extent**
+  — `frame_len` for v1/v2, `align_up(frame_len)` for v3 (ADR-0126 D1 as
+  amended 2026-09-14: the successor address and every segment cursor
+  advance by the padded extent, so that is what must fit).
+  A v3 `frame_len` that cannot be padded inside a `u32` is `BadLength`;
+  `align_up_frame` itself saturates at `u32::MAX` instead of wrapping to
+  0. A frame's first record is never inside its own header, and a frame
+  always fits inside a u32-addressed segment.
 - **New public variant `FrameDecodeError::BadFirstLsn { offset: u32 }`** —
   corruption class, not the torn-tail class (`ZeroMagic` stays the only
   expected end-of-log signal). `FrameDecodeError` deliberately stays
-  exhaustive (no `#[non_exhaustive]`, ADR-0072 D3): the added variant is
+  exhaustive (no `#[non_exhaustive]`, ADR-0126 D3): the added variant is
   semver-breaking for external matchers, accepted pre-1.0 and revisited at
   1.0. Decoder error enums grow by ADR, each naming its semver impact.
 - The bound also makes `inf-server::recover`'s `first_lsn.offset −
@@ -166,8 +210,24 @@ from the header and never bounded: a CRC-valid frame declaring
 
 `Lsn = { segment: SegmentId(u32), offset: u32 }`, per cell; ordering is
 (segment, offset) lexicographic = append order. A record's LSN is the byte
-offset of its length prefix within its segment. **No global LSN exists**
-(master plan §8.1).
+offset of its length prefix within its segment. **No global LSN exists**:
+each cell's log is ordered on its own, and nothing orders two cells' logs.
+
+`inf-log::MAX_SEGMENT_LEN` is the largest physical segment length whose
+one-past end is a representable LSN offset, and `check_segment_len` is the one
+refusal (ADR-0018, 2026-09-08 amendment). Recovery applies it to every
+retained segment before loading a checkpoint or replaying records; both
+tail-scan entry points and `SegmentReader::open` apply it to the opened file
+before reading. Every cursor advance and frame-implied address in both read
+paths is checked, so `new` — which takes a caller's handle — cannot wrap onto
+a live frame's address either. A refusal is `io::ErrorKind::InvalidData`
+naming the segment, its length and the limit.
+
+The bound is the format's address range, not the current rotation size: an
+older segment may exceed today's `segment_bytes` and stay replayable. The
+rotor seals before a frame would cross `segment_bytes` (a `u32`), so an
+oversized file is planted or foreign. Refusal never truncates the file or
+ignores its unaddressable suffix.
 
 ## Segment naming + lifecycle (`inf-log::segment`, `inf-log::scan`)
 
@@ -181,11 +241,73 @@ offset of its length prefix within its segment. **No global LSN exists**
   (`SegmentRotor::maintain`); rotation on the append path is a pointer
   swap; seal = fdatasync + write-handle drop (sealed segments are
   immutable by construction). Seal at `segment_bytes` (default 256 MiB)
-  or optional `seal_after_ms` (default off — M2 cut line).
+  or optional `seal_after_ms` (default off — M2 cut line; **synchronous
+  tier only**: `maintain_deferred` never time-seals — the synchronous
+  `rotate()` would swap the active segment under an in-flight frame).
+- **Segment recycling (M4.5-S39b, ADR-0090):** a sealed `Direct` segment
+  that was pre-zeroed (`SealedMeta { id, prezeroed }`, recorded at seal)
+  and falls below the MANIFEST floor is offered to a bounded per-cell
+  pool at truncation instead of being unlinked —
+  `SegmentRotor::forget_sealed(id) -> SealedDisposal::{Recycled,
+  Unlink(PathBuf)}`, bound `SegmentConfig::recycle_slots` (**default 1**
+  — ADR-0090 A7.2; `0` / `--no-segment-recycle` is the baseline arm;
+  campaign F's recovery gate was non-discriminating and its attribution
+  is S39d's). The MAINTAIN prealloc consults the pool before creating a
+  file: `rename(seg-M → seg-N)`,
+  open `N` direct, `fully_allocated()` **re-read** (ADR-0086 D4 — a
+  pooled file that reads sparse falls through to the zero-fill,
+  `recycle_fallbacks`), and on the deferred tier the rename's directory
+  entry rides the **same `PreallocBarrier`** a fresh prealloc's does —
+  registered coverage-neutral in the ledger in the slice that renamed,
+  so every write-through ticket of `N`'s frames sits behind it and no
+  record of `N` is acknowledged before the rename is durable (ADR-0090
+  D3 as amended; pinned in `commit.rs`, the rotor tests, `m2-recycle`).
+  Counters: `segments_recycled`, `recycle_misses` (prealloc found the
+  pool empty), `recycle_fallbacks`, `recycle_pool_bytes`. Ids are never
+  reissued: `N = active.next()` — a recycled file's residue is stamped
+  with every previous id it carried, all ≠ `N`.
+  **The take-time sentinel (ADR-0090 A15):** every take
+  of a fully allocated pooled file writes one v3 frame stamped for the
+  file's **old** id into its **last block** (`build_recycle_sentinel(
+  &mut FrameBuilder, old, segment_bytes)`, record `Delete { ns: 0, key:
+  RECYCLE_SENTINEL_KEY }`, stamp `{1, 1, 0}`) — foreign under `N`, so the
+  slack scanner always meets one foreign frame and the residue stays
+  provable when the next life's data end lands inside the last residue
+  frame's body (the one placement no surviving header proved). It rides
+  the zero-fill state machine as a one-block `Filling` with
+  `FillSource::RecycleSentinel { old }` (unpaced; ready after the fill
+  barrier — durable before the file can be taken write-through) on the
+  driver tier, and is written + `sync_data`ed inline on the synchronous
+  tier. `zero_fill_bytes` counts zeros only; `recycle_sentinels` counts
+  sentinels (INFO `recycle_sentinels`).
+- **The pool wait (ADR-0090 D9 / A8):** `SegmentConfig::prealloc =
+  PreallocPolicy::{Immediate, WaitForPool { bound: Quarter | Eighth }}`
+  (`infinityd --recycle-wait off|quarter|eighth`, default `quarter`).
+  The rotor keeps one explicit state while `next` is absent, reset to
+  `Immediate` at every rotation: `Immediate → WaitingForRecycle` when the
+  pool is empty and the wait is eligible (the rotor is `Direct`,
+  recycling on, the active segment pre-zeroed, ≥ 1 rotation this life, a
+  sealed pre-zeroed segment of this life exists, size-based sealing,
+  `active.written < bound`); each MAINTAIN slice re-checks the pool;
+  `→ FreshFallback { fill_origin }` at the bound (one `recycle_miss` per
+  generation, never per slice; a `NoSpace` retry neither waits nor counts
+  again). The fallback's zero-fill paces from `fill_origin` (`allowed =
+  2 × (written − origin) + 16 MiB`) so the head start stays ADR-0086
+  D4's burst and the fill completes by ¾ − 8 MiB; an immediate prealloc
+  has origin 0 and is byte-identical to the pre-D9 pacing. ENOSPC
+  surfaces at the bound with ¾ of the segment as admission headroom.
+  Counters: `recycle_waits_started` / `_satisfied` / `_expired`,
+  `recycle_wait_active_bytes_max`, `segment_inline_preallocs`,
+  `segment_prealloc_failures`. Invariants (pinned in
+  `segment_prealloc_wait.rs`, the `m2-recycle` oracles): every wait ends
+  exactly once; a waiting policy never strands a rotation
+  (`inline_preallocs = 0`); a wait nothing can feed is never started.
 - ENOSPC discipline: prealloc failure raises `space_exhausted()` *before*
-  writes need the space (the S08 admission hook); appends that outrun it
-  get typed `LogError::NoSpace`. fsync failure is the distinct,
-  non-recoverable `FsyncFailed` type (§8.4 fsyncgate rule — enforced
+  writes need the space (the S08 admission hook); on `MemFs` an append that
+  outruns it gets typed `LogError::NoSpace`; on the shipped backend a WAL
+  write that fails, `ENOSPC` included, ends in the cell's fail-stop
+  (`DurableCell::on_log_error`). fsync failure is the distinct,
+  non-recoverable `FsyncFailed` type (the fsyncgate rule — enforced
   since S17 by `scripts/check-fsync-fail-stop.sh`: the fsync-error types
   may appear only in the audited allowlist of fail-stop sites; on the
   node, `DurableCell::fail_stop` exits with
@@ -193,15 +315,16 @@ offset of its length prefix within its segment. **No global LSN exists**
   — zero acks for the affected batch, proven by the child-process
   fsyncgate test).
 - Append protocol: `begin_frame(len, now) -> FrameSlot` (rotates if
-  needed, reserves the base LSN) → `FrameBuilder::finalize(slot.
-  first_record_lsn())` → `commit_frame(slot, bytes) -> Lsn`.
+  needed, reserves the base LSN) →
+  `FrameBuilder::finalize(slot.first_record_lsn())` → `commit_frame(slot,
+  bytes) -> Lsn`.
 
 ## `SegmentFs` injection seam (`inf-log::fs`)
 
 Control-path file operations (create/prealloc, dir-fsync, list, open,
 positional read/write, fdatasync) behind a trait so DST can fault every
-one (L7). Tiers: `StdSegmentFs` (boot/dev; `set_len` prealloc — real
-`fallocate` arrives with the S05 BackendDriver file ops), `fs::mem::MemFs`
+one (L7). Tiers: `StdSegmentFs` (boot/dev; `set_len` prealloc, which
+reserves no blocks: no tier calls `fallocate`), `fs::mem::MemFs`
 (deterministic, fault-injectable test tier — process-KILL physics: every
 completed write survives), `fs::sim::SimDisk` (M2-S18 — power-CUT
 physics: un-fsynced state loses/tears/reorders, see the sim-disk section
@@ -216,6 +339,47 @@ those driver ops against the same `SimDisk`.
   dir-fsync, CRC32C-enveloped, payload-opaque). First consumer: the
   namespace catalog, single-written by `inf-server::control`; S11's
   MANIFEST reuses the protocol.
+
+### M4.5-S34 additions (ADR-0086 D4) — `Direct` log segments
+
+- `SegmentIoMode::{Buffered, Direct}` on `SegmentConfig::io_mode`
+  (default `Buffered` — the M2 path byte-for-byte) plus
+  `fua_max_frame_bytes` (the probed write-through crossover, default
+  256 KiB). `Direct` requires `segment_bytes % 4096 == 0`
+  (`SegmentConfig::assert_valid`).
+- `SegmentFs::create_segment_direct(path, prealloc)` — `O_DIRECT`
+  (verified), sparse, unsynced; `SegmentFs::open_segment_append(path,
+  mode)` — the recovered tail reopens in the configured mode;
+  `SegmentFile::fully_allocated()` — the **read, never remembered**
+  pre-zeroing fact (`st_blocks × 512 ≥ st_size` on the std tier; `true`
+  on `MemFs`; length ≥ preallocation target on the sim disk). Wrappers
+  (`ReadAheadFs`) forward explicitly, as for `create_tier`.
+- Rotor zero-fill state machine (driver-ridden, never a blocking write):
+  `next_zero_slice(max_len) → ZeroSlice{fd, offset, len, source:
+  FillSource::{Zeros, RecycleSentinel { old }}}` (paced against
+  `2 × active.written + ZERO_FILL_HEAD_START` while the active segment
+  is pre-zeroed and the source is zeros; unpaced otherwise — the plane
+  copies a sentinel image into its own aligned one-block window before
+  the push), `note_zero_slice_written()`,
+  `take_zero_fill_barrier() → fd`, `note_zero_fill_synced()`;
+  `FrameSlot::{len (padded), layout, write_through_ok}`;
+  `LogError::NextNotReady` (a zero-fill op is in flight on the segment
+  rotation needs — the frame waits one completion); class-upgrade
+  rotation at `begin_frame_deferred` when a pre-zeroed next segment is
+  ready and the active one is not; `RotorStats::{zero_fill_bytes,
+  rotations_unzeroed, rotations_upgrade}`;
+  `active_io_mode()`/`active_write_through()`.
+  **Amended 2026-09-30 (ADR-0167 D2):**
+  `ZeroSlice.offset` is `u32`, the segment cursor it is built from; its
+  `LogWrite` position is `FileOffset::from_u32_bytes`, total.
+- Sim disk: `create_segment_direct` creates an empty inode with a
+  preallocation target; `driver_write_through(fd, offset, data)` is
+  durable at completion and supersedes overlapping earlier pending
+  writes; `StallConfig::through_base_ns` (0 = inline) and
+  `schedule_write_through(now)`.
+  **Amended 2026-09-30 (ADR-0167 D2):**
+  `SimDisk::driver_write_at`, `driver_write_through` and `driver_read_at`
+  take `offset: FileOffset`.
 
 ### M4-S09/S11 additions (ADR-0054, ADR-0056)
 
@@ -254,7 +418,7 @@ enum MutationEffect<'a> {
   are borrowed field views and add no composed payload buffer or
   document-aware frame branch. `encoded_len()` is exact (admission +
   accounting input).
-- Defined in `inf-log` (the seam's consumer — §3.3); `inf-store` imports
+- Defined in `inf-log` (the seam's consumer); `inf-store` imports
   it when S08 wires durable namespaces (the dep-DAG edge lands there,
   direction fixed by ADR-0012).
 - `DocFull` replay is a blind idempotent upsert after validating canonical
@@ -268,14 +432,34 @@ enum MutationEffect<'a> {
   `inf-doc::apply` semantics and bumps once; `0 < distance < 2^23` is a
   counted stale skip; the other half-range is corruption. Replay uses the
   record's exact `match_count` and `post_len`, not current boot limits,
-  and fail-stops if the result count or canonical output length disagrees.
-  This is ADR-0043 D6 / M3 §3.4 R1–R3, including recreation and version
+  and fail-stops if the result count or canonical output length disagrees,
+  or if re-executing the delta crosses the format bounds every writer
+  enforces: nesting past 128 containers or a document past the record clamp
+  (ADR-0169 D6; a delta a pre-fix build wrote that way is corruption,
+  ADR-0042 A1).
+  This is ADR-0043 D6, including recreation and version
   wrap.
 
 ## Log staging domain (`inf-log::staging`, M2-S03)
 
-The §7.1 "log staging ring": a double-buffered frame pair (contiguity for
+The "log staging ring": a double-buffered frame pair (contiguity for
 one-writev — ADR-0012), fixed capacity, allocated once per cell.
+
+**M4.5-S35 amendment (ADR-0087 D1):** the pair is a **ring of
+`frames_in_flight + 1` whole frame buffers** (`StagingConfig { capacity_bytes,
+frames_in_flight: 1..=MAX_FRAMES_IN_FLIGHT (8) }`, default 1 — the pair,
+byte-identical). Up to K sealed frames stay leased at once; `release(lease)`
+frees its buffer by generation in **any order** (completions reorder);
+`seal` takes any free buffer; `can_seal()` = records pending ∧ a free buffer;
+`backlogged()` = every in-flight slot taken; `drained()` = no lease out (the
+rotation precondition, ADR-0087 D4); `in_flight()`, `frames_in_flight()`.
+`capacity_bytes` keeps its per-buffer meaning (so `max_record_len`, a
+user-visible admission contract, does not move with K); `resident_bytes` =
+(K + 1) × (capacity + 2 × `FRAME_ALIGN`). `StagingStats::in_flight_max` is
+the observed high-water mark (`frames_in_flight_max`). Operator surface:
+`infinityd --frames-in-flight K`; the L5-neutral pairing is `--frames-in-flight
+3 --log-staging-mib 2` (4 × 2 MiB). `StagingConfig::with_capacity(bytes)`
+is the K = 1 constructor tests and tooling use.
 
 - EXECUTE: `stage(&MutationEffect) -> Result<StagedAt, StagingFull>` —
   in-place encode, zero steady-state allocation (counting-allocator
@@ -286,25 +470,57 @@ one-writev — ADR-0012), fixed capacity, allocated once per cell.
   swaps to the free buffer; at most one frame in flight) →
   `leased_frame(&lease)` for the writev → `release(lease)` on completion.
   `flush_into(&mut SegmentRotor, now_ms)` is the synchronous pre-S05
-  choreography.
+  choreography; on a failed write it releases the lease and returns the
+  error — the failed frame's records are gone with the buffer, the ring
+  is never wedged.
 - LSN handoff (L6): `FrameLease::lsn_of(StagedAt) -> Lsn`,
   generation-checked — the S06 `WatermarkGate` registration input.
 - Accounting (L5): `staged_bytes`/`in_flight_bytes` exact at every
   append/seal/release; `resident_bytes` = 2 × capacity, constant;
+  `capacity_bytes()` (M4.5-S27 — the `log_staging_capacity_bytes`
+  observable, operator-set via `infinityd --log-staging-mib`);
   cumulative `StagingStats{appends, append_bytes, refusals, seals,
   releases}`.
+- M4.5-S27 amendment (ADR-0083 D1/D2): admission behaviour above this
+  seam changed — every parkable path (local pump *and* the fabric
+  per-origin pump) paces on `StagingFull` instead of refusing; typed
+  `-BUSY` is no longer the design response to pressure. A record that
+  can never fit (`est > max_record_len`) refuses up front with a typed
+  `ERR` (the M2-S08 up-front bound check this section always demanded).
 
 ## Sequential read path (`inf-log::reader`, M2-S04)
 
 `SegmentReader` over one segment (sealed or active tail), reads through
 the `SegmentFs` seam (→ `BackendDriver` at S05):
 
-- `next_frame() -> Result<Option<FrameRef>, ReadError>` (lending,
-  validate-then-yield, one CRC pass per frame via header peek) and
-  `apply_frames(callback) -> Result<ReadEnd, ApplyError>` (the replay
-  batch-apply shape).
+- `next_step() -> Result<ReadStep<'_>, ReadError>` is the lending,
+  validate-then-yield operation (one CRC pass per frame via header peek).
+  `ReadStep<'a> = Frame(FrameRef<'a>) | End(ReadEnd)` carries the clean
+  end in the return value; no caller must infer it from an absent frame.
+  A clean end repeats on subsequent calls. An invalid frame remains at
+  the failing cursor and subsequent steps report its error again; read
+  errors never authorize skipping bytes or treating failure as clean EOF.
+- `next_frame() -> Result<Option<FrameRef<'_>>, ReadError>` is the
+  compatibility wrapper: `Frame` becomes `Some`, `End` becomes `None`.
+  After a terminal read failure it fuses to `Ok(None)`; this is **not**
+  a clean end (`read_end()` remains `None`). `read_end()` returns `Some`
+  only once either stepping API has recorded a clean `ReadEnd`.
+- `apply_frames(callback) -> Result<ReadEnd, ApplyError<E>>` loops over
+  `next_step`: apply each validated frame, return its explicit clean end,
+  propagate `ApplyError::Read` on read failure. A callback failure returns
+  `ApplyError::Apply { at: frame.first_lsn(), error }`; that frame has
+  already been consumed. A `FrameRef` borrows the reader window and must
+  be released before another step.
 - Stored `first_lsn` cross-checked against physical offset per frame —
-  `ReadError::LsnMismatch` on misdirected writes (ADR-0011 D2).
+  `ReadError::LsnMismatch` on misdirected writes (ADR-0011 D2). **M4.5-S39b
+  (ADR-0090 D2 as amended):** a frame that decodes in full (magic, length,
+  record count, CRC32C) whose stored **offset equals** the physical offset
+  while its stored **segment id differs** from the file's is the typed
+  `ReadError::ForeignSegment { segment, offset, stored_segment }` — the
+  residue a recycled segment carries from its previous life. Both
+  variants are terminal for the reader: it never yields, skips or
+  truncates a misplaced frame (the invariant every consumer relies on is
+  unchanged); only recovery classifies the distinction.
 - Tail = facts, not policy (S14 owns the taxonomy):
   `ReadEnd::{ZeroTail, FileEnd}` with `.at()` = byte after the last valid
   frame (the `SegmentRotor::open_existing` tail_offset); torn/corrupt
@@ -313,24 +529,58 @@ the `SegmentFs` seam (→ `BackendDriver` at S05):
 - `ReaderConfig{chunk_bytes = 1 MiB, max_frame_len}`; window grows only
   when a frame exceeds it (bounded by `max_frame_len`).
 
+These are reader facts; recovery decides from them. A validating frame
+beyond a segment's data end marks a hole (ADR-0087 D6). Recovery refuses
+to start, with a `LogCorruption` naming the corruption point and the
+evidence, when a frame beyond the hole is format v1 or a surviving frame
+attests fsync coverage past it; otherwise it truncates at the hole and
+counts the frames it discards. Frames whose epochs all sit below the
+replayed prefix's or below a life observed beyond the hole, or whose own
+`first_lsn.segment` is not the segment they were read from, are residue
+of a discarded or recycled life, never a hole; when the epoch beyond the
+hole decides it, the segments probed beyond the hole are replayed.
+Non-validating residue at the resume point is a torn tail (the tail
+pointer moves back; no byte is rewritten); behind it, residue is
+tolerated and counted. A log that ends below the MANIFEST's begin-LSN
+refuses to start (ADR-0018 D2/D5, ADR-0031 D4/D5, ADR-0090 D2).
+
 ## Driver file ops (`inf-runtime`, M2-S05, ADR-0013 D1)
 
-Extension of the frozen M0 `BackendDriver` contract (recorded per the §3.2
-freeze discipline). The token *layout* is unchanged; `TokenClass` gains
+Extension of the frozen M0 `BackendDriver` contract (recorded per the
+interface-freeze discipline). The token *layout* is unchanged; `TokenClass` gains
 `LogWrite = 5` and `Fsync = 6`.
 
-- `IoOp::LogWrite { fd, offset, data: StableBytes, token, fsync_token }`
-  — positional write of one sealed frame (the contiguous frame makes "one
-  writev" a single-iovec write). Short writes resubmit internally:
-  `CompletionResult::LogWritten` ⇒ ALL bytes reached the fd (page cache —
-  the staging-lease release point, never an ack point).
-- `fsync_token: Some(_)` chains an fdatasync — `IOSQE_IO_LINK` on uring
-  (kept unsplittable across submit boundaries), issued after the write's
-  completion on fallback tiers. `CompletionResult::Synced` is the ONLY
-  durability fact (L2) and is delivered exactly once, only after every byte
-  of the write is both written and covered (a sync that raced a short write
-  is superseded internally); a failed write cancels it
-  (`Error{ECANCELED}` on `fsync_token` — no sync-past-failed-write).
+- `IoOp::LogWrite { fd, offset, data: StableBytes, token, barrier:
+  WriteBarrier }` — positional write of one sealed frame (the contiguous
+  frame makes "one writev" a single-iovec write). Short writes resubmit
+  internally: `CompletionResult::LogWritten` ⇒ ALL bytes reached the fd.
+  **Amended 2026-08-21 (M4.5-S34, ADR-0086 D1):** the former
+  `fsync_token: Option<CompletionToken>` became the `WriteBarrier` enum —
+  `None` (page cache / device cache, the staging-lease release point,
+  never an ack point), `WriteThrough` (`RWF_DSYNC` on an `O_DIRECT` fd:
+  `LogWritten` is delivered only once the bytes are on stable media — the
+  frame's durability fact, no `Synced` follows; a short write re-arms its
+  remainder write-through), `LinkedFsync { fsync_token }` (below). The
+  state "write-through and a linked sync" is unrepresentable.
+  **Amended 2026-09-30 (ADR-0167 D2):** `offset` is
+  `FileOffset`. A log frame's and a zero fill's position come from a
+  `u32` segment cursor and a checkpoint header's is 0 (all total); a
+  checkpoint section's or footer's is checked before `admit`, and a
+  refusal aborts the checkpoint with nothing admitted or sealed. A tier
+  flush round's write positions are checked when the round opens (the
+  flush-round inventory below).
+- `WriteBarrier::LinkedFsync { fsync_token }` chains an fdatasync —
+  `IOSQE_IO_LINK` on uring (kept unsplittable across submit boundaries),
+  issued after the write's completion on fallback tiers.
+  `CompletionResult::Synced` is the durability fact for this class (L2)
+  and is delivered exactly once, only after every byte of the write is
+  both written and covered (a sync that raced a short write is superseded
+  internally); a failed write cancels it (`Error{ECANCELED}` on
+  `fsync_token` — no sync-past-failed-write). kqueue executes
+  `WriteThrough` as write + fsync (the correctness tier).
+- `TokenClass::ZeroFillWrite = 13` (routing-only, ADR-0086 D4): a plain
+  `LogWrite` zero-filling a preallocated next segment; its completion
+  advances `SegmentRotor`'s zero cursor, never the staging lease.
 - `IoOp::Fdatasync { fd, token }` — standalone barrier (everysec tick,
   deferred seal).
 - `StableBytes::new(&[u8])` is the one `unsafe` seam: bytes must stay
@@ -338,8 +588,28 @@ freeze discipline). The token *layout* is unchanged; `TokenClass` gains
   `FrameLease` is the canonical proof (buffers never reallocate; reset only
   on release). Construction lives in the plane; `inf-log` stays
   `#![forbid(unsafe_code)]`. S08 decides `inf-server`'s shape (ADR-0013).
-- `fallocate`/rename/dir-fsync ops were deliberately NOT added (no unused
-  surface); they land with S11/ENOSPC-hardening consumers.
+- `IoOp` has no `fallocate` or rename op and no op of its own for a
+  directory sync: a rename is a `SegmentFs` call; a directory sync is a
+  blocking `SegmentFs::sync_dir` or an `IoOp::Fdatasync` on a directory fd
+  (the boot barriers, the checkpoint directory's sync); no production path
+  reserves blocks with `fallocate` (write-through segments are pre-zeroed
+  instead, ADR-0086 D4).
+
+### Amendment (2026-08-19, M4.5-S31 — ADR-0084): tier-flush token classes
+
+The token *layout* stays frozen; `TokenClass` gains two routing-only
+classes: `TierFlushWrite = 11` and `TierFlushSync = 12`. The ops are the
+existing `IoOp::LogWrite`/`Fdatasync` (the ADR-0056 alternatives-rejected
+rule) — only the completion routing differs: these classes route to the
+tier plane's round bookkeeping (`TierCell::on_flush_completion`), never
+to `DurableCell` (the frame-lease custody chain is not theirs) and never
+into the WAL commit ledger (flush watermarks are a separate custody
+chain; acks never wait on a tier barrier — ADR-0022 D3 untouched). Token
+payload: `slot = lane × 256 + op_index` (lane = the namespace's stable
+per-cell flush lane; ≤ 256 ops per round, asserted), `generation =
+round_seq` (stale completions mismatch and are counted, never applied).
+A third `StableBytes` construction (`log_bytes::tier_round_bytes`) joins
+the audit surface with the round-custody proof (SAFETY.md).
 
 ## M2.5-S01/S07 amendments (boot barriers · sync pipeline — ADR-0026)
 
@@ -352,11 +622,17 @@ discipline:
   hints the next two windows; `IckReader::next_step` hints per section.
   Hint-only by contract: implementations must not change any byte the
   reader sees (L7 — MemFs/sim keep the no-op). The real implementation is
-  `inf-server::ReadAheadFs` (boot-scoped prefetch thread; prefetch enabled
-  by the assembly iff a single cell recovers — the measured regime split).
+  `inf-server`'s crate-private `ReadAheadFs` — a boot-scoped prefetch
+  thread held only by `Recovery::boot_reads` (ADR-0109: the plane, the
+  rotor and the tier handles keep the bare tier by type); enabled by
+  `RecoverConfig::boot_prefetch`, which the assembly sets iff a single
+  cell recovers — the measured regime split.
   Also under this ADR: `read_ick_counts` gained a direct end-of-file
   footer probe (CRC-validated, hops as fallback) — a parse-path change
-  covered by the extended `ick_decode` fuzz oracle.
+  covered by the extended `ick_decode` fuzz oracle. ADR-0028 A1
+  (2026-09-12): the probe locates the footer by the
+  footer's **own** namespace count (an empty durable namespace is absent
+  from it), and `read_ick_counts_probed` reports whether it hit.
 - **`SegmentFs::create_segment_unsynced`** (default method, falls back to
   the synced create): segment creation with no durability side effects —
   the caller owns metadata durability via ledger barriers. Consumers:
@@ -370,12 +646,14 @@ discipline:
   ledger until `Synced`) and the active segment fd. Boot barriers enter at
   the head of the ledger covering the recovery floor; prealloc barriers
   enter **coverage-neutral** at the tail. The done-prefix rule fences
-  every durable ack (and manifest publication) behind them — boot-ready
-  never blocks on the device. A blocking metadata fsync on a reactor
-  thread is the ADR-0022 D7 wedge mechanism; the boot-storm DST scenario
-  (`inf-sim --scenario boot-storm`) enforces a zero blocking-sync ready
-  path, and `inf-bench boot-storm` is the device-tier spawn-storm
-  regression.
+  every durable ack (and manifest publication) behind them, so these
+  barriers do not hold boot-ready; the checkpoint probe does:
+  `CkptCell::new` runs `probe_direct`, one direct write and one fdatasync
+  on the cell thread during recovery, before the cell is ready. A blocking
+  metadata fsync on a reactor thread is the ADR-0022 D7 wedge mechanism;
+  the boot-storm DST scenario (`inf-sim --scenario boot-storm`) counts
+  blocking `sync_dir` calls on the ready path and fails on any, and
+  `inf-bench boot-storm` is the device-tier spawn-storm regression.
 - **Recovery machine**: `Recovery::deferred_boot_sync()` (loop-resident
   boots), `take_boot_barrier_dirs()`, `phase_code()`; the RecoveryBoard
   slot gains a `phase` published **before** each step plus assembly
@@ -390,32 +668,87 @@ discipline:
   step's linked sync; at bound 1 the completion path never issues.
   `register_standalone_fsync` now clears the always due exactly when the
   covered range discharges it (previously it was kept whenever always
-  traffic was pending).
+  traffic was pending). **Retired 2026-08-21 (M4.5-S35, ADR-0087 D5):**
+  the constructor is `GroupCommit::with_flush_bound(1|2)` and the field
+  `DurableConfig::flush_bound` (FLUSH-class barriers in flight — the
+  ADR-0022 D3 constant, 1 shipped); `infinityd --sync-pipeline` is refused
+  with a pointer to `--frames-in-flight`; `inf-bench` accepts
+  `sync-pipeline` for one campaign as a logged no-op and forwards
+  `frames-in-flight` / `barrier-class` / `staging-mib` instead. The
+  two-in-flight arm stays reachable by construction (tests, harness).
 - **Formation observables**: `CommitStats` gains `fsyncs_completion`,
   `fsyncs_boot_barrier`, `fsyncs_prealloc_barrier`; `DurableStats`/`INFO
   persistence` gain `fsync_group_p50`/`fsync_group_p99` (records newly
   covered per durability-fsync completion — the M2.5 formation gate
   observable); `gate-run m2` emits `tripwire:group_formation_x` and
-  `tripwire:spawn_retries` (must read zero post-S01).
+  `tripwire:spawn_retries` (whether the latest spawn needed its retry, 0
+  or 1; no gate row reads it).
 
 ## Group commit + durability watermark (`inf-log::commit`, M2-S05/S06)
+
+**M4.5-S35 amendment (ADR-0087 D2/D3):** `note_frame_queued(end, len) ->
+FrameId` pushes a bounded queued-frame FIFO; `note_frame_written(FrameId)`
+marks that frame written and advances `written_up_to`/`written_bytes` over
+the **completion-ordered written prefix** (a later frame landing first
+advances nothing — what an fdatasync can honestly cover). `frame_plan(
+write_through_ok, seal_ahead) -> FramePlan::{Plain, WriteThrough,
+LinkedFsync, Wait}` decides the next frame's barrier **before the seal**:
+write-through under the prefix rule (pending write-through tickets of
+earlier in-flight frames count as coverage; `seal_ahead` = a rotation's
+seal entry will precede the frame and covers every queued byte) **and
+only while fewer than `WRITE_THROUGH_WINDOW_ENTRIES` (16) write-through
+tickets sit unfolded (ADR-0087 D2 third amendment) — behind a
+wedged FLUSH-class front the arm declines and the frame seals `Plain`,
+its due accumulating**;
+`LinkedFsync` only when `drained()` (every earlier write completed —
+`IO_LINK` orders the sync after *this* frame's write alone; release-
+asserted in `register_linked_fsync`) and the FLUSH slot is free — **the
+seal a `seal_ahead` rotation registers counts as occupying it (ADR-0087
+D3/D4 amendment): at bound 1 the rotation's frame seals `Plain`**; `Wait`
+when a sync is due, write-through is inadmissible, and frames are still in
+flight below (the frame is held ≤ one write latency — sealing it
+barrier-less would starve the due); `Plain` otherwise (FLUSH slot busy:
+the due accumulates for the next group commit). `write_through_due()` / `frame_fsync_due()`
+are now pre-seal predicates (the next base is `queued_bytes`).
+`register_seal_fsync` asserts `drained()` — rotation is a drain point
+(ADR-0087 D4; the plane holds a frame that needs rotation until no write is
+in flight; `SegmentRotor::{rotation_due, next_frame_write_through_ok}` are
+the pre-seal queries). `sync_due()`, `drained()`, `frames_unwritten()`.
+
+**M4.5-S34 amendment (ADR-0086 D5):** `SyncReason::WriteThrough` (ticket
+registered at seal via `register_write_through`, completed from
+`LogWritten`; `write_through_due()` = `sync_due` ∧ **the prefix rule** —
+the frame's base equals the ledger's coverage tail, i.e. every byte below
+it is durable or covered by a pending FLUSH-class entry; a FUA write
+persists itself, never the un-barriered frames before it) and
+`SyncReason::ZeroFill` (coverage-neutral, `register_zero_fill_barrier`).
+`syncs_in_flight()` — the ADR-0022 D3 pipeline bound — counts FLUSH-class
+entries only (O(1) on `flush_in_flight`; a `Linked` /
+`Standalone` / `Completion` registration into a full pipeline is
+release-refused). `write_through_latency_hist()` is the class-split
+histogram; `CommitStats::{fsyncs_write_through, fsyncs_zero_fill}`.
+
 
 `GroupCommit<File>` — cell-local policy engine + fsync ledger; never names
 ops or sockets. The plane translates (choreography table in ADR-0013 D2 and
 the module docs; `inf-server` adopts it at S08):
 
 - Inputs: `note_staged(FsyncClass{Everysec,Always})` (EXECUTE),
-  `note_everysec_tick()` (plane-armed injected timer — idle ticks free),
+  `note_everysec_tick()` (plane-armed injected timer — idle ticks free;
+  a tick over staged records is never idle),
   `register_seal_fsync(SealHandoff)` (deferred rotation, ADR-0013 D4).
-- LOG: `frame_fsync_due()` → `note_frame_queued(end, len)` →
-  `register_linked_fsync()` (one sync covers every class due that
-  iteration — §8.2 group commit); `standalone_fsync_due()` →
+- LOG: `frame_plan(..)` before the seal (a `Wait` holds the frame) →
+  `note_frame_queued(end, len)` → `register_linked_fsync()` when the plan
+  is `LinkedFsync` (one sync covers every class due that
+  iteration — group commit); `standalone_fsync_due()` →
   `register_standalone_fsync()` (dirty bytes, no frame; covers
   written-at-submission, never queued).
-- REAP: `note_frame_written()` (lease release point);
+- REAP: `note_frame_written(FrameId)` (lease release point; written
+  prefix, ADR-0087 D2);
   `on_fsync_complete(ticket) -> Option<Lsn>` — submission-ordered ledger,
   **done-prefix** advance (completions may cross fds out of order);
-  `on_fsync_error(ticket)` freezes the watermark forever (§8.4 — caller
+  `on_fsync_error(ticket)` freezes the watermark forever (fsync failure is
+  fail-stop — caller
   fail-stops; observable in tests).
 - Watermark = **exclusive end** of the fsync-covered range; gate key =
   `Lsn::to_u64()` (`(segment << 32) | offset`, order-preserving). `always`
@@ -423,6 +756,11 @@ the module docs; `inf-server` adopts it at S08):
   FIFO by LSN under the EXECUTE budget (wake storms drain across slices).
 - Counters (S21 vocabulary): `CommitStats`, `fsync_latency_hist` (µs),
   `pending_log_bytes`, `last_durable_lsn` (= watermark), `queued_up_to`.
+- M4.5-S27 amendment (ADR-0083 D4): `rebase_clock(FsyncTicket, now)` —
+  a *linked* fsync's latency clock restarts at its covering write's
+  `LogWritten` (the `IO_LINK` sync starts only after the write), so
+  `fsync_latency_hist` measures sync service time, never the
+  write+sync chain. No-ops on completed/failed tickets.
 
 ## Segment lifecycle additions (M2-S05, ADR-0013 D4)
 
@@ -463,7 +801,7 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   vocabulary grew (M3-S17, ADR-0043 D7).
 - `digest` = chained `inf_foundation::hash64` over the header CRC and each
   section CRC in order (seeded; part of the v1 wire contract). Recorded
-  deviation from the plan's "xxh3" (ADR-0016 D6); the version field is the
+  deviation from the originally planned "xxh3" (ADR-0016 D6); the version field is the
   upgrade path.
 - Footer per-ns entry counts are S13's table-presizing input — realized by
   `read_ick_counts` (M2-S13, ADR-0018 D6): a header-hop footer peek (counts
@@ -472,6 +810,17 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   doubling-rehash storm cost ~15% of replay throughput). Both the stream
   writer and footer-audit count `StringPostImage | DocFull` as namespace
   entries; metadata records do not inflate the presize count.
+- **Section bound (ADR-0117 D1, 2026-09-12):** `ICK_MAX_SECTION_BYTES`
+  (= `DEFAULT_MAX_FRAME_LEN` + `ICK_SECTION_SLACK`, 64 MiB + 4 KiB) is
+  both `IckReaderConfig::default().max_section_bytes` and the writer's
+  seal ceiling (`seal_section` release-asserts it). `IckStream::fits`
+  is the walker's stage-or-seal test — true for an empty section
+  unconditionally (one maximal record plus its expiry companion fits by
+  the slack), else `body + bytes ≤ CkptConfig::section_bound` (default =
+  the constant, asserted ≤ it; the DST lowers it). A walker that
+  refuses an image resumes at it through the store's guarded in-chain
+  cursor (`WalkCursor`/`ChainPos`, ADR-0117 D2). Every published `.ick`
+  loads under the default reader.
 - Writer tiers: `IckStream` (double-buffered section pair, `SectionLease`
   custody — the reactor tier rides `IoOp::LogWrite`/`Fdatasync` on the
   `.ick` fd with `TokenClass::CkptWrite/CkptSync`) and `SyncIckWriter`
@@ -510,16 +859,38 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   0x02 footer · 0x03 addr-refs · 0x04 reserved (S14 live-set counters) ·
   0x05+ reserved (M4.5 index sidecars). Readers: `read_ick_hybrid` /
   `IckReader::next_step_hybrid` (per-section `IckRefSection` dispatch);
-  writers: `IckStream::new_v2` + `stage_addr_ref`, `SyncIckWriter::
-  create_v2` + `append_ref` (sections homogeneous by class, sealed at
-  class/ns/watermark boundaries). Record tag **8 = `ColdDisplace {ns,
-  old_addr: u48}`**: stages immediately before a tiered-namespace
+  writers: `IckStream::new_v2` + `stage_addr_ref`,
+  `SyncIckWriter::create_v2` + `append_ref` (sections homogeneous by class,
+  sealed at class/ns/watermark boundaries). Record tag **8 = `ColdDisplace
+  {ns, old_addr: u48}`**: stages immediately before a tiered-namespace
   mutation that displaced a record; replay removes exactly the slot
   `(hash, old_addr)` then applies the mutation (zero disk reads — the
   hash-repoint and deferred-reconcile alternatives are rejected in the
-  ADR); the walker never emits it; `Keyspace::apply_record` counts it
-  `SkippedReserved` (tiered replay routes through `TieredTable::apply_*`
-  until command wiring). Fuzz: `ick_decode` extended over the v2 arm.
+  ADR); the walker never emits it; `Keyspace::apply_record` parks it
+  until its paired mutation, which drains it (a marker of a namespace
+  that is not tiered here — dropped, or a foreign log — is skipped with
+  it). Fuzz: `ick_decode` extended over the v2 arm.
+- **Tiered boot replay demotes when the RAM window fills (ADR-0174 D1,
+  D3)**, and three rules above read so. Within one namespace every ref
+  section precedes every image section: `IckStream` refuses to stage a
+  ref for a namespace that has staged an image, and `apply_ref_section`
+  refuses a ref section for a namespace that already holds a record of
+  this life. A tag-8 marker naming an address below the life origin (the
+  manifested `flushed`) removes that exact slot as above; one at or above
+  it is a counted no-op (`markers_skipped`), and its mutation resolves by
+  key. Replay reads cold bytes where it settles a pair: a tail `DEL`
+  reads each same-hash cold slot at or above the life origin, and a RAM
+  record about to be sealed, or left unsealed at the end of replay in a
+  namespace that demoted, reads each same-hash cold slot. A read is the
+  record's key window (`TIER_KEY_WINDOW_BYTES`) through the file's held
+  creation-mode handle, parsed into `ColdKey`, whose constructor checks
+  that the key hashes to the slot's hash; a failed read or parse is a
+  typed boot refusal. `Keyspace::apply_record(rec, now, anchor, spill)`
+  takes the replay seam (`ReplaySpill` lends the namespace's
+  `TierReplay`; `NoSpill` lends none, and a record that needs room then
+  refuses typed); the machine-holding entries are crate-private, so a
+  machine reaches them only through it. A record that needs room changes
+  nothing — no marker is drained, no slot moves — until the room exists.
 - **M4-S14 amendment (ADR-0058 D3) — tag 0x04 activated.** v2 adds block
   tag **0x04 — live-set section**: `tag · body_len u32 · entry_count u32
   · ns u32 · entry_count × (file_id u32 · data_len u64 · dead_bytes u64
@@ -556,33 +927,251 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   untouched; only the marker count per mutation and the replay register
   changed. Origin entries drop at covering swaps by walk stamp.
 - Checkpoint I/O failure **aborts the checkpoint, never the process**
-  (milestone risk-table rule; deliberately narrower than §8.4 — nothing
+  (deliberately narrower than the log's fsync fail-stop rule — nothing
   was acked against the checkpoint and the log stays authoritative).
-- Trigger v1 (ADR-0016 D7): cell-local `interval_bytes` threshold +
-  `ControlHandle::request_ckpt_all()` epoch (polled in MAINTAIN — the
-  persisted-epoch pattern). One checkpoint in flight per cell; triggers
-  latch, never stack. `INF.CKPT`/`BGSAVE` ride this at S20.
+- Trigger v1 (ADR-0016 D7): cell-local `interval_bytes` threshold + the
+  manual request epoch the cell owes, `CkptBoard::requested(cell)`
+  (polled in MAINTAIN — the persisted-epoch pattern). One checkpoint in
+  flight per cell; triggers latch, never stack. `INF.CKPT`/`BGSAVE` ride
+  this.
+- Manual requests are issued, never counted (ADR-0159 D1, A1):
+  - A boot's partition (`inf_foundation::issue`) mints `N + 1` quotas of
+    `floor((u64::MAX − N) / (N + 1))` units — one per cell, one for the
+    control writer — and one final credit per cell, over a `CellCount`
+    `N` (`1 ≤ N ≤ 16,384`). Only a credit advances the checkpoint clock,
+    so every epoch is nonzero and above every earlier one of its boot; the
+    clock cannot wrap.
+  - A program reserves every unit it will issue before its first effect,
+    from its own cell's quota: `INF.CKPT`/`BGSAVE` one, a durable
+    namespace `CREATE`/`DROP` two (tombstone pacing and cleanup). An
+    exhausted quota answers `-ERR checkpoint identity space exhausted`
+    and changes nothing; it is permanent for the boot. The control
+    writer's quota pays the boot tombstone restamp, then belongs to the
+    host (direct admin, test and simulator requests). A cell's final
+    credit issues its stop checkpoint, even past exhaustion.
+  - The epoch is assigned when the credit issues (late), then raised into
+    the all-cell request word or one cell's slot. Orderings (ADR-0159
+    A1.6): the issue is an `AcqRel` `fetch_add`; every write to the word or
+    a slot is a `Release` `fetch_max`; `requested(cell)` is the larger of
+    two `Acquire` loads. An effect that happens before the issue of `e`
+    happens before every checkpoint begun after a load of
+    `requested(cell) ≥ e`. Loom checks it on the same types.
+  - Cells never fold the whole board. Each cell sweeps it, at most 64 slots
+    per MAINTAIN turn (`limits::CKPT_BOARD_VISITS_PER_TURN`, one Maintenance
+    unit, MAINTAIN's first budgeted step), folding the minimum, a `u128`
+    sum and the newest publication time; a completed sweep publishes its
+    observation, and a changed sum wakes the parked `WAIT`s. A cell with
+    a registered checkpoint waiter does not park while its sweep is
+    part-way, nor while its own slot published since the start of its
+    last completed sweep: a cell publishes after its sweep step, so the
+    sweep that wakes its own waiter is the next turn's (at most
+    `2 * ceil(N / 64)` unparked turns per own publication). A waiter
+    whose last publisher is a peer is woken by the cell's next completed
+    sweep after a park. All-cell `WAIT` and DROP pacing read the
+    observation's minimum (a lower bound, never early); `WAIT CELL k`
+    reads slot `k`. `LASTSAVE` and `rdb_last_save_time` read one per-cell
+    value (`LastSave`): the observation's newest publication time, raised
+    by every slot a `WAIT CELL k` on that cell confirmed, and written by
+    those two steps alone. On one cell the two surfaces cannot differ;
+    both can trail the board by up to two sweeps, except after a `WAIT` on
+    the same cell. The catalog writer alone folds the whole board
+    (tombstone retirement, one pass per persist on the control thread).
+
+  > **Accepted 2026-09-21, implementation open — ADR-0145:** ADR-0145
+  > adds a typed `RelocationPressure` cause beside Manual and Interval;
+  > `interval_bytes = 0` now disables only the Interval cause. Not built.
+
+### `.ick` container v3 (M4.5-S36 — ADR-0088 D3) — aligned blocks, direct writes
+
+`ICK_VERSION_V3 = 3`: the v2 tag vocabulary (0x01–0x06) with **every
+block — header, each section, footer — starting on an `ICK_BLOCK_ALIGN`
+(= `FRAME_ALIGN`, 4096) boundary and zero-padded to the next one**.
+Field layouts are unchanged (`body_len` is still the body length); the
+reader hops `ick_align_up(SECTION_HEADER_LEN + body_len + CRC_LEN)` on v3
+and the exact length on v1/v2 — one version-gated rule per hop site, the
+footer probe included (it reads the last `ick_align_up(footer_len)`
+bytes; the footer sits at the block's head). Padding is outside every
+CRC's extent and **asserted zero** by every reader path
+(`IckReadError::Padding` — the CRC's fail-stop class). The reactor tier
+writes v3 on an `O_DIRECT` fd (`SegmentFs::create_meta_direct`, a
+required trait method — a default would be a buffered file wearing a
+direct label, ADR-0054 D3) from `Block` buffers whose content base is
+4 KiB-aligned (the `FrameBuilder` shape; every growth re-bases). The sync
+tier (`SyncIckWriter`) drives the same `IckStream` and produces
+byte-identical v3 files (tests). v1/v2 files stay readable; no tool
+writes them except tests and the sync tier on request.
+`ckpt_padding_bytes` discloses the cost (≤ 4095 per block, ≤ 1.6 % at the 256 KiB
+target). The release path shrinks an over-grown staging buffer back to
+its nominal capacity (the v0.4.0 soak's 4× `ckpt_buffer_bytes` ratchet).
+
+### Checkpoint trigger — derived (M4.5-S36 — ADR-0088 D4)
+
+```text
+interval_bytes = clamp(α × ckpt_bytes_last, floor, replay_bytes_per_s × replay_budget_s)
+trigger        = frame_bytes_queued − at_begin ≥ interval_bytes
+              ∨ records_appended − at_begin ≥ replay_records_per_s × replay_budget_s
+α = 2 (DEFAULT_CKPT_ALPHA) · floor = CkptConfig::interval_bytes (256 MiB default; 0 = manual only)
+replay_bytes_per_s = 1 GiB · replay_records_per_s = 400 k · replay_budget_s = 15 − 5 − 5
+```
+
+The accumulator is **on-disk frame bytes** (header, trailer, v3 padding
+— ADR-0086 D3's obligation), not staged record bytes; before the first
+checkpoint the estimate is the cell's live record + document bytes
+(an over-estimate for tiered cells delays the first checkpoint toward
+the cap, which bounds recovery); `derive_interval` release-asserts
+`floor ≤ interval ≤ cap`. INFO: `ckpt_interval_bytes`,
+`ckpt_records_since_begin`, `ckpt_bytes_total/last`,
+`ckpt_padding_bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
+`write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
+
+## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0178)
+
+> **Not built yet (ADR-0178).** ADR-0178 supersedes ADR-0170 and restates this section's
+> contract under the same decision numbers. The grant rule, the overrun, the receipt and the
+> one-producer progress bound below are unchanged. The tier flush changes when its part is
+> built: a round is issued in groups of at most 1 MiB and 64 ops, each offered on its own and
+> never above the class cap, so no tier offer overruns; a round issues exactly what it
+> offers, and the settlement below (the unstaged part refunded, the bytes past the slice
+> charged) is removed; a cell prepares at most one round per MAINTAIN pass; tiered namespaces
+> offer in id order, and a refused group ends the pass for the tier class and is offered
+> first on the next. Both deviations below end with that build. Until then the text below
+> describes the tree.
+
+```rust
+pub enum IoClass { LogFrame, BlobWrite, ColdReadForeground,      // foreground: charged, never deferred
+                   ZeroFill, TierFlush, Checkpoint, ColdReadMaintain } // background: priority order, weights 4:4:2:1
+pub struct DeviceModel { write_bytes_per_s, write_ops_per_s, read_bytes_per_s, read_ops_per_s } // 0 = unbudgeted
+pub enum Issue { Now, NotThisSlice }                                // a background producer's only answer
+pub struct ClassCap { bytes, ops }                                  // the most a class's own credit holds
+impl DeviceBudget { fn refill(&mut self, now: Nanos);               // once per MAINTAIN entry
+                    fn offer(&mut self, class, bytes, ops) -> Issue; // the one background entry point
+                    fn charge(&mut self, class, bytes, ops);         // unconditional; owes what credit cannot hold
+                    fn refund(&mut self, class, bytes, ops);         // the unissued part of the grant just before it
+                    fn cap(&self, class) -> ClassCap; }
+pub struct SealPace;  // take(now, held) -> bool: a second frame seals at the cell's share of write_ops_per_s_4k_qd4
+```
+
+**The grant rule (ADR-0178 D2).** Per cell, per direction (write, read)
+and per axis (bytes, ops): the grant for the elapsed interval is the
+cell's share (`model / cells`, computed once at boot — L1) minus the
+foreground's spend since the last refill, clamped at `≥ share /
+FLOOR_DIVISOR` (8); carries keep every sub-unit remainder. It is split by
+weight into per-class credit capped at `cap_c = max(slice_c, share ×
+w_c/Σw × BURST_HORIZON_NS)` (50 ms, derived from the S27 D5 bar), and what
+a capped class cannot hold overflows into a per-direction pool (cap
+`share × horizon`). On the checkpoint's byte axis the grant is floored at
+the log's bytes since the last refill over the trigger's α (the keep-up
+floor): the floor and the weighted share are compared exactly and
+rounded once, with one remainder carried (ADR-0178 D2).
+
+- An offer at most `cap_c` on every budgeted axis is **attainable**: it is
+  granted from the class's credit, then the pool, or answered
+  `NotThisSlice` — the producer keeps it and re-offers next slice, with
+  nothing moved. A class that owes is granted nothing.
+- An offer above `cap_c` on a budgeted axis can never be covered by the
+  class's own credit, and the pool is not its to wait on: another class
+  may always drain it first. It is issued by a counted **overrun** once
+  the class is *rested* at its cap — its credit, then what the pool holds,
+  and the rest is owed, repaid by refills before the credit grows again.
+  A class is rested when every budgeted axis held its cap before a
+  refill's grant. Refill alone decides it, so a draw ends the rest pass
+  (the class drops below its cap) and a grant refunded in full does not.
+- `charge` (a checkpoint's header block and barriers, a tier round's
+  bytes staged past its grant, any foreground op) spends unconditionally
+  and owes what the credit cannot hold.
+- The budget keeps the last background `Now` answer's draws. The refund
+  directly after it returns at most that — the debt first, then the pool,
+  then the credit — so a full refund is the grant's exact inverse. Any
+  other call voids it, and a refund without it returns nothing.
+
+Producers match `Issue` and nothing else; the three outcomes and the
+overrun are resolved in `offer`, once. Consult sites: zero-fill
+(`next_zero_slice` peek → offer → push), tier flush (a round offers its
+slice only when the stage has a chunk to take —
+`TieredTable::flush_pending` — before `stage_flush_round`, then settles the
+grant against the record bytes it staged: the unstaged part refunded, the
+bytes past the slice charged, since a chunk takes at least one seal cut
+past its cursor; a stage refused part-way settles what it staged first —
+ADR-0170 A2),
+checkpoint (header/section/footer block at its padded length, before the
+seal; completion fdatasync charged as one op), cold-read drain
+(`drain_budgeted`: maintain reads offer the pool buffer bound and refund
+the unused window; foreground reads are charged). Charges: `queue_frame`
+(`LogFrame`, bytes + 1 op, +1 for a linked sync), `write_blob`
+(`BlobWrite`), MANIFEST barriers (`Checkpoint`). Model absent ⇒ every
+offer `Now`, every counter counts, the checkpoint keeps its 64 MiB/s pace
+(ADR-0017) — reported as `io_budget_model:absent`. No client reply is
+ever derived from `NotThisSlice` or an overrun.
+
+**Progress (ADR-0170 D4).** A class with one producer on the cell —
+zero-fill, the checkpoint, the cold-read drain, and tier flush with one
+tiered namespace — has every offer issued within `max over budgeted axes
+of (O + cap_c + C_c + 3) / r_c + 2Δ` of injected time. `r_c = share ×
+w_c / (8 Σw)`, and on the checkpoint's byte axis `share × max(w_c /
+(8 Σw), w_c / (α w_c + Σw))` (`share / 7` at α = 2). `O` is the class's
+debt when the offer is first made, at most `(largest offer − cap_c)⁺ +
+C_c`; `C_c` its unconditional charges between two offers (the
+checkpoint's header block and barrier ops; a tier round's bytes staged
+past its slice, below one flush chunk); the 3 units cover the
+carries' lag — each carry stage (the rate product, the ⅛ floor, the
+weighted split or the keep-up floor's one carry) trails its exact sum
+by under one unit, under 2⅛ in all (ADR-0178 D4); `Δ` is the longest
+refill interval — one for quantization, one for the rest pass. It is a
+progress bound, not a latency promise: a tier round whose bound exceeds
+its namespace's `TAIL-STALL-TIMEOUT` parks writers into the typed
+timeout.
+
+**The limit and the deviations** (ADR-0178 D4):
+
+- *Checkpoint block — a limit.* A section block holds one record plus
+  less than one section target. Above the class cap it issues as one
+  burst of up to the record bound (≤ 64 MiB + 8 KiB at the largest
+  `--log-staging-mib`), the same device time the log already spent
+  writing that record as one frame. `--log-staging-mib` owns it.
+- *Several tiered namespaces on a cell (DV-1).* No per-namespace bound:
+  the plane visits namespaces in index order, and an overrunning
+  namespace waits while another has a flush backlog on every pass (an
+  idle one never delays it). Owner: grouped tier rounds and a fair host
+  visit (ADR-0155 D4). Expiry proposed 2026-10-31.
+- *Tier round bursts (DV-2).* A round issues as one burst of up to its
+  slice plus one flush chunk — one seal step, or up to the namespace's
+  ring once the flush's cut list has dropped cuts — every round. That
+  passes the 50 ms horizon premise for a `MAINTAIN-SLICE` above the class
+  cap, a record above the slice, or a span of many records. Owner: tier
+  groups of at most 1 MiB, each offered on its own, a round issuing at
+  most its offer (ADR-0155 D4). Expiry proposed 2026-10-31.
+
+INFO, per class and cell scope: `io_budget_bytes_c`, `io_budget_ops_c`,
+`io_budget_deferrals_c` (every `NotThisSlice`), `io_budget_unattainable_c`
+(offers above the cap, repeats included) and `io_budget_overrun_bytes_c`
+(bytes issued overruns offered above the cap, cumulative).
+
+`SealPace` (ADR-0088 D2b): a token bucket at `write_ops_per_s_4k_qd4 /
+cells`, capacity K. The LOG step asks only when `!staging.drained()`;
+a refusal holds the frame (it keeps accumulating; `frame_waits_pace`
+per episode). A drained cell always seals — never slower than K = 1.
 
 ## Boot recovery orchestration (`inf-server::recover`/`plane`, M2-S15 — ADR-0019)
 
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with
   phases Start → Ick → Replay → Audit → Finish, each `step(ks, budget)`
   bounded by input bytes (one frame/section overshoot). `open_cell_log`
-  is the machine run to completion — one code path, so the S13
-  determinism sweep and S14 taxonomy suite prove the stepped machine.
+  is the machine run to completion — one code path. The determinism
+  sweep and the taxonomy suite run it in one step (a `u64::MAX` budget),
+  so they exercise no yield; the stepped drive is exercised by the
+  server's step tests and the sliced end-to-end tests.
   `IckReader` is the pull-based `.ick` loader (`read_ick` reimplemented
   on it; same audit, same fuzz target).
-- The node boots cells directly into their reactor loops: `ServerPlane::
-  begin_recovery` (requires `set_control`) drives steps from MAINTAIN
-  (`RecoverConfig{step_bytes: 8 MiB, throttle_bytes_per_sec: None}` —
-  the throttle is test-only, metered on **consumed** bytes, never the
-  prealloc-slack credits progress also carries). Unthrottled boots never
-  park (`before_park`); recovery failure surfaces via `take_boot_error`
-  → the assembly fail-stops the process (§8.4).
+- The node boots cells directly into their reactor loops:
+  `ServerPlane::begin_recovery` (requires `set_control`) drives steps from
+  MAINTAIN (`RecoverConfig{step_bytes: 8 MiB, throttle_bytes_per_sec:
+  None}` — the throttle is test-only, metered on **consumed** bytes, never
+  the prealloc-slack credits progress also carries). Unthrottled boots
+  never park (`before_park`); recovery failure surfaces via
+  `take_boot_error` → the assembly fail-stops the process.
 - **`-LOADING` gate (wire layer):** `CmdFlags::LOADING` in the command
   registry — membership pinned to *observed* Redis 8.0.5 behavior
-  (capture artifact `.artifacts/m2/loading-redis-capture-20260703/`;
-  notably **PING is gated** there). While `RecoveryBoard::all_ready()`
+  (captured 2026-07-03; notably **PING is gated** there). While `RecoveryBoard::all_ready()`
   is false, non-LOADING commands answer the exact Redis bytes
   (`-LOADING Redis is loading the dataset in memory`); unknown commands
   resolve first (Redis order). Node-scoped: a recovered cell still
@@ -610,8 +1199,7 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   (OFF in shipping builds; test builds enable it via dev-dependency
   unification). Compiled out, `fire` is a `const false` — measured
   **0.000 ns/call** and the release `infinityd` binary carries no
-  machinery strings (artifact
-  `.artifacts/m2/fault-points-ab-dev-20260703/`). Feature-on unarmed:
+  machinery strings (dev-box A/B, 2026-07-03). Feature-on unarmed:
   0.47 ns/call (one TLS read + branch).
 - Point names are declared by the owning crate: `inf_log::fault` v1 set
   `log_append_short_write`, `torn_frame` (prefix lands, call *succeeds* —
@@ -633,24 +1221,39 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   declared point must be fired in library code AND exercised by ≥ 1
   test (crate `tests/` trees or workspace test crates under `tests/*`) —
   an unexercised point fails the build. The M2-S17 crash matrix
-  (`tests/crash-matrix/m2.toml`) additionally requires a matrix row per
-  point (runner-enforced). The M2-S18 sim disk consumes the same
-  registry for power-cut scheduling (arm a point → observe the typed
-  error → `cut_after_ops`/`power_cut`); reactor-tier write/fsync
-  failures are injected by the ScriptedDriver, the sim disk's dead
-  switch, and `durable_fsync_eio`.
+  (`tests/crash-matrix/{m2,m4,m45}.toml`) additionally requires a matrix
+  row per point (runner-enforced). Node rows name an exact
+  `package::target::test_function`; the runner executes it and requires
+  a fresh point/verdict receipt after its assertions (ADR-0020 amendment).
+  Missing, ignored and empty carriers fail. The M2-S18 sim disk consumes
+  the same registry for power-cut scheduling (arm a point → observe the
+  typed error → `cut_after_ops`/`power_cut`); reactor-tier write/fsync
+  failures are injected by the ScriptedDriver, the sim disk's dead switch,
+  and `durable_fsync_eio`.
 
 ## MANIFEST schema v1 (`inf-log::manifest`, M2-S11 — ADR-0017)
 
 - `shard-k/MANIFEST` names the recovery unit atomically:
   `{format epoch, ckpt id, begin-LSN, live segment set}` inside the
   `inf-log::meta` envelope (magic `INFMETA1` + length + CRC32C — one swap
-  protocol shared with the catalog). Payload: magic `INFMAN1\0`,
-  `epoch: u32 = 1`, `ckpt_id: u64`, packed `begin: u64`, count + u32
-  segment ids (strictly ascending; `segments[0] == begin.segment` = the
-  truncation floor). Canonical decode: trailing bytes / empty or
-  non-ascending sets / floor mismatch are named errors. v1 writes the
-  contiguous `floor..=active`; decode admits holes (M5/M7 publish them).
+  protocol shared with the catalog; the reader refuses any envelope file
+  over `MAX_ENVELOPE_LEN` = 64 MiB **by inode length, before allocating**).
+
+  > **Accepted 2026-09-23, implementation open — ADR-0158:** reserved
+  > catalog publication and recovery headroom gives META its own envelope
+  > bound, `CATALOG_ENVELOPE_BYTES_MAX` = 70,837,137 B, owned by one
+  > byte-limit table in `inf-log::meta` and selected by envelope kind, not
+  > by caller or filename. MANIFEST keeps the 64 MiB bound above. Ordinary
+  > growth still ends at or below 64 MiB; the extra band holds legacy
+  > normalization and required cleanup. A META above 64 MiB is refused by
+  > binaries built before ADR-0158.
+
+  Payload: magic `INFMAN1\0`, `epoch: u32 = 1`, `ckpt_id: u64`, packed
+  `begin: u64`, count + u32 segment ids (strictly ascending; `segments[0]
+  == begin.segment` = the truncation floor). Canonical decode: trailing
+  bytes / empty or non-ascending sets / floor mismatch are named errors.
+  v1 writes the contiguous `floor..=active`; decode admits holes (M5/M7
+  publish them).
 - Swap = write-new + fdatasync + rename + dir-fsync, always. On the
   reactor tier the fsync-class steps ride `BackendDriver` as
   `TokenClass::ManifestSync` barriers (one in flight per cell) and the
@@ -678,10 +1281,33 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   region = torn-tail truncation of the tail pointer + trailing-segment GC;
   sealed-slack residue tolerated + counted) → begin-LSN guard (valid data
   ending below `begin` = missing covered state, fail-stop) → boot GC.
+  **Recycled-life residue (M4.5-S39b, ADR-0090 D2 as amended):** replay
+  ends a segment's data at the first `ForeignSegment` frame (a classified
+  end like `ZeroTail`; `RecoverStats::segment_residue_stops`; replay
+  continues in the next segment — unlike the epoch residue stop). The
+  audit's `RegionEvidence` carries `foreign_frames` / `max_foreign_epoch`
+  beside the self-located facts; foreign frames never contribute
+  attestation, epoch or hole evidence and are skipped by their padded
+  extent **only after their CRC passed** (a stale header over a partly
+  overwritten body fails the CRC and is scanned byte-wise, so a same-
+  segment frame can never hide behind a foreign length field). A slack
+  with no self-located frame and ≥ 1 foreign frame is **proven recycled
+  residue** (`recycled_residue_slacks`): never a hole, never torn —
+  trailing segments behind the resume point are removed as stale. A slack
+  with a self-located frame is a hole of this life at that frame exactly
+  as before, foreign frames or not. The resume epoch is `1 + max(prefix,
+  beyond-frame, foreign)` epochs.
   Manifest present but named state missing/corrupt = fail-stop, never a
   full-replay fallback. `open_cell_log` is generic over `SegmentFs` (DST
   seam); recovery is digest-deterministic (`Keyspace::state_digest`,
   same-files ⇒ same digest + same resume LSN, CI-asserted).
+  ADR-0137 adds the simulator's separate `state_hash`: event/step clocks,
+  boot/ready/end boundaries, recovered keyspace digests and disk-image
+  names/bytes. The apply-trace encoding and release trace baselines stay
+  unchanged; insertion debug assertions no longer inflate cold-read counts.
+  `TieredTable::simulation_digest` is a read-only diagnostic over every
+  index hash/address and resident record; the disk digest covers cold
+  bytes. It starts no checkpoint walk and changes no runtime state.
 - Checkpoint streaming is paced: `CkptConfig::stream_bytes_per_sec`
   (default 64 MiB/s, injected clock; 0 = unpaced) — burst walks trip
   kernel dirty-page throttling and stall the log write's CQE path
@@ -719,8 +1345,75 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
   (catalog clamped to `flushed`; zero-confirmed files not named).
   `TierFlush::with_catalog` seeds a recovered pipeline. Fuzz:
   `manifest_decode` extended over epoch 2 with the tiling invariants.
+- **Every tiered namespace in the catalog recovers through a manifest
+  section (ADR-0174 D2, D4, D5).** One that no section names (no MANIFEST
+  yet, or one published before the namespace was created) recovers
+  through the empty section (`flushed` 0, no files, next file id 0), so
+  its tier files are removed before any flush; a tombstoned namespace's
+  directory is swept with or without a MANIFEST. A replay allocation the
+  window refuses demotes through the recovered pipeline (`BootFlush`, on
+  the seam drive: seal one `MAINTAIN-SLICE` past the need, one flush with
+  one barrier the boot pipeline claims whole, release), padding the tail
+  to the ring top or the next commit page when the need lies above it; it
+  never fails the boot. The recovery driver drains each machine's
+  `ReplayWork` and charges each step the boot I/O it did (tier bytes and
+  the bytes the end settle walked at one budget byte each, 4 MiB per
+  barrier — `inf-server` `limits` — and 128 KiB per settle read, the
+  store's `SETTLE_READ_CHARGE_BYTES`, on which the end settle yields) and
+  yields at the next frame or checkpoint section once the charge and the
+  bytes read reach the step budget. At the end of the checkpoint each
+  address a settle chained releases its blob reference. Once the finish
+  step declines a lift, an unpaired marker refuses the boot; then the
+  `Settle` phase settles every RAM record a namespace that demoted left
+  unsealed, one budgeted step at a time; then the hand-over seals the
+  active file and the plane receives a pipeline under the live claim
+  rule with a handle for every sealed file, so a boot-demoted key is
+  readable by the first command. A boot that fits every window writes
+  only the `Recovered` reseal and leaves the zero set at zero.
+  Boot-written files stay unmanifested until the next checkpoint
+  publishes, and a crash leaves them for the next boot to remove. A
+  live-set entry naming a file this boot created restores nothing.
+  Counters (per cell in `RecoverStats::tier_replay`, the node fold in
+  `INFO persistence`, prefix `recover_node_tier_`): demote steps, pads,
+  tier bytes written, barriers, files sealed, settle reads, same-key and
+  distinct settles, deletes verified, blob releases (the zero set);
+  markers skipped and dead-life files removed (outside it); the largest
+  step charge (a gauge, the largest over the cells).
+- > **Accepted 2026-10-04, implementation open — ADR-0174 A1:** recovery
+  > resumes inside a frame and yields after bounded work. A step that has
+  > charged its budget stops at the next record or checkpoint entry, and
+  > the next step resumes there through a typed cursor; the read and audit
+  > of one frame or one section stay one unit, bounded by the decoder's
+  > cap. The yield sentence above then reads: the driver yields at the next
+  > record or entry once the step's charge reaches the budget. A charge is
+  > budget bytes, not elapsed time and not memory. From that build, its
+  > walked-byte price covers the bytes a demote step's seal walk passes as
+  > well as the end settle's; until then it covers the end settle's alone.
+  > `Keyspace::apply_record` (the tag-8 bullet above) answers
+  > one of three: consumed, consumed after priced boot work, or
+  > `NeedsRoom(ns)`; on `NeedsRoom` the record has changed nothing, and the
+  > driver runs the demotion under the step budget and presents the record
+  > again. The checkpoint reader announces an entered section, and a
+  > handler answers next or park (an entry handler also how many entries
+  > it applied); a parked step keeps its cursor at the item not consumed.
+  > The segment reader re-issues the frame it holds for a cursor its own
+  > record iterator produced; a cursor whose frame is no longer held is a
+  > typed boot refusal. The counter list gains, beside the largest step
+  > charge, the largest work one step did (its charge plus the bytes of the
+  > frame or section it parked in) and the largest loop-clock interval
+  > between two consecutive steps, in nanoseconds, recorded and not gated;
+  > and two liveness counters outside the zero set: the steps taken, and
+  > the yields inside a unit by kind (frame, section, demote step). Not
+  > built.
+- > **Accepted 2026-09-23, implementation open — ADR-0156:** bounded,
+  > acknowledged tier-file retirement replaces the plane-layer unlink
+  > below with an owned cell→control job: eight positions per cell cover
+  > request, worker and unconsumed result; the worker closes the final
+  > handle then unlinks; `Unlinked` and `AlreadyAbsent` are terminal,
+  > `Retry` returns the owner for paced retry; one 64-visit allowance per
+  > turn. Eligibility is unchanged.
 - **M4-S15 amendment (ADR-0059) — retirement + unlink lifecycle.** The
-  §3.1 deletion conjunction made mechanical, staged around the MANIFEST
+  deletion conjunction made mechanical, staged around the MANIFEST
   swap: `TieredTable::begin_ckpt_walk(ckpt_id: u64)` (signature grew
   the id — it stamps the live set's `ckpt_begun`) → walk → `retire_scan
   (ckpt_id, flush)` marks files `retiring` when `is_dead ∧ unref_stamp
@@ -785,14 +1478,17 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
      group-commit ack is the extent's commit record. `ExtentWriter`
      (chunked appends, 256-frame batched device writes, staging bounded
      by one batch window + one tail frame) → `finish()` fdatasyncs and
-     is the **only** constructor of `SealedExtent` — reference position
-     (`TieredTable::insert_extent`/`update_extent`,
-     `MutationEffect::StringSetExtent`) requires the token, so "extent
-     durable before referencing ack" is structural on the sync tier
-     (the reactor tier's coverage-neutral `GroupCommit` ledger barrier
+     builds a `SealedExtent`, and `finish_deferred` builds one before any
+     sync is issued (its caller owes the barrier).
+     `TieredTable::insert_extent`/`update_extent` take the token;
+     `MutationEffect::StringSetExtent` holds a namespace, the key and
+     three integers, and nothing in its type ties it to a
+     `SealedExtent`, so "extent durable before referencing ack" is kept
+     by the LOG step's extent-seal hold, not by the type (the reactor
+     tier's coverage-neutral `GroupCommit` ledger barrier
      is command wiring's named obligation). Extent **fsync failure is a
      typed abort** (extent abandoned, id quarantined, never retried —
-     the one ADR-audited narrower §8.4 posture; the module is
+     the one ADR-audited posture narrower than fsync fail-stop; the module is
      allowlisted in `check-fsync-fail-stop.sh`); fault points
      `blob_short_write` / `blob_fsync_err` / `blob_unlink_fail`
      (non-fatal; absent-is-success — a replayed death legitimately
@@ -832,6 +1528,161 @@ footer  := tag 0x02 · section_count u32 · records_total u64 · ns_count u32 ·
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
+- **Accepted 2026-09-22, implementation open — ADR-0148:** bounded tiered
+  namespace lifetimes amends the namespace DDL contract below. The catalog
+  writer reserves a tiered lifetime grant before publication;
+  `CreateApplied` does not return it. Durable removal plus every cell's
+  terminal-cleanup receipt permits reuse. A node admits at most 64 tiered
+  namespace lifetimes (`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`;
+  reserved, declared and retiring alike). At capacity a tiered `CREATE`
+  reserves nothing and answers `-TRYAGAIN tiered namespace capacity in
+  use` while a grant is retiring, else `-ERR tiered namespace limit
+  reached`. Namespace IDs never repeat: allocation answers `-ERR namespace
+  identity space exhausted` before the `u32` counter wraps. Boot refuses a
+  catalog with more than 64 live tiered definitions with a typed startup
+  error and serves none of it. After `META` publishes a create, an origin
+  that fails to construct rolls back as a refused peer does (durable
+  withdrawal, a `DROP` fan, the grant held to terminal cleanup), and a
+  disconnect after the persist request cannot abandon the create (ADR-0148
+  D1, D4, D5, A1; ADR-0172 D3). The existing nine-argument fan and durable
+  formats remain. These changes are not built; the descriptions below are
+  the implemented contract.
+- **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
+  persist-then-serve.**
+  1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
+     plane check → allocate the id → `Keyspace::ns_create_check`
+     (registry rules + tier gauntlet + reserved-VA arithmetic, applies
+     nothing) → `ControlHandle::request_persist_create(export ∪ spec)`
+     → wait `persisted(epoch)` → read the `CreateVerdict` → apply
+     locally → fan `INF.NSFAN CREATE` (unchanged 9 args) →
+     `create_applied(id)` → `+OK`*. No cell names a namespace before
+     `META` does. `SET` keeps *apply → fan → persist → ack*. `DROP`'s
+     order is drawn once, at `INF.NSFAN DROP` below.
+  2. **The writer's pending-create set** (`inf-server::control`,
+     ADR-0103 D2): every `PersistReq` may carry `create: (NsSpec,
+     CreateVerdict)`; the writer merges every pending spec the payload
+     lacks (by id) *before* the tombstone reconciliation, decides the
+     create against the merged view (`Accepted | NameExists |
+     AtCapacity`, written to the request's `Arc<AtomicU8>` before
+     `persisted_epoch` publishes), and retires an entry on
+     `CreateApplied { id }` or on any `DROP` of the id
+     (`request_persist_drop(catalog, id, tombstone)`). Bound
+     `PENDING_CREATE_MAX = 256` (gauge
+     `ControlHandle::pending_creates`; the origin answers `BUSY` at the cap). Empty at boot —
+     `META` already holds every accepted create. The sim's inline
+     inbox runs the same state.
+  3. **Recovery verifier** (`inf-store::keyspace`,
+     `inf-server::recover`, ADR-0103 D4):
+     `ReplayOutcome::SkippedUnknownNs(NsId)` carries the id;
+     `RecoverStats::records_skipped_unknown_ns` counts the skips whose id
+     no drop tombstone explains (the `RecoveryBoard` slot exposes it; the
+     boot line prints it when nonzero). Zero on every honest boot — the DST
+     asserts it.
+  4. **Fault point** `ns_create_after_meta` (crash-matrix row
+     `namespace-seeded-from-meta`): the restart seeds the namespace
+     from `META` and serves it.
+- **ADR-0108 amendment (2026-09-02) — one DDL program at a time; a failed
+  `CREATE` rolls back.**
+  1. **The DDL ticket** (`inf-server::control::DdlTicket`): every
+     `INF.NS CREATE`/`SET`/`DROP` program takes the node-wide ticket
+     (`ControlHandle::ddl_try_acquire(cell)`, CAS on `ddl_holder`)
+     before its first effect and holds it — a guard, dropped on every
+     exit path — until its reply; a program that finds it held parks
+     on the DDL waitlist and retries on the release edge MAINTAIN
+     detects (`ddl_generation`, one relaxed load per iteration, the
+     persisted-epoch pattern). Fan legs of one program never cross
+     another's.
+  2. **Every fan leg answers** (`plane::fan_all_or_first_error`): a
+     `CREATE`/`SET`/`DROP` fan awaits every peer; a leg that cannot be
+     sent or answers no bytes is an error leg.
+  3. **`CREATE` rollback** (`plane::rollback_create`, under the same
+     ticket): on any error leg the origin drops its copy, requests the
+     catalog persist that drops the id (`request_persist_drop` — the
+     pending entry retires, a durable namespace gets its tombstone),
+     waits the swap, fans `INF.NSFAN DROP name epoch` (a peer without
+     the namespace answers "not found", accepted), stamps a durable
+     drop for retirement, and answers the leg's error. The order
+     becomes *… → apply → fan → (all `+OK` → `create_applied` → `+OK` |
+     any error → rollback → the error)*.
+  4. **Fault point** `ns_create_fan_refused` (`plane::handle_ns_apply`,
+     a peer's `CREATE` leg before its local apply; crash-matrix row
+     `create-rolled-back`): no cell serves the namespace before or
+     after a restart. DST `m2-ns-ddl-race` (two crossing rounds with a
+     frozen origin, the refused-leg round, cuts and audits).
+  5. **Connection-level commands on any binding**
+     (`inf_wire::keyspace_scope`, `plane::keyspace_level`): a command with
+     no key position that is not a scatter program (`PING`, `ECHO`,
+     `HELLO`, `QUIT`, `CLIENT`, `COMMAND`, `LOLWUT`, `DEBUG SLEEP`, …)
+     executes through the ordinary path on a tiered-bound connection — on
+     the connection's cell and on the `ApplyNs` owner side alike — and the
+     planeless `execute` refuses a tiered namespace only for a command
+     that addresses it.
+- **ADR-0102 amendment (2026-09-01) — tier ring invariants at the
+  gauntlet.**
+  1. **`TierSpec::validate`** gains the four-page floor (`MEM-BUDGET +
+     MAINTAIN-SLICE ≥ 4mb`, `RING_WINDOW_MIN_BYTES`) and the half-ring
+     inline bound (`blob_threshold_bytes ≤
+     TierSpec::blob_threshold_max(R)` = `R/2 − HEADER_LEN − MAX_KEY_LEN + 1`, `R` derived from
+     the spec). `for_budget` and the `INF.NS CREATE` parser derive an
+     absent `BLOB-THRESHOLD` as `min(16mb, R/4)`
+     (`TierSpec::with_default_blob_threshold`); an explicit value is honoured or
+     refused, never clamped.
+  2. **`TieredTable`** enforces the bound structurally: the effective
+     `BlobConfig` threshold is clamped to `blob_threshold_max(R)` at
+     construction and `set_blob_config`; `append`/`append_extent`
+     refuse a record above `inline_record_max() = R/2` with
+     `OpError::TooLarge`; `write_stall_target` is total (`None` above
+     the bound) and `extent_stall_target(key)` sizes the blob path's
+     probe from the 24-byte reference (`plane::tiered::StallProbe`).
+     `AddressSpace::{new, alloc, stall_target}` keep their asserts as
+     internal invariants.
+  3. **Legacy catalogs**: `Keyspace::seed_catalog` clamps a pre-rule
+     entry's threshold to the bound (`seed_normalized_thresholds`,
+     reported by the boot).
+  4. **`INFO tiering`** gains `tiering_write_replans` (writes that
+     re-resolved because the slot moved under an extent read).
+  5. **`inf-runtime::cold`**: an intent joins a merged read only on
+     the same descriptor (`file` *and* `fd`).
+- **ADR-0100 amendment (2026-09-01) — namespace catalog v4 + the `DROP`
+  choreography.**
+  1. **Catalog v4** (`inf-store::catalog`): after the (now always
+     present) index section, `dropped_count: u32 · dropped_id: u32 *
+     count` — strictly ascending ids, each `≥ 16`, `< next_id`, never a
+     live entry, `≤ DROPPED_IDS_MAX` (4096); every violation is the
+     typed `InvalidDroppedId`. Written **iff non-empty** (else v3/v2
+     byte-identically); v1–v3 decode with an empty set. The set is
+     **owned by the catalog writer** (`inf-server::control`, ADR-0100
+     D2): cell exports leave it empty, the writer merges its live set
+     into every payload and drops any entry a tombstone names (replica
+     lag from a concurrent DDL — ids never reuse). A tombstone is added
+     by a durable namespace's `DROP`, stamped with the node-wide
+     checkpoint epoch the origin requests after the fan (the cleanup unit
+     the `DROP` reserved before any effect, ADR-0159 D2), and retired at
+     the next persist once every cell's published epoch covers it; boot
+     re-stamps survivors with one fresh request on the control writer's
+     quota. Bound `DROPPED_NS_MAX
+     = 256` — at the cap the `DROP` waits for its checkpoint first.
+  2. **`INF.NSFAN DROP name epoch`** (4 positional args): the fan carries
+     the persist epoch of the swap that drops the namespace; peers park
+     their tier-file teardown until `ControlHandle::persisted(epoch)`
+     (ADR-0100 D5). `DROP` itself runs *apply → request persist → wait
+     `persisted(epoch)` → fan → request a node checkpoint + `StampDrop` →
+     `+OK`*: the persist is requested before the fan, and the fan carries
+     its epoch (ADR-0100 D4). `CREATE` persists before it serves (item 1
+     of the `CREATE` choreography above) and `SET` runs *apply → fan →
+     persist → ack* (ADR-0015 D3).
+     `Keyspace::ns_drop` returns the dropped `NsSpec`;
+     `ns_tombstoned`/`ns_tombstones` expose the boot snapshot to recovery.
+  3. **Recovery rule** (`inf-server::recover`, ADR-0100 D6): a `MANIFEST`
+     tier section naming an id the catalog does not know is skipped and
+     its `shard-k/ns-N/cold` files unlinked **iff the id is tombstoned**
+     (`RecoverStats::{dropped_ns_swept, dropped_files_swept}`); every
+     tombstoned id's directory is swept even without a section; the
+     checkpoint's tiered sections (ref / live-set / blob-ref) naming a
+     tombstoned id are skipped (`dropped_sections_skipped`);
+     an untombstoned unknown id stays the fail-stop in both places. `INFO persistence`
+     gains `ns_drop_tombstones`. Fault points `ns_drop_before_meta` /
+     `ns_drop_after_meta` carry the two crash-matrix rows.
 - **M4-S19 amendment (ADR-0062) — namespace catalog v2 + the `INF.NS`
   tiering surface.**
   1. **Catalog v2** (`inf-store::catalog`): `CATALOG_VERSION = 2` — the
@@ -919,13 +1770,29 @@ durable-state corruption** (an ack for a byte that was never fsync-covered).
 | 1.8 | done-prefix advance: watermark only moves through contiguous `done && !failed` front entries | A failed/pending entry must freeze everything behind it (fsyncgate) | by-construction (loop breaks on `!done \|\| failed`) commit.rs:549–556 | keep |
 | 1.9 | `register_completion_fsync`: `always_discharged_at_written()` before issuing | A completion-issued sync that does not cover an owed `always` record acks it early | `debug_assert!` commit.rs:477 (guarded by `completion_fsync_due` at call site) | keep — call-site predicate is the real guard; debug_assert is the pair |
 | 1.10 | `with_sync_pipeline`: `bound ∈ 1..=2` — the pipeline is bounded, never a queue (L3) | An unbounded in-flight sync count is the batch=1.0 disease reborn | `assert!` **release** commit.rs:230 | keep (per-construction) |
-| 1.11 | `note_everysec_tick`: idle tick (clean + no `always`) issues no sync | A sync on a clean tick is wasted device work, not a correctness bug | by-construction (branch) commit.rs:267 | keep |
+| 1.11 | `note_everysec_tick`: idle tick (clean + no `always` + **nothing staged**) issues no sync — a record still in the staging builder (a held frame: fill, group hold, extent barrier, `NextNotReady`) is dirty (`everysec_unqueued`, cleared by `note_frame_queued`; ADR-0013 D3 second amendment) | A sync on a clean tick is wasted device work, not a correctness bug | by-construction (branch) commit.rs:267 | keep |
 | 1.12 | `register_prealloc_barrier`: coverage-neutral — enters at the current coverage tail, never advances past real data | A dir sync that claimed data coverage would advance the watermark past unfsynced frames | by-construction (copies tail `covers_*`) commit.rs:386–394; pinned by `prealloc_barrier_is_coverage_neutral` test | keep |
 
 **Verdict:** exceptionally well-asserted machine (32 `assert!` / 34
 `assert_eq!` / 4 `debug_assert!`). The three durable-honesty invariants that
 are still debug-only (1.1–1.3) are the promotion headline — all per-batch,
 so promotion is free.
+
+**M4.5-S35 additions (ADR-0087 D2/D3/D4, 2026-08-21):**
+
+| # | Invariant (identifiers) | Why it must hold | Enforcement | Disposition |
+|---|---|---|---|---|
+| 1.13 | `note_frame_written(id)`: `written_up_to`/`written_bytes` advance only over the contiguous written prefix of the queued-frame FIFO; a later frame landing first advances nothing | A standalone/completion fdatasync covers `written_up_to`; claiming a frame whose write has not completed is ack-before-durable | by-construction (prefix loop) + `expect`/`assert!` **release** on unknown/double ids; pinned by `written_prefix_is_completion_ordered` | keep |
+| 1.14 | `register_linked_fsync`: the only queued-unwritten frame is this one (`drained()` held at `frame_plan`) | `IO_LINK` orders the sync after *this* frame's write only; an earlier frame still in flight sits outside the sync's coverage | `assert!` **release** (per linked frame, free) + the `Wait` arm of `frame_plan` | keep — the 1.4 rule generalized from rotation to every linked sync |
+| 1.15 | `register_seal_fsync`: `drained()` — rotation is a pipeline drain point | 1.4 restated for K > 1: the plane holds a frame needing rotation until no write is in flight | `assert!` **release**; plane predicate `rotation_due && !staging.drained() ⇒ hold`; pinned by the K = 4 reference-plane test (seal syncs == rotations) | keep |
+| 1.16 | `note_frame_queued`: `unwritten < MAX_FRAMES_IN_FLIGHT` (the in-flight count the ring bounds) **and** `queued.len() < REORDER_WINDOW_FRAMES` (16 — the whole FIFO, unwritten frames plus those that landed ahead of an earlier one still in flight) | An unbounded in-flight count is a queue (L3) and a plane bug; a FIFO that grows behind one late front write is an unbounded ledger (memory, a linear completion search, eventually the cell) | two `assert!` **release** (per frame, free); `frame_plan` answers `Wait` while `reorder_window_full()`, the plane counts `frame_waits_reorder`; frames are found by ordinal arithmetic (`id − front.id`), O(1); pinned by `late_front_write_fills_the_reorder_window_then_the_plan_waits` and the `m2-reorder-window` DST | keep — **amended 2026-08-22 (ADR-0087 D2 as amended):** the first bound was mis-scoped to the FIFO (`2cb6074` moved it to unwritten frames), which left the FIFO unbounded; the window restores a bound on the FIFO itself |
+| 1.19 | `register_standalone_fsync` / `register_completion_fsync`: the due survives a sync whose coverage (`written_bytes`) is below `queued_bytes` — a barrier-less frame still in flight at the tick is covered within the tick, not at the next one — **or while an `everysec` record is still staged** (records in the builder sit outside any written coverage; the frame that seals them carries the barrier) | An everysec record whose frame was in flight when the tick's standalone issued would otherwise wait a full extra tick (~2 s loss window; `m2-reorder-window` seed `0x2e0d0179`) | by-construction (`settle_due_at_written`); the next LOG step drains and covers (linked sync or a second standalone); pinned by `everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight` | keep — **added 2026-08-22 (ADR-0013 D3 as amended)** |
+| 1.17 | `register_write_through`: coverage tail == this frame's base (the prefix rule, ADR-0086 D2.5) with the base read from the FIFO (`queued.iter().rev().nth(1)`, else `written_bytes`) | A FUA ticket claiming bytes it did not write | `assert_eq!` **release** | keep (S34's assert, base re-derived for K > 1) |
+| 1.18 | `frame_plan`: a due frame that cannot take write-through while writes are in flight below is **held** (`Wait`), never sealed barrier-less | Sealing it plain lets every later frame find the same shape — the due starves under load (livelock) | by-construction (decision order) ; pinned by `a_due_frame_waits_behind_in_flight_plain_frames_then_links`; `frame_waits_barrier` counts episodes | keep |
+| 1.20 | `pending_covers_within(lo, hi)` / `written_up_to()` / `pending_entries()`: the plane's LSN→seq ack map (`DurableCell::frame_seqs`) coalesces written entries across which no unfolded ledger coverage point lies — every later barrier covers both or neither — at each `LogWritten`, and release-asserts `len ≤ frames_behind_prefix() + pending_entries() + 1` | One entry per sealed frame accumulated for the whole life of a stalled barrier and between two ticks (the reorder window bounded the sibling FIFO, ADR-0087 D2 as amended; this map was the last unbounded structure on the commit path — L3) | `assert!` **release** in `coalesce_frame_seqs`; the DST's `frames_awaiting_watermark` gauge against `REORDER_WINDOW_FRAMES + fsync_entries + 1` on every durable scenario; `ack_map_tests` pin the merge rule (a coverage point between two written frames keeps the earlier; an unwritten frame is never merged into) | keep — **added 2026-09-13 (ADR-0087 D2 second amendment)** |
+| 1.21 | `frame_plan(_, seal_ahead = true)`: the FLUSH-slot arm counts the seal fdatasync the rotation registers ahead of the frame — `syncs_in_flight() + 1 < flush_bound`, so at bound 1 the frame seals `Plain` and its due accumulates behind the seal | Two FLUSH-class barriers in one iteration queue on the device-wide flush unit (ADR-0086 Context: ~1 000/s) — the batch=1.0 disease at the device tier; no durability consequence | by-construction (the arm); `assert!` **release** in `push_pending` for `Linked`/`Standalone`/`Completion` (`FLUSH-class barrier into a full pipeline`); pinned by `rotation_seal_and_linked_sync_respect_the_flush_bound` and `a_discretionary_barrier_never_enters_a_full_pipeline`; the `m2-durable` DST dies on the assert with the plan unfixed | keep — **added 2026-09-13 (ADR-0087 D3/D4 amendment)** |
+| 1.23 | `register_write_through`: `write_through_pending < WRITE_THROUGH_WINDOW_ENTRIES` (16 — write-through tickets registered and not yet folded into the durable prefix) | Behind a wedged FLUSH-class front (seal, dir barrier, linked sync) every FUA frame completes at `LogWritten` and its ticket stays in `pending` until the front folds — one entry per frame, bounded only by the gated clients' outstanding commands; the reorder window does not reach it (a FUA frame is written the moment its ticket completes) | `assert!` **release** (per write-through, free); `frame_plan` declines the write-through arm while `write_through_window_full()` — the frame seals `Plain`, the due accumulates, the first barrier after the front covers it (a linked sync: `write_through_due` is false over an uncovered plain frame); `DurableStats::write_through_entries` under the DST's gauge oracle on every durable scenario (`m2-fua-pending` 6/24 seeds red pre-fix at peaks 17–20, 0/24 and peak 16 after); pinned by `write_through_tickets_behind_a_wedged_front_are_bounded` | keep — **added 2026-09-13 (ADR-0087 D2 third amendment)** |
+| 1.22 | `DurableCell::note_issued`: a hold episode (`frame_held`, `fill_since`, `group_since`) ends only at the issue — the frame's `queue_frame` or the standalone's fdatasync; a reservation that waits keeps the episode | The standalone path left `group_since` open, so the next episode's first sight read as elapsed and sealed at once (the hold intermittently inert, `frame_waits_group` under-counted); the reservation-failure returns inflated `frame_waits_*` by one per return | two `assert!` **release** at each decision (`open group-hold episode without a held frame`, the fill twin); `DurableStats::{hold_open, fill_hold_open, group_hold_open}` under the DST's hold-episode oracle on every durable scenario (`m2-group-hold` 24/24 seeds red pre-fix, `m2-durable` 6/24 — the ARM seeds) | keep — **added 2026-09-13 (ADR-0092 D1 rule 6 amendment)** |
 
 ---
 
@@ -959,7 +1826,9 @@ mis-address a record → wrong data acked as durable).
 | 3.1 | `lsn_of`: `at.generation == self.generation` — token belongs to this lease | A cross-generation token resolves a record to a bogus LSN → an ack gates on the wrong watermark | `assert_eq!` **release** staging.rs:138 | keep (the custody invariant; already release — exemplary) |
 | 3.2 | `leased_frame`: `in_flight.generation == lease.generation` | Writing the wrong buffer's bytes to the segment | `assert_eq!` **release** staging.rs:349 | keep |
 | 3.3 | `release`: `in_flight.generation == lease.generation` | Releasing the wrong buffer resurrects in-flight bytes | `assert_eq!` **release** staging.rs:357 | keep |
-| 3.4 | `seal`: `!is_empty()` and `in_flight.is_none()` — at most one frame in flight, no empty seal | A second seal while a lease is outstanding aliases the in-flight buffer (memory > 2×capacity, torn write) | two `assert!` **release** staging.rs:328, 329 | keep |
+| 3.4 | `seal`: `!is_empty()` and `in_flight.is_none()` — at most one frame in flight, no empty seal | A second seal while a lease is outstanding aliases the in-flight buffer (memory > 2×capacity, torn write) | two `assert!` **release** staging.rs:328, 329 | keep — **amended M4.5-S35 (ADR-0087 D1):** `!backlogged()` (a free buffer exists; ≤ `frames_in_flight` leases out); the seal takes a `Free` buffer, never one in `InFlight`/`Staging` (typestate per buffer) |
+| 3.8 | `leased_index`/`release` (M4.5-S35): exactly one buffer is `InFlight { generation }` for a live lease; release moves it to `Free` in any order | A stale or double-released lease would free a buffer still leased to a write | `expect` **release** (position by generation) | keep |
+| 3.9 | `new` (M4.5-S35): `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT`; buffers = K + 1 allocated once; `resident_bytes` = (K + 1) × (capacity + 2 × FRAME_ALIGN) | The ring is bounded and attributed (L5); no allocation after construction (pinned at K = 4 by `staging_alloc`) | two `assert!` **release** | keep (per-boot) |
 | 3.5 | `new`: `capacity_bytes ∈ [min_frame, DEFAULT_MAX_FRAME_LEN]` | A capacity below a minimal frame or above the reader bound writes frames no default reader can replay | two `assert!` **release** staging.rs:204, 206 | keep (per-boot) |
 | 3.6 | `stage`: record over remaining capacity → typed `StagingFull`, effect not partially staged | Backpressure is an operating condition, not an invariant (L: bounded queue) | checked-error staging.rs:227–230 | keep |
 | 3.7 | oversized record (`> max_record_len`) is admission's problem, never retried here | Retrying an un-stageable record is a livelock | by-construction + doc (admission checks `max_record_len` up front) staging.rs:254–260 | keep — verify S08 admission actually calls `max_record_len` (out of scope here; note for cross-check) |
@@ -973,7 +1842,8 @@ model chapter for this whole audit. Nothing to promote.
 
 `CkptPhase` (stream) and `SwapPhase` (recovery-unit transition). Failure
 policy here is **abort, never fail-stop** (nothing is acked against an
-in-flight checkpoint) — deliberately narrower than the log path's §8.4.
+in-flight checkpoint) — deliberately narrower than the log path's fsync
+fail-stop rule.
 The dangerous invariant is publication: naming (in the durable MANIFEST) a
 checkpoint whose data is not fsync-durable → recovery loads a
 short/torn checkpoint = **silent durable-state corruption**.
@@ -988,6 +1858,10 @@ short/torn checkpoint = **silent durable-state corruption**.
 | 4.6 | `open_stream`/streaming: at most one `SectionLease` in flight (`in_flight: Option`) | A second section write aliases the stream buffer | by-construction (`Option` + `if in_flight.is_some() return`) durable.rs:508, ckpt.rs:76 | keep |
 | 4.7 | abort leaves the old checkpoint + whole log valid; `.new` orphan GC'd next boot | Checkpoint failure must never touch the live recovery unit | by-construction + boot GC (recover.rs:706–713) ckpt.rs:239–252 | keep |
 | 4.8 | `swap_slice`: every arm does O(1) file ops and queues ≤ 1 barrier; no device barrier on the loop | A blocking dir-fsync on the reactor is the S12 foreground-stall / D7-wedge class | by-construction (barriers ride `TokenClass::ManifestSync`) ckpt.rs:508–659 | keep |
+| 4.9 | `derive_interval` (M4.5-S36, ADR-0088 D4): `floor ≤ interval ≤ max(cap, floor)`; `interval_bytes == 0` stays 0 (manual only) | An interval above the cap lets a replay tail escape the boot gate; below the floor is the pre-S36 trigger storm at small datasets | two `assert!` **release** (per publish, free) | keep (per-publish) |
+| 4.10 | `should_begin`: fires on on-disk frame bytes **or** the record cap since the last *begin* (never publish) | A staged-bytes accumulator under-counts the device (ADR-0086 D3); rebasing at publish lets a burst mid-walk escape | by-construction (two-term predicate, begin-anchored bases) | keep |
+| 4.11 | `lease_staging` (v3): the block is padded to `ICK_BLOCK_ALIGN`, its base is aligned, `file_offset` is aligned | A misaligned `O_DIRECT` write is `EINVAL` on the device and a silent memcpy on tmpfs; the sim tier asserts it on every direct inode | `debug_assert!` ×2 (writer) + **release** `assert_eq!` ×2 in `SimDisk::assert_direct_aligned` + the fdinfo verify at open | keep — the sim is the enforcement tier |
+| 4.12 | `Block::realign`: after any `Vec` growth the content base is re-aligned (`debug_assert` on the new base) | A record outrunning the section target reallocates the `Vec`; an unaligned base is 4.11's failure one step earlier | `debug_assert_eq!` + by-construction (`reserve` before the shift) | keep |
 
 **Verdict:** the two publication invariants (4.1, 4.2) that stand between a
 crash and a corrupt recovery unit are debug-only. Promote both — free.
@@ -995,6 +1869,23 @@ crash and a corrupt recovery unit are debug-only. Promote both — free.
 ---
 
 ## 5. `Recovery` state steps (`inf-server/src/recover.rs`)
+
+**M4.5-S35 amendment (ADR-0087 D6, amends ADR-0031 D4):** the slack audit of
+segment `idx` runs immediately after its replay (`Replay{idx} → Audit{idx}`);
+the first slack holding a validating frame is the **hole**, after which
+every later segment is `Probe`d for stamp evidence and never replayed. `Finish`
+applies the one evidence rule at the resume point (the hole's segment when it
+holds data, else the last data-bearing segment before it): a v1 frame or a
+`covered_lsn` attestation past the hole refuses (covered data lost — the
+device lied); otherwise truncate there, remove every later segment, resume
+under a fresh epoch. Invariants: `ends.len() == evidence.len() ==
+segments.len()` at `Finish` (debug-asserted); `Probe` only behind a hole
+(debug-asserted); the end-of-replay checks (tiered, sidecar) run exactly once
+on the first transition out of `Replay`. Taxonomy pins: `recover_torn.rs`
+(`unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments`,
+`unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segment`,
+`attested_hole_in_a_sealed_segment_refuses_to_start`), crash row
+`seal-flush-x-fua-plain-tail`.
 
 Resumable boot machine (`Phase`: Start→Ick→Replay→Audit→Finish→Complete).
 Recovery is where a wrong decision **is** durable corruption made visible;
@@ -1061,3 +1952,225 @@ free `debug_assert`.
 Total invariants inventoried: **39** across 6 machines (+ the DurableCell
 glue). Deliberate unchecked gaps: **2**. Promotions proposed: **5** (6
 call sites after the split).
+
+### A.7 — Tier-flush round machine (M4.5-S31, ADR-0084)
+
+**Open conformance gap (2026-09-22):** one in-flight round does not
+bound its staged bytes/operations. A production-API coarse-cut witness
+reaches the operation assertion with validated geometry. The existing
+token/custody/durability contracts remain binding. ADR-0155 (accepted
+2026-09-22) supersedes the affected round/preparation/issue contract;
+its replacement is not built.
+
+The reactor-drive flush state machine (`TierFlush` round state in
+`inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell.rs`):
+
+- **One round in flight per namespace** — by-construction
+  (`TierNs::round: Option<FlushRound>`; staging debug-asserts
+  `!round_active()`).
+- **No durability fact at submission**: `advance_flushed`, `durable_len`,
+  seal catalog commits, and gap crossings apply only in
+  `complete_flush_round`, after every op's terminal completion —
+  by-construction (effects are data on the round; the only applier runs
+  post-completion). The equivalence storm
+  (`tiered_flush_reactor.rs`) asserts the watermark is unmoved between
+  stage and completion, every round.
+- **Barriers submit only after every write completed** (fdatasync covers
+  only completed writes) — by-construction (`FlushRound::barriers_sent`
+  gates on `pending == 0` with no write errors); conservative across
+  files (a two-file round waits for both files' writes).
+- **Effects apply in stage order** (`SealCommit` before the `GapCross`
+  it covers — ADR-0052 D2) — by-construction (a `Vec`, drained in
+  order); `commit_oldest_seal` release-asserts a pending seal exists,
+  `confirm_durable_to` release-asserts monotone-and-bounded.
+- **Window custody**: pool windows return only in `finish_round`
+  (all-terminal), and a dropped namespace parks whole in `round_drain`
+  until its completions drain — by-construction; the `StableBytes`
+  proof is SAFETY.md `tier_round_bytes`.
+- **Barrier completion error is fatal** (fsync failure is fail-stop): re-surfaced as
+  `TierFlushError::Fsync` at the next MAINTAIN → the plane's fatal arm →
+  `fail_stop` — checked by `check-fsync-fail-stop.sh` (allowlisted with
+  the review note); write errors resubmit byte-identical (ENOSPC latches
+  admission first, ADR-0063 D4).
+- **Amended 2026-09-30 (ADR-0167 D4):** an
+  unaddressable write position is fatal too. The round checks every write
+  position before `FlushRound` exists; a refusal opens no round, pushes
+  no op and returns `TierFlushError::Unaddressable { path, offset_bytes }`
+  from the same MAINTAIN, to the plane's fatal arm and `fail_stop`.
+  `is_fatal` names both causes, and `Unaddressable` is not storage-full. A
+  write-error resubmission reads the position the round holds, never
+  checked again.
+- **Deliberately unchecked**: op-index/kind agreement between the token
+  and the round table is a `debug_assert` (the generation check already
+  rejects cross-round routing); resubmitted write bytes are not
+  re-CRC'd (windows are never written after stage — custody, not
+  checksum).
+
+### A.8 — Device budget (M4.5-S36, ADR-0088 D2b; ADR-0178)
+
+`DeviceBudget` (`inf-runtime/src/budget.rs`) and `SealPace`:
+
+- **Foreground is never deferred** — by construction (`offer` answers
+  `Now` before any credit arithmetic for `is_foreground()` classes and
+  for an unbudgeted direction); INFO `io_budget_deferrals_{foreground}`
+  reads 0 by construction — a non-zero value there is an internal-
+  invariant bug, not a metric.
+- **Three outcomes, one place** — type: a producer sees only `Issue`; the
+  attainable, deferred and unattainable split and the overrun are private
+  to `budget.rs` and resolved in `offer` alone. Review-only, with the
+  reason: a `matches!`, `if let` or `let … else` collapse on those private
+  enums compiles (the wildcard lints see `match` arms only); the
+  population is `offer`, one site.
+- **Holds or owes, never both** — type: per axis the credit is `Held(h ≤
+  cap)` or `Owed(non-zero)`; a debtor is granted nothing.
+- **Bounded everything**: every class's credit ≤ its cap and every pool ≤
+  its cap (`min` on every refill and refund); a class owes at most
+  `(largest offer − cap)⁺` plus its charges, because an overrun needs the
+  class rested at its cap; `offer` never allocates or waits.
+- **An idle producer holds no overrun back** — construction: a grant
+  refunded in full leaves credit, debt, pool, rest state and `spent` as
+  they were (the receipt; the rest state written by refill alone), and a
+  tier round with nothing to stage makes no offer.
+- **Progress** — the class oracle
+  `no_background_offer_waits_past_its_bound`: every background class × seven hostile offers (1, cap − 1, cap,
+  cap + 1, cap + pool, cap + pool + 1, the largest producer offer) × five
+  shares × three refill intervals × seven regimes (idle, pool drained,
+  foreground at 10× the share, foreground at the keep-up crossover, a
+  same-class overrunner before and after, a zero-work sibling) — 2 940
+  cases, the invariants checked after every call, every issue checked
+  against the D4 bound computed from the formula, and each regime's
+  engagement asserted. Its canaries: a producer that re-offers without
+  the overrun, an overrun from any held credit, a grant that ends the rest
+  pass, a keep-up floor rounded on its own before the max.
+- **Accounting identity** (`io_budget_bytes_c == bytes the driver saw
+  under class c`, ops likewise; the two cold-read classes together ==
+  the driver's reads) — asserted every seed by the `m2-device-budget`
+  oracle on the sim driver's `ObservedIo`; `refund` keeps it exact.
+- **A tier round's spend is what it staged** — test: the `tier_cell`
+  producer tests over a real budget (a round staged past its slice owes
+  the excess; a stage refused part-way keeps what it staged spent) and a
+  wire test in which `io_budget_bytes_tier_flush` covers every flushed
+  record byte. The basis is record bytes; no sim scenario runs a tiered
+  namespace under a model.
+- **Rate bound** (background bytes over a run ≤ `share × elapsed + 2 ×
+  horizon + Σ slices`, plus one largest block per class that can
+  overrun) — the `m2-device-budget` oracle.
+- **Engagement, progress, foreground bound, liveness** — the same oracle:
+  the budget deferred ≥ 1 (non-vacuous), ≥ 1 checkpoint published and
+  zero-fill landed (no starvation), `write_stall_max_us ≤ (frame + one
+  background block + horizon bytes) / disk rate + base·(1 + tail) + one
+  scheduler step` (physics in both modes; guards a budget bug that admits
+  two blocks at once). On seeds ≡ 1 mod 4 values are padded above the
+  checkpoint cap plus the pool: an offer above the cap must be counted
+  (else the run is vacuous) and every checkpoint block issued within
+  `T_ckpt` of its first offer (`ckpt_block_wait_ns_max`); on the other
+  seeds no class counts one (the control leg).
+- **Determinism** — pinned by
+  `two_budgets_fed_the_same_sequence_agree_exactly`; the sim's trace hash under `--verify-determinism`.
+- **Seal pace never defers a drained cell** — by-construction (the LOG
+  step asks only when `!staging.drained()`); pinned by
+  `seal_pace_paces_a_pipelined_cell_and_never_a_drained_one`.
+- **Deliberately unchecked**: the model's truth. A stale or optimistic
+  probe file makes the budget a ceiling the device cannot meet; the
+  tripwires are `barrier_class_degraded` and the deferral rates, both
+  visible, neither automatic (ADR-0088 D6).
+
+### A.9 — Shadow-slot tickets and the record pin (M4.5-S37, ADR-0093)
+
+`TieredTable::shadow` (`inf-store/src/tiered/shadow.rs`) and
+`AddressSpace::record_pin`:
+
+- **A ticket is an exact-hash pair** — `(hash, cold, winner)` with
+  `contains_pair(hash, cold)`, `contains_pair(hash, winner)`, `cold`
+  below the head and `winner` RAM-resident — asserted at
+  `register_shadow` (release asserts: a ticket over a slot that does
+  not exist or a record the pin cannot keep is a violated invariant);
+  the write path's candidate comes from `Index::each_exact` (the
+  sidecar's 64 bits), never `lookup`'s 22-bit fingerprint.
+- **The winner never goes cold while its ticket is open** — the record
+  pin is the oldest unresolved winner (`sync_shadow_pin` after every map
+  change) and `release_ceiling = min(flushed, walk pin, record pin)`;
+  `advance_head` asserts `to ≤ release_ceiling()` (release); pinned by
+  `the_record_pin_clamps_release_until_resolution` and
+  `a_shadowed_winner_never_goes_cold`; `resolve_shadow` release-asserts
+  the winner is not cold when it runs.
+- **A checkpoint walk fixes each record's form when it begins** — an
+  entry at or above the walk watermark is an image, and so is the winner
+  of a ticket open as the walk began (the walk latches those winners);
+  every other entry is a reference, and the 0x05 section lists the
+  references' entries only, so an imaged extent record is registered
+  once, when recovery appends its image (ADR-0184 D1–D5).
+  `WalkLatch::form` is the one producer of a `WalkForm`; the walk's two
+  index passes (`ckpt_walk_slice_bounded`) and its 0x05 pass
+  (`extent_ckpt_entries_from`) read nothing else, in every writer. The
+  walk pin holds release at the lowest latched winner, which the table
+  hands it from the latch as the walk begins, until the walk ends, so a
+  ticket that ends mid-walk leaves its winner imaged and RAM-resident.
+  What that holds: the bytes from the lowest latched winner up to the
+  watermark, at most the pinned suffix as the walk began (throttled at
+  `MEM-BUDGET / 8` and bounded by the committed window, ADR-0093 A6),
+  for one walk; a write that finds the window full meanwhile parks on
+  the tail stall, as under any release pin. `tiering_shadow_pinned_bytes`
+  stops counting those bytes when the last ticket ends and no gauge
+  names the walk's hold: it is part of `flushed − head` on the
+  namespace's `tiering_ns<id>` line.
+  Pinned by
+  `an_imaged_ticket_winner_is_not_also_a_blob_reference_entry`,
+  `a_ticket_that_ends_before_the_images_keeps_its_winner_imaged`,
+  `a_ticket_that_ends_after_the_images_keeps_its_blob_entry_out_of_the_section`
+  and `a_walk_pins_release_at_its_lowest_image_until_it_ends`; canaries
+  `inf_canary_ckpt_image_listed`, `inf_canary_ckpt_form_unlatched` and
+  `inf_canary_ckpt_pin_at_watermark`.
+- **Nothing is removed on hash evidence** — the only slot removal the
+  module performs (`resolve_shadow`, same key) follows
+  `decode_record(image).key == record(winner).key` on the verbatim cold
+  image, after re-validating the ticket, both pairs and the winner's
+  residency post-suspension; a foreign image is a `Collision` that
+  removes nothing (`a_foreign_image_is_a_collision_and_removes_nothing`).
+- **Exact death, bounded origin chain** — the same-key removal calls
+  `note_death(cold, image.len())` (the space identity and the per-file
+  counters move by the truth — `check_accounting` after every step in
+  the store suite) and chains the twin plus its own origins into the
+  winner's list, release-asserted `≤ RELOC_ORIGIN_CAP` (admission
+  refuses a candidate whose list has no room — `fallback_origin`).
+- **A winner is never deleted under an open ticket** —
+  `TieredTable::delete` release-asserts no ticket names the address; the
+  plane's `delete_one` resolves first (a Foreground read of the twin);
+  replay's `apply_delete` ends the ticket instead (the crashed life's `DEL`
+  already carried the same-key twin's marker, or told it apart as a
+  collision) — pinned by `deleting_a_winner_with_an_open_ticket_panics`
+  and the collision half of
+  `recovery_appliers_reform_pairs_in_both_orders`.
+- **A ticket's cold slot is never relocated** — `compaction_apply`
+  defers it (blocks finalization), `try_promote` skips it; pinned by
+  `compaction_defers_a_tickets_cold_slot_until_resolution` and
+  `promotion_skips_a_tickets_cold_slot`.
+- **The ticket set is a projection of the index** — re-formed by
+  `apply_image`/`apply_extent_image` (RAM insert over exact cold slots)
+  and `apply_ref` (cold ref beside an exact RAM slot), dropped by every
+  slot removal (`shadow_note_removed`) and retargeted by every repoint
+  (`shadow_note_moved`); pinned by
+  `recovery_appliers_reform_pairs_in_both_orders`, the `m4-recovery` cardinality oracle (`len() ==
+  model.len()` at quiescence) and the `m4-tiered` quiescence oracle
+  (Σcells `DBSIZE` == model live keys; `live + dead == allocated`).
+- **Release runs during boot replay (ADR-0174 D3)**, so a replayed
+  winner is never sealed with its twin unverified, and cold slots at the
+  rebuild can be this life's. A namespace that demoted settles every
+  same-key pair before the rebuild, which then tickets only distinct keys
+  that share a hash. The rebuild's settle reads its slot through replay's
+  checked read: bytes whose key does not hash to the slot's hash are a
+  typed boot refusal.
+- **Bounded everything** — tickets ≤ `SHADOW_TICKETS_CAP`, the pinned
+  suffix ≤ `MEM-BUDGET / 8`, reads in flight ≤ `SHADOW_READS_IN_FLIGHT`;
+  each exhaustion is a counted refusal that leaves the synchronous
+  verify in force (`admission_refuses_at_every_bound_and_counts`,
+  `reads_in_flight_are_bounded_and_failures_retry`).
+- **Cardinality** — `len() == index.len() − open tickets`; pinned across
+  the store suite and both DST oracles.
+- **Deliberately unchecked**: a genuine 64-bit collision cannot be
+  constructed from real keys in a test (`lookup` asserts the hash is
+  the key's own); the probe order it relies on is pinned at the index
+  level with a forced pair (`ram_verified_slot_outranks_a_cold_twin`)
+  and the verdict with a foreign image. The reconciler's *liveness*
+  under sustained load is a campaign fact (the fallback counters), not
+  an invariant.

@@ -3,8 +3,8 @@
 # crash uploads the reproducing artifact — fixes land WITH the input
 # minimized into the target's corpus.
 #
-# Per-target budget: 5.5 h (owner decision 2026-08-08, v0.4.0 readiness
-# §9 D4 — max out the runner). GitHub hard-kills jobs at 6 h wall
+# Per-target budget: 5.5 h (owner decision 2026-08-08 — max out the
+# runner). GitHub hard-kills jobs at 6 h wall
 # including checkout/toolchain/cargo-install/fuzz-build overhead, so a
 # literal 6 h of fuzz time would be killed mid-run and bank nothing;
 # 5.5 h + overhead fits. The 24 h/target release gate accrues in 5
@@ -30,11 +30,30 @@ jobs:
       matrix:
         include:
           - { dir: crates/inf-wire, target: resp_parse }
+          # Reply half of the wire (review 2026-08-30 C6 / ADR-0097):
+          # a client's argument bytes reach every `-ERR` that quotes them.
+          - { dir: crates/inf-wire, target: resp_reply_frame }
           - { dir: crates/inf-fabric, target: fabric_codec }
           - { dir: crates/inf-server, target: glob_match }
           - { dir: crates/inf-server, target: scan_cursor }
+          # Adversarial surface coverage:
+          # the whole command registry under adversarial argv shapes.
+          - { dir: crates/inf-server, target: command_surface }
+          # F-L18-07 (review of 2026-08-30, batch 63): every parser in
+          # `bins/` — the CLI's reply decoder, the competitive harness's
+          # JSON reader and RESP framer, the load generator's framer, and
+          # the sim clients' framer. Iterative, depth-capped, fuzzed.
+          - { dir: bins/inf, target: cli_reply_parse }
+          - { dir: bins/inf-compare, target: memtier_json_parse, seeds: fuzz/seeds/memtier_json_parse }
+          - { dir: bins/inf-compare, target: compare_resp_frame, seeds: fuzz/seeds/compare_resp_frame }
+          - { dir: bins/inf-bench, target: bench_resp_frame }
+          - { dir: bins/inf-bench, target: loop_histogram }
+          - { dir: bins/inf-sim, target: sim_resp_frame }
+          # B64-65-R04 (batch 68): the sim's RESP2 *value* parser, total
+          # form, on arbitrary bytes and a generated model at/past the cap.
+          - { dir: bins/inf-sim, target: sim_resp_value }
           # Seeds the pinned first_lsn-offset-ceiling regression (this target
-          # found it on the 08-17 night; ADR-0072, readiness F35).
+          # found it on the 08-17 night; ADR-0126, readiness F35).
           - { dir: crates/inf-log, target: frame_decode, seeds: fuzz/corpora/frame_decode }
           - { dir: crates/inf-log, target: segment_read }
           - { dir: crates/inf-log, target: ick_decode }
@@ -42,7 +61,7 @@ jobs:
           # accrual was not wired — L9 requires the hours, not the file).
           - { dir: crates/inf-log, target: manifest_decode }
           - { dir: crates/inf-log, target: extent_decode }
-          # M4-S11 tier-file decoder — the M4 §6 plan requires it nightly.
+          # The tier-file decoder accrues its fuzz hours nightly.
           - { dir: crates/inf-log, target: fuzz_tierfile_decode }
           # M3-S01/S02 (gap caught in S05: the S02 ledger recorded this
           # accrual but the matrix was never extended) + M3-S05.
@@ -56,6 +75,9 @@ jobs:
           - { dir: crates/inf-doc, target: path_program, seeds: fuzz/corpora/path_program }
           # M3 delta-apply decoder (readiness F2).
           - { dir: crates/inf-doc, target: fuzz_delta_apply }
+          # The capped containers' op sequences against std models (ADR-0151
+          # D6): the types every cell container grows through.
+          - { dir: crates/inf-foundation, target: bounded_ops }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly

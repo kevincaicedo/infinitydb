@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M4-S09 tier-file I/O mode A/B (ADR-0054) — target root.
 //!
 //! The body drives `UringDriver` + a registered `AlignedPool` +

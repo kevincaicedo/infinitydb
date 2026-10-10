@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M0-S13/S14 gate bench: the L4 A/B for the hash→prefetch→execute batch
 //! pipeline at a cache-miss-bound working set, the probe-length histogram
 //! at load factor 0.85, and the per-key memory overhead artifact.
@@ -144,7 +148,8 @@ fn main() {
     println!("GET off-pipeline {:.2}M ops/s", off / 1e6);
     println!("GET on-pipeline  {:.2}M ops/s", on / 1e6);
     println!(
-        "PIPELINE GAIN   {:+.1}% (gate: >= +25% on the cache-miss-bound set, else demote to flag + ADR)",
+        "PIPELINE GAIN   {:+.1}% (gate: >= +25% on the cache-miss-bound set, else demote to flag + \
+             ADR)",
         (on / off - 1.0) * 100.0
     );
 }

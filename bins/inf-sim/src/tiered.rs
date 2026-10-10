@@ -38,19 +38,38 @@
 //! 9. The S19 drop-race finale: pipelined cold GETs race `INF.NS DROP`;
 //!    every reply is typed, the node answers `PING` after.
 //!
+//! **Shadow-slot arm (M4.5-S37, ADR-0093 D8):** three of every four
+//! seeds run `tiered-shadow-overwrite yes` (the DST's authority over the
+//! mechanism before it is the default; the fourth seed is the shipping
+//! off arm). Phase 6b overwrites every audited phase-2 key — cold by
+//! then (the recovered life re-demoted them) — with exact expectations,
+//! and deletes every fifth one (the forced-resolution path), so the
+//! shadow write, the reconciler and `DEL`'s verify-first rule run
+//! through the wire against keys with a real cold twin; phase 7's cold
+//! re-read sweep then serves the new values, and phase 7b is the
+//! **quiescence oracle**: MAINTAIN pumped until no ticket is open, then
+//! `DBSIZE` must equal the model's live-key count (no orphan slot, no
+//! lost key) and `live + dead` the space's allocated bytes. Coverage
+//! (`shadow_created`, the verdicts, the fallbacks) is disclosed per
+//! seed and aggregated by the sweep; phase 2's own overwrites open
+//! tickets only on seeds whose flush ran before the cut (disclosed as
+//! `open at the cut`).
+//!
 //! Coverage is disclosed, never assumed (ADR-0045 D4): flushed bytes,
 //! cold resolves, blob sets, refusals, and drop-race reply classes are
 //! reported per seed and aggregated in sweep manifests. Every event
 //! folds into `trace_hash`; `--verify-determinism` runs the scenario
 //! twice and requires trace identity (L7).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use inf_foundation::fault::FaultSpec;
 use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
+use inf_log::fs::sim::SimDisk;
 use inf_server::StallConfig;
 
 use crate::durable::{
@@ -61,8 +80,28 @@ use crate::durable::{
 use crate::net::Plant;
 use crate::resp::reply_len;
 
+mod late;
+mod support;
+
+use support::{
+    AgedKeys, ckpt_witness, dbsize_sum, finish, info_field, info_sum, info_tiering,
+    note_ckpt_witness, ns_watermarks, preview, pump_writers, reboot_until_ready, scan_all_keys,
+    tier_read_fault_probe, tier_residue_files, value_bytes,
+};
+
+// ---- shared data definitions (behaviour lives in the child modules) ----------
+
 /// The tiered namespace every phase drives.
 const NS_NAME: &[u8] = b"t";
+/// The first named namespace's id (`FIRST_NAMED_NS_ID`), the phase-10
+/// residue the boot sweep must clear.
+const DROPPED_NS_ID: u32 = 16;
+/// Phase 10b's second tiered namespace (id 17: ids never reuse) and its
+/// seeded cut window.
+const CUT_NS_NAME: &[u8] = b"t2";
+const CUT_NS_ID: u32 = 17;
+const CUT_NS_KEYS: u32 = 8;
+const CUT_STEPS_MAX: u64 = 48;
 
 /// `MEM-BUDGET` + `MAINTAIN-SLICE` at the smallest admissible pair: the
 /// alloc-admission window (budget + slice) must clear four region pages
@@ -74,6 +113,12 @@ const MAINTAIN_SLICE: &[u8] = b"1mb";
 /// target: phase-2 traffic overflows it, so demotion, flush, and cold
 /// reads happen inside the run, not past its end.
 const MUTABLE_FRACTION: &[u8] = b"100";
+/// The shadow arm's phase-2 target (M4.5-S37): 20‰ ≈ 60 KiB per cell —
+/// the 144-key corpus (≈ 250 KiB per cell) sits mostly cold, so a SET
+/// over a demoted key — the shape ADR-0093 exists for — is the common
+/// case, not the exception (at 100‰ the sweep opened five tickets in
+/// 750 arm seeds; coverage is disclosed per seed either way).
+const MUTABLE_FRACTION_SHADOW: &[u8] = b"20";
 /// The phase-6 clamp (hot-reload): 10‰ = ~30 KiB — any recovered tail
 /// plus the re-pressure fill overflows it by construction, making the
 /// flush-liveness oracle structural rather than statistical.
@@ -81,6 +126,19 @@ const MUTABLE_FRACTION_CLAMP: &[u8] = b"10";
 /// `BLOB-THRESHOLD` at its 4 KiB floor: the blob generator arm (≥ 6 KiB
 /// values) stores out of line, the inline arm (≤ 4 KiB) never does.
 const BLOB_THRESHOLD: &[u8] = b"4kb";
+/// The same threshold as the generator reads it (a value at or above it
+/// stores out of line and re-appends as a 24-byte reference at replay).
+const BLOB_THRESHOLD_BYTES: usize = 4 << 10;
+/// Each cell's replay window, `MEM-BUDGET` + `MAINTAIN-SLICE` (3 MiB +
+/// 1 MiB, the smallest legal pair): a boot whose re-appended records
+/// exceed it must demote during replay (ADR-0174 D1).
+const WINDOW_BYTES: u64 = 4 << 20;
+/// The replay-above-window seed class's phase-2 volume, in multiples of
+/// the plain seeds': the plain volume puts about 2.3 MiB of records on
+/// each cell (the sizing note on [`TieredScenario::m4_tiered`]), so three
+/// times it is about 7 MiB, past the window with margin on both cells of
+/// an uneven hash split.
+const REGIME_OPS_FACTOR: u64 = 3;
 /// `TIER-IO-MODE buffered`: the simulated disk models a buffered device
 /// (every store-tier sim scenario runs Buffered; the plane's `Direct`
 /// default is a real-NVMe posture the sim cannot honor).
@@ -108,6 +166,48 @@ pub struct TieredScenario {
     /// Device service-time model (the S14 reference stall device by
     /// default — fsync latency is part of the interleaving space).
     pub stall: Option<StallConfig>,
+    /// M4.5-S37 (ADR-0093 D8): the shadow arm — `CONFIG SET
+    /// tiered-shadow-overwrite yes` after the tiered DDL.
+    pub shadow: bool,
+    /// Review 2026-08-30, F-L01-02: arm `tier_dir_open_fail` once — the
+    /// first tier-file creation's directory hold is refused (`EMFILE`
+    /// physics). Pre-fix the round carried the dropped writer's header
+    /// write; the driver answered `EBADF` forever and the flush wedged.
+    /// The flush-liveness oracle and the command audit stand on it.
+    pub dir_open_fault: bool,
+    /// ADR-0117 D2's generator widening (see `DurableScenario`): one
+    /// seed in four walks under a 1 KiB section bound, so the tiered
+    /// pass-1 image resume runs at nearly every image.
+    pub ckpt_section_bound: Option<u32>,
+    /// F-L03-04 (ADR-0057 A3): `Some(n)` lets the sim disk take `n`
+    /// direct checkpoint writes (the probe's block and the header), then
+    /// refuses the first section write with `EINVAL` — the in-band
+    /// downgrade aborts a walk that already pinned its tables, and the
+    /// next checkpoint must re-latch the pin under its own id. The
+    /// `tiering_walk_behind` oracle below is the witness.
+    pub ckpt_direct_refused_after: Option<u64>,
+    /// F-L04-02 (ADR-0119 D2): before the phase-7 cold re-read sweep,
+    /// arm one `EIO` on the next read of every tier file. Each fault must
+    /// reach the client as exactly one typed `ERR cold read failed`
+    /// reply and one `tiering_cold_read_errors` increment — a nil, a
+    /// stale value, or an unattributed fault is a violation. Seeds ≡ 7
+    /// (mod 8); `--plant tier-read-eio` forces it.
+    pub tier_read_fault: bool,
+    /// The replay-above-window seed class (ADR-0174 D1), seeds ≡ 2 or 11
+    /// (mod 16) — the second with the double cut (≡ 3 mod 8), the other
+    /// double-cut seeds staying plain: no automatic checkpoint
+    /// runs and phase 2 writes [`REGIME_OPS_FACTOR`] times
+    /// its usual volume, so at least one cell's acknowledged tiered
+    /// records since the last `begin` exceed its window and the reboot
+    /// must demote during replay; its writers also age keys past a window
+    /// and then delete, rewrite, or delete and rewrite them
+    /// (`support::AgedKeys`), so the replay verifies deletes and settles
+    /// against copies it demoted. `--replay-above-window` forces it on any
+    /// seed; a run in it where no cell exceeded its window, whose boot did
+    /// not demote, or — on a draw of twice or three times the window — that
+    /// acknowledged no aged delete or whose reboot verified none, is
+    /// VACUOUS.
+    pub replay_above_window: bool,
 }
 
 impl TieredScenario {
@@ -120,7 +220,7 @@ impl TieredScenario {
         // page marks → two chunk ends, the earlier one confirmable).
         // 0.55 × ops × ~3.5 KiB ≈ 4.6 MiB per phase, hash-split across
         // two cells ≈ 2.3 MiB/cell, clears it in both lives.
-        TieredScenario {
+        let scenario = TieredScenario {
             seed,
             cells: 2,
             writers: 6,
@@ -137,7 +237,36 @@ impl TieredScenario {
             segment_bytes: 64 << 10,
             ckpt_interval_bytes: 24 << 10,
             stall: Some(m2_stall_config()),
+            shadow: seed % 4 != 3,
+            dir_open_fault: seed % 8 == 5,
+            ckpt_section_bound: DurableScenario::section_bound_for(seed, 1 << 10),
+            ckpt_direct_refused_after: (seed % 8 == 6).then_some(2),
+            tier_read_fault: seed % 8 == 7,
+            replay_above_window: false,
+        };
+        if matches!(seed % 16, 2 | 11) { scenario.with_replay_above_window() } else { scenario }
+    }
+
+    /// The replay-above-window class's knobs: the interval above any run
+    /// — `0`, the manual-only floor, since a large interval still leaves
+    /// the record cap's trigger (ADR-0088 D4) — and [`REGIME_OPS_FACTOR`]
+    /// times the phase-2 volume. The two arms whose engagement needs a
+    /// checkpoint walk inside the run — the `EINVAL` downgrade and the
+    /// section bound — are off: the run has none; so is the tier-read
+    /// fault arm, whose probe stands on the audited keys being cold again
+    /// at phase 6a, where a reboot that replays the whole log leaves them
+    /// in the window. Applied by the seed class and by the binary's flag.
+    pub fn with_replay_above_window(mut self) -> TieredScenario {
+        if self.replay_above_window {
+            return self;
         }
+        self.replay_above_window = true;
+        self.ckpt_interval_bytes = 0;
+        self.ops_per_writer *= REGIME_OPS_FACTOR;
+        self.ckpt_direct_refused_after = None;
+        self.ckpt_section_bound = None;
+        self.tier_read_fault = false;
+        self
     }
 
     /// The harness plumbing view of this scenario (`boot` + `Node::step`
@@ -149,18 +278,41 @@ impl TieredScenario {
             workload: DurableWorkload::KeyValue,
             cells: self.cells,
             always_writers: 0,
+            esec_think_ns_max: 0,
+            always_think_ns_max: 0,
             esec_writers: 0,
             mem_writers: 0,
             ops_per_writer: 0,
             keys_per_writer: self.keys_per_writer,
             value_max: 0,
+            value_pad_max: 0,
             step_ns_max: self.step_ns_max,
             double_cut: self.double_cut,
             plant: Plant::None,
             segment_bytes: self.segment_bytes,
             ckpt_interval_bytes: self.ckpt_interval_bytes,
+            ckpt_stream_bytes_per_sec: None,
+            ckpt_section_bytes: None,
+            ckpt_section_bound: self.ckpt_section_bound,
             stall: self.stall.clone(),
             replay_canary: false,
+            clean_stop: false,
+            io_mode: inf_server::SegmentIoMode::Buffered,
+            frames_in_flight: 1,
+            device: Default::default(),
+            budget_oracle: false,
+            ckpt_overrun: None,
+            reorder_oracle: false,
+            ckpt_direct_refused_after: self.ckpt_direct_refused_after,
+            fill: Default::default(),
+            group: Default::default(),
+            prelude: None,
+            recycle_slots: 0,
+            prealloc: inf_server::PreallocPolicy::DEFAULT,
+            recycle_oracle: false,
+            recycle_open_fault: false,
+            lift_regime: false,
+            spin_iters: DurableScenario::SPIN_ITERS,
         }
     }
 }
@@ -168,12 +320,39 @@ impl TieredScenario {
 /// What one seeded run produced. Coverage counters are disclosures
 /// (ADR-0045 D4) — sweeps aggregate them so a fleet that stopped
 /// demoting or stopped refusing is visible in the manifest.
+/// Phase 10b's verdict (ADR-0100 D5): the only two states a cut inside a
+/// `DROP` may leave behind.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum DropCutOutcome {
+    #[default]
+    NotReached,
+    /// The cut preceded the catalog swap: the namespace serves every key.
+    Whole,
+    /// The swap was durable: the namespace is gone, its residue swept.
+    Swept,
+}
+
 #[derive(Debug, Default)]
 pub struct TieredNodeReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
     pub stalled: bool,
+    /// ADR-0174 D1: per cell, the record bytes of the tiered `SET`s
+    /// acknowledged in phase 2 (header + key + value — what the reboot
+    /// re-appends when no checkpoint publishes in the run), and the cells
+    /// whose sum exceeded the window at the cut.
+    pub acked_record_bytes_per_cell: Vec<u64>,
+    pub replay_above_window_cells: u64,
+    /// ADR-0174 D6 from the reboot's `INFO persistence` node fold: demote
+    /// steps, tier bytes written, barriers, files sealed, settle reads,
+    /// deletes verified, and the largest step charge.
+    pub boot_tier: [u64; 7],
+    /// The replay-above-window class's aged keys (`support::AgedKeys`):
+    /// deletes of them acknowledged with `:1` before the cut — each one a
+    /// `DEL` the reboot replays against a copy it demoted.
+    pub aged_deletes_acked: u64,
     /// The reboot refused with the ADR-0018 taxonomy error — legal
     /// (§8.4 prefers refusing to serve over truncating possibly-covered
     /// data), counted, and the run ends early with phases 5–9 skipped.
@@ -192,6 +371,34 @@ pub struct TieredNodeReport {
     pub cold_resolves: u64,
     /// SETs at or above `BLOB-THRESHOLD` (the ADR-0061 extent leg).
     pub blob_sets: u64,
+    /// Phase 1b (review of 2026-08-30, F-L06-03): write replans the
+    /// shared blob-key race provoked — the interleaving's coverage,
+    /// disclosed per seed (a sweep whose races never replanned proved
+    /// nothing about the guard).
+    pub race_replans: u64,
+    /// F-L01-02: the `tier_dir_open_fail` arm this seed ran and how often
+    /// the point fired (an armed seed on which it never fired proved
+    /// nothing — the sweep counts both).
+    pub dir_open_fault_arm: bool,
+    pub dir_open_faults_fired: u64,
+    /// F-L04-02: the tier-read `EIO` arm this seed ran, the faults the
+    /// sweep's reads consumed, and the typed replies they produced
+    /// (equal, or the plane folded a device error).
+    pub tier_read_fault_arm: bool,
+    pub tier_read_faults_fired: u64,
+    pub tier_read_error_replies: u64,
+    /// Armed faults the audit never consumed (disarmed after it).
+    pub tier_read_faults_unconsumed: u64,
+    /// F-L17-13 (L3): `SCAN` pages that resolved cold slots, and the cold
+    /// intents they enqueued — the batching oracle's coverage (a walk
+    /// that never met a cold page proves nothing about batching).
+    pub scan_cold_pages: u64,
+    pub scan_cold_reads: u64,
+    /// F-L03-04 / ADR-0117 engagement: checkpoint staging downgrades
+    /// (the `EINVAL` seeds) and sections sealed for the bound (the
+    /// section-bound seeds), summed over cells at phase 10b.
+    pub ckpt_downgrades: u64,
+    pub ckpt_bound_splits: u64,
     /// Typed `DISKFULL` refusals observed at the clamped budget.
     pub diskfull_refusals: u64,
     /// Admission reopened after the budget lifted (phase 8's second
@@ -201,6 +408,72 @@ pub struct TieredNodeReport {
     pub drop_replies_value: u64,
     /// Drop-race replies that answered typed errors/nils (drop won).
     pub drop_replies_other: u64,
+    /// Phase 10 (ADR-0100 D6): the post-drop reboot succeeded; whether a
+    /// MANIFEST still named the dropped namespace (the row is inert on a
+    /// seed where a checkpoint raced the drop — disclosed).
+    pub drop_reboot_ok: bool,
+    pub drop_reboot_manifest_residue: bool,
+    /// Phase 10b (ADR-0100 D5): steps between the second DROP's send and
+    /// the power cut, and which of the two legal outcomes the reboot
+    /// landed on.
+    pub drop_cut_steps: u64,
+    pub drop_cut_outcome: DropCutOutcome,
+    /// M4.5-S37 (ADR-0093): the arm this seed ran, and the coverage the
+    /// quiescence oracle stood on — tickets created (both lives), the
+    /// verdicts, every fallback, and the ticket count at the cut.
+    pub shadow_arm: bool,
+    pub shadow_created: u64,
+    pub shadow_resolved_same_key: u64,
+    pub shadow_resolved_collision: u64,
+    pub shadow_fallbacks: u64,
+    pub shadow_stale: u64,
+    pub shadow_pending_at_cut: u64,
+    /// Phase 6b's cold resolves (both arms — how many of its overwrites
+    /// met a cold candidate; the shape's coverage, disclosed).
+    pub phase6b_cold_resolves: u64,
+    /// Phase 6c (ADR-0093 A7): crafted colliding pairs written through
+    /// the plane, the tickets they opened, the collision verdicts, the
+    /// `Ticketed` refusals, the `DBSIZE` drains and the SCAN twins the
+    /// phase observed — coverage, disclosed per seed.
+    pub collide_pairs: u64,
+    pub collide_tickets: u64,
+    pub collide_verdicts: u64,
+    pub collide_ticketed_fallbacks: u64,
+    pub collide_dbsize_drains: u64,
+    pub collide_scan_twins: u64,
+    /// Phase 6d (ADR-0093 A8, review of 2026-08-28): the open-ticket
+    /// rows under a paused reconciler — tickets opened and held open
+    /// through `GET`/`DBSIZE`/`SCAN`/a second `SET`/`DEL`, the `DBSIZE`
+    /// drains (two in flight together), the twins the drains read and
+    /// verified, the SCAN twins, the retargets, the read-free forced
+    /// deletes, the `Ticketed` refusals, the collision verdicts, the
+    /// injected twin-read errors `DBSIZE` relayed, and the tickets the
+    /// resumed reconciler settled without a read. Every row asserts its
+    /// own coverage — a vacuous row is a violation.
+    pub open_rows: bool,
+    pub open_tickets: u64,
+    pub open_dbsize_drains: u64,
+    pub open_dbsize_reads: u64,
+    pub open_verified_pending: u64,
+    pub open_scan_twins: u64,
+    pub open_retargeted: u64,
+    pub open_forced_deletes: u64,
+    pub open_ticketed_fallbacks: u64,
+    pub open_collision_verdicts: u64,
+    pub open_read_fault_errors: u64,
+    pub open_settled_without_read: u64,
+    /// Phase 7c (review of 2026-08-30, F-L07-01; batch 23, ADR-0093 A10):
+    /// a boot rebuild pairs every cold slot of one hash with its one RAM
+    /// sibling — the tickets the reboot formed on the phase's winners,
+    /// the `DEL`s that met a winner carrying several, the same-key twin
+    /// among them (shadow seeds), the filler writes that demoted it, and
+    /// the two extra reboots. Every row asserts its own coverage.
+    pub rebuilt_rows: bool,
+    pub rebuilt_tickets: u64,
+    pub rebuilt_multi_dels: u64,
+    pub rebuilt_same_key_twins: u64,
+    pub rebuilt_fill_sets: u64,
+    pub rebuilt_reboots: u64,
 }
 
 impl TieredNodeReport {
@@ -210,173 +483,21 @@ impl TieredNodeReport {
     }
 }
 
-/// Deterministic value bytes: a `tag:id:sent:` stamp cycled to `len`
-/// (exact expectations need exact bytes, not lengths).
-fn value_bytes(tag: u8, id: usize, sent: u64, len: usize) -> Vec<u8> {
-    let stamp = format!("{}:{id}:{sent}:", tag as char).into_bytes();
-    stamp.iter().copied().cycle().take(len).collect()
-}
-
-/// Builds the next tiered command + its exact expected reply: inline
-/// SETs (1–3 KiB — ring residents that demote), blob SETs (6–10 KiB —
-/// out-of-line extents, ADR-0061), exact GETs, and counted DELs.
-/// Overwrites across the arms exercise blob-over-inline,
-/// inline-over-blob, and cold-candidate displacement (ADR-0057 D4).
-fn next_tiered_command(
-    writer: &mut Writer,
-    scenario: &TieredScenario,
-    blob_sets: &mut u64,
-) -> (Vec<u8>, Pending) {
-    let key = writer.key(scenario.keys_per_writer);
-    let roll = writer.rng.next_below(100);
-    if roll < 65 {
-        let (tag, len) = if roll < 55 {
-            (b'i', 3072 + writer.rng.next_below(1024) as usize)
-        } else {
-            *blob_sets += 1;
-            (b'b', (6 << 10) + writer.rng.next_below(4096) as usize)
-        };
-        let value = value_bytes(tag, writer.id, writer.sent, len);
-        let wire = encode(&[b"SET", &key, &value]);
-        let pending = Pending {
-            key,
-            state_after: Some(value),
-            expect: b"+OK\r\n".to_vec(),
-            mutates: true,
-            taints: false,
-        };
-        (wire, pending)
-    } else if roll < 82 {
-        let state_after = writer.last_state(&key);
-        let expect = state_after.as_ref().map_or(b"$-1\r\n".to_vec(), |v| bulk(v));
-        let wire = encode(&[b"GET", &key]);
-        (wire, Pending { key, state_after, expect, mutates: false, taints: false })
-    } else {
-        let existed = writer.last_state(&key).is_some();
-        let expect = if existed { b":1\r\n".to_vec() } else { b":0\r\n".to_vec() };
-        let wire = encode(&[b"DEL", &key]);
-        (wire, Pending { key, state_after: None, expect, mutates: true, taints: false })
-    }
-}
-
-/// One traffic pump round for every writer on `node`: drain replies
-/// (asserting exact expectations + recording acks), then send the next
-/// command where a slot is free. Returns delivered-byte+send progress
-/// (the stall detector's currency).
-fn pump_writers(
-    node: &mut Node,
-    writers: &mut [Writer],
-    scenario: &TieredScenario,
-    clock: &Rc<VirtualClock>,
-    report: &mut TieredNodeReport,
-    blob_sets: &mut u64,
-) -> u64 {
-    let mut progress = 0u64;
-    for writer in writers.iter_mut() {
-        let mut net = node.nets[writer.cell].borrow_mut();
-        let bytes = net.client_recv(writer.fd);
-        progress += bytes.len() as u64;
-        writer.rx.extend_from_slice(&bytes);
-        while let Some(n) = reply_len(&writer.rx) {
-            let reply: Vec<u8> = writer.rx.drain(..n).collect();
-            if writer.setup {
-                if reply != b"+OK\r\n" {
-                    report.violations.push(format!("writer {}: USE answered {reply:?}", writer.id));
-                }
-                writer.setup = false;
-                continue;
-            }
-            let Some(pending) = writer.inflight.take() else {
-                report
-                    .violations
-                    .push(format!("writer {}: unsolicited reply {reply:?}", writer.id));
-                continue;
-            };
-            if reply != pending.expect {
-                report.violations.push(format!(
-                    "writer {} key {:?}: expected {}, got {}",
-                    writer.id,
-                    String::from_utf8_lossy(&pending.key),
-                    preview(&pending.expect),
-                    preview(&reply)
-                ));
-            }
-            if pending.mutates {
-                let ops = writer.ledger.entry(pending.key.clone()).or_default();
-                let rec = ops.last_mut().expect("sent op has a ledger entry");
-                rec.acked_at = Some(clock.now());
-            }
-            writer.replied += 1;
-            report.commands_done += 1;
-        }
-        if writer.setup || writer.inflight.is_some() || writer.sent >= writer.quota {
-            continue;
-        }
-        let (wire, pending) = next_tiered_command(writer, scenario, blob_sets);
-        if pending.mutates {
-            writer.ledger.entry(pending.key.clone()).or_default().push(OpRec {
-                state_after: pending.state_after.clone(),
-                sent_at: clock.now(),
-                acked_at: None,
-            });
-        }
-        writer.inflight = Some(pending);
-        net.client_send(writer.fd, &wire);
-        writer.sent += 1;
-        progress += 1;
-    }
-    progress
-}
-
-fn preview(reply: &[u8]) -> String {
-    let cut = reply.len().min(48);
-    format!(
-        "{:?}{}",
-        String::from_utf8_lossy(&reply[..cut]),
-        if reply.len() > cut { "…" } else { "" }
-    )
-}
-
-/// Extracts one `key:value` integer from an `INFO` section text.
-fn info_field(text: &str, key: &str) -> u64 {
-    text.lines()
-        .find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix(':')))
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-/// `INFO tiering` through a [`MiniClient`], bulk payload decoded to text.
-#[allow(clippy::too_many_arguments)] // one call site's plumbing, like MiniClient::call
-fn info_tiering(
-    client: &mut MiniClient,
-    node: &mut Node,
-    rng: &mut SplitMix64,
-    clock: &Rc<VirtualClock>,
-    disk: &inf_server::SimDisk,
-    step_ns_max: u64,
-) -> Result<String, String> {
-    let reply = client
-        .call(node, rng, clock, disk, step_ns_max, &[b"INFO", b"tiering"])
-        .map_err(|e| format!("INFO tiering: {e}"))?
-        .ok_or_else(|| "INFO tiering stalled".to_string())?;
-    if !reply.starts_with(b"$") {
-        return Err(format!("INFO tiering answered {}", preview(&reply)));
-    }
-    let header =
-        reply.windows(2).position(|w| w == b"\r\n").ok_or_else(|| "INFO framing".to_string())?;
-    Ok(String::from_utf8_lossy(&reply[header + 2..reply.len() - 2]).into_owned())
-}
-
 /// Runs one seeded tiered-node scenario (the phase list in the module
 /// docs). Violations carry the seed and the exact key/reply — a sweep
 /// line is a complete repro via `--seed`.
-#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: one linear phase script, like run_durable_scenario"
+)]
 #[must_use]
-pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
+fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNodeReport {
     let harness = scenario.harness();
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(scenario.seed, scenario.stall.as_ref());
-    let observer = TraceObserver::default();
+    if let Some(allowed) = scenario.ckpt_direct_refused_after {
+        disk.refuse_direct_writes_after(allowed);
+    }
     let mut rng = SplitMix64::new(scenario.seed ^ 0x71E7_ED00);
     let mut report = TieredNodeReport::default();
     let seed = scenario.seed;
@@ -404,7 +525,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         b"MEM-BUDGET",
         MEM_BUDGET,
         b"MUTABLE-FRACTION",
-        MUTABLE_FRACTION,
+        if scenario.shadow { MUTABLE_FRACTION_SHADOW } else { MUTABLE_FRACTION },
         b"MAINTAIN-SLICE",
         MAINTAIN_SLICE,
         b"BLOB-THRESHOLD",
@@ -419,6 +540,255 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             return finish(report, &observer, &clock);
         }
     }
+    // F-L01-02: the first tier-file creation's directory hold is refused.
+    // Every cell runs on this thread (thread-local registry), so the
+    // first creation in any cell takes it.
+    report.dir_open_fault_arm = scenario.dir_open_fault;
+    if scenario.dir_open_fault {
+        inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+    }
+    // The shadow arm (M4.5-S37, ADR-0093 D8): a CONFIG key, fanned to
+    // every cell like `tiered-promote-on-read`.
+    report.shadow_arm = scenario.shadow;
+    if scenario.shadow {
+        let knob: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("shadow CONFIG SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        // The fan's witness: the executing cell's table carries the arm
+        // (peers follow on the MAINTAIN version sweep).
+        match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &["tiering_shadow_enabled"]) {
+            Ok(v) if v[0] != u64::from(scenario.cells) => {
+                fail(
+                    &mut report,
+                    format!("shadow CONFIG SET reached {} of {} cells", v[0], scenario.cells),
+                );
+                return finish(report, &observer, &clock);
+            }
+            Ok(_) => {}
+            Err(err) => fail(&mut report, format!("post-knob scrape: {err}")),
+        }
+    }
+
+    // ADR-0093 A7 (phase 6c's material): the crafted colliding pairs'
+    // first keys are written now, pre-cut — acked `always` writes that
+    // survive the cut, demote with the phase-2 corpus and are re-demoted
+    // by phase 6's fill exactly like the audited keys — so phase 6c's
+    // second-key writes meet a **cold** exact candidate on both arms.
+    const COLLIDE_PAIRS: u64 = 4;
+    let pairs: Vec<([u8; 48], [u8; 48])> = (0..COLLIDE_PAIRS)
+        .map(|i| inf_store::forced_collision_pair(seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+        .collect();
+    let collide_values: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..COLLIDE_PAIRS)
+        .map(|i| {
+            (
+                value_bytes(b'c', 6, i, 2048),
+                value_bytes(b'd', 6, i, 1536),
+                value_bytes(b'e', 6, i, 2304),
+            )
+        })
+        .collect();
+    let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+    match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+        other => {
+            fail(&mut report, format!("setup USE answered {other:?}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    for (i, pair) in pairs.iter().enumerate() {
+        let set: &[&[u8]] = &[b"SET", &pair.0, &collide_values[i].0];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET pair {i}.0 answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += COLLIDE_PAIRS;
+    // ADR-0093 A8 (phase 6d's material): the open-ticket rows' keys —
+    // four plain keys (same-key tickets held open), four crafted triples
+    // (a collision ticket plus a `Ticketed` third key each) and one key
+    // for the injected-read-error row — written pre-cut like the pairs,
+    // so they are cold again when phase 6d runs.
+    const OPEN_SAME_KEYS: u64 = 4;
+    const OPEN_TRIPLES: u64 = 4;
+    let open_same_keys: Vec<Vec<u8>> =
+        (0..OPEN_SAME_KEYS).map(|i| format!("open:sk:{i}").into_bytes()).collect();
+    let open_fault_key: Vec<u8> = b"open:fault".to_vec();
+    // Batch 52 (F-L13-09): one more cold key, overwritten right after the
+    // failed drain — its ticket proves the fence came down.
+    let open_fence_key: Vec<u8> = b"open:fence".to_vec();
+    let open_triples: Vec<[[u8; 48]; 3]> = (0..OPEN_TRIPLES)
+        .map(|i| {
+            inf_store::forced_collision_triple(
+                seed ^ 0xA5A5_0000 ^ (i + 8).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            )
+        })
+        .collect();
+    let open_value = |tag: u8, i: u64| value_bytes(tag, 7, i, 1792);
+    for (i, key) in open_same_keys.iter().chain([&open_fault_key, &open_fence_key]).enumerate() {
+        let value = open_value(b'o', i as u64);
+        let set: &[&[u8]] = &[b"SET", key, &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET open key {i} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    for (i, triple) in open_triples.iter().enumerate() {
+        let value = open_value(b'p', i as u64);
+        let set: &[&[u8]] = &[b"SET", &triple[0], &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET open triple {i}.0 answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += OPEN_SAME_KEYS + 1 + OPEN_TRIPLES;
+    // Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): phase 7c's
+    // material — two collision keys of one triple (cold again by phase
+    // 6c, both arms) and the first key of a second triple (the same-key
+    // twin's cold slot on the shadow arm), written pre-cut like the pairs.
+    let rebuilt_triple = inf_store::forced_collision_triple(seed ^ 0x7C7C_0001);
+    let rebuilt_sk = inf_store::forced_collision_triple(seed ^ 0x7C7C_0002);
+    let rebuilt_value = |tag: u8, i: u64| value_bytes(tag, 8, i, 1600);
+    const REBUILT_PRECUT_KEYS: u64 = 3;
+    for (i, key) in [&rebuilt_triple[0], &rebuilt_triple[2], &rebuilt_sk[0]].into_iter().enumerate()
+    {
+        let value = rebuilt_value(b'g', i as u64);
+        let set: &[&[u8]] = &[b"SET", key, &value];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("pre-cut SET rebuilt key {i} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    report.commands_done += REBUILT_PRECUT_KEYS;
+
+    // ---- phase 1b: the shared blob-key write race (F-L06-03) ------------
+    // K clients on cell 0 write the same key with extent-sized values in
+    // lockstep: every write resolves through the extent arm and suspends
+    // on its cold read, so the slot moves under the others — the
+    // interleaving the orchestrator's stress run (L00-21) never reached.
+    // Oracle: every reply `+OK`, the final value one of the round's, the
+    // cell alive (the sim dies on a cell panic — the pre-fix
+    // `Index::replace` "replace target present"), and the guard's replan
+    // count disclosed.
+    const RACE_CLIENTS: usize = 4;
+    const RACE_ROUNDS: u64 = 6;
+    let mut racers: Vec<MiniClient> =
+        (0..RACE_CLIENTS).map(|_| MiniClient::connect(&mut node, 0)).collect();
+    for (i, racer) in racers.iter_mut().enumerate() {
+        match racer.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("racer {i} USE answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    for round in 0..RACE_ROUNDS {
+        let key = format!("race:{}", round % 2).into_bytes();
+        // Seed the key as an extent so every racer's resolve takes the
+        // suspending arm.
+        let seed_len = (6 << 10) + rng.next_below(2048) as usize;
+        let seed_value = value_bytes(b'R', 9, round, seed_len);
+        let set: &[&[u8]] = &[b"SET", &key, &seed_value];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("race round {round} seed SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        let values: Vec<Vec<u8>> = (0..RACE_CLIENTS)
+            .map(|i| value_bytes(b'r', i, round, (6 << 10) + rng.next_below(2048) as usize))
+            .collect();
+        for (racer, value) in racers.iter_mut().zip(&values) {
+            racer.send(&mut node, &[b"SET", &key, value]);
+        }
+        let mut replied = [false; RACE_CLIENTS];
+        let mut steps = 0u64;
+        while replied.iter().any(|r| !r) {
+            steps += 1;
+            report.scheduler_steps += 1;
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                fail(&mut report, format!("race round {round}: {err}"));
+                return finish(report, &observer, &clock);
+            }
+            for (i, racer) in racers.iter_mut().enumerate() {
+                if !replied[i]
+                    && let Some(reply) = racer.recv(&mut node)
+                {
+                    replied[i] = true;
+                    if reply != b"+OK\r\n" {
+                        fail(
+                            &mut report,
+                            format!(
+                                "race round {round} racer {i}: SET answered {}",
+                                preview(&reply)
+                            ),
+                        );
+                    }
+                }
+            }
+            if steps > STALL_STEPS {
+                report.stalled = true;
+                fail(&mut report, format!("race round {round} stalled"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        report.commands_done += RACE_CLIENTS as u64 + 1;
+        let get: &[&[u8]] = &[b"GET", &key];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, get) {
+            Ok(Some(reply)) => {
+                if !values.iter().any(|v| bulk(v) == reply) {
+                    fail(
+                        &mut report,
+                        format!(
+                            "race round {round}: final value {} is none of the round's writes",
+                            preview(&reply)
+                        ),
+                    );
+                }
+            }
+            other => {
+                fail(&mut report, format!("race round {round} GET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        report.commands_done += 1;
+    }
+    match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+        Ok(text) => report.race_replans = info_field(&text, "tiering_write_replans"),
+        Err(err) => fail(&mut report, format!("race scrape: {err}")),
+    }
+    // The race keys are outside every later model (the quiescence
+    // oracle counts DBSIZE against the writers' ledgers): delete them.
+    for round in 0..2u64 {
+        let key = format!("race:{round}").into_bytes();
+        let del: &[&[u8]] = &[b"DEL", &key];
+        match racers[0].call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
+            Ok(Some(ok)) if ok == b":1\r\n" => report.commands_done += 1,
+            other => {
+                fail(&mut report, format!("race key {round} DEL answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    drop(racers);
 
     // ---- phase 2: seeded traffic until the cut -------------------------
     let mut writers = Vec::new();
@@ -442,7 +812,26 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     // The cut window starts after the fill typically demotes and extends
     // past typical completion — early-cut and post-completion-cut seeds
     // both exist in the corpus (their coverage counters disclose which).
+    // In the replay-above-window class the cut lands once one cell's
+    // acknowledged records reach a volume drawn from the window's hostile
+    // row — one page above it, twice it, three times it, by the seed — or
+    // when the writers finish, whichever is first. The two larger volumes
+    // let an aged key's owning cell acknowledge `AGED_BYTES_MIN` past it,
+    // so the class's aged deletes and rewrites replay against demoted
+    // copies (R6, R7); one page above the window cannot.
     let cut_step = 600 + rng.next_below(total_ops * 6);
+    let drawn_target = match (scenario.seed >> 4) % 3 {
+        0 => WINDOW_BYTES + (1 << 20),
+        1 => 2 * WINDOW_BYTES,
+        _ => 3 * WINDOW_BYTES,
+    };
+    let regime_target = scenario.replay_above_window.then_some(drawn_target);
+    let mut aged: Vec<AgedKeys> = if scenario.replay_above_window {
+        (0..writers.len()).map(|_| AgedKeys::default()).collect()
+    } else {
+        Vec::new()
+    };
+    let cut_step = if regime_target.is_some() { total_ops * 12 + 600 } else { cut_step };
     let mut blob_sets = 0u64;
     let mut idle_steps = 0u64;
     for _ in 0..cut_step {
@@ -451,8 +840,23 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
             fail(&mut report, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
         }
-        let progress =
-            pump_writers(&mut node, &mut writers, scenario, &clock, &mut report, &mut blob_sets);
+        let aged_ledgers = scenario.replay_above_window.then_some(aged.as_mut_slice());
+        let progress = pump_writers(
+            &mut node,
+            &mut writers,
+            aged_ledgers,
+            scenario,
+            &clock,
+            &mut report,
+            &mut blob_sets,
+        );
+        if let Some(target) = regime_target {
+            let most = report.acked_record_bytes_per_cell.iter().copied().max().unwrap_or(0);
+            let done = writers.iter().all(|w| w.sent >= w.quota && w.replied >= w.sent);
+            if most >= target || done {
+                break;
+            }
+        }
         if progress == 0 {
             idle_steps += 1;
             if idle_steps >= STALL_STEPS && writers.iter().any(|w| w.replied < w.sent) {
@@ -476,20 +880,68 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         }
     }
     report.blob_sets = blob_sets;
+    // ADR-0174 D1: the class's engagement — which cells the reboot must
+    // demote for.
+    report.replay_above_window_cells =
+        report.acked_record_bytes_per_cell.iter().filter(|&&bytes| bytes > WINDOW_BYTES).count()
+            as u64;
+    if scenario.replay_above_window && report.replay_above_window_cells == 0 {
+        let message = format!(
+            "REPLAY-ABOVE-WINDOW VACUOUS: no cell's acknowledged tiered records exceeded the \
+             window before the cut ({:?} bytes)",
+            report.acked_record_bytes_per_cell
+        );
+        fail(&mut report, message);
+    }
     // Pre-cut coverage scrape (pumps a bounded number of extra steps —
     // part of the deterministic schedule, and the cut still lands with
     // writers mid-flight because the scrape never quiesces them).
     match info_tiering(&mut setup, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
         Ok(text) => {
             report.flushed_pre_cut_bytes = info_field(&text, "tiering_flush_confirmed_bytes");
+            report.shadow_created = info_field(&text, "tiering_shadow_created");
+            report.shadow_pending_at_cut = info_field(&text, "tiering_shadow_pending");
         }
         Err(err) => fail(&mut report, format!("pre-cut scrape: {err}")),
+    }
+    // F-L01-02 arm: the refused hold must have left no staged op behind —
+    // a write retry after it is the dropped writer's fd reaching the
+    // driver (`EBADF`, retried forever pre-fix: 4410 retries on the seed
+    // that proved it). Per cell: the section is cell-scoped and the point
+    // fires on whichever cell creates first. Flush progress before the
+    // cut is disclosed, not required — the cut can land before any
+    // cell's first round (several sweep shards report 0 B pre-cut).
+    if scenario.dir_open_fault {
+        for cell in 0..usize::from(scenario.cells) {
+            let mut probe = MiniClient::connect(&mut node, cell);
+            match info_tiering(&mut probe, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max)
+            {
+                Ok(text) => {
+                    let retries = info_field(&text, "tiering_flush_write_retries");
+                    if retries > 0 {
+                        fail(
+                            &mut report,
+                            format!(
+                                "DIR-OPEN FAULT VIOLATION cell {cell}: {retries} flush write \
+                                 retries before the cut (confirmed {} B, rounds {}, in flight \
+                                 {}) — a refused directory hold must stage nothing (F-L01-02)",
+                                info_field(&text, "tiering_flush_confirmed_bytes"),
+                                info_field(&text, "tiering_flush_rounds"),
+                                info_field(&text, "tiering_flush_rounds_inflight"),
+                            ),
+                        );
+                    }
+                }
+                Err(err) => fail(&mut report, format!("dir-open fault scrape cell {cell}: {err}")),
+            }
+        }
     }
 
     // ---- phase 3: POWER CUT --------------------------------------------
     let cut_time = clock.now();
+    note_ckpt_witness(&node, scenario.cells, &mut report);
     drop(node);
-    disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED0);
 
     // ---- phase 4: reboot (+ optional second cut mid-recovery) -----------
     let mut boots = 0;
@@ -535,8 +987,9 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         if node.ready() {
             break node;
         }
+        note_ckpt_witness(&node, scenario.cells, &mut report);
         drop(node);
-        disk.power_cut(scenario.seed ^ 0x0FF5_EED1 ^ boots);
+        observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
 
@@ -554,13 +1007,77 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         fail(&mut report, format!("acked tiered CREATE lost: audit USE answered {reply:?}"));
         return finish(report, &observer, &clock);
     }
+    // CONFIG keys are not durable (no CONFIG REWRITE in the sim): the
+    // recovered node boots with the shipping default, so the arm
+    // re-applies its knob here — what an operator's config file does —
+    // and the fan's witness is checked again on the recovered table.
+    if scenario.shadow {
+        let knob: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"];
+        match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, knob) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("post-boot shadow CONFIG SET answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        // The fan's witness on **every** cell (`INFO tiering` is
+        // cell-scoped; the review of 2026-08-27 found the one-cell
+        // witness blind to a cell the fan had not reached).
+        match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &["tiering_shadow_enabled"]) {
+            Ok(v) if v[0] != u64::from(scenario.cells) => {
+                fail(
+                    &mut report,
+                    format!(
+                        "post-boot shadow CONFIG SET reached {} of {} cells",
+                        v[0], scenario.cells
+                    ),
+                );
+                return finish(report, &observer, &clock);
+            }
+            Ok(_) => {}
+            Err(err) => fail(&mut report, format!("post-boot knob scrape: {err}")),
+        }
+    }
+    // ADR-0174 D6: the reboot's tiered replay, folded over the node. In
+    // the replay-above-window class no checkpoint publishes in the run,
+    // so a cell whose acknowledged records exceed the window re-appends
+    // more than it and must have demoted.
+    match support::boot_tier_fold(&mut audit, &mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(fold) => report.boot_tier = fold,
+        Err(err) => {
+            fail(&mut report, format!("post-boot INFO persistence: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    }
+    // ADR-0174 I9 at the shipped recovery driver, on every seed: a reboot
+    // that made no demote step leaves the rest of the fold's zero set at
+    // zero — no tier bytes, barriers, files sealed, settle reads or
+    // verified deletes (each needs a demote step first).
+    let fold = report.boot_tier;
+    if fold[0] == 0 && fold[1..6].iter().any(|&value| value != 0) {
+        let message = format!(
+            "ZERO-SET VIOLATION: the reboot made no demote step, yet its fold reads {fold:?}"
+        );
+        fail(&mut report, message);
+    }
+    let cells_above = report.replay_above_window_cells;
+    if cells_above > 0 && scenario.replay_above_window && report.boot_tier[0] == 0 {
+        fail(
+            &mut report,
+            format!(
+                "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: {cells_above} cell(s) above the \
+                 window and the reboot made no demote step"
+            ),
+        );
+        return finish(report, &observer, &clock);
+    }
     // Observed post-recovery replies, kept for the phase-7 cold sweep
     // (phases 6–8 never touch phase-2 keys, so equality stays exact).
     let mut observed: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     for writer in &writers {
         for (key, ops) in &writer.ledger {
             report.audited_keys += 1;
-            let required = required_index(NsClass::Always, ops, cut_time);
+            let required = required_index(NsClass::Always, ops, cut_time, false);
             report.required_ops += required.map_or(0, |i| i as u64 + 1);
             report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
             let reply = match audit.call(
@@ -591,6 +1108,26 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
                 ));
             }
             observed.insert(key.clone(), reply);
+        }
+    }
+    // The class's aged-key engagement (R6, R7), after the audit so a
+    // planted violation is read there first: on a draw whose volume ages a
+    // key past its window, aged deletes were acknowledged, and the reboot
+    // read and verified deletes against the copies it demoted.
+    if scenario.replay_above_window {
+        let (reads, verified) = (report.boot_tier[4], report.boot_tier[5]);
+        let aged_deletes = report.aged_deletes_acked;
+        let ages = regime_target.is_some_and(|target| target >= 2 * WINDOW_BYTES);
+        if (ages && aged_deletes == 0) || (aged_deletes > 0 && (reads == 0 || verified == 0)) {
+            fail(
+                &mut report,
+                format!(
+                    "REPLAY-ABOVE-WINDOW VACUOUS seed {seed:#x}: target {regime_target:?}, {} aged \
+                     deletes acknowledged, the reboot made {reads} settle reads and verified \
+                     {verified} deletes",
+                    aged_deletes
+                ),
+            );
         }
     }
 
@@ -644,6 +1181,7 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         let progress = pump_writers(
             &mut node,
             &mut post_writers,
+            None,
             scenario,
             &clock,
             &mut report,
@@ -703,6 +1241,610 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     }
     report.flushed_final_bytes = flushed_now;
 
+    // ---- phase 6a: the tier-read fault probe (F-L04-02, ADR-0119 D2) ----
+    // The audited keys are cold again (phase 6 re-demoted them) and every
+    // tier file exists: arm one `EIO` on the next read of each, GET every
+    // audited key, and require each fault to reach the client as exactly
+    // one typed reply — then the value on the retry (one op, not a dead
+    // file) — and one counter increment. Leftovers are disarmed so no
+    // later phase meets a fault its oracle never modeled.
+    if scenario.tier_read_fault
+        && let Err(what) = tier_read_fault_probe(
+            &mut node,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            &mut audit,
+            &observed,
+            &mut report,
+        )
+    {
+        fail(&mut report, what);
+        return finish(report, &observer, &clock);
+    }
+
+    // ---- phase 6b: overwrite + delete the cold phase-2 keys (M4.5-S37) --
+    // The recovered life re-demoted the audited keys (phase 6's fill
+    // overflowed the clamped target), so a plain SET over each meets a
+    // cold candidate — the ADR-0093 shape — on the shadow arm through
+    // the shadow path, on the off arm through the synchronous verify.
+    // Every fifth key is then deleted (a winner with an open ticket:
+    // `DEL` verifies the twin first). Exact expectations; phase 7
+    // re-reads the new state.
+    // Wait for demotion to finish on this cell: the head catches the
+    // flushed watermark and holds for eight polls (release runs a
+    // commit page per MAINTAIN slice behind the flush the liveness
+    // check saw). Bounded; a cell that never settles is disclosed by the
+    // cold-resolve delta below, not a violation.
+    let mut settled = 0u32;
+    let mut last_head = u64::MAX;
+    let mut cold_before = 0u64;
+    for _ in 0..512 {
+        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) => {
+                cold_before = info_field(&text, "tiering_cold_resolves");
+                let Some((head, flushed)) = ns_watermarks(&text) else { break };
+                if head == flushed && head == last_head {
+                    settled += 1;
+                    if settled >= 8 {
+                        break;
+                    }
+                } else {
+                    settled = 0;
+                }
+                last_head = head;
+            }
+            Err(err) => {
+                fail(&mut report, format!("phase-6b settle scrape: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+    let mut shadow_writes = 0u64;
+    for (i, key) in observed.keys().cloned().collect::<Vec<_>>().into_iter().enumerate() {
+        let value = value_bytes(b's', 6, i as u64, 2048 + (i % 7) * 128);
+        let set: &[&[u8]] = &[b"SET", &key, &value];
+        match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => {
+                fail(&mut report, format!("phase-6b SET {key:?} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        shadow_writes += 1;
+        if i % 5 == 4 {
+            let del: &[&[u8]] = &[b"DEL", &key];
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del) {
+                Ok(Some(reply)) if reply == b":1\r\n" => {}
+                other => {
+                    fail(&mut report, format!("phase-6b DEL {key:?} answered {other:?}"));
+                    return finish(report, &observer, &clock);
+                }
+            }
+            observed.insert(key, b"$-1\r\n".to_vec());
+        } else {
+            observed.insert(key, bulk(&value));
+        }
+    }
+    report.commands_done += shadow_writes;
+    match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+        Ok(text) => {
+            report.phase6b_cold_resolves =
+                info_field(&text, "tiering_cold_resolves").saturating_sub(cold_before);
+        }
+        Err(err) => fail(&mut report, format!("phase-6b scrape: {err}")),
+    }
+
+    // ---- phase 6c: forced 64-bit collisions through the plane (A7) ------
+    // Two real keys with one hash per pair (`forced_collision_pair`; the
+    // shared hashtag routes both to one cell): the first was written
+    // pre-cut and is cold again (phase 6's re-demotion, phase 6b's settle
+    // wait), the second now meets it as its only exact cold candidate —
+    // on the shadow arm a ticket whose verdict must be `Collision`, on
+    // the off arm the synchronous read that tells the keys apart. Every
+    // answer with the ticket open is exact: `GET` of each key, `DBSIZE`
+    // (the fenced drain), `SCAN` naming both; then an overwrite of the
+    // first key (the `Ticketed` refusal while the ticket is open), a
+    // `DEL` of the second, and the count again.
+    let base = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) => n,
+        Err(err) => {
+            fail(&mut report, format!("phase-6c DBSIZE base: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    // `INFO tiering` is cell-scoped: the pairs live on the hashtag's
+    // cell, so the coverage deltas are summed over every cell.
+    const COLLIDE_KEYS: [&str; 5] = [
+        "tiering_shadow_created",
+        "tiering_shadow_resolved_collision",
+        "tiering_shadow_fallback_ticketed",
+        "tiering_shadow_dbsize_drains",
+        "tiering_shadow_scan_twins_emitted",
+    ];
+    let before = match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &COLLIDE_KEYS) {
+        Ok(v) => v,
+        Err(err) => {
+            fail(&mut report, format!("phase-6c coverage scrape: {err}"));
+            return finish(report, &observer, &clock);
+        }
+    };
+    for (i, pair) in pairs.iter().enumerate() {
+        let (v1, v2, v1b) = &collide_values[i];
+        let mut expect_reply = |cmd: &[&[u8]], want: &[u8], what: &str| -> bool {
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, cmd) {
+                Ok(Some(reply)) if reply == want => true,
+                other => {
+                    report.violations.push(format!(
+                        "COLLISION VIOLATION seed {seed:#x} pair {i}: {what} answered {other:?}, \
+                         wanted {}",
+                        preview(want)
+                    ));
+                    false
+                }
+            }
+        };
+        let ok = expect_reply(&[b"SET", &pair.1, v2], b"+OK\r\n", "SET pair.1")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1), "GET pair.0 (ticket open)")
+            && expect_reply(&[b"GET", &pair.1], &bulk(v2), "GET pair.1 (ticket open)");
+        if !ok {
+            return finish(report, &observer, &clock);
+        }
+        // DBSIZE with the ticket possibly open: exact, never one short
+        // (every pair's first key is in `base`; the second is the one
+        // new key, deleted again below).
+        match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) if n == base + 1 => {}
+            Ok(n) => report.violations.push(format!(
+                "COLLISION VIOLATION seed {seed:#x} pair {i}: DBSIZE {n} after the colliding \
+                 SET, wanted {} (ADR-0093 A3)",
+                base + 1
+            )),
+            Err(err) => {
+                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        // SCAN names both keys (a collision key is never hidden).
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
+            Ok(keys) => {
+                for (side, key) in [(0, &pair.0[..]), (1, &pair.1[..])] {
+                    if !keys.iter().any(|k| k == key) {
+                        report.violations.push(format!(
+                            "COLLISION VIOLATION seed {seed:#x} pair {i}: SCAN did not name \
+                             pair.{side} (ADR-0093 A3)"
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                fail(&mut report, format!("phase-6c SCAN: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        let mut expect_reply = |cmd: &[&[u8]], want: &[u8], what: &str| -> bool {
+            match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, cmd) {
+                Ok(Some(reply)) if reply == want => true,
+                other => {
+                    report.violations.push(format!(
+                        "COLLISION VIOLATION seed {seed:#x} pair {i}: {what} answered {other:?}, \
+                         wanted {}",
+                        preview(want)
+                    ));
+                    false
+                }
+            }
+        };
+        let ok = expect_reply(&[b"SET", &pair.0, v1b], b"+OK\r\n", "SET pair.0 again")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1b), "GET pair.0 after overwrite")
+            && expect_reply(&[b"GET", &pair.1], &bulk(v2), "GET pair.1 after the other's SET")
+            && expect_reply(&[b"DEL", &pair.1], b":1\r\n", "DEL pair.1")
+            && expect_reply(&[b"GET", &pair.1], b"$-1\r\n", "GET pair.1 after DEL")
+            && expect_reply(&[b"GET", &pair.0], &bulk(v1b), "GET pair.0 after the other's DEL");
+        if !ok {
+            return finish(report, &observer, &clock);
+        }
+        match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) if n == base => {}
+            Ok(n) => report.violations.push(format!(
+                "COLLISION VIOLATION seed {seed:#x} pair {i}: DBSIZE {n} after DEL, wanted {base}"
+            )),
+            Err(err) => {
+                fail(&mut report, format!("phase-6c DBSIZE: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+        observed.insert(pair.0.to_vec(), bulk(v1b));
+        observed.insert(pair.1.to_vec(), b"$-1\r\n".to_vec());
+        report.commands_done += 11;
+    }
+    report.collide_pairs = COLLIDE_PAIRS;
+    match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &COLLIDE_KEYS) {
+        Ok(after) => {
+            let delta = |i: usize| after[i].saturating_sub(before[i]);
+            report.collide_tickets = delta(0);
+            report.collide_verdicts = delta(1);
+            report.collide_ticketed_fallbacks = delta(2);
+            report.collide_dbsize_drains = delta(3);
+            report.collide_scan_twins = delta(4);
+        }
+        Err(err) => fail(&mut report, format!("phase-6c scrape: {err}")),
+    }
+
+    // ---- phase 6d: open-ticket rows under a paused reconciler (A8) -----
+    // Phase 6c's tickets resolve between the harness's commands (the
+    // MAINTAIN reconciler runs every iteration), so its node-level rows
+    // never saw a ticket open — the review of 2026-08-28. Here the
+    // reconciler is paused (`tiered-shadow-reconcile no`, fanned to every
+    // cell and witnessed on each) and the tickets stay exactly as the
+    // writes left them while `GET`, two `DBSIZE`s in flight together
+    // (the fenced Foreground drain; the node-wide scatter), `SCAN` (the
+    // twin named), a second `SET` (the ticket follows the winner), `DEL`
+    // (read-free once the drain verified), a colliding third key
+    // (`Ticketed` → synchronous), a `DBSIZE` whose twin read is made to
+    // fail (the typed error, relayed through the scatter) and `DEL` of a
+    // collision winner run against them. Every row asserts its own
+    // coverage — a vacuous row is a violation, not a disclosure. The rows
+    // stand on keys written pre-cut being cold again; in the
+    // replay-above-window class no checkpoint publishes in the run, so
+    // those newest records replay into the window and the rows do not run.
+    if scenario.shadow && !scenario.replay_above_window {
+        report.open_rows = true;
+        macro_rules! bail {
+            ($($arg:tt)*) => {{
+                fail(&mut report, format!($($arg)*));
+                return finish(report, &observer, &clock);
+            }};
+        }
+        macro_rules! expect {
+            ($cmd:expr, $want:expr, $what:expr) => {{
+                let want: &[u8] = $want;
+                match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, $cmd) {
+                    Ok(Some(reply)) if reply == want => {}
+                    other => bail!(
+                        "OPEN-TICKET VIOLATION seed {seed:#x}: {} answered {other:?}, wanted {}",
+                        $what,
+                        preview(want)
+                    ),
+                }
+                report.commands_done += 1;
+            }};
+        }
+        const OPEN_KEYS: [&str; 13] = [
+            "tiering_shadow_created",
+            "tiering_shadow_dbsize_drains",
+            "tiering_shadow_dbsize_reads",
+            "tiering_shadow_verified_pending",
+            "tiering_shadow_scan_twins_emitted",
+            "tiering_shadow_retargeted",
+            "tiering_shadow_forced_by_delete",
+            "tiering_shadow_fallback_ticketed",
+            "tiering_shadow_resolved_collision",
+            "tiering_shadow_read_errors",
+            "tiering_shadow_reconcile_paused",
+            "tiering_shadow_pending",
+            "tiering_shadow_dbsize_fence",
+        ];
+        macro_rules! scrape {
+            () => {
+                match info_sum(&mut node, &mut rng, &clock, &disk, scenario, &OPEN_KEYS) {
+                    Ok(v) => v,
+                    Err(err) => bail!("phase-6d scrape: {err}"),
+                }
+            };
+        }
+        macro_rules! count {
+            ($want:expr, $what:expr) => {{
+                let want: u64 = $want;
+                match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+                    Ok(n) if n == want => {}
+                    Ok(n) => bail!(
+                        "OPEN-TICKET VIOLATION seed {seed:#x}: DBSIZE {n} {}, wanted {want}",
+                        $what
+                    ),
+                    Err(err) => bail!("phase-6d DBSIZE {}: {err}", $what),
+                }
+            }};
+        }
+        let pause: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"no"];
+        expect!(pause, b"+OK\r\n", "CONFIG SET tiered-shadow-reconcile no");
+        let before = scrape!();
+        if before[10] != u64::from(scenario.cells) {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: the pause reached {} of {} cells",
+                before[10],
+                scenario.cells
+            );
+        }
+        let base = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+            Ok(n) => n,
+            Err(err) => bail!("phase-6d DBSIZE base: {err}"),
+        };
+        // (1) Same-key writes over cold candidates: tickets open — and,
+        //     paused, they stay open. The winner serves at once.
+        let sk_v1: Vec<Vec<u8>> =
+            (0..OPEN_SAME_KEYS).map(|i| value_bytes(b'q', 7, i, 1920)).collect();
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"SET", key, &sk_v1[i]], b"+OK\r\n", "SET open same key");
+        }
+        let after_sets = scrape!();
+        let opened = after_sets[0] - before[0];
+        if opened != OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {opened} of {OPEN_SAME_KEYS} same-key \
+                 SETs opened a ticket (the candidates were not cold)"
+            );
+        }
+        if after_sets[11] < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} tickets pending under the pause, \
+                 wanted ≥ {OPEN_SAME_KEYS} (the reconciler did not pause)",
+                after_sets[11]
+            );
+        }
+        report.open_tickets += opened;
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"GET", key], &bulk(&sk_v1[i]), "GET open same key (ticket open)");
+        }
+        // (2) Two DBSIZEs in flight together, from two namespace-bound
+        //     connections on different cells: both drain (the fence
+        //     counts two), both answer the exact node-wide count.
+        let mut second = MiniClient::connect(&mut node, usize::from(scenario.cells) - 1);
+        let use_ns: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
+        match second.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_ns) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            other => bail!("phase-6d second USE answered {other:?}"),
+        }
+        audit.send(&mut node, &[b"DBSIZE"]);
+        second.send(&mut node, &[b"DBSIZE"]);
+        let (mut a, mut b) = (None, None);
+        for _ in 0..STALL_STEPS {
+            if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
+                bail!("phase-6d overlapping DBSIZE step: {err}");
+            }
+            report.scheduler_steps += 1;
+            if a.is_none() {
+                a = audit.recv(&mut node);
+            }
+            if b.is_none() {
+                b = second.recv(&mut node);
+            }
+            if a.is_some() && b.is_some() {
+                break;
+            }
+        }
+        let (Some(a), Some(b)) = (a, b) else {
+            report.stalled = true;
+            bail!("OPEN-TICKET STALL seed {seed:#x}: two DBSIZEs in flight never both answered");
+        };
+        report.commands_done += 2;
+        let want = format!(":{base}\r\n");
+        if a != want.as_bytes() || b != want.as_bytes() {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: overlapping DBSIZEs answered {} and {}, \
+                 wanted {want:?} on both (the same-key SETs change no count)",
+                preview(&a),
+                preview(&b)
+            );
+        }
+        let after_drain = scrape!();
+        let (drains, reads) = (after_drain[1] - before[1], after_drain[2] - before[2]);
+        if drains == 0 || reads < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: DBSIZE raised {drains} drains reading \
+                 {reads} twins, wanted ≥ 1 and ≥ {OPEN_SAME_KEYS}"
+            );
+        }
+        if after_drain[3] < OPEN_SAME_KEYS {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} verified tickets pending after the \
+                 drain, wanted ≥ {OPEN_SAME_KEYS} (verified tickets must stay open, paused)",
+                after_drain[3]
+            );
+        }
+        report.open_dbsize_drains += drains;
+        report.open_dbsize_reads += reads;
+        report.open_verified_pending = after_drain[3];
+        // (3) SCAN names each same key twice — its twin is a cold slot
+        //     like any other (ADR-0093 A3).
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
+            Ok(keys) => {
+                for key in &open_same_keys {
+                    let named = keys.iter().filter(|k| *k == key).count();
+                    if named < 2 {
+                        bail!(
+                            "OPEN-TICKET VIOLATION seed {seed:#x}: SCAN named {:?} {named} \
+                             time(s) with its twin slotted, wanted ≥ 2 (ADR-0093 A3)",
+                            String::from_utf8_lossy(key)
+                        );
+                    }
+                }
+            }
+            Err(err) => bail!("phase-6d SCAN: {err}"),
+        }
+        let after_scan = scrape!();
+        let twins = after_scan[4] - before[4];
+        if twins < OPEN_SAME_KEYS {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: SCAN emitted {twins} twins");
+        }
+        report.open_scan_twins += twins;
+        // (4) A second SET while the ticket is open: the ticket follows
+        //     the winner (retargeted), the value is the new one.
+        let sk_v2: Vec<Vec<u8>> =
+            (0..OPEN_SAME_KEYS).map(|i| value_bytes(b'w', 7, i, 2176)).collect();
+        for (i, key) in open_same_keys.iter().enumerate() {
+            expect!(&[b"SET", key, &sk_v2[i]], b"+OK\r\n", "second SET (ticket open)");
+            expect!(&[b"GET", key], &bulk(&sk_v2[i]), "GET after the second SET");
+        }
+        let after_set2 = scrape!();
+        let retargeted = after_set2[5] - before[5];
+        if retargeted < OPEN_SAME_KEYS {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: {retargeted} tickets retargeted");
+        }
+        report.open_retargeted += retargeted;
+        // (5) DEL of two verified winners: the forced resolution needs no
+        //     read; the twin dies through the marker path; the count is
+        //     exact.
+        for key in &open_same_keys[..2] {
+            expect!(&[b"DEL", key], b":1\r\n", "DEL open same key (verified ticket)");
+            expect!(&[b"GET", key], b"$-1\r\n", "GET after DEL");
+        }
+        let after_del = scrape!();
+        let forced = after_del[6] - before[6];
+        if forced < 2 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: {forced} forced deletes");
+        }
+        report.open_forced_deletes += forced;
+        count!(base - 2, "after two DELs");
+        // (6) Crafted triples: the second key's write over the cold first
+        //     opens a collision-shaped ticket; both keys read exactly
+        //     with it open; the third key's write finds the ticketed slot
+        //     (`Ticketed` → synchronous); DBSIZE's drain answers
+        //     `Collision`; SCAN names all three; DEL of the second leaves
+        //     the first.
+        let t_v: Vec<(Vec<u8>, Vec<u8>)> = (0..OPEN_TRIPLES)
+            .map(|i| (value_bytes(b'r', 7, i, 1664), value_bytes(b't', 7, i, 1408)))
+            .collect();
+        for (i, triple) in open_triples.iter().enumerate() {
+            expect!(&[b"SET", &triple[1], &t_v[i].0], b"+OK\r\n", "SET triple.1");
+            expect!(
+                &[b"GET", &triple[0]],
+                &bulk(&open_value(b'p', i as u64)),
+                "GET triple.0 (the collision key, ticket open)"
+            );
+            expect!(&[b"GET", &triple[1]], &bulk(&t_v[i].0), "GET triple.1 (winner)");
+            expect!(&[b"SET", &triple[2], &t_v[i].1], b"+OK\r\n", "SET triple.2 (Ticketed)");
+            expect!(&[b"GET", &triple[2]], &bulk(&t_v[i].1), "GET triple.2");
+        }
+        let after_triples = scrape!();
+        let ticketed = after_triples[7] - before[7];
+        if ticketed < OPEN_TRIPLES {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {ticketed} Ticketed refusals, wanted \
+                 ≥ {OPEN_TRIPLES}"
+            );
+        }
+        report.open_ticketed_fallbacks += ticketed;
+        count!(base - 2 + 2 * OPEN_TRIPLES, "after the triples' writes (the drain)");
+        let after_cdrain = scrape!();
+        let collisions = after_cdrain[8] - before[8];
+        if collisions < OPEN_TRIPLES {
+            bail!(
+                "OPEN-TICKET ROW VACUOUS seed {seed:#x}: {collisions} collision verdicts, \
+                 wanted ≥ {OPEN_TRIPLES}"
+            );
+        }
+        report.open_collision_verdicts += collisions;
+        match scan_all_keys(&mut node, &mut rng, &clock, &disk, scenario, &mut report) {
+            Ok(keys) => {
+                for (i, triple) in open_triples.iter().enumerate() {
+                    for (side, key) in triple.iter().enumerate() {
+                        if !keys.iter().any(|k| k == key) {
+                            bail!(
+                                "OPEN-TICKET VIOLATION seed {seed:#x}: SCAN did not name triple \
+                                 {i}.{side}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => bail!("phase-6d triple SCAN: {err}"),
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            expect!(&[b"DEL", &triple[1]], b":1\r\n", "DEL triple.1");
+            expect!(
+                &[b"GET", &triple[0]],
+                &bulk(&open_value(b'p', i as u64)),
+                "GET triple.0 after the other's DEL"
+            );
+        }
+        // (7) An unreadable twin: a fresh unverified ticket, the drain's
+        //     read made to fail — DBSIZE answers the typed error through
+        //     the scatter (never an inexact count) — then, healed, exact.
+        let fault_v = value_bytes(b'u', 7, 0, 1536);
+        expect!(&[b"SET", &open_fault_key, &fault_v], b"+OK\r\n", "SET open fault key");
+        let after_fault_set = scrape!();
+        if after_fault_set[0] - after_cdrain[0] != 1 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: the fault row's SET opened no ticket");
+        }
+        inf_foundation::fault::arm(inf_server::fault::SHADOW_TWIN_READ_FAIL, FaultSpec::Always);
+        let dbsize: &[&[u8]] = &[b"DBSIZE"];
+        let faulted = audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, dbsize);
+        inf_foundation::fault::disarm(inf_server::fault::SHADOW_TWIN_READ_FAIL);
+        report.commands_done += 1;
+        match faulted {
+            Ok(Some(reply)) if reply.starts_with(b"-ERR DBSIZE: shadow twin at ") => {}
+            other => bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: DBSIZE with an unreadable twin answered \
+                 {other:?}, wanted the typed `-ERR DBSIZE: shadow twin at …` (ADR-0093 A3)"
+            ),
+        }
+        let after_fault = scrape!();
+        // F-L13-09: the failed drain lowered its fence on every cell (the
+        // gauge is the exact witness; the SET below is the client face).
+        if after_fault[12] != 0 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} DBSIZE fences still raised after \
+                 the failed drain (F-L13-09)",
+                after_fault[12]
+            );
+        }
+        let faults = after_fault[9] - before[9];
+        if faults == 0 {
+            bail!("OPEN-TICKET ROW VACUOUS seed {seed:#x}: the injected twin read never failed");
+        }
+        report.open_read_fault_errors += faults;
+        // F-L13-09 (review of 2026-08-30): the failed drain must lower the
+        // fence it raised — a fresh overwrite of a cold key opens a ticket
+        // (a raised fence answers `ShadowRefusal::Fence`: no ticket, the
+        // fast path silently gone for the life of the table).
+        let fence_v = value_bytes(b'u', 8, 0, 1536);
+        expect!(&[b"SET", &open_fence_key, &fence_v], b"+OK\r\n", "SET open fence key");
+        let after_fence_set = scrape!();
+        if after_fence_set[0] - after_fault[0] != 1 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: the SET after the failed drain opened \
+                 {} tickets, wanted 1 — the DBSIZE fence stayed raised (F-L13-09)",
+                after_fence_set[0] - after_fault[0]
+            );
+        }
+        count!(base - 2 + OPEN_TRIPLES, "after the fault healed");
+        // (8) Resume the reconciler on every cell; phase 7b's quiescence
+        //     oracle then settles the verified tickets without a read.
+        let resume: &[&[u8]] = &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"yes"];
+        expect!(resume, b"+OK\r\n", "CONFIG SET tiered-shadow-reconcile yes");
+        let resumed = scrape!();
+        if resumed[10] != 0 {
+            bail!(
+                "OPEN-TICKET VIOLATION seed {seed:#x}: {} cells still paused after resume",
+                resumed[10]
+            );
+        }
+        for (i, key) in open_same_keys.iter().enumerate() {
+            let state = if i < 2 { b"$-1\r\n".to_vec() } else { bulk(&sk_v2[i]) };
+            observed.insert(key.clone(), state);
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            observed.insert(triple[0].to_vec(), bulk(&open_value(b'p', i as u64)));
+            observed.insert(triple[1].to_vec(), b"$-1\r\n".to_vec());
+            observed.insert(triple[2].to_vec(), bulk(&t_v[i].1));
+        }
+        observed.insert(open_fault_key.clone(), bulk(&fault_v));
+        observed.insert(open_fence_key.clone(), bulk(&fence_v));
+    } else {
+        // The off arm never touches phase 6d's pre-cut material: it is
+        // live as written, and the model must say so (the cardinality
+        // oracle counts it; the cold sweep re-reads it).
+        for (i, key) in open_same_keys.iter().chain([&open_fault_key, &open_fence_key]).enumerate()
+        {
+            observed.insert(key.clone(), bulk(&open_value(b'o', i as u64)));
+        }
+        for (i, triple) in open_triples.iter().enumerate() {
+            observed.insert(triple[0].to_vec(), bulk(&open_value(b'p', i as u64)));
+        }
+    }
+
     // ---- phase 7: cold re-read sweep (exact bytes after re-demotion) -----
     for (key, want) in &observed {
         let reply = match audit.call(
@@ -738,223 +1880,147 @@ pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
         Err(err) => fail(&mut report, format!("post-sweep scrape: {err}")),
     }
 
-    // ---- phase 8: DISKFULL clamp → typed refusal → reopen (ADR-0063) -----
-    // A probe key guaranteed live before the clamp (GET/DEL at the cap
-    // must have a target even if the clamp refuses instantly).
-    let probe_value = value_bytes(b'p', 999, 0, 2 << 10);
-    let probe: &[&[u8]] = &[b"SET", b"df:probe", &probe_value];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, probe) {
-        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-        other => {
-            fail(&mut report, format!("df:probe SET answered {other:?}"));
-            return finish(report, &observer, &clock);
-        }
-    }
-    let clamp: &[&[u8]] = &[b"INF.NS", b"SET", NS_NAME, b"DISK-BUDGET", b"1mb"];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, clamp) {
-        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-        other => {
-            fail(&mut report, format!("DISK-BUDGET clamp answered {other:?}"));
-            return finish(report, &observer, &clock);
-        }
-    }
-    // The admission projection (disk_used + unflushed tail, ADR-0063 D2)
-    // sits far above 1 MiB by now — the typed refusal must arrive within
-    // a few attempts (earlier OKs are legal while the refresh lands).
-    let mut refused = false;
-    for i in 0..50u32 {
-        let key = format!("df:{i:03}").into_bytes();
-        let value = value_bytes(b'd', 998, u64::from(i), 2 << 10);
-        let set: &[&[u8]] = &[b"SET", &key, &value];
-        let reply = match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set)
-        {
-            Ok(Some(reply)) => reply,
-            other => {
-                fail(&mut report, format!("diskfull fill SET answered {other:?}"));
+    // ---- phase 7b: the shadow quiescence oracle (ADR-0093 I5) -----------
+    // Every ticket the recovered life re-formed or opened must resolve
+    // under MAINTAIN (bounded polls — a reconciler that never drains is
+    // the violation); then the key count the index serves must equal the
+    // model's live keys exactly — no orphan slot, no lost key — and the
+    // space identity must hold. Runs on every arm: the off arm proves
+    // the oracle itself against the shipping path.
+    let mut shadow_text = String::new();
+    for _ in 0..256 {
+        match info_tiering(&mut audit, &mut node, &mut rng, &clock, &disk, scenario.step_ns_max) {
+            Ok(text) => {
+                let pending = info_field(&text, "tiering_shadow_pending");
+                shadow_text = text;
+                if pending == 0 {
+                    break;
+                }
+            }
+            Err(err) => {
+                fail(&mut report, format!("shadow quiescence scrape: {err}"));
                 return finish(report, &observer, &clock);
             }
-        };
-        if reply.starts_with(b"-DISKFULL") {
-            report.diskfull_refusals += 1;
-            if !reply.starts_with(b"-DISKFULL tiered namespace disk budget exhausted (used=") {
-                fail(&mut report, format!("DISKFULL shape drifted: {}", preview(&reply)));
+        }
+    }
+    let gauge = |key: &str| info_field(&shadow_text, key);
+    report.shadow_created += gauge("tiering_shadow_created");
+    report.shadow_resolved_same_key = gauge("tiering_shadow_resolved_same_key");
+    report.shadow_resolved_collision = gauge("tiering_shadow_resolved_collision");
+    report.shadow_stale = gauge("tiering_shadow_stale");
+    report.shadow_fallbacks = gauge("tiering_shadow_fallback_off")
+        + gauge("tiering_shadow_fallback_multi")
+        + gauge("tiering_shadow_fallback_tickets")
+        + gauge("tiering_shadow_fallback_pin")
+        + gauge("tiering_shadow_fallback_origin")
+        + gauge("tiering_shadow_fallback_staging");
+    if gauge("tiering_shadow_pending") != 0 {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW QUIESCENCE VIOLATION: {} tickets still open after 256 MAINTAIN polls \
+                 (reads_issued={} read_errors={} pinned_bytes={})",
+                gauge("tiering_shadow_pending"),
+                gauge("tiering_shadow_reads_issued"),
+                gauge("tiering_shadow_read_errors"),
+                gauge("tiering_shadow_pinned_bytes"),
+            ),
+        );
+    }
+    // Live keys the harness knows: phase-2 keys as the audit observed
+    // them (nil = absent) plus phase-6 keys by their ledgers' last state.
+    let mut live_keys: u64 =
+        observed.values().filter(|reply| !reply.starts_with(b"$-1")).count() as u64;
+    // Phase 7c's pre-cut material is live and untouched until 7c.
+    live_keys += REBUILT_PRECUT_KEYS;
+    for writer in &post_writers {
+        for ops in writer.ledger.values() {
+            if ops.last().is_some_and(|op| op.state_after.is_some()) {
+                live_keys += 1;
             }
-            refused = true;
-            break;
         }
-        if reply != b"+OK\r\n" {
-            fail(&mut report, format!("diskfull fill reply untyped: {}", preview(&reply)));
+    }
+    // DBSIZE on a namespace-bound connection is the node-wide count on
+    // every cell (the scatter-sum; the helper asserts the cells agree).
+    let total_keys = match dbsize_sum(&mut node, &mut rng, &clock, &disk, scenario) {
+        Ok(n) => n,
+        Err(err) => {
+            fail(&mut report, format!("quiescence DBSIZE: {err}"));
             return finish(report, &observer, &clock);
         }
-    }
-    if !refused {
-        fail(&mut report, "the clamped disk budget never refused (ADR-0063 D2)".to_string());
-    }
-    // Refusal scope is new-byte placements only (ADR-0063 D1): reads and
-    // deletes proceed at the cap.
-    let get_probe: &[&[u8]] = &[b"GET", b"df:probe"];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, get_probe) {
-        Ok(Some(reply)) if reply == bulk(&probe_value) => {}
-        other => fail(&mut report, format!("GET at the cap answered {other:?}")),
-    }
-    let del_probe: &[&[u8]] = &[b"DEL", b"df:probe"];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, del_probe) {
-        Ok(Some(reply)) if reply == b":1\r\n" => {}
-        other => fail(&mut report, format!("DEL at the cap answered {other:?}")),
-    }
-    // Lift the budget: admission must reopen without operator surgery
-    // (the M1-S07 honesty pattern — recovery is automatic).
-    let lift: &[&[u8]] = &[b"INF.NS", b"SET", NS_NAME, b"DISK-BUDGET", b"64mb"];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, lift) {
-        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-        other => {
-            fail(&mut report, format!("DISK-BUDGET lift answered {other:?}"));
-            return finish(report, &observer, &clock);
-        }
-    }
-    for i in 0..50u32 {
-        let key = format!("dr:{i:03}").into_bytes();
-        let value = value_bytes(b'r', 997, u64::from(i), 1 << 10);
-        let set: &[&[u8]] = &[b"SET", &key, &value];
-        let reply = match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, set)
-        {
-            Ok(Some(reply)) => reply,
-            other => {
-                fail(&mut report, format!("reopen SET answered {other:?}"));
-                return finish(report, &observer, &clock);
+    };
+    if report.open_rows {
+        // The resumed reconciler settled phase 6d's verified tickets
+        // without a read (ADR-0093 A1) — summed over every cell.
+        match info_sum(
+            &mut node,
+            &mut rng,
+            &clock,
+            &disk,
+            scenario,
+            &["tiering_shadow_settled_without_read"],
+        ) {
+            Ok(v) => {
+                report.open_settled_without_read = v[0];
+                if v[0] == 0 {
+                    fail(
+                        &mut report,
+                        format!(
+                            "OPEN-TICKET ROW VACUOUS seed {seed:#x}: no ticket settled without a \
+                             read after the reconciler resumed"
+                        ),
+                    );
+                }
             }
-        };
-        if reply == b"+OK\r\n" {
-            report.diskfull_reopened = true;
-            break;
-        }
-        if !reply.starts_with(b"-DISKFULL") {
-            fail(&mut report, format!("reopen reply untyped: {}", preview(&reply)));
-            return finish(report, &observer, &clock);
+            Err(err) => fail(&mut report, format!("settled-without-read scrape: {err}")),
         }
     }
-    if !report.diskfull_reopened {
-        fail(&mut report, "admission never reopened after the budget lifted".to_string());
+    if total_keys != live_keys {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW CARDINALITY VIOLATION: DBSIZE {total_keys} over {} cells != {live_keys} \
+                 model-live keys (an orphan slot or a lost key)",
+                scenario.cells
+            ),
+        );
+    }
+    let (live, dead, allocated) = (
+        gauge("tiering_live_bytes"),
+        gauge("tiering_dead_bytes"),
+        gauge("tiering_allocated_bytes"),
+    );
+    if allocated != 0 && live + dead != allocated {
+        fail(
+            &mut report,
+            format!(
+                "SHADOW ACCOUNTING VIOLATION: live {live} + dead {dead} != allocated {allocated}"
+            ),
+        );
     }
 
-    // ---- phase 9: the S19 drop-race through the wire ----------------------
-    let racer_cell = 0usize;
-    let racer_fd = node.nets[racer_cell].borrow_mut().connect();
-    node.nets[racer_cell]
-        .borrow_mut()
-        .client_send(racer_fd, &encode(&[b"INF.NS", b"USE", NS_NAME]));
-    // Settle the USE reply before pipelining (one framed +OK).
-    let mut rx = Vec::new();
-    let mut settled = false;
-    for _ in 0..STALL_STEPS {
-        if node.step(&mut rng, &clock, &disk, scenario.step_ns_max).is_err() {
-            break;
-        }
-        report.scheduler_steps += 1;
-        let bytes = node.nets[racer_cell].borrow_mut().client_recv(racer_fd);
-        rx.extend_from_slice(&bytes);
-        if let Some(n) = reply_len(&rx) {
-            let reply: Vec<u8> = rx.drain(..n).collect();
-            if reply != b"+OK\r\n" {
-                fail(&mut report, format!("racer USE answered {}", preview(&reply)));
-                return finish(report, &observer, &clock);
-            }
-            settled = true;
-            break;
-        }
-    }
-    if !settled {
-        report.stalled = true;
-        fail(&mut report, "racer USE stalled".to_string());
-        return finish(report, &observer, &clock);
-    }
-    let race_keys: Vec<Vec<u8>> = observed.keys().take(30).cloned().collect();
-    let mut batch = Vec::new();
-    for key in &race_keys {
-        batch.extend_from_slice(&encode(&[b"GET", key]));
-    }
-    node.nets[racer_cell].borrow_mut().client_send(racer_fd, &batch);
-    // DROP races the pipelined reads from a second connection.
-    let drop_ns: &[&[u8]] = &[b"INF.NS", b"DROP", NS_NAME];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, drop_ns) {
-        Ok(Some(ok)) if ok == b"+OK\r\n" => {}
-        other => {
-            fail(&mut report, format!("racing DROP answered {other:?}"));
-            return finish(report, &observer, &clock);
-        }
-    }
-    // Every pipelined reply must arrive typed — a missing reply is the
-    // hang this row exists to catch (§3.3 teardown vs in-flight custody).
-    let mut answered = 0usize;
-    let mut idle = 0u64;
-    while answered < race_keys.len() {
-        if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
-            fail(&mut report, format!("drop-race drain: {err}"));
-            return finish(report, &observer, &clock);
-        }
-        report.scheduler_steps += 1;
-        let bytes = node.nets[racer_cell].borrow_mut().client_recv(racer_fd);
-        if bytes.is_empty() {
-            idle += 1;
-            if idle >= STALL_STEPS {
-                report.stalled = true;
-                fail(
-                    &mut report,
-                    format!(
-                        "DROP-RACE HANG: {} of {} pipelined replies never arrived",
-                        race_keys.len() - answered,
-                        race_keys.len()
-                    ),
-                );
-                return finish(report, &observer, &clock);
-            }
-        } else {
-            idle = 0;
-        }
-        rx.extend_from_slice(&bytes);
-        while let Some(n) = reply_len(&rx) {
-            let reply: Vec<u8> = rx.drain(..n).collect();
-            answered += 1;
-            match reply.first() {
-                Some(b'$') if reply.starts_with(b"$-1") => report.drop_replies_other += 1,
-                Some(b'$') => report.drop_replies_value += 1,
-                Some(b'-') => report.drop_replies_other += 1,
-                _ => fail(&mut report, format!("untyped drop-race reply: {}", preview(&reply))),
-            }
-            if answered == race_keys.len() {
-                break;
-            }
-        }
-    }
-    // The audit connection sits on the dropped namespace: its PING must
-    // answer the typed dropped-namespace error (never a hang or a crash).
-    let ping: &[&[u8]] = &[b"PING"];
-    match audit.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, ping) {
-        Ok(Some(reply)) if reply.starts_with(b"-ERR") => {}
-        other => fail(&mut report, format!("post-drop PING (dropped ns) answered {other:?}")),
-    }
-    // The node itself stays live: a fresh connection serves.
-    let mut fresh = MiniClient::connect(&mut node, 0);
-    match fresh.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, ping) {
-        Ok(Some(reply)) if reply == b"+PONG\r\n" => {}
-        other => fail(&mut report, format!("post-drop PING (fresh conn) answered {other:?}")),
-    }
-    let use_dropped: &[&[u8]] = &[b"INF.NS", b"USE", NS_NAME];
-    match fresh.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, use_dropped) {
-        Ok(Some(reply)) if reply.starts_with(b"-ERR") => {}
-        other => fail(&mut report, format!("USE of the dropped ns answered {other:?}")),
-    }
-
+    // ---- phases 7c–10b: `tiered::late` (the same script, in phase functions)
+    let mut cx = late::Late {
+        scenario,
+        harness: &harness,
+        clock: &clock,
+        disk: &disk,
+        observer: &observer,
+        rng: &mut rng,
+        report: &mut report,
+        observed: &observed,
+        create,
+    };
+    // Every verdict ends the same way: the report carries the violations.
+    let _verdict = late::run(&mut cx, node, audit, total_keys);
     finish(report, &observer, &clock)
 }
 
-fn finish(
-    mut report: TieredNodeReport,
-    observer: &TraceObserver,
-    clock: &Rc<VirtualClock>,
-) -> TieredNodeReport {
-    report.trace = observer.trace_bytes();
-    report.trace_hash = hash64(&report.trace, 0x71E7);
-    report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    report.state_hash = observer.state_hash();
     report
 }

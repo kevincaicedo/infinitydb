@@ -1,0 +1,18 @@
+# ADR-0144 D1: the frozen `ADR-0143:` wildcard exemptions over CommandId.
+# Owner: ARCH-W1.1 (ADR-0143 build); expiry: its Done. The table only shrinks
+# (scripts/check-lint-scopes.sh). file<TAB>fn<TAB>column
+crates/inf-server/src/exec.rs	execute	handler
+crates/inf-server/src/exec.rs	inf_move_snapshot	handler
+crates/inf-server/src/json.rs	execute_json	handler
+crates/inf-server/src/json.rs	num_op	handler
+crates/inf-server/src/plane/dispatch.rs	dispatch_scatter	scatter
+crates/inf-server/src/plane/dispatch.rs	is_conn_state	conn_state
+crates/inf-server/src/plane/dispatch.rs	is_scatter	scatter
+crates/inf-server/src/plane/ns_ddl.rs	dispatch_ns	ns_program
+crates/inf-server/src/plane/publish.rs	dispatch_pubsub	pubsub
+crates/inf-server/src/plane/scatter.rs	program_move	scatter
+crates/inf-server/src/plane/shared.rs	estimate_effect_bytes	effect_bytes
+crates/inf-server/src/plane/shared.rs	json_mutation_path	json_path
+crates/inf-server/src/plane/tiered.rs	run_command	tiered_handler
+crates/inf-server/src/plane/tiered/write.rs	incr	handler
+crates/inf-wire/src/command.rs	key_spec	key_spec

@@ -1,40 +1,48 @@
 # inf-bench
 
-The InfinityDB benchmark and exit-gate harness (milestones M0-E6 / M1-S17).
+The InfinityDB benchmark and exit-gate harness.
 
 `inf-bench` spawns the system under test (`infinityd`) and, where relevant,
 real `redis-server` as a comparator, drives load with its own RESP client, and
-produces per-gate PASS/FAIL reports against the machine-readable gate files in
-`docs/milestones/`. It shares **no code** with the system under test — the
-client-side RESP lives in `src/resp.rs`, so the measurement tool and the server
-can never accidentally agree because they share a bug.
+produces per-gate PASS/FAIL reports against the machine-readable gate files
+`docs/milestones/*-gates.toml`. It has no external dependencies; internal
+dependencies are allowed. It shares `inf-foundation` RNG, checksum and histogram
+primitives with the system under test. The client-side RESP in `src/resp.rs`
+is independent of the server parser; shared primitives are not an independent
+correctness oracle. `inf-compare` supplies the separate external generators.
+
+Latency reports disclose their instrument: native load/cache/document rows
+use FineHistogram (256 sub-buckets per octave, about 0.391% bucket width);
+YCSB and mixed-audit tiered rows retain LogHistogram (32, about 3.125%).
+YCSB's memory-hit sidecar carries the same disclosure. Old unlabelled reports
+retain their original resolution; this repair does not remeasure them.
 
 ## Subcommands
 
 ```
 inf-bench env-check [--allow-dirty]
-inf-bench load --host H --port P [--threads N] [--pipeline P] [--duration S] ...
+inf-bench load --host H --port P [--conns N] [--pipeline P] [--duration S] ...
 inf-bench gate-run m0|m1|m2|m4 [flags]
 inf-bench zipfian [flags]
-inf-bench mixed-audit [flags]          # M4-S20 coexistence audit
-inf-bench ycsb [flags]                 # M4-S22 YCSB rows, split latency reporting
+inf-bench mixed-audit [flags]          # mixed-node coexistence audit
+inf-bench ycsb [flags]                 # YCSB rows, split latency reporting
 ```
 
-### `ycsb` (M4-S22)
+### `ycsb`
 
 YCSB-style workloads A–F (E adapted to cursor-scan slices — documented in
 every report preamble) at dataset = N× a namespace memory budget, scrambled
 zipfian θ=0.99 or uniform, with memory-hit and cold-read percentiles
-reported **separately** (§18/§19 — the combined number is context, never
-the headline). Deterministic from `--seed` (op-stream checksums +
-`--verify-seed` assert + a DBSIZE-integrity loader). Until command wiring
-(M4-S26) lifts the D8 refusal, runs drop to harness-validation mode with
-the tiered split named-absent; `--attach-port`/`--ns`/`--skip-fill` drive
-an already-running node (the `scripts/soak-m4.sh` legs).
+reported **separately** (the combined number is context, never the
+headline). Deterministic from `--seed` (op-stream checksums +
+`--verify-seed` assert + a DBSIZE-integrity loader). Tiered rows need the
+tiered command wiring; a build without it drops to harness-validation mode
+with the tiered split named-absent. `--attach-port`/`--ns`/`--skip-fill`
+drive an already-running node (long-running soak legs).
 
 ### `env-check`
 
-Validates that the box is fit to produce citation-grade numbers (M0-S03):
+Validates that the box is fit to produce citation-grade numbers:
 refuses a dirty git tree, a non-`performance` CPU governor or EPP, and any
 thermal throttling. Every other subcommand starts here — see
 [Reference-box requirements](#reference-box-requirements).
@@ -46,10 +54,21 @@ pipeline depth, a seeded SET/GET mix, merged latency histograms, and a
 deterministic `--fill N` mode (partitioned key ranges, each key written exactly
 once) used by the RSS gate.
 
+Every shared load report, including gate-run raw sections, prints
+`mode = closed-loop` or `mode = open-loop`. Open-loop reports also print
+`target_ops_per_sec` and offered/sent/skipped counts, even with no samples.
+The label follows the effective scheduler: fill mode and zero/absent targets
+are closed-loop. The `load` CLI uses closed-loop; offered-rate campaign legs
+select open-loop. Closed-loop percentiles can hide coordinated omission;
+open-loop latencies start at the intended send slot, and skipped slots remain
+visible in the counters rather than appearing as completed requests.
+
 ### `gate-run m0` / `gate-run m1`
 
 Runs the milestone's whole exit-gate matrix in one command and writes a report
-to `.artifacts/<milestone>/<stamp>-gate-run/report.md`.
+to ignored local output at `.artifacts/<milestone>/<stamp>-gate-run/report.md`.
+Commit harnesses and reproduction instructions, not generated reports. See
+[validation and reference hardware](../../docs/validation.md).
 
 - **`gate-run m0`** — pipelined replicates with windowed tripwire scrapes
   (raw `io_uring` counter deltas via `INFO` across all cells), cross-cell A/B
@@ -62,6 +81,59 @@ to `.artifacts/<milestone>/<stamp>-gate-run/report.md`.
   ≤ 1.0× **RSS** leg, and (with `--with-zipfian`) the LFU **hit-rate parity**
   row — against `docs/milestones/m1-gates.toml`.
 
+The four **empty-node** rows run first in `gate-run m1`, before any fill
+(`--only-empty-node` runs them alone). They measure the idle node at the
+default topology: **idle RSS** and **idle CPU** on a 4-cell memory node,
+the **data directory's allocated bytes** after a warm boot, and **warm boot**
+from spawn to the first `+PONG`. The listener accepts before the cells serve,
+so an accepted connection is never the boot instant, and `DBSIZE` must then
+answer `:0`. Each threshold is the design's own bill, stated beside its row
+in the gates file. The rows are informational: a measured baseline, never a
+published target.
+
+Every value comes from a read the harness parses itself: `/proc/<pid>`,
+`lstat` block counts (each inode once, no symlink followed) and the wire.
+A failed, partial or exited-process `/proc` read is an error that fails the
+leg. It is never a zero that passes a `<=` row. Each row runs a
+same-binary control set A′, interleaved with A, and publishes median(A) only
+when |median(A) − median(A′)| stays within its spread budget. It also runs a
+planted red in every run: `--buffers 8192`, a filler written at depth 3 of
+the stopped directory plus a sparse 1 GiB file, the probing first boot, and
+`--park-us 20`. A plant that reads green or never engages keeps its row
+unset and fails the run. The rows are withheld with a note on another cell
+count, off Linux, when fixed-buffer registration is unproven (VmPin), on a
+memory-filesystem data root (`--data-root`, default
+`.artifacts/m1/empty-node-data`), or on filesystem blocks over 4 KiB.
+A binding run fails instead of withholding when a precondition is unproven.
+
+M0/M1/M2 reports require a generator-saturation disposition.
+Steady native load rows run once more with 50% more connections, rounded
+up and capped at 1024. Workload, pipeline, duration, warmup, seed and
+namespace stay fixed. The report retains both samples and the connection
+counts; probe samples are excluded from gate values and server-counter
+windows. Positive throughput change of at least 5% is `GENERATOR-LIMITED`;
+negative change of at least 5% is `INCONCLUSIVE`; smaller changes are
+`PLATEAU`. A plateau does not establish CPU headroom or server capacity.
+Errors, missing samples and failed probes are `UNMEASURED`. Every result
+except a plateau makes the diagnostic report non-citable and the exit
+nonzero, even with `--unsafe-env` or a reduced gate file. Zero-duration
+smoke runs therefore cannot return a valid-run status.
+
+Coverage includes M0 routing/comparator arms, M1 baseline/TTL/eviction/KV
+under pub/sub, and M2 memory A/B, everysec arms, always writes and checkpoint
+pressure arms, including `--only-always`/`--only-everysec`. Reports explicitly
+exclude transient expiry/FLUSHALL, manually paced pub/sub/control checks,
+and fill/hit-rate rows from capacity inference. The grouping canary remains
+a correctness witness. Reference campaigns still owe every other
+run-validity check: replicates, a clean tree, governor/EPP and thermals,
+same-run tripwires and competitors on the same box.
+
+The M1 eviction note sums cell-owned logical domains and reads the maximum
+observed node-fold `used_memory` once. Each scrape must declare
+`memory_scope:node`; asynchronous scrapes can differ. This is accounted
+resident memory, not process RSS. INFO uses distinct node and cell names,
+independent of section selection/order.
+
 Common flags:
 
 ```
@@ -72,6 +144,7 @@ Common flags:
 --storm-keys N      --flushall-keys N   --fill-keys N
 --maxmemory-mb N    --subs N            --sub-channels N
 --with-zipfian      --zipfian-keyspace N  --zipfian-ops N  --zipfian-maxmemory-mb N
+--only-empty-node   --data-root DIR
 ```
 
 Example (full reference-box M1 campaign):
@@ -100,6 +173,15 @@ It writes a `.artifacts/m1/<stamp>-zipfian/report.md` artifact and exits
 non-zero if InfinityDB trails Redis by more than the threshold.
 
 ## Tier honesty (L10)
+
+`gate-run` exits nonzero when any selected STOP gate has no finite
+measurement or any attempted competitor startup fails. This applies in
+both tiers, including `--unsafe-env`. Diagnostic reports list the missing
+gate IDs/sources and startup errors under **INCOMPLETE / FAILED — NOT
+citation-grade**. Missing informational rows remain non-fatal. A skipped
+workload (`--skip-fill`, `--skip-comparator`, or `--only-*`) does not waive
+the gates in the selected file; `--gates` can select an explicit smaller
+scope, whose result proves only that scope.
 
 Gates marked `tier = "linux-reference-box"` report measured values everywhere
 but **bind** the milestone verdict only with `--reference-box`. Any run that

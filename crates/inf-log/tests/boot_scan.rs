@@ -36,7 +36,11 @@ proptest! {
 
     /// Removing one interior segment produces the exact `Gap` error.
     #[test]
-    fn interior_gap_is_named(start in 0u32..1000, len in 3u32..40, hole in any::<prop::sample::Index>()) {
+    fn interior_gap_is_named(
+        start in 0u32..1000,
+        len in 3u32..40,
+        hole in any::<prop::sample::Index>(),
+    ) {
         let missing = SegmentId(start + 1 + hole.index(len as usize - 2) as u32);
         let ids = (start..start + len).map(SegmentId).filter(|id| *id != missing);
         let (fs, log_dir) = fs_with_segments(ids);
@@ -49,7 +53,11 @@ proptest! {
     /// A second, non-canonically padded file for an existing id is the
     /// documented `Duplicate` error.
     #[test]
-    fn padded_duplicate_is_named(start in 0u32..100, len in 1u32..20, dup in any::<prop::sample::Index>()) {
+    fn padded_duplicate_is_named(
+        start in 0u32..100,
+        len in 1u32..20,
+        dup in any::<prop::sample::Index>(),
+    ) {
         let target = SegmentId(start + dup.index(len as usize) as u32);
         let (fs, log_dir) = fs_with_segments((start..start + len).map(SegmentId));
         let padded = format!("seg-{:09}.ilog", target.0);

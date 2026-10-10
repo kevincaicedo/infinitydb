@@ -41,8 +41,8 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_store::{
-    AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, DiskFullCause, Keyspace,
-    LogicalAddr, NsId, OpError, StoreConfig, TieredLookup, TieredTable,
+    AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, DiskFullCause, KeyHasher,
+    Keyspace, LogicalAddr, NsId, OpError, StoreConfig, TieredLookup, TieredTable,
 };
 
 const NS: NsId = NsId(63);
@@ -81,6 +81,8 @@ pub struct DiskfullReport {
     pub peak_disk_used: u64,
     pub keys_verified: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl DiskfullReport {
@@ -103,7 +105,8 @@ struct World {
 
 impl World {
     fn new(seed: u64) -> World {
-        let mut ks = Keyspace::new(StoreConfig::default());
+        let mut ks =
+            Keyspace::new(StoreConfig { hasher: KeyHasher::from_seed(seed), ..Default::default() });
         let demote = DemotionConfig {
             mem_budget_bytes: MEM_BUDGET,
             mutable_permille: 250,
@@ -153,6 +156,8 @@ impl World {
 
     fn fold(&mut self, tag: u64, value: u64) {
         self.report.trace_hash = hash64(&value.to_le_bytes(), self.report.trace_hash ^ tag);
+        self.report.state.number(b"event", tag);
+        self.report.state.number(b"value", value);
     }
 
     fn violation(&mut self, text: String) {
@@ -249,7 +254,7 @@ impl World {
         let generation = self.rng.next_below(1 << 20) + 1;
         let key = format!("k:{key_id:06}").into_bytes();
         let value = Self::value_for(key_id, generation);
-        let hash = TieredTable::hash_key(&key);
+        let hash = self.table().hash_key(&key);
         let found = match self.table().lookup(&key, hash, &[]) {
             TieredLookup::Ram(addr) => {
                 let parts = self.table().record(addr);
@@ -306,7 +311,7 @@ impl World {
 
     fn delete_key(&mut self, key: Vec<u8>) {
         let Some((_, len)) = self.model.remove(&key) else { return };
-        let hash = TieredTable::hash_key(&key);
+        let hash = self.table().hash_key(&key);
         let addr = match self.table().lookup(&key, hash, &[]) {
             TieredLookup::Ram(addr) | TieredLookup::Cold(addr) => addr,
             TieredLookup::Miss => {
@@ -350,7 +355,7 @@ impl World {
         let model: Vec<(Vec<u8>, ModelEntry)> =
             self.model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         for (key, (value, len)) in model {
-            let hash = TieredTable::hash_key(&key);
+            let hash = self.table().hash_key(&key);
             let ok = match self.table().lookup(&key, hash, &[]) {
                 TieredLookup::Ram(addr) => {
                     let parts = self.table().record(addr);
@@ -471,5 +476,8 @@ pub fn run_diskfull_scenario(scenario: &DiskfullScenario) -> DiskfullReport {
     w.fold(0xF1, refusals);
     let keys = w.report.keys_verified;
     w.fold(0xF2, keys);
+    w.report.state.keyspace(&w.ks, inf_foundation::time::Nanos(0));
+    w.report.state.disk(&w.disk);
+    w.report.state_hash = w.report.state.value();
     w.report
 }

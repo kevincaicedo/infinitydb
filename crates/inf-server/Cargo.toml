@@ -23,13 +23,21 @@ inf-doc = { workspace = true, optional = true }
 # `JSON.*` registry rows then answer unknown-command.
 default = ["doc"]
 doc = ["inf-store/doc", "dep:inf-doc"]
+# M4.5-S37 step 1: the blind-overwrite *ceiling* arm — an UNSOUND
+# measurement instrument (a cold candidate is treated as absent, the old
+# record orphaned) that bounds what ADR-0085 D5's verifying cold read
+# costs the tiered SET path. Never in a shipping build; `infinityd
+# --blind-overwrite-ceiling` exists only with it.
+bench-diagnostics = []
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # M2-S16: recovery/fault tests arm named points (dev-only unification).
-inf-foundation = { workspace = true, features = ["fault-points"] }
+inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
+inf-store = { workspace = true, features = ["collision-oracle"] }
 # M2.5-S12 (ADR-0031): recovery tests hand-build legacy v1 frames (CRC32C)
 # — no shipping code path emits them anymore.
 inf-simd.workspace = true
@@ -54,6 +62,12 @@ test = false
 
 [[bench]]
 name = "json_cmd"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
+name = "sidecar_recovery"
 harness = false
 test = false
 required-features = ["doc"]

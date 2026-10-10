@@ -19,10 +19,23 @@
 //! Validation runs **once at trust boundaries** (`TapeDoc::from_bytes`);
 //! traversal trusts validated bytes (debug asserts only). The fuzz target
 //! `idoc_decode` drives arbitrary bytes through here (L9).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
+
+use std::borrow::Cow;
 
 use inf_foundation::varint;
 
 use crate::error::DocError;
+use crate::header::{FLAG_INTERNED, HEADER_LEN};
 use crate::limits::DEPTH_MAX;
 
 pub(crate) const TAG_NULL: u8 = 0xA0;
@@ -46,22 +59,31 @@ pub(crate) const STR8_MIN_LEN: usize = 32;
 pub(crate) const STR24_MIN_LEN: usize = 256;
 pub(crate) const FIXINT_MIN: i64 = -32;
 pub(crate) const FIXINT_MAX: i64 = 127;
+/// [`FIXINT_MIN`] as the signed tag byte a fixint is recognized by.
+const FIXINT_MIN_TAG: i8 = -32;
+const _: () = assert!(FIXINT_MIN_TAG as i64 == FIXINT_MIN, "the fixint tag floor is FIXINT_MIN");
 
 /// Zigzag map for the `0xA3` i64 varint payload. Shift on the unsigned
 /// re-interpretation: `i64::MIN << 1` would overflow the signed type.
 #[inline]
 pub(crate) fn zigzag(v: i64) -> u64 {
-    ((v as u64) << 1) ^ ((v >> 63) as u64)
+    (v.cast_unsigned() << 1) ^ (v >> 63).cast_unsigned()
 }
 
 #[inline]
 pub(crate) fn unzigzag(u: u64) -> i64 {
-    ((u >> 1) as i64) ^ -((u & 1) as i64)
+    // The low bit selects an all-ones mask: 0 or -1, no overflow to guard.
+    (u >> 1).cast_signed() ^ (u & 1).cast_signed().wrapping_neg()
 }
 
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: bytes[off] is indexed before either sum is evaluated, so off < \
+              bytes.len() <= isize::MAX"
+)]
 pub(crate) fn read_u24(bytes: &[u8], off: usize) -> usize {
-    debug_assert!(off + 3 <= bytes.len());
+    debug_assert!(bytes.get(off..).is_some_and(|tail| tail.len() >= 3));
     bytes[off] as usize | (bytes[off + 1] as usize) << 8 | (bytes[off + 2] as usize) << 16
 }
 
@@ -272,6 +294,109 @@ impl<'a> TapeDoc<'a> {
     }
 }
 
+/// A document a store may hold (ADR-0169 D4): plain canonical v1 bytes,
+/// header and body, never interned, nesting at most [`DEPTH_MAX`], with a
+/// body of at most [`DOC_BYTES_MAX`](crate::limits::DOC_BYTES_MAX). Every
+/// store sink takes one. Its one field is private, so outside this crate a
+/// receipt comes only from [`CanonicalDoc::validate`] (a check), from the
+/// parser (a check under its limits), or from `apply` and
+/// `merge_absent_document`, which mint it from a canonical pre-image and
+/// canonical operands — trusted inputs, held by review, the agreement
+/// property and their debug postconditions.
+///
+/// ```compile_fail,E0451
+/// let _ = inf_doc::CanonicalDoc { bytes: std::borrow::Cow::Borrowed(&[0u8][..]) };
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalDoc<'a> {
+    bytes: Cow<'a, [u8]>,
+}
+
+impl<'a> CanonicalDoc<'a> {
+    /// The trust boundary for bytes from anywhere but this crate's writers:
+    /// a `DocFull`, a checkpoint image, a COPY source. The
+    /// [`TapeDoc::from_bytes`] walk, plus a refusal of the interned form —
+    /// stores hold plain bytes and intern only inside the sink (ADR-0038
+    /// D3).
+    pub fn validate(bytes: &'a [u8]) -> Result<CanonicalDoc<'a>, DocError> {
+        TapeDoc::from_bytes(bytes)?;
+        if bytes[3] & FLAG_INTERNED != 0 {
+            return Err(DocError::NonCanonical("interned form"));
+        }
+        Ok(CanonicalDoc { bytes: Cow::Borrowed(bytes) })
+    }
+
+    /// The parser's accepted output: its limits are the check.
+    pub(crate) fn parsed(bytes: &'a [u8]) -> CanonicalDoc<'a> {
+        debug_assert!(
+            CanonicalDoc::validate(bytes).is_ok(),
+            "the parser emits canonical documents"
+        );
+        CanonicalDoc { bytes: Cow::Borrowed(bytes) }
+    }
+
+    /// Header and body.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The root value's bytes: the header stripped.
+    #[inline]
+    pub fn body(&self) -> &[u8] {
+        &self.bytes[HEADER_LEN..]
+    }
+
+    /// The document as a validated tape.
+    #[inline]
+    pub fn tape(&self) -> TapeDoc<'_> {
+        TapeDoc::from_validated_bytes(&self.bytes)
+    }
+}
+
+impl CanonicalDoc<'static> {
+    /// A document this crate's mutation engine emitted from a canonical
+    /// pre-image and canonical operands (ADR-0169 D4's trusted inputs).
+    pub(crate) fn emitted(bytes: Vec<u8>) -> CanonicalDoc<'static> {
+        CanonicalDoc { bytes: Cow::Owned(bytes) }
+    }
+}
+
+/// Containers on the deepest path of one validated value — 0 for a
+/// scalar — saturating at `DEPTH_MAX + 1`: the composed-depth check's
+/// operand walk (ADR-0169 D3). Iterative over a fixed stack of container
+/// ends, so it allocates nothing; O(value bytes).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `open` indexes a DEPTH_MAX array — checked below it before each push and \
+              above 0 before each pop; `off + 4` is under a container tag indexed at \
+              `off < value.len() <= isize::MAX`; `DEPTH_MAX + 1` is a const"
+)]
+pub(crate) fn nesting_depth(value: &[u8]) -> usize {
+    let mut ends = [0usize; DEPTH_MAX];
+    let mut open = 0usize;
+    let mut deepest = 0usize;
+    let mut off = 0usize;
+    while off < value.len() {
+        // A child's extent never crosses its parent's: scopes close exactly here.
+        while open > 0 && ends[open - 1] == off {
+            open -= 1;
+        }
+        if !matches!(value[off], TAG_OBJ | TAG_ARR) {
+            off = skip_value(value, off);
+            continue;
+        }
+        if open == DEPTH_MAX {
+            return DEPTH_MAX + 1;
+        }
+        ends[open] = skip_value(value, off);
+        open += 1;
+        deepest = deepest.max(open);
+        off += 4;
+    }
+    deepest
+}
+
 /// One open container scope during validation.
 struct Scope {
     /// Absolute body offset where this container's region ends.
@@ -324,7 +449,8 @@ impl<'a> DictCheck<'a> {
         let Some(slot) = self.used.get_mut(id) else {
             return Err(DocError::BadKey); // id out of table bounds
         };
-        *slot += 1;
+        // Read only as `< 2` (`finish`), so saturation cannot change the verdict.
+        *slot = slot.saturating_add(1);
         Ok(())
     }
 
@@ -395,6 +521,12 @@ pub fn canonical_fragment(bytes: &[u8]) -> Result<ValueRef<'_>, DocError> {
 
 /// Validate a single value (or object key) starting at `off`, bounded by
 /// `limit`. Pushes a scope for containers; returns the next offset.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+              addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+              sum fits the 64-bit usize inf-foundation const-asserts"
+)]
 fn validate_one(
     body: &[u8],
     off: usize,
@@ -403,7 +535,8 @@ fn validate_one(
     stack: &mut Vec<Scope>,
     dict_check: &mut DictCheck<'_>,
 ) -> Result<usize, DocError> {
-    debug_assert!(off < limit && limit <= body.len());
+    debug_assert!(off < limit);
+    debug_assert!(limit <= body.len());
     let tag = body[off];
     // Key positions accept only string forms; everything else is a value.
     let is_string = matches!(tag, TAG_STR8 | TAG_STR24) || (FIXSTR_BASE..=0x9F).contains(&tag);
@@ -421,7 +554,7 @@ fn validate_one(
         if !is_string {
             return Err(DocError::BadKey);
         }
-        let (data_at, next) = validate_str(body, off, limit, tag)?;
+        let (data_at, next) = validate_str(body, off, limit)?;
         dict_check.check_plain_key(&body[data_at..next])?;
         let top = stack.last_mut().expect("key position implies an open object");
         top.expects_key = false;
@@ -436,9 +569,9 @@ fn validate_one(
         top.expects_key = true;
     }
     if is_string {
-        return validate_str(body, off, limit, tag).map(|(_, next)| next);
+        return validate_str(body, off, limit).map(|(_, next)| next);
     }
-    if (tag as i8) >= FIXINT_MIN as i8 {
+    if tag.cast_signed() >= FIXINT_MIN_TAG {
         return Ok(off + 1); // fixint: 0x00..=0x7F and 0xE0..=0xFF
     }
     match tag {
@@ -486,13 +619,15 @@ fn validate_one(
 
 /// Validate one string form (canonical width + UTF-8); returns the data
 /// offset and the next offset.
-fn validate_str(
-    body: &[u8],
-    off: usize,
-    limit: usize,
-    tag: u8,
-) -> Result<(usize, usize), DocError> {
-    let (data_at, len) = match tag {
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+              addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+              sum fits the 64-bit usize inf-foundation const-asserts; \
+              `t - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
+)]
+fn validate_str(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize), DocError> {
+    let (data_at, len) = match body[off] {
         t if (FIXSTR_BASE..=0x9F).contains(&t) => (off + 1, (t - FIXSTR_BASE) as usize),
         TAG_STR8 => {
             if off + 2 > limit {
@@ -528,10 +663,17 @@ fn validate_str(
 
 /// Skip one validated value; O(1) for containers via the u24 length.
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+              addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+              sum fits the 64-bit usize inf-foundation const-asserts; \
+              `tag - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
+)]
 pub(crate) fn skip_value(body: &[u8], off: usize) -> usize {
     debug_assert!(off < body.len());
     let tag = body[off];
-    if (tag as i8) >= FIXINT_MIN as i8 {
+    if tag.cast_signed() >= FIXINT_MIN_TAG {
         return off + 1;
     }
     if (FIXSTR_BASE..=0x9F).contains(&tag) {
@@ -554,11 +696,18 @@ pub(crate) fn skip_value(body: &[u8], off: usize) -> usize {
 
 /// Decode one validated value at `off`; returns it plus the next offset.
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+              addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+              sum fits the 64-bit usize inf-foundation const-asserts; \
+              `tag - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
+)]
 pub(crate) fn read_value<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (ValueRef<'a>, usize) {
     debug_assert!(off < body.len());
     let tag = body[off];
-    if (tag as i8) >= FIXINT_MIN as i8 {
-        return (ValueRef::I64((tag as i8) as i64), off + 1);
+    if tag.cast_signed() >= FIXINT_MIN_TAG {
+        return (ValueRef::I64(i64::from(tag.cast_signed())), off + 1);
     }
     if (FIXSTR_BASE..=0x9F).contains(&tag) {
         let len = (tag - FIXSTR_BASE) as usize;
@@ -601,6 +750,11 @@ pub(crate) fn read_value<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (Val
 
 /// Read one validated object key: a string form, or an interned-key ref
 /// resolved against the dict.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX and off + 3 \
+              fits usize"
+)]
 fn read_key<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (DocStr<'a>, usize) {
     if body[off] == TAG_KEYREF {
         let id = u16::from_le_bytes([body[off + 1], body[off + 2]]) as usize;
@@ -653,6 +807,13 @@ impl<'a> ObjRef<'a> {
     /// — the inlined loop is instruction-throughput-bound, and the extra
     /// shift/mask work beats the loads it saves; branch-misses ≈ 0).
     #[inline]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: e[off] is indexed under the loop guard, so off < e.len() <= isize::MAX; \
+                  every addend is a const <= 4 or a u8 or u24 length, so each sum fits the \
+                  64-bit usize inf-foundation const-asserts; `tag - FIXSTR_BASE` is under its \
+                  `FIXSTR_BASE..=0x9F` guard"
+    )]
     pub fn get(&self, key: &[u8]) -> Option<ValueRef<'a>> {
         let needle_id = if self.dict.is_empty() { None } else { self.dict.find(key) };
         let e = self.entries;
@@ -726,6 +887,10 @@ impl<'a> ArrRef<'a> {
 
     /// Element at `index` — `index` skips, each O(1). Negative-index
     /// commands resolve against `len()` at the command layer.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `remaining == 0` returns on the line above the decrement"
+    )]
     pub fn index(&self, index: usize) -> Option<ValueRef<'a>> {
         let mut off = 0;
         let mut remaining = index;
@@ -764,6 +929,76 @@ impl<'a> Iterator for ArrIter<'a> {
 mod tests {
     use super::*;
     use crate::model::{self, Value};
+
+    #[test]
+    fn u24_reader_checks_the_last_full_word() {
+        let bytes = [0xEE, 0x56, 0x34, 0x12];
+        assert_eq!(read_u24(&bytes, bytes.len() - 3), 0x12_3456);
+        assert!(std::panic::catch_unwind(|| read_u24(&bytes, bytes.len() - 2)).is_err());
+    }
+
+    #[test]
+    fn value_extents_accept_equality_and_refuse_one_byte_short() {
+        let mut body = vec![0xEE, TAG_F64];
+        body.extend_from_slice(&1.25f64.to_bits().to_le_bytes());
+        for (limit, expected) in [(9, Err(DocError::Truncated)), (10, Ok(10))] {
+            assert_eq!(
+                validate_one(&body, 1, limit, false, &mut Vec::new(), &mut DictCheck::new(&[])),
+                expected
+            );
+        }
+        assert_eq!(validate_body(&[TAG_ARR, 1, 0, 0, TAG_NULL], &[]), Ok(()));
+        assert_eq!(validate_body(&[TAG_ARR, 2, 0, 0, TAG_NULL], &[]), Err(DocError::BadLength));
+    }
+
+    #[test]
+    fn zigzag_covers_the_i64_extremes() {
+        for (v, u) in [(0, 0), (-1, 1), (1, 2), (-2, 3), (i64::MAX, u64::MAX - 1)] {
+            assert_eq!(zigzag(v), u, "zigzag({v})");
+            assert_eq!(unzigzag(u), v, "unzigzag({u})");
+        }
+        assert_eq!(zigzag(i64::MIN), u64::MAX);
+        assert_eq!(unzigzag(u64::MAX), i64::MIN);
+    }
+
+    /// The fixint tag band is 0x00..=0x7F and 0xE0..=0xFF (-32..=127).
+    #[test]
+    fn fixint_tag_band_edges() {
+        for (tag, v) in [(0x00u8, 0i64), (0x7F, 127), (0xE0, -32), (0xFF, -1)] {
+            assert_eq!(validate_body(&[tag], &[]), Ok(()), "tag {tag:#x}");
+            let body = [tag];
+            let (value, next) = read_value(&body, Dict::empty(), 0);
+            assert!(matches!(value, ValueRef::I64(got) if got == v), "tag {tag:#x}");
+            assert_eq!(next, 1);
+            assert_eq!(skip_value(&[tag], 0), 1);
+        }
+        assert_eq!(validate_body(&[0xDF], &[]), Err(DocError::BadTag(0xDF)));
+    }
+
+    /// String extents at their width floors: exact fit validates and
+    /// reads back; one byte short is `Truncated`.
+    #[test]
+    fn string_extent_edges() {
+        for (header, len) in [(vec![TAG_STR8, 32], 32usize), (vec![TAG_STR24, 0, 1, 0], 256)] {
+            let mut exact = header.clone();
+            exact.extend(core::iter::repeat_n(b'a', len));
+            assert_eq!(validate_body(&exact, &[]), Ok(()));
+            assert_eq!(skip_value(&exact, 0), exact.len());
+            let (value, next) = read_value(&exact, Dict::empty(), 0);
+            assert_eq!(next, exact.len());
+            let ValueRef::Str(text) = value else { panic!("a string form reads as a string") };
+            assert_eq!(text.as_bytes(), &exact[header.len()..]);
+            let short = &exact[..exact.len() - 1];
+            assert_eq!(validate_body(short, &[]), Err(DocError::Truncated));
+        }
+        // A header cut inside its length field.
+        assert_eq!(validate_body(&[TAG_STR8], &[]), Err(DocError::Truncated));
+        assert_eq!(validate_body(&[TAG_STR24, 0, 1], &[]), Err(DocError::Truncated));
+        assert_eq!(validate_body(&[TAG_OBJ, 0, 0], &[]), Err(DocError::Truncated));
+        // The largest u24 length over an empty region.
+        assert_eq!(validate_body(&[TAG_ARR, 0xFF, 0xFF, 0xFF], &[]), Err(DocError::BadLength));
+        assert_eq!(validate_body(&[TAG_STR24, 0xFF, 0xFF, 0xFF], &[]), Err(DocError::Truncated));
+    }
 
     #[test]
     fn canonicality_rejections() {
@@ -806,23 +1041,75 @@ mod tests {
         assert_eq!(validate_body(&[TAG_OBJ, 2, 0, 0, 0x81, b'k'], &[]), Err(DocError::BadKey));
     }
 
+    /// Raw bytes: `depth` arrays around a null. The builder refuses depth
+    /// 129 itself (typed — tested in build.rs), so the validator's cap
+    /// needs hand-rolled nesting.
+    fn raw_nested(depth: usize) -> Vec<u8> {
+        let mut body = vec![TAG_NULL];
+        for _ in 0..depth {
+            let len = body.len();
+            let mut outer =
+                vec![TAG_ARR, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len >> 16) as u8];
+            outer.append(&mut body);
+            body = outer;
+        }
+        body
+    }
+
     #[test]
     fn depth_cap_binds_at_129() {
-        // Raw bytes: the builder refuses depth 129 itself (typed — tested
-        // in build.rs), so the validator's cap needs hand-rolled nesting.
-        fn raw_nested(depth: usize) -> Vec<u8> {
-            let mut body = vec![TAG_NULL];
-            for _ in 0..depth {
-                let len = body.len();
-                let mut outer =
-                    vec![TAG_ARR, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len >> 16) as u8];
-                outer.append(&mut body);
-                body = outer;
-            }
-            body
-        }
         assert!(validate_body(&raw_nested(DEPTH_MAX), &[]).is_ok());
         assert_eq!(validate_body(&raw_nested(DEPTH_MAX + 1), &[]), Err(DocError::DepthExceeded));
+    }
+
+    /// ADR-0169 D3's operand walk: the deepest path, siblings and objects
+    /// included, saturating one past the bound.
+    #[test]
+    fn nesting_depth_counts_the_deepest_container_path() {
+        let fragment = |v: &Value| model::encode_fragment(v).expect("fragment");
+        assert_eq!(nesting_depth(&fragment(&Value::I64(0))), 0);
+        assert_eq!(nesting_depth(&fragment(&Value::Arr(vec![]))), 1);
+        let siblings = Value::Arr(vec![
+            Value::Arr(vec![Value::I64(1)]),
+            Value::Arr(vec![Value::Arr(vec![Value::I64(2)])]),
+            Value::I64(3),
+        ]);
+        assert_eq!(nesting_depth(&fragment(&siblings)), 3);
+        let objects = Value::Obj(vec![
+            ("a".into(), Value::Obj(vec![("b".into(), Value::Arr(vec![]))])),
+            ("c".into(), Value::Str("x".repeat(300))),
+        ]);
+        assert_eq!(nesting_depth(&fragment(&objects)), 3);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX)), DEPTH_MAX);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX + 1)), DEPTH_MAX + 1);
+        assert_eq!(nesting_depth(&raw_nested(DEPTH_MAX + 5)), DEPTH_MAX + 1);
+    }
+
+    /// ADR-0169 D4: the receipt's checked constructor accepts what the
+    /// parser emits and refuses a 129th container and the interned form.
+    #[test]
+    fn canonical_doc_validates_what_a_store_may_hold() {
+        let parsed = crate::JsonParser::new().parse(br#"{"a":[1,2]}"#).expect("parses");
+        let doc = CanonicalDoc::validate(&parsed).expect("parser output is canonical");
+        assert_eq!(doc.as_bytes(), &parsed[..]);
+        assert_eq!(doc.body(), &parsed[HEADER_LEN..]);
+        let mut deep = parsed[..HEADER_LEN].to_vec();
+        let body = raw_nested(DEPTH_MAX + 1);
+        deep[4..8].copy_from_slice(&u32::try_from(body.len()).expect("small").to_le_bytes());
+        deep.extend_from_slice(&body);
+        assert_eq!(CanonicalDoc::validate(&deep), Err(DocError::DepthExceeded));
+        #[cfg(feature = "doc-intern-keys")]
+        {
+            let entry = |n: u8| format!(r#"{{"a-repeated-long-key":{n}}}"#);
+            let repeated = format!("[{}]", (0..8).map(entry).collect::<Vec<_>>().join(","));
+            let plain = crate::JsonParser::new().parse(repeated.as_bytes()).expect("parses");
+            let interned = crate::intern::intern(&plain).expect("repeated keys intern");
+            assert!(TapeDoc::from_bytes(&interned).is_ok(), "an interned tape validates");
+            assert_eq!(
+                CanonicalDoc::validate(&interned),
+                Err(DocError::NonCanonical("interned form"))
+            );
+        }
     }
 
     #[test]

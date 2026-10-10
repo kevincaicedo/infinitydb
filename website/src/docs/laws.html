@@ -1,0 +1,47 @@
+<!--
+title: Design laws
+section: Engineering
+description: The thirteen laws InfinityDB is built on, from one owner per key to one decision in one place, and the mechanical checks that enforce them.
+lede: Thirteen laws shape every design and every change. Each one is enforced by the strongest mechanism available, and a law changes only by a recorded amendment, accepted before any code that depends on it.
+chips: Normative | L1–L13
+-->
+<p>A change that weakens a law starts as an issue, not a pull request; an accepted change is recorded as a numbered decision before the code. The full rules live in <a href="https://github.com/kevincaicedo/infinitydb/blob/main/CONTRIBUTING.md#design-laws"><code>CONTRIBUTING.md</code></a> and <a href="style.html">InfinityStyle</a>.</p>
+
+<h2 id="l1">L1 · One core, one shard, one owner.</h2>
+<p>Every key has one owning cell, and cells share no mutable data-plane state: no locks and no shared atomics on the per-key path, only the <a href="fabric.html">fabric</a>. Expiry, eviction and accounting become local, single-threaded problems. Command futures are <code>!Send</code> and the executor's wakers use no atomics. Guards: <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-cell-denylist.sh"><code>check-cell-denylist.sh</code></a>, backed by clippy's <code>disallowed-types</code>, rejects locks, channels and <code>tokio</code> in cell crates; a CI check scans the waker path for atomic instructions. The stated cost: one hot key lives on one core.</p>
+
+<h2 id="l2">L2 · The log is the database.</h2>
+<p>Every durable fact is a log append first. The index, documents, tier files, checkpoints and secondary indexes are projections, rebuildable from the log or from a checkpoint that is itself a log prefix. Checkpoint load and replay share one idempotent upsert, so there is one recovery path. Guards: the crash matrix kills the process at named fault points and compares recovery with a reference replay; the simulator's replay oracles do the same under seeded power cuts.</p>
+
+<h2 id="l3">L3 · Batch every boundary.</h2>
+<p>Syscalls, fabric hops, fsyncs and cache misses are paid once per batch: one <code>io_uring_enter</code> per loop iteration, at most one log frame and one barrier per iteration, many fabric messages per ring slot, index lines prefetched for a whole batch. Guard: the batching ratios are always-on tripwires in <code>INFO tripwires</code>, and a benchmark whose tripwires show the batching did not happen is not a valid measurement.</p>
+
+<h2 id="l4">L4 · Mechanical sympathy is measured.</h2>
+<p>SIMD, prefetching and layout tricks are hypotheses until measured. An optimization ships with an A/B against a named baseline or stays behind a flag, and a losing A/B is recorded and not merged. Correctness fixes merge on their tests. This law is enforced in review, through the pull-request checklist.</p>
+
+<h2 id="l5">L5 · Memory is the product.</h2>
+<p>For a cache, memory per key is the cost. Records carry an 8-byte header, the index slot is 8 bytes and holds no key, and eviction bits live in spare header bits. Every byte is attributed at its allocation site to a named, counted domain. Guards: the gate campaigns' attribution rows fail a run whose sum of attributed gauges drifts from process RSS beyond its tolerance (none of their gauges counts secondary-index memory, and no CI workflow runs the campaigns), a CI test holds one document load to the same tolerance, and the simulator reconciles accounting at quiescence.</p>
+
+<h2 id="l6">L6 · Every command is a resumable state machine.</h2>
+<p>A command that may wait, for another cell, a durable acknowledgment, log space or a cold read, suspends on a typed gate. A local command on a numbered database runs inline with no future and no task, so the fast path pays nothing. Nothing borrowed before a suspension is trusted after it. Guard: handles are shaped so that holding one across an <code>await</code> fails to compile where the types allow; review checks the rest on every change.</p>
+
+<h2 id="l7">L7 · Determinism is a feature.</h2>
+<p>Time, randomness, network and disk are injected through a <code>Clock</code>, seeded <code>SplitMix64</code> streams, the <code>BackendDriver</code> trait and the <code>SegmentFs</code> trait, so the whole node runs inside the <a href="simulation.html">simulator</a> and a violation the simulator reports names the seed that replays it. Guards: the cell denylist, and <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-clock-ban.sh"><code>check-clock-ban.sh</code></a>, which proves that clippy rejects every spelling of an ambient clock.</p>
+
+<h2 id="l8">L8 · Compatibility is staged and honest.</h2>
+<p>Redis compatibility is declared per command. The matrix records the differences the corpus finds and the ones a row's note declares; it does not show that no other difference exists. The <a href="compat.html">matrix</a> is generated from the command table and a corpus diffed byte for byte against Redis 8.0.5 and a pinned RedisJSON, in-process and against a multi-cell server. Guard: CI fails when <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/compat-matrix.md"><code>compat-matrix.md</code></a> is stale or a corpus reply differs from its oracle with no recorded deviation for the case.</p>
+
+<h2 id="l9">L9 · Safety is layered.</h2>
+<p>In shipped source, <code>unsafe</code> lives only in a few audited leaf crates and named modules, and every other <code>src/lib.rs</code>, <code>src/main.rs</code> and <code>src/bin/*.rs</code> root of the workspace forbids it. Each block there carries a <code>// SAFETY:</code> argument and a <code>SAFETY.md</code> entry. Build scripts, fuzz targets, integration tests and benchmarks are crate roots of their own, and some tests and benchmarks use <code>unsafe</code>. Every decoder, from client requests to every on-disk format, is iterative, bounded and total, and lands with its fuzz target. Guards: <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-unsafe-roots.sh"><code>check-unsafe-roots.sh</code></a>, the denied <code>undocumented_unsafe_blocks</code> lint, the inventory check, Miri, Loom and nightly fuzzing.</p>
+
+<h2 id="l10">L10 · Claims follow evidence.</h2>
+<p>No performance number is published without a reproducible measurement on known hardware with a control run, and a target is never shown as a result. Evidence that cannot go red is not evidence, so the law asks every oracle for a canary: a planted bug that must turn it red. Not every oracle has one: no lane plants a bug for the boot-storm scenario's ready-path oracle. Guards: <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-scripts-selftest.sh"><code>check-scripts-selftest.sh</code></a> plants a violation in front of every gate inside <code>just check</code>, and <code>just sim-canaries</code> requires each planted bug to turn its scenario red.</p>
+
+<h2 id="l11">L11 · Extensibility is a seam, not a fork.</h2>
+<p>Engines attach through versioned seams: the command table, record type tags, log record types and index projections. They never reach around them. The document engine is the stated exception today, linked by the store behind its own feature. Guards: <a href="https://github.com/kevincaicedo/infinitydb/blob/main/scripts/check-dep-dag.sh"><code>check-dep-dag.sh</code></a> fails on any crate edge not listed in <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/dep-dag.toml"><code>dep-dag.toml</code></a>, and CI checks that the slim server library holds no document or query code.</p>
+
+<h2 id="l12">L12 · Design is proven before code.</h2>
+<p>A change that adds state, a limit, a queue, a format, a decoder or a crate edge starts as a written design, reviewed by someone who did not write it, before any code. It draws the state machine as a table, states the cost at scale and each limit's crossing behaviour, names the oracle for hostile inputs, and names the observation that would reject it. Guard: review; frozen interfaces and formats change only by an accepted decision first.</p>
+
+<h2 id="l13">L13 · One decision, one place.</h2>
+<p>Each rule has one home, enforced by the strongest mechanism available: a type, then a lint, then a generated table, then a self-tested script, and only then review. The command table is the model: routing, flags, <code>COMMAND</code> and the compatibility matrix all read one static table, and a collision in its compile-time perfect hash fails the build. There is no second dispatcher and no hand-kept list. Guards: the lint ratchet, whose counts only go down, the generated tables and the gate self-test.</p>

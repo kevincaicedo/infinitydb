@@ -3,7 +3,8 @@
 # against the manifested watermark / the surviving MANIFEST. S11 rows
 # are carried by `tests/tier.rs`, S12 rows by `tests/recovery_v2.rs`
 # (the runner vocabulary here is tier flush + manifest v2 + recovery,
-# not the m2 WAL machinery — rows use the carried-by-named-test tier).
+# not the m2 WAL machinery). Each row selects an exact Cargo test whose
+# assertion receipt is checked by run_node_rows.py (ADR-0020 amendment).
 # The m2 coverage test (`every_declared_point_has_a_matrix_row`) reads
 # this file alongside `m2.toml`, so a declared-but-rowless tier point
 # fails the build.
@@ -63,6 +64,13 @@
 #                         step, zero corruption (the retained-batch +
 #                         append-rewind discipline: nothing claimable
 #                         was dropped, nothing misaligned)
+#   boot-refuses-typed-then-recovers — a boot settle read that fails
+#                         (ADR-0174 D3: a settle that cannot read or
+#                         verify its slot refuses the boot) is the
+#                         typed refusal: a DEL whose read failed has
+#                         changed nothing, the boot stops typed, and a
+#                         later boot with the fault cleared recovers
+#                         the same unit
 
 schema = 1
 milestone = "m4"
@@ -71,51 +79,81 @@ seeds = 3
 [[row]]
 point = "tier_short_write"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_short_write_append_fails_typed"
 expect = "append-fails-typed"
 
 [[row]]
 point = "tier_torn_frame"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_torn_frame_reseal_at_watermark"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "tier_fsync_err"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_fsync_err_fail_stop"
 expect = "fail-stop"
 
 [[row]]
 point = "tier_footer_torn"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_footer_torn_reseal_at_watermark"
 expect = "reseal-at-watermark"
+
+# ---- F-L04-14 (review 2026-08-30): the same points on a `Direct`-mode
+# file (the namespace default) — carried by `tests/tier_direct.rs` on
+# `SimDisk`, which asserts the O_DIRECT contract on every write, plus
+# one real-`O_DIRECT` leg under `TMPDIR`. A point whose torn prefix is
+# not whole aligned blocks cannot inject here (it did not, before).
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "crash-matrix::tier_direct::tier_torn_frame_injects_on_a_direct_tier_file"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "tier_short_write"
+tier = "node"
+test = "crash-matrix::tier_direct::tier_short_write_injects_on_a_direct_tier_file"
+expect = "append-fails-typed"
+
+[[row]]
+point = "tier_footer_torn"
+tier = "node"
+test = "crash-matrix::tier_direct::tier_footer_torn_injects_on_a_direct_tier_file"
+expect = "reseal-at-watermark"
+
+[[row]]
+point = "blob_short_write"
+tier = "node"
+test = "crash-matrix::tier_direct::blob_short_write_injects_on_a_direct_extent"
+expect = "blob-write-fails-typed"
 
 # ---- M4-S12 recovery-unit windows (ADR-0057 D8) ----
 
 [[row]]
 point = "manifest_rename_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::manifest_v2_rename_fail_keeps_old_unit"
 expect = "unit-resolves"
 
 [[row]]
 point = "dir_fsync_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::manifest_v2_dir_fsync_crash_resolves_new_unit"
 expect = "unit-resolves"
 
 [[row]]
 point = "tier_torn_frame"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::tier_torn_frame_reseal_from_manifest_v2"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "tier_fsync_err"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::tier_fsync_frozen_watermark_bounds_manifest"
 expect = "fail-stop"
 
 # ---- M4-S15 copy-forward windows (ADR-0057 D8's sixth window +
@@ -124,33 +162,91 @@ expect = "fail-stop"
 [[row]]
 point = "manifest_rename_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_covering_swap_abort_serves_from_prior_unit"
 expect = "serves-from-prior-unit"
 
 [[row]]
 point = "dir_fsync_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_covering_swap_dir_fsync_resolves_and_boot_gc_reclaims"
 expect = "unit-resolves"
 
 [[row]]
 point = "tier_unlink_fail"
 tier = "node"
-test = "recovery_v2.rs"
+test = "crash-matrix::recovery_v2::s15_unlink_failure_is_nonfatal_and_redriven"
 expect = "reclaim-deferred-nonfatal"
+
+# Review 2026-08-30, F-L01-02: a tier-file creation refused at its
+# directory hold (EMFILE physics) must stage nothing — the round keeps
+# only the ops it staged before, each on a handle the pipeline owns —
+# and the cut after that round recovers the sealed file whole.
+[[row]]
+point = "tier_dir_open_fail"
+tier = "node"
+test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
+expect = "creation-retried-round-owned"
+
+# ADR-0174 D3: the boot settle read's one fault point — a cold twin's
+# key window unreadable at a replayed DEL.
+[[row]]
+point = "replay_settle_read_fail"
+tier = "node"
+test = "crash-matrix::replay::replay_settle_read_fail_refuses_typed_and_the_next_boot_recovers"
+expect = "boot-refuses-typed-then-recovers"
+
+# ADR-0174 D2, D5: the tier fault points fired inside a boot demote step —
+# the step refuses typed with `flushed` unmoved and at most an
+# unmanifested file left; the next boot removes it and recovers the unit.
+# The torn write succeeds (its physics), so its boot is cut, not refused.
+[[row]]
+point = "tier_short_write"
+tier = "node"
+test = "crash-matrix::replay::tier_short_write_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_write_nospace"
+tier = "node"
+test = "crash-matrix::replay::tier_write_nospace_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_fsync_err"
+tier = "node"
+test = "crash-matrix::replay::tier_fsync_err_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_footer_torn"
+tier = "node"
+test = "crash-matrix::replay::tier_footer_torn_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_dir_open_fail"
+tier = "node"
+test = "crash-matrix::replay::tier_dir_open_fail_in_a_boot_demote_step_refuses_typed_and_the_next_boot_recovers"
+expect = "demote-step-refuses-typed-then-recovers"
+
+[[row]]
+point = "tier_torn_frame"
+tier = "node"
+test = "crash-matrix::replay::tier_torn_frame_in_a_boot_demote_step_is_cut_and_the_next_boot_recovers"
+expect = "demote-step-cut-then-recovers"
 
 # ---- M4-S17 blob-extent windows (ADR-0061 D3/D5/D9) ----
 
 [[row]]
 point = "blob_short_write"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_faults_abandon_the_extent_typed"
 expect = "blob-write-fails-typed"
 
 [[row]]
 point = "blob_fsync_err"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_faults_abandon_the_extent_typed"
 expect = "blob-write-fails-typed"
 
 # The AC1 ordering cut rides the fsync-abort point's row pair: the
@@ -160,13 +256,13 @@ expect = "blob-write-fails-typed"
 [[row]]
 point = "blob_fsync_err"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves"
 expect = "orphan-reclaimed-never-served"
 
 [[row]]
 point = "blob_unlink_fail"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims"
 expect = "reclaim-deferred-nonfatal"
 
 # ---- M4-S21 ENOSPC windows (ADR-0063 D4) ----
@@ -174,7 +270,7 @@ expect = "reclaim-deferred-nonfatal"
 [[row]]
 point = "tier_write_nospace"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_write_nospace_diskfull_typed_then_automatic_recovery"
 expect = "diskfull-typed-then-automatic-recovery"
 
 # Kill mid-exhaustion: the file recovers valid exactly to the
@@ -183,11 +279,122 @@ expect = "diskfull-typed-then-automatic-recovery"
 [[row]]
 point = "tier_write_nospace"
 tier = "node"
-test = "tier.rs"
+test = "crash-matrix::tier::tier_write_nospace_kill_recovers_at_watermark"
 expect = "reseal-at-watermark"
 
 [[row]]
 point = "blob_write_nospace"
 tier = "node"
-test = "blob.rs"
+test = "crash-matrix::blob::blob_write_nospace_fails_typed_and_next_attempt_recovers"
 expect = "blob-write-fails-typed"
+
+# ---- M4.5-S31 reactor-drive cut windows (ADR-0084 D4) ----
+# Cut-timing windows, not fault points, so they carry as named
+# power-cut tests in tier.rs (the documents.rs precedent — the row
+# schema requires a declared point):
+#   reactor_seal_barrier_lost_reseals_at_the_manifested_watermark
+#     (footer write completed, seal fdatasync did not → reseal-at-watermark)
+#   reactor_sealed_file_beyond_the_manifest_is_clamped_inert
+#     (seal completed, MANIFEST never named it → manifested-prefix clamp)
+
+# ---- M4.5-S34 write-through (FUA-class) frames on Direct segments
+# (ADR-0086 D8) — sim-disk physics, carried by tests/fua.rs ----
+#   fua-in-flight     — the cut lands with a write-through frame issued
+#                       but not executed: every acked key recovers
+#                       exactly, the in-flight frame and after are gone,
+#                       the tail reopens Direct at the aligned boundary
+#   seal-flush-x-fua  — a rotation's seal FLUSH never completes while a
+#                       write-through frame in the new segment does: the
+#                       done-prefix keeps it un-acked; recovery admits
+#                       either outcome for it and every acked key exactly
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "crash-matrix::fua::fua_in_flight_loses_only_the_unacked_frame"
+expect = "fua-in-flight"
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "crash-matrix::fua::seal_flush_in_flight_keeps_later_fua_frames_unacked"
+expect = "seal-flush-x-fua"
+
+# ---- M4.5-S35 bounded frame pipeline (ADR-0087 D6/D7) — sim-disk
+# physics, carried by tests/fua.rs ----
+#   seal-flush-x-fua-plain-tail — segment N ends in barrier-less everysec
+#                       frames, rotates (seal FLUSH pending), a write-
+#                       through frame lands in N+1, the cut eats N's tail:
+#                       a hole in a *sealed* segment with durable data
+#                       beyond — boot truncates at the hole (un-attested),
+#                       never refuses; every acked key exact
+#   pipeline-later-durable-earlier-torn — K = 4 write-through frames in
+#                       flight, only the third lands before the cut:
+#                       nothing acked, replay ends at the first frame's
+#                       base, the third is discarded as un-attested
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "crash-matrix::fua::plain_tail_behind_a_pending_seal_truncates_instead_of_refusing"
+expect = "seal-flush-x-fua-plain-tail"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "crash-matrix::fua::later_frame_durable_earlier_torn_acks_nothing_and_truncates_at_the_first"
+expect = "pipeline-later-durable-earlier-torn"
+
+# ---- Review row (ADR-0086 D4 as amended, 2026-08-21) — the FLUSH → FUA
+# transition on an existing log, carried by tests/fua.rs ----
+#   flush-to-fua-packed-tail — packed (v2) frames under FLUSH, restart
+#                       with FUA configured, acked always writes, restart:
+#                       the packed tail reopens Buffered at its exact end
+#                       (no alignment slack the reader cannot cross), the
+#                       class upgrades at the next rotation, every acked
+#                       key exact at every boot and after the seeded cut
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "crash-matrix::fua::flush_to_fua_transition_keeps_every_acked_record"
+expect = "flush-to-fua-packed-tail"
+
+# ---- M4.5-S36 `.ick` container v3 (ADR-0088 D3/D8) — the aligned,
+# direct-written checkpoint under the recovery driver's unchanged rules,
+# carried by tests/ickv3.rs ----
+#   v3-named-unit-loads    — the canary: a published v3 unit boots through
+#                            open_cell_log, every image loads, the tail
+#                            replays over it
+#   v3-mid-section-orphan  — the cut lands inside a section of a direct
+#                            .ick.new (an unaligned truncation): the old
+#                            unit stays authoritative, the orphan is GC'd
+#   v3-footer-before-fdatasync — the cut lands between the footer write
+#                            and its completion fdatasync: footer-complete
+#                            on disk, unnamed — boot replays the log alone
+#   v3-named-unit-damaged-padding — a non-zero byte in a named unit's
+#                            block padding fail-stops typed (Padding)
+
+[[row]]
+point = "power_cut_after_seal"
+tier = "node"
+test = "crash-matrix::ickv3::v3_named_unit_loads_and_the_tail_replays_over_it"
+expect = "v3-named-unit-loads"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "crash-matrix::ickv3::v3_mid_section_orphan_is_collected_and_the_old_unit_loads"
+expect = "v3-mid-section-orphan"
+
+[[row]]
+point = "manifest_rename_fail"
+tier = "node"
+test = "crash-matrix::ickv3::v3_footer_complete_orphan_without_a_manifest_never_loads"
+expect = "v3-footer-before-fdatasync"
+
+[[row]]
+point = "torn_frame"
+tier = "node"
+test = "crash-matrix::ickv3::v3_named_unit_with_damaged_padding_fail_stops"
+expect = "v3-named-unit-damaged-padding"

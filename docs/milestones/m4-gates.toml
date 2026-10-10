@@ -1,27 +1,26 @@
-# M4 exit gates (STOP) — machine-readable encoding of the M4 milestone plan
-# §7 (internal). Values are fixed by the project master plan §22 (M4,
-# internal); changing a threshold here is a master-plan amendment, not an
-# edit (L10: a gate may not be passed by narrowing it).
+# M4 exit gates (STOP) — machine-readable encoding of the M4 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # This file is the single authority for the M4 gate values: it lives in
 # this repository because `inf-bench` is its only consumer, and nothing in
 # this workspace may resolve a path outside the checkout (the macOS/CI
-# failure that forced the move — `bins/inf-bench/../../../docs/` does not
-# exist on a runner that checks out this repo alone).
+# failure that forced the move — a path above the repository root does
+# not exist on a runner that checks out this repo alone).
 #
 # Consumed by `inf-bench gate-run m4` and `inf-bench ycsb`. **Coverage
-# (S22/S24): the full §7 table.** Rows whose producer cannot run yet render
-# `PENDING (tooling)` in every report — a visible gap, never a passed gate:
+# (S22/S24): the full exit-gate table.** Rows whose producer cannot run yet render
+# `UNMEASURED` in the report and selected STOP omissions fail the run (ADR-0132):
 # the tiered rows (hot-set split, cold p99, endurance) produce values only
 # once command wiring (M4-S26) lifts the ADR-0062 D8 `USE` refusal, and the
 # campaign-carried rows (recovery, M3 regression, DST/crash, foreground,
 # endurance) bind through `gate-run m4` external-value flags that demand
 # `--campaign-note` provenance (the M2-S22 pattern, L10).
 #
-# The §7 "Tripwires" gate is deliberately NOT a static row here: the S10
+# The "Tripwires" gate is deliberately NOT a static row here: the S10
 # cold tripwires (`cold_read_qd_p99`, `coalesce_ratio`) get their bound
 # calibrated by S22 on the wired plane (ADR-0055 D2/D3); until then the
-# §19 rule stands process-side — a cited run renders its tripwires in the
+# run-validity rule stands process-side — a cited run renders its tripwires in the
 # report and a red tripwire invalidates the run by definition.
 #
 # tier = "linux-reference-box" verdicts bind only on the reference box;
@@ -118,12 +117,12 @@ comparator = "<="
 unit = "counter sum"
 tier = "any"
 source = "tripwire:tiering_counter_total"
-measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero — §3.3)"
+measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero)"
 
 [[gate]]
 id = "write_amplification"
 name = "Write amplification, worst tiered namespace"
-# §7: "< 3x reported". The measured value is (wal_bytes + flush_bytes) /
+# The gate: "< 3x reported". The measured value is (wal_bytes + flush_bytes) /
 # user_bytes for the worst namespace in the run — per namespace, never a
 # node-wide blend, and never averaged over a namespace with no denominator
 # (ADR-0060 D2/D4). `tier = "any"`: this is a ratio of counters, not a
@@ -151,7 +150,7 @@ measured_by = "INFO persistence scrape on the M4 leg after every row"
 [[gate]]
 id = "mixed_attribution"
 name = "Mixed-node attribution divergence (M4-S20)"
-# §7 memory-honesty extended over the coexistence audit: sum(domains) vs
+# Memory honesty extended over the coexistence audit: sum(domains) vs
 # RSS throughout the mixed run — the 12 M2 domains plus the RSS-resident
 # tiering terms (committed ring pages + tiered index; reserved VA is not
 # resident and is excluded). `tier = "any"`: an attribution identity, not
@@ -166,7 +165,7 @@ measured_by = "inf-bench mixed-audit sampler (RSS 100 ms, domains ~1 s, all cell
 [[gate]]
 id = "cache_isolation_p99"
 name = "Cache-namespace p99 isolation under the mixed node (M4-S20)"
-# The §4.3 unified-profile promise: the cache namespace's p99 within 10%
+# The unified-profile promise: the cache namespace's p99 within 10%
 # of its same-campaign solo baseline while the other namespaces serve.
 # Until command wiring + S22 land the tiered leg, the mixed side is
 # cache + document with the tiered namespace standing (budgets admitted,
@@ -177,17 +176,17 @@ comparator = "<="
 unit = "pct vs same-campaign solo baseline"
 tier = "linux-reference-box"
 source = "cache_isolation_p99_delta_pct"
-measured_by = "inf-bench mixed-audit solo/mixed legs, same box, same config, one campaign (§19)"
+measured_by = "inf-bench mixed-audit solo/mixed legs, same box, same config, one campaign"
 
 # ---------------------------------------------------------------------------
-# §7 rows added with S22/S24 (2026-07-31). Producers named per row.
+# Exit-gate rows added with S22/S24 (2026-07-31). Producers named per row.
 # ---------------------------------------------------------------------------
 
 [[gate]]
 id = "hot_set_p50"
 name = "Hot set at memory speed: memory-hit p50 delta"
-# §7: hot-set split percentiles within 10% of the identical workload on a
-# memory-only namespace. S22 interpretation (recorded in the plan): the
+# The gate: hot-set split percentiles within 10% of the identical workload on a
+# memory-only namespace. S22 interpretation (the rule this row encodes): the
 # reference leg is the same workload through the SAME instrument on a
 # fully-RAM-resident namespace (`ycsb --dataset-multiple 1`) — a service
 # histogram on the memory-mode path would violate the S03 zero-cost
@@ -222,7 +221,7 @@ measured_by = "inf-bench ycsb client-derived memory-hit split vs the RAM-residen
 [[gate]]
 id = "cold_read_p99"
 name = "Cold reads: p99 < 1.5 ms on NVMe under loaded zipfian rows"
-# Loaded rows, never idle drains (§7). Worst loaded YCSB row binds.
+# Loaded rows, never idle drains. Worst loaded YCSB row binds.
 threshold = 1.5
 comparator = "<"
 unit = "ms, cold-read split histogram, worst loaded row"
@@ -238,7 +237,7 @@ comparator = "<"
 unit = "pct per 24 h (storm-resistant first/last-5% medians)"
 tier = "linux-reference-box"
 source = "endurance:rss_slope_pct_per_24h"
-measured_by = "scripts/soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
+measured_by = "soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
 
 [[gate]]
 id = "endurance_crashes"
@@ -248,7 +247,7 @@ comparator = "<="
 unit = "crashes"
 tier = "any"
 source = "endurance:crashes"
-measured_by = "scripts/soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
+measured_by = "soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
 
 [[gate]]
 id = "m3_regression_worst"

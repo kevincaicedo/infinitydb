@@ -67,7 +67,8 @@ fn run_leg(
     m.raw_section(&format!("{name} {label} rep {rep}"), &render(&report));
     samples.ops.push(report.ops_per_sec);
     samples.p999.push(report.p999_us as f64);
-    samples.rss.push(server.rss_bytes() as f64);
+    let sample = server.proc_sample().map_err(|e| format!("{name} {label} rep {rep} RSS: {e}"))?;
+    samples.rss.push(sample.rss_bytes() as f64);
     Ok(())
 }
 
@@ -255,7 +256,10 @@ fn binary_fingerprint(path: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: orchestration script: linear rows, not branchy logic"
+)]
 pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m4")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m4/s03");
@@ -285,8 +289,9 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
         );
     }
     m.note(
-        "p99.9 deltas are quantized by LogHistogram (32 sub-buckets/octave ≈ 3%): \
-         0.0% = same bucket; any non-zero delta spans ≥ 1 bucket",
+        "p99.9 deltas are quantized by the client histogram (256 sub-buckets/octave ≈ 0.4% \
+         since 2026-08-22; 32 ≈ 3% before): 0.0% = same bucket; any non-zero delta spans \
+         ≥ 1 bucket",
     );
     m.note(format!("m4 binary {}: {}", infinityd, binary_fingerprint(&infinityd)));
     match &baseline_bin {
@@ -297,7 +302,7 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
             binary_fingerprint(bin)
         )),
         None => m.note(
-            "--baseline-bin not given: delta rows report PENDING (build the M3 tip commit's \
+            "--baseline-bin not given: delta rows report UNMEASURED (build the M3 tip commit's \
              infinityd and pass its path)"
                 .to_string(),
         ),

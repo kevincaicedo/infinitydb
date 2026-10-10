@@ -34,6 +34,9 @@ pub const MAX_VAL_LEN: usize = (1 << 24) - 1;
 
 pub(crate) const HEADER_LEN: usize = 8;
 pub(crate) const TTL_EXT_LEN: usize = 5;
+// The tier format's key window holds every record's key: the fixed
+// header, the TTL extension and the longest key end inside it.
+const _: () = assert!(HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN <= inf_log::TIER_KEY_WINDOW_BYTES);
 const FLAG_TTL: u8 = 0b0001;
 /// String was produced by a byte-surgery mutation (APPEND/SETRANGE) — drives
 /// `OBJECT ENCODING`'s `raw` answer the way Redis's `sds` conversion does
@@ -49,8 +52,44 @@ const REF_MASK: u8 = 0b1100;
 /// clamp here (recorded deviation: "effectively never expires"; the store
 /// clamps at every deadline-conversion site so the writer assert is an
 /// internal invariant, not an input panic — M1-S03 fix of a latent M0 bound
-/// panic on ≥ 34.8-year TTLs).
-pub(crate) const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+/// panic on ≥ 34.8-year TTLs). Public since ADR-0111: the command seam
+/// saturates into this bound instead of refusing what Redis accepts.
+pub const MAX_EXPIRE_MS: u64 = (1 << 40) - 1;
+
+/// The store deadline for an internal-clock instant in milliseconds:
+/// instants past [`MAX_EXPIRE_MS`] saturate to it (ADR-0111). Never
+/// overflows `Nanos` — the bound times 10⁶ is far below `u64::MAX`.
+#[inline]
+pub fn saturating_deadline(internal_ms: u64) -> Nanos {
+    Nanos::from_millis(internal_ms.min(MAX_EXPIRE_MS))
+}
+
+/// Where an accepted expire instant lands on the internal clock
+/// (ADR-0111 A1). The clock counts milliseconds from its origin, and a
+/// record's deadline is unsigned, so an instant before the origin has no
+/// deadline to carry: clamped onto the origin it would read as live
+/// through the origin's own millisecond (a key expires once `now > at`).
+/// It is its own variant instead, earlier than every reading of the
+/// clock, and every write that receives it removes the key at once.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum InternalDeadline {
+    /// Strictly before the clock's origin: expired at every `now`.
+    BeforeOrigin,
+    /// On the clock, saturated into [`MAX_EXPIRE_MS`].
+    At(Nanos),
+}
+
+impl InternalDeadline {
+    /// The deadline at a signed internal-clock instant in milliseconds:
+    /// a negative instant is before the origin, a large one saturates.
+    #[must_use]
+    pub fn from_internal_ms(internal_ms: i64) -> InternalDeadline {
+        match u64::try_from(internal_ms) {
+            Ok(ms) => InternalDeadline::At(saturating_deadline(ms)),
+            Err(_) => InternalDeadline::BeforeOrigin,
+        }
+    }
+}
 /// Versions live in 24 bits (see the module deviation note).
 pub(crate) const VERSION_MASK: u32 = (1 << 24) - 1;
 
@@ -142,16 +181,21 @@ impl ExtentRef {
     /// Decodes a [`TypeTag::StringExtent`] record's value bytes.
     ///
     /// # Panics
-    /// Panics when `value` is not exactly [`EXTENT_REF_LEN`] bytes —
-    /// extent records are written only by this crate, so a wrong length
-    /// is a record-lifecycle bug, not input.
+    /// Panics when `value` is not exactly [`EXTENT_REF_LEN`] bytes or its
+    /// offset is not 0 (ADR-0061 D2) — extent records are written only by
+    /// this crate, so either is a record-lifecycle bug, not input.
     #[inline]
     #[must_use]
     pub fn decode(value: &[u8]) -> ExtentRef {
         assert_eq!(value.len(), EXTENT_REF_LEN, "extent reference is exactly 24 bytes");
+        let offset = u64::from_le_bytes(value[8..16].try_into().expect("8 bytes"));
+        // ADR-0061 D2, checked where the bytes come back in: a non-zero v1
+        // offset is a lifecycle bug (or a CRC-passing corruption), not a
+        // value the extent reader's bounds arithmetic should ever see.
+        assert_eq!(offset, 0, "v1 extent references start at offset 0");
         ExtentRef {
             extent_id: u64::from_le_bytes(value[0..8].try_into().expect("8 bytes")),
-            offset: u64::from_le_bytes(value[8..16].try_into().expect("8 bytes")),
+            offset,
             len: u64::from_le_bytes(value[16..24].try_into().expect("8 bytes")),
         }
     }
@@ -244,6 +288,155 @@ pub(crate) fn bump_version_in_place(bytes: &mut [u8]) {
     bytes[5..8].copy_from_slice(&next[..3]);
 }
 
+/// Decodes just the key from a record *prefix* — `Some` when the prefix
+/// covers the fixed header, the TTL extension when present, and the whole
+/// key; `None` when it is too short. The key always ends within
+/// `HEADER_LEN + TTL_EXT_LEN + MAX_KEY_LEN` = 268 bytes of the record's
+/// start, so a cold-read first window always holds it: `SCAN`'s cold key
+/// resolution must not require the value's bytes to name a key.
+#[inline]
+pub(crate) fn key_from_prefix(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < HEADER_LEN {
+        return None;
+    }
+    let klen = bytes[1] as usize;
+    let at = HEADER_LEN + if bytes[0] & FLAG_TTL != 0 { TTL_EXT_LEN } else { 0 };
+    bytes.get(at..at + klen)
+}
+
+/// A cold record's identity as a boot settle may use it (ADR-0174 D3;
+/// the settle read's `parse` step): parsed from the record's **key
+/// window** — its first `TieredTable::KEY_PREFIX_LEN` bytes, or fewer at
+/// its file's end — by the one constructor that checks, in order, that
+/// the window holds the header, that the type tag decodes, that the key
+/// is whole, that the record's encoded length lies inside its file
+/// (`left`, the bytes from the record's address to the file's end) and
+/// that **the key hashes to the slot's hash**. A boot settle keeps or
+/// removes a slot only on one of these: a frame checksum checks bytes,
+/// not identity, and "distinct key" is answered only for a verified
+/// record of another key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ColdKey<'a> {
+    key: &'a [u8],
+    record_len: u32,
+    kind: TypeTag,
+    hash: u64,
+}
+
+/// Why a key window did not parse into a [`ColdKey`] — each a typed boot
+/// refusal naming the check, never "distinct".
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColdKeyError {
+    /// Fewer bytes than the fixed header.
+    ShortHeader { len: usize },
+    /// The type tag's bits name no record type.
+    TypeTag { bits: u8 },
+    /// The window ends inside the key (or the header's TTL extension).
+    KeyTruncated { len: usize },
+    /// The record's encoded length runs past its file's end.
+    LengthPastFile { record_len: u64, left: u64 },
+    /// The key does not hash to the slot's hash: another key's record,
+    /// misplaced or misdirected, under valid frame checksums.
+    HashMismatch { slot: u64, key: u64 },
+}
+
+impl core::fmt::Display for ColdKeyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ColdKeyError::ShortHeader { len } => {
+                write!(f, "key window of {len} bytes holds no record header")
+            }
+            ColdKeyError::TypeTag { bits } => write!(f, "record type tag {bits} is unknown"),
+            ColdKeyError::KeyTruncated { len } => {
+                write!(f, "key window of {len} bytes ends inside the key")
+            }
+            ColdKeyError::LengthPastFile { record_len, left } => {
+                write!(f, "record length {record_len} runs past the file's end ({left} bytes left)")
+            }
+            ColdKeyError::HashMismatch { slot, key } => {
+                write!(f, "the record's key hashes to {key:#018x}, the slot to {slot:#018x}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ColdKeyError {}
+
+impl<'a> ColdKey<'a> {
+    /// The one constructor (the checks in the type's documentation, in
+    /// that order). `hash_of` is the namespace's keyed hash (ADR-0094).
+    /// Total over arbitrary bytes: every refusal is a [`ColdKeyError`].
+    // ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+    #[cfg_attr(
+        not(test),
+        deny(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_wrap,
+            clippy::arithmetic_side_effects
+        )
+    )]
+    pub fn from_window(
+        window: &'a [u8],
+        left: u64,
+        slot_hash: u64,
+        hash_of: impl FnOnce(&[u8]) -> u64,
+    ) -> Result<ColdKey<'a>, ColdKeyError> {
+        if window.len() < HEADER_LEN {
+            return Err(ColdKeyError::ShortHeader { len: window.len() });
+        }
+        let bits = window[0] >> 4;
+        let kind = match TypeTag::from_bits(bits) {
+            Some(kind) => kind,
+            // The planted canary breaks ADR-0174 D3's identity check: a
+            // constructor that checks nothing takes an unknown tag for a
+            // string.
+            None if cfg!(inf_canary_replay_settle_unchecked) => TypeTag::String,
+            None => return Err(ColdKeyError::TypeTag { bits }),
+        };
+        let Some(key) = key_from_prefix(window) else {
+            return Err(ColdKeyError::KeyTruncated { len: window.len() });
+        };
+        let record_len = encoded_len_from_header(window);
+        let record_len_u64 = u64::try_from(record_len)
+            .map_err(|_| ColdKeyError::LengthPastFile { record_len: u64::MAX, left })?;
+        if record_len_u64 > left && !cfg!(inf_canary_replay_settle_unchecked) {
+            return Err(ColdKeyError::LengthPastFile { record_len: record_len_u64, left });
+        }
+        let key_hash = hash_of(key);
+        if key_hash != slot_hash && !cfg!(inf_canary_replay_settle_unchecked) {
+            return Err(ColdKeyError::HashMismatch { slot: slot_hash, key: key_hash });
+        }
+        let record_len = u32::try_from(record_len)
+            .map_err(|_| ColdKeyError::LengthPastFile { record_len: record_len_u64, left })?;
+        Ok(ColdKey { key, record_len, kind, hash: slot_hash })
+    }
+
+    /// The verified key.
+    #[inline]
+    pub fn key(&self) -> &'a [u8] {
+        self.key
+    }
+
+    /// The record's exact encoded length — its death's bytes.
+    #[inline]
+    pub fn record_len(&self) -> u32 {
+        self.record_len
+    }
+
+    /// The record's type.
+    #[inline]
+    pub fn kind(&self) -> TypeTag {
+        self.kind
+    }
+
+    /// The slot's hash the key verified against.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
 /// Computes a record's full encoded length from its fixed header alone —
 /// how the store sizes the second arena read (header first, then the whole
 /// record).
@@ -330,10 +523,15 @@ impl<'a> RecordView<'a> {
         Some(u64::from_le_bytes(raw))
     }
 
-    /// True if expired at `now` (expire-on-read, L7-deterministic).
+    /// True if expired at `now` (expire-on-read, L7-deterministic). The
+    /// deadline millisecond itself still serves the key — Redis's read
+    /// path is `now > when` (`PTTL` answers 0 there); the record is gone
+    /// from the next millisecond on (F-L05-05). One predicate serves
+    /// reads, scans, checkpoints, eviction and the wheel's fire check, so
+    /// the client view and the recovered view agree.
     #[inline]
     pub fn is_expired(self, now: Nanos) -> bool {
-        self.expire_at_ms().is_some_and(|at| now.0 / 1_000_000 >= at)
+        self.expire_at_ms().is_some_and(|at| now.0 / 1_000_000 > at)
     }
 
     /// The record's kind: type tag plus type-specific flag state.
@@ -393,7 +591,38 @@ impl core::fmt::Debug for RecordView<'_> {
 
 #[cfg(test)]
 mod tests {
+    use inf_foundation::KeyHasher;
+
     use super::*;
+
+    /// ADR-0061 D2: `offset` is 0 in v1 and asserted so — on the decode
+    /// side too (L04 style row), where a CRC-passing corrupt reference
+    /// would otherwise reach the extent reader's bounds arithmetic.
+    #[test]
+    #[should_panic(expected = "v1 extent references start at offset 0")]
+    fn decode_refuses_a_non_zero_v1_offset() {
+        let mut bytes = ExtentRef { extent_id: 7, offset: 0, len: 16 }.encode();
+        bytes[8] = 1;
+        let _ = ExtentRef::decode(&bytes);
+    }
+
+    /// ADR-0111 A1: the conversion keeps an instant before the clock's
+    /// origin apart from the origin itself — the origin is a deadline a
+    /// record carries (live through its millisecond), the instant one
+    /// millisecond earlier is expired at every reading of the clock.
+    #[test]
+    fn internal_deadlines_keep_the_origin_apart_from_before_it() {
+        use InternalDeadline::{At, BeforeOrigin};
+        assert_eq!(InternalDeadline::from_internal_ms(i64::MIN), BeforeOrigin);
+        assert_eq!(InternalDeadline::from_internal_ms(-1), BeforeOrigin);
+        assert_eq!(InternalDeadline::from_internal_ms(0), At(Nanos::ZERO));
+        assert_eq!(InternalDeadline::from_internal_ms(1), At(Nanos::from_millis(1)));
+        let bound = i64::try_from(MAX_EXPIRE_MS).expect("u40 fits i64");
+        let max = At(Nanos::from_millis(MAX_EXPIRE_MS));
+        assert_eq!(InternalDeadline::from_internal_ms(bound), max);
+        assert_eq!(InternalDeadline::from_internal_ms(bound + 1), max, "saturates");
+        assert_eq!(InternalDeadline::from_internal_ms(i64::MAX), max, "saturates");
+    }
 
     fn roundtrip(spec: RecordSpec<'_>) -> Vec<u8> {
         let mut buf = vec![0u8; spec.encoded_len()];
@@ -434,6 +663,32 @@ mod tests {
         assert_eq!(spec.encoded_len(), 88);
     }
 
+    /// Review of 2026-08-30 (C2): the key decodes from a record prefix —
+    /// with and without the TTL extension, at the 255-byte key bound, and
+    /// from a prefix holding none of the value — while a prefix that stops
+    /// inside the key answers `None`, never a truncated key.
+    #[test]
+    fn key_decodes_from_a_value_free_prefix() {
+        for expire_at_ms in [None, Some(5u64)] {
+            let key = vec![b'K'; MAX_KEY_LEN];
+            let spec = RecordSpec {
+                key: &key,
+                value: &[0xAB; 40_000],
+                version: 1,
+                expire_at_ms,
+                kind: RecordKind::String { raw: false },
+            };
+            let buf = roundtrip(spec);
+            let key_end =
+                HEADER_LEN + if expire_at_ms.is_some() { TTL_EXT_LEN } else { 0 } + key.len();
+            assert!(key_end <= 268, "prefix bound documented on key_from_prefix");
+            assert_eq!(key_from_prefix(&buf[..key_end]), Some(&key[..]));
+            assert_eq!(key_from_prefix(&buf), Some(&key[..]));
+            assert_eq!(key_from_prefix(&buf[..key_end - 1]), None);
+            assert_eq!(key_from_prefix(&buf[..HEADER_LEN - 1]), None);
+        }
+    }
+
     #[test]
     fn view_reads_back_every_field() {
         let spec = RecordSpec {
@@ -453,6 +708,70 @@ mod tests {
         assert_eq!(view.encoded_len(), buf.len());
     }
 
+    /// ADR-0174 D3: the one constructor refuses, in order, a window
+    /// without a header, an unbound type tag, a key the window cuts, a
+    /// length past the file and a key that does not hash to the slot's
+    /// hash — and accepts a record shorter than the key window at its
+    /// file's end, the window clamped to the file.
+    #[test]
+    fn cold_key_checks_in_order_and_accepts_a_clamped_window() {
+        let hash_of = |key: &[u8]| KeyHasher::default().hash(key);
+        let spec = RecordSpec {
+            key: b"k",
+            value: &[0xAB; 300],
+            version: 1,
+            expire_at_ms: Some(5),
+            kind: RecordKind::String { raw: false },
+        };
+        let buf = roundtrip(spec);
+        let slot = hash_of(b"k");
+        let len = buf.len() as u64;
+        assert_eq!(
+            ColdKey::from_window(&buf[..HEADER_LEN - 1], len, slot, hash_of),
+            Err(ColdKeyError::ShortHeader { len: HEADER_LEN - 1 })
+        );
+        let mut untagged = buf.clone();
+        untagged[0] &= 0x0F;
+        assert_eq!(
+            ColdKey::from_window(&untagged, len, slot, hash_of),
+            Err(ColdKeyError::TypeTag { bits: 0 })
+        );
+        let cut = HEADER_LEN + TTL_EXT_LEN; // the TTL extension, not the key
+        assert_eq!(
+            ColdKey::from_window(&buf[..cut], len, slot, hash_of),
+            Err(ColdKeyError::KeyTruncated { len: cut })
+        );
+        assert_eq!(
+            ColdKey::from_window(&buf, len - 1, slot, hash_of),
+            Err(ColdKeyError::LengthPastFile { record_len: len, left: len - 1 })
+        );
+        let other = hash_of(b"other");
+        assert_eq!(
+            ColdKey::from_window(&buf, len, other, hash_of),
+            Err(ColdKeyError::HashMismatch { slot: other, key: slot })
+        );
+        // The key window (268 B) is shorter than the record: the key is
+        // whole, the length is the header's, the hash checks.
+        let window = &buf[..HEADER_LEN + TTL_EXT_LEN + 1];
+        let cold = ColdKey::from_window(window, len, slot, hash_of).expect("a verified key");
+        assert_eq!(cold.key(), b"k");
+        assert_eq!(u64::from(cold.record_len()), len);
+        assert_eq!(cold.kind(), TypeTag::String);
+        assert_eq!(cold.hash(), slot);
+        // A record shorter than the key window at its file's end: the
+        // whole record is the window and the file holds exactly it.
+        let short = roundtrip(RecordSpec {
+            key: b"k",
+            value: b"v",
+            version: 0,
+            expire_at_ms: None,
+            kind: RecordKind::String { raw: false },
+        });
+        let cold = ColdKey::from_window(&short, short.len() as u64, slot, hash_of)
+            .expect("clamped to the file");
+        assert_eq!(u64::from(cold.record_len()), short.len() as u64);
+    }
+
     #[test]
     fn version_wraps_mod_2_pow_24() {
         let spec = RecordSpec {
@@ -467,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_is_inclusive_at_the_millisecond() {
+    fn expiry_is_exclusive_at_the_deadline_millisecond() {
         let spec = RecordSpec {
             key: b"k",
             value: b"",
@@ -478,7 +797,9 @@ mod tests {
         let buf = roundtrip(spec);
         let view = RecordView::new(&buf);
         assert!(!view.is_expired(Nanos(9_999_999)));
-        assert!(view.is_expired(Nanos(10_000_000)));
+        assert!(!view.is_expired(Nanos(10_000_000)), "the deadline ms is served (Redis)");
+        assert!(!view.is_expired(Nanos(10_999_999)));
+        assert!(view.is_expired(Nanos(11_000_000)));
     }
 
     #[test]

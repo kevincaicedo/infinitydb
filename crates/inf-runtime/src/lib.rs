@@ -12,37 +12,61 @@
 //! simulator driver implemented in `inf-sim` (M0-S20) against
 //! [`BackendDriver`].
 
+// §17.3 as amended (ADR-0121, batch 44): "parts of `inf-runtime`" is a
+// root `deny(unsafe_code)` with the backend/affinity/executor modules as
+// named `allow`s (SAFETY.md); the reactor, scheduler, timer, token,
+// budget and gate modules are safe and stay so.
+#![deny(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
+
+#[allow(unsafe_code)]
 mod affinity;
+mod budget;
+#[allow(unsafe_code)]
 mod cold;
+#[allow(unsafe_code)]
 mod driver;
+#[allow(unsafe_code)]
 mod executor;
 pub mod gate;
+#[allow(unsafe_code)]
 pub mod net;
 mod reactor;
 mod sched;
+pub mod signal;
 mod timer;
 mod token;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 mod kqueue;
 #[cfg(all(target_os = "linux", feature = "uring"))]
+#[allow(unsafe_code)]
 mod uring;
 
 pub use affinity::unpin_current_thread;
+pub use budget::{
+    BURST_HORIZON_NS, ClassCap, ClassCounters, ClassSlice, DeviceBudget, DeviceModel,
+    FLOOR_DIVISOR, IoClass, Issue, SealPace,
+};
 pub use cold::{
     ColdDone, ColdLeak, ColdReadConfig, ColdReadCounters, ColdReads, ColdRefused, ColdWait,
-    ReadClass, TierFileId,
+    ReadClass, TierFileId, UnrepresentableRead,
 };
 pub use driver::{
-    BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd, StableBytes,
-    StableBytesMut, SubmitStats, Wait,
+    AcceptFailure, BackendDriver, Capabilities, Completion, CompletionResult, IoOp, RawFd,
+    StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
 pub use executor::{CellExecutor, PollImmediate, TaskId};
 pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
 pub use reactor::{CellLoop, CellPlane, IterStats, LoopConfig, LoopCx};
 pub use sched::{GroupClass, GroupScheduler};
 pub use timer::{TimerId, TimerWheel};
-pub use token::{CompletionToken, TokenClass};
+pub use token::{CompletionToken, MAX_SLOT, TokenClass};
 
 #[cfg(target_os = "macos")]
 pub use kqueue::KqueueDriver;

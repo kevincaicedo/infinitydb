@@ -51,9 +51,10 @@ impl LogicalAddr {
         LogicalAddr::from_raw(raw)
     }
 
-    /// Distance from `origin` (which must not exceed `self` — the caller
-    /// compares addresses before subtracting; this is checked arithmetic,
-    /// not a range test).
+    /// Distance from `origin`, which must not exceed `self`: the caller
+    /// compares addresses before subtracting. Debug-asserted only — a
+    /// release build wraps like any `u64` subtraction (no range test, no
+    /// checked arithmetic; L16 style row, batch 47).
     #[inline]
     pub fn offset_from(self, origin: LogicalAddr) -> u64 {
         debug_assert!(origin.0 <= self.0, "offset_from below origin");

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M3-S05 parse-throughput rows (dev-tier; §4.1 budgets):
 //!
 //! - `parse/{shape}`: GB/s per corpus shape — the budget rows are
@@ -14,17 +19,92 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use inf_doc::JsonParser;
+use inf_doc::{DocValue, JsonParser, TapeDoc, serialize_canonical_into};
 
 #[allow(dead_code, unused_imports)] // shared generator also contains its CLI and witness tests
 #[path = "../../../bins/inf-bench/src/doc_corpus.rs"]
 mod doc_corpus;
+
+fn verify_document(case: &str, bytes: &[u8], expected: &serde_json::Value) {
+    let doc = TapeDoc::from_bytes(bytes).expect("benchmark parse produced valid tape");
+    let mut text = Vec::new();
+    serialize_canonical_into(DocValue::from(doc.root()), &mut text);
+    let mut actual: serde_json::Value = serde_json::from_slice(&text).expect("serialized JSON");
+    if std::env::var("INF_BENCH_JSON_PARSE_CANARY").as_deref() == Ok(case) {
+        actual = serde_json::Value::Null;
+    }
+    assert_eq!(&actual, expected, "{case} document answers");
+}
+
+/// The generated fixtures are valid JSON; this lexer is independent of
+/// the scanner's bit masks and includes opening and closing string quotes.
+fn expected_structurals(text: &[u8]) -> Vec<u32> {
+    let mut offsets = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if text[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        offsets.push(u32::try_from(at).expect("fixture offset fits u32"));
+        match text[at] {
+            b'"' => {
+                at += 1;
+                while text[at] != b'"' {
+                    at += if text[at] == b'\\' { 2 } else { 1 };
+                }
+                offsets.push(u32::try_from(at).expect("fixture offset fits u32"));
+                at += 1;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => at += 1,
+            _ => {
+                at += 1;
+                while at < text.len()
+                    && !text[at].is_ascii_whitespace()
+                    && !matches!(text[at], b'{' | b'}' | b'[' | b']' | b':' | b',')
+                {
+                    at += 1;
+                }
+            }
+        }
+    }
+    offsets
+}
+
+fn verify_scan(case: &str, text: &[u8], scan: fn(&[u8], &mut Vec<u32>) -> usize) {
+    let expected = expected_structurals(text);
+    let mut actual = Vec::new();
+    let count = scan(text, &mut actual);
+    actual.truncate(count);
+    if std::env::var("INF_BENCH_JSON_PARSE_CANARY").as_deref() == Ok(case) {
+        let _ = actual.pop();
+    }
+    assert_eq!(actual, expected, "{case} structural offsets");
+}
+
+fn verify_corpus(corpus: &[(&str, String)]) {
+    let mut parser = JsonParser::new();
+    let mut out = Vec::new();
+    for (name, text) in corpus {
+        let expected: serde_json::Value = serde_json::from_str(text).expect("reference JSON");
+        let bytes = parser.parse(text.as_bytes()).expect("fixture parses");
+        verify_document(&format!("parse/{name}"), &bytes, &expected);
+        parser.parse_into(text.as_bytes(), &mut out).expect("fixture parses into");
+        verify_document(&format!("parse_into/{name}"), &out, &expected);
+        let bytes = parser.parse_scalar_stage1(text.as_bytes()).expect("scalar fixture parses");
+        verify_document(&format!("parse_scalar_stage1/{name}"), &bytes, &expected);
+    }
+    let medium = &corpus.iter().find(|(name, _)| *name == "medium-2KiB").expect("medium").1;
+    verify_scan("scan/simd", medium.as_bytes(), inf_simd::json_scan_structurals);
+    verify_scan("scan/scalar", medium.as_bytes(), inf_simd::scalar_json_scan_structurals);
+}
 
 fn bench_parse(c: &mut Criterion) {
     let corpus: Vec<(&str, String)> = doc_corpus::generate(doc_corpus::CANONICAL_SEED)
         .into_iter()
         .map(|doc| (doc.name, doc.json))
         .collect();
+    verify_corpus(&corpus);
 
     let mut parser = JsonParser::new();
 

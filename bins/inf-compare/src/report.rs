@@ -4,31 +4,48 @@
 
 use std::fmt::Write;
 
+mod summary;
+
+use crate::engine::Durability;
 use crate::env::Env;
 use crate::memtier;
 use crate::redisbench;
 
 /// One engine's published launch config + peak memory.
 pub struct EngineConfig {
+    pub artifact: String,
     pub label: &'static str,
     pub version: String,
     pub mode: &'static str,
+    pub durability: Option<Durability>,
     pub launch_cmd: String,
     pub peak_rss_mib: Option<f64>,
 }
 
 /// One measured (engine × workload × pipeline) cell — either or both generators.
 pub struct Cell {
+    pub replicate: u16,
+    pub ordinal: u32,
     pub engine: &'static str,
     pub workload: &'static str,
     pub pipeline: u32,
     pub memtier: Option<memtier::Metrics>,
     pub redisbench: Option<redisbench::Metrics>,
     pub rss_mib: Option<f64>,
+    /// M4.5-S40 disclosures: the server's CPU across the memtier row
+    /// (% of one core; host launches only) and the block device's bytes
+    /// written during it (`--device-stat`).
+    pub server_cpu_pct: Option<f64>,
+    pub device_mib_written: Option<f64>,
+    /// Selected before/after persistence facts; complete raw INFO snapshots
+    /// are stored beside the generator output.
+    pub persistence_delta: Option<String>,
 }
 
 /// One bytes/key attribution row.
 pub struct MemCell {
+    pub replicate: u16,
+    pub ordinal: u32,
     pub engine: &'static str,
     pub keys: u64,
     pub value_size: usize,
@@ -39,6 +56,8 @@ pub struct MemCell {
 
 /// Run-level parameters echoed into the header.
 pub struct Params {
+    pub placement: Option<crate::affinity::Placement>,
+    pub replicates: u16,
     pub stamp_secs: u64,
     pub mode: String,
     pub generators: String,
@@ -52,6 +71,11 @@ pub struct Params {
     pub rb_requests: u64,
     pub crosscheck_pct: f64,
     pub maxmemory_mb: Option<u64>,
+    /// M4.5-S40: the offered rate (`None` = closed loop).
+    pub rate: Option<u64>,
+    pub data_root: Option<String>,
+    pub device_stat: Option<String>,
+    pub redis_no_auto_rewrite: bool,
 }
 
 pub fn render(
@@ -68,6 +92,7 @@ pub fn render(
     // ---- banner ----
     let _ = writeln!(md, "# inf-compare — competitive benchmark report\n");
     let _ = writeln!(md, "> **Tier:** {}", env.tier);
+    let _ = writeln!(md, "> **CPU placement:** {}", crate::affinity::description(p.placement));
     if !env.reasons.is_empty() {
         let _ = writeln!(md, ">");
         for reason in &env.reasons {
@@ -87,6 +112,7 @@ pub fn render(
     if let Some(detail) = &env.envcheck {
         let _ = writeln!(md, "| inf-bench env-check | {detail} |");
     }
+    let _ = writeln!(md, "| Replicates | {} |", p.replicates);
     let _ = writeln!(md, "| Mode | {} |", p.mode);
     let _ = writeln!(md, "| Generators | {} |", p.generators);
     let _ = writeln!(md, "| memtier | `{}` |", env.memtier_version);
@@ -95,50 +121,105 @@ pub fn render(
     }
     let _ = writeln!(
         md,
-        "| Parameters | duration={}s · threads={} · clients={} · value={} B · keyspace={} · pipeline={} · maxmemory={} |",
+        "| Parameters | duration={}s · threads={} · clients={} · value={} B · keyspace={} · \
+             pipeline={} · maxmemory={} |",
         p.duration, p.threads, p.clients, p.data_size, p.keyspace, pipelines, maxmem
+    );
+    let _ = writeln!(
+        md,
+        "| Load shape | {}{}{} |",
+        p.rate.map_or("closed loop".to_string(), |r| format!(
+            "offered {r} ops/s (memtier --rate-limiting {} per connection × {} connections)",
+            r.div_ceil((u64::from(p.threads) * p.clients as u64).max(1)),
+            u64::from(p.threads) * p.clients as u64
+        )),
+        p.data_root.as_deref().map_or(String::new(), |d| format!(" · data root `{d}`")),
+        p.device_stat.as_deref().map_or(String::new(), |d| format!(" · device `{d}`"))
     );
     let _ = writeln!(md);
 
     // ---- published configs ----
     let _ = writeln!(md, "## Engines — published configs\n");
-    let _ = writeln!(md, "| Engine | Mode | Version | Peak RSS (MiB) | Launch command |");
-    let _ = writeln!(md, "|---|---|---|---:|---|");
+    let _ = writeln!(
+        md,
+        "| Engine | Mode | Version | Durability | Peak RSS (MiB) | Launch command | Leg artifact |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---:|---|---|");
     for e in engines {
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} | `{}` |",
+            "| {} | {} | {} | {} | {} | `{}` | `{}` |",
             e.label,
             e.mode,
             e.version,
+            e.durability.map_or("unverified (attached)", Durability::label),
             fmt_opt(e.peak_rss_mib, 1),
-            e.launch_cmd
+            e.launch_cmd,
+            e.artifact
         );
     }
     let _ = writeln!(md);
 
+    summary::render(&mut md, cells, mem);
+
     // ---- memtier results ----
     if cells.iter().any(|c| c.memtier.is_some()) {
-        let _ = writeln!(md, "## Results — memtier_benchmark\n");
+        let _ = writeln!(md, "## Individual samples — memtier_benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (ops/s) | avg (ms) | p50 (ms) | p99 (ms) | p99.9 (ms) | RSS (MiB) |"
+            "| Engine | Workload | Pipe | Replicate | Leg | Throughput (ops/s) | \
+                 achieved/offered | avg (ms) | \
+                 p50 \
+                 (ms) | p99 (ms) | p99.9 (ms) | max (ms) | server CPU (%) | device MiB written | \
+                 RSS (MiB) |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|");
+        let _ = writeln!(
+            md,
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        );
         for c in cells {
             let Some(m) = c.memtier else { continue };
+            let achieved = m.offered_ops_per_sec.map(|offered| {
+                let x = m.ops_per_sec / offered.max(1) as f64;
+                if x < 0.9 { format!("{x:.2} ⚠ generator short") } else { format!("{x:.2}") }
+            });
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} | {:.3} | {} |",
+                "| {} | {} | {} | {} | {} | {:.0} | {} | {:.3} | {:.3} | {:.3} | \
+                 {:.3} | {} | {} | {} | {} |",
                 c.engine,
                 c.workload,
                 c.pipeline,
+                c.replicate,
+                c.ordinal,
                 m.ops_per_sec,
+                achieved.unwrap_or_else(|| "closed loop".to_string()),
                 m.avg_ms,
                 m.p50_ms,
                 m.p99_ms,
                 m.p999_ms,
+                fmt_opt(m.max_ms, 3),
+                fmt_opt(c.server_cpu_pct, 0),
+                fmt_opt(c.device_mib_written, 1),
                 fmt_opt(c.rss_mib, 1)
+            );
+        }
+        let _ = writeln!(md);
+
+        let _ = writeln!(md, "### Persistence and stall deltas\n");
+        let _ =
+            writeln!(md, "| Engine | Workload | Pipe | Replicate | Leg | Before/after summary |");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---|");
+        for c in cells.iter().filter(|c| c.memtier.is_some()) {
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.replicate,
+                c.ordinal,
+                c.persistence_delta.as_deref().unwrap_or("n/a")
             );
         }
         let _ = writeln!(md);
@@ -146,18 +227,27 @@ pub fn render(
 
     // ---- redis-benchmark results ----
     if cells.iter().any(|c| c.redisbench.is_some()) {
-        let _ = writeln!(md, "## Results — redis-benchmark\n");
+        let _ = writeln!(md, "## Individual samples — redis-benchmark\n");
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | Throughput (req/s) | avg (ms) | p50 (ms) | p99 (ms) |"
+            "| Engine | Workload | Pipe | Replicate | Leg | Throughput (req/s) | \
+                 avg (ms) | p50 (ms) | p99 (ms) |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|---:|");
         for c in cells {
             let Some(r) = c.redisbench else { continue };
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} |",
-                c.engine, c.workload, c.pipeline, r.rps, r.avg_ms, r.p50_ms, r.p99_ms
+                "| {} | {} | {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.replicate,
+                c.ordinal,
+                r.rps,
+                r.avg_ms,
+                r.p50_ms,
+                r.p99_ms
             );
         }
         let _ = writeln!(md);
@@ -168,22 +258,32 @@ pub fn render(
         let _ = writeln!(md, "## Cross-check — memtier vs redis-benchmark throughput\n");
         let _ = writeln!(
             md,
-            "Independent-generator agreement on the same engine/workload. Flagged when the two disagree by more than {:.0}%.\n",
+            "Independent-generator agreement on the same engine/workload. Flagged when the two \
+                 disagree by more than {:.0}%.\n",
             p.crosscheck_pct
         );
         let _ = writeln!(
             md,
-            "| Engine | Workload | Pipe | memtier (ops/s) | redis-bench (req/s) | Δ | |"
+            "| Engine | Workload | Pipe | Replicate | Leg | memtier (ops/s) | \
+                 redis-bench (req/s) | Δ | |"
         );
-        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|:--|");
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|:--|");
         for c in cells {
             let (Some(m), Some(r)) = (c.memtier, c.redisbench) else { continue };
             let delta = if r.rps > 0.0 { (m.ops_per_sec - r.rps) / r.rps * 100.0 } else { 0.0 };
             let flag = if delta.abs() > p.crosscheck_pct { "⚠ diverges" } else { "ok" };
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {:.0} | {:.0} | {:+.1}% | {} |",
-                c.engine, c.workload, c.pipeline, m.ops_per_sec, r.rps, delta, flag
+                "| {} | {} | {} | {} | {} | {:.0} | {:.0} | {:+.1}% | {} |",
+                c.engine,
+                c.workload,
+                c.pipeline,
+                c.replicate,
+                c.ordinal,
+                m.ops_per_sec,
+                r.rps,
+                delta,
+                flag
             );
         }
         let _ = writeln!(md);
@@ -194,18 +294,22 @@ pub fn render(
         let _ = writeln!(md, "## Memory attribution — bytes/key\n");
         let _ = writeln!(
             md,
-            "Fill the keyspace, then `(RSS_after − RSS_baseline) ÷ DBSIZE`. The L5 gate shape; the binding ≤ 1.0× Redis gate is `inf-bench gate-run m1` on the reference box.\n"
+            "Fill the keyspace, then `(RSS_after − RSS_baseline) ÷ DBSIZE`. The L5 gate shape; the \
+                 binding ≤ 1.0× Redis gate is `inf-bench gate-run m1` on the reference box.\n"
         );
         let _ = writeln!(
             md,
-            "| Engine | Keys | Value (B) | RSS baseline (MiB) | RSS after (MiB) | bytes/key |"
+            "| Engine | Replicate | Leg | Keys | Value (B) | RSS baseline (MiB) | \
+                 RSS after (MiB) | bytes/key |"
         );
-        let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|");
+        let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---:|");
         for m in mem {
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
                 m.engine,
+                m.replicate,
+                m.ordinal,
                 m.keys,
                 m.value_size,
                 fmt_opt(m.baseline_mib, 1),
@@ -221,37 +325,88 @@ pub fn render(
     if !env.binding {
         let _ = writeln!(
             md,
-            "- **Non-citable run.** DEV-TIER numbers prove the harness and show relative shape only. A binding number needs `--reference-box` on a clean box (the M0-R2 standing obligation). Authoritative gate: `inf-bench env-check`."
+            "- **Non-citable run.** DEV-TIER numbers prove the harness and show relative shape \
+                 only. A binding number needs `--reference-box` on a clean box (the M0-R2 standing \
+                 obligation). Authoritative gate: `inf-bench env-check`."
         );
     }
     let _ = writeln!(
         md,
-        "- redis is single-threaded; dragonfly and infinitydb ran with {} threads/cells. Each engine kept its own best config (recorded above), per master plan §22.",
-        p.threads
+        "- {}. Logical CPU affinity does not establish physical-core/SMT isolation or \
+             load-generator capacity; those need separate reference-run evidence.",
+        crate::affinity::description(p.placement)
     );
     let _ = writeln!(
         md,
-        "- GET rows were measured after a {}s sequential populate; redis-benchmark uses its own key format, so its GET cross-check reads against keys memtier didn't write (throughput-comparable, hit rate not).",
+        "- GET rows were measured after a {}s sequential populate; redis-benchmark uses its own \
+             key format, so its GET cross-check reads against keys memtier didn't write \
+             (throughput-comparable, hit rate not).",
         p.fill_secs
     );
     let _ = writeln!(
         md,
-        "- redis-benchmark is request-count based (`-n {}`) and reports only p50/p95/p99; p99.9 always comes from memtier. The two are compared on throughput, not latency.",
+        "- redis-benchmark is request-count based (`-n {}`) and reports only p50/p95/p99; p99.9 \
+             always comes from memtier. The two are compared on throughput, not latency.",
         p.rb_requests
     );
     let _ = writeln!(
         md,
-        "- Pub/sub fan-out latency is **not** measured here — memtier/redis-benchmark don't set up subscribers. That row lives in `inf-bench gate-run m1` (delivery-acked)."
+        "- Pub/sub fan-out latency is **not** measured here — memtier/redis-benchmark don't set up \
+             subscribers. That row lives in `inf-bench gate-run m1` (delivery-acked)."
     );
     if p.mode.contains("docker") {
         let _ = writeln!(
             md,
-            "- Under docker, RSS is the container's `docker stats` memory (no separate peak); infinitydb runs with the io_uring seccomp profile because Docker's default seccomp denies io_uring."
+            "- Under docker, RSS is the container's `docker stats` memory (no separate peak); \
+                 infinitydb runs with the io_uring seccomp profile because Docker's default \
+                 seccomp denies io_uring."
         );
+    }
+    if p.rate.is_some() {
+        let _ = writeln!(
+            md,
+            "- **Offered-rate row (M4.5-S40).** memtier paces each connection at \
+                 `--rate-limiting` = rate ÷ connections; `achieved/offered` below 0.90 means the \
+                 generator (or the server) could not hold the rate and the latency columns are not \
+                 an offered-rate measurement. `max (ms)` is memtier's worst request; server CPU \
+                 covers the host process plus Redis's completed AOF-child CPU and live \
+                 descendants; device MiB written is the block device's sectors-written delta \
+                 (journal and metadata included, NAND amplification not). Raw INFO before/after \
+                 each row is under `raw/`."
+        );
+    }
+    if p.redis_no_auto_rewrite {
+        let _ = writeln!(
+            md,
+            "- **Non-production diagnostic arm.** Redis ran `auto-aof-rewrite-percentage 0`; this \
+                 isolates automatic rewrite cost and cannot support a production/default-config \
+                 comparison."
+        );
+    }
+    for e in engines.iter().filter(|e| e.durability == Some(Durability::Everysec)) {
+        let mechanism = match e.label {
+            "redis" => "AOF with `--appendonly yes --appendfsync everysec`",
+            "infinitydb" => {
+                "an `FSYNC everysec` namespace via `--conn-default-ns cmp`, \
+                verified with a probe key before the row"
+            }
+            _ => "see published launch configuration",
+        };
+        let _ = writeln!(md, "- **{} durability:** {mechanism}.", e.label);
     }
     let _ =
         writeln!(md, "- Raw memtier JSON + redis-benchmark CSV for every row are under `raw/`.");
 
+    let _ = writeln!(
+        md,
+        "- Schedule: workload/pipeline, then replicate, then rotated engine order. \
+         `schedule.tsv` records each attempted/skipped leg. Raw/log subdirectories name the leg."
+    );
+    let _ = writeln!(
+        md,
+        "- Launched engines restart per leg; durable directories are fresh. Attached engines \
+         receive FLUSHALL/preload but retain process and cache state."
+    );
     md
 }
 
@@ -261,3 +416,6 @@ fn fmt_opt(value: Option<f64>, places: usize) -> String {
         None => "n/a".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests;

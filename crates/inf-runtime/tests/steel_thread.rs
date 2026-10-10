@@ -1,3 +1,11 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! M4-S04 steel thread: the smallest honest end-to-end vertical of the
 //! riskiest path — write → seal → flush (tier file, fdatasync) → demote
 //! (pages released) → **cold read through executor suspension** (real
@@ -19,6 +27,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBox, AlignedBufId, AlignedPool, BufferPool};
+use inf_foundation::FileOffset;
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
     TIER_FRAME_BYTES, TIER_FRAME_DATA, TierIoMode, TierWriter, tier_extract, tier_frame_offset,
@@ -28,6 +37,7 @@ use inf_runtime::{
     BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
     PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -116,14 +126,14 @@ fn plan_first_window(
             let frame_count = window_frames.min(ctx.tier_frames - first_frame) as usize;
             let buf = ctx.pool.try_lease().expect("steel-thread pool is sized");
             let token = ctx.mint_token();
-            let dest = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
+            let target = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
             // SAFETY: the pool buffer's address is stable for the pool's
             // lifetime and the lease is held (untouched) until this op's
             // terminal completion resumes us.
-            let stable = unsafe { StableBytesMut::new(dest) };
+            let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd: ctx.tier_fd,
-                offset: tier_frame_offset(first_frame),
+                offset: FileOffset::new(tier_frame_offset(first_frame)).expect("addressable"),
                 buf: stable,
                 token,
             });
@@ -188,7 +198,7 @@ fn resume_first_window(
             let stable = unsafe { StableBytesMut::new(boxed.bytes_mut()) };
             ctx.driver.push(IoOp::TierRead {
                 fd: ctx.tier_fd,
-                offset: tier_frame_offset(first),
+                offset: FileOffset::new(tier_frame_offset(first)).expect("addressable"),
                 buf: stable,
                 token,
             });
@@ -237,7 +247,7 @@ fn resume_oversized(
 /// The steel-thread GET (the L6 shape): RAM answers synchronously; cold
 /// candidates fetch-verify-retry through real suspension.
 async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = KeyHasher::default().hash(&key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     loop {
         let (plan, waiter) = match plan_first_window(&ctx, &key, hash, &exclude) {
@@ -368,7 +378,7 @@ fn build_demoted_corpus(
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (i, key) in corpus.small_keys.iter().enumerate() {
             let value = vec![b'a' + (i % 23) as u8; 40 + i * 7];
-            let addr = table.insert(key, &value, TieredTable::hash_key(key)).expect("fits");
+            let addr = table.insert(key, &value, KeyHasher::default().hash(key)).expect("fits");
             log.push((addr, table.record(addr).encoded_len));
             corpus.values.insert(key.clone(), value);
         }
@@ -376,7 +386,7 @@ fn build_demoted_corpus(
         // the exact second read.
         let big_value = vec![0xB6u8; 100 * 1024];
         let addr = table
-            .insert(&corpus.big_key, &big_value, TieredTable::hash_key(&corpus.big_key))
+            .insert(&corpus.big_key, &big_value, KeyHasher::default().hash(&corpus.big_key))
             .expect("fits");
         log.push((addr, table.record(addr).encoded_len));
         corpus.values.insert(corpus.big_key.clone(), big_value);
@@ -449,7 +459,7 @@ fn steel_thread_write_flush_demote_cold_read() {
     {
         let ctx = &mut *ctx.borrow_mut();
         let table = ctx.table();
-        let hash = TieredTable::hash_key(&hot_key);
+        let hash = KeyHasher::default().hash(&hot_key);
         let TieredLookup::Cold(old) = table.lookup(&hot_key, hash, &[]) else {
             panic!("expected the demoted record to be cold")
         };
@@ -483,7 +493,8 @@ fn steel_thread_write_flush_demote_cold_read() {
 
 /// Cold-read latency histogram (informational, risk-gate input — L10:
 /// never quotable as a claim). Run explicitly:
-/// `INF_STEEL_DIR=<dir-on-nvme> cargo test -p inf-runtime --features uring --release -- --ignored cold_read_histogram --nocapture`
+/// `INF_STEEL_DIR=<dir-on-nvme> cargo test -p inf-runtime --features uring --release -- --ignored
+/// cold_read_histogram --nocapture`
 /// `INF_STEEL_DIR` must sit on the device under test (temp_dir is often
 /// tmpfs — a RAM histogram would be a lie); page cache is dropped per
 /// read via `posix_fadvise(DONTNEED)` so the number reflects the device.

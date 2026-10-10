@@ -62,6 +62,21 @@ policies = ["always", "everysec"]
 workloads = ["rotation_heavy"]
 expect = "clean"
 
+# Review of 2026-08-30 (F-L02-01, ADR-0090 A14): the pooled file's open
+# fails at reuse. The runner's rotor is `Buffered` and never truncates,
+# so it cannot pool; the row is carried by the rotor tests
+# (`inf-log/tests/segment_recycle.rs`, `segment_prealloc_wait.rs`) and by
+# the `m2-recycle` DST scenario (armed on one seed class in eight).
+#   fresh-fallback — the generation preallocates fresh, counted as a
+#                    fallback; the pooled file keeps its below-floor name;
+#                    the rotor keeps preallocating (no `AlreadyExists`
+#                    loop, no fail-stop); a fed wait still ends once.
+[[row]]
+point = "recycle_open_fail"
+tier = "node"
+test = "inf-log::segment_recycle::a_failed_open_of_the_pooled_file_falls_back_and_never_wedges_the_rotor"
+expect = "fresh-fallback"
+
 # dir-fsync barrier at the MANIFEST envelope swap (publication site).
 [[row]]
 point = "dir_fsync_fail"
@@ -83,5 +98,159 @@ expect = "unit-resolves"
 [[row]]
 point = "durable_fsync_eio"
 tier = "node"
-test = "fsyncgate"
+platform = "linux"
+test = "crash-matrix::fsyncgate::fsyncgate_fail_stop"
 expect = "fail-stop"
+# M4.5-S37 (ADR-0093 D4.3/A3/A8): a shadow twin's cold read fails while
+# a ticket is open. Carried by `tests/shadow_open_tickets.rs` (the
+# whole-node `m4-tiered` scenario in-process, phase 6d: the point is
+# armed around one `DBSIZE` drain).
+#   dbsize-typed-error  — DBSIZE answers `-ERR DBSIZE: shadow twin at …
+#                         unreadable`, relayed through the namespace
+#                         scatter, never an inexact count; the ticket
+#                         stays open and the next drain reads it exactly
+[[row]]
+point = "shadow_twin_read_fail"
+tier = "node"
+test = "crash-matrix::shadow_open_tickets::open_ticket_rows_hold_every_plane_path_with_tickets_open"
+expect = "dbsize-typed-error"
+# Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): the
+# reconciler's twin reads fail while `DBSIZE`'s and `DEL`'s succeed, so a
+# **rebuilt** ticket set stays open on a real node. Carried by
+# `inf-server/tests/node_e2e.rs` (`del_of_a_rebuilt_winner_carrying_two_
+# tickets_drains_every_ticket`) and the `m4-tiered` phase 7c rows.
+#   del-drains-every-ticket — DEL of a winner carrying two rebuilt
+#                             tickets answers `:1`, both twins verified
+#                             (collision keys stay, a same-key twin dies
+#                             through its own marker), never the cell's
+#                             release assert
+[[row]]
+point = "shadow_reconcile_read_fail"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket"
+expect = "del-drains-every-ticket"
+# Review of 2026-08-30 (C2′ / F-L06-02, F-L06-04): the ColdReads enqueue
+# refuses QueueFull — the deterministic stand-in for a saturated cold
+# queue. Carried by `inf-server/tests/node_e2e.rs`
+# (`tiered_cold_read_failure_is_typed_for_every_read_command`, armed on
+# the cell thread at boot).
+#   read-typed-error  — GET/MGET/EXISTS/TOUCH answer the typed BUSY,
+#                       never nil / :0 (unreadability is not absence);
+#                       a SCAN page fails whole (the client retries its
+#                       cursor), never a silently shorter page; absent
+#                       keys keep their miss shapes (a miss never
+#                       reaches the queue); `tiering_cold_read_errors`
+#                       counts every refusal served.
+[[row]]
+point = "cold_enqueue_full"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_cold_read_failure_is_typed_for_every_read_command"
+expect = "read-typed-error"
+# ADR-0167 D3: the ColdReads enqueue refuses a position the kernel cannot
+# address (the point plants `i64::MAX + 1` right before it in `probe` and
+# `plan_key_fetch`). Carried by `inf-server/tests/node_e2e.rs`, one carrier
+# per read path, armed on the cell thread at boot.
+#   read-permanent-cold-io — a cold GET, and a SCAN page over cold keys,
+#                            answer the cold I/O error once, never BUSY
+#                            (the refusal is permanent); the refused read
+#                            changes no cold-read state (`cold_queue_depth`
+#                            and `cold_reads_inflight` 0;
+#                            `cold_reads_enqueued` and `cold_queue_full`
+#                            unchanged); `tiering_cold_read_errors` counts
+#                            every refusal served.
+[[row]]
+point = "cold_enqueue_unaddressable"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_unaddressable_get_replies_cold_io"
+expect = "read-permanent-cold-io"
+[[row]]
+point = "cold_enqueue_unaddressable"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::tiered_unaddressable_scan_replies_cold_io"
+expect = "read-permanent-cold-io"
+# Review of 2026-08-30 (H2 / F-L17-11, ADR-0098): a multi-key write
+# applies a prefix and then fails mid-way (the deterministic stand-in
+# for arena OOM — bounds are pre-validated since ADR-0098, so the
+# fault point is the only remaining partial-application trigger).
+# Carried by `inf-server/tests/node_e2e.rs`
+# (`durable_mset_midway_failure_stages_what_it_wrote` — the local pump
+# gate — and `durable_mset_midway_failure_stages_on_the_fabric_path` —
+# the `ApplyNs` owner gate; armed on the cell threads at boot).
+#   staged-prefix — the pairs the loop applied are durably staged
+#                   despite the error reply; recovery replays exactly
+#                   the live store, never a silent rollback of a
+#                   read-visible key; unapplied pairs stay absent.
+[[row]]
+point = "mset_midway_oom"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::durable_mset_midway_failure_stages_what_it_wrote"
+expect = "staged-prefix"
+# Review of 2026-08-30 (C13 / F-L14-04, ADR-0100): `INF.NS DROP` of a
+# tiered namespace — a power cut on either side of the catalog swap.
+# Each point stops the DDL program at one instant with the on-disk state
+# of a cut there, and the carrying tests restart the node on it. Carried
+# by `inf-server/tests/node_e2e.rs`
+# (`dropped_tiered_namespace_survives_a_cut_before_its_swap` /
+# `…_after_its_swap`; armed on the cell threads at boot).
+#   namespace-restored-whole — the cut fell after the local apply and
+#                         before the persist request: nothing durable had
+#                         changed, the teardown hold (ADR-0100 D5) kept
+#                         every tier file, and the restart serves the
+#                         namespace with its data. No row cuts later in
+#                         the wait, where a checkpoint of the origin cell
+#                         omits the namespace (ADR-0186 D2)
+#   residue-swept       — the cut followed the swap: META lacks the
+#                         namespace and carries its tombstone, each peer's
+#                         MANIFEST still names it, and the restart
+#                         boots (never the pre-ADR fail-stop), sweeps
+#                         `ns-N/cold`, and the namespace is gone
+[[row]]
+point = "ns_drop_before_meta"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::dropped_tiered_namespace_survives_a_cut_before_its_swap"
+expect = "namespace-restored-whole"
+
+[[row]]
+point = "ns_drop_after_meta"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::dropped_tiered_namespace_survives_a_cut_after_its_swap"
+expect = "residue-swept"
+
+# ADR-0103 D5 (`created_namespace_survives_a_cut_after_its_swap`): the
+# CREATE DDL stops once the catalog swap is durable and before the local
+# apply/fan — META names a namespace no cell serves and nothing was
+# acked.
+#   namespace-seeded-from-meta — the restart seeds the namespace from
+#                         META and serves it on every cell; an un-acked
+#                         DDL that took effect (ack-after-durable)
+[[row]]
+point = "ns_create_after_meta"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::created_namespace_survives_a_cut_after_its_swap"
+expect = "namespace-seeded-from-meta"
+# ADR-0108 D3 (review 2026-08-30, the batch-8 partial-fan residual): a
+# peer refuses its CREATE leg after the catalog swap — the origin rolls
+# the namespace back (local drop, drop persist and swap, then the DROP
+# fan), answers the leg's error, and no cell serves it before or after a
+# restart.
+[[row]]
+point = "ns_create_fan_refused"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::create_with_a_refused_fan_leg_rolls_back_on_every_cell"
+expect = "create-rolled-back"
+
+[[row]]
+point = "mset_midway_oom"
+tier = "node"
+platform = "linux"
+test = "inf-server::node_e2e::durable_mset_midway_failure_stages_on_the_fabric_path"
+expect = "staged-prefix"

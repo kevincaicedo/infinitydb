@@ -6,117 +6,21 @@
 //! offset (§8.4). Scan mechanics live in `inf-log/tests/tail_scan.rs`;
 //! crash-matrix rows over these paths bind at M2-S17.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use inf_foundation::time::Nanos;
+use inf_foundation::KeyHasher;
+use inf_log::FrameLayout;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, NsId,
-    RecordView, SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing,
-    create_cell_dirs, segment_file_name, write_manifest,
+    FRAME_HEADER_LEN, FrameBuilder, FrameStamp, Lsn, Manifest, MutationEffect, RecordView,
+    SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
-fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 1 << 16, seal_after_ms: None },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        sync_pipeline: 1,
-    }
-}
-
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
-
-/// One flushed frame per call: `SET key value` records at known LSNs.
-struct LogBuilder {
-    fs: MemFs,
-    rotor: SegmentRotor<MemFs>,
-    ring: StagingRing,
-    log_dir: PathBuf,
-}
-
-impl LogBuilder {
-    fn new(fs: &MemFs, cfg: &DurableConfig) -> LogBuilder {
-        let dirs = create_cell_dirs(fs, &cfg.data_dir.join(format!("shard-{CELL}"))).expect("dirs");
-        let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-        LogBuilder { fs: fs.clone(), rotor, ring: StagingRing::new(cfg.staging), log_dir: dirs.log }
-    }
-
-    /// Stage `records` as one frame, flush it, and return the frame's
-    /// (base offset, per-record LSNs). Frames attest like a live `always`
-    /// plane (ADR-0031 D1): each stamps `covered_lsn` = its own base — the
-    /// watermark of a group commit that fsynced every prior frame.
-    fn frame(&mut self, records: &[MutationEffect<'_>]) -> (Lsn, Vec<Lsn>) {
-        let staged: Vec<_> =
-            records.iter().map(|effect| self.ring.stage(effect).expect("stage")).collect();
-        self.rotor.maintain(0).expect("maintain");
-        let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
-        let covered = slot.base().to_u64();
-        let lease = self.ring.seal(slot.first_record_lsn(), covered);
-        let frame = self.ring.leased_frame(&lease).to_vec();
-        self.rotor.commit_frame(slot, &frame).expect("commit");
-        let lsns: Vec<Lsn> = staged.iter().map(|&at| lease.lsn_of(at)).collect();
-        self.ring.release(lease);
-        let first = lsns[0];
-        (Lsn::new(first.segment, first.offset - FRAME_HEADER_LEN as u32), lsns)
-    }
-
-    fn set_frame(&mut self, key: &[u8], value: &[u8]) -> (Lsn, Vec<Lsn>) {
-        self.frame(&[MutationEffect::StringSet { ns: NS, key, value }])
-    }
-
-    fn seg_path(&self, id: SegmentId) -> PathBuf {
-        self.log_dir.join(segment_file_name(id))
-    }
-
-    fn poke(&self, id: SegmentId, offset: u32, bytes: &[u8]) {
-        let mut file = self.fs.open_write(&self.seg_path(id)).expect("open");
-        file.write_at(u64::from(offset), bytes).expect("poke");
-    }
-}
-
-fn recover(
-    fs: &MemFs,
-    ks: &mut Keyspace,
-) -> std::io::Result<(SegmentRotor<MemFs>, inf_server::RecoverStats)> {
-    open_cell_log(fs.clone(), ks, CELL, &cfg(), anchor(), now())
-        .map(|(rotor, stats, _seed)| (rotor, stats))
-}
-
-fn get(ks: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-    ks.ns_store_mut(NS).expect("ns store").get(key, now()).map(<[u8]>::to_vec)
-}
+mod support;
+use support::*;
 
 #[test]
 fn torn_final_frame_recovers_minus_the_torn_frame() {
@@ -201,17 +105,20 @@ fn interior_corruption_refuses_to_start_naming_segment_and_offset() {
     let err = recover(&fs, &mut ks).expect_err("interior corruption is fail-stop");
     let msg = err.to_string();
     assert!(msg.contains("seg-000000"), "names the segment: {msg}");
-    assert!(msg.contains("refusing to start"), "explicit refusal: {msg}");
+    assert!(msg.ends_with("refusing to start"), "explicit refusal: {msg}");
     assert!(msg.contains("validating frame follows"), "names the evidence: {msg}");
 }
 
-#[test]
-fn corruption_in_a_sealed_segment_with_a_data_tail_refuses_to_start() {
-    let fs = MemFs::new();
-    let mut config = cfg();
-    // Small segments force rotation: several sealed segments + a tail.
-    config.segment.segment_bytes = 256;
-    let dirs = create_cell_dirs(&fs, Path::new("data/shard-0")).expect("dirs");
+/// Twenty one-record frames across several 256-byte segments through the
+/// synchronous tier (frames stamp `covered_lsn = 0` — they attest
+/// nothing), then corrupt the `nth` frame of sealed segment 1. Returns
+/// the corrupted frame's base and every frame base in order.
+fn sealed_volume_with_a_corrupt_frame(
+    fs: &MemFs,
+    config: &DurableConfig,
+    nth: usize,
+) -> (Lsn, Vec<Lsn>) {
+    let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
         SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
     let mut ring = StagingRing::new(config.staging);
@@ -227,20 +134,136 @@ fn corruption_in_a_sealed_segment_with_a_data_tail_refuses_to_start() {
         frame_bases.push(Lsn::new(lsn.segment, lsn.offset - FRAME_HEADER_LEN as u32));
         ring.release(lease);
     }
-    let tail = rotor.active_segment();
-    assert!(tail.0 >= 2, "the volume must have rotated");
+    assert!(rotor.active_segment().0 >= 2, "the volume must have rotated");
     drop(rotor);
-    // Corrupt a frame in a sealed (non-tail) segment.
-    let victim = frame_bases.iter().find(|lsn| lsn.segment.0 == 1).expect("segment 1 has a frame");
+    let victim =
+        *frame_bases.iter().filter(|lsn| lsn.segment.0 == 1).nth(nth).expect("segment 1 frame");
     let mut file = fs.open_write(&dirs.log.join(segment_file_name(victim.segment))).expect("open");
     file.write_at(u64::from(victim.offset + FRAME_HEADER_LEN as u32), &[0x55]).expect("poke");
+    (victim, frame_bases)
+}
+
+#[test]
+fn unattested_hole_in_a_sealed_segment_truncates_and_discards_later_segments() {
+    // ADR-0087 D6 (amends ADR-0031 D4): a validating frame beyond a hole
+    // in a *sealed* segment is judged by the same stamp evidence as one
+    // in the resume region. A hole exists only if the barrier covering
+    // it never completed, so nothing at or past it was ever acked; with
+    // no later frame attesting coverage past the hole, boot truncates
+    // there, discards every later segment unreplayed, and resumes — the
+    // availability refusal ADR-0086 recorded is gone.
+    let fs = MemFs::new();
+    let mut config = cfg();
+    config.segment.segment_bytes = 256;
+    let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 1);
+    assert!(victim.offset > 0, "a mid-segment hole: the segment keeps its own prefix");
 
     let mut ks = fresh_keyspace();
-    // Recovery with the same config the log was built with.
+    let (rotor, stats, _) = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
+        .expect("an un-attested hole in sealed slack truncates");
+    let hole_index = frame_bases.iter().position(|b| *b == victim).expect("victim indexed");
+    for (i, _) in frame_bases.iter().enumerate() {
+        let key = format!("k:{i}");
+        let present = get(&mut ks, key.as_bytes()).is_some();
+        assert_eq!(present, i < hole_index, "record {i}: prefix replays, hole and after do not");
+    }
+    assert_eq!(stats.torn_truncated_at, Some(victim), "the tail pointer stops at the hole");
+    assert!(stats.beyond_frames_discarded >= 1, "later frames counted, never silent");
+    assert!(stats.torn_segments_removed >= 1, "every later segment removed");
+    assert_eq!(rotor.active_segment(), victim.segment, "appends resume in the hole's segment");
+    assert_eq!(rotor.append_cursor(), victim, "at the hole");
+
+    // Second boot reaches the same verdict on the same bytes (the tail
+    // pointer moved; the remnant frames beyond it are never rewritten —
+    // the `resume_over_remnants` rule) and the same prefix.
+    let mut ks2 = fresh_keyspace();
+    let (_, stats2, _) =
+        open_cell_log(fs.clone(), &mut ks2, CELL, &config, anchor(), now()).expect("idempotent");
+    assert_eq!(stats2.torn_truncated_at, Some(victim));
+    // Only the hole segment's own remnants remain to be discarded.
+    let remnants_in_hole_segment = frame_bases
+        .iter()
+        .filter(|b| b.segment == victim.segment && b.offset > victim.offset)
+        .count() as u64;
+    assert_eq!(stats2.beyond_frames_discarded, remnants_in_hole_segment);
+    assert!(
+        stats.beyond_frames_discarded > remnants_in_hole_segment,
+        "first boot saw later segments"
+    );
+    assert_eq!(stats2.torn_segments_removed, 0, "later segments are already gone");
+    assert_eq!(get(&mut ks2, b"k:0").as_deref(), Some(&b"vvvvvvvv"[..]));
+}
+
+#[test]
+fn unattested_hole_at_a_sealed_segments_first_frame_resumes_in_the_previous_segment() {
+    // ADR-0087 D6: a hole at offset 0 keeps nothing of its own — the
+    // previous data-bearing segment's end is the resume point and the
+    // hole's segment is removed like any trailing one (the pristine
+    // prealloc invariant, as for a torn tail).
+    let fs = MemFs::new();
+    let mut config = cfg();
+    config.segment.segment_bytes = 256;
+    let (victim, frame_bases) = sealed_volume_with_a_corrupt_frame(&fs, &config, 0);
+    assert_eq!(victim.offset, 0);
+    let previous_end = data_end_of(
+        &fs,
+        &config,
+        frame_bases[..].iter().rev().find(|b| b.segment.0 == 0).expect("segment 0 frame"),
+    );
+
+    let mut ks = fresh_keyspace();
+    let (rotor, stats, _) = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
+        .expect("truncates into the previous segment");
+    assert_eq!(stats.torn_truncated_at, Some(previous_end));
+    assert_eq!(rotor.active_segment(), SegmentId(0));
+    assert_eq!(rotor.append_cursor(), previous_end);
+    let hole_index = frame_bases.iter().position(|b| *b == victim).expect("victim indexed");
+    for i in 0..frame_bases.len() {
+        let key = format!("k:{i}");
+        assert_eq!(get(&mut ks, key.as_bytes()).is_some(), i < hole_index, "record {i}");
+    }
+}
+
+/// Exclusive end of the frame at `base` (its length field).
+fn data_end_of(fs: &MemFs, config: &DurableConfig, base: &Lsn) -> Lsn {
+    let path = config
+        .data_dir
+        .join(format!("shard-{CELL}"))
+        .join("log")
+        .join(segment_file_name(base.segment));
+    let seg = fs.contents(&path).expect("segment bytes");
+    let at = base.offset as usize;
+    let frame_len = u32::from_le_bytes(seg[at + 4..at + 8].try_into().unwrap());
+    Lsn::new(base.segment, base.offset + frame_len)
+}
+
+#[test]
+fn attested_hole_in_a_sealed_segment_refuses_to_start() {
+    // The other verdict of ADR-0087 D6: frames sealed by a live plane
+    // stamp the watermark (`LogBuilder` attests its own base), so a frame
+    // in a later segment attests coverage past the corrupted one — the
+    // device lost covered data, and boot refuses naming segment 1.
+    let fs = MemFs::new();
+    let mut config = cfg();
+    config.segment.segment_bytes = 256;
+    let mut log = LogBuilder::new(&fs, &config);
+    let mut bases = Vec::new();
+    for i in 0..20u32 {
+        let key = format!("k:{i}");
+        let (base, _) = log.set_frame(key.as_bytes(), b"vvvvvvvv");
+        bases.push(base);
+    }
+    assert!(log.rotor.active_segment().0 >= 2, "the volume must have rotated");
+    let victim = *bases.iter().find(|b| b.segment.0 == 1).expect("segment 1 has a frame");
+    log.poke(victim.segment, victim.offset + FRAME_HEADER_LEN as u32, &[0x55]);
+
+    let mut ks = fresh_keyspace();
     let err = open_cell_log(fs.clone(), &mut ks, CELL, &config, anchor(), now())
         .map(|_| ())
-        .expect_err("sealed-segment corruption is fail-stop");
-    assert!(err.to_string().contains("seg-000001"), "names the segment: {err}");
+        .expect_err("an attested hole in a sealed segment is fail-stop");
+    let msg = err.to_string();
+    assert!(msg.contains("seg-000001"), "names the segment: {msg}");
+    assert!(msg.contains("attests fsync coverage"), "names the attestation evidence: {msg}");
 }
 
 #[test]
@@ -292,8 +315,13 @@ fn attesting_survivor_after_a_zero_gap_refuses_to_start() {
     b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
     let stamp =
         FrameStamp { epoch: 1, seq: 9, covered_lsn: Lsn::new(SegmentId(0), survivor_at).to_u64() };
-    let bytes =
-        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
+    let bytes = b
+        .finalize(
+            Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32),
+            stamp,
+            FrameLayout::Packed,
+        )
+        .to_vec();
     log.poke(SegmentId(0), survivor_at, &bytes);
 
     let mut ks = fresh_keyspace();
@@ -320,8 +348,13 @@ fn unattested_survivor_after_a_zero_gap_truncates_and_is_counted() {
     let mut b = FrameBuilder::new();
     b.append(&RecordView::StringPostImage { ns: NS, key: b"ghost", value: b"stale" });
     let stamp = FrameStamp { epoch: 3, seq: 9, covered_lsn: 0 };
-    let bytes =
-        b.finalize(Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32), stamp).to_vec();
+    let bytes = b
+        .finalize(
+            Lsn::new(SegmentId(0), survivor_at + FRAME_HEADER_LEN as u32),
+            stamp,
+            FrameLayout::Packed,
+        )
+        .to_vec();
     log.poke(SegmentId(0), survivor_at, &bytes);
 
     let mut ks = fresh_keyspace();
@@ -442,6 +475,7 @@ fn torn_tail_below_the_manifest_begin_lsn_refuses_to_start() {
             begin_lsn: begin,
             segments: vec![begin.segment],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest");
@@ -449,7 +483,9 @@ fn torn_tail_below_the_manifest_begin_lsn_refuses_to_start() {
 
     let mut ks = fresh_keyspace();
     let err = recover(&fs, &mut ks).expect_err("truncation below begin is lost covered state");
-    assert!(err.to_string().contains("below the MANIFEST begin-LSN"), "{}", err.to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("below the MANIFEST begin-LSN"), "{msg}");
+    assert!(msg.ends_with("fsync-covered bytes are missing — refusing to start"), "{msg}");
 }
 
 #[test]
@@ -480,6 +516,7 @@ fn torn_tail_above_begin_recovers_checkpoint_plus_tail() {
             begin_lsn: begin,
             segments: vec![begin.segment],
             tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
         },
     )
     .expect("manifest");

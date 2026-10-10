@@ -277,6 +277,9 @@ fn sse2_scan_crlf(buf: &[u8]) -> CrlfPositions {
     positions
 }
 
+/// # Safety
+/// AVX2 must be enabled on the running CPU: reached only through the `is_x86_feature_detected!`
+/// dispatch of this module.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[must_use]

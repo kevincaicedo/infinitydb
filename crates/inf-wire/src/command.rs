@@ -102,11 +102,16 @@ pub enum CommandId {
     /// publication across cells (0 before the first; deviation noted).
     Lastsave,
     /// Internal cross-cell program op: atomically read value+TTL and delete
-    /// at the owning cell (the RENAME/MOVE fabric-program primitive). Not a
-    /// Redis command; listed in `COMMAND` output as an `INF.*` extension.
+    /// at the owning cell. The IF form removes only matching snapshot bytes
+    /// and expiry (ADR-0110). Listed in COMMAND as an INF.* extension.
     InfTake,
-    /// Internal cross-cell program op: atomically read value+TTL (COPY).
+    /// Internal cross-cell read: value+TTL, or value+absolute expiry with
+    /// ABS (the RENAME/RENAMENX/COPY snapshot, ADR-0110).
     InfPeek,
+    /// Internal cross-cell put: `INF.PUT key value deadline [NX]` — the
+    /// RENAME/RENAMENX destination leg. Admitted as RENAME is (WRITE, no
+    /// DENYOOM); the arena's own refusal still applies (ADR-0110 A3).
+    InfPut,
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
     JsonSet,
     JsonGet,
@@ -156,6 +161,11 @@ impl CmdFlags {
     /// ECHO/SELECT/HELLO/pubsub/INFO/CONFIG/CLIENT/COMMAND/DEBUG/QUIT pass;
     /// **PING does not** (it answers `-LOADING` there, so it does here).
     pub const LOADING: CmdFlags = CmdFlags(1 << 5);
+    /// A fabric-program primitive (ADR-0115; Redis 8's internal-command
+    /// contract): unknown to every client connection, hidden from
+    /// `COMMAND`, executed only by a plane program — locally, or on a
+    /// fabric `Apply` carrying the program mark.
+    pub const INTERNAL: CmdFlags = CmdFlags(1 << 6);
 
     #[inline]
     pub fn contains(self, other: CmdFlags) -> bool {
@@ -210,6 +220,9 @@ pub struct CommandMeta {
     /// name); negative = at least `|arity|`.
     pub arity: i8,
     pub flags: CmdFlags,
+    /// The static registry row (the shape `COMMAND INFO` renders). Routing
+    /// reads [`key_spec`], which overrides this row for the
+    /// subcommand-scoped commands (ADR-0104).
     pub keys: KeySpec,
 }
 
@@ -225,8 +238,11 @@ const LOADING_FAST: CmdFlags = CmdFlags::FAST.union(CmdFlags::LOADING);
 const LOADING_ADMIN: CmdFlags = CmdFlags::ADMIN.union(CmdFlags::LOADING);
 const LOADING_RO_FAST: CmdFlags = CmdFlags::READONLY.union(CmdFlags::FAST).union(CmdFlags::LOADING);
 const W_FAST_OOM: CmdFlags = W_FAST.union(CmdFlags::DENYOOM);
+const W_FAST_INTERNAL: CmdFlags = W_FAST.union(CmdFlags::INTERNAL);
+const RO_FAST_INTERNAL: CmdFlags = RO_FAST.union(CmdFlags::INTERNAL);
+const W_INTERNAL: CmdFlags = CmdFlags::WRITE.union(CmdFlags::INTERNAL);
 
-/// One registry row (the array below stays readable at 90 entries).
+/// One registry row (the array below stays readable at 91 entries).
 const fn cmd(
     id: CommandId,
     name: &'static str,
@@ -239,7 +255,7 @@ const fn cmd(
 
 /// The registry. M1+ append here (and only here) — the hash table below is
 /// derived mechanically at compile time.
-pub static COMMANDS: [CommandMeta; 90] = [
+pub static COMMANDS: [CommandMeta; 91] = [
     cmd(CommandId::Ping, "PING", -1, CmdFlags::FAST, KeySpec::NONE),
     cmd(CommandId::Echo, "ECHO", 2, LOADING_FAST, KeySpec::NONE),
     cmd(CommandId::Hello, "HELLO", -1, LOADING_FAST, KeySpec::NONE),
@@ -325,8 +341,9 @@ pub static COMMANDS: [CommandMeta; 90] = [
     // recorded deviation.
     cmd(CommandId::Lastsave, "LASTSAVE", 1, LOADING_RO_FAST, KeySpec::NONE),
     // ---- internal fabric-program ops (INF.* extension namespace) ----
-    cmd(CommandId::InfTake, "INF.TAKE", 2, W_FAST, KeySpec::ONE),
-    cmd(CommandId::InfPeek, "INF.PEEK", 2, RO_FAST, KeySpec::ONE),
+    cmd(CommandId::InfTake, "INF.TAKE", -2, W_FAST_INTERNAL, KeySpec::ONE),
+    cmd(CommandId::InfPeek, "INF.PEEK", -2, RO_FAST_INTERNAL, KeySpec::ONE),
+    cmd(CommandId::InfPut, "INF.PUT", -4, W_INTERNAL, KeySpec::ONE),
     // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041 D6–D9).
     // DENYOOM membership mirrors the RedisJSON module declarations:
     // memory-growing writes deny under OOM; DEL/FORGET/CLEAR free.
@@ -497,11 +514,80 @@ impl<'a> Iterator for KeyIter<'_, 'a> {
     }
 }
 
-/// Extracts the key slices of `argv` per `meta.keys`. Robust against
+/// The key spec the router reads for one parsed command: the registry row,
+/// or the subcommand-scoped row for the commands whose key position
+/// depends on argv[1] (ADR-0104). `subcommand` is argv[1] when present.
+///
+/// Exactly one command has a scoped row today. `DEBUG` copies Redis's
+/// keyless table row, but Redis never routes; here `DEBUG OBJECT <key>`
+/// addresses argv[2] like its sibling `OBJECT ENCODING <key>`, while
+/// `SLEEP <secs>` / `JMAP` / `SET-ACTIVE-EXPIRE <0|1>` address nothing —
+/// so `DEBUG SLEEP 0.5` must never route on the bytes `"0.5"`. Every
+/// consumer of key positions (`extract_keys`, the plane's owner pass,
+/// `COMMAND GETKEYS`) reads this function, never `meta.keys` directly:
+/// review of 2026-08-30, L12-01 was two notions of a command's keys
+/// disagreeing about one argv shape (the last member of C1's class).
+#[inline]
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column key_spec")]
+pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec {
+    match meta.id {
+        CommandId::Debug => match subcommand {
+            Some(sub) if sub.eq_ignore_ascii_case(b"OBJECT") => KeySpec::SECOND,
+            _ => KeySpec::NONE,
+        },
+        _ => meta.keys,
+    }
+}
+
+/// What a command addresses in the connection's selected keyspace (the
+/// numbered database or the named namespace an `INF.NS USE` bound). The
+/// plane's namespace-bound dispatch reads this to decide which commands
+/// the namespace's engine arm must see and which execute the same
+/// whatever the connection selected (ADR-0108; review of 2026-08-30,
+/// batch-8 residual: a tiered-bound connection answered `PING`, `ECHO`,
+/// `CLIENT`, `INFO`, … with "not supported on tiered namespaces" because
+/// every command the string family did not name fell into the tiered
+/// arm's refusal — a limitation recorded where a class was missing).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum KeyspaceScope {
+    /// Nothing in the keyspace: connection or node state (`PING`, `HELLO`,
+    /// `INFO`, `CLIENT`, `CONFIG GET`, `INF.NS LIST`, pub/sub, …). Such a
+    /// command executes identically on every binding.
+    None,
+    /// The keys its [`key_spec`] names (`GET`, `MSET`, `DEBUG OBJECT`).
+    Keys,
+    /// The whole selected keyspace without naming a key (`DBSIZE`, `KEYS`,
+    /// `SCAN`, `RANDOMKEY`, `FLUSHDB`, `FLUSHALL`): the scatter programs.
+    Whole,
+}
+
+/// The [`KeyspaceScope`] of one parsed command. `subcommand` is argv[1]
+/// when present (the subcommand-scoped rows read it — ADR-0104). Total
+/// over the registry: a row is `Whole` by membership in the fixed scatter
+/// set, `Keys` when its scoped key spec names a position, `None`
+/// otherwise — so a new registry row lands in a class by construction,
+/// and the plane cannot leave it to a catch-all refusal.
+#[inline]
+pub fn keyspace_scope(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeyspaceScope {
+    if matches!(
+        meta.id,
+        CommandId::Dbsize
+            | CommandId::Keys
+            | CommandId::Scan
+            | CommandId::Randomkey
+            | CommandId::Flushdb
+            | CommandId::Flushall
+    ) {
+        return KeyspaceScope::Whole;
+    }
+    if key_spec(meta, subcommand).first == 0 { KeyspaceScope::None } else { KeyspaceScope::Keys }
+}
+
+/// Extracts the key slices of `argv` per [`key_spec`]. Robust against
 /// malformed arity (an argv shorter than the spec yields fewer keys — arity
 /// validation rejects the command separately).
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a> {
-    let spec = meta.keys;
+    let spec = key_spec(meta, (argv.len() > 1).then(|| argv.arg(1)));
     if spec.first == 0 || argv.is_empty() {
         return KeyIter { argv, next: 1, last: 0, step: 0 };
     }
@@ -524,6 +610,7 @@ pub fn arity_ok(meta: &CommandMeta, argc: usize) -> bool {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +663,58 @@ mod tests {
         for meta in &COMMANDS {
             assert!(seen.insert(meta.id), "duplicate id {:?}", meta.id);
             assert_eq!(lookup(meta.name.as_bytes()).expect("resolves").id, meta.id);
+        }
+    }
+
+    /// ADR-0108: every registry row has exactly one keyspace scope, the
+    /// `Whole` set is the scatter set and nothing else, and `None` means
+    /// "no key position" — the property the plane's namespace-bound
+    /// dispatch relies on. Iterates the table so a new row cannot land
+    /// unclassified (review of 2026-08-30, Theme 3: assert the class,
+    /// not one command).
+    #[test]
+    fn every_command_has_one_keyspace_scope() {
+        let whole: &[CommandId] = &[
+            CommandId::Dbsize,
+            CommandId::Keys,
+            CommandId::Scan,
+            CommandId::Randomkey,
+            CommandId::Flushdb,
+            CommandId::Flushall,
+        ];
+        let mut none = 0;
+        let mut keys = 0;
+        for meta in &COMMANDS {
+            let scope = keyspace_scope(meta, None);
+            if whole.contains(&meta.id) {
+                assert_eq!(scope, KeyspaceScope::Whole, "{}", meta.name);
+                assert_eq!(meta.keys, KeySpec::NONE, "{} names no key position", meta.name);
+                continue;
+            }
+            match scope {
+                KeyspaceScope::Whole => panic!("{} is not a scatter program", meta.name),
+                KeyspaceScope::Keys => {
+                    assert_ne!(meta.keys.first, 0, "{}", meta.name);
+                    keys += 1;
+                }
+                KeyspaceScope::None => {
+                    assert_eq!(meta.keys, KeySpec::NONE, "{}", meta.name);
+                    none += 1;
+                }
+            }
+        }
+        assert_eq!(none + keys + whole.len(), COMMANDS.len());
+        // The subcommand-scoped row (ADR-0104): `DEBUG OBJECT` addresses a
+        // key, every other `DEBUG` form addresses nothing.
+        let debug = lookup(b"DEBUG").expect("registered");
+        assert_eq!(keyspace_scope(debug, Some(b"OBJECT")), KeyspaceScope::Keys);
+        assert_eq!(keyspace_scope(debug, Some(b"object")), KeyspaceScope::Keys);
+        assert_eq!(keyspace_scope(debug, Some(b"SLEEP")), KeyspaceScope::None);
+        assert_eq!(keyspace_scope(debug, None), KeyspaceScope::None);
+        // The connection-level rows the batch-8 residual named.
+        for name in [&b"PING"[..], b"ECHO", b"HELLO", b"QUIT", b"CLIENT", b"INFO", b"COMMAND"] {
+            let meta = lookup(name).expect("registered");
+            assert_eq!(keyspace_scope(meta, None), KeyspaceScope::None, "{}", meta.name);
         }
     }
 

@@ -14,7 +14,14 @@
 //! cursors never cross a suspension boundary; resume re-derives them);
 //! the match set is capped with a typed error.
 
-use crate::cursor::{ArrEntries, DocValue, ObjEntries};
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
+
+use core::ops::ControlFlow;
+
+use crate::cursor::{ArrCursor, ArrEntries, DocValue, ObjEntries};
 
 use super::PathProgram;
 use super::program::{Op, read_op};
@@ -90,6 +97,10 @@ impl Matches {
     /// mutation planner branches on. Overlap detection is an adjacent
     /// prefix check: in lexicographic order every strict ancestor sorts
     /// immediately into its descendant run.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "bound: record refuses growth when spans.len() >= its u32 cap; spans is private"
+    )]
     pub fn canonical(&self) -> CanonicalMatches {
         let mut ids: Vec<u32> = (0..self.spans.len() as u32).collect();
         ids.sort_by(|&a, &b| self.get(a as usize).cmp(self.get(b as usize)));
@@ -107,17 +118,18 @@ impl Matches {
     }
 
     fn record(&mut self, path: &[u32], step: Option<u32>, cap: u32) -> Result<(), EvalError> {
-        let len = path.len() + usize::from(step.is_some());
-        if self.spans.len() as u32 == cap {
+        if self.spans.len() >= cap as usize {
             return Err(EvalError::TooManyMatches);
         }
-        debug_assert!(len <= u16::MAX as usize, "path depth is bounded far below u16");
-        let at = self.steps.len() as u32;
+        let len = path.len().checked_add(usize::from(step.is_some()));
+        let len = len.and_then(|len| u16::try_from(len).ok()).ok_or(EvalError::TooManyMatches)?;
+        let at = u32::try_from(self.steps.len()).map_err(|_| EvalError::TooManyMatches)?;
+        at.checked_add(u32::from(len)).ok_or(EvalError::TooManyMatches)?;
         self.steps.extend_from_slice(path);
         if let Some(s) = step {
             self.steps.push(s);
         }
-        self.spans.push(Span { at, len: len as u16 });
+        self.spans.push(Span { at, len });
         Ok(())
     }
 }
@@ -138,7 +150,11 @@ pub fn resolve<'a>(root: DocValue<'a>, steps: &[u32]) -> Option<DocValue<'a>> {
         node = match node {
             DocValue::Obj(o) => o.iter().nth(step as usize)?.1,
             DocValue::Arr(a) => a.index(step as usize)?,
-            _ => return None,
+            DocValue::Null
+            | DocValue::Bool(_)
+            | DocValue::I64(_)
+            | DocValue::F64(_)
+            | DocValue::Str(_) => return None,
         };
     }
     Some(node)
@@ -193,6 +209,19 @@ struct Item<'a> {
     pc: u32,
     cont: u32,
     step: Option<u32>,
+}
+
+/// Immutable bytes borrowed only from a validated, size-bounded program.
+/// Carry the slice into the walker without reloading its Vec on each node.
+#[derive(Clone, Copy)]
+struct ProgramView<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ProgramView<'a> {
+    fn new(program: &'a PathProgram) -> Self {
+        Self { bytes: program.as_bytes() }
+    }
 }
 
 pub enum EvalStep {
@@ -274,8 +303,8 @@ fn run<'a>(
     mut budget: u64,
     resume: Option<Box<EvalState>>,
 ) -> Result<EvalStep, EvalError> {
-    let bytes = program.as_bytes();
-    let end = bytes.len() as u32;
+    let program = ProgramView::new(program);
+    let end = program_end(program);
     let mut path: Vec<u32>;
     let mut matches: Matches;
     let mut stack: Vec<Frame<'a>>;
@@ -291,7 +320,7 @@ fn run<'a>(
             matches = Matches::default();
             stack = Vec::new();
             // The Root op (offset 2) selects the root node once.
-            let item = Item { node: root, pc: 3, cont: cont_of(bytes, 3), step: None };
+            let item = Item { node: root, pc: 3, cont: cont_of(program, 3), step: None };
             consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
         }
     }
@@ -299,7 +328,7 @@ fn run<'a>(
         let Some(top) = stack.last_mut() else {
             return Ok(EvalStep::Done(matches));
         };
-        let Some(item) = advance(top, bytes, end) else {
+        let Some(item) = advance(top, program) else {
             let frame = stack.pop().expect("stack top exists");
             if frame.stepped {
                 path.pop();
@@ -311,7 +340,7 @@ fn run<'a>(
             // possible, so the item becomes a Fresh frame first — the
             // saved state then resumes exactly here.
             consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
-            return Ok(EvalStep::Yield(Box::new(save(&stack, &path, &matches))));
+            return Ok(EvalStep::Yield(Box::new(save(&stack, path, matches))));
         }
         budget -= 1;
         consume(item, &mut stack, &mut path, &mut matches, end, limits)?;
@@ -343,17 +372,278 @@ fn consume<'a>(
     Ok(())
 }
 
+/// Fixed hot capacity of [`VisitFrames`]. The live spine is one frame
+/// per op application root-to-current (plus one per document level
+/// under `..`), so 16 covers every realistic predicate path without
+/// touching the heap; deeper walks spill (correctness path, not the
+/// M4.5-S08 zero-allocation eval path).
+const VISIT_FRAMES_HOT: usize = 16;
+
+/// Frame storage for [`eval_visit`]'s general walk: a fixed hot array
+/// (stack-resident — the S08 zero-allocation requirement) with heap
+/// spill past realistic depth. Constructed only when a walk actually
+/// needs frames — simple chains take the [`visit_simple`] lane and
+/// never pay the array fill (the perf profile made the fill ~18% of a
+/// two-leaf predicate eval before this split).
+struct VisitFrames<'a> {
+    hot: [Frame<'a>; VISIT_FRAMES_HOT],
+    hot_len: usize,
+    spill: Vec<Frame<'a>>,
+}
+
+impl<'a> VisitFrames<'a> {
+    fn new() -> VisitFrames<'a> {
+        let dummy = || Frame {
+            op_at: 0,
+            next_pc: 0,
+            node: DocValue::Null,
+            stepped: false,
+            progress: Progress::Fresh,
+        };
+        VisitFrames { hot: core::array::from_fn(|_| dummy()), hot_len: 0, spill: Vec::new() }
+    }
+
+    fn push(&mut self, frame: Frame<'a>) {
+        // The spine is bounded: ≤ 2 frames per segment level (a union
+        // frame plus its member's frame) plus one per document level
+        // under `..` — all format-capped, so spill growth is finite (L9).
+        debug_assert!(
+            self.hot_len + self.spill.len() < 2 * super::SEGMENTS_MAX + crate::limits::DEPTH_MAX,
+            "frame spine exceeds the segment + document-depth bound"
+        );
+        if self.hot_len < VISIT_FRAMES_HOT {
+            self.hot[self.hot_len] = frame;
+            self.hot_len += 1;
+        } else {
+            self.spill.push(frame);
+        }
+    }
+
+    fn pop_discard(&mut self) {
+        if !self.spill.is_empty() {
+            self.spill.pop();
+            return;
+        }
+        debug_assert!(self.hot_len > 0, "pop on an empty frame stack");
+        self.hot_len -= 1;
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Frame<'a>> {
+        if !self.spill.is_empty() {
+            return self.spill.last_mut();
+        }
+        if self.hot_len == 0 {
+            return None;
+        }
+        Some(&mut self.hot[self.hot_len - 1])
+    }
+}
+
+/// How a [`eval_visit`] walk ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VisitEnd {
+    /// Every match was delivered.
+    Complete,
+    /// The visitor broke early.
+    Stopped,
+    /// The node budget ran out. There is no yield state: a predicate
+    /// eval either completes within fuel or the caller surfaces the
+    /// typed fuel error (ADR-0079 D6).
+    Exhausted,
+}
+
+/// [`eval_visit`]'s result: how the walk ended plus the nodes it
+/// consumed — the ADR-0040 D6 budget unit, the caller's fuel charge.
+#[derive(Copy, Clone, Debug)]
+pub struct VisitOutcome {
+    pub end: VisitEnd,
+    pub nodes_visited: u64,
+}
+
+/// Streaming evaluation (M4.5-S08): every match is handed to `on_match`
+/// as a live cursor instead of being recorded as a location path — the
+/// predicate VM tests values existentially and never materializes the
+/// match set (no `Matches`, no step trail, no second `resolve` walk).
+/// Selector semantics are [`advance`], the same core [`eval`] and
+/// [`eval_budgeted`] drive, so this cannot diverge from the frozen
+/// ADR-0040 order/dedup rules — this loop differs only in match
+/// delivery and storage discipline; plain `Child`/`Index` chains take
+/// the established ADR-0043 D1 simple lane ([`visit_simple`]) with
+/// identical accounting. Matches stream in raw program order,
+/// duplicates included ([`Matches::canonical`] is where dedup lives);
+/// existential consumers are insensitive to both. The `max_matches`
+/// cap does not apply — nothing accumulates; the node budget is the
+/// bound. Zero heap allocation up to a [`VISIT_FRAMES_HOT`]-deep frame
+/// spine; deeper general walks spill.
+pub fn eval_visit<'a, F>(
+    program: &PathProgram,
+    root: DocValue<'a>,
+    budget_nodes: u64,
+    mut on_match: F,
+) -> VisitOutcome
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    if let Some(steps) = program.simple_steps() {
+        return visit_simple(steps, root, budget_nodes, on_match);
+    }
+    let program = ProgramView::new(program);
+    let end = program_end(program);
+    let mut frames = VisitFrames::new();
+    let mut budget = budget_nodes;
+    let mut nodes_visited: u64 = 0;
+    // The Root op (offset 2) selects the root node once, unbudgeted —
+    // the run() convention, so a completing walk consumes exactly the
+    // nodes eval_budgeted would (the congruence tests pin it).
+    let staged = Item { node: root, pc: 3, cont: cont_of(program, 3), step: None };
+    if stage_visit(staged, &mut frames, end, &mut on_match).is_break() {
+        return VisitOutcome { end: VisitEnd::Stopped, nodes_visited };
+    }
+    loop {
+        let Some(top) = frames.last_mut() else {
+            return VisitOutcome { end: VisitEnd::Complete, nodes_visited };
+        };
+        let Some(item) = advance(top, program) else {
+            frames.pop_discard();
+            continue;
+        };
+        if budget == 0 {
+            debug_assert_eq!(nodes_visited, budget_nodes, "exhaustion consumes the exact budget");
+            return VisitOutcome { end: VisitEnd::Exhausted, nodes_visited };
+        }
+        budget -= 1;
+        nodes_visited += 1;
+        if stage_visit(item, &mut frames, end, &mut on_match).is_break() {
+            return VisitOutcome { end: VisitEnd::Stopped, nodes_visited };
+        }
+    }
+}
+
+/// The ADR-0043 D1 lane for `Child`/`Index` chains: direct cursor hops,
+/// no frames, no op re-decode — at most one match by construction.
+/// Accounting is item-for-item what the general loop would do (each
+/// successful hop is the one item [`advance`] would produce, checked
+/// against the budget before it is consumed); the congruence proptest
+/// pins the equivalence across both lanes.
+fn visit_simple<'a, F>(
+    steps: super::program::SimpleSteps<'_>,
+    root: DocValue<'a>,
+    budget_nodes: u64,
+    mut on_match: F,
+) -> VisitOutcome
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    let mut node = root;
+    let mut budget = budget_nodes;
+    let mut nodes_visited: u64 = 0;
+    for step in steps {
+        let child = match step {
+            super::program::SimpleStep::Child(key) => match node {
+                DocValue::Obj(entries) => {
+                    entries.iter().find(|(k, _)| k.as_bytes() == key).map(|(_, value)| value)
+                }
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)
+                | DocValue::Arr(_) => None,
+            },
+            super::program::SimpleStep::Index(index) => match node {
+                DocValue::Arr(items) => resolve_index(index, || array_len(items))
+                    .and_then(|ordinal| items.index(ordinal as usize)),
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_)
+                | DocValue::Obj(_) => None,
+            },
+        };
+        // A failed hop is an empty match set — no item was produced, so
+        // nothing charges (the general loop's accounting, exactly).
+        let Some(child) = child else {
+            return VisitOutcome { end: VisitEnd::Complete, nodes_visited };
+        };
+        if budget == 0 {
+            debug_assert_eq!(nodes_visited, budget_nodes, "exhaustion consumes the exact budget");
+            return VisitOutcome { end: VisitEnd::Exhausted, nodes_visited };
+        }
+        budget -= 1;
+        nodes_visited += 1;
+        node = child;
+    }
+    let end = if on_match(node).is_break() { VisitEnd::Stopped } else { VisitEnd::Complete };
+    VisitOutcome { end, nodes_visited }
+}
+
+/// Deliver a finished item to the visitor, or push its frame. The step
+/// trail run() maintains does not exist here — no caller reads location
+/// paths, so `stepped` is dead weight kept false.
+fn stage_visit<'a, F>(
+    item: Item<'a>,
+    frames: &mut VisitFrames<'a>,
+    end: u32,
+    on_match: &mut F,
+) -> ControlFlow<()>
+where
+    F: FnMut(DocValue<'a>) -> ControlFlow<()>,
+{
+    if item.pc == end {
+        return on_match(item.node);
+    }
+    frames.push(Frame {
+        op_at: item.pc,
+        next_pc: item.cont,
+        node: item.node,
+        stepped: false,
+        progress: Progress::Fresh,
+    });
+    ControlFlow::Continue(())
+}
+
 /// Continuation of the op at `pc` (== `end` when `pc` is the last op).
-fn cont_of(bytes: &[u8], pc: u32) -> u32 {
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: ProgramView borrows PathProgram's validated u16::MAX-bounded bytes; \
+              read_op returns at or before its end, including the complete union member region"
+)]
+fn cont_of(program: ProgramView<'_>, pc: u32) -> u32 {
+    let bytes = program.bytes;
     if pc as usize >= bytes.len() {
         return bytes.len() as u32;
     }
     read_op(bytes, pc as usize).1 as u32
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: ProgramView borrows only PathProgram's validated u16::MAX-bounded bytes"
+)]
+fn program_end(program: ProgramView<'_>) -> u32 {
+    program.bytes.len() as u32
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "bound: ArrCursor's tape body length is u24 (each entry uses a byte); its arena \
+              form has a u32 count. Either element count fits i64"
+)]
+fn array_len(array: ArrCursor<'_>) -> i64 {
+    array.len() as i64
+}
+
 /// Advance one frame by one selection. `None` ⇒ the frame is exhausted.
-fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>> {
-    let (op, _) = read_op(bytes, frame.op_at as usize);
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bound: object ordinals are below the tape u24 body or arena u32 count; \
+              the slice guard and resolve_slice keep next in [0, the array's u32 count); \
+              union offsets lie in ProgramView's validated u16::MAX-bounded bytes"
+)]
+fn advance<'a>(frame: &mut Frame<'a>, program: ProgramView<'_>) -> Option<Item<'a>> {
+    let (op, _) = read_op(program.bytes, frame.op_at as usize);
     match op {
         Op::Child(key) => {
             if !matches!(frame.progress, Progress::Fresh) {
@@ -361,12 +651,9 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
             }
             frame.progress = Progress::Done;
             let DocValue::Obj(o) = frame.node else { return None };
-            let (ord, value) = o
-                .iter()
-                .enumerate()
-                .find(|(_, (k, _))| k.as_bytes() == key)
-                .map(|(ord, (_, v))| (ord as u32, v))?;
-            Some(child_item(frame, bytes, end, value, ord))
+            let (ord, (_, value)) = o.iter().enumerate().find(|(_, (k, _))| k.as_bytes() == key)?;
+            let ord = ord as u32;
+            Some(child_item(frame, program, value, ord))
         }
         Op::Index(i) => {
             if !matches!(frame.progress, Progress::Fresh) {
@@ -374,16 +661,20 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
             }
             frame.progress = Progress::Done;
             let DocValue::Arr(a) = frame.node else { return None };
-            let ord = resolve_index(i, || a.len() as i64)?;
+            let ord = resolve_index(i, || array_len(a))?;
             let value = a.index(ord as usize)?;
-            Some(child_item(frame, bytes, end, value, ord))
+            Some(child_item(frame, program, value, ord))
         }
         Op::ChildAny => {
             if let Progress::Fresh = frame.progress {
                 frame.progress = match frame.node {
                     DocValue::Obj(o) => Progress::Obj { it: o.iter(), next_ord: 0 },
                     DocValue::Arr(a) => Progress::Arr { it: a.iter(), next_ord: 0 },
-                    _ => Progress::Done,
+                    DocValue::Null
+                    | DocValue::Bool(_)
+                    | DocValue::I64(_)
+                    | DocValue::F64(_)
+                    | DocValue::Str(_) => Progress::Done,
                 };
             }
             match &mut frame.progress {
@@ -391,15 +682,20 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     let (_, value) = it.next()?;
                     let ord = *next_ord;
                     *next_ord += 1;
-                    Some(child_item(frame, bytes, end, value, ord))
+                    Some(child_item(frame, program, value, ord))
                 }
                 Progress::Arr { it, next_ord } => {
                     let value = it.next()?;
                     let ord = *next_ord;
                     *next_ord += 1;
-                    Some(child_item(frame, bytes, end, value, ord))
+                    Some(child_item(frame, program, value, ord))
                 }
-                _ => None,
+                Progress::Fresh
+                | Progress::Done
+                | Progress::Slice { .. }
+                | Progress::Union { .. }
+                | Progress::DescendObj { .. }
+                | Progress::DescendArr { .. } => None,
             }
         }
         Op::Slice(spec) => {
@@ -408,7 +704,7 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     frame.progress = Progress::Done;
                     return None;
                 };
-                let (next, stop, step) = resolve_slice(&spec, a.len() as i64);
+                let (next, stop, step) = resolve_slice(&spec, array_len(a));
                 frame.progress = Progress::Slice { next, stop, step };
             }
             let Progress::Slice { next, stop, step } = &mut frame.progress else {
@@ -418,11 +714,17 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                 return None;
             }
             let ord = *next;
-            *next += *step;
-            debug_assert!(ord >= 0, "resolved slice indices are in range");
+            // Saturating: a step of any magnitude lands past `stop` in
+            // its own direction (`i64::MAX >= stop`, `i64::MIN <= stop`),
+            // so the guard above ends the slice on the next call and the
+            // cursor never wraps (review C11: `[1::i64::MAX]` wrapped to
+            // `i64::MIN` in release and the `expect` below killed the
+            // cell). With `start`/`stop` clamped by `resolve_slice`, that
+            // guard keeps `ord` inside `[0, len)` in both directions.
+            *next = next.saturating_add(*step);
             let DocValue::Arr(a) = frame.node else { unreachable!("slice progress on array") };
             let value = a.index(ord as usize).expect("resolved slice indices are in range");
-            Some(child_item(frame, bytes, end, value, ord as u32))
+            Some(child_item(frame, program, value, ord as u32))
         }
         Op::Union(u) => {
             let member = match &mut frame.progress {
@@ -431,7 +733,12 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     0
                 }
                 Progress::Union { member } => *member,
-                _ => return None,
+                Progress::Done
+                | Progress::Obj { .. }
+                | Progress::Arr { .. }
+                | Progress::Slice { .. }
+                | Progress::DescendObj { .. }
+                | Progress::DescendArr { .. } => return None,
             };
             if member == u.count {
                 return None;
@@ -454,12 +761,16 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     frame.progress = match frame.node {
                         DocValue::Obj(o) => Progress::DescendObj { it: o.iter(), next_ord: 0 },
                         DocValue::Arr(a) => Progress::DescendArr { it: a.iter(), next_ord: 0 },
-                        _ => Progress::Done,
+                        DocValue::Null
+                        | DocValue::Bool(_)
+                        | DocValue::I64(_)
+                        | DocValue::F64(_)
+                        | DocValue::Str(_) => Progress::Done,
                     };
                     Some(Item {
                         node: frame.node,
                         pc: sel_at,
-                        cont: cont_of(bytes, sel_at),
+                        cont: cont_of(program, sel_at),
                         step: None,
                     })
                 }
@@ -476,7 +787,11 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
                     *next_ord += 1;
                     Some(Item { node: value, pc: frame.op_at, cont: sel_at, step: Some(ord) })
                 }
-                _ => None,
+                Progress::Done
+                | Progress::Obj { .. }
+                | Progress::Arr { .. }
+                | Progress::Slice { .. }
+                | Progress::Union { .. } => None,
             }
         }
         Op::Root => unreachable!("Root never becomes a frame"),
@@ -485,22 +800,23 @@ fn advance<'a>(frame: &mut Frame<'a>, bytes: &[u8], end: u32) -> Option<Item<'a>
 
 fn child_item<'a>(
     frame: &Frame<'a>,
-    bytes: &[u8],
-    _end: u32,
+    program: ProgramView<'_>,
     value: DocValue<'a>,
     ord: u32,
 ) -> Item<'a> {
-    Item { node: value, pc: frame.next_pc, cont: cont_of(bytes, frame.next_pc), step: Some(ord) }
+    Item { node: value, pc: frame.next_pc, cont: cont_of(program, frame.next_pc), step: Some(ord) }
 }
 
-/// Negative-index resolution: `len` is fetched lazily (a tape-array
-/// `len()` walks the body — only paid when the index is negative).
+/// Index resolution: negatives add `len` (the RedisJSON rule), and the
+/// result narrows to a `u32` ordinal only after `try_from` proves it is
+/// one — every other value, including the `i ≡ k (mod 2³²)` aliases a
+/// wrapping `as u32` used to land on real elements (review C10), is no
+/// match. `len` is fetched lazily (a tape-array `len()` walks the body
+/// — only paid when the index is negative); `index()` still filters
+/// `len..2³²`.
 fn resolve_index(i: i64, len: impl FnOnce() -> i64) -> Option<u32> {
-    if i >= 0 {
-        return Some(i as u32); // out-of-range surfaces as `index() == None`
-    }
-    let resolved = i + len();
-    if resolved < 0 { None } else { Some(resolved as u32) }
+    let resolved = if i < 0 { i + len() } else { i };
+    u32::try_from(resolved).ok()
 }
 
 /// Grammar §4: Python slice index resolution, pinned.
@@ -519,7 +835,14 @@ fn resolve_slice(spec: &super::ast::SliceSpec, len: i64) -> (i64, i64, i64) {
     }
 }
 
-fn save(stack: &[Frame<'_>], path: &[u32], matches: &Matches) -> EvalState {
+/// Serialize the live stack into owned counters. The trail and the match
+/// set move in unchanged — a yield costs O(frames), never O(matches)
+/// (ADR-0040 D6). Cloning the match set here made every yield pay for
+/// every match so far: at a per-slice budget the churn is
+/// O(nodes / budget × matches) — the `path_program` nightly OOM of
+/// 2026-09-12 (three `..[union]..[union]` inputs on a 20-node fixture,
+/// 139 MiB churned for 1,872 matches at budget 3).
+fn save(stack: &[Frame<'_>], path: Vec<u32>, matches: Matches) -> EvalState {
     let frames = stack
         .iter()
         .map(|f| SavedFrame {
@@ -542,7 +865,7 @@ fn save(stack: &[Frame<'_>], path: &[u32], matches: &Matches) -> EvalState {
             },
         })
         .collect();
-    EvalState { frames, path: path.to_vec(), matches: matches.clone() }
+    EvalState { frames, path, matches }
 }
 
 /// Re-derive live frames from saved counters: each frame's node comes
@@ -576,7 +899,11 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
                     }
                     Progress::Arr { it, next_ord }
                 }
-                _ => unreachable!("iterating frame on a container"),
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_) => unreachable!("iterating frame on a container"),
             },
             SavedProgress::Slice { next, stop, step } => Progress::Slice { next, stop, step },
             SavedProgress::Union { member } => Progress::Union { member },
@@ -595,7 +922,11 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
                     }
                     Progress::DescendArr { it, next_ord }
                 }
-                _ => unreachable!("descend-iterating frame on a container"),
+                DocValue::Null
+                | DocValue::Bool(_)
+                | DocValue::I64(_)
+                | DocValue::F64(_)
+                | DocValue::Str(_) => unreachable!("descend-iterating frame on a container"),
             },
         };
         frames.push(Frame {
@@ -608,4 +939,32 @@ fn rebuild_frames<'a>(saved: &[SavedFrame], path: &[u32], root: DocValue<'a>) ->
     }
     debug_assert_eq!(step_idx, path.len(), "every path step belongs to a frame");
     frames
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::{EvalError, Matches};
+
+    #[test]
+    fn match_refusal_keeps_both_arenas_unchanged() {
+        let mut matches = Matches::default();
+        matches.record(&[1, 2], Some(3), 1).unwrap();
+        let before = matches.clone();
+        for cap in [0, 1] {
+            assert_eq!(matches.record(&[4], None, cap), Err(EvalError::TooManyMatches));
+            assert_eq!(matches, before);
+        }
+        let too_deep = vec![0; usize::from(u16::MAX)];
+        assert_eq!(matches.record(&too_deep, Some(0), u32::MAX), Err(EvalError::TooManyMatches));
+        assert_eq!(matches, before);
+    }
+
+    #[test]
+    fn match_depth_width_accepts_equality() {
+        let path = vec![7; usize::from(u16::MAX)];
+        let mut matches = Matches::default();
+        matches.record(&path, None, 1).unwrap();
+        assert_eq!(matches.get(0), path);
+        assert_eq!(matches.canonical().ids, [0]);
+    }
 }

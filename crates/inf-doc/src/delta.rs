@@ -4,6 +4,16 @@
 //! module is the one semantic registry: live command capture encodes an
 //! [`ApplyOp`], replay decodes the bytes back to the same type, and every
 //! foreign fragment crosses the canonical idoc trust boundary here.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 
@@ -13,9 +23,35 @@ use crate::apply::{ApplyOp, Number};
 use crate::tape::{ValueRef, canonical_fragment};
 use crate::{DocError, emit};
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum DeltaOpcode {
+/// One `Variant = tag` list emits the enum, [`DeltaOpcode::ALL`] and the
+/// decoder's [`DeltaOpcode::from_u8`] (ADR-0169 §Class), so a variant
+/// cannot exist outside the table or the decoder. A duplicate discriminant
+/// does not compile, and a duplicate tag is an unreachable pattern that
+/// `-D warnings` refuses.
+macro_rules! delta_opcodes {
+    ($($variant:ident = $tag:literal,)+) => {
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        #[repr(u8)]
+        pub enum DeltaOpcode {
+            $($variant = $tag,)+
+        }
+
+        impl DeltaOpcode {
+            /// Every opcode, in tag order: the table the writer/reader
+            /// agreement property iterates.
+            pub const ALL: &'static [DeltaOpcode] = &[$(DeltaOpcode::$variant,)+];
+
+            pub const fn from_u8(tag: u8) -> Option<DeltaOpcode> {
+                match tag {
+                    $($tag => Some(DeltaOpcode::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+delta_opcodes! {
     SetReplace = 1,
     SetMember = 2,
     Del = 3,
@@ -31,27 +67,6 @@ pub enum DeltaOpcode {
     Merge = 13,
 }
 
-impl DeltaOpcode {
-    pub fn from_u8(tag: u8) -> Option<DeltaOpcode> {
-        Some(match tag {
-            1 => DeltaOpcode::SetReplace,
-            2 => DeltaOpcode::SetMember,
-            3 => DeltaOpcode::Del,
-            4 => DeltaOpcode::NumIncrBy,
-            5 => DeltaOpcode::NumMultBy,
-            6 => DeltaOpcode::StrAppend,
-            7 => DeltaOpcode::Toggle,
-            8 => DeltaOpcode::Clear,
-            9 => DeltaOpcode::ArrAppend,
-            10 => DeltaOpcode::ArrInsert,
-            11 => DeltaOpcode::ArrPop,
-            12 => DeltaOpcode::ArrTrim,
-            13 => DeltaOpcode::Merge,
-            _ => return None,
-        })
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DeltaDecodeError {
     UnknownOpcode(u8),
@@ -60,6 +75,10 @@ pub enum DeltaDecodeError {
     BadVarint,
     BadUtf8,
     WrongOperandKind,
+    /// An `ArrAppend`/`ArrInsert` operand with no element. The writer wraps
+    /// at least one value (ADR-0042 D2), and the plan splices what the
+    /// operand holds, so an empty one is no record a writer produced.
+    EmptyArrayOperand,
     BadFragment(DocError),
 }
 
@@ -74,6 +93,9 @@ impl fmt::Display for DeltaDecodeError {
             DeltaDecodeError::BadVarint => write!(f, "non-canonical document delta varint"),
             DeltaDecodeError::BadUtf8 => write!(f, "document delta member key is not UTF-8"),
             DeltaDecodeError::WrongOperandKind => write!(f, "wrong document delta operand kind"),
+            DeltaDecodeError::EmptyArrayOperand => {
+                write!(f, "document delta array operand holds no element")
+            }
             DeltaDecodeError::BadFragment(error) => {
                 write!(f, "invalid canonical document delta fragment: {error}")
             }
@@ -212,14 +234,26 @@ fn number(bytes: &[u8]) -> Result<Number, DeltaDecodeError> {
     match canonical_fragment(bytes).map_err(DeltaDecodeError::BadFragment)? {
         ValueRef::I64(value) => Ok(Number::I64(value)),
         ValueRef::F64(value) => Ok(Number::F64(value)),
-        _ => Err(DeltaDecodeError::WrongOperandKind),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_)
+        | ValueRef::Arr(_) => Err(DeltaDecodeError::WrongOperandKind),
     }
 }
 
+/// The one array operand `ArrAppend` and `ArrInsert` carry: a canonical
+/// array of at least one element, what `array_operand` writes.
 fn require_array(bytes: &[u8]) -> Result<(), DeltaDecodeError> {
     match canonical_fragment(bytes).map_err(DeltaDecodeError::BadFragment)? {
+        ValueRef::Arr(elements) if elements.is_empty() => Err(DeltaDecodeError::EmptyArrayOperand),
         ValueRef::Arr(_) => Ok(()),
-        _ => Err(DeltaDecodeError::WrongOperandKind),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::I64(_)
+        | ValueRef::F64(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_) => Err(DeltaDecodeError::WrongOperandKind),
     }
 }
 
@@ -275,10 +309,39 @@ mod tests {
         }
     }
 
+    /// The generated table and decoder agree: `ALL` round-trips through
+    /// `from_u8` in tag order, and no other tag decodes.
+    #[test]
+    fn the_opcode_table_is_the_decoder() {
+        for (index, opcode) in DeltaOpcode::ALL.iter().enumerate() {
+            assert_eq!(usize::from(*opcode as u8), index + 1);
+            assert_eq!(DeltaOpcode::from_u8(*opcode as u8), Some(*opcode));
+        }
+        let decoded = (0..=u8::MAX).filter_map(DeltaOpcode::from_u8).count();
+        assert_eq!(decoded, DeltaOpcode::ALL.len());
+    }
+
     #[test]
     fn wrong_kinds_and_trailing_bytes_are_typed() {
         assert_eq!(decode_apply_op(3, b"x").unwrap_err(), DeltaDecodeError::TrailingBytes);
         assert_eq!(decode_apply_op(9, &[1]).unwrap_err(), DeltaDecodeError::WrongOperandKind);
         assert_eq!(decode_apply_op(99, &[]).unwrap_err(), DeltaDecodeError::UnknownOpcode(99));
+    }
+
+    /// The array operand's reader bound is its writer's: at least one
+    /// element. `[]` (`TAG_ARR`, length 0) is a canonical fragment, so only
+    /// this check keeps a zero-element splice out of the plan.
+    #[test]
+    fn an_empty_array_operand_is_refused() {
+        let empty = [0xA8, 0, 0, 0];
+        assert!(canonical_fragment(&empty).is_ok(), "the fixture is a canonical empty array");
+        let append = DeltaOpcode::ArrAppend as u8;
+        let refused = DeltaDecodeError::EmptyArrayOperand;
+        assert_eq!(decode_apply_op(append, &empty).unwrap_err(), refused);
+        let mut insert = Vec::new();
+        encode_apply_op(&ApplyOp::ArrInsert { index: 0, elements: &empty }, &mut insert);
+        assert_eq!(decode_apply_op(DeltaOpcode::ArrInsert as u8, &insert).unwrap_err(), refused);
+        let one = [0xA8, 1, 0, 0, 0x07];
+        assert!(decode_apply_op(append, &one).is_ok(), "one element decodes");
     }
 }

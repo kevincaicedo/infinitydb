@@ -217,13 +217,17 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(1_000))]
 
         #[test]
-        fn valid_integer_strings_match_rust_parse(input in string_regex("[+-]?[0-9]{1,19}").unwrap()) {
+        fn valid_integer_strings_match_rust_parse(
+            input in string_regex("[+-]?[0-9]{1,19}").unwrap(),
+        ) {
             let expected = input.parse::<i64>().ok().map(|value| (value, input.len()));
             prop_assert_eq!(swar_parse_int(input.as_bytes()), expected);
         }
 
         #[test]
-        fn arbitrary_inputs_match_scalar_reference(input in proptest::collection::vec(any::<u8>(), 0..64)) {
+        fn arbitrary_inputs_match_scalar_reference(
+            input in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
             prop_assert_eq!(swar_parse_int(&input), scalar_parse_int(&input));
         }
     }

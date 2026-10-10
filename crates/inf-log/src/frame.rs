@@ -1,35 +1,59 @@
-//! Batch frame layouts **v1** (M2-S01, ADR-0011) and **v2** (M2.5-S12,
-//! ADR-0031). One frame per reactor-loop iteration groups that iteration's
-//! records so the log is written with one `writev` and replayed
-//! validate-then-apply per frame (L3). The writer emits v2 only; the
-//! decoder accepts both forever on the alpha line (ADR-0031 D2).
+//! Batch frame layouts **v1** (M2-S01, ADR-0011), **v2** (M2.5-S12,
+//! ADR-0031), and **v3** (M4.5-S34, ADR-0086 D3). One frame per
+//! reactor-loop iteration groups that iteration's records so the log is
+//! written with one `writev` and replayed validate-then-apply per frame
+//! (L3). The writer emits v2 on buffered segments and v3 on `O_DIRECT`
+//! segments; the decoder accepts all three forever on the alpha line
+//! (ADR-0031 D2).
 //!
 //! ```text
-//! frame   := header · body · trailer
-//! header  := magic: [u8;4] = "IFR1" | "IFR2"
-//!            frame_len: u32 LE       — total bytes, header+body+trailer
+//! frame   := header · body · trailer [· padding]
+//! header  := magic: [u8;4] = "IFR1" | "IFR2" | "IFR3"
+//!            frame_len: u32 LE       — total bytes, header+body+trailer (padding excluded)
 //!            record_count: u32 LE    — ≥ 1 (empty iterations emit no frame)
 //!            first_lsn: u32 LE × 2   — (segment, offset) of the FIRST record
-//!            -- v2 only (ADR-0031 D1) --
+//!            -- v2/v3 only (ADR-0031 D1) --
 //!            epoch: u32 LE           — log life this frame belongs to (≥ 1)
 //!            seq: u64 LE             — frame ordinal within the epoch (from 1)
 //!            covered_lsn: u64 LE     — durability watermark at seal (Lsn::to_u64)
 //! body    := record_count records (record.rs)
 //! trailer := CRC32C(header · body): u32 LE
+//! padding := v3 only — zero bytes up to the next FRAME_ALIGN boundary
 //! ```
 //!
 //! A record's LSN is the byte offset of its length prefix within the
 //! segment; the first record therefore sits at `frame offset + header
-//! length` (20 for v1, 40 for v2), and the iterator derives every
+//! length` (20 for v1, 40 for v2/v3), and the iterator derives every
 //! subsequent LSN from record extents. All-zero magic means preallocated,
 //! never-written bytes — the end of the active segment's tail
 //! (M2-S04/S14 build tail policy on that signal).
+//!
+//! **v3 is v2 with an aligned successor** (ADR-0086 D3): the layout and
+//! the CRC are identical; only the magic differs, and the next frame
+//! begins at `align_up(base + frame_len, FRAME_ALIGN)` instead of at
+//! `base + frame_len`. That is what lets a frame be one `O_DIRECT`
+//! write-through (FUA-class) write: aligned offset, aligned length,
+//! zeroed padding written by the frame's own write. The reader rounds up
+//! after a v3 frame and applies the end-of-log rule at the boundary; it
+//! does **not** validate the padding bytes — the frame's CRC is the
+//! evidence, a padding sector that did not land is not.
 //!
 //! The v2 stamp is what lets recovery distinguish a torn un-covered tail
 //! from covered bytes the disk lost (the ADR-0021 D3 refusal class):
 //! `covered_lsn` is a CRC-protected attestation of the watermark, `epoch`
 //! separates log lives so discarded residue can never re-enter a replay
 //! prefix, and `seq` pins writer continuity (ADR-0031 D3–D5).
+
+// ADR-0144 D2/D3: bytes from a log file enter here first.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 
@@ -40,16 +64,35 @@ use crate::record::{RecordDecodeError, RecordView, decode_record};
 
 /// Legacy v1 magic — read support only (ADR-0031 D2).
 pub const FRAME_MAGIC_V1: [u8; 4] = *b"IFR1";
-/// Current (v2) magic — what the writer emits.
+/// The v2 magic — what the writer emits on buffered segments
+/// ([`FrameLayout::Packed`]).
 pub const FRAME_MAGIC: [u8; 4] = *b"IFR2";
+/// The v3 magic (ADR-0086 D3) — the v2 layout whose successor is
+/// [`FRAME_ALIGN`]-aligned; what the writer emits on `O_DIRECT` segments
+/// ([`FrameLayout::Aligned`]).
+pub const FRAME_MAGIC_V3: [u8; 4] = *b"IFR3";
+/// Successor alignment of a v3 frame: the device's physical page and the
+/// `O_DIRECT` offset/length/memory alignment every realistic device
+/// accepts (ADR-0086 D3 — a constant, not a probed value).
+pub const FRAME_ALIGN: u32 = 4096;
 pub const FRAME_HEADER_LEN_V1: usize = 20;
-/// Header length of the current (v2) format.
+/// Header length of the current (v2/v3) format.
 pub const FRAME_HEADER_LEN: usize = 40;
 pub const FRAME_TRAILER_LEN: usize = 4;
 /// Smallest well-formed v1 frame: header + one minimal record + CRC.
-pub const MIN_FRAME_LEN_V1: u32 = (FRAME_HEADER_LEN_V1 + 4 + FRAME_TRAILER_LEN) as u32;
+pub const MIN_FRAME_LEN_V1: u32 = 28;
+const _: () = assert!(
+    MIN_FRAME_LEN_V1 as usize == FRAME_HEADER_LEN_V1 + 4 + FRAME_TRAILER_LEN,
+    "MIN_FRAME_LEN_V1 is header + minimal record + trailer"
+);
 /// Smallest well-formed frame of the current format.
-pub const MIN_FRAME_LEN: u32 = (FRAME_HEADER_LEN + 4 + FRAME_TRAILER_LEN) as u32;
+pub const MIN_FRAME_LEN: u32 = 48;
+const _: () = assert!(
+    MIN_FRAME_LEN as usize == FRAME_HEADER_LEN + 4 + FRAME_TRAILER_LEN,
+    "MIN_FRAME_LEN is header + minimal record + trailer"
+);
+/// Leading + trailing alignment slack of a [`FrameBuilder`] buffer.
+const BUILDER_SLACK_LEN: usize = 2 * FRAME_ALIGN as usize;
 /// Default decoder bound on a single frame. Real frames are bounded by the
 /// staging ring capacity (M2-S03); the decoder cap exists so a corrupt
 /// length field cannot command absurd skips.
@@ -72,14 +115,66 @@ pub const fn frame_header_len(has_stamp: bool) -> usize {
     if has_stamp { FRAME_HEADER_LEN } else { FRAME_HEADER_LEN_V1 }
 }
 
-/// Accumulates one iteration's records and seals them into a (v2) frame.
-/// The buffer is reused across iterations (`reset`) — zero steady-state
+/// `len` rounded up to the next [`FRAME_ALIGN`] multiple — the on-disk
+/// extent of a v3 frame and the base of its successor. Saturates at
+/// `u32::MAX` for the top 4095 values (review 2026-08-30 F-L02-04: the
+/// plain multiply wrapped to 0 there); a frame the decoder admits never
+/// reaches saturation — `decode_frame` refuses any frame whose padded
+/// extent does not fit a u32 segment (ADR-0126 D1 as amended).
+#[must_use]
+pub const fn align_up_frame(len: u32) -> u32 {
+    match len.checked_next_multiple_of(FRAME_ALIGN) {
+        Some(padded) => padded,
+        None => u32::MAX,
+    }
+}
+
+/// How a sealed frame lies on the device (ADR-0086 D3). The segment's I/O
+/// mode picks it at seal time: buffered segments pack (v2), `O_DIRECT`
+/// segments align (v3).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FrameLayout {
+    /// v2: the successor begins exactly at `base + frame_len`.
+    Packed,
+    /// v3: zero-padded to [`FRAME_ALIGN`]; the successor begins at
+    /// `align_up(base + frame_len)`.
+    Aligned,
+}
+
+impl FrameLayout {
+    /// Bytes the frame occupies on the device under this layout.
+    #[must_use]
+    pub const fn padded_len(self, frame_len: u32) -> u32 {
+        match self {
+            FrameLayout::Packed => frame_len,
+            FrameLayout::Aligned => align_up_frame(frame_len),
+        }
+    }
+}
+
+/// Accumulates one iteration's records and seals them into a v2 or v3
+/// frame. The buffer is allocated once with [`FRAME_ALIGN`] slack on both
+/// ends and the frame is built at its first aligned offset, so the
+/// sealed bytes are a legal `O_DIRECT` source (ADR-0086 D6 — the
+/// ADR-0054 D2 `align_offset` shape, no unsafe); it never reallocates
+/// while the owner respects `capacity` (the staging ring refuses beyond
+/// it), and it is reused across iterations (`reset`) — zero steady-state
 /// allocation on the append path (L5; asserted end-to-end in M2-S03).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameBuilder {
     buf: Vec<u8>,
+    /// First aligned offset inside `buf`: the frame base.
+    at: usize,
     record_count: u32,
     sealed: bool,
+    /// Bytes of the sealed frame including padding (valid while sealed).
+    sealed_len: usize,
+}
+
+impl Default for FrameBuilder {
+    fn default() -> Self {
+        FrameBuilder::new()
+    }
 }
 
 impl FrameBuilder {
@@ -88,11 +183,24 @@ impl FrameBuilder {
         FrameBuilder::with_capacity(0)
     }
 
+    /// A builder for frames of up to `capacity` bytes (header + records +
+    /// trailer). Allocation: `capacity + 2 × FRAME_ALIGN` — one alignment
+    /// of leading slack (the aligned base lands inside it) and one of
+    /// trailing slack (the v3 padding) — so a `capacity`-bounded owner can
+    /// never make the buffer grow.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> FrameBuilder {
-        let mut buf = Vec::with_capacity(capacity.max(FRAME_HEADER_LEN));
-        buf.resize(FRAME_HEADER_LEN, 0);
-        FrameBuilder { buf, record_count: 0, sealed: false }
+        let align = FRAME_ALIGN as usize;
+        // Saturating: a capacity no allocation can serve is the allocator's
+        // capacity fail-stop, never a wrapped (small) buffer.
+        let mut buf =
+            Vec::with_capacity(capacity.max(FRAME_HEADER_LEN).saturating_add(BUILDER_SLACK_LEN));
+        buf.resize(align, 0);
+        let at = buf.as_ptr().align_offset(align);
+        debug_assert!(at < align, "an aligned base fits the leading slack");
+        buf.truncate(at);
+        buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
+        FrameBuilder { buf, at, record_count: 0, sealed: false, sealed_len: 0 }
     }
 
     #[must_use]
@@ -105,11 +213,17 @@ impl FrameBuilder {
         self.record_count == 0
     }
 
-    /// Total frame size (header + records so far + trailer) — what
-    /// `SegmentRotor::begin_frame` reserves.
+    /// Total frame size (header + records so far + trailer, **padding
+    /// excluded**) — what `SegmentRotor::begin_frame` reserves under
+    /// [`FrameLayout::Packed`]; the rotor pads it for `Aligned`.
     #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: buf holds at + FRAME_HEADER_LEN bytes since new/reset, and a Vec's \
+                  length (<= isize::MAX) plus the 4-byte trailer fits usize; try_from owns u32"
+    )]
     pub fn frame_len(&self) -> u32 {
-        u32::try_from(self.buf.len() + FRAME_TRAILER_LEN).expect("frame exceeds u32")
+        u32::try_from(self.buf.len() - self.at + FRAME_TRAILER_LEN).expect("frame exceeds u32")
     }
 
     /// Append one record, encoding directly into the frame buffer.
@@ -117,6 +231,11 @@ impl FrameBuilder {
     /// # Panics
     /// If called after `finalize` without `reset` — an internal invariant
     /// of the LOG step, not a runtime condition.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: a record is >= 1 byte, so a count past u32::MAX is a frame past \
+                  u32::MAX bytes, which finalize's frame_len refuses before it reads the count"
+    )]
     pub fn append(&mut self, record: &RecordView<'_>) {
         assert!(!self.sealed, "append on a sealed frame (missing reset)");
         record.encode_into(&mut self.buf);
@@ -124,9 +243,12 @@ impl FrameBuilder {
     }
 
     /// Seal the frame: patch the header with `first_record_lsn` (the LSN of
-    /// the first record — frame base + [`FRAME_HEADER_LEN`]) and the v2
-    /// `stamp`, and append the CRC32C trailer. Returns the finished frame
-    /// bytes.
+    /// the first record — frame base + [`FRAME_HEADER_LEN`]) and the
+    /// `stamp`, append the CRC32C trailer, and — under
+    /// [`FrameLayout::Aligned`] — zero-pad to the next [`FRAME_ALIGN`]
+    /// boundary (every padding byte is written, never left over from a
+    /// previous frame: the "zero every padding byte that crosses a trust
+    /// boundary" rule). Returns the finished frame bytes, padding included.
     ///
     /// # Panics
     /// On an empty frame — record_count ≥ 1 is a format invariant; callers
@@ -134,7 +256,18 @@ impl FrameBuilder {
     /// malformed (`epoch == 0` or `seq == 0` — reserved by ADR-0031 D1) or
     /// the covered watermark leads the frame's own records (it can never
     /// lead the append cursor).
-    pub fn finalize(&mut self, first_record_lsn: Lsn, stamp: FrameStamp) -> &[u8] {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: buf.len() >= at (new/reset), at <= buf.len() <= isize::MAX and the \
+                  padded length is a u32, so each sum fits the 64-bit usize inf-foundation \
+                  asserts; FRAME_ALIGN is a non-zero const"
+    )]
+    pub fn finalize(
+        &mut self,
+        first_record_lsn: Lsn,
+        stamp: FrameStamp,
+        layout: FrameLayout,
+    ) -> &[u8] {
         assert!(self.record_count > 0, "finalize of an empty frame");
         assert!(!self.sealed, "double finalize (missing reset)");
         assert!(stamp.epoch > 0, "frame epoch 0 is reserved (ADR-0031 D1)");
@@ -144,23 +277,37 @@ impl FrameBuilder {
             "covered watermark leads the frame's own records"
         );
         let frame_len = self.frame_len();
-        self.buf[0..4].copy_from_slice(&FRAME_MAGIC);
-        self.buf[4..8].copy_from_slice(&frame_len.to_le_bytes());
-        self.buf[8..12].copy_from_slice(&self.record_count.to_le_bytes());
-        self.buf[12..16].copy_from_slice(&first_record_lsn.segment.0.to_le_bytes());
-        self.buf[16..20].copy_from_slice(&first_record_lsn.offset.to_le_bytes());
-        self.buf[20..24].copy_from_slice(&stamp.epoch.to_le_bytes());
-        self.buf[24..32].copy_from_slice(&stamp.seq.to_le_bytes());
-        self.buf[32..40].copy_from_slice(&stamp.covered_lsn.to_le_bytes());
-        let crc = crc32c(&self.buf);
+        let magic = match layout {
+            FrameLayout::Packed => FRAME_MAGIC,
+            FrameLayout::Aligned => FRAME_MAGIC_V3,
+        };
+        let at = self.at;
+        let header = &mut self.buf[at..];
+        header[0..4].copy_from_slice(&magic);
+        header[4..8].copy_from_slice(&frame_len.to_le_bytes());
+        header[8..12].copy_from_slice(&self.record_count.to_le_bytes());
+        header[12..16].copy_from_slice(&first_record_lsn.segment.0.to_le_bytes());
+        header[16..20].copy_from_slice(&first_record_lsn.offset.to_le_bytes());
+        header[20..24].copy_from_slice(&stamp.epoch.to_le_bytes());
+        header[24..32].copy_from_slice(&stamp.seq.to_le_bytes());
+        header[32..40].copy_from_slice(&stamp.covered_lsn.to_le_bytes());
+        let crc = crc32c(&self.buf[at..]);
         self.buf.extend_from_slice(&crc.to_le_bytes());
+        debug_assert_eq!(self.buf.len() - at, frame_len as usize, "frame_len accounts the trailer");
+        let padded = layout.padded_len(frame_len) as usize;
+        self.buf.resize(at + padded, 0);
         self.sealed = true;
-        &self.buf
+        self.sealed_len = padded;
+        if layout == FrameLayout::Aligned {
+            debug_assert_eq!(self.buf[at..].as_ptr() as usize % FRAME_ALIGN as usize, 0);
+            debug_assert!(self.buf[at + frame_len as usize..].iter().all(|&b| b == 0));
+        }
+        &self.buf[at..]
     }
 
-    /// The finished frame bytes, available from `finalize` until `reset` —
-    /// what an in-flight write (the M2-S03 staging lease) hands to the
-    /// `writev`.
+    /// The finished frame bytes (padding included), available from
+    /// `finalize` until `reset` — what an in-flight write (the M2-S03
+    /// staging lease) hands to the `writev`.
     ///
     /// # Panics
     /// If the frame has not been finalized — an internal invariant of the
@@ -168,15 +315,25 @@ impl FrameBuilder {
     #[must_use]
     pub fn sealed_frame(&self) -> &[u8] {
         assert!(self.sealed, "sealed_frame before finalize");
-        &self.buf
+        &self.buf[self.at..][..self.sealed_len]
     }
 
-    /// Clear for the next iteration, keeping the allocation.
+    /// The finished frame's length (padding included), 0 before
+    /// `finalize` — an observability read that never panics.
+    #[must_use]
+    pub fn sealed_len(&self) -> usize {
+        self.sealed_len
+    }
+
+    /// Clear for the next iteration, keeping the allocation. O(1): only the
+    /// header is re-zeroed; a later `finalize` rewrites every byte it
+    /// emits (padding included).
     pub fn reset(&mut self) {
-        self.buf.truncate(0);
-        self.buf.resize(FRAME_HEADER_LEN, 0);
+        self.buf.truncate(self.at);
+        self.buf.extend_from_slice(&[0; FRAME_HEADER_LEN]);
         self.record_count = 0;
         self.sealed = false;
+        self.sealed_len = 0;
     }
 }
 
@@ -214,7 +371,7 @@ pub enum FrameDecodeError {
     /// below one header length, or the frame's bytes would run past the
     /// `u32` offset ceiling. Honest writers derive it as `base + header_len`
     /// (20 for v1, 40 for v2) inside a segment — ADR-0011 D2 as restated
-    /// per-version by ADR-0072 D1 — so either shape is corruption.
+    /// per-version by ADR-0126 D1 — so either shape is corruption.
     BadFirstLsn {
         offset: u32,
     },
@@ -252,6 +409,8 @@ pub struct FrameRef<'a> {
     first_lsn: Lsn,
     record_count: u32,
     stamp: Option<FrameStamp>,
+    layout: FrameLayout,
+    frame_len: u32,
     body: &'a [u8],
 }
 
@@ -266,10 +425,31 @@ impl<'a> FrameRef<'a> {
         self.record_count
     }
 
-    /// The v2 stamp, `None` on a legacy v1 frame.
+    /// The v2/v3 stamp, `None` on a legacy v1 frame.
     #[must_use]
     pub fn stamp(&self) -> Option<FrameStamp> {
         self.stamp
+    }
+
+    /// How this frame lies on the device: `Aligned` for v3 (the successor
+    /// is [`FRAME_ALIGN`]-aligned), `Packed` otherwise.
+    #[must_use]
+    pub fn layout(&self) -> FrameLayout {
+        self.layout
+    }
+
+    /// Header + body + trailer bytes (the `frame_len` field).
+    #[must_use]
+    pub fn frame_len(&self) -> u32 {
+        self.frame_len
+    }
+
+    /// Bytes from this frame's base to its successor's base — the reader's
+    /// advance (ADR-0086 D3): `frame_len` for v1/v2, the aligned extent for
+    /// v3.
+    #[must_use]
+    pub fn padded_len(&self) -> u32 {
+        self.layout.padded_len(self.frame_len)
     }
 
     /// This frame's header length (version-dependent) — the distance from
@@ -340,6 +520,13 @@ pub struct RecordIter<'a> {
 impl<'a> Iterator for RecordIter<'a> {
     type Item = Result<(Lsn, RecordView<'a>), FrameRecordError>;
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: remaining starts at declared and only falls, and is non-zero where it \
+                  is decremented; decode_record consumes <= the slice it was given, so offset \
+                  stays <= body.len(), and the body is part of a frame whose length is a u32"
+    )]
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
             return None;
@@ -375,11 +562,13 @@ impl<'a> Iterator for RecordIter<'a> {
 }
 
 /// Header facts shared by the decoder and the readers' window sizing:
-/// which version the magic names and that version's header/minimum bounds.
+/// which version the magic names, that version's header/minimum bounds,
+/// and how the frame lies on the device.
 pub(crate) struct FrameShape {
     pub header_len: usize,
     pub min_frame_len: u32,
     pub has_stamp: bool,
+    pub layout: FrameLayout,
 }
 
 /// Classify the 4-byte magic. `Ok(None)` = all-zero (preallocated tail).
@@ -392,6 +581,15 @@ pub(crate) fn frame_shape(magic: [u8; 4]) -> Result<Option<FrameShape>, FrameDec
             header_len: FRAME_HEADER_LEN,
             min_frame_len: MIN_FRAME_LEN,
             has_stamp: true,
+            layout: FrameLayout::Packed,
+        }));
+    }
+    if magic == FRAME_MAGIC_V3 {
+        return Ok(Some(FrameShape {
+            header_len: FRAME_HEADER_LEN,
+            min_frame_len: MIN_FRAME_LEN,
+            has_stamp: true,
+            layout: FrameLayout::Aligned,
         }));
     }
     if magic == FRAME_MAGIC_V1 {
@@ -399,13 +597,18 @@ pub(crate) fn frame_shape(magic: [u8; 4]) -> Result<Option<FrameShape>, FrameDec
             header_len: FRAME_HEADER_LEN_V1,
             min_frame_len: MIN_FRAME_LEN_V1,
             has_stamp: false,
+            layout: FrameLayout::Packed,
         }));
     }
     Err(FrameDecodeError::BadMagic { found: magic })
 }
 
-/// Decode and CRC-validate one frame (either format) from the front of
-/// `buf`. Returns the frame view and total bytes consumed (`frame_len`).
+/// Decode and CRC-validate one frame (any format) from the front of
+/// `buf`. Returns the frame view and the bytes consumed **by the frame
+/// itself** (`frame_len`) — a v3 frame's padding is not required to be
+/// present (`FrameRef::padded_len` is the successor distance; the
+/// callers that walk a segment advance by it and treat a short padding
+/// region like any short tail).
 pub fn decode_frame(
     buf: &[u8],
     max_frame_len: u32,
@@ -427,13 +630,26 @@ pub fn decode_frame(
     if frame_len < shape.min_frame_len || frame_len > max_frame_len {
         return Err(FrameDecodeError::BadLength { len: frame_len });
     }
+    // The on-device extent (ADR-0126 D1 as amended, F-L02-04): a v3
+    // frame occupies `align_up(frame_len)`, and that is what the successor
+    // address and every segment cursor advance by — so it, not
+    // `frame_len`, is what must fit a u32-addressed segment.
+    let Some(extent) = (match shape.layout {
+        FrameLayout::Packed => Some(frame_len),
+        FrameLayout::Aligned => frame_len.checked_next_multiple_of(FRAME_ALIGN),
+    }) else {
+        return Err(FrameDecodeError::BadLength { len: frame_len });
+    };
     let frame_len_usize = frame_len as usize;
     if buf.len() < frame_len_usize {
         return Err(FrameDecodeError::Truncated { needed: frame_len_usize, available: buf.len() });
     }
     let frame = &buf[..frame_len_usize];
-    let (covered, trailer) = frame.split_at(frame_len_usize - FRAME_TRAILER_LEN);
-    let stored = u32::from_le_bytes(trailer.try_into().expect("4-byte trailer"));
+    // `frame_len >= min_frame_len` (checked above) covers the trailer.
+    let Some((covered, trailer)) = frame.split_last_chunk::<FRAME_TRAILER_LEN>() else {
+        return Err(FrameDecodeError::BadLength { len: frame_len });
+    };
+    let stored = u32::from_le_bytes(*trailer);
     let computed = crc32c(covered);
     if stored != computed {
         return Err(FrameDecodeError::CrcMismatch { stored, computed });
@@ -447,19 +663,21 @@ pub fn decode_frame(
         u32::from_le_bytes(frame[16..20].try_into().expect("4-byte slice")),
     );
     // An honest writer derives the first record's offset as `base +
-    // header_len` — 20 for v1, 40 for v2 — and the whole frame sits inside a
-    // u32-addressed segment (ADR-0011 D2 as restated per-version by
-    // ADR-0072 D1; D2's own text says "+ 20", which is v1-era wording).
-    // So the offset is at least one header in and the frame's own bytes fit
-    // below the ceiling. Without this bound a CRC-valid frame declaring a
+    // header_len` — 20 for v1, 40 for v2/v3 — and the whole frame, padding
+    // included, sits inside a u32-addressed segment (ADR-0011 D2 as
+    // restated per-version by ADR-0126 D1, extent as amended for v3;
+    // D2's own text says "+ 20", which is v1-era wording). So the offset
+    // is at least one header in and the frame's on-device bytes fit below
+    // the ceiling. Without this bound a CRC-valid frame declaring a
     // near-`u32::MAX` offset makes `RecordIter` advance the record cursor
-    // past the ceiling and panic in `Lsn::advance`, and makes
-    // `Phase::Replay`'s `first_lsn.offset - header_len` frame-base
-    // subtraction underflow.
-    let header_len_u32 = shape.header_len as u32;
-    if first_lsn.offset < header_len_u32
-        || (first_lsn.offset - header_len_u32).checked_add(frame_len).is_none()
-    {
+    // past the ceiling and panic in `Lsn::advance`, makes `Phase::Replay`'s
+    // `first_lsn.offset - header_len` frame-base subtraction underflow,
+    // and (v3) lets the successor address wrap past the ceiling.
+    let fits_segment = u64::from(first_lsn.offset)
+        .checked_sub(shape.header_len as u64)
+        .and_then(|base| base.checked_add(u64::from(extent)))
+        .is_some_and(|end| end <= u64::from(u32::MAX));
+    if !fits_segment {
         return Err(FrameDecodeError::BadFirstLsn { offset: first_lsn.offset });
     }
     let stamp = if shape.has_stamp {
@@ -478,8 +696,9 @@ pub fn decode_frame(
     } else {
         None
     };
-    let body = &frame[shape.header_len..frame_len_usize - FRAME_TRAILER_LEN];
-    Ok((FrameRef { first_lsn, record_count, stamp, body }, frame_len_usize))
+    let body = &covered[shape.header_len..];
+    let frame = FrameRef { first_lsn, record_count, stamp, layout: shape.layout, frame_len, body };
+    Ok((frame, frame_len_usize))
 }
 
 /// Sequential frame iterator over a contiguous byte region (a segment
@@ -511,14 +730,17 @@ impl<'a> Iterator for FrameIter<'a> {
     type Item = Result<(usize, FrameRef<'a>), FrameDecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done || self.offset == self.buf.len() {
+        if self.done || self.offset >= self.buf.len() {
             self.done = true;
             return None;
         }
         match decode_frame(&self.buf[self.offset..], self.max_frame_len) {
-            Ok((frame, consumed)) => {
+            Ok((frame, _consumed)) => {
                 let at = self.offset;
-                self.offset += consumed;
+                // v3: the successor sits at the aligned boundary (ADR-0086
+                // D3); an image ending inside the padding ends the walk.
+                // Saturating: a cursor at or past the image's end ends the walk.
+                self.offset = self.offset.saturating_add(frame.padded_len() as usize);
                 Some(Ok((at, frame)))
             }
             Err(FrameDecodeError::ZeroMagic) => {
@@ -545,8 +767,9 @@ mod tests {
         let mut builder = FrameBuilder::new();
         builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
         let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
-        let mut image =
-            builder.finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp).to_vec();
+        let mut image = builder
+            .finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp, FrameLayout::Packed)
+            .to_vec();
         image[16..20].copy_from_slice(&offset.to_le_bytes());
         let end = image.len() - FRAME_TRAILER_LEN;
         let crc = crc32c(&image[..end]);
@@ -584,6 +807,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn first_lsn_at_the_header_boundary_decodes_v1_and_v2() {
+        let v2 = frame_with_first_offset(FRAME_HEADER_LEN as u32);
+        let mut v1 = v2[..FRAME_HEADER_LEN_V1].to_vec();
+        v1.extend_from_slice(&v2[FRAME_HEADER_LEN..v2.len() - FRAME_TRAILER_LEN]);
+        v1[..4].copy_from_slice(&FRAME_MAGIC_V1);
+        let frame_len = v1.len() as u32 + FRAME_TRAILER_LEN as u32;
+        v1[4..8].copy_from_slice(&frame_len.to_le_bytes());
+        v1[16..20].copy_from_slice(&(FRAME_HEADER_LEN_V1 as u32).to_le_bytes());
+        let crc = crc32c(&v1);
+        v1.extend_from_slice(&crc.to_le_bytes());
+        for (image, header_len) in [(&v1, FRAME_HEADER_LEN_V1), (&v2, FRAME_HEADER_LEN)] {
+            let (frame, consumed) = decode_frame(image, DEFAULT_MAX_FRAME_LEN).unwrap();
+            assert_eq!(consumed, image.len());
+            assert_eq!(frame.first_lsn().offset, header_len as u32);
+            assert_eq!(frame.records().filter(|r| r.is_ok()).count(), 1);
+        }
+    }
+
     /// The bound admits the whole legal range: a frame ending exactly at the
     /// ceiling decodes, and every record walks without panicking.
     #[test]
@@ -596,5 +838,97 @@ mod tests {
         assert_eq!(consumed, frame_len as usize);
         assert_eq!(frame.first_lsn().offset, last);
         assert_eq!(frame.records().filter(|r| r.is_ok()).count(), 1);
+    }
+
+    /// One honest single-record v3 frame with `first_lsn.offset` rewritten
+    /// (CRC repaired), padding included — the aligned shape whose extent
+    /// is `align_up(frame_len)`, not `frame_len`.
+    fn aligned_frame_with_first_offset(offset: u32) -> Vec<u8> {
+        let mut builder = FrameBuilder::new();
+        builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+        let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+        let frame_len = builder.frame_len() as usize;
+        let mut image = builder
+            .finalize(Lsn::new(SegmentId(0), FRAME_HEADER_LEN as u32), stamp, FrameLayout::Aligned)
+            .to_vec();
+        image[16..20].copy_from_slice(&offset.to_le_bytes());
+        let end = frame_len - FRAME_TRAILER_LEN;
+        let crc = crc32c(&image[..end]);
+        image[end..frame_len].copy_from_slice(&crc.to_le_bytes());
+        image
+    }
+
+    /// Review 2026-08-30 F-L02-04: the aligned round-up saturates instead
+    /// of wrapping — `len.div_ceil(4096) * 4096` overflowed for the top
+    /// 4095 values (a debug multiply panic; `0` in release, which made
+    /// `FrameIter` re-decode the same frame forever).
+    #[test]
+    fn align_up_saturates_at_the_ceiling() {
+        assert_eq!(align_up_frame(u32::MAX - 4094), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX - 1), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX), u32::MAX);
+        assert_eq!(align_up_frame(u32::MAX - 4095), u32::MAX - 4095);
+        assert_eq!(align_up_frame(1), FRAME_ALIGN);
+        assert_eq!(align_up_frame(0), 0);
+    }
+
+    /// ADR-0126 D1 as amended (F-L02-04): the second inequality bounds
+    /// the frame's **on-device extent**. A v3 frame whose `frame_len`
+    /// fits below the ceiling but whose padded extent does not is refused
+    /// — before this bound it decoded, and its successor address wrapped.
+    #[test]
+    fn aligned_frame_whose_padding_crosses_the_ceiling_is_a_decode_error() {
+        let frame_len = aligned_frame_with_first_offset(FRAME_HEADER_LEN as u32)[4..8]
+            .try_into()
+            .map(u32::from_le_bytes)
+            .expect("4-byte slice");
+        assert!(frame_len < FRAME_ALIGN, "one-block test frame");
+        // base + frame_len == u32::MAX: legal under the old bound, and the
+        // padded extent base + 4096 crosses the ceiling.
+        let base = u32::MAX - frame_len;
+        let offset = base + FRAME_HEADER_LEN as u32;
+        let image = aligned_frame_with_first_offset(offset);
+        assert!(
+            matches!(
+                decode_frame(&image, DEFAULT_MAX_FRAME_LEN),
+                Err(FrameDecodeError::BadFirstLsn { offset: o }) if o == offset
+            ),
+            "a v3 frame whose padded extent crosses the u32 ceiling must not decode"
+        );
+        // The last legal aligned base: the padded extent ends exactly at
+        // the ceiling + 1 (`base + 4096 == 2^32` is one past — refused),
+        // so `base + 4096 - 1 == u32::MAX` is the boundary that decodes.
+        let last_base = u32::MAX - FRAME_ALIGN + 1;
+        let last = aligned_frame_with_first_offset(last_base + FRAME_HEADER_LEN as u32);
+        assert!(
+            decode_frame(&last, DEFAULT_MAX_FRAME_LEN).is_err(),
+            "an extent ending one past the ceiling is refused"
+        );
+        let legal_base = u32::MAX - 2 * FRAME_ALIGN + 1;
+        let legal = aligned_frame_with_first_offset(legal_base + FRAME_HEADER_LEN as u32);
+        let (frame, _) = decode_frame(&legal, DEFAULT_MAX_FRAME_LEN).expect("the last legal base");
+        assert_eq!(
+            u64::from(legal_base) + u64::from(frame.padded_len()),
+            u64::from(u32::MAX) - FRAME_ALIGN as u64 + 1
+        );
+    }
+
+    /// A v3 frame whose `frame_len` itself cannot be padded inside a u32
+    /// is a bad length whatever its position (the saturating round-up
+    /// must never be the only thing between the decoder and a wrap).
+    #[test]
+    fn aligned_frame_len_that_cannot_be_padded_is_a_bad_length() {
+        let mut image = aligned_frame_with_first_offset(FRAME_HEADER_LEN as u32);
+        let len = u32::MAX - 4094;
+        image[4..8].copy_from_slice(&len.to_le_bytes());
+        // Short buffer: the length bound must fire before the truncation
+        // check reads a 4 GiB frame, and before the CRC.
+        assert!(
+            matches!(
+                decode_frame(&image, u32::MAX),
+                Err(FrameDecodeError::BadLength { len: l }) if l == len
+            ),
+            "an unpaddable frame_len is a BadLength under a permissive max_frame_len"
+        );
     }
 }

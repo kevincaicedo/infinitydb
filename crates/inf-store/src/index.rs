@@ -23,15 +23,21 @@
 //! a disk storm (the §3.3 index-only rule); memory tables' sidecar is
 //! zero-sized and every touch of it compiles away.
 //!
-//! M1 reserve: incremental split-order migration replaces the stop-and-copy
-//! `grow` below; the `(live, tombstones, growth_left)` bookkeeping is
-//! already per-table so the migration can move one group per MAINTAIN slice.
+//! Growth is stop-and-copy on the foreground write path (every key
+//! rehashed under SipHash; a 16 M-key doubling is one multi-hundred-
+//! millisecond stall), attributed by `StoreStats::index_grows`. The M1
+//! reserve for an incremental split-order migration (one group per
+//! MAINTAIN slice, on the per-table `(live, tombstones)` bookkeeping) was
+//! never taken up; it stays a design item, not a plan in flight (review
+//! 2026-08-30, lane L05).
+
+use core::ops::ControlFlow;
 
 use inf_alloc::ArenaAddr;
 use inf_foundation::LogicalAddr;
 use inf_simd::{eq_mask16, high_bit_mask16, prefetch_read};
 
-const GROUP: usize = 16;
+pub(crate) const GROUP: usize = 16;
 const CTRL_EMPTY: u8 = 0x80;
 const CTRL_TOMB: u8 = 0xFE;
 /// Numerator of the maximum load factor (live + tombstones ≤ 85% of slots).
@@ -200,6 +206,81 @@ pub struct Index<M: SlotMode = MemoryMode> {
     capacity: usize,
     live: usize,
     tombstones: usize,
+    /// Stop-and-copy rebuilds so far (doublings and same-size tombstone
+    /// recycles) — every entry re-places, so a [`ChainPos`] cut under an
+    /// older count is void (ADR-0117 D2).
+    rebuilds: u64,
+}
+
+/// A position inside one home group's probe chain — the checkpoint
+/// walk's in-chain resume (ADR-0117 D2, amending ADR-0016 D2's
+/// group-only cursor). Exact across removals (slots never move; `remove`
+/// writes EMPTY only into groups that already hold one, so no chain
+/// shortens under it) and across inserts (a filled slot behind the
+/// position is a mid-walk write the log tail covers); void across a
+/// rebuild, which the `rebuilds` stamp detects — the home group then
+/// restarts from its head, re-emitting at most one chain (duplicates
+/// only, never a miss; a walk sees at most `log₂` doublings).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ChainPos {
+    rebuilds: u64,
+    home: usize,
+    group: usize,
+    stride: usize,
+    slot: usize,
+}
+
+/// The checkpoint walk's resumable position over one index: a home-group
+/// cursor (reverse-binary order, ADR-0016 D2) plus an optional in-chain
+/// resume inside that group (ADR-0117 D2). `START` names the beginning;
+/// a completed walk hands `START` back.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WalkCursor {
+    pub group: u64,
+    pub chain: Option<ChainPos>,
+}
+
+impl WalkCursor {
+    pub const START: WalkCursor = WalkCursor { group: 0, chain: None };
+
+    /// True at a pass boundary: nothing of this index was walked yet
+    /// (or the walk completed and reset).
+    #[must_use]
+    pub fn at_start(&self) -> bool {
+        self.group == 0 && self.chain.is_none()
+    }
+}
+
+/// How one [`Index::probe_exact_bounded`] walk ended. Three outcomes, so
+/// an enum: only `ChainEnd` proves the whole chain was seen — negative
+/// evidence ("no other record has this hash") is valid on nothing else.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProbeEnd {
+    /// An `EMPTY` (or the full cycle) ended the chain after `groups`
+    /// control groups were loaded: every candidate was visited.
+    ChainEnd { groups: u32 },
+    /// `groups_max` groups were loaded and the chain had not ended.
+    GroupBudget,
+    /// `visit` returned `Break` after `groups` groups were loaded.
+    Stopped { groups: u32 },
+}
+
+/// The position of a resumable home-group walk
+/// ([`Index::home_group_cursor`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HomeGroupCursor {
+    mask: usize,
+    home: usize,
+    group: usize,
+    stride: usize,
+}
+
+impl HomeGroupCursor {
+    /// The home group this cursor walks.
+    #[must_use]
+    pub fn home(&self) -> usize {
+        self.home
+    }
 }
 
 impl<M: SlotMode> Index<M> {
@@ -214,6 +295,7 @@ impl<M: SlotMode> Index<M> {
             capacity,
             live: 0,
             tombstones: 0,
+            rebuilds: 0,
         }
     }
 
@@ -233,6 +315,15 @@ impl<M: SlotMode> Index<M> {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Stop-and-copy rebuilds so far (doublings and same-size tombstone
+    /// recycles). Between two rebuilds no entry changes slot, so a walk
+    /// stamped with this count and still matching it saw every entry
+    /// present throughout exactly once (ADR-0117 D2; ADR-0008 A1 rule 6).
+    #[inline]
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
     }
 
     /// Exact table footprint in bytes (feeds `index_bytes`, L5) — the
@@ -295,6 +386,87 @@ impl<M: SlotMode> Index<M> {
             }
             group = (group + stride) & mask;
         }
+    }
+
+    /// The **one** probe-chain walk over fragment matches (ADR-0139 D9):
+    /// visits, in probe order, every slotted address that passes the
+    /// 22-bit fragment (control tag **and** `fp15`) and — on tiered
+    /// tables — the full sidecar hash (`ext_matches`). On memory tables
+    /// a visited slot is therefore only a *candidate*: the caller
+    /// re-hashes the record's key to confirm 64 bits.
+    ///
+    /// The group budget lives here because only the traversal can keep
+    /// it: a group is charged when its control bytes are loaded, match
+    /// or not, so a chain of match-free full groups is bounded too. A
+    /// chain that ends **in** its `groups_max`-th group is
+    /// [`ProbeEnd::ChainEnd`]; one that needs another is
+    /// [`ProbeEnd::GroupBudget`]. The full-cycle exit (every group seen,
+    /// a table saturated with tombstones) is `ChainEnd`. `visit`
+    /// returning `Break` stops the walk at once.
+    pub fn probe_exact_bounded(
+        &self,
+        hash: u64,
+        groups_max: usize,
+        mut visit: impl FnMut(M::Addr) -> ControlFlow<()>,
+    ) -> ProbeEnd {
+        let (tag, fp) = (h2(hash), fp15(hash));
+        let mask = self.group_mask();
+        let mut group = (hash as usize) & mask;
+        let mut stride = 0;
+        let mut groups: u32 = 0;
+        loop {
+            #[cfg(not(inf_canary_walk_callback_cap))]
+            if groups as usize >= groups_max {
+                return ProbeEnd::GroupBudget;
+            }
+            #[cfg(inf_canary_walk_callback_cap)]
+            let _ = groups_max;
+            let ctrl = self.ctrl_group(group);
+            groups += 1;
+            let mut candidates = eq_mask16(ctrl, tag);
+            while candidates != 0 {
+                let i = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let pos = group * GROUP + i;
+                let slot = self.slots[pos];
+                if slot.fp15() == fp
+                    && M::ext_matches(&self.ext, pos, hash)
+                    && visit(M::addr_from_raw(slot.addr_raw())).is_break()
+                {
+                    return ProbeEnd::Stopped { groups };
+                }
+            }
+            // An EMPTY anywhere in the group terminates the probe chain
+            // (tombstones do not — deleted slots were once links).
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return ProbeEnd::ChainEnd { groups };
+            }
+            stride += 1;
+            if stride > mask {
+                return ProbeEnd::ChainEnd { groups }; // every group was seen
+            }
+            group = (group + stride) & mask;
+        }
+    }
+
+    /// Visits every slotted address that passes the control tag, `fp15`
+    /// and — on tiered tables — the **full** sidecar hash, in probe
+    /// order, until the chain ends. The M4.5-S37 shadow probe (ADR-0093
+    /// D2): a cold candidate is a *shadow* only when its 64-bit hash
+    /// equals the key's — a fingerprint-only match is another key and is
+    /// left alone. Diagnostics-class cost (one chain walk); the eligible
+    /// write pays it once, after `lookup` reported a cold candidate.
+    /// A call of [`probe_exact_bounded`](Self::probe_exact_bounded) with
+    /// the whole table as its budget — there is no second traversal.
+    pub fn each_exact(&self, hash: u64, mut visit: impl FnMut(M::Addr)) {
+        let end = self.probe_exact_bounded(hash, self.group_count(), |addr| {
+            visit(addr);
+            ControlFlow::Continue(())
+        });
+        debug_assert!(
+            matches!(end, ProbeEnd::ChainEnd { .. }),
+            "a whole-table budget always reaches the chain's end: {end:?}"
+        );
     }
 
     /// Diagnostics: groups visited until the probe for `hash` terminates
@@ -446,6 +618,129 @@ impl<M: SlotMode> Index<M> {
         }
     }
 
+    /// One home group's probe chain, resumable at a [`ChainPos`] (ADR-0117
+    /// D2): visits every live slot from the position (or the chain's head
+    /// when `resume` is `None` or predates a rebuild), handing `visit`
+    /// the slot index and its position; `visit` returns `false` to stop
+    /// *before* consuming that slot, and the position comes back so the
+    /// next call resumes exactly there. `None` = the chain ended.
+    fn walk_chain(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut visit: impl FnMut(usize, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        let mut pos = match resume {
+            Some(p) if p.rebuilds == self.rebuilds && p.home == home => p,
+            _ => ChainPos { rebuilds: self.rebuilds, home, group: home, stride: 0, slot: 0 },
+        };
+        loop {
+            let ctrl = self.ctrl_group(pos.group);
+            while pos.slot < GROUP {
+                if ctrl[pos.slot] & 0x80 == 0 && !visit(pos.group * GROUP + pos.slot, pos) {
+                    return Some(pos);
+                }
+                pos.slot += 1;
+            }
+            if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+                return None;
+            }
+            pos.stride += 1;
+            if pos.stride > mask {
+                return None;
+            }
+            pos.group = (pos.group + pos.stride) & mask;
+            pos.slot = 0;
+        }
+    }
+
+    /// [`scan_home_group`](Self::scan_home_group) resumable at a
+    /// [`ChainPos`] (ADR-0117 D2): `emit(addr, pos)` returns `false` to
+    /// stop before that entry; the returned position resumes there.
+    pub fn scan_home_group_from(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut hash_of: impl FnMut(M::Addr) -> u64,
+        mut emit: impl FnMut(M::Addr, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        self.walk_chain(home_group, resume, |slot, pos| {
+            let addr = M::addr_from_raw(self.slots[slot].addr_raw());
+            (hash_of(addr) as usize) & mask != home || emit(addr, pos)
+        })
+    }
+
+    /// [`scan_home_group_ext`](Self::scan_home_group_ext) resumable at a
+    /// [`ChainPos`] (ADR-0117 D2): `emit(addr, hash, pos)` returns `false`
+    /// to stop before that entry; the returned position resumes there.
+    pub fn scan_home_group_ext_from(
+        &self,
+        home_group: usize,
+        resume: Option<ChainPos>,
+        mut emit: impl FnMut(M::Addr, u64, ChainPos) -> bool,
+    ) -> Option<ChainPos> {
+        let mask = self.group_mask();
+        let home = home_group & mask;
+        self.walk_chain(home_group, resume, |slot, pos| {
+            let hash = M::ext_hash(&self.ext, slot);
+            (hash as usize) & mask != home
+                || emit(M::addr_from_raw(self.slots[slot].addr_raw()), hash, pos)
+        })
+    }
+
+    /// A resumable home-group walk positioned at `group`'s home (M4.5-S37,
+    /// ADR-0093 A4′): [`scan_home_group_step`](Self::scan_home_group_step)
+    /// visits the chain one 16-slot probe group at a time, so a caller
+    /// that mutates between steps holds a scratch bounded by the group,
+    /// never by the chain.
+    #[must_use]
+    pub fn home_group_cursor(&self, group: usize) -> HomeGroupCursor {
+        let mask = self.group_mask();
+        let home = group & mask;
+        HomeGroupCursor { mask, home, group: home, stride: 0 }
+    }
+
+    /// One step of a home-group walk: emits `(addr, full hash)` for the
+    /// live entries of the cursor's current probe group whose home is
+    /// the cursor's, then advances it; `false` once the chain has ended
+    /// (this was its last group). Same guarantee as
+    /// [`scan_home_group_ext`](Self::scan_home_group_ext) taken group by
+    /// group. Valid across removals between steps: `remove` writes EMPTY
+    /// only into groups that already hold one, so no chain shortens
+    /// under a cursor — and never across growth (debug-asserted: the
+    /// cursor carries the mask it was cut for).
+    pub fn scan_home_group_step(
+        &self,
+        cursor: &mut HomeGroupCursor,
+        mut emit: impl FnMut(M::Addr, u64),
+    ) -> bool {
+        let mask = self.group_mask();
+        debug_assert_eq!(cursor.mask, mask, "a home-group cursor outlived a grow");
+        let ctrl = self.ctrl_group(cursor.group);
+        for (i, &c) in ctrl.iter().enumerate() {
+            if c & 0x80 == 0 {
+                let pos = cursor.group * GROUP + i;
+                let hash = M::ext_hash(&self.ext, pos);
+                if (hash as usize) & mask == cursor.home {
+                    emit(M::addr_from_raw(self.slots[pos].addr_raw()), hash);
+                }
+            }
+        }
+        if eq_mask16(ctrl, CTRL_EMPTY) != 0 {
+            return false;
+        }
+        cursor.stride += 1;
+        if cursor.stride > mask {
+            return false;
+        }
+        cursor.group = (cursor.group + cursor.stride) & mask;
+        true
+    }
+
     fn position_of(&self, hash: u64, addr: M::Addr) -> Option<usize> {
         let tag = h2(hash);
         let raw = M::addr_to_raw(addr);
@@ -472,6 +767,15 @@ impl<M: SlotMode> Index<M> {
             }
             group = (group + stride) & mask;
         }
+    }
+
+    /// The slot holding `(hash, addr)`, if slotted — test-support only
+    /// (the mid-pass leg of ADR-0008 A1 rule 6 places keys relative to
+    /// the sweep's cursor).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn slot_of(&self, hash: u64, addr: M::Addr) -> Option<usize> {
+        self.position_of(hash, addr)
     }
 
     /// Probe groups in the table (the SCAN cursor space — one cursor value
@@ -583,6 +887,7 @@ impl<M: SlotMode> Index<M> {
             capacity: new_capacity,
             live: 0,
             tombstones: 0,
+            rebuilds: self.rebuilds + 1,
         };
         for pos in 0..self.capacity {
             if self.ctrl[pos] & 0x80 == 0 {
@@ -604,6 +909,7 @@ impl<M: SlotMode> core::fmt::Debug for Index<M> {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,6 +1166,100 @@ mod tests {
         }
         // Load factor honored after growth churn.
         assert!(rig.index.len() * 100 <= rig.index.capacity() * 85);
+    }
+
+    /// A hostile but **admitted** table state (ADR-0139 D9): `full`
+    /// consecutive groups of `target`'s probe chain, each filled with 16
+    /// entries homed there. 410 of 512 groups is 80 % occupancy — under
+    /// the 85 % load rule, which bounds the expected chain only. With
+    /// `same_fragment` every entry passes `target`'s 22-bit filter; with
+    /// it off none does, so only the traversal can bound the walk.
+    fn chained_table(target: u64, full: usize, same_fragment: bool) -> Index {
+        let mut index: Index = Index::with_capacity(6_900);
+        assert_eq!(index.group_count(), 512);
+        let mask = index.group_mask();
+        let fragment = if same_fragment { target } else { !target } & !(mask as u64);
+        let mut group = (target as usize) & mask;
+        let mut next_addr = 0u64;
+        for stride in 1..=full {
+            for _ in 0..GROUP {
+                assert!(!index.needs_grow(), "the state is admitted by the load rule");
+                let addr = ArenaAddr::from_raw(next_addr).expect("small");
+                index.insert(fragment | group as u64, addr);
+                next_addr += 1;
+            }
+            group = (group + stride) & mask;
+        }
+        index
+    }
+
+    const CHAIN_TARGET: u64 = 0xA5A5_5A5A_DEAD_0000;
+
+    #[test]
+    fn bounded_walk_charges_every_loaded_group_match_or_not() {
+        // No slot passes the fragment, so `visit` never runs: a budget
+        // kept in the callback would walk all 411 groups.
+        let index = chained_table(CHAIN_TARGET, 410, false);
+        let mut visits = 0usize;
+        let mut count = |_| {
+            visits += 1;
+            ControlFlow::Continue(())
+        };
+        assert_eq!(index.probe_exact_bounded(CHAIN_TARGET, 32, &mut count), ProbeEnd::GroupBudget);
+        assert_eq!(
+            index.probe_exact_bounded(CHAIN_TARGET, 410, &mut count),
+            ProbeEnd::GroupBudget,
+            "the chain needs a 411th group"
+        );
+        assert_eq!(
+            index.probe_exact_bounded(CHAIN_TARGET, 411, &mut count),
+            ProbeEnd::ChainEnd { groups: 411 },
+            "a chain that ends in its last budgeted group is complete"
+        );
+        assert_eq!(visits, 0);
+    }
+
+    #[test]
+    fn bounded_walk_stops_on_break_and_each_exact_sees_the_same_slots() {
+        let index = chained_table(CHAIN_TARGET, 410, true);
+        let mut all = Vec::new();
+        index.each_exact(CHAIN_TARGET, |addr| all.push(addr));
+        assert_eq!(all.len(), 410 * GROUP, "every fragment match on the chain");
+        let mut seen = Vec::new();
+        let end = index.probe_exact_bounded(CHAIN_TARGET, 32, |addr| {
+            seen.push(addr);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(end, ProbeEnd::GroupBudget);
+        assert_eq!(seen, all[..32 * GROUP], "32 groups loaded, in probe order");
+        let mut taken = 0usize;
+        let end = index.probe_exact_bounded(CHAIN_TARGET, 32, |_| {
+            taken += 1;
+            if taken == 17 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+        });
+        assert_eq!(end, ProbeEnd::Stopped { groups: 2 }, "the 17th match sits in group 2");
+    }
+
+    /// The smallest budget: a chain that ends in its first group is
+    /// complete under `groups_max = 1`, and a budget of zero loads
+    /// nothing. (The full-cycle exit is not constructible here: the load
+    /// rule always leaves an `EMPTY` somewhere on a cycle.)
+    #[test]
+    fn bounded_walk_budget_of_one_and_zero() {
+        let mut index: Index = Index::with_capacity(8);
+        assert_eq!(index.group_count(), 1);
+        for i in 0..13u64 {
+            index.insert(i * 16, ArenaAddr::from_raw(i).expect("small"));
+        }
+        let visits = core::cell::Cell::new(0usize);
+        let count = |_| {
+            visits.set(visits.get() + 1);
+            ControlFlow::Continue(())
+        };
+        assert_eq!(index.probe_exact_bounded(0, 1, count), ProbeEnd::ChainEnd { groups: 1 });
+        assert_eq!(visits.get(), 13, "small hashes all carry the zero fragment");
+        assert_eq!(index.probe_exact_bounded(0, 0, count), ProbeEnd::GroupBudget);
+        assert_eq!(visits.get(), 13, "a zero budget loads no group");
     }
 
     #[test]

@@ -16,6 +16,16 @@
 //! `type` tags without touching this framing). Unknown types and unknown
 //! flag bits are **fail-stop decode errors**, never skipped (§8.4 honesty:
 //! replaying a newer log on an older binary must refuse, not corrupt).
+// ADR-0144 D2/D3: bytes from a log file enter here first.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 use core::num::NonZeroU64;
@@ -190,11 +200,19 @@ impl RecordView<'_> {
     /// by the staging accounting (`log_staging_bytes`, L5) and the frame
     /// builder.
     #[must_use]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: a live record's body plus its ≤ 10-byte prefix fits the address space"
+    )]
     pub fn encoded_len(&self) -> usize {
         let body = self.body_len();
         varint_len(body as u64) + body
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: live slice lengths plus ≤ 10-byte varints fit the address space"
+    )]
     fn body_len(&self) -> usize {
         // type + flags = 2 bytes, then per-variant fields.
         2 + match *self {
@@ -287,7 +305,8 @@ impl RecordView<'_> {
                 operand,
             } => {
                 debug_assert_eq!(base_version & !DOC_VERSION_MASK, 0);
-                debug_assert!(match_count > 0 && post_len > 0);
+                debug_assert!(match_count > 0);
+                debug_assert!(post_len > 0);
                 debug_assert_eq!(post_len & !DOC_VERSION_MASK, 0);
                 out.push(RecordType::DocDelta as u8);
                 out.push(RECORD_FLAGS_V1);
@@ -405,9 +424,8 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
         RecordDecodeError::Varint
     })?;
     let body_len = usize::try_from(body_len).map_err(|_| RecordDecodeError::Truncated)?;
-    let body = buf
-        .get(prefix_len..prefix_len.checked_add(body_len).ok_or(RecordDecodeError::Truncated)?)
-        .ok_or(RecordDecodeError::Truncated)?;
+    let end = prefix_len.checked_add(body_len).ok_or(RecordDecodeError::Truncated)?;
+    let body = buf.get(prefix_len..end).ok_or(RecordDecodeError::Truncated)?;
 
     let [tag, flags, fields @ ..] = body else {
         return Err(RecordDecodeError::Truncated);
@@ -526,7 +544,7 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordView<'_>, usize), RecordDecode
             RecordView::StringExtentRef { ns, key, extent_id, offset, len }
         }
     };
-    Ok((view, prefix_len + body_len))
+    Ok((view, end))
 }
 
 fn decode_key(payload: &[u8]) -> Result<(&[u8], &[u8]), RecordDecodeError> {
@@ -555,6 +573,10 @@ fn decode_doc_lineage(bytes: &[u8]) -> Result<DocLineage, RecordDecodeError> {
 
 /// Byte length of the canonical LEB128 encoding of `v`.
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: v != 0 on this arm, so leading_zeros() <= 63 and the difference is 1..=64"
+)]
 fn varint_len(v: u64) -> usize {
     if v == 0 { 1 } else { ((64 - v.leading_zeros()) as usize).div_ceil(7) }
 }

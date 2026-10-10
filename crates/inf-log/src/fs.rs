@@ -40,6 +40,54 @@ pub enum TierIoMode {
     Direct,
 }
 
+/// Log-segment I/O mode (M4.5-S34, ADR-0086 D1) — fixed at segment
+/// creation, carried by the segment. `Buffered` is the M2 path byte-for-
+/// byte (sparse prealloc, frame format v2, buffered write + linked
+/// fdatasync). `Direct` opens the segment `O_DIRECT`, writes 4 KiB-aligned
+/// v3 frames, and — once the segment is pre-zeroed — makes `always`
+/// frames write-through (FUA-class) instead of FLUSH-class. Durability is
+/// mode-independent (ADR-0086 D2); the mode decides the barrier's *cost*.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum SegmentIoMode {
+    /// Kernel page cache + fdatasync (the M2 default).
+    #[default]
+    Buffered,
+    /// `O_DIRECT`, verified at open — never a silent fallback.
+    Direct,
+}
+
+/// The storage-exhaustion class — ADR-0063's typed, non-fatal admission
+/// path (`LogError::NoSpace`, the tier/blob `is_storage_full` legs,
+/// `DISKFULL` at the client). `ENOSPC` and, since F-L04-03, `EDQUOT`: a
+/// quota'd filesystem (the reference box's `/tmp usrquota`) reports the
+/// same operator condition with a different errno, and
+/// `ErrorKind::FilesystemQuotaExceeded` is unstable, so the raw errno is
+/// the stable test. Every site classifies through here — never inline.
+#[must_use]
+pub fn is_storage_exhausted(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded)
+        || matches!(e.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+}
+
+/// A read loop's cursor after `read_at` reported `n` bytes into the
+/// `cap - done` bytes it was handed. The one refusal, for every reader, of
+/// a file that reports more than that slice: a broken fs seam must not
+/// pass unwritten buffer bytes off as read.
+///
+/// # Errors
+/// `InvalidData` naming the over-report.
+pub(crate) fn advance_read(done: usize, n: usize, cap: usize) -> io::Result<usize> {
+    done.checked_add(n).filter(|&next| next <= cap).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "read_at reported {n} bytes into the {} it was handed",
+                cap.saturating_sub(done)
+            ),
+        )
+    })
+}
+
 /// One open segment file. Offsets are absolute; the caller (the rotor)
 /// owns position bookkeeping.
 pub trait SegmentFile {
@@ -67,6 +115,15 @@ pub trait SegmentFile {
     /// sim tier implements the driver ops themselves. `inf-log` never
     /// performs a syscall on it.
     fn raw_fd(&self) -> Option<std::os::fd::RawFd>;
+    /// True when every byte of the file's length is backed by allocated,
+    /// written storage — the **read, never remembered** pre-zeroing fact
+    /// (ADR-0086 D4): a `Direct` segment writes write-through frames only
+    /// while this holds; a sparse tail, a zero-fill whose barrier a crash
+    /// lost, or a filesystem that elides zero blocks all read `false` and
+    /// run FLUSH-class barriers — correct, slower, visible. The std tier
+    /// reads `st_blocks`; in-memory tiers have no sparse concept (`true`);
+    /// the sim tier compares its length to the preallocation target.
+    fn fully_allocated(&self) -> io::Result<bool>;
     /// Advisory (M2.5-S08 read/apply overlap): the caller will soon read
     /// `[offset, offset + len)` sequentially. Tiers that can prefetch pull
     /// that window toward the page cache in the background, so the device
@@ -74,8 +131,9 @@ pub trait SegmentFile {
     /// never an effect: it changes no bytes the caller reads, so L7
     /// determinism and every digest are untouched — the default (and every
     /// in-memory/sim tier) is a no-op. The real implementation is
-    /// `inf-server`'s `ReadAheadFs` boot wrapper (a per-file prefetch
-    /// thread; this crate forbids unsafe and never blocks on the hint).
+    /// `inf-server`'s crate-private `ReadAheadFs` — held only by its boot
+    /// `Recovery` machine (ADR-0109), a per-file prefetch thread; this
+    /// crate forbids unsafe and never blocks on the hint.
     fn advise_read_ahead(&self, offset: u64, len: u64) {
         let _ = (offset, len);
     }
@@ -99,11 +157,13 @@ pub trait SegmentFs {
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File>;
     /// Create a tier file in `mode` (M4-S09, ADR-0054 D1). The default
     /// delegates to [`create_segment`](Self::create_segment) ignoring the
-    /// mode — honest **by construction** on the in-memory/sim tiers, whose
+    /// mode — honest **by construction** on the in-memory tier, whose
     /// byte-visibility model has no page cache to bypass (`Buffered ≡
     /// Direct` there), never a silent fallback on a real filesystem:
     /// [`StdSegmentFs`] implements the real thing and refuses typed when
-    /// `Direct` does not take effect (D3). Wrappers must forward this
+    /// `Direct` does not take effect (D3); the sim overrides it so a
+    /// `Direct` file asserts the `O_DIRECT` alignment contract on every
+    /// write (F-L04-14, ADR-0119 A1). Wrappers must forward this
     /// explicitly (falling into the default would drop the flag).
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         let _ = mode;
@@ -112,9 +172,9 @@ pub trait SegmentFs {
     /// Open an **existing** tier file in `mode` (M4-S11, ADR-0056 D5 —
     /// the recovery reopen). Same honesty contract as
     /// [`create_tier`](Self::create_tier): the default delegates to
-    /// [`open_write`](Self::open_write) (mode-equivalent on
-    /// in-memory/sim tiers), [`StdSegmentFs`] applies and verifies
-    /// `O_DIRECT`, and wrappers must forward explicitly.
+    /// [`open_write`](Self::open_write) (mode-equivalent on the in-memory
+    /// tier), [`StdSegmentFs`] applies and verifies `O_DIRECT`, the sim
+    /// flags the inode, and wrappers must forward explicitly.
     fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         let _ = mode;
         self.open_write(path)
@@ -126,9 +186,35 @@ pub trait SegmentFs {
     /// before any durable ack can reference it. A create-time sync here
     /// blocks the reactor behind foreign journal writeback (the boot-wedge
     /// mechanism). The default falls back to the synced create: correct,
-    /// but it pays the barrier at create time.
+    /// but it pays the barrier at create time — and on the sim it would
+    /// make the prealloc length durable at creation, which `set_len`
+    /// never is (F-L04-05): the sim overrides it, length pending until
+    /// the caller's barrier.
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         self.create_segment(path, prealloc_bytes)
+    }
+    /// Create a `Direct`-mode segment (ADR-0086 D4): `O_DIRECT` (verified
+    /// on the std tier, `Unsupported` off Linux — never a silent
+    /// fallback), **sparse** at `prealloc_bytes`, no durability side
+    /// effects (the M2.5-S01 deferred shape). The rotor zero-fills it
+    /// through the driver before its first frame; until the zero-fill
+    /// barrier lands, [`SegmentFile::fully_allocated`] is `false`. The
+    /// default delegates to the synced buffered create — honest on tiers
+    /// without a page cache to bypass (`Buffered ≡ Direct` there, and a
+    /// zero-filled in-memory vector is "fully allocated"); wrappers must
+    /// forward explicitly.
+    fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        self.create_segment(path, prealloc_bytes)
+    }
+    /// Open an **existing** segment for append in `mode` (ADR-0086 D4 —
+    /// the recovered tail): `Direct` opens `O_DIRECT` (verified);
+    /// `Buffered` is [`open_write`](Self::open_write). Whether the
+    /// reopened file is pre-zeroed is the caller's
+    /// [`SegmentFile::fully_allocated`] question, not this method's. The
+    /// default ignores the mode (in-memory/sim tiers); wrappers forward.
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        let _ = mode;
+        self.open_write(path)
     }
     /// Create a new *staging* file (create-new semantics) with **no
     /// durability side effects** (M2-S11/S12): META/MANIFEST `.new` and
@@ -136,6 +222,14 @@ pub trait SegmentFs {
     /// fdatasync and its name durability from the publication dir-fsync —
     /// a create-time sync here is a wasted device barrier on the loop.
     fn create_meta(&self, path: &Path) -> io::Result<Self::File>;
+    /// `create_meta` with `O_DIRECT` (M4.5-S36, ADR-0088 D3): the `.ick`
+    /// staging file whose v3 blocks are written as aligned direct writes.
+    /// **Required, not defaulted** — a default falling back to
+    /// `create_meta` would be a buffered file wearing a direct label
+    /// (ADR-0054 D3). Std verifies the flag through fdinfo; the memory
+    /// and sim tiers record the mode and assert every write's alignment,
+    /// so the simulator catches what tmpfs swallows. Wrappers forward.
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File>;
     /// Open a directory as a syncable handle (M2-S11/S12): `sync_data` on
     /// it is the dir-fsync, and `raw_fd` is the address a driver
     /// `Fdatasync` targets so publication barriers never block the loop.
@@ -162,6 +256,7 @@ pub struct StdSegmentFs;
 
 /// A real file. Uses positional I/O (`pread`/`pwrite`) — no seek state.
 #[derive(Debug)]
+#[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
 pub struct StdSegmentFile(std::fs::File);
 
 impl SegmentFile for StdSegmentFile {
@@ -188,27 +283,42 @@ impl SegmentFile for StdSegmentFile {
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         Some(std::os::fd::AsRawFd::as_raw_fd(&self.0))
     }
+
+    fn fully_allocated(&self) -> io::Result<bool> {
+        let meta = self.0.metadata()?;
+        // `st_blocks` is in 512-byte units regardless of the block size.
+        // Our writer allocates only as a prefix (sequential zero-fill or
+        // sequential frames), so "all blocks present" ⇔ "no sparse tail".
+        // `fallocate`d unwritten extents would also count, which is why
+        // the writer never uses `fallocate` (ADR-0086 D4).
+        let allocated = std::os::unix::fs::MetadataExt::blocks(&meta).saturating_mul(512);
+        Ok(allocated >= meta.len())
+    }
 }
 
 impl SegmentFs for StdSegmentFs {
     type File = StdSegmentFile;
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::create_dir_all(dir)
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         std::fs::File::open(dir)?.sync_all()
     }
 
     fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         for entry in std::fs::read_dir(dir)? {
             names.push(entry?.file_name().to_string_lossy().into_owned());
         }
         Ok(names)
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
@@ -217,6 +327,7 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         // No sync_all: an fsync here commits the whole ext4 journal and
         // blocks the reactor behind any entangled foreign writeback for
@@ -228,6 +339,59 @@ impl SegmentFs for StdSegmentFs {
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
+    fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Sparse + unsynced like `create_segment_unsynced`: the zero-
+            // fill through the driver allocates the extents and its
+            // barrier commits them; the dir entry rides the prealloc dir
+            // barrier (ADR-0086 D4).
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            verify_o_direct(&file, path)?;
+            file.set_len(prealloc_bytes)?;
+            Ok(StdSegmentFile(file))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, prealloc_bytes);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT log segments are Linux-only (ADR-0086 D1); configure Buffered",
+            ))
+        }
+    }
+
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        match mode {
+            SegmentIoMode::Buffered => self.open_write(path),
+            #[cfg(target_os = "linux")]
+            SegmentIoMode::Direct => {
+                use std::os::unix::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)?;
+                verify_o_direct(&file, path)?;
+                Ok(StdSegmentFile(file))
+            }
+            #[cfg(not(target_os = "linux"))]
+            SegmentIoMode::Direct => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT log segments are Linux-only (ADR-0086 D1); configure Buffered",
+            )),
+        }
+    }
+
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         match mode {
             TierIoMode::Buffered => self.create_segment(path, 0),
@@ -252,6 +416,7 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         match mode {
             TierIoMode::Buffered => self.open_write(path),
@@ -274,29 +439,63 @@ impl SegmentFs for StdSegmentFs {
         }
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         let file =
             std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
         Ok(StdSegmentFile(file))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // No preallocation: plain `O_DIRECT` writes allocate as they
+            // go and the terminal fdatasync commits the metadata once
+            // (the FUA-on-unwritten-extent trap is an `O_DSYNC` trap;
+            // the checkpoint has no per-write barrier — ADR-0088 D3).
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            verify_o_direct(&file, path)?;
+            Ok(StdSegmentFile(file))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_DIRECT checkpoint files are Linux-only (ADR-0088 D3)",
+            ))
+        }
+    }
+
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::File::open(dir)?))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::OpenOptions::new().read(true).write(true).open(path)?))
     }
 
+    #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         Ok(StdSegmentFile(std::fs::File::open(path)?))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::rename(from, to)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
         std::fs::remove_file(path)
     }
 }
@@ -308,8 +507,10 @@ impl SegmentFs for StdSegmentFs {
 /// procfs read; this crate forbids unsafe, so no `fcntl` — and absence
 /// of the flag is a typed `Unsupported` refusal, never a downgrade.
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
 fn verify_o_direct(file: &std::fs::File, path: &Path) -> io::Result<()> {
     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    #[allow(clippy::disallowed_methods, reason = "fs-seam: injected SegmentFs real backend")]
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
     let flags = info
         .lines()
@@ -349,14 +550,44 @@ pub mod mem {
 
     use super::{SegmentFile, SegmentFs};
 
+    /// One file: its bytes and the preallocation the budget was debited
+    /// for at create (credited back on remove / rename-clobber).
+    #[derive(Debug)]
+    struct Entry {
+        data: Rc<RefCell<Vec<u8>>>,
+        debited: u64,
+    }
+
     #[derive(Debug, Default)]
     struct State {
         dirs: std::collections::BTreeSet<PathBuf>,
-        files: BTreeMap<PathBuf, Rc<RefCell<Vec<u8>>>>,
+        files: BTreeMap<PathBuf, Entry>,
         /// Remaining preallocation budget; `None` = unlimited. Debited by
-        /// `create_segment` — the ENOSPC injection point.
+        /// `create_segment` — the ENOSPC injection point — and credited
+        /// by `remove_file` / a clobbering `rename` (L04 style row).
         capacity: Option<u64>,
+        /// The errno an over-capacity create reports (`None` = the
+        /// `StorageFull` kind). `Some(libc::EDQUOT)` models a quota'd
+        /// filesystem (F-L04-03).
+        exhaustion_errno: Option<i32>,
+        /// The errno a `create_dir_all` that would add a directory
+        /// reports (`None` = mkdir succeeds): a full or over-quota device
+        /// has no block for a new directory, while an existing one is no
+        /// change and succeeds.
+        mkdir_errno: Option<i32>,
+        /// Cap on bytes one `read_at` returns (`None` = unlimited): the
+        /// partial-read model every reader must loop over (F-L04-10).
+        read_cap: Option<usize>,
+        #[cfg(test)]
+        overreport_reads: bool,
         fail_next_sync_data: bool,
+        /// `read_at` calls across every file — the dependent-read oracle
+        /// for the `.ick` loader (review L03, batch 34).
+        reads: u64,
+        /// `create_meta_direct` answers `Unsupported` — the filesystem /
+        /// platform without `O_DIRECT` (ADR-0088 D3 as amended): the
+        /// checkpoint's probed buffered fallback is exercised here.
+        refuse_direct_meta: bool,
         /// Crash-at-step injection (M2-S11): `Some(n)` allows `n` more
         /// mutating operations, then **every** further mutating op fails —
         /// modeling a dead process whose best-effort cleanup also never
@@ -365,6 +596,13 @@ pub mod mem {
     }
 
     impl State {
+        /// Returns a removed file's preallocation to the budget.
+        fn credit(&mut self, bytes: u64) {
+            if let Some(capacity) = self.capacity.as_mut() {
+                *capacity += bytes;
+            }
+        }
+
         /// Charge one mutating operation against the crash countdown.
         fn tick_op(&mut self) -> io::Result<()> {
             match self.ops_until_fault {
@@ -402,6 +640,30 @@ pub mod mem {
 
         /// Cap the total bytes `create_segment` may preallocate from now
         /// on. `None` lifts the cap.
+        /// Over-capacity creates fail with this raw errno instead of the
+        /// `StorageFull` kind (`libc::EDQUOT` = a quota'd filesystem).
+        pub fn set_exhaustion_errno(&self, errno: Option<i32>) {
+            self.state.borrow_mut().exhaustion_errno = errno;
+        }
+
+        /// Every `create_dir_all` that would add a directory fails with
+        /// this raw errno from now on (`libc::ENOSPC`, `libc::EDQUOT`);
+        /// one whose directories all exist still succeeds. `None` lifts it.
+        pub fn set_mkdir_errno(&self, errno: Option<i32>) {
+            self.state.borrow_mut().mkdir_errno = errno;
+        }
+
+        /// Every `read_at` returns at most `cap` bytes (partial reads).
+        pub fn set_read_cap(&self, cap: Option<usize>) {
+            self.state.borrow_mut().read_cap = cap;
+        }
+
+        /// Plant a broken file seam: report one byte past the supplied slice.
+        #[cfg(test)]
+        pub(crate) fn overreport_reads(&self) {
+            self.state.borrow_mut().overreport_reads = true;
+        }
+
         pub fn set_capacity(&self, bytes: Option<u64>) {
             self.state.borrow_mut().capacity = bytes;
         }
@@ -410,6 +672,12 @@ pub mod mem {
         /// fsyncgate probe (§8.4).
         pub fn fail_next_sync_data(&self) {
             self.state.borrow_mut().fail_next_sync_data = true;
+        }
+
+        /// Model a filesystem without `O_DIRECT`: every
+        /// `create_meta_direct` answers `Unsupported` from now on.
+        pub fn refuse_direct_meta(&self) {
+            self.state.borrow_mut().refuse_direct_meta = true;
         }
 
         /// Crash-at-step injection (M2-S11 swap matrix): allow `n` more
@@ -429,7 +697,13 @@ pub mod mem {
         /// Raw contents of a file (test assertions).
         #[must_use]
         pub fn contents(&self, path: &Path) -> Option<Vec<u8>> {
-            self.state.borrow().files.get(path).map(|data| data.borrow().clone())
+            self.state.borrow().files.get(path).map(|entry| entry.data.borrow().clone())
+        }
+
+        /// `read_at` calls so far across every file (test assertions).
+        #[must_use]
+        pub fn reads(&self) -> u64 {
+            self.state.borrow().reads
         }
     }
 
@@ -454,13 +728,22 @@ pub mod mem {
         }
 
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            let read_cap = {
+                let mut fs = self.fs.borrow_mut();
+                fs.reads += 1;
+                fs.read_cap
+            };
             let bytes = self.data.borrow();
             let offset = usize::try_from(offset).expect("offset fits usize");
             if offset >= bytes.len() {
                 return Ok(0);
             }
-            let n = buf.len().min(bytes.len() - offset);
+            let n = buf.len().min(bytes.len() - offset).min(read_cap.unwrap_or(usize::MAX));
             buf[..n].copy_from_slice(&bytes[offset..offset + n]);
+            #[cfg(test)]
+            if self.fs.borrow().overreport_reads {
+                return Ok(buf.len() + 1);
+            }
             Ok(n)
         }
 
@@ -488,6 +771,11 @@ pub mod mem {
         fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
             None
         }
+
+        fn fully_allocated(&self) -> io::Result<bool> {
+            // No sparse concept: a vector's bytes all exist.
+            Ok(true)
+        }
     }
 
     impl SegmentFs for MemFs {
@@ -495,6 +783,14 @@ pub mod mem {
 
         fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
+            // Charged like the sim tier's: a crash-at-step index means the
+            // same op on both (L04 style row).
+            state.tick_op()?;
+            if let Some(errno) = state.mkdir_errno
+                && !state.dirs.contains(dir)
+            {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
             let mut current = PathBuf::new();
             for part in dir.components() {
                 current.push(part);
@@ -548,7 +844,10 @@ pub mod mem {
             }
             if let Some(capacity) = state.capacity.as_mut() {
                 if prealloc_bytes > *capacity {
-                    return Err(io::Error::new(io::ErrorKind::StorageFull, "injected ENOSPC"));
+                    return Err(match state.exhaustion_errno {
+                        Some(errno) => io::Error::from_raw_os_error(errno),
+                        None => io::Error::new(io::ErrorKind::StorageFull, "injected ENOSPC"),
+                    });
                 }
                 *capacity -= prealloc_bytes;
             }
@@ -557,13 +856,27 @@ pub mod mem {
                 usize::try_from(prealloc_bytes)
                     .expect("prealloc fits usize")
             ]));
-            state.files.insert(path.to_path_buf(), Rc::clone(&data));
+            let debited = if state.capacity.is_some() { prealloc_bytes } else { 0 };
+            state.files.insert(path.to_path_buf(), Entry { data: Rc::clone(&data), debited });
             Ok(MemFile { data, fs: Rc::clone(&self.state) })
         }
 
         fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
             // Same create-new semantics, zero length, no capacity debit
             // (staging envelopes, not preallocated segments).
+            self.create_segment(path, 0)
+        }
+
+        fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+            if self.state.borrow().refuse_direct_meta {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "MemFs: O_DIRECT refused (refuse_direct_meta)",
+                ));
+            }
+            // Direct ≡ buffered in memory; the alignment of every write
+            // is asserted by the caller's block layout (v3 sealer) and by
+            // the sim tier — this tier records nothing (ADR-0088 D3).
             self.create_segment(path, 0)
         }
 
@@ -582,10 +895,10 @@ pub mod mem {
 
         fn open_write(&self, path: &Path) -> io::Result<Self::File> {
             let state = self.state.borrow();
-            let data = state.files.get(path).ok_or_else(|| {
+            let entry = state.files.get(path).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("no file {}", path.display()))
             })?;
-            Ok(MemFile { data: Rc::clone(data), fs: Rc::clone(&self.state) })
+            Ok(MemFile { data: Rc::clone(&entry.data), fs: Rc::clone(&self.state) })
         }
 
         fn open_read(&self, path: &Path) -> io::Result<Self::File> {
@@ -602,24 +915,45 @@ pub mod mem {
                     format!("no dir {}", parent.display()),
                 ));
             }
-            let data = state.files.remove(from).ok_or_else(|| {
+            let entry = state.files.remove(from).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
             })?;
-            // Replaces an existing destination atomically, like POSIX rename.
-            state.files.insert(to.to_path_buf(), data);
+            // Replaces an existing destination atomically, like POSIX
+            // rename; the clobbered file's bytes return to the budget.
+            if let Some(old) = state.files.insert(to.to_path_buf(), entry) {
+                state.credit(old.debited);
+            }
             Ok(())
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
             let mut state = self.state.borrow_mut();
             state.tick_op()?;
-            if state.files.remove(path).is_none() {
+            let Some(entry) = state.files.remove(path) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no file {}", path.display()),
                 ));
-            }
+            };
+            state.credit(entry.debited);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod advance_read_tests {
+    use super::advance_read;
+
+    /// The cursor advances up to the slice's end and refuses one past it,
+    /// and at the integer maximum — never a wrapped or clamped cursor.
+    #[test]
+    fn a_read_past_the_slice_is_refused() {
+        assert_eq!(advance_read(0, 0, 0).expect("empty"), 0);
+        assert_eq!(advance_read(0, 8, 8).expect("exactly the slice"), 8);
+        assert_eq!(advance_read(3, 4, 8).expect("inside"), 7);
+        assert!(advance_read(0, 9, 8).is_err(), "one past the slice");
+        assert!(advance_read(8, 1, 8).is_err(), "a byte into a full buffer");
+        assert!(advance_read(usize::MAX, 1, usize::MAX).is_err(), "the sum overflows");
     }
 }

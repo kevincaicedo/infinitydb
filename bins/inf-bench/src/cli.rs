@@ -11,7 +11,7 @@ pub struct Flags {
 
 // Some accessors are reserved for the M0-S18 `load`/`gate-run` subcommands
 // (in progress); only env-check links this module today.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "accessors reserved for the load/gate-run subcommands")]
 impl Flags {
     /// Parse `args` into flag/value pairs. Flags named in `bool_flags` take
     /// no value; every flag must appear in `known` (which includes the bool

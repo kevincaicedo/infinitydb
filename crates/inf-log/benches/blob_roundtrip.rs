@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M4-S17 — the 1 GiB round-trip staging budget (plan §4.1 / AC 2,
 //! ADR-0061 D1/D8): one 1 GiB value flows through the chunked extent
 //! writer and back through the chunked reader while resident staging

@@ -24,9 +24,15 @@
 //!   vanishes with all its data, fdatasync'd or not (the classic
 //!   fsync-the-directory lesson); a remove that did not survive
 //!   resurrects the file (ADR-0017's boot-GC re-collection).
-//! - `create_segment`'s prealloc extent is durable-if-the-name-survives
-//!   (`StdSegmentFs` syncs the file at create); `create_meta` carries no
-//!   durability side effects (ADR-0017).
+//! - `create_segment`'s prealloc **length** is durable-if-the-name-
+//!   survives (`StdSegmentFs` syncs the file at create; the blocks are
+//!   holes — ADR-0119 D1); `create_segment_unsynced`'s length is pending
+//!   until a barrier on the fd, like its bytes (F-L04-05, ADR-0119 A2);
+//!   `create_meta` carries no durability side effects (ADR-0017).
+//! - A `Direct` tier file (`create_tier`/`open_tier`) and a `Direct`
+//!   segment assert the `O_DIRECT` alignment contract on every write
+//!   (offset and length on the 4 KiB block) — the sim catches what tmpfs
+//!   swallows (F-L04-14, ADR-0119 A1).
 //! - **Power cut** ([`SimDisk::power_cut`]): per surviving inode, each
 //!   pending write is split into **sectors** (`sector_bytes` grid,
 //!   absolute file offsets); each sector independently survives a
@@ -58,6 +64,36 @@
 //! disk ([`SimDisk::driver_write_at`] / [`SimDisk::driver_fdatasync`] —
 //! ADR-0020 D7). A `SimDisk` must only ever pair with the sim driver: a
 //! real driver on a fake fd fails loudly with `EBADF`, never corrupts.
+//!
+//! **Write-through** (M4.5-S34, ADR-0086 D8): [`SimDisk::driver_write_
+//! through`] models a FUA-class write — the bytes reach the durable image
+//! at completion, earlier pending writes overlapping the range are
+//! superseded (a device cannot resurrect a cached write over a later
+//! FUA-acknowledged one to the same sectors), and later plain writes to
+//! the range are ordinary pending writes again. `Direct`-mode segments are
+//! created **empty** with a preallocation target so the rotor's driver
+//! zero-fill, its barrier, and the lost-barrier reopen all run here.
+//!
+//! **Allocation** (review 2026-08-30, F-L04-01 — ADR-0119): every inode
+//! tracks which sectors are backed by written storage, in two layers
+//! like the bytes. `written` is the OS view (`st_blocks`: a block counts
+//! from the write on, a hole never does); `committed` is what a cut
+//! keeps — a barrier commits every written sector's mapping, and the
+//! cut's own coin commits the surviving pieces. `fully_allocated()` is
+//! full `written` coverage of the file's length at its preallocation
+//! target — the `st_blocks × 512 ≥ st_size` fact the std tier reads — so
+//! a torn zero-fill (full length, holes underneath) reads `false` here
+//! as it does on the device. A write-through persists only the sectors
+//! whose mapping is committed; into a hole it is a plain write (the
+//! extent commit no barrier delivered — ADR-0086's "FUA on an unwritten
+//! extent" hazard), so a rotor that *assumes* pre-zeroing loses acked
+//! frames at the cut and the durability oracle catches it.
+//!
+//! **Per-file faults** (F-L04-02): [`SimDisk::inject`] arms `EIO` on the
+//! next `n` reads or writes of one file — the single-op device failure
+//! the dead switch (every op, every file) cannot express. The fault is
+//! consumed by whichever tier issues the op (blocking or driver) and
+//! touches no byte; [`SimDisk::faults_fired`] is the engagement witness.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,13 +101,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::{FileOffset, hash64};
 
-use super::{SegmentFile, SegmentFs};
+use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 
-/// Fake-fd base for inode handles (dir handles sit above it). High
-/// enough that no simulated socket fd space collides.
+/// Fake-fd base for file handles (dir handles sit above it). High
+/// enough that no simulated socket fd space collides. One fd per
+/// *open* (F-L04-07): two handles on one inode are two fds, as the
+/// kernel's open file descriptions are.
 const FILE_FD_BASE: i64 = 0x4000_0000;
 const DIR_FD_BASE: i64 = 0x6000_0000;
 
@@ -114,12 +152,50 @@ pub struct StallConfig {
     pub episode_gap_ns: u64,
     pub episode_ms_min: u64,
     pub episode_ms_max: u64,
+    /// Write-through (FUA-class) service time (ns, M4.5-S34 / ADR-0086
+    /// D8): a per-write barrier that does **not** queue on the serial
+    /// flush timeline — the modeled difference between the classes. Same
+    /// heavy tail as fsyncs (`tail_permille`/`tail_mult` over this base).
+    /// 0 completes inline (every pre-S34 trace stays byte-identical).
+    pub through_base_ns: u64,
+    /// Plain (barrier-less) write service time (ns, M4.5-S35 / ADR-0087
+    /// D7): the page-cache copy, or under `O_DIRECT` the device write
+    /// without a barrier. Drawn independently per write, never on the
+    /// serial flush timeline — so with K frames in flight plain writes
+    /// complete in any order and a write can land **after** an fdatasync
+    /// issued later, the shape the linked-sync drain rule must survive.
+    /// Same heavy tail and stall-episode inheritance as the other
+    /// classes. 0 completes inline (every pre-S35 trace byte-identical).
+    pub write_base_ns: u64,
+    /// Device bandwidth (M4.5-S36, ADR-0088 D8): every write — plain,
+    /// write-through, zero-fill, checkpoint, tier — and every `TierRead`
+    /// takes `len × 1e9 / rate` on a **shared per-disk byte timeline**
+    /// (FIFO) in addition to its own off-timeline base draw; completion
+    /// = max(base due, timeline finish). Large background writes now
+    /// delay the foreground frame behind them — the contention the
+    /// device budget exists for. 0 = unlimited (every existing trace
+    /// byte-identical; reads stay inline).
+    pub write_bytes_per_s: u64,
+    pub read_bytes_per_s: u64,
+    /// Wedged plain writes (ADR-0087 D2 as amended): every
+    /// `wedge_every_writes`-th plain write (0 = never) completes
+    /// `wedge_ns` later than its draw — one write held at the front of
+    /// the pipeline while every later frame lands behind it, the shape
+    /// that fills the completion ledger's reorder window. Off the flush
+    /// timeline like every plain write: nothing else waits on it, only
+    /// the written prefix does. 0 keeps every existing trace
+    /// byte-identical.
+    pub wedge_every_writes: u64,
+    pub wedge_ns: u64,
 }
 
-impl Default for StallConfig {
-    fn default() -> Self {
-        // The instant device — byte-identical to the pre-S14 sim.
-        // Durable scenarios opt in with concrete numbers.
+impl StallConfig {
+    /// The instant device: every op completes inline, in submission
+    /// order — byte-identical to the pre-S14 sim. Name it when a scenario
+    /// deliberately runs order-preserving (F-L04-06); the driver tier's
+    /// durable boots refuse it.
+    #[must_use]
+    pub const fn instant() -> StallConfig {
         StallConfig {
             base_ns: 0,
             tail_permille: 0,
@@ -127,7 +203,37 @@ impl Default for StallConfig {
             episode_gap_ns: u64::MAX,
             episode_ms_min: 0,
             episode_ms_max: 0,
+            through_base_ns: 0,
+            write_base_ns: 0,
+            write_bytes_per_s: 0,
+            read_bytes_per_s: 0,
+            wedge_every_writes: 0,
+            wedge_ns: 0,
         }
+    }
+
+    /// The smallest device that opens the ADR-0087 D7 window (F-L04-06):
+    /// plain writes pay ~8 µs off the flush timeline, so a write can land
+    /// after an fdatasync issued later; fsyncs, write-throughs and reads
+    /// stay instant, no stall episodes, no bandwidth term. For driver-tier
+    /// scenarios whose oracles are not about device timing.
+    #[must_use]
+    pub const fn write_reorder() -> StallConfig {
+        StallConfig { write_base_ns: 8_000, ..StallConfig::instant() }
+    }
+
+    /// True when plain writes can complete out of submission order
+    /// against a later fsync — `write_base_ns` or `write_bytes_per_s`
+    /// non-zero, the exact condition [`SimDisk::schedule_write`] defers on.
+    #[must_use]
+    pub const fn opens_write_reorder_window(&self) -> bool {
+        self.write_base_ns != 0 || self.write_bytes_per_s != 0
+    }
+}
+
+impl Default for StallConfig {
+    fn default() -> Self {
+        StallConfig::instant()
     }
 }
 
@@ -139,10 +245,15 @@ struct StallModel {
     rng: SplitMix64,
     /// Serial device timeline: the next fsync starts no earlier than this.
     device_free_at: u64,
+    /// The byte timeline (ADR-0088 D8): the next transfer starts no
+    /// earlier than this; shared by every write and read class.
+    bandwidth_free_at: u64,
     /// Next scheduled stall episode starts here...
     next_episode_at: u64,
     /// ...and lasts this long (memoized with the start, one draw each).
     episode_dur_ns: u64,
+    /// Plain writes drawn so far — the wedge cadence's counter.
+    plain_writes: u64,
 }
 
 impl StallModel {
@@ -151,8 +262,10 @@ impl StallModel {
             cfg,
             rng: SplitMix64::new(seed),
             device_free_at: 0,
+            bandwidth_free_at: 0,
             next_episode_at: 0,
             episode_dur_ns: 0,
+            plain_writes: 0,
         };
         model.arm_next_episode();
         model
@@ -186,6 +299,72 @@ impl StallModel {
         finish
     }
 
+    /// One write-through barrier's absolute completion time (virtual ns,
+    /// ADR-0086 D8). Drawn on the same seeded stream in call order; never
+    /// advances `device_free_at` — a FUA write persists itself without
+    /// the flush unit. A stall episode still wedges it (the whole device
+    /// is wedged), which is what keeps the model honest about tails.
+    fn schedule_through(&mut self, now_ns: u64, len: u64) -> u64 {
+        let due = self.schedule_off_timeline(now_ns, self.cfg.through_base_ns);
+        due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s))
+    }
+
+    /// One plain write's absolute completion time (ADR-0087 D7): the same
+    /// off-timeline draw as write-through over `write_base_ns`, then the
+    /// byte timeline (ADR-0088 D8).
+    fn schedule_write(&mut self, now_ns: u64, len: u64) -> u64 {
+        let due = self.schedule_off_timeline(now_ns, self.cfg.write_base_ns);
+        let due = due.max(self.schedule_transfer(now_ns, len, self.cfg.write_bytes_per_s));
+        self.plain_writes += 1;
+        if self.cfg.wedge_every_writes > 0
+            && self.plain_writes.is_multiple_of(self.cfg.wedge_every_writes)
+        {
+            return due.saturating_add(self.cfg.wedge_ns);
+        }
+        due
+    }
+
+    /// One tier read's absolute completion time (ADR-0088 D8): the byte
+    /// timeline alone (reads have no base draw — with the rate at 0 the
+    /// driver keeps completing them inline).
+    fn schedule_read(&mut self, now_ns: u64, len: u64) -> u64 {
+        self.schedule_transfer(now_ns, len, self.cfg.read_bytes_per_s)
+    }
+
+    /// The shared byte timeline: `len × 1e9 / rate` of transfer, FIFO
+    /// behind whatever is already queued. `now_ns` when the rate is 0.
+    fn schedule_transfer(&mut self, now_ns: u64, len: u64, rate: u64) -> u64 {
+        if rate == 0 {
+            return now_ns;
+        }
+        let transfer_ns =
+            u64::try_from(u128::from(len) * 1_000_000_000 / u128::from(rate)).unwrap_or(u64::MAX);
+        let start = now_ns.max(self.bandwidth_free_at);
+        let finish = start.saturating_add(transfer_ns);
+        self.bandwidth_free_at = finish;
+        finish
+    }
+
+    /// A per-op service time that does not queue on the serial flush
+    /// timeline: base + the seeded heavy tail, inheriting a straddled
+    /// stall episode's remainder (the device wedges for every class).
+    fn schedule_off_timeline(&mut self, now_ns: u64, base_ns: u64) -> u64 {
+        let mut service_ns = base_ns;
+        if self.cfg.tail_permille > 0
+            && self.rng.next_below(1_000) < u64::from(self.cfg.tail_permille)
+        {
+            service_ns += self.rng.next_below(base_ns.max(1) * self.cfg.tail_mult);
+        }
+        while self.next_episode_at.saturating_add(self.episode_dur_ns) <= now_ns {
+            self.arm_next_episode();
+        }
+        if now_ns.saturating_add(service_ns) >= self.next_episode_at {
+            let episode_end = self.next_episode_at.saturating_add(self.episode_dur_ns);
+            service_ns = service_ns.max(episode_end.saturating_sub(now_ns));
+        }
+        now_ns + service_ns
+    }
+
     fn arm_next_episode(&mut self) {
         let gap = self.cfg.episode_gap_ns;
         // gap ± gap/4: `gap - gap/4 + uniform(0 .. gap/2)`.
@@ -205,6 +384,73 @@ struct PendingWrite {
     data: Vec<u8>,
 }
 
+/// A per-file device fault (F-L04-02): one file, one op class, a count.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceFault {
+    /// The next reads answer `EIO` (a latent sector error).
+    ReadEio,
+    /// The next writes answer `EIO` and land nothing.
+    WriteEio,
+}
+
+/// `EIO` as the kernel returns it (`raw_os_error() == Some(5)`).
+fn eio() -> io::Error {
+    io::Error::from_raw_os_error(libc::EIO)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the model copied wholesale — `Inode::sync` images and
+    /// `image()` clones — the perf witness for the sync / digest rows.
+    static COPIED_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_copied(bytes: usize) {
+    COPIED_BYTES.with(|c| c.set(c.get() + bytes as u64));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_copied(_bytes: usize) {}
+
+/// Sector coverage of one inode — a bitset over the tear grid.
+#[derive(Clone, Debug, Default)]
+struct SectorMap {
+    bits: Vec<u64>,
+}
+
+impl SectorMap {
+    fn contains(&self, sector: u64) -> bool {
+        let word = usize::try_from(sector / 64).expect("sector index fits usize");
+        self.bits.get(word).is_some_and(|w| w & (1 << (sector % 64)) != 0)
+    }
+
+    /// Marks every sector in `[from, to)`.
+    fn set_range(&mut self, from: u64, to: u64) {
+        for sector in from..to {
+            let word = usize::try_from(sector / 64).expect("sector index fits usize");
+            if word >= self.bits.len() {
+                self.bits.resize(word + 1, 0);
+            }
+            self.bits[word] |= 1 << (sector % 64);
+        }
+    }
+
+    /// True when every sector in `[0, to)` is marked.
+    fn covers(&self, to: u64) -> bool {
+        (0..to).all(|sector| self.contains(sector))
+    }
+
+    /// Drops every sector at or past `to`.
+    fn truncate(&mut self, to: u64) {
+        for sector in to..(self.bits.len() as u64 * 64) {
+            let word = usize::try_from(sector / 64).expect("sector index fits usize");
+            self.bits[word] &= !(1 << (sector % 64));
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inode {
     /// Survives any power cut (fsync-covered bytes + length).
@@ -213,9 +459,90 @@ struct Inode {
     os: Vec<u8>,
     /// Un-fsynced writes, issue order.
     pending: Vec<PendingWrite>,
+    /// Preallocation target of a `Direct`-mode segment (ADR-0086 D8 as
+    /// amended by ADR-0119): `fully_allocated` ⇔ the OS length reached
+    /// it **and** `written` covers it. 0 for every other file (its own
+    /// length is the target).
+    prealloc_target: u64,
+    /// The allocation grid — the disk's `sector_bytes`.
+    sector: u64,
+    /// Sectors backed by written storage in the OS view (`st_blocks`).
+    written: SectorMap,
+    /// Sectors whose mapping a barrier or a cut committed: the only ones
+    /// a write-through persists without a barrier (ADR-0119 D1).
+    committed: SectorMap,
+    /// Per-file faults armed (F-L04-02): the next `n` reads / writes on
+    /// this inode answer `EIO` and touch nothing.
+    read_faults_left: u64,
+    write_faults_left: u64,
+    /// Direct-meta refusal budget (ADR-0088 D3 as amended): `Some(n)` on
+    /// a `create_meta_direct` inode while the disk's refusal is armed —
+    /// `n` more direct writes to *this file* succeed, every later one
+    /// answers `InvalidInput`. `None` on every other inode.
+    direct_writes_left: Option<u64>,
+    /// A truncate since the last barrier: the in-place barrier cannot
+    /// replay pending writes over a shortened image (bytes a truncate
+    /// dropped and a later write re-zeroed would come back), so the next
+    /// `sync` images the file wholesale instead (rare — ADR-0056 D5).
+    truncated_since_sync: bool,
+}
+
+/// One open file description (F-L04-07): the fd's inode and the mode
+/// of *this* open. `O_DIRECT` lives here, as in the kernel — a segment
+/// created `Direct` and reopened `Buffered` (ADR-0086 D7's packed tail)
+/// has one checked and one unchecked fd on the same inode. Dropping the
+/// [`SimFile`] closes the fd: a driver op naming it answers `EBADF`, as
+/// the kernel would — a staged op outliving its handle is a
+/// use-after-close the model refuses to serve (F-L01-02).
+#[derive(Debug, Clone, Copy)]
+struct OpenFile {
+    ino: u64,
+    /// Opened `O_DIRECT` (segments, tier files, v3 checkpoints): every
+    /// write through this fd must be [`crate::ckpt::ICK_BLOCK_ALIGN`]-
+    /// aligned in offset and length, asserted so the simulator catches
+    /// what tmpfs swallows (ADR-0088 D3).
+    direct: bool,
 }
 
 impl Inode {
+    /// The direct-write gate: counts this inode's budget down, then
+    /// refuses with `InvalidInput` (the kernel's `EINVAL`).
+    fn direct_write_gate(&mut self) -> io::Result<()> {
+        match self.direct_writes_left {
+            None => Ok(()),
+            Some(0) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SimDisk: O_DIRECT write refused (refuse_direct_writes_after)",
+            )),
+            Some(ref mut n) => {
+                *n -= 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Consumes one armed read fault: `true` when this op must fail.
+    fn take_read_fault(&mut self) -> bool {
+        let fire = self.read_faults_left > 0;
+        if fire {
+            self.read_faults_left -= 1;
+        }
+        fire
+    }
+
+    fn take_write_fault(&mut self) -> bool {
+        let fire = self.write_faults_left > 0;
+        if fire {
+            self.write_faults_left -= 1;
+        }
+        fire
+    }
+
+    /// Sectors `[first, last)` touching the byte range `[offset, end)`.
+    fn sectors(&self, offset: u64, end: u64) -> (u64, u64) {
+        (offset / self.sector, end.div_ceil(self.sector))
+    }
+
     fn write(&mut self, offset: u64, data: &[u8]) {
         let offset_usize = usize::try_from(offset).expect("offset fits usize");
         let end = offset_usize + data.len();
@@ -223,12 +550,107 @@ impl Inode {
             self.os.resize(end, 0);
         }
         self.os[offset_usize..end].copy_from_slice(data);
+        let (first, last) = self.sectors(offset, end as u64);
+        self.written.set_range(first, last);
         self.pending.push(PendingWrite { offset, data: data.to_vec() });
     }
 
+    /// Write-through (ADR-0086 D8, ADR-0119 D1): per sector, the bytes
+    /// whose mapping is committed are durable at completion; the rest
+    /// ride the cut like a plain write — a FUA write into a hole is data
+    /// the device holds under a mapping no barrier committed.
+    fn write_through(&mut self, offset: u64, data: &[u8]) {
+        let range_end = offset + data.len() as u64;
+        let (first, last) = self.sectors(offset, range_end);
+        let mut at = first;
+        while at < last {
+            let committed = self.committed.contains(at);
+            let mut run_end = at + 1;
+            while run_end < last && self.committed.contains(run_end) == committed {
+                run_end += 1;
+            }
+            let from = (at * self.sector).max(offset);
+            let to = (run_end * self.sector).min(range_end);
+            let piece = &data[(from - offset) as usize..(to - offset) as usize];
+            if committed {
+                self.through_committed(from, piece);
+            } else {
+                self.write(from, piece);
+            }
+            at = run_end;
+        }
+    }
+
+    /// The durable half of a write-through: lands in both layers, and any
+    /// earlier pending write overlapping the range is trimmed — on media
+    /// the FUA-acknowledged bytes are the newest content of those sectors
+    /// and a superseded cached write cannot land over them later.
+    fn through_committed(&mut self, offset: u64, data: &[u8]) {
+        let offset_usize = usize::try_from(offset).expect("offset fits usize");
+        let end = offset_usize + data.len();
+        if end > self.os.len() {
+            self.os.resize(end, 0);
+        }
+        self.os[offset_usize..end].copy_from_slice(data);
+        if end > self.durable.len() {
+            self.durable.resize(end, 0);
+        }
+        self.durable[offset_usize..end].copy_from_slice(data);
+        let (first, last) = self.sectors(offset, end as u64);
+        self.written.set_range(first, last);
+        let range_end = offset + data.len() as u64;
+        let earlier = std::mem::take(&mut self.pending);
+        for write in earlier {
+            let write_end = write.offset + write.data.len() as u64;
+            if write_end <= offset || write.offset >= range_end {
+                self.pending.push(write);
+                continue;
+            }
+            // Keep the non-overlapping head and tail pieces (either may be
+            // empty); the overlapped middle is superseded.
+            if write.offset < offset {
+                let keep = (offset - write.offset) as usize;
+                self.pending
+                    .push(PendingWrite { offset: write.offset, data: write.data[..keep].to_vec() });
+            }
+            if write_end > range_end {
+                let from = (range_end - write.offset) as usize;
+                self.pending
+                    .push(PendingWrite { offset: range_end, data: write.data[from..].to_vec() });
+            }
+        }
+    }
+
+    /// fdatasync: data, length, and every written sector's mapping.
+    /// O(dirty bytes): the pending writes replay onto the durable image
+    /// in issue order (write-throughs already landed in both layers, and
+    /// trimmed what they superseded). After a truncate the replay would
+    /// resurrect bytes the OS view dropped, so that barrier images the
+    /// file wholesale (L04 perf row).
     fn sync(&mut self) {
-        self.durable = self.os.clone();
+        if self.truncated_since_sync {
+            note_copied(self.os.len());
+            self.durable.clear();
+            self.durable.extend_from_slice(&self.os);
+            self.truncated_since_sync = false;
+        } else {
+            for write in &self.pending {
+                let from = usize::try_from(write.offset).expect("offset fits usize");
+                let to = from + write.data.len();
+                note_copied(write.data.len());
+                if to > self.durable.len() {
+                    self.durable.resize(to, 0);
+                }
+                self.durable[from..to].copy_from_slice(&write.data);
+            }
+            // An unsynced create's `set_len` is holes: zeros in the OS view
+            // with no pending write to replay — the barrier commits the
+            // length (F-L04-05).
+            debug_assert!(self.durable.len() <= self.os.len(), "replayed image length");
+            self.durable.resize(self.os.len(), 0);
+        }
         self.pending.clear();
+        self.committed = self.written.clone();
     }
 
     /// Power cut: seeded permutation over pending writes, per-sector
@@ -256,6 +678,10 @@ impl Inode {
                         image.resize(dst_to, 0);
                     }
                     image[dst_from..dst_to].copy_from_slice(&write.data[src_from..src_to]);
+                    // The surviving piece's mapping committed with it; the
+                    // gap a resize opened stays a hole (ADR-0119 D1).
+                    let (first, last) = self.sectors(at, piece_end);
+                    self.committed.set_range(first, last);
                 }
                 at = piece_end;
             }
@@ -263,6 +689,8 @@ impl Inode {
         self.durable = image;
         self.os = self.durable.clone();
         self.pending.clear();
+        self.truncated_since_sync = false;
+        self.written = self.committed.clone();
     }
 }
 
@@ -303,12 +731,30 @@ struct DiskState {
     pending_meta: BTreeMap<PathBuf, Vec<MetaOp>>,
     inodes: BTreeMap<u64, Inode>,
     next_ino: u64,
+    /// Open file descriptions by fd index (`raw_fd − FILE_FD_BASE`);
+    /// an index below `next_file_fd` and absent here is a closed fd.
+    open_files: BTreeMap<u64, OpenFile>,
+    next_file_fd: u64,
     /// Dir-handle fd → directory (driver dir-fsync routing).
     dir_fds: BTreeMap<i64, PathBuf>,
     next_dir_fd: i64,
     /// `Some(n)`: n more mutating ops succeed, then everything fails
     /// until [`SimDisk::power_cut`] (the dead switch).
     ops_until_cut: Option<u64>,
+    /// `create_meta_direct` answers `Unsupported` — a filesystem without
+    /// `O_DIRECT` (ADR-0088 D3 as amended): the checkpoint's probed
+    /// buffered fallback under the reactor tier.
+    refuse_direct_meta: bool,
+    /// `Some(n)`: every `create_meta_direct` file from now on takes `n`
+    /// direct writes and answers `InvalidInput` (the kernel's `EINVAL`
+    /// for a direct write the filesystem cannot take) to every later one
+    /// — ADR-0088 D3 as amended: `Some(0)` fails the boot probe's own
+    /// block (the open passed), `Some(1)` passes the one-block probe and
+    /// refuses the checkpoint file's second block, the in-band
+    /// downgrade's shape. Meta files only — the model is a ckpt
+    /// directory whose filesystem cannot take direct writes; `Direct`
+    /// log segments are untouched. `None` = every direct write succeeds.
+    direct_meta_writes_allowed: Option<u64>,
     /// Cumulative **blocking** `SegmentFs::sync_dir` calls (M2.5-S01):
     /// the boot-storm oracle's observable — the ready path must issue
     /// zero of these (driver-ridden barrier syncs on dir handles do not
@@ -317,6 +763,8 @@ struct DiskState {
     /// Device service-time model (M2.5-S14). `None` = instant fsyncs,
     /// the pre-S14 behavior — every legacy trace stays byte-identical.
     stall: Option<StallModel>,
+    /// Per-file faults consumed (F-L04-02): the engagement witness.
+    faults_fired: u64,
 }
 
 impl DiskState {
@@ -336,6 +784,74 @@ impl DiskState {
             return Err(io::Error::other("injected fault: power lost (sim disk dead)"));
         }
         Ok(())
+    }
+
+    /// The open file description behind a driver file fd and its inode,
+    /// refusing a closed one with `EBADF`, one never issued with
+    /// `NotFound`, and one whose inode a power cut discarded with
+    /// `NotFound` (the dead life's handle).
+    fn open_file_mut(&mut self, fd: i32) -> io::Result<(OpenFile, &mut Inode)> {
+        let index = file_fd_index(fd)?;
+        if index >= self.next_file_fd {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")));
+        }
+        let Some(open) = self.open_files.get(&index).copied() else {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        };
+        let inode = self
+            .inodes
+            .get_mut(&open.ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        Ok((open, inode))
+    }
+
+    /// Issues an fd for a new open of `ino` in `direct` mode.
+    fn open_fd(&mut self, ino: u64, direct: bool) -> u64 {
+        let index = self.next_file_fd;
+        self.next_file_fd += 1;
+        self.open_files.insert(index, OpenFile { ino, direct });
+        index
+    }
+
+    /// Commits `dir`'s pending metadata ops to the durable namespace (the
+    /// dir barrier), then frees every inode the commit orphaned.
+    fn commit_dir(&mut self, dir: &Path) {
+        let ops = self.pending_meta.remove(dir).unwrap_or_default();
+        let mut displaced = Vec::new();
+        for op in &ops {
+            let victim = match op {
+                MetaOp::Create { .. } => None,
+                MetaOp::Rename { to, .. } => self.durable_names.get(to).copied(),
+                MetaOp::Remove { name } => self.durable_names.get(name).copied(),
+            };
+            apply_meta(&mut self.durable_names, op);
+            displaced.extend(victim);
+        }
+        for ino in displaced {
+            self.release_if_orphan(ino);
+        }
+    }
+
+    /// Frees `ino` once nothing can reach it (F-L04-04): no name in the
+    /// OS or durable namespace, no pending create a cut could still
+    /// commit (ADR-0020 D6 resurrection), no open handle. A removed or
+    /// clobbered file otherwise keeps its full image for the life of the
+    /// sim.
+    fn release_if_orphan(&mut self, ino: u64) {
+        let named = self.os_names.values().any(|&i| i == ino)
+            || self.durable_names.values().any(|&i| i == ino);
+        if named {
+            return;
+        }
+        let creatable = self
+            .pending_meta
+            .values()
+            .flatten()
+            .any(|op| matches!(op, MetaOp::Create { ino: pending, .. } if *pending == ino));
+        if creatable || self.open_files.values().any(|open| open.ino == ino) {
+            return;
+        }
+        self.inodes.remove(&ino);
     }
 
     fn ino_of(&self, path: &Path) -> io::Result<u64> {
@@ -392,10 +908,128 @@ impl SimDisk {
         self.state.borrow_mut().stall.as_mut().map(|model| model.schedule(now_ns))
     }
 
+    /// Draws one write-through barrier's absolute completion time
+    /// (ADR-0086 D8). `None` when no model is armed **or** the model's
+    /// `through_base_ns` is 0 — inline completion, byte-identical traces.
+    #[must_use]
+    pub fn schedule_write_through(&self, now_ns: u64, len: u64) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let model = state.stall.as_mut()?;
+        if model.cfg.through_base_ns == 0 && model.cfg.write_bytes_per_s == 0 {
+            return None;
+        }
+        Some(model.schedule_through(now_ns, len))
+    }
+
+    /// Draws one tier read's absolute completion time (ADR-0088 D8).
+    /// `None` when no model is armed or `read_bytes_per_s` is 0 — inline
+    /// completion, byte-identical traces.
+    #[must_use]
+    pub fn schedule_read(&self, now_ns: u64, len: u64) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let model = state.stall.as_mut()?;
+        if model.cfg.read_bytes_per_s == 0 {
+            return None;
+        }
+        Some(model.schedule_read(now_ns, len))
+    }
+
+    /// Draws one plain write's absolute completion time (ADR-0087 D7).
+    /// `None` when no model is armed **or** `write_base_ns` is 0 — inline
+    /// completion, byte-identical traces.
+    #[must_use]
+    pub fn schedule_write(&self, now_ns: u64, len: u64) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        let model = state.stall.as_mut()?;
+        if model.cfg.write_base_ns == 0 && model.cfg.write_bytes_per_s == 0 {
+            return None;
+        }
+        Some(model.schedule_write(now_ns, len))
+    }
+
+    /// Whether the write-vs-fsync reorder window is open on this disk
+    /// (F-L04-06): a stall model armed with a non-zero plain-write base
+    /// or bandwidth. `SimDisk::new()` answers `false` — the instant,
+    /// submission-ordered device — and a driver-tier durable scenario
+    /// must not boot on it unless it says so.
+    #[must_use]
+    pub fn write_reorder_armed(&self) -> bool {
+        self.state.borrow().stall.as_ref().is_some_and(|m| m.cfg.opens_write_reorder_window())
+    }
+
+    /// Inodes resident in the model (F-L04-04): a removed or clobbered
+    /// file's inode is freed once no name in either namespace, no pending
+    /// create and no open handle reaches it.
+    #[must_use]
+    pub fn inode_count(&self) -> usize {
+        self.state.borrow().inodes.len()
+    }
+
+    /// Open directory handles (F-L04-04): dropped handles leave the table.
+    #[must_use]
+    pub fn open_dir_count(&self) -> usize {
+        self.state.borrow().dir_fds.len()
+    }
+
+    /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
+    /// answers `Unsupported` from now on (ADR-0088 D3 as amended).
+    pub fn refuse_direct_meta(&self) {
+        self.state.borrow_mut().refuse_direct_meta = true;
+    }
+
+    /// Model a ckpt-dir filesystem that takes the `O_DIRECT` open but
+    /// refuses direct writes (ADR-0088 D3 as amended): every
+    /// `create_meta_direct` file from now on takes `n` direct writes and
+    /// refuses every later one with `InvalidInput`. `0` fails the boot
+    /// probe's own block; `1` lets the one-block probe pass and refuses
+    /// the checkpoint file's second block — the in-band downgrade.
+    pub fn refuse_direct_writes_after(&self, n: u64) {
+        self.state.borrow_mut().direct_meta_writes_allowed = Some(n);
+    }
+
     /// Arms the dead switch: `n` more mutating ops succeed, then every
     /// operation fails with a named error until [`Self::power_cut`].
     pub fn cut_after_ops(&self, n: u64) {
         self.state.borrow_mut().ops_until_cut = Some(n);
+    }
+
+    /// Arms `count` `EIO` answers on the next reads or writes of the file
+    /// at `path` (F-L04-02): blocking and driver tiers alike, every other
+    /// file and op class untouched, no byte moved by a failing op — the
+    /// single-op device failure the dead switch cannot express. Counts
+    /// accumulate across calls.
+    ///
+    /// # Errors
+    /// `NotFound` when no file has that name in the OS view.
+    pub fn inject(&self, path: &Path, fault: DeviceFault, count: u64) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        let ino = state.ino_of(path)?;
+        let inode = state.inodes.get_mut(&ino).expect("ino_of resolved the inode");
+        match fault {
+            DeviceFault::ReadEio => inode.read_faults_left += count,
+            DeviceFault::WriteEio => inode.write_faults_left += count,
+        }
+        Ok(())
+    }
+
+    /// Injected faults consumed so far (an armed fault that never fired
+    /// is a vacuous run, not a green one — batch 34's rule).
+    #[must_use]
+    pub fn faults_fired(&self) -> u64 {
+        self.state.borrow().faults_fired
+    }
+
+    /// Disarms every per-file fault; returns how many were never consumed
+    /// (a scenario's arm must not leak into the phases after its oracle).
+    pub fn clear_faults(&self) -> u64 {
+        let mut state = self.state.borrow_mut();
+        let mut left = 0;
+        for inode in state.inodes.values_mut() {
+            left += inode.read_faults_left + inode.write_faults_left;
+            inode.read_faults_left = 0;
+            inode.write_faults_left = 0;
+        }
+        left
     }
 
     /// Cumulative blocking `sync_dir` calls (M2.5-S01 boot-storm oracle):
@@ -457,17 +1091,23 @@ impl SimDisk {
         state
             .os_names
             .iter()
-            .map(|(path, ino)| (path.clone(), state.inodes[ino].os.clone()))
+            .map(|(path, ino)| {
+                note_copied(state.inodes[ino].os.len());
+                (path.clone(), state.inodes[ino].os.clone())
+            })
             .collect()
     }
 
     /// Chained `hash64` over [`Self::image`].
     #[must_use]
     pub fn image_digest(&self) -> u64 {
+        // Hashed in place over the resident image — no second copy of the
+        // disk (L04 perf row); the same chain `image()` would feed.
+        let state = self.state.borrow();
         let mut acc = 0xD15C_0BAD_5EED_0001;
-        for (path, bytes) in self.image() {
+        for (path, ino) in &state.os_names {
             acc = hash64(path.as_os_str().as_encoded_bytes(), acc);
-            acc = hash64(&bytes, acc);
+            acc = hash64(&state.inodes[ino].os, acc);
         }
         acc
     }
@@ -481,20 +1121,47 @@ impl SimDisk {
     }
 
     /// Driver tier (ADR-0020 D7): execute a `LogWrite` payload against a
-    /// fake file fd. Page-cache semantics — NOT durable.
+    /// fake file fd. Page-cache semantics — NOT durable. The position is a
+    /// `LogWrite`'s `FileOffset` (ADR-0167 D2).
     ///
     /// # Errors
     /// `EBADF`-class errors for unknown fds; the dead-switch error when
     /// the disk is dead.
-    pub fn driver_write_at(&self, fd: i32, offset: u64, data: &[u8]) -> io::Result<()> {
+    pub fn driver_write_at(&self, fd: i32, offset: FileOffset, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get_mut(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
-        inode.write(offset, data);
+        let (open, inode) = state.open_file_mut(fd)?;
+        assert_direct_aligned(open.direct, offset.bytes(), data.len());
+        if open.direct {
+            inode.direct_write_gate()?;
+        }
+        if inode.take_write_fault() {
+            state.faults_fired += 1;
+            return Err(eio());
+        }
+        inode.write(offset.bytes(), data);
+        Ok(())
+    }
+
+    /// Driver tier (M4.5-S34, ADR-0086 D8): execute a write-through
+    /// `LogWrite` against a fake file fd — durable at completion, earlier
+    /// overlapping pending writes superseded.
+    ///
+    /// # Errors
+    /// As [`Self::driver_write_at`].
+    pub fn driver_write_through(&self, fd: i32, offset: FileOffset, data: &[u8]) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.tick_op()?;
+        let (open, inode) = state.open_file_mut(fd)?;
+        assert_direct_aligned(open.direct, offset.bytes(), data.len());
+        if open.direct {
+            inode.direct_write_gate()?;
+        }
+        if inode.take_write_fault() {
+            state.faults_fired += 1;
+            return Err(eio());
+        }
+        inode.write_through(offset.bytes(), data);
         Ok(())
     }
 
@@ -506,15 +1173,15 @@ impl SimDisk {
     ///
     /// # Errors
     /// As [`Self::driver_write_at`].
-    pub fn driver_read_at(&self, fd: i32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn driver_read_at(&self, fd: i32, offset: FileOffset, buf: &mut [u8]) -> io::Result<usize> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
-        let offset = usize::try_from(offset).expect("offset fits usize");
+        let (_, inode) = state.open_file_mut(fd)?;
+        if inode.take_read_fault() {
+            state.faults_fired += 1;
+            return Err(eio());
+        }
+        let offset = usize::try_from(offset.bytes()).expect("offset fits usize");
         if offset >= inode.os.len() {
             return Ok(0);
         }
@@ -532,24 +1199,44 @@ impl SimDisk {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         if let Some(dir) = state.dir_fds.get(&i64::from(fd)).cloned() {
-            let ops = state.pending_meta.remove(&dir).unwrap_or_default();
-            for op in &ops {
-                apply_meta(&mut state.durable_names, op);
-            }
+            state.commit_dir(&dir);
             return Ok(());
         }
-        let ino = file_fd_ino(fd)?;
-        let inode = state
-            .inodes
-            .get_mut(&ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")))?;
+        if i64::from(fd) >= DIR_FD_BASE {
+            // A dropped directory handle: closed, as the kernel sees it.
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        let (_, inode) = state.open_file_mut(fd)?;
         inode.sync();
         Ok(())
     }
 
     fn create_inode(&self, path: &Path, os: Vec<u8>, durable: Vec<u8>) -> io::Result<SimFile> {
+        self.create_inode_full(path, os, durable, 0, false, false)
+    }
+
+    fn create_inode_targeted(
+        &self,
+        path: &Path,
+        os: Vec<u8>,
+        durable: Vec<u8>,
+        prealloc_target: u64,
+    ) -> io::Result<SimFile> {
+        self.create_inode_full(path, os, durable, prealloc_target, true, false)
+    }
+
+    fn create_inode_full(
+        &self,
+        path: &Path,
+        os: Vec<u8>,
+        durable: Vec<u8>,
+        prealloc_target: u64,
+        direct: bool,
+        meta: bool,
+    ) -> io::Result<SimFile> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
+        let sector = u64::from(state.cfg.sector_bytes.max(1));
         let parent = parent_dir(path);
         if !state.dirs.contains(&parent) {
             return Err(io::Error::new(
@@ -565,14 +1252,55 @@ impl SimDisk {
         }
         state.next_ino += 1;
         let ino = state.next_ino;
-        state.inodes.insert(ino, Inode { durable, os, pending: Vec::new() });
+        let direct_writes_left =
+            if direct && meta { state.direct_meta_writes_allowed } else { None };
+        state.inodes.insert(
+            ino,
+            Inode {
+                durable,
+                os,
+                pending: Vec::new(),
+                prealloc_target,
+                sector,
+                // Born sparse: a prealloc'd length is `set_len` on the std
+                // tier — holes until written (F-L04-01).
+                written: SectorMap::default(),
+                committed: SectorMap::default(),
+                read_faults_left: 0,
+                write_faults_left: 0,
+                direct_writes_left,
+                truncated_since_sync: false,
+            },
+        );
         state.os_names.insert(path.to_path_buf(), ino);
         state
             .pending_meta
             .entry(parent)
             .or_default()
             .push(MetaOp::Create { name: path.to_path_buf(), ino });
-        Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
+        let fd = state.open_fd(ino, direct);
+        Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
+    }
+
+    /// Opens an existing file in `direct` mode — its own file
+    /// description (F-L04-07).
+    fn open_handle(&self, path: &Path, direct: bool) -> io::Result<SimFile> {
+        let mut state = self.state.borrow_mut();
+        state.dead_check()?;
+        let ino = state.ino_of(path)?;
+        let fd = state.open_fd(ino, direct);
+        Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
+    }
+}
+
+/// A direct open takes only aligned writes — the `O_DIRECT` contract
+/// the kernel enforces with `EINVAL`, enforced here as an invariant so a
+/// misaligned block is a sim failure, never a device-only one.
+fn assert_direct_aligned(direct: bool, offset: u64, len: usize) {
+    if direct {
+        let align = crate::ckpt::ICK_BLOCK_ALIGN as u64;
+        assert_eq!(offset % align, 0, "direct write offset {offset} is not {align}-aligned");
+        assert_eq!(len as u64 % align, 0, "direct write length {len} is not {align}-aligned");
     }
 }
 
@@ -580,7 +1308,7 @@ fn parent_dir(path: &Path) -> PathBuf {
     path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
 }
 
-fn file_fd_ino(fd: i32) -> io::Result<u64> {
+fn file_fd_index(fd: i32) -> io::Result<u64> {
     let fd = i64::from(fd);
     if (FILE_FD_BASE..DIR_FD_BASE).contains(&fd) {
         Ok((fd - FILE_FD_BASE) as u64)
@@ -589,7 +1317,8 @@ fn file_fd_ino(fd: i32) -> io::Result<u64> {
     }
 }
 
-/// One open handle: follows its inode across renames (POSIX fd
+/// One open handle — one open file description with its own fd and
+/// mode (F-L04-07): follows its inode across renames (POSIX fd
 /// semantics); dir handles map `sync_data` to the directory barrier.
 #[derive(Debug)]
 pub struct SimFile {
@@ -599,8 +1328,26 @@ pub struct SimFile {
 
 #[derive(Debug)]
 enum Target {
-    Ino(u64),
+    File { ino: u64, fd: u64, direct: bool },
     Dir(PathBuf, i64),
+}
+
+impl Drop for SimFile {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        match &self.target {
+            // Closes the fd; the inode stays while a name or another
+            // handle reaches it (a power cut may already have discarded
+            // it — the dead process's handles drop after the cut).
+            Target::File { ino, fd, .. } => {
+                state.open_files.remove(fd);
+                state.release_if_orphan(*ino);
+            }
+            Target::Dir(_, fd) => {
+                state.dir_fds.remove(fd);
+            }
+        }
+    }
 }
 
 impl SegmentFile for SimFile {
@@ -608,8 +1355,19 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, direct, .. } => {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
+                // The blocking tier sees the same direct-write physics as
+                // the driver tier (ADR-0088 D3 as amended): alignment
+                // asserted, the refusal gate consulted.
+                assert_direct_aligned(*direct, offset, data.len());
+                if *direct {
+                    inode.direct_write_gate()?;
+                }
+                if inode.take_write_fault() {
+                    state.faults_fired += 1;
+                    return Err(eio());
+                }
                 inode.write(offset, data);
                 Ok(())
             }
@@ -620,10 +1378,15 @@ impl SegmentFile for SimFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         state.dead_check()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
+                if state.inodes.get_mut(ino).expect("open handle pins its inode").take_read_fault()
+                {
+                    state.faults_fired += 1;
+                    return Err(eio());
+                }
                 let bytes = &state.inodes[ino].os;
                 let offset = usize::try_from(offset).expect("offset fits usize");
                 if offset >= bytes.len() {
@@ -641,7 +1404,7 @@ impl SegmentFile for SimFile {
         let state = self.state.borrow();
         state.dead_check()?;
         match &self.target {
-            Target::Ino(ino) => Ok(state.inodes[ino].os.len() as u64),
+            Target::File { ino, .. } => Ok(state.inodes[ino].os.len() as u64),
             Target::Dir(..) => Ok(0),
         }
     }
@@ -650,15 +1413,21 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 let inode = state.inodes.get_mut(ino).expect("open handle pins its inode");
                 let len = usize::try_from(len).expect("length fits usize");
                 // OS view honors the new length immediately; the durable
-                // image keeps the old tail until the next sync, and
-                // retained pending writes may resurrect bytes beyond the
-                // cut at power-cut time — real ftruncate physics, which
-                // is why ADR-0056 D5 syncs before any new flush.
+                // image keeps the old tail until the next sync. Pending
+                // writes beyond the cut stay pending: a cut before the
+                // barrier can land them (writeback that reached media
+                // before an un-journaled truncate) — never after a
+                // barrier, which clears them. That is why ADR-0056 D5
+                // syncs before any new flush.
                 inode.os.resize(len, 0);
+                inode.truncated_since_sync = true;
+                // A shrink deallocates in the OS view; a grow is a hole.
+                let (_, keep) = inode.sectors(0, len as u64);
+                inode.written.truncate(keep);
                 Ok(())
             }
             Target::Dir(dir, _) => {
@@ -671,15 +1440,13 @@ impl SegmentFile for SimFile {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
         match &self.target {
-            Target::Ino(ino) => {
+            Target::File { ino, .. } => {
                 state.inodes.get_mut(ino).expect("open handle pins its inode").sync();
                 Ok(())
             }
             Target::Dir(dir, _) => {
-                let ops = state.pending_meta.remove(dir).unwrap_or_default();
-                for op in &ops {
-                    apply_meta(&mut state.durable_names, op);
-                }
+                let dir = dir.clone();
+                state.commit_dir(&dir);
                 Ok(())
             }
         }
@@ -687,10 +1454,26 @@ impl SegmentFile for SimFile {
 
     fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
         let fd = match &self.target {
-            Target::Ino(ino) => FILE_FD_BASE + *ino as i64,
+            Target::File { fd, .. } => FILE_FD_BASE + *fd as i64,
             Target::Dir(_, fd) => *fd,
         };
         Some(i32::try_from(fd).expect("sim fd fits i32"))
+    }
+
+    fn fully_allocated(&self) -> io::Result<bool> {
+        let state = self.state.borrow();
+        state.dead_check()?;
+        match &self.target {
+            Target::File { ino, .. } => {
+                // `st_blocks × 512 ≥ st_size` at the target (F-L04-01):
+                // every sector of the length written, in the OS view.
+                let inode = &state.inodes[ino];
+                let len = inode.os.len() as u64;
+                let (_, sectors) = inode.sectors(0, len);
+                Ok(len >= inode.prealloc_target && inode.written.covers(sectors))
+            }
+            Target::Dir(..) => Ok(true),
+        }
     }
 }
 
@@ -710,7 +1493,6 @@ impl SegmentFs for SimDisk {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        state.sync_dir_calls += 1;
         state.tick_op()?;
         if !state.dirs.contains(dir) {
             return Err(io::Error::new(
@@ -718,10 +1500,10 @@ impl SegmentFs for SimDisk {
                 format!("no dir {}", dir.display()),
             ));
         }
-        let ops = state.pending_meta.remove(dir).unwrap_or_default();
-        for op in &ops {
-            apply_meta(&mut state.durable_names, op);
-        }
+        // Counted once served: a barrier the dead switch refused never
+        // blocked the ready path (M2.5-S01 oracle; L04 style row).
+        state.sync_dir_calls += 1;
+        state.commit_dir(dir);
         Ok(())
     }
 
@@ -744,16 +1526,60 @@ impl SegmentFs for SimDisk {
     }
 
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
-        // StdSegmentFs syncs the file at create: the prealloc extent is
-        // durable-if-the-name-survives; the name still needs the dir
-        // barrier.
+        // StdSegmentFs syncs the file at create: the prealloc length is
+        // durable-if-the-name-survives (the blocks are holes — ADR-0119
+        // D1); the name still needs the dir barrier.
         let len = usize::try_from(prealloc_bytes).expect("prealloc fits usize");
         self.create_inode(path, vec![0; len], vec![0; len])
+    }
+
+    fn create_segment_unsynced(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        // No create-time sync (M2.5-S01): the OS sees the `set_len` length,
+        // the journal has not committed it — a cut before the caller's
+        // barrier leaves the file at 0 or at the end of whichever pending
+        // piece survived, never at the prealloc length (F-L04-05,
+        // ADR-0119 A2). A barrier on the fd makes the length durable.
+        let len = usize::try_from(prealloc_bytes).expect("prealloc fits usize");
+        self.create_inode(path, vec![0; len], Vec::new())
+    }
+
+    fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        // Synced at create like the std tier (empty either way); `Direct`
+        // flags the inode so every tier write is alignment-asserted — the
+        // `O_DIRECT` contract the fault points broke unseen while the sim
+        // took the mode-blind default (F-L04-14, ADR-0119 A1).
+        self.create_inode_full(path, Vec::new(), Vec::new(), 0, mode == TierIoMode::Direct, false)
+    }
+
+    /// The mode of *this* open, as [`open_segment_append`](Self::open_segment_append).
+    fn open_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        self.open_handle(path, mode == TierIoMode::Direct)
+    }
+
+    fn create_segment_direct(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
+        // Empty, volatile, with a target (ADR-0086 D8): the rotor's driver
+        // zero-fill grows it and its barrier makes the length durable —
+        // exactly the real sparse-then-written shape, so the not-ready
+        // rotation and the lost-barrier reopen are reachable here.
+        self.create_inode_targeted(path, Vec::new(), Vec::new(), prealloc_bytes)
     }
 
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         // No durability side effects (ADR-0017): all volatile.
         self.create_inode(path, Vec::new(), Vec::new())
+    }
+
+    fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
+        if self.state.borrow().refuse_direct_meta {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SimDisk: O_DIRECT refused (refuse_direct_meta)",
+            ));
+        }
+        // Volatile like `create_meta`, flagged direct: every driver write
+        // to it is alignment-asserted (ADR-0088 D3) and gated by the
+        // meta refusal budget (D3 as amended).
+        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
     }
 
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
@@ -772,14 +1598,22 @@ impl SegmentFs for SimDisk {
     }
 
     fn open_write(&self, path: &Path) -> io::Result<Self::File> {
-        let state = self.state.borrow();
-        state.dead_check()?;
-        let ino = state.ino_of(path)?;
-        Ok(SimFile { state: Rc::clone(&self.state), target: Target::Ino(ino) })
+        self.open_handle(path, false)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Self::File> {
         self.open_write(path)
+    }
+
+    /// The reopened tail takes the mode of *this* open (ADR-0086 D4 as
+    /// amended): `O_DIRECT` is a property of the open file description,
+    /// not the inode (F-L04-07), so a segment created direct and
+    /// reopened `Buffered` (the FUA → FLUSH transition, packed frames at
+    /// the v3 tail's aligned end) takes packed writes on the new fd while
+    /// any still-open direct fd stays alignment-checked, and a buffered
+    /// segment reopened `Direct` asserts alignment on the new fd only.
+    fn open_segment_append(&self, path: &Path, mode: SegmentIoMode) -> io::Result<Self::File> {
+        self.open_handle(path, mode == SegmentIoMode::Direct)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -806,30 +1640,34 @@ impl SegmentFs for SimDisk {
             io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
         })?;
         // Replaces an existing destination atomically, like POSIX rename.
-        state.os_names.insert(to.to_path_buf(), ino);
+        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
         state
             .pending_meta
             .entry(parent)
             .or_default()
             .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+        if let Some(old) = clobbered {
+            state.release_if_orphan(old);
+        }
         Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
         state.tick_op()?;
-        if state.os_names.remove(path).is_none() {
+        let Some(ino) = state.os_names.remove(path) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no file {}", path.display()),
             ));
-        }
+        };
         let parent = parent_dir(path);
         state
             .pending_meta
             .entry(parent)
             .or_default()
             .push(MetaOp::Remove { name: path.to_path_buf() });
+        state.release_if_orphan(ino);
         Ok(())
     }
 }
@@ -846,7 +1684,82 @@ mod stall_tests {
             episode_gap_ns: 1_500_000_000,
             episode_ms_min: 50,
             episode_ms_max: 90,
+            through_base_ns: 0,
+            write_base_ns: 0,
+            write_bytes_per_s: 0,
+            read_bytes_per_s: 0,
+            wedge_every_writes: 0,
+            wedge_ns: 0,
         }
+    }
+
+    /// ADR-0087 D2 as amended: every Nth plain write is wedged by a fixed
+    /// term on top of its draw; the writes around it are untouched and
+    /// the flush timeline never sees it.
+    #[test]
+    fn wedge_delays_every_nth_plain_write_only() {
+        let mut cfg = armed_cfg();
+        cfg.write_base_ns = 8_000;
+        cfg.tail_permille = 0;
+        cfg.wedge_every_writes = 3;
+        cfg.wedge_ns = 150_000_000;
+        let disk = SimDisk::with_stall(SimDiskConfig::default(), cfg, 7);
+        let w1 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w2 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w3 = disk.schedule_write(1_000, 4096).expect("armed");
+        let w4 = disk.schedule_write(1_000, 4096).expect("armed");
+        assert_eq!(w1, 9_000);
+        assert_eq!(w2, 9_000);
+        assert_eq!(w3, 9_000 + 150_000_000, "the third write is wedged");
+        assert_eq!(w4, 9_000, "the next one is not");
+        let sync = disk.schedule_fsync(1_000).expect("armed");
+        assert!(sync < w3, "the wedge never rides the flush timeline");
+    }
+
+    #[test]
+    fn plain_writes_defer_only_when_armed_and_off_the_flush_timeline() {
+        // ADR-0087 D7: `write_base_ns = 0` keeps plain writes inline
+        // (every pre-S35 trace byte-identical); armed, each write draws
+        // its own service time without advancing the serial flush
+        // timeline, so a write issued after an fsync can be due before
+        // or after it — the reorder the written prefix must survive.
+        let off = SimDisk::with_stall(SimDiskConfig::default(), armed_cfg(), 7);
+        assert_eq!(off.schedule_write(1_000, 4096), None);
+        let mut cfg = armed_cfg();
+        cfg.write_base_ns = 8_000;
+        let on = SimDisk::with_stall(SimDiskConfig::default(), cfg, 7);
+        let sync_due = on.schedule_fsync(1_000).expect("armed");
+        let write_due = on.schedule_write(1_000, 4096).expect("armed");
+        assert!(write_due >= 1_000 + 8_000, "base service time");
+        assert!(write_due < sync_due, "a plain write does not queue behind the flush unit");
+        let next_sync = on.schedule_fsync(1_000).expect("armed");
+        assert!(next_sync >= sync_due, "the flush timeline stays serial");
+    }
+
+    /// ADR-0088 D8: with a byte rate armed, every write and read queues
+    /// FIFO on one shared byte timeline by its length; with the rate at
+    /// 0 nothing changes (reads stay inline, writes keep their draws).
+    #[test]
+    fn bandwidth_term_queues_every_class_on_one_byte_timeline() {
+        let mut cfg = armed_cfg();
+        cfg.write_bytes_per_s = 1_000_000_000; // 1 byte per ns
+        cfg.read_bytes_per_s = 1_000_000_000;
+        let disk = SimDisk::with_stall(SimDiskConfig::default(), cfg, 11);
+        // A 1 MiB plain write takes ~1 ms of transfer (base is 0).
+        let w1 = disk.schedule_write(1_000, 1 << 20).expect("rate armed");
+        assert!(w1 >= 1_000 + (1 << 20), "transfer time at the rate");
+        // A 4 KiB write-through issued at the same instant queues behind it.
+        let w2 = disk.schedule_write_through(1_000, 4096).expect("rate armed");
+        assert!(w2 >= w1 + 4096, "FIFO behind the in-flight transfer");
+        // A read shares the same timeline.
+        let r = disk.schedule_read(1_000, 8192).expect("read rate armed");
+        assert!(r >= w2 + 8192);
+        // Idle timeline: a later op starts at `now`.
+        let later = disk.schedule_write(r + 1_000_000, 4096).expect("rate armed");
+        assert_eq!(later, r + 1_000_000 + 4096);
+        // The unarmed rate keeps reads inline.
+        let off = SimDisk::with_stall(SimDiskConfig::default(), armed_cfg(), 11);
+        assert_eq!(off.schedule_read(1_000, 8192), None);
     }
 
     #[test]
@@ -904,5 +1817,102 @@ mod stall_tests {
         assert!(due >= 200_000_000 + 120_000);
         // Idle device: base + tail only, unless an episode straddles.
         assert!(due <= 200_000_000 + 120_000 * 9 + 90_000_000);
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn copied() -> u64 {
+        COPIED_BYTES.with(|c| c.replace(0))
+    }
+
+    fn disk_with(name: &str, len: usize) -> (SimDisk, SimFile) {
+        let disk = SimDisk::new();
+        disk.create_dir_all(Path::new("d")).expect("dirs");
+        let file = disk.create_segment(&Path::new("d").join(name), len as u64).expect("create");
+        disk.sync_dir(Path::new("d")).expect("commit");
+        (disk, file)
+    }
+
+    /// Perf row (L04): an fdatasync costs the dirty bytes, not the file —
+    /// 1000 barriers over a 4 KiB write on a 64 MiB segment copy 4 MB,
+    /// not 64 GB.
+    #[test]
+    fn fdatasync_copies_dirty_bytes_not_the_file() {
+        let (_disk, mut file) = disk_with("seg-000000.ilog", 64 << 20);
+        copied();
+        for i in 0..1000u64 {
+            file.write_at(i * 4096, &[7u8; 4096]).expect("write");
+            file.sync_data().expect("fsync");
+        }
+        let bytes = copied();
+        assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
+    }
+
+    /// Perf row (L04): the determinism digest hashes the resident image
+    /// in place — no second copy of the disk.
+    #[test]
+    fn image_digest_copies_nothing() {
+        let (disk, mut file) = disk_with("seg-000000.ilog", 8 << 20);
+        file.write_at(0, b"hello").expect("write");
+        copied();
+        let digest = disk.image_digest();
+        assert_eq!(copied(), 0, "image_digest materialized a copy of the disk");
+        // The digest is the chained hash over `image()`, unchanged.
+        let mut acc = 0xD15C_0BAD_5EED_0001;
+        for (path, bytes) in disk.image() {
+            acc = hash64(path.as_os_str().as_encoded_bytes(), acc);
+            acc = hash64(&bytes, acc);
+        }
+        assert_eq!(digest, acc);
+    }
+
+    /// The in-place barrier equals the clone it replaces on every op mix:
+    /// plain writes, write-throughs, truncates, barriers, cuts — the
+    /// durable image after each barrier is the OS image, byte for byte.
+    #[test]
+    fn in_place_sync_matches_the_clone_reference() {
+        for seed in 0..64u64 {
+            let mut rng = SplitMix64::new(seed ^ 0x5C1E_0000);
+            let mut inode = Inode { sector: 512, ..Inode::default() };
+            // Odd seeds start as an unsynced create: a length the OS sees
+            // and no barrier has committed (F-L04-05).
+            if seed % 2 == 1 {
+                inode.os = vec![0; 4096];
+            }
+            for step in 0..200u32 {
+                match rng.next_below(10) {
+                    0..=4 => {
+                        let off = rng.next_below(8192);
+                        let len = 1 + rng.next_below(2048) as usize;
+                        let byte = (rng.next_below(256)) as u8;
+                        inode.write(off, &vec![byte; len]);
+                    }
+                    5 => {
+                        let off = rng.next_below(8192);
+                        let len = 1 + rng.next_below(2048) as usize;
+                        inode.write_through(off, &vec![0xA5; len]);
+                    }
+                    6 => {
+                        let len = rng.next_below(10_240) as usize;
+                        inode.os.resize(len, 0);
+                        let (_, keep) = inode.sectors(0, len as u64);
+                        inode.written.truncate(keep);
+                        inode.truncated_since_sync = true;
+                    }
+                    7 | 8 => {
+                        inode.sync();
+                        assert_eq!(inode.durable, inode.os, "seed {seed} step {step}: barrier");
+                        assert!(inode.pending.is_empty());
+                    }
+                    _ => {
+                        inode.cut(&mut rng, 512);
+                        assert_eq!(inode.durable, inode.os, "seed {seed} step {step}: cut");
+                    }
+                }
+            }
+        }
     }
 }

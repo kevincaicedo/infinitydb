@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! S01 golden vectors: committed `.idoc` files under `tests/golden/` —
 //! decoding them is a CI test forever (plan AC). A format change that
 //! alters any byte here is an ADR event, not a refactor.

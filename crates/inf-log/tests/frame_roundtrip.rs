@@ -1,12 +1,41 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S01 AC: arbitrary record sequences round-trip frame encode/decode
 //! byte-exact, including frame-boundary edge cases; corruption and
 //! truncation are always detected, never silently absorbed.
 
+use inf_log::FrameLayout;
 use inf_log::{
     DEFAULT_MAX_FRAME_LEN, DOC_VERSION_MASK, DocLineage, FRAME_HEADER_LEN, FRAME_TRAILER_LEN,
     FrameBuilder, FrameIter, FrameStamp, Lsn, NsId, RecordView, SegmentId, decode_frame,
 };
 use proptest::prelude::*;
+
+/// ADR-0126 D1 as amended (review F-L02-04): a named `frame_decode`
+/// corpus seed for the v3 padded-extent boundary — a CRC-valid aligned
+/// frame whose `frame_len` fits below the u32 ceiling from its base but
+/// whose padding does not, a shape random mutation almost never reaches.
+/// Writes `crates/inf-log/fuzz/corpora/frame_decode/v3-padded-extent-
+/// ceiling-20260914` when `INF_WRITE_FUZZ_SEED=1` (a no-op otherwise).
+#[test]
+fn v3_padded_extent_ceiling_fuzz_seed() {
+    if std::env::var_os("INF_WRITE_FUZZ_SEED").is_none() {
+        return;
+    }
+    let mut builder = FrameBuilder::new();
+    builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+    let frame_len = builder.frame_len();
+    let base = u32::MAX - frame_len;
+    let first = Lsn::new(SegmentId(0), base + FRAME_HEADER_LEN as u32);
+    let stamp = FrameStamp { epoch: 1, seq: 1, covered_lsn: 0 };
+    let image = builder.finalize(first, stamp, FrameLayout::Aligned)[..frame_len as usize].to_vec();
+    assert!(decode_frame(&image, u32::MAX).is_err(), "the seed is the refused shape");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpora/frame_decode");
+    std::fs::create_dir_all(path).expect("corpora dir");
+    std::fs::write(format!("{path}/v3-padded-extent-ceiling-20260914"), &image).expect("seed");
+}
 
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
 /// attests nothing). `seq` matters only where a test builds sequential
@@ -218,9 +247,11 @@ fn build_image(
             expected.push((base.advance(staged as u32), record.clone()));
             builder.append(&record.view());
         }
-        image.extend_from_slice(
-            builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(index as u64 + 1)),
-        );
+        image.extend_from_slice(builder.finalize(
+            base.advance(FRAME_HEADER_LEN as u32),
+            stamp(index as u64 + 1),
+            FrameLayout::Packed,
+        ));
     }
     (image, expected)
 }
@@ -274,7 +305,9 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let mut image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
+        let mut image = builder
+            .finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed)
+            .to_vec();
         let at = corrupt.index(image.len());
         image[at] ^= flip;
         match decode_frame(&image, DEFAULT_MAX_FRAME_LEN) {
@@ -298,7 +331,9 @@ proptest! {
             builder.append(&record.view());
         }
         let base = Lsn::new(SegmentId(0), 0);
-        let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
+        let image = builder
+            .finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed)
+            .to_vec();
         for cut in 0..image.len() {
             prop_assert!(
                 decode_frame(&image[..cut], DEFAULT_MAX_FRAME_LEN).is_err(),
@@ -375,7 +410,9 @@ fn minimal_frame_round_trips() {
     let mut builder = FrameBuilder::new();
     builder.append(&RecordView::Delete { ns: NsId(0), key: b"" });
     let base = Lsn::new(SegmentId(0), 0);
-    let image = builder.finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1)).to_vec();
+    let image = builder
+        .finalize(base.advance(FRAME_HEADER_LEN as u32), stamp(1), FrameLayout::Packed)
+        .to_vec();
     let (frame, consumed) = decode_frame(&image, DEFAULT_MAX_FRAME_LEN).expect("decodes");
     assert_eq!(consumed, image.len());
     assert_eq!(frame.record_count(), 1);
@@ -392,12 +429,12 @@ fn builder_reuse_is_clean() {
 
     let mut reused = FrameBuilder::new();
     reused.append(&RecordView::Delete { ns: NsId(1), key: b"first-frame-key" });
-    let _ = reused.finalize(first_lsn, stamp(1));
+    let _ = reused.finalize(first_lsn, stamp(1), FrameLayout::Packed);
     reused.reset();
     reused.append(&RecordView::NsOp { ns: NsId(2), payload: b"second" });
-    let from_reused = reused.finalize(first_lsn, stamp(2)).to_vec();
+    let from_reused = reused.finalize(first_lsn, stamp(2), FrameLayout::Packed).to_vec();
 
     let mut fresh = FrameBuilder::new();
     fresh.append(&RecordView::NsOp { ns: NsId(2), payload: b"second" });
-    assert_eq!(fresh.finalize(first_lsn, stamp(2)), from_reused.as_slice());
+    assert_eq!(fresh.finalize(first_lsn, stamp(2), FrameLayout::Packed), from_reused.as_slice());
 }

@@ -24,6 +24,11 @@
 //! drives it — L9). fsync failure anywhere on this path is
 //! fatal-by-default (§8.4; ADR-0056 D4) — surfaced typed via
 //! [`TierWriteFailure::Fsync`], never retried.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +43,17 @@ use crate::record::NsId;
 pub const TIER_FRAME_BYTES: usize = 4096;
 /// Payload bytes per frame (the rest is the CRC32C trailer).
 pub const TIER_FRAME_DATA: usize = TIER_FRAME_BYTES - 4;
+/// Bytes from a tier record's start that always hold its key — the
+/// record's fixed header, its TTL extension and the longest key, which
+/// `inf-store`'s record layout keeps inside this prefix (asserted there
+/// at compile time). The one bound of a key-window read: the boot settle
+/// read returns this many bytes, clamped to the record's file, and the
+/// store's cold-prefix readers ask for it. Crossing: none — a key always
+/// ends inside the window; bytes that do not hold a whole key fail the
+/// store's parse, a typed refusal.
+pub const TIER_KEY_WINDOW_BYTES: usize = 268;
+// A window of at most one frame's payload spans at most two frames.
+const _: () = assert!(TIER_KEY_WINDOW_BYTES <= TIER_FRAME_DATA);
 /// Header block size (magic + identity, zero-padded to one frame).
 pub const TIER_HEADER_BYTES: usize = 4096;
 /// Footer block size (sealed files only — ADR-0056 D1).
@@ -98,6 +114,7 @@ impl core::fmt::Display for TierWriteFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TierWriteFailure::Write(e) => write!(f, "tier write failed: {e}"),
+            // fsync-fail-stop-allow: Display arm: renders, never handles
             TierWriteFailure::Fsync(e) => {
                 write!(f, "FATAL: tier fsync failed — cell must stop: {e}")
             }
@@ -168,6 +185,10 @@ pub fn probe_tier_file<F: SegmentFs>(
 /// `delta`: (first frame index, frame count, skip inside the first
 /// frame's payload).
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bound: the skip is a remainder of TIER_FRAME_DATA, itself a usize"
+)]
 pub fn tier_frame_span(delta: u64, len: usize) -> (u64, u32, usize) {
     assert!(len > 0, "empty read");
     let data = TIER_FRAME_DATA as u64;
@@ -197,6 +218,11 @@ pub struct TierCorruption {
 /// `window` is raw disk frames as read (a multiple of
 /// [`TIER_FRAME_BYTES`]).
 ///
+/// **`out` is replaced, not appended** (cleared first): a multi-window
+/// assembler must extract each window into a scratch and extend its own
+/// accumulator. Handing the accumulator here erases every previously
+/// assembled window — the review-of-2026-09-01 N1 infinite read loop.
+///
 /// # Errors
 /// [`TierCorruption`] naming the first frame whose CRC fails.
 ///
@@ -223,7 +249,8 @@ pub fn tier_extract(
             window[at + TIER_FRAME_DATA..at + TIER_FRAME_BYTES].try_into().expect("4 bytes"),
         );
         if crc32c(payload) != stored {
-            return Err(TierCorruption { window_frame: frame as u32 });
+            // A diagnostic index: a window past u32 frames reports the last.
+            return Err(TierCorruption { window_frame: u32::try_from(frame).unwrap_or(u32::MAX) });
         }
         let take = remaining.min(TIER_FRAME_DATA - skip);
         out.extend_from_slice(&payload[skip..skip + take]);
@@ -282,17 +309,272 @@ impl FrameStaging {
 
     /// The aligned prefix of `count` filled slots (the device write).
     pub(crate) fn filled(&self, count: usize) -> &[u8] {
+        &self.raw[self.span(count)]
+    }
+
+    /// The aligned window of the first `count` slots, writable (a read
+    /// target: an `O_DIRECT` read needs the destination aligned as a
+    /// write needs its source — ADR-0054 D2).
+    pub(crate) fn frames_mut(&mut self, count: usize) -> &mut [u8] {
+        let span = self.span(count);
+        &mut self.raw[span]
+    }
+
+    /// The raw range of the first `count` slots.
+    fn span(&self, count: usize) -> core::ops::Range<usize> {
         debug_assert!(count <= self.frames, "count inside the window");
-        &self.raw[self.at..self.at + count * TIER_FRAME_BYTES]
+        self.at..self.at + count * TIER_FRAME_BYTES
+    }
+}
+
+/// One staged op of a reactor-drive flush round (M4.5-S31, ADR-0084):
+/// the plane converts writes to `IoOp::LogWrite` and barriers to
+/// `IoOp::Fdatasync`. `bytes` borrows the round's pool-owned window —
+/// heap-stable until the round finishes (the driver's `StableBytes`
+/// custody proof).
+pub struct TierOpView<'a> {
+    /// Backend fd the op targets.
+    pub fd: std::os::fd::RawFd,
+    /// `true` = fdatasync barrier (`bytes` is empty).
+    pub is_barrier: bool,
+    /// Absolute file offset of a write.
+    pub offset: u64,
+    /// The aligned window prefix to write (empty for barriers).
+    pub bytes: &'a [u8],
+}
+
+/// A deferred durability fact of one flush round (ADR-0084 D2) —
+/// applied in stage order at the round's last barrier completion,
+/// never at submission (the §3.1 chain). The store's
+/// `complete_flush_round` is the single applier.
+#[derive(Copy, Clone, Debug)]
+pub enum RoundEffect {
+    /// The active writer's `durable_len` advances to `data_len`.
+    DurableTo {
+        /// Data bytes the round's barrier covers.
+        data_len: u64,
+    },
+    /// The oldest pending seal commits to the catalog.
+    SealCommit,
+    /// `flushed` may cross the ADR-0052 D2 gap ending at `to` (the
+    /// covering seal's barrier is in the same round, earlier in order).
+    GapCross {
+        /// First address past the sealed-dead interval.
+        to: u64,
+    },
+}
+
+/// One staged write held by a round until its terminal completion.
+struct StagedWrite {
+    fd: std::os::fd::RawFd,
+    offset: u64,
+    window: PooledWindow,
+    frames: usize,
+}
+
+/// The staged I/O of one reactor-drive flush round (ADR-0084 D2/D3):
+/// windows move here from the writer at stage time and return to the
+/// pool at [`TierRound::recycle`]; ops are viewed by index so the plane
+/// can resubmit identical intents after a write-completion error (the
+/// M4-S21 retained-batch retry at the reactor tier). The reactor drive
+/// requires fd-backed files — fd-less filesystems (`MemFs`) stay on the
+/// seam drive by construction (`TierFlush::set_drive` is a plane call
+/// and the plane's filesystems all carry fds).
+pub struct TierRound {
+    writes: Vec<StagedWrite>,
+    barriers: Vec<std::os::fd::RawFd>,
+    effects: Vec<RoundEffect>,
+}
+
+impl TierRound {
+    pub(crate) fn new() -> TierRound {
+        TierRound { writes: Vec::new(), barriers: Vec::new(), effects: Vec::new() }
+    }
+
+    /// Ops staged for the driver (writes first, barriers after — the
+    /// plane submits barriers only once every write completed).
+    #[must_use]
+    pub fn op_count(&self) -> usize {
+        self.writes.len() + self.barriers.len()
+    }
+
+    /// Leading ops that are data writes (the wave-1 set).
+    #[must_use]
+    pub fn write_count(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Barrier ops in this round (wave 2) — nonzero exactly when the
+    /// round stages any durability fact.
+    #[must_use]
+    pub fn barrier_count(&self) -> usize {
+        self.barriers.len()
+    }
+
+    /// The op at `index` (stage order: writes, then barriers).
+    ///
+    /// # Panics
+    /// Panics past `op_count` — indices come from this round's tokens.
+    #[must_use]
+    pub fn op(&self, index: usize) -> TierOpView<'_> {
+        if let Some(w) = self.writes.get(index) {
+            return TierOpView {
+                fd: w.fd,
+                is_barrier: false,
+                offset: w.offset,
+                bytes: w.window.staging().filled(w.frames),
+            };
+        }
+        let fd = self.barriers[index - self.writes.len()];
+        TierOpView { fd, is_barrier: true, offset: 0, bytes: &[] }
+    }
+
+    pub(crate) fn push_write(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        offset: u64,
+        window: PooledWindow,
+        frames: usize,
+    ) {
+        self.admit_op();
+        self.writes.push(StagedWrite { fd, offset, window, frames });
+    }
+
+    pub(crate) fn push_barrier(&mut self, fd: std::os::fd::RawFd) {
+        self.admit_op();
+        self.barriers.push(fd);
+    }
+
+    /// The ADR-0084 D3 staging bound: op indices are 8 token bits. A
+    /// validated slice (≤ 64 MiB, ring ≥ slice) stages ≤ ~75 ops; past
+    /// [`ROUND_OPS_MAX`] a completion would alias another op's.
+    fn admit_op(&self) {
+        assert!(
+            self.op_count() < ROUND_OPS_MAX,
+            "tier round exceeds its 8-bit op index (ADR-0084 D3)"
+        );
+    }
+
+    pub(crate) fn push_effect(&mut self, effect: RoundEffect) {
+        self.effects.push(effect);
+    }
+
+    /// Returns every window to the pool and yields the deferred effects
+    /// in stage order; the round is spent. Called at completion (every
+    /// op terminal) — never while the driver may still touch a window.
+    pub(crate) fn recycle(self, pool: &mut WindowPool) -> Vec<RoundEffect> {
+        for w in self.writes {
+            pool.put(w.window);
+        }
+        self.effects
+    }
+}
+
+/// Aligned-window pool for the reactor drive (L5: a named bounded term
+/// — at most [`WINDOWS_OUTSTANDING_CAP`] windows circulate per
+/// pipeline; one round in flight makes the working set
+/// `ceil(slice_bytes / 1 MiB)` batch windows + 3 single blocks).
+pub(crate) struct WindowPool {
+    batch: Vec<FrameStaging>,
+    single: Vec<FrameStaging>,
+    outstanding: u32,
+}
+
+/// A window the pool issued (F-L04-13): the only kind a round may carry,
+/// so every `recycle` returns exactly what `take` counted — the pool's
+/// count cannot go below its issued windows. Made by [`WindowPool::take`]
+/// alone.
+pub(crate) struct PooledWindow(FrameStaging);
+
+impl PooledWindow {
+    pub(crate) fn staging(&self) -> &FrameStaging {
+        &self.0
+    }
+
+    pub(crate) fn staging_mut(&mut self) -> &mut FrameStaging {
+        &mut self.0
+    }
+}
+
+/// The writer's append batch window, typed by the drive that staged into
+/// it: the seam path owns its window outright; the queued path stages
+/// into a pooled one that moves onto the round (F-L04-13 — a seam window
+/// can never be `put`). The drives never interleave (ADR-0084 D2): a
+/// retained seam window is dropped at the first queued frame and at a
+/// drive switch.
+enum BatchWindow {
+    Seam(FrameStaging),
+    Pooled(PooledWindow),
+}
+
+impl BatchWindow {
+    fn staging(&self) -> &FrameStaging {
+        match self {
+            BatchWindow::Seam(w) => w,
+            BatchWindow::Pooled(w) => w.staging(),
+        }
+    }
+
+    fn staging_mut(&mut self) -> &mut FrameStaging {
+        match self {
+            BatchWindow::Seam(w) => w,
+            BatchWindow::Pooled(w) => w.staging_mut(),
+        }
+    }
+}
+
+/// Ops a round may stage (ADR-0084 D3): the plane packs the op index
+/// into 8 token bits (`slot = lane × 256 + op_index`), so a 257th op
+/// would share another op's completion token.
+pub const ROUND_OPS_MAX: usize = 256;
+
+/// Backstop on circulating windows — a round staging more than this is
+/// a programmer error (the token op-index bound is [`ROUND_OPS_MAX`];
+/// see ADR-0084 D3).
+const WINDOWS_OUTSTANDING_CAP: u32 = 256;
+const _: () = assert!(
+    WINDOWS_OUTSTANDING_CAP as usize == ROUND_OPS_MAX,
+    "the window backstop is the round's op bound"
+);
+
+impl WindowPool {
+    pub(crate) fn new() -> WindowPool {
+        WindowPool { batch: Vec::new(), single: Vec::new(), outstanding: 0 }
+    }
+
+    fn take(&mut self, frames: usize) -> PooledWindow {
+        self.outstanding += 1;
+        assert!(self.outstanding <= WINDOWS_OUTSTANDING_CAP, "flush window pool overrun");
+        let free = if frames == TIER_BATCH_FRAMES { &mut self.batch } else { &mut self.single };
+        PooledWindow(free.pop().unwrap_or_else(|| FrameStaging::new(frames)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> u32 {
+        self.outstanding
+    }
+
+    fn put(&mut self, window: PooledWindow) {
+        // Release-checked: a `u32` floor a debug assert alone left to wrap
+        // (F-L04-13); the type makes it unreachable, the check names it.
+        self.outstanding = self.outstanding.checked_sub(1).expect("window returned twice");
+        let PooledWindow(window) = window;
+        if window.frames == TIER_BATCH_FRAMES {
+            self.batch.push(window);
+        } else {
+            self.single.push(window);
+        }
     }
 }
 
 /// Tier-file writer over the injected fs seam (the `SyncIckWriter`
 /// pattern — blocking writes, driven from flush slices and tests, never
-/// from command futures; the reactor-tier drive reuses the staged
-/// `{fd, offset, aligned bytes}` intents via `IoOp::LogWrite` — ADR-0056
-/// D3). The I/O mode (ADR-0054) is fixed at creation; every device write
-/// goes through the aligned staging window in both modes.
+/// from command futures; the reactor-tier drive stages the same
+/// `{fd, offset, aligned bytes}` intents into a [`TierRound`] and the
+/// plane rides them via `IoOp::LogWrite`/`Fdatasync` — ADR-0056 D3,
+/// discharged by ADR-0084). The I/O mode (ADR-0054) is fixed at
+/// creation; every device write goes through an aligned staging window
+/// in both modes.
 pub struct TierWriter<F: SegmentFs> {
     file: F::File,
     path: PathBuf,
@@ -303,12 +585,18 @@ pub struct TierWriter<F: SegmentFs> {
     /// Partial tail-frame payload (zero-padded on write).
     tail: Box<[u8]>,
     tail_fill: usize,
+    /// `append`'s rewind snapshot of the filled tail prefix, reused across
+    /// calls (capacity `TIER_FRAME_DATA`, allocated once at create).
+    tail_snapshot: Vec<u8>,
     /// Data bytes covered by the last `sync` (fdatasync barrier).
     durable_len: u64,
     /// Single-block window (header, footer, partial tail frame, reads).
     staging: FrameStaging,
     /// Multi-frame append batch (one device write per full window — L3).
-    batch: FrameStaging,
+    /// Lazily allocated on the first full frame; in the reactor drive
+    /// (ADR-0084) the window comes from the pipeline's pool and moves
+    /// into the round on spill, so `None` between rounds costs nothing.
+    batch: Option<BatchWindow>,
     batch_frames: usize,
     batch_first_frame: u64,
     /// Bytes this writer handed the device (M4-S13): the header block,
@@ -387,15 +675,7 @@ impl<F: SegmentFs> TierWriter<F> {
         let mut file = fs.create_tier(&path, mode)?;
         let mut staging = FrameStaging::new(1);
         let header = staging.frame_mut();
-        header.fill(0);
-        header[0..4].copy_from_slice(TIER_MAGIC);
-        header[4..8].copy_from_slice(&1u32.to_le_bytes()); // format version
-        header[8..12].copy_from_slice(&cell.to_le_bytes());
-        header[12..16].copy_from_slice(&ns.0.to_le_bytes());
-        header[16..24].copy_from_slice(&base.to_raw().to_le_bytes());
-        header[24..32].copy_from_slice(&capacity_hint.to_le_bytes());
-        let crc = crc32c(&header[..TIER_HEADER_CRC_COVER]);
-        header[32..36].copy_from_slice(&crc.to_le_bytes());
+        encode_tier_header(header, cell, ns, base, capacity_hint);
         file.write_at(0, header)?;
         fs.sync_dir(&cold_dir)?;
         Ok(TierWriter {
@@ -405,15 +685,75 @@ impl<F: SegmentFs> TierWriter<F> {
             mode,
             data_len: 0,
             tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
+            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
             tail_fill: 0,
             durable_len: 0,
             staging,
-            batch: FrameStaging::new(TIER_BATCH_FRAMES),
+            batch: None,
             batch_frames: 0,
             batch_first_frame: 0,
             // The header block is already on the device (written above).
             device_bytes: TIER_HEADER_BYTES as u64,
         })
+    }
+
+    /// Reactor-drive creation (M4.5-S31, ADR-0084 D2): the open and the
+    /// once-per-namespace directory creation stay blocking metadata (the
+    /// rotor-prealloc class); the header block and both dir-fsync
+    /// barriers ride the round instead of the seam — the plane's confirm
+    /// waits on them, so nothing durable ever names an un-durable file
+    /// (the segment-create rule, completion-gated).
+    ///
+    /// # Errors
+    /// I/O failures from the open/mkdir metadata calls (the only seam
+    /// I/O on this path).
+    ///
+    /// # Panics
+    /// Returns the writer and its header block; the caller stages the
+    /// block on its round **after** every step that can fail — nothing
+    /// here touches a round, so a refused creation leaves no staged op
+    /// behind (review 2026-08-30, F-L01-02). The caller owns the cold
+    /// directory's existence.
+    ///
+    /// # Panics
+    /// Panics on an fd-less file — the reactor drive is fd-backed by
+    /// construction (D1).
+    #[allow(clippy::too_many_arguments)] // creation names the full identity once
+    pub(crate) fn create_queued(
+        fs: &F,
+        shard_dir: &Path,
+        id: u32,
+        cell: u32,
+        ns: NsId,
+        base: LogicalAddr,
+        mode: TierIoMode,
+        capacity_hint: u64,
+        pool: &mut WindowPool,
+    ) -> io::Result<(TierWriter<F>, PooledWindow)> {
+        let path = shard_dir.join("cold").join(tier_file_name(id));
+        let file = fs.create_tier(&path, mode)?;
+        assert!(file.raw_fd().is_some(), "reactor drive requires fd-backed tier files (ADR-0084)");
+        let mut window = pool.take(1);
+        encode_tier_header(window.staging_mut().frame_mut(), cell, ns, base, capacity_hint);
+        let writer = TierWriter {
+            file,
+            path,
+            base,
+            mode,
+            data_len: 0,
+            tail: vec![0u8; TIER_FRAME_DATA].into_boxed_slice(),
+            tail_snapshot: Vec::with_capacity(TIER_FRAME_DATA),
+            tail_fill: 0,
+            durable_len: 0,
+            staging: FrameStaging::new(1),
+            batch: None,
+            batch_frames: 0,
+            batch_first_frame: 0,
+            // The header block is staged in this round (counted now —
+            // its write either lands or the round retries it whole).
+            device_bytes: TIER_HEADER_BYTES as u64,
+        };
+        Ok((writer, window))
     }
 
     /// Recovers an **unsealed** tier file to the manifested durable
@@ -521,6 +861,13 @@ impl<F: SegmentFs> TierWriter<F> {
         self.file.raw_fd()
     }
 
+    /// The open file in its creation mode — the boot settle read's
+    /// handle for the active file (ADR-0054 D1: one file, one mode; a
+    /// file with a writer is never opened a second way).
+    pub(crate) fn file(&self) -> &F::File {
+        &self.file
+    }
+
     /// The file's path (test observability).
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -571,8 +918,10 @@ impl<F: SegmentFs> TierWriter<F> {
         let tail_fill0 = self.tail_fill;
         let batch_frames0 = self.batch_frames;
         let device_bytes0 = self.device_bytes;
-        let mut tail0 = [0u8; TIER_FRAME_DATA];
-        tail0[..tail_fill0].copy_from_slice(&self.tail[..tail_fill0]);
+        // The rewind snapshot is the filled prefix only — no per-append
+        // frame-sized zeroing (L04 perf row).
+        self.tail_snapshot.clear();
+        self.tail_snapshot.extend_from_slice(&self.tail[..tail_fill0]);
         let mut bytes = bytes;
         let result = loop {
             if bytes.is_empty() {
@@ -600,11 +949,25 @@ impl<F: SegmentFs> TierWriter<F> {
             // window over the new slot contents would rewrite garbage).
             self.data_len = data_len0;
             self.tail_fill = tail_fill0;
-            self.tail[..tail_fill0].copy_from_slice(&tail0[..tail_fill0]);
+            self.tail[..tail_fill0].copy_from_slice(&self.tail_snapshot);
             self.tail[tail_fill0..].fill(0);
             self.batch_frames = if self.device_bytes > device_bytes0 { 0 } else { batch_frames0 };
         }
         result
+    }
+
+    /// Drive-switch reconciliation (F-L04-13): a pooled window goes back
+    /// to the pool, a seam window is dropped — the next drive stages into
+    /// its own kind. Staged, unflushed frames at a switch are the
+    /// interleave ADR-0084 D2 forbids.
+    ///
+    /// # Panics
+    /// Panics with frames staged.
+    pub(crate) fn release_batch_window(&mut self, pool: &mut WindowPool) {
+        assert_eq!(self.batch_frames, 0, "drive change with staged frames");
+        if let Some(BatchWindow::Pooled(window)) = self.batch.take() {
+            pool.put(window);
+        }
     }
 
     /// Stages the (full) tail frame into the append batch; the batch
@@ -622,7 +985,11 @@ impl<F: SegmentFs> TierWriter<F> {
             "batched frames are consecutive"
         );
         let crc = crc32c(&self.tail);
-        let slot = self.batch.slot_mut(self.batch_frames);
+        let batch = self
+            .batch
+            .get_or_insert_with(|| BatchWindow::Seam(FrameStaging::new(TIER_BATCH_FRAMES)))
+            .staging_mut();
+        let slot = batch.slot_mut(self.batch_frames);
         slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
         slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
         self.batch_frames += 1;
@@ -646,7 +1013,12 @@ impl<F: SegmentFs> TierWriter<F> {
         let count = self.batch_frames;
         // The borrow is split by hand: `filled` reads the batch window,
         // the write targets the file.
-        let bytes = self.batch.filled(count);
+        let bytes = self
+            .batch
+            .as_ref()
+            .expect("staged frames imply a batch window")
+            .staging()
+            .filled(count);
         let len = bytes.len() as u64;
         device_write(&mut self.file, offset, bytes)?;
         self.batch_frames = 0;
@@ -672,10 +1044,13 @@ impl<F: SegmentFs> TierWriter<F> {
         // non-recoverable by contract (§8.4: no caller may catch and
         // continue past it).
         if inf_foundation::fault::fire(crate::fault::TIER_FSYNC_ERR) {
+            // fsync-fail-stop-allow: tier_fsync_err injection (sync): constructs and returns typed
             return Err(TierWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the tier sync barrier: mapped to TierWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         self.durable_len = self.data_len;
         Ok(())
@@ -709,9 +1084,12 @@ impl<F: SegmentFs> TierWriter<F> {
         // for death). Recovery sees an unsealed file and re-seals at the
         // manifested watermark (the crash-matrix row's contract).
         if inf_foundation::fault::fire(crate::fault::TIER_FOOTER_TORN) {
+            // The CRC cover torn inside its sector — the CRC-refuse input
+            // (D7) — written as the whole legal block (F-L04-14): a
+            // Direct fd takes it, the sim asserts it.
             let cut = TIER_FOOTER_CRC_COVER / 2;
-            let torn: Vec<u8> = footer[..cut].to_vec();
-            self.file.write_at(footer_at, &torn).map_err(TierWriteFailure::Write)?;
+            footer[cut..].fill(0);
+            self.file.write_at(footer_at, footer).map_err(TierWriteFailure::Write)?;
             return Err(TierWriteFailure::Write(crate::fault::injected(
                 crate::fault::TIER_FOOTER_TORN,
             )));
@@ -719,10 +1097,13 @@ impl<F: SegmentFs> TierWriter<F> {
         self.file.write_at(footer_at, footer).map_err(TierWriteFailure::Write)?;
         self.device_bytes += TIER_FOOTER_BYTES as u64;
         if inf_foundation::fault::fire(crate::fault::TIER_FSYNC_ERR) {
+            // fsync-fail-stop-allow: tier_fsync_err injection (seal): constructs and returns typed
             return Err(TierWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::TIER_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the tier seal barrier: mapped to TierWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(TierWriteFailure::Fsync)?;
         let outcome = SealOutcome {
             data_len: self.data_len,
@@ -747,6 +1128,187 @@ impl<F: SegmentFs> TierWriter<F> {
         self.device_bytes += TIER_FRAME_BYTES as u64;
         Ok(())
     }
+
+    // ---- reactor-drive funnels (M4.5-S31, ADR-0084 D1/D2) ----
+    //
+    // Queued twins of the seam funnels above: no device I/O at stage
+    // time — frames land in pool windows that move onto the round as
+    // positional write intents, and every durability fact defers to a
+    // round effect. Infallible by construction (the seam error surface
+    // is a *completion* concern, handled by the plane per ADR-0084 D4).
+
+    /// The backend fd, asserted present (D1: the reactor drive is
+    /// fd-backed by construction; `MemFs` pipelines stay on the seam).
+    pub(crate) fn queued_fd(&self) -> std::os::fd::RawFd {
+        self.file.raw_fd().expect("reactor drive requires fd-backed tier files (ADR-0084)")
+    }
+
+    /// Queued twin of [`append`](Self::append). No rewind machinery: a
+    /// stage performs no device I/O, so there is nothing to fail
+    /// mid-range — write failures surface at completion and retry by
+    /// resubmitting the same intents (D4).
+    ///
+    /// # Panics
+    /// Panics when `addr` is not the write cursor (the contiguity
+    /// contract, as [`append`](Self::append)).
+    pub(crate) fn append_queued(
+        &mut self,
+        addr: LogicalAddr,
+        bytes: &[u8],
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+    ) {
+        assert_eq!(
+            addr.to_raw(),
+            self.base.to_raw() + self.data_len,
+            "tier appends are contiguous (gaps live between files — crate::flush)"
+        );
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
+            let take = bytes.len().min(TIER_FRAME_DATA - self.tail_fill);
+            self.tail[self.tail_fill..self.tail_fill + take].copy_from_slice(&bytes[..take]);
+            self.tail_fill += take;
+            self.data_len += take as u64;
+            bytes = &bytes[take..];
+            if self.tail_fill == TIER_FRAME_DATA {
+                self.stage_full_frame_queued(round, pool);
+                self.tail.fill(0);
+                self.tail_fill = 0;
+            }
+        }
+    }
+
+    /// Queued twin of [`stage_full_frame`](Self::stage_full_frame): the
+    /// batch window comes from the pool and spills onto the round when
+    /// full (one ≥ 1 MiB write intent — L3 unchanged).
+    fn stage_full_frame_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
+        debug_assert_eq!(self.tail_fill, TIER_FRAME_DATA, "staging a full frame");
+        let frame_index = (self.data_len - 1) / TIER_FRAME_DATA as u64;
+        if self.batch_frames == 0 {
+            self.batch_first_frame = frame_index;
+        }
+        debug_assert_eq!(
+            frame_index,
+            self.batch_first_frame + self.batch_frames as u64,
+            "batched frames are consecutive"
+        );
+        let crc = crc32c(&self.tail);
+        let batch = match &mut self.batch {
+            Some(b @ BatchWindow::Pooled(_)) => b,
+            // Seam frames under the reactor drive: staged where they are;
+            // the spill refuses them (ADR-0084 D2).
+            Some(b @ BatchWindow::Seam(_)) if self.batch_frames > 0 => b,
+            // None, or a seam window retained empty after its flush.
+            slot => slot.insert(BatchWindow::Pooled(pool.take(TIER_BATCH_FRAMES))),
+        }
+        .staging_mut();
+        let slot = batch.slot_mut(self.batch_frames);
+        slot[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
+        slot[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
+        self.batch_frames += 1;
+        if self.batch_frames == TIER_BATCH_FRAMES {
+            self.spill_batch_queued(round);
+        }
+    }
+
+    /// Moves the staged batch window onto the round as one write intent.
+    fn spill_batch_queued(&mut self, round: &mut TierRound) {
+        if self.batch_frames == 0 {
+            return;
+        }
+        let Some(BatchWindow::Pooled(window)) = self.batch.take() else {
+            panic!("staged frames imply a pooled batch window (ADR-0084 D2)");
+        };
+        let offset = tier_frame_offset(self.batch_first_frame);
+        let len = (self.batch_frames * TIER_FRAME_BYTES) as u64;
+        round.push_write(self.queued_fd(), offset, window, self.batch_frames);
+        self.batch_frames = 0;
+        self.device_bytes += len;
+    }
+
+    /// Stages the partial tail frame as one single-block write intent
+    /// (the queued twin of [`write_tail_frame`](Self::write_tail_frame)).
+    fn stage_tail_frame_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
+        let frame_index = (self.data_len - 1) / TIER_FRAME_DATA as u64;
+        let mut window = pool.take(1);
+        let frame = window.staging_mut().frame_mut();
+        frame[..TIER_FRAME_DATA].copy_from_slice(&self.tail);
+        frame[TIER_FRAME_DATA..].copy_from_slice(&crc32c(&self.tail).to_le_bytes());
+        round.push_write(self.queued_fd(), tier_frame_offset(frame_index), window, 1);
+        self.device_bytes += TIER_FRAME_BYTES as u64;
+    }
+
+    /// Queued twin of [`sync`](Self::sync): stages the remaining batch,
+    /// the partial tail frame, one fdatasync barrier, and the
+    /// [`RoundEffect::DurableTo`] fact the completion applies —
+    /// `durable_len` moves **only** there (the §3.1 chain).
+    pub(crate) fn sync_queued(&mut self, round: &mut TierRound, pool: &mut WindowPool) {
+        self.spill_batch_queued(round);
+        if self.tail_fill > 0 {
+            self.stage_tail_frame_queued(round, pool);
+        }
+        round.push_barrier(self.queued_fd());
+        round.push_effect(RoundEffect::DurableTo { data_len: self.data_len });
+    }
+
+    /// Queued twin of [`seal`](Self::seal): stages the final tail frame,
+    /// the footer block, and the seal barrier; the catalog commit is the
+    /// caller's [`RoundEffect::SealCommit`], applied at the barrier's
+    /// completion CQE — a file is sealed on disk only once its footer's
+    /// fdatasync completed (ADR-0056 D1, completion-gated).
+    pub(crate) fn seal_queued(
+        mut self,
+        reason: SealReason,
+        round: &mut TierRound,
+        pool: &mut WindowPool,
+    ) -> QueuedSeal<F::File> {
+        self.spill_batch_queued(round);
+        if self.tail_fill > 0 {
+            self.stage_tail_frame_queued(round, pool);
+        }
+        let frames = self.data_len.div_ceil(TIER_FRAME_DATA as u64);
+        let footer_at = TIER_HEADER_BYTES as u64 + frames * TIER_FRAME_BYTES as u64;
+        let mut window = pool.take(1);
+        encode_tier_footer(window.staging_mut().frame_mut(), self.data_len, reason);
+        round.push_write(self.queued_fd(), footer_at, window, 1);
+        self.device_bytes += TIER_FOOTER_BYTES as u64;
+        round.push_barrier(self.queued_fd());
+        QueuedSeal {
+            outcome: SealOutcome {
+                data_len: self.data_len,
+                path: self.path,
+                device_bytes: self.device_bytes,
+            },
+            file: self.file,
+            base: self.base,
+            confirmed_len: (self.durable_len / TIER_FRAME_DATA as u64) * TIER_FRAME_DATA as u64,
+        }
+    }
+
+    /// Applies a completed round's [`RoundEffect::DurableTo`] fact.
+    ///
+    /// # Panics
+    /// Panics on a regressing or overreaching watermark — effects are
+    /// generated by this writer's own `sync_queued`, so a mismatch is a
+    /// programmer error.
+    pub(crate) fn confirm_durable_to(&mut self, data_len: u64) {
+        assert!(data_len >= self.durable_len, "durable watermark regressed");
+        assert!(data_len <= self.data_len, "durable watermark past the append cursor");
+        self.durable_len = data_len;
+    }
+}
+
+/// What a queued seal produced (ADR-0084 D2): the catalog facts commit
+/// at the round's barrier completion; until then the pipeline parks
+/// them as a pending seal, with the open handle serving cold reads on
+/// the already-confirmed prefix.
+pub(crate) struct QueuedSeal<File> {
+    pub(crate) outcome: SealOutcome,
+    pub(crate) file: File,
+    pub(crate) base: LogicalAddr,
+    /// Full, final frame bytes confirmed before the seal staged — the
+    /// ADR-0056 D5 claim bound cold reads may rely on mid-round.
+    pub(crate) confirmed_len: u64,
 }
 
 /// The one device-write funnel — every data byte reaches the fd here
@@ -762,9 +1324,7 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // ADR-0056 D6 `tier_short_write`: the device accepts a prefix and
     // the write FAILS — the caller treats the range as never written.
     if inf_foundation::fault::fire(crate::fault::TIER_SHORT_WRITE) {
-        let cut = bytes.len() / 2;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        let _ = file.write_at(offset, &torn);
+        let _ = write_torn_prefix(file, offset, bytes, bytes.len() / 2);
         return Err(crate::fault::injected(crate::fault::TIER_SHORT_WRITE));
     }
     // ADR-0056 D6 `tier_torn_frame`: a prefix lands and the write
@@ -772,11 +1332,53 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // final write before a crash (recovery truncates or CRC-refuses
     // per D5; the crash-matrix row proves which).
     if inf_foundation::fault::fire(crate::fault::TIER_TORN_FRAME) {
-        let cut = bytes.len() * 2 / 3;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        return file.write_at(offset, &torn);
+        return write_torn_prefix(file, offset, bytes, bytes.len() * 2 / 3);
     }
     file.write_at(offset, bytes)
+}
+
+/// The tear grid a torn write lands on — the device's sector, the
+/// simulator's coin granularity (ADR-0020 D6).
+const TORN_SECTOR_BYTES: usize = 512;
+
+/// Lands the first `cut` bytes of a staged write, rounded down to the
+/// sector grid, as **whole aligned blocks** (F-L04-14, ADR-0119 A1): the
+/// intact prefix is a sub-slice of the aligned window; the sector-torn
+/// block keeps its prior on-device content beyond the tear (read back
+/// through an aligned scratch block — zeros past EOF), which is what a
+/// power cut leaves on media. Every write here is legal on an `O_DIRECT`
+/// fd, where the sub-block `to_vec` prefix these points once wrote was
+/// refused `EINVAL` (the tmpfs/`MemFs` tiers swallowed it). Fault-path
+/// only: the scratch block is allocated when a point fires.
+pub(crate) fn write_torn_prefix<File: SegmentFile>(
+    file: &mut File,
+    offset: u64,
+    bytes: &[u8],
+    cut: usize,
+) -> io::Result<()> {
+    debug_assert_eq!(offset % TIER_FRAME_BYTES as u64, 0, "staged writes are block-aligned");
+    debug_assert_eq!(bytes.len() % TIER_FRAME_BYTES, 0, "staged writes are whole blocks");
+    let landed = cut.min(bytes.len()) / TORN_SECTOR_BYTES * TORN_SECTOR_BYTES;
+    let full = landed / TIER_FRAME_BYTES * TIER_FRAME_BYTES;
+    if full > 0 {
+        file.write_at(offset, &bytes[..full])?;
+    }
+    if landed > full {
+        let block_at = offset + full as u64;
+        let mut scratch = FrameStaging::new(1);
+        let block = scratch.frame_mut();
+        block.fill(0);
+        let mut read = 0usize;
+        while read < block.len() {
+            match file.read_at(block_at + read as u64, &mut block[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        block[..landed - full].copy_from_slice(&bytes[full..landed]);
+        file.write_at(block_at, block)?;
+    }
+    Ok(())
 }
 
 // ---- v1 block codecs + the untrusted-input decoder (ADR-0056 D1/D7) ----
@@ -832,6 +1434,25 @@ impl core::fmt::Display for TierDecodeError {
             TierDecodeError::Geometry => write!(f, "footer geometry disagrees with file length"),
         }
     }
+}
+
+fn encode_tier_header(
+    block: &mut [u8],
+    cell: u32,
+    ns: NsId,
+    base: LogicalAddr,
+    capacity_hint: u64,
+) {
+    debug_assert_eq!(block.len(), TIER_HEADER_BYTES, "header is one block");
+    block.fill(0);
+    block[0..4].copy_from_slice(TIER_MAGIC);
+    block[4..8].copy_from_slice(&1u32.to_le_bytes()); // format version
+    block[8..12].copy_from_slice(&cell.to_le_bytes());
+    block[12..16].copy_from_slice(&ns.0.to_le_bytes());
+    block[16..24].copy_from_slice(&base.to_raw().to_le_bytes());
+    block[24..32].copy_from_slice(&capacity_hint.to_le_bytes());
+    let crc = crc32c(&block[..TIER_HEADER_CRC_COVER]);
+    block[32..36].copy_from_slice(&crc.to_le_bytes());
 }
 
 fn encode_tier_footer(block: &mut [u8], data_len: u64, reason: SealReason) {
@@ -946,14 +1567,13 @@ pub fn inspect_tier_bytes(bytes: &[u8]) -> Result<TierSummary, TierDecodeError> 
         }
     }
     let mut first_bad_frame = None;
-    for frame_index in 0..frames {
-        let at = frame_index as usize * TIER_FRAME_BYTES;
-        let frame = &body[at..at + TIER_FRAME_BYTES];
+    let checkable = usize::try_from(frames).unwrap_or(usize::MAX);
+    for (frame_index, frame) in body.chunks_exact(TIER_FRAME_BYTES).take(checkable).enumerate() {
         let stored = u32::from_le_bytes(
             frame[TIER_FRAME_DATA..TIER_FRAME_BYTES].try_into().expect("4 bytes"),
         );
         if crc32c(&frame[..TIER_FRAME_DATA]) != stored {
-            first_bad_frame = Some(frame_index);
+            first_bad_frame = Some(frame_index as u64);
             break;
         }
     }
@@ -993,6 +1613,7 @@ impl<F: SegmentFs> core::fmt::Debug for TierWriter<F> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: real filesystem fixtures")]
 mod tests {
     use super::*;
     use crate::fs::mem::MemFs;
@@ -1003,6 +1624,19 @@ mod tests {
         let n = file.read_at(tier_frame_offset(first), &mut window).expect("read");
         assert_eq!(n, window.len(), "window inside the synced file");
         window
+    }
+
+    /// Batch 14 of the 2026-08-30 review: ADR-0084 D3 names a "≤ 256
+    /// ops/round, asserted at staging" bound that was never written; the
+    /// plane packs the op index into 8 token bits, so a 257th op would
+    /// have shared another op's completion token silently.
+    #[test]
+    #[should_panic(expected = "tier round exceeds its 8-bit op index")]
+    fn round_refuses_the_257th_op() {
+        let mut round = TierRound::new();
+        for _ in 0..=ROUND_OPS_MAX {
+            round.push_barrier(0);
+        }
     }
 
     /// Round trip: appended records read back byte-exact through the
@@ -1337,5 +1971,34 @@ mod tests {
         )
         .expect("create");
         writer.append(LogicalAddr::from_raw(64).expect("fits"), &[0u8; 8]).expect("append");
+    }
+}
+
+#[cfg(test)]
+mod append_cost_tests {
+    use super::*;
+    use crate::fs::mem::MemFs;
+
+    /// L04 perf row, dev-tier witness (run alone, `--release`): 500 000
+    /// 100-byte appends. Pre-fix every append zeroed a 4092-byte stack
+    /// snapshot; the snapshot is now the filled prefix only.
+    #[test]
+    #[ignore = "wall-clock witness for the ledger; run alone"]
+    #[allow(clippy::disallowed_methods, reason = "test-only wall-clock witness, not cell code")]
+    fn small_appends_pay_for_their_bytes_not_a_frame() {
+        let fs = MemFs::new();
+        let shard = Path::new("shard-0");
+        fs.create_dir_all(shard).expect("dirs");
+        let mut writer =
+            TierWriter::create(&fs, shard, 0, 0, NsId(1), LogicalAddr::ZERO, TierIoMode::Buffered)
+                .expect("create");
+        let record = [0xABu8; 100];
+        let start = std::time::Instant::now();
+        let mut addr = LogicalAddr::ZERO;
+        for _ in 0..500_000u64 {
+            writer.append(addr, &record).expect("append");
+            addr = addr.advanced(record.len() as u64).expect("fits");
+        }
+        eprintln!("500000 appends: {:?}", start.elapsed());
     }
 }

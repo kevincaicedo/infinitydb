@@ -1,0 +1,51 @@
+<!--
+title: Why this site has no benchmarks
+dek: The evidence bar for a public number, and why we have not cleared it yet.
+date: 2026-10-08
+topic: Evidence
+group: Evidence
+crumb: Evidence
+kicker: Evidence · claims follow evidence
+excerpt: Every public number needs replicates, a clean tree and the system we compare against in the same run. Until the ledger says Allowed, we say nothing.
+-->
+<p class="lede">You will not find a throughput figure on this site. No latency, no memory per key, no chart against another database. The engine has harnesses that measure all of these, and they have produced plenty of output. None of it meets the bar for public copy yet. Vortex, the project before this one, published targets while it shipped something else, and the gap became the story. We would rather say nothing than print a number the next run takes back.</p>
+
+<h2 id="s1"><span class="num">1</span>What a public number needs.</h2>
+<ul class="dots">
+<li>Three to five replicates, with their spread reported and the A/B order stated.</li>
+<li>A clean tree, and the exact baseline and candidate revisions, toolchain and build.</li>
+<li>The environment recorded: kernel, CPU governor and energy policy, raw and effective, thermals, and the server and the load generator on disjoint cores.</li>
+<li>A load generator that was not the thing that saturated.</li>
+<li>The system we compare against on the same box, with the same workload files and published configurations, in the same run. No comparison ships from a run the comparator was not in.</li>
+<li>Tripwire metrics green in the same run. A throughput number from a run where the reactor was not batching is invalid by definition.</li>
+<li>Memory attribution and a flamegraph reviewed, and the command that reproduces the result.</li>
+</ul>
+<p>A claim then gets one status: Allowed, Narrowed to a weaker wording, or Rejected. Evidence-pending is treated as Rejected. The gate harness enforces part of this itself: it refuses to run on a dirty tree, the wrong governor or a throttling CPU unless it is told the result is not citable.</p>
+<aside class="law"><div class="law-label">Law derived · L10</div><p>Claims follow evidence. A number without replicates, a recorded environment and its comparator in the same run is not a weak claim. It is not a claim.</p></aside>
+
+<h2 id="s2"><span class="num">2</span>A gate that cannot go red is not evidence.</h2>
+<p>The rule is that every gate, oracle and claim row names its canary: the planted violation that turns it red, run in the same lane. The boot-storm scenario's ready-path oracle does not meet it: no lane plants its bug. Every instrument gets a specification before it measures: its estimator and scope, its resolution, a spread budget with a same-binary control leg, and a liveness counter with a planted red. And a run whose saturated resource is not the one the budget named is a finding before it is a number.</p>
+<p>Each rule came from a failure. At M0, fabric hop latency was gated finer than the loop-granularity clock that measured it could resolve. A batching counter divided by enters that submitted nothing, so it measured the idle policy. A sweep recipe ended in a bare <code>wait</code> that returned success whatever its shards reported. None of those could have told us we were wrong.</p>
+
+<h2 id="s3"><span class="num">3</span>The ways a measurement lies.</h2>
+<p>Each of these has happened here:</p>
+<ul class="dots">
+<li>The cheap device. On tmpfs, group commit looked healthy. On a real NVMe drive it was issuing a stream of tiny syncs.</li>
+<li>The convenient corpus. A document corpus that loaded identical bytes into many keys let the comparator deduplicate them, which no real workload allows.</li>
+<li>The layout. Two separately built binaries place the same code at different addresses, and that alone moves timings. A cross-binary timing A/B smaller than that band is no evidence either way, so we count instructions and time both variants inside one binary.</li>
+<li>The lucky rerun. Some rows have two stable modes, or one outlier leg. Re-running such a row until it passes is not a measurement; the repair is declared before the run that uses it.</li>
+</ul>
+
+<h2 id="s4"><span class="num">4</span>Why not yet.</h2>
+<p>No release has been published, and Allowed is per release. Every release re-runs the harness behind each Allowed row, and a row not re-validated for the release being announced reverts to Evidence-pending for that announcement. With no announcement, there is nothing yet to re-validate against.</p>
+<p>Runs on a development box can never back a performance claim; only the reference box can. Its storage device is a disclosed deviation from the class the device-bound gates were written for, so those rows stay pending until a matching device runs them. Run output is not committed either. A claim records revisions, commands, the box and the result, and an old output path is provenance, not current acceptance. A number from an earlier milestone would have to be measured again on the release's own revision before we could quote it.</p>
+<p>And the release itself is not ready. M4 is in progress, and the first public alpha waits on the trust and safety work the <a href="../docs/roadmap.html">roadmap</a> lists as planned. At the other end of the train, M11 re-baselines performance with every public claim measured again.</p>
+
+<h2 id="s5"><span class="num">5</span>What we publish instead.</h2>
+<p>Correctness evidence anyone can rerun from a checkout. The <a href="../docs/compat.html">compatibility matrix</a> is generated from the command registry and a corpus whose replies CI compares with its pinned oracles (Redis 8.0.5 for the core commands, a pinned RedisJSON for <code>JSON.*</code>), and CI fails when the committed matrix is stale. The <a href="../docs/simulation.html">simulator</a>'s scenarios and seeds are in the repository. The crash matrix's rows are data files anyone can review. Each one comes with the command that produces it, and each one can go red.</p>
+<pre class="code" data-label="shell">$ just compat
+$ just sim-smoke
+$ cargo test -p crash-matrix</pre>
+
+<h2 id="close">When a number appears.</h2>
+<p>The roadmap says it in one line: no performance or memory numbers are published until a reproducible measurement backs them. When the ledger allows one for a release, it will appear with its box, its revision, its spread and the comparator that was in the run. Until then the absence is deliberate. The <a href="../docs/laws.html">laws</a> page states the rule this post follows, and the <a href="../docs/style.html">style</a> page covers the rest of how we test.</p>

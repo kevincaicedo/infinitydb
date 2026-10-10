@@ -1,13 +1,12 @@
-# M0 exit gates (STOP) — machine-readable encoding of the M0 milestone plan
-# §6 (internal). Values are fixed by the project master plan §22 (M0, internal);
-# changing a threshold here is a master-plan amendment,
-# not an edit (L10: a gate may not be passed by narrowing it).
+# M0 exit gates (STOP) — machine-readable encoding of the M0 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # Consumed by `inf-bench gate-run m0`. Field semantics:
 #   threshold/comparator/unit — the gate inequality, e.g. measured >= 6000000 ops/s.
 #   tier        — "linux-reference-box": a performance gate; its verdict may only
 #                 be decided from runs on the Linux reference box (macOS runs are
-#                 plumbing validation and report PENDING, never PASS/FAIL).
+#                 plumbing validation with non-binding threshold verdicts).
 #                 "any": structural gate; evaluated wherever the measurement
 #                 source actually provides a value.
 #   source      — where gate-run obtains the measurement:
@@ -15,8 +14,9 @@
 #                 "tripwire:<name>"   INFO tripwires scrape (inf_foundation::tripwire names)
 #                 "ab:<metric>"       interleaved A/B replicates (--ab), ratio A/B
 #                 "external:<what>"   gate-campaign tooling (memtier, flamegraph, smem);
-#                                     always PENDING from gate-run until that tooling lands.
+#                                     unmeasured until supplied by the owning tooling.
 #   informational — tripwire row that does not block the verdict (still reported).
+# Missing/non-finite selected STOP measurements fail in every tier (ADR-0132).
 
 schema = 1
 milestone = "m0"
@@ -113,7 +113,7 @@ comparator = "<"
 unit = "us"
 tier = "linux-reference-box"
 source = "tripwire:loop_iter_p999_us"
-measured_by = "always-on HDR histogram, scraped via INFO tripwires under the M0 reference load"
+measured_by = "maximum cell/window p99.9 from fresh INFO loophist bucket deltas around M0 load replicates (ADR-0136)"
 
 [[gate]]
 id = "syscall_cpu_share"

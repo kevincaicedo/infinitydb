@@ -17,6 +17,16 @@
 //! the fsyncgate poison — retrying the fsync and trusting a later
 //! success — is structurally absent. WAL and tier-file fsync fatality
 //! are untouched.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -72,6 +82,22 @@ pub fn parse_extent_file_name(name: &str) -> Option<ExtentId> {
     digits.parse::<u64>().ok().map(ExtentId)
 }
 
+/// `blob-NNNNNN.iblob.quarantine` — the boot-orphan quarantine twin
+/// (ADR-0096 D2): same bytes, a name no read or listing resolves, so a
+/// wrong orphan verdict is recoverable by rename instead of being an
+/// `unlink(2)`.
+#[must_use]
+pub fn quarantined_file_name(id: ExtentId) -> String {
+    format!("{}.quarantine", extent_file_name(id))
+}
+
+/// Parses a quarantined extent file name back to its id (`None` for
+/// foreign names — the [`parse_extent_file_name`] rule).
+#[must_use]
+pub fn parse_quarantined_file_name(name: &str) -> Option<ExtentId> {
+    parse_extent_file_name(name.strip_suffix(".quarantine")?)
+}
+
 /// Parsed v1 extent header — the ground truth the orphan sweep and every
 /// read verifies against (ADR-0061 D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -106,6 +132,7 @@ impl core::fmt::Display for ExtentWriteFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ExtentWriteFailure::Write(e) => write!(f, "extent write failed: {e}"),
+            // fsync-fail-stop-allow: Display arm: renders, never handles
             ExtentWriteFailure::Fsync(e) => write!(f, "extent fsync failed (typed abort): {e}"),
         }
     }
@@ -121,9 +148,9 @@ impl ExtentWriteFailure {
     #[must_use]
     pub fn is_storage_full(&self) -> bool {
         match self {
-            ExtentWriteFailure::Write(e) => {
-                e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28)
-            }
+            ExtentWriteFailure::Write(e) => crate::fs::is_storage_exhausted(e),
+            // fsync-fail-stop-allow: is_retryable classifier: false — the ADR-0061 D3 typed abort
+            // is never retried
             ExtentWriteFailure::Fsync(_) => false,
         }
     }
@@ -213,11 +240,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// I/O failures from the fs seam — including the typed `Unsupported`
     /// refusal when `Direct` does not take effect (ADR-0054 D3) and
     /// ENOSPC surfaced typed (the S21 blob taxonomy: refusal, never
-    /// corruption).
-    ///
-    /// # Panics
-    /// Panics when `data_len` is zero — an inline-able value out of line
-    /// is a caller routing bug, not an operating condition.
+    /// corruption). `InvalidInput` for zero bytes or a length whose
+    /// framed device size is unrepresentable; no file is created.
     pub fn create(
         fs: &F,
         shard_dir: &Path,
@@ -227,7 +251,9 @@ impl<F: SegmentFs> ExtentWriter<F> {
         data_len: u64,
         mode: TierIoMode,
     ) -> io::Result<ExtentWriter<F>> {
-        assert!(data_len > 0, "an extent holds at least one value byte");
+        if data_len == 0 || checked_extent_device_bytes(data_len).is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid extent geometry"));
+        }
         let cold_dir = shard_dir.join("cold");
         fs.create_dir_all(&cold_dir)?;
         fs.sync_dir(shard_dir)?;
@@ -276,9 +302,15 @@ impl<F: SegmentFs> ExtentWriter<F> {
     ///
     /// # Panics
     /// Panics when the chunk would exceed the declared length.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: tail_fill < TIER_FRAME_DATA on entry to each pass (reset when it \
+                  reaches it), take <= the room left in the tail, and written + take <= \
+                  data_len by the assert above the loop"
+    )]
     pub fn append_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
         assert!(
-            self.written + bytes.len() as u64 <= self.data_len,
+            self.data_len.checked_sub(self.written).is_some_and(|room| bytes.len() as u64 <= room),
             "chunks must not exceed the declared extent length"
         );
         let mut bytes = bytes;
@@ -300,9 +332,14 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// Stages the (full) tail frame into the append batch; the batch
     /// reaches the device as one multi-frame write when the window fills
     /// (L3 — never one syscall per frame).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: batch_frames < TIER_BATCH_FRAMES here — flush_batch zeroes it the \
+                  moment it reaches the window — and the frame index is a u64 quotient"
+    )]
     fn stage_full_frame(&mut self) -> io::Result<()> {
         debug_assert_eq!(self.tail_fill, TIER_FRAME_DATA, "staging a full frame");
-        let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
+        let frame_index = self.last_frame_index();
         if self.batch_frames == 0 {
             self.batch_first_frame = frame_index;
         }
@@ -322,6 +359,24 @@ impl<F: SegmentFs> ExtentWriter<F> {
         Ok(())
     }
 
+    /// Index of the frame holding the last appended byte.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: every caller holds a non-empty tail (`tail_fill > 0`, tested in \
+                  `finish*`, or == TIER_FRAME_DATA in `stage_full_frame`), and `append_chunk` \
+                  adds to `written` whatever it adds to `tail_fill`, so written >= 1"
+    )]
+    fn last_frame_index(&self) -> u64 {
+        const FRAME_DATA: u64 = TIER_FRAME_DATA as u64;
+        (self.written - 1) / FRAME_DATA
+    }
+
+    /// Bytes handed to the device, summed. Saturating: the figure is
+    /// bounded by `extent_device_bytes(data_len)`, which saturates too.
+    fn account_device_bytes(&mut self, len: u64) {
+        self.device_bytes = self.device_bytes.saturating_add(len);
+    }
+
     /// One device write for the staged batch (aligned offset, aligned
     /// length, aligned memory — legal in both I/O modes).
     fn flush_batch(&mut self) -> io::Result<()> {
@@ -334,7 +389,7 @@ impl<F: SegmentFs> ExtentWriter<F> {
         let bytes = self.batch.filled(count);
         let len = bytes.len() as u64;
         device_write(&mut self.file, offset, bytes)?;
-        self.device_bytes += len;
+        self.account_device_bytes(len);
         Ok(())
     }
 
@@ -354,23 +409,25 @@ impl<F: SegmentFs> ExtentWriter<F> {
         assert_eq!(self.written, self.data_len, "an extent finishes at its declared length");
         self.flush_batch().map_err(ExtentWriteFailure::Write)?;
         if self.tail_fill > 0 {
-            let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
-            let offset = extent_frame_offset(frame_index);
+            let offset = extent_frame_offset(self.last_frame_index());
             let frame = self.staging.frame_mut();
             frame.fill(0);
             frame[..self.tail_fill].copy_from_slice(&self.tail[..self.tail_fill]);
             let crc = crc32c(&frame[..TIER_FRAME_DATA]);
             frame[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
             device_write(&mut self.file, offset, frame).map_err(ExtentWriteFailure::Write)?;
-            self.device_bytes += TIER_FRAME_BYTES as u64;
+            self.account_device_bytes(TIER_FRAME_BYTES as u64);
         }
         // ADR-0061 D3/D9 `blob_fsync_err`: the barrier fails — typed
         // abort; the extent is abandoned, nothing durable references it.
         if inf_foundation::fault::fire(crate::fault::BLOB_FSYNC_ERR) {
+            // fsync-fail-stop-allow: blob_fsync_err injection: constructs and returns typed
             return Err(ExtentWriteFailure::Fsync(crate::fault::injected(
                 crate::fault::BLOB_FSYNC_ERR,
             )));
         }
+        // fsync-fail-stop-allow: the extent barrier: mapped to ExtentWriteFailure::Fsync and
+        // propagated with `?`
         self.file.sync_data().map_err(ExtentWriteFailure::Fsync)?;
         Ok(SealedExtent {
             ns: self.ns,
@@ -396,15 +453,14 @@ impl<F: SegmentFs> ExtentWriter<F> {
         assert_eq!(self.written, self.data_len, "an extent finishes at its declared length");
         self.flush_batch().map_err(ExtentWriteFailure::Write)?;
         if self.tail_fill > 0 {
-            let frame_index = (self.written - 1) / TIER_FRAME_DATA as u64;
-            let offset = extent_frame_offset(frame_index);
+            let offset = extent_frame_offset(self.last_frame_index());
             let frame = self.staging.frame_mut();
             frame.fill(0);
             frame[..self.tail_fill].copy_from_slice(&self.tail[..self.tail_fill]);
             let crc = crc32c(&frame[..TIER_FRAME_DATA]);
             frame[TIER_FRAME_DATA..].copy_from_slice(&crc.to_le_bytes());
             device_write(&mut self.file, offset, frame).map_err(ExtentWriteFailure::Write)?;
-            self.device_bytes += TIER_FRAME_BYTES as u64;
+            self.account_device_bytes(TIER_FRAME_BYTES as u64);
         }
         let sealed = SealedExtent {
             ns: self.ns,
@@ -426,7 +482,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// the L5 term the S17 staging-bound assert reads.
     #[must_use]
     pub fn staging_bytes(&self) -> usize {
-        BLOB_CHUNK_BYTES + TIER_FRAME_BYTES + self.tail.len()
+        const FIXED_BYTES: usize = BLOB_CHUNK_BYTES + TIER_FRAME_BYTES;
+        FIXED_BYTES.saturating_add(self.tail.len())
     }
 
     /// The extent file's path (tests and the plane's pin bookkeeping).
@@ -448,9 +505,7 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
     // ADR-0061 D9 `blob_short_write`: the device accepts a prefix and
     // the write FAILS — the caller abandons the extent whole.
     if inf_foundation::fault::fire(crate::fault::BLOB_SHORT_WRITE) {
-        let cut = bytes.len() / 2;
-        let torn: Vec<u8> = bytes[..cut].to_vec();
-        let _ = file.write_at(offset, &torn);
+        let _ = crate::tier::write_torn_prefix(file, offset, bytes, bytes.len() / 2);
         return Err(crate::fault::injected(crate::fault::BLOB_SHORT_WRITE));
     }
     file.write_at(offset, bytes)
@@ -458,19 +513,37 @@ fn device_write<File: SegmentFile>(file: &mut File, offset: u64, bytes: &[u8]) -
 
 /// Device offset of extent frame `frame` (header block first — the tier
 /// arithmetic with the blob header).
+///
+/// Saturating: a frame index no file can hold addresses `u64::MAX`, never a
+/// wrapped real frame. Every consumer stays bounded by bytes its caller
+/// holds: the writers and the synchronous reader address frames of bytes
+/// their caller appended or assembled, where a saturated position fails
+/// typed, and the cold read path's `ColdReads::enqueue` refuses any
+/// position above the driver's range, `u64::MAX` included (ADR-0167 D6,
+/// ADR-0165).
 #[must_use]
 pub fn extent_frame_offset(frame: u64) -> u64 {
-    BLOB_HEADER_BYTES as u64 + frame * TIER_FRAME_BYTES as u64
+    frame.saturating_mul(TIER_FRAME_BYTES as u64).saturating_add(BLOB_HEADER_BYTES as u64)
 }
 
 /// On-disk size of a complete extent holding `data_len` value bytes:
 /// the header block plus whole CRC frames. The disk-budget accounting's
 /// per-extent term (M4-S19, ADR-0062 D5) — one formula, shared with the
 /// writer's cumulative figure so the two can never drift.
+///
+/// Saturating accounting: header parsing and writer creation refuse
+/// unrepresentable geometry. Callers folding these terms must saturate
+/// too, so a full device cannot wrap into available admission headroom.
 #[must_use]
 pub fn extent_device_bytes(data_len: u64) -> u64 {
-    let payload = TIER_FRAME_BYTES as u64 - 4; // 4092 payload + 4 CRC
-    BLOB_HEADER_BYTES as u64 + data_len.div_ceil(payload) * TIER_FRAME_BYTES as u64
+    checked_extent_device_bytes(data_len).unwrap_or(u64::MAX)
+}
+
+fn checked_extent_device_bytes(data_len: u64) -> Option<u64> {
+    data_len
+        .div_ceil(TIER_FRAME_DATA as u64)
+        .checked_mul(TIER_FRAME_BYTES as u64)?
+        .checked_add(BLOB_HEADER_BYTES as u64)
 }
 
 /// Parses a v1 extent header block from untrusted bytes (ADR-0061 D9,
@@ -478,7 +551,7 @@ pub fn extent_device_bytes(data_len: u64) -> u64 {
 ///
 /// # Errors
 /// [`TierDecodeError`] naming the first check that failed (`Geometry`
-/// for a zero `data_len` — no extent holds zero value bytes).
+/// for a zero `data_len` or an unrepresentable framed device size).
 pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeError> {
     if block.len() < BLOB_HEADER_CRC_COVER + 4 {
         return Err(TierDecodeError::TooShort);
@@ -498,7 +571,7 @@ pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeErr
     let ns = NsId(u32::from_le_bytes(block[12..16].try_into().expect("4 bytes")));
     let extent_id = ExtentId(u64::from_le_bytes(block[16..24].try_into().expect("8 bytes")));
     let data_len = u64::from_le_bytes(block[24..32].try_into().expect("8 bytes"));
-    if data_len == 0 {
+    if data_len == 0 || checked_extent_device_bytes(data_len).is_none() {
         return Err(TierDecodeError::Geometry);
     }
     Ok(ExtentHeaderV1 { cell, ns, extent_id, data_len })
@@ -514,7 +587,7 @@ pub fn parse_extent_header(block: &[u8]) -> Result<ExtentHeaderV1, TierDecodeErr
 pub fn probe_extent_file<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<ExtentHeaderV1> {
     let file = fs.open_read(path)?;
     let mut block = vec![0u8; BLOB_HEADER_BYTES];
-    let got = file.read_at(0, &mut block)?;
+    let got = read_full(&file, 0, &mut block)?;
     parse_extent_header(&block[..got])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: {e}")))
 }
@@ -555,13 +628,11 @@ pub fn inspect_extent_bytes(bytes: &[u8]) -> Result<ExtentSummary, TierDecodeErr
     let frames = (body.len() / TIER_FRAME_BYTES) as u64;
     let expected_frames = header.data_len.div_ceil(TIER_FRAME_DATA as u64);
     let mut first_bad_frame = None;
-    let checkable = frames.min(expected_frames);
-    for frame in 0..checkable {
-        let from = (frame as usize) * TIER_FRAME_BYTES;
-        let block = &body[from..from + TIER_FRAME_BYTES];
+    let checkable = usize::try_from(frames.min(expected_frames)).unwrap_or(usize::MAX);
+    for (frame, block) in body.chunks_exact(TIER_FRAME_BYTES).take(checkable).enumerate() {
         let stored = u32::from_le_bytes(block[TIER_FRAME_DATA..].try_into().expect("4 bytes"));
         if crc32c(&block[..TIER_FRAME_DATA]) != stored {
-            first_bad_frame = Some(frame);
+            first_bad_frame = Some(frame as u64);
             break;
         }
     }
@@ -608,6 +679,13 @@ impl<File: SegmentFile> ExtentReader<File> {
     /// Panics when the requested range exceeds the extent's `data_len`
     /// or the chunk budget — caller arithmetic, not operating
     /// conditions.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: len <= BLOB_CHUNK_BYTES (asserted), so tier_frame_span returns at most \
+                  TIER_BATCH_FRAMES + 2 frames (a u32) and a skip < TIER_FRAME_DATA; taken <= len \
+                  because each take is capped by len - taken"
+    )]
     pub fn read(
         &mut self,
         offset: u64,
@@ -616,7 +694,7 @@ impl<File: SegmentFile> ExtentReader<File> {
     ) -> io::Result<Result<(), TierCorruption>> {
         assert!(len <= BLOB_CHUNK_BYTES, "extent reads are chunk-bounded (stream larger ranges)");
         assert!(
-            offset + len as u64 <= self.data_len,
+            self.data_len.checked_sub(offset).is_some_and(|room| len as u64 <= room),
             "extent read inside the value range (offset {offset} + len {len} > {})",
             self.data_len
         );
@@ -635,7 +713,7 @@ impl<File: SegmentFile> ExtentReader<File> {
         }
         self.window.resize(window_len, 0);
         let device_at = extent_frame_offset(first_frame);
-        let got = self.file.read_at(device_at, &mut self.window)?;
+        let got = read_full(&self.file, device_at, &mut self.window)?;
         if got < window_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -650,8 +728,7 @@ impl<File: SegmentFile> ExtentReader<File> {
         // here).
         let mut taken = 0usize;
         let mut in_frame = skip;
-        for frame in 0..frame_count as usize {
-            let block = &self.window[frame * TIER_FRAME_BYTES..(frame + 1) * TIER_FRAME_BYTES];
+        for (frame, block) in self.window.chunks_exact(TIER_FRAME_BYTES).enumerate() {
             let stored = u32::from_le_bytes(block[TIER_FRAME_DATA..].try_into().expect("4 bytes"));
             if crc32c(&block[..TIER_FRAME_DATA]) != stored {
                 return Ok(Err(TierCorruption { window_frame: frame as u32 }));
@@ -689,6 +766,22 @@ pub fn list_extent_ids<F: SegmentFs>(fs: &F, shard_dir: &Path) -> io::Result<Vec
     let mut ids: Vec<ExtentId> = names.iter().filter_map(|n| parse_extent_file_name(n)).collect();
     ids.sort_unstable();
     Ok(ids)
+}
+
+/// Fill `buf` from `offset`, looping over partial reads (the
+/// `SegmentFile::read_at` contract: "partial reads are legal — readers
+/// loop", F-L04-10). Returns the bytes read; short only at EOF, so a
+/// short return is the honest "the file really is shorter".
+fn read_full<File: SegmentFile>(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = file.read_at(offset.saturating_add(read as u64), &mut buf[read..])?;
+        if n == 0 {
+            break;
+        }
+        read = crate::fs::advance_read(read, n, buf.len())?;
+    }
+    Ok(read)
 }
 
 /// Opens an existing extent for reading in `mode` (cold blob reads).
@@ -738,6 +831,91 @@ pub fn unlink_extent_file<F: SegmentFs>(fs: &F, shard_dir: &Path, id: ExtentId) 
     }
 }
 
+/// Lists quarantined extent ids in `shard_dir/cold/` — names only, the
+/// [`list_extent_ids`] rule (ADR-0096 D3: the boot collection pass
+/// partitions the directory; both halves advance the id cursor).
+///
+/// # Errors
+/// I/O failures from the directory listing itself.
+pub fn list_quarantined_extent_ids<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+) -> io::Result<Vec<ExtentId>> {
+    let cold_dir = shard_dir.join("cold");
+    let names = match fs.list_dir(&cold_dir) {
+        Ok(names) => names,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut ids: Vec<ExtentId> =
+        names.iter().filter_map(|n| parse_quarantined_file_name(n)).collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Quarantines one boot-orphan extent file (ADR-0096 D2): an atomic
+/// rename to the `.quarantine` twin — the bytes survive the life, reads
+/// of the id fail typed, and the next boot delivers the second verdict.
+/// No directory fsync: a rename lost to a crash re-lists the file as an
+/// orphan and re-quarantines (idempotent). An already-absent source is
+/// **success** — either the file is already quarantined (re-listed next
+/// boot) or already gone.
+///
+/// # Errors
+/// The typed I/O failure — callers defer the candidate and retry.
+pub fn quarantine_extent_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<()> {
+    let cold = shard_dir.join("cold");
+    match fs.rename(&cold.join(extent_file_name(id)), &cold.join(quarantined_file_name(id))) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Revives one quarantined extent (ADR-0096 D3): renames the
+/// `.quarantine` twin back so reads resolve again. `Ok(false)` when
+/// there was nothing to revive (already revived, or the file is gone —
+/// reads answer that typed); the caller counts `Ok(true)`.
+///
+/// # Errors
+/// The typed I/O failure from the rename itself.
+pub fn revive_extent_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<bool> {
+    let cold = shard_dir.join("cold");
+    match fs.rename(&cold.join(quarantined_file_name(id)), &cold.join(extent_file_name(id))) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Unlinks one quarantined extent file — the second-verdict disposal
+/// (ADR-0096 D4). Same contract as [`unlink_extent_file`]: non-fatal,
+/// already-absent is success.
+///
+/// # Errors
+/// The typed I/O failure — callers count it and retry next round.
+pub fn unlink_quarantined_file<F: SegmentFs>(
+    fs: &F,
+    shard_dir: &Path,
+    id: ExtentId,
+) -> io::Result<()> {
+    if inf_foundation::fault::fire(crate::fault::BLOB_UNLINK_FAIL) {
+        return Err(crate::fault::injected(crate::fault::BLOB_UNLINK_FAIL));
+    }
+    let path = shard_dir.join("cold").join(quarantined_file_name(id));
+    match fs.remove_file(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +923,48 @@ mod tests {
     use std::path::Path;
 
     const SHARD: &str = "/shard-0";
+
+    #[test]
+    fn extent_geometry_refuses_unrepresentable_device_lengths() {
+        let max_frames =
+            (u128::from(u64::MAX) - BLOB_HEADER_BYTES as u128) / TIER_FRAME_BYTES as u128;
+        let max_data = (max_frames * TIER_FRAME_DATA as u128) as u64;
+        for (data_len, valid) in
+            [(1, true), (max_data, true), (max_data + 1, false), (u64::MAX, false), (0, false)]
+        {
+            let mut block = [0u8; BLOB_HEADER_BYTES];
+            block[..4].copy_from_slice(BLOB_MAGIC);
+            block[4..8].copy_from_slice(&1u32.to_le_bytes());
+            block[24..32].copy_from_slice(&data_len.to_le_bytes());
+            let crc = crc32c(&block[..BLOB_HEADER_CRC_COVER]);
+            block[32..36].copy_from_slice(&crc.to_le_bytes());
+            let result = parse_extent_header(&block);
+            if valid {
+                assert_eq!(result.unwrap().data_len, data_len);
+            } else {
+                assert!(matches!(result, Err(TierDecodeError::Geometry)), "{data_len}");
+            }
+        }
+        assert_eq!(extent_device_bytes(u64::MAX), u64::MAX);
+        assert_eq!(extent_frame_offset(u64::MAX / TIER_FRAME_BYTES as u64 + 1), u64::MAX);
+    }
+
+    #[test]
+    fn extent_geometry_refusal_precedes_file_creation() {
+        let fs = MemFs::new();
+        let result = ExtentWriter::create(
+            &fs,
+            Path::new(SHARD),
+            ExtentId(1),
+            0,
+            NsId(7),
+            u64::MAX,
+            TierIoMode::Buffered,
+        );
+        let error = result.err().expect("unrepresentable geometry refuses");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs.list_dir(Path::new(SHARD)).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
 
     fn value(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
@@ -766,6 +986,40 @@ mod tests {
             w.append_chunk(chunk).expect("append");
         }
         w.finish().expect("finish")
+    }
+
+    #[test]
+    fn extent_reader_refuses_an_overreporting_file() {
+        let fs = MemFs::new();
+        write_extent(&fs, 1, b"value");
+        fs.overreport_reads();
+        let path = Path::new(SHARD).join("cold").join(extent_file_name(ExtentId(1)));
+        let error = probe_extent_file(&fs, &path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read_at reported"));
+    }
+
+    /// F-L04-10: a filesystem that returns short reads (every `pread`
+    /// may) must not turn an intact extent into "header does not verify"
+    /// / "extent shorter than its declared frames" — both readers loop.
+    #[test]
+    fn short_reads_are_looped_never_reported_as_corruption() {
+        let fs = MemFs::default();
+        let bytes = value(2 * TIER_FRAME_DATA + 77, 9);
+        let sealed = write_extent(&fs, 3, &bytes);
+        assert_eq!(sealed.data_len(), bytes.len() as u64);
+        for cap in [1usize, 7, 35, 36, 4095, 4096] {
+            fs.set_read_cap(Some(cap));
+            let mut reader = open_extent(&fs, Path::new(SHARD), ExtentId(3), TierIoMode::Buffered)
+                .unwrap_or_else(|e| panic!("open under a {cap}-byte read cap: {e}"));
+            let mut out = Vec::new();
+            reader
+                .read(0, bytes.len(), &mut out)
+                .unwrap_or_else(|e| panic!("read under a {cap}-byte read cap: {e}"))
+                .expect("crc");
+            assert_eq!(out, bytes, "read cap {cap}");
+        }
+        fs.set_read_cap(None);
     }
 
     #[test]
@@ -857,6 +1111,52 @@ mod tests {
         assert_eq!(parse_extent_file_name("tier-000003.itier"), None);
         assert_eq!(parse_extent_file_name("blob-3.iblob"), None);
         assert_eq!(parse_extent_file_name("blob-00000a.iblob"), None);
+        // ADR-0096: the quarantine twin's name parses back and never
+        // aliases the live name (each parser refuses the other's form).
+        assert_eq!(quarantined_file_name(ExtentId(3)), "blob-000003.iblob.quarantine");
+        assert_eq!(parse_quarantined_file_name("blob-000003.iblob.quarantine"), Some(ExtentId(3)));
+        assert_eq!(parse_quarantined_file_name("blob-000003.iblob"), None);
+        assert_eq!(parse_extent_file_name("blob-000003.iblob.quarantine"), None);
+    }
+
+    /// ADR-0096 D2–D4 file lifecycle: quarantine renames (bytes intact,
+    /// out of both the listing and `open_extent`'s reach), revive
+    /// restores service, the second-verdict unlink returns the disk —
+    /// every step idempotent under an already-absent source.
+    #[test]
+    fn quarantine_revive_and_second_verdict_lifecycle() {
+        let fs = MemFs::default();
+        let bytes = value(2000, 9);
+        write_extent(&fs, 4, &bytes);
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("quarantine");
+        assert_eq!(list_extent_ids(&fs, Path::new(SHARD)).expect("ids"), Vec::new());
+        assert_eq!(
+            list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("ids"),
+            vec![ExtentId(4)]
+        );
+        assert!(
+            open_extent(&fs, Path::new(SHARD), ExtentId(4), TierIoMode::Buffered).is_err(),
+            "a quarantined extent does not resolve"
+        );
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4))
+            .expect("re-quarantine is idempotent success");
+        // Revive: the bytes serve again, byte-exact.
+        assert!(revive_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("revive"));
+        let mut reader =
+            open_extent(&fs, Path::new(SHARD), ExtentId(4), TierIoMode::Buffered).expect("open");
+        let mut out = Vec::new();
+        reader.read(0, bytes.len(), &mut out).expect("io").expect("crc");
+        assert_eq!(out, bytes, "revival is loss-free");
+        assert!(
+            !revive_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("nothing to revive"),
+            "a second revive is a no-op, not an error"
+        );
+        // Second verdict: quarantine again, then unlink the twin.
+        quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(4)).expect("quarantine");
+        unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(4)).expect("unlink twin");
+        assert_eq!(list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("ids"), Vec::new());
+        unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(4))
+            .expect("already-absent is success");
     }
 
     #[test]

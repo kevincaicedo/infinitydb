@@ -26,10 +26,16 @@ inf-log = { path = "crates/inf-log" }
 inf-store = { path = "crates/inf-store", default-features = false }
 inf-stream = { path = "crates/inf-stream" }
 inf-doc = { path = "crates/inf-doc" }
+inf-query = { path = "crates/inf-query" }
 inf-vector = { path = "crates/inf-vector" }
 inf-compute = { path = "crates/inf-compute" }
 inf-replica = { path = "crates/inf-replica" }
 inf-server = { path = "crates/inf-server" }
+# M4.5-S42 (ADR-0091): the device probe shared by `inf probe-device` and
+# the in-boot probe of `infinityd` — dev-tool code (ambient clocks,
+# threads), a leaf the two binaries share so `inf-server` stays cell-
+# resident and libc-free.
+inf-probe = { path = "crates/inf-probe" }
 infinity-embedded = { path = "crates/infinity-embedded" }
 
 # external — data plane allows libc (kqueue/mmap FFI), io-uring (Linux),
@@ -52,11 +58,14 @@ serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # default features pull rayon + plotters; benches need neither (rayon is
 # ban-listed — nothing multithreaded belongs anywhere near the data plane).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-toml = "1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "allow"
+# Planted-bug canaries (ADR-0090 D5): compile-time `--cfg` switches that
+# disable one load-bearing rule so a DST sweep can prove the rule has
+# teeth. Never a Cargo feature, never reachable from a shipped binary.
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(inf_canary_foreign_segment)', 'cfg(inf_canary_reply_lie)', 'cfg(inf_canary_alias_blind)', 'cfg(inf_canary_cover_by_hash)', 'cfg(inf_canary_alias_no_rehash)', 'cfg(inf_canary_gate_covered)', 'cfg(inf_canary_prune_survives_death)', 'cfg(inf_canary_forget_in_place)', 'cfg(inf_canary_copy_abort_after_death)', 'cfg(inf_canary_held_on_one)', 'cfg(inf_canary_walk_unbounded)', 'cfg(inf_canary_walk_callback_cap)', 'cfg(inf_canary_lazy_participation)', 'cfg(inf_canary_sidecar_rules_ignored)', 'cfg(inf_canary_held_remark)', 'cfg(inf_canary_fetch_uncharged)', 'cfg(inf_canary_death_scratch_kept)', 'cfg(inf_canary_write_set_split_cap)', 'cfg(inf_canary_json_reply_after_effect)', 'cfg(inf_canary_json_reply_uncharged)', 'cfg(inf_canary_json_reply_framing_uncharged)', 'cfg(inf_canary_json_fixed_unreserved)', 'cfg(inf_canary_wheel_arm_per_change)', 'cfg(inf_canary_wheel_refused_lazy)', 'cfg(inf_canary_wheel_release_by_hash)', 'cfg(inf_canary_wheel_refile_at_or_before_now)', 'cfg(inf_canary_sweep_owed_by_own_refusals)', 'cfg(inf_canary_wheel_tombstone_every_removal)', 'cfg(inf_canary_wheel_death_skips_transition)', 'cfg(inf_canary_issue_clock_relaxed)', 'cfg(inf_canary_request_raise_relaxed)', 'cfg(inf_canary_request_read_relaxed)', 'cfg(inf_canary_lastsave_floor_skipped)', 'cfg(inf_canary_ckpt_park_guard_own_slot_skipped)', 'cfg(inf_canary_ckpt_park_guard_cursor_skipped)', 'cfg(inf_canary_ckpt_own_seen_not_advanced)', 'cfg(inf_canary_ckpt_own_loaded_at_cursor)', 'cfg(inf_canary_ckpt_sweep_own_slot_zero)', 'cfg(inf_canary_lastsave_cell_stale)', 'cfg(inf_canary_info_lastsave_from_observation)', 'cfg(inf_canary_unattainable_deferred)', 'cfg(inf_canary_overrun_any_held)', 'cfg(inf_canary_grant_clears_rest)', 'cfg(inf_canary_keepup_truncates)', 'cfg(inf_canary_replay_no_pad)', 'cfg(inf_canary_replay_no_page_pad)', 'cfg(inf_canary_replay_settle_unchecked)', 'cfg(inf_canary_replay_no_demote)', 'cfg(inf_canary_replay_seal_no_settle)', 'cfg(inf_canary_replay_no_end_settle)', 'cfg(inf_canary_replay_del_no_verify)', 'cfg(inf_canary_replay_origin_drop)', 'cfg(inf_canary_replay_blob_release_skip)', 'cfg(inf_canary_replay_ref_settle_charges)', 'cfg(inf_canary_replay_restore_unguarded)', 'cfg(inf_canary_replay_handles_dropped)', 'cfg(inf_canary_replay_stall_seal)', 'cfg(inf_canary_replay_seal_every_range)', 'cfg(inf_canary_replay_no_section_gc)', 'cfg(inf_canary_replay_settle_unbudgeted)', 'cfg(inf_canary_replay_settle_doubled)', 'cfg(inf_canary_replay_yield_uncharged)', 'cfg(inf_canary_replay_charge_dropped)', 'cfg(inf_canary_ckpt_image_listed)', 'cfg(inf_canary_ckpt_form_unlatched)', 'cfg(inf_canary_ckpt_pin_at_watermark)'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

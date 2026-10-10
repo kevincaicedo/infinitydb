@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M1-S02 AC: the SCAN guarantee proptest shape — random interleaved
 //! inserts/deletes (driving both doubling growth and tombstone-recycling
 //! same-size rehashes) while a cursor walk is in flight; every key present

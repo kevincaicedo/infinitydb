@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M2-S06 integration: `always` acks gate on the durability watermark.
 //! The oracle — **no response leaves the cell before the watermark covers
 //! its LSN** — is asserted inside every ack future (support harness) and
@@ -46,8 +51,8 @@ fn run_schedule(seed: u64, dir: &Path) {
     // Small segments: rotation + seal fsyncs interleave with linked ones.
     let mut plane = DurablePlane::new(
         dir,
-        StagingConfig { capacity_bytes: 16 << 10 },
-        SegmentConfig { segment_bytes: 16 << 10, seal_after_ms: None },
+        StagingConfig::with_capacity(16 << 10),
+        SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
     );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;
@@ -71,7 +76,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         assert!(iters < 200_000, "schedule {seed:#x} failed to quiesce");
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_none()
+            && plane.in_flight.is_empty()
             && plane.commit.pending_fsyncs() == 0;
         idle = if quiesced { idle + 1 } else { 0 };
     }

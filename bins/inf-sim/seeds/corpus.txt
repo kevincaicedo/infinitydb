@@ -29,3 +29,27 @@ boot-storm 0x5EED0003
 # seed whose phase-2 traffic completes with pre-cut flushed tier bytes
 # (recovery composes MANIFEST v2 → tier files → checkpoint → WAL tail).
 m4-tiered 0x5EED0003
+# Adversarial key/value
+# lengths — MAX_KEY_LEN-edge keys, values past the 16,368 B cold-window
+# class, MSET/MSETNX with over-bound pairs (ADR-0098 atomicity).
+m0-adversarial 0xC0FFEE
+m0-adversarial 0xBAD5EED
+# F-L17-14 (review of 2026-08-30): the M4.5 index crash scenarios ran in
+# no automated lane between story close and this row.
+m45-backfill 0xC0FFEE
+m45-sidecar 0xC0FFEE
+# F-L19-05 / F-L19-06 (review of 2026-08-30): the surface mix — SELECTed and
+# namespace-bound clients, concurrent SCAN walks, quiescent audits of the
+# served surface and the stored content (values, deadlines), seeded flushes.
+m0-surface 0xC0FFEE
+m0-surface 0x5CA1AB1E
+# ADR-0061 D6 with ADR-0093 A12: a checkpoint that images a ticket winner
+# below its watermark leaves the winner's entry out of the 0x05 section.
+# Each seed met an imaged winner listed there too, and its boot's refcount
+# oracle saw the extent counted twice — on 0xC103D7 an entry that outlived
+# its key. The first three run the spec-variant class by rotation, the
+# last the plain class.
+m4-recovery 0xC10073
+m4-recovery 0xC10093
+m4-recovery 0xC103D7
+m4-recovery 0xC11D7E

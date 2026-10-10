@@ -25,5 +25,10 @@ harness = false
 # bench binary.
 test = false
 
+[[bench]]
+name = "mesh"
+harness = false
+test = false
+
 [lints]
 workspace = true

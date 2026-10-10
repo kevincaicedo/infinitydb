@@ -26,8 +26,9 @@ pub enum ReloadClass {
 enum Kind {
     /// Byte size with Redis memory units (`100mb` → `104857600`).
     Memory,
-    /// Plain integer.
-    Int,
+    /// Integer within `[min, max]` (Redis's per-key bounds; `ANY_INT`
+    /// for keys Redis leaves unbounded).
+    Int(i64, i64),
     /// One of a fixed token set (case-insensitive, stored lowercase).
     Enum(&'static [&'static str]),
     /// Free-form string.
@@ -54,6 +55,24 @@ pub enum ConfigSetError {
     Invalid { key: String, value: String },
 }
 
+/// A validated, normalized pair ready for [`ConfigStore::apply`] — the
+/// typestate that makes applying an unvalidated pair unrepresentable
+/// (ADR-0098). Holds the entry's table index, so it must be applied to
+/// the store that validated it within the same borrow scope.
+#[derive(Debug)]
+pub struct ValidatedSet {
+    index: usize,
+    normalized: String,
+}
+
+impl ValidatedSet {
+    /// The canonical (lowercase, `'static`) key name — the duplicate-pair
+    /// detector's identity (Redis refuses duplicates; measured 8.0.5).
+    pub fn key(&self, store: &ConfigStore) -> &'static str {
+        store.entries[self.index].key
+    }
+}
+
 /// All eight Redis eviction policies (M1-E3 consumes the selection).
 pub const MAXMEMORY_POLICIES: &[&str] = &[
     "noeviction",
@@ -66,10 +85,23 @@ pub const MAXMEMORY_POLICIES: &[&str] = &[
     "volatile-lfu",
 ];
 
+/// `Kind::Int` bounds for the keys Redis leaves unbounded.
+const ANY_INT: (i64, i64) = (i64::MIN, i64::MAX);
+
+/// Databases per keyspace — the one owner of "16" (review 2026-08-30 L17
+/// E6(b)): `SELECT`/`COPY … DB` bound their index by it, the `databases`
+/// row admits exactly it, and the fabric `Apply` packing asserts at
+/// compile time that it fits the cmd byte's 4-bit db field.
+pub const DATABASES: u16 = 16;
+/// Redis's `0..=INT_MAX` bound (`timeout`, `tcp-keepalive`).
+const NON_NEGATIVE_I32: (i64, i64) = (0, i32::MAX as i64);
+
 /// The M1 key subset. Defaults mirror Redis 8 so `CONFIG GET` byte-diffs.
 #[derive(Debug)]
 pub struct ConfigStore {
     entries: Vec<Entry>,
+    #[cfg(feature = "doc")]
+    path_cache_capacity: inf_doc::limits::ProgramCacheCapacity,
     /// Bumped on every successful SET — the plane's MAINTAIN sweep compares
     /// it to push `hot-per-cell` keys (eviction pressure) without re-parsing
     /// the table each iteration (M1-E3).
@@ -79,50 +111,120 @@ pub struct ConfigStore {
 impl Default for ConfigStore {
     fn default() -> ConfigStore {
         let e = |key, class, kind, value: &str| Entry { key, class, kind, value: value.into() };
+        let mut entries = vec![
+            e("appendonly", ReloadClass::BootOnly, Kind::Enum(&["no", "yes"]), "no"),
+            e(
+                "client-output-buffer-limit",
+                ReloadClass::HotPerCell,
+                Kind::OutputBufferLimit,
+                "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+            ),
+            // Exactly `DATABASES`: the fabric db field's capacity (L17 E6b).
+            e(
+                "databases",
+                ReloadClass::BootOnly,
+                Kind::Int(i64::from(DATABASES), i64::from(DATABASES)),
+                "16",
+            ),
+            // ADR-0123 D1: the node bound, divided per cell like
+            // `maxmemory`; the accept path refuses past the share.
+            e("maxclients", ReloadClass::HotPerCell, Kind::Int(1, i64::from(u32::MAX)), "10000"),
+            e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
+            e(
+                "maxmemory-policy",
+                ReloadClass::HotPerCell,
+                Kind::Enum(MAXMEMORY_POLICIES),
+                "noeviction",
+            ),
+            e("maxmemory-samples", ReloadClass::HotPerCell, Kind::Int(ANY_INT.0, ANY_INT.1), "5"),
+            // ADR-0122: the parser's bulk cap — the record bound by
+            // default (16 MiB; Redis 512 MiB), floored at Redis's
+            // 1 MiB, pushed to every live parser on the MAINTAIN sweep.
+            e("proto-max-bulk-len", ReloadClass::HotPerCell, Kind::Memory, "16777216"),
+            e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
+            // ADR-0123 D3: set on sockets accepted after the change.
+            e(
+                "tcp-keepalive",
+                ReloadClass::HotPerCell,
+                Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                "300",
+            ),
+            // M4.5-S30 (ADR-0085 D6): read-driven promotion
+            // admission. `no` is fully inert (the pre-S30 read
+            // path) — the same-binary A/B arm and the escape hatch
+            // for scan-heavy namespaces until the reserved per-ns
+            // `TIER-PROMOTE` key earns its catalog bump.
+            e("tiered-promote-on-read", ReloadClass::HotPerCell, Kind::Enum(&["no", "yes"]), "yes"),
+            // M4.5-S37 (ADR-0093 D8): shadow-slot reconciliation for
+            // cold overwrites — the same-binary A/B arm, default off
+            // until the reference-box campaign decides; `no` is inert
+            // for new writes and open tickets keep reconciling.
+            e("tiered-shadow-overwrite", ReloadClass::HotPerCell, Kind::Enum(&["no", "yes"]), "no"),
+            // M4.5-S37 (ADR-0093 A8, review of 2026-08-28): pauses
+            // the shadow reconciler (no MAINTAIN reads, no settles)
+            // so open tickets stay open — the DST's lever for the
+            // open-ticket rows (`DBSIZE`'s drain, `SCAN`'s twin, the
+            // `Ticketed` refusal, `DEL`'s forced resolution) and an
+            // operator's pause; the pin cap and the ticket cap bound
+            // what a paused reconciler can hold. `DBSIZE` and `DEL`
+            // keep their own reads.
+            e(
+                "tiered-shadow-reconcile",
+                ReloadClass::HotPerCell,
+                Kind::Enum(&["yes", "no"]),
+                "yes",
+            ),
+            // M4-S19 (ADR-0062 D4): the node bound on aggregate
+            // reserved tiered-Region VA — an explicit bounded
+            // default, never an inferred host maximum. Divided per
+            // cell like `maxmemory`; admission-only (lowering it
+            // never evicts standing reservations).
+            e("tiered-reserved-va-limit", ReloadClass::HotPerCell, Kind::Memory, "274877906944"),
+            // ADR-0123 D2: idle unsubscribed connections close in
+            // the MAINTAIN sweep; 0 = off.
+            e(
+                "timeout",
+                ReloadClass::HotPerCell,
+                Kind::Int(NON_NEGATIVE_I32.0, NON_NEGATIVE_I32.1),
+                "0",
+            ),
+        ];
+        #[cfg(feature = "doc")]
+        entries.push(e(
+            "doc-path-cache-size",
+            ReloadClass::BootOnly,
+            Kind::Int(0, i64::from(inf_doc::limits::PROGRAM_CACHE_ENTRIES_MAX)),
+            &inf_doc::limits::PROGRAM_CACHE_DEFAULT_ENTRIES.to_string(),
+        ));
+        entries.sort_unstable_by_key(|entry| entry.key);
         ConfigStore {
+            entries,
             version: 0,
-            entries: vec![
-                e("appendonly", ReloadClass::BootOnly, Kind::Enum(&["no", "yes"]), "no"),
-                e(
-                    "client-output-buffer-limit",
-                    ReloadClass::HotPerCell,
-                    Kind::OutputBufferLimit,
-                    "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
-                ),
-                e("databases", ReloadClass::BootOnly, Kind::Int, "16"),
-                // M3-S10 (ADR-0041 D2): per-cell compiled-path-program
-                // cache entries; 0 disables. Applied at plane assembly.
-                e("doc-path-cache-size", ReloadClass::BootOnly, Kind::Int, "1024"),
-                e("maxclients", ReloadClass::BootOnly, Kind::Int, "10000"),
-                e("maxmemory", ReloadClass::HotPerCell, Kind::Memory, "0"),
-                e(
-                    "maxmemory-policy",
-                    ReloadClass::HotPerCell,
-                    Kind::Enum(MAXMEMORY_POLICIES),
-                    "noeviction",
-                ),
-                e("maxmemory-samples", ReloadClass::HotPerCell, Kind::Int, "5"),
-                e("proto-max-bulk-len", ReloadClass::Hot, Kind::Memory, "536870912"),
-                e("save", ReloadClass::Hot, Kind::Str, "3600 1 300 100 60 10000"),
-                e("tcp-keepalive", ReloadClass::Hot, Kind::Int, "300"),
-                // M4-S19 (ADR-0062 D4): the node bound on aggregate
-                // reserved tiered-Region VA — an explicit bounded
-                // default, never an inferred host maximum. Divided per
-                // cell like `maxmemory`; admission-only (lowering it
-                // never evicts standing reservations).
-                e(
-                    "tiered-reserved-va-limit",
-                    ReloadClass::HotPerCell,
-                    Kind::Memory,
-                    "274877906944",
-                ),
-                e("timeout", ReloadClass::Hot, Kind::Int, "0"),
-            ],
+            #[cfg(feature = "doc")]
+            path_cache_capacity: inf_doc::limits::ProgramCacheCapacity::default(),
         }
     }
 }
 
 impl ConfigStore {
+    /// Assemble boot configuration from the owning cache's checked capacity.
+    /// The CONFIG SET entry remains immutable after assembly (ADR-0146 D2).
+    #[cfg(feature = "doc")]
+    pub fn with_path_cache_capacity(capacity: inf_doc::limits::ProgramCacheCapacity) -> Self {
+        let mut config = Self { path_cache_capacity: capacity, ..Self::default() };
+        for entry in &mut config.entries {
+            if entry.key == "doc-path-cache-size" {
+                entry.value = capacity.entries().to_string();
+            }
+        }
+        config
+    }
+
+    #[cfg(feature = "doc")]
+    pub(crate) fn path_cache_capacity(&self) -> inf_doc::limits::ProgramCacheCapacity {
+        self.path_cache_capacity
+    }
+
     /// Keys matching any of `patterns` (nocase glob, Redis CONFIG GET),
     /// deduplicated, in table (alphabetical) order.
     pub fn get_matching(&self, patterns: &[&[u8]]) -> Vec<(&'static str, &str)> {
@@ -138,10 +240,15 @@ impl ConfigStore {
         self.entries.iter().find(|e| e.key == key).map(|e| e.value.as_str())
     }
 
-    /// Validates and stores. The caller maps errors to Redis reply strings.
-    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<ReloadClass, ConfigSetError> {
+    /// Validates one pair without mutating anything — the validate half of
+    /// the all-or-nothing split (review of 2026-08-30, H1 / F-L17-12,
+    /// ADR-0098): a multi-pair `CONFIG SET` runs every pair through here
+    /// before [`ConfigStore::apply`] touches the first, so an error reply
+    /// implies zero mutation (Redis 7 semantics, oracle-verified).
+    pub fn validate(&self, key: &[u8], value: &[u8]) -> Result<ValidatedSet, ConfigSetError> {
         let key_str = String::from_utf8_lossy(key).to_lowercase();
-        let Some(entry) = self.entries.iter_mut().find(|e| e.key == key_str) else {
+        let Some((index, entry)) = self.entries.iter().enumerate().find(|(_, e)| e.key == key_str)
+        else {
             return Err(ConfigSetError::Unknown(key_str));
         };
         if entry.class == ReloadClass::BootOnly {
@@ -149,12 +256,24 @@ impl ConfigStore {
         }
         let text = String::from_utf8_lossy(value).to_string();
         let normalized = match entry.kind {
-            Kind::Memory => parse_memory(&text).map(|b| b.to_string()).ok_or_else(|| {
-                ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() }
-            })?,
-            Kind::Int => text.parse::<i64>().map(|v| v.to_string()).map_err(|_| {
-                ConfigSetError::Invalid { key: key_str.clone(), value: text.clone() }
-            })?,
+            Kind::Memory => parse_memory(&text)
+                .filter(|&bytes| {
+                    entry.key != "proto-max-bulk-len" || bytes >= PROTO_MAX_BULK_LEN_FLOOR
+                })
+                .map(|b| b.to_string())
+                .ok_or_else(|| ConfigSetError::Invalid {
+                    key: key_str.clone(),
+                    value: text.clone(),
+                })?,
+            Kind::Int(min, max) => text
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (min..=max).contains(v))
+                .map(|v| v.to_string())
+                .ok_or_else(|| ConfigSetError::Invalid {
+                    key: key_str.clone(),
+                    value: text.clone(),
+                })?,
             Kind::Enum(tokens) => {
                 let lower = text.to_lowercase();
                 if !tokens.contains(&lower.as_str()) {
@@ -166,9 +285,23 @@ impl ConfigStore {
             Kind::OutputBufferLimit => merge_output_buffer_limit(&entry.value, &text)
                 .ok_or(ConfigSetError::Invalid { key: key_str, value: text })?,
         };
-        entry.value = normalized;
+        Ok(ValidatedSet { index, normalized })
+    }
+
+    /// Applies a validated pair. Infallible by construction — validation
+    /// already resolved the entry and normalized the value.
+    pub fn apply(&mut self, set: ValidatedSet) -> ReloadClass {
+        let entry = &mut self.entries[set.index];
+        entry.value = set.normalized;
         self.version += 1;
-        Ok(entry.class)
+        entry.class
+    }
+
+    /// Validates and stores one pair. The caller maps errors to Redis
+    /// reply strings. Multi-pair callers must use the split directly.
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<ReloadClass, ConfigSetError> {
+        let validated = self.validate(key, value)?;
+        Ok(self.apply(validated))
     }
 
     /// Monotone mutation counter (see the field note).
@@ -176,6 +309,22 @@ impl ConfigStore {
     pub fn version(&self) -> u64 {
         self.version
     }
+}
+
+/// Redis's floor for `proto-max-bulk-len` (1 MiB): below it the value is
+/// refused, as Redis refuses it.
+pub const PROTO_MAX_BULK_LEN_FLOOR: u64 = 1024 * 1024;
+
+/// The parser limits `proto-max-bulk-len` names (ADR-0122): applied at
+/// accept and pushed to every live parser of the cell on the MAINTAIN
+/// config sweep. The value was validated at SET, so a parse failure is
+/// the declared default, never a wider cap.
+pub fn parser_limits(cfg: &ConfigStore) -> inf_wire::ParserLimits {
+    let cap = cfg
+        .get("proto-max-bulk-len")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(inf_wire::DEFAULT_MAX_BULK_BYTES);
+    inf_wire::ParserLimits::for_bulk_cap(cap)
 }
 
 /// `client-output-buffer-limit` value as `(class_index, [hard, soft,
@@ -220,16 +369,48 @@ fn merge_output_buffer_limit(current: &str, update: &str) -> Option<String> {
     Some(rendered.join(" "))
 }
 
-/// The pubsub class triple `(hard, soft, soft_ms)` for the plane's
-/// output-cap enforcement (M1-S11). Zeros disable a limit.
-pub(crate) fn pubsub_output_limit(cfg: &ConfigStore) -> (u64, u64, u64) {
+/// An output-buffer class triple `(hard, soft, soft_ms)` for the plane's
+/// output-cap enforcement (M1-S11; the `normal` class since ADR-0123
+/// D4). Zeros disable a limit. Classes: 0 = normal, 2 = pubsub.
+pub(crate) fn output_limit(cfg: &ConfigStore, class: usize) -> (u64, u64, u64) {
     let Some(text) = cfg.get("client-output-buffer-limit") else { return (0, 0, 0) };
     let Some(groups) = parse_output_buffer_groups(text) else { return (0, 0, 0) };
     groups
         .iter()
         .rev()
-        .find(|(class, _)| *class == 2)
+        .find(|(c, _)| *c == class)
         .map_or((0, 0, 0), |(_, [hard, soft, secs])| (*hard, *soft, secs.saturating_mul(1000)))
+}
+
+/// The connection knobs the plane caches from the config store (ADR-0123
+/// D5): read at assembly and on every version-compared MAINTAIN sweep.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnKnobs {
+    /// This cell's `maxclients` share: `max(1, maxclients / cells)` — the
+    /// `push_pressure` division (cells are symmetric).
+    pub maxclients_share: usize,
+    /// `timeout` in milliseconds; 0 = off.
+    pub timeout_ms: u64,
+    /// `tcp-keepalive` seconds; 0 = off.
+    pub keepalive_secs: u32,
+    /// `client-output-buffer-limit normal` and `pubsub`.
+    pub cob_normal: (u64, u64, u64),
+    pub cob_pubsub: (u64, u64, u64),
+}
+
+pub(crate) fn conn_knobs(cfg: &ConfigStore, cells: u16) -> ConnKnobs {
+    let int = |key: &str, default: u64| {
+        cfg.get(key).and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+    };
+    let cells = u64::from(cells.max(1));
+    let maxclients = int("maxclients", 10_000);
+    ConnKnobs {
+        maxclients_share: usize::try_from((maxclients / cells).max(1)).unwrap_or(usize::MAX),
+        timeout_ms: int("timeout", 0).saturating_mul(1000),
+        keepalive_secs: u32::try_from(int("tcp-keepalive", 300)).unwrap_or(u32::MAX),
+        cob_normal: output_limit(cfg, 0),
+        cob_pubsub: output_limit(cfg, 2),
+    }
 }
 
 /// Redis memory-unit grammar: bare bytes, or `k/kb/m/mb/g/gb` suffixes
@@ -253,12 +434,47 @@ pub(crate) fn parse_memory(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "doc")]
+    #[test]
+    fn boot_cache_capacity_and_config_text_share_one_checked_value() {
+        for requested in [0, 1024, usize::from(inf_doc::limits::PROGRAM_CACHE_ENTRIES_MAX)] {
+            let capacity = inf_doc::limits::ProgramCacheCapacity::try_from(requested).unwrap();
+            let mut config = ConfigStore::with_path_cache_capacity(capacity);
+            assert_eq!(config.path_cache_capacity(), capacity);
+            assert_eq!(config.get("doc-path-cache-size"), Some(requested.to_string().as_str()));
+            assert_eq!(config.version(), 0);
+            assert!(matches!(
+                config.set(b"doc-path-cache-size", b"0"),
+                Err(ConfigSetError::Immutable(_))
+            ));
+            assert_eq!(config.path_cache_capacity(), capacity);
+            assert_eq!(config.version(), 0);
+        }
+    }
+
     #[test]
     fn defaults_match_redis_shapes() {
         let cfg = ConfigStore::default();
         assert_eq!(cfg.get("maxmemory"), Some("0"));
         assert_eq!(cfg.get("maxmemory-policy"), Some("noeviction"));
         assert_eq!(cfg.get("databases"), Some("16"));
+    }
+
+    /// Review 2026-08-30 L17 E6(b): `db` rides 4 bits of the fabric
+    /// `Apply` cmd byte, so the `databases` row admits exactly the value
+    /// that field can carry — one owner (`DATABASES`) for SELECT/COPY,
+    /// the row and the packing, never a literal that a boot-time setter
+    /// could outgrow into a silent mis-route.
+    #[test]
+    fn databases_row_admits_only_the_fabric_field_capacity() {
+        let cfg = ConfigStore::default();
+        let entry = cfg.entries.iter().find(|e| e.key == "databases").expect("row");
+        assert!(
+            matches!(entry.kind, Kind::Int(lo, hi) if lo == i64::from(DATABASES) && hi == lo),
+            "databases admits {:?}, the fabric field carries exactly {DATABASES}",
+            entry.kind
+        );
+        assert_eq!(cfg.get("databases").and_then(|v| v.parse::<u16>().ok()), Some(DATABASES));
     }
 
     #[test]
@@ -274,6 +490,90 @@ mod tests {
         ));
         assert!(matches!(cfg.set(b"databases", b"32"), Err(ConfigSetError::Immutable(_))));
         assert!(matches!(cfg.set(b"nope", b"1"), Err(ConfigSetError::Unknown(_))));
+    }
+
+    /// ADR-0098: `validate` mutates nothing (value, version), and
+    /// `apply(validate(..))` lands exactly where `set` does.
+    #[test]
+    fn validate_is_pure_and_apply_completes_it() {
+        let mut cfg = ConfigStore::default();
+        let v = cfg.validate(b"maxmemory", b"100mb").expect("valid");
+        assert_eq!(v.key(&cfg), "maxmemory");
+        assert_eq!(cfg.get("maxmemory"), Some("0"), "validate must not mutate");
+        assert_eq!(cfg.version(), 0, "validate must not bump the version");
+        assert!(cfg.validate(b"maxmemory", b"nope").is_err());
+        assert!(cfg.validate(b"databases", b"32").is_err());
+        assert_eq!(cfg.version(), 0);
+        assert_eq!(cfg.apply(v), ReloadClass::HotPerCell);
+        assert_eq!(cfg.get("maxmemory"), Some("104857600"));
+        assert_eq!(cfg.version(), 1);
+    }
+
+    /// Batch 45 (review 2026-08-30, F-L15-04): `CONFIG GET proto-max-bulk-len`
+    /// answers the cap the parser enforces — the declared default and the
+    /// wire default are one number.
+    #[test]
+    fn proto_max_bulk_len_default_is_the_cap_the_parser_enforces() {
+        let mut cfg = ConfigStore::default();
+        let declared: usize =
+            cfg.get("proto-max-bulk-len").expect("declared").parse().expect("an integer");
+        assert_eq!(declared, inf_wire::ParserLimits::default().max_bulk_bytes);
+        assert_eq!(parser_limits(&cfg), inf_wire::ParserLimits::default());
+        // A set value is the cap the next accept and the sweep apply.
+        assert_eq!(cfg.set(b"proto-max-bulk-len", b"4mb"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(parser_limits(&cfg).max_bulk_bytes, 4 << 20);
+        assert_eq!(parser_limits(&cfg).max_frame_bytes, (4 << 20) + (64 << 10));
+        // Redis's floor: 1 MiB.
+        assert_eq!(cfg.set(b"proto-max-bulk-len", b"1mb"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(
+            cfg.set(b"proto-max-bulk-len", b"1048575"),
+            Err(ConfigSetError::Invalid { .. })
+        ));
+        assert_eq!(cfg.get("proto-max-bulk-len"), Some("1048576"));
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-05): `maxclients` is settable at
+    /// runtime as in Redis (hot per cell — the accept path reads its
+    /// share), and the three integer keys the node now applies carry
+    /// Redis's bounds: `maxclients` 1..=4294967295, `timeout` and
+    /// `tcp-keepalive` 0..=2147483647. Pre-fix `maxclients` was
+    /// `BootOnly` and every integer was accepted.
+    #[test]
+    fn applied_integer_keys_are_hot_and_bounded_like_redis() {
+        let mut cfg = ConfigStore::default();
+        assert_eq!(cfg.set(b"maxclients", b"5"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(cfg.get("maxclients"), Some("5"));
+        assert!(matches!(cfg.set(b"maxclients", b"0"), Err(ConfigSetError::Invalid { .. })));
+        assert!(matches!(cfg.set(b"maxclients", b"-1"), Err(ConfigSetError::Invalid { .. })));
+        assert_eq!(cfg.get("maxclients"), Some("5"), "a refused value mutates nothing");
+        assert_eq!(cfg.set(b"timeout", b"0"), Ok(ReloadClass::HotPerCell));
+        assert_eq!(cfg.set(b"timeout", b"2147483647"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(cfg.set(b"timeout", b"-1"), Err(ConfigSetError::Invalid { .. })));
+        assert!(matches!(cfg.set(b"timeout", b"2147483648"), Err(ConfigSetError::Invalid { .. })));
+        assert_eq!(cfg.set(b"tcp-keepalive", b"0"), Ok(ReloadClass::HotPerCell));
+        assert!(matches!(cfg.set(b"tcp-keepalive", b"-1"), Err(ConfigSetError::Invalid { .. })));
+    }
+
+    /// ADR-0123 D1/D4/D5: the plane's cached knobs — the per-cell
+    /// `maxclients` share never floors to zero, `timeout` is milliseconds,
+    /// and the `normal` class reads independently of `pubsub`.
+    #[test]
+    fn conn_knobs_divide_maxclients_and_read_both_output_classes() {
+        let mut cfg = ConfigStore::default();
+        let k = conn_knobs(&cfg, 4);
+        assert_eq!(k.maxclients_share, 2_500);
+        assert_eq!(k.timeout_ms, 0);
+        assert_eq!(k.keepalive_secs, 300);
+        assert_eq!(k.cob_normal, (0, 0, 0));
+        assert_eq!(k.cob_pubsub, (33_554_432, 8_388_608, 60_000));
+        cfg.set(b"maxclients", b"3").expect("hot");
+        cfg.set(b"timeout", b"7").expect("hot");
+        cfg.set(b"client-output-buffer-limit", b"normal 64mb 16mb 10").expect("hot");
+        let k = conn_knobs(&cfg, 4);
+        assert_eq!(k.maxclients_share, 1, "a configured bound never floors to zero");
+        assert_eq!(k.timeout_ms, 7_000);
+        assert_eq!(k.cob_normal, (64 << 20, 16 << 20, 10_000));
+        assert_eq!(k.cob_pubsub, (33_554_432, 8_388_608, 60_000));
     }
 
     #[test]

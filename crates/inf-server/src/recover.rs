@@ -20,23 +20,27 @@
 //!   the MANIFEST swap) are garbage-collected here, before the cell
 //!   serves.
 //!
-//! End-of-log policy (M2-S14, ADR-0018): after replay, every segment's
-//! slack — the bytes beyond its last valid frame — is scanned. A
-//! validating, self-located frame there means interior data would be
-//! silently lost (a gap the replay skipped, or a survivor a future append
-//! could resurrect out of order): fail-stop with a named
-//! [`inf_log::LogCorruption`]. In the resume region (the last data-bearing
-//! segment and everything after it — where future appends flow), torn
-//! remnants or a failed final frame classify as a torn tail: the tail
-//! *pointer* is
-//! truncated to the last valid frame (bytes are never rewritten), trailing
-//! segments — verified frame-free — are removed to restore the pristine
-//! prealloc invariant, and the cell continues. In sealed slack behind the
-//! resume point, non-validating remnants are the inert residue of an
-//! earlier torn-tail resume: tolerated and counted, never fatal. A torn
-//! tail may never truncate below the manifest's `begin-LSN`: everything
-//! the manifest names was durable at publication, so a shorter log is
-//! disk lying.
+//! End-of-log policy (M2-S14, ADR-0018; ADR-0031 D4 as amended by
+//! ADR-0087 D6): every segment's slack — the bytes beyond its last valid
+//! frame — is scanned **right after that segment replays**. The first
+//! slack holding a validating, self-located frame marks a **hole**: a
+//! frame the writer queued below surviving data and the device lost. A
+//! hole exists only if the barrier that would have covered those bytes
+//! never completed, so the watermark never passed it and nothing at or
+//! past it was acked — everything later is un-acked residue. The v2
+//! stamps decide the one remaining question, whether the device is
+//! lying: a later frame whose `covered_lsn` attests coverage at or past
+//! the hole (or a v1 frame, which cannot attest) proves covered data was
+//! lost — fail-stop with a named [`inf_log::LogCorruption`]. Otherwise
+//! the tail *pointer* is truncated at the hole (bytes are never
+//! rewritten), every later segment — probed for evidence, never replayed
+//! — is removed to restore the pristine prealloc invariant, and the cell
+//! continues under a fresh epoch. With no hole, the last data-bearing
+//! segment's clean end is the resume point; non-validating remnants
+//! behind it are the inert residue of an earlier torn-tail resume:
+//! tolerated and counted, never fatal. A torn tail may never truncate
+//! below the manifest's `begin-LSN`: everything the manifest names was
+//! durable at publication, so a shorter log is disk lying.
 //!
 //! In the floor segment, records below `begin-LSN` are skipped: the
 //! checkpoint already holds their final state, and replaying an older
@@ -56,26 +60,128 @@ use std::path::PathBuf;
 
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::{
-    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts,
+    IckReader, IckReaderConfig, IckStep, ick_file_name, parse_ick_file_name, read_ick_counts_probed,
 };
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReaderConfig, RegionEvidence, RegionScan,
-    SegmentId, SegmentReader, SegmentRotor, SegmentScan, create_cell_dirs,
-    create_cell_dirs_deferred, read_manifest, scan_log_dir_from, scan_region, scan_region_evidence,
-    segment_file_name,
+    FrameStamp, LogCorruption, Lsn, Manifest, ReadError, ReadStep, ReaderConfig, RegionEvidence,
+    RegionScan, SegmentId, SegmentReader, SegmentRotor, SegmentScan, check_segment_len,
+    create_cell_dirs, create_cell_dirs_deferred, read_manifest, scan_log_dir_from,
+    scan_region_evidence, segment_file_name,
 };
 use inf_store::{Keyspace, ReplayOutcome, WallAnchor};
 
 use crate::durable::DurableConfig;
 
+/// The recovery pipeline's phases as the outside sees them (M4.5-S39d):
+/// what each [`Recovery::step`] is about to do, typed so the driver can
+/// attribute the loop clock to it. Audit and probe share a phase — both
+/// are the slack/evidence scan — exactly as the board's phase code does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RecoverPhase {
+    /// Dirs, MANIFEST, directory scan, floor checks, checkpoint open.
+    Start,
+    /// Checkpoint sections streamed into the store.
+    Ckpt,
+    /// Tail frames replayed.
+    Replay,
+    /// Slack audit / evidence probe of a segment.
+    Audit,
+    /// Torn-tail resolution, begin guard, boot GC (stale files), rotor
+    /// reopen.
+    Finish,
+    /// Nothing left: the next step reports completion.
+    Complete,
+}
+
+impl RecoverPhase {
+    /// The board's phase code (`CellRecoverySlot::phase_name`): 1 =
+    /// start, 2 = checkpoint, 3 = replay, 4 = audit, 5 = finish, 6 =
+    /// complete.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            RecoverPhase::Start => 1,
+            RecoverPhase::Ckpt => 2,
+            RecoverPhase::Replay => 3,
+            RecoverPhase::Audit => 4,
+            RecoverPhase::Finish => 5,
+            RecoverPhase::Complete => 6,
+        }
+    }
+}
+
+/// Per-phase recovery accounting (M4.5-S39d, ADR-0090 A10): the bytes
+/// each phase read and the time it took, so one boot's recovery figure
+/// decomposes instead of being compared as a sum. Bytes are counted by
+/// the machine itself; durations are credited by the driver from the
+/// **injected loop clock** between consecutive steps
+/// ([`Recovery::credit_phase_time`]) — cell code never reads an ambient
+/// clock (L7). The synchronous tier (`open_cell_log`) has no clock and
+/// leaves every duration zero. By construction every credited
+/// nanosecond lands in exactly one phase, so `phase_ns` sums to
+/// `total_ns` exactly — a property the e2e pins.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoverPhases {
+    pub start_ns: u64,
+    /// Checkpoint bytes read (sections + header/footer) and load time.
+    pub ckpt_bytes: u64,
+    pub ckpt_ns: u64,
+    /// Tail frame bytes read + validated, frames, and replay time.
+    pub replay_bytes: u64,
+    pub replay_frames: u64,
+    pub replay_ns: u64,
+    /// Slack/probe bytes the evidence scans read, the self-located and
+    /// foreign-segment frames they CRC-validated, and scan time.
+    pub audit_bytes: u64,
+    pub audit_valid_frames: u64,
+    pub audit_foreign_frames: u64,
+    pub audit_ns: u64,
+    /// Torn-tail resolution + boot GC + rotor reopen time (the stale
+    /// files removed are `RecoverStats::stale_files_removed`).
+    pub finish_ns: u64,
+    /// First step to completion, loop-clock.
+    pub total_ns: u64,
+}
+
+impl RecoverPhases {
+    /// The phase that took longest (ties resolve in pipeline order) —
+    /// the row's "dominating phase"; `None` before any time was credited.
+    #[must_use]
+    pub fn dominating(&self) -> Option<RecoverPhase> {
+        let phases = [
+            (RecoverPhase::Start, self.start_ns),
+            (RecoverPhase::Ckpt, self.ckpt_ns),
+            (RecoverPhase::Replay, self.replay_ns),
+            (RecoverPhase::Audit, self.audit_ns),
+            (RecoverPhase::Finish, self.finish_ns),
+        ];
+        let (phase, ns) =
+            phases.iter().fold(phases[0], |best, &p| if p.1 > best.1 { p } else { best });
+        (ns > 0).then_some(phase)
+    }
+
+    /// The durations in pipeline order (the sum-equals-total pin).
+    #[must_use]
+    pub const fn phase_ns(&self) -> [u64; 5] {
+        [self.start_ns, self.ckpt_ns, self.replay_ns, self.audit_ns, self.finish_ns]
+    }
+}
+
 /// What one cell's recovery did (log lines + `INFO persistence` inputs).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RecoverStats {
+    /// M4.5-S39d: per-phase bytes + loop-clock durations.
+    pub phases: RecoverPhases,
     pub segments: u64,
     pub frames: u64,
     pub records_applied: u64,
     pub records_skipped: u64,
+    /// The subset of `records_skipped` whose namespace id no drop
+    /// tombstone explains (ADR-0103 D4). After ADR-0103 a namespace is
+    /// never servable before its definition is durable, so a nonzero
+    /// count means a foreign log or corruption — the C14 verifier.
+    pub records_skipped_unknown_ns: u64,
     /// Tail deltas already represented by a fuzzy checkpoint/full image
     /// (ADR-0043 R1). Separate from foreign-record skips.
     pub doc_deltas_skipped_stale: u64,
@@ -90,6 +196,11 @@ pub struct RecoverStats {
     /// Tail records below `begin-LSN` in the floor segment, skipped (the
     /// checkpoint supersedes them).
     pub records_pre_begin: u64,
+    /// F-L03-03 (ADR-0028 A1): whether the checkpoint's presize counts
+    /// came from the end-of-file footer probe (`Some(false)` = the
+    /// dependent hop chain located the footer). `None` without a
+    /// checkpoint.
+    pub ckpt_footer_probe_hit: Option<bool>,
     /// Boot GC: stale below-floor segments + unnamed `.ick`/`.ick.new`
     /// orphans removed.
     pub stale_files_removed: u64,
@@ -100,19 +211,142 @@ pub struct RecoverStats {
     /// Trailing segments removed with a torn tail (each verified to hold
     /// no validating frame before deletion).
     pub torn_segments_removed: u64,
+    /// M4.5-S37 (ADR-0093 A4): rebuilt shadow slots the boot read and
+    /// settled by their full key — the ambiguous (two RAM keys with one
+    /// hash) and over-cap pairs, never the general index.
+    pub shadow_settle_reads: u64,
+    /// ADR-0096 D3: quarantined extents the replayed map references,
+    /// renamed back before serving — a wrong orphan verdict healed.
+    /// Nonzero is the upstream-accounting falsifier signal; logged.
+    pub blob_revived: u64,
+    /// ADR-0100 D6: tombstoned namespaces whose residue this boot swept
+    /// (a `MANIFEST` tier section, an `ns-N/cold` directory, or both),
+    /// the files unlinked doing it, and the checkpoint's tiered sections
+    /// (ref / live-set / blob-ref) skipped for them.
+    pub dropped_ns_swept: u64,
+    pub dropped_files_swept: u64,
+    pub dropped_sections_skipped: u64,
     /// Sealed segments with non-validating remnant bytes behind their data
     /// end — the inert residue of an earlier torn-tail resume (the reader
     /// never crosses a segment's data end, so they can never replay).
     /// Tolerated, but counted: never silent (§8.4).
     pub sealed_slack_remnants: u64,
-    /// M2.5-S12 (ADR-0031 D4): validating frames beyond the data end that
-    /// the stamp evidence proved un-covered (no surviving attestation
-    /// reaches them) — discarded with the torn tail instead of refusing.
-    /// The retired ADR-0021 D3 refusal class, counted, never silent.
+    /// M2.5-S12 (ADR-0031 D4, ADR-0087 D6): validating frames beyond a
+    /// hole that the stamp evidence proved un-covered (no surviving
+    /// attestation reaches them) — discarded with the torn tail instead
+    /// of refusing. The retired ADR-0021 D3 refusal class, counted, never
+    /// silent. Since ADR-0087 D6 this includes frames in later segments
+    /// behind a hole in a sealed one (probed, never replayed).
     pub beyond_frames_discarded: u64,
     /// Epoch-regressed frames ending replay early (discarded-life residue
     /// resurfacing at the data end — ADR-0031 D3/D5). Counted per boot.
     pub epoch_residue_stops: u64,
+    /// Segment slacks holding **validating discarded-life residue** —
+    /// frames of an earlier life left beyond a data end that a torn-tail
+    /// resume truncated the pointer at and never rewrote (ADR-0031 D4's
+    /// "bytes are never rewritten"), then sealed past by a later life
+    /// that rotated away before overwriting them (the ADR-0086 D4
+    /// class-upgrade rotation makes this routine). Proven residue by
+    /// epoch — below the replayed prefix's, or below a life observed
+    /// beyond it — never a hole: excluded from the attestation decision,
+    /// replay continues past it. Counted per boot (ADR-0031 D5 as amended
+    /// 2026-08-21).
+    pub stale_residue_slacks: u64,
+    /// M4.5-S39b (ADR-0090 D2 as amended): replay ended a segment's data
+    /// at a **foreign-segment frame** — a decoded frame at its stored
+    /// offset but stamped for another segment id, the residue a recycled
+    /// file carries from its previous life. A classified end like a zero
+    /// tail (replay continues in the next segment), never data, never a
+    /// hole. Counted per boot.
+    pub segment_residue_stops: u64,
+    /// Segment slacks proven **recycled-life residue** by the audit: no
+    /// self-located frame, ≥ 1 foreign-segment frame (garbage beside it
+    /// allowed — a torn tail over residue is indistinguishable from
+    /// residue and nothing acked can sit past a data end). Never torn,
+    /// never a hole; trailing ones are removed as stale. Counted per boot.
+    pub recycled_residue_slacks: u64,
+    /// Boot replay of the tiered namespaces (ADR-0174 D6), per cell.
+    pub tier_replay: TierReplayStats,
+}
+
+/// What boot replay of the tiered namespaces did on one cell (ADR-0174
+/// D6): the replay machines' counters summed over the cell's recovered
+/// tiered namespaces, D4's dead-life tier files removed, and the largest
+/// boot I/O charge one recovery step took. The zero set — every counter
+/// but `counters.markers_skipped` — is zero on a boot that did not demote;
+/// outside it are the markers skipped, `dead_life_files_removed`, and the
+/// gauge, which also prices the settle reads of ADR-0093's rebuild on any
+/// boot. `INFO persistence` renders the node fold of these
+/// ([`TierReplayStats::fold`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierReplayStats {
+    /// The machines' counters, summed over the cell's namespaces.
+    pub counters: inf_store::ReplayCounters,
+    /// Tier files no manifest section named, removed before any flush
+    /// (ADR-0174 D4) — outside the zero set.
+    pub dead_life_files_removed: u64,
+    /// The gauge: the largest boot I/O charge one recovery step took, in
+    /// step-budget bytes (`boot_io_charge`).
+    pub step_charge_bytes_max: u64,
+}
+
+/// [`TierReplayStats`]' fields in `INFO` order, the one order the
+/// recovery board stores them in.
+pub const TIER_REPLAY_FIELDS: usize = 13;
+
+/// One `INFO persistence` line of the node fold: its name, and the field
+/// of [`TierReplayStats`] it prints and the recovery board restores.
+pub type TierReplayField = (&'static str, fn(&mut TierReplayStats) -> &mut u64);
+
+impl TierReplayStats {
+    /// The one table of the node fold's `INFO persistence` lines, in board
+    /// order, each name beside the field it reads: the `recover_node_tier_`
+    /// prefix names the population — every cell's recovered tiered
+    /// namespaces, summed; the step-charge gauge is the largest over the
+    /// cells.
+    pub const FIELDS: [TierReplayField; TIER_REPLAY_FIELDS] = [
+        ("recover_node_tier_demote_steps", |s| &mut s.counters.demote_steps),
+        ("recover_node_tier_pads_placed", |s| &mut s.counters.pads_placed),
+        ("recover_node_tier_bytes_written", |s| &mut s.counters.tier_bytes),
+        ("recover_node_tier_barriers", |s| &mut s.counters.barriers),
+        ("recover_node_tier_files_sealed", |s| &mut s.counters.files_sealed),
+        ("recover_node_tier_settle_reads", |s| &mut s.counters.settle_reads),
+        ("recover_node_tier_settled_same_key", |s| &mut s.counters.settled_same_key),
+        ("recover_node_tier_settled_distinct", |s| &mut s.counters.settled_distinct),
+        ("recover_node_tier_deletes_verified", |s| &mut s.counters.deletes_verified),
+        ("recover_node_tier_blob_releases", |s| &mut s.counters.blob_releases),
+        ("recover_node_tier_markers_skipped", |s| &mut s.counters.markers_skipped),
+        ("recover_node_tier_dead_life_files_removed", |s| &mut s.dead_life_files_removed),
+        ("recover_node_tier_step_charge_bytes_max", |s| &mut s.step_charge_bytes_max),
+    ];
+
+    /// The fields in [`FIELDS`](Self::FIELDS) order.
+    #[must_use]
+    pub fn to_array(self) -> [u64; TIER_REPLAY_FIELDS] {
+        let mut stats = self;
+        std::array::from_fn(|i| *(Self::FIELDS[i].1)(&mut stats))
+    }
+
+    /// The inverse of [`to_array`](Self::to_array).
+    #[must_use]
+    pub fn from_array(values: [u64; TIER_REPLAY_FIELDS]) -> TierReplayStats {
+        let mut stats = TierReplayStats::default();
+        for ((_, field), value) in Self::FIELDS.iter().zip(values) {
+            *field(&mut stats) = value;
+        }
+        stats
+    }
+
+    /// The fold of two cells (or namespaces): counters sum, the gauge
+    /// takes the larger.
+    #[must_use]
+    pub fn fold(mut self, other: TierReplayStats) -> TierReplayStats {
+        self.counters.absorb(other.counters);
+        self.dead_life_files_removed =
+            self.dead_life_files_removed.saturating_add(other.dead_life_files_removed);
+        self.step_charge_bytes_max = self.step_charge_bytes_max.max(other.step_charge_bytes_max);
+        self
+    }
 }
 
 /// The recovered manifest — hands the recovery-time floor + named
@@ -150,6 +384,13 @@ pub fn open_cell_log<F: SegmentFs + Clone>(
     Ok(recovery.finish())
 }
 
+use crate::readahead::{ReadAheadFile, ReadAheadFs};
+
+/// A boot reader's file: the bare tier's file behind the boot-read
+/// prefetch wrapper (ADR-0109). Only [`Recovery`]'s readers hold these;
+/// the rotor, tier handles and barrier dirs stay `F::File`.
+type BootFile<F> = ReadAheadFile<<F as SegmentFs>::File>;
+
 /// Continuity verdict for one validating frame's stamp (ADR-0031 D3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StampVerdict {
@@ -183,12 +424,25 @@ enum Phase<File: SegmentFile> {
         idx: usize,
         reader: Option<Box<SegmentReader<File>>>,
     },
-    /// M2-S14 slack audit, one segment per step.
+    /// M2-S14 slack audit of segment `idx`, right after its replay
+    /// (ADR-0087 D6); one segment per step.
     Audit {
         idx: usize,
     },
-    /// Torn-tail resolution, begin guard, boot GC, rotor reopen.
+    /// A hole was found in an earlier segment: segment `idx` is scanned
+    /// whole for stamp evidence and never replayed (ADR-0087 D6); one
+    /// segment per step.
+    Probe {
+        idx: usize,
+    },
+    /// The lift decision; once declined, replay has ended: the unpaired-
+    /// marker check, then each tiered machine's end of replay.
     Finish,
+    /// The end-of-replay settle of every tiered namespace that demoted
+    /// (ADR-0174 R10), one budgeted step at a time; at its end the
+    /// hand-over (E13), the sidecar commit, then the torn-tail resolution,
+    /// begin guard, boot GC and rotor reopen.
+    Settle,
     Complete,
 }
 
@@ -198,12 +452,18 @@ enum Phase<File: SegmentFile> {
 /// their semantics are exactly [`open_cell_log`]'s documented pipeline —
 /// that function *is* this machine run to completion.
 pub struct Recovery<F: SegmentFs> {
+    /// The bare tier: dirs, the size probe, tier handles, the rotor —
+    /// everything that outlives boot is opened here.
     fs: Option<F>,
+    /// The boot readers' tier (ADR-0109): MANIFEST, checkpoint stream,
+    /// segment replay and the slack audit open through the prefetch
+    /// wrapper; it is constructed here and dies with this machine.
+    boot_reads: ReadAheadFs<F>,
     cell: u16,
     cfg: DurableConfig,
     anchor: WallAnchor,
     now: Nanos,
-    phase: Phase<F::File>,
+    phase: Phase<BootFile<F>>,
     stats: RecoverStats,
     shard_dir: PathBuf,
     log_dir: PathBuf,
@@ -219,6 +479,10 @@ pub struct Recovery<F: SegmentFs> {
     seg_sizes: Vec<u64>,
     ends: Vec<(u32, Option<ReadError>)>,
     residue: Vec<bool>,
+    /// Per segment: its slack's validating frames are discarded-life
+    /// residue (ADR-0031 D5 as amended) — counted as remnants, excluded
+    /// from the hole/attestation decision.
+    stale_slack: Vec<bool>,
     bytes_total: u64,
     bytes_done: u64,
     /// Bytes actually read+validated (frames, checkpoint blocks) — the
@@ -249,32 +513,130 @@ pub struct Recovery<F: SegmentFs> {
     /// Highest epoch observed in the valid prefix (the ADR-0031 D5
     /// derivation input, joined with the audit's beyond-frame evidence).
     max_prefix_epoch: u32,
-    /// Aggregate stamp evidence over the resume region's slack (tail
-    /// segment + trailing segments), gathered by the audit (ADR-0031 D4).
-    resume_evidence: RegionEvidence,
-    /// First validating beyond-frame in the resume region — the refusal
-    /// message anchor.
-    resume_evidence_anchor: Option<(SegmentId, u32)>,
-    /// Index of the last data-bearing segment, fixed when the audit phase
-    /// opens (every segment's end is known by then).
+    /// Stamp evidence per segment's slack (whole segment once probed),
+    /// gathered by the audit/probe steps (ADR-0031 D4, ADR-0087 D6); the
+    /// Finish phase aggregates it from the resume point on.
+    evidence: Vec<RegionEvidence>,
+    /// Index of the first segment whose slack held a validating frame —
+    /// the hole (ADR-0087 D6). Every later segment is probed, never
+    /// replayed.
+    hole: Option<usize>,
+    /// Index of the resume segment, fixed in the Finish phase: the hole's
+    /// segment when it holds data, else the last data-bearing segment.
     last_data: usize,
     finished: Option<(SegmentRotor<F>, Option<RecoveredManifest>)>,
+    /// Recovered tiered namespaces during replay (ADR-0174): each one's
+    /// boot replay machine, holding its pipeline and the creation-mode
+    /// handles, plus the extent sweep seed — every tiered namespace of the
+    /// catalog (D4). Lent to `Keyspace::apply_record` as the replay seam;
+    /// handed over at the end of replay into `recovered_tiers`.
+    recovering_tiers: RecoveringTiers<F>,
+    /// The boot I/O the replay machines did inside the current step, in
+    /// bytes of the recovery step budget (ADR-0174 R10; D6's gauge reads
+    /// its largest): the barriers, the tier bytes, the settle reads, the
+    /// bytes the end settle walked. Drained per frame, per checkpoint
+    /// section and per settle step, and added to the bytes read when the
+    /// step decides whether to yield.
+    step_charge: u64,
     /// Recovered tiered namespaces' plane half (M4-S26, ADR-0057 D6):
     /// flush pipeline + open sealed-file handles + the extent sweep
     /// seed — installed into the plane's tier state at completion.
     recovered_tiers: Vec<RecoveredTierNs<F>>,
-    /// End-of-replay tiered checks ran (once, on entering the audit).
+    /// Replay has ended: set once by `end_replay`, at the finish step
+    /// that declines the lift; its debug assertion that replay ends once
+    /// reads it.
     tier_replay_checked: bool,
+    /// Sidecar boot loader (M4.5-S06, ADR-0078 D6): consumes tag-0x06
+    /// sections during the ick phase, arms `CatchUp` for the tail, and
+    /// commits loaded trees at end of replay. Taken (once) on entering
+    /// the audit — the commit point.
+    #[cfg(feature = "doc")]
+    sidecar: Option<inf_store::SidecarLoader>,
 }
 
-/// One recovered tiered namespace's plane-side pieces (M4-S26).
+/// One recovered tiered namespace while replay runs: its boot machine
+/// (the pipeline under the barrier claim rule, the held handles, the
+/// counters — ADR-0174 D5) and the extent sweep seed.
+struct RecoveringTierNs<F: SegmentFs> {
+    ns: inf_log::NsId,
+    replay: inf_store::TierReplay<F>,
+    extents_listed: Vec<u64>,
+    extents_quarantined: Vec<u64>,
+    /// Lent through the seam since the last drain (its index is in
+    /// [`RecoveringTiers::lent`] once).
+    lent: bool,
+}
+
+/// The replay seam over the recovered pipelines (ADR-0174 D1): lends a
+/// namespace's boot machine to the keyspace's tiered replay arms — one
+/// binary search per record among the cell's tiered namespaces, kept in
+/// namespace order. The machines keep the I/O they did; the driver
+/// drains it with [`take_charge`](Self::take_charge) where it decides
+/// whether to yield, from the machines lent since the last drain only.
+struct RecoveringTiers<F: SegmentFs> {
+    /// The machines, ordered by namespace id.
+    tiers: Vec<RecoveringTierNs<F>>,
+    /// Indices into `tiers` lent since the last drain, each once: a frame
+    /// or section drains O(machines it lent), not O(tiered namespaces).
+    lent: Vec<usize>,
+}
+
+impl<F: SegmentFs> inf_store::ReplaySpill for RecoveringTiers<F> {
+    type Fs = F;
+
+    fn replay_mut(&mut self, ns: inf_log::NsId) -> Option<&mut inf_store::TierReplay<F>> {
+        let index = self.tiers.binary_search_by_key(&ns, |tier| tier.ns).ok()?;
+        let tier = &mut self.tiers[index];
+        if !tier.lent {
+            tier.lent = true;
+            self.lent.push(index);
+        }
+        Some(&mut tier.replay)
+    }
+}
+
+impl<F: SegmentFs> RecoveringTiers<F> {
+    /// The boot I/O the machines lent since the last drain did, in
+    /// step-budget bytes (bound: the machines lent, each once).
+    fn take_charge(&mut self) -> u64 {
+        let mut charge = 0u64;
+        for index in self.lent.drain(..) {
+            let tier = &mut self.tiers[index];
+            tier.lent = false;
+            charge = charge.saturating_add(boot_io_charge(tier.replay.take_work()));
+        }
+        charge
+    }
+}
+
+/// The recovery step budget's charge for a machine's drained boot I/O
+/// (ADR-0174 R10; D6's gauge): tier bytes written at
+/// [`REPLAY_TIER_BYTE_CHARGE`](crate::limits::REPLAY_TIER_BYTE_CHARGE),
+/// barriers at [`REPLAY_BARRIER_CHARGE_BYTES`](crate::limits::REPLAY_BARRIER_CHARGE_BYTES),
+/// and the settle reads and walked bytes at the store's prices, which its
+/// end settle walk yields on
+/// ([`settle_charge_bytes`](inf_store::ReplayWork::settle_charge_bytes)).
+/// Saturating: a yield test and a gauge, never an account that balances.
+fn boot_io_charge(work: inf_store::ReplayWork) -> u64 {
+    use crate::limits::{REPLAY_BARRIER_CHARGE_BYTES, REPLAY_TIER_BYTE_CHARGE};
+    if cfg!(inf_canary_replay_charge_dropped) {
+        // The planted canary charges no boot I/O to the step budget.
+        return 0;
+    }
+    work.tier_bytes
+        .saturating_mul(REPLAY_TIER_BYTE_CHARGE)
+        .saturating_add(work.barriers.saturating_mul(REPLAY_BARRIER_CHARGE_BYTES))
+        .saturating_add(work.settle_charge_bytes())
+}
+
+/// One recovered tiered namespace's plane-side pieces (M4-S26), as the
+/// boot machine handed them over (ADR-0174 R10).
 pub(crate) struct RecoveredTierNs<F: SegmentFs> {
     pub ns: inf_log::NsId,
     pub flush: inf_log::TierFlush<F>,
-    /// Creation-mode fds for the manifested files (ADR-0054: one fd,
-    /// one mode) — the cold-read table inherits them.
+    /// Creation-mode fds for every sealed catalogue file (ADR-0054: one
+    /// fd, one mode) — the cold-read table inherits them.
     pub files: Vec<(u32, F::File)>,
-    pub extents_listed: Vec<u64>,
 }
 
 impl<F: SegmentFs + Clone> Recovery<F> {
@@ -283,8 +645,10 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     #[must_use]
     pub fn new(fs: F, cell: u16, cfg: &DurableConfig, anchor: WallAnchor, now: Nanos) -> Self {
         let shard_dir = cfg.data_dir.join(format!("shard-{cell}"));
+        let boot_reads = ReadAheadFs::new(fs.clone(), cfg.recover.boot_prefetch);
         Recovery {
             fs: Some(fs),
+            boot_reads,
             cell,
             cfg: cfg.clone(),
             anchor,
@@ -303,6 +667,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             seg_sizes: Vec::new(),
             ends: Vec::new(),
             residue: Vec::new(),
+            stale_slack: Vec::new(),
             bytes_total: 0,
             bytes_done: 0,
             bytes_consumed: 0,
@@ -313,12 +678,16 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             saw_v2: false,
             residue_stop: false,
             max_prefix_epoch: 0,
-            resume_evidence: RegionEvidence::default(),
-            resume_evidence_anchor: None,
+            evidence: Vec::new(),
+            hole: None,
             last_data: 0,
             finished: None,
+            recovering_tiers: RecoveringTiers { tiers: Vec::new(), lent: Vec::new() },
+            step_charge: 0,
             recovered_tiers: Vec::new(),
             tier_replay_checked: false,
+            #[cfg(feature = "doc")]
+            sidecar: Some(inf_store::SidecarLoader::default()),
         }
     }
 
@@ -348,14 +717,41 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// 6 = complete.
     #[must_use]
     pub fn phase_code(&self) -> u8 {
+        self.phase().code()
+    }
+
+    /// The phase the next [`step`](Self::step) runs (M4.5-S39d).
+    #[must_use]
+    pub fn phase(&self) -> RecoverPhase {
         match &self.phase {
-            Phase::Start => 1,
-            Phase::Ick { .. } => 2,
-            Phase::Replay { .. } => 3,
-            Phase::Audit { .. } => 4,
-            Phase::Finish => 5,
-            Phase::Complete => 6,
+            Phase::Start => RecoverPhase::Start,
+            Phase::Ick { .. } => RecoverPhase::Ckpt,
+            Phase::Replay { .. } => RecoverPhase::Replay,
+            Phase::Audit { .. } | Phase::Probe { .. } => RecoverPhase::Audit,
+            // The end settle finishes replay's state: its time is the
+            // finish phase's (the board and `INFO` decompose five phases).
+            Phase::Finish | Phase::Settle => RecoverPhase::Finish,
+            Phase::Complete => RecoverPhase::Complete,
         }
+    }
+
+    /// Credits `ns` of the driver's clock to `phase` (M4.5-S39d): the
+    /// driver samples its injected clock around consecutive steps and
+    /// attributes the delta to the phase the earlier step ran. Credits to
+    /// `Complete` are the sample after the last real step — nothing ran,
+    /// so they are dropped on the floor rather than invented as a phase.
+    pub fn credit_phase_time(&mut self, phase: RecoverPhase, ns: u64) {
+        let phases = &mut self.stats.phases;
+        let slot = match phase {
+            RecoverPhase::Start => &mut phases.start_ns,
+            RecoverPhase::Ckpt => &mut phases.ckpt_ns,
+            RecoverPhase::Replay => &mut phases.replay_ns,
+            RecoverPhase::Audit => &mut phases.audit_ns,
+            RecoverPhase::Finish => &mut phases.finish_ns,
+            RecoverPhase::Complete => return,
+        };
+        *slot += ns;
+        phases.total_ns += ns;
     }
 
     /// Progress numerator: bytes validated + applied so far (checkpoint
@@ -384,8 +780,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     pub fn segments_progress(&self) -> (u64, u64) {
         let done = match &self.phase {
             Phase::Start | Phase::Ick { .. } => 0,
-            Phase::Replay { idx, .. } => *idx as u64,
-            Phase::Audit { .. } | Phase::Finish | Phase::Complete => self.segments.len() as u64,
+            Phase::Replay { idx, .. } | Phase::Probe { idx } => *idx as u64,
+            Phase::Audit { idx } => *idx as u64 + 1,
+            Phase::Finish | Phase::Settle | Phase::Complete => self.segments.len() as u64,
         };
         (done, self.segments.len() as u64)
     }
@@ -396,8 +793,28 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         &self.stats
     }
 
+    /// The boot I/O charge the last [`step`](Self::step) took, in bytes
+    /// of the recovery step budget (ADR-0174 R10): the tier bytes,
+    /// barriers, settle reads and end-settle bytes its replay machines
+    /// drained, at their prices. ADR-0174 D6's gauge is the largest of
+    /// these.
+    #[must_use]
+    pub fn step_charge_bytes(&self) -> u64 {
+        self.step_charge
+    }
+
     fn fs(&self) -> &F {
         self.fs.as_ref().expect("fs present until finish")
+    }
+
+    /// Folds one evidence scan's cost into the audit phase's accounting
+    /// (M4.5-S39d). Cumulative: a probe later lifted into a replay still
+    /// read its bytes.
+    fn note_audit(&mut self, evidence: &RegionEvidence) {
+        let phases = &mut self.stats.phases;
+        phases.audit_bytes += evidence.bytes_read;
+        phases.audit_valid_frames += evidence.valid_frames;
+        phases.audit_foreign_frames += evidence.foreign_frames;
     }
 
     /// Runs one bounded recovery step: at most ~`budget_bytes` of
@@ -409,19 +826,35 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     /// Exactly [`open_cell_log`]'s fail-stop taxonomy; a failed machine
     /// must not be stepped again.
     pub fn step(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<RecoveryProgress> {
-        match core::mem::replace(&mut self.phase, Phase::Complete) {
+        self.step_charge = 0;
+        let progress = match core::mem::replace(&mut self.phase, Phase::Complete) {
             Phase::Start => self.step_start(ks),
             Phase::Ick { reader } => self.step_ick(ks, reader, budget_bytes),
             Phase::Replay { idx, reader } => self.step_replay(ks, idx, reader, budget_bytes),
-            Phase::Audit { idx } => {
-                if !self.tier_replay_checked {
-                    self.finish_tier_replay(ks)?;
-                }
-                self.step_audit(idx)
-            }
-            Phase::Finish => self.step_finish(),
+            Phase::Audit { idx } => self.step_audit(idx),
+            // Replay is not over while a hole can still be lifted: the
+            // end-of-replay checks run inside the finish step, once the
+            // lift is declined — never at a probe, which precedes segments
+            // a lift replays.
+            Phase::Probe { idx } => self.step_probe(idx),
+            Phase::Finish => self.step_finish(ks),
+            // The last settle step reports `Working` and the *next* step
+            // `Complete` (M4.5-S39d): the driver samples its clock around
+            // every step, so its time is only attributable once a later
+            // call exists — one extra polling iteration at boot.
+            Phase::Settle => self.step_settle(ks, budget_bytes).map(|_| RecoveryProgress::Working),
             Phase::Complete => Ok(RecoveryProgress::Complete),
-        }
+        };
+        // ADR-0174 D6's gauge: the largest boot I/O charge one step took.
+        let gauge = &mut self.stats.tier_replay.step_charge_bytes_max;
+        *gauge = (*gauge).max(self.step_charge);
+        progress
+    }
+
+    /// Drains the replay machines' boot I/O into this step's charge.
+    fn drain_boot_io(&mut self) {
+        let charge = self.recovering_tiers.take_charge();
+        self.step_charge = self.step_charge.saturating_add(charge);
     }
 
     /// The recovered rotor + stats + manifest seed.
@@ -447,13 +880,33 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             create_cell_dirs(self.fs(), &self.shard_dir)?
         };
         debug_assert_eq!(dirs.log, self.log_dir);
-        let manifest = read_manifest(self.fs(), &self.shard_dir)?;
+        let manifest = read_manifest(&self.boot_reads, &self.shard_dir)?;
+        // ADR-0094 D6: the manifest names the secret that placed its
+        // checkpoint's refs; a boot holding another one refuses here,
+        // before the checkpoint loads. `infinityd` pre-scans every shard
+        // before any cell starts; this is the guard every boot passes —
+        // the simulators' and the embedded one's included.
+        if let Some(m) = &manifest {
+            let secret = ks.hasher().identity();
+            if m.key_hash_id != secret {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cell {}: MANIFEST names key-hash id {} but the node's secret is {}: the \
+                         secret was replaced after that checkpoint was placed (ADR-0094 D6) — \
+                         every cold ref would be silently unreachable; restore the directory's \
+                         original key-hash.toml (fail-stop)",
+                        self.cell, m.key_hash_id, secret
+                    ),
+                ));
+            }
+        }
 
         // The manifest names the recovery unit; without one, the whole
         // retained log is the unit.
         self.floor = manifest.as_ref().map_or(SegmentId(0), Manifest::floor);
         let outcome =
-            scan_log_dir_from(self.fs(), &self.log_dir, self.floor).map_err(io_invalid)?;
+            scan_log_dir_from(&self.boot_reads, &self.log_dir, self.floor).map_err(io_invalid)?;
         let scan = outcome.scan;
         self.stale = outcome.stale;
         self.segments = scan.segments().to_vec();
@@ -462,7 +915,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 .fs()
                 .open_read(&self.log_dir.join(segment_file_name(segment)))
                 .map_err(io_invalid)?;
-            self.seg_sizes.push(file.file_size().map_err(io_invalid)?);
+            // Before a checkpoint is loaded or a record replayed: a file
+            // whose end no LSN can name is refused, never truncated to fit
+            // (ADR-0018).
+            let size = file.file_size().map_err(io_invalid)?;
+            check_segment_len(segment, size).map_err(io_invalid)?;
+            self.seg_sizes.push(size);
         }
         self.bytes_total = self.seg_sizes.iter().sum();
 
@@ -486,22 +944,25 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     "MANIFEST lists segment {last_listed} but the log ends at {tail}"
                 )));
             }
-            // Tiered namespaces recover first (M4-S26; ADR-0057 D6
-            // steps 1-2): map manifested files, seed the new life at the
-            // manifested flushed watermark, and swap the recovered table
-            // in — checkpoint entries and tail records then apply onto
-            // the recovered life, never the fresh one.
-            self.recover_tiers(ks, &manifest)?;
+            // Tiered namespaces recover first (M4-S26; ADR-0174 D4): map
+            // manifested files, seed the new life at the manifested
+            // flushed watermark, and swap the recovered table in —
+            // checkpoint entries and tail records then apply onto the
+            // recovered life, never the fresh one.
+            self.recover_tiers(ks, Some(&manifest))?;
             let ick_path = self.ckpt_dir.join(ick_file_name(manifest.ckpt_id));
             // Presize from the footer counts before streaming (M2-S13):
             // the bulk apply must not pay a doubling-rehash storm.
-            let counts = read_ick_counts(self.fs(), &ick_path, IckReaderConfig::default())
-                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            let (counts, probe_hit) =
+                read_ick_counts_probed(&self.boot_reads, &ick_path, IckReaderConfig::default())
+                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            self.stats.ckpt_footer_probe_hit = Some(probe_hit);
             for &(ns, entries) in &counts {
                 ks.reserve_ns(inf_log::NsId(ns), entries);
             }
-            let reader = IckReader::open(self.fs(), &ick_path, IckReaderConfig::default())
-                .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            let reader =
+                IckReader::open(&self.boot_reads, &ick_path, IckReaderConfig::default())
+                    .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
             let info = reader.info();
             if info.ckpt_id != manifest.ckpt_id
                 || info.begin_lsn != manifest.begin_lsn
@@ -523,7 +984,12 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.manifest = Some(manifest);
             Phase::Ick { reader: Box::new(reader) }
         } else if scan.is_empty() {
-            // Fresh cell: nothing to replay, nothing to audit.
+            // Fresh cell: nothing to replay, nothing to audit. Its tiered
+            // namespaces still recover through the empty section (ADR-0174
+            // D4: a dead life's tier files go before any flush) and hand
+            // their machines over at once.
+            self.recover_tiers(ks, None)?;
+            self.finish_tier_replay(ks)?;
             let fs = self.fs.take().expect("fs present");
             let rotor = if self.defer_boot_sync {
                 SegmentRotor::create_fresh_deferred(fs, self.log_dir.clone(), self.cfg.segment)
@@ -537,6 +1003,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.phase = Phase::Complete;
             return Ok(RecoveryProgress::Complete);
         } else {
+            // No MANIFEST: the whole retained log replays, into tiered
+            // namespaces recovered through the empty section (D4).
+            self.recover_tiers(ks, None)?;
             Phase::Replay { idx: 0, reader: None }
         };
         self.scan = Some(scan);
@@ -544,66 +1013,17 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(RecoveryProgress::Working)
     }
 
-    /// Recovers every manifested tiered namespace (M4-S26, ADR-0057
-    /// D6): map + verify tier files, seed the new life at the
-    /// manifested flushed watermark, install the recovered table, and
-    /// retain creation-mode fds for the plane's cold-read table.
-    fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: &Manifest) -> io::Result<()> {
-        for tier in &manifest.tiers {
-            let ns = inf_log::NsId(tier.ns);
-            let Some(spec) = ks.ns_get_by_id(ns).and_then(|spec| spec.tier) else {
-                return Err(io_msg(format!(
-                    "MANIFEST carries a tier section for ns {} the catalog does not know",
-                    tier.ns
-                )));
-            };
-            let demote = spec.demotion_config();
-            let reserve_bytes = demote
-                .ring_reserve_bytes()
-                .ok_or_else(|| io_msg("tier spec ring reservation unrepresentable".into()))?;
-            let recovered = inf_store::recover_tiered_ns(
-                self.fs().clone(),
-                tier,
-                manifest.ckpt_id,
-                inf_log::TierFlushConfig {
-                    shard_dir: self.shard_dir.join(format!("ns-{}", tier.ns)),
-                    cell: u32::from(self.cell),
-                    ns,
-                    mode: spec.tier_io_mode,
-                    file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
-                    slice_bytes: spec.maintain_slice_bytes,
-                },
-                inf_store::AddressSpaceConfig {
-                    reserve_bytes,
-                    page_bytes: inf_alloc::REGION_PAGE_BYTES,
-                    life_origin: inf_store::LogicalAddr::ZERO, // overridden by the manifest
-                },
-                demote,
-                1024,
-            )?;
-            ks.install_recovered_tiered(ns, recovered.table);
-            let mut files = Vec::with_capacity(recovered.flush.sealed().len());
-            for meta in recovered.flush.sealed() {
-                let handle = self.fs().open_tier(&meta.path, spec.tier_io_mode)?;
-                files.push((meta.id, handle));
-            }
-            self.recovered_tiers.push(RecoveredTierNs {
-                ns,
-                flush: recovered.flush,
-                files,
-                extents_listed: recovered.extents_listed,
-            });
-        }
-        Ok(())
-    }
-
-    /// End-of-replay tiered checks (M4-S26), run once when replay hands
-    /// to the audit: a non-empty displacement register means the log
-    /// ended between a marker and its paired mutation — corrupt input
-    /// by the ADR-0057 D4 same-frame rule (fail-stop, never a skip);
-    /// then the extent orphan sweep seeds from the boot listing
-    /// (ADR-0061 D6 — liveness is post-replay refcount truth).
-    fn finish_tier_replay(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+    /// The end of replay (ADR-0174 R10's first half), once the finish
+    /// step declined a lift — after the last replayed record, which a
+    /// lifted hole moves past the probed segments: the checks must see the
+    /// displacement register and the index after every record a lift
+    /// replays, never before. A non-empty displacement register means the log
+    /// ended between a marker and its paired mutation — corrupt input by
+    /// the ADR-0057 D4 same-frame rule (fail-stop, never a skip); then
+    /// every tiered machine declares the end of replay, and one that
+    /// demoted enters its end settle at `ro`.
+    fn end_replay(&mut self, ks: &Keyspace) -> io::Result<()> {
+        debug_assert!(!self.tier_replay_checked, "replay ends once");
         self.tier_replay_checked = true;
         if ks.displace_register_len() > 0 {
             return Err(io_msg(format!(
@@ -611,24 +1031,321 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                 ks.displace_register_len()
             )));
         }
-        for tier in &self.recovered_tiers {
-            if let Some(table) = ks.tiered_store_mut(tier.ns) {
-                table.extent_sweep_seed(&tier.extents_listed);
+        for tier in &mut self.recovering_tiers.tiers {
+            if let Some(table) = ks.tiered_store(tier.ns) {
+                tier.replay.end_of_replay(table);
             }
         }
         Ok(())
     }
 
+    /// R9 at the end of the checkpoint, before the tail: every address a
+    /// boot settle chained during image load releases its blob reference,
+    /// now that the blob-reference sections have registered them.
+    fn end_of_checkpoint(&mut self, ks: &mut Keyspace) {
+        for tier in &mut self.recovering_tiers.tiers {
+            if let Some(table) = ks.tiered_store_mut(tier.ns) {
+                tier.replay.end_of_checkpoint(table);
+            }
+        }
+    }
+
+    /// Recovers every tiered namespace the catalog holds (ADR-0174 D4):
+    /// map + verify tier files, seed the new life at the manifested
+    /// flushed watermark, install the recovered table, and build the boot
+    /// machine that holds the creation-mode fds the plane's cold-read
+    /// table inherits. A namespace no section names — no MANIFEST yet, or
+    /// one published before the namespace was created — recovers through
+    /// the empty section: `flushed` 0, no file, its dead-life tier files
+    /// removed before any flush.
+    fn recover_tiers(&mut self, ks: &mut Keyspace, manifest: Option<&Manifest>) -> io::Result<()> {
+        self.sweep_dropped(ks, manifest)?;
+        let tiered: Vec<(inf_log::NsId, inf_store::TierSpec)> =
+            ks.ns_iter().filter_map(|spec| spec.tier.map(|tier| (spec.id, tier))).collect();
+        // Bound: one recovery per tiered namespace of the catalog.
+        for (ns, spec) in tiered {
+            let named = manifest.and_then(|m| m.tier_ns(ns.0));
+            let empty =
+                inf_log::manifest::TierNsManifest { ns: ns.0, flushed: 0, files: Vec::new() };
+            let section = named.unwrap_or(&empty);
+            let ckpt_id = manifest.map_or(0, |m| m.ckpt_id);
+            self.recover_tier_ns(ks, ns, &spec, section, ckpt_id)?;
+        }
+        // The seam finds a record's machine by binary search.
+        self.recovering_tiers.tiers.sort_unstable_by_key(|tier| tier.ns);
+        Ok(())
+    }
+
+    /// ADR-0100 D6: the catalog decides which namespaces exist. Over a
+    /// MANIFEST's tier sections a tombstoned id's residue is swept and an
+    /// unknown id's is corruption; then every tombstoned namespace's
+    /// directory no section names is swept — with or without a MANIFEST,
+    /// as D4 recovers a catalogued namespace with or without one (a DROP
+    /// cut mid-teardown before the first checkpoint publishes leaves it).
+    fn sweep_dropped(&mut self, ks: &Keyspace, manifest: Option<&Manifest>) -> io::Result<()> {
+        let mut swept: Vec<inf_log::NsId> = Vec::new();
+        for tier in manifest.map_or(&[][..], |m| m.tiers.as_slice()) {
+            let ns = inf_log::NsId(tier.ns);
+            if ks.ns_get_by_id(ns).and_then(|spec| spec.tier).is_some() {
+                continue;
+            }
+            if !ks.ns_tombstoned(ns) {
+                return Err(io_msg(format!(
+                    "MANIFEST carries a tier section for ns {} the catalog does not know and no \
+                     drop tombstone explains (corruption or a foreign META — ADR-0100 D6)",
+                    tier.ns
+                )));
+            }
+            self.sweep_dropped_ns(ns)?;
+            swept.push(ns);
+        }
+        let tombstones: Vec<inf_log::NsId> = ks.ns_tombstones().to_vec();
+        for ns in tombstones {
+            if !swept.contains(&ns) {
+                self.sweep_dropped_ns(ns)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One tiered namespace through `section` (its manifest section, or
+    /// the empty one): the recovered table installed in the keyspace, the
+    /// boot machine kept for replay.
+    fn recover_tier_ns(
+        &mut self,
+        ks: &mut Keyspace,
+        ns: inf_log::NsId,
+        spec: &inf_store::TierSpec,
+        section: &inf_log::manifest::TierNsManifest,
+        ckpt_id: u64,
+    ) -> io::Result<()> {
+        let demote = spec.demotion_config();
+        let reserve_bytes = demote
+            .ring_reserve_bytes()
+            .ok_or_else(|| io_msg("tier spec ring reservation unrepresentable".into()))?;
+        let recovered = inf_store::recover_tiered_ns(
+            self.fs().clone(),
+            section,
+            ckpt_id,
+            inf_log::TierFlushConfig {
+                shard_dir: self.shard_dir.join(format!("ns-{}", ns.0)),
+                cell: u32::from(self.cell),
+                ns,
+                mode: spec.tier_io_mode,
+                file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
+                slice_bytes: spec.maintain_slice_bytes,
+            },
+            inf_store::AddressSpaceConfig {
+                reserve_bytes,
+                page_bytes: inf_alloc::REGION_PAGE_BYTES,
+                life_origin: inf_store::LogicalAddr::ZERO, // overridden by the section
+            },
+            demote,
+            1024,
+            ks.hasher(),
+        )?;
+        ks.install_recovered_tiered(ns, recovered.table);
+        let removed = &mut self.stats.tier_replay.dead_life_files_removed;
+        *removed = removed.saturating_add(u64::from(recovered.stats.files_removed));
+        // The manifested files' creation-mode handles are the boot
+        // machine's (ADR-0054 D1; opened by `recover_tiered_ns`), and the
+        // hand-over at the end of replay returns them.
+        self.recovering_tiers.tiers.push(RecoveringTierNs {
+            ns,
+            replay: recovered.replay,
+            extents_listed: recovered.extents_listed,
+            extents_quarantined: recovered.extents_quarantined,
+            lent: false,
+        });
+        Ok(())
+    }
+
+    /// Unlinks a tombstoned namespace's `ns-N/cold` files — tier files and
+    /// blob extents share that directory — before the cell serves
+    /// (ADR-0100 D6: the teardown an acked `DROP` owed). Idempotent: an
+    /// absent directory is nothing to do; a cut mid-sweep repeats it on
+    /// the next boot because the tombstone outlives the residue.
+    fn sweep_dropped_ns(&mut self, ns: inf_log::NsId) -> io::Result<()> {
+        let cold = self.shard_dir.join(format!("ns-{}", ns.0)).join("cold");
+        let names = match self.fs().list_dir(&cold) {
+            Ok(names) => names,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut files = 0u64;
+        for name in names {
+            self.fs().remove_file(&cold.join(&name))?;
+            files += 1;
+        }
+        if files > 0 {
+            self.fs().sync_dir(&cold)?;
+        }
+        self.stats.dropped_ns_swept += 1;
+        self.stats.dropped_files_swept += files;
+        eprintln!(
+            "cell {}: swept dropped namespace {} residue ({files} files) — ADR-0100 D6",
+            self.cell, ns.0
+        );
+        Ok(())
+    }
+
+    /// The hand-over (ADR-0174 R10's last half), once every machine's end
+    /// settle reached its tail: per tiered namespace, the extent orphan
+    /// sweep seeds from the boot listing (ADR-0061 D6 — liveness is
+    /// post-replay refcount truth), ADR-0093's ticket rebuild settles
+    /// through the machine's settle read, and the machine hands the plane
+    /// its pipeline and handles; its counters fold into the cell's D6
+    /// stats and the hand-over's own drain into this step's charge.
+    fn finish_tier_replay(&mut self, ks: &mut Keyspace) -> io::Result<()> {
+        debug_assert!(self.recovering_tiers.lent.is_empty(), "every lent machine drained");
+        for mut tier in std::mem::take(&mut self.recovering_tiers.tiers) {
+            if let Some(table) = ks.tiered_store_mut(tier.ns) {
+                let revive =
+                    table.extent_sweep_seed(&tier.extents_listed, &tier.extents_quarantined);
+                // ADR-0096 D3: a quarantined extent the replayed map
+                // references was a wrong orphan verdict — rename it back
+                // before the node serves, so reads never see the twin.
+                // A rename I/O failure is a recovery fail-stop (§8.4);
+                // "nothing to revive" is fine (already revived or gone —
+                // reads answer the latter typed).
+                for extent_id in revive {
+                    let shard = self.shard_dir.join(format!("ns-{}", tier.ns.0));
+                    inf_log::blob::revive_extent_file(
+                        self.fs(),
+                        &shard,
+                        inf_log::ExtentId(extent_id),
+                    )?;
+                    self.stats.blob_revived += 1;
+                }
+                // M4.5-S37 (ADR-0093 D5/A4′): the shadow ticket set is a
+                // projection of the finished index — rebuild it once the
+                // checkpoint and WAL tail have replayed, before serving.
+                // The rebuild is a cursor: the slots it cannot pair by
+                // construction (two RAM keys with one hash beside a cold
+                // twin) or beyond the ticket cap are handed back one at a
+                // time, read and settled by their full key here — exactly
+                // those, never the general index, never a list of them.
+                // An unreadable or unsettleable slot is a recovery
+                // fail-stop (corrupt input, ADR-0057's posture).
+                // The settle answers from a `ColdKey` (ADR-0174 D3): the
+                // read is the boot machine's settle read — the slot's key
+                // window through the held creation-mode handle, with the
+                // bytes left to its file's end — and the table verifies
+                // the key against the slot's hash.
+                let ns = tier.ns;
+                let stats = &mut self.stats;
+                let replay = &mut tier.replay;
+                table
+                    .rebuild_shadow_tickets(|slot| -> io::Result<inf_store::KeyWindow> {
+                        let window = replay.read_key_window(slot.cold).map_err(io_invalid)?;
+                        stats.shadow_settle_reads += 1;
+                        Ok(inf_store::KeyWindow { bytes: window.bytes.to_vec(), left: window.left })
+                    })
+                    .map_err(|err| io_msg(format!("ns {}: {err} (ADR-0093 A4′)", ns.0)))?;
+                // The hand-over (ADR-0174 R10): the pipeline under the live
+                // claim rule, with a handle for every sealed file.
+                let done =
+                    tier.replay.hand_over(table).map_err(|refusal| replay_refused(ns, &refusal))?;
+                self.stats.tier_replay.counters.absorb(done.counters);
+                self.step_charge = self.step_charge.saturating_add(boot_io_charge(done.work));
+                self.recovered_tiers.push(RecoveredTierNs {
+                    ns,
+                    flush: done.handed.flush,
+                    files: done.handed.handles,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// One end-of-replay settle step (ADR-0174 R10) over every tiered
+    /// namespace that demoted, under what is left of the step budget once
+    /// this step's charge is taken; at its end, once, the hand-over (E13),
+    /// the sidecar commit, then the log's resume point and the rotor.
+    fn step_settle(&mut self, ks: &mut Keyspace, budget_bytes: u64) -> io::Result<()> {
+        // Bound: one settle step per namespace still settling, each under
+        // the budget left; a machine that did not demote answers `Done`.
+        // A step yields only once it charged something (L6: progress is
+        // explicit): at a budget it never spent — a zero budget — the
+        // first settle walks one record (`settle_step`'s floor).
+        for i in 0..self.recovering_tiers.tiers.len() {
+            let left = budget_bytes.saturating_sub(self.step_charge);
+            if left == 0 && self.step_charge > 0 {
+                self.phase = Phase::Settle;
+                return Ok(());
+            }
+            // The planted canaries break R10's budget: the end settle walks
+            // its whole open span in one step, or settles at twice its budget.
+            let left = if cfg!(inf_canary_replay_settle_unbudgeted) { u64::MAX } else { left };
+            let left =
+                if cfg!(inf_canary_replay_settle_doubled) { left.saturating_mul(2) } else { left };
+            let tier = &mut self.recovering_tiers.tiers[i];
+            let ns = tier.ns;
+            let table = ks
+                .tiered_store_mut(ns)
+                .ok_or_else(|| io_msg(format!("ns {}: a boot machine with no table", ns.0)))?;
+            let progress = tier
+                .replay
+                .settle_step(table, left)
+                .map_err(|refusal| replay_refused(ns, &refusal))?;
+            let charge = boot_io_charge(tier.replay.take_work());
+            self.step_charge = self.step_charge.saturating_add(charge);
+            if progress == inf_store::SettleProgress::More {
+                self.phase = Phase::Settle;
+                return Ok(());
+            }
+        }
+        self.finish_tier_replay(ks)?;
+        self.finish_index_replay(ks);
+        self.resume_log()
+    }
+
+    /// End-of-replay sidecar commit (M4.5-S06, ADR-0078 D6), run once
+    /// after the last replayed record: loaded trees are tail-caught-up — mark
+    /// them converged + cell `Ready`, disarm replay maintenance, and
+    /// log every per-index rebuild-vs-load decision (the was-ready
+    /// downgrade loudly — L10). No-checkpoint boots commit an empty
+    /// loader: every declaration records `rebuilt (no-sidecar)`.
+    fn finish_index_replay(&mut self, ks: &mut Keyspace) {
+        #[cfg(feature = "doc")]
+        if let Some(sidecar) = self.sidecar.take() {
+            for row in sidecar.commit_ready(ks) {
+                match row.decision {
+                    inf_store::SidecarBootDecision::Loaded { entries } => eprintln!(
+                        "cell {}: index {}/{} sidecar loaded ({entries} entries; tail caught up)",
+                        self.cell, row.ns.0, row.id.0
+                    ),
+                    inf_store::SidecarBootDecision::Rebuilt { reason } => {
+                        let downgrade =
+                            if row.was_ready { " — was serving before the crash" } else { "" };
+                        eprintln!(
+                            "cell {}: index {}/{} rebuilding ({}){downgrade}",
+                            self.cell,
+                            row.ns.0,
+                            row.id.0,
+                            reason.name()
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "doc"))]
+        {
+            let _ = ks;
+        }
+    }
+
     /// Hands the recovered tiered plane halves to the caller (the plane
     /// installs them into its tier state at completion — M4-S26).
     pub(crate) fn take_recovered_tiers(&mut self) -> Vec<RecoveredTierNs<F>> {
+        debug_assert!(self.recovering_tiers.tiers.is_empty(), "every boot machine handed over");
         std::mem::take(&mut self.recovered_tiers)
     }
 
     fn step_ick(
         &mut self,
         ks: &mut Keyspace,
-        mut reader: Box<IckReader<F::File>>,
+        mut reader: Box<IckReader<BootFile<F>>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
         let manifest = self.manifest.as_ref().expect("ick phase");
@@ -646,15 +1363,33 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         let ks = std::cell::RefCell::new(ks);
         let mut spent = 0u64;
         loop {
+            // ADR-0100 D6: a tiered section naming a tombstoned namespace
+            // is the residue of an acked DROP — skipped and counted (the
+            // m4-tiered DST found this class on the fix's first seed);
+            // an untombstoned unknown id stays the fail-stop below.
+            let dropped_sections = core::cell::Cell::new(0u64);
+            let tombstoned = |ns: u32| {
+                let skip = ks.borrow().ns_tombstoned(inf_log::NsId(ns));
+                if skip {
+                    dropped_sections.set(dropped_sections.get() + 1);
+                }
+                skip
+            };
             let step = reader
                 .next_step_hybrid(
+                    // The replay seam (ADR-0174 D1): a tiered image enters
+                    // its namespace's boot machine, which demotes when the
+                    // window is full.
                     |record| {
                         ks.borrow_mut()
-                            .apply_record(&record, now, anchor)
+                            .apply_record(&record, now, anchor, &mut self.recovering_tiers)
                             .map(|_| ())
                             .map_err(io_invalid)
                     },
                     |refs| {
+                        if tombstoned(refs.ns) {
+                            return Ok(());
+                        }
                         let flushed = flushed_of(refs.ns).ok_or_else(|| {
                             io_msg(format!("ref section for unmanifested tier ns {}", refs.ns))
                         })?;
@@ -666,6 +1401,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         inf_store::apply_ref_section(table, &refs, flushed)
                     },
                     |live| {
+                        if tombstoned(live.ns) {
+                            return Ok(());
+                        }
                         let mut ks = ks.borrow_mut();
                         let table =
                             ks.tiered_store_mut(inf_log::NsId(live.ns)).ok_or_else(|| {
@@ -675,6 +1413,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         Ok(())
                     },
                     |blob| {
+                        if tombstoned(blob.ns) {
+                            return Ok(());
+                        }
                         let mut ks = ks.borrow_mut();
                         let table =
                             ks.tiered_store_mut(inf_log::NsId(blob.ns)).ok_or_else(|| {
@@ -683,25 +1424,84 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                         inf_store::apply_blob_ref_section(table, &blob);
                         Ok(())
                     },
+                    // Index sidecars (M4.5-S06, ADR-0078 D4/D6): every
+                    // verdict is a loader-state transition — body damage
+                    // is counted and the read continues; a boot is never
+                    // refused past the file's framing audit.
+                    |step| {
+                        #[cfg(feature = "doc")]
+                        {
+                            let sidecar =
+                                self.sidecar.as_mut().expect("loader present until the audit");
+                            match step {
+                                inf_log::IckIdxSidecarStep::Section(section) => {
+                                    let mut guard = ks.borrow_mut();
+                                    sidecar.apply_section(&mut guard, &section);
+                                }
+                                inf_log::IckIdxSidecarStep::Damaged { at } => {
+                                    eprintln!(
+                                        "cell {}: damaged index-sidecar section at offset {at} — \
+                                         unattributed; affected streams resolve as incomplete \
+                                         (ADR-0078 D4)",
+                                        self.cell
+                                    );
+                                    sidecar.note_damaged();
+                                }
+                            }
+                            Ok(())
+                        }
+                        // A slim build refuses index-bearing catalogs at
+                        // seed (ADR-0075 D2.5), so this arm is typed,
+                        // never reached on a healthy node.
+                        #[cfg(not(feature = "doc"))]
+                        {
+                            let at = match step {
+                                inf_log::IckIdxSidecarStep::Section(ref s) => u64::from(s.ns),
+                                inf_log::IckIdxSidecarStep::Damaged { at } => at,
+                            };
+                            Err(io_msg(format!(
+                                "index-sidecar section (near {at}) but this build carries no \
+                                 document support"
+                            )))
+                        }
+                    },
                 )
                 .map_err(|err| io_msg(format!("checkpoint {}: {err:?}", ick_path.display())))?;
+            self.stats.dropped_sections_skipped += dropped_sections.get();
             match step {
                 IckStep::Section { bytes } => {
                     spent += bytes;
                     self.ick_credited += bytes;
                     self.bytes_done += bytes;
                     self.bytes_consumed += bytes;
-                    if spent >= budget_bytes {
+                    // The section's boot I/O is the step's too (ADR-0174
+                    // R10's step budget): it yields at the next section
+                    // boundary, a section being the non-yielding unit (OD-1).
+                    self.drain_boot_io();
+                    if spent.saturating_add(self.step_charge) >= budget_bytes {
                         self.phase = Phase::Ick { reader };
                         return Ok(RecoveryProgress::Working);
                     }
                 }
                 IckStep::Done(summary) => {
                     self.stats.ckpt_records = summary.records;
+                    // ADR-0174 R9: the end of the checkpoint, before the tail.
+                    self.end_of_checkpoint(&mut ks.borrow_mut());
+                    self.drain_boot_io();
+                    // Sidecar streams close with the checkpoint: open
+                    // ones discard as incomplete, and `CatchUp` arms on
+                    // every loaded namespace *before* the first tail
+                    // record applies (ADR-0078 D6).
+                    #[cfg(feature = "doc")]
+                    if let Some(sidecar) = self.sidecar.as_mut() {
+                        let mut guard = ks.borrow_mut();
+                        sidecar.finish_load(&mut guard);
+                    }
                     // Header + footer bytes complete the file's credit.
                     let rest = reader.file_size().saturating_sub(self.ick_credited);
                     self.bytes_done += rest;
                     self.bytes_consumed += rest;
+                    self.stats.phases.ckpt_bytes = self.bytes_consumed;
                     self.phase = Phase::Replay { idx: 0, reader: None };
                     return Ok(RecoveryProgress::Working);
                 }
@@ -712,8 +1512,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
     fn step_replay(
         &mut self,
         ks: &mut Keyspace,
-        mut idx: usize,
-        reader: Option<Box<SegmentReader<F::File>>>,
+        idx: usize,
+        reader: Option<Box<SegmentReader<BootFile<F>>>>,
         budget_bytes: u64,
     ) -> io::Result<RecoveryProgress> {
         // ADR-0031 D5: replay already ended at an epoch-regressed frame —
@@ -723,19 +1523,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             self.stats.segments += 1;
             self.ends.push((0, None));
             self.bytes_done += self.seg_sizes[idx];
-            idx += 1;
-            self.phase = if idx == self.segments.len() {
-                Phase::Audit { idx: 0 }
-            } else {
-                Phase::Replay { idx, reader: None }
-            };
+            self.phase = Phase::Audit { idx };
             return Ok(RecoveryProgress::Working);
         }
         let mut reader = match reader {
             Some(reader) => reader,
             None => Box::new(
                 SegmentReader::open(
-                    self.fs(),
+                    &self.boot_reads,
                     &self.log_dir,
                     self.segments[idx],
                     ReaderConfig::default(),
@@ -754,8 +1549,8 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // v2 stamp continuity (ADR-0031 D3) is checked before any record
         // of the frame applies.
         loop {
-            match reader.next_frame() {
-                Ok(Some(frame)) => {
+            match reader.next_step() {
+                Ok(ReadStep::Frame(frame)) => {
                     let frame_base =
                         frame.first_lsn().offset - u32::try_from(frame.header_len()).expect("40");
                     let verdict = self.classify_stamp(
@@ -779,12 +1574,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             self.bytes_consumed += consumed;
                             self.bytes_done +=
                                 self.seg_sizes[idx].saturating_sub(u64::from(frame_base));
-                            idx += 1;
-                            self.phase = if idx == self.segments.len() {
-                                Phase::Audit { idx: 0 }
-                            } else {
-                                Phase::Replay { idx, reader: None }
-                            };
+                            self.phase = Phase::Audit { idx };
                             return Ok(RecoveryProgress::Working);
                         }
                     }
@@ -803,14 +1593,28 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             continue;
                         }
                         let outcome = ks
-                            .apply_record(&record, self.now, self.anchor)
+                            .apply_record(
+                                &record,
+                                self.now,
+                                self.anchor,
+                                &mut self.recovering_tiers,
+                            )
                             .map_err(io_invalid)
                             .map_err(|error| replay_apply_failed(at, &error))?;
                         match outcome {
                             ReplayOutcome::Applied => self.stats.records_applied += 1,
-                            ReplayOutcome::SkippedUnknownNs | ReplayOutcome::SkippedReserved => {
+                            ReplayOutcome::SkippedUnknownNs(ns) => {
                                 self.stats.records_skipped += 1;
+                                // ADR-0103 D4: a tombstone explains a
+                                // dropped namespace's records; an id
+                                // nothing explains is a foreign log or
+                                // corruption — counted apart, asserted
+                                // zero by the DST, never silent.
+                                if !ks.ns_tombstoned(ns) {
+                                    self.stats.records_skipped_unknown_ns += 1;
+                                }
                             }
+                            ReplayOutcome::SkippedReserved => self.stats.records_skipped += 1,
                             ReplayOutcome::SkippedMarker => self.stats.markers += 1,
                             ReplayOutcome::SkippedDocDeltaStale => {
                                 self.stats.doc_deltas_skipped_stale += 1;
@@ -820,16 +1624,23 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                             }
                         }
                     }
+                    // The frame's boot I/O is the step's too (ADR-0174
+                    // R10's step budget): a step that demotes yields at the
+                    // next frame boundary, a frame being the non-yielding
+                    // unit (OD-1).
+                    self.drain_boot_io();
                     let consumed = u64::from(reader.offset()) - start_offset;
-                    if consumed >= budget_bytes {
+                    // The planted canary leaves the charge out of the yield.
+                    let charge =
+                        if cfg!(inf_canary_replay_yield_uncharged) { 0 } else { self.step_charge };
+                    if consumed.saturating_add(charge) >= budget_bytes {
                         self.bytes_done += consumed;
                         self.bytes_consumed += consumed;
                         self.phase = Phase::Replay { idx, reader: Some(reader) };
                         return Ok(RecoveryProgress::Working);
                     }
                 }
-                Ok(None) => {
-                    let end = reader.read_end().expect("clean exhaustion records an end");
+                Ok(ReadStep::End(end)) => {
                     // Continuity never spans a segment boundary (ADR-0031
                     // D3): a torn rotation-tail frame leaves the same
                     // clean-end shape as ordinary prealloc slack, so a seq
@@ -846,21 +1657,36 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_consumed += consumed;
                     self.bytes_done +=
                         self.seg_sizes[idx].saturating_sub(u64::from(reader.offset()));
-                    idx += 1;
-                    self.phase = if idx == self.segments.len() {
-                        Phase::Audit { idx: 0 }
-                    } else {
-                        Phase::Replay { idx, reader: None }
-                    };
+                    self.phase = Phase::Audit { idx };
                     return Ok(RecoveryProgress::Working);
                 }
                 Err(err @ ReadError::Io { .. }) => return Err(io_invalid(err)),
+                Err(ReadError::ForeignSegment { offset, .. }) => {
+                    // ADR-0090 D2 as amended: a decoded frame at its own
+                    // offset stamped for another segment id is recycled-
+                    // life residue — this segment's data ends here, as
+                    // cleanly as at a zero tail. Replay goes on in the
+                    // next segment (a foreign frame says nothing about
+                    // the segments after it); the audit proves the slack.
+                    self.prev_stamp = None;
+                    self.stats.segments += 1;
+                    self.stats.segment_residue_stops += 1;
+                    self.ends.push((offset, None));
+                    let consumed = u64::from(offset).saturating_sub(start_offset);
+                    self.bytes_done += consumed;
+                    self.bytes_consumed += consumed;
+                    self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
+                    self.phase = Phase::Audit { idx };
+                    return Ok(RecoveryProgress::Working);
+                }
                 Err(err) => {
                     let offset = match &err {
                         ReadError::Frame { offset, .. } | ReadError::LsnMismatch { offset, .. } => {
                             *offset
                         }
-                        ReadError::Io { .. } => unreachable!("Io read errors fail-stop above"),
+                        ReadError::Io { .. } | ReadError::ForeignSegment { .. } => {
+                            unreachable!("Io and foreign-segment reads are handled above")
+                        }
                     };
                     // The contiguity run breaks here (ADR-0031 D3): frames
                     // in later segments are a fresh baseline — the audit
@@ -873,12 +1699,7 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     self.bytes_done += consumed;
                     self.bytes_consumed += consumed;
                     self.bytes_done += self.seg_sizes[idx].saturating_sub(u64::from(offset));
-                    idx += 1;
-                    self.phase = if idx == self.segments.len() {
-                        Phase::Audit { idx: 0 }
-                    } else {
-                        Phase::Replay { idx, reader: None }
-                    };
+                    self.phase = Phase::Audit { idx };
                     return Ok(RecoveryProgress::Working);
                 }
             }
@@ -975,87 +1796,187 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         Ok(StampVerdict::Replay)
     }
 
+    /// Slack audit of segment `idx`, immediately after its replay
+    /// (ADR-0087 D6 — the order is the point: a later segment is never
+    /// applied to the keyspace before this segment's slack is known
+    /// clean). `scan_region_evidence` aggregates the v2 stamp facts in
+    /// O(1) memory. A validating frame marks the hole: every later segment
+    /// is probed for evidence instead of replayed, and the Finish phase
+    /// decides refuse-or-truncate at the hole. Non-validating residue
+    /// classifies by position there as before: torn final write at the
+    /// resume point, tolerated inert remnants behind it.
     fn step_audit(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
-        // M2-S14 slack scan, ADR-0031 D4 evidence rules: beyond a *sealed*
-        // segment's data end (behind the resume region), a validating
-        // self-located frame is unreachable interior data — fail-stop
-        // (seals fsync, so that slack is covered territory). In the
-        // *resume region* (the last data-bearing segment and everything
-        // after it), validating frames are aggregated as stamp evidence:
-        // the Finish phase refuses if any attests coverage past the data
-        // end (or cannot attest — v1), and truncates them with the torn
-        // tail otherwise. Every other residue classifies by position as
-        // before: torn final write in the resume region, tolerated inert
-        // remnants behind it — treating those as corruption would poison
-        // every boot after a benign torn tail seals.
-        if idx == 0 {
-            let ends = &self.ends;
-            self.last_data = (0..ends.len()).rev().find(|&i| ends[i].0 > 0).unwrap_or(0);
-        }
         let segment = self.segments[idx];
-        let (end, failed) = &self.ends[idx];
-        if idx < self.last_data {
-            match scan_region(self.fs(), &self.log_dir, segment, *end, ReaderConfig::default())? {
-                RegionScan::ValidFrame { offset } => {
-                    return Err(io_msg(
-                        LogCorruption {
-                            segment,
-                            offset: *end,
-                            evidence_segment: segment,
-                            evidence_offset: offset,
-                            detail: failed.as_ref().map_or_else(
-                                || {
-                                    "sealed slack holds real log data — a dropped-write gap or \
-                                     torn remnants precede it"
-                                        .to_owned()
-                                },
-                                ToString::to_string,
-                            ),
-                        }
-                        .to_string(),
-                    ));
-                }
-                RegionScan::Garbage { .. } => self.residue.push(true),
-                RegionScan::AllZero => self.residue.push(failed.is_some()),
-            }
-        } else {
-            let evidence = scan_region_evidence(
-                self.fs(),
-                &self.log_dir,
-                segment,
-                *end,
-                ReaderConfig::default(),
-            )?;
-            if self.resume_evidence_anchor.is_none()
-                && let Some(offset) = evidence.first_valid
-            {
-                self.resume_evidence_anchor = Some((segment, offset));
-            }
-            self.resume_evidence.absorb(&evidence);
-            match evidence.summary() {
-                RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => {
-                    self.residue.push(true);
-                }
-                RegionScan::AllZero => self.residue.push(failed.is_some()),
-            }
+        let (end, failed) = (self.ends[idx].0, self.ends[idx].1.is_some());
+        let evidence = scan_region_evidence(
+            &self.boot_reads,
+            &self.log_dir,
+            segment,
+            end,
+            ReaderConfig::default(),
+        )?;
+        self.note_audit(&evidence);
+        let residue = match evidence.summary() {
+            RegionScan::ValidFrame { .. } | RegionScan::Garbage { .. } => true,
+            RegionScan::AllZero => failed,
+        };
+        // ADR-0031 D5 as amended (2026-08-21): validating frames whose
+        // epochs all sit below the replayed prefix's are discarded-life
+        // residue — a recovery already resumed past them and a later life
+        // wrote the prefix above them — never a hole of this life. (A hole
+        // of the current life carries its own epoch; a lying device that
+        // lost covered bytes of this life leaves this life's frames, or
+        // attestations in later segments the cross-segment check refuses.)
+        // The residue-stop that may have ended this segment's replay at
+        // such a frame is lifted with it: the segments after it are the
+        // live log, not residue.
+        let stale_by_epoch = evidence.valid_frames > 0
+            && !evidence.any_v1
+            && evidence.max_epoch < self.max_prefix_epoch;
+        if stale_by_epoch {
+            self.stats.stale_residue_slacks += 1;
+            self.residue_stop = false;
         }
-        self.phase = if idx + 1 == self.segments.len() {
+        // ADR-0090 D2 as amended: a slack with no self-located frame and
+        // at least one foreign-segment frame is recycled-life residue —
+        // proven by the frames' own stamps, never a hole (there is no
+        // frame of this life to be a hole *to*), never torn. Same
+        // disposition as the epoch-proven class: excluded from the
+        // attestation decision, trailing ones removed as stale.
+        let recycled = evidence.is_recycled_residue();
+        if recycled {
+            self.stats.recycled_residue_slacks += 1;
+        }
+        // Proven residue is treated exactly like pre-zeroed slack for the
+        // torn/trailing decisions: an empty recycled next segment stays
+        // the tail (resume at 0, write-through from the first frame —
+        // the file is fully allocated), a recycled tail resumes at its
+        // data end, and nothing is reported torn. The reader's
+        // foreign-segment stop makes the bytes behind the data end
+        // unreachable on every later boot, which is the property zeros
+        // gave (ADR-0090 D2/D3 as amended).
+        let residue = residue && !recycled;
+        self.residue.push(residue);
+        self.stale_slack.push(stale_by_epoch);
+        self.evidence.push(evidence);
+        let next = idx + 1;
+        self.phase = if evidence.valid_frames > 0 && !stale_by_epoch {
+            self.hole = Some(idx);
+            if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } }
+        } else if next == self.segments.len() {
             Phase::Finish
         } else {
-            Phase::Audit { idx: idx + 1 }
+            Phase::Replay { idx: next, reader: None }
         };
         Ok(RecoveryProgress::Working)
     }
 
-    fn step_finish(&mut self) -> io::Result<RecoveryProgress> {
+    /// Evidence-only scan of segment `idx`, behind a hole (ADR-0087 D6):
+    /// the whole file is residue by construction (nothing at or past the
+    /// hole was acked), so it is never replayed — scanned for the stamp
+    /// facts the Finish decision needs, then removed there. Records an
+    /// empty data end and credits the segment's bytes to progress.
+    fn step_probe(&mut self, idx: usize) -> io::Result<RecoveryProgress> {
+        debug_assert!(self.hole.is_some_and(|hole| hole < idx), "probe only behind a hole");
+        let segment = self.segments[idx];
+        let evidence = scan_region_evidence(
+            &self.boot_reads,
+            &self.log_dir,
+            segment,
+            0,
+            ReaderConfig::default(),
+        )?;
+        self.note_audit(&evidence);
+        self.stats.segments += 1;
+        self.ends.push((0, None));
+        self.residue.push(!matches!(evidence.summary(), RegionScan::AllZero));
+        self.stale_slack.push(false);
+        self.evidence.push(evidence);
+        self.bytes_done += self.seg_sizes[idx];
+        let next = idx + 1;
+        self.phase =
+            if next == self.segments.len() { Phase::Finish } else { Phase::Probe { idx: next } };
+        Ok(RecoveryProgress::Working)
+    }
+
+    fn step_finish(&mut self, ks: &mut Keyspace) -> io::Result<RecoveryProgress> {
+        debug_assert_eq!(self.ends.len(), self.segments.len(), "every segment has an end");
+        debug_assert_eq!(self.evidence.len(), self.segments.len(), "every segment was audited");
+        // ADR-0031 D5 as amended (2026-08-21), the non-local half: a hole
+        // whose slack frames all carry an epoch below one probed *beyond*
+        // it is discarded-life residue the later life resumed past (the
+        // prefix and the residue share a life, so the audit could not tell
+        // locally; the later segments can). The probed segments are the
+        // live log: drop their probe bookkeeping and replay them — nothing
+        // of theirs was applied, so the replay order ADR-0087 D6 fixes is
+        // kept (this segment's slack is now known to be residue).
+        if let Some(hole) = self.hole {
+            let later_max_epoch =
+                self.evidence[hole + 1..].iter().map(|e| e.max_epoch).max().unwrap_or(0);
+            let at_hole = &self.evidence[hole];
+            if !at_hole.any_v1 && at_hole.max_epoch < later_max_epoch {
+                self.stats.stale_residue_slacks += 1;
+                self.stale_slack[hole] = true;
+                self.hole = None;
+                self.residue_stop = false;
+                for idx in hole + 1..self.segments.len() {
+                    self.stats.segments -= 1;
+                    self.bytes_done -= self.seg_sizes[idx];
+                }
+                self.ends.truncate(hole + 1);
+                self.residue.truncate(hole + 1);
+                self.stale_slack.truncate(hole + 1);
+                self.evidence.truncate(hole + 1);
+                self.phase = Phase::Replay { idx: hole + 1, reader: None };
+                return Ok(RecoveryProgress::Working);
+            }
+        }
+        // No lift: the last replayed record is behind us. The
+        // unpaired-marker check, then the end settle, the hand-over and the
+        // sidecar commit — each sees the finished keyspace.
+        self.end_replay(ks)?;
+        self.phase = Phase::Settle;
+        Ok(RecoveryProgress::Working)
+    }
+
+    /// The log's resume point (ADR-0087 D6, ADR-0031 D4): the resume
+    /// segment and offset, whether residue lies behind it (torn, or a
+    /// discarded life's), and the beyond-frame evidence's top epoch —
+    /// refusing when a surviving frame attests coverage past the data end.
+    fn resume_point(&mut self) -> io::Result<ResumePoint> {
         let ends = &self.ends;
-        let last_data = self.last_data;
-        let torn = self.residue[last_data..].iter().any(|&r| r);
+        // The resume segment (ADR-0087 D6): the hole's, when it holds
+        // data; else the last data-bearing segment before it (a hole at
+        // offset 0 keeps nothing of its own — the previous data end is
+        // the resume point and the segment is removed like any trailing
+        // one). With no hole: the last data-bearing segment.
+        let last_with_data = |upto: usize| (0..upto).rev().find(|&i| ends[i].0 > 0).unwrap_or(0);
+        let last_data = match self.hole {
+            Some(hole) if ends[hole].0 > 0 => hole,
+            Some(hole) => last_with_data(hole),
+            None => last_with_data(ends.len()),
+        };
+        self.last_data = last_data;
+        // Residue beyond the resume point: torn (this life's, or
+        // garbage) or stale (a discarded life's validating frames — a
+        // remnant, removed with the trailing segments but never a
+        // truncation of this life's data).
+        let torn = (last_data..self.residue.len()).any(|i| self.residue[i] && !self.stale_slack[i]);
+        let stale_trailing =
+            (last_data..self.residue.len()).any(|i| self.residue[i] && self.stale_slack[i]);
         self.stats.sealed_slack_remnants =
             self.residue[..last_data].iter().filter(|&&r| r).count() as u64;
+        let (resume_evidence, resume_evidence_anchor) = self.resume_evidence(last_data);
 
         let scan = self.scan.as_ref().expect("scan set in start");
-        let (resume_segment, resume_offset) = if torn {
+        // The resume point: the last data-bearing segment's data end
+        // whenever anything is truncated or removed behind it (torn, or
+        // stale trailing residue — every later segment goes, so the tail
+        // *is* that segment); otherwise the scan's tail at its own end (a
+        // clean empty next segment resumes at 0 — pinned in
+        // `recover_stamp.rs`: reading the removed segment's end here once
+        // reopened the live segment at offset 0).
+        let (resume_segment, resume_offset) = if torn || stale_trailing {
             (self.segments[last_data], ends[last_data].0)
         } else {
             (scan.tail().expect("non-empty scan"), ends.last().expect("non-empty scan").0)
@@ -1067,9 +1988,9 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // proof the gap sat in covered territory. Otherwise they are the
         // legal remainder of a reorder hole in the un-covered suffix and
         // truncate with the torn tail (the retired ADR-0021 D3 refusal).
-        if self.resume_evidence.valid_frames > 0 {
+        if resume_evidence.valid_frames > 0 {
             let (evidence_segment, evidence_offset) =
-                self.resume_evidence_anchor.expect("evidence anchor set with a valid frame");
+                resume_evidence_anchor.expect("evidence anchor set with a valid frame");
             let corruption = |detail: String| {
                 io_msg(
                     LogCorruption {
@@ -1082,23 +2003,58 @@ impl<F: SegmentFs + Clone> Recovery<F> {
                     .to_string(),
                 )
             };
-            if self.resume_evidence.any_v1 {
+            if resume_evidence.any_v1 {
                 return Err(corruption(
                     "a format-v1 frame beyond the data end cannot attest whether the gap \
                      before it was fsync-covered (ADR-0031 D4)"
                         .to_owned(),
                 ));
             }
-            if self.resume_evidence.max_covered_lsn > resume.to_u64() {
+            if resume_evidence.max_covered_lsn > resume.to_u64() {
                 return Err(corruption(format!(
                     "a surviving frame attests fsync coverage up to {:#x}, past the valid \
                      data end {} — covered data was lost (ADR-0031 D4)",
-                    self.resume_evidence.max_covered_lsn, resume
+                    resume_evidence.max_covered_lsn, resume
                 )));
             }
             debug_assert!(torn, "beyond-frame evidence implies resume-region residue");
-            self.stats.beyond_frames_discarded = self.resume_evidence.valid_frames;
+            self.stats.beyond_frames_discarded = resume_evidence.valid_frames;
         }
+        Ok(ResumePoint {
+            resume,
+            torn,
+            stale_trailing,
+            beyond_max_epoch: resume_evidence.max_epoch,
+        })
+    }
+
+    /// Evidence from the resume segment's slack and everything after it —
+    /// the frames a truncation at the resume point would discard — with
+    /// the first validating frame's position. Stale residue attests a
+    /// discarded life's watermark, not this one's: excluded.
+    fn resume_evidence(&self, last_data: usize) -> (RegionEvidence, Option<(SegmentId, u32)>) {
+        let mut resume_evidence = RegionEvidence::default();
+        let mut anchor = None;
+        for (i, evidence) in self.evidence.iter().enumerate().skip(last_data) {
+            if self.stale_slack[i] {
+                continue;
+            }
+            if anchor.is_none()
+                && let Some(offset) = evidence.first_valid
+            {
+                anchor = Some((self.segments[i], offset));
+            }
+            resume_evidence.absorb(evidence);
+        }
+        (resume_evidence, anchor)
+    }
+
+    /// The rest of the finish once replay's state is handed over: the
+    /// begin guard, the torn-tail truncation, the boot GC and the rotor
+    /// reopened at the resume point under the resumed life's epoch.
+    fn resume_log(&mut self) -> io::Result<()> {
+        let ResumePoint { resume, torn, stale_trailing, beyond_max_epoch } = self.resume_point()?;
+        let last_data = self.last_data;
         // Everything the manifest names was durable at publication (the
         // watermark-≥-begin staging guard): a log ending below begin is
         // lost covered state, never a torn un-synced tail.
@@ -1107,27 +2063,30 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         {
             return Err(io_msg(format!(
                 "the log's valid data ends at {resume}, below the MANIFEST begin-LSN {begin}: \
-                 fsync-covered bytes are missing — refusing to start (§8.4)"
+                 fsync-covered bytes are missing — refusing to start"
             )));
         }
         if torn {
             self.stats.torn_truncated_at = Some(resume);
-            // Trailing segments hold no validating frame (the audit) —
-            // remove them so appends resume in the truncated segment with
-            // the pristine-prealloc invariant restored.
+        }
+        if torn || stale_trailing {
+            // Every later segment is un-acked residue (frame-free, probed
+            // and proven un-covered above, or a discarded life's) — remove
+            // them so appends resume in the truncated segment with the
+            // pristine-prealloc invariant restored.
             for &trailing in &self.segments[last_data + 1..] {
                 self.fs().remove_file(&self.log_dir.join(segment_file_name(trailing)))?;
                 self.stats.torn_segments_removed += 1;
             }
             if self.stats.torn_segments_removed > 0 {
                 self.scan = Some(
-                    scan_log_dir_from(self.fs(), &self.log_dir, self.floor)
+                    scan_log_dir_from(&self.boot_reads, &self.log_dir, self.floor)
                         .map_err(io_invalid)?
                         .scan,
                 );
             }
         }
-        let tail_offset = resume_offset;
+        let tail_offset = resume.offset;
 
         // Boot GC: stale below-floor segments (crash mid-truncation) and
         // checkpoint-dir orphans (unnamed `.ick` from a crash before the
@@ -1165,7 +2124,14 @@ impl<F: SegmentFs + Clone> Recovery<F> {
         // audit saw it). Discarded-life residue that later resurfaces at
         // the new data end then fails the prefix's epoch-monotonicity rule
         // instead of replaying.
-        let observed = self.max_prefix_epoch.max(self.resume_evidence.max_epoch);
+        // ADR-0090 D2 as amended: foreign-segment frames carry epochs at or
+        // below the prefix's by append order (a recycled file was sealed
+        // before every segment above the floor); folding them in makes the
+        // "every epoch observed this boot" rule literal at the cost of one
+        // max over the audited segments.
+        let max_foreign_epoch =
+            self.evidence.iter().map(|e| e.max_foreign_epoch).max().unwrap_or(0);
+        let observed = self.max_prefix_epoch.max(beyond_max_epoch).max(max_foreign_epoch);
         let epoch = observed.checked_add(1).ok_or_else(|| {
             io_msg(format!("log epoch space exhausted at {observed} — refusing to start"))
         })?;
@@ -1176,8 +2142,22 @@ impl<F: SegmentFs + Clone> Recovery<F> {
             .map(|m| RecoveredManifest { ckpt_id: m.ckpt_id, begin_lsn: m.begin_lsn });
         self.finished = Some((rotor, seed));
         self.phase = Phase::Complete;
-        Ok(RecoveryProgress::Complete)
+        let phases = &mut self.stats.phases;
+        phases.replay_bytes = self.bytes_consumed.saturating_sub(phases.ckpt_bytes);
+        phases.replay_frames = self.stats.frames;
+        Ok(())
     }
+}
+
+/// Where the log resumes after replay (the finish's evidence verdict).
+struct ResumePoint {
+    resume: Lsn,
+    /// This life's residue lies behind the resume point.
+    torn: bool,
+    /// A discarded life's residue lies behind the resume point.
+    stale_trailing: bool,
+    /// The top epoch of the validating frames beyond the data end.
+    beyond_max_epoch: u32,
 }
 
 /// The `open_cell_log` replay-failure message (kept byte-compatible with
@@ -1186,10 +2166,65 @@ fn replay_apply_failed(at: Lsn, error: &io::Error) -> io::Error {
     io_msg(format!("replay apply failed at {at}: {error}"))
 }
 
+/// A tiered boot machine's typed refusal as the recovery fail-stop,
+/// naming the namespace and the check (ADR-0174 D1).
+fn replay_refused(ns: inf_log::NsId, refusal: &inf_store::ReplayRefusal) -> io::Error {
+    io_msg(format!("tiered ns {}: boot replay refused: {refusal}", ns.0))
+}
+
 fn io_invalid(err: impl std::fmt::Debug) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}"))
 }
 
 fn io_msg(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `INFO persistence` line prints the field its name says: every
+    /// field set by name to a distinct value, the expected lines written
+    /// out by hand. A name paired with another field in
+    /// [`TierReplayStats::FIELDS`] is red here, not a mislabelled line.
+    #[test]
+    fn every_tier_replay_field_prints_under_its_own_name() {
+        let stats = TierReplayStats {
+            counters: inf_store::ReplayCounters {
+                demote_steps: 1,
+                pads_placed: 2,
+                tier_bytes: 3,
+                barriers: 4,
+                files_sealed: 5,
+                settle_reads: 6,
+                settled_same_key: 7,
+                settled_distinct: 8,
+                deletes_verified: 9,
+                blob_releases: 10,
+                markers_skipped: 11,
+            },
+            dead_life_files_removed: 12,
+            step_charge_bytes_max: 13,
+        };
+        let names = TierReplayStats::FIELDS.iter().map(|(name, _)| *name);
+        let printed: Vec<(&str, u64)> = names.zip(stats.to_array()).collect();
+        let expected = [
+            ("recover_node_tier_demote_steps", 1),
+            ("recover_node_tier_pads_placed", 2),
+            ("recover_node_tier_bytes_written", 3),
+            ("recover_node_tier_barriers", 4),
+            ("recover_node_tier_files_sealed", 5),
+            ("recover_node_tier_settle_reads", 6),
+            ("recover_node_tier_settled_same_key", 7),
+            ("recover_node_tier_settled_distinct", 8),
+            ("recover_node_tier_deletes_verified", 9),
+            ("recover_node_tier_blob_releases", 10),
+            ("recover_node_tier_markers_skipped", 11),
+            ("recover_node_tier_dead_life_files_removed", 12),
+            ("recover_node_tier_step_charge_bytes_max", 13),
+        ];
+        assert_eq!(printed, expected);
+        assert_eq!(TierReplayStats::from_array(stats.to_array()), stats, "the board round-trips");
+    }
 }

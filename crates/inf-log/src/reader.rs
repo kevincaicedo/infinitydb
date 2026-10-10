@@ -18,9 +18,21 @@
 //! [`ReadEnd::ZeroTail`] (preallocated, never-written bytes) or
 //! [`ReadEnd::FileEnd`]; anything else surfaces as a typed [`ReadError`]
 //! with the exact segment offset. `ReadEnd::at` is the byte after the
-//! last valid frame — precisely the `tail_offset` that
+//! last valid frame — its aligned successor when that frame is v3
+//! (ADR-0086 D3; the padding bytes are skipped, never validated) —
+//! precisely the `tail_offset` that
 //! [`SegmentRotor::open_existing`](crate::SegmentRotor::open_existing)
 //! resumes appending at.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 use std::io;
@@ -28,7 +40,7 @@ use std::path::Path;
 
 use crate::frame::{FRAME_HEADER_LEN, FrameDecodeError, FrameRef, decode_frame, frame_shape};
 use crate::fs::{SegmentFile, SegmentFs};
-use crate::lsn::{Lsn, SegmentId};
+use crate::lsn::{Lsn, SegmentId, check_segment_len};
 use crate::segment::segment_file_name;
 
 /// Default read-ahead window (bytes): large sequential reads amortize the
@@ -67,6 +79,14 @@ pub enum ReadEnd {
     FileEnd { at: u32 },
 }
 
+/// One [`SegmentReader::next_step`] outcome: a validated frame, or the
+/// clean end of the written portion.
+#[derive(Debug)]
+pub enum ReadStep<'a> {
+    Frame(FrameRef<'a>),
+    End(ReadEnd),
+}
+
 impl ReadEnd {
     /// Byte offset one past the last valid frame — the recovered
     /// `tail_offset` for reopening the segment as the active tail.
@@ -102,6 +122,20 @@ pub enum ReadError {
         stored: Lsn,
         expected: Lsn,
     },
+    /// The frame decodes in full (magic, length, record count, CRC32C)
+    /// and its stored **offset equals** the physical offset, but its
+    /// stored **segment id is not this file's** (M4.5-S39b, ADR-0090 D2
+    /// as amended): the residue a recycled segment carries from its
+    /// previous life — bytes written when this file had another id. No
+    /// honest writer emits it into the segment its LSN names, so the
+    /// reader still refuses it (terminal, like every misplaced frame);
+    /// only recovery gives the distinction a meaning (a classified data
+    /// end, never data, never a hole).
+    ForeignSegment {
+        segment: SegmentId,
+        offset: u32,
+        stored_segment: SegmentId,
+    },
 }
 
 impl fmt::Display for ReadError {
@@ -118,6 +152,11 @@ impl fmt::Display for ReadError {
                 "misdirected frame in {segment} at {offset:#x}: stored LSN {stored}, \
                  physical position implies {expected}"
             ),
+            ReadError::ForeignSegment { segment, offset, stored_segment } => write!(
+                f,
+                "foreign-segment frame in {segment} at {offset:#x}: stamped for {stored_segment} \
+                 at the same offset — recycled-life residue (ADR-0090 D2)"
+            ),
         }
     }
 }
@@ -127,7 +166,7 @@ impl std::error::Error for ReadError {
         match self {
             ReadError::Io { source, .. } => Some(source),
             ReadError::Frame { error, .. } => Some(error),
-            ReadError::LsnMismatch { .. } => None,
+            ReadError::LsnMismatch { .. } | ReadError::ForeignSegment { .. } => None,
         }
     }
 }
@@ -221,7 +260,8 @@ impl<File: SegmentFile> fmt::Debug for SegmentReader<File> {
         f.debug_struct("SegmentReader")
             .field("segment", &self.segment)
             .field("next_offset", &self.next_offset)
-            .field("window", &(self.valid - self.start))
+            // `start` may run ahead of `valid` (a v3 frame's padding).
+            .field("window", &self.valid.saturating_sub(self.start))
             .field("end", &self.end)
             .finish()
     }
@@ -254,8 +294,11 @@ impl<File: SegmentFile> SegmentReader<File> {
         cfg: ReaderConfig,
     ) -> Result<SegmentReader<File>, ReadError> {
         let path = log_dir.join(segment_file_name(segment));
-        let file =
-            fs.open_read(&path).map_err(|source| ReadError::Io { segment, offset: 0, source })?;
+        let at_open = |source| ReadError::Io { segment, offset: 0, source };
+        let file = fs.open_read(&path).map_err(at_open)?;
+        // A file whose end no LSN can name is refused here, not wrapped
+        // later (ADR-0018): the cursor below is a u32.
+        check_segment_len(segment, file.file_size().map_err(at_open)?).map_err(at_open)?;
         Ok(SegmentReader::new(file, segment, cfg))
     }
 
@@ -263,27 +306,40 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// cleanly ([`read_end`](Self::read_end) then reports how). Errors are
     /// terminal: the reader yields nothing after one.
     pub fn next_frame(&mut self) -> Result<Option<FrameRef<'_>>, ReadError> {
-        if self.end.is_some() || self.failed {
+        if self.failed {
             return Ok(None);
         }
+        match self.next_step()? {
+            ReadStep::Frame(frame) => Ok(Some(frame)),
+            ReadStep::End(_) => Ok(None),
+        }
+    }
+
+    /// One read step: the next validated frame, or how the written
+    /// portion ended — the end rides the return value, so a replay loop
+    /// never asks for an end it must assume was recorded. A clean end
+    /// repeats on every later call; a terminal error is reported again
+    /// (the failing window is left untouched — [`next_frame`]
+    /// (Self::next_frame) is the fusing form).
+    pub fn next_step(&mut self) -> Result<ReadStep<'_>, ReadError> {
+        if let Some(end) = self.end {
+            return Ok(ReadStep::End(end));
+        }
         let frame_len = loop {
-            let window = &self.buf[self.start..self.valid];
+            let window = &self.buf[self.start.min(self.valid)..self.valid];
             match peek(window, self.cfg.max_frame_len) {
                 Peek::Ready(frame_len) => break frame_len,
                 Peek::ZeroTail => {
-                    self.end = Some(ReadEnd::ZeroTail { at: self.next_offset });
-                    return Ok(None);
+                    return Ok(self.end_at(ReadEnd::ZeroTail { at: self.next_offset }));
                 }
                 Peek::NeedMore(needed) if self.hit_eof => {
                     if window.is_empty() {
-                        self.end = Some(ReadEnd::FileEnd { at: self.next_offset });
-                        return Ok(None);
+                        return Ok(self.end_at(ReadEnd::FileEnd { at: self.next_offset }));
                     }
                     if window.iter().all(|&b| b == 0) {
                         // Shorter than a magic word but all zeros: still
                         // the preallocated tail, same as decode_frame.
-                        self.end = Some(ReadEnd::ZeroTail { at: self.next_offset });
-                        return Ok(None);
+                        return Ok(self.end_at(ReadEnd::ZeroTail { at: self.next_offset }));
                     }
                     self.failed = true;
                     return Err(ReadError::Frame {
@@ -310,25 +366,72 @@ impl<File: SegmentFile> SegmentReader<File> {
         match decode_frame(window, self.cfg.max_frame_len) {
             Ok((frame, consumed)) => {
                 debug_assert_eq!(consumed, frame_len, "peek and decode_frame disagree");
-                let expected = Lsn::new(self.segment, at + frame.header_len() as u32);
-                if frame.first_lsn() != expected {
+                // Both addresses this frame implies — its first record and
+                // its successor's base — must be nameable before either is
+                // used. Unreachable through `open`, which bounds the file;
+                // `new` takes any handle, so the cursor is checked rather
+                // than wrapped onto a live frame's address.
+                let addresses = u32::try_from(frame.header_len()).ok().and_then(|header| {
+                    Some((at.checked_add(header)?, at.checked_add(frame.padded_len())?))
+                });
+                let Some((first_record_at, next_offset)) = addresses else {
                     self.failed = true;
+                    return Err(ReadError::Io {
+                        segment: self.segment,
+                        offset: at,
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "frame ends outside the u32 segment address limit",
+                        ),
+                    });
+                };
+                let expected = Lsn::new(self.segment, first_record_at);
+                let stored = frame.first_lsn();
+                // Planted-bug canary (ADR-0090 D5): a reader blind to the
+                // segment id replays recycled residue as data — the
+                // `m2-recycle` sweep must catch it. Build-time only.
+                #[cfg(inf_canary_foreign_segment)]
+                let expected = Lsn::new(stored.segment, expected.offset);
+                if stored != expected {
+                    self.failed = true;
+                    // Offset equal, segment different: the one mismatch
+                    // a recycled file produces by construction (ADR-0090
+                    // D2 as amended). Any offset disagreement is the
+                    // ADR-0011 misdirected-write class, segment or not.
+                    if stored.offset == expected.offset {
+                        return Err(ReadError::ForeignSegment {
+                            segment: self.segment,
+                            offset: at,
+                            stored_segment: stored.segment,
+                        });
+                    }
                     return Err(ReadError::LsnMismatch {
                         segment: self.segment,
                         offset: at,
-                        stored: frame.first_lsn(),
+                        stored,
                         expected,
                     });
                 }
-                self.start += consumed;
-                self.next_offset += consumed as u32;
-                Ok(Some(frame))
+                // v3: skip to the aligned successor (ADR-0086 D3). The
+                // padding may extend past the window — `start` may run
+                // ahead of `valid`; the next peek's refill compacts from
+                // the boundary (a file ending inside the padding is a
+                // clean `FileEnd`, like any other short tail).
+                self.start = self.start.saturating_add(frame.padded_len() as usize);
+                self.next_offset = next_offset;
+                Ok(ReadStep::Frame(frame))
             }
             Err(error) => {
                 self.failed = true;
                 Err(ReadError::Frame { segment: self.segment, offset: at, error })
             }
         }
+    }
+
+    /// Records the clean end (repeated by every later step) and returns it.
+    fn end_at(&mut self, end: ReadEnd) -> ReadStep<'_> {
+        self.end = Some(end);
+        ReadStep::End(end)
     }
 
     /// Batch-apply every remaining frame (the replay shape: validate, then
@@ -338,14 +441,12 @@ impl<File: SegmentFile> SegmentReader<File> {
         mut apply: impl FnMut(FrameRef<'_>) -> Result<(), E>,
     ) -> Result<ReadEnd, ApplyError<E>> {
         loop {
-            match self.next_frame() {
-                Ok(Some(frame)) => {
+            match self.next_step() {
+                Ok(ReadStep::Frame(frame)) => {
                     let at = frame.first_lsn();
                     apply(frame).map_err(|error| ApplyError::Apply { at, error })?;
                 }
-                Ok(None) => {
-                    return Ok(self.end.expect("clean exhaustion always records an end"));
-                }
+                Ok(ReadStep::End(end)) => return Ok(end),
                 Err(err) => return Err(ApplyError::Read(err)),
             }
         }
@@ -368,7 +469,21 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// boundary (or end at EOF), compacting and reading ahead in
     /// `chunk_bytes` strides. The buffer grows only when one frame
     /// exceeds it — bounded by `max_frame_len`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: start > valid is tested before their difference and start <= valid \
+                  holds after it (advance_read keeps valid <= target); \
+                  file_pos is a byte position inside one u32-addressed segment file"
+    )]
     fn refill(&mut self, needed: usize) -> Result<(), ReadError> {
+        if self.start > self.valid {
+            // A v3 frame's padding ran past the bytes read so far: the
+            // successor lies `start - valid` bytes beyond the window.
+            // Skip them in the file position (they are never consumed
+            // as data) and start an empty window at the boundary.
+            self.file_pos += (self.start - self.valid) as u64;
+            self.start = self.valid;
+        }
         self.buf.copy_within(self.start..self.valid, 0);
         self.valid -= self.start;
         self.start = 0;
@@ -388,7 +503,10 @@ impl<File: SegmentFile> SegmentReader<File> {
             if read == 0 {
                 self.hit_eof = true;
             } else {
-                self.valid += read;
+                self.valid =
+                    crate::fs::advance_read(self.valid, read, target).map_err(|source| {
+                        ReadError::Io { segment: self.segment, offset: self.next_offset, source }
+                    })?;
                 self.file_pos += read as u64;
             }
         }
@@ -400,8 +518,28 @@ impl<File: SegmentFile> SegmentReader<File> {
         // path. Hint-only (no-op on in-memory tiers): bytes and digests
         // unchanged.
         if !self.hit_eof {
-            self.file.advise_read_ahead(self.file_pos, 2 * self.cfg.chunk_bytes as u64);
+            let hint_len = (self.cfg.chunk_bytes as u64).saturating_mul(2);
+            self.file.advise_read_ahead(self.file_pos, hint_len);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refill_refuses_an_overreport_before_advancing_its_cursor() {
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("shard")).unwrap();
+        let mut file = fs.create_meta(std::path::Path::new("shard/test.ilog")).unwrap();
+        file.write_at(0, &[0; 16]).unwrap();
+        fs.overreport_reads();
+        let mut reader = SegmentReader::new(file, SegmentId(0), ReaderConfig::default());
+        assert!(matches!(reader.refill(1), Err(ReadError::Io { ref source, .. })
+                         if source.kind() == std::io::ErrorKind::InvalidData));
+        assert_eq!(reader.valid, 0);
+        assert_eq!(reader.file_pos, 0);
     }
 }

@@ -211,7 +211,8 @@ fn depth_cap_binds_at_129() {
 
 #[test]
 fn size_cap_rejects_incrementally() {
-    let mut p = JsonParser::with_limits(ParseLimits { max_body: 64, ..ParseLimits::default() });
+    let doc = inf_doc::DocLimits::new(inf_doc::limits::DEPTH_MAX, 64);
+    let mut p = JsonParser::with_limits(ParseLimits { doc, ..ParseLimits::default() });
     let text = format!("[{}]", (0..64).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
     let e = p.parse(text.as_bytes()).unwrap_err();
     assert_eq!(e.kind, JsonErrorKind::DocumentTooLarge);
@@ -225,4 +226,66 @@ fn error_offsets_are_exact() {
     assert_eq!((e.offset, e.kind), (6, JsonErrorKind::InvalidNumber));
     let display = format!("{e}");
     assert_eq!(display, "invalid number at offset 6");
+}
+
+/// The digit-run bound (ADR-0144 D3): 19 digits is the last run the
+/// accumulator takes, a mantissa is two runs read as one, and the
+/// exponent saturates past nine digits. Every token on either side of a
+/// bound is the value std parses — through the document parser and the
+/// standalone token parser alike.
+#[test]
+fn digit_run_bounds_agree_with_std() {
+    let tokens = [
+        "999999999999999999",       // 18 digits: i64
+        "9999999999999999999",      // 19: past i64, f64
+        "18446744073709551615",     // 20: u64::MAX
+        "18446744073709551616",     // 20: u64::MAX + 1
+        "99999999999999999999",     // 20 nines
+        "-9999999999999999999",     // 19, negative
+        "-18446744073709551616",    // 20, negative
+        "123456789.1234567890",     // mantissa 19 (9 + 10)
+        "1234567890.123456789",     // mantissa 19 (10 + 9)
+        "9999999999.999999999",     // mantissa 19, all nines
+        "12345678901.123456789",    // mantissa 20
+        "0.0000000000000000001",    // mantissa 20, leading zeros
+        "0.1234567890123456789",    // mantissa 20 (1 + 19)
+        "1.2345678901234567890123", // frac past the pow10 table
+        "9007199254740992.0",       // 2^53
+        "9007199254740993.0",       // 2^53 + 1: off the fast path
+        "1e22",
+        "1e23",
+        "1e-22",
+        "1e-23", // Clinger's exponent edge
+        "1e000000022",
+        "1e0000000022", // 9 and 10 exponent digits
+        "1e-000000022",
+        "1e-0000000022",
+        "1e-999999999",
+        "1e-9999999999", // underflow: zero, finite
+        "123.456e+5",
+        "123.456E-5",
+    ];
+    for token in tokens {
+        let want: f64 = token.parse().expect("std parses the token");
+        let want = match token.parse::<i64>() {
+            Ok(int) => Value::I64(int),
+            Err(_) => Value::F64(want),
+        };
+        let got = value(token);
+        match (&got, &want) {
+            (Value::F64(a), Value::F64(b)) => assert_eq!(a.to_bits(), b.to_bits(), "{token}"),
+            _ => assert_eq!(got, want, "{token}"),
+        }
+        let standalone = match parse_number_token(token.as_bytes()).expect("token parses") {
+            Number::I64(int) => Value::I64(int),
+            Number::F64(float) => Value::F64(float),
+        };
+        match (&standalone, &want) {
+            (Value::F64(a), Value::F64(b)) => assert_eq!(a.to_bits(), b.to_bits(), "{token}"),
+            _ => assert_eq!(standalone, want, "{token}"),
+        }
+    }
+    for token in ["1e999999999", "1e9999999999", "-1e0000000400"] {
+        assert_eq!(kind(token), JsonErrorKind::NumberOutOfRange, "{token}");
+    }
 }

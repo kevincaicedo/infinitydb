@@ -5,8 +5,10 @@
 //! output bytes are part of the durable contract (L7).
 //!
 //! The RFC's recursive definition is realized with an explicit frame
-//! stack (the L9/STYLE no-recursion rule); depth is bounded by the
-//! validated inputs' 128-level cap. Two frame kinds:
+//! stack (the L9/STYLE no-recursion rule). The stack holds at most the
+//! patch's own nesting, which the validated patch bounds at `DEPTH_MAX`;
+//! the merged value's nesting is the apply plan's check (ADR-0169 D3).
+//! Two frame kinds:
 //!
 //! - `Merge` — both sides are objects: phase 1 walks the target's
 //!   entries in order (kept verbatim, replaced, recursed into, or
@@ -24,6 +26,7 @@
 //! value. Member deletion occurs only while merging a null-valued member
 //! from an object patch, exactly where the RFC defines it.
 
+use crate::limits::DEPTH_MAX;
 use crate::tape::{Dict, TAG_NULL, TAG_OBJ, ValueRef, read_value, skip_value};
 
 /// One in-progress container merge. Offsets index the frame's own input
@@ -93,7 +96,7 @@ pub(crate) fn merge_absent(patch: &[u8], out: &mut Vec<u8>) {
 
 fn run(t_body: &[u8], patch: &[u8], out: &mut Vec<u8>, stack: &mut Vec<Frame>) {
     while let Some(&frame) = stack.last() {
-        debug_assert!(stack.len() <= 128, "validated inputs bound merge depth");
+        debug_assert!(stack.len() <= DEPTH_MAX, "the validated patch bounds the frame stack");
         let top = stack.len() - 1;
         match frame {
             Frame::Strip { p_off, p_end, hdr_at } => {

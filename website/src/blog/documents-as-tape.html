@@ -1,0 +1,50 @@
+<!--
+title: Documents as tape
+dek: The memory gate failed on large documents. The fix was a placement rule, not tuning.
+date: 2026-07-16
+topic: M3 · Engineering
+group: Engineering
+crumb: Engineering
+kicker: M3 · JSON documents
+excerpt: JSON documents now live as a compact tape at every size. The memory gate failed, and the fix was to stop building a representation rather than tune it.
+-->
+<p class="lede">M3 makes JSON a first-class value, stored as a compact binary document and mutated by path. Until today a document could take two physical forms, a tape for small documents and a tree of arena nodes for large ones. The development pre-campaign for the memory gate failed on both of its axes, and it failed on the large documents. We did not tune the tree. We stopped building it: every document is now a tape, at every size.</p>
+
+<h2 id="s1"><span class="num">1</span>Two forms, one durable truth.</h2>
+<p>The document format is a tape. Each value starts with a tag, and each container carries a 24-bit skip length, so a traversal can jump over a whole subtree without visiting it. Object keys keep their insertion order end to end. The tape is canonical, and it is what the log and checkpoints carry. Documents up to 512 bytes sit inline in their record; larger ones live in the cell's document arena.</p>
+<p>The second form was a tree: nodes in the arena with references between them, built by a one-way morph once a document crossed a 4 KiB threshold. Freezing a morphed tree gives back the original tape byte for byte, proven by property tests and fuzzing. The bet behind it was that large documents get edited structurally, and that a tree makes structural edits cheap.</p>
+<p>From the client, none of this is visible:</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; JSON.SET order:7 $ '{"id":7,"items":[{"sku":"a1","qty":2}],"paid":false}'
+OK
+127.0.0.1:6379&gt; JSON.NUMINCRBY order:7 $.items[0].qty 1
+"[3]"
+127.0.0.1:6379&gt; JSON.GET order:7 $.items[0].sku
+"[\"a1\"]"</pre>
+
+<h2 id="s2"><span class="num">2</span>The gate failed where the tree lived.</h2>
+<p>The memory gate bounds document RSS twice: against the serialized JSON bytes of a reference corpus, and against the comparator loading the same corpus. Both axes failed. By shape, the failures sat exactly where ingest had morphed documents into the tree: large documents and wide arrays.</p>
+<p>Byte accounting from the shipped struct layouts explained the whole gap. The tree paid a full-width reference for every array element, where the tape spends one to three bytes. It paid two references per object entry before any key bytes, and a separate string cell for every key, never shared. Every wide number got its own cell, and the allocator's smallest size class rounded each tiny cell up.</p>
+<aside class="law"><div class="law-label">Law derived · L5</div><p>Memory is the product. A representation that is pleasant to traverse and expensive to hold has to win end to end, at the wire, or it goes.</p></aside>
+
+<h2 id="s3"><span class="num">3</span>The mutation engine never needed the tree.</h2>
+<p>The decisive fact came from the code, not a benchmark. The scalar fast lane, which patches a number or a boolean of the same width in place, already had a tape arm that allocates nothing. An increment like the one above, where the new value keeps its width, takes that lane. Every structural mutation runs the canonical planner, and the planner works only on tape bytes. So a tree document paid three whole-document passes for each structural edit: freeze to tape, splice, morph back. A tape document paid the splice alone. The tree was strictly worse for the operations it was built to serve.</p>
+<p>The one API that required a tree had no production caller. The tree's one measured read win was taken before root prefetch landed, which hints tapes and does nothing for trees, and the read gate binds on documents too small to have ever been trees.</p>
+
+<h2 id="s4"><span class="num">4</span>Stop building it, rather than tune it.</h2>
+<p>The alternatives, with their arithmetic, were written down first:</p>
+<ul class="dots">
+<li>Densify the tree with narrower references, packed entries and pooled key cells. Even its arithmetic ceiling could not reach the comparator axis: weeks of layout work to fail the gate. Rejected before code.</li>
+<li>Intern repeated keys. It shrinks stored bytes, but its measured read regression stood, and trees never intern. Kept in reserve.</li>
+<li>Morph on edit heat instead of size. It adds policy state before any workload shows a tree winning. Named as the future path, not shipped.</li>
+<li>Narrow the gate. Forbidden by the milestone's own STOP ruling.</li>
+</ul>
+<p>The decision: ingest never builds the tree. A document up to 512 bytes is an inline tape; anything larger, up to the 16 MiB cap, is a tape blob in the arena. The morph threshold remains a configuration key, and its default is now never. The tree code stays, tested and reachable by configuration or an explicit morph, as a policy that must earn its place.</p>
+<p>No durable byte changed: the tape format, record framing, checkpoints and replay are untouched, and recovery simply drops the morph pass. Placement is still a pure function of size and configuration, so simulator runs stay deterministic.</p>
+<aside class="law"><div class="law-label">Law derived · L4</div><p>Mechanical sympathy is measured, not assumed. The napkin math and the rejected alternatives were recorded before the change, and an A/B checked the arithmetic after it.</p></aside>
+
+<h2 id="s5"><span class="num">5</span>The corpus was wrong too.</h2>
+<p>Checking the arithmetic found a second defect, in the measurement itself. The first harness loaded one generated file per shape into many keys. The comparator stores identical strings across keys at a fraction of their unique cost, and no real workload hands it that redundancy. InfinityDB stores each key's document either way, so the identical-bytes corpus mis-measured the comparator axis by construction.</p>
+<p>The gate corpus is now frozen: six shapes, 71,200 documents, a fixed seed, and a unique document behind every key. The mixed corpus binds the gate; per-shape rows are diagnostics. Every report notes that the load is write-once, so RSS excludes growth slack after ingest, and the protocol records key counts and reported memory on both engines before sampling RSS.</p>
+
+<h2 id="close">What it settled.</h2>
+<p>Development runs on the frozen corpus are not citable; the reference-box campaign owns the result, and this site will not quote it before that campaign does. What the change settled is the shape: one representation at every size, the same one the log already trusted. See <a href="../docs/json.html">JSON documents</a> for the format and commands, and <a href="../docs/memory.html">memory</a> for how document bytes are attributed.</p>

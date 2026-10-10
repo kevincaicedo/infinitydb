@@ -9,6 +9,8 @@
 
 use inf_foundation::time::Nanos;
 
+use crate::record::InternalDeadline;
+
 /// One instant expressed on both clocks: `internal_ms` on the injected
 /// monotonic clock and `unix_ms` on the wall clock. Injected at boot (L7 —
 /// the simulator owns both values).
@@ -29,17 +31,19 @@ impl WallAnchor {
         unix.max(0) as u64
     }
 
-    /// Internal (injected-clock) milliseconds for a Unix-epoch deadline,
-    /// as [`Nanos`]. Pre-anchor deadlines clamp to 0 (already expired);
-    /// `None` means arithmetic overflow — the deadline is not representable
-    /// on the internal clock and the caller decides the policy (replay
-    /// clamps to `now`; see `Keyspace::apply_record`).
+    /// The internal-clock deadline for a Unix-epoch deadline (ADR-0111
+    /// A1): an instant before the internal clock's origin is
+    /// [`InternalDeadline::BeforeOrigin`], expired at every reading of
+    /// the clock, and a far one saturates into the store bound. `None`
+    /// means the i64 arithmetic overflowed — the caller decides the
+    /// policy (replay clamps forward to the store bound, "never", so an
+    /// unrepresentable deadline can never resurrect as an
+    /// already-expired key; see `Keyspace::apply_record`).
     #[must_use]
-    pub fn internal_from_unix(&self, unix_ms: u64) -> Option<Nanos> {
+    pub fn internal_from_unix(&self, unix_ms: u64) -> Option<InternalDeadline> {
         let delta = i64::try_from(unix_ms).ok()?.checked_sub(i64::try_from(self.unix_ms).ok()?)?;
         let internal = i64::try_from(self.internal_ms).ok()?.checked_add(delta)?;
-        let ns = (internal.max(0) as u64).checked_mul(1_000_000)?;
-        Some(Nanos(ns))
+        Some(InternalDeadline::from_internal_ms(internal))
     }
 }
 
@@ -55,7 +59,7 @@ mod tests {
             let at = Nanos::from_millis(internal_ms);
             let unix = ANCHOR.unix_from_internal(at);
             assert_eq!(unix, 1_750_000_000_000 + (internal_ms - 5_000));
-            assert_eq!(ANCHOR.internal_from_unix(unix), Some(at));
+            assert_eq!(ANCHOR.internal_from_unix(unix), Some(InternalDeadline::At(at)));
         }
     }
 
@@ -68,12 +72,17 @@ mod tests {
     }
 
     #[test]
-    fn pre_anchor_unix_clamps_to_internal_zero() {
-        // A Unix deadline before the node's internal origin is already
-        // expired: it clamps to internal 0, never wraps.
+    fn pre_origin_unix_is_before_the_origin() {
+        // A Unix deadline before the internal clock's origin is expired
+        // at every reading of the clock: never clamped onto the origin,
+        // where it would read as live for a millisecond, never wrapped.
         let ancient = 1_750_000_000_000 - 1_000_000;
-        assert_eq!(ANCHOR.internal_from_unix(ancient), Some(Nanos::ZERO));
-        assert_eq!(ANCHOR.internal_from_unix(0), Some(Nanos::ZERO));
+        assert_eq!(ANCHOR.internal_from_unix(ancient), Some(InternalDeadline::BeforeOrigin));
+        assert_eq!(ANCHOR.internal_from_unix(0), Some(InternalDeadline::BeforeOrigin));
+        // One millisecond before the origin, and the origin itself.
+        let origin = 1_750_000_000_000 - 5_000;
+        assert_eq!(ANCHOR.internal_from_unix(origin - 1), Some(InternalDeadline::BeforeOrigin));
+        assert_eq!(ANCHOR.internal_from_unix(origin), Some(InternalDeadline::At(Nanos::ZERO)));
     }
 
     #[test]
@@ -87,8 +96,9 @@ mod tests {
     #[test]
     fn overflow_is_none_not_a_panic() {
         assert_eq!(ANCHOR.internal_from_unix(u64::MAX), None, "u64 > i64::MAX");
-        // i64-representable but too far in the future for Nanos (ms × 1e6
-        // overflows u64): still None, never a wrap.
-        assert_eq!(ANCHOR.internal_from_unix(u64::MAX / 4), None);
+        // i64-representable but past the store bound: saturates into it
+        // (ADR-0111 D2), never a wrap.
+        let far = InternalDeadline::At(crate::record::saturating_deadline(u64::MAX));
+        assert_eq!(ANCHOR.internal_from_unix(u64::MAX / 4), Some(far));
     }
 }

@@ -16,11 +16,11 @@ mod program;
 pub use ast::{Member, PathAst, Segment, SliceSpec};
 pub use cache::{PROGRAM_CACHE_DEFAULT_ENTRIES, ProgramCache};
 pub use eval::{
-    CanonicalMatches, EvalError, EvalLimits, EvalState, EvalStep, Matches, eval, eval_budgeted,
-    resolve,
+    CanonicalMatches, EvalError, EvalLimits, EvalState, EvalStep, Matches, VisitEnd, VisitOutcome,
+    eval, eval_budgeted, eval_visit, resolve,
 };
-pub use program::PathProgram;
 pub(crate) use program::SimpleStep;
+pub use program::{PathProgram, PathStep, PathSteps};
 
 /// Hard ceiling on path text and program bytes (u16-shaped lengths in
 /// the S10 cache and delta accounting; ADR-0040 D6). Config lowers via
@@ -122,7 +122,7 @@ pub fn compile_with_max_bytes(text: &[u8], max_bytes: usize) -> Result<PathProgr
         return Err(PathError { offset, kind: PathErrorKind::InvalidUtf8 });
     }
     let ast = parse::parse(text)?;
-    Ok(program::encode(&ast))
+    program::encode(&ast)
 }
 
 /// Parse without encoding (tests and the printer property).
@@ -137,7 +137,12 @@ pub fn parse_ast(text: &[u8]) -> Result<PathAst, PathError> {
     parse::parse(text)
 }
 
-/// Encode a (test-constructed) AST — the round-trip property's second leg.
-pub fn encode_ast(ast: &PathAst) -> PathProgram {
+/// Encode an AST the caller built — the round-trip property's second
+/// leg, and the parent-path derivation (a prefix of an accepted program).
+///
+/// # Errors
+/// `PathTooLong` when the encoding reaches the program ceiling (an AST
+/// decoded from accepted bytes, or a prefix of one, never does).
+pub fn encode_ast(ast: &PathAst) -> Result<PathProgram, PathError> {
     program::encode(ast)
 }

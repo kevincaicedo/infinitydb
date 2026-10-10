@@ -1,0 +1,19 @@
+# Planted-violation probe for scripts/check-lint-scopes.sh (ADR-0144). Not a
+# workspace member: the gate copies it under target/ and runs clippy there,
+# so the workspace clippy.toml is found by the same walk-up the real crates
+# use. A plant that compiles clean is a red gate (STOP rule 4).
+[package]
+name = "lint-scope-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+# The await and discard plants hold the engine's own slot types. The gate
+# rewrites this path to the workspace's absolute one in the copy it builds.
+[dependencies]
+inf-foundation = { path = "../../crates/inf-foundation" }

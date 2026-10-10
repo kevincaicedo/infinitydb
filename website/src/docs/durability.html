@@ -1,0 +1,51 @@
+<!--
+title: Namespaces & durability
+description: Durability in InfinityDB is a property of the namespace: what an acknowledgement means, what each mode can lose, and how a node recovers.
+lede: Durability is a property of the namespace, not the server. One node serves a cache and a system of record at once; the difference is which namespace a key lives in. This page states exactly what an acknowledgement means and what each mode can lose.
+chips: Available · alpha | Law L2
+-->
+<h2 id="namespaces">Namespaces</h2>
+<p>A namespace is a logical keyspace with its own durability class, eviction policy and memory budget. Redis <code>SELECT 0..15</code> maps to default namespaces, which are always memory-only. Named namespaces are created with <code>INF.NS</code>:</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.NS CREATE cache MODE memory EVICTION allkeys-lfu MAXMEMORY 16gb
+OK
+127.0.0.1:6379&gt; INF.NS CREATE ledger MODE durable FSYNC always
+OK
+127.0.0.1:6379&gt; INF.NS CREATE sessions MODE durable FSYNC everysec
+OK</pre>
+<p><code>INF.NS USE ledger</code> binds a connection to a namespace. The choice is per connection, never by key prefix: a command runs in the connection's current namespace, which starts as database 0 (or the server's <code>--conn-default-ns</code>) until <code>INF.NS USE</code> or <code>SELECT</code> changes it. Namespace DDL needs the server started with <code>--data-dir</code>; without one, <code>INF.NS CREATE</code> is refused.</p>
+<p>A <code>memory</code> namespace never touches the log. Not rarely: never. Topic namespaces, with retention instead of eviction, arrive with streams and queues in M7.</p>
+
+<h2 id="classes">Durability classes</h2>
+<table class="doc-table"><thead><tr><th>Mode</th><th>Acknowledged</th><th>Mechanism</th><th>Lost on a crash</th></tr></thead><tbody>
+<tr><td><code>memory</code></td><td>on apply</td><td>no log</td><td>everything: cache semantics</td></tr>
+<tr><td><code>everysec</code></td><td>on apply</td><td>group commit every loop; fsync on a one-second timer and on segment seal</td><td>at most the last second of acknowledged writes</td></tr>
+<tr><td><code>always</code></td><td>after fsync</td><td>the reply waits on the durability watermark; one group fsync covers every concurrent writer</td><td>nothing, on a single node</td></tr>
+<tr><td><code>wait-replica</code></td><td>after replicas acknowledge</td><td>the watermark is the replicated position</td><td>nothing across node loss. Planned for M9, not shipped</td></tr>
+</tbody></table>
+<ul class="dots">
+<li><strong>An <code>always</code> acknowledgement is a durability fact.</strong> The mutation applies immediately, but the reply is gated: the command suspends until the group fsync covering its log position completes. Throughput comes from grouping, because every concurrent writer shares one fsync.</li>
+<li><strong><code>everysec</code> is a real window, stated plainly.</strong> Writes are acknowledged on apply and the log is synced on a one-second timer, so a power cut can lose up to the last second of acknowledged writes in that namespace. If that window is unacceptable, use <code>always</code>.</li>
+</ul>
+
+<h2 id="failstop">fsync failure is fail-stop</h2>
+<p>If the device reports an fsync failure, InfinityDB does not retry, degrade or pretend. The durability watermark freezes, no further acknowledgement can be issued against unverified storage, and the process exits with a dedicated code. A repository check makes sure fsync errors can only surface at the allowed fail-stop sites, and a child-process test proves the affected batch is never acknowledged.</p>
+
+<h2 id="checkpoints">Checkpoints, without fork</h2>
+<p>A checkpoint is a fuzzy snapshot taken by the owning cell in bounded background slices. The live index and records stream to a checkpoint file; records changed mid-checkpoint are covered by the log tail. Then a <code>MANIFEST</code> names the new recovery unit atomically (write new, fsync, rename, fsync the directory), and older log segments are truncated.</p>
+<ul class="dots">
+<li>No <code>fork()</code>, no copy-on-write, no doubled memory during a rewrite.</li>
+<li>A <code>MANIFEST</code> is published only once the watermark covers the checkpoint's start, so a checkpoint never names state the log has not made durable.</li>
+<li>A checkpoint I/O failure aborts the checkpoint, never the process: nothing was acknowledged against it, and the log stays authoritative.</li>
+<li>Operator surface: <code>INF.CKPT [CELL k] [WAIT]</code>. <code>BGSAVE</code> maps onto it with a Redis-identical reply and no RDB file; <code>LASTSAVE</code> reports the newest durable <code>MANIFEST</code>.</li>
+</ul>
+
+<h2 id="recovery">Recovery</h2>
+<p>Recovery is per cell and parallel. Each cell loads its named checkpoint, then replays its log tail from the checkpoint's position. There is no global sequence number and no merge step.</p>
+<ul class="dots">
+<li>While loading, the node answers like Redis: commands outside the exempt set receive <code>-LOADING Redis is loading the dataset in memory</code>. The gate is node-wide, so a cell that has finished still answers <code>-LOADING</code> while a peer replays.</li>
+<li>A torn final frame, detected by its checksum, is truncated, and replay resumes behind it. That is the defined crash window. Every frame also records the durability watermark at seal time, so recovery can prove when a gap was never fsync-covered and truncate it too. Discarded frames are counted, never silent.</li>
+<li>Everything else is a refusal, not a guess: a surviving frame that attests coverage past where valid data ends, a <code>MANIFEST</code> that names missing state, an unknown record type. The boot stops and names the evidence. A database that boots with quietly missing acknowledged data is worse than one that refuses and says why.</li>
+</ul>
+<p>What a refusal looks like, and what to do about one, is on <a href="observability.html">Observability</a>.</p>
+
+<aside class="law-box"><span class="law-code">L2</span><div><div class="law-title">The log is the database.</div><p>Every durable fact is an append to a per-cell log first. Checkpoints, indexes and tiers are projections that can be rebuilt from the log or a checkpoint.</p></div></aside>

@@ -15,28 +15,30 @@
 use libfuzzer_sys::fuzz_target;
 
 use inf_doc::model::{self, Value};
-use inf_doc::{JsonParser, ParseLimits, TapeDoc};
+use inf_doc::{DocLimits, JsonParser, ParseLimits, TapeDoc};
 
 /// S07 arm: hostile caps far below the defaults.
-const TIGHT: ParseLimits = ParseLimits { max_depth: 8, max_text: 1 << 20, max_body: 256 };
+const TIGHT: ParseLimits = ParseLimits { doc: DocLimits::new(8, 256), max_text: 1 << 20 };
 
 /// The tight parser either agrees byte-for-byte or rejects with its held
 /// memory bounded by the caps — never a panic, never unbounded growth.
 fn tight_limits_arm(data: &[u8], accepted: Option<&[u8]>) {
     let mut tight = JsonParser::with_limits(TIGHT);
     let mut out = Vec::new();
-    match tight.parse_into(data, &mut out) {
-        Ok(()) => {
+    let refused = match tight.parse_into(data, &mut out) {
+        Ok(doc) => {
             let full = accepted.expect("tight limits accept ⊆ default limits accept");
-            assert_eq!(out, full, "limits must not change accepted bytes");
+            assert_eq!(doc.as_bytes(), full, "limits must not change accepted bytes");
+            false
         }
-        Err(_) => {
-            assert!(
-                out.len() <= inf_doc::HEADER_LEN + TIGHT.max_body + 16,
-                "rejection left an over-cap output ({} bytes)",
-                out.len()
-            );
-        }
+        Err(_) => true,
+    };
+    if refused {
+        assert!(
+            out.len() <= inf_doc::HEADER_LEN + TIGHT.doc.body_bytes_max() + 16,
+            "rejection left an over-cap output ({} bytes)",
+            out.len()
+        );
     }
 }
 

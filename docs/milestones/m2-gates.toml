@@ -1,21 +1,21 @@
-# M2 exit gates (STOP) — machine-readable encoding of the M2 milestone plan
-# §6 (docs/milestones/m2-durability.md). Values are fixed by the master plan
-# §22 (M2); changing a threshold here is a master-plan amendment, not an
-# edit (L10: a gate may not be passed by narrowing it).
+# M2 exit gates (STOP) — machine-readable encoding of the M2 exit gates.
+# Values are fixed by project decision; changing a threshold here is a
+# recorded decision, not an edit (L10: a gate may not be passed by narrowing it).
 #
 # Consumed by `inf-bench gate-run m2`. Field semantics identical to
 # m0-gates.toml/m1-gates.toml: loadgen:*/ab:*/tripwire:* rows are measured
 # natively by gate-run (the ab:* zero-cost rows need `--baseline-bin`, the
 # pre-M2 infinityd build); external:* rows come from campaign tooling (DST
 # sweep, crash matrix, recovery timing, soak, M0/M1 regression A/B) and
-# report PENDING from gate-run until that artifact is supplied. The S22 gate
+# remain unmeasured until supplied. Missing/non-finite selected STOP measurements
+# fail in every tier (ADR-0132). The S22 gate
 # campaign is the binding run; S09 lands the ab:* + counter rows first.
 # tier = "linux-reference-box" verdicts bind only on the reference box.
 
 schema = 1
 milestone = "m2"
 
-# ---- M2-S09: memory namespaces pay zero (supporting gate, §6) ------------
+# ---- M2-S09: memory namespaces pay zero (supporting gate) -----------------
 
 [[gate]]
 id = "mem_ab_pipelined_ops"
@@ -87,7 +87,7 @@ tier = "any"
 source = "tripwire:mem_only_log_records_appended"
 measured_by = "gate-run m2: INFO log_records_appended summed across cells after every memory-only row; also hard-fails the run"
 
-# ---- §6 STOP gates (S22 campaign; PENDING until their rows land) ---------
+# ---- STOP gates (S22 campaign; PENDING until their rows land) -----------
 
 [[gate]]
 id = "everysec_penalty"

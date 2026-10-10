@@ -1,7 +1,7 @@
 //! Server-introspection surface (M1-S03): `HELLO`, `INFO` real sections,
 //! `COMMAND` full output, `CONFIG GET/SET`, `CLIENT *`, `DEBUG` subset.
-//! Cold admin paths — `format!`/procfs reads are acceptable here (the M0
-//! precedent: INFO already read `/proc/self/status`).
+//! Formatting runs on the cell; process gauges come from the supervisor's
+//! read-only board. INFO never opens procfs files (ADR-0144 D5).
 //!
 //! Payloads are documented deviations in the compat matrix (identity
 //! fields, registry size, address placeholders); the *shape* — section
@@ -15,10 +15,16 @@ use inf_store::{
 use inf_wire::{CmdFlags, Protocol, RespWriter};
 
 use crate::clients::{format_client_line, valid_client_name};
-use crate::config::ConfigSetError;
+use crate::config::{ConfigSetError, ValidatedSet};
 use crate::exec::{Argv, ConnCx, NodeInfo, arity_error, parse_i64, wall_ms};
 
+mod sections;
+
+pub(crate) use sections::info;
+
 // ---- HELLO -------------------------------------------------------------------
+
+// ---- shared data definitions (behaviour lives in the child modules) ----------
 
 pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, out: &mut Vec<u8>) {
     let mut requested = cx.proto;
@@ -62,585 +68,30 @@ pub(crate) fn hello(argv: &(impl Argv + ?Sized), cx: &mut ConnCx, now: Nanos, ou
     w.array_header(0);
 }
 
-// ---- INFO --------------------------------------------------------------------
-
-const SECTIONS: &[&str] = &[
-    "server",
-    "clients",
-    "memory",
-    "persistence",
-    "tiering",
-    "stats",
-    "replication",
-    "cpu",
-    "tripwires",
-    "keyspace",
-];
-
-pub(crate) fn info(
-    argv: &(impl Argv + ?Sized),
-    ks: &Keyspace,
-    node: &NodeInfo,
-    now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
-    let mut selected: Vec<&str> = Vec::new();
-    for i in 1..argv.len() {
-        let arg = argv.arg(i).to_ascii_lowercase();
-        match arg.as_slice() {
-            b"all" | b"default" | b"everything" => selected.clear(),
-            section => {
-                if let Some(name) = SECTIONS.iter().find(|s| s.as_bytes() == section) {
-                    selected.push(name);
-                }
-                // Unknown sections yield nothing for that name (Redis shape).
-            }
-        }
-    }
-    let wants = |name: &str| selected.is_empty() || selected.contains(&name);
-    let mut text = String::new();
-    let push = |text: &mut String, line: &str| {
-        text.push_str(line);
-        text.push_str("\r\n");
-    };
-
-    if wants("server") {
-        let uptime_secs = {
-            let (internal_anchor, _) = node.wall_anchor.get();
-            now.as_secs().saturating_sub(internal_anchor / 1000)
-        };
-        push(&mut text, "# Server");
-        push(&mut text, "infinitydb_version:0.1.0-alpha.0");
-        push(&mut text, "redis_version:7.4.0-compat");
-        push(&mut text, "redis_git_sha1:00000000");
-        push(&mut text, "redis_git_dirty:0");
-        push(&mut text, "redis_mode:standalone");
-        push(&mut text, &format!("os:{}", std::env::consts::OS));
-        push(&mut text, "arch_bits:64");
-        push(&mut text, &format!("process_id:{}", std::process::id()));
-        push(
-            &mut text,
-            &format!(
-                "run_id:{:032x}",
-                u128::from(node.rng_state.get()) << 64 | u128::from(node.cell.get())
-            ),
-        );
-        push(&mut text, &format!("tcp_port:{}", node.tcp_port.get()));
-        push(&mut text, &format!("server_time_usec:{}", wall_ms(node, now) * 1000));
-        push(&mut text, &format!("uptime_in_seconds:{uptime_secs}"));
-        push(&mut text, &format!("uptime_in_days:{}", uptime_secs / 86_400));
-        push(&mut text, "config_file:");
-        push(&mut text, &format!("cell:{}", node.cell.get()));
-        push(&mut text, &format!("cells:{}", node.cells.get()));
-        text.push_str("\r\n");
-    }
-    if wants("clients") {
-        push(&mut text, "# Clients");
-        push(&mut text, &format!("connected_clients:{}", node.connections.get()));
-        push(&mut text, "cluster_connections:0");
-        let maxclients = node.config.borrow().get("maxclients").unwrap_or("10000").to_string();
-        push(&mut text, &format!("maxclients:{maxclients}"));
-        push(&mut text, "blocked_clients:0");
-        push(&mut text, "tracking_clients:0");
-        push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
-        text.push_str("\r\n");
-    }
-    #[cfg(feature = "doc")]
-    let report = {
-        let mut report = ks.report();
-        node.add_cell_doc_memory(&mut report);
-        report
-    };
-    #[cfg(not(feature = "doc"))]
-    let report = ks.report();
-    if wants("memory") {
-        // M3-S25 attribution fix: `used_memory_rss` is process-wide, so
-        // the byte gauges beside it must be node-wide too. The serving
-        // cell publishes its fresh gauges and folds the board (peers lag
-        // their MAINTAIN publish by at most one period); without a board
-        // (bare harness) the section renders cell scope and says so.
-        let local = crate::exec::memory_gauges_of(&report, node);
-        let (scope, g) = match node.publish_and_total_memory(local) {
-            Some(totals) => ("node", totals),
-            None => ("cell", local),
-        };
-        let used = g.used_bytes;
-        let rss = process_rss_bytes();
-        push(&mut text, "# Memory");
-        push(&mut text, &format!("used_memory:{used}"));
-        push(&mut text, &format!("used_memory_human:{}", human_bytes(used)));
-        push(&mut text, &format!("used_memory_rss:{rss}"));
-        push(&mut text, &format!("memory_scope:{scope}"));
-        let cfg = node.config.borrow();
-        push(&mut text, &format!("maxmemory:{}", cfg.get("maxmemory").unwrap_or("0")));
-        push(
-            &mut text,
-            &format!("maxmemory_policy:{}", cfg.get("maxmemory-policy").unwrap_or("noeviction")),
-        );
-        drop(cfg);
-        let frag = if used > 0 { rss as f64 / used as f64 } else { 0.0 };
-        push(&mut text, &format!("mem_fragmentation_ratio:{frag:.2}"));
-        push(&mut text, "mem_allocator:inf-arena");
-        push(&mut text, &format!("doc_tape_bytes:{}", g.doc_tape_bytes));
-        push(&mut text, &format!("doc_arena_bytes:{}", g.doc_arena_bytes));
-        push(&mut text, &format!("doc_resident_bytes:{}", g.doc_resident_bytes));
-        push(&mut text, &format!("doc_intern_bytes:{}", g.doc_intern_bytes));
-        push(&mut text, &format!("doc_slack_bytes:{}", g.doc_slack_bytes));
-        push(&mut text, &format!("doc_scratch_bytes:{}", g.doc_scratch_bytes));
-        push(&mut text, &format!("doc_path_cache_bytes:{}", g.doc_path_cache_bytes));
-        push(&mut text, &format!("docs_live:{}", g.docs_live));
-        text.push_str("\r\n");
-    }
-    if wants("persistence") {
-        push(&mut text, "# Persistence");
-        // Boot-recovery fields (M2-S15): shapes mirror Redis (`loading:1`
-        // plus `loading_*` while a load is in progress — capture artifact
-        // `.artifacts/m2/loading-redis-capture-20260703/`); byte totals
-        // are file extents including preallocated slack (upper bound).
-        let loading = node.loading.get() != 0;
-        push(&mut text, &format!("loading:{}", u8::from(loading)));
-        if loading {
-            let (anchor_internal_ms, anchor_unix_ms) = node.wall_anchor.get();
-            let wall_now_ms = anchor_unix_ms + now.as_millis().saturating_sub(anchor_internal_ms);
-            let start_ms = node.loading_start_unix_ms.get();
-            let done = node.loading_loaded_bytes.get();
-            let total = node.loading_total_bytes.get();
-            let elapsed_ms = wall_now_ms.saturating_sub(start_ms);
-            let perc = if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 };
-            let eta_s = if done > 0 {
-                let remaining = total.saturating_sub(done) as f64;
-                (elapsed_ms as f64 / 1000.0 * remaining / done as f64).ceil() as u64
-            } else {
-                0
-            };
-            push(&mut text, &format!("loading_start_time:{}", start_ms / 1000));
-            push(&mut text, &format!("loading_total_bytes:{total}"));
-            push(&mut text, &format!("loading_loaded_bytes:{done}"));
-            push(&mut text, &format!("loading_loaded_perc:{perc:.2}"));
-            push(&mut text, &format!("loading_eta_seconds:{eta_s}"));
-            // Extension fields (per-cell recovery is an InfinityDB shape).
-            push(&mut text, &format!("loading_cells_ready:{}", node.loading_cells_ready.get()));
-            push(&mut text, &format!("loading_cells:{}", node.cells.get()));
-        }
-        push(&mut text, "rdb_changes_since_last_save:0");
-        // M2-S20: BGSAVE maps onto the fuzzy checkpoint (no fork); the
-        // save time is the newest durable MANIFEST publication (board
-        // max across cells, unix seconds — the LASTSAVE currency).
-        push(&mut text, &format!("rdb_bgsave_in_progress:{}", node.ckpt_in_progress.get()));
-        push(&mut text, &format!("rdb_last_save_time:{}", node.rdb_last_save_ms.get() / 1000));
-        push(&mut text, "aof_enabled:0");
-        push(&mut text, "aof_rewrite_in_progress:0");
-        // Durable-namespace gauges (M2-S08, this cell's slice — the S21
-        // counter set; control-plane aggregation lands with S21).
-        push(&mut text, &format!("log_records_appended:{}", node.log_records_appended.get()));
-        push(&mut text, &format!("pending_log_bytes:{}", node.log_pending_bytes.get()));
-        push(&mut text, &format!("last_durable_lsn:{}", node.log_last_durable_lsn.get()));
-        push(&mut text, &format!("watermark_lag_lsn:{}", node.log_watermark_lag.get()));
-        push(&mut text, &format!("fsyncs_completed:{}", node.log_fsyncs_completed.get()));
-        push(&mut text, &format!("acks_gated:{}", node.log_acks_gated.get()));
-        // M2-S22: frames queued (log_writes_per_iter numerator) + the
-        // staging domain's resident bytes (attribution observable).
-        push(&mut text, &format!("log_frames_queued:{}", node.log_frames_queued.get()));
-        push(&mut text, &format!("log_staging_bytes:{}", node.log_staging_bytes.get()));
-        // Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
-        // instrument fix): the `would_fit` pre-check stages nothing, so
-        // only this counter records them.
-        push(&mut text, &format!("log_admission_busy:{}", node.log_admission_busy.get()));
-        // M2-S21: windowed rates (previous everysec tick window, injected
-        // clock) + fsync latency percentiles (HDR-class histogram, ~3%
-        // quantization — the §8.2 storage-bound honesty fields).
-        push(&mut text, &format!("fsyncs_per_sec:{}", node.fsyncs_per_sec.get()));
-        push(&mut text, &format!("acks_per_sec:{}", node.acks_per_sec.get()));
-        push(&mut text, &format!("fsync_latency_p50_us:{}", node.fsync_p50_us.get()));
-        push(&mut text, &format!("fsync_latency_p99_us:{}", node.fsync_p99_us.get()));
-        push(&mut text, &format!("fsync_latency_p999_us:{}", node.fsync_p999_us.get()));
-        // M2.5-S07: group formation — records covered per durability
-        // fsync (the >= 0.8x available-in-flight-writes gate observable).
-        push(&mut text, &format!("fsync_group_p50:{}", node.fsync_group_p50.get()));
-        push(&mut text, &format!("fsync_group_p99:{}", node.fsync_group_p99.get()));
-        // Fuzzy-checkpoint gauges (M2-S10; `ckpt_age_s` derives at S21).
-        push(&mut text, &format!("ckpts_completed:{}", node.ckpts_completed.get()));
-        push(&mut text, &format!("ckpts_aborted:{}", node.ckpts_aborted.get()));
-        push(&mut text, &format!("ckpt_last_unix_ms:{}", node.ckpt_last_unix_ms.get()));
-        push(&mut text, &format!("ckpt_last_begin_lsn:{}", node.ckpt_last_begin_lsn.get()));
-        push(&mut text, &format!("ckpt_buffer_bytes:{}", node.ckpt_buffer_bytes.get()));
-        push(&mut text, &format!("ckpt_age_s:{}", node.ckpt_age_s.get()));
-        // MANIFEST + truncation gauges (M2-S11 — the reclamation-bound
-        // observables: live segments stay bounded once truncation runs).
-        push(&mut text, &format!("manifests_published:{}", node.manifests_published.get()));
-        push(&mut text, &format!("manifests_aborted:{}", node.manifests_aborted.get()));
-        push(&mut text, &format!("segments_truncated:{}", node.segments_truncated.get()));
-        push(&mut text, &format!("log_segments_live:{}", node.log_segments_live.get()));
-        text.push_str("\r\n");
-    }
-    if wants("tiering") {
-        tiering_section(ks, node, &mut text);
-    }
-    let stats = ks.stats();
-    if wants("stats") {
-        let [_, _, _, _, commands, _] = node.raw_counters.get();
-        push(&mut text, "# Stats");
-        push(&mut text, &format!("total_connections_received:{}", node.total_connections.get()));
-        push(&mut text, &format!("total_commands_processed:{commands}"));
-        push(&mut text, "instantaneous_ops_per_sec:0");
-        push(&mut text, "rejected_connections:0");
-        push(&mut text, &format!("expired_keys:{}", stats.expired_lazy + stats.expired_active));
-        push(&mut text, &format!("expired_active:{}", stats.expired_active));
-        push(&mut text, &format!("expired_lazy:{}", stats.expired_lazy));
-        push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
-        push(&mut text, &format!("keyspace_hits:{}", stats.keyspace_hits));
-        push(&mut text, &format!("keyspace_misses:{}", stats.keyspace_misses));
-        // M3-S10: per-cell path-program cache (extension fields).
-        #[cfg(feature = "doc")]
-        {
-            let cache = node.path_cache.borrow();
-            push(&mut text, &format!("path_cache_hits:{}", cache.hits()));
-            push(&mut text, &format!("path_cache_misses:{}", cache.misses()));
-            push(&mut text, &format!("path_cache_evictions:{}", cache.evictions()));
-        }
-        push(&mut text, &format!("pubsub_channels:{}", node.pubsub_channels.get()));
-        push(&mut text, &format!("pubsub_patterns:{}", node.pubsub_patterns.get()));
-        push(
-            &mut text,
-            &format!("client_output_buffer_limit_disconnections:{}", node.cob_disconnections.get()),
-        );
-        push(&mut text, "latest_fork_usec:0");
-        text.push_str("\r\n");
-    }
-    if wants("replication") {
-        push(&mut text, "# Replication");
-        push(&mut text, "role:master");
-        push(&mut text, "connected_slaves:0");
-        push(&mut text, "master_failover_state:no-failover");
-        push(&mut text, &format!("master_replid:{:040x}", node.rng_state.get()));
-        push(&mut text, "master_repl_offset:0");
-        text.push_str("\r\n");
-    }
-    if wants("cpu") {
-        let (sys, user) = process_cpu_secs();
-        push(&mut text, "# CPU");
-        push(&mut text, &format!("used_cpu_sys:{sys:.6}"));
-        push(&mut text, &format!("used_cpu_user:{user:.6}"));
-        text.push_str("\r\n");
-    }
-    if wants("tripwires") {
-        use inf_foundation::tripwire as tw;
-        let [sqes, cqes, cmds, fabric, p999] = node.tripwires.get();
-        push(&mut text, "# Tripwires");
-        push(&mut text, &format!("{}:{sqes}", tw::SQES_PER_SUBMIT));
-        push(&mut text, &format!("{}:{cqes}", tw::CQES_PER_REAP));
-        push(&mut text, &format!("{}:{cmds}", tw::CMDS_PER_ITER));
-        push(&mut text, &format!("{}:{fabric}", tw::FABRIC_MSGS_PER_BATCH));
-        push(&mut text, &format!("{}:{p999}", tw::LOOP_ITER_P999_US));
-        push(&mut text, &format!("fabric_rtt_p50_ns:{}", node.fabric_rtt_p50_ns.get()));
-        push(&mut text, &format!("recv_dropped:{}", node.recv_dropped.get()));
-        let [submits, raw_sqes, raw_cqes, iters, commands, fabric_msgs] = node.raw_counters.get();
-        push(&mut text, &format!("raw_submits:{submits}"));
-        push(&mut text, &format!("raw_sqes:{raw_sqes}"));
-        push(&mut text, &format!("raw_cqes:{raw_cqes}"));
-        push(&mut text, &format!("raw_iterations:{iters}"));
-        push(&mut text, &format!("raw_commands:{commands}"));
-        push(&mut text, &format!("raw_fabric_msgs:{fabric_msgs}"));
-        push(&mut text, &format!("{}:{}", tw::RECORDS_LIVE_BYTES, report.records_live_bytes));
-        push(&mut text, &format!("{}:{}", tw::RECORDS_SLACK_BYTES, report.records_slack_bytes));
-        push(&mut text, &format!("records_resident_bytes:{}", report.records_resident_bytes));
-        push(&mut text, &format!("{}:{}", tw::INDEX_BYTES, report.index_bytes));
-        push(&mut text, &format!("{}:{}", tw::WHEEL_BYTES, report.wheel_bytes));
-        push(&mut text, &format!("{}:{}", tw::EVICT_BYTES, report.evict_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_TAPE_BYTES, report.doc_tape_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_ARENA_BYTES, report.doc_arena_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_RESIDENT_BYTES, report.doc_resident_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_INTERN_BYTES, report.doc_intern_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_SLACK_BYTES, report.doc_slack_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_SCRATCH_BYTES, report.doc_scratch_bytes));
-        push(&mut text, &format!("{}:{}", tw::DOC_PATH_CACHE_BYTES, report.doc_path_cache_bytes));
-        push(&mut text, &format!("wheel_fallback:{}", stats.wheel_fallback));
-        push(&mut text, &format!("wheel_stale:{}", stats.wheel_stale));
-        push(&mut text, &format!("evicted_keys:{}", stats.evicted_keys));
-        push(&mut text, &format!("pubsub_fan_msgs:{}", node.pubsub_fan_msgs.get()));
-        push(&mut text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
-        push(&mut text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
-        push(&mut text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
-        push(&mut text, &format!("{}:{}", tw::CONN_STATE_BYTES, node.conn_state_bytes.get()));
-        // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):
-        // the reply/command pools were the last unattributed malloc
-        // consumers — the warm-up-grower hypothesis instrument, read
-        // against `process_rss` over a soak.
-        push(&mut text, &format!("reply_pool_bytes:{}", node.reply_pool_bytes.get()));
-        push(&mut text, &format!("cmd_pool_bytes:{}", node.cmd_pool_bytes.get()));
-        push(&mut text, &format!("cold_pool_bytes:{}", node.cold_pool_bytes.get()));
-        push(&mut text, &format!("{}:{}", tw::PROCESS_RSS, process_rss_bytes()));
-        text.push_str("\r\n");
-    }
-    if wants("keyspace") {
-        push(&mut text, "# Keyspace");
-        // One line per non-empty database (Redis shape) — per-ns numbers
-        // reconcile with the aggregated sections above (M1-S09).
-        for (db, store) in ks.dbs() {
-            if !store.is_empty() {
-                push(
-                    &mut text,
-                    &format!(
-                        "db{db}:keys={},expires={},avg_ttl=0",
-                        store.len(),
-                        store.stats().ttl_live
-                    ),
-                );
-            }
-        }
-        text.push_str("\r\n");
-    }
-    // Redis ends INFO without the final blank line duplicated.
-    while text.ends_with("\r\n\r\n") {
-        text.truncate(text.len() - 2);
-    }
-    w.verbatim(b"txt", text.as_bytes());
-}
-
-/// `INFO tiering` — this cell's slice of the M4 tiered-storage surface.
-///
-/// Two shapes, deliberately: cell-aggregate `tiering_*` fields (the
-/// §3.3 degenerate-case contract — on a node with no durable-tiered
-/// namespace **every one of them is identically zero**, which the
-/// `inf-bench` m4 rows assert as a release blocker), and one
-/// `tiering_ns<id>:` line per tiered namespace carrying the watermarks,
-/// the budget, the M4-S13 write counters, and the M4-S16 write
-/// amplification. Per-namespace is not a nicety: a blended node-wide
-/// number hides a runaway tiered namespace behind a quiet one, which is
-/// why the ratio is per namespace and the only aggregate of it is a
-/// maximum.
-///
-/// The operator's reading of every field is
-/// `infinitydb/docs/ops-tiered-storage.md` — that chapter and this
-/// function are edited together.
-fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
-    let push = |text: &mut String, line: &str| {
-        text.push_str(line);
-        text.push_str("\r\n");
-    };
-    // M4-S03: tiering code-path counters (this cell's slice).
-    let tiering = ks.tiering_counters();
-    push(text, "# Tiering");
-    push(text, &format!("tiering_tables:{}", ks.tiered_tables()));
-    // M4-S26 (ADR-0064 D3): the pinned `SPLIT_FIELDS` contract — the
-    // resolver-tagged service percentiles the S22 harness scrapes — plus
-    // the five ADR-0055 cold-read counters. Flushed by the tiered
-    // MAINTAIN; identically zero on nodes with no tiered namespace. The
-    // ram-hit half renders absent while tiered is live — see the branch.
-    let split = node.tiering_split.get();
-    if ks.tiered_tables() == 0 {
-        // Degenerate contract (§3.3): every field literal zero.
-        push(text, &format!("tiering_ram_hit_p50_us:{}", split[0]));
-        push(text, &format!("tiering_ram_hit_p99_us:{}", split[1]));
-        push(text, &format!("tiering_ram_hit_p999_us:{}", split[2]));
-    } else {
-        // The ram-hit lane records on the loop clock, which is frozen
-        // per reactor iteration — a command that never suspends reads
-        // 0 µs whatever its true service time. Rendering those zeros
-        // would let the M4 §7 hot-set gate "pass" on an instrument with
-        // no discriminating power, so the percentile fields go absent
-        // (refuse/absent over silent zero) and this named line keeps
-        // the absence loud. The S22 harness refuses a tiered row that
-        // misses a SPLIT_FIELDS entry — by design, until a finer
-        // injected clock exists (v0.4.0-alpha instrument fix).
-        push(text, "tiering_ram_hit_split:unmeasured-iteration-clock");
-    }
-    push(text, &format!("tiering_cold_p50_us:{}", split[3]));
-    push(text, &format!("tiering_cold_p99_us:{}", split[4]));
-    push(text, &format!("tiering_cold_p999_us:{}", split[5]));
-    push(text, &format!("cold_read_qd_p99:{}", split[6]));
-    push(text, &format!("coalesce_ratio_milli:{}", split[7]));
-    push(text, &format!("cold_reads_inflight:{}", split[8]));
-    push(text, &format!("cold_queue_depth:{}", split[9]));
-    push(text, &format!("cold_read_p99_us:{}", split[10]));
-    push(text, &format!("cold_reads_issued:{}", split[11]));
-    push(text, &format!("cold_reads_enqueued:{}", split[12]));
-    // Pool-sizing stalls + typed enqueue refusals (v0.4.0-alpha
-    // instrument fix — invisible in soak artifacts until now).
-    push(text, &format!("cold_pool_dry:{}", split[13]));
-    push(text, &format!("cold_queue_full:{}", split[14]));
-    push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
-    push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
-    push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));
-    push(text, &format!("tiering_region_commit_pages:{}", tiering.region_commit_pages));
-    push(text, &format!("tiering_region_decommit_pages:{}", tiering.region_decommit_pages));
-    push(text, &format!("tiering_cold_resolves:{}", tiering.cold_resolves));
-    // M4-S07: demotion + backpressure counters and the L5 usage
-    // attribution — same zero-in-memory-mode contract as above.
-    push(text, &format!("tiering_tail_alloc_stalls:{}", tiering.tail_alloc_stalls));
-    push(text, &format!("tiering_demote_slices:{}", tiering.demote_slices));
-    push(text, &format!("tiering_demote_sealed_bytes:{}", tiering.demote_sealed_bytes));
-    // M4-S11: flush-pipeline counters — same zero contract.
-    push(text, &format!("tiering_flush_slices:{}", tiering.flush_slices));
-    push(text, &format!("tiering_flush_confirmed_bytes:{}", tiering.flush_confirmed_bytes));
-    // M4-S15: copy-forward slices — same zero contract.
-    push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
-    let usage = ks.tiering_usage();
-    push(text, &format!("tiering_reserved_bytes:{}", usage.reserved_bytes));
-    push(text, &format!("tiering_committed_bytes:{}", usage.committed_bytes));
-    push(text, &format!("tiering_allocated_bytes:{}", usage.allocated_bytes));
-    push(text, &format!("tiering_dead_bytes:{}", usage.dead_bytes));
-    push(text, &format!("tiering_live_bytes:{}", usage.live_bytes));
-    push(text, &format!("tiering_index_bytes:{}", usage.index_bytes));
-    // M4-S13 write-path accounting: cell totals, then the per-namespace
-    // lines they are the exact field-wise sum of. `written_bytes` is the
-    // write-amp numerator (WAL + flush — M4-S16/ADR-0060 D2: the
-    // relocation volume in `compaction_bytes` reaches the device through
-    // the flush leg and is not added again).
-    let write = ks.tiering_write_accounting();
-    push(text, &format!("tiering_user_bytes:{}", write.user_bytes));
-    push(text, &format!("tiering_wal_bytes:{}", write.wal_bytes));
-    push(text, &format!("tiering_flush_bytes:{}", write.flush_bytes));
-    push(text, &format!("tiering_compaction_bytes:{}", write.compaction_bytes));
-    push(text, &format!("tiering_written_bytes:{}", write.written_bytes()));
-    // M4-S16 write amplification: the **worst** namespace, plus the count
-    // of namespaces that wrote bytes while admitting none (unbounded — a
-    // gate must not read those as a pass, and no maximum over the others
-    // describes them). Never a blended cell-wide ratio: that is the shape
-    // that hides one runaway namespace behind a quiet one.
-    let amp = ks.tiering_write_amp();
-    push(text, &format!("tiering_write_amp_milli_max:{}", amp.milli_max));
-    push(text, &format!("tiering_write_amp_undefined_ns:{}", amp.unbounded_namespaces));
-    // M4-S17 blob extents (ADR-0061 D8): the disjoint device leg and the
-    // extent lifecycle observables — same zero contract.
-    push(text, &format!("tiering_blob_user_bytes:{}", write.blob_user_bytes));
-    push(text, &format!("tiering_blob_bytes:{}", write.blob_bytes));
-    // M4-S18: the blob leg's own worst-namespace ratio — never blended
-    // into the record ratio above (a byte is written once and counted in
-    // exactly one leg), and never blended across namespaces either.
-    let blob_amp = ks.tiering_blob_write_amp();
-    push(text, &format!("tiering_blob_write_amp_milli_max:{}", blob_amp.milli_max));
-    push(text, &format!("tiering_blob_write_amp_undefined_ns:{}", blob_amp.unbounded_namespaces));
-    let extents = ks.tiering_extent_stats();
-    push(text, &format!("tiering_blob_extents_live:{}", extents.live));
-    push(text, &format!("tiering_blob_extent_bytes_live:{}", extents.live_bytes));
-    push(text, &format!("tiering_blob_extents_created:{}", extents.created));
-    push(text, &format!("tiering_blob_extents_reclaimed:{}", extents.reclaimed));
-    // M4-S18 reclaim visibility: the standing backlog (parked + stamped +
-    // handed out) and the non-fatal unlink deferrals — both zero at
-    // quiescence, which is exactly what the leak test asserts.
-    push(text, &format!("tiering_blob_reclaimable:{}", extents.reclaimable));
-    push(text, &format!("tiering_blob_reclaim_deferred:{}", extents.reclaim_deferred));
-    push(text, &format!("tiering_blob_reclaim_slices:{}", extents.reclaim_slices));
-    push(text, &format!("tiering_blob_rmw_ops:{}", extents.rmw_ops));
-    // M4-S19 (ADR-0062 D5): extent device bytes on disk right now — the
-    // blob half of every namespace's disk usage (the tier-file half is
-    // plane state and joins with the wiring).
-    push(text, &format!("tiering_blob_disk_bytes:{}", extents.disk_bytes));
-    // M4-S21 (ADR-0063 D5): disk-admission observables — namespaces
-    // currently refusing, typed refusals issued, the
-    // nothing-compactable-under-pressure alarm, and the enforced
-    // `disk_used` snapshots. Same zero contract.
-    let disk = ks.tiering_disk_admission();
-    push(text, &format!("tiering_diskfull_ns:{}", disk.full_namespaces));
-    push(text, &format!("tiering_diskfull_refusals:{}", disk.refusals));
-    push(text, &format!("tiering_compact_idle_pressure:{}", disk.compact_idle_pressure));
-    push(text, &format!("tiering_disk_used_bytes:{}", disk.used_bytes));
-    for (ns, table) in ks.tiered_namespaces() {
-        let space = table.space();
-        let report = space.report();
-        let write = table.write_accounting();
-        push(
-            text,
-            &format!(
-                "tiering_ns{}:head={},flushed={},ro_boundary={},tail={},committed_bytes={},\
-                 budget_bytes={},disk_budget_bytes={},mutable_permille={},live_bytes={},\
-                 dead_bytes={},user_bytes={},wal_bytes={},flush_bytes={},compaction_bytes={},\
-                 write_amp_milli={},blob_user_bytes={},blob_bytes={},blob_write_amp_milli={},\
-                 blob_extents_live={},blob_disk_bytes={},disk_used_bytes={},disk_full={},\
-                 diskfull_refusals={},compact_idle_pressure={}",
-                ns.0,
-                space.head().to_raw(),
-                space.flushed().to_raw(),
-                space.ro_boundary().to_raw(),
-                space.tail().to_raw(),
-                report.committed_bytes,
-                table.demotion().mem_budget_bytes,
-                table.disk_budget(),
-                table.demotion().mutable_permille,
-                table.live_bytes(),
-                report.dead_bytes,
-                write.user_bytes,
-                write.wal_bytes,
-                write.flush_bytes,
-                write.compaction_bytes,
-                write.write_amplification(),
-                write.blob_user_bytes,
-                write.blob_bytes,
-                write.blob_write_amplification(),
-                table.extent_stats().live,
-                table.extent_stats().disk_bytes,
-                table.disk_admission_used(),
-                // M4-S21 (ADR-0063 D5): which admission leg is refusing.
-                match table.disk_full() {
-                    None => "none",
-                    Some(inf_store::DiskFullCause::Budget { .. }) => "budget",
-                    Some(inf_store::DiskFullCause::Device) => "device",
-                },
-                table.diskfull_refusals(),
-                table.compact_idle_pressure(),
-            ),
-        );
-    }
-    text.push_str("\r\n");
-}
-
-/// VmRSS from procfs (Linux); 0 where unavailable.
-fn process_rss_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-        })
-        .map_or(0, |kb| kb * 1024)
-}
-
-/// (sys, user) CPU seconds from `/proc/self/stat` (USER_HZ=100 assumption,
-/// dev-tier; zeros where unavailable).
-fn process_cpu_secs() -> (f64, f64) {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return (0.0, 0.0);
-    };
-    // Split after the parenthesised comm; utime/stime are overall fields
-    // 14/15 → indices 11/12 of the remainder (state is index 0).
-    let Some((_, after)) = stat.rsplit_once(')') else { return (0.0, 0.0) };
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    let utime: f64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let stime: f64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    (stime / 100.0, utime / 100.0)
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: &[(&str, u64)] = &[("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)];
-    for (suffix, scale) in UNITS {
-        if bytes >= *scale {
-            return format!("{:.2}{suffix}", bytes as f64 / *scale as f64);
-        }
-    }
-    format!("{bytes}B")
-}
-
 // ---- COMMAND -----------------------------------------------------------------
 
 pub(crate) fn command_introspection(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
+    // ADR-0115: `INTERNAL` rows are not a client surface — absent from
+    // every COMMAND form, exactly as Redis hides its internal commands.
+    let visible = || inf_wire::COMMANDS.iter().filter(|m| !m.flags.contains(CmdFlags::INTERNAL));
     if argv.len() == 1 {
-        w.array_header(inf_wire::COMMANDS.len());
-        for meta in &inf_wire::COMMANDS {
+        w.array_header(visible().count());
+        for meta in visible() {
             command_row(meta, w);
         }
         return;
     }
     let sub = argv.arg(1);
     if sub.eq_ignore_ascii_case(b"COUNT") {
-        w.int(inf_wire::COMMANDS.len() as i64);
+        w.int(visible().count() as i64);
     } else if sub.eq_ignore_ascii_case(b"INFO") {
         w.array_header(argv.len() - 2);
         for i in 2..argv.len() {
             match inf_wire::lookup(argv.arg(i)) {
-                Some(meta) => command_row(meta, w),
-                None => w.null_array(),
+                Some(meta) if !meta.flags.contains(CmdFlags::INTERNAL) => command_row(meta, w),
+                // A null bulk, as Redis answers an unknown name (oracle:
+                // `COMMAND INFO nosuch` → `$-1`; found by the ADR-0115 lane).
+                _ => w.null(),
             }
         }
     } else if sub.eq_ignore_ascii_case(b"DOCS") {
@@ -695,13 +146,19 @@ fn command_getkeys(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
             "ERR Unknown subcommand or wrong number of arguments for 'GETKEYS'. Try COMMAND HELP.",
         );
     }
-    let Some(meta) = inf_wire::lookup(argv.arg(2)) else {
+    let Some(meta) =
+        inf_wire::lookup(argv.arg(2)).filter(|m| !m.flags.contains(CmdFlags::INTERNAL))
+    else {
         return w.error("ERR Invalid command specified");
     };
     if !inf_wire::arity_ok(meta, argv.len() - 2) {
         return w.error("ERR Invalid number of arguments specified for command");
     }
-    let spec = meta.keys;
+    // The routing truth, subcommand-aware (ADR-0104): `GETKEYS DEBUG OBJECT
+    // k` answers `k` where Redis's keyless table says "no key arguments" —
+    // the recorded deviation; introspection that hid the key the router
+    // reads would misreport the engine.
+    let spec = inf_wire::key_spec(meta, (argv.len() > 3).then(|| argv.arg(3)));
     if spec.first == 0 {
         return w.error("ERR The command has no key arguments");
     }
@@ -755,30 +212,60 @@ pub(crate) fn config(
                 "ERR Unknown subcommand or wrong number of arguments for 'SET'. Try CONFIG HELP.",
             );
         }
-        // Validate every pair before applying any (Redis 7 all-or-nothing).
+        // Validate every pair before applying any (Redis 7 all-or-nothing,
+        // oracle-verified on 8.0.5). Review of 2026-08-30 (H1 / F-L17-12,
+        // ADR-0098): the pre-fix loop applied while validating, so an
+        // error reply left earlier pairs live on this cell only — the
+        // plane's "error short-circuits the fan-out" rule depends on an
+        // error implying zero local mutation.
+        let mut cfg = node.config.borrow_mut();
+        let mut validated: Vec<ValidatedSet> = Vec::with_capacity((argv.len() - 2) / 2);
         let mut i = 2;
         while i < argv.len() {
-            let outcome = node.config.borrow_mut().set(argv.arg(i), argv.arg(i + 1));
-            match outcome {
-                Ok(_) => {}
+            match cfg.validate(argv.arg(i), argv.arg(i + 1)) {
+                Ok(pair) => {
+                    // Redis refuses duplicate parameters, case-insensitive,
+                    // echoing the second occurrence's raw client spelling
+                    // (oracle-measured 8.0.5 — the corpus diff caught the
+                    // canonical-name guess).
+                    let key = pair.key(&cfg);
+                    if validated.iter().any(|p| p.key(&cfg) == key) {
+                        drop(cfg);
+                        let mut text =
+                            b"ERR CONFIG SET failed (possibly related to argument '".to_vec();
+                        text.extend_from_slice(argv.arg(i));
+                        text.extend_from_slice(b"') - duplicate parameter");
+                        return w.error_bytes(&text);
+                    }
+                    validated.push(pair);
+                }
                 Err(ConfigSetError::Unknown(key)) => {
+                    drop(cfg);
                     return w.error(&format!(
                         "ERR Unknown option or number of arguments for CONFIG SET - '{key}'"
                     ));
                 }
                 Err(ConfigSetError::Immutable(key)) => {
+                    drop(cfg);
                     return w.error(&format!(
-                        "ERR CONFIG SET failed (possibly related to argument '{key}') - can't set immutable config"
+                        "ERR CONFIG SET failed (possibly related to argument '{key}') - can't set \
+                             immutable config"
                     ));
                 }
                 Err(ConfigSetError::Invalid { key, value }) => {
+                    drop(cfg);
                     return w.error(&format!(
-                        "ERR CONFIG SET failed (possibly related to argument '{key}') - invalid value '{value}'"
+                        "ERR CONFIG SET failed (possibly related to argument '{key}') - invalid \
+                             value '{value}'"
                     ));
                 }
             }
             i += 2;
         }
+        for pair in validated {
+            cfg.apply(pair);
+        }
+        drop(cfg);
         // hot-per-cell (M1-S03 freeze): the executing cell applies its
         // pressure config immediately; peers apply on the scatter leg, and
         // the MAINTAIN version sweep covers boot-time mutation.
@@ -816,14 +303,31 @@ pub(crate) fn push_pressure(ks: &mut Keyspace, node: &NodeInfo) {
         .get("tiered-reserved-va-limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(inf_store::TIERED_VA_LIMIT_DEFAULT);
+    // M4.5-S30 (ADR-0085 D6): promotion admission rides the same
+    // hot-per-cell sweep — a boolean, so no per-cell division.
+    let promote = cfg.get("tiered-promote-on-read").is_none_or(|v| v != "no");
+    // M4.5-S37 (ADR-0093 D8): the shadow arm rides the same sweep;
+    // absent or anything but `yes` is off (the shipping default).
+    let shadow = cfg.get("tiered-shadow-overwrite").is_some_and(|v| v == "yes");
+    // ADR-0093 A8: the reconciler runs unless paused (`no`); absent is on.
+    let reconcile = cfg.get("tiered-shadow-reconcile").is_none_or(|v| v != "no");
     drop(cfg);
     let cells = u64::from(node.cells.get().max(1));
     // Per-namespace MAXMEMORY shares divide by the same symmetric cell
     // count (M4-S27, ADR-0068 D2) — pushed before the pressure config so
     // the flag recompute inside `set_pressure` sees current shares.
     ks.set_budget_shares(cells);
-    ks.set_pressure(PressureConfig { limit_bytes: maxmemory / cells, policy, samples });
-    ks.set_tiered_va_limit(va_limit / cells);
+    // A configured nonzero bound must stay nonzero per cell: `0` is the
+    // "no limit" sentinel, so flooring `maxmemory < cells` to 0 would
+    // silently turn memory protection OFF on every multi-cell node — the
+    // per-namespace fan (`ns_budget_share`) guards with `.max(1)`; this is
+    // the same rule applied to the global class.
+    let cell_share = |bound: u64| if bound == 0 { 0 } else { (bound / cells).max(1) };
+    ks.set_pressure(PressureConfig { limit_bytes: cell_share(maxmemory), policy, samples });
+    ks.set_tiered_va_limit(cell_share(va_limit));
+    ks.set_tier_promote(promote);
+    ks.set_tier_shadow(shadow);
+    ks.set_tier_shadow_reconcile(reconcile);
 }
 
 // ---- INF.NS (M1-S08) -----------------------------------------------------------
@@ -842,6 +346,7 @@ pub(crate) fn inf_ns(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     node: &NodeInfo,
+    now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
     let sub = argv.arg(1);
@@ -872,8 +377,9 @@ pub(crate) fn inf_ns(
         // `USE dbN` is SELECT symmetry: back to the default namespace.
         if let Some(db) = default_db_index(name) {
             cx.db = db as u16;
-            cx.ns = None;
+            cx.ns = crate::exec::ConnNamespace::Default;
             let _ = ks.db_mut(db);
+            cx.publish_client_state(now);
             return w.simple("OK");
         }
         let Some(spec) = ks.ns_get(name) else {
@@ -887,7 +393,7 @@ pub(crate) fn inf_ns(
         // plane is wired (exec routing, cold-read suspension, WAL
         // staging with displacement origins, recovery composition).
         // `USE` of a tiered namespace now routes to the tiered arm.
-        cx.ns = Some(spec.id);
+        cx.ns = crate::exec::ConnNamespace::Named(spec.id);
         w.simple("OK")
     } else if sub.eq_ignore_ascii_case(b"SET") {
         // Planeless arm (unit tests, embedded); on a node the pump's DDL
@@ -907,7 +413,7 @@ pub(crate) fn inf_ns(
             return arity_error("INF.NS|DROP", w);
         }
         match ks.ns_drop(argv.arg(2)) {
-            Ok(()) => w.simple("OK"),
+            Ok(_) => w.simple("OK"),
             Err(e) => ns_error(e, w),
         }
     } else if sub.eq_ignore_ascii_case(b"LIST") {
@@ -1004,7 +510,8 @@ pub(crate) fn inf_ns(
         }
     } else {
         w.error(&format!(
-            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS CREATE|SET|USE|LIST|INFO|DROP.",
+            "ERR Unknown subcommand or wrong number of arguments for '{}'. Try INF.NS \
+                 CREATE|SET|USE|LIST|INFO|DROP.",
             String::from_utf8_lossy(sub)
         ));
     }
@@ -1246,6 +753,7 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
         tier: None,
     };
     let mut saw_mem_budget = false;
+    let mut saw_blob_threshold = false;
     let mut i = 3;
     while i < argv.len() {
         let opt = argv.arg(i);
@@ -1279,7 +787,8 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
                     .ok_or("ERR invalid MAXMEMORY value")?,
             );
         } else if let Some(applied) = parse_tier_key(&mut draft.tier, opt, value)? {
-            saw_mem_budget |= applied;
+            saw_mem_budget |= applied == TierKey::MemBudget;
+            saw_blob_threshold |= applied == TierKey::BlobThreshold;
         } else {
             return Err("ERR syntax error".to_string());
         }
@@ -1290,18 +799,34 @@ pub(crate) fn parse_ns_create(argv: &(impl Argv + ?Sized)) -> Result<NsSpecDraft
                     ADR-0062 D1)"
             .to_string());
     }
+    // ADR-0102 D2: an absent BLOB-THRESHOLD derives from the ring the
+    // budget reserves (the accumulator started at budget 0, so the
+    // derivation must run once every key is in); an explicit one is
+    // honoured or refused by the gauntlet, never clamped.
+    if !saw_blob_threshold && let Some(tier) = draft.tier.as_mut() {
+        *tier = tier.with_default_blob_threshold();
+    }
     Ok(draft)
+}
+
+/// Which tier key [`parse_tier_key`] applied — the two the parser's
+/// post-loop rules key on.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TierKey {
+    MemBudget,
+    BlobThreshold,
+    Other,
 }
 
 /// One tier key applied onto an accumulating [`TierSpec`] (ADR-0062 D2
 /// vocabulary; ranges validate at registration through
 /// `TierSpec::validate` — one gauntlet, not two). Returns `Ok(None)` for
-/// a non-tier key, `Ok(Some(is_mem_budget))` when applied.
+/// a non-tier key, `Ok(Some(which))` when applied.
 fn parse_tier_key(
     tier: &mut Option<TierSpec>,
     opt: &[u8],
     value: &[u8],
-) -> Result<Option<bool>, String> {
+) -> Result<Option<TierKey>, String> {
     let memory = |value: &[u8], key: &str| {
         core::str::from_utf8(value)
             .ok()
@@ -1331,7 +856,7 @@ fn parse_tier_key(
     match key.as_slice() {
         b"MEM-BUDGET" => {
             spec.mem_budget_bytes = memory(value, "MEM-BUDGET")?;
-            return Ok(Some(true));
+            return Ok(Some(TierKey::MemBudget));
         }
         b"DISK-BUDGET" => spec.disk_budget_bytes = memory(value, "DISK-BUDGET")?,
         b"MUTABLE-FRACTION" => {
@@ -1351,6 +876,7 @@ fn parse_tier_key(
         b"BLOB-THRESHOLD" => {
             spec.blob_threshold_bytes = u32::try_from(memory(value, "BLOB-THRESHOLD")?)
                 .map_err(|_| "ERR invalid BLOB-THRESHOLD value")?;
+            return Ok(Some(TierKey::BlobThreshold));
         }
         b"TIER-IO-MODE" => {
             spec.tier_io_mode = match value.to_ascii_lowercase().as_slice() {
@@ -1365,7 +891,7 @@ fn parse_tier_key(
         }
         _ => unreachable!("membership matched above"),
     }
-    Ok(Some(false))
+    Ok(Some(TierKey::Other))
 }
 
 /// Planeless-tier id allocation: past the registered maximum, floor 16.
@@ -1521,7 +1047,7 @@ pub(crate) fn debug(
 mod tests {
     use super::*;
     use crate::exec::execute;
-    use inf_store::StoreConfig;
+    use inf_store::{EvictionPolicy, SetExpire, SetOptions, StoreConfig};
     use inf_wire::{ConnParser, Parsed, ParserLimits};
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
@@ -1539,9 +1065,29 @@ mod tests {
         out
     }
 
+    /// Review 2026-09-01 (INFINITYD_BIN compat lane): the per-cell fan of
+    /// a configured nonzero bound must never floor to the `0` "no limit"
+    /// sentinel — `maxmemory 1` on a 4-cell node turned memory
+    /// protection OFF on every cell while the single-cell path (and the
+    /// redis oracle) refused writes with -OOM. Red pre-fix.
+    #[test]
+    fn nonzero_maxmemory_never_fans_to_the_unlimited_sentinel() {
+        let node = NodeInfo::try_default().expect("fixture cache allocation");
+        node.cells.set(4);
+        let mut ks = Keyspace::new(StoreConfig::default());
+        for (configured, per_cell) in [(1u64, 1u64), (2, 1), (5, 1), (100, 25), (0, 0)] {
+            node.config
+                .borrow_mut()
+                .set(b"maxmemory", configured.to_string().as_bytes())
+                .expect("valid maxmemory");
+            push_pressure(&mut ks, &node);
+            assert_eq!(ks.pressure().limit_bytes, per_cell, "maxmemory {configured} on 4 cells");
+        }
+    }
+
     #[test]
     fn config_get_set_roundtrip() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut store, &[b"CONFIG", b"GET", b"maxmemory"]),
@@ -1559,9 +1105,292 @@ mod tests {
         assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
     }
 
+    /// Review of 2026-08-30 (H1 / F-L17-12, ADR-0098): `CONFIG SET` is
+    /// all-or-nothing (Redis 7 multi-pair semantics, oracle-verified
+    /// 2026-09-01 on redis-server 8.0.5) — an erroring pair leaves every
+    /// other pair unapplied. Pre-fix the loop applied while validating,
+    /// so `maxmemory` here stuck at 104857600 while the reply was `-ERR`.
+    #[test]
+    fn config_set_error_applies_nothing() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        // Valid pair, then an immutable pair.
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"100mb", b"databases", b"32"],
+        );
+        assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
+        assert_eq!(
+            cx.node.config.borrow().get("maxmemory"),
+            Some("0"),
+            "a valid earlier pair must not apply when a later pair fails"
+        );
+        // Valid pair, then an invalid value.
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"timeout", b"7", b"maxmemory-policy", b"bogus"],
+        );
+        assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{reply:?}");
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("0"));
+        // Valid pair, then an unknown key (the Unknown error shape wins).
+        let reply = run(&mut cx, &mut store, &[b"CONFIG", b"SET", b"timeout", b"7", b"nope", b"1"]);
+        assert!(reply.starts_with(b"-ERR Unknown option"), "{reply:?}");
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("0"));
+        // Duplicate parameter (case-insensitive) is refused with nothing
+        // applied, echoing the second occurrence's raw spelling — both
+        // measured on redis-server 8.0.5 (the compat corpus byte-diffs
+        // the uppercase-echo shape too).
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"MAXMEMORY", b"1mb", b"maxmemory", b"2mb"],
+        );
+        assert_eq!(
+            reply,
+            b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory') - duplicate \
+                 parameter\r\n"
+        );
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("0"));
+        let reply = run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1mb", b"MAXMEMORY", b"2mb"],
+        );
+        assert_eq!(
+            reply,
+            b"-ERR CONFIG SET failed (possibly related to argument 'MAXMEMORY') - duplicate \
+                 parameter\r\n"
+        );
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("0"));
+        // A fully valid multi-pair command still applies whole.
+        let reply =
+            run(&mut cx, &mut store, &[b"CONFIG", b"SET", b"maxmemory", b"4mb", b"timeout", b"9"]);
+        assert_eq!(reply, b"+OK\r\n");
+        assert_eq!(cx.node.config.borrow().get("maxmemory"), Some("4194304"));
+        assert_eq!(cx.node.config.borrow().get("timeout"), Some("9"));
+    }
+
+    /// Batch 45 (review 2026-08-30, F-L15-06): one `INFO` reply names every
+    /// field once. Pre-fix nine attribution names rendered twice — the
+    /// node fold in `# Memory`, this cell's slice in `# Tripwires` — and a
+    /// flat-map parser (every client library, `inf-bench`'s own scrape)
+    /// kept whichever section came last.
+    #[test]
+    fn info_all_names_every_field_once() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for line in all.lines().skip(1) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (name, _) = line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+            *seen.entry(name).or_default() += 1;
+        }
+        let twice: Vec<&str> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+        assert!(twice.is_empty(), "INFO names a field more than once: {twice:?}");
+        // Both scopes are disclosed beside the numbers they qualify.
+        assert!(all.contains("memory_scope:"), "{all}");
+        assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
+    }
+
+    #[test]
+    fn info_loop_histogram_is_explicit_and_does_not_duplicate_tripwire_fields() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let ordinary = run(&mut cx, &mut store, &[b"INFO"]);
+        assert!(!String::from_utf8_lossy(&ordinary).contains("loop_histogram_"));
+        let pending = run(&mut cx, &mut store, &[b"INFO", b"loophist"]);
+        assert!(String::from_utf8_lossy(&pending).contains("loop_histogram_pending:1"));
+        let mut histogram = inf_foundation::LogHistogram::new();
+        histogram.record(1000);
+        cx.node.loop_snapshot.capture_if_requested(&histogram, [1, 16, 0, 1, 0, 0]);
+        let combined = run(&mut cx, &mut store, &[b"INFO", b"all", b"loophist"]);
+        let text = String::from_utf8(combined).unwrap();
+        let mut fields = std::collections::BTreeSet::new();
+        for line in text.lines().skip(1).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let name = line.split_once(':').unwrap().0;
+            assert!(fields.insert(name), "duplicate field {name}");
+        }
+        assert!(text.contains("loop_histogram_samples:1\r\n"));
+        assert!(text.contains("loop_histogram_submits:1\r\n"));
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-10): a section name this build
+    /// does not have yields nothing for that name — `INFO nosuchsection`
+    /// is an empty body (Redis 8.0.5: `$0\r\n\r\n`), `INFO server
+    /// nosuchsection` is `# Server` alone, and `INFO nosuchsection all`
+    /// is everything. Pre-fix "nothing selected" meant "everything", so
+    /// an argv of only unknown names rendered the whole body.
+    #[test]
+    fn info_unknown_section_renders_an_empty_body() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let raw = run(&mut cx, &mut store, &[b"INFO", b"nosuchsection"]);
+        assert_eq!(raw, b"$0\r\n\r\n", "{:?}", String::from_utf8_lossy(&raw));
+        let raw = run(&mut cx, &mut store, &[b"INFO", b"commandstats", b"latencystats"]);
+        assert_eq!(raw, b"$0\r\n\r\n", "{:?}", String::from_utf8_lossy(&raw));
+        let one = String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"server", b"nosuch"]))
+            .expect("ascii");
+        assert!(one.contains("# Server"), "{one}");
+        assert_eq!(one.matches("\n# ").count(), 1, "only one section: {one}");
+        let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"nosuch", b"all"]))
+            .expect("ascii");
+        for section in ["# Server", "# Memory", "# Keyspace"] {
+            assert!(all.contains(section), "`all` beside an unknown name: {all}");
+        }
+    }
+
+    /// Batch 50 (review 2026-08-30, F-L15-03): `# Keyspace` says which
+    /// scope its counts are — `keyspace_scope:cell` on the bare harness
+    /// (no board), the node fold with a board. Pre-fix the section
+    /// rendered the serving cell's counts with no scope line while
+    /// `DBSIZE` folded the node.
+    #[test]
+    fn info_keyspace_discloses_its_scope() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let keyspace =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"keyspace"])).expect("ascii");
+        assert!(keyspace.contains("db0:keys=1,expires=0,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(keyspace.contains("keyspace_scope:cell\r\n"), "no scope line: {keyspace}");
+    }
+
+    /// ADR-0122 A2 (batch 50, F-L15-03): with a board, `# Keyspace` is the
+    /// node fold — the serving cell's fresh counts plus every peer's last
+    /// publication — under `keyspace_scope:node`.
+    #[test]
+    fn info_keyspace_folds_the_board() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"SETEX", b"t", b"100", b"v"]), b"+OK\r\n");
+        let board = std::sync::Arc::new(crate::control::MemoryBoard::new(2));
+        let mut peer = crate::control::MemoryGauges::default();
+        peer.db_keys[0] = 40;
+        peer.db_expires[0] = 3;
+        peer.db_keys[5] = 7;
+        board.slot(1).publish(peer);
+        cx.node.cell.set(0);
+        *cx.node.memory_board.borrow_mut() = Some(std::sync::Arc::clone(&board));
+        let keyspace =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"keyspace"])).expect("ascii");
+        assert!(keyspace.contains("keyspace_scope:node\r\n"), "{keyspace}");
+        assert!(keyspace.contains("db0:keys=42,expires=4,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(keyspace.contains("db5:keys=7,expires=0,avg_ttl=0\r\n"), "{keyspace}");
+        assert!(!keyspace.contains("db1:"), "empty dbs render no line: {keyspace}");
+    }
+
+    /// Batch 49 (review 2026-08-30, F-L15-07): `# Tripwires` is wholly cell
+    /// scope. `process_rss` — the one process-wide number — renders in
+    /// `# Memory` beside `used_memory_rss`, under `memory_scope`, from the
+    /// same board sample. Pre-fix it sat inside the cell section, so the
+    /// section's own L5 gate (`sum(domains)` vs RSS) read one cell's
+    /// domains over the whole process.
+    #[test]
+    fn info_tripwires_carries_no_process_wide_gauge() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        cx.node.process_board.replace(Some(crate::ProcessBoard::fixture(crate::ProcessSample {
+            rss_bytes: 123_456,
+            ..crate::ProcessSample::default()
+        })));
+        let mut store = Keyspace::new(StoreConfig::default());
+        let tripwires =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
+        assert!(tripwires.contains("tripwire_scope:cell\r\n"), "{tripwires}");
+        assert!(
+            !tripwires.contains("process_rss:"),
+            "a process-wide gauge inside the cell-scope section: {tripwires}"
+        );
+        let memory =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        let field = |name: &str| -> u64 {
+            memory
+                .lines()
+                .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+                .unwrap_or_else(|| panic!("missing {name}: {memory}"))
+                .parse()
+                .expect("u64")
+        };
+        assert_eq!(field("process_rss"), 123_456, "{memory}");
+        assert_eq!(
+            field("process_rss"),
+            field("used_memory_rss"),
+            "one sample, two names: {memory}"
+        );
+    }
+
+    #[test]
+    fn info_process_gauges_are_zero_before_the_board_and_render_its_values() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let startup =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"cpu", b"memory"])).unwrap();
+        for field in [
+            "used_cpu_sys:0.000000\r\n",
+            "used_cpu_user:0.000000\r\n",
+            "used_memory_rss:0\r\n",
+            "process_rss:0\r\n",
+        ] {
+            assert!(startup.contains(field), "{startup}");
+        }
+        cx.node.process_board.replace(Some(crate::ProcessBoard::fixture(crate::ProcessSample {
+            rss_bytes: 987_654,
+            cpu_sys_us: 1_250_000,
+            cpu_user_us: 2_500_000,
+        })));
+        let sampled =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"cpu", b"memory"])).unwrap();
+        for field in [
+            "used_cpu_sys:1.250000\r\n",
+            "used_cpu_user:2.500000\r\n",
+            "used_memory_rss:987654\r\n",
+            "process_rss:987654\r\n",
+        ] {
+            assert!(sampled.contains(field), "{sampled}");
+        }
+    }
+
+    /// Batch 45 (review 2026-08-30, F-L15-09): `db`, `sub` and `psub` are
+    /// tracked state, so `CLIENT LIST`/`INFO` report them — RESP3 so the
+    /// subscribed connection may still be inspected (Redis shape).
+    #[test]
+    fn client_info_reports_the_selected_db_and_subscription_counts() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let info = |cx: &mut ConnCx, store: &mut Keyspace| -> String {
+            let reply = run(cx, store, &[b"CLIENT", b"INFO"]);
+            let text = String::from_utf8(reply).expect("ascii");
+            let body = text.strip_prefix('$').and_then(|t| t.split_once("\r\n")).expect("bulk").1;
+            body.trim_end_matches("\r\n").to_string()
+        };
+        assert!(run(&mut cx, &mut store, &[b"HELLO", b"3"]).starts_with(b"%"));
+        assert!(info(&mut cx, &mut store).contains(" db=0 sub=0 psub=0 "));
+        assert_eq!(run(&mut cx, &mut store, &[b"SELECT", b"7"]), b"+OK\r\n");
+        run(&mut cx, &mut store, &[b"SUBSCRIBE", b"a", b"b", b"c"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=7 sub=3 psub=0 "), "{line}");
+        run(&mut cx, &mut store, &[b"PSUBSCRIBE", b"p*"]);
+        run(&mut cx, &mut store, &[b"UNSUBSCRIBE", b"a"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=7 sub=2 psub=1 "), "{line}");
+        assert_eq!(run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"db3"]), b"+OK\r\n");
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=3 sub=2 psub=1 "), "{line}");
+        run(&mut cx, &mut store, &[b"PUNSUBSCRIBE"]);
+        run(&mut cx, &mut store, &[b"UNSUBSCRIBE"]);
+        let line = info(&mut cx, &mut store);
+        assert!(line.contains(" db=3 sub=0 psub=0 "), "{line}");
+    }
+
     #[test]
     fn client_name_and_kill_flow() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"CLIENT", b"ID"]), b":1\r\n");
         // No name yet: null (Redis 8, oracle-pinned), not an empty bulk.
@@ -1583,7 +1412,7 @@ mod tests {
 
     #[test]
     fn info_sections_filter() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
@@ -1602,7 +1431,7 @@ mod tests {
     #[cfg(feature = "doc")]
     #[test]
     fn info_exposes_every_document_and_tripwire_domain() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut store, &[b"JSON.SET", b"doc", b"$", br#"{"pad":"xxxxxxxx"}"#],),
@@ -1611,13 +1440,15 @@ mod tests {
         let memory =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
         for name in [
-            "doc_tape_bytes",
-            "doc_arena_bytes",
-            "doc_resident_bytes",
-            "doc_intern_bytes",
-            "doc_slack_bytes",
-            "doc_scratch_bytes",
-            "doc_path_cache_bytes",
+            "used_memory_doc_tape",
+            "used_memory_doc_arena",
+            "used_memory_doc_resident",
+            "used_memory_doc_intern",
+            "used_memory_doc_slack",
+            "used_memory_doc_scratch",
+            "used_memory_doc_path_cache",
+            "used_memory_idx_tree",
+            "used_memory_idx_slack",
             "docs_live",
         ] {
             assert!(memory.contains(&format!("{name}:")), "missing {name}: {memory}");
@@ -1625,7 +1456,9 @@ mod tests {
         let tripwires =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tripwires"])).expect("ascii");
         for name in inf_foundation::tripwire::ALL {
-            assert!(tripwires.contains(&format!("{name}:")), "missing {name}: {tripwires}");
+            let home =
+                if *name == inf_foundation::tripwire::PROCESS_RSS { &memory } else { &tripwires };
+            assert!(home.contains(&format!("{name}:")), "missing {name}: {home}");
         }
     }
 
@@ -1635,7 +1468,7 @@ mod tests {
     /// (bare harness), it renders and labels cell scope.
     #[test]
     fn info_memory_aggregates_across_cells_via_the_board() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
         let bare =
@@ -1659,6 +1492,89 @@ mod tests {
         assert!(board.totals().used_bytes > 1_000, "serving cell published its slot");
     }
 
+    /// Batch 57 (review 2026-08-30, the L05-02 DX row; ADR-0068 A2):
+    /// `# Memory` renders the figure `maxmemory` compares against —
+    /// `used_memory_pool`, the pool's logical bytes folded across cells
+    /// like `used_memory`. A budgeted namespace's bytes are in
+    /// `used_memory` and out of the pool; a peer's publication adds in.
+    #[test]
+    fn info_memory_renders_the_maxmemory_comparable() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        for i in 0..8u32 {
+            let key = format!("db0:{i}");
+            assert_eq!(
+                run(&mut cx, &mut store, &[b"SET", key.as_bytes(), &[b'v'; 4096]]),
+                b"+OK\r\n"
+            );
+        }
+        store
+            .ns_create(inf_store::NsSpec {
+                id: inf_store::NsId(16),
+                name: b"cache".to_vec(),
+                mode: inf_store::NsMode::Memory,
+                fsync: None,
+                policy: Some(EvictionPolicy::AllKeysRandom),
+                maxmemory: Some(64 << 20),
+                tier: None,
+            })
+            .expect("create");
+        let cache = store.ns_store_mut(inf_store::NsId(16)).expect("registered");
+        for i in 0..64u32 {
+            let key = format!("c:{i}");
+            cache.set(key.as_bytes(), &[b'v'; 4096], SetOptions::default(), Nanos(1)).expect("set");
+        }
+        let field = |text: &str, name: &str| -> u64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+                .unwrap_or_else(|| panic!("missing {name}: {text}"))
+                .parse()
+                .expect("u64")
+        };
+        let bare =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        let pool = field(&bare, "used_memory_pool");
+        assert_eq!(pool, store.pool_used_bytes(), "{bare}");
+        assert!(pool >= 8 * 4096, "db0 is in the pool: {bare}");
+        assert!(pool < 64 * 4096, "the budgeted cache is out of the pool: {bare}");
+        assert!(field(&bare, "used_memory") > pool + 64 * 4096, "used_memory keeps it: {bare}");
+
+        let board = std::sync::Arc::new(crate::control::MemoryBoard::new(2));
+        board
+            .slot(1)
+            .publish(crate::control::MemoryGauges { pool_used_bytes: 777, ..Default::default() });
+        cx.node.cell.set(0);
+        *cx.node.memory_board.borrow_mut() = Some(board);
+        let noded =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"memory"])).expect("ascii");
+        assert_eq!(field(&noded, "used_memory_pool"), pool + 777, "node fold: {noded}");
+    }
+
+    /// Batch 57 (review 2026-08-30, F-L05-03): the M1-S05 `expiry_debt`
+    /// backlog renders in `# Stats` as `expiry_debt_ms` — the worst wheel
+    /// debt across every store of the serving cell, whether or not the
+    /// last slice reached it (pre-fix the figure was plane-internal and
+    /// folded only the stores the slice ran).
+    #[test]
+    fn info_stats_renders_the_expiry_debt() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let idle =
+            String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"stats"])).expect("ascii");
+        assert!(idle.contains("expiry_debt_ms:0\r\n"), "{idle}");
+        // A deadline long past on db3, never ticked: the harness renders at
+        // `now = 1 ns`, so arm at 0 ms and read the debt from a later now.
+        let opts = SetOptions { expire: SetExpire::At(Nanos(0)), ..SetOptions::default() };
+        store.db_mut(3).set(b"stale", b"v", opts, Nanos(0)).expect("set");
+        let later = Nanos(5_000 * 1_000_000);
+        assert_eq!(store.expiry_lag_ms(later), 5_000);
+        let mut out = Vec::new();
+        let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+        info(&[b"INFO".as_slice(), b"stats"][..], &store, &cx.node, later, &mut w);
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(text.contains("expiry_debt_ms:5000\r\n"), "{text}");
+    }
+
     /// M4-S03/S13 degenerate-case contract, as an operator sees it: on a
     /// memory-mode node the section renders in full and **every**
     /// `tiering_*` field is identically zero, with no per-namespace line
@@ -1666,7 +1582,7 @@ mod tests {
     /// release blocker; breaking it here breaks the gate there.
     #[test]
     fn info_tiering_is_all_zero_without_a_tiered_namespace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"k", b"v"]);
         let text =
@@ -1687,6 +1603,13 @@ mod tests {
             // the same structural reason as the counters.
             "tiering_write_amp_milli_max",
             "tiering_write_amp_undefined_ns",
+            // C2′ (review of 2026-08-30): no table, no cold reads to
+            // fail — and zero in any healthy tiered run too.
+            "tiering_cold_read_errors",
+            // F-L06-03: no table, no write to replan.
+            "tiering_write_replans",
+            // F-L03-04: no table, no walk to trail a checkpoint.
+            "tiering_walk_behind",
             // M4-S17 (ADR-0061 D8): no table, no extents — the blob leg
             // reads zero for the same structural reason.
             "tiering_blob_user_bytes",
@@ -1702,6 +1625,36 @@ mod tests {
             "tiering_blob_write_amp_undefined_ns",
             "tiering_blob_reclaimable",
             "tiering_blob_reclaim_deferred",
+            // ADR-0096: no table, no boot sweep — structurally zero.
+            "tiering_blob_quarantined",
+            "tiering_blob_quarantine_revived",
+            // M4.5-S30 (ADR-0085 D6): no table, no promotion path — the
+            // read-promotion observables and the filter's L5 term read
+            // zero for the same structural reason.
+            "tiering_promotions",
+            "tiering_promoted_bytes",
+            "tiering_promote_first_touch",
+            "tiering_promote_skip_window",
+            "tiering_promote_skip_pinned",
+            "tiering_promote_skip_disk",
+            "tiering_promote_skip_stale",
+            "tiering_promote_skip_cap",
+            "tiering_promote_filter_bytes",
+            // M4.5-S37 (ADR-0093 D8): no table, no tickets.
+            "tiering_shadow_enabled",
+            "tiering_shadow_reconcile_paused",
+            "tiering_shadow_created",
+            "tiering_shadow_pending",
+            "tiering_shadow_pinned_bytes",
+            "tiering_shadow_fallback_pin",
+            "tiering_shadow_fallback_fence",
+            "tiering_shadow_fallback_ticketed",
+            "tiering_shadow_verified_pending",
+            "tiering_shadow_dbsize_drains",
+            "tiering_shadow_dbsize_fence",
+            "tiering_shadow_rebuild_reads",
+            "tiering_shadow_scan_twins_emitted",
+            "tiering_shadow_bytes",
         ] {
             assert!(text.contains(&format!("{name}:0")), "missing {name}: {text}");
         }
@@ -1712,9 +1665,9 @@ mod tests {
     /// cell aggregate is the exact sum of those lines.
     #[test]
     fn info_tiering_renders_per_namespace_watermarks_and_write_counters() {
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(17);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -1733,7 +1686,7 @@ mod tests {
                 .is_ok()
         );
         let table = store.tiered_store_mut(ns).expect("materialized");
-        table.insert(b"key", b"value", TieredTable::hash_key(b"key")).expect("fits");
+        table.insert(b"key", b"value", KeyHasher::default().hash(b"key")).expect("fits");
 
         let text =
             String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"tiering"])).expect("ascii");
@@ -1764,7 +1717,7 @@ mod tests {
     fn info_tiering_ram_hit_split_renders_absent_not_zero_when_tiered() {
         use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(23);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -1805,7 +1758,7 @@ mod tests {
     /// 24 h soak took 31 M with no server-side trace).
     #[test]
     fn info_persistence_renders_admission_busy_refusals() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.log_admission_busy.set(31_260_000);
         let text =
@@ -1818,7 +1771,7 @@ mod tests {
     /// byte-attribution observables.
     #[test]
     fn info_tripwires_renders_recycle_pool_bytes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         cx.node.reply_pool_bytes.set(4096 * 100);
         cx.node.cmd_pool_bytes.set(4096 * 7);
@@ -1838,9 +1791,9 @@ mod tests {
     #[test]
     fn info_tiering_reports_write_amplification_per_namespace() {
         use inf_log::{MutationEffect, StagingConfig, StagingRing};
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let mut ring = StagingRing::new(StagingConfig::default());
         for id in [7u32, 9u32] {
@@ -1872,7 +1825,7 @@ mod tests {
                 MutationEffect::StringSet { ns: NsId(7), key: key.as_bytes(), value: &value };
             table.stage_wal(&mut ring, &effect).expect("frame has room");
             table
-                .insert(key.as_bytes(), &value, TieredTable::hash_key(key.as_bytes()))
+                .insert(key.as_bytes(), &value, KeyHasher::default().hash(key.as_bytes()))
                 .expect("fits");
         }
         let measured = table.write_accounting();
@@ -1900,13 +1853,88 @@ mod tests {
         );
     }
 
+    /// ADR-0102 D1/D2 (review of 2026-08-30, H0 / F-L06-01): the parser
+    /// derives an absent `BLOB-THRESHOLD` from the ring the budget
+    /// reserves (in any key order), honours an explicit one, and the
+    /// gauntlet refuses both a sub-floor budget and an over-bound
+    /// explicit threshold — typed, at the surface, never a cell panic.
+    #[test]
+    fn inf_ns_create_derives_the_blob_threshold_and_refuses_the_ring_floor() {
+        let tier = |argv: &[&[u8]]| parse_ns_create(argv).expect("parses").tier.expect("tiered");
+        // Budget-only: a quarter of the 8 MiB ring.
+        let spec = tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"4mb"]);
+        assert_eq!(spec.blob_threshold_bytes, 2 << 20);
+        assert!(spec.validate().is_ok());
+        // Key order does not matter: the derivation runs after the loop.
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MAINTAIN-SLICE",
+            b"64kb",
+            b"MEM-BUDGET",
+            b"4mb",
+        ]);
+        assert_eq!(spec.ring_bytes(), Some(8 << 20), "4 MiB + 64 KiB rounds up to 8 MiB");
+        assert_eq!(spec.blob_threshold_bytes, 2 << 20);
+        // A large budget keeps the ADR-0061 default.
+        let spec = tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"64mb"]);
+        assert_eq!(spec.blob_threshold_bytes, 1 << 24);
+        // Explicit values are kept verbatim — legal or not; the gauntlet
+        // decides at registration.
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"BLOB-THRESHOLD",
+            b"64kb",
+            b"MEM-BUDGET",
+            b"4mb",
+        ]);
+        assert_eq!(spec.blob_threshold_bytes, 64 << 10);
+        assert!(spec.validate().is_ok());
+        let spec = tier(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"4mb",
+            b"BLOB-THRESHOLD",
+            b"16mb",
+        ]);
+        assert_eq!(spec.blob_threshold_bytes, 1 << 24);
+        let err = spec.validate().expect_err("16 MiB threshold in an 8 MiB ring");
+        assert!(err.starts_with("BLOB-THRESHOLD exceeds"), "{err}");
+        // The H0 budgets: the floor rule, typed.
+        for budget in [&b"64kb"[..], b"256kb", b"512kb", b"1mb", b"2mb"] {
+            let spec =
+                tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", budget]);
+            let err = spec.validate().expect_err("sub-floor budget");
+            assert!(
+                err.starts_with("MEM-BUDGET + MAINTAIN-SLICE must reserve at least 4mb"),
+                "{err}"
+            );
+        }
+        assert!(
+            tier(&[b"INF.NS", b"CREATE", b"t", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"])
+                .validate()
+                .is_ok()
+        );
+    }
+
     /// M4-S19 (ADR-0062): the `INF.NS` tiering surface — the D1 rule
     /// (tier keys require MODE durable + MEM-BUDGET), the D8 `USE`
     /// refusal, `SET` hot-reload with the CreateOnly refusals, and the
     /// tier block read back through `INF.NS INFO`.
     #[test]
     fn inf_ns_tiering_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Tier keys without MEM-BUDGET refuse typed (the discriminator).
         let r = run(
@@ -1948,7 +1976,7 @@ mod tests {
         // exec fallback still refuses data commands (plane-resident).
         let r = run(&mut cx, &mut store, &[b"INF.NS", b"USE", b"tiered"]);
         assert_eq!(r, b"+OK\r\n");
-        cx.ns = None;
+        cx.ns = crate::exec::ConnNamespace::Default;
         let r =
             run(&mut cx, &mut store, &[b"INF.NS", b"SET", b"tiered", b"MUTABLE-FRACTION", b"300"]);
         assert_eq!(r, b"+OK\r\n");
@@ -1994,7 +2022,7 @@ mod tests {
     /// refusals on durable namespaces and for tier keys on memory ones.
     #[test]
     fn inf_ns_memory_pressure_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let r = run(
             &mut cx,
@@ -2058,9 +2086,9 @@ mod tests {
         use inf_log::TierIoMode;
         use inf_log::blob::{ExtentId, ExtentWriter};
         use inf_log::fs::mem::MemFs;
-        use inf_store::{AddressSpaceConfig, DemotionConfig, LogicalAddr, NsId, TieredTable};
+        use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher, LogicalAddr, NsId};
 
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let ns = NsId(21);
         let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
@@ -2095,7 +2123,7 @@ mod tests {
         let table = store.tiered_store_mut(ns).expect("materialized");
         table.note_blob_bytes(sealed.device_bytes());
         table
-            .insert_extent(b"blob-key", TieredTable::hash_key(b"blob-key"), &sealed)
+            .insert_extent(b"blob-key", KeyHasher::default().hash(b"blob-key"), &sealed)
             .expect("fits");
         let expect_milli = table
             .write_accounting()
@@ -2121,10 +2149,13 @@ mod tests {
 
     #[test]
     fn command_introspection_shapes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let count = run(&mut cx, &mut store, &[b"COMMAND", b"COUNT"]);
-        assert_eq!(count, format!(":{}\r\n", inf_wire::COMMANDS.len()).into_bytes());
+        // ADR-0115: the three INTERNAL rows are not a client surface.
+        let visible = inf_wire::COMMANDS.iter().filter(|m| !m.flags.contains(CmdFlags::INTERNAL));
+        assert_eq!(count, format!(":{}\r\n", visible.count()).into_bytes());
+        assert_eq!(count, format!(":{}\r\n", inf_wire::COMMANDS.len() - 3).into_bytes());
         let getkeys = run(
             &mut cx,
             &mut store,
@@ -2133,5 +2164,59 @@ mod tests {
         assert_eq!(getkeys, b"*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
         let nokeys = run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"PING"]);
         assert!(nokeys.starts_with(b"-ERR The command has no key arguments"), "{nokeys:?}");
+        // ADR-0104: the subcommand-scoped row is the routing truth GETKEYS
+        // reports (Redis's keyless DEBUG row is the recorded deviation);
+        // the keyless DEBUG subcommands stay keyless.
+        let debug_object =
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"DEBUG", b"OBJECT", b"k"]);
+        assert_eq!(debug_object, b"*1\r\n$1\r\nk\r\n");
+        let debug_sleep =
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"DEBUG", b"SLEEP", b"0.5"]);
+        assert!(
+            debug_sleep.starts_with(b"-ERR The command has no key arguments"),
+            "{debug_sleep:?}"
+        );
+    }
+    /// Review 2026-08-30 F-L15-02 (batch 51, ADR-0124 D5): `run_id` is a
+    /// node identity — 40 hex digits, the same value before and after a
+    /// `RANDOMKEY` (pre-fix it was the RANDOMKEY RNG cursor, 32 digits),
+    /// Batch 61: `process_id` renders the pid assembly set — the identity
+    /// a harness checks its spawned child against (a foreign node on the
+    /// same port answers `PING` just as well).
+    #[test]
+    fn process_id_renders_the_assembled_pid() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.process_id.set(424_242);
+        let reply = run(&mut cx, &mut store, &[b"INFO", b"server"]);
+        let text = String::from_utf8(reply).expect("ascii");
+        assert!(text.contains("\r\nprocess_id:424242\r\n"), "{text}");
+    }
+
+    /// and `master_replid` renders the same identity.
+    #[test]
+    fn run_id_survives_randomkey() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let field = |cx: &mut ConnCx, store: &mut Keyspace, section: &[u8], name: &str| {
+            let reply = run(cx, store, &[b"INFO", section]);
+            let text = String::from_utf8(reply).expect("ascii");
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("{name} missing: {text}"))
+                .trim()
+                .to_string()
+        };
+        let before = field(&mut cx, &mut store, b"server", "run_id");
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        for _ in 0..3 {
+            assert_eq!(run(&mut cx, &mut store, &[b"RANDOMKEY"]), b"$1\r\nk\r\n");
+        }
+        let after = field(&mut cx, &mut store, b"server", "run_id");
+        assert_eq!(after, before, "run_id moved with the RANDOMKEY stream");
+        assert_eq!(before.len(), 40, "run_id is 40 hex digits like Redis: {before}");
+        assert!(before.bytes().all(|b| b.is_ascii_hexdigit()), "{before}");
+        let replid = field(&mut cx, &mut store, b"replication", "master_replid");
+        assert_eq!(replid, before, "master_replid is the same identity");
     }
 }

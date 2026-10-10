@@ -1,13 +1,15 @@
-# InfinityDB CI — heavy suite (on-demand).
+# InfinityDB CI — heavy suite (main, weekly, and on demand).
 #
-# Runs ONLY the jobs that are too slow for every push and were the reason the
+# Runs the jobs that are too slow for every PR push and were the reason the
 # PR pipeline blew up: the full strict-provenance Miri (inf-alloc + inf-fabric,
-# the M0-S02 acceptance gate — was timing out at 45 min), the full 11-target
-# fuzz smoke (~42 min), and a benchmark COMPILE smoke. Everything else (3-OS
+# the M0-S02 acceptance gate — was timing out at 45 min), the full 14-target
+# fuzz smoke (70 min plus build time), and benchmark correctness/compile sanity. Everything else (3-OS
 # build matrix, client-smoke, compat-diff, kernel-matrix, loom, sim-smoke)
 # stays on the fast PR lane in infinity-ci.yml, where it costs little.
 #
 # Triggers:
+#   • push to main — verify the merged commit.
+#   • schedule — Mondays at 07:23 UTC, on the default branch.
 #   • pull_request labeled `ci-full` — add the label to a PR to run the suite.
 #     `pull_request` uses the workflow file from the PR branch, so this is the
 #     path that works for PR #1 (before this file is on `main`).
@@ -18,12 +20,16 @@
 #   • workflow_dispatch — the Actions "Run workflow" button (also requires the
 #     file on `main`).
 #
-# Real benchmark *numbers* never come from CI (shared runners; L10 / §19). The
-# bench job is compile-only; gate numbers come from the reference-box campaign
-# (M3 plan H6: inf-bench gate-run --reference-box, inf-compare).
+# Real benchmark *numbers* never come from CI (shared runners; L10). The
+# bench job tests and compiles; gate numbers come from the reference-box campaign
+# (inf-bench gate-run --reference-box, inf-compare).
 name: infinity-ci-full
 
 on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 7 * * 1"
   workflow_dispatch:
   pull_request:
     types: [labeled] # add the `ci-full` label to run the suite on a PR
@@ -31,7 +37,8 @@ on:
     types: [created]
 
 concurrency:
-  group: infinity-ci-full-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  # Every automatic run completes independently of later pushes and PR requests.
+  group: infinity-ci-full-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -42,12 +49,15 @@ permissions:
 jobs:
   authorize:
     # Gate the suite, acknowledge the command, and resolve the commit to test.
+    #   - push to main / schedule: tests the event SHA.
     #   - workflow_dispatch: always runs, tests the dispatched branch head.
     #   - pull_request labeled `ci-full`: tests the PR head SHA.
     #   - issue_comment `/ci-full` on a PR from a maintainer: tests the PR head.
     #   - anything else (random label / comment): the `if` is false, so this
     #     job and every job that `needs` it is skipped — no runner is spent.
     if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.event.label.name == 'ci-full') ||
       (github.event_name == 'issue_comment' &&
@@ -111,7 +121,7 @@ jobs:
           MIRIFLAGS: -Zmiri-strict-provenance
 
   fuzz-smoke:
-    # Full 11-target smoke, 300 s each. The json_parse / path_program targets
+    # Full 14-target smoke, 300 s each. The json_parse / path_program targets
     # take an explicit writable corpus dir that is gitignored; create it so a
     # fresh checkout does not fail with "required directory ... does not exist"
     # (the run #9 fuzz-smoke failure). The committed seed corpora
@@ -133,10 +143,10 @@ jobs:
       - name: fuzz fabric codec (smoke)
         run: cargo +nightly fuzz run fabric_codec -- -max_total_time=300
         working-directory: crates/inf-fabric
-      - name: fuzz glob matcher (smoke, M1 §5)
+      - name: fuzz glob matcher (smoke)
         run: cargo +nightly fuzz run glob_match -- -max_total_time=300
         working-directory: crates/inf-server
-      - name: fuzz SCAN cursor (smoke, M1 §5)
+      - name: fuzz SCAN cursor (smoke)
         run: cargo +nightly fuzz run scan_cursor -- -max_total_time=300
         working-directory: crates/inf-server
       - name: fuzz log frame decoder (smoke, M2-S01)
@@ -154,7 +164,7 @@ jobs:
       - name: fuzz extent decoder (smoke, M4-S17 — readiness F2)
         run: cargo +nightly fuzz run extent_decode -- -max_total_time=300
         working-directory: crates/inf-log
-      - name: fuzz tier-file decoder (smoke, M4-S11 — M4 §6 requires nightly accrual)
+      - name: fuzz tier-file decoder (smoke; the nightly accrues its hours)
         run: cargo +nightly fuzz run fuzz_tierfile_decode -- -max_total_time=300
         working-directory: crates/inf-log
       - name: fuzz idoc decoder (smoke, M3-S01/S02)
@@ -175,9 +185,9 @@ jobs:
         working-directory: crates/inf-doc
 
   bench-build:
-    # Benchmark COMPILE smoke only — verifies the campaign harnesses and the
-    # criterion benches build in release. NO measurements: CI runners never
-    # back a number (L10 / §19). Real gate numbers come from the reference
+    # Benchmark sanity — release instrument tests and compilation, also on PRs.
+    # NO measurements: CI runners never
+    # back a number (L10). Real gate numbers come from the reference
     # box (inf-bench gate-run --reference-box, inf-compare).
     needs: authorize
     runs-on: ubuntu-24.04
@@ -190,8 +200,10 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
+      - name: benchmark instrument tests (release)
+        run: cargo test --release -p inf-bench -p inf-compare
       - name: campaign harnesses build (release)
-        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim
+        run: cargo build --release -p inf-bench -p inf-compare -p inf-sim --features inf-sim/dst
       - name: criterion benches compile (no run)
         run: cargo bench --workspace --no-run
 

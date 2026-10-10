@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! Sequential log read throughput (M2-S04 AC, L4): a full CRC-validating
 //! `SegmentReader` pass over a segment written by the staging ring + rotor.
 //! Criterion reports bytes/s; the gate value (≥ 2 GB/s sequential read,
@@ -67,9 +72,9 @@ fn payload(len: usize) -> Vec<u8> {
 fn write_segment(root: &Path, segment_bytes: u32) -> (PathBuf, u64, u64) {
     let fs = StdSegmentFs;
     let dirs = create_cell_dirs(&fs, &root.join("shard-0")).expect("dirs");
-    let cfg = SegmentConfig { segment_bytes, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg).expect("rotor");
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 1 << 20 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(1 << 20));
 
     let value = payload(256);
     let mut key = *b"user:0000000000000000";

@@ -11,7 +11,7 @@
 //! is a named L5 term bounded by `disk_budget / blob_threshold` entries.
 //!
 //! Lifecycle sites (ADR-0061 D4): births at `insert_extent`/
-//! `update_extent`/`apply_extent_image`; deaths ride the `note_death`
+//! `update_extent`/`replay_upsert_extent`; deaths ride the `note_death`
 //! routing (the S06/S14 choke point) on its unconditional side;
 //! compaction **moves** the entry before the old address dies — the
 //! count never dips or spikes across a relocation. Reclaim gates on the
@@ -19,7 +19,6 @@
 //! logged; ADR-0061 D5), then on the plane's in-flight read pins.
 
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 
 /// Default out-of-line threshold: exactly the u24 inline ceiling, so the
 /// default changes no existing value's path (ADR-0061 D1). Values at or
@@ -31,8 +30,9 @@ pub const BLOB_MAX_BYTES_DEFAULT: u64 = 1 << 30;
 /// Default unlink candidates one MAINTAIN reclaim slice hands the plane
 /// (M4-S18): each candidate is one syscall-class unlink, so the bound
 /// keeps a slice's wall time flat regardless of backlog depth — the
-/// backlog itself stays visible as `blob_reclaimable`. A plane budget,
-/// not an `INF.NS` key (the `EvictBudget` class of bound).
+/// queue is stamp-ordered and a slice pops at most `max` from its front
+/// (F-L04-11) — the backlog itself stays visible as `blob_reclaimable`.
+/// A plane budget, not an `INF.NS` key (the `EvictBudget` class of bound).
 pub const BLOB_RECLAIM_PER_SLICE_DEFAULT: usize = 8;
 
 /// Per-namespace blob routing bounds (ADR-0061 D1). Construction
@@ -73,18 +73,59 @@ struct ExtentEntry {
     len: u64,
 }
 
-/// A reclaim candidate: refcount hit zero; `stamp` is the WAL epoch its
-/// killing record staged under (0 = durable by construction — replayed
-/// or orphaned). `len` is the dead extent's declared value length — its
-/// bytes stay on the device until the unlink completes, so the
-/// disk-budget accounting (M4-S19, ADR-0062 D5) carries it through the
-/// queue. Boot-sweep orphans carry 0 (the sweep lists names only — a
-/// bounded under-count that heals at their unlink, disclosed).
+/// Why a reclaim candidate is eligible (ADR-0096 D1) — the plane's
+/// disposal dispatches on it: a refcount-proven death unlinks; a
+/// boot-listed orphan is probed and **quarantined** (renamed), never
+/// unlinked in the life it booted in; a quarantined file re-listed by a
+/// later boot — still unreferenced — unlinks its `.quarantine` twin.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimOrigin {
+    /// Refcount reached zero in this life or replayed from the log
+    /// (ADR-0061 D5) — the count is the proof; unlink as always.
+    Death,
+    /// Listed at boot, referenced by nothing after replay (ADR-0061 D6)
+    /// — the verdict rests on one rebuilt map, so the disposal is
+    /// probe-then-quarantine (ADR-0096 D2).
+    BootOrphan,
+    /// A `.quarantine` twin re-listed by this boot and still
+    /// unreferenced — the second verdict (ADR-0096 D4).
+    Quarantined,
+}
+
+/// One reclaim candidate handed to the plane: the extent id and the
+/// provenance its disposal dispatches on (ADR-0096 D1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimCandidate {
+    /// The extent to dispose of.
+    pub extent_id: u64,
+    /// Why it is eligible — selects unlink vs quarantine vs
+    /// second-verdict unlink.
+    pub origin: ReclaimOrigin,
+}
+
+/// A reclaim candidate: refcount hit zero. `len` is the dead extent's
+/// declared value length — its bytes stay on the device until the
+/// unlink completes, so the disk-budget accounting (M4-S19, ADR-0062
+/// D5) carries it through the queue. Boot-sweep orphans carry 0 (the
+/// sweep lists names only — a bounded under-count that heals at their
+/// unlink, disclosed).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Reclaimable {
     extent_id: u64,
     len: u64,
+    origin: ReclaimOrigin,
+}
+
+/// The reclaim queue's hand-out order (F-L04-11): `stamp` is the WAL
+/// epoch the killing record staged under (0 = durable by construction —
+/// replayed, orphaned, or re-offered), `seq` keeps arrival order within
+/// a stamp. Stamps arrive monotone (`stage_wal` epochs), so the set
+/// eligible under any durable epoch is a prefix of this order and one
+/// slice never examines past its `max`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReclaimKey {
     stamp: u64,
+    seq: u64,
 }
 
 /// Observable blob-extent state (`INFO tiering` + the §3.3 zero-assert
@@ -106,6 +147,13 @@ pub struct ExtentStats {
     /// Unlink failures deferred non-fatally (`blob_unlink_fail` — the
     /// candidate re-offers; the boot sweep re-drives after a crash).
     pub reclaim_deferred: u64,
+    /// Boot orphans quarantined instead of unlinked (ADR-0096 D2 —
+    /// header-valid files renamed to their `.quarantine` twin).
+    pub quarantined: u64,
+    /// Quarantined extents revived at boot because the replayed map
+    /// references them (ADR-0096 D3 — a wrong orphan verdict healed;
+    /// nonzero is the upstream-accounting falsifier signal).
+    pub quarantine_revived: u64,
     /// Blob read-modify-write rewrites (ADR-0061 D7 — the doc-path cost
     /// counter, reserved at this seam; zero until doc-tiering wires).
     pub rmw_ops: u64,
@@ -133,16 +181,25 @@ pub struct ExtentRefs {
     /// `(extent id, value len)` — the len rides the whole queue for the
     /// D5 disk accounting.
     parked: Vec<(u64, u64)>,
-    /// Stamped candidates, drained by `reclaim_work` under the plane's
-    /// durable epoch.
-    reclaimable: VecDeque<Reclaimable>,
+    /// Stamped candidates in hand-out order; `reclaim_work` pops at most
+    /// `max` from the front under the plane's durable epoch.
+    reclaimable: BTreeMap<ReclaimKey, Reclaimable>,
+    /// extent id → its queue key: the boot sweep's candidacy test and a
+    /// replay revival's retraction in O(log n), never a queue walk.
+    queued: BTreeMap<u64, ReclaimKey>,
+    /// Arrival counter for [`ReclaimKey::seq`].
+    reclaim_seq: u64,
     /// Candidates handed out and not yet confirmed or deferred, as
-    /// `(extent id, value len)`.
-    in_reclaim: Vec<(u64, u64)>,
+    /// `(extent id, value len, origin)`.
+    in_reclaim: Vec<(u64, u64, ReclaimOrigin)>,
     /// Allocate-once cursor (ADR-0061 D1/D6): never reissued while any
     /// durable artifact can name the id.
     next_extent_id: u64,
     stats: ExtentStats,
+    /// Candidates a reclaim slice or a sweep candidacy test examined —
+    /// the F-L04-11 cost witness (test-only; shipped code pays nothing).
+    #[cfg(test)]
+    scan_steps: u64,
 }
 
 impl ExtentRefs {
@@ -179,14 +236,15 @@ impl ExtentRefs {
         // displace-then-reapply pairing transiently zeroes the extent's
         // count between the two. A park latched at the dip must revoke at
         // re-registration or the boot sweep reclaims a live extent — the
-        // same at-least-once physics that makes `apply_ref` idempotent
+        // same at-least-once physics that makes `replay_ref` idempotent
         // (D4 rule 3), applied to the reclaim queue.
         self.parked.retain(|&(id, _)| id != extent_id);
-        if let Some(at) = self.reclaimable.iter().position(|r| r.extent_id == extent_id) {
-            self.reclaimable.remove(at);
-        }
-        debug_assert!(
-            !self.in_reclaim.iter().any(|&(id, _)| id == extent_id),
+        self.dequeue(extent_id);
+        // Release-checked (F-L04-12): a candidate the plane holds is
+        // being disposed of on this very slice — a revival here would
+        // leave a live reference to an unlinked file.
+        assert!(
+            !self.in_reclaim.iter().any(|&(id, _, _)| id == extent_id),
             "a handed-out reclaim candidate re-registered (the plane may be unlinking it)"
         );
         match self.refs.insert(addr, (extent_id, len)) {
@@ -215,7 +273,9 @@ impl ExtentRefs {
             return false;
         };
         let prev = self.refs.insert(new_addr, entry);
-        debug_assert!(prev.is_none(), "relocation target already registered");
+        // Release-checked (F-L04-12): a clobbered reference would keep
+        // its extent's count above zero forever — a silent disk leak.
+        assert!(prev.is_none(), "relocation target already registered");
         true
     }
 
@@ -226,8 +286,9 @@ impl ExtentRefs {
     pub fn note_death(&mut self, addr: u64) -> Option<u64> {
         let (extent_id, len) = self.refs.remove(&addr)?;
         let entry = self.extents.get_mut(&extent_id).expect("a mapped reference has an extent");
-        debug_assert!(entry.refs > 0, "refcount underflow");
-        entry.refs -= 1;
+        // Release-checked (the F-L04-12 class): a wrapped count is an
+        // extent that never reclaims.
+        entry.refs = entry.refs.checked_sub(1).expect("refcount underflow");
         if entry.refs > 0 {
             return None;
         }
@@ -241,51 +302,118 @@ impl ExtentRefs {
     /// at or before this epoch, so `epoch ≤ durable` implies the death
     /// is durable; ADR-0061 D5).
     pub fn stamp(&mut self, wal_epoch: u64) {
-        for (extent_id, len) in self.parked.drain(..) {
-            self.reclaimable.push_back(Reclaimable { extent_id, len, stamp: wal_epoch });
+        let parked = std::mem::take(&mut self.parked);
+        for &(extent_id, len) in &parked {
+            self.enqueue(extent_id, len, wal_epoch, ReclaimOrigin::Death);
+        }
+        // Keep the drained Vec's capacity (no allocation per stamp).
+        self.parked = parked;
+        self.parked.clear();
+    }
+
+    /// Queues one candidate at the back of its stamp's arrival order.
+    fn enqueue(&mut self, extent_id: u64, len: u64, stamp: u64, origin: ReclaimOrigin) {
+        let key = ReclaimKey { stamp, seq: self.reclaim_seq };
+        self.reclaim_seq += 1;
+        // Release-checked: a twice-queued id is a double disposal.
+        assert!(self.queued.insert(extent_id, key).is_none(), "an extent queued for reclaim twice");
+        self.reclaimable.insert(key, Reclaimable { extent_id, len, origin });
+    }
+
+    /// Retracts a queued candidate (a replay revival); no-op when the id
+    /// is not queued.
+    fn dequeue(&mut self, extent_id: u64) {
+        if let Some(key) = self.queued.remove(&extent_id) {
+            self.reclaimable.remove(&key);
         }
     }
 
-    /// Seeds the boot sweep (ADR-0061 D6): every listed extent id not
-    /// referenced by any live record is an orphan, immediately
-    /// reclaimable (stamp 0 — nothing durable names it, by the replay
-    /// that just completed). Also stamps any parked replay deaths at 0
-    /// (they were replayed *from* the log — durable by construction)
-    /// and advances the id cursor past everything listed.
-    pub fn sweep_seed(&mut self, listed: &[u64]) {
+    /// Seeds the boot sweep (ADR-0061 D6, disposal per ADR-0096): every
+    /// listed extent id not referenced by any live record is an orphan,
+    /// immediately *eligible* (stamp 0 — nothing durable names it, by
+    /// the replay that just completed) — typed `BootOrphan`, so the
+    /// plane quarantines rather than unlinks. A quarantined id still
+    /// unreferenced is the second verdict (`Quarantined` — the plane
+    /// unlinks its twin); a quarantined id the replayed map *does*
+    /// reference is returned for revival (the caller renames it back
+    /// and counts it — ADR-0096 D3). Advances the id cursor past
+    /// everything listed and stamps any parked replay deaths at 0 (they
+    /// were replayed *from* the log — durable by construction).
+    pub fn sweep_seed(&mut self, listed: &[u64], quarantined: &[u64]) -> Vec<u64> {
         self.stamp(0);
         for &extent_id in listed {
             self.note_observed_id(extent_id);
-            let live = self.extents.contains_key(&extent_id);
-            let queued = self.reclaimable.iter().any(|r| r.extent_id == extent_id)
-                || self.in_reclaim.iter().any(|&(id, _)| id == extent_id);
-            if !live && !queued {
+            if self.sweep_candidate(extent_id) {
                 // Orphans list by name only (D6 — no content reads at
                 // boot), so their device bytes are unknown: len 0 is the
                 // disclosed under-count that heals at unlink.
-                self.reclaimable.push_back(Reclaimable { extent_id, len: 0, stamp: 0 });
+                self.enqueue(extent_id, 0, 0, ReclaimOrigin::BootOrphan);
             }
         }
+        let mut revive = Vec::new();
+        for &extent_id in quarantined {
+            self.note_observed_id(extent_id);
+            if self.extents.contains_key(&extent_id) {
+                self.stats.quarantine_revived += 1;
+                revive.push(extent_id);
+            } else if self.sweep_candidate(extent_id) {
+                self.enqueue(extent_id, 0, 0, ReclaimOrigin::Quarantined);
+            }
+        }
+        revive
     }
 
-    /// Hands the plane up to `max` unlink candidates whose killing
-    /// record is durable (`stamp ≤ durable_epoch`). The plane composes
-    /// the in-flight read pin check (pins are runtime state the store
-    /// never sees — the ADR-0059 D3 fence) and confirms each unlink via
-    /// [`reclaim_done`](Self::reclaim_done) or returns it via
-    /// [`reclaim_deferred`](Self::reclaim_deferred).
-    pub fn reclaim_work(&mut self, durable_epoch: u64, max: usize) -> Vec<u64> {
-        let mut out = Vec::new();
-        let mut kept = VecDeque::new();
-        while let Some(candidate) = self.reclaimable.pop_front() {
-            if out.len() < max && candidate.stamp <= durable_epoch {
-                out.push(candidate.extent_id);
-                self.in_reclaim.push((candidate.extent_id, candidate.len));
-            } else {
-                kept.push_back(candidate);
-            }
+    /// True when a listed id is neither referenced nor already queued —
+    /// the sweep's candidacy test: one index probe per id (F-L04-11;
+    /// `in_reclaim` holds at most one slice, answered before any sweep).
+    fn sweep_candidate(&mut self, extent_id: u64) -> bool {
+        #[cfg(test)]
+        {
+            self.scan_steps += 1;
         }
-        self.reclaimable = kept;
+        let live = self.extents.contains_key(&extent_id);
+        let queued = self.queued.contains_key(&extent_id)
+            || self.in_reclaim.iter().any(|&(id, _, _)| id == extent_id);
+        !live && !queued
+    }
+
+    /// Candidates examined so far (the F-L04-11 witness): a reclaim
+    /// slice must examine at most `max + 1`, a boot sweep at most one
+    /// per listed id.
+    #[cfg(test)]
+    fn scan_steps(&self) -> u64 {
+        self.scan_steps
+    }
+
+    /// Hands the plane up to `max` disposal candidates whose killing
+    /// record is durable (`stamp ≤ durable_epoch`), each typed with its
+    /// [`ReclaimOrigin`] (ADR-0096 D1). The plane composes the
+    /// in-flight read pin check (pins are runtime state the store never
+    /// sees — the ADR-0059 D3 fence), dispatches the disposal on the
+    /// origin, and answers each candidate via
+    /// [`reclaim_done`](Self::reclaim_done),
+    /// [`reclaim_quarantined`](Self::reclaim_quarantined), or
+    /// [`reclaim_deferred`](Self::reclaim_deferred).
+    ///
+    /// Cost: at most `max` pops from the front of the stamp order plus
+    /// one peek (F-L04-11) — never a walk of the backlog; the oldest
+    /// eligible stamp hands out first, arrival order within a stamp.
+    pub fn reclaim_work(&mut self, durable_epoch: u64, max: usize) -> Vec<ReclaimCandidate> {
+        let mut out = Vec::with_capacity(max.min(self.reclaimable.len()));
+        while out.len() < max {
+            #[cfg(test)]
+            {
+                self.scan_steps += 1;
+            }
+            let Some(front) = self.reclaimable.first_entry() else { break };
+            if front.key().stamp > durable_epoch {
+                break;
+            }
+            let candidate = front.remove();
+            self.queued.remove(&candidate.extent_id);
+            out.push(ReclaimCandidate { extent_id: candidate.extent_id, origin: candidate.origin });
+            self.in_reclaim.push((candidate.extent_id, candidate.len, candidate.origin));
+        }
         if !out.is_empty() {
             self.stats.reclaim_slices += 1;
         }
@@ -294,21 +422,34 @@ impl ExtentRefs {
 
     /// Confirms one unlink (the file is gone; `statfs` sees the space).
     pub fn reclaim_done(&mut self, extent_id: u64) {
-        let at = self.in_reclaim.iter().position(|&(id, _)| id == extent_id);
+        let at = self.in_reclaim.iter().position(|&(id, _, _)| id == extent_id);
         let at = at.expect("reclaim_done for a candidate reclaim_work handed out");
         self.in_reclaim.swap_remove(at);
         self.stats.reclaimed += 1;
     }
 
-    /// Returns one candidate after a non-fatal unlink failure
-    /// (`blob_unlink_fail`): counted, re-offered next round; the boot
-    /// sweep re-drives it after any crash (idempotent by construction).
+    /// Confirms one boot-orphan quarantine (ADR-0096 D2): the file left
+    /// the reachable namespace by rename, not unlink — counted apart
+    /// from `reclaimed` because the bytes are still on the device until
+    /// a later boot's second verdict.
+    pub fn reclaim_quarantined(&mut self, extent_id: u64) {
+        let at = self.in_reclaim.iter().position(|&(id, _, _)| id == extent_id);
+        let at = at.expect("reclaim_quarantined for a candidate reclaim_work handed out");
+        self.in_reclaim.swap_remove(at);
+        self.stats.quarantined += 1;
+    }
+
+    /// Returns one candidate after a non-fatal disposal failure
+    /// (`blob_unlink_fail`): counted, re-offered next round with its
+    /// origin intact; the boot sweep re-drives it after any crash
+    /// (idempotent by construction).
     pub fn reclaim_deferred(&mut self, extent_id: u64) {
-        let at = self.in_reclaim.iter().position(|&(id, _)| id == extent_id);
+        let at = self.in_reclaim.iter().position(|&(id, _, _)| id == extent_id);
         let at = at.expect("reclaim_deferred for a candidate reclaim_work handed out");
-        let (_, len) = self.in_reclaim.swap_remove(at);
+        let (_, len, origin) = self.in_reclaim.swap_remove(at);
         self.stats.reclaim_deferred += 1;
-        self.reclaimable.push_back(Reclaimable { extent_id, len, stamp: 0 });
+        // Stamp 0: durable already — re-offered at the next slice's front.
+        self.enqueue(extent_id, len, 0, origin);
     }
 
     /// The reference at `addr`, if that record stores out of line.
@@ -330,6 +471,22 @@ impl ExtentRefs {
         self.refs.range(..watermark).map(|(&addr, &(extent_id, len))| (addr, extent_id, len))
     }
 
+    /// [`entries_below`](Self::entries_below) resumed at `resume` — the
+    /// multi-slice walk's cursor form (review of 2026-08-30, C4 /
+    /// F-L03-01): the resume is an **address**, so a removal below it
+    /// (foreground DEL/overwrite, compaction relocate) between two
+    /// slices cannot shift what the next slice sees — the ordinal
+    /// `.skip(n)` resume it replaces stepped over one live entry per
+    /// below-cursor removal, and the boot sweep then unlinked the
+    /// never-emitted extent.
+    pub fn entries_from(
+        &self,
+        resume: u64,
+        watermark: u64,
+    ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        self.refs.range(resume..watermark).map(|(&addr, &(extent_id, len))| (addr, extent_id, len))
+    }
+
     /// Counts a blob read-modify-write rewrite (ADR-0061 D7 — reserved
     /// seam; doc-tiering wires the caller).
     pub fn note_rmw(&mut self) {
@@ -344,13 +501,20 @@ impl ExtentRefs {
         use inf_log::blob::extent_device_bytes;
         let mut stats = self.stats;
         stats.live = self.extents.len() as u64;
-        stats.live_bytes = self.extents.values().map(|e| e.len).sum();
+        stats.live_bytes = self.extents.values().map(|e| e.len).fold(0, u64::saturating_add);
         stats.reclaimable =
             (self.parked.len() + self.reclaimable.len() + self.in_reclaim.len()) as u64;
-        stats.disk_bytes = self.extents.values().map(|e| extent_device_bytes(e.len)).sum::<u64>()
-            + self.parked.iter().map(|&(_, len)| extent_device_bytes(len)).sum::<u64>()
-            + self.reclaimable.iter().map(|r| extent_device_bytes(r.len)).sum::<u64>()
-            + self.in_reclaim.iter().map(|&(_, len)| extent_device_bytes(len)).sum::<u64>();
+        // This accounting feeds admission: overflow must report a full
+        // device, never wrap small and manufacture budget headroom.
+        stats.disk_bytes = self
+            .extents
+            .values()
+            .map(|e| e.len)
+            .chain(self.parked.iter().map(|&(_, len)| len))
+            .chain(self.reclaimable.values().map(|r| r.len))
+            .chain(self.in_reclaim.iter().map(|&(_, len, _)| len))
+            .map(extent_device_bytes)
+            .fold(0, u64::saturating_add);
         stats
     }
 
@@ -365,6 +529,32 @@ impl ExtentRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_accounting_never_wraps_across_reclaim_states() {
+        let max_frames = (u128::from(u64::MAX) - inf_log::blob::BLOB_HEADER_BYTES as u128)
+            / inf_log::tier::TIER_FRAME_BYTES as u128;
+        let max_data = (max_frames * inf_log::tier::TIER_FRAME_DATA as u128) as u64;
+        for state in 0..4 {
+            let mut refs = ExtentRefs::new();
+            refs.register(1, 1, max_data);
+            refs.register(2, 2, 1);
+            if state >= 1 {
+                refs.note_death(1);
+            }
+            if state >= 2 {
+                refs.stamp(1);
+            }
+            if state >= 3 {
+                assert_eq!(refs.reclaim_work(1, 1).len(), 1);
+            }
+            assert_eq!(refs.stats().disk_bytes, u64::MAX, "state {state}");
+        }
+        let mut refs = ExtentRefs::new();
+        refs.register(1, 1, max_data);
+        refs.register(2, 2, max_data);
+        assert_eq!(refs.stats().live_bytes, u64::MAX);
+    }
 
     #[test]
     fn refcount_follows_the_reference_map_exactly() {
@@ -384,7 +574,10 @@ mod tests {
         assert!(x.reclaim_work(u64::MAX, 8).is_empty(), "unstamped deaths never reclaim");
         x.stamp(7);
         assert!(x.reclaim_work(6, 8).is_empty(), "not durable yet");
-        assert_eq!(x.reclaim_work(7, 8), vec![e]);
+        assert_eq!(
+            x.reclaim_work(7, 8),
+            vec![ReclaimCandidate { extent_id: e, origin: ReclaimOrigin::Death }]
+        );
         x.reclaim_done(e);
         assert_eq!(x.stats().reclaimed, 1);
     }
@@ -396,18 +589,62 @@ mod tests {
         x.register(50, e, 10);
         x.note_death(50);
         x.stamp(1);
-        assert_eq!(x.reclaim_work(1, 8), vec![e]);
+        let death = ReclaimCandidate { extent_id: e, origin: ReclaimOrigin::Death };
+        assert_eq!(x.reclaim_work(1, 8), vec![death]);
         x.reclaim_deferred(e);
-        assert_eq!(x.reclaim_work(1, 8), vec![e], "a deferred candidate re-offers");
+        assert_eq!(
+            x.reclaim_work(1, 8),
+            vec![death],
+            "a deferred candidate re-offers with its origin intact"
+        );
         x.reclaim_done(e);
-        // Orphans: listed on disk, referenced by nothing.
+        // Orphans: listed on disk, referenced by nothing — typed
+        // `BootOrphan`, so the plane quarantines them (ADR-0096 D2).
         let mut y = ExtentRefs::new();
         y.register(10, 3, 100);
-        y.sweep_seed(&[2, 3, 9]);
+        assert!(y.sweep_seed(&[2, 3, 9], &[]).is_empty(), "nothing to revive");
         let mut orphans = y.reclaim_work(0, 8);
-        orphans.sort_unstable();
-        assert_eq!(orphans, vec![2, 9], "live extents never sweep");
+        orphans.sort_unstable_by_key(|c| c.extent_id);
+        assert_eq!(
+            orphans,
+            vec![
+                ReclaimCandidate { extent_id: 2, origin: ReclaimOrigin::BootOrphan },
+                ReclaimCandidate { extent_id: 9, origin: ReclaimOrigin::BootOrphan },
+            ],
+            "live extents never sweep; orphans carry boot provenance"
+        );
         assert_eq!(y.allocate_id(), 10, "the cursor advanced past everything listed");
+    }
+
+    /// ADR-0096 D3/D4: a quarantined id the replayed map references is
+    /// revived (and counted — the upstream-omission falsifier signal);
+    /// one still unreferenced is the second verdict, unlinked through
+    /// its own typed candidate.
+    #[test]
+    fn quarantined_ids_revive_when_referenced_and_unlink_on_the_second_verdict() {
+        let mut x = ExtentRefs::new();
+        x.register(10, 3, 100);
+        let revive = x.sweep_seed(&[9], &[3, 7]);
+        assert_eq!(revive, vec![3], "the referenced quarantined id revives");
+        assert_eq!(x.stats().quarantine_revived, 1);
+        let mut work = x.reclaim_work(0, 8);
+        work.sort_unstable_by_key(|c| c.extent_id);
+        assert_eq!(
+            work,
+            vec![
+                ReclaimCandidate { extent_id: 7, origin: ReclaimOrigin::Quarantined },
+                ReclaimCandidate { extent_id: 9, origin: ReclaimOrigin::BootOrphan },
+            ],
+            "second verdict + fresh boot orphan, each typed"
+        );
+        // The plane's dispositions: the fresh orphan quarantines (rename
+        // — bytes survive), the second verdict unlinks its twin.
+        x.reclaim_quarantined(9);
+        x.reclaim_done(7);
+        assert_eq!(x.stats().quarantined, 1);
+        assert_eq!(x.stats().reclaimed, 1);
+        assert_eq!(x.refcount(3), 1, "the revived extent's count is untouched");
+        assert_eq!(x.allocate_id(), 10, "listed and quarantined names both advance the cursor");
     }
 
     #[test]
@@ -430,5 +667,170 @@ mod tests {
         x.register(200, 2, 20);
         let got: Vec<_> = x.entries_below(250).collect();
         assert_eq!(got, vec![(100, 1, 10), (200, 2, 20)], "ascending, watermark-filtered");
+    }
+
+    /// Review of 2026-08-30 (C4 / F-L03-01, F-L14-02): the checkpoint's
+    /// 0x05 walk resumes across MAINTAIN slices while foreground DEL /
+    /// overwrite / compaction mutate the reference map, so the resume
+    /// must be stable under removals on either side of the cursor.
+    /// `entries_from` (the address-cursor resume `tier_walk_step` pass 3
+    /// composes) is; the ordinal `.skip(n)` resume it replaced stepped
+    /// over one live entry per below-cursor removal — this exact
+    /// schedule against `entries_below(MAX).skip(2)` emitted
+    /// `[100, 200, 400, 500]`, silently missing live entry 300, and the
+    /// boot sweep then unlinked its extent (the recorded falsifier run).
+    #[test]
+    fn mid_walk_death_below_the_cursor_never_hides_an_entry() {
+        let mut x = ExtentRefs::new();
+        for addr in [100u64, 200, 300, 400, 500] {
+            x.register(addr, addr / 100, 10);
+        }
+        // Slice 1: the walk emits the first two entries, exactly as
+        // `tier_walk_step` pass 3 does; the cursor is the last emitted
+        // address + 1, never an ordinal.
+        let mut emitted: Vec<(u64, u64, u64)> = x.entries_from(0, u64::MAX).take(2).collect();
+        let cursor = emitted.last().expect("two entries staged").0 + 1;
+        // Between slices: a DEL kills an entry *below* the cursor and an
+        // overwrite kills one above it.
+        assert_eq!(x.note_death(100), Some(1));
+        assert_eq!(x.note_death(400), Some(4));
+        // Slice 2 resumes at the address; every surviving entry that
+        // existed the whole walk must still be emitted.
+        emitted.extend(x.entries_from(cursor, u64::MAX));
+        let got: Vec<u64> = emitted.iter().map(|&(addr, _, _)| addr).collect();
+        assert_eq!(
+            got,
+            vec![100, 200, 300, 500],
+            "a still-live pre-watermark entry was never emitted into any 0x05 section"
+        );
+    }
+
+    /// F-L04-12: a candidate handed to the plane for disposal cannot be
+    /// revived — the guard holds in every profile (a release build once
+    /// let the unlink proceed against a live reference).
+    #[test]
+    #[should_panic(expected = "a handed-out reclaim candidate re-registered")]
+    fn reviving_a_handed_out_candidate_is_refused_in_every_profile() {
+        let mut x = ExtentRefs::new();
+        let e = x.allocate_id();
+        x.register(100, e, 64);
+        x.note_death(100);
+        x.stamp(1);
+        assert_eq!(x.reclaim_work(1, 8).len(), 1, "handed out");
+        x.register(200, e, 64);
+    }
+
+    /// F-L04-12: a relocation onto a live address is a lifecycle bug in
+    /// every profile (a release build once dropped the displaced
+    /// reference — that extent's count could never reach zero again).
+    #[test]
+    #[should_panic(expected = "relocation target already registered")]
+    fn relocating_onto_a_live_reference_is_refused_in_every_profile() {
+        let mut x = ExtentRefs::new();
+        x.register(100, 1, 64);
+        x.register(200, 2, 64);
+        x.relocate(100, 200);
+    }
+
+    /// F-L04-11: a MAINTAIN reclaim slice examines at most `max + 1`
+    /// candidates whatever the backlog — the flat-cost claim the
+    /// `BLOB_RECLAIM_PER_SLICE_DEFAULT` doc makes. Pre-fix every slice
+    /// drained and rebuilt the whole queue (steps == backlog).
+    #[test]
+    fn reclaim_slice_examines_at_most_max_plus_one_candidates() {
+        let mut x = ExtentRefs::new();
+        let backlog = 10_000u64;
+        for i in 0..backlog {
+            let e = x.allocate_id();
+            x.register(i, e, 64);
+            x.note_death(i);
+            if i % 100 == 99 {
+                x.stamp(i / 100 + 1); // epochs 1..=100, 100 deaths each
+            }
+        }
+        assert_eq!(x.stats().reclaimable, backlog);
+        let before = x.scan_steps();
+        let work = x.reclaim_work(u64::MAX, 8);
+        assert_eq!(work.len(), 8);
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 9, "one slice examined {steps} candidates for 8 hand-outs (F-L04-11)");
+        for c in work {
+            x.reclaim_done(c.extent_id);
+        }
+        // A partially durable epoch: eligible = the first 50 epochs. The
+        // slice still costs max + 1, and it hands out the oldest first.
+        let before = x.scan_steps();
+        let work = x.reclaim_work(50, 8);
+        assert_eq!(work.len(), 8);
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 9, "partial epoch: {steps} candidates examined");
+        for c in work {
+            x.reclaim_done(c.extent_id);
+        }
+        // Nothing eligible: one peek, no scan of the ineligible tail.
+        let before = x.scan_steps();
+        assert!(x.reclaim_work(0, 8).is_empty());
+        let steps = x.scan_steps() - before;
+        assert!(steps <= 1, "nothing eligible cost {steps} steps");
+    }
+
+    /// F-L04-11: seeding the boot sweep costs one candidacy probe per
+    /// listed id — never a walk of the queue per id (pre-fix O(n²):
+    /// every listed id scanned every already-queued candidate).
+    #[test]
+    fn boot_sweep_seeding_is_linear_in_the_listing() {
+        let mut x = ExtentRefs::new();
+        // Half the listing is already queued (replayed deaths the
+        // directory also lists — the common boot shape); half is orphans.
+        let n = 20_000u64;
+        for i in 0..n / 2 {
+            let e = x.allocate_id();
+            x.register(i, e, 64);
+            x.note_death(i);
+        }
+        let listed: Vec<u64> = (1..=n).collect();
+        let before = x.scan_steps();
+        assert!(x.sweep_seed(&listed, &[]).is_empty());
+        let steps = x.scan_steps() - before;
+        assert!(
+            steps <= n,
+            "seeding {n} listed ids examined {steps} queued candidates (F-L04-11: O(n²))"
+        );
+        assert_eq!(x.stats().reclaimable, n, "every listed id queued exactly once");
+    }
+
+    /// F-L04-11, the regime witness (run explicitly — a wall-clock
+    /// bound has no place in the parallel suite): 50 000 boot orphans
+    /// seeded then drained eight per slice. Pre-fix: seconds (the
+    /// quadratic seed plus a full queue rebuild per slice); after: tens
+    /// of milliseconds. `cargo test -p inf-store --lib -- --ignored
+    /// large_backlog_seeds_and_drains_in_bounded_time`.
+    #[test]
+    #[ignore = "wall-clock witness; run explicitly"]
+    #[allow(clippy::disallowed_methods, reason = "test-only wall-clock witness, not cell code")]
+    fn large_backlog_seeds_and_drains_in_bounded_time() {
+        let n = 50_000u64;
+        let mut x = ExtentRefs::new();
+        let listed: Vec<u64> = (1..=n).collect();
+        let started = std::time::Instant::now();
+        assert!(x.sweep_seed(&listed, &[]).is_empty());
+        let mut slices = 0u64;
+        loop {
+            let work = x.reclaim_work(0, BLOB_RECLAIM_PER_SLICE_DEFAULT);
+            if work.is_empty() {
+                break;
+            }
+            slices += 1;
+            for c in work {
+                x.reclaim_quarantined(c.extent_id);
+            }
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(slices, n / BLOB_RECLAIM_PER_SLICE_DEFAULT as u64);
+        assert_eq!(x.stats().reclaimable, 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "seed + drain of {n} orphans took {elapsed:?} (F-L04-11)"
+        );
     }
 }

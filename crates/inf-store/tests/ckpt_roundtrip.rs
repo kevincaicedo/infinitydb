@@ -13,6 +13,8 @@ use inf_log::ckpt::{IckReaderConfig, SyncIckWriter, ick_file_name, read_ick};
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{CkptConfig, Lsn, RecordView, SegmentId};
+use inf_store::InternalDeadline::At;
+use inf_store::NoSpill;
 use inf_store::{
     FsyncClass, Keyspace, NsCatalog, NsId, NsMode, NsSpec, ReplayOutcome, StoreConfig, WallAnchor,
 };
@@ -37,6 +39,8 @@ fn durable_keyspace() -> Keyspace {
             maxmemory: None,
             tier: None,
         }],
+        index: Default::default(),
+        dropped: Vec::new(),
     };
     ks.seed_catalog(&catalog).expect("seed");
     ks
@@ -77,7 +81,7 @@ fn apply(ks: &mut Keyspace, op: &Op) {
         Op::SetWithDeadline { key, value, at_ms } => {
             let key = key_bytes(*key);
             store.replay_set(&key, value, NOW).expect("set");
-            store.replay_expire_at(&key, Nanos::from_millis(*at_ms), NOW);
+            store.replay_expire_at(&key, At(Nanos::from_millis(*at_ms)), NOW);
         }
         Op::Del { key } => store.replay_del(&key_bytes(*key), NOW),
     }
@@ -151,7 +155,8 @@ proptest! {
             &dir.join(ick_file_name(1)),
             IckReaderConfig::default(),
             |view| {
-                let outcome = recovered.apply_record(&view, NOW, ANCHOR).expect("apply");
+                let outcome =
+                    recovered.apply_record(&view, NOW, ANCHOR, &mut NoSpill).expect("apply");
                 assert!(matches!(outcome, ReplayOutcome::Applied), "checkpoint records apply");
                 Ok::<(), ()>(())
             },

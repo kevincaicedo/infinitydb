@@ -1,3 +1,11 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! M3-S20 placement + document-root prefetch evidence harness.
 //!
 //! Gate run (10M-document working set, ABBA x3):
@@ -10,8 +18,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inf_doc::JsonParser;
+use inf_doc::{CanonicalDoc, JsonParser};
 use inf_foundation::time::Nanos;
+use inf_store::InternalDeadline::At;
+use inf_store::KeyHasher;
 use inf_store::{CellStore, ExpireCond, JsonSetOptions, StoreConfig};
 
 #[allow(dead_code, unused_imports)] // shared generator also contains its CLI and witness tests
@@ -73,7 +83,7 @@ fn run(store: &mut CellStore, keys: &[[u8; 12]], arm: Arm) -> f64 {
     for chunk in keys.chunks(BATCH) {
         if arm != Arm::Off {
             for (index, key) in chunk.iter().enumerate() {
-                hashes[index] = CellStore::hash_key(key);
+                hashes[index] = KeyHasher::default().hash(key);
                 store.prefetch(hashes[index]);
             }
             for hash in &hashes[..chunk.len()] {
@@ -98,7 +108,7 @@ fn run(store: &mut CellStore, keys: &[[u8; 12]], arm: Arm) -> f64 {
 fn run_ttl(store: &mut CellStore, keys: &[[u8; 12]]) -> f64 {
     let started = Instant::now();
     for key in keys {
-        assert!(store.expire(key, Some(Nanos::from_millis(10_000)), ExpireCond::Always, NOW));
+        assert!(store.expire(key, Some(At(Nanos::from_millis(10_000))), ExpireCond::Always, NOW));
         assert!(store.expire(key, None, ExpireCond::Always, NOW));
     }
     (2 * keys.len()) as f64 / started.elapsed().as_secs_f64()
@@ -157,7 +167,8 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
     let thresholds = [0usize, 256, 512, 1_024, 2_048];
     let keys = trace(documents, operations, doc_corpus::CANONICAL_SEED ^ 0x5448_5245_5348);
     println!(
-        "threshold corpus=small-200B,deep-32,gate-1KiB,medium-2KiB documents={documents} operations={operations} reps={reps}"
+        "threshold corpus=small-200B,deep-32,gate-1KiB,medium-2KiB documents={documents} \
+             operations={operations} reps={reps}"
     );
     for threshold in thresholds {
         let mut store = CellStore::new(StoreConfig {
@@ -165,9 +176,13 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
             doc_inline_bytes_max: threshold,
             ..StoreConfig::default()
         });
+        let receipts: Vec<CanonicalDoc<'_>> = corpus
+            .iter()
+            .map(|(_, idoc)| CanonicalDoc::validate(idoc).expect("corpus is canonical"))
+            .collect();
         let started = Instant::now();
         for index in 0..documents {
-            let idoc = &corpus[index % corpus.len()].1;
+            let idoc = &receipts[index % receipts.len()];
             store
                 .json_set(&key_of(index), idoc, JsonSetOptions::default(), NOW)
                 .expect("threshold load");
@@ -182,7 +197,9 @@ fn threshold_rows(corpus: &[(String, Vec<u8>)]) {
         let read_rate = median(&mut rates);
         let ttl_rate = run_ttl(&mut store, &keys[..ttl_operations.min(keys.len())]);
         println!(
-            "threshold bytes={} inline_docs={} records_B_per_doc={:.3} doc_resident_B_per_doc={:.3} attributed_B_per_doc={:.3} load_mops={:.6} read_mops={:.6} ttl_mops={:.6}",
+            "threshold bytes={} inline_docs={} records_B_per_doc={:.3} \
+                 doc_resident_B_per_doc={:.3} attributed_B_per_doc={:.3} load_mops={:.6} \
+                 read_mops={:.6} ttl_mops={:.6}",
             threshold,
             domain.inline_docs,
             report.records_resident_bytes as f64 / documents as f64,
@@ -208,20 +225,23 @@ fn prefetch_rows(gate: &[u8]) {
         ..StoreConfig::default()
     });
     println!(
-        "prefetch corpus=gate-1KiB idoc_bytes={} documents={documents} operations={operations} batch={BATCH} seed=0x{:08X}",
+        "prefetch corpus=gate-1KiB idoc_bytes={} documents={documents} operations={operations} \
+             batch={BATCH} seed=0x{:08X}",
         gate.len(),
         doc_corpus::CANONICAL_SEED
     );
+    let gate_doc = CanonicalDoc::validate(gate).expect("the gate document is canonical");
     let started = Instant::now();
     for index in 0..documents {
         store
-            .json_set(&key_of(index), gate, JsonSetOptions::default(), NOW)
+            .json_set(&key_of(index), &gate_doc, JsonSetOptions::default(), NOW)
             .expect("prefetch load");
     }
     let elapsed = started.elapsed().as_secs_f64();
     let report = store.report();
     println!(
-        "prefetch load_seconds={elapsed:.6} load_mops={:.6} attributed_bytes={} doc_resident_bytes={} index_bytes={}",
+        "prefetch load_seconds={elapsed:.6} load_mops={:.6} attributed_bytes={} \
+             doc_resident_bytes={} index_bytes={}",
         documents as f64 / elapsed / 1e6,
         report.attributed_bytes(),
         report.doc_resident_bytes,

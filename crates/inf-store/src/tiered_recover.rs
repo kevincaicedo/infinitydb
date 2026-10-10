@@ -19,8 +19,11 @@
 //! 3. The caller then loads the checkpoint (images re-append at the new
 //!    tail; ref sections apply through [`apply_ref_section`] with the
 //!    manifested-watermark cross-check) and replays the WAL tail through
-//!    the `TieredTable::apply_*` rules (ADR-0057 D4) — zero disk reads
-//!    in either step.
+//!    the replay machine ([`TierReplay`]) and the table's `replay_*`
+//!    entries (ADR-0174 D3): a record the window cannot hold demotes
+//!    through the boot pipeline instead of failing the boot (D1), and a
+//!    record sealed by that step is settled against its cold twins by
+//!    an identity-checked read through a held handle (R7).
 //!
 //! Fail-stop philosophy: the manifest is the only authority — a named
 //! file that is missing, mis-identified, or shorter than its manifested
@@ -28,10 +31,10 @@
 
 use std::io;
 
-use inf_foundation::LogicalAddr;
+use inf_foundation::{KeyHasher, LogicalAddr};
 use inf_log::blob::parse_extent_file_name;
 use inf_log::ckpt::{IckBlobRefSection, IckLiveSetSection, IckRefSection};
-use inf_log::flush::{TierFileMeta, TierFlush, TierFlushConfig};
+use inf_log::flush::{BootFlush, TierFileMeta, TierFlush, TierFlushConfig};
 use inf_log::fs::SegmentFs;
 use inf_log::manifest::TierNsManifest;
 use inf_log::tier::{
@@ -41,6 +44,7 @@ use inf_log::tier::{
 use crate::address_space::AddressSpaceConfig;
 use crate::demote::DemotionConfig;
 use crate::tiered::TieredTable;
+use crate::tiered::replay::TierReplay;
 
 /// Boot facts for the log line and the ledger (counts, not policy).
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -54,17 +58,20 @@ pub struct TierRecoverStats {
     pub files_removed: u32,
 }
 
-/// One recovered tiered namespace: the new-life table, the seeded flush
-/// pipeline, and the boot facts.
+/// One recovered tiered namespace: the new-life table, its boot replay
+/// machine over the seeded flush pipeline, and the boot facts.
 pub struct RecoveredTier<F: SegmentFs> {
     /// New life at `life_origin = manifested flushed`; watermarks all at
     /// the origin (RAM starts cold — disclosed, L10). Live/dead counters
     /// boot *unreconciled* for the cold set (S14's lazy rebuild owns
     /// them).
     pub table: TieredTable,
-    /// Catalog seeded with the manifested files; `next_id` above every
-    /// named id.
-    pub flush: TierFlush<F>,
+    /// The replay machine (ADR-0174), `Seeded`:
+    /// the boot pipeline — catalog seeded with the manifested files,
+    /// `next_id` above every named id, the creation-mode handle of every
+    /// manifested file held, the barrier claim rule — and the counters.
+    /// Its `hand_over` is the plane's pipeline and the handles.
+    pub replay: TierReplay<F>,
     /// Blob-extent ids present on disk (names only — no content reads;
     /// M4-S17, ADR-0061 D6). The caller hands this to
     /// [`TieredTable::extent_sweep_seed`] **after** checkpoint + tail
@@ -72,6 +79,11 @@ pub struct RecoveredTier<F: SegmentFs> {
     /// refcounts, never by the manifest — the tier-file "unmanifested ⇒
     /// garbage" rule deliberately does not extend to extents.
     pub extents_listed: Vec<u64>,
+    /// `.quarantine`-named extent ids (ADR-0096 D3) — boot orphans a
+    /// previous life renamed instead of unlinking. Handed to the same
+    /// sweep seed; ids the replayed map references come back for
+    /// revival, the rest await their second-verdict unlink.
+    pub extents_quarantined: Vec<u64>,
     /// Boot facts.
     pub stats: TierRecoverStats,
 }
@@ -86,6 +98,8 @@ pub struct RecoveredTier<F: SegmentFs> {
 /// I/O failures; `InvalidData` when a named file is missing, its header
 /// identity mismatches, or a sealed footer covers less than the
 /// manifested range; `OutOfMemory` when the ring reservation fails.
+// the recovery entry's seven inputs + the key hasher (ADR-0094)
+#[allow(clippy::too_many_arguments)]
 pub fn recover_tiered_ns<F: SegmentFs>(
     fs: F,
     tier: &TierNsManifest,
@@ -94,10 +108,15 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     space: AddressSpaceConfig,
     demote: DemotionConfig,
     initial_keys: usize,
+    hasher: KeyHasher,
 ) -> io::Result<RecoveredTier<F>> {
     assert_eq!(flush_config.ns.0, tier.ns, "manifest section vs pipeline namespace");
+    // The directory is not created here: a namespace that never flushed
+    // has none, the pipeline creates it with its first tier file, and a
+    // boot that fits writes nothing for the namespace (ADR-0174 D5) — a
+    // full device refuses a mkdir. A section that names files needs it,
+    // and their probes refuse typed when it is missing.
     let cold_dir = flush_config.shard_dir.join("cold");
-    fs.create_dir_all(&cold_dir)?;
     let mut stats = TierRecoverStats::default();
     let mut catalog: Vec<TierFileMeta> = Vec::with_capacity(tier.files.len());
     for range in &tier.files {
@@ -159,19 +178,44 @@ pub fn recover_tiered_ns<F: SegmentFs>(
     // refcount-governed — their ids are collected here (names only) and
     // the post-replay sweep decides.
     let mut extents_listed: Vec<u64> = Vec::new();
-    for name in fs.list_dir(&cold_dir)? {
+    let mut extents_quarantined: Vec<u64> = Vec::new();
+    let names = match fs.list_dir(&cold_dir) {
+        Ok(names) => names,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    for name in names {
         if let Some(extent_id) = parse_extent_file_name(&name) {
             extents_listed.push(extent_id.0);
             continue;
         }
+        if let Some(extent_id) = inf_log::parse_quarantined_file_name(&name) {
+            extents_quarantined.push(extent_id.0);
+            continue;
+        }
         let Some(id) = parse_tier_file_name(&name) else { continue };
+        // The planted canary breaks ADR-0174 D4: a namespace recovered
+        // through the empty section keeps its dead-life tier files.
+        let empty_section = tier.flushed == 0 && tier.files.is_empty();
+        if cfg!(inf_canary_replay_no_section_gc) && empty_section {
+            continue;
+        }
         if tier.files.iter().all(|f| f.id != id) {
             fs.remove_file(&cold_dir.join(name))?;
             stats.files_removed += 1;
         }
     }
     extents_listed.sort_unstable();
+    extents_quarantined.sort_unstable();
     let next_id = tier.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
+    // The held handles (ADR-0054 D1; ADR-0174 D3, D5): one per
+    // manifested file in its creation mode, opened here and held by the
+    // boot pipeline — the settle read opens nothing, and the plane's
+    // cold-read table inherits them at the hand-over.
+    let mut handles = Vec::with_capacity(catalog.len());
+    for meta in &catalog {
+        handles.push((meta.id, fs.open_tier(&meta.path, flush_config.mode)?));
+    }
     let mut table = TieredTable::new(
         AddressSpaceConfig {
             life_origin: LogicalAddr::from_raw(tier.flushed)
@@ -180,39 +224,65 @@ pub fn recover_tiered_ns<F: SegmentFs>(
         },
         demote,
         initial_keys,
+        hasher,
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "tier ring reservation failed"))?;
     // Live-set seeding (M4-S14, ADR-0058 D4): counts start at zero and
-    // reconstruct through `apply_ref`/`apply_displace` as the checkpoint
+    // reconstruct through `replay_ref`/`replay_displace` as the checkpoint
     // and tail replay run; byte counters restore when the `.ick` 0x04
     // section arrives ([`apply_live_set_section`]).
     table.seed_recovered_files(&catalog, boot_ckpt_id);
     let flush = TierFlush::with_catalog(fs, flush_config, next_id, catalog);
-    Ok(RecoveredTier { table, flush, extents_listed, stats })
+    let replay = TierReplay::new(BootFlush::new(flush, handles), &table);
+    Ok(RecoveredTier { table, replay, extents_listed, extents_quarantined, stats })
 }
 
 /// Applies one validated `.ick` address-reference section (ADR-0057 D6
 /// step 3): cross-checks the section's walk watermark against the
 /// manifested flushed watermark — the §3.1 corollary's recovery half — a
 /// section claiming refs above it means the checkpoint and manifest are
-/// not one recovery unit (fail-stop), then applies every entry
-/// idempotently.
+/// not one recovery unit (fail-stop); refuses a section for a namespace
+/// whose table already holds a record of this life (ADR-0174 R2: within
+/// a namespace every ref section precedes every image section, so a ref
+/// can never name a key a replayed record of this life already settled
+/// against); then applies every entry idempotently.
 ///
 /// # Errors
-/// `InvalidData` on the watermark cross-check.
+/// `InvalidData` on the watermark cross-check and on the section order.
 pub fn apply_ref_section(
     table: &mut TieredTable,
     section: &IckRefSection<'_>,
     manifested_flushed: u64,
 ) -> io::Result<()> {
-    if section.walk_watermark > manifested_flushed {
+    apply_refs(table, section.ns, section.walk_watermark, section.iter(), manifested_flushed)
+}
+
+/// [`apply_ref_section`]'s body over the section's facts — the one place
+/// of both checks (reachable by a test without a decoded section).
+fn apply_refs(
+    table: &mut TieredTable,
+    ns: u32,
+    walk_watermark: u64,
+    refs: impl Iterator<Item = (u64, u64)>,
+    manifested_flushed: u64,
+) -> io::Result<()> {
+    if walk_watermark > manifested_flushed {
         return Err(invalid(format!(
-            "ick ref section (ns {}) walk watermark {} outruns the manifested flushed {}",
-            section.ns, section.walk_watermark, manifested_flushed
+            "ick ref section (ns {ns}) walk watermark {walk_watermark} outruns the manifested \
+             flushed {manifested_flushed}"
         )));
     }
-    for (hash, addr) in section.iter() {
-        table.apply_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
+    let (origin, tail) = (table.space().life_origin(), table.space().tail());
+    if tail > origin {
+        return Err(invalid(format!(
+            "ick ref section (ns {ns}) after an image of its namespace: the table holds {} bytes \
+             of this life above its origin {} (ADR-0174 R2)",
+            tail.offset_from(origin),
+            origin.to_raw()
+        )));
+    }
+    for (hash, addr) in refs {
+        table.replay_ref(hash, LogicalAddr::from_raw(addr).expect("reader checked 48 bits"));
     }
     Ok(())
 }
@@ -243,4 +313,65 @@ pub fn apply_blob_ref_section(table: &mut TieredTable, section: &IckBlobRefSecti
 
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::KeyHasher;
+
+    use super::*;
+
+    /// A recovered table at origin 1 MiB with one manifested file below
+    /// it (a ref must name a file's range).
+    fn table() -> TieredTable {
+        let demote = DemotionConfig::for_budget(1 << 20, 4 << 10);
+        let mut table = TieredTable::new(
+            AddressSpaceConfig {
+                reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
+                page_bytes: 4 << 10,
+                life_origin: LogicalAddr::from_raw(1 << 20).expect("48-bit"),
+            },
+            demote,
+            64,
+            KeyHasher::default(),
+        )
+        .expect("ring");
+        table.seed_recovered_files(
+            &[TierFileMeta {
+                id: 0,
+                base: LogicalAddr::ZERO,
+                data_len: 1 << 20,
+                reason: SealReason::Capacity,
+                path: std::path::Path::new("shard-0/cold/tier-000000.itier").to_path_buf(),
+            }],
+            1,
+        );
+        table
+    }
+
+    /// ADR-0174 R2, the reader half: a ref section for a namespace
+    /// whose table already holds a record of this life is a typed boot
+    /// refusal naming the namespace; the reverse order applies. Red
+    /// before the law: the refs applied beside the image.
+    #[test]
+    fn a_ref_section_after_an_image_of_its_namespace_refuses_the_boot() {
+        let flushed = 1u64 << 20;
+        let hash = KeyHasher::default().hash(b"k");
+        let refs = [(hash, 4096u64)];
+        let mut t = table();
+        apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed).expect("refs first");
+        t.replay_upsert(&[], b"k", b"v", hash).expect("fits");
+        assert_eq!(t.len(), 2, "two slots: the ref and this life's record (no rebuild yet)");
+        let err = apply_refs(&mut t, 41, flushed, refs.iter().copied(), flushed)
+            .expect_err("a ref section after an image of its namespace");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let text = err.to_string();
+        assert!(text.contains("ns 41") && text.contains("ADR-0174 R2"), "{text}");
+        let mut fresh = table();
+        fresh.replay_upsert(&[], b"k", b"v", hash).expect("fits");
+        let err = apply_refs(&mut fresh, 41, flushed, refs.iter().copied(), flushed)
+            .expect_err("the first ref section after an image refuses too");
+        assert!(err.to_string().contains("ADR-0174 R2"));
+        assert!(!fresh.contains_pair(hash, LogicalAddr::from_raw(4096).expect("48-bit")));
+    }
 }

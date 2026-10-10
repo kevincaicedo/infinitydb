@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use inf_log::FRAME_ALIGN;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, Lsn, MutationEffect, NsId, ReaderConfig, SegmentConfig,
@@ -17,7 +18,7 @@ const FRAME_OVERHEAD: u32 = (FRAME_HEADER_LEN + FRAME_TRAILER_LEN) as u32;
 
 fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let cfg = SegmentConfig { segment_bytes, seal_after_ms: None };
+    let cfg = SegmentConfig { segment_bytes, ..Default::default() };
     let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg).expect("rotor");
     (rotor, dirs.log)
 }
@@ -50,11 +51,12 @@ impl Rng {
 fn accounting_is_exact_at_every_append_and_drain_site() {
     let fs = MemFs::new();
     let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 4096 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(4096));
 
     assert_eq!(ring.staged_bytes(), 0);
     assert_eq!(ring.pending_frame_len(), FRAME_OVERHEAD);
-    assert_eq!(ring.resident_bytes(), 2 * 4096);
+    // Two buffers plus the O_DIRECT alignment slack (ADR-0086 D6).
+    assert_eq!(ring.resident_bytes(), 2 * (4096 + 2 * FRAME_ALIGN as usize));
     // The never-fits bound admission must reject against (not retry).
     assert_eq!(ring.max_record_len(), 4096 - FRAME_OVERHEAD);
     assert!(ring.would_fit(ring.max_record_len() as usize));
@@ -88,7 +90,11 @@ fn accounting_is_exact_at_every_append_and_drain_site() {
 
     ring.release(lease);
     assert_eq!(ring.in_flight_bytes(), 0);
-    assert_eq!(ring.resident_bytes(), 2 * 4096, "domain memory is constant");
+    assert_eq!(
+        ring.resident_bytes(),
+        2 * (4096 + 2 * FRAME_ALIGN as usize),
+        "domain memory is constant"
+    );
 
     // Empty iterations emit no frame.
     assert!(ring.flush_into(&mut rotor, 0).expect("flush").is_none());
@@ -99,7 +105,7 @@ fn full_ring_refuses_with_typed_backpressure_and_bounded_memory() {
     let fs = MemFs::new();
     let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
     let capacity = 1024u32;
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: capacity });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(capacity));
 
     let value = [0xCD_u8; 100];
     let effect = MutationEffect::StringSet { ns: NsId(1), key: b"key", value: &value };
@@ -134,7 +140,7 @@ fn full_ring_refuses_with_typed_backpressure_and_bounded_memory() {
 fn backlogged_ring_keeps_staging_and_stays_bounded() {
     let fs = MemFs::new();
     let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 512 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
 
     ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"one" }).expect("fits");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("frame");
@@ -157,7 +163,7 @@ fn backlogged_ring_keeps_staging_and_stays_bounded() {
         }
     }
     assert!(refused > 0, "storm hit the bound");
-    assert_eq!(ring.resident_bytes(), 2 * 512);
+    assert_eq!(ring.resident_bytes(), 2 * (512 + 2 * FRAME_ALIGN as usize));
     assert!(ring.pending_frame_len() <= 512);
 
     // Release unblocks the next seal; nothing staged was lost.
@@ -202,7 +208,7 @@ fn storm_loses_and_reorders_nothing() {
     let segment_bytes = 8 << 10;
     let (mut rotor, log_dir) = mem_rotor(&fs, segment_bytes);
     let capacity = 512;
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: capacity });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(capacity));
     let mut rng = Rng(0xC0FF_EE00_0000_0001);
 
     let workload: Vec<OwnedEffect> = (0..2_000)
@@ -293,7 +299,7 @@ fn storm_loses_and_reorders_nothing() {
 fn stale_token_is_rejected_by_generation_check() {
     let fs = MemFs::new();
     let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 512 });
+    let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
 
     let stale = ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"a" }).expect("fits");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("frame");
@@ -303,4 +309,88 @@ fn stale_token_is_rejected_by_generation_check() {
     ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"b" }).expect("fits");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("frame");
     let _ = lease.lsn_of(stale); // panics: token from an earlier generation
+}
+
+#[test]
+fn ring_of_k_plus_one_buffers_releases_leases_in_any_order() {
+    // ADR-0087 D1: with `frames_in_flight = 3` the domain is four fixed
+    // buffers; up to three sealed frames stay leased at once, released by
+    // generation in any order (completions reorder), and the fourth seal
+    // waits for a free buffer — bounded by construction, never a queue.
+    let fs = MemFs::new();
+    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
+    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 4096, frames_in_flight: 3 });
+    assert_eq!(ring.resident_bytes(), 4 * (4096 + 2 * FRAME_ALIGN as usize));
+    assert_eq!(ring.max_record_len(), 4096 - FRAME_OVERHEAD, "the admission bound ignores K");
+    assert_eq!(ring.frames_in_flight(), 3);
+    assert!(ring.drained());
+
+    let mut leases = Vec::new();
+    for i in 0..3u8 {
+        let value = [i; 16];
+        ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k", value: &value })
+            .expect("fits");
+        assert!(ring.can_seal(), "a free buffer exists for seal {i}");
+        let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
+        let lease = ring.seal(slot.first_record_lsn(), 0, slot.layout());
+        rotor.commit_frame(slot, ring.leased_frame(&lease)).expect("commit");
+        leases.push(lease);
+        assert_eq!(ring.in_flight(), i + 1);
+    }
+    assert!(ring.backlogged(), "three leases out: every in-flight slot taken");
+    assert!(!ring.drained());
+    ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"k" }).expect("staging still accepts");
+    assert!(!ring.can_seal(), "the fourth seal waits for a release");
+    assert_eq!(ring.stats().in_flight_max, 3);
+
+    // Each leased frame is still readable by its own lease while others
+    // are out — the buffers are distinct.
+    let frames: Vec<Vec<u8>> = leases.iter().map(|l| ring.leased_frame(l).to_vec()).collect();
+    assert!(frames.windows(2).all(|w| w[0] != w[1]), "distinct sealed frames");
+
+    // Release the middle lease first: its buffer rejoins the free list and
+    // the waiting seal proceeds; the other two leases remain valid.
+    let middle = leases.remove(1);
+    ring.release(middle);
+    assert_eq!(ring.in_flight(), 2);
+    assert!(ring.can_seal());
+    let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
+    let fourth = ring.seal(slot.first_record_lsn(), 0, slot.layout());
+    rotor.commit_frame(slot, ring.leased_frame(&fourth)).expect("commit");
+    assert_eq!(ring.leased_frame(&leases[0]), frames[0].as_slice(), "first lease intact");
+    assert_eq!(ring.leased_frame(&leases[1]), frames[2].as_slice(), "third lease intact");
+    for lease in leases.into_iter().rev() {
+        ring.release(lease);
+    }
+    ring.release(fourth);
+    assert!(ring.drained());
+    assert_eq!(ring.stats().seals, 4);
+    assert_eq!(ring.stats().releases, 4);
+}
+
+/// F-L01-06 (batch 43): a failed `commit_frame` inside `flush_into` must
+/// not leak the frame lease — the ring stays usable (the records of the
+/// failed frame are gone with the buffer; the error is the caller's
+/// signal), never wedged behind a phantom in-flight slot.
+#[test]
+fn flush_into_releases_the_lease_when_the_write_fails() {
+    use inf_foundation::fault::{self, FaultSpec};
+    fault::disarm_all();
+    let fs = MemFs::new();
+    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
+    let mut ring = StagingRing::new(StagingConfig { frames_in_flight: 1, ..Default::default() });
+    ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k", value: b"v" }).expect("stage");
+    fault::arm(inf_log::fault::LOG_APPEND_SHORT_WRITE, FaultSpec::Nth(1));
+    let err = ring.flush_into(&mut rotor, 0).expect_err("the short write fails the append");
+    fault::disarm_all();
+    assert!(err.to_string().contains("log_append_short_write"), "{err}");
+    assert_eq!(ring.in_flight(), 0, "the failed frame's lease is released, not leaked");
+    assert!(ring.is_empty(), "the failed frame's records left the builder");
+    assert_eq!(ring.stats().releases, 1);
+    ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k2", value: b"v2" })
+        .expect("stage");
+    assert!(ring.can_seal(), "the ring is not backlogged after the failure");
+    let lease = ring.flush_into(&mut rotor, 0).expect("the next flush succeeds").expect("frame");
+    ring.release(lease);
+    assert!(ring.drained());
 }

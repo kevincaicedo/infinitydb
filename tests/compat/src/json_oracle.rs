@@ -47,6 +47,34 @@ const fn c(
     JsonCase { id, argv, json_reply, source }
 }
 
+/// 127 nested arrays around `0`: the deepest value both parsers accept.
+const ARRAYS_127: &str = concat!(
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+    "]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+);
+
+/// 128 nested arrays around `0`: InfinityDB's bound, one past RedisJSON's.
+const ARRAYS_128: &str = concat!(
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+    "]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+);
+
+/// 127 nested objects `{"a":…}` around `0`: a merge patch both parsers accept.
+const OBJECTS_127: &str = concat!(
+    r#"{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a""#,
+    r#":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a"#,
+    r#"":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{""#,
+    r#"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"#,
+    r#""a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":"#,
+    r#"{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a""#,
+    r#":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a"#,
+    r#"":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{"a":0}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}"#,
+    "}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "}}}}}}}",
+);
+
 /// Ordered, stateful script re-derived from the local S11-S15 command
 /// matrices. The final `fuzz-*` cases are minimized parser/delta edge shapes,
 /// not copied upstream tests.
@@ -175,6 +203,16 @@ pub static JSON_CASES: &[JsonCase] = &[
     c("edge-negative-zero-set", &["JSON.SET", "edge:-0", "$", "-0"], false, "S05"),
     c("edge-negative-zero-get", &["JSON.GET", "edge:-0"], true, "S05"),
     c("edge-invalid-json", &["JSON.SET", "edge:bad", "$", "{bad"], false, "S05"),
+    // Composed depth 129 from operands of at most 127 levels, under two
+    // enclosing containers (ADR-0042 A1): RedisJSON stores each result.
+    c("depth-set-fixture", &["JSON.SET", "deep", "$", r#"{"r":[0],"a":[],"g":[0]}"#], false, "A1"),
+    c("depth-set-129", &["JSON.SET", "deep", "$.r[0]", ARRAYS_127], false, "A1"),
+    c("depth-arrappend-129", &["JSON.ARRAPPEND", "deep", "$.a", ARRAYS_127], false, "A1"),
+    c("depth-arrinsert-129", &["JSON.ARRINSERT", "deep", "$.a", "0", ARRAYS_127], false, "A1"),
+    c("depth-merge-129", &["JSON.MERGE", "deep", "$.g[0]", OBJECTS_127], false, "A1"),
+    // The parsed-value bound: a 128-level value and a 128-level element.
+    c("depth-set-128-value", &["JSON.SET", "deep128", "$", ARRAYS_128], false, "A1"),
+    c("depth-arrappend-128-element", &["JSON.ARRAPPEND", "deep", "$.a", ARRAYS_128], false, "A1"),
 ];
 
 pub struct Deviation {
@@ -209,31 +247,36 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-get-after-abort",
         Protocol::Resp2,
         "JSON.ARRINSERT",
-        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error",
+        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match \
+             before a later index error",
     ),
     d(
         "edge-del-overlap",
         Protocol::Resp2,
         "JSON.DEL",
-        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical",
+        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; \
+             post-state is identical",
     ),
     d(
         "edge-wrongtype-get",
         Protocol::Resp2,
         "JSON.GET",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-wrongtype-arrlen",
         Protocol::Resp2,
         "JSON.ARRLEN",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-debug-memory",
         Protocol::Resp2,
         "JSON.DEBUG",
-        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator bytes",
+        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator \
+             bytes",
     ),
     d(
         "fuzz-exp-get",
@@ -251,13 +294,67 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-merge-overlap-get",
         Protocol::Resp2,
         "JSON.MERGE",
-        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results",
+        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor \
+             supersede descendants; RedisJSON cascades descendant results",
     ),
     d(
         "edge-trim-overlap",
         Protocol::Resp2,
         "JSON.ARRTRIM",
-        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error while InfinityDB reports per-match length/null results",
+        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error \
+             while InfinityDB reports per-match length/null results",
+    ),
+    d(
+        "depth-set-129",
+        Protocol::Resp2,
+        "JSON.SET",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrappend-129",
+        Protocol::Resp2,
+        "JSON.ARRAPPEND",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrinsert-129",
+        Protocol::Resp2,
+        "JSON.ARRINSERT",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-merge-129",
+        Protocol::Resp2,
+        "JSON.MERGE",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-set-128-value",
+        Protocol::Resp2,
+        "JSON.SET",
+        "a 128-level value: InfinityDB accepts it (its bound is 128 containers); RedisJSON \
+             refuses a parsed value's 128th container — a permissive difference, a permanent \
+             product boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrappend-128-element",
+        Protocol::Resp2,
+        "JSON.ARRAPPEND",
+        "a 128-level element: both refuse it before the write; InfinityDB answers `ERR \
+             document nesting too deep`, RedisJSON its recursion-limit parse error — a permanent \
+             product boundary (ADR-0042 A1)",
     ),
     d(
         "s15-debug-missing",
@@ -269,31 +366,36 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-get-after-abort",
         Protocol::Resp3,
         "JSON.ARRINSERT",
-        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match before a later index error",
+        "InfinityDB validates the full match set before commit; RedisJSON mutates an earlier match \
+             before a later index error",
     ),
     d(
         "edge-del-overlap",
         Protocol::Resp3,
         "JSON.DEL",
-        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; post-state is identical",
+        "recursive overlap: InfinityDB reports three raw matches; RedisJSON reports two removals; \
+             post-state is identical",
     ),
     d(
         "edge-wrongtype-get",
         Protocol::Resp3,
         "JSON.GET",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-wrongtype-arrlen",
         Protocol::Resp3,
         "JSON.ARRLEN",
-        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error text",
+        "InfinityDB uses the core Redis WRONGTYPE envelope; RedisJSON uses module-specific error \
+             text",
     ),
     d(
         "edge-debug-memory",
         Protocol::Resp3,
         "JSON.DEBUG",
-        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator bytes",
+        "InfinityDB reports canonical document attribution; RedisJSON reports module allocator \
+             bytes",
     ),
     d(
         "fuzz-exp-get",
@@ -311,13 +413,67 @@ pub static DEVIATIONS: &[Deviation] = &[
         "edge-merge-overlap-get",
         Protocol::Resp3,
         "JSON.MERGE",
-        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor supersede descendants; RedisJSON cascades descendant results",
+        "InfinityDB computes retaining overlaps from one snapshot and lets a changed ancestor \
+             supersede descendants; RedisJSON cascades descendant results",
     ),
     d(
         "edge-trim-overlap",
         Protocol::Resp3,
         "JSON.ARRTRIM",
-        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error while InfinityDB reports per-match length/null results",
+        "overlapping mixed-type matches reach the same post-state; RedisJSON returns a path error \
+             while InfinityDB reports per-match length/null results",
+    ),
+    d(
+        "depth-set-129",
+        Protocol::Resp3,
+        "JSON.SET",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrappend-129",
+        Protocol::Resp3,
+        "JSON.ARRAPPEND",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrinsert-129",
+        Protocol::Resp3,
+        "JSON.ARRINSERT",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-merge-129",
+        Protocol::Resp3,
+        "JSON.MERGE",
+        "composed depth 129: InfinityDB refuses a write whose result would nest past 128 \
+             containers (`ERR document nesting too deep`, nothing changed); RedisJSON stores it, \
+             and its JSON.SET then refuses that document's JSON.GET text — a permanent product \
+             boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-set-128-value",
+        Protocol::Resp3,
+        "JSON.SET",
+        "a 128-level value: InfinityDB accepts it (its bound is 128 containers); RedisJSON \
+             refuses a parsed value's 128th container — a permissive difference, a permanent \
+             product boundary (ADR-0042 A1)",
+    ),
+    d(
+        "depth-arrappend-128-element",
+        Protocol::Resp3,
+        "JSON.ARRAPPEND",
+        "a 128-level element: both refuse it before the write; InfinityDB answers `ERR \
+             document nesting too deep`, RedisJSON its recursion-limit parse error — a permanent \
+             product boundary (ADR-0042 A1)",
     ),
 ];
 
@@ -352,7 +508,8 @@ pub fn compare(
         return Ok(Comparison::Allowed { deviation_index, semantic_equal });
     }
     Err(format!(
-        "{} {} {}: unallowlisted byte mismatch (semantic_equal={semantic_equal})\n  oracle    {:?}\n  candidate {:?}",
+        "{} {} {}: unallowlisted byte mismatch (semantic_equal={semantic_equal})\n  oracle    \
+             {:?}\n  candidate {:?}",
         protocol.name(),
         case.id,
         case.argv[0],

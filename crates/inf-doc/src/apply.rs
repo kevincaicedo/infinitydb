@@ -1,10 +1,11 @@
-//! Path-mutation engine v1 (M3-S11/S12; ADR-0041 D5): two-phase
+//! Path-mutation engine v1 (M3-S11/S12; ADR-0169 D1): two-phase
 //! plan/apply per milestone §3.4 R4/R5, over plain canonical tape bytes.
 //!
 //! **Plan** resolves the full match set against the pre-mutation state
 //! (canonical order — document order, deduplicated, ADR-0040 D4),
 //! validates every per-match operation (type checks, i64 range, non-finite
-//! results, the post-edit idoc-byte bound), and computes each edit's exact
+//! results), then the kept edits' composed depth and the post-edit body
+//! bound (ADR-0169 D1/D3), and computes each edit's exact
 //! byte range and replacement. **Apply** then streams one new tape in a
 //! single pass. Any validation failure returns before a byte of output
 //! exists — there is no rollback path because nothing partial ever starts
@@ -31,11 +32,11 @@ use std::collections::BTreeMap;
 
 use crate::cursor::DocValue;
 use crate::header::HEADER_LEN;
-use crate::limits::DOC_BYTES_MAX;
+use crate::limits::{DEPTH_MAX, DOC_BYTES_MAX, DocLimits};
 use crate::path::{EvalError, EvalLimits, Matches, PathProgram, SimpleStep, eval};
 use crate::tape::{
-    Dict, TAG_ARR, TAG_FALSE, TAG_OBJ, TAG_TRUE, TapeDoc, ValueRef, read_u24, read_value,
-    skip_value,
+    CanonicalDoc, Dict, TAG_ARR, TAG_FALSE, TAG_OBJ, TAG_TRUE, TapeDoc, ValueRef, nesting_depth,
+    read_u24, read_value, skip_value,
 };
 use crate::{emit, header, merge};
 
@@ -109,6 +110,45 @@ pub enum ApplyOp<'a> {
     },
 }
 
+/// What an op writes below the containers that enclose its edit: the
+/// input of the composed-depth check (ADR-0169 D3).
+#[derive(Copy, Clone, Debug)]
+pub enum Written<'a> {
+    /// One value at every edit: `SetReplace`'s and `SetMember`'s fragment,
+    /// `Merge`'s patch. A merged value nests at least the patch and at most
+    /// the patch or the surviving target, which is already within bound.
+    Value(&'a [u8]),
+    /// An array operand's elements: its wrapper is not written.
+    Elements(&'a [u8]),
+    /// Scalars, removals, an empty container or a sub-range of the
+    /// pre-image: never deeper than the input.
+    WithinPreImage,
+}
+
+impl<'a> ApplyOp<'a> {
+    /// The op's row of ADR-0169 D3's table. Exhaustive, with no wildcard:
+    /// a new op does not compile until it declares what it writes.
+    pub fn written(&self) -> Written<'a> {
+        match *self {
+            ApplyOp::SetReplace { fragment } | ApplyOp::SetMember { fragment, .. } => {
+                Written::Value(fragment)
+            }
+            ApplyOp::Merge { patch } => Written::Value(patch),
+            ApplyOp::ArrAppend { elements } | ApplyOp::ArrInsert { elements, .. } => {
+                Written::Elements(elements)
+            }
+            ApplyOp::Del
+            | ApplyOp::NumIncrBy(_)
+            | ApplyOp::NumMultBy(_)
+            | ApplyOp::StrAppend(_)
+            | ApplyOp::Toggle
+            | ApplyOp::Clear
+            | ApplyOp::ArrPop { .. }
+            | ApplyOp::ArrTrim { .. } => Written::WithinPreImage,
+        }
+    }
+}
+
 /// Per-match outcome, in **raw (program) order** — replies echo raw
 /// order (ADR-0040 D4) even though edits apply in document order.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -136,12 +176,13 @@ pub enum MatchResult {
     PoppedEmpty,
 }
 
-/// The apply verdict. `bytes` is the complete new document (header +
-/// body) — `None` when every match was skipped: nothing changed, the
-/// caller must not rewrite the record or bump the version (ADR-0041 D8).
+/// The apply verdict. `document` is the complete new document, the
+/// receipt a store sink takes (ADR-0169 D4) — `None` when every match was
+/// skipped: nothing changed, the caller must not rewrite the record or
+/// bump the version (ADR-0041 D8).
 #[derive(Clone, Debug)]
 pub struct ApplyOutcome {
-    pub bytes: Option<Vec<u8>>,
+    pub document: Option<CanonicalDoc<'static>>,
     pub results: Vec<MatchResult>,
     /// Count of non-skipped matches (the `JSON.DEL`/`JSON.CLEAR` reply).
     pub applied: u32,
@@ -156,6 +197,9 @@ pub enum ApplyError {
     NotANumber,
     /// The post-edit document would exceed the configured byte cap.
     TooLarge,
+    /// A kept edit's enclosing containers plus the nesting it writes would
+    /// pass the depth cap (plan phase — nothing mutated; ADR-0169 D3).
+    DepthExceeded,
     /// An `ARRINSERT` index fell outside `0..=len` after negative
     /// resolution (plan phase — nothing mutated; the R4 contract).
     OutOfBounds,
@@ -169,13 +213,32 @@ pub enum ApplyError {
 /// the canonical two-phase engine must run; every other arm is a complete
 /// command verdict and the probe has either committed exactly once or
 /// left the document untouched.
-#[derive(Copy, Clone, Debug, PartialEq)]
+///
+/// Neither `Copy` nor `Clone`: `Unsupported` carries the one [`Unapplied`]
+/// proof its probe made (ADR-0099 A1).
+#[derive(Debug, PartialEq)]
 pub enum ScalarPatch {
-    Unsupported,
+    Unsupported(Unapplied),
     Missing,
     Skipped,
     Number(Number),
     Toggled(bool),
+}
+
+/// Proof that an in-place scalar probe changed no byte (ADR-0043 D1's
+/// fall-through). Only this crate's two in-place patch functions make one,
+/// and only on the arms that return before a byte changes. It is neither
+/// `Copy` nor `Clone`, so one proof reopens one reply reservation that was
+/// taken before the probe ran (ADR-0099 A1).
+#[derive(Debug, PartialEq)]
+pub struct Unapplied {
+    _probe_wrote_nothing: (),
+}
+
+impl Unapplied {
+    pub(crate) fn new() -> Unapplied {
+        Unapplied { _probe_wrote_nothing: () }
+    }
 }
 
 /// Allocation-free same-width scalar patch over a plain stored tape.
@@ -187,10 +250,10 @@ pub fn patch_scalar_in_place(
     op: &ApplyOp<'_>,
 ) -> Result<ScalarPatch, ApplyError> {
     if idoc.get(3).copied().unwrap_or(0) != 0 {
-        return Ok(ScalarPatch::Unsupported);
+        return Ok(ScalarPatch::Unsupported(Unapplied::new()));
     }
     let Some(steps) = program.simple_steps() else {
-        return Ok(ScalarPatch::Unsupported);
+        return Ok(ScalarPatch::Unsupported(Unapplied::new()));
     };
     let body = &idoc[HEADER_LEN..];
     let Some(at) = locate_simple(body, steps) else {
@@ -206,7 +269,7 @@ pub fn patch_scalar_in_place(
             let mut encoded = [0u8; emit::I64_MAX_LEN];
             let len = encode_number(result, &mut encoded);
             if len != end - at {
-                return Ok(ScalarPatch::Unsupported);
+                return Ok(ScalarPatch::Unsupported(Unapplied::new()));
             }
             idoc[HEADER_LEN + at..HEADER_LEN + end].copy_from_slice(&encoded[..len]);
             Ok(ScalarPatch::Number(result))
@@ -222,7 +285,16 @@ pub fn patch_scalar_in_place(
             }
             _ => Ok(ScalarPatch::Skipped),
         },
-        _ => Ok(ScalarPatch::Unsupported),
+        ApplyOp::SetReplace { .. }
+        | ApplyOp::SetMember { .. }
+        | ApplyOp::Del
+        | ApplyOp::StrAppend(_)
+        | ApplyOp::Clear
+        | ApplyOp::ArrAppend { .. }
+        | ApplyOp::ArrInsert { .. }
+        | ApplyOp::ArrPop { .. }
+        | ApplyOp::ArrTrim { .. }
+        | ApplyOp::Merge { .. } => Ok(ScalarPatch::Unsupported(Unapplied::new())),
     }
 }
 
@@ -285,6 +357,7 @@ impl core::fmt::Display for ApplyError {
             ApplyError::Overflow => write!(f, "arithmetic overflows a 64-bit integer"),
             ApplyError::NotANumber => write!(f, "result is not a number"),
             ApplyError::TooLarge => write!(f, "document too large"),
+            ApplyError::DepthExceeded => write!(f, "document nesting too deep"),
             ApplyError::OutOfBounds => write!(f, "index out of bounds"),
             ApplyError::RootDelete => write!(f, "document root deletion requires a key delete"),
             ApplyError::Eval(e) => write!(f, "{e}"),
@@ -304,14 +377,14 @@ impl From<EvalError> for ApplyError {
 ///
 /// `doc` must be the **plain** canonical form (never interned — the
 /// store's freeze path guarantees it; ADR-0038 D3 keeps interning
-/// storage-local). `max_body` is the namespace's idoc-byte cap
-/// (clamped to the format ceiling like `ParseLimits`).
+/// storage-local). `doc_limits` bounds the output: the kept edits'
+/// composed depth, then its body bytes (ADR-0169 D1/D3).
 pub fn apply(
     doc: &TapeDoc<'_>,
     program: &PathProgram,
     op: &ApplyOp<'_>,
     limits: &EvalLimits,
-    max_body: usize,
+    doc_limits: DocLimits,
 ) -> Result<ApplyOutcome, ApplyError> {
     if program.is_root() && matches!(op, ApplyOp::Del) {
         return Err(ApplyError::RootDelete);
@@ -333,21 +406,46 @@ pub fn apply(
     let applied = results.iter().filter(|r| !matches!(r, MatchResult::Skipped)).count() as u32;
     let kept = drop_superseded(&mut plan.edits);
     if kept.is_empty() {
-        return Ok(ApplyOutcome { bytes: None, results, applied });
+        return Ok(ApplyOutcome { document: None, results, applied });
     }
-    let bytes = build_output(body, &kept, max_body.min(DOC_BYTES_MAX))?;
-    Ok(ApplyOutcome { bytes: Some(bytes), results, applied })
+    check_depth(&kept, op, doc_limits.depth_max())?;
+    let bytes = build_output(body, &kept, doc_limits.body_bytes_max())?;
+    Ok(ApplyOutcome { document: Some(CanonicalDoc::emitted(bytes)), results, applied })
+}
+
+/// Refuse, before any output byte exists, a kept edit whose enclosing
+/// containers plus the nesting its op writes pass `depth_max` (ADR-0169
+/// D3). Only kept edits count, so a superseded descendant cannot refuse an
+/// output that never contains it; the operand is walked once per command.
+fn check_depth(kept: &[Edit], op: &ApplyOp<'_>, depth_max: usize) -> Result<(), ApplyError> {
+    let below = match op.written() {
+        Written::WithinPreImage => return Ok(()),
+        Written::Value(value) => nesting_depth(value),
+        // The wrapper array is one of the operand's containers, not written.
+        Written::Elements(wrapper) => nesting_depth(wrapper).saturating_sub(1),
+    };
+    let enclosing = kept.iter().map(|edit| edit.patch.len()).max().unwrap_or(0);
+    if enclosing + below > depth_max {
+        return Err(ApplyError::DepthExceeded);
+    }
+    Ok(())
 }
 
 /// Wrap parsed value fragments into the single canonical **array**
 /// operand `ARRAPPEND`/`ARRINSERT` carry (ADR-0042 D2 — one operand per
-/// future `DocDelta`). `None` when the combined operand would exceed the
-/// u24/document ceiling (the command layer answers the size error).
-pub fn array_operand(fragments: &[&[u8]]) -> Option<Vec<u8>> {
+/// `DocDelta`). It refuses what the delta decoder would refuse: an element
+/// nesting `DEPTH_MAX` makes the wrapper nest one more (`DepthExceeded`,
+/// ADR-0169 D3), and a combined operand past the u24/document ceiling is
+/// `TooLarge`. The command layer calls it while the operands parse, ahead
+/// of path compile and key lookup.
+pub fn array_operand(fragments: &[&[u8]]) -> Result<Vec<u8>, ApplyError> {
     debug_assert!(!fragments.is_empty(), "command arity guarantees at least one value");
+    if fragments.iter().any(|fragment| nesting_depth(fragment) >= DEPTH_MAX) {
+        return Err(ApplyError::DepthExceeded);
+    }
     let body: usize = fragments.iter().map(|f| f.len()).sum();
     if body > DOC_BYTES_MAX - 4 {
-        return None;
+        return Err(ApplyError::TooLarge);
     }
     let mut out = Vec::with_capacity(4 + body);
     out.push(TAG_ARR);
@@ -355,20 +453,22 @@ pub fn array_operand(fragments: &[&[u8]]) -> Option<Vec<u8>> {
     for fragment in fragments {
         out.extend_from_slice(fragment);
     }
-    Some(out)
+    Ok(out)
 }
 
 /// The `JSON.MERGE` creation value (ADR-0042 D6): `MergePatch(absent,
 /// patch)` — object patches merge into `{}` (nulls stripped through
 /// object chains), everything else is literal — as a complete document
-/// (header + body), ready for `json_set`.
-pub fn merge_absent_document(patch_fragment: &[u8]) -> Vec<u8> {
+/// (header + body), ready for `json_set`. The receipt rests on a
+/// canonical patch (ADR-0169 D4's trusted input): its nesting equals the
+/// patch's.
+pub fn merge_absent_document(patch_fragment: &[u8]) -> CanonicalDoc<'static> {
     let mut out = vec![0u8; HEADER_LEN];
     merge::merge_absent(patch_fragment, &mut out);
     let body_len = (out.len() - HEADER_LEN) as u32;
     header::patch(&mut out, 0, body_len);
     debug_assert!(TapeDoc::from_bytes(&out).is_ok(), "merge emits canonical documents");
-    out
+    CanonicalDoc::emitted(out)
 }
 
 // ---- plan ------------------------------------------------------------------
@@ -489,7 +589,13 @@ fn plan_site(body: &[u8], site: &Site, op: &ApplyOp<'_>) -> Result<Verdict, Appl
                 // versions or (S17) log records (ADR-0041 D8).
                 ValueRef::I64(v) if v != 0 => vec![0x00],
                 ValueRef::F64(f) if f != 0.0 => vec![0x00],
-                _ => return Ok(Verdict::Skip),
+                ValueRef::Null
+                | ValueRef::Bool(_)
+                | ValueRef::I64(_)
+                | ValueRef::F64(_)
+                | ValueRef::Str(_)
+                | ValueRef::Obj(_)
+                | ValueRef::Arr(_) => return Ok(Verdict::Skip),
             };
             replace(repl, MatchResult::Cleared)
         }
@@ -704,7 +810,11 @@ fn num_op(value: ValueRef<'_>, operand: Number, mul: bool) -> Result<Number, App
     let current = match value {
         ValueRef::I64(v) => Number::I64(v),
         ValueRef::F64(v) => Number::F64(v),
-        _ => unreachable!("caller checked the numeric arms"),
+        ValueRef::Null
+        | ValueRef::Bool(_)
+        | ValueRef::Str(_)
+        | ValueRef::Obj(_)
+        | ValueRef::Arr(_) => unreachable!("caller checked the numeric arms"),
     };
     number_op(current, operand, mul)
 }
@@ -842,20 +952,33 @@ fn drop_superseded(edits: &mut Vec<Edit>) -> Vec<Edit> {
     use core::cmp::Reverse;
     edits.sort_by_key(|e| (e.start, Reverse(e.depth)));
     let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
-    let mut covered_end = 0u32;
-    let mut covering = false;
+    // The last kept non-empty range, as `(start, end)`.
+    let mut covered: Option<(u32, u32)> = None;
     for edit in edits.drain(..) {
-        if covering && edit.start < covered_end {
-            debug_assert!(edit.end <= covered_end, "value extents nest, never straddle");
+        if covered.is_some_and(|range| inside(&edit, range)) {
             continue;
         }
         if edit.end > edit.start {
-            covered_end = edit.end;
-            covering = true;
+            covered = Some((edit.start, edit.end));
         }
         kept.push(edit);
     }
     kept
+}
+
+/// Whether `edit` lies inside the kept range `(start, end)`. Edits arrive
+/// in ascending start order, so one that starts before `end` is inside.
+/// An insert at `end` itself is inside when the container it inserts into
+/// is: an append to an object ends on the byte the object ends on, so its
+/// offset cannot tell it from a sibling that follows the range. An
+/// insert's last patched header is its own container (`with_self`).
+fn inside(edit: &Edit, (start, end): (u32, u32)) -> bool {
+    if edit.start < end {
+        debug_assert!(edit.end <= end, "value extents nest, never straddle");
+        return true;
+    }
+    let insert_at_end = edit.start == end && edit.end == edit.start;
+    insert_at_end && edit.patch.last().is_some_and(|&container| container >= start)
 }
 
 /// Stream the new document in one pass: gaps memcpy, ancestor headers

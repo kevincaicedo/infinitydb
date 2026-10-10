@@ -1,12 +1,17 @@
 # syntax=docker/dockerfile:1
-# InfinityDB release image (M1-S14): static musl build → `scratch`.
+# InfinityDB release image: static musl build → `scratch`.
 #
 # The binary is fully static (musl + crt-static, verified static-pie), so the
 # runtime stage carries nothing but the executable: no shell, no libc, no
 # distro CVE surface. Size gate: < 10 MB image (the stripped binary is ~3 MB).
 #
-#   docker build -t infinitydb:dev --build-arg INF_RELEASE_VERSION=v0.1.0-alpha.1 .
-#   docker run --rm -p 6379:6379 infinitydb:dev
+#   docker build -t infinitydb:dev --build-arg INF_RELEASE_VERSION=<tag> .
+#   docker run --rm -p 127.0.0.1:6379:6379 \
+#     --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json infinitydb:dev
+#
+# Docker's default seccomp profile blocks io_uring, and the server exits at
+# start without the bundled profile (docs/deployment.md). The loopback bind
+# keeps the unauthenticated port off other interfaces.
 #
 # Multi-arch builds run this same file per-platform under buildx (the rust
 # alpine image exists for linux/amd64 and linux/arm64; the native target of

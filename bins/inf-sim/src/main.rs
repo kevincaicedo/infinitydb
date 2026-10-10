@@ -5,13 +5,22 @@
 //! inf-sim --scenario m0-smoke --seed 0xC0FFEE --verify-determinism
 //! ```
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "sim-harness: scenario files and reports outside simulated cells (ADR-0144 D5)"
+)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
-use inf_sim::RecoveryScenario;
 use inf_sim::net::Plant;
 use inf_sim::{
     CombinedScenario, DurableScenario, Scenario, run_combined_scenario, run_durable_scenario,
     run_scenario,
 };
+use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
 
 fn parse_seed(text: &str) -> Result<u64, String> {
     let text = text.trim();
@@ -22,7 +31,37 @@ fn parse_seed(text: &str) -> Result<u64, String> {
     }
 }
 
+/// The census's closest boot, `files of bound`, or that no boot sealed a
+/// file.
+fn closest_boot(closest: Option<(u64, u64)>) -> String {
+    closest.map_or_else(
+        || "none sealed a file".to_owned(),
+        |(files, bound)| format!("{files} of {bound}"),
+    )
+}
+
+/// ADR-0107 (review of 2026-08-30, F-L16-01): a simulator built without
+/// its `dst` feature carries no fault registry and no collision oracle —
+/// every armed point would fire `false` and every forced-collision row
+/// would hash two distinct keys, so a "clean" run would prove nothing.
+/// Refuse to run instead of reporting a lie. Exit 2 is the harness's
+/// usage-error code (`run-sweep.sh` treats it as a missing simulator).
+fn require_dst_build() {
+    if inf_foundation::fault::COMPILED_IN && inf_foundation::COLLISION_ORACLE {
+        return;
+    }
+    eprintln!(
+        "inf-sim: this binary was built without the `dst` feature (fault points: {}, collision \
+         oracle: {}) — build it with `cargo build -p inf-sim --features dst` (ADR-0107); a plain \
+         workspace build carries neither so that `infinityd` never does",
+        inf_foundation::fault::COMPILED_IN,
+        inf_foundation::COLLISION_ORACLE
+    );
+    std::process::exit(2);
+}
+
 fn main() {
+    require_dst_build();
     let mut scenario_name = "m0-smoke".to_string();
     let mut seed = 0xC0FFEEu64;
     let mut verify = false;
@@ -34,6 +73,17 @@ fn main() {
     let mut shard = (0u64, 1u64);
     let mut out_dir: Option<String> = None;
     let mut replay_canary = false;
+    // F-L14-01 (batch 20): force the m2 lift regime on any seed — the
+    // arm on a seed known to lift (the sweep discloses which).
+    let mut lift_regime = false;
+    // ADR-0174 D1: force the replay-above-window seed class on any seed of
+    // m4-recovery and m4-tiered — the tail replay must demote; a run in it
+    // that never exceeded a window is VACUOUS.
+    let mut replay_above_window = false;
+    // ADR-0174 D2 rule 6: force m4-recovery's spec-variant class on any
+    // seed — every boot recovers at a window below its ring, with records
+    // up to the inline maximum; a run that placed no pad is VACUOUS.
+    let mut spec_variant: Option<SpecVariant> = None;
     let mut ops_override: Option<u64> = None;
 
     let mut it = std::env::args().skip(1);
@@ -48,10 +98,14 @@ fn main() {
                     plant = match take("--plant")?.as_str() {
                         "lost-wakeup" => Plant::LostWakeup,
                         "fsync-lies" => Plant::FsyncLies,
+                        "accept-error" => Plant::AcceptError,
+                        "tier-read-eio" => Plant::TierReadEio,
+                        "stop-kill" => Plant::StopKill,
                         other => return Err(format!("unknown plant {other}")),
                     }
                 }
-                "--cells" | "--connections" | "--commands" | "--key-space" => {
+                "--cells" | "--connections" | "--commands" | "--key-space"
+                | "--wheel-nodes-max" => {
                     let value = take(&flag)?.parse().map_err(|e| format!("{flag}: {e}"))?;
                     overrides.push((flag.clone(), value));
                 }
@@ -71,6 +125,15 @@ fn main() {
                 }
                 "--out" => out_dir = Some(take("--out")?),
                 "--replay-canary" => replay_canary = true,
+                "--lift-regime" => lift_regime = true,
+                "--replay-above-window" => replay_above_window = true,
+                "--spec-variant" => {
+                    spec_variant = Some(match take("--spec-variant")?.as_str() {
+                        "ring-top" => SpecVariant::RingTop,
+                        "page" => SpecVariant::Page,
+                        other => return Err(format!("unknown spec variant {other}")),
+                    });
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -78,12 +141,22 @@ fn main() {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "inf-sim --scenario m0-smoke|m1-cache|m2-durable|m3-document|m2-combined|boot-storm \
+                        "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies] [--replay-canary] [--cells N] \
-                         [--connections N] [--commands N] [--trace-out FILE] \
-                         [--sweep N [--shard I/K] [--out DIR]]"
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
+                         [--replay-canary] [--lift-regime] [--replay-above-window] \
+                         [--spec-variant ring-top|page] [--cells N] \
+                         [--connections N] [--commands N] [--wheel-nodes-max N] \
+                         [--trace-out FILE] \
+                         [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
+                        inf_sim::SCENARIOS.join("|")
                     );
+                    std::process::exit(0);
+                }
+                "--list-scenarios" => {
+                    for name in inf_sim::SCENARIOS {
+                        println!("{name}");
+                    }
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown flag {other}")),
@@ -95,15 +168,42 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // The two flags each force one of m4-recovery's seed classes, which a
+    // seed runs one of: together they are refused, never one dropped.
+    let forced_class = match (replay_above_window, spec_variant) {
+        (true, Some(_)) => {
+            eprintln!(
+                "inf-sim: --replay-above-window and --spec-variant force two seed classes; give \
+                 one"
+            );
+            std::process::exit(2);
+        }
+        (true, None) => Some(SeedClass::ReplayAboveWindow),
+        (false, variant) => variant.map(SeedClass::SpecVariant),
+    };
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
-    if matches!(scenario_name.as_str(), "m2-durable" | "m3-document") {
+    if matches!(
+        scenario_name.as_str(),
+        "m2-durable"
+            | "m2-clean-stop"
+            | "m2-device-budget"
+            | "m2-mode-transition"
+            | "m2-reorder-window"
+            | "m2-fill-tick"
+            | "m2-group-hold"
+            | "m2-fua-pending"
+            | "m2-ckpt-refused"
+            | "m2-recycle"
+            | "m3-document"
+    ) {
         run_durable(
             &scenario_name,
             seed,
             plant,
             replay_canary,
+            lift_regime,
             verify,
             sweep,
             shard,
@@ -131,9 +231,93 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_steel_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-steel determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The M4.5-S05 backfill scenario (crash at every backfill phase;
+    // ready only with oracle-verified contents — ADR-0077).
+    if scenario_name == "m45-backfill" {
+        let scenario = inf_sim::BackfillScenario::m45_backfill(seed);
+        let report = inf_sim::run_backfill_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m45-backfill seed {seed:#x}: {} boots, cuts {:?}, \
+             {} ready checks, {} refused bindings, {} raced mutations, {} steps, \
+             hash {:#018x}",
+            report.boots,
+            report.cuts,
+            report.ready_checks,
+            report.refused_bindings,
+            report.raced_mutations,
+            report.scheduler_steps,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_backfill_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m45-backfill determinism: second run diverged"
+            );
+            println!("inf-sim: determinism verified — second run hash-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The M4.5-S06 sidecar scenario (checkpoint under mutation storm,
+    // cut, boot with sidecar load + tail catch-up ⇒ oracle green;
+    // mid-write cut ⇒ rebuild — ADR-0078).
+    if scenario_name == "m45-sidecar" {
+        let scenario = inf_sim::SidecarScenario::m45_sidecar(seed);
+        let report = inf_sim::run_sidecar_scenario(&scenario);
+        println!(
+            "inf-sim: scenario m45-sidecar seed {seed:#x}: {} boots, cuts {:?}, \
+             {} loaded, {} storm-during-stream, {} ready checks, {} refused bindings, \
+             {} degraded-tail rebuilds, {} steps, hash {:#018x}",
+            report.boots,
+            report.cuts,
+            report.loaded,
+            report.storm_during_stream,
+            report.ready_checks,
+            report.refused_bindings,
+            report.degraded_rebuilds,
+            report.scheduler_steps,
+            report.trace_hash
+        );
+        if verify {
+            let second = inf_sim::run_sidecar_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            assert_eq!(
+                report.trace_hash, second.trace_hash,
+                "m45-sidecar determinism: second run diverged"
             );
             println!("inf-sim: determinism verified — second run hash-identical");
         }
@@ -163,6 +347,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_diskfull_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-diskfull determinism: second run diverged"
@@ -194,6 +383,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_pressure_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-pressure determinism: second run diverged"
@@ -212,12 +406,16 @@ fn main() {
     // staging, cancellation, pin-deferred unlinks).
     if scenario_name == "m4-recovery" {
         let run_one = |seed: u64| {
-            let scenario = RecoveryScenario::m4_recovery(seed);
+            let mut scenario = RecoveryScenario::m4_recovery(seed);
+            if let Some(class) = forced_class {
+                scenario = scenario.with_class(class);
+            }
             inf_sim::run_recovery_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut lines = Vec::new();
             let mut violations = 0u64;
             let mut ran = 0u64;
@@ -233,10 +431,70 @@ fn main() {
             let mut blobs = 0u64;
             let mut blob_orphans = 0u64;
             let mut blob_reclaims = 0u64;
+            let mut shadow_opened = 0u64;
+            let mut shadow_at_cut = 0u64;
+            let mut shadow_reformed = 0u64;
+            let mut shadow_same_key = 0u64;
+            let mut shadow_collision = 0u64;
+            let mut shadow_collide_ops = 0u64;
+            let mut shadow_settled_at_boot = 0u64;
+            let mut shadow_drain_checks = 0u64;
+            let mut shadow_multi_winners = 0u64;
+            let mut shadow_multi_dels = 0u64;
+            let mut shadow_twin_origin_rows = 0u64;
+            let mut shadow_twin_origins_covered = 0u64;
+            let mut shadow_held_rows = 0u64;
+            let mut shadow_held_reformed = 0u64;
+            let mut shadow_held_not_restored = 0u64;
+            // ADR-0174 D6: the boots that demoted, the fitting boots the
+            // zero set was checked on, and boot replay's counters.
+            let mut demoting_boots = 0u64;
+            let mut fitting_boots = 0u64;
+            let mut boot_replay = inf_store::ReplayCounters::default();
+            let mut writer_parks = 0u64;
+            let mut two_crash_removed = 0u64;
+            let mut two_crash_skipped = 0u64;
+            // ADR-0174 D2 rule 6: the spec-variant seeds and their long
+            // records (the pads are `boot_replay.pads_placed`).
+            let mut variant_seeds = 0u64;
+            let mut long_records = 0u64;
+            let mut seal_census = inf_sim::SealCensus::default();
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                demoting_boots += report.demoting_boots;
+                fitting_boots += report.fitting_boots_checked;
+                boot_replay.absorb(report.boot_replay);
+                writer_parks += report.writer_parks;
+                two_crash_removed += report.two_crash_markers_removed;
+                two_crash_skipped += report.two_crash_unit_past_window;
+                variant_seeds += u64::from(report.spec_variant.is_some());
+                long_records += report.long_records_written;
+                seal_census.absorb(report.seal_census);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
+                shadow_held_rows += report.shadow_held_rows;
+                shadow_held_reformed += report.shadow_held_reformed;
+                shadow_held_not_restored += report.shadow_held_not_restored;
+                shadow_multi_winners += report.shadow_multi_ticket_winners;
+                shadow_multi_dels += report.shadow_multi_ticket_dels;
+                shadow_twin_origin_rows += report.shadow_twin_origin_rows;
+                shadow_twin_origins_covered += report.shadow_twin_origins_covered;
+                shadow_opened += report.shadow_opened;
+                shadow_at_cut += report.shadow_open_at_cut;
+                shadow_reformed += report.shadow_reformed;
+                shadow_same_key += report.shadow_same_key;
+                shadow_collision += report.shadow_collision;
+                shadow_collide_ops += report.shadow_collide_ops;
+                shadow_settled_at_boot += report.shadow_settled_at_boot;
+                shadow_drain_checks += report.shadow_drain_checks;
                 refs += report.refs_emitted;
                 images += report.images_emitted;
                 cuts_before += report.cut_before_publish;
@@ -267,7 +525,39 @@ fn main() {
                  {live_entries} live-set entries, {relocations} relocations, \
                  {files_retired} retired, {files_unlinked} unlinked, \
                  {boot_gc} left-to-boot-gc, {blobs} blobs, {blob_orphans} orphans-planted, \
-                 {blob_reclaims} blob-reclaims"
+                 {blob_reclaims} blob-reclaims; shadow {shadow_opened} opened, \
+                 {shadow_at_cut} open at a cut, {shadow_reformed} re-formed by recovery, \
+                 {shadow_same_key} same-key / {shadow_collision} collision verdicts; \
+                 {shadow_collide_ops} ops on crafted colliding pairs, \
+                 {shadow_settled_at_boot} slots settled at boot, {shadow_drain_checks} \
+                 DBSIZE-drain checks; rebuilt multi-ticket winners {shadow_multi_winners} \
+                 ({shadow_multi_dels} DELs drained them), twin-with-origins rows \
+                 {shadow_twin_origin_rows} ({shadow_twin_origins_covered} origins covered by \
+                 DEL markers), held-across-the-walk rows {shadow_held_rows} \
+                 ({shadow_held_reformed} re-formed at boot, {shadow_held_not_restored} not \
+                 restored by an older manifest); boots {demoting_boots} demoting / \
+                 {fitting_boots} fitting checked, boot replay {} demote steps / {} tier bytes / \
+                 {} settle reads / {} same-key / {} distinct / {} deletes verified / {} blob \
+                 releases, {writer_parks} writer parks, {two_crash_removed} two-crash refs \
+                 removed by a marker ({two_crash_skipped} rows skipped: unit past the raised \
+                 window); spec-variant seeds {variant_seeds}, {long_records} long records, {} \
+                 pads placed; boot files censused {} (capacity {} / gap {} / shutdown {} \
+                 seals), {} page pads crossed, against a summed bound of {} (closest boot: {})",
+                boot_replay.demote_steps,
+                boot_replay.tier_bytes,
+                boot_replay.settle_reads,
+                boot_replay.settled_same_key,
+                boot_replay.settled_distinct,
+                boot_replay.deletes_verified,
+                boot_replay.blob_releases,
+                boot_replay.pads_placed,
+                seal_census.files,
+                seal_census.capacity_seals,
+                seal_census.gap_seals,
+                seal_census.shutdown_seals,
+                seal_census.page_pads,
+                seal_census.bound,
+                closest_boot(seal_census.closest)
             );
             if let Some(dir) = out_dir {
                 std::fs::create_dir_all(&dir).expect("--out dir");
@@ -278,7 +568,19 @@ fn main() {
                      flush_lag_lives={flush_lag} live_set_entries={live_entries} \
                      relocations={relocations} files_retired={files_retired} \
                      files_unlinked={files_unlinked} unlinks_boot_gc={boot_gc} \
-                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims}\n"
+                     blobs={blobs} blob_orphans={blob_orphans} blob_reclaims={blob_reclaims} \
+                     shadow_opened={shadow_opened} shadow_at_cut={shadow_at_cut} \
+                     shadow_reformed={shadow_reformed} shadow_same_key={shadow_same_key} \
+                     shadow_collision={shadow_collision} shadow_collide_ops={shadow_collide_ops} \
+                     shadow_settled_at_boot={shadow_settled_at_boot} \
+                     shadow_drain_checks={shadow_drain_checks} \
+                     shadow_multi_winners={shadow_multi_winners} \
+                     shadow_multi_dels={shadow_multi_dels} \
+                     shadow_twin_origin_rows={shadow_twin_origin_rows} \
+                     shadow_twin_origins_covered={shadow_twin_origins_covered} \
+                     shadow_held_rows={shadow_held_rows} \
+                     shadow_held_reformed={shadow_held_reformed} \
+                     shadow_held_not_restored={shadow_held_not_restored}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -295,7 +597,18 @@ fn main() {
             "inf-sim: m4-recovery seed {seed:#x}: {} lives, {} refs, {} images, {} tail \
              records, {} cut-before-publish, {} flush-lag, {} keys audited, {} live-set \
              entries, {} relocations, {} retired, {} unlinked, {} left-to-boot-gc, \
-             {} blobs, {} orphans-planted, {} blob-reclaims, trace {:#x}",
+             {} blobs, {} orphans-planted, {} blob-reclaims, shadow {} opened / {} open at a \
+             cut / {} re-formed / {} same-key / {} collision, {} collide-ops, {} settled-at-boot, \
+             {} drain-checks, {} multi-ticket winners / {} DELs, {} twin-origin rows / {} \
+             origins covered, {} held rows / {} re-formed / {} not restored, {} lives above the \
+             window (largest unit {} windows), boots {} demoting / {} fitting checked, boot \
+             replay {} demote steps / {} tier bytes / {} settle reads / {} same-key / {} \
+             deletes verified / {} markers skipped, {} writer parks ({} past a walk, {} held \
+             released), {} boot files censused, two-crash rows {} opened / {} settled / {} \
+             refs removed by a marker ({} skipped: unit past the raised window), spec \
+             variant {:?}: {} pads placed, {} long records written ({} written short), boot \
+             files censused {} (capacity {} / gap {} / shutdown {} seals), {} page pads \
+             crossed, against a summed bound of {} (closest boot: {}), trace {:#x}",
             report.lives,
             report.refs_emitted,
             report.images_emitted,
@@ -311,10 +624,59 @@ fn main() {
             report.blobs_written,
             report.blob_orphans_planted,
             report.blob_extents_reclaimed,
+            report.shadow_opened,
+            report.shadow_open_at_cut,
+            report.shadow_reformed,
+            report.shadow_same_key,
+            report.shadow_collision,
+            report.shadow_collide_ops,
+            report.shadow_settled_at_boot,
+            report.shadow_drain_checks,
+            report.shadow_multi_ticket_winners,
+            report.shadow_multi_ticket_dels,
+            report.shadow_twin_origin_rows,
+            report.shadow_twin_origins_covered,
+            report.shadow_held_rows,
+            report.shadow_held_reformed,
+            report.shadow_held_not_restored,
+            report.replay_above_window_lives,
+            report.replay_unit_windows_max,
+            report.demoting_boots,
+            report.fitting_boots_checked,
+            report.boot_replay.demote_steps,
+            report.boot_replay.tier_bytes,
+            report.boot_replay.settle_reads,
+            report.boot_replay.settled_same_key,
+            report.boot_replay.deletes_verified,
+            report.boot_replay.markers_skipped,
+            report.writer_parks,
+            report.writes_parked_past_a_walk,
+            report.held_released_by_park,
+            report.boot_files_censused,
+            report.two_crash_rows_opened,
+            report.two_crash_rows_settled,
+            report.two_crash_markers_removed,
+            report.two_crash_unit_past_window,
+            report.spec_variant,
+            report.boot_replay.pads_placed,
+            report.long_records_written,
+            report.long_records_shortened,
+            report.seal_census.files,
+            report.seal_census.capacity_seals,
+            report.seal_census.gap_seals,
+            report.seal_census.shutdown_seals,
+            report.seal_census.page_pads,
+            report.seal_census.bound,
+            closest_boot(report.seal_census.closest),
             report.trace_hash
         );
         if verify {
             let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
             assert_eq!(report.trace_hash, twin.trace_hash, "determinism violated (L7)");
             println!("inf-sim: determinism verified (two runs, identical traces)");
         }
@@ -332,12 +694,18 @@ fn main() {
     // DISKFULL clamp → drop race). Sweep mode mirrors m4-recovery.
     if scenario_name == "m4-tiered" {
         let run_one = |seed: u64| {
-            let scenario = inf_sim::TieredScenario::m4_tiered(seed);
+            let mut scenario = inf_sim::TieredScenario::m4_tiered(seed);
+            // F-L04-02: the flag forces the seed-cadence arm on.
+            scenario.tier_read_fault |= plant == Plant::TierReadEio;
+            if replay_above_window {
+                scenario = scenario.with_replay_above_window();
+            }
             inf_sim::run_tiered_scenario(&scenario)
         };
         if let Some(sweep) = sweep {
             let (shard_i, shard_k) = shard;
-            assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
             let mut lines = Vec::new();
             let mut violations = 0u64;
             let mut refused = 0u64;
@@ -348,22 +716,121 @@ fn main() {
             let mut flushed_pre_cut = 0u64;
             let mut cold_resolves = 0u64;
             let mut blob_sets = 0u64;
+            let mut race_replans = 0u64;
+            let mut dir_open_fault_seeds = 0u64;
+            let mut dir_open_faults_fired = 0u64;
+            let mut tier_read_fault_seeds = 0u64;
+            let mut tier_read_faults_fired = 0u64;
+            let mut tier_read_error_replies = 0u64;
+            let mut tier_read_faults_unconsumed = 0u64;
+            let mut scan_cold_pages = 0u64;
+            let mut scan_cold_reads = 0u64;
+            let mut ckpt_downgrades = 0u64;
+            let mut ckpt_bound_splits = 0u64;
             let mut diskfull_refusals = 0u64;
             let mut drop_values = 0u64;
             let mut drop_other = 0u64;
+            let mut drop_reboots = 0u64;
+            let mut drop_reboot_residue = 0u64;
+            let mut drop_cut_whole = 0u64;
+            let mut drop_cut_swept = 0u64;
+            let mut shadow_seeds = 0u64;
+            let mut shadow_created = 0u64;
+            let mut shadow_same_key = 0u64;
+            let mut shadow_collision = 0u64;
+            let mut shadow_fallbacks = 0u64;
+            let mut shadow_stale = 0u64;
+            let mut shadow_at_cut = 0u64;
+            let mut collide_tickets = 0u64;
+            let mut collide_verdicts = 0u64;
+            let mut collide_ticketed = 0u64;
+            let mut collide_drains = 0u64;
+            let mut collide_scan_twins = 0u64;
+            let mut open_seeds = 0u64;
+            let mut open_tickets = 0u64;
+            let mut open_drains = 0u64;
+            let mut open_reads = 0u64;
+            let mut open_scan_twins = 0u64;
+            let mut open_retargeted = 0u64;
+            let mut open_forced_deletes = 0u64;
+            let mut open_ticketed = 0u64;
+            let mut open_collisions = 0u64;
+            let mut open_read_faults = 0u64;
+            let mut open_settled_without_read = 0u64;
+            let mut rebuilt_seeds = 0u64;
+            let mut rebuilt_tickets = 0u64;
+            let mut rebuilt_multi_dels = 0u64;
+            let mut rebuilt_same_key_twins = 0u64;
+            let mut rebuilt_fill_sets = 0u64;
+            let mut rebuilt_reboots = 0u64;
             for i in (shard_i..sweep).step_by(shard_k as usize) {
                 let seed = seed.wrapping_add(i);
                 let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
                 ran += 1;
+                rebuilt_seeds += u64::from(report.rebuilt_rows);
+                rebuilt_tickets += report.rebuilt_tickets;
+                rebuilt_multi_dels += report.rebuilt_multi_dels;
+                rebuilt_same_key_twins += report.rebuilt_same_key_twins;
+                rebuilt_fill_sets += report.rebuilt_fill_sets;
+                rebuilt_reboots += report.rebuilt_reboots;
+                open_seeds += u64::from(report.open_rows);
+                open_tickets += report.open_tickets;
+                open_drains += report.open_dbsize_drains;
+                open_reads += report.open_dbsize_reads;
+                open_scan_twins += report.open_scan_twins;
+                open_retargeted += report.open_retargeted;
+                open_forced_deletes += report.open_forced_deletes;
+                open_ticketed += report.open_ticketed_fallbacks;
+                open_collisions += report.open_collision_verdicts;
+                open_read_faults += report.open_read_fault_errors;
+                open_settled_without_read += report.open_settled_without_read;
+                collide_tickets += report.collide_tickets;
+                collide_verdicts += report.collide_verdicts;
+                collide_ticketed += report.collide_ticketed_fallbacks;
+                collide_drains += report.collide_dbsize_drains;
+                collide_scan_twins += report.collide_scan_twins;
+                shadow_seeds += u64::from(report.shadow_arm);
+                shadow_created += report.shadow_created;
+                shadow_same_key += report.shadow_resolved_same_key;
+                shadow_collision += report.shadow_resolved_collision;
+                shadow_fallbacks += report.shadow_fallbacks;
+                shadow_stale += report.shadow_stale;
+                shadow_at_cut += report.shadow_pending_at_cut;
                 sim_seconds += report.sim_seconds;
                 commands += report.commands_done;
                 audited += report.audited_keys;
                 flushed_pre_cut += report.flushed_pre_cut_bytes;
                 cold_resolves += report.cold_resolves;
                 blob_sets += report.blob_sets;
+                race_replans += report.race_replans;
+                dir_open_fault_seeds += u64::from(report.dir_open_fault_arm);
+                dir_open_faults_fired += report.dir_open_faults_fired;
+                tier_read_fault_seeds += u64::from(report.tier_read_fault_arm);
+                tier_read_faults_fired += report.tier_read_faults_fired;
+                tier_read_error_replies += report.tier_read_error_replies;
+                tier_read_faults_unconsumed += report.tier_read_faults_unconsumed;
+                scan_cold_pages += report.scan_cold_pages;
+                scan_cold_reads += report.scan_cold_reads;
+                ckpt_downgrades += report.ckpt_downgrades;
+                ckpt_bound_splits += report.ckpt_bound_splits;
                 diskfull_refusals += report.diskfull_refusals;
                 drop_values += report.drop_replies_value;
                 drop_other += report.drop_replies_other;
+                drop_reboots += u64::from(report.drop_reboot_ok);
+                drop_reboot_residue += u64::from(report.drop_reboot_manifest_residue);
+                match report.drop_cut_outcome {
+                    inf_sim::tiered::DropCutOutcome::Whole => drop_cut_whole += 1,
+                    inf_sim::tiered::DropCutOutcome::Swept => drop_cut_swept += 1,
+                    inf_sim::tiered::DropCutOutcome::NotReached => {}
+                }
                 if report.refused_boot && report.ok() {
                     refused += 1;
                     lines.push(format!("{seed:#x} refused (taxonomy fail-stop)"));
@@ -383,8 +850,32 @@ fn main() {
                 "inf-sim: m4-tiered sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
                  violations, {refused} legal taxonomy refusals, {commands} commands, {audited} \
                  keys audited, {flushed_pre_cut} B flushed pre-cut, {cold_resolves} cold \
-                 resolves, {blob_sets} blob sets, {diskfull_refusals} DISKFULL refusals, \
-                 drop-race {drop_values} values / {drop_other} typed-other"
+                 resolves, {blob_sets} blob sets, {race_replans} blob-key race replans, \
+                 dir-open fault armed on {dir_open_fault_seeds} seeds ({dir_open_faults_fired} \
+                 fired), tier-read EIO armed on {tier_read_fault_seeds} seeds \
+                 ({tier_read_faults_fired} fired, {tier_read_error_replies} typed replies, \
+                 {tier_read_faults_unconsumed} unconsumed), SCAN batching oracle on \
+                 {scan_cold_pages} cold pages ({scan_cold_reads} cold intents), \
+                 ckpt arms [downgrades {ckpt_downgrades} bound_splits \
+                 {ckpt_bound_splits}], {diskfull_refusals} DISKFULL refusals, \
+                 drop-race {drop_values} values / {drop_other} typed-other; post-drop reboots \
+                 {drop_reboots} ({drop_reboot_residue} with MANIFEST residue), cut inside DROP: \
+                 {drop_cut_whole} whole / {drop_cut_swept} swept (ADR-0100); shadow arm on \
+                 {shadow_seeds} seeds: {shadow_created} tickets ({shadow_at_cut} open at the \
+                 cut), {shadow_same_key} same-key / {shadow_collision} collision verdicts, \
+                 {shadow_stale} stale, {shadow_fallbacks} fallbacks; forced collisions: \
+                 {collide_tickets} tickets, {collide_verdicts} collision verdicts, \
+                 {collide_ticketed} ticketed fallbacks, {collide_drains} DBSIZE drains, \
+                 {collide_scan_twins} SCAN twins; open-ticket rows on {open_seeds} seeds: \
+                 {open_tickets} tickets held open, {open_drains} DBSIZE drains reading \
+                 {open_reads} twins, {open_scan_twins} SCAN twins, {open_retargeted} \
+                 retargets, {open_forced_deletes} read-free forced deletes, {open_ticketed} \
+                 ticketed fallbacks, {open_collisions} collision verdicts, {open_read_faults} \
+                 injected read errors relayed, {open_settled_without_read} settled without a \
+                 read after resume; rebuilt multi-ticket rows on {rebuilt_seeds} seeds: \
+                 {rebuilt_tickets} tickets rebuilt, {rebuilt_multi_dels} DELs draining several, \
+                 {rebuilt_same_key_twins} same-key twins among them, {rebuilt_fill_sets} filler \
+                 writes, {rebuilt_reboots} reboots"
             );
             println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
             if let Some(dir) = out_dir {
@@ -394,8 +885,34 @@ fn main() {
                      shard={shard_i}/{shard_k} seeds_run={ran} violations={violations} \
                      refused={refused} commands={commands} keys_audited={audited} \
                      flushed_pre_cut={flushed_pre_cut} cold_resolves={cold_resolves} \
-                     blob_sets={blob_sets} diskfull_refusals={diskfull_refusals} \
-                     drop_values={drop_values} drop_other={drop_other}\n"
+                     blob_sets={blob_sets} dir_open_fault_seeds={dir_open_fault_seeds} \
+                     dir_open_faults_fired={dir_open_faults_fired} \
+                     tier_read_fault_seeds={tier_read_fault_seeds} \
+                     tier_read_faults_fired={tier_read_faults_fired} \
+                     tier_read_error_replies={tier_read_error_replies} \
+                     tier_read_faults_unconsumed={tier_read_faults_unconsumed} \
+                     scan_cold_pages={scan_cold_pages} scan_cold_reads={scan_cold_reads} \
+                     ckpt_downgrades={ckpt_downgrades} ckpt_bound_splits={ckpt_bound_splits} \
+                     diskfull_refusals={diskfull_refusals} \
+                     drop_values={drop_values} drop_other={drop_other} \
+                     drop_reboots={drop_reboots} drop_reboot_residue={drop_reboot_residue} \
+                     drop_cut_whole={drop_cut_whole} drop_cut_swept={drop_cut_swept} \
+                     shadow_seeds={shadow_seeds} shadow_created={shadow_created} \
+                     shadow_at_cut={shadow_at_cut} shadow_same_key={shadow_same_key} \
+                     shadow_collision={shadow_collision} shadow_stale={shadow_stale} \
+                     shadow_fallbacks={shadow_fallbacks} collide_tickets={collide_tickets} \
+                     collide_verdicts={collide_verdicts} collide_ticketed={collide_ticketed} \
+                     collide_drains={collide_drains} collide_scan_twins={collide_scan_twins} \
+                     open_seeds={open_seeds} open_tickets={open_tickets} \
+                     open_drains={open_drains} open_reads={open_reads} \
+                     open_scan_twins={open_scan_twins} open_retargeted={open_retargeted} \
+                     open_forced_deletes={open_forced_deletes} open_ticketed={open_ticketed} \
+                     open_collisions={open_collisions} open_read_faults={open_read_faults} \
+                     open_settled_without_read={open_settled_without_read} \
+                     rebuilt_seeds={rebuilt_seeds} rebuilt_tickets={rebuilt_tickets} \
+                     rebuilt_multi_dels={rebuilt_multi_dels} \
+                     rebuilt_same_key_twins={rebuilt_same_key_twins} \
+                     rebuilt_fill_sets={rebuilt_fill_sets} rebuilt_reboots={rebuilt_reboots}\n"
                 );
                 std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest)
                     .expect("manifest");
@@ -405,14 +922,41 @@ fn main() {
                 )
                 .expect("results");
             }
+            // F-L04-02 engagement at sweep scope (batch 34's rule): armed
+            // seeds whose audits never met a fault proved nothing.
+            if tier_read_fault_seeds > 0 && tier_read_faults_fired == 0 {
+                eprintln!(
+                    "inf-sim: VIOLATION: TIER-READ FAULT ARM VACUOUS across the shard: \
+                     {tier_read_fault_seeds} armed seeds, no fault consumed"
+                );
+                violations += 1;
+            }
             std::process::exit(if violations > 0 { 1 } else { 0 });
         }
-        let report = run_one(seed);
+        let mut report = run_one(seed);
+        // The forced arm is a positive control: it must fire on this seed.
+        if plant == Plant::TierReadEio && report.tier_read_faults_fired == 0 {
+            report.violations.push(format!(
+                "TIER-READ FAULT ARM VACUOUS seed {seed:#x}: --plant tier-read-eio forced the \
+                 arm and the audit consumed no fault (pick a seed whose flush confirmed before \
+                 the cut)"
+            ));
+        }
         println!(
             "inf-sim: m4-tiered seed {seed:#x}: {} commands, {} steps, {} keys audited, {} \
              required ops, {} allowed-lost, {} B flushed pre-cut, {} B flushed final, {} cold \
              resolves, {} blob sets, {} DISKFULL refusals (reopened: {}), drop-race {} values / \
-             {} typed-other, refused-boot {}, trace {} bytes, hash {:#018x}",
+             {} typed-other, post-drop reboot {} (MANIFEST residue {}), cut inside DROP after {} \
+             steps: {:?}, refused-boot {}, shadow arm {} ({} tickets, {} open at the cut, \
+             {} same-key / {} collision, {} stale, {} fallbacks; phase 6b cold resolves {}; \
+             phase 6c {} pairs: {} tickets, {} collision verdicts, {} ticketed fallbacks, {} \
+             DBSIZE drains, {} SCAN twins), blob-key race {} replans, dir-open fault arm {} \
+             (fired {}), tier-read EIO arm {} (fired {}, {} typed replies), ckpt downgrades {} \
+             / bound splits {}, SCAN batching oracle on {} cold pages ({} cold intents), replay \
+             unit above the window on {} cell(s) (acked record bytes per cell {:?}), boot \
+             tier replay {:?} (demote steps, bytes, barriers, files sealed, settle reads, \
+             deletes verified, step charge max), {} aged deletes acked, trace {} bytes, hash \
+             {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -426,13 +970,60 @@ fn main() {
             report.diskfull_reopened,
             report.drop_replies_value,
             report.drop_replies_other,
+            report.drop_reboot_ok,
+            report.drop_reboot_manifest_residue,
+            report.drop_cut_steps,
+            report.drop_cut_outcome,
             report.refused_boot,
+            report.shadow_arm,
+            report.shadow_created,
+            report.shadow_pending_at_cut,
+            report.shadow_resolved_same_key,
+            report.shadow_resolved_collision,
+            report.shadow_stale,
+            report.shadow_fallbacks,
+            report.phase6b_cold_resolves,
+            report.collide_pairs,
+            report.collide_tickets,
+            report.collide_verdicts,
+            report.collide_ticketed_fallbacks,
+            report.collide_dbsize_drains,
+            report.collide_scan_twins,
+            report.race_replans,
+            report.dir_open_fault_arm,
+            report.dir_open_faults_fired,
+            report.tier_read_fault_arm,
+            report.tier_read_faults_fired,
+            report.tier_read_error_replies,
+            report.ckpt_downgrades,
+            report.ckpt_bound_splits,
+            report.scan_cold_pages,
+            report.scan_cold_reads,
+            report.replay_above_window_cells,
+            report.acked_record_bytes_per_cell,
+            report.boot_tier,
+            report.aged_deletes_acked,
             report.trace.len(),
             report.trace_hash
         );
-        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        println!(
+            "inf-sim: sim_seconds={:.6} published=0 delivered=0 tier_read_fault_arm={} \
+             tier_read_faults_fired={} tier_read_error_replies={} scan_cold_pages={} \
+             scan_cold_reads={}",
+            report.sim_seconds,
+            report.tier_read_fault_arm,
+            report.tier_read_faults_fired,
+            report.tier_read_error_replies,
+            report.scan_cold_pages,
+            report.scan_cold_reads
+        );
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
@@ -455,6 +1046,219 @@ fn main() {
         return;
     }
 
+    // ADR-0108 (review of 2026-08-30, the batch-8 residual): concurrent
+    // namespace DDL — a CREATE and a DROP of one name from two cells with
+    // crossing fans, a CREATE whose peer leg is refused, then a cut and
+    // the audit that every cell agrees with META.
+    if scenario_name == "m2-ns-ddl-race" {
+        let run_one = |seed: u64| inf_sim::run_ns_ddl_race_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
+            let mut violations = 0u64;
+            let mut ran = 0u64;
+            let (mut found, mut phantoms, mut partial, mut skips) = (0u64, 0u64, 0u64, 0u64);
+            let mut crossings = 0u64;
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
+                ran += 1;
+                found += u64::from(report.drop_found);
+                crossings += report.crossings;
+                let served = u64::from(report.served_before_cut);
+                if served != 0 && served != 4 {
+                    phantoms += 1;
+                }
+                partial += u64::from(report.partial_served);
+                skips += report.skipped_unknown_ns;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m2-ns-ddl-race sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {crossings} crossings (origin frozen mid-fan), {found} \
+                 DROPs found the namespace, {phantoms} phantom namespaces, {partial} cells serving \
+                 a refused CREATE, {skips} untombstoned unknown-ns skips"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m2-ns-ddl-race seed {seed:#x}: {} commands, {} steps, DROP after \
+             {} steps ({}, origin frozen {} steps), 'x' served on {} cells before the cut / {} \
+             after, refused leg {} left {} cells serving 'y', {} untombstoned unknown-ns skips, {} \
+             released keys found, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.scheduler_steps,
+            report.drop_delay,
+            if report.drop_found { "found" } else { "not found" },
+            report.freeze_steps,
+            report.served_before_cut,
+            report.served_after_cut,
+            report.refused_leg,
+            report.partial_served,
+            report.skipped_unknown_ns,
+            report.released_keys_found,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        if verify {
+            let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            if second.trace != report.trace {
+                eprintln!(
+                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
+                     {:#x})",
+                    report.trace.len(),
+                    second.trace.len(),
+                    report.trace_hash,
+                    second.trace_hash
+                );
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified (second run identical)");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // ADR-0103 (review of 2026-08-30, C14): the namespace-creation window
+    // — a held catalog swap, probes attempting `USE`/`SET` inside it, a
+    // cut, and the audit that an acked write never vanishes and no tail
+    // record is skipped for a namespace nothing explains. Sweep mode
+    // mirrors m4-cold's shape.
+    if scenario_name == "m2-ns-create-window" {
+        let run_one = |seed: u64| inf_sim::run_ns_create_window_scenario(seed);
+        if let Some(sweep) = sweep {
+            let (shard_i, shard_k) = shard;
+            assert!(shard_k > 0, "--shard I/K wants K > 0");
+            assert!(shard_i < shard_k, "--shard I/K wants I < K");
+            let mut violations = 0u64;
+            let mut ran = 0u64;
+            let (mut attempts, mut refused, mut acked, mut skips, mut held) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut lines = Vec::new();
+            for i in (shard_i..sweep).step_by(shard_k as usize) {
+                let seed = seed.wrapping_add(i);
+                let report = run_one(seed);
+                if verify {
+                    let twin = run_one(seed);
+                    verify_hashes(
+                        (report.trace_hash, report.state_hash),
+                        (twin.trace_hash, twin.state_hash),
+                    );
+                    assert!(twin.ok(), "second run failed its oracles");
+                }
+                ran += 1;
+                attempts += report.use_attempts;
+                refused += report.use_refused;
+                acked += report.acked_in_window;
+                skips += report.skipped_unknown_ns;
+                held += report.held_steps;
+                if report.ok() {
+                    lines.push(format!("{seed:#x} ok"));
+                } else {
+                    violations += 1;
+                    let first = report.violations.first().map_or("stall", |v| v.as_str());
+                    lines.push(format!("{seed:#x} VIOLATION {first}"));
+                    eprintln!("inf-sim: seed {seed:#x}: {first}");
+                }
+            }
+            println!(
+                "inf-sim: m2-ns-create-window sweep shard {shard_i}/{shard_k}: {ran} seeds, \
+                 {violations} violations, {attempts} USE attempts in the window ({refused} \
+                 refused, {acked} writes acked), {skips} untombstoned unknown-ns skips, {held} \
+                 held steps"
+            );
+            if let Some(dir) = out_dir.as_deref() {
+                std::fs::create_dir_all(dir).expect("out dir");
+                std::fs::write(
+                    format!("{dir}/results-shard-{shard_i}.txt"),
+                    lines.join("\n") + "\n",
+                )
+                .expect("results");
+            }
+            std::process::exit(if violations > 0 { 1 } else { 0 });
+        }
+        let report = run_one(seed);
+        println!(
+            "inf-sim: scenario m2-ns-create-window seed {seed:#x}: {} commands, {} steps, swap \
+             held {} steps, {} USE attempts ({} refused, {} writes acked in the window), {} \
+             untombstoned unknown-ns skips, {} released keys found, trace {} bytes, hash {:#018x}",
+            report.commands_done,
+            report.scheduler_steps,
+            report.held_steps,
+            report.use_attempts,
+            report.use_refused,
+            report.acked_in_window,
+            report.skipped_unknown_ns,
+            report.released_keys_found,
+            report.trace.len(),
+            report.trace_hash
+        );
+        println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        if verify {
+            let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
+            if second.trace != report.trace {
+                eprintln!(
+                    "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs \
+                     {:#x})",
+                    report.trace.len(),
+                    second.trace.len(),
+                    report.trace_hash,
+                    second.trace_hash
+                );
+                std::process::exit(1);
+            }
+            println!("inf-sim: determinism verified — second run trace byte-identical");
+        }
+        if !report.ok() {
+            for v in &report.violations {
+                eprintln!("inf-sim: VIOLATION: {v}");
+            }
+            std::process::exit(1);
+        }
+        return;
+    }
     if scenario_name == "m4-cold" {
         let mut scenario = inf_sim::ColdStormScenario::m4_cold(seed);
         if let Some(ops) = ops_override {
@@ -480,6 +1284,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_cold_storm_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "m4-cold determinism: second run diverged"
@@ -505,6 +1314,11 @@ fn main() {
         );
         if verify {
             let second = inf_sim::run_boot_storm_scenario(&scenario);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             assert_eq!(
                 report.trace_hash, second.trace_hash,
                 "boot-storm determinism: second run diverged"
@@ -525,12 +1339,15 @@ fn main() {
     }
     let mut scenario = match scenario_name.as_str() {
         "m0-smoke" => Scenario::m0_smoke(seed),
+        "m0-adversarial" => Scenario::m0_adversarial(seed),
+        "m0-surface" => Scenario::m0_surface(seed),
+        "m0-fabric-fairness" => Scenario::m0_fabric_fairness(seed),
+        "m0-admission" => Scenario::m0_admission(seed),
         "m1-cache" => Scenario::m1_cache(seed),
         other => {
             eprintln!(
-                "inf-sim: unknown scenario {other} (have: m0-smoke, m1-cache, m2-durable, \
-                 m3-document, m2-combined, boot-storm, m4-steel, m4-pressure, m4-cold, \
-                 m4-recovery, m4-diskfull, m4-tiered)"
+                "inf-sim: unknown scenario {other} (have: {})",
+                inf_sim::SCENARIOS.join(", ")
             );
             std::process::exit(2);
         }
@@ -542,6 +1359,16 @@ fn main() {
             "--connections" => scenario.connections = value as usize,
             "--commands" => scenario.commands = value,
             "--key-space" => scenario.key_space = value,
+            "--wheel-nodes-max" => {
+                let nodes = usize::try_from(value).unwrap_or(usize::MAX);
+                match inf_store::WheelNodesMax::new(nodes) {
+                    Ok(max) => scenario.wheel_nodes_max = Some(max),
+                    Err(e) => {
+                        eprintln!("inf-sim: --wheel-nodes-max {} is over the width bound", e.nodes);
+                        std::process::exit(2);
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -558,8 +1385,25 @@ fn main() {
     );
     // Machine-readable line for the nightly fleet (sim-seconds budget sum).
     println!(
-        "inf-sim: sim_seconds={:.6} published={} delivered={}",
-        report.sim_seconds, report.published, report.delivered
+        "inf-sim: sim_seconds={:.6} published={} delivered={} audits={} flushes={} \
+         scan_walks={} replays_skipped={} plant_fired={} accept_resumes={} \
+         fabric_skip_streak_max={} refused_clients={} idle_closed={} idle_survived={} \
+         shadow_checked={} shadow_unmodeled={:?}",
+        report.sim_seconds,
+        report.published,
+        report.delivered,
+        report.audits,
+        report.flushes,
+        report.scan_walks,
+        report.replays_skipped,
+        report.plant_fired,
+        report.accept_resumes,
+        report.fabric_skip_streak_max,
+        report.refused_clients,
+        report.idle_closed,
+        report.idle_survived,
+        report.shadow_checked,
+        report.shadow_unmodeled
     );
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)
@@ -579,6 +1423,11 @@ fn main() {
 
     if verify {
         let second = run_scenario(&scenario);
+        verify_hashes(
+            (report.trace_hash, report.state_hash),
+            (second.trace_hash, second.state_hash),
+        );
+        assert!(second.ok(), "second run failed its oracles");
         if second.trace != report.trace {
             eprintln!(
                 "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes, {:#x} vs {:#x})",
@@ -602,6 +1451,7 @@ fn run_durable(
     seed: u64,
     plant: Plant,
     replay_canary: bool,
+    lift_regime: bool,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -610,11 +1460,21 @@ fn run_durable(
     let run_one = |seed: u64| -> inf_sim::DurableReport {
         let mut scenario = match scenario_name {
             "m2-durable" => DurableScenario::m2_durable(seed),
+            "m2-clean-stop" => DurableScenario::m2_clean_stop(seed),
+            "m2-device-budget" => DurableScenario::m2_device_budget(seed),
+            "m2-mode-transition" => DurableScenario::m2_mode_transition(seed),
+            "m2-reorder-window" => DurableScenario::m2_reorder_window(seed),
+            "m2-fill-tick" => DurableScenario::m2_fill_tick(seed),
+            "m2-group-hold" => DurableScenario::m2_group_hold(seed),
+            "m2-fua-pending" => DurableScenario::m2_fua_pending(seed),
+            "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
+            "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
             _ => unreachable!("the caller filters durable scenario names"),
         };
         scenario.plant = plant;
         scenario.replay_canary = replay_canary;
+        scenario.lift_regime |= lift_regime;
         run_durable_scenario(&scenario)
     };
 
@@ -623,7 +1483,13 @@ fn run_durable(
         println!(
             "inf-sim: scenario {scenario_name} seed {seed:#x}: {} commands, {} steps, {} keys \
              audited, {} required ops, {} allowed-lost, {} equivalence checks, {} documents \
-             compared, {} corpus docs, cut classes {:?}, trace {} bytes, hash {:#018x}",
+             compared, {} corpus docs, cut classes {:?}, lift regime {} (tiered ops {}, indexed \
+             ops {}, sidecars loaded {}, stale slacks lifted {}; plant: cells {}, lifts {}, \
+             sidecars {}; torn plants {}), arms [ckpt_downgrades {} bound_splits {} waits_fill \
+             {} waits_group {} plant_fired {}], log oracles [idle_tick_violations {} \
+             frames_awaiting_max {} fsync_entries_max {} write_through_entries_max {} \
+             hold_episode_violations {}], clean stop [steps {} replay_records {}], trace {} \
+             bytes, hash {:#018x}",
             report.commands_done,
             report.scheduler_steps,
             report.audited_keys,
@@ -633,6 +1499,27 @@ fn run_durable(
             report.documents_compared,
             report.corpus_documents_used,
             report.cut_classes,
+            report.lift_regime,
+            report.lift_tiered_ops,
+            report.lift_indexed_ops,
+            report.lift_sidecars_loaded,
+            report.stale_residue_slacks,
+            report.lift_plants,
+            report.lift_plant_lifts,
+            report.lift_plant_sidecars,
+            report.torn_plants,
+            report.ckpt_downgrades,
+            report.ckpt_bound_splits,
+            report.frame_waits_fill,
+            report.frame_waits_group,
+            report.plant_fired,
+            report.idle_tick_violations,
+            report.frames_awaiting_max,
+            report.fsync_entries_max,
+            report.write_through_entries_max,
+            report.hold_episode_violations,
+            report.clean_stop_steps,
+            report.clean_stop_replay_records,
             report.trace.len(),
             report.trace_hash
         );
@@ -648,6 +1535,11 @@ fn run_durable(
         }
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
@@ -662,7 +1554,8 @@ fn run_durable(
     };
 
     // Sweep mode: seeds base+i for i ≡ shard_i (mod shard_k).
-    assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+    assert!(shard_k > 0, "--shard I/K wants K > 0");
+    assert!(shard_i < shard_k, "--shard I/K wants I < K");
     let mut lines = Vec::new();
     let mut violations = 0u64;
     let mut refused = 0u64;
@@ -673,10 +1566,116 @@ fn run_durable(
     let mut corpus_documents = 0u64;
     let mut cut_classes: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
+    // Frame-pipeline coverage (ADR-0087 D7): seeds whose cells reached
+    // ≥ 2 frames in flight, the deepest seen, and the bounded waits.
+    let mut pipelined_seeds = 0u64;
+    let mut depth_max = 0u64;
+    let mut waits_barrier = 0u64;
+    let mut waits_rotation = 0u64;
+    let mut waits_reorder = 0u64;
+    let mut ckpt_downgrades = 0u64;
+    let mut bound_splits = 0u64;
+    let mut waits_fill = 0u64;
+    let mut waits_group = 0u64;
+    // Batch 42 log oracles: idle-tick violations summed, map depth and
+    // ledger entries as sweep maxima.
+    let mut idle_tick_violations = 0u64;
+    let mut frames_awaiting_max = 0u64;
+    let mut fsync_entries_max = 0u64;
+    let mut write_through_entries_max = 0u64;
+    let mut hold_episode_violations = 0u64;
+    // Device-budget coverage (ADR-0088 D8): background bytes granted,
+    // deferrals issued, seal-pace waits, worst frame-write latency.
+    let mut budget_bytes = 0u64;
+    let mut budget_deferrals = 0u64;
+    let (mut budget_unattainable, mut block_wait_ns_max) = (0u64, 0u64);
+    let mut waits_pace = 0u64;
+    let mut stall_max_us = 0u64;
+    // Transition coverage (ADR-0086 D4 as amended): packed tails reopened
+    // under a `Direct` rotor at the `m2-mode-transition` restart.
+    let mut reopened_packed_tails = 0u64;
+    // Recycling coverage (ADR-0090 D5): segments recycled, pool misses +
+    // fallbacks, rotations, and residue the reboots proved.
+    let mut recycled = 0u64;
+    let mut recycle_misses = 0u64;
+    let mut recycle_fallbacks = 0u64;
+    let mut recycle_served = 0u64;
+    let mut open_unreached = 0u64;
+    let mut recycle_sentinels = 0u64;
+    let mut clean_stop_torn_tails = 0u64;
+    let mut rotations = 0u64;
+    let mut residue_slacks = 0u64;
+    // Pool-wait coverage (ADR-0090 D9): both outcomes must occur in a
+    // sweep that claims to cover the wait.
+    let mut waits_started = 0u64;
+    let mut waits_satisfied = 0u64;
+    let mut waits_expired = 0u64;
+    let mut inline_preallocs = 0u64;
+    // The lift regime (F-L14-01): seeds that ran it, the records its
+    // writers landed behind the lift, the sidecars the final boot loaded,
+    // and — every seed — the residue slacks the final boot lifted past.
+    let mut lift_seeds = 0u64;
+    let mut lift_tiered_ops = 0u64;
+    let mut lift_indexed_ops = 0u64;
+    let mut lift_sidecars_loaded = 0u64;
+    let mut lift_plants = 0u64;
+    let mut lift_plant_lifts = 0u64;
+    let mut lift_plant_sidecars = 0u64;
+    let mut stale_slacks = 0u64;
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
+        if verify {
+            let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
+        }
         ran += 1;
+        pipelined_seeds += u64::from(report.frames_in_flight_max >= 2);
+        depth_max = depth_max.max(report.frames_in_flight_max);
+        waits_barrier += report.frame_waits_barrier;
+        waits_rotation += report.frame_waits_rotation;
+        waits_reorder += report.frame_waits_reorder;
+        ckpt_downgrades += report.ckpt_downgrades;
+        bound_splits += report.ckpt_bound_splits;
+        waits_fill += report.frame_waits_fill;
+        waits_group += report.frame_waits_group;
+        idle_tick_violations += report.idle_tick_violations;
+        frames_awaiting_max = frames_awaiting_max.max(report.frames_awaiting_max);
+        fsync_entries_max = fsync_entries_max.max(report.fsync_entries_max);
+        write_through_entries_max = write_through_entries_max.max(report.write_through_entries_max);
+        hold_episode_violations += report.hold_episode_violations;
+        budget_bytes += report.budget_background_bytes;
+        budget_deferrals += report.budget_deferrals;
+        budget_unattainable += report.budget_unattainable;
+        block_wait_ns_max = block_wait_ns_max.max(report.ckpt_block_wait_ns_max);
+        waits_pace += report.frame_waits_pace;
+        stall_max_us = stall_max_us.max(report.write_stall_max_us);
+        reopened_packed_tails += report.reopened_packed_tails;
+        recycled += report.segments_recycled;
+        recycle_misses += report.recycle_misses;
+        recycle_fallbacks += report.recycle_fallbacks;
+        recycle_served += report.recycle_served;
+        open_unreached += u64::from(report.recycle_open_unreached);
+        recycle_sentinels += report.recycle_sentinels;
+        clean_stop_torn_tails += report.clean_stop_torn_tails;
+        rotations += report.segment_rotations;
+        residue_slacks += report.recycled_residue_slacks;
+        waits_started += report.recycle_waits_started;
+        waits_satisfied += report.recycle_waits_satisfied;
+        waits_expired += report.recycle_waits_expired;
+        inline_preallocs += report.segment_inline_preallocs;
+        lift_seeds += u64::from(report.lift_regime);
+        lift_tiered_ops += report.lift_tiered_ops;
+        lift_indexed_ops += report.lift_indexed_ops;
+        lift_sidecars_loaded += report.lift_sidecars_loaded;
+        stale_slacks += report.stale_residue_slacks;
+        lift_plants += report.lift_plants;
+        lift_plant_lifts += report.lift_plant_lifts;
+        lift_plant_sidecars += report.lift_plant_sidecars;
         sim_seconds += report.sim_seconds;
         equivalence_checks += report.equivalence_checks;
         documents_compared += report.documents_compared;
@@ -705,7 +1704,28 @@ fn run_durable(
     println!(
         "inf-sim: {scenario_name} sweep shard {shard_i}/{shard_k}: {ran} seeds, {violations} \
          violations, {refused} legal taxonomy refusals, {equivalence_checks} equivalence \
-         checks, {documents_compared} documents compared, cut classes [{}]",
+         checks, {documents_compared} documents compared, cut classes [{}], frame pipeline \
+         [pipelined_seeds:{pipelined_seeds} depth_max:{depth_max} waits_barrier:{waits_barrier} \
+         waits_rotation:{waits_rotation} waits_reorder:{waits_reorder}], device budget \
+         [background_bytes:{budget_bytes} \
+         deferrals:{budget_deferrals} unattainable:{budget_unattainable} \
+         ckpt_block_wait_ns_max:{block_wait_ns_max} waits_pace:{waits_pace} \
+         write_stall_max_us:{stall_max_us}], \
+         reopened_packed_tails:{reopened_packed_tails} ckpt_downgrades:{ckpt_downgrades} \
+         bound_splits:{bound_splits} waits_fill:{waits_fill} waits_group:{waits_group}, log \
+         oracles \
+         [idle_tick_violations:{idle_tick_violations} frames_awaiting_max:{frames_awaiting_max} \
+         fsync_entries_max:{fsync_entries_max} \
+         write_through_entries_max:{write_through_entries_max} \
+         hold_episode_violations:{hold_episode_violations}], \
+         recycling [recycled:{recycled} misses:{recycle_misses} \
+         fallbacks:{recycle_fallbacks} served:{recycle_served} \
+         open_unreached:{open_unreached} rotations:{rotations} residue_slacks:{residue_slacks} \
+         waits_started:{waits_started} waits_satisfied:{waits_satisfied} \
+         waits_expired:{waits_expired} inline_preallocs:{inline_preallocs}], lift regime \
+         [seeds:{lift_seeds} tiered_ops:{lift_tiered_ops} indexed_ops:{lift_indexed_ops} \
+         sidecars_loaded:{lift_sidecars_loaded} stale_slacks:{stale_slacks} \
+         plants:{lift_plants} plant_lifts:{lift_plant_lifts} plant_sidecars:{lift_plant_sidecars}]",
         classes.join(" ")
     );
     println!("inf-sim: sim_seconds={sim_seconds:.6} published=0 delivered=0");
@@ -716,7 +1736,29 @@ fn run_durable(
              plant={plant:?} replay_canary={replay_canary} seeds_run={ran} \
              violations={violations} refused={refused} equivalence_checks={equivalence_checks} \
              documents_compared={documents_compared} corpus_documents={corpus_documents} \
-             cut_classes=[{}]\n",
+             cut_classes=[{}] pipelined_seeds={pipelined_seeds} depth_max={depth_max} \
+             waits_barrier={waits_barrier} waits_rotation={waits_rotation} \
+             waits_reorder={waits_reorder} budget_background_bytes={budget_bytes} \
+             budget_deferrals={budget_deferrals} budget_unattainable={budget_unattainable} \
+             ckpt_block_wait_ns_max={block_wait_ns_max} \
+             waits_pace={waits_pace} write_stall_max_us={stall_max_us} \
+             reopened_packed_tails={reopened_packed_tails} ckpt_downgrades={ckpt_downgrades} \
+             ckpt_bound_splits={bound_splits} waits_fill={waits_fill} waits_group={waits_group} \
+             idle_tick_violations={idle_tick_violations} frames_awaiting_max={frames_awaiting_max} \
+             fsync_entries_max={fsync_entries_max} \
+             write_through_entries_max={write_through_entries_max} \
+             hold_episode_violations={hold_episode_violations} \
+             segments_recycled={recycled} recycle_misses={recycle_misses} \
+             recycle_fallbacks={recycle_fallbacks} recycle_served={recycle_served} \
+             recycle_open_unreached={open_unreached} recycle_sentinels={recycle_sentinels} \
+             clean_stop_torn_tails={clean_stop_torn_tails} segment_rotations={rotations} \
+             recycled_residue_slacks={residue_slacks} recycle_waits_started={waits_started} \
+             recycle_waits_satisfied={waits_satisfied} recycle_waits_expired={waits_expired} \
+             segment_inline_preallocs={inline_preallocs} lift_seeds={lift_seeds} \
+             lift_tiered_ops={lift_tiered_ops} lift_indexed_ops={lift_indexed_ops} \
+             lift_sidecars_loaded={lift_sidecars_loaded} stale_residue_slacks={stale_slacks} \
+             lift_plants={lift_plants} lift_plant_lifts={lift_plant_lifts} \
+             lift_plant_sidecars={lift_plant_sidecars}\n",
             classes.join(" ")
         );
         std::fs::write(format!("{dir}/manifest-shard-{shard_i}.txt"), manifest).expect("manifest");
@@ -776,6 +1818,11 @@ fn run_m2_combined(
         }
         if verify {
             let second = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (second.trace_hash, second.state_hash),
+            );
+            assert!(second.ok(), "second run failed its oracles");
             if second.trace != report.trace {
                 eprintln!(
                     "inf-sim: DETERMINISM VIOLATION — traces differ ({} vs {} bytes)",
@@ -789,7 +1836,8 @@ fn run_m2_combined(
         return;
     };
 
-    assert!(shard_k > 0 && shard_i < shard_k, "--shard I/K wants I < K");
+    assert!(shard_k > 0, "--shard I/K wants K > 0");
+    assert!(shard_i < shard_k, "--shard I/K wants I < K");
     let mut lines = Vec::new();
     let mut violations = 0u64;
     let mut refused = 0u64;
@@ -800,6 +1848,14 @@ fn run_m2_combined(
     for i in (shard_i..sweep).step_by(shard_k as usize) {
         let seed = seed.wrapping_add(i);
         let report = run_one(seed);
+        if verify {
+            let twin = run_one(seed);
+            verify_hashes(
+                (report.trace_hash, report.state_hash),
+                (twin.trace_hash, twin.state_hash),
+            );
+            assert!(twin.ok(), "second run failed its oracles");
+        }
         ran += 1;
         sim_seconds += report.sim_seconds;
         published += report.published;
@@ -833,5 +1889,39 @@ fn run_m2_combined(
     }
     if violations > 0 {
         std::process::exit(1);
+    }
+}
+
+fn verify_hashes(first: (u64, u64), second: (u64, u64)) {
+    if let Err(reason) = inf_sim::state::verify(first.0, first.1, second.0, second.1) {
+        eprintln!("inf-sim: DETERMINISM VIOLATION — {reason}");
+        std::process::exit(1);
+    }
+    println!("inf-sim: state_hash={:#018x}; state hash identical", first.1);
+}
+
+#[cfg(test)]
+mod determinism_exit {
+    #[test]
+    fn state_only_mismatch_exits_one_with_a_named_reason() {
+        const CHILD: &str = "INF_SIM_STATE_VERIFY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::verify_hashes((7, 1), (7, 2));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "determinism_exit::state_only_mismatch_exits_one_with_a_named_reason",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("state_hash differs"),
+            "{output:?}"
+        );
     }
 }

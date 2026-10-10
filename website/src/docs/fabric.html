@@ -1,0 +1,55 @@
+<!--
+title: The fabric
+section: Concepts
+description: How InfinityDB cells cooperate without sharing memory: a mesh of single-producer rings, batched messages, credits and backpressure to the client.
+lede: Cells never touch each other's memory. When a command needs a key that another cell owns, it crosses the fabric: a full mesh of single-producer, single-consumer rings, paid for in batches and bounded by credits.
+chips: Available · alpha | Law L3
+-->
+{{fig:fabric}}
+<p class="fig-note">One ring per directed pair of cells. Requests spend a credit; replies never need one.</p>
+
+<h2 id="mesh">A ring per pair</h2>
+<p>A node of N cells builds N × (N − 1) rings, one for each directed pair. Each ring has exactly one producer and one consumer, so it needs no lock. It is a fixed power-of-two array of 64-byte slots, 4,096 slots in <code>infinityd</code>. The producer and the consumer each own a free-running index on its own cache line and keep a cached copy of the other side's index, so the common case touches only local memory. A whole batch is published with one release store and consumed with one release store.</p>
+<p>The fabric is the only way cells talk: no shared tables, no shared queues, no locks on the data plane.</p>
+
+<h2 id="batching">Batched once per loop</h2>
+<p>A message is an encoded operation with an 8-byte header. Up to 62 bytes sit inline in a ring slot; a larger message spills to the heap. Operations toward one destination are packed into an open buffer that seals into a single slot at 2 KiB or 64 operations, so one slot carries many operations and one heap allocation is shared by the whole pack.</p>
+<p>Publishing follows the <a href="cells.html">cell loop</a>. Requests are published at the FABRIC-OUT step near the end of an iteration, and each destination with new work gets one doorbell for the batch. The receiving cell drains at FABRIC-IN, about 1,024 messages per iteration, round-robin over its peers from a rotating start. The replies a drain produced are published as soon as the drain ends, not at the end of the iteration, which shortens the round trip.</p>
+<p>An idle cell parks in the kernel. So that no wakeup is lost, it sets its park flag, issues a full fence and checks its doorbells again before it sleeps. A publisher writes the peer's <code>eventfd</code> only when that flag is set. You can watch the batching: <code>INFO tripwires</code> reports <code>fabric_msgs_per_batch</code> for the cell that served the command.</p>
+
+<h2 id="remote">When the key is remote</h2>
+<p>Routing reads the key's slot from the command table's key specification. If the connection's own cell owns the key, a command on a numbered database runs inline, with no future and no task. If another cell owns it, the command moves to the connection's pump, a per-connection future, and suspends:</p>
+<ul class="dots">
+<li>The pump encodes an <code>Apply</code> operation carrying a token (16 bits of origin cell, 48 bits of sequence), takes a credit and waits on the gate for that token.</li>
+<li>The owner drains it, runs the command exactly as if a local client had sent it, and replies with the raw RESP bytes, so the reply is identical either way.</li>
+<li>The origin returns the credit, completes the gate, resumes the pump in the same iteration and appends the reply to the connection's output.</li>
+</ul>
+<p>Replies keep request order. Once a connection defers one command, the commands behind it in the same pipeline are deferred too, so a fast local reply can never overtake an earlier remote one. Suspension is safe because nothing borrowed before it is trusted after it: a resumed command looks up what it needs again.</p>
+
+<h2 id="multi-key">Multi-key commands</h2>
+<p>Redis Cluster answers <code>CROSSSLOT</code> when a multi-key command names keys in different slots. On InfinityDB's numbered databases those commands work across cells and pay a fabric hop instead. <code>MGET</code> gathers each value from its owner, in key order. <code>DEL</code>, <code>UNLINK</code>, <code>EXISTS</code> and <code>TOUCH</code> send one operation per remote key and sum the results; if any leg fails, the reply is that error, never a partial sum. <code>MSET</code> sends one leg per remote pair.</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; MSET user:1 ada user:2 grace
+OK
+127.0.0.1:6379&gt; MGET user:1 user:2 user:3
+1) "ada"
+2) "grace"
+3) (nil)</pre>
+<p>Two limits are stated plainly. Multi-key writes that span cells are not atomic across cells: another client can see some legs applied and not others. And on a named namespace, a multi-key command whose keys live on more than one cell is refused, <code>JSON.MGET</code> excepted. Keys that share a hash tag, such as <code>{u42}</code>, always land on one cell. See <a href="strings.html">Strings &amp; keys</a>.</p>
+
+<h2 id="credits">Credits and backpressure</h2>
+<table class="doc-table"><thead><tr><th>Bound</th><th>Default</th><th>When crossed</th></tr></thead><tbody>
+<tr><td>Unanswered data operations toward one peer</td><td>1,024 credits</td><td>the sender waits for a credit to return</td></tr>
+<tr><td>Remote operations in flight per connection, tested before each command</td><td>32</td><td>the pump dispatches no further command until replies arrive; one command then adds one operation per remote key (at most 1,023 under the 1,024-argument cap) or one per other cell it reaches, so at most 31 plus one command's operations are in flight: 1,054 on a node of up to 1,024 cells</td></tr>
+<tr><td>Pending replies per connection</td><td>256</td><td>the pump stops dispatching until replies drain</td></tr>
+<tr><td>Queued commands per connection</td><td>1,024, resume at 64</td><td>the cell stops receiving; TCP pushes back on the client</td></tr>
+<tr><td>Fabric drain per iteration</td><td>about 1,024 messages</td><td>the rest wait for the next iteration</td></tr>
+</tbody></table>
+<p>Pressure travels back to the client instead of into a growing queue. A saturated owner returns credits slowly, the origin's pumps stop dispatching, queued commands reach their cap and the cell disarms the connection's receive. TCP flow control does the rest.</p>
+<p>Replies need no credit, and each ring holds at least twice the credit count, so a reply can always be sent. The drain never blocks and never sends. Together these remove the cycle in which two cells wait on each other, so the fabric cannot deadlock.</p>
+
+<h2 id="verified">How the ring is checked</h2>
+<p>The ring is the only <code>unsafe</code> code in <code>inf-fabric</code>, and each block is listed with its argument in the crate's <a href="https://github.com/kevincaicedo/infinitydb/blob/main/crates/inf-fabric/SAFETY.md"><code>SAFETY.md</code></a>. Indices use release and acquire ordering only, never <code>SeqCst</code>. Loom model-checks publish, consume, wrap-around, full, empty and the stale-cache path across two threads, and Miri runs the ring's tests under strict provenance. The fabric codec's decoder is total, bounded and fuzzed. If you change <code>inf-fabric</code>, run the model check:</p>
+<pre class="code" data-label="shell">$ just loom</pre>
+<p>In the <a href="simulation.html">simulator</a> the whole mesh runs on one thread, so a failing cross-cell interleaving replays from its seed.</p>
+
+<aside class="law-box"><span class="law-code">L3</span><div><div class="law-title">Batch every boundary.</div><p>A fabric hop is a boundary, like a syscall or an fsync, and it is paid once per batch: many operations per slot, one release store per batch, one doorbell per destination per iteration.</p></div></aside>

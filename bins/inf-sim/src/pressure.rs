@@ -42,8 +42,8 @@ use inf_log::{
 };
 use inf_runtime::{CellExecutor, WatermarkGate, WatermarkWait};
 use inf_store::{
-    AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig, TieredLookup,
-    TieredTable,
+    AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
+    TieredLookup, TieredTable,
 };
 
 const NS: NsId = NsId(88);
@@ -94,6 +94,8 @@ pub struct PressureReport {
     pub stall_p99_ns: u64,
     pub peak_committed_bytes: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl PressureReport {
@@ -283,7 +285,7 @@ async fn write_until_done(world: &Rc<RefCell<World>>, key: &[u8], value: &[u8], 
 /// The mutation attempt: upsert through the routed entry; `Err(())` is
 /// the budget-window refusal (the stall signal).
 fn try_upsert(world: &mut World, key: &[u8], value: &[u8]) -> Result<(), ()> {
-    let hash = TieredTable::hash_key(key);
+    let hash = world.table().hash_key(key);
     let found = match world.table().lookup(key, hash, &[]) {
         TieredLookup::Ram(addr) => {
             let parts = world.table().record(addr);
@@ -307,7 +309,9 @@ fn try_upsert(world: &mut World, key: &[u8], value: &[u8]) -> Result<(), ()> {
     result.map_err(|_| ())?;
     let placed = match world.table().lookup(key, hash, &[]) {
         TieredLookup::Ram(addr) => addr,
-        other => panic!("fresh write must be RAM-resident: {other:?}"),
+        other @ (TieredLookup::Cold(_) | TieredLookup::Miss) => {
+            panic!("fresh write must be RAM-resident: {other:?}")
+        }
     };
     world.model.insert(key.to_vec(), value.to_vec());
     world.trace_hash = hash64(value, world.trace_hash ^ placed.to_raw());
@@ -397,9 +401,10 @@ impl TierFleet {
     }
 }
 
-fn build_world(demote: DemotionConfig) -> Rc<RefCell<World>> {
+fn build_world(demote: DemotionConfig, seed: u64) -> Rc<RefCell<World>> {
     let ring = demote.ring_reserve_bytes().expect("valid budget");
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks =
+        Keyspace::new(StoreConfig { hasher: KeyHasher::from_seed(seed), ..Default::default() });
     assert!(
         ks.materialize_tiered(
             NS,
@@ -455,6 +460,8 @@ fn run_round(
     report: &mut PressureReport,
     round: u64,
 ) {
+    report.state.number(b"round-time", world.borrow().now.get());
+    report.state.number(b"round", round);
     {
         // Bank this round's credit (bounded: full-speed rounds cover
         // demand outright, so the bank never grows past a few slices).
@@ -578,7 +585,7 @@ fn audit(world: &Rc<RefCell<World>>, fleet: &TierFleet, report: &mut PressureRep
 /// Ground-truth read: RAM via the table, cold via the device's bytes,
 /// fingerprint false positives excluded and retried.
 fn read_back(world: &mut World, fleet: &TierFleet, key: &[u8], want_len: usize) -> Option<Vec<u8>> {
-    let hash = TieredTable::hash_key(key);
+    let hash = world.table().hash_key(key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     loop {
         match world.table().lookup(key, hash, &exclude) {
@@ -601,7 +608,7 @@ fn read_back(world: &mut World, fleet: &TierFleet, key: &[u8], want_len: usize) 
 #[must_use]
 pub fn run_pressure_scenario(scenario: &PressureScenario) -> PressureReport {
     let mut report = PressureReport::default();
-    let world = build_world(DemotionConfig::for_budget(BUDGET, PAGE));
+    let world = build_world(DemotionConfig::for_budget(BUDGET, PAGE), scenario.seed);
     let mut fleet = TierFleet::new();
     let mut ex = CellExecutor::new(64);
     for writer in 0..WRITERS {
@@ -622,5 +629,10 @@ pub fn run_pressure_scenario(scenario: &PressureScenario) -> PressureReport {
     }
     drain(&world, &mut fleet);
     audit(&world, &fleet, &mut report);
+    let world = world.borrow();
+    report.state.number(b"finish-time", world.now.get());
+    report.state.keyspace(&world.ks, inf_foundation::time::Nanos(world.now.get()));
+    report.state.disk(&fleet.disk);
+    report.state_hash = report.state.value();
     report
 }

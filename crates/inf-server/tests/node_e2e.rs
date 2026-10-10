@@ -1,8 +1,15 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! End-to-end node assembly test (Linux + uring): two real cells on real
 //! threads behind one SO_REUSEPORT port, driven over TCP — local fast path,
 //! cross-cell Apply round-trips, multi-key aggregation, pipelined reply
 //! ordering, HELLO protocol switching, and protocol-error close.
 #![cfg(target_os = "linux")]
+
+#[path = "../../../tests/crash-matrix/receipt.rs"]
+mod receipt;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -15,24 +22,262 @@ use std::time::{Duration, Instant};
 use inf_alloc::BufferPool;
 use inf_fabric::{Mesh, MeshConfig};
 use inf_foundation::CellId;
-use inf_foundation::time::{Clock, StdClock};
+use inf_foundation::time::{Clock, Nanos, StdClock};
 use inf_runtime::net::{bound_port, listen_reuseport};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig, UringDriver};
+use inf_runtime::{CellLoop, LoopConfig, UringDriver};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane};
 use inf_store::{Keyspace, SlotRouter, StoreConfig};
 
+/// The checkpoint trigger a test node boots with (ADR-0088 D4). The
+/// product derives its interval from the last checkpoint's size, which
+/// makes any retained-log bound a function of the dataset *and* of how
+/// fast the device completed the previous cycle — `truncation_bounds`
+/// learned this on the NVMe (2026-08-22): a 21 MiB checkpoint derives a
+/// 42 MiB trigger the test's 32 MiB trickle cannot reach, while tmpfs
+/// passed on cycle ordering alone. Tests that assert a bound therefore
+/// name the trigger they assert against instead of an integer.
+#[derive(Clone, Copy)]
+enum CkptTrigger {
+    /// Automatic trigger off: e2e checkpoints fire via the control
+    /// handle so tests own the timing.
+    Manual,
+    /// The product's derived trigger: `clamp(α × ckpt_bytes_last, floor,
+    /// cap)` with the default α.
+    Derived { floor_bytes: u64 },
+    /// The pre-S36 fixed trigger (α = 0): every `interval_bytes` staged
+    /// bytes, independent of checkpoint size and device speed.
+    Fixed { interval_bytes: u64 },
+    /// Manual trigger with a tightened fill slice and stream pace, so a
+    /// walk spans many MAINTAIN calls and a test can interleave foreground
+    /// mutations with specific walk passes (the 2026-08-30 review's C4
+    /// reproduction shape).
+    Paced { slice_bytes: u32, stream_bytes_per_sec: u32 },
+}
+
+impl CkptTrigger {
+    fn config(self) -> inf_log::CkptConfig {
+        let base = inf_log::CkptConfig::default();
+        match self {
+            CkptTrigger::Manual => inf_log::CkptConfig { interval_bytes: 0, ..base },
+            CkptTrigger::Derived { floor_bytes } => {
+                inf_log::CkptConfig { interval_bytes: floor_bytes, ..base }
+            }
+            CkptTrigger::Fixed { interval_bytes } => {
+                inf_log::CkptConfig { interval_bytes, alpha: 0, ..base }
+            }
+            CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec } => inf_log::CkptConfig {
+                interval_bytes: 0,
+                slice_bytes,
+                // One section per fill slice: every slice pays a real
+                // section write before the next fill call runs, so
+                // foreground commands interleave with every walk slice.
+                section_bytes: slice_bytes,
+                stream_bytes_per_sec,
+                ..base
+            },
+        }
+    }
+}
+
+/// Every cell's clock held at one reading, with internal 0 anchored at
+/// `anchor_unix_ms`: a test reads a moment the wire cannot pin, such as
+/// the clock's first millisecond, in any build. Volatile nodes only.
+#[derive(Clone, Copy)]
+struct HeldClock {
+    internal: Nanos,
+    anchor_unix_ms: u64,
+}
+
+/// One cell's running clock, which a test may hold (L7: every cell
+/// effect reads injected time). Open, the cell reads the monotonic clock
+/// plus whatever a past hold ran ahead of it. Held, the cell reads a
+/// value only the test advances, so time-paced cell work (the
+/// checkpoint stream's ADR-0017 D6 pace) moves by the test's steps instead
+/// of by the host's speed. Readings never go backwards.
+struct ClockGate {
+    /// Started on the cell thread where the loop is built (the origin
+    /// the wall anchor pairs with).
+    clock: std::sync::OnceLock<StdClock>,
+    /// The held reading in ns; 0 = open (a held reading is never 0).
+    held: std::sync::atomic::AtomicU64,
+    /// Added to the monotonic clock while open: how far holds ran ahead.
+    ahead: std::sync::atomic::AtomicU64,
+    /// The latest reading handed out (the monotonicity floor).
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl ClockGate {
+    fn new() -> ClockGate {
+        ClockGate {
+            clock: std::sync::OnceLock::new(),
+            held: Default::default(),
+            ahead: Default::default(),
+            last: Default::default(),
+        }
+    }
+
+    fn start(self: Arc<Self>) -> Arc<Self> {
+        assert!(self.clock.set(StdClock::new()).is_ok(), "one cell loop per gate");
+        self
+    }
+
+    fn monotonic(&self) -> u64 {
+        self.clock.get().expect("the cell loop started its clock").now().0
+    }
+
+    fn open_reading(&self) -> u64 {
+        self.monotonic().saturating_add(self.ahead.load(Ordering::Acquire))
+    }
+
+    fn read(&self) -> Nanos {
+        let held = self.held.load(Ordering::Acquire);
+        let at = if held == 0 { self.open_reading() } else { held };
+        Nanos(self.last.fetch_max(at, Ordering::AcqRel).max(at))
+    }
+
+    /// Freezes the clock at its current reading.
+    fn hold(&self) {
+        let at = self.open_reading().max(self.last.load(Ordering::Acquire)).max(1);
+        self.held.store(at, Ordering::Release);
+    }
+
+    /// Advances a held clock by `by` (a no-op while open).
+    fn step(&self, by: Duration) {
+        let by = u64::try_from(by.as_nanos()).expect("a test step fits u64 ns");
+        let _ = self.held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            (held != 0).then(|| held.saturating_add(by))
+        });
+    }
+
+    /// Back to the monotonic clock, from wherever the steps left it.
+    fn open(&self) {
+        let held = self.held.load(Ordering::Acquire);
+        if held != 0 {
+            let lag = held.saturating_sub(self.monotonic());
+            self.ahead.fetch_max(lag, Ordering::AcqRel);
+            self.held.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// A cell loop's clock: the product's monotonic one behind a test gate,
+/// or a held reading.
+enum CellClock {
+    Running(Arc<ClockGate>),
+    Held(Nanos),
+}
+
+impl Clock for CellClock {
+    fn now(&self) -> Nanos {
+        match self {
+            CellClock::Running(gate) => gate.read(),
+            CellClock::Held(at) => *at,
+        }
+    }
+}
+
 struct Node {
     port: u16,
+    cells: u16,
     stop: Arc<AtomicBool>,
+    /// The graceful stop (ADR-0124): cells drain and exit once every
+    /// cell is `Drained`.
+    graceful: Arc<AtomicBool>,
+    /// Whether that stop takes its checkpoint (`--shutdown-checkpoint`);
+    /// cleared by [`Node::stop_synced`].
+    stop_checkpoint: Arc<AtomicBool>,
+    drained: Arc<std::sync::atomic::AtomicU16>,
     handles: Vec<std::thread::JoinHandle<()>>,
     /// Control handle of a durable node (manual checkpoint trigger — the
     /// surface `INF.CKPT` rides at S20).
     control: Option<Arc<inf_server::ControlHandle>>,
+    /// The control writer's checkpoint quota, which the host holds after
+    /// construction (ADR-0159 A1.2): the harness's direct requests.
+    ckpt_host: std::cell::RefCell<Option<inf_server::CkptQuota>>,
+    /// A harness-driven catalog writer instead of the control thread
+    /// (review of 2026-08-30, C14): the detached `ControlInbox` is drained
+    /// by a harness thread only while `hold` is clear — the e2e form of
+    /// "the META swap has not completed yet", which no fault point can
+    /// express (the registry is thread-local to the cells).
+    catalog_pump: Option<CatalogPump>,
+    /// Harness/control owner. No OS sampling runs in the cell test threads.
+    process_sampler: std::cell::RefCell<inf_server::ProcessSampler>,
+    /// One per cell, open unless a test holds it (`drive_paced_ckpt_with_pump`).
+    clock_gates: Vec<Arc<ClockGate>>,
+}
+
+struct CatalogPump {
+    hold: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
 }
 
 impl Node {
+    /// A durable node whose catalog swaps are held while `hold` is set
+    /// (C14): DDL parks on `persisted(epoch)` exactly as it would behind
+    /// a slow device, and the test decides when — or whether — the swap
+    /// lands. Clearing `hold` drains every queued swap.
+    fn start_durable_with_held_catalog(
+        cells: u16,
+        data_dir: &std::path::Path,
+        hold: Arc<AtomicBool>,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            Some(hold),
+            None,
+            None,
+        )
+    }
+
+    /// Ends the node the way a power cut inside a held swap would: cell
+    /// threads stop, the catalog pump exits **without draining**, so a
+    /// swap that never landed never lands. Everything the cells fsynced
+    /// stays on disk (process-kill physics).
+    fn kill_without_catalog_drain(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            handle.join().expect("cell thread");
+        }
+        let pump = self.catalog_pump.take().expect("a held-catalog node");
+        pump.stop.store(true, Ordering::Relaxed);
+        pump.handle.join().expect("catalog pump thread");
+    }
+
     fn start(cells: u16) -> Node {
-        Node::start_with(cells, None, 0)
+        Node::start_with(cells, None, CkptTrigger::Manual)
+    }
+
+    /// A volatile node whose cell clocks all read `held` (see [`HeldClock`]).
+    fn start_held_clock(cells: u16, held: HeldClock) -> Node {
+        Node::start_cfg_default(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            None,
+            Some(held),
+        )
     }
 
     /// A node with the durable plane enabled (M2-S08): catalog loaded and
@@ -40,25 +285,110 @@ impl Node {
     /// the catalog's single writer — the boot order infinityd adopts.
     /// Automatic checkpoints stay off (tests own the trigger).
     fn start_durable(cells: u16, data_dir: &std::path::Path) -> Node {
-        Node::start_with(cells, Some(data_dir.to_path_buf()), 0)
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Manual)
+    }
+
+    fn start_durable_with_default_ns(
+        cells: u16,
+        data_dir: &std::path::Path,
+        default_ns: &[u8],
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            Some(default_ns.to_vec()),
+            Default::default(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A durable node whose cells spend a **device budget** (ADR-0088
+    /// D2): `model` is the per-device model the harness shares across
+    /// `cells` — the product path when `io-properties.toml` is probed.
+    fn start_durable_with_device_model(
+        cells: u16,
+        data_dir: &std::path::Path,
+        model: inf_runtime::DeviceModel,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            inf_server::DeviceConfig {
+                model_share: model.share(cells),
+                seal_barriers_per_s: 0,
+                provenance: Default::default(),
+            },
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A durable node whose checkpoint issuance space starts `(N + 1)·h + N`
+    /// below `u64::MAX` (ADR-0159 A1.5): `units` per quota, so the wire
+    /// reaches the last epochs and every quota's exhaustion.
+    fn start_durable_with_ckpt_headroom(
+        cells: u16,
+        data_dir: &std::path::Path,
+        units: u64,
+    ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+            None,
+            Default::default(),
+            None,
+            Some(std::num::NonZeroU64::new(units).expect("headroom >= 1")),
+            None,
+        )
     }
 
     /// Durable node with the bytes-appended checkpoint trigger armed
-    /// (M2-S10, ADR-0016 D7).
-    fn start_durable_auto_ckpt(
+    /// (M2-S10, ADR-0016 D7) in its product form: the S36 derived
+    /// interval above `floor_bytes`.
+    fn start_durable_auto_ckpt(cells: u16, data_dir: &std::path::Path, floor_bytes: u64) -> Node {
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Derived { floor_bytes })
+    }
+
+    /// Durable node with a fixed `interval_bytes` trigger (α = 0) — for
+    /// tests whose bound is stated in multiples of the interval.
+    fn start_durable_fixed_ckpt(
         cells: u16,
         data_dir: &std::path::Path,
         interval_bytes: u64,
     ) -> Node {
-        Node::start_with(cells, Some(data_dir.to_path_buf()), interval_bytes)
+        Node::start_with(cells, Some(data_dir.to_path_buf()), CkptTrigger::Fixed { interval_bytes })
     }
 
-    fn start_with(
-        cells: u16,
-        data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
-    ) -> Node {
-        Node::start_full(cells, data_dir, ckpt_interval_bytes, Default::default(), Vec::new())
+    fn start_with(cells: u16, data_dir: Option<std::path::PathBuf>, ckpt: CkptTrigger) -> Node {
+        Node::start_full(cells, data_dir, ckpt, Default::default(), Vec::new())
     }
 
     /// Durable node with a boot-recovery pacing override (M2-S15): the
@@ -67,10 +397,9 @@ impl Node {
     fn start_with_recover(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
         recover: inf_server::RecoverConfig,
     ) -> Node {
-        Node::start_full(cells, data_dir, ckpt_interval_bytes, recover, Vec::new())
+        Node::start_full(cells, data_dir, CkptTrigger::Manual, recover, Vec::new())
     }
 
     /// Durable node with named fault points armed on every cell thread at
@@ -81,47 +410,207 @@ impl Node {
         data_dir: &std::path::Path,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_full(cells, Some(data_dir.to_path_buf()), 0, Default::default(), faults)
+        Node::start_full(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            faults,
+        )
     }
 
     /// Node with the M2.5 Phase-H fabric-apply prefetch enabled (the A/B
     /// lever's on-arm correctness surface).
     fn start_with_apply_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), true, false, false)
+        Node::start_cfg(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            true,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     fn start_with_parse_prefetch(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, true, false)
+        Node::start_cfg(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            true,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     /// Node with the M2.5 Phase-H de-async dispatch enabled (ADR-0030 D4
     /// lever): the pump's sync fast path on-arm correctness surface.
     fn start_with_deasync(cells: u16) -> Node {
-        Node::start_cfg(cells, None, 0, Default::default(), Vec::new(), false, false, true)
+        Node::start_cfg(
+            cells,
+            None,
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            true,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     fn start_full(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
+        ckpt: CkptTrigger,
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
     ) -> Node {
-        Node::start_cfg(cells, data_dir, ckpt_interval_bytes, recover, faults, false, false, false)
+        Node::start_cfg(
+            cells,
+            data_dir,
+            ckpt,
+            recover,
+            faults,
+            false,
+            false,
+            false,
+            None,
+            inf_log::SegmentIoMode::Buffered,
+        )
+    }
+
+    /// M4.5-S27: a durable node with a deliberately tiny staging domain —
+    /// the pressure-regime injector (ADR-0083 D3): headroom below one
+    /// pipelined burst makes admission pressure deterministic on any
+    /// device, no degraded drive required.
+    /// M4.5-S34 (ADR-0086): a durable node whose log segments are
+    /// `Direct` — v3 frames, driver zero-fill, write-through `always`
+    /// frames once pre-zeroed. Real `O_DIRECT` on the test directory.
+    fn start_durable_direct(cells: u16, data_dir: &std::path::Path) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            inf_server::RecoverConfig::default(),
+            Vec::new(),
+            true,
+            true,
+            false,
+            None,
+            inf_log::SegmentIoMode::Direct,
+        )
+    }
+
+    /// A Direct node with `frames_in_flight = k` (M4.5-S35, ADR-0087).
+    fn start_durable_pipeline(cells: u16, data_dir: &std::path::Path, k: u8) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            inf_server::RecoverConfig::default(),
+            Vec::new(),
+            true,
+            true,
+            false,
+            Some(inf_log::StagingConfig { frames_in_flight: k, ..Default::default() }),
+            inf_log::SegmentIoMode::Direct,
+        )
+    }
+
+    fn start_durable_small_staging(
+        cells: u16,
+        data_dir: &std::path::Path,
+        staging_bytes: u32,
+    ) -> Node {
+        Node::start_cfg(
+            cells,
+            Some(data_dir.to_path_buf()),
+            CkptTrigger::Manual,
+            Default::default(),
+            Vec::new(),
+            false,
+            false,
+            false,
+            Some(inf_log::StagingConfig::with_capacity(staging_bytes)),
+            inf_log::SegmentIoMode::Buffered,
+        )
     }
 
     #[allow(clippy::too_many_arguments)] // test harness funnel
+    #[allow(clippy::too_many_arguments)] // test harness assembly, not an API surface
     fn start_cfg(
         cells: u16,
         data_dir: Option<std::path::PathBuf>,
-        ckpt_interval_bytes: u64,
+        ckpt: CkptTrigger,
         recover: inf_server::RecoverConfig,
         faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
         apply_prefetch: bool,
         parse_prefetch: bool,
         deasync_dispatch: bool,
+        staging: Option<inf_log::StagingConfig>,
+        io_mode: inf_log::SegmentIoMode,
     ) -> Node {
+        Node::start_cfg_default(
+            cells,
+            data_dir,
+            ckpt,
+            recover,
+            faults,
+            apply_prefetch,
+            parse_prefetch,
+            deasync_dispatch,
+            staging,
+            io_mode,
+            None,
+            Default::default(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // test harness assembly, not an API surface
+    fn start_cfg_default(
+        cells: u16,
+        data_dir: Option<std::path::PathBuf>,
+        ckpt: CkptTrigger,
+        recover: inf_server::RecoverConfig,
+        faults: Vec<(&'static str, inf_foundation::fault::FaultSpec)>,
+        apply_prefetch: bool,
+        parse_prefetch: bool,
+        deasync_dispatch: bool,
+        staging: Option<inf_log::StagingConfig>,
+        io_mode: inf_log::SegmentIoMode,
+        default_ns: Option<Vec<u8>>,
+        device: inf_server::DeviceConfig,
+        held_catalog: Option<Arc<AtomicBool>>,
+        ckpt_headroom: Option<std::num::NonZeroU64>,
+        held_clock: Option<HeldClock>,
+    ) -> Node {
+        assert!(held_clock.is_none() || data_dir.is_none(), "a held clock boots a volatile node");
         let stop = Arc::new(AtomicBool::new(false));
+        let mut process_sampler = inf_server::ProcessSampler::default();
+        process_sampler.sample();
+        let graceful = Arc::new(AtomicBool::new(false));
+        let stop_checkpoint = Arc::new(AtomicBool::new(true));
+        let quiet = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let drained = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        // The node identity (ADR-0124 D5): one value per node, every cell.
+        let run_id = {
+            let seed = u64::from(std::process::id()) << 32 | u64::from(port_seed());
+            [seed, seed.rotate_left(17) ^ 0xA5A5_5A5A, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)]
+        };
+        let mut catalog_pump = None;
         // Bind cell 0 first on an ephemeral port, then the rest join it.
         let first = listen_reuseport(0).expect("listen");
         let port = bound_port(&first).expect("port");
@@ -132,37 +621,102 @@ impl Node {
         let fabrics = Mesh::new(cells, MeshConfig { ring_capacity: 1024, data_credits: 256 });
         // Catalog before cells (ADR-0015 D3): the id→definition map must
         // exist before any cell replays records that name ids.
+        // ADR-0159 A1.5: a test may start the checkpoint clock near the top
+        // of its space; production and every other test use the full split.
+        let cell_count = inf_foundation::CellCount::new(cells).expect("a valid test topology");
+        let space = match ckpt_headroom {
+            None => inf_server::CkptSpace::full(cell_count),
+            Some(h) => inf_server::CkptSpace::with_headroom(cell_count, h).expect("space fits"),
+        };
         let boot = data_dir.map(|dir| {
             let catalog = inf_server::load_catalog(&dir).expect("readable catalog");
             let boot_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let control =
-                inf_server::spawn_control(dir.clone(), catalog.as_ref(), cells, boot_unix_ms);
-            (dir, catalog, control)
+            let (control, issuers) = match &held_catalog {
+                None => {
+                    inf_server::spawn_control_in(dir.clone(), catalog.as_ref(), space, boot_unix_ms)
+                }
+                Some(hold) => {
+                    // The sim's detached writer, driven by a harness
+                    // thread that honours `hold` — same `prepare_persist`,
+                    // same on-disk swap, no control thread.
+                    let (control, mut inbox, issuers) = inf_server::ControlHandle::detached_in(
+                        catalog.as_ref(),
+                        space,
+                        boot_unix_ms,
+                    );
+                    let hold = Arc::clone(hold);
+                    let pump_stop = Arc::new(AtomicBool::new(false));
+                    let pump_dir = dir.clone();
+                    let handle = {
+                        let hold = Arc::clone(&hold);
+                        let pump_stop = Arc::clone(&pump_stop);
+                        std::thread::spawn(move || {
+                            while !pump_stop.load(Ordering::Relaxed) {
+                                if !hold.load(Ordering::Relaxed) {
+                                    inbox
+                                        .drain(&inf_server::StdSegmentFs, &pump_dir)
+                                        .expect("held-catalog META swap");
+                                }
+                                #[allow(clippy::disallowed_methods)] // harness thread
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        })
+                    };
+                    catalog_pump = Some(CatalogPump { hold, stop: pump_stop, handle });
+                    (control, issuers)
+                }
+            };
+            ((dir, catalog, control), issuers)
         });
+        let (boot, ckpt_host, mut cell_issuers) = match boot {
+            Some((boot, inf_server::CkptIssuers { host, cells })) => {
+                (Some(boot), Some(host), cells.into_iter().map(Some).collect::<Vec<_>>())
+            }
+            None => (None, None, Vec::new()),
+        };
         let mut handles = Vec::new();
+        let clock_gates: Vec<Arc<ClockGate>> =
+            (0..cells).map(|_| Arc::new(ClockGate::new())).collect();
         for (i, (fabric, listener)) in fabrics.into_iter().zip(listeners).enumerate() {
+            let gate = Arc::clone(&clock_gates[i]);
+            let process_board = process_sampler.board();
             let stop = Arc::clone(&stop);
+            let graceful = Arc::clone(&graceful);
+            let stop_checkpoint = Arc::clone(&stop_checkpoint);
+            let quiet = Arc::clone(&quiet);
+            let drained = Arc::clone(&drained);
             let boot = boot.clone();
+            let issuer = cell_issuers.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
+            let default_ns = default_ns.clone();
             handles.push(std::thread::spawn(move || {
                 // M2-S16: arm this cell's fault plan before recovery — the
                 // registry is thread-local (cells are single-threaded, L1).
                 for &(point, spec) in &faults {
                     inf_foundation::fault::arm(point, spec);
                 }
-                let mut pool = BufferPool::new(256, 4096);
-                let mut driver = UringDriver::new(256).expect("uring");
-                driver.register_pool(&mut pool).expect("register");
-                let node = Rc::new(NodeInfo::default());
+                let pool = BufferPool::new(256, 4096);
+                // No fixed-buffer registration: it is a capability probe no
+                // op consumes, and its pinned pages would hold most of an
+                // 8 MiB RLIMIT_MEMLOCK, so a sibling test node's ring
+                // creation fails with ENOMEM. The rings alone fit.
+                let driver = UringDriver::new(256).expect("uring");
+                let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
+                node.process_board.replace(Some(process_board));
+                node.run_id.set(run_id);
+                *node.conn_default_ns.borrow_mut() = default_ns;
                 // Real wall anchor (the infinityd boot pattern): LASTSAVE/
                 // rdb_last_save_time report true unix seconds (M2-S20).
-                let unix_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let unix_ms = match held_clock {
+                    Some(held) => held.anchor_unix_ms,
+                    None => std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                };
                 node.wall_anchor.set((0, unix_ms));
                 let mut ks = Keyspace::new(StoreConfig::default());
                 let mut durable = None;
@@ -172,19 +726,19 @@ impl Node {
                     }
                     let cfg = inf_server::DurableConfig {
                         data_dir: dir.clone(),
-                        staging: inf_log::StagingConfig::default(),
+                        staging: staging.unwrap_or_default(),
                         segment: inf_log::SegmentConfig {
                             segment_bytes: 8 << 20, // small: tests rotate
+                            io_mode,
                             ..Default::default()
                         },
-                        // 0 = automatic trigger off: e2e checkpoints fire
-                        // via the control handle so tests own the timing.
-                        ckpt: inf_log::CkptConfig {
-                            interval_bytes: ckpt_interval_bytes,
-                            ..Default::default()
-                        },
+                        ckpt: ckpt.config(),
                         recover,
-                        sync_pipeline: 1,
+                        flush_bound: 1,
+                        fua_p50_us_probed: 0,
+                        device,
+                        fill: Default::default(),
+                        group: Default::default(),
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
@@ -198,13 +752,15 @@ impl Node {
                     NoopObserver,
                     false,
                 );
+                plane.set_tcp_transport(true);
                 plane.set_fabric_apply_prefetch(apply_prefetch);
                 plane.set_parse_batch_prefetch(parse_prefetch);
                 plane.set_deasync_dispatch(deasync_dispatch);
                 if let Some((cfg, control)) = durable {
                     // Loop-resident recovery (M2-S15): the cell serves
                     // -LOADING while MAINTAIN replays its log.
-                    plane.set_control(control);
+                    let issuer = issuer.expect("one checkpoint issuer per cell");
+                    plane.set_control(control, issuer).expect("the issuer of this cell");
                     plane.begin_recovery(
                         inf_server::StdSegmentFs,
                         &cfg,
@@ -216,17 +772,59 @@ impl Node {
                     park_default: Some(Duration::from_millis(5)),
                     ..Default::default()
                 };
-                let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+                let clock = match held_clock {
+                    Some(held) => CellClock::Held(held.internal),
+                    None => CellClock::Running(gate.start()),
+                };
+                let mut cell_loop = CellLoop::new(driver, clock, pool, config);
+                let (mut counted_quiet, mut counted) = (false, false);
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
                     if let Some(err) = plane.take_boot_error() {
-                        panic!("cell {i} recovery failed (fail-stop, §8.4): {err}");
+                        panic!("cell {i} recovery failed (fail-stop): {err}");
+                    }
+                    if graceful.load(Ordering::Relaxed) {
+                        plane.set_stop_checkpoint(stop_checkpoint.load(Ordering::Relaxed));
+                        plane.request_stop();
+                        let phase = plane.stop_phase();
+                        if !counted_quiet
+                            && matches!(
+                                phase,
+                                inf_server::StopPhase::Quiet | inf_server::StopPhase::Drained
+                            )
+                        {
+                            counted_quiet = true;
+                            quiet.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if quiet.load(Ordering::Acquire) == cells {
+                            plane.finish_stop();
+                        }
+                        if !counted && phase == inf_server::StopPhase::Drained {
+                            counted = true;
+                            drained.fetch_add(1, Ordering::AcqRel);
+                        }
+                        if drained.load(Ordering::Acquire) == cells {
+                            break;
+                        }
                     }
                 }
             }));
         }
         let control = boot.map(|(_, _, control)| control);
-        let node = Node { port, stop, handles, control };
+        let node = Node {
+            port,
+            cells,
+            stop,
+            graceful,
+            stop_checkpoint,
+            drained,
+            handles,
+            control,
+            ckpt_host: std::cell::RefCell::new(ckpt_host),
+            catalog_pump,
+            process_sampler: std::cell::RefCell::new(process_sampler),
+            clock_gates,
+        };
         // Most tests speak data commands immediately after start: wait out
         // the -LOADING window unless the test throttled recovery to
         // observe it (the throttle IS the -LOADING test's subject).
@@ -235,6 +833,13 @@ impl Node {
         {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !control.recovery_board().all_ready() {
+                // A cell thread that exited during recovery panicked on
+                // its boot error (fail-stop): report that now, with
+                // the refusal on stderr, instead of a 30 s timeout.
+                assert!(
+                    !node.handles.iter().any(std::thread::JoinHandle::is_finished),
+                    "a cell thread exited during recovery (fail-stop — see stderr)"
+                );
                 assert!(Instant::now() < deadline, "recovery did not finish in 30s");
                 #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
                 std::thread::sleep(Duration::from_millis(1));
@@ -243,12 +848,20 @@ impl Node {
         node
     }
 
+    /// A direct all-cell checkpoint request on the host's quota (the
+    /// surface `INF.CKPT` rides): the harness's manual trigger.
+    fn request_ckpt_all(&self) -> u64 {
+        let mut host = self.ckpt_host.borrow_mut();
+        let host = host.as_mut().expect("a durable node");
+        host.request(inf_server::CkptTarget::All).expect("the host's quota holds a unit").get()
+    }
+
     fn connect(&self) -> TcpStream {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match TcpStream::connect(("127.0.0.1", self.port)) {
                 Ok(s) => {
-                    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+                    s.set_read_timeout(Some(REPLY_TIMEOUT)).expect("timeout");
                     s.set_nodelay(true).expect("nodelay");
                     return s;
                 }
@@ -257,6 +870,34 @@ impl Node {
         }
     }
 
+    /// The graceful stop (ADR-0124): every cell drains — connections
+    /// flush and close, the stop checkpoint publishes, the final sync
+    /// lands — and the threads exit once all are `Drained`; then the
+    /// same control-thread quiesce as `stop`.
+    fn stop_gracefully(self) {
+        self.graceful.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.drained.load(Ordering::Acquire) < self.cells {
+            assert!(Instant::now() < deadline, "the node did not drain in 30 s");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.stop();
+    }
+
+    /// The durable stop without a checkpoint (`--shutdown-checkpoint
+    /// off`): the ADR-0124 drain and final sync, so every acknowledged
+    /// write is in the log and the next boot replays it. [`Node::stop`] is
+    /// crash-equivalent — an everysec ack promises nothing there — so a
+    /// test that reads acknowledged everysec writes after a restart stops
+    /// with this, or writes through an `always` namespace.
+    fn stop_synced(self) {
+        self.stop_checkpoint.store(false, Ordering::Relaxed);
+        self.stop_gracefully();
+    }
+
+    /// Crash-equivalent: the cells stop where they are (no drain, no final
+    /// sync; queued frame writes die with the ring). See [`Node::stop_synced`].
     fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for handle in self.handles.drain(..) {
@@ -274,6 +915,11 @@ impl Node {
         // whole queue drained (single FIFO receiver), after which the old
         // thread can never touch the data dir again.
         if let Some(control) = &self.control {
+            // A held catalog pump drains everything on stop (a test that
+            // wants the swap lost calls `kill_without_catalog_drain`).
+            if let Some(pump) = &self.catalog_pump {
+                pump.hold.store(false, Ordering::Relaxed);
+            }
             let sentinel = std::env::temp_dir().join(format!(
                 "inf-e2e-drain-{}-{}",
                 std::process::id(),
@@ -291,6 +937,10 @@ impl Node {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        if let Some(pump) = self.catalog_pump.take() {
+            pump.stop.store(true, Ordering::Relaxed);
+            pump.handle.join().expect("catalog pump thread");
+        }
     }
 }
 
@@ -304,9 +954,32 @@ fn cmd(parts: &[&[u8]]) -> Vec<u8> {
     wire
 }
 
+/// How long a reply may take before the harness calls it a hang. A
+/// durable node's replies can wait on the device: even an `everysec`
+/// blob `SET`, acked on apply, first runs `write_blob`'s synchronous dir
+/// fsyncs and data writes on the cell thread (ADR-0088's recorded
+/// limitation 2), and a loaded CI runner's disk held one such `SET` past
+/// the former 5 s. The bound turns a hang into a failure; it is not a
+/// device latency budget.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A failed reply read, named: a timeout is a missing reply.
+fn reply_read_failed(stream: &TcpStream, what: &str, err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            let bound = stream.read_timeout().ok().flatten();
+            format!("{what}: no reply within {bound:?} — a hang, or a device stall past the bound")
+        }
+        _ => format!("{what}: {err}"),
+    }
+}
+
 fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
     let mut got = vec![0u8; want.len()];
-    stream.read_exact(&mut got).expect("read reply");
+    if let Err(err) = stream.read_exact(&mut got) {
+        let what = format!("read reply {:?}", String::from_utf8_lossy(want));
+        panic!("{}", reply_read_failed(stream, &what, &err));
+    }
     assert_eq!(
         got,
         want,
@@ -318,9 +991,15 @@ fn read_exactly(stream: &mut TcpStream, want: &[u8]) {
 
 /// A key owned by `cell` under an N-cell contiguous router.
 fn key_for_cell(cells: u16, cell: u16) -> Vec<u8> {
+    key_for_cell_prefixed(cells, cell, "k")
+}
+
+/// A key named `{prefix}:{i}` owned by `cell` under an N-cell contiguous
+/// router: one key per cell for each prefix a test names.
+fn key_for_cell_prefixed(cells: u16, cell: u16, prefix: &str) -> Vec<u8> {
     let router = SlotRouter::new_contiguous(cells);
     for i in 0..100_000u32 {
-        let key = format!("k:{i}");
+        let key = format!("{prefix}:{i}");
         if router.cell_of(SlotRouter::slot_of(key.as_bytes())) == CellId(cell) {
             return key.into_bytes();
         }
@@ -508,10 +1187,99 @@ fn parse_batch_prefetch_matches_inline_semantics() {
     pipeline.extend(cmd(&[b"GET", b"q"]));
     client.write_all(&pipeline).expect("write");
     read_exactly(&mut client, b"+OK\r\n+OK\r\n");
-    let mut rest = Vec::new();
-    client.read_to_end(&mut rest).expect("server closes after QUIT");
-    assert!(rest.is_empty(), "nothing after QUIT's +OK: {rest:?}");
+    assert_closed(&mut client, "QUIT mid-pipeline");
 
+    node.stop();
+}
+
+/// Reads `stream` until the server closes it, handing `sink` every byte
+/// delivered first. Closed is EOF or `ECONNRESET`: Linux answers a close
+/// with our input still unread (a kill, a refusal) with RST, after the
+/// bytes already sent. A timeout or any other error is "never closed". A
+/// test whose property is "replies flushed before the close" asserts the
+/// FIN itself.
+fn drain_to_close(stream: &mut TcpStream, what: &str, mut sink: impl FnMut(&[u8])) {
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut total = 0usize;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                total += n;
+                sink(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(e) => {
+                panic!("{what}: the server never closed the connection after {total} bytes ({e})")
+            }
+        }
+    }
+}
+
+/// Every byte the server delivers before it closes (see `drain_to_close`).
+fn read_to_close(stream: &mut TcpStream, what: &str) -> Vec<u8> {
+    let mut delivered = Vec::new();
+    drain_to_close(stream, what, |bytes| delivered.extend_from_slice(bytes));
+    delivered
+}
+
+/// The server closes with nothing after the replies already read.
+fn assert_closed(stream: &mut TcpStream, what: &str) {
+    let rest = read_to_close(stream, what);
+    assert!(rest.is_empty(), "{what}: bytes after the reply: {:?}", String::from_utf8_lossy(&rest));
+}
+
+/// Batch 46 (review of 2026-08-30, F-L13-08): every command on a
+/// namespace-bound connection rides the pump, and the pump executed
+/// `QUIT` under a throwaway `ConnCx` — `+OK`, socket left open, slot
+/// held until the peer gave up. Single-cell node, memory namespace: the
+/// §5.5 regime. The pipelined form pins the discard rule: the command
+/// before `QUIT` answers, the one after never runs.
+#[test]
+fn quit_on_a_namespace_bound_connection_closes_after_its_reply() {
+    let dir = temp_data_dir("quit-bound");
+    let node = Node::start_durable(1, &dir);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+
+    let mut bound = connect_use(&node, b"cache");
+    bound.write_all(&cmd(&[b"QUIT"])).expect("write");
+    read_exactly(&mut bound, b"+OK\r\n");
+    assert_closed(&mut bound, "QUIT on a memory-bound connection");
+
+    let mut bound = connect_use(&node, b"cache");
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", b"before", b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"SET", b"after", b"1"]));
+    bound.write_all(&pipeline).expect("write");
+    read_exactly(&mut bound, b"+OK\r\n+OK\r\n");
+    assert_closed(&mut bound, "pipelined QUIT on a memory-bound connection");
+    let mut check = connect_use(&node, b"cache");
+    check.write_all(&cmd(&[b"MGET", b"before", b"after"])).expect("write");
+    read_exactly(&mut check, b"*2\r\n$1\r\n1\r\n$-1\r\n");
+    node.stop();
+}
+
+/// The same defect without namespaces: on a multi-cell node a cross-cell
+/// command spawns the pump and a `QUIT` pipelined behind it defers there.
+#[test]
+fn quit_deferred_behind_a_cross_cell_command_closes_after_its_reply() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let remote = key_for_cell(2, 1);
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"SET", &remote, b"1"]));
+    pipeline.extend(cmd(&[b"QUIT"]));
+    pipeline.extend(cmd(&[b"SET", b"after", b"1"]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    assert_closed(&mut client, "QUIT deferred behind a cross-cell SET");
+    let mut check = node.connect();
+    check.write_all(&cmd(&[b"MGET", &remote, b"after"])).expect("write");
+    read_exactly(&mut check, b"*2\r\n$1\r\n1\r\n$-1\r\n");
     node.stop();
 }
 
@@ -602,6 +1370,24 @@ fn deasync_dispatch_matches_pump_semantics() {
     let line = read_line(&mut sub);
     assert!(line.starts_with(b"-ERR"), "restricted error for remote-ish key: {line:?}");
 
+    // Review 2026-09-01 (INFINITYD_BIN compat lane): PUBSUB and PUBLISH
+    // are plane pub/sub yet NOT in the Redis subscriber-mode allowlist —
+    // the plane gate must refuse them like `execute`'s fast path does
+    // (pre-fix, the node answered `PUBSUB CHANNELS` with the channel
+    // list; oracle-pinned refusal byte shape).
+    sub.write_all(&cmd(&[b"PUBSUB", b"CHANNELS"])).expect("write");
+    read_exactly(
+        &mut sub,
+        b"-ERR Can't execute 'pubsub|channels': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / \
+          PING / QUIT / RESET are allowed in this context\r\n",
+    );
+    sub.write_all(&cmd(&[b"PUBLISH", b"ch", b"m"])).expect("write");
+    let line = read_line(&mut sub);
+    assert!(line.starts_with(b"-ERR Can't execute 'publish'"), "restricted PUBLISH: {line:?}");
+    // The allowlist itself still passes: a further SUBSCRIBE works.
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch2"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$3\r\nch2\r\n:2\r\n");
+
     node.stop();
 }
 
@@ -630,8 +1416,7 @@ fn hello_switch_and_protocol_error_close() {
     // A protocol error gets an error reply, then the server closes.
     let mut bad = node.connect();
     bad.write_all(b"*1\r\n$NOTANUMBER\r\n").expect("write");
-    let mut reply = Vec::new();
-    bad.read_to_end(&mut reply).expect("read until close");
+    let reply = read_to_close(&mut bad, "a protocol error");
     assert!(reply.starts_with(b"-ERR Protocol error"), "got {:?}", String::from_utf8_lossy(&reply));
 
     node.stop();
@@ -699,6 +1484,46 @@ fn read_bulk(stream: &mut TcpStream) -> Vec<u8> {
 fn info_text(conn: &mut TcpStream, section: &[u8]) -> String {
     conn.write_all(&cmd(&[b"INFO", section])).expect("write");
     String::from_utf8(read_bulk(conn)).expect("ascii")
+}
+
+/// A deadline before the internal clock's origin reads nil inside that
+/// clock's first millisecond, on every cell (ADR-0111 A1). `infinityd`
+/// serves a pipeline queued at connect inside that millisecond, but only a
+/// release build reaches it in time; here every cell's clock is held at
+/// 1 ns, so the read lands there in any build. A deadline clamped onto the
+/// origin was served at this reading. The control, a deadline *at* the
+/// origin, is live through its millisecond as Redis serves `PXAT now`: it
+/// fails unless the clock reads inside millisecond 0.
+#[test]
+fn a_pre_origin_deadline_reads_nil_in_the_clocks_first_millisecond() {
+    const CELLS: u16 = 4;
+    const ANCHOR_UNIX_MS: u64 = 1_757_000_000_000;
+    let node = Node::start_held_clock(
+        CELLS,
+        HeldClock { internal: Nanos(1), anchor_unix_ms: ANCHOR_UNIX_MS },
+    );
+    let mut client = node.connect();
+    let origin = ANCHOR_UNIX_MS.to_string();
+    for cell in 0..CELLS {
+        let at_origin = key_for_cell_prefixed(CELLS, cell, "origin");
+        let fresh = key_for_cell_prefixed(CELLS, cell, "sxp");
+        let live = key_for_cell_prefixed(CELLS, cell, "sxg");
+        let steps: [(Vec<u8>, &[u8]); 7] = [
+            (cmd(&[b"SET", &at_origin, b"v", b"PXAT", origin.as_bytes()]), b"+OK\r\n"),
+            (cmd(&[b"GET", &at_origin]), b"$1\r\nv\r\n"),
+            (cmd(&[b"SET", &fresh, b"v", b"EXAT", b"1"]), b"+OK\r\n"),
+            (cmd(&[b"GET", &fresh]), b"$-1\r\n"),
+            (cmd(&[b"SET", &live, b"old"]), b"+OK\r\n"),
+            (cmd(&[b"SET", &live, b"v", b"PXAT", b"1", b"GET"]), b"$3\r\nold\r\n"),
+            (cmd(&[b"EXISTS", &live]), b":0\r\n"),
+        ];
+        let pipeline: Vec<u8> = steps.iter().flat_map(|(wire, _)| wire.iter().copied()).collect();
+        client.write_all(&pipeline).expect("write");
+        for (_, reply) in &steps {
+            read_exactly(&mut client, reply);
+        }
+    }
+    node.stop();
 }
 
 /// Connects until landing on `cell` (SO_REUSEPORT spreads arbitrarily).
@@ -838,8 +1663,7 @@ fn slow_subscriber_hits_the_output_cap_and_dies() {
 
     // The subscriber is killed by the MAINTAIN sweep: EOF after whatever
     // partial output flushed first.
-    let mut sink = Vec::new();
-    sub.read_to_end(&mut sink).expect("read until close");
+    drain_to_close(&mut sub, "a subscriber past the pubsub hard cap", |_| {});
 
     // Registry unwound (close-path cleanup): no receivers remain.
     publisher.write_all(&cmd(&[b"PUBLISH", &ch, b"after"])).expect("write");
@@ -885,6 +1709,12 @@ fn many_connections_spread_across_cells() {
 
 // ---- M2-S08: durable namespaces ------------------------------------------------
 
+/// A per-node salt for the harness's `run_id` seed.
+fn port_seed() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn temp_data_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("inf-s08-{tag}-{}", std::process::id()));
     if dir.exists() {
@@ -898,12 +1728,222 @@ fn read_line(stream: &mut TcpStream) -> Vec<u8> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        stream.read_exact(&mut byte).expect("read byte");
+        if let Err(err) = stream.read_exact(&mut byte) {
+            panic!("{}", reply_read_failed(stream, "read reply line", &err));
+        }
         line.push(byte[0]);
         if line.ends_with(b"\r\n") {
             return line;
         }
     }
+}
+
+/// Review of 2026-08-28 (M4.5-S37 finding 2): `DBSIZE` on a
+/// namespace-bound connection is the **node-wide** count — the compat
+/// matrix's `DBSIZE | full` — on a memory namespace, a flat durable one
+/// and a tiered one, with keys spread over both cells of a two-cell
+/// node; before, it answered the connection's cell alone. Asked from a
+/// second connection too (whichever cell it lands on, the same count).
+#[test]
+fn namespace_bound_dbsize_counts_every_cell() {
+    let dir = temp_data_dir("ns-dbsize");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let namespaces: [&[&[u8]]; 3] = [
+        &[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"],
+        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
+        &[
+            b"INF.NS",
+            b"CREATE",
+            b"hot",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+        ],
+    ];
+    for create in namespaces {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Keys owned by each cell, ten per cell, so a per-cell answer would
+    // read 10 and the node-wide one 20.
+    let keys: Vec<Vec<u8>> = (0..10u32)
+        .flat_map(|i| {
+            let mut a = key_for_cell(2, 0);
+            a.extend_from_slice(format!(":{i}").as_bytes());
+            let mut b = key_for_cell(2, 1);
+            b.extend_from_slice(format!(":{i}").as_bytes());
+            [a, b]
+        })
+        .collect();
+    for ns in [&b"cache"[..], b"ledger", b"hot"] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":0\r\n");
+        for key in &keys {
+            c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":20\r\n");
+        // Single-key deletes (a multi-key DEL spanning cells is the
+        // recorded M2 limitation of named namespaces): one per cell + one.
+        for key in &keys[..3] {
+            c.write_all(&cmd(&[b"DEL", key])).expect("write");
+            read_exactly(&mut c, b":1\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":17\r\n");
+        // A second connection, bound to the same namespace — the same
+        // node-wide answer whichever cell accepted it.
+        let mut other = connect_use(&node, ns);
+        other.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut other, b":17\r\n");
+    }
+}
+
+/// Reads one flat RESP array of bulk strings (the `KEYS` reply shape).
+fn read_key_array(stream: &mut TcpStream) -> std::collections::BTreeSet<Vec<u8>> {
+    let header = read_line(stream);
+    assert_eq!(header.first(), Some(&b'*'), "KEYS reply shape: {header:?}");
+    let count: usize =
+        String::from_utf8_lossy(&header[1..header.len() - 2]).parse().expect("array length");
+    (0..count).map(|_| read_bulk(stream)).collect()
+}
+
+/// Review of 2026-08-30 (full-codebase review C1 / F-L13-07): on a
+/// namespace-bound connection of a multi-cell node, `SCAN`, `KEYS` and
+/// `RANDOMKEY` cover **every** cell, and `FLUSHALL` deletes node-wide —
+/// the same programs the default database rides, with `ApplyNs` legs.
+/// Before the fix each served the connection's own cell and reported a
+/// complete answer (`FLUSHALL` replied `+OK` having deleted 1/cells).
+/// `FLUSHDB` keeps its honest typed refusal (ADR-0015): under a named
+/// namespace it means "flush the namespace", which is not yet a thing.
+#[test]
+fn namespace_bound_scan_keys_flushall_cover_every_cell() {
+    // A durable node whose only namespace is a memory one: DDL needs the
+    // control plane, while FLUSHALL refuses only when a *durable*
+    // namespace exists (exec.rs's ADR-0015 guard).
+    let dir = temp_data_dir("ns-scan-flushall");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"cache", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut c = connect_use(&node, b"cache");
+    let cell0: std::collections::BTreeSet<Vec<u8>> = keys_for_cell(2, 0, 10).into_iter().collect();
+    let cell1: std::collections::BTreeSet<Vec<u8>> = keys_for_cell(2, 1, 10).into_iter().collect();
+    let expected: std::collections::BTreeSet<Vec<u8>> = cell0.union(&cell1).cloned().collect();
+    for key in &expected {
+        c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Keys in the *default* database too — FLUSHALL's blast radius.
+    let mut plain = node.connect();
+    for key in &expected {
+        plain.write_all(&cmd(&[b"SET", key, b"db0"])).expect("write");
+        read_exactly(&mut plain, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":20\r\n");
+    // SCAN and KEYS name the whole namespace — set equality, both ways
+    // (the defect's signature was a complete-looking 1/cells answer).
+    assert_eq!(scan_to_completion(&mut c, b"7"), expected, "SCAN covers every cell");
+    c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+    assert_eq!(read_key_array(&mut c), expected, "KEYS covers every cell");
+    // RANDOMKEY draws from every cell's pool (200 draws: the chance of
+    // missing one cell with both non-empty is 2⁻²⁰⁰-ish).
+    let mut saw = (false, false);
+    for _ in 0..200 {
+        c.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+        let key = read_bulk(&mut c);
+        saw.0 |= cell0.contains(&key);
+        saw.1 |= cell1.contains(&key);
+        assert!(expected.contains(&key), "RANDOMKEY named a foreign key: {key:?}");
+    }
+    assert!(saw.0 && saw.1, "RANDOMKEY drew from one cell's pool only: {saw:?}");
+    // FLUSHDB: the honest refusal, nothing deleted.
+    c.write_all(&cmd(&[b"FLUSHDB"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR"), "FLUSHDB refuses typed: {refusal:?}");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":20\r\n");
+    // FLUSHALL: +OK means gone — from every cell, namespace and db0 both.
+    c.write_all(&cmd(&[b"FLUSHALL"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+    read_exactly(&mut c, b"*0\r\n");
+    plain.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut plain, b":0\r\n");
+    drop(plain);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The C1 sweep's durable half: `SCAN`/`KEYS` on a namespace-bound
+/// connection cover both cells of a flat durable namespace, and tiered
+/// `SCAN` hops cells through the packed cursor (its per-cell walk was
+/// the same 1/cells defect through `plane/tiered.rs`). Tiered `KEYS`/
+/// `RANDOMKEY` keep their honest typed refusals.
+#[test]
+fn namespace_bound_scan_covers_durable_and_tiered_namespaces() {
+    let dir = temp_data_dir("ns-scan-sweep");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let namespaces: [&[&[u8]]; 2] = [
+        &[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"everysec"],
+        &[
+            b"INF.NS",
+            b"CREATE",
+            b"hot",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"8mb",
+            b"DISK-BUDGET",
+            b"64mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+        ],
+    ];
+    for create in namespaces {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    let expected: std::collections::BTreeSet<Vec<u8>> =
+        keys_for_cell(2, 0, 10).into_iter().chain(keys_for_cell(2, 1, 10)).collect();
+    for ns in [&b"ledger"[..], b"hot"] {
+        let mut c = connect_use(&node, ns);
+        for key in &expected {
+            c.write_all(&cmd(&[b"SET", key, b"v"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+        read_exactly(&mut c, b":20\r\n");
+        let label = String::from_utf8_lossy(ns).into_owned();
+        assert_eq!(scan_to_completion(&mut c, b"7"), expected, "{label}: SCAN covers every cell");
+        c.write_all(&cmd(&[b"KEYS", b"*"])).expect("write");
+        if ns == b"hot" {
+            let reply = read_line(&mut c);
+            assert!(reply.starts_with(b"-ERR"), "{label}: tiered KEYS refuses typed: {reply:?}");
+            c.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+            let reply = read_line(&mut c);
+            assert!(reply.starts_with(b"-ERR"), "{label}: tiered RANDOMKEY refusal: {reply:?}");
+        } else {
+            assert_eq!(read_key_array(&mut c), expected, "{label}: KEYS covers every cell");
+        }
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// `INF.NS CREATE … MODE durable` goes live: create → USE → write → read,
@@ -934,9 +1974,7 @@ fn durable_namespace_survives_restart() {
     read_exactly(&mut c, b"$3\r\n100\r\n");
     let info = {
         c.write_all(&cmd(&[b"INF.NS", b"INFO", b"ledger"])).expect("write");
-        let mut buf = vec![0u8; 512];
-        let n = c.read(&mut buf).expect("read info");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
     assert!(info.contains("always"), "INFO reports the fsync class: {info}");
     drop(c);
@@ -956,6 +1994,665 @@ fn durable_namespace_survives_restart() {
     c.write_all(&cmd(&[b"TTL", b"sess:9"])).expect("write");
     let ttl = read_line(&mut c);
     assert!(ttl.starts_with(b":") && ttl != b":-1\r\n" && ttl != b":-2\r\n", "{ttl:?}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-08-30 (H1 / F-L17-12 defect B, ADR-0098): an erroring
+/// `CONFIG SET` must leave **every** cell unchanged. Pre-fix the local
+/// leg applied pairs while validating them, then the error reply
+/// suppressed the peer fan-out — cell 0 held `maxmemory 100mb` while
+/// cells 1–3 held the default, permanently and silently.
+#[test]
+fn config_set_error_leaves_every_cell_unchanged() {
+    let node = Node::start(4);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"CONFIG", b"SET", b"maxmemory", b"100mb", b"databases", b"32"]))
+        .expect("write");
+    let reply = read_line(&mut c);
+    assert!(reply.starts_with(b"-ERR CONFIG SET failed"), "{:?}", String::from_utf8_lossy(&reply));
+    // The cell-scope scrape (the S37 convention): CONFIG GET reads the
+    // executing cell's replica, so every cell must report the default.
+    for cell in 0..4 {
+        let mut peer = conn_on_cell(&node, cell);
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n");
+    }
+    node.stop();
+}
+
+/// Review of 2026-08-30 (H1 / F-L13-01, ADR-0098): a `CONFIG SET` whose
+/// argv exceeds the fabric codec's `MAX_APPLY_ARGS` (8 pairs = 18
+/// args, over the 16-slice cap) must still reach every peer. Pre-fix
+/// every peer leg's
+/// `send_apply` refusal was silently swallowed: the reply was `+OK`,
+/// the local cell applied, and the peers never saw the command.
+#[test]
+fn config_set_eight_pairs_reaches_every_cell() {
+    let node = Node::start(2);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[
+        b"CONFIG",
+        b"SET",
+        b"maxmemory",
+        b"64mb",
+        b"maxmemory-policy",
+        b"allkeys-lru",
+        b"maxmemory-samples",
+        b"7",
+        b"proto-max-bulk-len",
+        b"268435456",
+        b"tcp-keepalive",
+        b"200",
+        b"timeout",
+        b"30",
+        b"tiered-promote-on-read",
+        b"no",
+        b"save",
+        b"900 1",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2 {
+        let mut peer = conn_on_cell(&node, cell);
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$9\r\nmaxmemory\r\n$8\r\n67108864\r\n");
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"maxmemory-policy"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n");
+        peer.write_all(&cmd(&[b"CONFIG", b"GET", b"timeout"])).expect("write");
+        read_exactly(&mut peer, b"*2\r\n$7\r\ntimeout\r\n$2\r\n30\r\n");
+    }
+    node.stop();
+}
+
+/// Connects until landing on `cell`, then selects `ns` (retrying fresh
+/// connections until the DDL fan reached that cell).
+fn conn_on_cell_use(node: &Node, cell: u16, ns: &[u8]) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = conn_on_cell(node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        if read_line(&mut c) == b"+OK\r\n" {
+            return c;
+        }
+        assert!(Instant::now() < deadline, "USE never fanned to cell {cell}");
+    }
+}
+
+/// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): a
+/// partially-failing `MSET` on a durable namespace. Pre-fix the first
+/// pair applied (readable for hours), the error reply skipped durable
+/// staging, and recovery silently rolled the key back while a later
+/// acked write survived — the review's proven L2 breach. The fix makes
+/// the command atomic (bounds validated before any pair applies), so
+/// the live store and recovery agree on the pre-command state.
+#[test]
+fn durable_mset_bounds_failure_is_atomic_across_recovery() {
+    let dir = temp_data_dir("mset-atomic");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let long_key = vec![b'k'; 256];
+    c.write_all(&cmd(&[b"MSET", b"a", b"new", &long_key, b"v"])).expect("write");
+    read_exactly(&mut c, b"-ERR key or value exceeds InfinityDB M0 record bounds\r\n");
+    // Atomic: the error reply implies zero mutation (pre-fix: "new").
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nold\r\n");
+    // The log stays live and healthy — a later write acks durably.
+    c.write_all(&cmd(&[b"SET", b"z", b"9"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+
+    // Recovery agrees with everything the client observed.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nold\r\n");
+    c.write_all(&cmd(&[b"GET", b"z"])).expect("write");
+    read_exactly(&mut c, b"$1\r\n9\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, b":2\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The `mset_midway_oom` crash-matrix row, local-pump site (review of
+/// 2026-08-30, H2 / F-L17-11, ADR-0098): when a multi-key write genuinely
+/// applies a prefix and then fails (arena OOM — bounds are pre-validated
+/// now, so the fault point is the deterministic stand-in), the applied
+/// prefix must be durably staged despite the error reply. Pre-fix the
+/// emission gate read the reply's first byte, so the prefix was applied
+/// in RAM, never logged, and silently rolled back by recovery.
+#[test]
+fn durable_mset_midway_failure_stages_what_it_wrote() {
+    let dir = temp_data_dir("mset-midway");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_server::fault::MSET_MIDWAY_OOM, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Pair 1 applies; the armed point fails pair 2.
+    c.write_all(&cmd(&[b"MSET", b"a", b"new", b"b", b"vb"])).expect("write");
+    read_exactly(&mut c, b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n"); // the prefix is live and read-visible
+    c.write_all(&cmd(&[b"GET", b"b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+
+    // Recovery must replay exactly the live store — never roll back a
+    // read-visible key (pre-fix: `a` came back as "old").
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pay"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("mset_midway_oom", "staged-prefix");
+}
+
+/// The same staged-prefix contract on the fabric path (`ApplyNs`, the
+/// owner-side emission gate at `Shared::execute_ns_owned`): a hashtag
+/// routes both pairs to one remote owner, the owner applies pair 1,
+/// the armed point fails pair 2, and the origin's client sees the error
+/// while the owner's staged prefix survives restart.
+#[test]
+fn durable_mset_midway_failure_stages_on_the_fabric_path() {
+    let dir = temp_data_dir("mset-midway-fabric");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::MSET_MIDWAY_OOM, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut boot = node.connect();
+    boot.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pay", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut boot, b"+OK\r\n");
+    drop(boot);
+    // Both keys share the `{t}` hashtag slot; connect on the other cell
+    // so the MSET rides `ApplyNs` to the owner.
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(b"{t}a")).0;
+    let mut c = conn_on_cell_use(&node, 1 - owner, b"pay");
+    c.write_all(&cmd(&[b"SET", b"{t}a", b"old"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"MSET", b"{t}a", b"new", b"{t}b", b"vb"])).expect("write");
+    read_exactly(&mut c, b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = connect_use(&node, b"pay");
+    c.write_all(&cmd(&[b"GET", b"{t}a"])).expect("write");
+    read_exactly(&mut c, b"$3\r\nnew\r\n");
+    c.write_all(&cmd(&[b"GET", b"{t}b"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("mset_midway_oom", "staged-prefix");
+}
+
+/// Review of 2026-08-30, F-L17-15 (ADR-0120): a named-namespace command
+/// whose keys share one **remote** owner ships whole whatever its width —
+/// the fabric's apply bound follows the client parser (1024 slices), so
+/// an `MSET` of 9 pairs (19 slices) and one of 511 pairs (1023 slices,
+/// the widest argv a client can send) answer `+OK` from either cell and
+/// read back through the same arm. Red on the 16-slice codec: the
+/// non-owner cell answered `-ERR too many arguments for cross-cell
+/// execution` for the command the owner cell accepted — one outcome per
+/// `--cells`/slot layout, none of them in the matrix.
+#[test]
+fn named_ns_wide_mset_ships_whole_to_its_remote_owner() {
+    let dir = temp_data_dir("ns-wide-mset");
+    let node = Node::start_durable(2, &dir);
+    let mut boot = node.connect();
+    boot.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"wide",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut boot, b"+OK\r\n");
+    drop(boot);
+    // Every key carries the `{w}` hashtag: one slot, one owner, under
+    // every topology (ADR-0116 D1's portable guarantee).
+    let router = SlotRouter::new_contiguous(2);
+    let owner = router.cell_of(SlotRouter::slot_of(b"{w}0")).0;
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+        (0..9).map(|i| (format!("{{w}}{i}").into_bytes(), format!("v{i}").into_bytes())).collect();
+    let mut mset: Vec<&[u8]> = vec![b"MSET"];
+    for (k, v) in &pairs {
+        mset.push(k);
+        mset.push(v);
+    }
+    let mut mget: Vec<&[u8]> = vec![b"MGET"];
+    let mut want = format!("*{}\r\n", pairs.len()).into_bytes();
+    for (k, v) in &pairs {
+        mget.push(k);
+        want.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+        want.extend_from_slice(v);
+        want.extend_from_slice(b"\r\n");
+    }
+    // The non-owner cell: the whole argv rides `ApplyNs` to the owner.
+    let mut remote = conn_on_cell_use(&node, 1 - owner, b"wide");
+    remote.write_all(&cmd(&mset)).expect("write");
+    read_exactly(&mut remote, b"+OK\r\n");
+    remote.write_all(&cmd(&mget)).expect("write");
+    read_exactly(&mut remote, &want);
+    // The widest client argv (`ParserLimits::max_args` = 1024): 511 pairs.
+    let wide: Vec<(Vec<u8>, Vec<u8>)> = (0..511)
+        .map(|i| (format!("{{w}}big{i}").into_bytes(), format!("x{i}").into_bytes()))
+        .collect();
+    let mut widest: Vec<&[u8]> = vec![b"MSET"];
+    for (k, v) in &wide {
+        widest.push(k);
+        widest.push(v);
+    }
+    assert_eq!(widest.len(), 1023);
+    remote.write_all(&cmd(&widest)).expect("write");
+    read_exactly(&mut remote, b"+OK\r\n");
+    remote.write_all(&cmd(&[b"GET", &wide[510].0])).expect("write");
+    read_exactly(&mut remote, b"$4\r\nx510\r\n");
+    remote.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut remote, b":520\r\n");
+    // The owner cell sees the same keys locally — the discriminator the
+    // finding named (the same command passed on the owner and failed on
+    // the peer).
+    let mut local = conn_on_cell_use(&node, owner, b"wide");
+    local.write_all(&cmd(&mget)).expect("write");
+    read_exactly(&mut local, &want);
+    drop(local);
+    drop(remote);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0120 D1: every argv the client parser admits ships whole across
+/// the fabric — the two bounds are one contract, checked where both
+/// crates are visible (`inf-fabric` cannot name `inf-wire`).
+#[test]
+fn fabric_apply_bound_covers_every_client_argv() {
+    let client = inf_wire::ParserLimits::default().max_args;
+    assert!(
+        inf_fabric::MAX_APPLY_ARGS >= client,
+        "fabric apply bound {} < client argv bound {client}: a client-legal command can be \
+         refused by slot ownership (F-L17-15)",
+        inf_fabric::MAX_APPLY_ARGS
+    );
+}
+
+/// `--conn-default-ns` is an operator requirement, not a best-effort hint:
+/// an unresolved name must never route a command to db0. Namespace DDL and
+/// explicit selection remain available, and an `always` ack written after
+/// recovery from the fail-closed state survives a full node restart.
+#[test]
+fn configured_default_namespace_fails_closed_and_durable_ack_survives_restart() {
+    let dir = temp_data_dir("conn-default-ns");
+    let node = Node::start_durable_with_default_ns(2, &dir, b"ledger");
+    let mut c = node.connect();
+    let unavailable =
+        b"-ERR configured default namespace is unavailable; use SELECT or INF.NS USE\r\n";
+
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    c.write_all(&cmd(&[b"SET", b"must-not-leak", b"db0"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    c.write_all(&cmd(&[b"GET", b"must-not-leak"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    let k0 = key_for_cell(2, 0);
+    let k1 = key_for_cell(2, 1);
+    for key in [&k0, &k1] {
+        c.write_all(&cmd(&[b"SET", key, b"routed-must-not-leak"])).expect("write");
+        read_exactly(&mut c, unavailable);
+    }
+
+    // DDL is a recovery command. The existing connection stays fail-closed
+    // until it explicitly selects the namespace; new accepts resolve it.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ledger", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"still-closed", b"x"])).expect("write");
+    read_exactly(&mut c, unavailable);
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"ledger"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"durable-key", b"survives"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n"); // `always`: the ack is the durability fence.
+
+    let mut auto = node.connect();
+    auto.write_all(&cmd(&[b"GET", b"durable-key"])).expect("write");
+    read_exactly(&mut auto, b"$8\r\nsurvives\r\n");
+    drop(auto);
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable_with_default_ns(2, &dir, b"ledger");
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"GET", b"durable-key"])).expect("write");
+    read_exactly(&mut c, b"$8\r\nsurvives\r\n");
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"must-not-leak"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    for key in [&k0, &k1] {
+        c.write_all(&cmd(&[b"GET", key])).expect("write");
+        read_exactly(&mut c, b"$-1\r\n");
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- M4.5-S27: durable admission paces instead of refusing (ADR-0083) ----
+
+/// `n` distinct keys owned by `cell` under the N-cell contiguous router.
+fn keys_for_cell(cells: u16, cell: u16, n: usize) -> Vec<Vec<u8>> {
+    let router = SlotRouter::new_contiguous(cells);
+    let mut keys = Vec::with_capacity(n);
+    for i in 0..1_000_000u32 {
+        if keys.len() == n {
+            break;
+        }
+        let key = format!("k:{i}");
+        if router.cell_of(SlotRouter::slot_of(key.as_bytes())) == CellId(cell) {
+            keys.push(key.into_bytes());
+        }
+    }
+    assert_eq!(keys.len(), n, "not enough keys routed to cell {cell}");
+    keys
+}
+
+/// Connects and selects `ns`, retrying fresh connections until the DDL
+/// fan has reached the landed cell (REUSEPORT spreads connections, and a
+/// peer cell may not have applied the CREATE yet — the S29 bench trap).
+fn connect_use(node: &Node, ns: &[u8]) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+        let line = read_line(&mut c);
+        if line == b"+OK\r\n" {
+            return c;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "USE never fanned to all cells: {:?}",
+            String::from_utf8_lossy(&line)
+        );
+    }
+}
+
+/// One `INFO persistence` round-trip (bulk-string reply → text).
+fn info_persistence(c: &mut TcpStream) -> String {
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let header = read_line(c);
+    assert!(header.starts_with(b"$"), "bulk header: {header:?}");
+    let len: usize = String::from_utf8_lossy(&header[1..header.len() - 2]).parse().expect("len");
+    let mut body = vec![0u8; len + 2];
+    c.read_exact(&mut body).expect("info body");
+    String::from_utf8_lossy(&body[..len]).into_owned()
+}
+
+fn info_field(info: &str, field: &str) -> u64 {
+    info.lines()
+        .find_map(|l| l.strip_prefix(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("{field} missing from INFO:\n{info}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{field} not numeric"))
+}
+
+/// M4.5-S27 (ADR-0083 D1): under staging pressure every durable write —
+/// local *and* fabric-routed — parks and succeeds; none refuses with
+/// `-BUSY`. Pre-fix, the owner-side fabric admission answered `-BUSY`
+/// while only local writes parked, so this test pins the regression: a
+/// 64 KiB staging domain against pipelined 8 KiB values over keys owned
+/// by both cells makes the pressure regime deterministic on any device.
+#[test]
+fn durable_pressure_parks_fabric_writes_instead_of_busy() {
+    let dir = temp_data_dir("s27-park");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"press",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let value = vec![b'v'; 8 * 1024];
+    let keys0 = keys_for_cell(2, 0, 50);
+    let keys1 = keys_for_cell(2, 1, 50);
+    let mut conns: Vec<TcpStream> = (0..3).map(|_| connect_use(&node, b"press")).collect();
+    for (ci, c) in conns.iter_mut().enumerate() {
+        let mut pipeline = Vec::new();
+        for (k0, k1) in keys0.iter().zip(&keys1) {
+            let mut k0 = k0.clone();
+            let mut k1 = k1.clone();
+            k0.extend_from_slice(format!(":{ci}").as_bytes());
+            k1.extend_from_slice(format!(":{ci}").as_bytes());
+            pipeline.extend(cmd(&[b"SET", &k0, &value]));
+            pipeline.extend(cmd(&[b"SET", &k1, &value]));
+        }
+        c.write_all(&pipeline).expect("write burst");
+    }
+    // Every reply is +OK: fabric-routed writes parked (paced) instead of
+    // bouncing with the typed -BUSY refusal.
+    for c in &mut conns {
+        for _ in 0..100 {
+            read_exactly(c, b"+OK\r\n");
+        }
+    }
+    // The pressure regime actually engaged (this is not a trivially-idle
+    // pass), and no client-visible refusal was counted anywhere: sample
+    // both cells via fresh REUSEPORT connections.
+    let mut parked_total = 0u64;
+    for _ in 0..8 {
+        let mut c = node.connect();
+        let info = info_persistence(&mut c);
+        assert_eq!(info_field(&info, "log_admission_busy"), 0, "no -BUSY was issued:\n{info}");
+        parked_total += info_field(&info, "log_admission_parked_total");
+    }
+    assert!(parked_total > 0, "staging pressure engaged at least once across cells");
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 ordering: a GET pipelined behind a parked SET on the same
+/// connection must observe that SET (read-your-write through the pump
+/// FIFO) — under pressure, reads divert to the same per-origin queue so
+/// nothing overtakes a parked write.
+#[test]
+fn durable_pressure_preserves_read_your_write_order() {
+    let dir = temp_data_dir("s27-order");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ordr", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let keys0 = keys_for_cell(2, 0, 25);
+    let keys1 = keys_for_cell(2, 1, 25);
+    let mut c = connect_use(&node, b"ordr");
+    // Interleaved SET/GET bursts, values large enough that the SETs park:
+    // every GET must return the value its immediately-preceding SET wrote.
+    let mut pipeline = Vec::new();
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    for (i, key) in keys0.iter().chain(&keys1).enumerate() {
+        let value = vec![b'a' + (i % 26) as u8; 8 * 1024];
+        pipeline.extend(cmd(&[b"SET", key, &value]));
+        pipeline.extend(cmd(&[b"GET", key]));
+        expected.push(value);
+    }
+    c.write_all(&pipeline).expect("write burst");
+    for value in &expected {
+        read_exactly(&mut c, b"+OK\r\n");
+        read_exactly(&mut c, format!("${}\r\n", value.len()).as_bytes());
+        let mut body = vec![0u8; value.len() + 2];
+        c.read_exact(&mut body).expect("bulk body");
+        assert_eq!(&body[..value.len()], value.as_slice(), "GET observed its preceding SET");
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 (ADR-0083 D2): a write whose record can never fit any drain
+/// refuses up front with a typed ERR — never `-BUSY`, never a parked
+/// livelock — and the connection (and node) stay serviceable after it.
+#[test]
+fn oversized_durable_write_refuses_typed_and_never_livelocks() {
+    let dir = temp_data_dir("s27-oversized");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"tight",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let huge = vec![b'x'; 100 * 1024]; // > the 64 KiB staging domain
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        let mut c = connect_use(&node, b"tight");
+        c.write_all(&cmd(&[b"SET", &key, &huge])).expect("write");
+        let line = read_line(&mut c);
+        assert!(
+            line.starts_with(b"-ERR write exceeds durable log staging capacity"),
+            "typed never-fits refusal (got {:?})",
+            String::from_utf8_lossy(&line)
+        );
+        // The refusal is per-write, not a wedge: a normal write succeeds.
+        c.write_all(&cmd(&[b"SET", &key, b"small"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S27 × ADR-0082: `FSYNC always` under staging pressure — parked
+/// fabric writes produce *gated* verdicts through the pump, and every
+/// ack still arrives (after fsync) with zero refusals.
+#[test]
+fn durable_pressure_always_acks_gate_through_the_pump() {
+    let dir = temp_data_dir("s27-always");
+    let node = Node::start_durable_small_staging(2, &dir, 64 * 1024);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"led27", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+
+    let value = vec![b'w'; 8 * 1024];
+    let keys0 = keys_for_cell(2, 0, 25);
+    let keys1 = keys_for_cell(2, 1, 25);
+    let mut c = connect_use(&node, b"led27");
+    let mut pipeline = Vec::new();
+    for key in keys0.iter().chain(&keys1) {
+        pipeline.extend(cmd(&[b"SET", key, &value]));
+    }
+    c.write_all(&pipeline).expect("write burst");
+    for _ in 0..50 {
+        read_exactly(&mut c, b"+OK\r\n"); // fsync-gated ack, never -BUSY
+    }
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-09-01 (found by Group 0 item 3 — the widened DST
+/// value generator; N1 in the review report): `fetch_extent` passed its
+/// accumulator straight to `tier_extract`, which **replaces** its
+/// output's contents — so every continuation window erased the bytes
+/// already assembled and the loop could never terminate. Any `GET` of a
+/// blob value needing more than one cold window (> 16,368 data bytes)
+/// spun device reads forever: no reply, no error, the connection's pump
+/// held, unbounded foreground I/O. Client-reachable on any namespace
+/// with a sub-16 KiB `BLOB-THRESHOLD` (a public CREATE option), and at
+/// the 16 MiB default by any tiered value over 16 MiB. Pre-fix this
+/// test times out on the first big GET; post-fix all sizes round-trip.
+#[test]
+fn tiered_blob_get_spanning_multiple_cold_windows() {
+    let dir = temp_data_dir("blob-multiwindow");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"blobs",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"blobs"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // One-window (≤ 16,368), boundary-crossing, and four-window sizes:
+    // the continuation loop must terminate for every one of them.
+    for (name, len) in [(&b"one"[..], 16_000usize), (&b"cross"[..], 17_000), (&b"four"[..], 50_000)]
+    {
+        let value: Vec<u8> = (0..len).map(|i| b'a' + (i % 23) as u8).collect();
+        c.write_all(&cmd(&[b"SET", name, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"STRLEN", name])).expect("write");
+        read_exactly(&mut c, format!(":{len}\r\n").as_bytes());
+        c.write_all(&cmd(&[b"GET", name])).expect("write");
+        let mut want = format!("${len}\r\n").into_bytes();
+        want.extend_from_slice(&value);
+        want.extend_from_slice(b"\r\n");
+        read_exactly(&mut c, &want);
+    }
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -1023,9 +2720,7 @@ fn tiered_namespace_lifecycle_survives_restart() {
     assert!(tiering.contains("tiering_tables:1"), "re-materialized at boot: {tiering}");
     assert!(tiering.contains("mutable_permille=300"), "the reload persisted: {tiering}");
     c.write_all(&cmd(&[b"INF.NS", b"INFO", b"hot"])).expect("write");
-    let mut buf = vec![0u8; 1024];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = String::from_utf8_lossy(&read_frame(&mut c)).into_owned();
     assert!(info.contains("mem-budget"), "{info}");
     assert!(info.contains("8388608"), "{info}");
     // Teardown: DROP removes the tables on every cell; the zero
@@ -1108,9 +2803,7 @@ fn named_memory_ns_pressure_enforced_and_survives_restart() {
     let node = Node::start_durable(2, &dir);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"INFO", b"cache"])).expect("write");
-    let mut buf = vec![0u8; 1024];
-    let n = c.read(&mut buf).expect("read info");
-    let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+    let info = String::from_utf8_lossy(&read_frame(&mut c)).into_owned();
     assert!(info.contains("allkeys-lfu"), "policy survived restart: {info}");
     assert!(info.contains("1073741824"), "budget survived restart: {info}");
     drop(c);
@@ -1201,13 +2894,15 @@ fn tiered_data_plane_serves_and_survives_restart() {
         // RAM images above, live-set sections, manifest v2 tier ranges.
         c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
-        // Post-checkpoint tail: these records replay from the WAL.
+        // Post-checkpoint tail: these records replay from the WAL. The
+        // synced stop lands them without a second checkpoint (a crash
+        // stop lost the everysec tail under a parallel suite).
         for i in 60..80 {
             c.write_all(&cmd(&[b"SET", &key_of(i), &value_of(i, 2)])).expect("write");
             read_exactly(&mut c, b"+OK\r\n");
         }
         drop(c);
-        node.stop();
+        node.stop_synced();
     }
 
     // Restart: MANIFEST v2 → tier files → checkpoint (refs idempotent,
@@ -1236,6 +2931,226 @@ fn tiered_data_plane_serves_and_survives_restart() {
         expect.extend_from_slice(b"\r\n");
         read_exactly(&mut c, &expect);
     }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads one `SCAN` reply (`[next-cursor, [key…]]`) off the stream.
+fn read_scan_page(stream: &mut TcpStream) -> (u64, Vec<Vec<u8>>) {
+    let header = read_line(stream);
+    assert_eq!(header, b"*2\r\n", "SCAN reply shape: {header:?}");
+    let cursor_text = read_bulk(stream);
+    let cursor: u64 =
+        String::from_utf8_lossy(&cursor_text).parse().expect("SCAN cursor is a decimal u64");
+    let count_line = read_line(stream);
+    assert_eq!(count_line.first(), Some(&b'*'), "SCAN keys array: {count_line:?}");
+    let count: usize = String::from_utf8_lossy(&count_line[1..count_line.len() - 2])
+        .parse()
+        .expect("array length");
+    let keys = (0..count).map(|_| read_bulk(stream)).collect();
+    (cursor, keys)
+}
+
+/// Drives `SCAN` to cursor 0 and returns every key named, as a set.
+fn scan_to_completion(stream: &mut TcpStream, count: &[u8]) -> std::collections::BTreeSet<Vec<u8>> {
+    let mut collected = std::collections::BTreeSet::new();
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    for _ in 0..10_000 {
+        stream.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", count])).expect("write");
+        let (next, keys) = read_scan_page(stream);
+        collected.extend(keys);
+        if next == 0 {
+            return collected;
+        }
+        cursor = next.to_string().into_bytes();
+    }
+    panic!("SCAN never returned cursor 0");
+}
+
+/// Review of 2026-08-30 (full-codebase review C2 / F-L07-05): `SCAN` on a
+/// tiered namespace names **every** live key — including cold records
+/// whose value overruns the 4-frame (~16 KiB) cold-read window. Before
+/// the fix, `fetch_key` demanded the whole record from one window and
+/// silently dropped the key while the cursor advanced: values from
+/// ~16,368 bytes up to the blob threshold vanished from a "complete"
+/// iteration (DBSIZE 920 / SCAN 373 in the review's reproduction) while
+/// `GET` still served them. The small-value band pins the control: keys
+/// inside the window were never affected.
+#[test]
+fn tiered_scan_names_every_cold_key_across_the_window() {
+    let dir = temp_data_dir("tiered-scan-window");
+    let big = 150usize; // 40 KB values — far past the 16,368-byte window
+    let small = 150usize; // 50 B values — the always-worked control band
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut expected = std::collections::BTreeSet::new();
+    for i in 0..big {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        expected.insert(key);
+    }
+    for i in 0..small {
+        let key = format!("small:{i:04}").into_bytes();
+        c.write_all(&cmd(&[b"SET", &key, &[b's'; 50]])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        expected.insert(key);
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", big + small).as_bytes());
+    // ~6 MB against a 3 MB budget: poll MAINTAIN-driven demotion until
+    // most of the fill is flushed AND released pages exist (records are
+    // genuinely cold — a RAM-served SCAN would not exercise the window).
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        let tiering = info_text(c, b"tiering");
+        tiering
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    let mut last = (0u64, 0u64);
+    for _ in 0..1000 {
+        last = (
+            info_u64(&mut c, "tiering_flush_confirmed_bytes:"),
+            info_u64(&mut c, "tiering_region_decommit_pages:"),
+        );
+        if last.0 > 3 << 20 && last.1 > 0 {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never released (flushed {}, decommitted pages {})", last.0, last.1);
+    // The defect's signature: the count is right and the contents are
+    // wrong — so assert exact set equality, not cardinality alone.
+    let cold_reads_before = info_u64(&mut c, "cold_reads_enqueued:");
+    let collected = scan_to_completion(&mut c, b"64");
+    let cold_reads = info_u64(&mut c, "cold_reads_enqueued:") - cold_reads_before;
+    assert!(cold_reads > 0, "SCAN resolved no cold slot — the window path was not exercised");
+    let missing: Vec<_> =
+        expected.difference(&collected).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+    let phantom: Vec<_> =
+        collected.difference(&expected).map(|k| String::from_utf8_lossy(k).into_owned()).collect();
+    assert!(
+        missing.is_empty() && phantom.is_empty(),
+        "SCAN vs DBSIZE: {} of {} named; missing {:?}…; phantom {:?}",
+        collected.len(),
+        expected.len(),
+        &missing[..missing.len().min(5)],
+        &phantom[..phantom.len().min(5)],
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Review of 2026-08-30, F-L17-13 (L3 — batch every boundary): a `SCAN`
+/// page resolves its cold keys one **batch** at a time — every intent of
+/// a `COLD-READ-QD`-sized chunk is in the FIFO before the page suspends,
+/// so ADR-0055 D4's merge sees them together and the device runs at
+/// queue depth. Red on the sequential loop: one intent per drain can
+/// never merge (`cold_reads_issued == cold_reads_enqueued` over the
+/// page, by construction) and `cold_read_qd_p99` stayed at 1 — a
+/// `COUNT 10000` page was up to 10 000 device round trips inside one
+/// command.
+#[test]
+fn tiered_scan_batches_its_cold_key_reads() {
+    let dir = temp_data_dir("tiered-scan-batch");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // ~96 K records of ~70 B (dozens per 4 KiB tier frame): the dense
+    // cold region where a batched page has adjacent windows to merge.
+    let keys = 98_304usize;
+    let batch = 2048usize;
+    for start in (0..keys).step_by(batch) {
+        let mut wire = Vec::with_capacity(batch * 64);
+        for i in start..start + batch {
+            let key = format!("k:{i:06}").into_bytes();
+            wire.extend_from_slice(&cmd(&[b"SET", &key, &[b'v'; 32]]));
+        }
+        c.write_all(&wire).expect("write");
+        for _ in 0..batch {
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+    }
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    let mut last = (0u64, 0u64);
+    for _ in 0..1500 {
+        last = (
+            info_u64(&mut c, "tiering_flush_confirmed_bytes:"),
+            info_u64(&mut c, "tiering_region_decommit_pages:"),
+        );
+        // ~5 MB of records against a 3 MB budget: the demoter flushes
+        // the ~2 MB excess (a dense cold region of ~40 K records).
+        if last.0 > 1 << 20 && last.1 > 0 {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never released (flushed {}, decommitted pages {})", last.0, last.1);
+    let before = (info_u64(&mut c, "cold_reads_enqueued:"), info_u64(&mut c, "cold_reads_issued:"));
+    c.write_all(&cmd(&[b"SCAN", b"0", b"COUNT", b"4096"])).expect("write");
+    let (_, named) = read_scan_page(&mut c);
+    let after = (info_u64(&mut c, "cold_reads_enqueued:"), info_u64(&mut c, "cold_reads_issued:"));
+    let enqueued = after.0 - before.0;
+    let issued = after.1 - before.1;
+    assert!(!named.is_empty(), "empty page");
+    assert!(enqueued >= 256, "the page touched {enqueued} cold slots — not the cold regime");
+    let qd = info_u64(&mut c, "cold_read_qd_p99:");
+    eprintln!(
+        "scan page: {} keys, {enqueued} cold intents, {issued} device reads, qd p99 {qd}",
+        named.len()
+    );
+    assert!(
+        issued < enqueued,
+        "no coalescing on the page: {issued} device reads for {enqueued} cold keys — one \
+         intent per drain (F-L17-13)"
+    );
+    assert!(qd > 1, "the page ran at queue depth 1 (cold_read_qd_p99 {qd}) — sequential awaits");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -1313,6 +3228,1015 @@ fn blob_values_round_trip_and_survive_restart() {
     read_exactly(&mut c, b"$-1\r\n");
     drop(c);
     node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F-L04-09: a blob write refused for space answers `DISKFULL`, the same
+/// typed reply the inline path gives — not the generic blob I/O error.
+/// The `blob_write_nospace` fault point is the `StorageFull` refusal at
+/// `blob::device_write` (no byte lands, ADR-0063 D4).
+#[test]
+fn blob_write_at_disk_full_replies_diskfull() {
+    let dir = temp_data_dir("tiered-blob-diskfull");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"b",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Inline values still land: the refusal is the device's, per extent.
+    c.write_all(&cmd(&[b"SET", b"small", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"big", &vec![0xA1u8; 8 << 10]])).expect("write");
+    let reply = read_line(&mut c);
+    assert!(
+        reply.starts_with(b"-DISKFULL"),
+        "a space-refused blob write is DISKFULL, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    c.write_all(&cmd(&[b"GET", b"big"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads one GET reply: `Ok(body)` for a bulk, `Err(line)` for an error
+/// reply, `Ok(empty)` is unreachable here (no test key is empty).
+fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let header = read_line(stream);
+    match header.first() {
+        Some(&b'-') => Err(String::from_utf8_lossy(&header).into_owned()),
+        Some(&b'$') => {
+            let len: i64 = std::str::from_utf8(&header[1..header.len() - 2])
+                .expect("ascii")
+                .parse()
+                .expect("bulk length");
+            if len < 0 {
+                return Ok(Vec::new()); // nil
+            }
+            let mut body = vec![0u8; len as usize + 2];
+            stream.read_exact(&mut body).expect("bulk body");
+            body.truncate(len as usize);
+            Ok(body)
+        }
+        other => panic!("unexpected GET reply head {other:?}: {header:?}"),
+    }
+}
+
+// ---- the paced-checkpoint fixture ----
+
+/// One `INFO` integer field from this connection's cell. Scope caveats
+/// apply: `Memory` is a node fold, `Tiering`/`Persistence` are
+/// cell-scope — multiply by cells before comparing to node totals.
+fn scrape_u64(c: &mut TcpStream, section: &[u8], field: &str) -> u64 {
+    info_text(c, section)
+        .lines()
+        .find_map(|l| l.strip_prefix(field))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Waits until demotion has genuinely pushed records cold. Batch-1 trap
+/// (review remediation, 2026-08-31): cold-ness must be **asserted**
+/// (flush-confirmed bytes past `min_confirmed` AND decommitted pages),
+/// never assumed from write volume — an e2e that "forces demotion" by
+/// filling and then reads immediately measures the RAM path.
+fn wait_demoted(c: &mut TcpStream, min_confirmed: u64) {
+    for _ in 0..1500 {
+        if scrape_u64(c, b"tiering", "tiering_flush_confirmed_bytes:") > min_confirmed
+            && scrape_u64(c, b"tiering", "tiering_region_decommit_pages:") > 0
+        {
+            return;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("demotion never pushed the records cold (confirmed > {min_confirmed} + decommit)");
+}
+
+/// The reusable paced-checkpoint driver: holds every cell's clock, requests a checkpoint on every
+/// cell, then alternates `pump` with one `step` of cell time. The walk's
+/// pace (ADR-0017 D6: at most `stream_bytes_per_sec × elapsed` streamed,
+/// in injected time) is read from the cell clock, so each step admits one step's worth of
+/// walk bytes and the walk cannot outrun the pump whatever the host's
+/// speed: it spans at least `walk bytes / (pace × step)` pump calls. A
+/// wall-clock pace raced the pump instead — 40 calls per walk here, 13
+/// on a loaded CI runner. The unpaced-pump trap (the pump spends its
+/// whole schedule inside pass 0) stays closed the same way: pass 0
+/// itself needs the steps. Returns the number of pump calls that landed
+/// inside the walk. The node must be booted with `CkptTrigger::Paced`
+/// (with `section_bytes == slice_bytes` a section is written per fill
+/// slice); with any other trigger the walk completes inside one MAINTAIN
+/// call and no schedule can interleave.
+fn drive_paced_ckpt_with_pump(
+    node: &Node,
+    probe: &mut TcpStream,
+    step: Duration,
+    mut pump: impl FnMut(&mut TcpStream),
+    timeout: Duration,
+) -> u32 {
+    let before = scrape_u64(probe, b"persistence", "ckpts_completed:");
+    node.clock_gates.iter().for_each(|gate| gate.hold());
+    node.request_ckpt_all();
+    let deadline = Instant::now() + timeout;
+    let mut pumped = 0u32;
+    let completed = loop {
+        pump(probe);
+        pumped += 1;
+        node.clock_gates.iter().for_each(|gate| gate.step(step));
+        // The scrape also gives the cell an iteration on the stepped
+        // clock before the next pump call.
+        if scrape_u64(probe, b"persistence", "ckpts_completed:") > before {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    node.clock_gates.iter().for_each(|gate| gate.open());
+    assert!(completed, "checkpoint never completed under the pump ({pumped} steps of {step:?})");
+    pumped
+}
+
+/// Review of 2026-08-30 (C4 / F-L03-01 + C7 / F-L04-08, F-L14-02): the
+/// checkpoint's 0x05 blob-reference walk must not lose a live entry when
+/// foreground `DEL`s remove reference-map entries *below its cursor*
+/// between MAINTAIN slices. Before the fix the pass-3 resume was a
+/// positional `.skip(ordinal)` into the mutating `BTreeMap`: each
+/// below-cursor removal shifted every later rank down one, the resume
+/// stepped over one live entry, the checkpoint published without its
+/// 0x05 row, and the next boot's orphan sweep unlinked the extent — a
+/// `GET` of an acked, never-deleted key then failed forever.
+///
+/// The walk is paced (1 KiB fill slices) so pass 3 spans many MAINTAIN
+/// calls, and the `DEL` pump runs on the same cell for the whole stream:
+/// deletes land between pass-3 slices at the lowest-ranked addresses —
+/// the exact adversarial schedule. The pace runs on the cell clock the
+/// pump steps one slice per `DEL`, so the schedule is the same on any
+/// host. After the fix (address-keyed resume) the schedule is harmless
+/// by construction, so this test is deterministic-green; before it, each
+/// in-window DEL dropped one surviving key's extent (observed red: GET →
+/// ERR blob extent read failed after reopen).
+#[test]
+fn blob_refs_survive_a_checkpoint_walk_racing_deletes() {
+    let dir = temp_data_dir("blob-ckpt-del-race");
+    let blobs = 600usize;
+    let fillers = 2400usize;
+    // 4,200 B ≥ 4 KiB threshold
+    let blob_value = |i: usize| format!("V{i:04}!").into_bytes().repeat(700);
+    let mut deleted = std::collections::BTreeSet::new();
+    let (slice_bytes, stream_bytes_per_sec) = (1u32 << 10, 64u32 << 10);
+    // One slice of pace per pump call (16 ms → 1,048 B ≥ the 1 KiB slice).
+    let step = Duration::from_millis(
+        (u64::from(slice_bytes) * 1000).div_ceil(u64::from(stream_bytes_per_sec)),
+    );
+    {
+        let node = Node::start_with(
+            1,
+            Some(dir.clone()),
+            CkptTrigger::Paced { slice_bytes, stream_bytes_per_sec },
+        );
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"b",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+            // Copy-forward off (a 100% dead-ratio trigger never fires):
+            // compaction would otherwise relocate the cold blob
+            // references to the RAM tail once the filler is deleted, and
+            // pass 3 would have nothing to walk.
+            b"COMPACTION-DEAD-RATIO",
+            b"100",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // Blob keys first: their 24-byte reference records take the lowest
+        // addresses, so the DEL pump below always removes entries ranked
+        // below any pass-3 cursor position.
+        for i in 0..blobs {
+            let key = format!("big:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &blob_value(i)])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        // Inline filler past the budget: forces demotion, so every blob
+        // reference record is cold (below the walk watermark) and pass 3
+        // owns all 600 entries.
+        for i in 0..fillers {
+            let key = format!("fill:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &[b'f'; 3000]])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        wait_demoted(&mut c, 3 << 20);
+        // Clear the filler (compaction is off, so the cold blob refs stay
+        // put): pass 1 then emits nothing and the paced walk's wall time
+        // splits between pass 0 and pass 3 — the DEL pump lands between
+        // pass-3 slices.
+        for i in 0..fillers {
+            let key = format!("fill:{i:04}");
+            c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
+            read_exactly(&mut c, b":1\r\n");
+        }
+        // The paced walk with the review's adversarial schedule: DEL from
+        // the low end between the walk's MAINTAIN slices.
+        let walk_started = Instant::now();
+        let mut next_del = 0usize;
+        let pumped = drive_paced_ckpt_with_pump(
+            &node,
+            &mut c,
+            step,
+            |c| {
+                if next_del < 300 {
+                    let key = format!("big:{next_del:04}");
+                    c.write_all(&cmd(&[b"DEL", key.as_bytes()])).expect("write");
+                    read_exactly(c, b":1\r\n");
+                    deleted.insert(key.into_bytes());
+                    next_del += 1;
+                }
+            },
+            Duration::from_secs(30),
+        );
+        eprintln!(
+            "walk took {:?}, {next_del} DELs landed during it ({pumped} pump rounds)",
+            walk_started.elapsed()
+        );
+        assert!(next_del > 20, "VACUOUS: {next_del} DELs over the walk — the pump barely ran");
+        // Let everysec cover the DEL deaths, then stop without a further
+        // checkpoint (a second walk would re-emit the intact RAM map and
+        // mask the omission).
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(c);
+        node.stop();
+    }
+    let mut blob_entries = 0usize;
+    {
+        // At-least-once floor on the published 0x05 section. The count
+        // alone cannot prove correctness (the recorded falsifier run
+        // emitted a *count-right, contents-wrong* section: 560 entries,
+        // 19 live keys skipped, 19 dead/duplicate rows in their place) —
+        // the GET sweep below is the contents oracle.
+        let ick = dir.join("shard-0").join("ckpt").join("ckpt-000001.ick");
+        let _ = inf_log::ckpt::read_ick_hybrid(
+            &inf_log::fs::StdSegmentFs,
+            &ick,
+            inf_log::ckpt::IckReaderConfig::default(),
+            |_| Ok::<(), ()>(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |section| {
+                blob_entries += section.len();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("published checkpoint validates");
+        assert!(blob_entries > 0, "pass 3 emitted nothing — the setup lost its cold refs");
+        eprintln!("published 0x05 entries: {blob_entries}");
+    }
+    // Reopen: replay = short 0x05 section + the tail. Pre-fix, the boot
+    // sweep unlinks the never-emitted extent and its key errors forever.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Drain the boot reclaim backlog (the deleted extents' deaths) so a
+    // pre-fix run cannot pass by racing the unlink.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while scrape_u64(&mut c, b"tiering", "tiering_blob_reclaimable:") > 0 {
+        assert!(Instant::now() < deadline, "boot reclaim backlog never drained");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Every surviving key's extent is referenced again (the recorded
+    // falsifier run booted at live 541 < 560 survivors). `>=`, not `==`:
+    // an acked everysec DEL that missed the last fsync legitimately
+    // revives its key (and extent) at replay.
+    let live = scrape_u64(&mut c, b"tiering", "tiering_blob_extents_live:");
+    assert!(
+        live >= (blobs - deleted.len()) as u64,
+        "extents live after reopen ({live}) below the {} surviving blob keys",
+        blobs - deleted.len()
+    );
+    let mut lost: Vec<String> = Vec::new();
+    for i in 0..blobs {
+        let key = format!("big:{i:04}");
+        if deleted.contains(key.as_bytes()) {
+            continue; // acked DELs may or may not have replayed (everysec)
+        }
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        match read_get(&mut c) {
+            Ok(body) if body == blob_value(i) => {}
+            Ok(body) => lost.push(format!("{key}: served {} bytes", body.len())),
+            Err(err) => lost.push(format!("{key}: {err}")),
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {} surviving blob keys lost after the checkpoint/DEL race (first: {:?})",
+        lost.len(),
+        blobs - deleted.len(),
+        &lost[..lost.len().min(5)]
+    );
+    // The schedule reached the hazard, read from what the walk published
+    // (after the contents oracle, which a pre-fix section fails first): a
+    // DEL acked before pass 3 reached its entry kept it out of the
+    // section, one acked behind the cursor left it listed. Those shifted
+    // the pre-fix ordinal resume; the count also takes the one or two
+    // acked between the walk's end and its publication (15–19 measured).
+    let behind_cursor = deleted.len().saturating_sub(blobs - blob_entries.min(blobs));
+    eprintln!("DELs behind the pass-3 cursor: {behind_cursor}");
+    assert!(behind_cursor >= 5, "VACUOUS: {behind_cursor} DELs landed behind the pass-3 cursor");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A blob `SET` of a key whose shadow ticket is open leaves an
+/// extent-typed winner (the reconciler paused keeps the ticket open), and
+/// filler flushes it below the watermark the next walk latches. The walk
+/// images that winner (ADR-0093 A12), so the 0x05 section does not list
+/// its extent (ADR-0061 D6): a boot that registered the reference from the
+/// image and from the section would hold the extent after its last key is
+/// deleted. Two oracles: the published checkpoint read back from the
+/// directory, and the extents live after the restart's `DEL`.
+#[test]
+fn a_checkpoint_names_a_ticketed_blob_winner_in_its_image_alone() {
+    let dir = temp_data_dir("blob-winner-imaged");
+    let blob = vec![0xB7u8; 8 << 10]; // 8 KiB ≥ the 4 KiB threshold
+    let filler = vec![b'f'; 3000];
+    let bulk = |v: &[u8]| {
+        let mut e = format!("${}\r\n", v.len()).into_bytes();
+        e.extend_from_slice(v);
+        e.extend_from_slice(b"\r\n");
+        e
+    };
+    let ok = |c: &mut TcpStream, parts: &[&[u8]]| {
+        c.write_all(&cmd(parts)).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    };
+    let tiering = |c: &mut TcpStream, field: &str| scrape_u64(c, b"tiering", field);
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        ok(
+            &mut c,
+            &[
+                b"INF.NS",
+                b"CREATE",
+                b"t",
+                b"MODE",
+                b"durable",
+                b"MEM-BUDGET",
+                b"3mb",
+                b"BLOB-THRESHOLD",
+                b"4kb",
+                b"MUTABLE-FRACTION",
+                b"200",
+            ],
+        );
+        // Promotion off: the cold `GET` below is a witness, never a
+        // relocation. The shadow path on, its reconciler paused.
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"]);
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-shadow-overwrite", b"yes"]);
+        ok(&mut c, &[b"CONFIG", b"SET", b"tiered-shadow-reconcile", b"no"]);
+        ok(&mut c, &[b"INF.NS", b"USE", b"t"]);
+        ok(&mut c, &[b"SET", b"victim", &[b'0'; 1500]]);
+        for i in 0..2400u32 {
+            ok(&mut c, &[b"SET", format!("fill:{i:04}").as_bytes(), &filler]);
+        }
+        wait_demoted(&mut c, 3 << 20);
+        let cold = tiering(&mut c, "tiering_cold_resolves:");
+        c.write_all(&cmd(&[b"GET", b"victim"])).expect("write");
+        read_exactly(&mut c, &bulk(&[b'0'; 1500]));
+        assert!(
+            tiering(&mut c, "tiering_cold_resolves:") > cold,
+            "VACUOUS: the key is not cold before its shadow write"
+        );
+        // The shadow write, then the blob write that moves the open ticket
+        // to an extent-typed winner.
+        let created = tiering(&mut c, "tiering_shadow_created:");
+        ok(&mut c, &[b"SET", b"victim", &[b'1'; 1400]]);
+        assert_eq!(
+            tiering(&mut c, "tiering_shadow_created:"),
+            created + 1,
+            "VACUOUS: the inline write did not take the shadow path"
+        );
+        ok(&mut c, &[b"SET", b"victim", &blob]);
+        assert_eq!(tiering(&mut c, "tiering_shadow_pending:"), 1, "VACUOUS: no ticket is open");
+        // `flushed` past the winner's end: both gauges count from the
+        // life's origin, and the node holds this one tiered table.
+        // `flushed` lands on seal cuts and the frame under the newest cut
+        // is held back until bytes fill it (ADR-0056 D5), so the cut past
+        // the winner confirms with the round of the seal after it. Filler
+        // makes that seal (bytes); the round's barrier is device time. A
+        // fixed filler volume raced the device and lost on loaded runners,
+        // so filler goes in only while no round is in flight.
+        let winner_end = tiering(&mut c, "tiering_allocated_bytes:");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut batch = 0u32;
+        loop {
+            let text = info_text(&mut c, b"tiering");
+            let gauge = |field: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(field))
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("INFO tiering names {field}"))
+            };
+            let (confirmed, inflight) =
+                (gauge("tiering_flush_confirmed_bytes:"), gauge("tiering_flush_rounds_inflight:"));
+            if confirmed > winner_end {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "flushed stuck at {confirmed} below the winner's end {winner_end} for 30 s \
+                 ({inflight} rounds in flight)"
+            );
+            if inflight > 0 {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            // Under the 3 MiB window: release is pinned at the winner.
+            assert!(batch < 40, "VACUOUS: 1.9 MiB of filler never sealed past the winner");
+            for i in 0..16u32 {
+                ok(&mut c, &[b"SET", format!("late:{batch:02}:{i:02}").as_bytes(), &filler]);
+            }
+            batch += 1;
+        }
+        eprintln!("filler batches to flush past the winner: {batch}");
+        assert_eq!(
+            tiering(&mut c, "tiering_shadow_pending:"),
+            1,
+            "VACUOUS: the ticket ended before the walk"
+        );
+        ok(&mut c, &[b"INF.CKPT", b"WAIT"]);
+        drop(c);
+        node.stop();
+    }
+    let listed_too = {
+        let ckpt_dir = dir.join("shard-0").join("ckpt");
+        let ick = std::fs::read_dir(&ckpt_dir)
+            .expect("checkpoint directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ick"))
+            .max()
+            .expect("a published checkpoint");
+        let mut imaged: Option<u64> = None;
+        let mut listed: Vec<u64> = Vec::new();
+        let _ = inf_log::ckpt::read_ick_hybrid(
+            &inf_log::fs::StdSegmentFs,
+            &ick,
+            inf_log::ckpt::IckReaderConfig::default(),
+            |record| {
+                if let inf_log::RecordView::StringExtentRef { key: b"victim", extent_id, .. } =
+                    record
+                {
+                    imaged = Some(extent_id);
+                }
+                Ok::<(), ()>(())
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+            |section| {
+                listed.extend(section.iter().map(|entry| entry.extent_id));
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("the published checkpoint validates");
+        let imaged = imaged.expect("VACUOUS: the checkpoint holds no image of the blob winner");
+        listed.contains(&imaged)
+    };
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    ok(&mut c, &[b"INF.NS", b"USE", b"t"]);
+    c.write_all(&cmd(&[b"GET", b"victim"])).expect("write");
+    read_exactly(&mut c, &bulk(&blob));
+    assert_eq!(tiering(&mut c, "tiering_blob_extents_live:"), 1, "the key's one extent");
+    c.write_all(&cmd(&[b"DEL", b"victim"])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    let live_after_del = tiering(&mut c, "tiering_blob_extents_live:");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    // Both oracles in one verdict, so a red names each.
+    assert_eq!(
+        (listed_too, live_after_del),
+        (false, 0),
+        "the 0x05 section lists the imaged winner's extent, extents live after the key's DEL"
+    );
+}
+
+/// Review of 2026-08-30 (C2′ / F-L06-04 + F-L06-02's BUSY leg): a
+/// failed cold read is a **typed error on every read command** — never
+/// "the key is not there". Before the fix, `MGET` rendered
+/// `Resolved::Fail` as a nil element and `EXISTS`/`TOUCH` skipped the
+/// count, so the node answered *differently for the same key in the
+/// same instant* depending on which command asked (`GET` → `-BUSY`,
+/// `EXISTS` → `:0`, `MGET` → nil) — and `EXISTS` is exactly what a
+/// cache-fill path uses to decide whether to overwrite. The
+/// `cold_enqueue_full` fault point is the deterministic stand-in for a
+/// saturated `ColdReads` queue (the review's `overflow_cap` scenario);
+/// genuinely absent keys keep their miss shapes — a miss never reaches
+/// the queue.
+#[test]
+fn tiered_cold_read_failure_is_typed_for_every_read_command() {
+    let dir = temp_data_dir("tiered-cold-busy");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_server::fault::COLD_ENQUEUE_FULL, inf_foundation::fault::FaultSpec::Always)],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let keys = 150usize;
+    for i in 0..keys {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let mut demoted = false;
+    for _ in 0..1000 {
+        if info_u64(&mut c, "tiering_flush_confirmed_bytes:") > 3 << 20
+            && info_u64(&mut c, "tiering_region_decommit_pages:") > 0
+        {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never made a cold working set");
+    // Per-key agreement: whatever GET answers, EXISTS/TOUCH/MGET must
+    // agree — a key is served, absent, or *unreadable, typed*; the
+    // defect's signature was GET erroring while the others said absent.
+    let read_int_or_err = |c: &mut TcpStream| -> Result<i64, String> {
+        let line = read_line(c);
+        match line.first() {
+            Some(&b'-') => Err(String::from_utf8_lossy(&line).into_owned()),
+            Some(&b':') => Ok(std::str::from_utf8(&line[1..line.len() - 2])
+                .expect("ascii")
+                .parse()
+                .expect("int")),
+            other => panic!("unexpected reply head {other:?}: {line:?}"),
+        }
+    };
+    let mut cold_failures = 0usize;
+    let mut disagreements: Vec<String> = Vec::new();
+    for i in 0..keys {
+        let key = format!("big:{i:04}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        let get = read_get(&mut c);
+        c.write_all(&cmd(&[b"EXISTS", key.as_bytes()])).expect("write");
+        let exists = read_int_or_err(&mut c);
+        c.write_all(&cmd(&[b"TOUCH", key.as_bytes()])).expect("write");
+        let touch = read_int_or_err(&mut c);
+        c.write_all(&cmd(&[b"MGET", key.as_bytes()])).expect("write");
+        let mget_head = read_line(&mut c);
+        let mget_err = mget_head.first() == Some(&b'-');
+        if !mget_err {
+            assert_eq!(mget_head, b"*1\r\n", "one-key MGET array");
+            let _ = read_get(&mut c); // consume the element
+        }
+        match get {
+            Ok(_) => {
+                if exists != Ok(1) || touch != Ok(1) || mget_err {
+                    disagreements.push(format!(
+                        "{key}: GET served but EXISTS {exists:?} / TOUCH {touch:?} / MGET err \
+                             {mget_err}"
+                    ));
+                }
+            }
+            Err(_) => {
+                cold_failures += 1;
+                if exists.is_ok() || touch.is_ok() || !mget_err {
+                    disagreements.push(format!(
+                        "{key}: GET failed typed but EXISTS {exists:?} / TOUCH {touch:?} / \
+                         MGET err {mget_err} — unreadability rendered as absence"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(cold_failures > 0, "no cold read failed — the BUSY leg was never exercised");
+    assert!(
+        disagreements.is_empty(),
+        "{} of {keys} keys answered inconsistently across read commands (first: {:?})",
+        disagreements.len(),
+        &disagreements[..disagreements.len().min(3)]
+    );
+    // Absent keys keep their miss shapes: a miss never reaches the queue.
+    c.write_all(&cmd(&[b"EXISTS", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"TOUCH", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"MGET", b"nosuch"])).expect("write");
+    read_exactly(&mut c, b"*1\r\n$-1\r\n");
+    // The SCAN page fails typed too (the F-L06-02 BUSY leg): with every
+    // cold read refused, an iteration must surface an error — never a
+    // "complete" enumeration missing the cold keys.
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    let mut scan_errored = false;
+    for _ in 0..10_000 {
+        c.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", b"64"])).expect("write");
+        let head = read_line(&mut c);
+        if head.first() == Some(&b'-') {
+            scan_errored = true;
+            break;
+        }
+        assert_eq!(head, b"*2\r\n", "scan reply shape");
+        let next = read_get(&mut c).expect("cursor bulk");
+        let inner = read_line(&mut c);
+        assert_eq!(inner.first(), Some(&b'*'), "keys array");
+        let n: usize =
+            std::str::from_utf8(&inner[1..inner.len() - 2]).expect("ascii").parse().expect("len");
+        for _ in 0..n {
+            let _ = read_get(&mut c);
+        }
+        if next == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert!(
+        scan_errored,
+        "SCAN completed an iteration with every cold read refused — silent omission"
+    );
+    // The failures are scrapeable, not just per-reply (L10): the
+    // always-on counter moved for every typed refusal above.
+    assert!(
+        info_u64(&mut c, "tiering_cold_read_errors:") as usize >= cold_failures,
+        "tiering_cold_read_errors below the observed typed failures"
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_full", "read-typed-error");
+}
+
+/// The cold-read failure reply (`plane::tiered::ERR_COLD_IO`), framed.
+const COLD_IO_REPLY: &[u8] = b"-ERR cold read failed (tier I/O error)\r\n";
+
+/// `INFO tiering` counters a refused cold read must leave unchanged
+/// (ADR-0167 D3). The last two name the background readers — compaction
+/// and the shadow reconciler — so a background enqueue reads as that,
+/// never as this change's.
+const COLD_STATE_HELD: [&str; 4] = [
+    "cold_reads_enqueued:",
+    "cold_queue_full:",
+    "tiering_compaction_bytes:",
+    "tiering_shadow_reads_issued:",
+];
+
+/// One `INFO tiering` field. A missing line panics: an absent counter is a
+/// broken instrument, never a zero.
+fn tiering_field(text: &str, field: &str) -> u64 {
+    text.lines()
+        .find_map(|line| line.strip_prefix(field))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("INFO tiering has no {field} line"))
+}
+
+/// A durable tiered namespace demoted past its budget with
+/// `cold_enqueue_unaddressable` armed on the cell thread at boot (the
+/// `tiered_cold_read_failure_is_typed_for_every_read_command` recipe).
+/// Every key is written once: no dead bytes feed compaction and no shadow
+/// ticket feeds the reconciler.
+fn unaddressable_fixture(tag: &str) -> (Node, TcpStream, std::path::PathBuf) {
+    let dir = temp_data_dir(tag);
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(
+            inf_server::fault::COLD_ENQUEUE_UNADDRESSABLE,
+            inf_foundation::fault::FaultSpec::Always,
+        )],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"everysec",
+        b"MEM-BUDGET",
+        b"3mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..UNADDRESSABLE_KEYS {
+        let key = format!("big:{i:04}").into_bytes();
+        let value = format!("B{i:04}:").into_bytes().repeat(6_667); // ~40 KB
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let mut demoted = false;
+    for _ in 0..1000 {
+        let text = info_text(&mut c, b"tiering");
+        if tiering_field(&text, "tiering_flush_confirmed_bytes:") > 3 << 20
+            && tiering_field(&text, "tiering_region_decommit_pages:") > 0
+        {
+            demoted = true;
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(demoted, "demotion never made a cold working set");
+    (node, c, dir)
+}
+
+/// Keys the unaddressable fixture writes.
+const UNADDRESSABLE_KEYS: usize = 150;
+
+/// After the refused reads' replies: one more command proves each read got
+/// exactly one reply, then a bounded poll waits for the in-flight gauge to
+/// settle, and the refusals must have changed no cold-read state and been
+/// counted (ADR-0167 D3's no-state-change rule, over the wire).
+fn assert_refusals_left_no_cold_state(c: &mut TcpStream, before: &str, io_errors: u64) {
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(c, b"+PONG\r\n");
+    let mut after = info_text(c, b"tiering");
+    for _ in 0..1000 {
+        if tiering_field(&after, "cold_reads_inflight:") == 0 {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        after = info_text(c, b"tiering");
+    }
+    assert_eq!(tiering_field(&after, "cold_reads_inflight:"), 0, "no device read in flight");
+    assert_eq!(tiering_field(&after, "cold_queue_depth:"), 0, "nothing queued");
+    for field in COLD_STATE_HELD {
+        assert_eq!(
+            tiering_field(&after, field),
+            tiering_field(before, field),
+            "{field} moved across refused reads"
+        );
+    }
+    let counted = tiering_field(&after, "tiering_cold_read_errors:")
+        - tiering_field(before, "tiering_cold_read_errors:");
+    assert!(counted >= io_errors, "tiering_cold_read_errors rose {counted}, replies {io_errors}");
+}
+
+/// ADR-0167 D3 over the wire, GET leg: `enqueue` refuses a position the
+/// kernel cannot address permanently, so a cold `GET` answers the cold I/O
+/// error — once, never the `BUSY` a client would retry — and the refusal
+/// leaves no cold-read state behind. The `cold_enqueue_unaddressable`
+/// point plants the position right before the real `enqueue` in `probe`;
+/// keys still in RAM are served (they never reach the queue).
+#[test]
+fn tiered_unaddressable_get_replies_cold_io() {
+    let (node, mut c, dir) = unaddressable_fixture("tiered-unaddressable-get");
+    let before = info_text(&mut c, b"tiering");
+    let mut io_errors = 0u64;
+    for i in 0..UNADDRESSABLE_KEYS {
+        let key = format!("big:{i:04}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        match read_get(&mut c) {
+            Ok(value) => {
+                assert_eq!(value, format!("B{i:04}:").into_bytes().repeat(6_667), "{key}");
+            }
+            Err(line) => {
+                assert_eq!(
+                    line.as_bytes(),
+                    COLD_IO_REPLY,
+                    "{key}: never BUSY, never another error"
+                );
+                io_errors += 1;
+            }
+        }
+    }
+    assert!(io_errors > 0, "no GET reached a cold key — the refusal was never exercised");
+    assert_refusals_left_no_cold_state(&mut c, &before, io_errors);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_unaddressable", "read-permanent-cold-io");
+}
+
+/// ADR-0167 D3 over the wire, SCAN leg: a page over cold keys fails whole
+/// with the cold I/O error — once, never `BUSY` — when the key fetch's
+/// `enqueue` refuses permanently (the point plants in `plan_key_fetch`),
+/// and the refusal leaves no cold-read state behind.
+#[test]
+fn tiered_unaddressable_scan_replies_cold_io() {
+    let (node, mut c, dir) = unaddressable_fixture("tiered-unaddressable-scan");
+    let before = info_text(&mut c, b"tiering");
+    let mut io_errors = 0u64;
+    let mut cursor: Vec<u8> = b"0".to_vec();
+    for _ in 0..10_000 {
+        c.write_all(&cmd(&[b"SCAN", &cursor, b"COUNT", b"64"])).expect("write");
+        let head = read_line(&mut c);
+        if head.first() == Some(&b'-') {
+            assert_eq!(head, COLD_IO_REPLY, "the page fails with the cold I/O error, never BUSY");
+            io_errors += 1;
+            break;
+        }
+        assert_eq!(head, b"*2\r\n", "scan reply shape");
+        let next = read_get(&mut c).expect("cursor bulk");
+        let inner = read_line(&mut c);
+        assert_eq!(inner.first(), Some(&b'*'), "keys array");
+        let n: usize =
+            std::str::from_utf8(&inner[1..inner.len() - 2]).expect("ascii").parse().expect("len");
+        for _ in 0..n {
+            let _ = read_get(&mut c);
+        }
+        if next == b"0" {
+            break;
+        }
+        cursor = next;
+    }
+    assert!(io_errors > 0, "SCAN completed with every cold key fetch refused — silent omission");
+    assert_refusals_left_no_cold_state(&mut c, &before, io_errors);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("cold_enqueue_unaddressable", "read-permanent-cold-io");
+}
+
+/// Review of 2026-08-30 (C7 / F-L04-08; ADR-0096) over the wire: a
+/// header-valid boot orphan — an extent file no durable artifact
+/// references, the crashed-blob-write shape — is **quarantined** by the
+/// first boot's MAINTAIN slice (renamed, counted, bytes intact) and
+/// unlinked only by the next boot's second verdict. Before ADR-0096 the
+/// first slice after boot destroyed the file outright, which turned any
+/// upstream accounting omission into permanent loss. A referenced blob
+/// key keeps serving through both lives.
+#[test]
+fn blob_boot_orphan_quarantines_for_one_life_then_reclaims() {
+    let dir = temp_data_dir("blob-orphan-quarantine");
+    let value = vec![0xAB_u8; 8 << 10];
+    let orphan_id = inf_log::ExtentId(700_001);
+    let info_u64 = |c: &mut TcpStream, field: &str| {
+        info_text(c, b"tiering")
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    // Life 1: one referenced blob key.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"q",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"always",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"BLOB-THRESHOLD",
+            b"4kb",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"SET", b"big:1", &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // A published checkpoint: the sweep seeds from the manifest
+        // recovery path, so the next boot lists the cold directory.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+    // Between lives: plant a well-formed orphan extent in the namespace's
+    // cold dir — the "extent durable, referencing frame lost" crash shape.
+    let shard = dir.join("shard-0");
+    let ns_dir = std::fs::read_dir(&shard)
+        .expect("shard dir")
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("ns-"))
+        .expect("tiered ns dir")
+        .path();
+    let ns_id: u32 = ns_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("ns-"))
+        .and_then(|n| n.parse().ok())
+        .expect("ns id from dir name");
+    {
+        let fs = inf_log::fs::StdSegmentFs;
+        let mut w = inf_log::ExtentWriter::create(
+            &fs,
+            &ns_dir,
+            orphan_id,
+            0,
+            inf_log::NsId(ns_id),
+            128,
+            inf_log::TierIoMode::Buffered,
+        )
+        .expect("orphan create");
+        w.append_chunk(&[0xEE; 128]).expect("orphan bytes");
+        let _ = w.finish().expect("orphan seal");
+    }
+    // Life 2: the boot sweep quarantines the orphan — renamed, counted,
+    // bytes intact — and the referenced key serves untouched.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while info_u64(&mut c, "tiering_blob_quarantined:") == 0 {
+            assert!(Instant::now() < deadline, "the boot orphan was never quarantined");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(info_u64(&mut c, "tiering_blob_quarantine_revived:"), 0);
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        assert_eq!(read_get(&mut c).expect("serves"), value);
+        drop(c);
+        node.stop();
+    }
+    let fs = inf_log::fs::StdSegmentFs;
+    assert_eq!(
+        inf_log::list_quarantined_extent_ids(&fs, &ns_dir).expect("listing"),
+        vec![orphan_id],
+        "the twin holds the bytes through the life"
+    );
+    assert!(
+        !inf_log::list_extent_ids(&fs, &ns_dir).expect("listing").contains(&orphan_id),
+        "the orphan left the reachable listing"
+    );
+    // Life 3: the second verdict — still unreferenced — unlinks the twin.
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"q"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !inf_log::list_quarantined_extent_ids(&fs, &ns_dir).expect("listing").is_empty() {
+            assert!(Instant::now() < deadline, "the second verdict never reclaimed the twin");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(info_u64(&mut c, "tiering_blob_quarantined:"), 0, "nothing new quarantined");
+        c.write_all(&cmd(&[b"GET", b"big:1"])).expect("write");
+        assert_eq!(read_get(&mut c).expect("serves"), value);
+        drop(c);
+        node.stop();
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1490,12 +4414,11 @@ fn mixed_classes_share_one_cell_and_memory_stays_off_the_log() {
     // Zero-cost assert (M2-S09 mechanism): exactly the durable records —
     // one everysec + two always SETs — hit the log; the two memory-ns SETs
     // stayed off it. The gauge flushes via MAINTAIN, so poll briefly.
+    // Whole replies: one 2 KiB `read` took a prefix of the section and
+    // left the rest to desync the next poll.
     let deadline = Instant::now() + Duration::from_secs(5);
     let info = loop {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 2048];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_text(&mut c, b"persistence");
         if info.contains("log_records_appended:3") || Instant::now() > deadline {
             break info;
         }
@@ -1582,13 +4505,8 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     read_exactly(&mut c, b"+OK\r\n");
     #[cfg(feature = "doc")]
     {
-        c.write_all(&cmd(&[
-            b"JSON.SET",
-            b"book:doc",
-            b"$",
-            br#"{"n":40,"a":[1],"values":[1,1],"pad":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
-        ]))
-        .expect("write");
+        let padded = format!(r#"{{"n":40,"a":[1],"values":[1,1],"pad":"{}"}}"#, "x".repeat(128));
+        c.write_all(&cmd(&[b"JSON.SET", b"book:doc", b"$", padded.as_bytes()])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
         c.write_all(&cmd(&[b"JSON.NUMINCRBY", b"book:doc", b".n", b"2"])).expect("write");
         read_exactly(&mut c, b"$2\r\n42\r\n");
@@ -1601,7 +4519,7 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
     // Manual trigger (the surface INF.CKPT rides at S20), then keep
     // writing while the walker streams — the dirty-under-checkpoint shape
     // on the real path.
-    node.control.as_ref().expect("durable node").request_ckpt_all();
+    node.request_ckpt_all();
     let deadline = Instant::now() + Duration::from_secs(20);
     let info = loop {
         for i in 0..20 {
@@ -1609,10 +4527,7 @@ fn fuzzy_checkpoint_streams_under_live_writes() {
             c.write_all(&cmd(&[b"SET", key.as_bytes(), b"late"])).expect("write");
             read_exactly(&mut c, b"+OK\r\n");
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info.contains("ckpts_completed:1") || Instant::now() > deadline {
             break info;
         }
@@ -1726,15 +4641,412 @@ fn bytes_threshold_triggers_a_checkpoint() {
             read_exactly(&mut c, b"+OK\r\n");
             i += 1;
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if !info.contains("ckpts_completed:0") || Instant::now() > deadline {
             break info;
         }
     };
     assert!(!info.contains("ckpts_completed:0"), "threshold trigger produced a checkpoint: {info}");
+    // M4.5-S36 (ADR-0088 D4/D7): the trigger is derived and reported —
+    // the interval in force is at least the floor (16 KiB here) and, once
+    // a checkpoint published, twice its on-disk size or the floor; the
+    // write-amplification figure is defined only after the publish, and
+    // the checkpoint's bytes are counted (v3 blocks: a multiple of 4 KiB).
+    let interval = info_u64(&info, "ckpt_interval_bytes");
+    let last = info_u64(&info, "ckpt_bytes_last");
+    assert!(
+        last > 0 && last.is_multiple_of(4096),
+        "v3 checkpoint bytes are aligned blocks: {info}"
+    );
+    assert_eq!(interval, (2 * last).max(16 << 10), "interval = clamp(2 × last, floor, cap)");
+    assert_eq!(info_u64(&info, "write_amp_log_checkpoint_undefined"), 0, "{info}");
+    let amp = info_u64(&info, "write_amp_milli_log_checkpoint");
+    assert!(amp >= 1000, "device bytes can only exceed record bytes: {info}");
+    assert!(info_u64(&info, "log_frame_bytes") > 0, "{info}");
+    assert!(info_u64(&info, "ckpt_bytes_total") >= last, "the total counts every publish");
+    assert!(info.contains("io_budget_model:absent"), "no probe file in the test tree: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S39d: a loop-resident boot's recovery decomposes by phase — the
+/// checkpoint, the tail replay and the slack audit each report the bytes
+/// they read, and the loop-clock durations sum to the total within the
+/// µs rounding of five fields (every credited instant lands in exactly
+/// one phase). The boot line carries the same numbers.
+#[test]
+fn recovery_phases_report_bytes_and_sum_to_the_total() {
+    let dir = temp_data_dir("phases");
+    let value = vec![b'p'; 2048];
+    let tail_keys = 64u32;
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"ph", b"MODE", b"durable", b"FSYNC", b"always"]))
+            .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"ph"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        for i in 0..256u32 {
+            let key = format!("base:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        // The checkpoint boundary: everything above is checkpoint work,
+        // everything below is tail replay.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        for i in 0..tail_keys {
+            let key = format!("tail:{i:04}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        drop(c);
+        node.stop();
+    }
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    let info = info_persistence(&mut c);
+    let f = |field: &str| info_u64(&info, field);
+    assert!(f("recover_ckpt_bytes") > 256 * 2048, "the checkpoint's bytes were read: {info}");
+    assert!(f("recover_replay_bytes") >= u64::from(tail_keys) * 2048, "tail bytes: {info}");
+    // Frames, not records: the floor segment replays from its first
+    // frame and skips the pre-begin records, so frames ≥ the tail's.
+    assert!(f("recover_replay_frames") >= 1, "{info}");
+    // The audit scans the active segment's slack (8 MiB segments here)
+    // and the preallocated next one: far more than the data it follows.
+    assert!(f("recover_audit_bytes") >= 4 << 20, "the slack audit read the slack: {info}");
+    assert_eq!(f("recover_audit_foreign_frames"), 0, "no recycled life in a fresh log");
+    let phases = [
+        "recover_start_us",
+        "recover_ckpt_us",
+        "recover_replay_us",
+        "recover_audit_us",
+        "recover_finish_us",
+    ];
+    let sum: u64 = phases.iter().map(|p| f(p)).sum();
+    let total = f("recover_total_us");
+    assert!(total > 0, "the loop clock advanced across the boot: {info}");
+    assert!(
+        sum.abs_diff(total) <= phases.len() as u64,
+        "phases sum to the total within µs rounding: {sum} vs {total}: {info}"
+    );
+    assert!(f("recover_ckpt_us") > 0 && f("recover_audit_us") > 0, "timed phases: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0178 D2's carries: a checkpoint requested on an **idle** node
+/// that spends a device budget completes. Before the
+/// carry, the reference box's probe (2 540 write ops/s per device) on a
+/// loop iterating every few hundred µs granted the checkpoint class
+/// `⌊1270 × 0.0004⌋ × 2/10 = 0` ops per refill forever — `INF.CKPT
+/// WAIT` after a fill never returned (the keep-up floor that feeds the
+/// class under load is zero at idle). The budget must grant its share
+/// over time whatever the refill interval.
+#[test]
+fn a_checkpoint_requested_on_an_idle_budgeted_node_completes() {
+    let dir = temp_data_dir("idle-ckpt");
+    // The harness loop parks 5 ms at idle (the product loop spun at
+    // ~430 µs), so the model's op rate is scaled to reproduce the same
+    // quantization: 100 ops/s per cell × 5 ms = 0.5 → 0 per refill, and
+    // 0 × 2/10 = 0 for the checkpoint class. With the carry the class
+    // accrues its 20 ops/s and the ~12-op checkpoint lands in < 1 s.
+    let model = inf_runtime::DeviceModel {
+        write_bytes_per_s: 510_132_224,
+        write_ops_per_s: 200,
+        read_bytes_per_s: 0,
+        read_ops_per_s: 0,
+    };
+    let node = Node::start_durable_with_device_model(2, &dir, model);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"idle", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"idle"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let value = vec![b'i'; 4096];
+    // ~4 MiB of images: a checkpoint of several 256 KiB sections — more
+    // than one op's worth on every cell, so a starved op axis shows.
+    for i in 0..1024u32 {
+        let key = format!("k:{i:05}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Idle now. The WAIT must return — the connection's 20 s read timeout
+    // is the failure.
+    c.set_read_timeout(Some(Duration::from_secs(20))).expect("timeout");
+    let t0 = Instant::now();
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let took = t0.elapsed();
+    let info = info_persistence(&mut c);
+    assert!(info.contains("io_budget_model:probed"), "the budget was in force: {info}");
+    assert!(info_u64(&info, "ckpts_completed") >= 1, "{info}");
+    assert!(took < Duration::from_secs(10), "an idle checkpoint of ~2 MiB/cell took {took:?}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The device model of the ADR-0178 wire tests: 40 MB/s and 40 000
+/// ops/s per device in both directions, so at 2 cells each cell's share
+/// is 20 MB/s — a checkpoint cap of one 266 240 B section slice, a tier
+/// cap of the 1 MiB default slice, and a 1 MB pool per direction.
+fn overrun_test_model() -> inf_runtime::DeviceModel {
+    inf_runtime::DeviceModel {
+        write_bytes_per_s: 40_000_000,
+        write_ops_per_s: 40_000,
+        read_bytes_per_s: 40_000_000,
+        read_ops_per_s: 40_000,
+    }
+}
+
+/// The first `count` keys `{prefix}:{i}` a contiguous router gives `cell`.
+fn keys_on_cell(cells: u16, cell: u16, prefix: &str, count: usize) -> Vec<Vec<u8>> {
+    let router = SlotRouter::new_contiguous(cells);
+    (0..1_000_000u32)
+        .map(|i| format!("{prefix}:{i}").into_bytes())
+        .filter(|key| router.cell_of(SlotRouter::slot_of(key)) == CellId(cell))
+        .take(count)
+        .collect()
+}
+
+/// ADR-0178 D4 for the checkpoint byte axis: the class's credit gains at
+/// least the larger of the ⅛ floor's weighted share and, at α > 0, the
+/// keep-up crossover `w / (αw + Σw)` of the share per second — `share / 7`
+/// at α = 2 — within three bytes for the carries' lag (A1). α is the
+/// harness's: the manual trigger R2 runs carries the product default.
+/// Returns `T_ckpt` in seconds for an offer first made while the class
+/// owes `owed` bytes.
+fn t_ckpt_seconds(share_bytes_per_s: f64, owed: f64, cap: f64, charged: f64, delta: f64) -> f64 {
+    const LAG_UNITS: f64 = 3.0;
+    let alpha = CkptTrigger::Manual.config().alpha as f64;
+    let (weight, weights) = (2.0, 10.0);
+    let keep_up = if alpha > 0.0 { weight / (alpha * weight + weights) } else { 0.0 };
+    let rate = share_bytes_per_s * f64::max(weight / (8.0 * weights), keep_up);
+    (owed + cap + charged + LAG_UNITS) / rate + 2.0 * delta
+}
+
+/// R2 (ADR-0178): a checkpoint whose section holds one value above the
+/// class cap plus the pool completes. Before the overrun the budget
+/// answered that block "not this slice" on every call — the walk never
+/// advanced, the checkpoint never published, and `INF.CKPT WAIT` never
+/// returned. The bound is two D4 waits (the oversized block, then the
+/// footer behind its debt) plus 2 s of harness slack.
+#[test]
+fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
+    let dir = temp_data_dir("ckpt-overrun");
+    let model = overrun_test_model();
+    let key = key_for_cell(2, 0);
+    let chunk = vec![b'v'; 900 << 10];
+    let value_len = 4 * chunk.len();
+    {
+        let node = Node::start_durable_with_device_model(2, &dir, model);
+        let mut c = conn_on_cell(&node, 0);
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"big",
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            b"everysec",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        let mut c = conn_on_cell_use(&node, 0, b"big");
+        for a in 1..=4 {
+            c.write_all(&cmd(&[b"APPEND", &key, &chunk])).expect("write");
+            read_exactly(&mut c, format!(":{}\r\n", a * chunk.len()).as_bytes());
+        }
+        // 20 MB/s per cell: cap 266 240 B (the section slice), pool 1 MB.
+        let share = 20_000_000.0;
+        let cap = 266_240.0;
+        let header_block = 4_096.0;
+        // A section block is one record plus less than one target, aligned.
+        let block_max = value_len as f64 + cap + header_block;
+        let delta = 0.005; // the harness loop's idle park
+        let bound = t_ckpt_seconds(share, 0.0, cap, header_block, delta)
+            + t_ckpt_seconds(share, block_max - cap, cap, header_block, delta)
+            + 2.0;
+        c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+        let t0 = Instant::now();
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let took = t0.elapsed().as_secs_f64();
+        assert!(
+            took < bound,
+            "the oversized block's checkpoint took {took:.2} s, bound {bound:.2}"
+        );
+        let info = info_text(&mut c, b"persistence");
+        assert!(info.contains("io_budget_model:probed"), "the budget was in force: {info}");
+        assert!(info_field(&info, "ckpts_completed") >= 1, "{info}");
+        assert!(
+            info_field(&info, "io_budget_unattainable_checkpoint") >= 1,
+            "engagement: the block was above the class cap: {info}"
+        );
+        drop(c);
+        node.stop();
+    }
+    let node = Node::start_durable_with_device_model(2, &dir, model);
+    let mut c = connect_use(&node, b"big");
+    c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+    c.write_all(&cmd(&[b"GET", &key])).expect("write");
+    assert_eq!(read_bulk(&mut c), vec![b'v'; value_len], "the value survives byte-exact");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Creates R3's tiered namespace `t` (ADR-0170): `MEM-BUDGET 4mb`, a
+/// `MAINTAIN-SLICE` of 8 MiB — above the 20 MB/s share's tier cap plus
+/// pool — and a 20 s `TAIL-STALL-TIMEOUT`, above `T_tier(8 MiB)` at D4's
+/// floor rate (share / 20 = 1 MB/s) with a round's bytes staged past its
+/// slice `C_tier ≤ 3 MiB` (ADR-0170 D4, A2): (7 340 032 + 3 145 728 +
+/// 1 048 576 + 3 145 728 + 3) / 10⁶ s + 2Δ ≈ 14.7 s. Returns a connection
+/// on cell 0 using `t`, reading with a 60 s timeout.
+fn overrun_tier_namespace(node: &Node) -> TcpStream {
+    tier_namespace_with_slice(node, b"8mb")
+}
+
+/// R3's namespace `t` with `MAINTAIN-SLICE slice`.
+fn tier_namespace_with_slice(node: &Node, slice: &[u8]) -> TcpStream {
+    let mut c = conn_on_cell(node, 0);
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"t",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"4mb",
+        b"MAINTAIN-SLICE",
+        slice,
+        b"TAIL-STALL-TIMEOUT",
+        b"20000",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    let c = conn_on_cell_use(node, 0, b"t");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    c
+}
+
+/// Writes `count` 64 KiB values to cell 0 of `t`, each acknowledged `+OK`.
+fn fill_tier_cell0(c: &mut TcpStream, count: usize) {
+    let value = vec![b'x'; 64 << 10];
+    for key in keys_on_cell(2, 0, "tier", count) {
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    }
+}
+
+/// Polls cell 0's `INFO tiering` until a flush round completed, within
+/// R3's tail-stall timeout (a round completes after the last reply).
+fn wait_tier_round_completed(c: &mut TcpStream) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let tiering = info_text(c, b"tiering");
+        if info_field(&tiering, "tiering_flush_rounds") >= 1 {
+            return;
+        }
+        assert!(Instant::now() < deadline, "no flush round completed: {tiering}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// R3 (ADR-0170): a tier round of `MAINTAIN-SLICE 8mb` — above the tier
+/// cap plus the pool — is issued by an overrun. Before it, the round was
+/// deferred on every pass, nothing flushed, and the first write the full
+/// ring parked waited out the tail-stall timeout.
+#[test]
+fn a_tier_round_above_the_class_cap_is_issued() {
+    let dir = temp_data_dir("tier-overrun");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = overrun_tier_namespace(&node);
+    // 24 MiB on cell 0: 20 MiB past MEM-BUDGET, three 8 MiB rounds.
+    fill_tier_cell0(&mut c, 384);
+    wait_tier_round_completed(&mut c);
+    let info = info_text(&mut c, b"persistence");
+    assert!(
+        info_field(&info, "io_budget_unattainable_tier_flush") >= 1,
+        "engagement: the round was above the class cap: {info}"
+    );
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0170 D2 and I10 at the wire: a tier round stages past its slice
+/// whenever the next seal cut lies beyond it — every round here, since a
+/// 512 KiB record is one cut and `MAINTAIN-SLICE` is 64 KiB — and the
+/// tier class's `spent` counts every staged byte. Without the charge each
+/// round counted its 64 KiB offer while the device wrote the record:
+/// eight times its grant, unmetered. Tiering is read before the budget,
+/// so every byte counted as flushed was staged before `spent` is read.
+#[test]
+fn a_tier_round_staged_past_its_slice_counts_every_byte() {
+    const SLICE: u64 = 64 << 10;
+    let dir = temp_data_dir("tier-past-slice");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = tier_namespace_with_slice(&node, b"64kb");
+    let value = vec![b'x'; 512 << 10];
+    // 8 MiB on cell 0: 4 MiB past MEM-BUDGET, so at least 3 MiB flushes.
+    for key in keys_on_cell(2, 0, "past-slice", 16) {
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (rounds, flushed) = loop {
+        let tiering = info_text(&mut c, b"tiering");
+        let confirmed = info_field(&tiering, "tiering_flush_confirmed_bytes");
+        let holes = info_field(&tiering, "tiering_seal_hole_bytes");
+        let flushed = confirmed.saturating_sub(holes);
+        if flushed >= 3 << 20 {
+            break (info_field(&tiering, "tiering_flush_rounds"), flushed);
+        }
+        assert!(Instant::now() < deadline, "the flush stalled: {tiering}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(flushed > rounds * SLICE, "engagement: {rounds} rounds flushed {flushed} B");
+    let info = info_text(&mut c, b"persistence");
+    let spent = info_field(&info, "io_budget_bytes_tier_flush");
+    assert!(spent >= flushed, "tier spent {spent} B, flushed {flushed} B (ADR-0170 I10): {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// R5 (ADR-0170 D3): a tiered namespace with nothing to flush makes no
+/// tier offer. Before the gate, an idle namespace offered its whole slice
+/// on every pass — deferred every time at `MAINTAIN-SLICE 8mb` — and the
+/// budget's rule alone would overrun on every rested pass and refund.
+/// Then the gate opens on work: R3's writes are issued.
+#[test]
+fn an_idle_tiered_namespace_makes_no_tier_offer() {
+    let dir = temp_data_dir("tier-idle-offer");
+    let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
+    let mut c = overrun_tier_namespace(&node);
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_secs(1));
+    for cell in 0..2u16 {
+        let mut probe = conn_on_cell(&node, cell);
+        let info = info_text(&mut probe, b"persistence");
+        assert_eq!(info_field(&info, "io_budget_deferrals_tier_flush"), 0, "cell {cell}: {info}");
+        assert_eq!(info_field(&info, "io_budget_unattainable_tier_flush"), 0, "cell {cell}");
+    }
+    // 12 MiB on cell 0: 8 MiB past MEM-BUDGET.
+    fill_tier_cell0(&mut c, 192);
+    wait_tier_round_completed(&mut c);
+    let info = info_text(&mut c, b"persistence");
+    assert!(info_field(&info, "io_budget_unattainable_tier_flush") >= 1, "{info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
@@ -1756,11 +5068,82 @@ fn info_u64(info: &str, field: &str) -> u64 {
 /// checkpoint (their segments are gone), so the restart leg proves
 /// manifest-named recovery end to end: MANIFEST → `.ick` load → tail
 /// replay from begin.
+/// F-L03-02 (review of 2026-08-30; ADR-0117 D1/D2): large values at the
+/// default flags. Twenty 3.5 MiB strings (grown by `APPEND` under the
+/// 1 MiB frame cap) sum to 70 MiB inside one 32-entry scan chunk; the
+/// walk used to stage the whole chunk into one section, publishing a
+/// `.ick` whose body exceeded the loader's 64 MiB bound — the next boot
+/// fail-stopped on `SectionTooLarge` with no other recovery unit on
+/// disk. Now the walk seals before the image that would breach the
+/// bound and resumes at exactly that entry; the reboot serves every
+/// byte.
+#[test]
+fn large_values_checkpoint_within_the_loader_bound_and_reboot() {
+    let dir = temp_data_dir("bigval");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"big", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"big"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const KEYS: usize = 20;
+    const APPENDS: usize = 4;
+    let chunk = vec![b'v'; 900 << 10];
+    for k in 0..KEYS {
+        let key = format!("k{k}");
+        for a in 1..=APPENDS {
+            c.write_all(&cmd(&[b"APPEND", key.as_bytes(), &chunk])).expect("write");
+            read_exactly(&mut c, format!(":{}\r\n", a * chunk.len()).as_bytes());
+        }
+    }
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // The engagement witness: the walk sealed once for the bound (the
+    // 18th image would have carried the section past 64 MiB).
+    c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
+    let info = String::from_utf8(read_bulk(&mut c)).expect("ascii");
+    let splits = info_field(&info, "ckpt_bound_splits");
+    assert!(splits >= 1, "no section sealed for the bound:\n{info}");
+    drop(c);
+    node.stop();
+
+    let ick: Vec<u64> = std::fs::read_dir(dir.join("shard-0").join("ckpt"))
+        .expect("ckpt dir")
+        .map(|e| e.expect("entry").metadata().expect("meta").len())
+        .collect();
+    assert_eq!(ick.len(), 1, "one published checkpoint");
+    assert!(ick[0] > 70 << 20, "the checkpoint carries every image ({} B)", ick[0]);
+
+    // Pre-fix the harness panicked here: `cell 0 recovery failed
+    // (fail-stop): ... SectionTooLarge`.
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"big"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{KEYS}\r\n").as_bytes());
+    for k in 0..KEYS {
+        let key = format!("k{k}");
+        c.write_all(&cmd(&[b"STRLEN", key.as_bytes()])).expect("write");
+        read_exactly(&mut c, format!(":{}\r\n", APPENDS * chunk.len()).as_bytes());
+    }
+    c.write_all(&cmd(&[b"GETRANGE", b"k7", b"3686390", b"3686399"])).expect("write");
+    read_exactly(&mut c, b"$10\r\nvvvvvvvvvv\r\n");
+    drop(c);
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
     let dir = temp_data_dir("trunc");
-    // 8 MiB segments (harness), checkpoint every 1 MiB appended.
-    let node = Node::start_durable_auto_ckpt(1, &dir, 1 << 20);
+    // 8 MiB segments (harness), checkpoint every 1 MiB appended — the
+    // *fixed* trigger (α = 0): the bound below is stated in multiples of
+    // the interval, and the product's derived trigger would chase the
+    // dataset instead (a 21 MiB checkpoint → a 42 MiB interval the 32 MiB
+    // trickle cap never reaches on a real device; see `CkptTrigger`).
+    let node = Node::start_durable_fixed_ckpt(1, &dir, 1 << 20);
     let mut c = node.connect();
     c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"soak", b"MODE", b"durable", b"FSYNC", b"everysec"]))
         .expect("write");
@@ -1808,10 +5191,7 @@ fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
             #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
             std::thread::sleep(Duration::from_millis(20));
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info_u64(&info, "segments_truncated") >= 2 || Instant::now() > deadline {
             break info;
         }
@@ -1825,27 +5205,22 @@ fn truncation_bounds_log_size_and_restart_recovers_from_checkpoint() {
     // prealloc'd next (+1 transient around a rotation).
     let settle = Instant::now() + Duration::from_secs(15);
     loop {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let sample = info_persistence(&mut c);
         if info_u64(&sample, "log_segments_live") <= 3 {
             break;
         }
         assert!(Instant::now() < settle, "never settled to the bound: {sample}");
     }
     for _ in 0..5 {
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let sample = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let sample = info_persistence(&mut c);
         assert!(
             info_u64(&sample, "log_segments_live") <= 3,
             "retained log bounded by interval + one segment (+ next): {sample}"
         );
     }
     drop(c);
-    node.stop();
+    // Synced: the GET of the last trickle key below reads an everysec ack.
+    node.stop_synced();
 
     // On-disk truth matches the gauges: ≤ 3 segment files — polled
     // briefly, because unlinks are *delegated* to the control thread
@@ -1944,21 +5319,12 @@ fn ckpt_slice_budget_rehearsal() {
 
     let info_before = {
         c.write_all(&cmd(&[b"INFO"])).expect("write");
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            let n = c.read(&mut chunk).expect("read info");
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(2).rev().take(64).any(|w| w == b"\r\n") && n < chunk.len() {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
 
     // Trigger, then hammer GETs and sample per-request latency until the
     // checkpoint completes.
-    node.control.as_ref().expect("durable").request_ckpt_all();
+    node.request_ckpt_all();
     let ckpt_started = Instant::now();
     let mut max_get_us = 0u128;
     let mut gets = 0u64;
@@ -1984,10 +5350,7 @@ fn ckpt_slice_budget_rehearsal() {
             }
             gets += 1;
         }
-        c.write_all(&cmd(&[b"INFO", b"persistence"])).expect("write");
-        let mut buf = vec![0u8; 4096];
-        let n = c.read(&mut buf).expect("read info");
-        let info = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let info = info_persistence(&mut c);
         if info.contains("ckpts_completed:1") {
             break true;
         }
@@ -2000,9 +5363,7 @@ fn ckpt_slice_budget_rehearsal() {
 
     let info_after = {
         c.write_all(&cmd(&[b"INFO"])).expect("write");
-        let mut buf = vec![0u8; 65536];
-        let n = c.read(&mut buf).expect("read info");
-        String::from_utf8_lossy(&buf[..n]).into_owned()
+        String::from_utf8_lossy(&read_frame(&mut c)).into_owned()
     };
     let iter_p999 = |s: &str| {
         s.lines()
@@ -2048,18 +5409,15 @@ fn loading_gate_byte_matches_redis_and_lifts() {
     let dir = temp_data_dir("loading");
     let val = vec![b'v'; 4096];
 
-    // Phase 1: build ~1 MiB of durable log to replay.
+    // Phase 1: build ~1 MiB of durable log to replay. FSYNC always: the
+    // harness `stop()` is crash-equivalent, so only an ack gated on the
+    // fsync watermark proves the frame is in the segment (an everysec ack
+    // lost 255 of 256 frames under a parallel suite).
     {
         let node = Node::start_durable(1, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -2078,8 +5436,11 @@ fn loading_gate_byte_matches_redis_and_lifts() {
     let node = Node::start_with_recover(
         1,
         Some(dir.clone()),
-        0,
-        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+        inf_server::RecoverConfig {
+            step_bytes: 32 << 10,
+            throttle_bytes_per_sec: Some(128 << 10),
+            ..Default::default()
+        },
     );
     let mut c = node.connect();
 
@@ -2173,17 +5534,14 @@ fn loading_lifts_only_when_every_cell_recovered() {
     let val = vec![b'v'; 4096];
     let k0 = key_for_cell(2, 0);
 
+    // FSYNC always: the harness `stop()` is crash-equivalent, so only an
+    // ack gated on the fsync watermark proves the ~1 MiB is in cell 0's
+    // log (under a parallel suite an everysec run replayed 1 of 256).
     {
         let node = Node::start_durable(2, &dir);
         let mut c = node.connect();
         c.write_all(&cmd(&[
-            b"INF.NS",
-            b"CREATE",
-            b"led",
-            b"MODE",
-            b"durable",
-            b"FSYNC",
-            b"everysec",
+            b"INF.NS", b"CREATE", b"led", b"MODE", b"durable", b"FSYNC", b"always",
         ]))
         .expect("write");
         read_exactly(&mut c, b"+OK\r\n");
@@ -2203,8 +5561,11 @@ fn loading_lifts_only_when_every_cell_recovered() {
     let node = Node::start_with_recover(
         2,
         Some(dir.clone()),
-        0,
-        inf_server::RecoverConfig { step_bytes: 32 << 10, throttle_bytes_per_sec: Some(128 << 10) },
+        inf_server::RecoverConfig {
+            step_bytes: 32 << 10,
+            throttle_bytes_per_sec: Some(128 << 10),
+            ..Default::default()
+        },
     );
 
     // Wait until cell 1 (empty log) is ready while cell 0 still loads.
@@ -2439,6 +5800,409 @@ fn inf_ckpt_cell_targets_one_cell() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The refusal every checkpoint producer answers once its cell's quota is
+/// exhausted (ADR-0159 A1.2, `IdentityExhausted(Checkpoint)`), byte-exact.
+const CKPT_EXHAUSTED_REPLY: &[u8] = b"-ERR checkpoint identity space exhausted\r\n";
+
+/// What a refused checkpoint producer must leave unchanged (ADR-0159 D1:
+/// refused before effects, existing state unchanged), read by the harness
+/// from the disk, the wire and the control handle.
+#[derive(Debug, PartialEq, Eq)]
+struct CkptProducerSnapshot {
+    meta_bytes: Vec<u8>,
+    listings: Vec<Vec<u8>>,
+    next_ns_id: u32,
+    persisted_epoch: u64,
+    drop_tombstones: usize,
+    requested: Vec<u64>,
+    published: Vec<u64>,
+}
+
+fn ckpt_producer_snapshot(node: &Node, dir: &std::path::Path) -> CkptProducerSnapshot {
+    let control = node.control.as_ref().expect("a durable node");
+    let board = control.ckpt_board();
+    let mut listings = Vec::new();
+    for cell in 0..node.cells {
+        let mut c = conn_on_cell(node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"LIST"])).expect("write");
+        listings.push(read_frame(&mut c));
+    }
+    CkptProducerSnapshot {
+        meta_bytes: std::fs::read(dir.join(inf_log::meta::META_FILE)).unwrap_or_default(),
+        listings,
+        next_ns_id: control.next_ns_id(),
+        persisted_epoch: control.persisted_epoch(),
+        drop_tombstones: control.drop_tombstones(),
+        requested: (0..node.cells).map(|cell| board.requested(cell)).collect(),
+        published: (0..node.cells).map(|cell| board.slot(cell).published()).collect(),
+    }
+}
+
+/// ADR-0159 A1.5 driven over the wire (1 cell, 3 units per quota): the
+/// last epochs of the space serve `WAIT`; a durable DROP or CREATE whose
+/// cell holds fewer than its two units is refused byte-exact and changes
+/// nothing, while a memory-mode CREATE (no unit) still answers `+OK`;
+/// `INF.CKPT` spends the last unit, after which `INF.CKPT` and `BGSAVE`
+/// are refused the same way; the graceful stop still publishes its
+/// checkpoint on the final credit, and a restart serves the namespace.
+#[test]
+fn ckpt_identity_exhaustion_refuses_before_effects_and_the_stop_still_publishes() {
+    let dir = temp_data_dir("ckptexhaust");
+    let node = Node::start_durable_with_ckpt_headroom(1, &dir, 3);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let mut c = node.connect();
+    // CREATE reserves its two units: one is left.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"keep", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"keep"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // A DROP needs two units: refused before any effect.
+    let before = ckpt_producer_snapshot(&node, &dir);
+    let mut d = node.connect();
+    d.write_all(&cmd(&[b"INF.NS", b"DROP", b"keep"])).expect("write");
+    read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused DROP changed state");
+    // So does a durable CREATE: refused before its namespace id is taken.
+    d.write_all(&cmd(&[b"INF.NS", b"CREATE", b"more", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused CREATE changed state");
+    // A memory-mode CREATE reserves no unit: it serves on the same cell,
+    // and the snapshot oracle sees it (engagement for the CREATE arm).
+    d.write_all(&cmd(&[b"INF.NS", b"CREATE", b"scratch", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut d, b"+OK\r\n");
+    assert_ne!(ckpt_producer_snapshot(&node, &dir), before, "the oracle missed a CREATE");
+    // The one unit left: `INF.CKPT WAIT` at the top of the space.
+    let completed = scrape_u64(&mut d, b"persistence", "ckpts_completed:");
+    d.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut d, b"+OK\r\n");
+    assert!(scrape_u64(&mut d, b"persistence", "ckpts_completed:") > completed);
+    // The clock started (N + 1)·h + N = 7 below the top, and CREATE's two
+    // units are reserved but never issued (the pacing unit, and a cleanup
+    // only a rollback spends): the WAIT issued the first epoch. Engagement:
+    // a WAIT that issued nothing leaves `u64::MAX - 7`.
+    let top = control.ckpt_last_issued();
+    assert_eq!(top, u64::MAX - 6, "the WAIT issued the first epoch of the space");
+    assert!(control.ckpt_board().slot(0).published() >= top, "WAIT fenced its publication");
+    let before = ckpt_producer_snapshot(&node, &dir);
+    for refused in [&[&b"INF.CKPT"[..]][..], &[b"BGSAVE"], &[b"INF.CKPT", b"WAIT"]] {
+        d.write_all(&cmd(refused)).expect("write");
+        read_exactly(&mut d, CKPT_EXHAUSTED_REPLY);
+    }
+    assert_eq!(ckpt_producer_snapshot(&node, &dir), before, "a refused INF.CKPT changed state");
+    drop((c, d));
+    node.stop_gracefully();
+    let final_epoch = control.ckpt_last_issued();
+    assert_eq!(final_epoch, top + 1, "the stop issued its final credit past exhaustion");
+    assert!(control.ckpt_board().slot(0).published() >= final_epoch, "the stop published");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"keep"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 A1.5 driven to the integer maximum (1 cell, 1 unit per quota:
+/// the clock starts 3 below `u64::MAX`). The host's unit issues
+/// `u64::MAX - 2` and `INF.CKPT WAIT` the cell's `u64::MAX - 1`, the highest
+/// epoch a `WAIT` can reach, since final credits issue only at the stop.
+/// The cell's next `INF.CKPT` is refused, and the graceful stop's final
+/// credit issues `u64::MAX` itself: the cell edge-detects a request of
+/// `u64::MAX`, checkpoints and publishes it. No credit is left unissued, so
+/// the drive ends exactly at the top.
+#[test]
+fn ckpt_the_stop_checkpoint_issues_and_publishes_u64_max() {
+    let dir = temp_data_dir("ckptmax");
+    let node = Node::start_durable_with_ckpt_headroom(1, &dir, 1);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    assert_eq!(node.request_ckpt_all(), u64::MAX - 2, "the host's one unit");
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 1, "the cell's one unit");
+    assert!(control.ckpt_board().slot(0).published() >= u64::MAX - 1, "WAIT fenced it");
+    c.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut c, CKPT_EXHAUSTED_REPLY);
+    drop(c);
+    node.stop_gracefully();
+    assert_eq!(control.ckpt_last_issued(), u64::MAX, "the final credit issued the top");
+    let board = control.ckpt_board();
+    assert_eq!(board.requested(0), u64::MAX, "the stop requested u64::MAX");
+    assert_eq!(board.slot(0).published(), u64::MAX, "the stop published u64::MAX");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Canary: the snapshot oracle, run on a DROP that succeeds, must see the
+/// difference (otherwise the refusal check above proves nothing).
+#[test]
+fn canary_the_snapshot_oracle_sees_a_drop_that_succeeds() {
+    let dir = temp_data_dir("ckptsnapcanary");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"gone", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let before = ckpt_producer_snapshot(&node, &dir);
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"gone"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    assert_ne!(ckpt_producer_snapshot(&node, &dir), before, "the snapshot canary must go red");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 D2 at the tombstone cap (2 cells): a durable DROP that finds
+/// `DROPPED_NS_MAX` live tombstones issues its pacing unit as one all-cell
+/// checkpoint and persists only after every cell published it; below the
+/// cap the unit is dropped unissued. Every DROP here is cut after its
+/// catalog swap (`ns_drop_after_meta`), so no fan runs, no cleanup stamp is
+/// issued and the tombstones stay live. The cut also ends the DROP at the
+/// cap, after its pacing wait: the branch under test.
+#[test]
+fn a_drop_at_the_tombstone_cap_waits_for_its_pacing_checkpoint() {
+    let dir = temp_data_dir("ckptpacing");
+    let cut = (inf_server::fault::NS_DROP_AFTER_META, inf_foundation::fault::FaultSpec::Always);
+    let node = Node::start_durable_with_faults(2, &dir, vec![cut]);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let cap = inf_server::DROPPED_NS_MAX;
+    let mut c = conn_on_cell(&node, 0);
+    let create_and_drop = |c: &mut TcpStream, index: usize| {
+        let name = format!("paced{index}");
+        let create = [&b"INF.NS"[..], b"CREATE", name.as_bytes(), b"MODE", b"durable"];
+        c.write_all(&cmd(&create)).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"DROP", name.as_bytes()])).expect("write");
+        read_exactly(c, b"-ERR fault: ns_drop_after_meta\r\n");
+    };
+    let issued = control.ckpt_last_issued();
+    for index in 0..cap {
+        create_and_drop(&mut c, index);
+    }
+    assert_eq!(control.drop_tombstones(), cap, "every cut DROP left its tombstone live");
+    assert_eq!(control.ckpt_last_issued(), issued, "below the cap no DROP issued an epoch");
+    create_and_drop(&mut c, cap);
+    let paced = control.ckpt_last_issued();
+    assert_eq!(paced, issued + 1, "the DROP at the cap issued its one pacing epoch");
+    let board = control.ckpt_board();
+    for cell in 0..node.cells {
+        let published = board.slot(cell).published();
+        assert!(published >= paced, "cell {cell} published {published} before the DROP persisted");
+    }
+    assert_eq!(control.drop_tombstones(), cap + 1, "the paced DROP persisted its own tombstone");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 D4 at the top of the space (2 cells): both slots publish
+/// epochs near `u64::MAX`, so the published sum passes 2^64 — `WAIT`
+/// returns only after both cells' checkpoints complete, and the sweep's
+/// wake is not lost to a wrapped sum.
+#[test]
+fn ckpt_wait_at_the_top_of_the_space_returns_after_both_cells_publish() {
+    let dir = temp_data_dir("ckpttopwait");
+    let node = Node::start_durable_with_ckpt_headroom(2, &dir, 2);
+    let control = Arc::clone(node.control.as_ref().expect("durable"));
+    let mut cells = [conn_on_cell(&node, 0), conn_on_cell(&node, 1)];
+    let completed: Vec<u64> =
+        cells.iter_mut().map(|c| scrape_u64(c, b"persistence", "ckpts_completed:")).collect();
+    for round in 0..2 {
+        cells[0].write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut cells[0], b"+OK\r\n");
+        for (cell, c) in cells.iter_mut().enumerate() {
+            let now = scrape_u64(c, b"persistence", "ckpts_completed:");
+            assert!(now > completed[cell] + round, "cell {cell} checkpointed before WAIT returned");
+        }
+    }
+    // Two issues into a space that starts (N + 1)·h + N = 8 below the top.
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 6, "engagement: both WAITs issued");
+    let board = control.ckpt_board();
+    let sum = u128::from(board.slot(0).published()) + u128::from(board.slot(1).published());
+    assert!(sum >= 1 << 64, "engagement: the published sum passed 2^64 ({sum})");
+    drop(cells);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 A1.2 at the wire (2 cells, 1 unit each): one cell's quota
+/// exhausted, the other cell still answers `+OK`.
+#[test]
+fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
+    let dir = temp_data_dir("ckptpercell");
+    let node = Node::start_durable_with_ckpt_headroom(2, &dir, 1);
+    let mut first = conn_on_cell(&node, 0);
+    let mut second = conn_on_cell(&node, 1);
+    first.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut first, b"+OK\r\n");
+    first.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut first, CKPT_EXHAUSTED_REPLY);
+    second.write_all(&cmd(&[b"INF.CKPT"])).expect("write");
+    read_exactly(&mut second, b"+OK\r\n");
+    // Two issues into a space that starts (N + 1)·h + N = 5 below the top.
+    let control = node.control.as_ref().expect("durable");
+    assert_eq!(control.ckpt_last_issued(), u64::MAX - 3, "engagement: both cells issued");
+    drop((first, second));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0159 D3 at the wiring seam: a cell's stop credit raises its own
+/// slot and its stop waits on that slot, so a plane accepts only the
+/// issuer minted for its cell. Another cell's issuer is refused with
+/// nothing wired and comes back in the error; its own cell accepts it.
+#[test]
+fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = |cell: u16| unwired_plane(cell, 2, fabrics.next().expect("a fabric per cell"));
+    let (mut first, mut second) = (plane(0), plane(1));
+    let mut issuers = issuers.cells.into_iter();
+    let (zero, one) = (issuers.next().expect("cell 0"), issuers.next().expect("cell 1"));
+    assert_eq!((zero.cell(), one.cell()), (CellId(0), CellId(1)), "minted in cell order");
+    let refused =
+        first.set_control(Arc::clone(&control), one).expect_err("cell 1's issuer on cell 0");
+    assert_eq!((refused.plane, refused.issuer.cell()), (CellId(0), CellId(1)));
+    let other_cell = inf_server::IssuerMismatch::OtherCell { issuer: CellId(1) };
+    assert_eq!(refused.mismatch, other_cell);
+    second.set_control(Arc::clone(&control), refused.issuer).expect("custody came back");
+    first.set_control(control, zero).expect("cell 0's own issuer");
+}
+
+/// A plane of `cells` with no control handle wired yet: the subject of the
+/// wiring checks below.
+fn unwired_plane(
+    cell: u16,
+    cells: u16,
+    fabric: inf_fabric::CellFabric,
+) -> ServerPlane<NoopObserver, inf_server::StdSegmentFs> {
+    let listener = listen_reuseport(0).expect("listen");
+    ServerPlane::new(
+        CellId(cell),
+        cells,
+        listener.into_raw_fd(),
+        Keyspace::new(StoreConfig::default()),
+        fabric,
+        Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
+        NoopObserver,
+        false,
+    )
+}
+
+/// ADR-0159 A1.2 at the wiring seam: a credit issues only into its own
+/// boot's board, so a plane refuses a cell issuer minted by another
+/// control handle's partition. Wired, its `INF.CKPT WAIT` would raise a
+/// board this cell never reads and park for ever, and its stop would wait
+/// out the deadline on the handle's slot. The allowance comes back, and the
+/// handle that minted it accepts it.
+#[test]
+fn set_control_refuses_an_issuer_of_another_boot() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, _issuers) = inf_server::ControlHandle::detached(two, 0);
+    let (other, _other_inbox, other_issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = unwired_plane(0, 2, fabrics.next().expect("cell 0's fabric"));
+    let foreign = other_issuers.cells.into_iter().next().expect("the other boot's cell 0");
+    let refused = plane.set_control(control, foreign).expect_err("another boot's issuer");
+    assert_eq!(refused.mismatch, inf_server::IssuerMismatch::OtherBoot);
+    plane.set_control(other, refused.issuer).expect("the minting boot's handle accepts it");
+}
+
+/// ADR-0159 A1.1 at the wiring seam: the plane validates `INF.CKPT CELL k`
+/// against its own cell count, so its board must hold exactly that many
+/// slots. A 4-cell plane over a 2-cell board is refused before anything
+/// is wired; wired, `CELL 3` would pass the check and index past the board
+/// after the clock had moved.
+#[test]
+fn set_control_refuses_a_board_of_another_cell_count() {
+    let two = inf_foundation::CellCount::new(2).expect("two cells");
+    let (control, _inbox, issuers) = inf_server::ControlHandle::detached(two, 0);
+    let mut fabrics = Mesh::new(4, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
+    let mut plane = unwired_plane(0, 4, fabrics.next().expect("cell 0's fabric"));
+    let zero = issuers.cells.into_iter().next().expect("cell 0's issuer");
+    let refused = plane.set_control(control, zero).expect_err("a 4-cell plane, a 2-cell board");
+    let mismatch = inf_server::IssuerMismatch::CellCount { plane: 4, board: 2 };
+    assert_eq!(refused.mismatch, mismatch);
+}
+
+/// ADR-0159 A1.4 at the wire (2 cells): after `INF.CKPT CELL k WAIT` on
+/// one connection, `LASTSAVE` on the same connection is at or after the
+/// second the `WAIT` was sent. This is the reachability leg only: the sweep
+/// that wakes the `WAIT` has usually read slot `k` already, so it passes
+/// with or without the floor. The floor itself is pinned by the control
+/// unit test `lastsave_after_wait_cell_covers_the_fenced_checkpoint` and
+/// its planted canary.
+#[test]
+fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
+    let dir = temp_data_dir("ckptlastsave");
+    let node = Node::start_durable(2, &dir);
+    let mut c = conn_on_cell(&node, 0);
+    // Mid-second, and past every earlier publication's second.
+    let unix_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    };
+    let start_s = unix_ms() / 1000;
+    while unix_ms() / 1000 == start_s || unix_ms() % 1000 >= 500 {
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let sent_s = unix_ms() / 1000;
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"LASTSAVE"])).expect("write");
+    let line = read_line(&mut c);
+    let lastsave: u64 = std::str::from_utf8(&line[1..line.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("LASTSAVE answered {line:?}"));
+    assert!(lastsave >= sent_s, "LASTSAVE {lastsave} trails the WAIT sent at {sent_s}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One `LASTSAVE` value per cell (`interfaces-m2.md`, "Cells never fold
+/// the whole board") at the wire (2 cells): after `INF.CKPT CELL k WAIT`,
+/// `LASTSAVE` and INFO's `rdb_last_save_time` answer the same second on
+/// the same connection, sent in one write. The reachability leg only: on
+/// the wire the sweep that wakes the `WAIT` has usually read slot `k`. The
+/// schedule in which it has not is the simulator's
+/// `lastsave_and_info_answer_one_second_when_a_wait_confirms_ahead_of_the_sweep`,
+/// and the unit test `lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell`
+/// carries the planted canaries.
+#[test]
+fn lastsave_and_rdb_last_save_time_answer_one_second_after_inf_ckpt_cell_wait() {
+    let dir = temp_data_dir("ckptonelastsave");
+    let node = Node::start_durable(2, &dir);
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let mut pipeline = cmd(&[b"LASTSAVE"]);
+    pipeline.extend_from_slice(&cmd(&[b"INFO", b"persistence"]));
+    c.write_all(&pipeline).expect("write");
+    let line = read_line(&mut c);
+    let lastsave: u64 = std::str::from_utf8(&line[1..line.len() - 2])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("LASTSAVE answered {line:?}"));
+    let info = String::from_utf8(read_bulk(&mut c)).expect("INFO is text");
+    assert!(lastsave > 0, "the WAIT fenced a publication");
+    assert_eq!(info_u64(&info, "rdb_last_save_time"), lastsave, "one value per cell: {info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// M3-S11 cross-cell `JSON.MGET` (ADR-0041 D9): the gather splits per
 /// key with single-key sub-ops whose `*1` elements reassemble in argv
 /// order — over the default db, and over a **named** namespace, which is
@@ -2447,6 +6211,7 @@ fn inf_ckpt_cell_targets_one_cell() {
 /// everything else). Single-key remote JSON commands ride the ordinary
 /// fast arm alongside.
 #[test]
+#[cfg(feature = "doc")]
 fn json_mget_gathers_across_cells() {
     // A durable node shape: namespace DDL needs the control plane. The
     // JSON namespace itself is memory-class (durable JSON writes refuse
@@ -2485,4 +6250,2964 @@ fn json_mget_gathers_across_cells() {
     client.write_all(&cmd(&[b"MGET", &k0, &k1])).expect("write");
     let line = read_line(&mut client);
     assert!(line.starts_with(b"-ERR multi-key commands"), "refusal stays: {line:?}");
+}
+
+/// ADR-0099 A1 at the shipped topology and the default budget (128 MiB):
+/// a 133-byte path of four 16-member duplicate unions selects 65,536 raw
+/// matches of one node. Over a 4 KiB string element `ARRPOP` would answer
+/// 65,536 × 4,107 ≈ 269 MB, and over a 400-key object `OBJKEYS` would
+/// answer 65,536 × 4,006 ≈ 262 MB. Both answer the error instead, the pop
+/// does not happen, and the connection keeps serving. The element key is
+/// owned by the accepting cell and the object key by the other one, so
+/// both the local and the forwarded reply paths refuse.
+#[test]
+#[cfg(feature = "doc")]
+fn json_amplified_replies_refuse_at_the_wire() {
+    let node = Node::start(2);
+    let mut client = conn_on_cell(&node, 0);
+    let (local, remote) = (key_for_cell(2, 0), key_for_cell(2, 1));
+    let union = format!("[{}]", ["0"; 16].join(","));
+    let path = format!("${}", union.repeat(4));
+    assert_eq!(path.len(), 133, "four unions of 16 members");
+    let element = format!("[[[[[\"{}\"]]]]]", "x".repeat(4_096));
+    let keys: Vec<String> = (0..400).map(|i| format!("\"k{i:03}\":0")).collect();
+    let object = format!("[[[[{{{}}}]]]]", keys.join(","));
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"JSON.SET", &local, b"$", element.as_bytes()]));
+    pipeline.extend(cmd(&[b"JSON.SET", &remote, b"$", object.as_bytes()]));
+    client.write_all(&pipeline).expect("write");
+    read_exactly(&mut client, b"+OK\r\n+OK\r\n");
+    let refused = b"-ERR reply too large\r\n";
+    for (key, command) in [(&local, b"JSON.ARRPOP".as_slice()), (&remote, b"JSON.OBJKEYS")] {
+        client.write_all(&cmd(&[command, key, path.as_bytes()])).expect("write");
+        let line = read_line(&mut client);
+        assert!(
+            line == refused,
+            "{} answered {:?}",
+            String::from_utf8_lossy(command),
+            String::from_utf8_lossy(&line[..line.len().min(48)])
+        );
+    }
+    client.write_all(&cmd(&[b"JSON.ARRLEN", &local, b"$[0][0][0][0]"])).expect("write");
+    read_exactly(&mut client, b"*1\r\n:1\r\n");
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+    // Each cell counts the refusal it executed, and the bytes it built
+    // before the rollback: past the budget by at most one patched bulk's
+    // slack and scalar token (39 B), or short of it by less than one
+    // frame, the largest here a 4,107 B popped element.
+    let budget = u64::try_from(StoreConfig::default().doc_max_reply_bytes).expect("u64");
+    for cell in [0, 1] {
+        let stats = info_text(&mut conn_on_cell(&node, cell), b"stats");
+        assert_eq!(info_field(&stats, "json_reply_refusals_cell"), 1, "cell {cell}: {stats}");
+        let refused_bytes = info_field(&stats, "json_reply_refused_bytes_cell");
+        let span = budget - 4_106..=budget + 39;
+        assert!(span.contains(&refused_bytes), "cell {cell}: {refused_bytes} B refused");
+    }
+    node.stop();
+}
+
+// ---- ADR-0169 Falsifier 3: the depth cliff through checkpoint and restart ----
+
+/// The deepest nesting a stored document may reach (`inf_doc::limits`).
+#[cfg(feature = "doc")]
+const CLIFF_DEPTH_MAX: usize = 128;
+
+/// JSON text: `levels` nested arrays around `0`.
+#[cfg(feature = "doc")]
+fn cliff_arrays(levels: usize) -> String {
+    format!("{}0{}", "[".repeat(levels), "]".repeat(levels))
+}
+
+/// JSON text: `levels` nested objects `{"a":…}` around `0`.
+#[cfg(feature = "doc")]
+fn cliff_objects(levels: usize) -> String {
+    format!("{}0{}", r#"{"a":"#.repeat(levels), "}".repeat(levels))
+}
+
+/// One shape that composes a site's depth with an operand's nesting
+/// (ADR-0169 D3). `Finding` is the review's script, unpadded; the others
+/// are padded objects `{"n":0,"pad":…,"d":…}` whose operand nests at most
+/// 127 levels under two enclosing containers.
+#[cfg(feature = "doc")]
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Cliff {
+    Finding,
+    Replace,
+    Member,
+    Merge,
+    Append,
+    Insert,
+}
+
+#[cfg(feature = "doc")]
+const CLIFF_SHAPES: [Cliff; 6] =
+    [Cliff::Finding, Cliff::Replace, Cliff::Member, Cliff::Merge, Cliff::Append, Cliff::Insert];
+
+#[cfg(feature = "doc")]
+impl Cliff {
+    fn padded(site: &str, n: u8) -> String {
+        format!(r#"{{"n":{n},"pad":"{}","d":{site}}}"#, "x".repeat(1024))
+    }
+
+    /// The `d` site a padded shape starts with.
+    fn site(self) -> &'static str {
+        match self {
+            Cliff::Finding => "",
+            Cliff::Replace | Cliff::Merge => "[0]",
+            Cliff::Member => "{}",
+            Cliff::Append | Cliff::Insert => "[]",
+        }
+    }
+
+    fn initial(self) -> String {
+        match self {
+            Cliff::Finding => "[]".into(),
+            _ => Cliff::padded(self.site(), 0),
+        }
+    }
+
+    /// The command that composes depth `depth` on `key`.
+    fn command(self, key: &[u8], depth: usize) -> Vec<Vec<u8>> {
+        let finding = cliff_arrays(depth - 1).into_bytes();
+        let arrays = cliff_arrays(depth - 2).into_bytes();
+        let objects = cliff_objects(depth - 2).into_bytes();
+        let parts: &[&[u8]] = match self {
+            Cliff::Finding => &[b"JSON.ARRAPPEND", key, b"$", &finding],
+            Cliff::Replace => &[b"JSON.SET", key, b"$.d[0]", &arrays],
+            Cliff::Member => &[b"JSON.SET", key, b"$.d.x", &arrays],
+            Cliff::Merge => &[b"JSON.MERGE", key, b"$.d[0]", &objects],
+            Cliff::Append => &[b"JSON.ARRAPPEND", key, b"$.d", &arrays],
+            Cliff::Insert => &[b"JSON.ARRINSERT", key, b"$.d", b"0", &arrays],
+        };
+        parts.iter().map(|part| part.to_vec()).collect()
+    }
+
+    fn accepted_reply(self) -> &'static [u8] {
+        match self {
+            Cliff::Replace | Cliff::Member | Cliff::Merge => b"+OK\r\n",
+            Cliff::Finding | Cliff::Append | Cliff::Insert => b"*1\r\n:1\r\n",
+        }
+    }
+
+    /// The document after the command at `depth`: the edit at 128, or the
+    /// initial document with only the probe applied at 129.
+    fn expected(self, depth: usize) -> String {
+        if depth > CLIFF_DEPTH_MAX {
+            return match self {
+                Cliff::Finding => "[]".into(),
+                _ => Cliff::padded(self.site(), 1),
+            };
+        }
+        let inner = cliff_arrays(depth - 2);
+        match self {
+            Cliff::Finding => format!("[{}]", cliff_arrays(depth - 1)),
+            Cliff::Replace | Cliff::Append | Cliff::Insert => {
+                Cliff::padded(&format!("[{inner}]"), 0)
+            }
+            Cliff::Member => Cliff::padded(&format!(r#"{{"x":{inner}}}"#), 0),
+            Cliff::Merge => Cliff::padded(&format!("[{}]", cliff_objects(depth - 2)), 0),
+        }
+    }
+}
+
+/// One key the test wrote, and the reply its command answered.
+#[cfg(feature = "doc")]
+struct CliffKey {
+    phase: u8,
+    cell: u16,
+    shape: Option<Cliff>,
+    depth: usize,
+    key: Vec<u8>,
+    reply: Vec<u8>,
+}
+
+/// One complete RESP reply, or a named liveness failure when the client's
+/// read timeout elapses first.
+#[cfg(feature = "doc")]
+fn cliff_reply(stream: &mut TcpStream, what: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(len) = reply_len(&buf, 0).expect("valid RESP") {
+            buf.truncate(len);
+            return buf;
+        }
+        match stream.read(&mut chunk) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            Ok(_) => panic!("liveness: the connection closed before {what} answered"),
+            Err(error) => panic!("liveness: {}", reply_read_failed(stream, what, &error)),
+        }
+    }
+}
+
+#[cfg(feature = "doc")]
+fn cliff_send(c: &mut TcpStream, argv: &[Vec<u8>]) -> Vec<u8> {
+    let parts: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    c.write_all(&cmd(&parts)).expect("write");
+    let what = parts.iter().take(2).map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>();
+    cliff_reply(c, &what.join(" "))
+}
+
+/// Phase 1 or 2: every shape at composed depth 129, then its twin at 128,
+/// on one key per cell; a probe `NUMINCRBY` after each padded 129 command;
+/// and a 128-level `ARRAPPEND` element on a missing key per cell. Replies
+/// are recorded; the only assertion is liveness.
+#[cfg(feature = "doc")]
+fn cliff_phase(c: &mut TcpStream, phase: u8) -> Vec<CliffKey> {
+    let mut keys = Vec::new();
+    for depth in [CLIFF_DEPTH_MAX + 1, CLIFF_DEPTH_MAX] {
+        for cell in 0..2 {
+            for shape in CLIFF_SHAPES {
+                let prefix = format!("cliff{phase}-{shape:?}-{depth}");
+                let key = key_for_cell_prefixed(2, cell, &prefix);
+                let init = shape.initial().into_bytes();
+                let set = [b"JSON.SET".to_vec(), key.clone(), b"$".to_vec(), init];
+                assert_eq!(cliff_send(c, &set), b"+OK\r\n", "setup {prefix}");
+                let reply = cliff_send(c, &shape.command(&key, depth));
+                if depth > CLIFF_DEPTH_MAX && shape != Cliff::Finding {
+                    let probe = [b"JSON.NUMINCRBY".to_vec(), key.clone(), b"$.n".to_vec()];
+                    cliff_send(c, &[&probe[..], &[b"1".to_vec()]].concat());
+                }
+                keys.push(CliffKey { phase, cell, shape: Some(shape), depth, key, reply });
+            }
+        }
+    }
+    for cell in 0..2 {
+        let key = key_for_cell_prefixed(2, cell, &format!("cliff{phase}-missing"));
+        let element = cliff_arrays(CLIFF_DEPTH_MAX).into_bytes();
+        let argv = [b"JSON.ARRAPPEND".to_vec(), key.clone(), b"$".to_vec(), element];
+        let reply = cliff_send(c, &argv);
+        let depth = CLIFF_DEPTH_MAX + 1;
+        keys.push(CliffKey { phase, cell, shape: None, depth, key, reply });
+    }
+    keys
+}
+
+/// A document record the scan saw, in log order, for one key.
+#[cfg(feature = "doc")]
+#[derive(Clone, Debug, PartialEq)]
+enum CliffRecord {
+    Full { version: u32, idoc: Vec<u8> },
+    Delta { base_version: u32 },
+}
+
+/// Containers on the deepest path of a JSON value: the test's own
+/// recursive walk, independent of the engine's.
+#[cfg(feature = "doc")]
+fn cliff_nesting(value: &inf_doc::model::Value) -> usize {
+    use inf_doc::model::Value;
+    match value {
+        Value::Obj(entries) => 1 + entries.iter().map(|(_, v)| cliff_nesting(v)).max().unwrap_or(0),
+        Value::Arr(items) => 1 + items.iter().map(cliff_nesting).max().unwrap_or(0),
+        Value::Null | Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Str(_) => 0,
+    }
+}
+
+#[cfg(feature = "doc")]
+fn idoc_nesting(idoc: &[u8]) -> usize {
+    let doc = inf_doc::TapeDoc::from_bytes(idoc).expect("a logged image validates");
+    cliff_nesting(&inf_doc::model::from_tape(&doc))
+}
+
+/// Every document record in `cell`'s log, keyed by its key, in log order.
+/// It decodes records, not documents, and asserts nothing.
+#[cfg(feature = "doc")]
+fn cliff_log(dir: &std::path::Path, cell: u16) -> Vec<(Vec<u8>, CliffRecord)> {
+    let log_dir = dir.join(format!("shard-{cell}")).join("log");
+    let fs = inf_log::fs::StdSegmentFs;
+    let scan = inf_log::scan_log_dir(&fs, &log_dir).expect("scan log");
+    let mut records = Vec::new();
+    for &segment in scan.segments() {
+        let config = inf_log::ReaderConfig::default();
+        let mut reader =
+            inf_log::SegmentReader::open(&fs, &log_dir, segment, config).expect("open segment");
+        while let Some(frame) = reader.next_frame().expect("valid frame") {
+            for record in frame.records() {
+                match record.expect("valid record").1 {
+                    inf_log::RecordView::DocFull { key, version, idoc, .. } => {
+                        let full = CliffRecord::Full { version, idoc: idoc.to_vec() };
+                        records.push((key.to_vec(), full));
+                    }
+                    inf_log::RecordView::DocDelta { key, base_version, .. } => {
+                        records.push((key.to_vec(), CliffRecord::Delta { base_version }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    records
+}
+
+/// The keys of the `DocFull` images in `cell`'s published checkpoint.
+#[cfg(feature = "doc")]
+fn cliff_ick(dir: &std::path::Path, cell: u16) -> Vec<Vec<u8>> {
+    let ckpt = dir.join(format!("shard-{cell}")).join("ckpt");
+    let published: Vec<std::path::PathBuf> = std::fs::read_dir(&ckpt)
+        .expect("checkpoint dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ick"))
+        .collect();
+    assert_eq!(published.len(), 1, "cell {cell} published one checkpoint: {published:?}");
+    let mut keys = Vec::new();
+    inf_log::ckpt::read_ick(
+        &inf_log::fs::StdSegmentFs,
+        &published[0],
+        inf_log::ckpt::IckReaderConfig::default(),
+        |view| {
+            if let inf_log::RecordView::DocFull { key, .. } = view {
+                keys.push(key.to_vec());
+            }
+            Ok::<(), ()>(())
+        },
+    )
+    .expect("the published checkpoint validates");
+    keys
+}
+
+#[cfg(feature = "doc")]
+fn cliff_wait_ckpt(node: &Node) {
+    let mut cells = [conn_on_cell(node, 0), conn_on_cell(node, 1)];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for (cell, c) in cells.iter_mut().enumerate() {
+        while scrape_u64(c, b"persistence", "ckpts_completed:") == 0 {
+            assert!(Instant::now() < deadline, "cell {cell} never completed its checkpoint");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// ADR-0169 Falsifier 3 on the shipped multi-cell shape: two cells, a
+/// durable `FSYNC always` namespace, every deepening shape at composed
+/// depth 129 and its 128 twin on one key per cell — so one copy of each is
+/// remote whichever cell accepted the connection — then a checkpoint, the
+/// same shapes on fresh keys, a crash-equivalent stop and a restart. The
+/// pre-fix build stored the 129-level documents, and its restart
+/// fail-stopped on its own checkpoint image; the phases run in this order
+/// so that build reaches the restart.
+#[test]
+#[cfg(feature = "doc")]
+fn json_depth_cliff_survives_checkpoint_and_restart() {
+    let dir = temp_data_dir("json-depth-cliff");
+    let node = Node::start_durable(2, &dir);
+    let mut admin = node.connect();
+    let create: [&[u8]; 7] =
+        [b"INF.NS", b"CREATE", b"cliff", b"MODE", b"durable", b"FSYNC", b"always"];
+    admin.write_all(&cmd(&create)).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    drop(admin);
+    let mut c = connect_use(&node, b"cliff");
+    // Phase 1: write and record.
+    let mut keys = cliff_phase(&mut c, 1);
+    // Phase 2: a completed checkpoint, then the shapes again on fresh keys.
+    node.request_ckpt_all();
+    cliff_wait_ckpt(&node);
+    keys.extend(cliff_phase(&mut c, 2));
+    drop(c);
+    node.stop();
+    // Phase 3: scan, then restart; the boot check is the first assertion.
+    let logs = [cliff_log(&dir, 0), cliff_log(&dir, 1)];
+    let icks = [cliff_ick(&dir, 0), cliff_ick(&dir, 1)];
+    let node = Node::start_durable(2, &dir);
+    // Phase 4: every key reads back over the wire.
+    let mut c = connect_use(&node, b"cliff");
+    for k in &keys {
+        let argv = [b"JSON.GET".to_vec(), k.key.clone()];
+        let got = cliff_send(&mut c, &argv);
+        let want = match k.shape {
+            Some(shape) => {
+                let text = shape.expected(k.depth);
+                format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+            }
+            None => b"$-1\r\n".to_vec(),
+        };
+        let name = String::from_utf8_lossy(&k.key);
+        assert!(got == want, "{name}: read back {:.120}", String::from_utf8_lossy(&got));
+    }
+    drop(c);
+    node.stop();
+    // Phase 5: engagement, or the verdict is VACUOUS.
+    let twin = |k: &&CliffKey| k.depth == CLIFF_DEPTH_MAX;
+    for cell in 0..2u16 {
+        let log = &logs[usize::from(cell)];
+        let owned: Vec<&CliffKey> =
+            keys.iter().filter(|k| k.phase == 2 && k.cell == cell).filter(twin).collect();
+        let delta = log.iter().any(|(key, record)| {
+            matches!(record, CliffRecord::Delta { .. }) && owned.iter().any(|k| k.key == *key)
+        });
+        assert!(delta, "VACUOUS: cell {cell}'s tail holds no DocDelta for a 128 key");
+        let ick = &icks[usize::from(cell)];
+        let imaged = keys.iter().filter(|k| k.phase == 1 && k.cell == cell).filter(twin);
+        let imaged = imaged.filter(|k| ick.contains(&k.key)).count();
+        assert!(imaged > 0, "VACUOUS: cell {cell}'s checkpoint holds no DocFull for a 128 key");
+    }
+    let deepest = logs.iter().flatten().any(|(key, record)| {
+        let tail = keys.iter().any(|k| k.phase == 2 && k.key == *key);
+        matches!(record, CliffRecord::Full { idoc, .. } if tail && idoc_nesting(idoc) == 128)
+    });
+    assert!(deepest, "VACUOUS: the tail holds no DocFull whose image nests 128");
+    // Phase 6: the recorded replies.
+    for k in &keys {
+        let name = String::from_utf8_lossy(&k.key);
+        let want = match k.shape {
+            Some(shape) if k.depth <= CLIFF_DEPTH_MAX => shape.accepted_reply(),
+            Some(_) | None => b"-ERR document nesting too deep\r\n".as_slice(),
+        };
+        assert_eq!(String::from_utf8_lossy(&k.reply), String::from_utf8_lossy(want), "{name}");
+    }
+    // Phase 7 (ADR-0169 I5(b)): a refused padded key written after the
+    // checkpoint logs its creation and its probe, nothing from the refusal.
+    for k in keys.iter().filter(|k| k.phase == 2 && k.depth > CLIFF_DEPTH_MAX) {
+        if matches!(k.shape, None | Some(Cliff::Finding)) {
+            continue;
+        }
+        let log = &logs[usize::from(k.cell)];
+        let own: Vec<&CliffRecord> =
+            log.iter().filter(|(key, _)| *key == k.key).map(|(_, record)| record).collect();
+        let name = String::from_utf8_lossy(&k.key);
+        let [CliffRecord::Full { version, .. }, CliffRecord::Delta { base_version }] = own[..]
+        else {
+            panic!("{name}: records {own:?}");
+        };
+        assert_eq!(version, base_version, "{name}: the refusal moved the version");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- M4.5-S34: FUA-class frames on pre-zeroed O_DIRECT segments (ADR-0086) ----
+
+/// On a `Direct` node (real `O_DIRECT` + `RWF_DSYNC` through io_uring) a
+/// fresh cell starts FLUSH-class, MAINTAIN pre-zeroes the next segment,
+/// the class-upgrade rotation flips it to `fua`, and from then on every
+/// `always` write rides a write-through frame (`fsyncs_fua` climbs while
+/// `fsyncs_linked` stops). Every acked write replays after a restart — the
+/// reopened tail reads its pre-zeroed fact from the file — and padding
+/// and zero-fill amplification are disclosed, never zero.
+#[test]
+fn direct_segments_converge_to_fua_and_survive_restart() {
+    let dir = temp_data_dir("s34-direct");
+    let node = Node::start_durable_direct(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fua", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fua"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+
+    // Segment 0 is sparse (FLUSH class); the 8 MiB next segment zero-fills
+    // in eight 1 MiB driver slices plus a barrier — wait for the upgrade
+    // rotation by writing until INFO reports the class.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut writes = 0u32;
+    loop {
+        writes += 1;
+        let key = format!("k:{writes}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let info = info_persistence(&mut c);
+        let class = info
+            .lines()
+            .find_map(|l| l.strip_prefix("barrier_class:"))
+            .unwrap_or_else(|| panic!("barrier_class missing:\n{info}"));
+        if class == "fua" {
+            assert!(info_field(&info, "rotations_upgrade") >= 1, "{info}");
+            assert!(info_field(&info, "zero_fill_bytes") >= 8 << 20, "{info}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never upgraded to fua after {writes} writes:\n{info}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Now every always write is a write-through frame: the FUA counter
+    // climbs and the linked-fsync counter freezes.
+    let before = info_persistence(&mut c);
+    let linked_before = info_field(&before, "fsyncs_linked");
+    let fua_before = info_field(&before, "fsyncs_fua");
+    for i in 0..64u32 {
+        let key = format!("w:{i}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"through"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    let after = info_persistence(&mut c);
+    assert_eq!(info_field(&after, "fsyncs_linked"), linked_before, "no FLUSH after the upgrade");
+    assert!(info_field(&after, "fsyncs_fua") >= fua_before + 64, "{after}");
+    assert!(info_field(&after, "fua_latency_p50_us") > 0, "{after}");
+    assert!(info_field(&after, "log_padding_bytes") > 0, "v3 padding is disclosed");
+    assert_eq!(info_field(&after, "barrier_class_degraded"), 0);
+    drop(c);
+    node.stop();
+
+    // Restart: the tail reopens Direct and pre-zeroed; every acked write
+    // is back; new writes are write-through from the first frame.
+    let node = Node::start_durable_direct(1, &dir);
+    let mut c = connect_use(&node, b"fua");
+    for i in 0..64u32 {
+        let key = format!("w:{i}");
+        c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+        read_exactly(&mut c, b"$7\r\nthrough\r\n");
+    }
+    c.write_all(&cmd(&[b"GET", b"k:1"])).expect("write");
+    read_exactly(&mut c, b"$1\r\nv\r\n");
+    c.write_all(&cmd(&[b"SET", b"after", b"restart"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let info = info_persistence(&mut c);
+    assert!(info.contains("barrier_class:fua"), "reopened tail is pre-zeroed:\n{info}");
+    assert!(info_field(&info, "fsyncs_fua") >= 1, "{info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// M4.5-S35 (ADR-0087): with `frames_in_flight = 4` on a Direct cell,
+/// concurrent `always` writers fill the pipeline (INFO proves it reached
+/// ≥ 2 frames in flight), every write is a write-through frame, acks stay
+/// a prefix (every acked key is back after a restart), and the pipeline
+/// gauges are exported. Real io_uring; run with `TMPDIR` on the NVMe for
+/// the device tier (tmpfs swallows `O_DIRECT`/FUA).
+/// M4.5-S36 (ADR-0088 D5 amended): a `Direct` cell with only `everysec`
+/// namespaces never pre-zeroes — no write-through consumer, no second
+/// write (`zero_fill_bytes` stays 0 while segments rotate un-zeroed and
+/// the class reads `flush`); the first `always` namespace starts the fill
+/// and the class upgrades at the next rotation (ADR-0086 D4's machinery).
+#[test]
+fn everysec_only_cell_skips_pre_zeroing_until_an_always_namespace_exists() {
+    let dir = temp_data_dir("s36-zero-fill-gate");
+    let node = Node::start_durable_pipeline(1, &dir, 3);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"esec", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Drive past several segment rotations (the test node's segments are
+    // small): no zero byte is ever written, the class stays flush.
+    let value = vec![b'z'; 4096];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        for i in 0..256 {
+            let key = format!("e:{i:05}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        let info = info_persistence(&mut c);
+        if info_field(&info, "rotations_unzeroed") >= 2 || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(info_field(&info, "rotations_unzeroed") >= 2, "segments rotated un-zeroed:\n{info}");
+    assert_eq!(info_field(&info, "zero_fill_bytes"), 0, "no write-through consumer:\n{info}");
+    assert!(info.contains("barrier_class:flush"), "{info}");
+    assert_eq!(info_field(&info, "io_budget_bytes_zero_fill"), 0, "{info}");
+
+    // An `always` namespace appears: the fill starts and the class
+    // upgrades at the next rotation.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"alw", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut i = 0u32;
+    let info = loop {
+        for _ in 0..64 {
+            let key = format!("f:{i:05}");
+            c.write_all(&cmd(&[b"SET", key.as_bytes(), &value])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            i += 1;
+        }
+        let info = info_persistence(&mut c);
+        if info.contains("barrier_class:fua") || Instant::now() > deadline {
+            break info;
+        }
+    };
+    assert!(
+        info.contains("barrier_class:fua"),
+        "the class upgraded once an always ns exists:\n{info}"
+    );
+    assert!(info_field(&info, "zero_fill_bytes") > 0, "{info}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn frame_pipeline_fills_under_concurrent_always_writers_and_survives_restart() {
+    let dir = temp_data_dir("s35-pipeline");
+    let node = Node::start_durable_pipeline(1, &dir, 4);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"pipe", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"pipe"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // Wait for the class-upgrade rotation (segment 1 pre-zeroed).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut writes = 0u32;
+    loop {
+        writes += 1;
+        let key = format!("k:{writes}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let info = info_persistence(&mut c);
+        if info.contains("barrier_class:fua") {
+            assert_eq!(info_field(&info, "frames_in_flight"), 4, "{info}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never upgraded to fua after {writes} writes:\n{info}");
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let before = info_persistence(&mut c);
+    let linked_before = info_field(&before, "fsyncs_linked");
+    let fua_before = info_field(&before, "fsyncs_fua");
+    // Eight concurrent always writers: frames seal every iteration while
+    // earlier ones are still in flight — the pipeline fills.
+    const WRITERS: u32 = 8;
+    const PER_WRITER: u32 = 200;
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let mut c = connect_use(&node, b"pipe");
+            std::thread::spawn(move || {
+                for i in 0..PER_WRITER {
+                    let key = format!("p:{w}:{i}");
+                    c.write_all(&cmd(&[b"SET", key.as_bytes(), b"through"])).expect("write");
+                    read_exactly(&mut c, b"+OK\r\n");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer");
+    }
+    let after = info_persistence(&mut c);
+    assert_eq!(info_field(&after, "fsyncs_linked"), linked_before, "every frame write-through");
+    assert!(info_field(&after, "fsyncs_fua") > fua_before, "{after}");
+    assert!(info_field(&after, "frames_in_flight_max") >= 2, "the pipeline filled:\n{after}");
+    assert_eq!(info_field(&after, "frame_waits_barrier"), 0, "pure always never waits:\n{after}");
+    assert_eq!(info_field(&after, "barrier_class_degraded"), 0);
+    drop(c);
+    node.stop();
+
+    // Restart: every acked key is back; the pipeline config persists.
+    let node = Node::start_durable_pipeline(1, &dir, 4);
+    let mut c = connect_use(&node, b"pipe");
+    for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+            let key = format!("p:{w}:{i}");
+            c.write_all(&cmd(&[b"GET", key.as_bytes()])).expect("write");
+            read_exactly(&mut c, b"$7\r\nthrough\r\n");
+        }
+    }
+    let info = info_persistence(&mut c);
+    assert!(info.contains("barrier_class:fua"), "{info}");
+    assert_eq!(info_field(&info, "frames_in_flight"), 4);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- C6 · RESP reply framing under hostile argument bytes ------------------
+//
+// Review 2026-08-30, finding **C6** (= `F-L00-25` / `F-L12-04`): raw client
+// bytes were spliced into line-framed error replies, so one command's
+// argument could open a *second* RESP frame and forge the reply to the next
+// pipelined command. The sanitizer lives in `RespWriter` (ADR-0097); these
+// tests are the node-level contract — the plane writes error replies from
+// paths `execute` never sees (`CONFIG`, `CLIENT`, `INF.NS`, the subcommand
+// dispatchers), so the class is only closed if it is closed *here*.
+
+/// Length of one complete RESP2/RESP3 reply at `buf[at..]`, or `None` when
+/// the bytes are incomplete. `Err` when they cannot be RESP at all — which
+/// is itself the C6 signature (an injected payload leaves a ragged tail).
+fn reply_len(buf: &[u8], at: usize) -> Result<Option<usize>, String> {
+    let Some(&tag) = buf.get(at) else { return Ok(None) };
+    let Some(rel) = buf[at..].windows(2).position(|w| w == b"\r\n") else { return Ok(None) };
+    let line_end = at + rel;
+    let head = &buf[at + 1..line_end];
+    let count = || -> Result<i64, String> {
+        std::str::from_utf8(head)
+            .map_err(|_| format!("non-utf8 length at {at}"))?
+            .parse::<i64>()
+            .map_err(|_| format!("bad length {:?} at {at}", String::from_utf8_lossy(head)))
+    };
+    match tag {
+        b'+' | b'-' | b':' | b',' | b'#' | b'(' | b'_' => Ok(Some(line_end + 2 - at)),
+        b'$' | b'=' => {
+            let n = count()?;
+            if n < 0 {
+                return Ok(Some(line_end + 2 - at));
+            }
+            let end = line_end + 2 + n as usize + 2;
+            Ok(if end <= buf.len() { Some(end - at) } else { None })
+        }
+        b'*' | b'~' | b'>' | b'%' => {
+            let n = count()?;
+            if n < 0 {
+                return Ok(Some(line_end + 2 - at));
+            }
+            let elements = if tag == b'%' { n * 2 } else { n };
+            let mut cur = line_end + 2;
+            for _ in 0..elements {
+                match reply_len(buf, cur)? {
+                    Some(len) => cur += len,
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(cur - at))
+        }
+        other => Err(format!("unknown RESP tag {:?} at {at}", other as char)),
+    }
+}
+
+/// Splits `buf` into complete replies. `Err` names the first byte that is
+/// not the start of a valid reply — a split reply always ends there.
+fn split_replies(buf: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < buf.len() {
+        match reply_len(buf, at)? {
+            Some(len) => {
+                out.push(&buf[at..at + len]);
+                at += len;
+            }
+            None => return Err(format!("incomplete reply at byte {at}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Everything the server sends before its reply to a sentinel `PING`
+/// written behind the caller's commands. Replies are in order, so the
+/// sentinel's reply proves every earlier one arrived — a quiet window
+/// instead would read a slow host's late reply as a missing one. `Err`
+/// holds what arrived when the server closed before the sentinel.
+fn read_through_ping(stream: &mut TcpStream) -> Result<Vec<u8>, Vec<u8>> {
+    // RESP2 subscriber mode answers `PING` with an array.
+    const PONGS: [&[u8]; 2] = [b"+PONG\r\n", b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"];
+    stream.write_all(&cmd(&[b"PING"])).expect("write");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if let Some(pong) = PONGS.iter().find(|pong| buf.ends_with(pong)) {
+            buf.truncate(buf.len() - pong.len());
+            return Ok(buf);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(buf),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err(buf),
+            Err(e) => panic!("{}", reply_read_failed(stream, "read through the PING sentinel", &e)),
+        }
+    }
+}
+
+/// The review's scenario, end to end on a real node: an application passes
+/// user data to a command InfinityDB has not implemented yet (the common
+/// case during the Redis-adoption story the product is built for) and
+/// pipelines a read it cares about behind it. The user's bytes must not be
+/// able to answer that read.
+#[test]
+fn a_command_argument_cannot_forge_the_reply_to_the_next_command() {
+    let node = Node::start(2);
+    let mut client = node.connect();
+
+    client.write_all(&cmd(&[b"SET", b"session:victim", b"REAL-SESSION-TOKEN"])).expect("write");
+    read_exactly(&mut client, b"+OK\r\n");
+
+    // The payload is a complete RESP bulk reply wrapped in CRLFs: if it
+    // reaches the wire verbatim, the client reads it as the *next* reply.
+    let payload = b"hello\r\n$18\r\nFORGED-SESSION-TOK\r\n";
+    let mut pipeline = Vec::new();
+    pipeline.extend(cmd(&[b"LPUSH", b"mylist", payload])); // M5 command: unknown today
+    pipeline.extend(cmd(&[b"GET", b"session:victim"]));
+    client.write_all(&pipeline).expect("write");
+
+    let raw = read_through_ping(&mut client).expect("the connection stays open");
+    let replies = split_replies(&raw)
+        .unwrap_or_else(|e| panic!("two commands produced un-framed bytes ({e}): {raw:?}"));
+    assert_eq!(
+        replies.len(),
+        2,
+        "two commands must produce exactly two replies, got {}: {:?}",
+        replies.len(),
+        String::from_utf8_lossy(&raw)
+    );
+    assert!(replies[0].starts_with(b"-ERR unknown command "), "{:?}", replies[0]);
+    assert_eq!(
+        replies[1],
+        b"$18\r\nREAL-SESSION-TOKEN\r\n",
+        "the client was handed a forged reply: {:?}",
+        String::from_utf8_lossy(replies[1])
+    );
+    // Nothing may be left over: a leftover is a permanently desynced socket.
+    client.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut client, b"+PONG\r\n");
+
+    node.stop();
+}
+
+/// Class check, not site check: every command in the registry, plus every
+/// subcommand dispatcher that formats client bytes into its error, answers
+/// **exactly one** RESP reply when its arguments carry CR/LF. One fresh
+/// connection per case, so a split cannot hide inside the next case.
+#[test]
+fn no_command_can_split_its_reply_with_hostile_argument_bytes() {
+    let node = Node::start(2);
+    // A complete `+INJECTED\r\n` reply framed by CRLFs: if any byte of it
+    // reaches the wire unsanitized, `split_replies` sees two replies.
+    const SPLIT: &[u8] = b"\r\n+INJECTED\r\n";
+
+    let mut cases: Vec<(String, Vec<Vec<u8>>)> = Vec::new();
+    let hostile = |suffix: &[u8]| -> Vec<u8> {
+        let mut v = suffix.to_vec();
+        v.extend_from_slice(SPLIT);
+        v
+    };
+    // The unknown-command path: the payload as the command *name*, and as
+    // an argument of an unknown command.
+    cases.push(("unknown-name".into(), vec![hostile(b"BAD"), b"x".to_vec()]));
+    cases.push(("unknown-arg".into(), vec![b"NOSUCHCMD".to_vec(), hostile(b"a")]));
+    cases.push(("lone-lf-name".into(), vec![b"BAD\nLF".to_vec(), b"x".to_vec()]));
+    cases.push(("lone-cr-name".into(), vec![b"BAD\rCR".to_vec(), b"x".to_vec()]));
+    cases.push(("trailing-crlf-name".into(), vec![b"BAD\r\n".to_vec()]));
+    // The subcommand dispatchers, which reply through the plane rather than
+    // `execute` — every one of these split the reply before the fix.
+    for (name, sub) in [
+        (&b"DEBUG"[..], &b"NOPE"[..]),
+        (b"CONFIG", b"NOPE"),
+        (b"OBJECT", b"NOPE"),
+        (b"CLIENT", b"NOPE"),
+        (b"PUBSUB", b"NOPE"),
+        (b"INF.NS", b"NOPE"),
+        (b"INF.CKPT", b"NOPE"),
+    ] {
+        cases.push((
+            format!("{}-subcommand", String::from_utf8_lossy(name)),
+            vec![name.to_vec(), hostile(sub)],
+        ));
+    }
+    cases.push((
+        "config-set-param".into(),
+        vec![b"CONFIG".to_vec(), b"SET".to_vec(), hostile(b"nope"), b"1".to_vec()],
+    ));
+    cases.push((
+        "json-path".into(),
+        vec![b"JSON.GET".to_vec(), b"nokey".to_vec(), hostile(b"$.a[")],
+    ));
+    cases.push(("ns-use-name".into(), vec![b"INF.NS".to_vec(), b"USE".to_vec(), hostile(b"nope")]));
+    // And the whole registry with a hostile trailing argument: the point is
+    // that no *future* error text can reopen the hole either.
+    for meta in &inf_wire::COMMANDS {
+        cases.push((
+            format!("registry-{}", meta.name),
+            vec![meta.name.as_bytes().to_vec(), hostile(b"z")],
+        ));
+    }
+
+    let mut failures = Vec::new();
+    for (label, argv) in &cases {
+        let parts: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+        let mut client = node.connect();
+        client.write_all(&cmd(&parts)).expect("write");
+        let raw = match read_through_ping(&mut client) {
+            Ok(raw) => raw,
+            Err(raw) => {
+                let raw = String::from_utf8_lossy(&raw);
+                failures.push(format!("{label}: the connection closed after: {raw:?}"));
+                continue;
+            }
+        };
+        match split_replies(&raw) {
+            Err(e) => failures.push(format!(
+                "{label}: reply is not whole frames ({e}): {:?}",
+                String::from_utf8_lossy(&raw)
+            )),
+            Ok(replies) => {
+                if replies.len() != 1 {
+                    failures.push(format!(
+                        "{label}: {} replies for one command: {:?}",
+                        replies.len(),
+                        String::from_utf8_lossy(&raw)
+                    ));
+                } else if replies[0] == b"+INJECTED\r\n" {
+                    failures.push(format!("{label}: the reply IS the injected frame"));
+                }
+            }
+        }
+        // The connection must still be usable — sanitization, not closure:
+        // a second sentinel answers with nothing ahead of it.
+        match read_through_ping(&mut client) {
+            Ok(raw) if raw.is_empty() => {}
+            Ok(raw) | Err(raw) => failures.push(format!(
+                "{label}: connection unusable after: {:?}",
+                String::from_utf8_lossy(&raw)
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} hostile-argument cases split their reply:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+
+    node.stop();
+}
+
+// ---------------------------------------------------------------------
+// ADR-0101 — cross-cell pub/sub self-delivery order (review finding N4).
+// ---------------------------------------------------------------------
+
+/// A channel owned by `cell` under an N-cell contiguous router.
+fn channel_for_cell(cells: u16, cell: u16) -> Vec<u8> {
+    let router = SlotRouter::new_contiguous(cells);
+    for i in 0..100_000u32 {
+        let ch = format!("ch:{i}");
+        if router.cell_of(SlotRouter::slot_of(ch.as_bytes())) == CellId(cell) {
+            return ch.into_bytes();
+        }
+    }
+    panic!("no channel found for cell {cell}");
+}
+
+/// `HELLO 3`, draining the reply map (ends with the empty modules array).
+fn hello3(conn: &mut TcpStream) {
+    conn.write_all(&cmd(&[b"HELLO", b"3"])).expect("write");
+    let mut drained = Vec::new();
+    let mut byte = [0u8; 1];
+    while !drained.ends_with(b"*0\r\n") {
+        conn.read_exact(&mut byte).expect("hello body");
+        drained.push(byte[0]);
+    }
+}
+
+fn bulk_frame(s: &[u8]) -> Vec<u8> {
+    let mut out = format!("${}\r\n", s.len()).into_bytes();
+    out.extend_from_slice(s);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// RESP3 `>3 message ch payload`.
+fn push_message(ch: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = b">3\r\n$7\r\nmessage\r\n".to_vec();
+    out.extend(bulk_frame(ch));
+    out.extend(bulk_frame(payload));
+    out
+}
+
+/// RESP3 `>4 pmessage pattern ch payload`.
+fn push_pmessage(pattern: &[u8], ch: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = b">4\r\n$8\r\npmessage\r\n".to_vec();
+    out.extend(bulk_frame(pattern));
+    out.extend(bulk_frame(ch));
+    out.extend(bulk_frame(payload));
+    out
+}
+
+/// `SUBSCRIBE ch` on a RESP3 connection, expecting subscription count `n`.
+fn subscribe3(conn: &mut TcpStream, ch: &[u8], n: u32) {
+    conn.write_all(&cmd(&[b"SUBSCRIBE", ch])).expect("write");
+    let mut want = b">3\r\n$9\r\nsubscribe\r\n".to_vec();
+    want.extend(bulk_frame(ch));
+    want.extend_from_slice(format!(":{n}\r\n").as_bytes());
+    read_exactly(conn, &want);
+}
+
+/// ADR-0101 D1–D4 (review finding N4): a RESP3 connection subscribed to a
+/// channel a *remote* cell owns publishes to it. Redis order is the count
+/// reply, then the publisher's own push. Pre-fix the owner's `INF.PUBFAN`
+/// leg wrote the push into this connection before the fabric round-trip
+/// returned `:1` — the frame permutation the node compat lane pinned.
+#[test]
+fn cross_cell_self_publish_reply_precedes_push() {
+    let node = Node::start(2);
+    let mut c = conn_on_cell(&node, 0);
+    hello3(&mut c);
+    let ch = channel_for_cell(2, 1);
+    subscribe3(&mut c, &ch, 1);
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"selfmsg"])).expect("write");
+    let mut want = b":1\r\n".to_vec();
+    want.extend(push_message(&ch, b"selfmsg"));
+    read_exactly(&mut c, &want);
+    // Channel and pattern frames both ride the reply: message, then
+    // pmessage, after the count — Redis order (ADR-0010 §5).
+    c.write_all(&cmd(&[b"PSUBSCRIBE", b"ch:*"])).expect("write");
+    read_exactly(&mut c, b">3\r\n$10\r\npsubscribe\r\n$4\r\nch:*\r\n:2\r\n");
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"both"])).expect("write");
+    let mut want = b":2\r\n".to_vec();
+    want.extend(push_message(&ch, b"both"));
+    want.extend(push_pmessage(b"ch:*", &ch, b"both"));
+    read_exactly(&mut c, &want);
+    // An unsubscribed publisher on the same connection state is untagged
+    // and unchanged: plain count reply.
+    c.write_all(&cmd(&[b"UNSUBSCRIBE", &ch])).expect("write");
+    let mut want = b">3\r\n$11\r\nunsubscribe\r\n".to_vec();
+    want.extend(bulk_frame(&ch));
+    want.extend_from_slice(b":1\r\n");
+    read_exactly(&mut c, &want);
+    c.write_all(&cmd(&[b"PUNSUBSCRIBE", b"ch:*"])).expect("write");
+    read_exactly(&mut c, b">3\r\n$12\r\npunsubscribe\r\n$4\r\nch:*\r\n:0\r\n");
+    c.write_all(&cmd(&[b"PUBLISH", &ch, b"nobody"])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    drop(c);
+    node.stop();
+}
+
+/// ADR-0101 D4: pipelined publishes to channels with two *different*
+/// remote owners. Their fan legs and replies reach this cell in any
+/// order; pairing by sequence keeps each reply followed by exactly its
+/// own frames — `:1 push(a) :1 push(b)`, never a foreign push after the
+/// wrong reply (the per-connection deferral alternative's failure).
+#[test]
+fn pipelined_self_publishes_pair_each_reply_with_its_own_frames() {
+    let node = Node::start(4);
+    let mut c = conn_on_cell(&node, 0);
+    hello3(&mut c);
+    let a = channel_for_cell(4, 1);
+    let b = channel_for_cell(4, 2);
+    subscribe3(&mut c, &a, 1);
+    subscribe3(&mut c, &b, 2);
+    for round in 0..20u32 {
+        let ma = format!("a{round}").into_bytes();
+        let mb = format!("b{round}").into_bytes();
+        let mut wire = cmd(&[b"PUBLISH", &a, &ma]);
+        wire.extend(cmd(&[b"PUBLISH", &b, &mb]));
+        c.write_all(&wire).expect("write");
+        let mut want = b":1\r\n".to_vec();
+        want.extend(push_message(&a, &ma));
+        want.extend_from_slice(b":1\r\n");
+        want.extend(push_message(&b, &mb));
+        read_exactly(&mut c, &want);
+    }
+    drop(c);
+    node.stop();
+}
+
+/// ADR-0101 D3: the tag defers only the tagged connection's frames. A
+/// second subscriber on the owner cell publishing the *same payload* on
+/// the same channel while the first's publish is in flight loses
+/// nothing: both frames reach both connections, every count is 2, and
+/// the self-subscribed publisher's own push still follows its reply.
+#[test]
+fn foreign_publish_during_self_publish_is_not_swallowed() {
+    let node = Node::start(2);
+    let ch = channel_for_cell(2, 1);
+    let mut remote = conn_on_cell(&node, 0);
+    hello3(&mut remote);
+    subscribe3(&mut remote, &ch, 1);
+    let mut owner = conn_on_cell(&node, 1);
+    hello3(&mut owner);
+    subscribe3(&mut owner, &ch, 1);
+    for _ in 0..20 {
+        // Neither reply is read before both publishes are on the wire.
+        owner.write_all(&cmd(&[b"PUBLISH", &ch, b"same"])).expect("write");
+        remote.write_all(&cmd(&[b"PUBLISH", &ch, b"same"])).expect("write");
+        let push = push_message(&ch, b"same");
+        for conn in [&mut remote, &mut owner] {
+            // Three frames: `:2` and two identical pushes, in one of the
+            // two legal orders — the publisher's own push is contiguous
+            // with its reply, so the frame after `:2` is always a push.
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            let total = 4 + 2 * push.len();
+            while got.len() < total {
+                conn.read_exact(&mut byte).expect("frames");
+                got.push(byte[0]);
+            }
+            let mut a = b":2\r\n".to_vec();
+            a.extend(&push);
+            a.extend(&push);
+            let mut b = push.clone();
+            b.extend_from_slice(b":2\r\n");
+            b.extend(&push);
+            assert!(got == a || got == b, "frames: {:?}", String::from_utf8_lossy(&got));
+        }
+    }
+    drop(remote);
+    drop(owner);
+    node.stop();
+}
+
+// ---------------------------------------------------------------------
+// ADR-0100 — namespace drop residue (review C13 / F-L14-04).
+// ---------------------------------------------------------------------
+
+/// The value of key `k{i}` in the ADR-0100 tests: every even key is an
+/// 8 KiB blob (above the 4 KiB `BLOB-THRESHOLD`, so it lands in
+/// `ns-16/cold` as an extent file at SET time — real residue on disk);
+/// odd keys stay inline.
+fn cold_value(i: u32) -> Vec<u8> {
+    if i.is_multiple_of(2) {
+        let mut v = format!("blob{i}:").into_bytes();
+        v.resize(8 << 10, b'x');
+        v
+    } else {
+        format!("v{i}").into_bytes()
+    }
+}
+
+/// Creates the tiered namespace `cold` (id 16 on a fresh directory),
+/// writes `keys` values into it (half of them blob extents), fills the
+/// ring until **every cell has demoted and flush-confirmed** cold bytes
+/// (so the checkpoint carries a live-set section — the residue class the
+/// `m4-tiered` DST found on the fix's first seed, invisible to a
+/// checkpoint of RAM-only data), publishes a checkpoint on every cell so
+/// each `MANIFEST` carries its tier section, and asserts every cell holds
+/// cold files — the residue the tests are about must exist, or they
+/// prove nothing.
+fn seed_tiered_namespace_with_checkpoint(node: &Node, dir: &std::path::Path, keys: u32) {
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"cold",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+        b"MUTABLE-FRACTION",
+        b"100",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..keys {
+        c.write_all(&cmd(&[b"SET", format!("k{i}").as_bytes(), &cold_value(i)])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // Ring fill: 3 KiB inline values (below the blob threshold) in
+    // pipelined batches until both cells report flush-confirmed bytes.
+    let mut scrapers: Vec<TcpStream> = (0..2).map(|cell| conn_on_cell(node, cell)).collect();
+    let filler = vec![b'f'; 3 << 10];
+    let mut batch = 0u32;
+    loop {
+        let flushed_everywhere = scrapers
+            .iter_mut()
+            .all(|s| scrape_u64(s, b"tiering", "tiering_flush_confirmed_bytes:") > 0);
+        if flushed_everywhere {
+            break;
+        }
+        assert!(batch < 128, "no cell demoted after {batch} batches of 200 × 3 KiB");
+        let mut wire = Vec::new();
+        for i in 0..200u32 {
+            wire.extend(cmd(&[b"SET", format!("fill{batch}:{i}").as_bytes(), &filler]));
+        }
+        c.write_all(&wire).expect("write");
+        for _ in 0..200 {
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        batch += 1;
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let shard = dir.join(format!("shard-{cell}"));
+        let manifest = inf_log::read_manifest(&inf_log::fs::StdSegmentFs, &shard)
+            .expect("manifest reads")
+            .expect("checkpoint published");
+        assert!(
+            manifest.tiers.iter().any(|t| t.ns == 16),
+            "cell {cell}: MANIFEST names the tiered namespace before the drop"
+        );
+        assert!(
+            tier_residue_files(dir, cell) > 0,
+            "cell {cell}: cold files exist before the drop (the residue under test)"
+        );
+    }
+}
+
+/// Files under `shard-k/ns-16/cold` (0 when the directory is gone).
+fn tier_residue_files(dir: &std::path::Path, cell: u16) -> usize {
+    let cold = dir.join(format!("shard-{cell}")).join("ns-16").join("cold");
+    match std::fs::read_dir(&cold) {
+        Ok(entries) => entries.count(),
+        Err(_) => 0,
+    }
+}
+
+/// Polls `INFO persistence` until `field` reads `want` (the gauge
+/// refreshes at MAINTAIN cadence), returning the last text.
+fn wait_persistence_field(conn: &mut TcpStream, field: &str, want: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = info_text(conn, b"persistence");
+        if text.contains(&format!("{field}:{want}\r\n")) || Instant::now() >= deadline {
+            return text;
+        }
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// ADR-0100 (review C13 / F-L14-04): dropping a tiered namespace after a
+/// checkpoint named it must leave a bootable directory even when no
+/// checkpoint follows the drop. Pre-fix every reopen refused with
+/// "MANIFEST carries a tier section for ns 16 the catalog does not know".
+/// Post-fix: the catalog's tombstone explains the residue, recovery
+/// sweeps it, a post-boot checkpoint plus one DDL persist retires the
+/// tombstone, and a third boot reads a tombstone-free catalog.
+#[test]
+fn dropped_tiered_namespace_reboots_without_a_checkpoint() {
+    let dir = temp_data_dir("drop-reboot");
+    let node = Node::start_durable(2, &dir);
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 64);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+
+    // No checkpoint since the drop: every MANIFEST still names ns 16.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:0"), "{tiering}");
+    for cell in 0..2 {
+        assert_eq!(tier_residue_files(&dir, cell), 0, "cell {cell}: residue swept at boot");
+    }
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "1");
+    assert!(text.contains("ns_drop_tombstones:1\r\n"), "survives the boot: {text}");
+    // Retirement: every cell publishes a post-boot checkpoint (the boot
+    // re-stamped the tombstone with one), then any DDL persist retires it.
+    c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"scratch", b"MODE", b"memory"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "retired: {text}");
+    drop(c);
+    node.stop();
+
+    // Third boot: no tier section, no tombstone, no residue.
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "{text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reads every key `k0..keys` from namespace `cold` on `conn`.
+fn assert_cold_keys_served(conn: &mut TcpStream, keys: u32) {
+    conn.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    read_exactly(conn, b"+OK\r\n");
+    for i in 0..keys {
+        conn.write_all(&cmd(&[b"GET", format!("k{i}").as_bytes()])).expect("write");
+        let value = cold_value(i);
+        let mut want = format!("${}\r\n", value.len()).into_bytes();
+        want.extend_from_slice(&value);
+        want.extend_from_slice(b"\r\n");
+        read_exactly(conn, &want);
+    }
+    conn.write_all(&cmd(&[b"SELECT", b"0"])).expect("write");
+    read_exactly(conn, b"+OK\r\n");
+}
+
+/// Crash-matrix row `ns_drop_before_meta` (ADR-0100 D5): the DDL stops
+/// after the local apply and before the catalog persist request — the
+/// on-disk state of a cut at that instant. Nothing durable changed, the
+/// node's checkpoints are manual and none is requested after the drop,
+/// before the crash-equivalent stop, and the teardown hold kept every
+/// tier file (the origin cell's registry alone lacks the namespace, so
+/// the origin's own files are the ones that would have been unlinked
+/// pre-ADR). A restart serves the namespace with every key. A checkpoint
+/// of the origin cell published after the drop would omit the namespace
+/// (ADR-0186 D2); no row covers it.
+#[test]
+fn dropped_tiered_namespace_survives_a_cut_before_its_swap() {
+    let dir = temp_data_dir("drop-cut-before");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_DROP_BEFORE_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 32);
+    let residue_before: Vec<usize> = (0..2).map(|cell| tier_residue_files(&dir, cell)).collect();
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_drop_before_meta\r\n");
+    // Give MAINTAIN time to run its teardown slices: the hold must keep
+    // every file since no catalog swap carried the drop.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(200));
+    for cell in 0..2 {
+        assert_eq!(
+            tier_residue_files(&dir, cell),
+            residue_before[usize::from(cell)],
+            "cell {cell}: the teardown hold kept every file (ADR-0100 D5)"
+        );
+    }
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:1"), "namespace restored whole: {tiering}");
+    assert_cold_keys_served(&mut c, 32);
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "0");
+    assert!(text.contains("ns_drop_tombstones:0\r\n"), "no tombstone was ever written: {text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_drop_before_meta", "namespace-restored-whole");
+}
+
+/// Crash-matrix row `ns_drop_after_meta` (ADR-0100 D6): the DDL stops
+/// once the catalog swap is durable and before the fan — the on-disk
+/// state of a cut after the swap. `META` lacks the namespace and carries
+/// its tombstone while each peer's `MANIFEST` still names it. The restart
+/// boots (the pre-ADR fail-stop refused exactly this state), sweeps the
+/// residue on every cell, and the namespace is gone.
+#[test]
+fn dropped_tiered_namespace_survives_a_cut_after_its_swap() {
+    let dir = temp_data_dir("drop-cut-after");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_DROP_AFTER_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    seed_tiered_namespace_with_checkpoint(&node, &dir, 32);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"DROP", b"cold"])).expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_drop_after_meta\r\n");
+    drop(c);
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(tiering.contains("tiering_tables:0"), "the drop was durable: {tiering}");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"cold"])).expect("write");
+    let refusal = read_line(&mut c);
+    assert!(refusal.starts_with(b"-ERR"), "{refusal:?}");
+    for cell in 0..2 {
+        assert_eq!(tier_residue_files(&dir, cell), 0, "cell {cell}: residue swept (ADR-0100 D6)");
+    }
+    let text = wait_persistence_field(&mut c, "ns_drop_tombstones", "1");
+    assert!(text.contains("ns_drop_tombstones:1\r\n"), "{text}");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_drop_after_meta", "residue-swept");
+}
+
+// ---- review of 2026-08-30: H0 / F-L06-01 / F-L06-03 / C14 falsifiers ----
+
+/// H0 (review of 2026-08-30 §2, proven by execution): `INF.NS CREATE …
+/// MEM-BUDGET 1mb` — and every budget whose window is under four commit
+/// pages — reached `AddressSpace::new`'s release `assert!("ring smaller
+/// than four pages")` before the range gauntlet ran; the connection
+/// closed and the cell was dead. `2mb` alone was refused typed, because
+/// its ring happened to clear the assert and fail the later window
+/// check. Every sub-floor budget must answer a typed error, the node
+/// must keep serving, and the smallest legal budget must materialize.
+#[test]
+fn ns_create_sub_floor_budget_refuses_typed_and_node_survives() {
+    let dir = temp_data_dir("h0-sub-floor-budget");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    for budget in [&b"64kb"[..], b"256kb", b"512kb", b"1mb", b"2mb"] {
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"tiny",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            budget,
+        ]))
+        .expect("write");
+        // Pre-fix at 64kb: the read fails — the cell panicked and closed
+        // the socket (the review's "connection closed / node DEAD" row).
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR MEM-BUDGET + MAINTAIN-SLICE"),
+            "budget {}: {:?}",
+            String::from_utf8_lossy(budget),
+            String::from_utf8_lossy(&reply)
+        );
+        c.write_all(&cmd(&[b"PING"])).expect("write");
+        read_exactly(&mut c, b"+PONG\r\n");
+    }
+    // 3mb + the 1 MiB default slice = exactly four commit pages.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"tiny", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"tiny"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F-L06-01 (lane L06, High/Certain): ADR-0052 D1's `R ≥ 2 ×
+/// RECORD_INLINE_MAX` invariant was never enforced — `MEM-BUDGET 3mb`
+/// reserves a 4 MiB ring (`ring / 2` = 2 MiB) while the default
+/// `BLOB-THRESHOLD` stayed at 16 MiB, so a legal inline value between
+/// the two tripped `alloc`'s release assert. Reachability correction to
+/// the lane's scenario: one frame is capped at 1 MiB by the wire parser
+/// (`ParserLimits::max_frame_bytes`), so the route is growth —
+/// `APPEND` (or `SETRANGE`, L13-04) walks a value past `ring / 2` in
+/// three 900 KiB steps. Now the default threshold derives from the ring
+/// (ADR-0102 D2), so the grown value rides an extent and round-trips;
+/// an explicit over-bound threshold is refused typed at CREATE.
+#[test]
+fn inline_value_above_half_ring_is_routed_out_of_line() {
+    let dir = temp_data_dir("l06-01-half-ring");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"DISK-BUDGET",
+        b"64mb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let chunk: Vec<u8> = (0..900usize << 10).map(|i| b'a' + (i % 23) as u8).collect();
+    c.write_all(&cmd(&[b"SET", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // 1.8 MiB: still under ring / 2 pre-fix (inline), over the derived
+    // 1 MiB threshold post-fix (extent).
+    c.write_all(&cmd(&[b"APPEND", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 2 * chunk.len()).as_bytes());
+    // 2.7 MiB: above ring / 2, below the old 16 MiB default threshold.
+    // Pre-fix: the read fails — `allocation exceeds half the ring`.
+    c.write_all(&cmd(&[b"APPEND", b"big", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 3 * chunk.len()).as_bytes());
+    c.write_all(&cmd(&[b"STRLEN", b"big"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 3 * chunk.len()).as_bytes());
+    c.write_all(&cmd(&[b"GET", b"big"])).expect("write");
+    let got = read_get(&mut c).expect("GET");
+    assert_eq!(got.len(), 3 * chunk.len());
+    assert!(got == chunk.repeat(3), "the 2.7 MiB value round-trips through its extent");
+    let tiering = info_text(&mut c, b"tiering");
+    assert!(
+        scrape_u64(&mut c, b"tiering", "tiering_blob_extents_created:") >= 1,
+        "routed out of line: {tiering}"
+    );
+    // The explicit face: a threshold the ring cannot honour is refused
+    // at the gauntlet, never accepted and clamped in silence.
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot2",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"BLOB-THRESHOLD",
+        b"4mb",
+    ]))
+    .expect("write");
+    let reply = read_line(&mut c);
+    assert!(
+        reply.starts_with(b"-ERR BLOB-THRESHOLD"),
+        "an over-bound explicit threshold refuses typed: {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    // Liveness from an unbound connection (PING is outside the tiered
+    // string family on a bound one).
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    drop((c, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ADR-0103 D5 / crash-matrix row `ns_create_after_meta`: the CREATE DDL
+/// stops once its catalog swap is durable and before the local apply —
+/// `META` names a namespace no cell serves and no client was ever
+/// answered `+OK`. A restart seeds it from `META` and serves it on
+/// every cell (an un-acked DDL that took effect: ack-after-durable).
+#[test]
+fn created_namespace_survives_a_cut_after_its_swap() {
+    let dir = temp_data_dir("create-cut-after");
+    let node = Node::start_durable_with_faults(
+        2,
+        &dir,
+        vec![(inf_server::fault::NS_CREATE_AFTER_META, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"early", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_create_after_meta\r\n");
+    // No cell serves it in this life: the apply never ran anywhere.
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"early"])).expect("write");
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR namespace 'early' not found"),
+            "cell {cell}: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    drop(c);
+    // The cut: the durable swap is the on-disk state the restart reads.
+    node.stop();
+
+    let node = Node::start_durable(2, &dir);
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"early"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"seeded-from-meta"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    // The name is taken for good in this life: the DDL took effect.
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"early", b"MODE", b"durable"])).expect("write");
+    read_exactly(&mut c, b"-ERR namespace already exists\r\n");
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("ns_create_after_meta", "namespace-seeded-from-meta");
+}
+
+/// F-L06-03 (lane L06, High; L00-21 could not reproduce it by random
+/// racing): the extent read arm of `resolve` returns an address
+/// validated **before** `fetch_extent`'s multi-round `await` chain, and
+/// `try_write` consumed it unguarded — a concurrent write to the same
+/// key moved the slot, and `Index::replace` panicked the cell
+/// (`replace target present`). Two connections on one cell, a ~3 MB
+/// blob (184 cold windows per fetch, so the second writer's resolve
+/// lands inside the first's read): both writes must complete, the final
+/// value must be one of the two, and the write funnel must have
+/// **observed** the race (`tiering_write_replans`), so a green run is
+/// never vacuous.
+#[test]
+fn concurrent_writes_to_a_blob_key_never_desync_the_index() {
+    let dir = temp_data_dir("l06-03-blob-race");
+    let node = Node::start_durable(1, &dir);
+    let mut a = node.connect();
+    let mut b = node.connect();
+    a.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"hot",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"16mb",
+        b"DISK-BUDGET",
+        b"512mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    for c in [&mut a, &mut b] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"hot"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    }
+    // One frame is capped at 1 MiB (`ParserLimits`): grow the blob by
+    // `APPEND` — every step re-fetches and re-writes the extent.
+    let piece: Vec<u8> = (0..1_000_000usize).map(|i| b'a' + (i % 23) as u8).collect();
+    for round in 0..6u32 {
+        let key = format!("race:{round}").into_bytes();
+        a.write_all(&cmd(&[b"SET", &key, &piece])).expect("write");
+        read_exactly(&mut a, b"+OK\r\n");
+        for n in 2..=3u32 {
+            a.write_all(&cmd(&[b"APPEND", &key, &piece])).expect("write");
+            read_exactly(&mut a, format!(":{}\r\n", n as usize * piece.len()).as_bytes());
+        }
+        // Both resolve the key through the extent arm; the first to
+        // finish moves the slot, the other holds a dead address. The
+        // sender order alternates so each connection is the loser too.
+        let va = format!("a:{round}").into_bytes();
+        let vb = format!("b:{round}").into_bytes();
+        let (first, second) = if round % 2 == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
+        let (vf, vs) = if round % 2 == 0 { (&va, &vb) } else { (&vb, &va) };
+        first.write_all(&cmd(&[b"SET", &key, vf])).expect("write");
+        second.write_all(&cmd(&[b"SET", &key, vs])).expect("write");
+        // Pre-fix: one of these reads fails — the cell panicked.
+        read_exactly(first, b"+OK\r\n");
+        read_exactly(second, b"+OK\r\n");
+        a.write_all(&cmd(&[b"GET", &key])).expect("write");
+        let got = read_get(&mut a).expect("GET");
+        assert!(got == va || got == vb, "round {round}: {:?}", String::from_utf8_lossy(&got));
+    }
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    let replans = scrape_u64(&mut probe, b"tiering", "tiering_write_replans:");
+    assert!(replans >= 1, "the race was never exercised — the test proves nothing");
+    drop((a, b, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// C14 (= F-L14-05, Critical; L00-35 missed it with a 50-round-trip
+/// window): a namespace was servable on every cell **before its
+/// definition was durable** — the DDL program applied locally, fanned,
+/// and only then requested the `META` swap, while nothing gated command
+/// dispatch on the swap. A second connection could `USE` the namespace
+/// inside that window and have an `always` write acked; a cut before
+/// the swap booted a catalog that never learned the id, and replay
+/// skipped the record as `SkippedUnknownNs`. The swap is held here
+/// (harness-driven catalog writer), so the window is as wide as the
+/// test wants: no cell may serve the namespace until `META` names it.
+#[test]
+fn namespace_is_unusable_until_its_definition_is_durable() {
+    let dir = temp_data_dir("c14-create-window");
+    let hold = Arc::new(AtomicBool::new(true));
+    let node = Node::start_durable_with_held_catalog(2, &dir, Arc::clone(&hold));
+    let mut creator = node.connect();
+    creator
+        .write_all(&cmd(&[
+            b"INF.NS", b"CREATE", b"fresh", b"MODE", b"durable", b"FSYNC", b"always",
+        ]))
+        .expect("write");
+    // The DDL parks on the held swap. Give the fan (pre-fix) or the
+    // persist request (post-fix) time to land before probing.
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(300));
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh"])).expect("write");
+        let reply = read_line(&mut c);
+        if reply == b"+OK\r\n" {
+            // Pre-fix: servable — and an `always` write acks here.
+            let mut key = key_for_cell(2, cell);
+            key.extend_from_slice(b":c14");
+            c.write_all(&cmd(&[b"SET", &key, b"acked-before-durable"])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+            acked.push(key);
+        } else {
+            assert!(
+                reply.starts_with(b"-ERR namespace 'fresh' not found"),
+                "cell {cell}: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+    }
+    // The cut inside the window: the swap never lands.
+    drop(creator);
+    node.kill_without_catalog_drain();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh"])).expect("write");
+    let reply = read_line(&mut c);
+    if !acked.is_empty() {
+        // The review's exact signature: acked writes, namespace gone.
+        assert_eq!(
+            reply,
+            b"+OK\r\n",
+            "acked `always` writes into 'fresh' exist but the namespace is gone after the cut \
+             (keys {:?}): {:?}",
+            acked.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>(),
+            String::from_utf8_lossy(&reply)
+        );
+        for key in &acked {
+            c.write_all(&cmd(&[b"GET", key])).expect("write");
+            assert_eq!(read_get(&mut c).expect("GET"), b"acked-before-durable");
+        }
+    }
+    assert!(
+        acked.is_empty(),
+        "{} acked write(s) were served before the namespace's definition was durable (C14)",
+        acked.len()
+    );
+    // Nothing was promised: the un-acked CREATE may or may not exist.
+    assert!(
+        reply == b"+OK\r\n" || reply.starts_with(b"-ERR namespace 'fresh' not found"),
+        "{:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    drop(c);
+    node.stop();
+
+    // The released half: the swap lands, the CREATE acks, the namespace
+    // serves on every cell, and an acked write survives a restart.
+    let hold = Arc::new(AtomicBool::new(false));
+    let node = Node::start_durable_with_held_catalog(2, &dir, hold);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"fresh2", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh2"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"durable-definition"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    node.stop();
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"fresh2"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_get(&mut c).expect("GET"), b"durable-definition");
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- review of 2026-08-30, L12-01: DEBUG OBJECT routes to the owner ----
+
+/// Review of 2026-08-30 (L12-01, the last member of C1's class):
+/// `DEBUG OBJECT <key>` was the one key-addressed command declared
+/// `KeySpec::NONE`, so it probed whichever cell the connection landed on
+/// and answered `-ERR no such key` for every key another cell owns — while
+/// `GET` on the same connection served the value. Goal: on a four-cell
+/// node, one connection SETs a key owned by every cell and `DEBUG OBJECT`
+/// must agree with `GET` on all four (pre-fix: three of four answered
+/// "no such key", stable by key name). Method: the default db here; the
+/// namespace-bound `ApplyNs` route in the test below.
+#[test]
+fn debug_object_routes_to_the_owning_cell() {
+    let node = Node::start(4);
+    let mut c = node.connect();
+    assert_debug_object_agrees_with_get(&mut c, 4, "db0");
+    drop(c);
+    node.stop();
+}
+
+/// The namespace-bound half of L12-01: a connection bound with `INF.NS
+/// USE` dispatches through `dispatch_ns`, whose owner resolution reads the
+/// same key spec — a memory namespace and a flat durable one, both on a
+/// four-cell node.
+#[test]
+fn debug_object_routes_under_a_named_namespace() {
+    let dir = temp_data_dir("debug-object-ns");
+    let node = Node::start_durable(4, &dir);
+    let mut c = node.connect();
+    let creates: [&[&[u8]]; 2] = [
+        &[b"INF.NS", b"CREATE", b"dbgmem", b"MODE", b"memory"],
+        &[b"INF.NS", b"CREATE", b"dbgdur", b"MODE", b"durable", b"FSYNC", b"everysec"],
+    ];
+    for create in creates {
+        c.write_all(&cmd(create)).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    for ns in ["dbgmem", "dbgdur"] {
+        c.write_all(&cmd(&[b"INF.NS", b"USE", ns.as_bytes()])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        assert_debug_object_agrees_with_get(&mut c, 4, ns);
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One key per cell: `SET`, then `DEBUG OBJECT` and `GET` on the same
+/// connection must agree on existence; the reply shape is the documented
+/// engine-internal one (`Value at:0x0 … serializedlength:<strlen>`), and a
+/// never-set key answers the Redis-exact error.
+fn assert_debug_object_agrees_with_get(c: &mut TcpStream, cells: u16, scope: &str) {
+    let mut disagreeing: Vec<(u16, String)> = Vec::new();
+    for cell in 0..cells {
+        let key = key_for_cell(cells, cell);
+        let value = format!("{scope}:{cell}");
+        c.write_all(&cmd(&[b"SET", &key, value.as_bytes()])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"DEBUG", b"OBJECT", &key])).expect("write");
+        let debug = read_line(c);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_bulk(c), value.as_bytes(), "{scope}: GET on cell {cell}'s key");
+        if debug.starts_with(b"+Value at:0x0 refcount:1 encoding:") {
+            let tail = format!("serializedlength:{} lru:0 lru_seconds_idle:0\r\n", value.len());
+            assert!(
+                debug.ends_with(tail.as_bytes()),
+                "{scope}: DEBUG OBJECT reported another cell's length: {:?}",
+                String::from_utf8_lossy(&debug)
+            );
+        } else {
+            disagreeing.push((cell, String::from_utf8_lossy(&debug).into_owned()));
+        }
+    }
+    assert!(
+        disagreeing.is_empty(),
+        "{scope}: DEBUG OBJECT disagrees with GET for keys owned by cells {disagreeing:?}"
+    );
+    c.write_all(&cmd(&[b"DEBUG", b"OBJECT", b"never-set:l12-01"])).expect("write");
+    read_exactly(c, b"-ERR no such key\r\n");
+}
+
+/// Reads one complete RESP frame (any type, nested arrays included).
+fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(len) = reply_len(&buf, 0).expect("valid RESP") {
+            buf.truncate(len);
+            return buf;
+        }
+        let n = stream
+            .read(&mut chunk)
+            .unwrap_or_else(|err| panic!("{}", reply_read_failed(stream, "read frame", &err)));
+        assert!(n > 0, "connection closed mid-frame; got {:?}", String::from_utf8_lossy(&buf));
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// How one connection-level template's three replies are compared.
+#[derive(Copy, Clone)]
+enum ConnLevelCompare {
+    /// Byte-identical on every binding.
+    Exact,
+    /// The same reply type and no error (payload carries connection or
+    /// wall-clock identity: `HELLO`'s id, `INFO`, `LASTSAVE`).
+    Shape,
+}
+
+/// ADR-0108 (review of 2026-08-30, the batch-8 residual): a command that
+/// addresses nothing in the keyspace — `PING`, `ECHO`, `HELLO`, `CLIENT`,
+/// `INFO`, `COMMAND`, `CONFIG GET`, `INF.NS LIST`, `DEBUG SLEEP`, `LOLWUT`,
+/// pub/sub, the checkpoint surface — answers the same on an unbound
+/// connection, a memory-namespace-bound one and a **tiered**-bound one.
+/// Pre-fix the tiered arm's catch-all answered `-ERR this command is not
+/// supported on tiered namespaces in M4 (string family only)` to every
+/// one of them that reached it (batch 8 recorded `PING` as a limitation;
+/// the class was every `KeyspaceScope::None` row the dispatch did not
+/// list by hand). The test iterates the command table: every `None` row
+/// needs a template here, so a new connection-level command cannot land
+/// outside the class (Theme 3: assert the class, not one command).
+#[test]
+fn connection_level_commands_ignore_the_bound_namespace() {
+    use inf_wire::{COMMANDS, KeyspaceScope, keyspace_scope};
+    let dir = temp_data_dir("conn-level-ns");
+    let node = Node::start_durable(4, &dir);
+    let mut admin = node.connect();
+    for argv in [
+        &[&b"INF.NS"[..], b"CREATE", b"mem", b"MODE", b"memory"][..],
+        &[
+            &b"INF.NS"[..],
+            b"CREATE",
+            b"tier",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"64mb",
+            b"DISK-BUDGET",
+            b"256mb",
+        ][..],
+    ] {
+        admin.write_all(&cmd(argv)).expect("write");
+        assert_eq!(read_line(&mut admin), b"+OK\r\n", "{argv:?}");
+    }
+    // One template per connection-level command. `QUIT` closes the
+    // connection after its `+OK`; the subscribe family flips the
+    // connection into subscriber mode — every template therefore runs on
+    // three fresh connections.
+    let templates: &[(&str, &[&[u8]], ConnLevelCompare)] = &[
+        ("PING", &[b"PING"], ConnLevelCompare::Exact),
+        ("PING", &[b"PING", b"bound"], ConnLevelCompare::Exact),
+        ("ECHO", &[b"ECHO", b"tiered-bound"], ConnLevelCompare::Exact),
+        ("HELLO", &[b"HELLO", b"2"], ConnLevelCompare::Shape),
+        ("QUIT", &[b"QUIT"], ConnLevelCompare::Exact),
+        ("INFO", &[b"INFO", b"server"], ConnLevelCompare::Shape),
+        ("COMMAND", &[b"COMMAND", b"COUNT"], ConnLevelCompare::Exact),
+        ("SELECT", &[b"SELECT", b"0"], ConnLevelCompare::Exact),
+        ("CONFIG", &[b"CONFIG", b"GET", b"maxmemory"], ConnLevelCompare::Exact),
+        ("CLIENT", &[b"CLIENT", b"GETNAME"], ConnLevelCompare::Exact),
+        ("CLIENT", &[b"CLIENT", b"SETNAME", b"bound"], ConnLevelCompare::Exact),
+        ("LOLWUT", &[b"LOLWUT"], ConnLevelCompare::Exact),
+        ("SUBSCRIBE", &[b"SUBSCRIBE", b"conn-level"], ConnLevelCompare::Exact),
+        ("UNSUBSCRIBE", &[b"UNSUBSCRIBE", b"conn-level"], ConnLevelCompare::Exact),
+        ("PSUBSCRIBE", &[b"PSUBSCRIBE", b"conn-*"], ConnLevelCompare::Exact),
+        ("PUNSUBSCRIBE", &[b"PUNSUBSCRIBE", b"conn-*"], ConnLevelCompare::Exact),
+        ("PUBLISH", &[b"PUBLISH", b"conn-level", b"m"], ConnLevelCompare::Exact),
+        ("PUBSUB", &[b"PUBSUB", b"NUMSUB", b"conn-level"], ConnLevelCompare::Exact),
+        ("INF.NS", &[b"INF.NS", b"LIST"], ConnLevelCompare::Exact),
+        ("INF.NS", &[b"INF.NS", b"INFO", b"tier"], ConnLevelCompare::Exact),
+        ("INF.CKPT", &[b"INF.CKPT", b"WAIT"], ConnLevelCompare::Exact),
+        ("BGSAVE", &[b"BGSAVE"], ConnLevelCompare::Exact),
+        ("LASTSAVE", &[b"LASTSAVE"], ConnLevelCompare::Shape),
+        ("DEBUG", &[b"DEBUG", b"SLEEP", b"0"], ConnLevelCompare::Exact),
+        ("DEBUG", &[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"1"], ConnLevelCompare::Exact),
+    ];
+    // Coverage: every registry row whose scope is `None` has a template.
+    let missing: Vec<&str> = COMMANDS
+        .iter()
+        .filter(|m| keyspace_scope(m, None) == KeyspaceScope::None)
+        .filter(|m| !templates.iter().any(|(name, _, _)| *name == m.name))
+        .map(|m| m.name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "connection-level commands without a template (add one — the class must stay total): \
+         {missing:?}"
+    );
+    for (name, _, _) in templates {
+        let meta = inf_wire::lookup(name.as_bytes()).expect("template names a registered command");
+        assert_eq!(
+            keyspace_scope(meta, None),
+            KeyspaceScope::None,
+            "{name} is not connection-level"
+        );
+    }
+    const TIERED_REFUSAL: &[u8] =
+        b"-ERR this command is not supported on tiered namespaces in M4 (string family only)\r\n";
+    let mut failures = Vec::new();
+    let show = |argv: &[&[u8]]| {
+        argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>().join(" ")
+    };
+    for (name, argv, compare) in templates {
+        let argv_text = show(argv);
+        let mut unbound = node.connect();
+        let mut mem = connect_use(&node, b"mem");
+        let mut tier = connect_use(&node, b"tier");
+        let mut replies = Vec::new();
+        for (binding, conn) in
+            [("unbound", &mut unbound), ("memory-bound", &mut mem), ("tiered-bound", &mut tier)]
+        {
+            conn.write_all(&cmd(argv)).expect("write");
+            let reply = read_frame(conn);
+            // Batch 46 (F-L13-08): the template read one frame and never
+            // asserted the close — a bound connection's QUIT rides the
+            // pump, which dropped `close_requested`.
+            if *name == "QUIT" {
+                assert_closed(conn, &format!("QUIT on a {binding} connection"));
+            }
+            if reply == TIERED_REFUSAL {
+                failures.push(format!(
+                    "`{argv_text}` on a {binding} connection: the tiered arm's catch-all refusal"
+                ));
+            }
+            replies.push((binding, reply));
+            // Peer close is asynchronous; retire subscriptions before the next template.
+            let unsubscribe = match *name {
+                "SUBSCRIBE" => Some((
+                    &b"UNSUBSCRIBE"[..],
+                    &b"*3\r\n$11\r\nunsubscribe\r\n$10\r\nconn-level\r\n:0\r\n"[..],
+                )),
+                "PSUBSCRIBE" => Some((
+                    &b"PUNSUBSCRIBE"[..],
+                    &b"*3\r\n$12\r\npunsubscribe\r\n$6\r\nconn-*\r\n:0\r\n"[..],
+                )),
+                _ => None,
+            };
+            if let Some((command, expected)) = unsubscribe {
+                conn.write_all(&cmd(&[command, argv[1]])).expect("unsubscribe");
+                assert_eq!(read_frame(conn), expected);
+            }
+        }
+        let (_, first) = &replies[0];
+        for (binding, reply) in &replies[1..] {
+            let ok = match compare {
+                ConnLevelCompare::Exact => reply == first,
+                ConnLevelCompare::Shape => {
+                    reply.first() == first.first() && first.first() != Some(&b'-')
+                }
+            };
+            if !ok {
+                failures.push(format!(
+                    "`{argv_text}`: {binding} answered {:?}, unbound answered {:?}",
+                    String::from_utf8_lossy(&reply[..reply.len().min(120)]),
+                    String::from_utf8_lossy(&first[..first.len().min(120)])
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} connection-level command(s) depend on the bound namespace:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    println!(
+        "conn-level: {} templates over {} KeyspaceScope::None commands, 3 bindings each, 0 \
+             failures",
+        templates.len(),
+        COMMANDS.iter().filter(|m| keyspace_scope(m, None) == KeyspaceScope::None).count()
+    );
+    node.stop();
+}
+
+/// ADR-0108 D3 (review of 2026-08-30, the batch-8 partial-fan residual):
+/// a `CREATE` whose fan leg is refused on a peer must leave the namespace
+/// on **no** cell — before this the origin and the peers that accepted
+/// their leg served it while the client held an error, and `META` kept
+/// naming it until the next persist (the `m2-ns-ddl-race` DST's
+/// pre-fix signature: 64 of 64 seeds, cells `[1, 2, 3]` serving a
+/// refused `y`). The fault fires on the first `INF.NSFAN CREATE` leg
+/// every cell receives, so every peer refuses; the origin rolls back
+/// and answers the leg's error; a restart seeds nothing.
+#[test]
+fn create_with_a_refused_fan_leg_rolls_back_on_every_cell() {
+    let dir = temp_data_dir("create-refused-leg");
+    let node = Node::start_durable_with_faults(
+        4,
+        &dir,
+        vec![(inf_server::fault::NS_CREATE_FAN_REFUSED, inf_foundation::fault::FaultSpec::Nth(1))],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"half", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"-ERR fault: ns_create_fan_refused\r\n");
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"half"])).expect("write");
+        let reply = read_line(&mut c);
+        assert!(
+            reply.starts_with(b"-ERR namespace 'half' not found"),
+            "cell {cell} serves a rolled-back namespace: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    // The name is free again in this life (the rollback retired the
+    // pending entry and the catalog dropped the definition): a second
+    // CREATE — the fault fired once per cell — succeeds everywhere.
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"half", b"MODE", b"durable", b"FSYNC", b"always"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell_use(&node, cell, b"half");
+        let key = key_for_cell(4, cell);
+        c.write_all(&cmd(&[b"SET", &key, b"after-rollback"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    drop(c);
+    node.stop();
+
+    // The restart: META names exactly the second definition, and the
+    // acked writes into it are there (the rolled-back id's tombstone
+    // explains nothing because nothing was ever written under it).
+    let node = Node::start_durable(4, &dir);
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell_use(&node, cell, b"half");
+        let key = key_for_cell(4, cell);
+        c.write_all(&cmd(&[b"GET", &key])).expect("write");
+        read_exactly(&mut c, b"$14\r\nafter-rollback\r\n");
+    }
+    node.stop();
+    receipt::verified("ns_create_fan_refused", "create-rolled-back");
+}
+
+/// ADR-0108 D1: concurrent namespace DDL from every cell — `CREATE` and
+/// `DROP` of one name racing from four connections on four cells — ends
+/// with every cell agreeing on the namespace's existence and on the
+/// catalog listing, and every reply one of the honest four (`+OK`,
+/// "already exists", "not found"). The DDL ticket serializes the
+/// programs; the `m2-ns-ddl-race` DST holds the deterministic crossing
+/// (a frozen origin mid-fan); this is the real-node smoke of the class.
+#[test]
+fn concurrent_namespace_ddl_leaves_every_cell_agreeing() {
+    let dir = temp_data_dir("ddl-storm");
+    let node = Node::start_durable(4, &dir);
+    let port = node.port;
+    let rounds = 40u32;
+    let handles: Vec<_> = (0..4u16)
+        .map(|cell| {
+            std::thread::spawn(move || {
+                let mut c = loop {
+                    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
+                    s.write_all(&cmd(&[b"INFO", b"server"])).expect("write");
+                    let info = read_bulk(&mut s);
+                    let text = String::from_utf8_lossy(&info);
+                    if text.contains(&format!("cell:{cell}\r\n")) {
+                        break s;
+                    }
+                };
+                let mut bad = Vec::new();
+                for round in 0..rounds {
+                    let argv: Vec<&[u8]> = if (round + u32::from(cell)) % 2 == 0 {
+                        vec![
+                            b"INF.NS", b"CREATE", b"storm", b"MODE", b"durable", b"FSYNC",
+                            b"always",
+                        ]
+                    } else {
+                        vec![b"INF.NS", b"DROP", b"storm"]
+                    };
+                    c.write_all(&cmd(&argv)).expect("write");
+                    let reply = read_line(&mut c);
+                    // `DROP` spells the miss `namespace not found`; `USE`
+                    // spells it `namespace 'storm' not found` — both honest.
+                    let honest = reply == b"+OK\r\n"
+                        || reply.starts_with(b"-ERR namespace already exists")
+                        || reply.starts_with(b"-ERR namespace not found")
+                        || reply.starts_with(b"-ERR namespace 'storm' not found");
+                    if !honest {
+                        bad.push(format!(
+                            "cell {cell} round {round} {argv:?}: {:?}",
+                            String::from_utf8_lossy(&reply)
+                        ));
+                    }
+                }
+                bad
+            })
+        })
+        .collect();
+    let mut bad = Vec::new();
+    for h in handles {
+        bad.extend(h.join().expect("storm thread"));
+    }
+    assert!(bad.is_empty(), "dishonest DDL replies under contention:\n{}", bad.join("\n"));
+    // Quiescent agreement: every cell answers USE the same way and lists
+    // the same catalog.
+    let mut served = Vec::new();
+    let mut listings = Vec::new();
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"storm"])).expect("write");
+        served.push(read_line(&mut c) == b"+OK\r\n");
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"LIST"])).expect("write");
+        listings.push(read_frame(&mut c));
+    }
+    assert!(
+        served.iter().all(|&s| s == served[0]),
+        "cells disagree on 'storm' after the storm: {served:?}"
+    );
+    assert!(
+        listings.iter().all(|l| l == &listings[0]),
+        "cells list different catalogs after the storm"
+    );
+    // And META agrees with the cells: a restart serves it on every cell
+    // or on none, matching the pre-restart verdict.
+    node.stop();
+    let node = Node::start_durable(4, &dir);
+    for cell in 0..4u16 {
+        let mut c = conn_on_cell(&node, cell);
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"storm"])).expect("write");
+        let now = read_line(&mut c) == b"+OK\r\n";
+        assert_eq!(now, served[0], "cell {cell}: META disagrees with the pre-restart verdict");
+    }
+    node.stop();
+}
+
+/// Review of 2026-08-30 (F-L07-01; batch 23, ADR-0093 A10): a boot
+/// rebuild pairs **every** cold slot of one hash with its one RAM
+/// sibling, so a winner can carry several tickets — here two collision
+/// keys' cold slots beside the third key's RAM record, with the shadow
+/// arm **off** (the rebuild runs on every boot regardless of the knob).
+/// Pre-fix `delete_one` resolved the first ticket only, and
+/// `TieredTable::delete`'s release assert killed the cell (`delete of a
+/// shadow winner before its ticket resolved`). The reconciler's reads are
+/// failed by `shadow_reconcile_read_fail` so the rebuilt tickets stay
+/// open until the `DEL` — its own read is unaffected (ADR-0093 D4.3's
+/// shape on a real node). A third life proves the deletion durable and
+/// the collision keys intact.
+#[test]
+fn del_of_a_rebuilt_winner_carrying_two_tickets_drains_every_ticket() {
+    let dir = temp_data_dir("shadow-rebuilt-two-tickets");
+    let [k0, k1, k2] = inf_store::forced_collision_triple(0xF107_0001);
+    let (v0, v1, v2) = (vec![b'0'; 1500], vec![b'1'; 1400], vec![b'2'; 1300]);
+    let filler_keys = 600u64;
+    let filler = vec![b'f'; 8 << 10];
+    let bulk = |v: &[u8]| {
+        let mut e = format!("${}\r\n", v.len()).into_bytes();
+        e.extend_from_slice(v);
+        e.extend_from_slice(b"\r\n");
+        e
+    };
+    let use_t = |c: &mut TcpStream| {
+        // Promotion off: a cold GET below is a witness of cold-ness,
+        // never a relocation into RAM.
+        c.write_all(&cmd(&[b"CONFIG", b"SET", b"tiered-promote-on-read", b"no"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+        c.write_all(&cmd(&[b"INF.NS", b"USE", b"t"])).expect("write");
+        read_exactly(c, b"+OK\r\n");
+    };
+    {
+        let node = Node::start_durable(1, &dir);
+        let mut c = node.connect();
+        c.write_all(&cmd(&[
+            b"INF.NS",
+            b"CREATE",
+            b"t",
+            b"MODE",
+            b"durable",
+            b"MEM-BUDGET",
+            b"3mb",
+            b"MUTABLE-FRACTION",
+            b"200",
+        ]))
+        .expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        use_t(&mut c);
+        for (k, v) in [(&k0, &v0), (&k2, &v2)] {
+            c.write_all(&cmd(&[b"SET", k, v])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        for i in 0..filler_keys {
+            c.write_all(&cmd(&[b"SET", format!("fill:{i}").as_bytes(), &filler])).expect("write");
+            read_exactly(&mut c, b"+OK\r\n");
+        }
+        wait_demoted(&mut c, 1 << 20);
+        // Cold-ness asserted (the batch-1 trap): both collision keys
+        // resolve through the cold path.
+        let before = scrape_u64(&mut c, b"tiering", "tiering_cold_resolves:");
+        c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+        read_exactly(&mut c, &bulk(&v0));
+        c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+        read_exactly(&mut c, &bulk(&v2));
+        assert!(
+            scrape_u64(&mut c, b"tiering", "tiering_cold_resolves:") >= before + 2,
+            "the collision keys are cold before the third key is written"
+        );
+        // The third key of the hash: two exact cold candidates ⇒ the
+        // synchronous path (no ticket), RAM at the tail.
+        c.write_all(&cmd(&[b"SET", &k1, &v1])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        // The walk: refs for the two cold slots, an image for the RAM
+        // sibling — the index the next boot rebuilds tickets from.
+        c.write_all(&cmd(&[b"INF.CKPT", b"WAIT"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+        drop(c);
+        node.stop();
+    }
+    // Life 2: the rebuild forms two tickets on k1's record; the
+    // reconciler cannot resolve them; DEL must.
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(
+            inf_server::fault::SHADOW_RECONCILE_READ_FAIL,
+            inf_foundation::fault::FaultSpec::Always,
+        )],
+    );
+    let mut c = node.connect();
+    use_t(&mut c);
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"),
+        2,
+        "the rebuild paired both cold collision slots with the one RAM sibling (a vacuous row \
+         otherwise)"
+    );
+    let collisions = scrape_u64(&mut c, b"tiering", "tiering_shadow_resolved_collision:");
+    let forced = scrape_u64(&mut c, b"tiering", "tiering_shadow_forced_by_delete:");
+    c.write_all(&cmd(&[b"DEL", &k1])).expect("write");
+    read_exactly(&mut c, b":1\r\n");
+    c.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    read_exactly(&mut c, &bulk(&v0));
+    c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+    read_exactly(&mut c, &bulk(&v2));
+    assert_eq!(scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"), 0, "every ticket ended");
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_resolved_collision:"),
+        collisions + 2,
+        "both twins were read and told apart by DEL"
+    );
+    assert_eq!(
+        scrape_u64(&mut c, b"tiering", "tiering_shadow_forced_by_delete:"),
+        forced + 2,
+        "DEL forced both tickets"
+    );
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
+    drop(c);
+    node.stop();
+    // Life 3 (no fault): the deletion is durable, the collision keys
+    // survive, no ticket re-forms (the winner is gone).
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    use_t(&mut c);
+    c.write_all(&cmd(&[b"GET", &k1])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", &k0])).expect("write");
+    read_exactly(&mut c, &bulk(&v0));
+    c.write_all(&cmd(&[b"GET", &k2])).expect("write");
+    read_exactly(&mut c, &bulk(&v2));
+    assert_eq!(scrape_u64(&mut c, b"tiering", "tiering_shadow_pending:"), 0);
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", filler_keys + 2).as_bytes());
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("shadow_reconcile_read_fail", "del-drains-every-ticket");
+}
+
+/// Reads a `CONFIG GET <one key>` reply (`*2` of bulks) and returns the value.
+fn read_config_value(stream: &mut TcpStream) -> String {
+    assert_eq!(read_line(stream), b"*2\r\n");
+    let _key = read_bulk(stream);
+    String::from_utf8(read_bulk(stream)).expect("ascii")
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-04): `proto-max-bulk-len` is the cap
+/// the parser enforces — `CONFIG GET` answers it, a value under it is
+/// admitted on the local and the fabric path, `CONFIG SET` re-limits the
+/// cell's live connections in the same MAINTAIN that follows the apply and
+/// reaches every cell through the fan. Pre-fix the key answered 512 MiB,
+/// accepted any value, and changed nothing: the cap was a hard-coded
+/// 1 MiB and a 2 MiB `SET` closed the connection.
+#[test]
+fn proto_max_bulk_len_is_enforced_and_applies_to_live_connections() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CONFIG", b"GET", b"proto-max-bulk-len"])).expect("write");
+    let declared: usize = read_config_value(&mut a).parse().expect("an integer");
+    assert_eq!(declared, 16 << 20, "the declared default is the record-bound cap");
+
+    // A 2 MiB value: admitted on both owners (one of them crosses the fabric).
+    let two_mib = vec![b'v'; 2 << 20];
+    for cell in 0..2u16 {
+        let key = key_for_cell(2, cell);
+        a.write_all(&cmd(&[b"SET", &key, &two_mib])).expect("write");
+        read_exactly(&mut a, b"+OK\r\n");
+        a.write_all(&cmd(&[b"GET", &key])).expect("write");
+        assert_eq!(read_bulk(&mut a), two_mib, "cell {cell} owner round-trips 2 MiB");
+    }
+
+    // Lower the cap from `a`: `b`, live on the same cell, is re-limited
+    // before `a` even reads its `+OK` (apply → MAINTAIN push → RESPOND).
+    let mut b = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"1mb"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    let k0 = key_for_cell(2, 0);
+    // The refusal fires from the length line, before any payload: send
+    // the frame up to it (a full 2 MiB write would race the close).
+    let header = |key: &[u8]| {
+        let mut h = format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).into_bytes();
+        h.extend_from_slice(key);
+        h.extend_from_slice(format!("\r\n${}\r\n", two_mib.len()).as_bytes());
+        h
+    };
+    b.write_all(&header(&k0)).expect("write");
+    let line = read_line(&mut b);
+    assert!(
+        line.starts_with(
+            b"-ERR Protocol error: invalid bulk length: 2097152 exceeds limit 1048576"
+        ),
+        "{:?}",
+        String::from_utf8_lossy(&line)
+    );
+    assert_closed(&mut b, "a bulk length past proto-max-bulk-len");
+
+    // The fan reaches cell 1: once its `CONFIG GET` shows the value, the
+    // push ran in the same iteration, so a fresh connection there parses
+    // under the new cap.
+    let mut c1 = conn_on_cell(&node, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        c1.write_all(&cmd(&[b"CONFIG", b"GET", b"proto-max-bulk-len"])).expect("write");
+        if read_config_value(&mut c1) == "1048576" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the CONFIG fan never reached cell 1");
+    }
+    let mut d1 = conn_on_cell(&node, 1);
+    d1.write_all(&header(&k0)).expect("write");
+    let line = read_line(&mut d1);
+    assert!(line.starts_with(b"-ERR Protocol error: invalid bulk length"), "{line:?}");
+
+    // Redis's floor (1 MiB) is the floor here too.
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"512kb"])).expect("write");
+    let line = read_line(&mut a);
+    assert!(line.starts_with(b"-ERR CONFIG SET failed"), "{line:?}");
+
+    // Raised again: a fresh connection admits what the cap admits.
+    a.write_all(&cmd(&[b"CONFIG", b"SET", b"proto-max-bulk-len", b"4mb"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    let mut c = conn_on_cell(&node, 0);
+    c.write_all(&cmd(&[b"SET", &k0, &two_mib])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    node.stop();
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-06): one `INFO` reply from a
+/// multi-cell node names every field once, and each section's scope is
+/// disclosed beside its numbers. Pre-fix nine attribution names appeared
+/// twice — node-folded in `# Memory`, this cell's slice in `# Tripwires`.
+#[test]
+fn info_names_every_field_once_on_a_multi_cell_node() {
+    let node = Node::start(2);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    let all = info_text(&mut c, b"all");
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for line in all.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (name, _) = line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+        *seen.entry(name).or_default() += 1;
+    }
+    let twice: Vec<&str> = seen.iter().filter(|(_, n)| **n > 1).map(|(k, _)| *k).collect();
+    assert!(twice.is_empty(), "INFO names a field more than once: {twice:?}");
+    // This harness assembles no control plane, so the memory section says
+    // `cell`; the board-backed `node` fold is proven by the admin unit
+    // test and by the compat lane's spawned `infinityd`.
+    assert!(all.contains("memory_scope:cell\r\n"), "{all}");
+    assert!(all.contains("tripwire_scope:cell\r\n"), "{all}");
+    // Each section carries its own family only.
+    let memory = info_text(&mut c, b"memory");
+    assert!(memory.contains("used_memory_doc_resident:"), "{memory}");
+    assert!(!memory.contains("doc_resident_bytes:"), "{memory}");
+    let tripwires = info_text(&mut c, b"tripwires");
+    assert!(tripwires.contains("doc_resident_bytes:"), "{tripwires}");
+    assert!(!tripwires.contains("used_memory_doc_resident:"), "{tripwires}");
+    node.stop();
+}
+
+/// Batch 49 (review 2026-08-30, F-L15-07): every cell's `# Tripwires` is
+/// wholly its own slice, so folding the section across cells (the
+/// `inf-bench` scrape) sums cell numbers only. Pre-fix each cell's copy
+/// carried the whole process's `process_rss`: the fold read `cells × RSS`
+/// and a one-cell scrape's `sum(domains) / process_rss` read ≈ 1 / cells.
+/// `process_rss` renders once, in `# Memory`, beside `used_memory_rss`.
+#[test]
+fn info_tripwires_folds_across_cells_without_a_process_wide_gauge() {
+    const CELLS: u16 = 2;
+    let node = Node::start(CELLS);
+    let mut fold = std::collections::BTreeMap::<String, u64>::new();
+    for cell in 0..CELLS {
+        let mut c = conn_on_cell(&node, cell);
+        let tripwires = info_text(&mut c, b"tripwires");
+        assert!(tripwires.contains("tripwire_scope:cell\r\n"), "{tripwires}");
+        for line in tripwires.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let (name, value) =
+                line.split_once(':').unwrap_or_else(|| panic!("no ':' in {line:?}"));
+            if let Ok(v) = value.parse::<u64>() {
+                *fold.entry(name.to_string()).or_default() += v;
+            }
+        }
+    }
+    // The node runs in this process: its VmRSS is ours.
+    let rss = process_vm_rss_bytes();
+    assert!(rss > 0, "VmRSS unreadable");
+    if let Some(folded) = fold.get("process_rss") {
+        panic!(
+            "process_rss inside the cell-scope section: folded over {CELLS} cells = {folded} \
+             (this process's VmRSS {rss}, ×{:.2})",
+            *folded as f64 / rss as f64
+        );
+    }
+    let mut c = conn_on_cell(&node, 0);
+    node.process_sampler.borrow_mut().sample();
+    let memory = info_text(&mut c, b"memory");
+    let field = |name: &str| -> u64 {
+        memory
+            .lines()
+            .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(':')))
+            .unwrap_or_else(|| panic!("missing {name}: {memory}"))
+            .parse()
+            .expect("u64")
+    };
+    assert_eq!(field("process_rss"), field("used_memory_rss"), "{memory}");
+    assert!(field("process_rss") > 0, "the control-owner sample must reach INFO");
+    assert_eq!(memory.matches("process_rss:").count(), 1, "{memory}");
+    node.stop();
+}
+
+/// `VmRSS` of this process from procfs (Linux), in bytes.
+fn process_vm_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
+        })
+        .map_or(0, |kb| kb * 1024)
+}
+
+/// Batch 45 (review 2026-08-30, F-L15-09): `CLIENT LIST` from one
+/// connection reports another's selected db and subscription counts.
+/// Pre-fix every line said `db=0 sub=0 psub=0`.
+#[test]
+fn client_list_reports_the_db_and_subscriptions_of_another_connection() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    let mut b = conn_on_cell(&node, 0);
+    a.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+    let id_line = read_line(&mut a);
+    let id = String::from_utf8_lossy(&id_line[1..id_line.len() - 2]).to_string();
+    a.write_all(&cmd(&[b"SELECT", b"7"])).expect("write");
+    read_exactly(&mut a, b"+OK\r\n");
+    a.write_all(&cmd(&[b"SUBSCRIBE", b"x", b"y", b"z"])).expect("write");
+    let mut want = Vec::new();
+    for (i, ch) in ["x", "y", "z"].iter().enumerate() {
+        want.extend_from_slice(
+            format!("*3\r\n$9\r\nsubscribe\r\n$1\r\n{ch}\r\n:{}\r\n", i + 1).as_bytes(),
+        );
+    }
+    read_exactly(&mut a, &want);
+    b.write_all(&cmd(&[b"CLIENT", b"LIST"])).expect("write");
+    let list = String::from_utf8(read_bulk(&mut b)).expect("ascii");
+    let line = list
+        .lines()
+        .find(|l| l.starts_with(&format!("id={id} ")))
+        .unwrap_or_else(|| panic!("client {id} missing from CLIENT LIST:\n{list}"));
+    assert!(line.contains(" db=7 sub=3 psub=0 "), "{line}");
+    node.stop();
+}
+
+// ---- Batch 50 (review 2026-08-30): F-L15-03 + F-L15-05 --------------------
+
+/// Batch 50 (review 2026-08-30, F-L15-03): `INFO keyspace` counts the
+/// whole node, like `DBSIZE` — the node fold of every cell's per-db
+/// counts, labelled `keyspace_scope:node` (a durable node assembles the
+/// control plane, so the board exists). Pre-fix the section rendered the
+/// serving cell's counts with no scope line: half of `DBSIZE` on two cells.
+#[test]
+fn info_keyspace_counts_the_whole_node_like_dbsize() {
+    const CELLS: u16 = 2;
+    let dir = temp_data_dir("keyspace-fold");
+    let node = Node::start_durable(CELLS, &dir);
+    let mut c = node.connect();
+    for i in 0..64u32 {
+        let key = format!("kf:{i}");
+        c.write_all(&cmd(&[b"SET", key.as_bytes(), b"v"])).expect("write");
+        read_exactly(&mut c, b"+OK\r\n");
+    }
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    let line = read_line(&mut c);
+    let dbsize: u64 =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert_eq!(dbsize, 64);
+    let keys_of = |text: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix("db0:keys="))
+            .and_then(|r| r.split(',').next())
+            .unwrap_or_else(|| panic!("no db0 line: {text}"))
+            .parse()
+            .expect("u64")
+    };
+    for cell in 0..CELLS {
+        let mut peer = conn_on_cell(&node, cell);
+        #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let keyspace = info_text(&mut peer, b"keyspace");
+            let keys = keys_of(&keyspace);
+            assert!(
+                keyspace.contains("keyspace_scope:"),
+                "cell {cell}: no scope line, db0:keys={keys} vs DBSIZE {dbsize} (×{:.2}): \
+                     {keyspace}",
+                keys as f64 / dbsize as f64
+            );
+            if keys == dbsize && keyspace.contains("keyspace_scope:node\r\n") {
+                break;
+            }
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            let overdue = Instant::now() >= deadline;
+            assert!(!overdue, "cell {cell}: db0:keys={keys} vs DBSIZE {dbsize}: {keyspace}");
+            #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    node.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `maxclients`): the bound is
+/// divided per cell like `maxmemory` (ADR-0123); a connection landing on
+/// a full cell gets Redis's `-ERR max number of clients reached` and a
+/// close. Two cells, `maxclients 2` → one slot each: at most two
+/// connections are admitted, the third is refused. Pre-fix `CONFIG SET
+/// maxclients` was refused as immutable and no bound existed below the
+/// 2^24 slab cap.
+#[test]
+fn maxclients_refuses_the_next_connection_like_redis() {
+    let node = Node::start(2);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"maxclients", b"2"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    // No settle wait (batch 59): each cell's knobs follow its apply within
+    // the same iteration (MAINTAIN precedes the next accept reap), and the
+    // origin's precede its `+OK`.
+    let mut held = vec![admin];
+    let mut refused: Option<TcpStream> = None;
+    for attempt in 0..8 {
+        let mut s = node.connect();
+        s.write_all(&cmd(&[b"PING"])).expect("write");
+        let line = read_line(&mut s);
+        if line == b"+PONG\r\n" {
+            held.push(s);
+            continue;
+        }
+        assert_eq!(
+            line,
+            b"-ERR max number of clients reached\r\n",
+            "attempt {attempt}: {:?}",
+            String::from_utf8_lossy(&line)
+        );
+        refused = Some(s);
+        break;
+    }
+    let mut refused = refused.expect("a connection past the per-cell share is refused");
+    assert_closed(&mut refused, "refused connection");
+    assert!(held.len() <= 2, "{} connections admitted under maxclients 2", held.len());
+    drop(held);
+    node.stop();
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `timeout`): an idle connection
+/// is closed after `timeout` seconds; a subscribed one is exempt (Redis's
+/// `clientsCronHandleTimeout`). Single cell — the §5.5 regime. Pre-fix
+/// `CONFIG SET timeout 1` answered `+OK` and nothing ever closed.
+#[test]
+fn timeout_closes_idle_connections_but_not_subscribers() {
+    let node = Node::start(1);
+    let mut admin = node.connect();
+    admin.write_all(&cmd(&[b"CONFIG", b"SET", b"timeout", b"1"])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    let mut idle = node.connect();
+    idle.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut idle, b"+PONG\r\n");
+    let mut sub = node.connect();
+    sub.write_all(&cmd(&[b"SUBSCRIBE", b"ch"])).expect("write");
+    read_exactly(&mut sub, b"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_closed(&mut idle, "idle connection past `timeout 1`");
+    sub.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut sub, b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+    let mut probe = node.connect();
+    let stats = info_text(&mut probe, b"stats");
+    assert_eq!(info_field(&stats, "idle_disconnections"), 2, "{stats}");
+    node.stop();
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `tcp-keepalive`): accepted
+/// sockets carry `SO_KEEPALIVE` with the configured idle time (default
+/// 300 s), visible as the kernel's keepalive timer on the server-side
+/// socket. Pre-fix no accepted socket had keepalive set.
+#[test]
+fn accepted_sockets_carry_tcp_keepalive() {
+    let node = Node::start(1);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut c, b"+PONG\r\n");
+    let client_port = c.local_addr().expect("local addr").port();
+    let filter = format!("( sport = :{} and dport = :{client_port} )", node.port);
+    let Ok(out) =
+        std::process::Command::new("ss").args(["-tno", "state", "established", &filter]).output()
+    else {
+        eprintln!("SKIPPED: `ss` (iproute2) not runnable — keepalive not observed");
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("timer:(keepalive"),
+        "the server-side socket carries no keepalive timer:\n{text}"
+    );
+    node.stop();
+}
+
+/// Batch 50 (review 2026-08-30, F-L15-05 `client-output-buffer-limit
+/// normal`): a client that stops reading while replies pile up is killed
+/// at the normal class's hard cap, like a stalled subscriber at the
+/// pubsub cap (M1-S11). 512 × 200 KiB replies the victim never reads;
+/// pre-fix every byte was delivered and the connection stayed open.
+#[test]
+fn client_output_buffer_limit_normal_kills_a_non_reading_client() {
+    let node = Node::start(1);
+    let mut admin = node.connect();
+    admin
+        .write_all(&cmd(&[b"CONFIG", b"SET", b"client-output-buffer-limit", b"normal 1mb 0 0"]))
+        .expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    let big = vec![b'x'; 200 * 1024];
+    admin.write_all(&cmd(&[b"SET", b"big", &big])).expect("write");
+    read_exactly(&mut admin, b"+OK\r\n");
+    #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+    std::thread::sleep(Duration::from_millis(50));
+    let mut victim = node.connect();
+    victim.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let get = cmd(&[b"GET", b"big"]);
+    for _ in 0..512 {
+        victim.write_all(&get).expect("write");
+    }
+    // The kill closes with GETs still unread, so the close may be a reset.
+    let mut total = 0usize;
+    drain_to_close(&mut victim, "a client past the normal hard cap", |bytes| total += bytes.len());
+    let every_reply = 512 * (big.len() + 11);
+    assert!(total < every_reply, "every reply was delivered ({total} bytes) — no cap fired");
+    let mut probe = node.connect();
+    let stats = info_text(&mut probe, b"stats");
+    assert_eq!(info_field(&stats, "client_output_buffer_limit_disconnections"), 1, "{stats}");
+    node.stop();
+}
+
+// ---- Review 2026-08-30 F-L15-02 + the id-0 kill gap (batch 51, ADR-0124) ----
+
+/// Every cell of one node answers the same 40-hex `run_id`, before and
+/// after `RANDOMKEY` (pre-fix: per-cell RNG cursors, 32 digits, moving).
+#[test]
+fn run_id_is_one_value_across_cells() {
+    let node = Node::start(2);
+    let mut ids = std::collections::BTreeMap::new();
+    for cell in 0..2u16 {
+        let mut conn = conn_on_cell(&node, cell);
+        let info = info_text(&mut conn, b"server");
+        let run_id = info
+            .lines()
+            .find_map(|l| l.strip_prefix("run_id:"))
+            .expect("run_id")
+            .trim()
+            .to_string();
+        assert_eq!(run_id.len(), 40, "{run_id}");
+        conn.write_all(&cmd(&[b"SET", b"k", b"v"])).expect("write");
+        read_exactly(&mut conn, b"+OK\r\n");
+        conn.write_all(&cmd(&[b"RANDOMKEY"])).expect("write");
+        let _ = read_bulk(&mut conn);
+        let again = info_text(&mut conn, b"server");
+        assert!(again.contains(&format!("run_id:{run_id}\r\n")), "run_id moved on cell {cell}");
+        ids.insert(cell, run_id);
+    }
+    let values: std::collections::BTreeSet<&String> = ids.values().collect();
+    assert_eq!(values.len(), 1, "cells disagree on run_id: {ids:?}");
+    node.stop();
+}
+
+/// The first connection a cell ever accepts has an id ≥ 1, so `CLIENT
+/// KILL ID` can reach it (pre-fix: id 0, refused with Redis's `client-id
+/// should be greater than 0`).
+#[test]
+fn client_kill_by_id_reaches_the_first_connection_of_a_cell() {
+    let node = Node::start(1);
+    let mut first = node.connect();
+    first.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+    let line = read_line(&mut first);
+    let id: i64 =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert!(id >= 1, "first client id is {id}");
+    let mut killer = node.connect();
+    killer.write_all(&cmd(&[b"CLIENT", b"KILL", b"ID", id.to_string().as_bytes()])).expect("write");
+    read_exactly(&mut killer, b":1\r\n");
+    assert_closed(&mut first, "the killed connection");
+    node.stop();
+}
+
+/// F-L15-08 (ADR-0124) in-process: a durable 2-cell node with an
+/// `everysec` namespace and 2 000 acked pipelined writes stops
+/// gracefully — the client's pending replies flush before a FIN, the
+/// reboot has every key, loaded from the stop checkpoint with no tail
+/// replay, and a fresh connection during the drain is closed unanswered.
+#[test]
+fn graceful_stop_flushes_replies_and_closes_with_fin() {
+    let dir = temp_data_dir("graceful-stop");
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"CREATE", b"esec", b"MODE", b"durable", b"FSYNC", b"everysec"]))
+        .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const N: usize = 2_000;
+    let mut wire = Vec::new();
+    for i in 0..N {
+        wire.extend_from_slice(&cmd(&[b"SET", format!("k{i}").as_bytes(), b"v"]));
+    }
+    c.write_all(&wire).expect("pipeline");
+    node.stop_gracefully();
+    let mut rest = Vec::new();
+    let read = c.read_to_end(&mut rest);
+    assert!(read.is_ok(), "the close was a reset, not a FIN: {read:?}");
+    let lines: Vec<&[u8]> = rest.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    assert!(!lines.is_empty() && lines.len() <= N, "{} replies", lines.len());
+    assert!(lines.iter().all(|l| *l == b"+OK\r"), "a reply is not +OK");
+    let acked = lines.len();
+
+    let node = Node::start_durable(2, &dir);
+    let mut c = node.connect();
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"esec"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"DBSIZE"])).expect("write");
+    let line = read_line(&mut c);
+    let dbsize: usize =
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int");
+    assert!(dbsize >= acked, "acked writes lost: {dbsize} < {acked}");
+    for cell in 0..2u16 {
+        let mut conn = conn_on_cell(&node, cell);
+        let info = info_text(&mut conn, b"persistence");
+        assert_ne!(info_field(&info, "recover_ckpt_bytes"), 0, "cell {cell}: no stop checkpoint");
+        assert_eq!(info_field(&info, "recover_replay_records"), 0, "cell {cell}: {info}");
+    }
+    node.stop();
+}
+
+/// Ids are node-unique (`cell << 48 | seq`, ADR-0124 D6): a `CLIENT KILL
+/// ID` issued on another cell for an id it does not own answers `:0` and
+/// kills nothing — with per-cell slab ids (the first fix's `packed + 1`)
+/// cell 1's first connection was id 1 too, and the sibling killed itself
+/// (the full `just compat` run caught it: "server closed the connection
+/// mid-script").
+#[test]
+fn client_ids_are_node_unique_so_a_foreign_kill_reaches_nothing() {
+    let node = Node::start(2);
+    let mut a = conn_on_cell(&node, 0);
+    let mut b = conn_on_cell(&node, 1);
+    let id_of = |c: &mut TcpStream| -> u64 {
+        c.write_all(&cmd(&[b"CLIENT", b"ID"])).expect("write");
+        let line = read_line(c);
+        std::str::from_utf8(&line[1..line.len() - 2]).expect("ascii").parse().expect("int")
+    };
+    let (ia, ib) = (id_of(&mut a), id_of(&mut b));
+    assert_ne!(ia, ib, "two cells issued the same client id");
+    assert_eq!(ia >> 48, 0, "cell 0's id carries its cell: {ia:#x}");
+    assert_eq!(ib >> 48, 1, "cell 1's id carries its cell: {ib:#x}");
+    b.write_all(&cmd(&[b"CLIENT", b"KILL", b"ID", ia.to_string().as_bytes()])).expect("write");
+    read_exactly(&mut b, b":0\r\n");
+    // Both connections are still alive.
+    a.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut a, b"+PONG\r\n");
+    b.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut b, b"+PONG\r\n");
+    node.stop();
+}
+
+// ---- Batch 52 (review 2026-08-30): F-L13-04 + the L13 tiered-parse items ----
+
+/// Creates a tiered namespace and binds `c` to it (the §5.5 regime: one
+/// cell, a namespace-bound connection).
+fn bind_tiered(c: &mut TcpStream, ns: &[u8]) {
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        ns,
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"8mb",
+        b"DISK-BUDGET",
+        b"64mb",
+    ]))
+    .expect("write");
+    read_exactly(c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", ns])).expect("write");
+    read_exactly(c, b"+OK\r\n");
+}
+
+/// F-L13-04 (review 2026-08-30, filed High, downgraded to Needs-proof on
+/// offsets up to 512 MB — the wrong regime): the tiered `SETRANGE` built
+/// its post-image at the raw client offset before any bound. Offset
+/// `i64::MAX` is `Vec::resize` past `isize::MAX` — a `capacity overflow`
+/// panic in the cell thread; `2^62` asks the allocator for 4 EiB — an
+/// abort of the whole process. Post-fix every post-image past `BLOB-MAX`
+/// (the namespace's declared value cap, 1 GiB default) refuses typed
+/// before a byte is built, an empty patch is a length read (Redis: no
+/// bound check, no write), and the node stays alive.
+#[test]
+fn tiered_setrange_past_blob_max_refuses_typed_and_keeps_the_node_alive() {
+    let dir = temp_data_dir("l13-04-setrange-bound");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    bind_tiered(&mut c, b"hot");
+    c.write_all(&cmd(&[b"SET", b"k", b"value"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    // The panic class, the abort class, and one byte past the cap.
+    for offset in [&b"9223372036854775807"[..], b"4611686018427387904", b"1073741824"] {
+        c.write_all(&cmd(&[b"SETRANGE", b"k", offset, b"x"])).expect("write");
+        read_exactly(&mut c, b"-ERR value exceeds BLOB-MAX for this namespace\r\n");
+        c.write_all(&cmd(&[b"SETRANGE", b"missing", offset, b"x"])).expect("write");
+        read_exactly(&mut c, b"-ERR value exceeds BLOB-MAX for this namespace\r\n");
+    }
+    // An empty patch never grows the value (Redis `setrangeCommand`):
+    // the existing length, or 0 for a missing key — no write either way.
+    c.write_all(&cmd(&[b"SETRANGE", b"k", b"9223372036854775807", b""])).expect("write");
+    read_exactly(&mut c, b":5\r\n");
+    c.write_all(&cmd(&[b"SETRANGE", b"missing", b"9223372036854775807", b""])).expect("write");
+    read_exactly(&mut c, b":0\r\n");
+    c.write_all(&cmd(&[b"GET", b"missing"])).expect("write");
+    read_exactly(&mut c, b"$-1\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$5\r\nvalue\r\n");
+    // The last byte under the cap is the legal shape (no allocation
+    // here either: the refusal is a comparison, the acceptance a write
+    // this test does not need to pay for at 1 GiB — the bound itself is
+    // what is pinned).
+    c.write_all(&cmd(&[b"SETRANGE", b"k", b"1", b"ALUE"])).expect("write");
+    read_exactly(&mut c, b":5\r\n");
+    c.write_all(&cmd(&[b"GET", b"k"])).expect("write");
+    read_exactly(&mut c, b"$5\r\nvALUE\r\n");
+    // APPEND shares the pre-image bound: a suffix that would cross
+    // BLOB-MAX refuses typed before the post-image is built.
+    let probe_len = 1usize << 20;
+    let chunk: Vec<u8> = vec![b'z'; probe_len];
+    c.write_all(&cmd(&[b"APPEND", b"k", &chunk])).expect("write");
+    read_exactly(&mut c, format!(":{}\r\n", 5 + probe_len).as_bytes());
+    let mut probe = node.connect();
+    probe.write_all(&cmd(&[b"PING"])).expect("write");
+    read_exactly(&mut probe, b"+PONG\r\n");
+    drop((c, probe));
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// L13 style items (review 2026-08-30): the tiered plane parsed integers
+/// with `str::parse` (accepting `+5`, `007`), answered every unknown
+/// `SET` option with the expiry refusal (and accepted `NX XX`), and let a
+/// trailing lone `COUNT` on `SCAN` pass. The numbered-db path — and Redis
+/// 8.0.5 — answer as pinned here; the expiry refusals stay the declared
+/// M4 deviation.
+#[test]
+fn tiered_namespace_parses_arguments_like_the_numbered_db() {
+    let dir = temp_data_dir("l13-style-tiered-parse");
+    let node = Node::start_durable(1, &dir);
+    let mut c = node.connect();
+    bind_tiered(&mut c, b"hot");
+    c.write_all(&cmd(&[b"SET", b"n", b"5"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    const NOT_INT: &[u8] = b"-ERR value is not an integer or out of range\r\n";
+    const SYNTAX: &[u8] = b"-ERR syntax error\r\n";
+    const NO_EXPIRY: &[u8] = b"-ERR expiry is not supported on tiered namespaces in M4\r\n";
+    let rows: &[(&[&[u8]], &[u8])] = &[
+        (&[b"SETRANGE", b"n", b"007", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"+1", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"abc", b"x"], NOT_INT),
+        (&[b"SETRANGE", b"n", b"-1", b"x"], b"-ERR offset is out of range\r\n"),
+        (&[b"INCRBY", b"n", b"+5"], NOT_INT),
+        (&[b"INCRBY", b"n", b"007"], NOT_INT),
+        (&[b"DECRBY", b"n", b"-0"], NOT_INT),
+        (&[b"GETRANGE", b"n", b"007", b"1"], NOT_INT),
+        (&[b"GETRANGE", b"n", b"0", b"+1"], NOT_INT),
+        (&[b"SET", b"n", b"v", b"BOGUS"], SYNTAX),
+        (&[b"SET", b"n", b"v", b"NX", b"XX"], SYNTAX),
+        (&[b"SET", b"n", b"v", b"NX", b"NX"], b"$-1\r\n"),
+        (&[b"SET", b"n", b"v", b"XX", b"NX"], SYNTAX),
+        (&[b"SET", b"g", b"v", b"GET", b"GET"], b"$-1\r\n"),
+        (&[b"SET", b"n", b"5", b"EX", b"10"], NO_EXPIRY),
+        (&[b"SET", b"n", b"5", b"KEEPTTL"], NO_EXPIRY),
+        (&[b"SET", b"n", b"5", b"EX"], NO_EXPIRY),
+        (&[b"SCAN", b"0", b"COUNT"], SYNTAX),
+        (&[b"SCAN", b"0", b"COUNT", b"007"], NOT_INT),
+        (&[b"SCAN", b"0", b"COUNT", b"0"], SYNTAX),
+        (&[b"SCAN", b"0", b"COUNT", b"10", b"MATCH"], SYNTAX),
+        (&[b"INCRBY", b"n", b"2"], b":7\r\n"),
+        (&[b"GETRANGE", b"n", b"0", b"-1"], b"$1\r\n7\r\n"),
+    ];
+    for (argv, want) in rows {
+        c.write_all(&cmd(argv)).expect("write");
+        let got = read_frame(&mut c);
+        assert_eq!(
+            got,
+            *want,
+            "{}: got {:?}",
+            argv.iter().map(|a| String::from_utf8_lossy(a)).collect::<Vec<_>>().join(" "),
+            String::from_utf8_lossy(&got)
+        );
+    }
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }

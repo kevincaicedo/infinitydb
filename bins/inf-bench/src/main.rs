@@ -1,3 +1,12 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "tool: corpus and campaign files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "inf-bench is the load generator: the wall clock is its instrument; it drives \
+         infinityd over the wire and runs no cell"
+)]
 //! `inf-bench` — InfinityDB benchmark harness (M0).
 //!
 //! Subcommands:
@@ -11,19 +20,27 @@
 //!
 //! Tooling tier: `std::thread` and blocking sockets are fine here; this
 //! binary never runs on the data plane. It deliberately does not depend on
-//! `inf-wire` — the measurement tool shares no code with the system under
-//! test (client-side RESP lives in [`resp`]).
+//! `inf-wire` (client-side RESP lives in [`resp`]). Internal `inf-foundation`
+//! primitives are shared; there are no external dependencies (ADR-0134).
 #![forbid(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod bootstorm;
 mod cli;
 mod doc_corpus;
 mod envcheck;
+mod finehist;
 mod gaterun;
 mod gates;
 mod load;
+mod loop_histogram;
 mod m1rows;
 mod m2rows;
+mod m45rows;
 mod m4rows;
 mod mixedaudit;
 mod resp;
@@ -41,17 +58,22 @@ USAGE:
     inf-bench load --host H --port P [--threads N] [--conns-per-thread N] [--pipeline P]
                    [--duration SECS] [--mix SET:GET] [--keys N] [--key-prefix S]
                    [--value-size BYTES] [--seed N] [--out FILE.toml]
-    inf-bench gate-run m0|m1|m2|m4 [--replicates N] [--gates FILE] [--artifacts-root DIR]
+    inf-bench gate-run m0|m1|m2|m4|m4.5 [--replicates N] [--gates FILE] [--artifacts-root DIR]
                    [--allow-dirty] [--unsafe-env] [--reference-box] [--skip-fill]
                    [--cells N] [--duration SECS] [--fill-keys N]
                    [--infinityd-bin PATH] [--redis-bin PATH]
                    m1 rows: [--storm-keys N] [--flushall-keys N] [--maxmemory-mb N]
                             [--subs N] [--sub-channels N]
+                            [--only-empty-node] [--data-root DIR]  (empty-node
+                            rows run first; data-root must not be tmpfs)
                    m2 rows: [--baseline-bin PATH]  (pre-M2 infinityd for the
                             zero-cost A/B; delta rows PENDING without it)
                    m4 rows: [--baseline-bin PATH]  (M3-tip infinityd for the
                             degenerate-case A/B — M4-S03 hard sub-gate;
                             tiering-counter tripwire binds on every box)
+                   m4.5 rows: [--data-root DIR] [--pin-start N]
+                            (S29 tiered-always scaling row; data-root
+                             must not be tmpfs — fsyncs must hit a device)
     inf-bench boot-storm --infinityd-bin PATH [--cycles 500] [--cells 4]
                    [--pressure-mb 2048] [--data-root DIR] [--ready-timeout-s 10]
                    [--pin-start N] [--artifacts-root DIR]

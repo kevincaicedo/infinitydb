@@ -19,6 +19,8 @@ use inf_log::{
     CkptConfig, Lsn, MutationEffect, ReaderConfig, RecordView, SegmentConfig, SegmentReader,
     SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
 };
+use inf_store::InternalDeadline::At;
+use inf_store::NoSpill;
 use inf_store::{
     FsyncClass, Keyspace, NsCatalog, NsId, NsMode, NsSpec, ReplayOutcome, StoreConfig, WallAnchor,
 };
@@ -41,6 +43,8 @@ fn durable_keyspace() -> Keyspace {
             maxmemory: None,
             tier: None,
         }],
+        index: Default::default(),
+        dropped: Vec::new(),
     };
     ks.seed_catalog(&catalog).expect("seed");
     ks
@@ -85,7 +89,7 @@ fn mutate(ks: &mut Keyspace, staging: &mut StagingRing, rng: &mut SplitMix64) {
                 100_000 + rng.next_u64() % 1_000_000
             };
             store.replay_set(&key, &value, NOW).expect("set");
-            store.replay_expire_at(&key, Nanos::from_millis(at_ms), NOW);
+            store.replay_expire_at(&key, At(Nanos::from_millis(at_ms)), NOW);
             staging
                 .stage(&MutationEffect::StringSet { ns, key: &key, value: &value })
                 .expect("stage");
@@ -195,7 +199,7 @@ fn run_seed(seed: u64) {
     // ---- Recovery (the S13 shape): .ick + tail replay from begin. ----
     let mut recovered = durable_keyspace();
     read_ick(&fs, &ckpt_dir.join(ick_file_name(1)), IckReaderConfig::default(), |view| {
-        recovered.apply_record(&view, NOW, ANCHOR).expect("apply ick");
+        recovered.apply_record(&view, NOW, ANCHOR, &mut NoSpill).expect("apply ick");
         Ok::<(), ()>(())
     })
     .expect("load ick");
@@ -212,7 +216,10 @@ fn run_seed(seed: u64) {
                     if lsn.to_u64() < begin_lsn.to_u64() {
                         continue; // covered by the checkpoint
                     }
-                    match recovered.apply_record(&record, NOW, ANCHOR).expect("apply tail") {
+                    match recovered
+                        .apply_record(&record, NOW, ANCHOR, &mut NoSpill)
+                        .expect("apply tail")
+                    {
                         ReplayOutcome::SkippedMarker => markers += 1,
                         ReplayOutcome::Applied => {}
                         other => panic!("unexpected outcome {other:?}"),

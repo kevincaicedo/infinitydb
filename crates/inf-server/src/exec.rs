@@ -22,14 +22,14 @@ use std::rc::Rc;
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    CellStore, CopyResult, ExpireCond, Keyspace, OpError, SetCond, SetExpire, SetOptions,
-    SetOutcome, Ttl, TtlUpdate,
+    CellStore, CopyResult, ExpireCond, InternalDeadline, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN,
+    OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
 use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
 
 use crate::admin;
 use crate::clients::ClientRegistry;
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, DATABASES};
 use crate::glob::glob_match;
 #[cfg(feature = "doc")]
 use crate::json;
@@ -42,14 +42,14 @@ pub(crate) struct DocLogAdmission {
     pub record_max: usize,
 }
 
-/// Node-level state surfaced through the command layer (M0-S19 + M1-S03):
+/// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
 /// can't see, and the M1 cell-local registries (clients, config), the
 /// injected wall-clock anchor, and the injected RNG state. The node assembly
-/// (or sim harness) wires these; a default-constructed `ConnCx` carries an
-/// all-zero instance, so tests and the compat candidate need no wiring.
+/// (or sim harness) wires these. [`NodeInfo`] owns this state together
+/// with the cache whose reservation makes node construction fallible.
 #[derive(Default, Debug)]
-pub struct NodeInfo {
+pub struct NodeState {
     /// Frozen order: sqes_per_submit, cqes_per_reap, cmds_per_iter,
     /// fabric_msgs_per_batch (each ×1000), loop_iter_p999_us.
     pub tripwires: Cell<[u64; 5]>,
@@ -66,9 +66,16 @@ pub struct NodeInfo {
     /// `INFO` renders them absent-with-disclosure while tiered is live,
     /// never as numbers (v0.4.0-alpha instrument fix).
     pub tiering_split: Cell<[u64; 15]>,
+    /// Reactor-drive flush gauges (M4.5-S31, ADR-0084 D6), flushed by
+    /// MAINTAIN: rounds, write_retries, stale_completions, round_p50_us,
+    /// round_p99_us, rounds_inflight, files_sealed, files_active.
+    /// Identically zero on nodes that never created a tiered namespace.
+    pub tier_flush: Cell<[u64; 9]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,
+    /// Requested iteration-boundary snapshots; ordinary INFO does not copy buckets.
+    pub loop_snapshot: crate::LoopSnapshot,
     pub wire_buffers_bytes: Cell<u64>,
     pub conn_state_bytes: Cell<u64>,
     /// Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges,
@@ -92,8 +99,39 @@ pub struct NodeInfo {
     /// Injected RNG state (SplitMix64 stream; RANDOMKEY) — seeded by the
     /// assembly layer, deterministic under DST (L7).
     pub rng_state: Cell<u64>,
+    /// The node identity `INFO server:run_id` / `replication:master_replid`
+    /// render (ADR-0124 D5): 40 hex digits, seeded once at assembly and
+    /// never mutated — every cell of a node carries the same value.
+    pub run_id: Cell<[u64; 3]>,
+    /// Client ids issued by this cell (ADR-0124 D6): `cell << 48 | seq`,
+    /// seq from 1 — node-unique and never reused, like Redis's.
+    pub next_client_id: Cell<u64>,
     pub tcp_port: Cell<u16>,
+    /// `INFO server:process_id` (Redis's field; batch 61): the OS pid,
+    /// set once at assembly. A harness pairs a test with the process it
+    /// spawned by it — a foreign node on the port answers `PING` too.
+    pub process_id: Cell<u32>,
+    /// M4.5-S40 (`infinityd --conn-default-ns NAME`): every accepted
+    /// connection starts as if it had sent `INF.NS USE NAME` — the
+    /// operator's opt-in for clients that cannot send a per-connection
+    /// prelude (`memtier_benchmark`, drop-in Redis clients wanting a
+    /// durable default). Resolved by name at accept time against the
+    /// cell's catalog; a name that does not (yet) exist, or names a topic,
+    /// leaves the connection fail-closed until `SELECT` or `INF.NS USE`
+    /// explicitly recovers it. `None` (the default) changes nothing.
+    pub conn_default_ns: RefCell<Option<Vec<u8>>>,
     pub total_connections: Cell<u64>,
+    /// Accepts closed at the connection slab's admission bound (batch 12
+    /// of the 2026-08-30 review): the completion token carries the slot
+    /// in 24 bits, so a cell serves at most `MAX_SLOT` live connections;
+    /// the next accept is closed and counted here (`INFO stats`
+    /// `rejected_connections`, Redis's `maxclients` counter) instead of
+    /// tripping a release assert in the slab.
+    pub rejected_connections: Cell<u64>,
+    /// Accept completions the kernel failed (`EMFILE`, `ENFILE`,
+    /// `ECONNABORTED`; F-L11-05 of the 2026-08-30 review): counted here
+    /// (`INFO stats accept_errors`), never routed to a connection.
+    pub accept_errors: Cell<u64>,
     /// Pub/sub gauges + counters (M1-S10/S11), flushed by the plane's
     /// MAINTAIN: channels this cell owns with live subscribers, live
     /// patterns (node-wide — the index is replicated), estimated registry
@@ -105,6 +143,18 @@ pub struct NodeInfo {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
+    /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
+    /// idle_disconnections`, cell scope).
+    pub idle_disconnections: Cell<u64>,
+    /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` (a
+    /// refused `JSON.MGET` element counts one) and the reply bytes those
+    /// refusals built and discarded — the CPU the limit cost (ADR-0099 A1;
+    /// `INFO stats`, cell scope). Lifetime counters that saturate at
+    /// `u64::MAX`: metrics only, no accounting reads them.
+    #[cfg(feature = "doc")]
+    pub json_reply_refusals_cell: Cell<u64>,
+    #[cfg(feature = "doc")]
+    pub json_reply_refused_bytes_cell: Cell<u64>,
     /// Durable-plane gauges (M2-S08, flushed by MAINTAIN — the S21
     /// vocabulary for `INFO persistence`).
     pub log_records_appended: Cell<u64>,
@@ -120,13 +170,144 @@ pub struct NodeInfo {
     pub log_frames_queued: Cell<u64>,
     pub log_staging_bytes: Cell<u64>,
     /// Typed `-BUSY` staging-admission refusals (v0.4.0-alpha
-    /// instrument fix): the `would_fit` pre-check refuses without ever
-    /// calling `stage()`, so no staging counter sees these — the
-    /// refusal sites themselves increment (owner-side admission + the
-    /// doc path's exact late admission).
+    /// instrument fix; **re-scoped by M4.5-S27/ADR-0083 D5 to
+    /// client-visible refusals only** — parks are counted separately):
+    /// after ADR-0083 D1 the only remaining emitter is the doc path's
+    /// exact late admission, so a non-zero rate here is a finding.
     pub log_admission_busy: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D2): typed never-fits refusals — the staged
+    /// record can never fit any drain (`est > max_record_len`).
+    pub log_admission_oversized: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D5): pacing observables — commands currently
+    /// parked on the drain waitlist, cumulative park episodes, the
+    /// configured staging capacity (per buffer), and the frame-write
+    /// submit → `LogWritten` stall percentiles (µs) — the staging
+    /// drain's binding variable.
+    pub log_admission_parked: Cell<u64>,
+    pub log_admission_parked_total: Cell<u64>,
+    pub log_staging_capacity: Cell<u64>,
+    pub log_write_stall_p50_us: Cell<u64>,
+    pub log_write_stall_p99_us: Cell<u64>,
+    pub log_write_stall_p999_us: Cell<u64>,
+    /// M4.5-S27 (ADR-0083 D5): per-reason durability-fsync counts (the
+    /// S29 named observability gap).
+    pub fsyncs_linked: Cell<u64>,
+    pub fsyncs_seal: Cell<u64>,
+    pub fsyncs_standalone: Cell<u64>,
+    pub fsyncs_completion: Cell<u64>,
+    /// M4.5-S34 (ADR-0086): barrier class of the active log segment (1 =
+    /// write-through/FUA, 0 = FLUSH), write-through ticket count and
+    /// latency, the two write-amplification disclosures of the direct
+    /// class (v3 padding, pre-zeroing), rotation shape, and the
+    /// `barrier_class_degraded` tripwire.
+    pub barrier_class_fua: Cell<u64>,
+    /// The configured class beside the active segment's (M4.5-S42
+    /// follow-up): `io_class_configured`.
+    pub io_class_configured_fua: Cell<u64>,
+    pub fsyncs_fua: Cell<u64>,
+    pub fua_p50_us: Cell<u64>,
+    pub fua_p99_us: Cell<u64>,
+    pub log_padding_bytes: Cell<u64>,
+    pub zero_fill_bytes: Cell<u64>,
+    pub rotations_unzeroed: Cell<u64>,
+    pub rotations_upgrade: Cell<u64>,
+    pub reopened_packed_tails: Cell<u64>,
+    pub barrier_class_degraded: Cell<u64>,
+    /// M4.5-S35 (ADR-0087 D5): the frame pipeline's configured depth, its
+    /// observed high-water mark, and its two bounded waits.
+    pub frames_in_flight: Cell<u64>,
+    pub frames_in_flight_max: Cell<u64>,
+    /// M4.5-S36 (ADR-0088 D7, ADR-0178 D5): the device budget's ledger —
+    /// one `ClassCounters` per class in `IoClass::ALL` order — model
+    /// presence, the cell's byte shares, the seal pacer's wait episodes,
+    /// the checkpoint domain's bytes, the derived trigger and the
+    /// `write_amp_milli_log_checkpoint` figure (+ its undefined flag).
+    pub io_budget: Cell<[inf_runtime::ClassCounters; inf_runtime::IoClass::COUNT]>,
+    pub io_budget_model_absent: Cell<u64>,
+    pub io_budget_write_bytes_per_s: Cell<u64>,
+    pub io_budget_read_bytes_per_s: Cell<u64>,
+    pub frame_waits_pace: Cell<u64>,
+    pub log_frame_bytes: Cell<u64>,
+    pub ckpt_bytes_total: Cell<u64>,
+    pub ckpt_bytes_last: Cell<u64>,
+    pub ckpt_padding_bytes: Cell<u64>,
+    pub manifest_bytes_total: Cell<u64>,
+    pub ckpt_interval_bytes: Cell<u64>,
+    pub ckpt_records_since_begin: Cell<u64>,
+    /// ADR-0088 D4 as amended: the replay term and the byte cap.
+    pub ckpt_replay_bytes_per_s: Cell<u64>,
+    pub ckpt_cap_bytes: Cell<u64>,
+    pub ckpt_io_mode_buffered: Cell<u64>,
+    pub ckpt_io_mode_downgrades: Cell<u64>,
+    pub write_amp_milli_log_checkpoint: Cell<u64>,
+    pub write_amp_log_checkpoint_undefined: Cell<u64>,
+    /// M4.5-S39b (ADR-0090 D4 as amended): the accounted host-write
+    /// figure (zero-fill included) and its ratio, the recycle pool's
+    /// counters, and the two recovery facts of this cell's boot.
+    pub accounted_host_write_bytes: Cell<u64>,
+    pub write_amp_milli_accounted_host: Cell<u64>,
+    pub segments_recycled: Cell<u64>,
+    pub recycle_misses: Cell<u64>,
+    pub recycle_fallbacks: Cell<u64>,
+    pub recycle_pool_bytes: Cell<u64>,
+    pub recycle_pool_full: Cell<u64>,
+    pub recycle_sentinels: Cell<u64>,
+    pub segment_rotations: Cell<u64>,
+    pub segment_preallocs: Cell<u64>,
+    pub segment_inline_preallocs: Cell<u64>,
+    pub segment_prealloc_failures: Cell<u64>,
+    pub recycle_waits_started: Cell<u64>,
+    pub recycle_waits_satisfied: Cell<u64>,
+    pub recycle_waits_expired: Cell<u64>,
+    pub recycle_wait_active_bytes_max: Cell<u64>,
+    pub recover_segment_residue_stops: Cell<u64>,
+    pub recover_recycled_residue_slacks: Cell<u64>,
+    /// Epoch-classified discarded-life residue the boot lifted past
+    /// (ADR-0031 D5 as amended; the F-L14-01 regime's observable).
+    pub recover_stale_residue_slacks: Cell<u64>,
+    /// M4.5-S39d: this cell's boot recovery decomposed (loop-resident
+    /// boots only; zero on a memory node).
+    pub recover_phases: Cell<crate::recover::RecoverPhases>,
+    pub recover_stale_files_removed: Cell<u64>,
+    /// Records recovered (checkpoint + tail applied) — the fixed-work
+    /// identity a recovery row checks across arms.
+    pub recover_records: Cell<u64>,
+    /// Tail records applied after the checkpoint's begin (ADR-0124 D4's
+    /// observable: a boot after a clean stop replays nothing).
+    pub recover_replay_records: Cell<u64>,
+    /// ADR-0174 D6: the node fold of every cell's tiered boot replay
+    /// (summed; the step-charge gauge the largest), taken once when every
+    /// cell is ready — zero without a recovery board.
+    pub recover_tier_replay: Cell<crate::recover::TierReplayStats>,
+    /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
+    /// ceiling arm wrote blind over a cold candidate.
+    #[cfg(feature = "bench-diagnostics")]
+    pub blind_overwrites_ceiling: Cell<u64>,
+    /// M4.5-S37 (ADR-0093 D2 step 7): eligible shadow writes refused at
+    /// the plane's staging/disk gate (the store's counters carry the
+    /// store-side refusals).
+    pub shadow_fallback_staging: Cell<u64>,
+    pub frame_waits_barrier: Cell<u64>,
+    pub frame_waits_rotation: Cell<u64>,
+    pub frame_waits_reorder: Cell<u64>,
+    pub frame_waits_fill: Cell<u64>,
+    pub fill_window_us: Cell<u64>,
+    pub fill_target_bytes: Cell<u64>,
+    /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — episodes, the
+    /// window in force, the adaptive target.
+    pub frame_waits_group: Cell<u64>,
+    pub flush_group_window_us: Cell<u64>,
+    pub frame_records_last: Cell<u64>,
+    pub group_round_target: Cell<u64>,
+    /// M4.5-S42 (ADR-0091 D5): where the device model came from.
+    pub io_provenance: Cell<crate::IoProvenance>,
     /// Fuzzy-checkpoint gauges (M2-S10, flushed by MAINTAIN).
     pub ckpts_completed: Cell<u64>,
+    /// F-L03-04 witness: publications that walked a tiered table under
+    /// an older checkpoint id (sticky, cell scope).
+    pub ckpt_walks_behind: Cell<u64>,
+    /// ADR-0117: sections sealed for the section bound (cell scope).
+    pub ckpt_bound_splits: Cell<u64>,
     pub ckpts_aborted: Cell<u64>,
     pub ckpt_last_unix_ms: Cell<u64>,
     pub ckpt_last_begin_lsn: Cell<u64>,
@@ -136,11 +317,15 @@ pub struct NodeInfo {
     pub manifests_aborted: Cell<u64>,
     pub segments_truncated: Cell<u64>,
     pub log_segments_live: Cell<u64>,
-    /// Checkpoint operator surface (M2-S20): streaming-now flag +
-    /// newest durable MANIFEST publication (unix ms, node-wide board
-    /// max — `rdb_last_save_time`/`LASTSAVE`).
+    /// Checkpoint operator surface (M2-S20): the streaming-now flag, and
+    /// the newest durable MANIFEST publication this cell has observed,
+    /// which `LASTSAVE` answers (ADR-0159 A1.4) and `rdb_last_save_time`
+    /// with it (`interfaces-m2.md`, "Cells never fold the whole board").
     pub ckpt_in_progress: Cell<u64>,
-    pub rdb_last_save_ms: Cell<u64>,
+    pub lastsave: crate::control::LastSave,
+    /// ADR-0100 D7: live drop tombstones in the catalog writer (node
+    /// scope, refreshed at MAINTAIN from the control handle).
+    pub ns_drop_tombstones: Cell<u64>,
     /// M2-S21: windowed rates (previous everysec-tick window) + fsync
     /// latency percentiles (µs) + checkpoint age (s).
     pub fsyncs_per_sec: Cell<u64>,
@@ -163,15 +348,13 @@ pub struct NodeInfo {
     /// assembly when a control plane exists. `None` in bare harnesses,
     /// where `INFO` renders cell scope and labels it.
     pub memory_board: RefCell<Option<std::sync::Arc<crate::control::MemoryBoard>>>,
+    /// Read-only process gauges; the process supervisor alone samples the OS.
+    /// Bare deterministic harnesses render zeros until they attach a board.
+    pub process_board: RefCell<Option<std::sync::Arc<crate::ProcessBoard>>>,
     /// CLIENT registry for this cell's connections (single-threaded).
     pub clients: RefCell<ClientRegistry>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
-    /// Per-cell compiled-path-program cache (M3-S10; ADR-0041 D1) —
-    /// shared by every connection and namespace the cell serves, sized
-    /// by `doc-path-cache-size` at node assembly (default 1024).
-    #[cfg(feature = "doc")]
-    pub path_cache: RefCell<inf_doc::ProgramCache>,
     /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
     /// across commands (the S05 lever-G seam); limits re-point per
     /// target namespace via `set_limits`.
@@ -192,6 +375,32 @@ pub struct NodeInfo {
     pub(crate) doc_log: RefCell<json::DocLogScratch>,
 }
 
+/// Cell-owned command state, built only after cache reservation succeeds.
+/// The default-initializable state stays inline; field access through
+/// Deref adds no allocation or shared ownership (ADR-0146 D2).
+#[derive(Debug)]
+pub struct NodeInfo {
+    state: NodeState,
+    pub(crate) cache_boot: crate::cache_boot::CacheBootReadiness,
+    /// One compiled-path cache shared by this cell's connections and namespaces.
+    #[cfg(feature = "doc")]
+    pub path_cache: RefCell<inf_doc::ProgramCache>,
+}
+
+impl core::ops::Deref for NodeInfo {
+    type Target = NodeState;
+
+    fn deref(&self) -> &NodeState {
+        &self.state
+    }
+}
+
+impl core::ops::DerefMut for NodeInfo {
+    fn deref_mut(&mut self) -> &mut NodeState {
+        &mut self.state
+    }
+}
+
 /// Fold a keyspace report plus this cell's node-side bytes into the
 /// memory gauges `INFO` renders and the board publishes — one
 /// definition shared by the plane's MAINTAIN publisher and the INFO
@@ -199,11 +408,23 @@ pub struct NodeInfo {
 pub(crate) fn memory_gauges_of(
     report: &inf_store::MemoryReport,
     node: &NodeInfo,
+    ks: &inf_store::Keyspace,
 ) -> crate::control::MemoryGauges {
+    // ADR-0122 A2: the per-db counts ride the same publication, so
+    // `# Keyspace` folds like `# Memory` and never drifts from it.
+    let mut db_keys = [0u64; inf_store::DEFAULT_DBS];
+    let mut db_expires = [0u64; inf_store::DEFAULT_DBS];
+    for (db, store) in ks.dbs() {
+        if let (Some(k), Some(e)) = (db_keys.get_mut(db), db_expires.get_mut(db)) {
+            *k = store.len() as u64;
+            *e = store.stats().ttl_live;
+        }
+    }
     crate::control::MemoryGauges {
         used_bytes: report.attributed_bytes()
             + node.wire_buffers_bytes.get()
             + node.conn_state_bytes.get(),
+        pool_used_bytes: ks.pool_used_bytes(),
         docs_live: report.docs_live,
         doc_tape_bytes: report.doc_tape_bytes,
         doc_arena_bytes: report.doc_arena_bytes,
@@ -212,10 +433,40 @@ pub(crate) fn memory_gauges_of(
         doc_slack_bytes: report.doc_slack_bytes,
         doc_scratch_bytes: report.doc_scratch_bytes,
         doc_path_cache_bytes: report.doc_path_cache_bytes,
+        idx_tree_bytes: report.idx_tree_bytes,
+        idx_slack_bytes: report.idx_slack_bytes,
+        db_keys,
+        db_expires,
     }
 }
 
 impl NodeInfo {
+    /// Assemble this cell's state from validated boot configuration before accepting
+    /// connections. A refused cache reservation publishes no node or config.
+    pub fn try_new(config: ConfigStore) -> Result<Self, std::collections::TryReserveError> {
+        #[cfg(feature = "doc")]
+        let path_cache = inf_doc::ProgramCache::try_new(config.path_cache_capacity())?;
+        Ok(Self {
+            state: NodeState { config: RefCell::new(config), ..NodeState::default() },
+            cache_boot: crate::cache_boot::CacheBootReadiness::Standalone,
+            #[cfg(feature = "doc")]
+            path_cache: RefCell::new(path_cache),
+        })
+    }
+
+    pub fn try_default() -> Result<Self, std::collections::TryReserveError> {
+        Self::try_new(ConfigStore::default())
+    }
+
+    /// Install the boot reader before publishing this cell's arrival. The
+    /// non-cloneable permit makes the cache reservation precede readiness.
+    pub fn into_boot_group(mut self, permit: crate::CacheBootPermit) -> Rc<Self> {
+        self.cache_boot = permit.reader();
+        let node = Rc::new(self);
+        permit.complete();
+        node
+    }
+
     /// Publish this cell's memory gauges to the node board and return the
     /// node-wide fold — `None` without a board (bare harness): the caller
     /// renders cell scope and labels it (M3-S25 fix).
@@ -241,6 +492,31 @@ impl NodeInfo {
     }
 }
 
+/// Namespace route selected for one connection. The third state is the
+/// fail-closed form of `--conn-default-ns`: an operator required a named
+/// namespace, but the catalog cannot currently resolve it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ConnNamespace {
+    Default,
+    Named(inf_store::NsId),
+    RequiredUnavailable,
+}
+
+impl ConnNamespace {
+    #[inline]
+    pub fn named(self) -> Option<inf_store::NsId> {
+        match self {
+            ConnNamespace::Named(ns) => Some(ns),
+            ConnNamespace::Default | ConnNamespace::RequiredUnavailable => None,
+        }
+    }
+
+    #[inline]
+    pub fn unavailable(self) -> bool {
+        self == ConnNamespace::RequiredUnavailable
+    }
+}
+
 /// Per-connection execution state (protocol negotiated via `HELLO`,
 /// database selected via `SELECT` — M1-S08, subscriptions via
 /// `(P)SUBSCRIBE` — M1-S10).
@@ -250,10 +526,9 @@ pub struct ConnCx {
     pub id: u64,
     /// Selected default namespace (`SELECT 0..15`); 0 unless SELECTed.
     pub db: u16,
-    /// Selected *named* namespace (`INF.NS USE`, M2-S08); `None` = the
-    /// default-db path. One `Option` load is the memory fast path's whole
-    /// cost for the durable feature (M2-S09).
-    pub ns: Option<inf_store::NsId>,
+    /// Selected namespace route. The ordinary memory path is `Default`;
+    /// `RequiredUnavailable` refuses data instead of silently using db0.
+    pub ns: ConnNamespace,
     /// Subscribed channels, in subscription order (M1-S10). Empty vectors
     /// never allocate, so a non-subscriber connection pays two length
     /// loads at most.
@@ -265,20 +540,49 @@ pub struct ConnCx {
     /// Set by `QUIT`: reply `+OK`, then the plane closes the connection after
     /// flushing. Interior-mutable so a `&ConnCx` handler can request it.
     pub close_requested: Cell<bool>,
+    /// The execution was composed by a plane program (a move leg, a
+    /// fabric `Apply` carrying the program mark) — never a client
+    /// connection. `INTERNAL` rows execute only under it (ADR-0115).
+    pub program: bool,
 }
 
-impl Default for ConnCx {
-    fn default() -> ConnCx {
-        ConnCx {
+impl ConnCx {
+    /// Mirrors db and subscription counts into the cell's client registry
+    /// (F-L15-09) — called where they change, so `CLIENT LIST` from any
+    /// connection reads tracked state. `program` contexts (fabric legs)
+    /// are never clients and never register.
+    pub(crate) fn publish_client_state(&self, now: Nanos) {
+        if self.program {
+            return;
+        }
+        let sub = u32::try_from(self.sub_channels.len()).unwrap_or(u32::MAX);
+        let psub = u32::try_from(self.sub_patterns.len()).unwrap_or(u32::MAX);
+        self.node.clients.borrow_mut().note_conn_state(
+            self.id,
+            now.as_millis(),
+            self.db,
+            sub,
+            psub,
+        );
+    }
+}
+
+impl ConnCx {
+    /// Standalone connection state for embedded command harnesses. Production
+    /// connections share their plane's already constructed NodeInfo.
+    pub fn try_default() -> Result<ConnCx, std::collections::TryReserveError> {
+        let node = Rc::new(NodeInfo::try_default()?);
+        Ok(ConnCx {
             proto: Protocol::Resp2,
             id: 1,
             db: 0,
-            ns: None,
+            ns: ConnNamespace::Default,
             sub_channels: Vec::new(),
             sub_patterns: Vec::new(),
-            node: Rc::new(NodeInfo::default()),
+            node,
             close_requested: Cell::new(false),
-        }
+            program: false,
+        })
     }
 }
 
@@ -319,11 +623,31 @@ impl Argv for [&[u8]] {
     }
 }
 
+/// Commands that can recover or inspect a connection whose configured
+/// default namespace was unavailable at accept time. No command in this set
+/// reads or mutates the implicit numbered database.
+pub(crate) fn unavailable_default_allows(id: CommandId) -> bool {
+    matches!(
+        id,
+        CommandId::Ping
+            | CommandId::Echo
+            | CommandId::Hello
+            | CommandId::Quit
+            | CommandId::Command
+            | CommandId::Client
+            | CommandId::Config
+            | CommandId::Info
+            | CommandId::Select
+            | CommandId::InfNs
+    )
+}
+
 /// Executes one parsed command against the cell's keyspace, appending the
 /// reply to `out`. `now` is injected (L7) — same clock the store's TTLs
 /// live on. Keyspace-level commands (SELECT, FLUSHALL, cross-db COPY,
 /// INF.NS, INFO, CONFIG) dispatch here; everything else runs against the
 /// connection's selected database.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
 pub fn execute(
     argv: &(impl Argv + ?Sized),
     ks: &mut Keyspace,
@@ -335,9 +659,20 @@ pub fn execute(
         let mut w = RespWriter::new(out, cx.proto);
         return unknown_command(argv, &mut w);
     };
+    // ADR-0115: a fabric-program primitive is unknown to every client —
+    // decided at lookup, before arity, as Redis decides internal commands.
+    if meta.flags.contains(CmdFlags::INTERNAL) && !cx.program {
+        let mut w = RespWriter::new(out, cx.proto);
+        return unknown_command(argv, &mut w);
+    }
     if !arity_ok(meta, argv.len()) {
         let mut w = RespWriter::new(out, cx.proto);
         return arity_error(meta.name, &mut w);
+    }
+    if cx.ns.unavailable() && !unavailable_default_allows(meta.id) {
+        let mut w = RespWriter::new(out, cx.proto);
+        return w
+            .error("ERR configured default namespace is unavailable; use SELECT or INF.NS USE");
     }
     // M1-S07 OOM gate: DENYOOM commands enter through metadata, never
     // per-handler checks (kernel rule). The first test is one branch on a
@@ -349,7 +684,7 @@ pub fn execute(
     // `cx.ns`, state this path already resolved, so the numbered-DB arm
     // executes the M1 instructions unchanged (A/B: .artifacts/m4/s27/).
     if meta.flags.contains(CmdFlags::DENYOOM) {
-        let refused = match cx.ns {
+        let refused = match cx.ns.named() {
             Some(ns) => match ks.ns_free_for_write(ns, now) {
                 Some(verdict) => verdict.is_err(),
                 None => ks.over_limit() && ks.free_for_write(now).is_err(),
@@ -372,7 +707,7 @@ pub fn execute(
         // ---- keyspace-level commands (M1-E3/E4) ----
         CommandId::Select => {
             let mut w = RespWriter::new(out, cx.proto);
-            select(argv, ks, cx, &mut w);
+            select(argv, ks, cx, now, &mut w);
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
@@ -388,7 +723,7 @@ pub fn execute(
         CommandId::Flushdb => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            if cx.ns.is_some() {
+            if cx.ns.named().is_some() {
                 return w
                     .error("ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)");
             }
@@ -397,7 +732,7 @@ pub fn execute(
         CommandId::Copy => {
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
-            if cx.ns.is_some() {
+            if cx.ns.named().is_some() {
                 return w.error("ERR COPY within a named namespace is not yet supported (M2)");
             }
             copy(argv, ks, db, now, &mut w);
@@ -413,7 +748,7 @@ pub fn execute(
         CommandId::InfNs => {
             let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, cx, &node, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, now, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -427,7 +762,7 @@ pub fn execute(
                 pubsub::SubKind::Pattern
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
-            pubsub::apply_subscribe(&names, kind, cx, out);
+            pubsub::apply_subscribe(&names, kind, cx, now, out);
         }
         CommandId::Unsubscribe | CommandId::Punsubscribe => {
             let kind = if meta.id == CommandId::Unsubscribe {
@@ -437,7 +772,7 @@ pub fn execute(
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
             let names = if names.is_empty() { None } else { Some(names.as_slice()) };
-            pubsub::apply_unsubscribe(names, kind, cx, out);
+            pubsub::apply_unsubscribe(names, kind, cx, now, out);
         }
         CommandId::Publish => pubsub::publish_fallback(argv.arg(1), argv.arg(2), cx, out),
         CommandId::Pubsub => {
@@ -445,12 +780,21 @@ pub fn execute(
             pubsub::pubsub_fallback(&args, cx, out);
         }
         _ => {
-            if let Some(id) = cx.ns {
+            if let Some(id) = cx.ns.named() {
                 // Tiered namespaces are plane-resident (M4-S26): their
                 // command path needs the reactor (cold-read suspension,
                 // WAL staging), so the planeless fallback refuses rather
-                // than silently serving the empty CellStore shell.
-                if ks.is_tiered(id) {
+                // than silently serving the empty CellStore shell — for
+                // a command that addresses the keyspace. A connection-
+                // level command (`HELLO`, `PING`, `CLIENT`, … —
+                // `KeyspaceScope::None`, ADR-0108) touches no store and
+                // executes here whatever the binding: review of
+                // 2026-08-30, the batch-8 residual — `HELLO` on a
+                // tiered-bound connection answered this refusal.
+                if ks.is_tiered(id)
+                    && inf_wire::keyspace_scope(meta, (argv.len() > 1).then(|| argv.arg(1)))
+                        != inf_wire::KeyspaceScope::None
+                {
                     let mut w = RespWriter::new(out, cx.proto);
                     return w.error("ERR tiered namespaces require the server plane (M4-S26)");
                 }
@@ -515,6 +859,12 @@ fn execute_db(
             cx.close_requested.set(true);
         }
         CommandId::Get => match store.get_str(argv.arg(1), now) {
+            // Planted-bug canary (F-L19-04, `scripts/sim-canaries.sh`):
+            // one byte appended to every value. The shared-store replay
+            // cannot see it; the simulator's independent model must.
+            #[cfg(inf_canary_reply_lie)]
+            Ok(Some(value)) => w.bulk(&[value, b"!"].concat()),
+            #[cfg(not(inf_canary_reply_lie))]
             Ok(Some(value)) => w.bulk(value),
             Ok(None) => w.null(),
             Err(e) => op_error(e, &mut w),
@@ -529,17 +879,13 @@ fn execute_db(
             }
         }
         CommandId::Setex | CommandId::Psetex => {
-            let unit_ms = if meta.id == CommandId::Setex { 1000 } else { 1 };
-            let Ok(ttl) = parse_i64(argv.arg(2)) else {
-                return w.error("ERR value is not an integer or out of range");
+            let ms = if meta.id == CommandId::Setex { 1000 } else { 1 };
+            let unit = ExpireUnit { ms, absolute: false };
+            let at = match set_expire_deadline(&cx.node, now, argv.arg(2), unit) {
+                Ok(at) => at,
+                Err(message) => return w.error(&message(&meta.name.to_ascii_lowercase())),
             };
-            let Some(at) = expire_deadline(now, ttl, unit_ms) else {
-                return w.error(&format!(
-                    "ERR invalid expire time in '{}' command",
-                    meta.name.to_ascii_lowercase()
-                ));
-            };
-            let opts = SetOptions { expire: SetExpire::At(at), ..Default::default() };
+            let opts = SetOptions { expire: SetExpire::from(at), ..Default::default() };
             match store.set(argv.arg(1), argv.arg(3), opts, now) {
                 Ok(_) => w.simple("OK"),
                 Err(e) => op_error(e, &mut w),
@@ -666,7 +1012,9 @@ fn execute_db(
             if !store.exists(argv.arg(1), now) {
                 return w.error("ERR no such key");
             }
-            if store.exists(argv.arg(2), now) && argv.arg(1) != argv.arg(2) {
+            // Same key answers `:0` before the store is touched (Redis
+            // `renameGenericCommand`; RENAME's same-key case is `+OK`).
+            if argv.arg(1) == argv.arg(2) || store.exists(argv.arg(2), now) {
                 return w.int(0);
             }
             match store.rename(argv.arg(1), argv.arg(2), now) {
@@ -739,8 +1087,13 @@ fn execute_db(
         CommandId::Lolwut => w.bulk(b"InfinityDB ver. 0.1.0-alpha.0\n"),
         // ---- internal fabric-program ops ----
         CommandId::InfTake | CommandId::InfPeek => {
-            inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+            if argv.len() == 2 {
+                inf_take_peek(argv, store, meta.id == CommandId::InfTake, now, &mut w);
+            } else {
+                inf_move_snapshot(argv, store, meta.id, &cx.node, now, &mut w);
+            }
         }
+        CommandId::InfPut => inf_move_put(argv, store, &cx.node, now, &mut w),
         // ---- M3-S11/S12 · `JSON.*` document family (ADR-0041) ----
         CommandId::JsonSet
         | CommandId::JsonGet
@@ -814,13 +1167,28 @@ pub(crate) fn wall_ms(node: &NodeInfo, now: Nanos) -> u64 {
     now.as_millis().saturating_sub(internal_anchor).saturating_add(unix_anchor)
 }
 
-/// Internal (injected-clock) milliseconds for a Unix-epoch deadline. Past
-/// deadlines clamp to 0 (already expired); `None` = arithmetic overflow.
-fn internal_from_unix_ms(node: &NodeInfo, unix_ms: i64) -> Option<u64> {
+/// The store deadline for a Unix-epoch instant (ADR-0111 A1): an instant
+/// before the internal clock's origin is expired at every reading of the
+/// clock, its first millisecond included, and instants past the store's
+/// u40-ms bound saturate to it. Every instant Redis represents in i64 ms
+/// lands somewhere on the internal clock — this never refuses.
+fn absolute_deadline(node: &NodeInfo, unix_ms: i64) -> InternalDeadline {
     let (internal_anchor, unix_anchor) = node.wall_anchor.get();
-    let delta = unix_ms.checked_sub(i64::try_from(unix_anchor).ok()?)?;
-    let internal = i64::try_from(internal_anchor).ok()?.checked_add(delta)?;
-    Some(internal.max(0) as u64)
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let internal =
+        unix_ms.saturating_sub(clamp(unix_anchor)).saturating_add(clamp(internal_anchor));
+    InternalDeadline::from_internal_ms(internal)
+}
+
+/// The store deadline `ttl_ms` after `now` (ADR-0111). Redis refuses only
+/// when the Unix-ms sum overflows `i64` (`expire.c`: `when > LLONG_MAX -
+/// basetime`); a negative TTL is already expired (delete on apply) and a
+/// far-future one saturates to the store bound.
+fn relative_deadline(node: &NodeInfo, now: Nanos, ttl_ms: i64) -> Option<InternalDeadline> {
+    let base = i64::try_from(wall_ms(node, now)).unwrap_or(i64::MAX);
+    ttl_ms.checked_add(base)?;
+    let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX);
+    Some(InternalDeadline::from_internal_ms(now_ms.saturating_add(ttl_ms)))
 }
 
 /// Unix-epoch milliseconds for an internal deadline (EXPIRETIME family).
@@ -850,67 +1218,52 @@ fn set(
     w: &mut RespWriter<'_>,
 ) {
     let mut opts = SetOptions::default();
-    let mut have_cond = false;
-    let mut have_expire = false;
+    let mut expire: Option<(&[u8], ExpireUnit)> = None;
     let mut i = 3;
+    // Redis `parseExtendedStringArgumentsOrReply`: an option conflicts
+    // only with a *different* one of its family (`NX XX`, `EX … PX …`,
+    // `EX … KEEPTTL`); a repeat is accepted, the last value wins
+    // (batch 52, review of 2026-08-30 — `NX NX` and `EX 1 EX 2` were
+    // syntax errors here, oracle-pinned otherwise).
     while i < argv.len() {
         let opt = argv.arg(i);
         if opt.eq_ignore_ascii_case(b"NX") || opt.eq_ignore_ascii_case(b"XX") {
-            if have_cond {
-                return w.error("ERR syntax error");
-            }
-            have_cond = true;
-            opts.cond = if opt.eq_ignore_ascii_case(b"NX") {
+            let cond = if opt.eq_ignore_ascii_case(b"NX") {
                 SetCond::IfAbsent
             } else {
                 SetCond::IfPresent
             };
+            if opts.cond != SetCond::Always && opts.cond != cond {
+                return w.error("ERR syntax error");
+            }
+            opts.cond = cond;
         } else if opt.eq_ignore_ascii_case(b"GET") {
             opts.get_old = true;
         } else if opt.eq_ignore_ascii_case(b"KEEPTTL") {
-            if have_expire {
+            if expire.is_some() {
                 return w.error("ERR syntax error");
             }
-            have_expire = true;
             opts.expire = SetExpire::Keep;
-        } else if opt.eq_ignore_ascii_case(b"EX")
-            || opt.eq_ignore_ascii_case(b"PX")
-            || opt.eq_ignore_ascii_case(b"EXAT")
-            || opt.eq_ignore_ascii_case(b"PXAT")
-        {
-            if have_expire || i + 1 >= argv.len() {
+        } else if let Some(unit) = expire_option(opt) {
+            if opts.expire == SetExpire::Keep
+                || expire.is_some_and(|(_, prev)| prev != unit)
+                || i + 1 >= argv.len()
+            {
                 return w.error("ERR syntax error");
             }
-            have_expire = true;
-            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
-            };
-            let unit_ms: i64 =
-                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
-                    1000
-                } else {
-                    1
-                };
-            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
-            let at = if absolute {
-                // Past EXAT/PXAT is legal: SET applies, the key is born
-                // expired (Redis semantics).
-                value
-                    .checked_mul(unit_ms)
-                    .and_then(|unix| internal_from_unix_ms(node, unix))
-                    .and_then(ms_to_nanos)
-            } else {
-                expire_deadline(now, value, unit_ms)
-            };
-            let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'set' command");
-            };
-            opts.expire = SetExpire::At(at);
+            expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
             return w.error("ERR syntax error");
         }
         i += 1;
+    }
+    // Syntax first, the value after (Redis's order), before any write.
+    if let Some((raw, unit)) = expire {
+        match set_expire_deadline(node, now, raw, unit) {
+            Ok(at) => opts.expire = SetExpire::from(at),
+            Err(message) => return w.error(&message("set")),
+        }
     }
     match store.set(argv.arg(1), argv.arg(2), opts, now) {
         Ok(outcome) => {
@@ -943,52 +1296,45 @@ fn getex(
     w: &mut RespWriter<'_>,
 ) {
     let mut update = TtlUpdate::Keep;
-    let mut have = false;
+    let mut expire: Option<(&[u8], ExpireUnit)> = None;
     let mut i = 2;
+    // The same family rule as SET: `PERSIST PERSIST` and `EX 1 EX 2`
+    // are accepted, `EX … PERSIST` and `EX … PX …` are syntax errors.
     while i < argv.len() {
         let opt = argv.arg(i);
-        if have {
-            return w.error("ERR syntax error");
-        }
         if opt.eq_ignore_ascii_case(b"PERSIST") {
-            have = true;
-            update = TtlUpdate::Persist;
-        } else if opt.eq_ignore_ascii_case(b"EX")
-            || opt.eq_ignore_ascii_case(b"PX")
-            || opt.eq_ignore_ascii_case(b"EXAT")
-            || opt.eq_ignore_ascii_case(b"PXAT")
-        {
-            if i + 1 >= argv.len() {
+            if expire.is_some() {
                 return w.error("ERR syntax error");
             }
-            have = true;
-            let Ok(value) = parse_i64(argv.arg(i + 1)) else {
-                return w.error("ERR value is not an integer or out of range");
-            };
-            let unit_ms: i64 =
-                if opt.eq_ignore_ascii_case(b"EX") || opt.eq_ignore_ascii_case(b"EXAT") {
-                    1000
-                } else {
-                    1
-                };
-            let absolute = opt.eq_ignore_ascii_case(b"EXAT") || opt.eq_ignore_ascii_case(b"PXAT");
-            let at = if absolute {
-                value
-                    .checked_mul(unit_ms)
-                    .and_then(|unix| internal_from_unix_ms(node, unix))
-                    .and_then(ms_to_nanos)
-            } else {
-                expire_deadline(now, value, unit_ms)
-            };
-            let Some(at) = at else {
-                return w.error("ERR invalid expire time in 'getex' command");
-            };
-            update = TtlUpdate::At(at);
+            update = TtlUpdate::Persist;
+        } else if let Some(unit) = expire_option(opt) {
+            if matches!(update, TtlUpdate::Persist)
+                || expire.is_some_and(|(_, prev)| prev != unit)
+                || i + 1 >= argv.len()
+            {
+                return w.error("ERR syntax error");
+            }
+            expire = Some((argv.arg(i + 1), unit));
             i += 1;
         } else {
             return w.error("ERR syntax error");
         }
         i += 1;
+    }
+    if let Some((raw, unit)) = expire {
+        match set_expire_deadline(node, now, raw, unit) {
+            Ok(at) => update = TtlUpdate::from(at),
+            // Redis reads the value after its lookup: a missing key
+            // answers nil and a document WRONGTYPE whatever the value
+            // says (oracle-pinned). The probe is on the error path only.
+            Err(message) => {
+                return match store.type_of(argv.arg(1), now) {
+                    None => w.null(),
+                    Some(inf_store::TypeTag::JsonDoc) => op_error(OpError::WrongType, w),
+                    Some(_) => w.error(&message("getex")),
+                };
+            }
+        }
     }
     match store.get_ex(argv.arg(1), update, now) {
         Some(value) => w.bulk(&value),
@@ -1001,15 +1347,41 @@ fn getex(
 
 // ---- MSET / MSETNX -----------------------------------------------------------
 
+/// Bounds pre-pass for the multi-pair writes (review of 2026-08-30, H2 /
+/// F-L13-06, F-L17-11, ADR-0098): every pair validates before any pair
+/// applies — Redis's MSET is atomic, and the durable emission gate needs
+/// an error reply to imply zero mutation. The store's own `check_bounds`
+/// stays as the per-write invariant; this is the command-shape gate.
+fn pairs_within_bounds(argv: &(impl Argv + ?Sized)) -> bool {
+    let mut i = 1;
+    while i < argv.len() {
+        if argv.arg(i).len() > MAX_KEY_LEN || argv.arg(i + 1).len() > MAX_VAL_LEN {
+            return false;
+        }
+        i += 2;
+    }
+    true
+}
+
 fn mset(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mut RespWriter<'_>) {
     if argv.len().is_multiple_of(2) {
         return arity_error("MSET", w);
     }
+    if !pairs_within_bounds(argv) {
+        return op_error(OpError::TooLarge, w);
+    }
     let mut i = 1;
     while i < argv.len() {
-        // Single-cell MSET is atomic by single-threadedness; an OOM mid-way
-        // surfaces as the error (partial application — Redis can't hit this
-        // shape; recorded with the OOM backpressure semantics).
+        // Deterministic stand-in for arena OOM after a prefix applied —
+        // with bounds pre-validated, the only remaining mid-way failure
+        // (review of 2026-08-30, H2 — the staged-prefix crash-matrix row).
+        if i > 1 && inf_foundation::fault::fire(crate::fault::MSET_MIDWAY_OOM) {
+            return op_error(OpError::OutOfMemory, w);
+        }
+        // Single-cell MSET is atomic by single-threadedness; an OOM
+        // mid-way surfaces as the error, and the durable emission gate
+        // stages the applied prefix despite it (ADR-0098 — recovery
+        // replays the live store, never a silent rollback).
         if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
             return op_error(e, w);
         }
@@ -1022,6 +1394,11 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
     if argv.len().is_multiple_of(2) {
         return arity_error("MSETNX", w);
     }
+    // Bounds are command validity (like arity), so they precede the NX
+    // existence gate (ADR-0098).
+    if !pairs_within_bounds(argv) {
+        return op_error(OpError::TooLarge, w);
+    }
     let mut i = 1;
     while i < argv.len() {
         if store.exists(argv.arg(i), now) {
@@ -1031,6 +1408,10 @@ fn msetnx(argv: &(impl Argv + ?Sized), store: &mut CellStore, now: Nanos, w: &mu
     }
     let mut i = 1;
     while i < argv.len() {
+        // Same mid-way stand-in as `mset` (one point, both apply loops).
+        if i > 1 && inf_foundation::fault::fire(crate::fault::MSET_MIDWAY_OOM) {
+            return op_error(OpError::OutOfMemory, w);
+        }
         if let Err(e) = store.set(argv.arg(i), argv.arg(i + 1), SetOptions::default(), now) {
             return op_error(e, w);
         }
@@ -1062,7 +1443,7 @@ fn copy(
                 return w.error("ERR syntax error");
             }
             match parse_i64(argv.arg(i + 1)) {
-                Ok(n @ 0..=15) => dst_db = n as u16,
+                Ok(n) if (0..i64::from(DATABASES)).contains(&n) => dst_db = n as u16,
                 Ok(_) => return w.error("ERR DB index is out of range"),
                 Err(()) => return w.error("ERR value is not an integer or out of range"),
             }
@@ -1188,6 +1569,15 @@ fn scan(
 /// SCAN cursors are decimal u64 (Redis `strtoull` shape). `pub` (hidden)
 /// for the fuzz target only — command code stays the consumer.
 #[doc(hidden)]
+#[cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 pub fn parse_cursor(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() || bytes.len() > 20 || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
@@ -1241,7 +1631,9 @@ fn object(
             w.int(i64::from(store.object_freq(key, now).unwrap_or(0)));
         } else {
             w.error(
-                "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+                "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+                     Please note that when switching between policies at runtime LRU and LFU data \
+                     will take some time to adjust.",
             );
         }
     }
@@ -1260,13 +1652,20 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 /// `SELECT 0..15` maps to the default namespaces (M1-S08). The selection
 /// is connection state — the plane serializes it in pipeline order exactly
 /// like HELLO's protocol switch (a conn-state barrier).
-fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
+fn select(
+    argv: &(impl Argv + ?Sized),
+    ks: &mut Keyspace,
+    cx: &mut ConnCx,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
     match parse_i64(argv.arg(1)) {
-        Ok(n @ 0..=15) => {
+        Ok(n) if (0..i64::from(DATABASES)).contains(&n) => {
             cx.db = n as u16;
-            cx.ns = None; // SELECT returns the connection to the defaults
+            cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
+            cx.publish_client_state(now);
             w.simple("OK");
         }
         Ok(_) => w.error("ERR DB index is out of range"),
@@ -1330,13 +1729,16 @@ fn expire(
     } else {
         ExpireCond::Always
     };
-    // Deadline overflow is "invalid expire time".
+    // Redis's arithmetic (`expire.c`): seconds must fit i64 ms, a relative
+    // TTL must not overflow when the wall clock is added; nothing else
+    // refuses — negatives delete on apply, the far future saturates.
     let at = match deadline {
-        Deadline::Relative { unit_ms } => expire_deadline_signed(now, value, unit_ms),
-        Deadline::AbsoluteUnix { unit_ms } => value
-            .checked_mul(unit_ms)
-            .and_then(|unix| internal_from_unix_ms(node, unix))
-            .and_then(ms_to_nanos),
+        Deadline::Relative { unit_ms } => {
+            value.checked_mul(unit_ms).and_then(|ms| relative_deadline(node, now, ms))
+        }
+        Deadline::AbsoluteUnix { unit_ms } => {
+            value.checked_mul(unit_ms).map(|unix| absolute_deadline(node, unix))
+        }
     };
     let Some(at) = at else {
         return w
@@ -1389,19 +1791,141 @@ fn inf_take_peek(
     w.int(pttl);
 }
 
+/// ADR-0110: the move snapshot and cleanup compare bytes plus an absolute
+/// deadline. No store borrow or record identity survives a fabric hop.
+#[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column handler")]
+fn inf_move_snapshot(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    command: CommandId,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let expected = match command {
+        CommandId::InfPeek
+            if (argv.len() == 3
+                || (argv.len() == 4 && argv.arg(3).eq_ignore_ascii_case(b"NOSTATS")))
+                && argv.arg(2).eq_ignore_ascii_case(b"ABS") =>
+        {
+            None
+        }
+        CommandId::InfTake if argv.len() == 5 && argv.arg(2).eq_ignore_ascii_case(b"IF") => {
+            match parse_i64(argv.arg(4)) {
+                Ok(deadline) if deadline >= -1 => Some(deadline),
+                _ => return w.error("ERR invalid move snapshot deadline"),
+            }
+        }
+        _ => return w.error("ERR syntax error"),
+    };
+    let key = argv.arg(1);
+    let deadline = match store.expire_at(key, now) {
+        Ttl::Missing => return if expected.is_some() { w.int(0) } else { w.null_array() },
+        Ttl::NoExpiry => -1,
+        Ttl::Ms(ms) => unix_from_internal_ms(node, ms),
+    };
+    let value = if expected.is_some() || argv.len() == 4 {
+        store.peek_str(key, now)
+    } else {
+        store.get_str(key, now)
+    };
+    let value = match value {
+        Ok(Some(value)) => value,
+        Ok(None) => return if expected.is_some() { w.int(0) } else { w.null_array() },
+        // A changed type is a mismatched cleanup, not permission to delete.
+        Err(_) if expected.is_some() => return w.int(0),
+        Err(error) => return op_error(error, w),
+    };
+    if let Some(expected) = expected {
+        if deadline != expected || value != argv.arg(3) {
+            return w.int(0);
+        }
+        // Comparison and removal share one owner execution and one `now`.
+        let removed = store.del(key, now);
+        debug_assert!(removed, "snapshot matched a live key at this same instant");
+        return w.int(i64::from(removed));
+    }
+    w.array_header(2);
+    w.bulk(value);
+    w.int(deadline);
+}
+
+/// `INF.PUT key value deadline [NX]` — the RENAME/RENAMENX destination leg
+/// (ADR-0110 third amendment). A bounded put whose admission is RENAME's
+/// (the registry row carries no DENYOOM; Redis admits both renames under
+/// `maxmemory`), whose deadline is the snapshot's absolute Unix ms (`-1` =
+/// none, saturating like every deadline — ADR-0111), and whose replies are
+/// `SET`'s (`+OK`, null on a refused NX) so the program's parser is one.
+/// The arena's own refusal (`OpError::OutOfMemory`) still answers OOM.
+fn inf_move_put(
+    argv: &(impl Argv + ?Sized),
+    store: &mut CellStore,
+    node: &NodeInfo,
+    now: Nanos,
+    w: &mut RespWriter<'_>,
+) {
+    let cond = match argv.len() {
+        4 => SetCond::Always,
+        5 if argv.arg(4).eq_ignore_ascii_case(b"NX") => SetCond::IfAbsent,
+        _ => return w.error("ERR syntax error"),
+    };
+    let expire = match parse_i64(argv.arg(3)) {
+        Ok(-1) => SetExpire::Clear,
+        Ok(unix_ms) if unix_ms > 0 => SetExpire::from(absolute_deadline(node, unix_ms)),
+        _ => return w.error("ERR invalid move snapshot deadline"),
+    };
+    let opts = SetOptions { cond, expire, get_old: false };
+    match store.set(argv.arg(1), argv.arg(2), opts, now) {
+        Ok(SetOutcome::Applied { .. }) => w.simple("OK"),
+        Ok(SetOutcome::Skipped { .. }) => w.null(),
+        Err(e) => op_error(e, w),
+    }
+}
+
 // ---- shared helpers ---------------------------------------------------------------
 
+/// Longest command name echoed back (Redis: `%.128s` on the name).
+const UNKNOWN_NAME_MAX: usize = 128;
+/// Byte budget for the whole argument tail (Redis: arguments are appended
+/// while the tail is under 128 bytes, each truncated to what is left).
+const UNKNOWN_ARGS_BUDGET: usize = 128;
+
 // Format pinned byte-exact against Redis 8.0.5 by the compat harness:
-// `'arg1' 'arg2' ` — space-separated, trailing space, no parentheses.
+// `'arg1' 'arg2' ` — space-separated, trailing space, no parentheses. The
+// *bounds* are the oracle's too (`server.c`): without them 20 arguments of
+// `max_frame_bytes` each build a ~20 MB reply per bogus command. Argument
+// bytes go out raw (`error_bytes`) — they need not be UTF-8, and a lossy
+// conversion would change the byte budget as well as the bytes. CR/LF
+// inside them cannot break framing: `RespWriter` sanitizes the line
+// (ADR-0097 — review finding C6, where these bytes forged a second reply).
+/// The unknown-command reply for a client-typed `INTERNAL` row, refused
+/// at the plane's dispatch funnels before any routing (ADR-0115).
+pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut Vec<u8>) {
+    unknown_command(argv, &mut RespWriter::new(out, proto));
+}
+
 fn unknown_command(argv: &(impl Argv + ?Sized), w: &mut RespWriter<'_>) {
-    let mut text = format!(
-        "ERR unknown command '{}', with args beginning with: ",
-        String::from_utf8_lossy(argv.arg(0))
-    );
-    for i in 1..argv.len().min(21) {
-        text.push_str(&format!("'{}' ", String::from_utf8_lossy(argv.arg(i))));
+    // One allocation, always: the message is bounded by its own two caps.
+    let mut text = Vec::with_capacity(UNKNOWN_NAME_MAX + UNKNOWN_ARGS_BUDGET + 64);
+    text.extend_from_slice(b"ERR unknown command '");
+    let name = argv.arg(0);
+    text.extend_from_slice(&name[..name.len().min(UNKNOWN_NAME_MAX)]);
+    text.extend_from_slice(b"', with args beginning with: ");
+    let mut spent = 0usize;
+    for i in 1..argv.len() {
+        if spent >= UNKNOWN_ARGS_BUDGET {
+            break;
+        }
+        let arg = argv.arg(i);
+        let take = arg.len().min(UNKNOWN_ARGS_BUDGET - spent);
+        text.push(b'\'');
+        text.extend_from_slice(&arg[..take]);
+        text.extend_from_slice(b"' ");
+        // The quotes and the separator count against the budget, as in the
+        // oracle's `sdscatprintf(args, "'%.*s' ", ...)`.
+        spent += take + 3;
     }
-    w.error(&text);
+    w.error_bytes(&text);
 }
 
 pub(crate) fn arity_error(name: &str, w: &mut RespWriter<'_>) {
@@ -1430,28 +1954,58 @@ pub(crate) fn op_error(e: OpError, w: &mut RespWriter<'_>) {
         OpError::DiskFull(inf_store::DiskFullCause::Device) => {
             w.error("DISKFULL tier device out of space (ENOSPC)")
         }
+        // M4.5-S04 (ADR-0072 D7.1): the bracket refused before anything
+        // changed; one message definition rides the refusal type.
+        OpError::IndexMaintenance(refusal) => w.error(refusal.message()),
     }
 }
 
-/// Positive-TTL deadline for SET EX/PX, SETEX, and GETEX EX/PX (must be > 0).
-fn expire_deadline(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
-    if ttl <= 0 {
-        return None;
+/// A `SET`/`GETEX` expire option: its unit in ms and whether the value is
+/// a Unix instant (`EXAT`/`PXAT`) or a TTL (`EX`/`PX`).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct ExpireUnit {
+    ms: i64,
+    absolute: bool,
+}
+
+pub(crate) fn expire_option(opt: &[u8]) -> Option<ExpireUnit> {
+    if opt.eq_ignore_ascii_case(b"EX") {
+        Some(ExpireUnit { ms: 1000, absolute: false })
+    } else if opt.eq_ignore_ascii_case(b"PX") {
+        Some(ExpireUnit { ms: 1, absolute: false })
+    } else if opt.eq_ignore_ascii_case(b"EXAT") {
+        Some(ExpireUnit { ms: 1000, absolute: true })
+    } else if opt.eq_ignore_ascii_case(b"PXAT") {
+        Some(ExpireUnit { ms: 1, absolute: true })
+    } else {
+        None
     }
-    let ms = ttl.checked_mul(unit_ms)?;
-    let at = (now.0 / 1_000_000).checked_add_signed(ms)?;
-    Some(Nanos(at.checked_mul(1_000_000)?))
 }
 
-/// EXPIRE deadline — negative TTLs are legal (delete-on-apply).
-fn expire_deadline_signed(now: Nanos, ttl: i64, unit_ms: i64) -> Option<Nanos> {
-    let ms = ttl.checked_mul(unit_ms)?;
-    let at = (now.0 / 1_000_000).saturating_add_signed(ms);
-    Some(Nanos(at.checked_mul(1_000_000)?))
-}
-
-fn ms_to_nanos(ms: u64) -> Option<Nanos> {
-    Some(Nanos(ms.checked_mul(1_000_000)?))
+/// The deadline of a `SET`/`SETEX`/`PSETEX`/`GETEX` expire value — Redis's
+/// one gate (`getExpireMillisecondsOrReply`; review 2026-08-30, M1 /
+/// F-L13-02, width ADR-0111): an integer, **> 0 for every option**,
+/// seconds that fit i64 ms, and a relative sum that fits i64 Unix ms.
+/// Every instant that passes is stored (saturating at the store bound);
+/// a positive past `EXAT`/`PXAT` is born expired. `Err` carries the
+/// message builder (the command name differs).
+fn set_expire_deadline(
+    node: &NodeInfo,
+    now: Nanos,
+    raw: &[u8],
+    unit: ExpireUnit,
+) -> Result<InternalDeadline, fn(&str) -> String> {
+    let Ok(value) = parse_i64(raw) else {
+        return Err(|_| "ERR value is not an integer or out of range".to_owned());
+    };
+    let at = if value <= 0 {
+        None
+    } else if unit.absolute {
+        value.checked_mul(unit.ms).map(|unix| absolute_deadline(node, unix))
+    } else {
+        value.checked_mul(unit.ms).and_then(|ms| relative_deadline(node, now, ms))
+    };
+    at.ok_or(|name| format!("ERR invalid expire time in '{name}' command"))
 }
 
 /// Redis `string2ll`: optional sign, no leading zeros (and no `-0` —
@@ -1526,6 +2080,7 @@ pub fn stall_request(argv: &[&[u8]]) -> Option<Nanos> {
     Some(Nanos((secs * 1e9) as u64))
 }
 
+#[allow(clippy::disallowed_types, reason = "test-only: std containers in test code (ADR-0163 D2)")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1584,9 +2139,559 @@ mod tests {
         run_at(cx, store, Nanos(1), parts)
     }
 
+    /// Batch 44 (review of 2026-08-30, F-L17-11 verified against ADR-0098
+    /// D4): the durable emission gate stages on a non-error reply, so
+    /// every write-class command must be all-or-nothing — an error reply
+    /// implies zero mutation — unless it is in `stages_despite_error`.
+    /// ADR-0098's "M5 checklist item" is mechanical here: every `WRITE`
+    /// row of the registry needs at least one argv template (a new
+    /// multi-key write with none fails this test by name), every command
+    /// must produce at least one error reply across its templates, and
+    /// after every error reply the keyspace digest is byte-identical.
+    /// The pool covers the §5.5 blind spots (a 9-byte key, a 6-byte
+    /// value), a 256-byte key and a `MAX_VAL_LEN + 1` value (the two
+    /// bounds), an expiring key, a document, and an absent key; argv are
+    /// slices (the queued/remote paths execute slices; the 16 MiB bulk
+    /// exceeds the test parser's frame cap).
+    #[test]
+    fn an_error_reply_never_leaves_a_mutation_for_any_write_command() {
+        use inf_wire::COMMANDS;
+
+        let mut cx =
+            ConnCx { program: true, ..ConnCx::try_default().expect("fixture cache allocation") };
+        let mut store = Keyspace::new(StoreConfig::default());
+        let big_key = vec![b'k'; MAX_KEY_LEN + 1];
+        let big_val = vec![b'v'; MAX_VAL_LEN + 1];
+        let pool: Vec<(&[u8], Vec<u8>)> = vec![
+            (b"{k}", b"a".to_vec()),
+            (b"{k9}", b"k9bytes__".to_vec()),
+            (b"{ke}", b"e".to_vec()),
+            (b"{kj}", b"j".to_vec()),
+            (b"{km}", b"missing".to_vec()),
+            (b"{bigk}", big_key),
+            (b"{v}", b"v".to_vec()),
+            (b"{v6}", b"sixval".to_vec()),
+            (b"{bigv}", big_val),
+            (b"{num}", b"5".to_vec()),
+            (b"{bad}", b"notanumber".to_vec()),
+            (b"{neg}", b"-1".to_vec()),
+            (b"{huge}", b"99999999999999999999".to_vec()),
+            (b"{json}", br#"{"a":1,"arr":[1,2],"s":"x","b":true}"#.to_vec()),
+            (b"{badjson}", b"{bad".to_vec()),
+            (b"{path}", b"$.arr".to_vec()),
+            (b"{spath}", b"$.s".to_vec()),
+            (b"{bpath}", b"$.b".to_vec()),
+            (b"{badpath}", b"$[".to_vec()),
+        ];
+        let fill = |tok: &str| -> Vec<u8> {
+            pool.iter()
+                .find(|(t, _)| *t == tok.as_bytes())
+                .map_or_else(|| tok.as_bytes().to_vec(), |(_, v)| v.clone())
+        };
+        let keys: Vec<Vec<u8>> = [b"a".as_slice(), b"k9bytes__", b"e", b"j", b"missing"]
+            .iter()
+            .map(|k| k.to_vec())
+            .collect();
+        let seed = |cx: &mut ConnCx, store: &mut Keyspace| {
+            assert_eq!(run(cx, store, &[b"SET", b"a", b"old"]), b"+OK\r\n");
+            assert_eq!(run(cx, store, &[b"SET", b"k9bytes__", b"sixval"]), b"+OK\r\n");
+            assert_eq!(run(cx, store, &[b"SET", b"e", b"ev", b"PX", b"100000"]), b"+OK\r\n");
+            #[cfg(feature = "doc")]
+            assert_eq!(
+                run(
+                    cx,
+                    store,
+                    &[b"JSON.SET", b"j", b"$", br#"{"a":1,"arr":[1,2],"s":"x","b":true}"#]
+                ),
+                b"+OK\r\n"
+            );
+            run(cx, store, &[b"DEL", b"missing"]);
+        };
+        let digest = |cx: &mut ConnCx, store: &mut Keyspace| -> Vec<u8> {
+            let mut d = run(cx, store, &[b"DBSIZE"]);
+            for k in &keys {
+                let ty = run(cx, store, &[b"TYPE", k]);
+                d.extend_from_slice(&ty);
+                d.extend_from_slice(&run(cx, store, &[b"PTTL", k]));
+                if ty.starts_with(b"+string") {
+                    d.extend_from_slice(&run(cx, store, &[b"GET", k]));
+                } else if !ty.starts_with(b"+none") {
+                    #[cfg(feature = "doc")]
+                    d.extend_from_slice(&run(cx, store, &[b"JSON.GET", k]));
+                }
+            }
+            d
+        };
+
+        // One template list per write-class command: valid shapes seed
+        // the partial-apply paths, invalid ones drive the error replies.
+        type T = &'static [&'static [&'static str]];
+        let templates: &[(&str, T)] = &[
+            (
+                "SET",
+                &[
+                    &["{k}", "{v}"],
+                    &["{k}", "{bigv}"],
+                    &["{bigk}", "{v}"],
+                    &["{k}", "{v}", "EX", "0"],
+                    &["{k}", "{v}", "EX", "{bad}"],
+                    &["{k}", "{v}", "NX", "XX"],
+                    &["{k}", "{v}", "PX", "{huge}"],
+                    &["{k}", "{v}", "GET", "EX", "{neg}"],
+                    &["{kj}", "{v}", "GET"],
+                ],
+            ),
+            ("SETNX", &[&["{km}", "{v}"], &["{k}", "{bigv}"], &["{bigk}", "{v}"], &["{k}"]]),
+            (
+                "SETEX",
+                &[
+                    &["{k}", "{num}", "{v}"],
+                    &["{k}", "0", "{v}"],
+                    &["{k}", "{bad}", "{v}"],
+                    &["{k}", "{num}", "{bigv}"],
+                    &["{bigk}", "{num}", "{v}"],
+                ],
+            ),
+            (
+                "PSETEX",
+                &[
+                    &["{k}", "{num}", "{v}"],
+                    &["{k}", "{neg}", "{v}"],
+                    &["{k}", "{huge}", "{v}"],
+                    &["{k}", "{num}", "{bigv}"],
+                ],
+            ),
+            (
+                "GETSET",
+                &[&["{k}", "{v}"], &["{kj}", "{v}"], &["{k}", "{bigv}"], &["{bigk}", "{v}"]],
+            ),
+            ("GETDEL", &[&["{k}"], &["{kj}"], &["{km}"], &["{k}", "{v}"]]),
+            ("DEL", &[&["{k}", "{km}", "{k9}"], &["{bigk}"], &[]]),
+            ("INCR", &[&["{k}"], &["{km}"], &["{kj}"], &["{bigk}"]]),
+            ("DECR", &[&["{k}"], &["{kj}"], &["{k}", "{num}"]]),
+            (
+                "INCRBY",
+                &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k}", "{huge}"], &["{kj}", "{num}"]],
+            ),
+            ("DECRBY", &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k9}", "{num}"]]),
+            (
+                "APPEND",
+                &[&["{k}", "{v}"], &["{k}", "{bigv}"], &["{kj}", "{v}"], &["{bigk}", "{v}"]],
+            ),
+            (
+                "EXPIRE",
+                &[
+                    &["{k}", "{num}"],
+                    &["{k}", "{bad}"],
+                    &["{k}", "{num}", "NX", "XX"],
+                    &["{k}", "{num}", "BOGUS"],
+                    &["{k}", "{huge}"],
+                ],
+            ),
+            ("PEXPIRE", &[&["{k}", "{num}"], &["{k}", "{bad}"], &["{k}", "{num}", "GT", "LT"]]),
+            ("PERSIST", &[&["{ke}"], &["{k}", "{v}"], &["{bigk}"]]),
+            (
+                "MSET",
+                &[
+                    &["{k}", "{v}", "{bigk}", "{v}"],
+                    &["{k}", "{v}", "{k9}", "{bigv}"],
+                    &["{k}", "{v}", "{k9}"],
+                    &["{k}", "{v}", "{k9}", "{v6}"],
+                ],
+            ),
+            (
+                "MSETNX",
+                &[
+                    &["{km}", "{v}", "{bigk}", "{v}"],
+                    &["{km}", "{v}", "{k}", "{bigv}"],
+                    &["{km}", "{v}"],
+                    &["{km}", "{v}", "{k9}"],
+                ],
+            ),
+            (
+                "SETRANGE",
+                &[
+                    &["{k}", "0", "{v}"],
+                    &["{k}", "{neg}", "{v}"],
+                    &["{k}", "{huge}", "{v}"],
+                    &["{k}", "536870911", "{v}"],
+                    &["{kj}", "0", "{v}"],
+                    &["{k}", "1", "{bigv}"],
+                ],
+            ),
+            (
+                "GETEX",
+                &[
+                    &["{k}", "EX", "{num}"],
+                    &["{k}", "EX", "0"],
+                    &["{k}", "EX", "{bad}"],
+                    &["{k}", "BOGUS"],
+                    &["{kj}", "PERSIST"],
+                    &["{k}", "PX", "{huge}"],
+                ],
+            ),
+            (
+                "INCRBYFLOAT",
+                &[
+                    &["{k}", "1.5"],
+                    &["{k}", "{bad}"],
+                    &["{k}", "inf"],
+                    &["{kj}", "1"],
+                    &["{k9}", "1e400"],
+                ],
+            ),
+            (
+                "RENAME",
+                &[
+                    &["{k}", "{k9}"],
+                    &["{k}", "{bigk}"],
+                    &["{km}", "{k}"],
+                    &["{bigk}", "{k}"],
+                    &["{k}"],
+                ],
+            ),
+            (
+                "RENAMENX",
+                &[&["{k}", "{km}"], &["{k}", "{bigk}"], &["{km}", "{k}"], &["{k}", "{k9}"]],
+            ),
+            (
+                "COPY",
+                &[
+                    &["{k}", "{km}"],
+                    &["{k}", "{bigk}"],
+                    &["{km}", "{k}"],
+                    &["{k}", "{k9}"],
+                    &["{k}", "{km}", "DB", "{bad}"],
+                    &["{k}", "{km}", "DB", "99999"],
+                    &["{k}", "{km}", "BOGUS"],
+                ],
+            ),
+            ("UNLINK", &[&["{k9}", "{km}"], &["{bigk}"], &[]]),
+            ("FLUSHDB", &[&["BOGUS"], &["ASYNC", "SYNC"]]),
+            ("FLUSHALL", &[&["BOGUS"], &["ASYNC", "SYNC"]]),
+            (
+                "EXPIREAT",
+                &[&["{k}", "{huge}"], &["{k}", "{bad}"], &["{k}", "{neg}"], &["{k}", "1", "BOGUS"]],
+            ),
+            ("PEXPIREAT", &[&["{k}", "{huge}"], &["{k}", "{bad}"], &["{k}", "{num}", "NX", "XX"]]),
+            (
+                "INF.TAKE",
+                &[
+                    &["{k}"],
+                    &["{km}"],
+                    &["{k}", "IF", "{bad}", "{bad}"],
+                    &["{k}", "IF", "{v}", "{bad}"],
+                    &["{bigk}"],
+                ],
+            ),
+            (
+                "INF.PUT",
+                &[
+                    &["{km}", "{v}", "-1"],
+                    &["{km}", "{v}", "{bad}"],
+                    &["{bigk}", "{v}", "-1"],
+                    &["{km}", "{bigv}", "-1"],
+                    &["{km}", "{v}", "-1", "BOGUS"],
+                    &["{k}", "{v}", "-1", "NX"],
+                ],
+            ),
+            (
+                "JSON.SET",
+                &[
+                    &["{kj}", "$", "{json}"],
+                    &["{kj}", "$", "{badjson}"],
+                    &["{kj}", "{badpath}", "{json}"],
+                    &["{kj}", "$.new", "{json}", "XX", "NX"],
+                    &["{k}", "$", "{json}"],
+                    &["{bigk}", "$", "{json}"],
+                    &["{km}", "$.a", "{json}"],
+                ],
+            ),
+            ("JSON.DEL", &[&["{kj}", "{path}"], &["{kj}", "{badpath}"], &["{k}"], &["{km}"]]),
+            ("JSON.FORGET", &[&["{kj}", "{badpath}"], &["{k}", "$"], &["{km}", "$"]]),
+            (
+                "JSON.NUMINCRBY",
+                &[
+                    &["{kj}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "{bad}"],
+                    &["{kj}", "{badpath}", "{num}"],
+                    &["{k}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "1e400"],
+                ],
+            ),
+            (
+                "JSON.NUMMULTBY",
+                &[
+                    &["{kj}", "$.a", "{num}"],
+                    &["{kj}", "$.a", "{bad}"],
+                    &["{k}", "$.a", "{num}"],
+                    &["{km}", "$.a", "{num}"],
+                ],
+            ),
+            (
+                "JSON.STRAPPEND",
+                &[
+                    &["{kj}", "{spath}", "\"y\""],
+                    &["{kj}", "{spath}", "{badjson}"],
+                    &["{kj}", "{spath}", "1"],
+                    &["{kj}", "{badpath}", "\"y\""],
+                    &["{k}", "{spath}", "\"y\""],
+                ],
+            ),
+            (
+                "JSON.TOGGLE",
+                &[
+                    &["{kj}", "{bpath}"],
+                    &["{kj}", "{badpath}"],
+                    &["{k}", "{bpath}"],
+                    &["{km}", "{bpath}"],
+                ],
+            ),
+            ("JSON.CLEAR", &[&["{kj}", "{path}"], &["{kj}", "{badpath}"], &["{k}"], &["{km}"]]),
+            (
+                "JSON.ARRAPPEND",
+                &[
+                    &["{kj}", "{path}", "3"],
+                    &["{kj}", "{path}", "3", "{badjson}"],
+                    &["{kj}", "{badpath}", "3"],
+                    &["{k}", "{path}", "3"],
+                    &["{kj}", "{path}"],
+                ],
+            ),
+            (
+                "JSON.ARRINSERT",
+                &[
+                    &["{kj}", "{path}", "0", "3"],
+                    &["{kj}", "{path}", "0", "3", "{badjson}"],
+                    &["{kj}", "{path}", "{bad}", "3"],
+                    &["{kj}", "{path}", "99", "3"],
+                    &["{k}", "{path}", "0", "3"],
+                ],
+            ),
+            (
+                "JSON.ARRPOP",
+                &[
+                    &["{kj}", "{path}"],
+                    &["{kj}", "{path}", "{bad}"],
+                    &["{kj}", "{badpath}"],
+                    &["{k}"],
+                    &["{kj}", "{path}", "99"],
+                ],
+            ),
+            (
+                "JSON.ARRTRIM",
+                &[
+                    &["{kj}", "{path}", "0", "0"],
+                    &["{kj}", "{path}", "{bad}", "0"],
+                    &["{kj}", "{badpath}", "0", "0"],
+                    &["{k}", "{path}", "0", "0"],
+                ],
+            ),
+            (
+                "JSON.MERGE",
+                &[
+                    &["{kj}", "$", "{json}"],
+                    &["{kj}", "$", "{badjson}"],
+                    &["{kj}", "{badpath}", "{json}"],
+                    &["{k}", "$", "{json}"],
+                    &["{bigk}", "$", "{json}"],
+                ],
+            ),
+        ];
+
+        let mut cases = 0usize;
+        let mut errors_seen = 0usize;
+        let mut covered: Vec<&str> = Vec::new();
+        for (name, shapes) in templates {
+            let meta =
+                lookup(name.as_bytes()).unwrap_or_else(|| panic!("{name} is not a registry row"));
+            assert!(meta.flags.contains(CmdFlags::WRITE), "{name} is not a write-class row");
+            #[cfg(not(feature = "doc"))]
+            if name.starts_with("JSON.") {
+                continue;
+            }
+            covered.push(name);
+            let mut errors_for_this = 0usize;
+            for shape in shapes.iter() {
+                seed(&mut cx, &mut store);
+                let before = digest(&mut cx, &mut store);
+                let owned: Vec<Vec<u8>> = std::iter::once(name.as_bytes().to_vec())
+                    .chain(shape.iter().map(|tok| fill(tok)))
+                    .collect();
+                let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+                let mut reply = Vec::new();
+                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+                cases += 1;
+                if reply.first() == Some(&b'-') {
+                    errors_seen += 1;
+                    errors_for_this += 1;
+                    let after = digest(&mut cx, &mut store);
+                    assert_eq!(
+                        after,
+                        before,
+                        "{name} {:?} replied {:?} and mutated the keyspace",
+                        shape,
+                        String::from_utf8_lossy(&reply[..reply.len().min(80)])
+                    );
+                }
+            }
+            assert!(errors_for_this > 0, "{name}: no template produced an error reply");
+        }
+        // Every WRITE row is covered, or the M5 rule has an unchecked command.
+        let uncovered: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|m| m.flags.contains(CmdFlags::WRITE))
+            .filter(|m| !covered.contains(&m.name))
+            .filter(|m| cfg!(feature = "doc") || !m.name.starts_with("JSON."))
+            .map(|m| m.name)
+            .collect();
+        assert!(uncovered.is_empty(), "write-class rows without a template: {uncovered:?}");
+        eprintln!("{} write rows, {cases} cases, {errors_seen} error replies", covered.len());
+        let minimum_cases = if cfg!(feature = "doc") { 150 } else { 128 };
+        assert!(cases >= minimum_cases && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
+    }
+
+    /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
+    /// atomic — an over-bound pair anywhere refuses the whole command with
+    /// zero mutation, so an error reply implies nothing changed (the
+    /// premise the durable emission gate stands on). Pre-fix, the first
+    /// pair applied before the second pair's bounds check fired.
+    #[test]
+    fn mset_bounds_failure_applies_nothing() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"a", b"old"]), b"+OK\r\n");
+        let long_key = vec![b'k'; 256];
+        let reply = run(&mut cx, &mut store, &[b"MSET", b"a", b"new", &long_key, b"v"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"GET", b"a"]),
+            b"$3\r\nold\r\n",
+            "an erroring MSET must apply none of its pairs"
+        );
+        // Over-bound value in the last pair, fresh first key: same
+        // contract (slice argv — a 16 MiB bulk exceeds the test parser's
+        // frame cap, and the queued/remote paths execute slices anyway).
+        let big_val = vec![b'v'; MAX_VAL_LEN + 1];
+        let argv: Vec<&[u8]> = vec![b"MSET", b"fresh", b"x", b"b", &big_val];
+        let mut reply = Vec::new();
+        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"fresh"]), b"$-1\r\n");
+    }
+
+    /// The MSETNX half of the same contract. Bounds are command validity
+    /// (like arity), so they precede the NX existence gate.
+    #[test]
+    fn msetnx_bounds_failure_applies_nothing() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let long_key = vec![b'k'; 256];
+        let reply = run(&mut cx, &mut store, &[b"MSETNX", b"fresh", b"v", &long_key, b"w"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"GET", b"fresh"]),
+            b"$-1\r\n",
+            "an erroring MSETNX must apply none of its pairs"
+        );
+        // An existing key alongside an over-bound pair: validity first.
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"held", b"1"]), b"+OK\r\n");
+        let reply = run(&mut cx, &mut store, &[b"MSETNX", b"held", b"2", &long_key, b"w"]);
+        assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"held"]), b"$1\r\n1\r\n");
+    }
+
+    /// C6 (review 2026-08-30, `F-L12-04` / `F-L00-25`): the unknown-command
+    /// reply interpolates raw client bytes, so it is where a client's own
+    /// argument can forge a *second* reply frame. Two contracts are pinned
+    /// here, both read off **redis-server 8.0.5**:
+    ///
+    /// 1. **Framing** — the reply is exactly one RESP frame whatever the
+    ///    argument bytes are (the sanitizer lives in `RespWriter`, so this
+    ///    is the command layer's end of that contract).
+    /// 2. **Bounds** — `server.c` truncates the name to 128 bytes and
+    ///    appends arguments *while the tail is under 128 bytes*, each
+    ///    truncated to the remaining budget. The old 20-argument cap had no
+    ///    byte bound at all: 20 × 1 MiB of argument built a ~20 MB `String`
+    ///    per bogus command.
+    #[test]
+    fn unknown_command_reply_is_bounded_and_framed_like_the_oracle() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        // One frame: a terminating CRLF and no other CR or LF anywhere.
+        let framed = |reply: &[u8]| -> bool {
+            reply.ends_with(b"\r\n")
+                && !reply[..reply.len() - 2].iter().any(|b| *b == b'\r' || *b == b'\n')
+        };
+
+        // Name truncated at 128 bytes (oracle: 300 N's -> 128 N's).
+        let long_name = vec![b'N'; 300];
+        let reply = run(&mut cx, &mut store, &[&long_name, b"x"]);
+        let want = format!(
+            "-ERR unknown command '{}', with args beginning with: 'x' \r\n",
+            "N".repeat(128)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // One long argument truncated to the 128-byte budget.
+        let long_arg = vec![b'A'; 300];
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", &long_arg]);
+        let want = format!(
+            "-ERR unknown command 'NOSUCHCMD', with args beginning with: '{}' \r\n",
+            "A".repeat(128)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // The budget is spent across arguments: 'A*100' costs 103 bytes, so
+        // the next argument gets 25 and the third is never reached.
+        let a = vec![b'A'; 100];
+        let b = vec![b'B'; 100];
+        let c = vec![b'C'; 100];
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", &a, &b, &c]);
+        let want = format!(
+            "-ERR unknown command 'NOSUCHCMD', with args beginning with: '{}' '{}' \r\n",
+            "A".repeat(100),
+            "B".repeat(25)
+        );
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // Many short arguments stop at the same byte budget (oracle: a22).
+        let args: Vec<Vec<u8>> = (0..30).map(|i| format!("a{i}").into_bytes()).collect();
+        let mut parts: Vec<&[u8]> = vec![b"NOSUCHCMD"];
+        parts.extend(args.iter().map(|a| a.as_slice()));
+        let reply = run(&mut cx, &mut store, &parts);
+        let mut tail = String::new();
+        for i in 0..=22 {
+            tail.push_str(&format!("'a{i}' "));
+        }
+        let want =
+            format!("-ERR unknown command 'NOSUCHCMD', with args beginning with: {tail}\r\n");
+        assert_eq!(reply, want.as_bytes(), "{}", String::from_utf8_lossy(&reply));
+
+        // Framing: CR/LF in the name and in an argument stay inside one frame.
+        let reply = run(&mut cx, &mut store, &[b"BAD\r\n+INJECTED", b"x"]);
+        assert_eq!(
+            reply,
+            b"-ERR unknown command 'BAD  +INJECTED', with args beginning with: 'x' \r\n"
+        );
+        assert!(framed(&reply));
+        let reply = run(&mut cx, &mut store, &[b"NOSUCHCMD", b"a\r\n$3\r\nfoo"]);
+        assert_eq!(
+            reply,
+            b"-ERR unknown command 'NOSUCHCMD', with args beginning with: 'a  $3  foo' \r\n"
+        );
+        assert!(framed(&reply));
+
+        // A name that is nothing but CR/LF collapses to spaces, and the
+        // empty argument tail keeps the oracle's trailing space.
+        let reply = run(&mut cx, &mut store, &[b"BAD\r\n"]);
+        assert_eq!(reply, b"-ERR unknown command 'BAD  ', with args beginning with: \r\n");
+        assert!(framed(&reply));
+    }
+
     #[test]
     fn hello_switches_protocol_and_rejects_unknown_versions() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // RESP2 null is the bulk form.
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"missing"]), b"$-1\r\n");
@@ -1610,7 +2715,7 @@ mod tests {
 
     #[test]
     fn quit_replies_ok_and_requests_close() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"QUIT"]), b"+OK\r\n");
         assert!(cx.close_requested.get(), "QUIT must request a connection close");
@@ -1622,9 +2727,26 @@ mod tests {
         assert!(cx.close_requested.get());
     }
 
+    /// Batch 46 (review of 2026-08-30, F-L13-03): Redis's
+    /// `renameGenericCommand` answers the same-key case before it touches
+    /// the store — `:0` for RENAMENX, `+OK` for RENAME.
+    #[test]
+    fn renamenx_onto_itself_answers_zero_like_redis() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        assert_eq!(run(&mut cx, &mut store, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"RENAMENX", b"k", b"k"]), b":0\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"RENAME", b"k", b"k"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(
+            run(&mut cx, &mut store, &[b"RENAMENX", b"absent", b"absent"]),
+            b"-ERR no such key\r\n"
+        );
+    }
+
     #[test]
     fn record_bound_deviation_is_a_typed_error() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         let long_key = vec![b'k'; 256];
         let reply = run(&mut cx, &mut store, &[b"SET", &long_key, b"v"]);
@@ -1633,7 +2755,7 @@ mod tests {
 
     #[test]
     fn mget_mset_roundtrip() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut store, &[b"MSET", b"a", b"1", b"b", b"2"]), b"+OK\r\n");
         assert_eq!(
@@ -1651,9 +2773,298 @@ mod tests {
         assert_eq!(run(&mut cx, &mut store, &[b"MSETNX", b"n1", b"1", b"n2", b"2"]), b":1\r\n");
     }
 
+    /// Review 2026-08-30 (M1 / F-L13-02): `SET`/`GETEX` with an absolute
+    /// deadline ≤ 0 are argument errors in Redis, refused before the
+    /// write — pre-fix the store applied them and the key was born
+    /// expired (destroyed under a `+OK`). GETEX validates after its
+    /// lookup: a missing key answers nil and a document WRONGTYPE,
+    /// whatever the value says.
+    #[test]
+    fn set_and_getex_refuse_non_positive_absolute_deadlines_before_the_write() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.wall_anchor.set((1_000, 5_000_000));
+        let now = Nanos::from_millis(1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+        let cases: [(&[u8], &[u8]); 4] =
+            [(b"EXAT", b"0"), (b"EXAT", b"-1"), (b"PXAT", b"0"), (b"PXAT", b"-1")];
+        for (opt, value) in cases {
+            let ctx =
+                format!("{} {}", String::from_utf8_lossy(opt), String::from_utf8_lossy(value));
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"SET", b"k", b"v2", opt, value]),
+                b"-ERR invalid expire time in 'set' command\r\n",
+                "SET {ctx}"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", opt, value]),
+                b"-ERR invalid expire time in 'getex' command\r\n",
+                "GETEX {ctx}"
+            );
+        }
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TTL", b"k"]), b":-1\r\n");
+        // GETEX: the lookup precedes the value (Redis 8.0.5, oracle-pinned).
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GETEX", b"nk", b"EXAT", b"0"]), b"$-1\r\n");
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"nk", b"EX", b"notanint"]),
+            b"$-1\r\n"
+        );
+        #[cfg(feature = "doc")]
+        {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"GETEX", b"d", b"EXAT", b"0"]),
+                b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+            );
+        }
+    }
+
+    /// Review 2026-08-30 follow-up (batch 17, ADR-0111): Redis decides an
+    /// expire argument in i64 Unix milliseconds — seconds must fit i64 ms,
+    /// a relative TTL adds the wall clock and must not exceed `i64::MAX`,
+    /// and every instant it represents is *accepted*. The engine refused
+    /// past year 2554 (`ms_to_nanos` overflowed `u64`) and refused the
+    /// lower side too (`PEXPIREAT i64::MIN`). Accepted instants saturate
+    /// into the store's u40-ms bound — the recorded clamp deviation.
+    #[test]
+    fn far_future_deadlines_follow_redis_arithmetic_and_saturate() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        // Anchor: internal 1000 ms == unix 1_757_000_000_000 ms (2025-09).
+        cx.node.wall_anchor.set((1_000, 1_757_000_000_000));
+        let now = Nanos::from_millis(1_000);
+        let ok: &[u8] = b"+OK\r\n";
+        let one: &[u8] = b":1\r\n";
+        let invalid = |name: &str| format!("-ERR invalid expire time in '{name}' command\r\n");
+        let set = |cx: &mut ConnCx, store: &mut Keyspace| {
+            assert_eq!(run_at(cx, store, now, &[b"SET", b"k", b"v"]), ok);
+        };
+        let exists =
+            |cx: &mut ConnCx, store: &mut Keyspace| run_at(cx, store, now, &[b"EXISTS", b"k"]);
+        // Redis 8.0.5, oracle-pinned (scratch probe 2026-09-08): every
+        // accept/refuse below matches the real server's reply.
+        let accepted: &[&[&[u8]]] = &[
+            &[b"SET", b"k", b"v", b"PXAT", b"9223372036854775807"],
+            &[b"SET", b"k", b"v", b"EXAT", b"9223372036854775"],
+            &[b"SET", b"k", b"v", b"EX", b"9223000000000000"],
+            &[b"SET", b"k", b"v", b"PX", b"9223000000000000000"],
+            &[b"SETEX", b"k", b"9223000000000000", b"v"],
+            &[b"PSETEX", b"k", b"9223000000000000000", b"v"],
+        ];
+        for argv in accepted {
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), ok, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), one, "{argv:?} must leave a live key");
+        }
+        let refused: &[(&[&[u8]], &str)] = &[
+            (&[b"SET", b"k", b"v", b"EXAT", b"9223372036854776"], "set"),
+            (&[b"SET", b"k", b"v", b"PX", b"9223372036854775807"], "set"),
+            (&[b"SET", b"k", b"v", b"EX", b"9223372036854775"], "set"),
+            (&[b"SETEX", b"k", b"9223372036854775", b"v"], "setex"),
+            (&[b"PSETEX", b"k", b"9223372036854775807", b"v"], "psetex"),
+            (&[b"GETEX", b"k", b"EX", b"9223372036854775"], "getex"),
+            (&[b"GETEX", b"k", b"PX", b"9223372036854775807"], "getex"),
+            (&[b"EXPIREAT", b"k", b"9223372036854775807"], "expireat"),
+            (&[b"EXPIRE", b"k", b"9223372036854775"], "expire"),
+            (&[b"PEXPIRE", b"k", b"9223372036854775807"], "pexpire"),
+            (&[b"EXPIRE", b"k", b"-9223372036854775808"], "expire"),
+            (&[b"EXPIREAT", b"k", b"-9223372036854775808"], "expireat"),
+        ];
+        for (argv, name) in refused {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, argv),
+                invalid(name).as_bytes(),
+                "{argv:?}"
+            );
+        }
+        // Accepted instants past the store bound saturate to it: the key
+        // lives, and the read-backs report the bound (the ADR-0008 clamp).
+        set(&mut cx, &mut store);
+        assert_eq!(
+            run_at(
+                &mut cx,
+                &mut store,
+                now,
+                &[b"SET", b"k", b"v", b"PXAT", b"9223372036854775807"]
+            ),
+            ok
+        );
+        const BOUND_MS: u64 = (1 << 40) - 1; // inf-store's u40 record bound
+        let pttl = format!(":{}\r\n", BOUND_MS - 1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"PTTL", b"k"]), pttl.as_bytes());
+        let pexpiretime = format!(":{}\r\n", BOUND_MS - 1_000 + 1_757_000_000_000);
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]),
+            pexpiretime.as_bytes()
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", b"PXAT", b"9223372036854775807"]),
+            b"$1\r\nv\r\n"
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"GETEX", b"k", b"EXAT", b"9223372036854775"]),
+            b"$1\r\nv\r\n"
+        );
+        for argv in [
+            &[b"PEXPIREAT".as_slice(), b"k", b"9223372036854775807"],
+            &[b"EXPIREAT", b"k", b"9223372036854775"],
+            &[b"EXPIRE", b"k", b"9223000000000000"],
+            &[b"PEXPIRE", b"k", b"9223000000000000000"],
+        ] {
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), one, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), one, "{argv:?}");
+        }
+        // The lower side: milliseconds never refuse — a pre-epoch instant
+        // deletes on apply, exactly as any past deadline does.
+        for argv in [
+            &[b"PEXPIREAT".as_slice(), b"k", b"-9223372036854775808"],
+            &[b"EXPIREAT", b"k", b"-9223372036854775"],
+            &[b"EXPIRE", b"k", b"-9223372036854775"],
+            &[b"PEXPIRE", b"k", b"-9223372036854775808"],
+        ] {
+            set(&mut cx, &mut store);
+            assert_eq!(run_at(&mut cx, &mut store, now, argv), one, "{argv:?}");
+            assert_eq!(exists(&mut cx, &mut store), b":0\r\n", "{argv:?} deletes on apply");
+        }
+    }
+
+    /// ADR-0110 third amendment (batch 17): `INF.PUT key value deadline
+    /// [NX]` is the move's destination leg — a bounded put whose admission
+    /// is RENAME's (no DENYOOM), whose deadline is absolute Unix ms or `-1`,
+    /// and whose replies are SET's so the program's parser is unchanged.
+    #[test]
+    fn inf_put_is_a_bounded_put_admitted_like_rename() {
+        // ADR-0115: the leg runs under the program context.
+        let mut cx =
+            ConnCx { program: true, ..ConnCx::try_default().expect("fixture cache allocation") };
+        let mut store = Keyspace::new(StoreConfig::default());
+        cx.node.wall_anchor.set((1_000, 5_000_000));
+        let now = Nanos::from_millis(1_000);
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v", b"-1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"TTL", b"k"]), b":-1\r\n");
+        // NX against a live key answers SET's null; the value stands.
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v2", b"5100000", b"NX"]),
+            b"$-1\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+        // An absolute deadline lands exactly (unix 5_100_000 → internal 101 s).
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v2", b"5100000"]),
+            b"+OK\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"PEXPIRETIME", b"k"]), b":5100000\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$2\r\nv2\r\n");
+        // A document at the destination is overwritten, as RENAME does.
+        #[cfg(feature = "doc")]
+        {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"JSON.SET", b"d", b"$", b"{}"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"d", b"s", b"-1"]),
+                b"+OK\r\n"
+            );
+            assert_eq!(run_at(&mut cx, &mut store, now, &[b"TYPE", b"d"]), b"+string\r\n");
+        }
+        // Validation precedes any write: the deadline is `-1` or positive.
+        for bad in [&b"0"[..], b"-2", b"x", b"9223372036854775808"] {
+            assert_eq!(
+                run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3", bad]),
+                b"-ERR invalid move snapshot deadline\r\n",
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3", b"-1", b"BOGUS"]),
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"k", b"v3"]),
+            b"-ERR wrong number of arguments for 'inf.put' command\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"k"]), b"$2\r\nv2\r\n");
+        // Bounds are the store's, refused typed before any write.
+        let long_key = vec![b'k'; 256];
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"INF.PUT", &long_key, b"v", b"-1"]),
+            b"-ERR key or value exceeds InfinityDB M0 record bounds\r\n"
+        );
+        // Admission is RENAME's: under `maxmemory` with `noeviction`, SET
+        // answers OOM and the put lands (Redis admits RENAME there).
+        run_at(
+            &mut cx,
+            &mut store,
+            now,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"],
+        );
+        assert_eq!(
+            run_at(&mut cx, &mut store, now, &[b"SET", b"x", b"y"]),
+            b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"INF.PUT", b"x", b"y", b"-1"]), b"+OK\r\n");
+        assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"x"]), b"$1\r\ny\r\n");
+    }
+
+    /// ADR-0115: the fabric-program primitives are internal commands in
+    /// Redis 8's sense — a client typing one gets the unknown-command
+    /// reply (before arity, as Redis decides), also under `maxmemory`;
+    /// only a program-composed execution runs them.
+    #[test]
+    fn internal_commands_are_unknown_to_clients() {
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let unknown = |argv: &[&[u8]]| {
+            let mut text = b"-ERR unknown command '".to_vec();
+            text.extend_from_slice(argv[0]);
+            text.extend_from_slice(b"', with args beginning with: ");
+            for arg in &argv[1..] {
+                text.push(b'\'');
+                text.extend_from_slice(arg);
+                text.extend_from_slice(b"' ");
+            }
+            text.extend_from_slice(b"\r\n");
+            text
+        };
+        for argv in [
+            &[b"INF.PUT".as_slice(), b"k", b"v", b"-1"][..],
+            &[b"INF.TAKE", b"k"],
+            &[b"INF.PEEK", b"k", b"ABS"],
+            &[b"INF.PUT"], // arity would answer differently: lookup decides first
+            &[b"inf.put", b"k", b"v", b"-1"],
+        ] {
+            assert_eq!(run(&mut cx, &mut store, argv), unknown(argv), "{argv:?}");
+        }
+        assert_eq!(run(&mut cx, &mut store, &[b"GET", b"k"]), b"$-1\r\n", "nothing landed");
+        run(
+            &mut cx,
+            &mut store,
+            &[b"CONFIG", b"SET", b"maxmemory", b"1", b"maxmemory-policy", b"noeviction"],
+        );
+        let argv: &[&[u8]] = &[b"INF.PUT", b"k", b"v", b"-1"];
+        assert_eq!(run(&mut cx, &mut store, argv), unknown(argv), "under maxmemory too");
+        assert_eq!(run(&mut cx, &mut store, &[b"COMMAND", b"INFO", b"INF.PUT"]), b"*1\r\n$-1\r\n");
+        assert!(
+            run(&mut cx, &mut store, &[b"COMMAND", b"GETKEYS", b"INF.PUT", b"k", b"v", b"-1"])
+                .starts_with(b"-ERR Invalid command specified"),
+        );
+        let listed = run(&mut cx, &mut store, &[b"COMMAND"]);
+        assert!(!listed.windows(7).any(|w| w == b"inf.put"), "COMMAND hides internal rows");
+        // The program's own execution runs the leg.
+        cx.program = true;
+        assert_eq!(run(&mut cx, &mut store, argv), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut store, &[b"INF.PEEK", b"k"]), b"*2\r\n$1\r\nv\r\n:-1\r\n");
+    }
+
     #[test]
     fn expireat_family_uses_the_wall_anchor() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         // Anchor: internal 1000 ms == unix 5_000_000 ms.
         cx.node.wall_anchor.set((1_000, 5_000_000));
@@ -1675,9 +3086,59 @@ mod tests {
         assert_eq!(run_at(&mut cx, &mut store, now, &[b"GET", b"p"]), b"$-1\r\n");
     }
 
+    /// An instant before the internal clock's origin is expired at every
+    /// reading of that clock, its first millisecond included (ADR-0111
+    /// A1). `infinityd` anchors the wall clock at the origin, and a
+    /// pipeline queued in the listener's backlog runs inside that
+    /// millisecond: an instant clamped onto the origin was served there
+    /// (Redis 8.0.5 answers nil). The control is an instant *at* the
+    /// origin: a real deadline, served through its own millisecond as
+    /// Redis serves `PXAT now`, so a sentinel test on internal 0 is red.
+    #[test]
+    fn pre_origin_instants_are_expired_in_the_clocks_first_millisecond() {
+        let origin_unix_ms: &[u8] = b"1757000000000";
+        for now in [Nanos(1), Nanos(999_999)] {
+            let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+            let mut store = Keyspace::new(StoreConfig::default());
+            // The boot anchor: internal 0 ms == unix 1_757_000_000_000 ms.
+            cx.node.wall_anchor.set((0, 1_757_000_000_000));
+            let mut at = |argv: &[&[u8]]| run_at(&mut cx, &mut store, now, argv);
+            assert_eq!(at(&[b"SET", b"sxp", b"v", b"EXAT", b"1"]), b"+OK\r\n", "{now}");
+            assert_eq!(at(&[b"GET", b"sxp"]), b"$-1\r\n", "SET EXAT 1 at {now}");
+            assert_eq!(at(&[b"TTL", b"sxp"]), b":-2\r\n", "{now}");
+            // The overwrite answers the old value and leaves no key.
+            assert_eq!(at(&[b"SET", b"g", b"old"]), b"+OK\r\n");
+            assert_eq!(at(&[b"SET", b"g", b"v", b"PXAT", b"1", b"GET"]), b"$3\r\nold\r\n");
+            assert_eq!(at(&[b"EXISTS", b"g"]), b":0\r\n", "SET PXAT 1 GET at {now}");
+            // GETEX and EXPIREAT delete on apply.
+            assert_eq!(at(&[b"SET", b"x", b"v"]), b"+OK\r\n");
+            assert_eq!(at(&[b"GETEX", b"x", b"EXAT", b"1"]), b"$1\r\nv\r\n");
+            assert_eq!(at(&[b"EXISTS", b"x"]), b":0\r\n", "GETEX EXAT 1 at {now}");
+            assert_eq!(at(&[b"SET", b"r", b"v"]), b"+OK\r\n");
+            assert_eq!(at(&[b"PEXPIRE", b"r", b"-5"]), b":1\r\n");
+            assert_eq!(at(&[b"EXISTS", b"r"]), b":0\r\n", "PEXPIRE -5 at {now}");
+            // Control: an instant at the origin is live through its
+            // millisecond, and LT against it is the pre-origin instant's
+            // win (Redis: 1 < origin, applied, already expired: deleted).
+            assert_eq!(at(&[b"SET", b"o", b"v", b"PXAT", origin_unix_ms]), b"+OK\r\n");
+            assert_eq!(at(&[b"GET", b"o"]), b"$1\r\nv\r\n", "PXAT origin at {now}");
+            assert_eq!(at(&[b"PEXPIREAT", b"o", b"1", b"GT"]), b":0\r\n");
+            assert_eq!(at(&[b"PEXPIREAT", b"o", b"1", b"LT"]), b":1\r\n", "LT at {now}");
+            assert_eq!(at(&[b"EXISTS", b"o"]), b":0\r\n", "PEXPIREAT 1 LT at {now}");
+            // The cross-cell move's destination put carries a snapshot
+            // deadline through the same seam.
+            let mut out = Vec::new();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
+            inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
+            assert_eq!(out, b"+OK\r\n");
+            assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXISTS", b"m"]), b":0\r\n", "{now}");
+        }
+    }
+
     #[test]
     fn object_encoding_tracks_int_embstr_raw() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut store, &[b"SET", b"n", b"123"]);
         assert_eq!(run(&mut cx, &mut store, &[b"OBJECT", b"ENCODING", b"n"]), b"$3\r\nint\r\n");
@@ -1696,7 +3157,7 @@ mod tests {
 
     #[test]
     fn scan_walks_the_whole_keyspace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut store = Keyspace::new(StoreConfig::default());
         for i in 0..500 {
             let key = format!("k:{i}");
@@ -1737,7 +3198,7 @@ mod tests {
 
     #[test]
     fn select_isolates_databases_and_flushdb_scopes() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"zero"]), b"+OK\r\n");
         assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"1"]), b"+OK\r\n");
@@ -1766,7 +3227,7 @@ mod tests {
 
     #[test]
     fn copy_crosses_databases_with_ttl_and_encoding() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         let now = Nanos::from_millis(1_000);
         run_at(&mut cx, &mut ks, now, &[b"SET", b"src", b"v", b"PX", b"5000"]);
@@ -1797,7 +3258,7 @@ mod tests {
 
     #[test]
     fn inf_ns_registry_surface() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(
@@ -1830,9 +3291,9 @@ mod tests {
         assert!(reply.starts_with(b"-ERR FSYNC applies to MODE durable"), "{reply:?}");
         // INF.NS USE selects a named namespace; SELECT returns to defaults.
         assert_eq!(run(&mut cx, &mut ks, &[b"INF.NS", b"USE", b"cache"]), b"+OK\r\n");
-        assert!(cx.ns.is_some(), "USE selects the named namespace");
+        assert!(cx.ns.named().is_some(), "USE selects the named namespace");
         assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
-        assert!(cx.ns.is_none(), "SELECT returns to the defaults");
+        assert_eq!(cx.ns, ConnNamespace::Default, "SELECT returns to the defaults");
         let list = run(&mut cx, &mut ks, &[b"INF.NS", b"LIST"]);
         let text = String::from_utf8(list).expect("ascii");
         assert!(text.starts_with("*17\r\n"), "16 defaults + 1 named: {text}");
@@ -1851,11 +3312,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unavailable_configured_default_refuses_data_until_explicit_selection() {
+        let mut cx = ConnCx {
+            ns: ConnNamespace::RequiredUnavailable,
+            ..ConnCx::try_default().expect("fixture cache allocation")
+        };
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let refusal =
+            b"-ERR configured default namespace is unavailable; use SELECT or INF.NS USE\r\n";
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]), refusal);
+        assert_eq!(run(&mut cx, &mut ks, &[b"GET", b"k"]), refusal);
+        assert_eq!(run(&mut cx, &mut ks, &[b"PING"]), b"+PONG\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SELECT", b"0"]), b"+OK\r\n");
+        assert_eq!(run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+    }
+
     // ---- M1-E5 · pub/sub (exec-layer fallback + subscriber mode) -----------------
 
     #[test]
     fn resp2_subscriber_mode_restricts_and_reshapes_ping() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
         assert_eq!(
@@ -1865,7 +3342,9 @@ mod tests {
         // Disallowed commands answer the Redis-exact context error.
         assert_eq!(
             run(&mut cx, &mut ks, &[b"GET", b"k"]),
-            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n".to_vec()
+            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / \
+                 RESET are allowed in this context\r\n"
+                .to_vec()
         );
         // PING reshapes to [pong, <arg|"">] in RESP2 subscriber mode.
         assert_eq!(run(&mut cx, &mut ks, &[b"PING"]), b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
@@ -1885,7 +3364,7 @@ mod tests {
 
     #[test]
     fn resp3_lifts_the_restriction_and_self_delivers() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"HELLO", b"3"]);
         assert_eq!(
@@ -1926,7 +3405,7 @@ mod tests {
 
     #[test]
     fn oom_gate_denies_writes_allows_reads_and_recovers() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         run(&mut cx, &mut ks, &[b"SET", b"k", b"v"]);
         // maxmemory 1 byte: below the fixed floor, unfreeable — every
@@ -1978,7 +3457,7 @@ mod tests {
     /// its own keys inline instead of refusing.
     #[test]
     fn per_ns_budget_gate_scopes_oom_to_the_namespace() {
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         assert_eq!(
             run(&mut cx, &mut ks, &[b"INF.NS", b"CREATE", b"cache", b"MAXMEMORY", b"1"]),
@@ -2041,7 +3520,7 @@ mod tests {
         // the exec-layer push applies it to this cell immediately, and the
         // eviction MAINTAIN slice (driven here directly) frees to the
         // watermark.
-        let mut cx = ConnCx::default();
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
         let mut ks = Keyspace::new(StoreConfig::default());
         for i in 0..500 {
             let key = format!("fill:{i}");

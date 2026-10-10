@@ -22,20 +22,23 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, open_extent, unlink_extent_file};
+use inf_log::blob::{
+    ExtentId, ExtentWriter, extent_file_name, list_extent_ids, open_extent, unlink_extent_file,
+};
 use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
     CkptConfig, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingConfig, StagingRing,
-    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid,
-    write_manifest,
+    SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, write_manifest,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, BlobConfig, CompactionWork, DemotionConfig, LogicalAddr, TieredLookup,
-    TieredTable, apply_blob_ref_section, apply_live_set_section, apply_ref_section,
-    recover_tiered_ns,
+    TieredTable, recover_tiered_ns,
 };
 use proptest::prelude::*;
+
+mod support;
 
 const NS: NsId = NsId(51);
 const SHARD: &str = "shard-0";
@@ -102,6 +105,7 @@ impl Rig {
             },
             demote,
             2048,
+            KeyHasher::default(),
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });
@@ -167,7 +171,7 @@ impl Rig {
     /// or above it (ADR-0061 D3 — the token is the ordering proof).
     fn set(&mut self, id: u64, generation: u64, blob: bool) {
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let value = value_for(id, generation, blob);
         let old = self.model.get(&id).cloned();
         if let Some(old) = &old {
@@ -289,7 +293,7 @@ impl Rig {
     fn del(&mut self, id: u64) {
         let Some(entry) = self.model.remove(&id) else { return };
         let key = Self::key(id);
-        let hash = TieredTable::hash_key(&key);
+        let hash = KeyHasher::default().hash(&key);
         let addr = LogicalAddr::from_raw(entry.addr).expect("48-bit");
         self.stage_displacement(hash, addr);
         self.stage(&MutationEffect::Delete { ns: NS, key: &key });
@@ -332,7 +336,7 @@ impl Rig {
         let entries: Vec<u64> = self.model.keys().copied().collect();
         for id in entries {
             let key = Self::key(id);
-            let hash = TieredTable::hash_key(&key);
+            let hash = KeyHasher::default().hash(&key);
             let entry = self.model.get_mut(&id).expect("just listed");
             if let Some(ext) = entry.extent_id {
                 let (addr, _, _) = references
@@ -380,7 +384,13 @@ impl Rig {
             if work.is_empty() {
                 break;
             }
-            for id in work {
+            for candidate in work {
+                let id = candidate.extent_id;
+                assert_eq!(
+                    candidate.origin,
+                    inf_store::ReclaimOrigin::Death,
+                    "runtime churn only produces refcount-proven deaths"
+                );
                 assert!(
                     !self.model.values().any(|e| e.extent_id == Some(id)),
                     "early free: extent {id} is model-live"
@@ -465,7 +475,9 @@ proptest! {
     /// Randomized op sequences reconcile exactly (the proptest arm of
     /// AC 3 — seeds beyond the deterministic storm's).
     #[test]
-    fn blob_refcounts_match_the_model(ops in proptest::collection::vec((0u8..10, 0u64..48), 1..400)) {
+    fn blob_refcounts_match_the_model(
+        ops in proptest::collection::vec((0u8..10, 0u64..48), 1..400),
+    ) {
         let mut rig = Rig::new();
         let mut generation = 0u64;
         for (op, id) in ops {
@@ -548,19 +560,31 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         &[NS.0],
     )
     .expect("create ick");
+    // Refs first, then images (ADR-0174 R2), as the reactor writer walks.
     let mut cursor = 0u64;
     loop {
         let mut refs: Vec<(u64, u64)> = Vec::new();
-        let mut images: Vec<(Vec<u8>, Vec<u8>, Option<inf_store::ExtentRef>)> = Vec::new();
         cursor = rig.table.ckpt_walk_slice(
             cursor,
             64,
             |hash, addr| refs.push((hash, addr.to_raw())),
-            |parts| images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref())),
+            |_| {},
         );
         for (hash, addr) in refs {
             writer.append_ref(NS.0, w, hash, addr).expect("ref");
         }
+        if cursor == 0 {
+            break;
+        }
+    }
+    loop {
+        let mut images: Vec<(Vec<u8>, Vec<u8>, Option<inf_store::ExtentRef>)> = Vec::new();
+        cursor = rig.table.ckpt_walk_slice(
+            cursor,
+            64,
+            |_, _| {},
+            |parts| images.push((parts.key.to_vec(), parts.value.to_vec(), parts.extent_ref())),
+        );
         for (key, value, ext) in images {
             match ext {
                 Some(ext) => writer
@@ -596,6 +620,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         begin_lsn,
         segments: vec![SegmentId(1)],
         tiers: vec![rig.table.tier_manifest(NS.0, &rig.flush)],
+        key_hash_id: KeyHasher::default().identity(),
     };
     write_manifest(&rig.fs, Path::new(SHARD), &manifest).expect("manifest swap");
     // Recovery replays from begin-LSN: everything before the walk is
@@ -653,77 +678,90 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         },
         demote,
         2048,
+        KeyHasher::default(),
     )
     .expect("recovery");
     assert!(
         recovered.extents_listed.contains(&orphan_id.0),
         "the listing collected the orphan (names only)"
     );
-    let table = std::cell::RefCell::new(recovered.table);
+    let mut ks = support::keyspace_with(NS, recovered.table);
+    let mut spill = support::TestSpill::new(NS, recovered.replay);
     let ick = Path::new(SHARD).join(inf_log::ckpt::ick_file_name(stored.ckpt_id));
-    read_ick_hybrid(
-        &fs,
-        &ick,
-        inf_log::ckpt::IckReaderConfig::default(),
-        |record| {
-            match record {
-                RecordView::StringPostImage { key, value, .. } => {
-                    table
-                        .borrow_mut()
-                        .apply_image(key, value, TieredTable::hash_key(key))
-                        .expect("fits");
-                }
-                RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                    table
-                        .borrow_mut()
-                        .apply_extent_image(
-                            key,
-                            TieredTable::hash_key(key),
-                            inf_store::ExtentRef { extent_id, offset, len },
-                        )
-                        .expect("fits");
-                }
-                _ => panic!("unexpected image class in this checkpoint"),
-            }
-            Ok::<(), std::convert::Infallible>(())
-        },
-        |section| {
-            apply_ref_section(&mut table.borrow_mut(), &section, tier.flushed).expect("refs");
-            Ok(())
-        },
-        |section| {
-            apply_live_set_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-        |section| {
-            assert_eq!(section.ns, NS.0);
-            apply_blob_ref_section(&mut table.borrow_mut(), &section);
-            Ok(())
-        },
-    )
-    .expect("hybrid load");
-    let mut table = table.into_inner();
-    replay_tail(&mut table, &tail);
-    // The sweep: orphans reclaim through ordinary slices; nothing live
-    // is ever handed out.
-    table.extent_sweep_seed(&recovered.extents_listed);
-    let mut swept: Vec<u64> = Vec::new();
+    support::load_checkpoint(&fs, &ick, &mut ks, &mut spill, NS, tier.flushed)
+        .expect("hybrid load");
+    support::replay_tail(&mut ks, &mut spill, &tail);
+    let (_flush, _handles) = support::handed(support::finish_boot(&mut ks, &mut spill, NS));
+    let mut table = support::take_table(&mut ks, NS);
+    // The sweep (ADR-0096): orphans dispose through ordinary slices —
+    // the header-valid orphan quarantines (rename, bytes survive the
+    // life), and only the next boot's second verdict unlinks; nothing
+    // live is ever handed out.
+    let revive = table.extent_sweep_seed(&recovered.extents_listed, &[]);
+    assert!(revive.is_empty(), "nothing was quarantined before this boot");
+    let mut quarantined: Vec<u64> = Vec::new();
     loop {
         let work = table.extent_reclaim_work(0, 8);
         if work.is_empty() {
             break;
         }
-        for id in work {
+        for candidate in work {
+            let id = candidate.extent_id;
             assert!(
                 !model.values().any(|e| e.extent_id == Some(id)),
                 "sweep handed out live extent {id}"
             );
-            unlink_extent_file(&fs, Path::new(SHARD), ExtentId(id)).expect("unlink");
-            table.extent_reclaim_done(id);
-            swept.push(id);
+            match candidate.origin {
+                inf_store::ReclaimOrigin::Death => {
+                    unlink_extent_file(&fs, Path::new(SHARD), ExtentId(id)).expect("unlink");
+                    table.extent_reclaim_done(id);
+                }
+                inf_store::ReclaimOrigin::BootOrphan => {
+                    // The plane's dispatch: probe, then quarantine.
+                    let path = Path::new(SHARD).join("cold").join(extent_file_name(ExtentId(id)));
+                    let header = inf_log::probe_extent_file(&fs, &path).expect("orphan verifies");
+                    assert_eq!(header.extent_id, ExtentId(id));
+                    inf_log::quarantine_extent_file(&fs, Path::new(SHARD), ExtentId(id))
+                        .expect("quarantine");
+                    table.extent_reclaim_quarantined(id);
+                    quarantined.push(id);
+                }
+                inf_store::ReclaimOrigin::Quarantined => {
+                    panic!("no quarantined names existed at this boot")
+                }
+            }
         }
     }
-    assert!(swept.contains(&orphan_id.0), "the orphan was reclaimed");
+    assert!(
+        quarantined.contains(&orphan_id.0),
+        "the deliberate orphan quarantined (with the churn's own dead-extent debris)"
+    );
+    let quarantined_on_disk: Vec<u64> = inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD))
+        .expect("listing")
+        .iter()
+        .map(|i| i.0)
+        .collect();
+    assert!(quarantined_on_disk.contains(&orphan_id.0), "the twin holds the bytes");
+    // The next boot's second verdict: still unreferenced ⇒ every twin
+    // unlinks through its own typed candidate.
+    let revive = table.extent_sweep_seed(&[], &quarantined_on_disk);
+    assert!(revive.is_empty(), "an unreferenced quarantined id never revives");
+    loop {
+        let work = table.extent_reclaim_work(0, 8);
+        if work.is_empty() {
+            break;
+        }
+        for candidate in work {
+            assert_eq!(candidate.origin, inf_store::ReclaimOrigin::Quarantined);
+            inf_log::unlink_quarantined_file(&fs, Path::new(SHARD), ExtentId(candidate.extent_id))
+                .expect("unlink twin");
+            table.extent_reclaim_done(candidate.extent_id);
+        }
+    }
+    assert!(
+        inf_log::list_quarantined_extent_ids(&fs, Path::new(SHARD)).expect("listing").is_empty(),
+        "the second verdict returned the disk"
+    );
 
     // Refcount reconciliation + content: every model-live blob key's
     // extent exists, counts exactly 1, and serves its exact bytes
@@ -781,51 +819,15 @@ fn reclaim_gates_on_the_deaths_durability() {
     // Durability reaches the death: the extent reclaims and the disk
     // returns.
     let work = rig.table.extent_reclaim_work(stamped, 8);
-    assert_eq!(work, vec![ext]);
+    assert_eq!(
+        work,
+        vec![inf_store::ReclaimCandidate {
+            extent_id: ext,
+            origin: inf_store::ReclaimOrigin::Death
+        }]
+    );
     unlink_extent_file(&rig.fs, Path::new(SHARD), ExtentId(ext)).expect("unlink");
     rig.table.extent_reclaim_done(ext);
     let on_disk = list_extent_ids(&rig.fs, Path::new(SHARD)).expect("listing");
     assert!(!on_disk.contains(&ExtentId(ext)), "reclaimed after the gate");
-}
-
-/// Replays one modeled WAL tail through the ADR-0057 D4 rules plus the
-/// tag-9 arm (the `tiered_recovery.rs` replayer with the extent kind).
-fn replay_tail(table: &mut TieredTable, tail: &[u8]) {
-    let mut rest = tail;
-    let mut pending: Vec<u64> = Vec::new();
-    while !rest.is_empty() {
-        let (record, consumed) = decode_record(rest).expect("tail decodes");
-        match record {
-            RecordView::ColdDisplace { old_addr, .. } => {
-                pending.push(old_addr);
-                assert!(pending.len() <= 4, "displace register exceeds the D9 bound");
-            }
-            RecordView::StringPostImage { key, value, .. } => {
-                let hash = TieredTable::hash_key(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_image(key, value, hash).expect("fits");
-            }
-            RecordView::StringExtentRef { key, extent_id, offset, len, .. } => {
-                let hash = TieredTable::hash_key(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table
-                    .apply_extent_image(key, hash, inf_store::ExtentRef { extent_id, offset, len })
-                    .expect("fits");
-            }
-            RecordView::Delete { key, .. } => {
-                let hash = TieredTable::hash_key(key);
-                for old in pending.drain(..) {
-                    table.apply_displace(hash, LogicalAddr::from_raw(old).expect("48-bit"));
-                }
-                table.apply_delete(key, hash);
-            }
-            _ => panic!("unexpected record class in the modeled tail"),
-        }
-        rest = &rest[consumed..];
-    }
-    assert!(pending.is_empty(), "a displace marker with no paired mutation");
 }

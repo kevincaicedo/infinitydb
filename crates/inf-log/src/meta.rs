@@ -26,6 +26,16 @@
 //! Swap steps, in order (each becomes a named fault point at M2-S16):
 //! remove stale staging → create staging → write envelope → fdatasync →
 //! rename → dir-fsync.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::io;
 use std::path::Path;
@@ -46,7 +56,16 @@ pub const META_MAGIC: [u8; 8] = *b"INFMETA1";
 const HEADER_LEN: usize = META_MAGIC.len() + 4;
 const TRAILER_LEN: usize = 4;
 /// Smallest well-formed envelope: magic + length + empty payload + CRC.
-const MIN_ENVELOPE_LEN: usize = HEADER_LEN + TRAILER_LEN;
+/// The smallest envelope: header + trailer around an empty payload.
+pub const MIN_ENVELOPE_LEN: usize = HEADER_LEN + TRAILER_LEN;
+/// The largest envelope file the reader will materialize (review
+/// 2026-08-30 F-L02-05): 64 MiB — the log's one-object bound
+/// (`DEFAULT_MAX_FRAME_LEN`), sixteen times the largest honest MANIFEST
+/// (`MAX_SEGMENTS` ids at 4 bytes) and far beyond any catalog. Checked
+/// against the inode length **before** the read buffer is allocated, so
+/// a wrong restore or a corrupt length is a named refusal, never an
+/// allocation of the file's size.
+pub const MAX_ENVELOPE_LEN: u64 = 64 << 20;
 
 /// Durably replace `dir/META` with an envelope holding `payload`.
 ///
@@ -129,7 +148,20 @@ pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    let len = usize::try_from(file.file_size()?).expect("envelope size fits usize");
+    // Bound before allocate (F-L02-05): the inode length is untrusted
+    // input like every other envelope field, and it is the one the read
+    // buffer is sized from.
+    let size = file.file_size()?;
+    if size > MAX_ENVELOPE_LEN {
+        return Err(invalid(format!(
+            "envelope {} is {size} bytes, over the {MAX_ENVELOPE_LEN}-byte envelope bound — \
+             refusing to read it",
+            path.display()
+        )));
+    }
+    let len = usize::try_from(size).map_err(|_| {
+        invalid(format!("envelope {} is {size} bytes: unaddressable", path.display()))
+    })?;
     let mut buf = vec![0u8; len];
     let mut read = 0;
     while read < buf.len() {
@@ -137,11 +169,11 @@ pub fn read_envelope<F: SegmentFs>(fs: &F, path: &Path) -> io::Result<Option<Vec
         if n == 0 {
             return Err(invalid(format!("envelope torn: EOF at {read} of {len} bytes")));
         }
-        read += n;
+        read = crate::fs::advance_read(read, n, buf.len())?;
     }
-    decode_envelope(&buf)?;
-    buf.truncate(len - TRAILER_LEN);
+    let payload_len = decode_envelope(&buf)?.len();
     buf.drain(..HEADER_LEN);
+    buf.truncate(payload_len);
     Ok(Some(buf))
 }
 
@@ -165,15 +197,22 @@ pub fn decode_envelope(buf: &[u8]) -> io::Result<&[u8]> {
     let payload_len =
         u32::from_le_bytes(buf[META_MAGIC.len()..HEADER_LEN].try_into().expect("4-byte slice"))
             as usize;
-    let expected = MIN_ENVELOPE_LEN + payload_len;
+    let Some(expected) = MIN_ENVELOPE_LEN.checked_add(payload_len) else {
+        return Err(invalid(format!(
+            "envelope declares an unaddressable {payload_len}-byte payload"
+        )));
+    };
     if len != expected {
         return Err(invalid(format!(
             "envelope length mismatch: envelope declares a {payload_len}-byte payload \
              ({expected} bytes total), file holds {len}"
         )));
     }
-    let (covered, trailer) = buf.split_at(len - TRAILER_LEN);
-    let stored = u32::from_le_bytes(trailer.try_into().expect("4-byte trailer"));
+    // `len >= MIN_ENVELOPE_LEN` (checked above) covers the trailer.
+    let Some((covered, trailer)) = buf.split_last_chunk::<TRAILER_LEN>() else {
+        return Err(invalid(format!("envelope too short for its trailer: {len} bytes")));
+    };
+    let stored = u32::from_le_bytes(*trailer);
     let computed = crc32c(covered);
     if stored != computed {
         return Err(invalid(format!(
@@ -187,7 +226,7 @@ pub(crate) fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "envelope payload exceeds the u32 length field")
     })?;
-    let mut envelope = Vec::with_capacity(MIN_ENVELOPE_LEN + payload.len());
+    let mut envelope = Vec::with_capacity(MIN_ENVELOPE_LEN.saturating_add(payload.len()));
     envelope.extend_from_slice(&META_MAGIC);
     envelope.extend_from_slice(&payload_len.to_le_bytes());
     envelope.extend_from_slice(payload);
@@ -198,4 +237,37 @@ pub(crate) fn encode_envelope(payload: &[u8]) -> io::Result<Vec<u8>> {
 
 fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_reader_refuses_an_overreporting_file() {
+        let fs = crate::fs::mem::MemFs::new();
+        let dir = Path::new("shard");
+        fs.create_dir_all(dir).unwrap();
+        write_envelope(&fs, dir, "META.new", "META", b"value").unwrap();
+        fs.overreport_reads();
+        let error = read_envelope(&fs, &dir.join("META")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read_at reported"));
+    }
+
+    #[test]
+    fn declared_payload_length_must_equal_the_envelope_extent() {
+        let good = encode_envelope(b"data").unwrap();
+        assert_eq!(decode_envelope(&good).unwrap(), b"data");
+        for declared in [3u32, 5, u32::MAX] {
+            let mut bad = good.clone();
+            bad[META_MAGIC.len()..HEADER_LEN].copy_from_slice(&declared.to_le_bytes());
+            let covered = bad.len() - TRAILER_LEN;
+            let crc = crc32c(&bad[..covered]);
+            bad[covered..].copy_from_slice(&crc.to_le_bytes());
+            let error = decode_envelope(&bad).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("length mismatch"));
+        }
+    }
 }

@@ -14,9 +14,12 @@
 
 use std::io;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use inf_log::ckpt::{ick_file_name, ick_staging_file_name, parse_ick_file_name};
+use inf_alloc::AlignedBox;
+use inf_foundation::KeyHashId;
+use inf_foundation::time::Nanos;
+use inf_log::ckpt::{ICK_BLOCK_ALIGN, ick_file_name, ick_staging_file_name, parse_ick_file_name};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{CkptConfig, IckStream, Lsn, Manifest, SectionLease, SegmentId, StagedAt};
 use inf_runtime::{CompletionToken, TokenClass};
@@ -60,7 +63,7 @@ pub(crate) struct Streaming<File: SegmentFile> {
     pub stream: IckStream,
     /// Keeps the fd alive for the driver ops; dropped at publish/abort
     /// (never read — its job is ownership).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "ownership only: the fd lives as long as the driver ops")]
     pub file: File,
     pub fd: RawFd,
     /// Durable namespaces captured at stream open, ascending id. Namespaces
@@ -68,12 +71,38 @@ pub(crate) struct Streaming<File: SegmentFile> {
     pub ns_ids: Vec<u32>,
     pub ns_idx: usize,
     pub cursor: u64,
+    /// The in-chain resume inside `cursor`'s home group (ADR-0117 D2):
+    /// `Some` only after an image was refused for the section bound —
+    /// the next slice re-enters that group at exactly that entry.
+    pub resume: Option<inf_store::ChainPos>,
+    /// Sections this walk sealed for the section bound (folded into
+    /// `CkptStats::bound_splits` at publish).
+    pub bound_splits: u64,
     /// Tiered-namespace walk sub-pass (M4-S26, ADR-0057 D1/D3): 0 =
     /// address refs, 1 = RAM images, 2 = live-set + blob-ref sections +
     /// walk end + retirement scan. Section classes never mix inside a
     /// pass, so class seals happen only at pass boundaries.
     pub tier_pass: u8,
     pub walk_done: bool,
+    /// The stream opened v2 — sidecar emission is representable
+    /// (M4.5-S06; an index converging mid-walk on a v1 stream waits
+    /// for the next checkpoint).
+    pub v2: bool,
+    /// Sidecar emission plan (M4.5-S06, ADR-0078 D1): captured once
+    /// when the record walk completes — converged, non-degraded
+    /// indexes on the captured durable namespaces. `None` until then.
+    pub sidecar_plan: Option<Vec<inf_log::ckpt::IdxSidecarMeta>>,
+    /// Position in the plan; the entries below it are finished or
+    /// abandoned.
+    pub sidecar_at: usize,
+    /// The current index's re-seek walk cursor (owns its resume pair —
+    /// nothing borrowed across slices, the S01 freeze).
+    pub sidecar_cursor: inf_store::OrderedCursor,
+    /// Pairs emitted for the current index (the ordinal counter and
+    /// the FINAL total).
+    pub sidecar_emitted: u64,
+    /// Every plan entry emitted or abandoned — the footer may stage.
+    pub sidecar_done: bool,
     pub footer_staged: bool,
     pub sync_issued: bool,
     pub sync_done: bool,
@@ -88,36 +117,157 @@ pub(crate) struct Streaming<File: SegmentFile> {
 pub struct CkptStats {
     pub completed: u64,
     pub aborted: u64,
+    /// The last published checkpoint's id (0 before the first).
+    pub last_id: u64,
+    /// F-L03-04 witness (ADR-0057 A3): publications that walked some
+    /// tiered table under an older checkpoint id — a leaked pin reused.
+    /// Counted by the driver at publish; sticky.
+    pub walks_behind: u64,
+    /// ADR-0117 D1/D2: sections sealed because the next image would
+    /// have breached the section bound (the walk resumed at that
+    /// image). Zero unless a chunk sums past the bound — or the DST
+    /// lowers the bound; its engagement witness.
+    pub bound_splits: u64,
+    /// 1 when the staging mode in force is `Buffered` (ADR-0088 D3 as
+    /// amended) — the disclosed fallback, probed at boot or downgraded
+    /// in-band (`io_mode_downgrades`, 0 or 1 per cell life).
+    pub io_mode_buffered: u64,
+    pub io_mode_downgrades: u64,
     pub last_unix_ms: u64,
     pub last_begin_lsn: u64,
     /// Live checkpoint-buffer domain bytes (0 when idle — L5).
     pub buffer_bytes: u64,
+    /// M4.5-S36 (ADR-0088 D4/D7): on-disk bytes of every published
+    /// checkpoint, the last one's, the v3 padding inside them, the
+    /// derived trigger interval, and records staged since the current
+    /// (or last) begin — the write-amplification and trigger observables.
+    pub bytes_total: u64,
+    pub bytes_last: u64,
+    pub padding_bytes: u64,
+    pub interval_bytes: u64,
+    pub records_since_begin: u64,
+    /// ADR-0178 D5: the longest injected-time wait of one checkpoint
+    /// block on the device budget, first offer to `Now`, this cell's
+    /// life — the pending block's age at this cell's last MAINTAIN entry
+    /// included, whether or not that slice offered it.
+    pub block_wait_ns_max: u64,
 }
+
+/// One checkpoint block's wait on the device budget (ADR-0178 D5): the
+/// walk offers a block every slice until the budget answers `Now`.
+/// Injected time; the source of `CkptStats::block_wait_ns_max`.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct BlockWait {
+    /// The pending block's first offer; `None` while no block waits.
+    offered_at: Option<Nanos>,
+    /// The pending block's age at the last offer or observation.
+    age_ns: u64,
+    /// The longest ended wait.
+    max_ns: u64,
+}
+
+impl BlockWait {
+    /// A block is offered at `now`; its first offer starts the wait.
+    pub(crate) fn offered(&mut self, now: Nanos) {
+        self.offered_at.get_or_insert(now);
+        self.observed(now);
+    }
+
+    /// The cell's clock reached `now`: a pending block has waited that
+    /// long, offered this slice or not. A slice the scheduler withholds
+    /// from the checkpoint makes no offer, and the block still waits.
+    pub(crate) fn observed(&mut self, now: Nanos) {
+        if let Some(first) = self.offered_at {
+            self.age_ns = now.saturating_sub(first).0;
+        }
+    }
+
+    /// The pending block issued, or its checkpoint aborted: the wait ends.
+    pub(crate) fn ended(&mut self) {
+        self.max_ns = self.max_ns.max(self.age_ns);
+        self.offered_at = None;
+        self.age_ns = 0;
+    }
+
+    /// The longest wait, a pending block's age included.
+    fn max_ns(&self) -> u64 {
+        self.max_ns.max(self.age_ns)
+    }
+}
+
+/// How the `.ick.new` staging file is written (ADR-0088 D3 as amended
+/// 2026-08-21): `Direct` is the design (`O_DIRECT`, no page-cache lump);
+/// `Buffered` is the **probed** fallback where the filesystem or platform
+/// refuses `O_DIRECT` (macOS, some Linux filesystems) — the same v3
+/// container, aligned blocks and all, on a buffered fd. Decided once per
+/// cell at boot by creating a probe file in the ckpt dir, **writing one
+/// aligned block to it and syncing it** (an open can succeed where the
+/// first direct write is refused — the review of `2cb6074`), then
+/// removing it; never per checkpoint (a per-checkpoint failure would
+/// retry every slice and never complete — the unbounded-retained-log
+/// posture the review named). One in-band rule backs the probe: a
+/// checkpoint op refused with `EINVAL` under `Direct` downgrades the cell
+/// to `Buffered` for good and retries at once — a refusal the probe could
+/// not see (a per-write constraint) never loops; a real error (`EIO`,
+/// `ENOSPC`) aborts with the ordinary backoff and never changes the
+/// mode. Disclosed: a boot line, INFO `ckpt_io_mode`, and
+/// `ckpt_io_mode_downgrades`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CkptIoMode {
+    Direct,
+    Buffered,
+}
+
+/// MAINTAIN slices between a checkpoint abort and the next trigger
+/// (the manifest's `RETRY_BACKOFF_SLICES` shape): a persistent create or
+/// I/O fault otherwise re-fires the trigger every slice, staging one
+/// `CkptBegin` record into the log per attempt.
+const ABORT_BACKOFF_SLICES: u32 = RETRY_BACKOFF_SLICES;
 
 pub(crate) struct CkptCell<F: SegmentFs> {
     pub cfg: CkptConfig,
     dir: PathBuf,
     cell: u16,
     fs: F,
+    io_mode: CkptIoMode,
+    /// In-band `Direct` → `Buffered` downgrades (ADR-0088 D3 as amended):
+    /// 0 or 1 per cell life, surfaced as `ckpt_io_mode_downgrades`.
+    io_mode_downgrades: u64,
+    /// Slices left before an aborted checkpoint may be retried.
+    backoff_slices: u32,
     next_id: u64,
     /// Manual trigger latch (`INF.CKPT` via the control handle — S20).
     pub requested: bool,
+    /// The checkpoint in flight was begun for a manual request (N15,
+    /// batch 33): an abort re-arms `requested`, so `INF.CKPT WAIT` is
+    /// answered by the retry instead of hanging until the bytes trigger.
+    serving_request: bool,
     /// Latest `INF.CKPT` request epoch seen (M2-S20) — recorded at
     /// request, consumed into `epoch_in_flight` when the begin marker
     /// stages, published to the control board at the MANIFEST commit.
     pub req_epoch: u64,
     pub epoch_in_flight: u64,
-    /// `StagingStats::append_bytes` at the last completed checkpoint's
-    /// **begin** — the bytes-appended-since trigger base. Begin, not
-    /// publish: a paced walk (ADR-0017) can lag a write burst by a full
-    /// dataset, and rebasing at publish would let everything staged
-    /// mid-walk escape the trigger — an unbounded retained log if writes
-    /// then quiesce.
+    /// `CommitStats::frame_bytes_queued` — on-disk frame bytes, header,
+    /// trailer and v3 padding included (ADR-0088 D4; ADR-0086 D3's
+    /// obligation) — at the last completed checkpoint's **begin**: the
+    /// bytes-since trigger base. Begin, not publish: a paced walk
+    /// (ADR-0017) can lag a write burst by a full dataset, and rebasing
+    /// at publish would let everything staged mid-walk escape the
+    /// trigger — an unbounded retained log if writes then quiesce.
     pub bytes_at_last: u64,
-    /// The staged-bytes total captured when the current checkpoint's
+    /// The frame-bytes total captured when the current checkpoint's
     /// begin marker was staged (becomes `bytes_at_last` at publish).
     pub bytes_at_begin: u64,
+    /// Records staged at the last begin — the record-cap trigger base
+    /// (recovery is bound by record count, ADR-0088 D4).
+    pub records_at_last: u64,
+    pub records_at_begin: u64,
+    /// The derived interval in force (`CkptConfig::derive_interval` of
+    /// the last checkpoint's bytes; the floor before the first).
+    pub interval_bytes: u64,
     pub phase: CkptPhase<F::File>,
+    /// The pending block's budget wait (ADR-0178 D5).
+    pub block_wait: BlockWait,
     stats: CkptStats,
 }
 
@@ -132,18 +282,27 @@ impl<F: SegmentFs> CkptCell<F> {
             .filter_map(|name| parse_ick_file_name(name))
             .max()
             .map_or(1, |max| max + 1);
+        let io_mode = probe_direct(&fs, &dir, cell)?;
         Ok(CkptCell {
             cfg,
             dir,
             cell,
             fs,
+            io_mode,
+            io_mode_downgrades: 0,
+            backoff_slices: 0,
             next_id,
             requested: false,
+            serving_request: false,
             req_epoch: 0,
             epoch_in_flight: 0,
             bytes_at_last: 0,
             bytes_at_begin: 0,
+            records_at_last: 0,
+            records_at_begin: 0,
+            interval_bytes: cfg.derive_interval(0),
             phase: CkptPhase::Idle,
+            block_wait: BlockWait::default(),
             stats: CkptStats::default(),
         })
     }
@@ -153,12 +312,76 @@ impl<F: SegmentFs> CkptCell<F> {
         self.next_id
     }
 
-    /// Trigger check (Idle only): manual request, or the bytes-appended
-    /// threshold (`interval_bytes = 0` disables the automatic trigger).
-    pub fn should_begin(&self, staged_bytes_total: u64) -> bool {
-        self.requested
-            || (self.cfg.interval_bytes > 0
-                && staged_bytes_total.saturating_sub(self.bytes_at_last) >= self.cfg.interval_bytes)
+    /// The staging-file I/O mode in force: probed at boot, downgraded at
+    /// most once by [`abort_refused_direct`](Self::abort_refused_direct).
+    #[cfg(test)]
+    pub fn io_mode(&self) -> CkptIoMode {
+        self.io_mode
+    }
+
+    /// A checkpoint op was refused with `EINVAL` under `Direct` (ADR-0088
+    /// D3 as amended): the filesystem took the probe's aligned block but
+    /// refuses this write — per-write constraints the probe cannot see.
+    /// Downgrade the cell to `Buffered` for the rest of its life, abort
+    /// the checkpoint, and clear the abort backoff so the next MAINTAIN
+    /// slice retries immediately in the new mode; the trigger state is
+    /// untouched. Under `Buffered` an `EINVAL` is an ordinary abort (the
+    /// caller routes it there). Never silent: a log line and the
+    /// `ckpt_io_mode_downgrades` counter.
+    pub fn abort_refused_direct(&mut self, what: &str) {
+        debug_assert_eq!(self.io_mode, CkptIoMode::Direct);
+        self.io_mode = CkptIoMode::Buffered;
+        self.io_mode_downgrades += 1;
+        eprintln!(
+            "cell {}: checkpoint staging downgraded to buffered I/O — O_DIRECT {what} refused \
+             (EINVAL) after the boot probe passed; v3 blocks stay aligned, retrying at once \
+             (INFO ckpt_io_mode:buffered, ckpt_io_mode_downgrades:{})",
+            self.cell, self.io_mode_downgrades
+        );
+        self.abort(what, "EINVAL under O_DIRECT");
+        self.backoff_slices = 0;
+    }
+
+    /// True while the staging mode is `Direct` — the caller's guard for
+    /// routing an `EINVAL` to [`abort_refused_direct`](Self::abort_refused_direct).
+    pub fn io_mode_direct(&self) -> bool {
+        self.io_mode == CkptIoMode::Direct
+    }
+
+    /// One MAINTAIN slice of abort backoff elapsed; `true` while the
+    /// trigger is still held.
+    pub fn tick_backoff(&mut self) -> bool {
+        if self.backoff_slices > 0 {
+            self.backoff_slices -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Trigger check (Idle only): manual request, the derived on-disk
+    /// frame-bytes threshold, or the record cap (ADR-0088 D4 — either
+    /// bound alone lets the other shape's replay escape the boot gate).
+    /// `interval_bytes = 0` (the floor) disables the automatic trigger
+    /// entirely, record cap included — manual checkpoints only.
+    pub fn should_begin(&self, frame_bytes_total: u64, records_total: u64) -> bool {
+        if self.requested {
+            return true;
+        }
+        if self.cfg.interval_bytes == 0 {
+            return false;
+        }
+        let bytes_since = frame_bytes_total.saturating_sub(self.bytes_at_last);
+        let records_since = records_total.saturating_sub(self.records_at_last);
+        let cap_records = self.cfg.cap_records();
+        bytes_since >= self.interval_bytes || (cap_records > 0 && records_since >= cap_records)
+    }
+
+    /// Re-derives the interval from the bytes the last checkpoint wrote
+    /// (ADR-0088 D4) — called at publish; before the first checkpoint the
+    /// interval is the floor (`derive_interval(0)`).
+    fn rederive_interval(&mut self, ckpt_bytes_last: u64) {
+        self.interval_bytes = self.cfg.derive_interval(ckpt_bytes_last);
+        self.stats.interval_bytes = self.interval_bytes;
     }
 
     /// `LOG` sealed the frame carrying the begin marker: resolve its LSN.
@@ -184,16 +407,27 @@ impl<F: SegmentFs> CkptCell<F> {
         id: u64,
         begin_lsn: Lsn,
         ns_ids: Vec<u32>,
-        tiered_present: bool,
+        v2: bool,
         now: inf_foundation::time::Nanos,
     ) -> io::Result<()> {
         // v2 opens the ADR-0057 D3 vocabulary (address refs, live-set,
-        // blob refs) — emitted only when a tiered namespace exists, so
-        // memory-durable nodes keep producing v1 files byte-identically
-        // (M4-S26; the S03 zero-change posture).
-        let mut stream =
-            if tiered_present { IckStream::new_v2(&self.cfg) } else { IckStream::new(&self.cfg) };
-        let file = self.fs.create_meta(&self.dir.join(ick_staging_file_name(id)))?;
+        // blob refs) plus the ADR-0073 D2 index sidecars — selected iff
+        // a tiered namespace exists or an index declaration targets a
+        // durable namespace (ADR-0078 D7: registration, not
+        // convergence, drives the version — it must be fixed at header
+        // time). Cells with neither keep producing v1 byte-identically
+        // (the S03 zero-change posture).
+        // M4.5-S36 (ADR-0088 D3): every reactor-tier checkpoint is the v3
+        // container on an `O_DIRECT` fd — aligned blocks, no page-cache
+        // lump. `v2` keeps selecting the *walk* (tiered passes, sidecars);
+        // the v3 vocabulary is a superset, so a v1-shaped cell writes the
+        // same sections on aligned blocks.
+        let mut stream = IckStream::new_v3(&self.cfg);
+        let path = self.dir.join(ick_staging_file_name(id));
+        let file = match self.io_mode {
+            CkptIoMode::Direct => self.fs.create_meta_direct(&path)?,
+            CkptIoMode::Buffered => self.fs.create_meta(&path)?,
+        };
         let fd = file.raw_fd().ok_or_else(|| io::Error::other("std segment tier has fds"))?;
         let lease = stream.begin(self.cell, id, begin_lsn, &ns_ids);
         self.phase = CkptPhase::Stream(Box::new(Streaming {
@@ -207,8 +441,16 @@ impl<F: SegmentFs> CkptCell<F> {
             ns_ids,
             ns_idx: 0,
             cursor: 0,
+            resume: None,
+            bound_splits: 0,
             tier_pass: 0,
             walk_done: false,
+            v2,
+            sidecar_plan: None,
+            sidecar_at: 0,
+            sidecar_cursor: inf_store::OrderedCursor::from_start(),
+            sidecar_emitted: 0,
+            sidecar_done: false,
             footer_staged: false,
             sync_issued: false,
             sync_done: false,
@@ -237,12 +479,25 @@ impl<F: SegmentFs> CkptCell<F> {
         assert!(st.in_flight.is_none(), "publish with a section write still in flight");
         let id = st.id;
         let begin = st.begin_lsn;
+        let ick_bytes = st.stream.file_bytes();
+        let padding = st.stream.padding_bytes();
+        let bound_splits = st.bound_splits;
         drop(st); // closes the fd before rename (write handle no longer needed)
         self.fs
             .rename(&self.dir.join(ick_staging_file_name(id)), &self.dir.join(ick_file_name(id)))?;
         self.next_id = id + 1;
         self.bytes_at_last = self.bytes_at_begin;
+        self.records_at_last = self.records_at_begin;
+        self.stats.bytes_total += ick_bytes;
+        self.stats.bytes_last = ick_bytes;
+        self.stats.padding_bytes += padding;
+        // The next interval is derived from what this checkpoint actually
+        // wrote (ADR-0088 D4): the file's size is the measurement.
+        self.rederive_interval(ick_bytes);
         self.stats.completed += 1;
+        self.stats.last_id = id;
+        self.stats.bound_splits += bound_splits;
+        self.serving_request = false;
         self.stats.last_unix_ms = unix_now_ms;
         self.stats.last_begin_lsn = begin.to_u64();
         self.phase = CkptPhase::Idle;
@@ -262,18 +517,95 @@ impl<F: SegmentFs> CkptCell<F> {
         if let Some(id) = id {
             eprintln!("cell {}: checkpoint {id} aborted at {what}: {detail}", self.cell);
             self.phase = CkptPhase::Idle; // drops the stream + fd first
+            self.block_wait.ended();
             let _ = self.fs.remove_file(&self.dir.join(ick_staging_file_name(id)));
             self.next_id = id + 1;
             self.stats.aborted += 1;
+            self.backoff_slices = ABORT_BACKOFF_SLICES;
+            // N15: a manual request the aborted checkpoint was serving
+            // survives it — the retry answers `INF.CKPT WAIT`.
+            if self.serving_request {
+                self.serving_request = false;
+                self.requested = true;
+            }
         }
     }
 
-    pub fn stats(&self) -> CkptStats {
+    /// The begin marker is staging: the manual latch is consumed into the
+    /// checkpoint in flight (an abort hands it back — N15).
+    pub fn consume_request(&mut self) {
+        self.serving_request = self.requested;
+        self.requested = false;
+    }
+
+    /// The publication `id` walked `behind` tiered tables under an older
+    /// id (the F-L03-04 witness; zero in every correct run).
+    pub fn note_walks_behind(&mut self, behind: u64) {
+        self.stats.walks_behind += behind;
+    }
+
+    /// `records_total` is the cell's records-staged counter (the record
+    /// cap's numerator reads against the last begin).
+    pub fn stats(&self, records_total: u64) -> CkptStats {
         let buffer_bytes = match &self.phase {
             CkptPhase::Stream(st) => st.stream.resident_bytes() as u64,
-            _ => 0,
+            CkptPhase::Idle | CkptPhase::AwaitBeginLsn { .. } | CkptPhase::Begun { .. } => 0,
         };
-        CkptStats { buffer_bytes, ..self.stats }
+        let base = if matches!(self.phase, CkptPhase::Idle) {
+            self.records_at_last
+        } else {
+            self.records_at_begin
+        };
+        CkptStats {
+            buffer_bytes,
+            interval_bytes: self.interval_bytes,
+            records_since_begin: records_total.saturating_sub(base),
+            io_mode_buffered: u64::from(self.io_mode == CkptIoMode::Buffered),
+            io_mode_downgrades: self.io_mode_downgrades,
+            block_wait_ns_max: self.block_wait.max_ns(),
+            ..self.stats
+        }
+    }
+}
+
+/// Boot-time `O_DIRECT` probe for the ckpt dir (ADR-0088 D3 as amended):
+/// create a probe file direct, **write one aligned block and sync it**,
+/// remove it. `Unsupported` / `InvalidInput` (the kernel's `EINVAL` for a
+/// filesystem without `O_DIRECT`, at the open or at the first write)
+/// select `Buffered`, loudly; any other error is the boot's (a ckpt dir
+/// that cannot take a file cannot take a checkpoint either). Boot-time,
+/// blocking, before the cell loop runs — the same class as the create
+/// and remove beside it.
+fn probe_direct<F: SegmentFs>(fs: &F, dir: &Path, cell: u16) -> io::Result<CkptIoMode> {
+    let probe = dir.join(".direct-probe");
+    let _ = fs.remove_file(&probe);
+    let refused = |err: &io::Error| {
+        matches!(err.kind(), io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput)
+    };
+    let attempt = fs.create_meta_direct(&probe).and_then(|mut file| {
+        let block = AlignedBox::new(ICK_BLOCK_ALIGN);
+        file.write_at(0, block.bytes())?;
+        file.sync_data()
+    });
+    match attempt {
+        Ok(()) => {
+            fs.remove_file(&probe)?;
+            Ok(CkptIoMode::Direct)
+        }
+        Err(err) if refused(&err) => {
+            let _ = fs.remove_file(&probe);
+            eprintln!(
+                "cell {cell}: checkpoint staging falls back to buffered I/O — O_DIRECT refused \
+                 on {} ({err}); v3 blocks stay aligned, the page-cache lump ADR-0088 D3 removes \
+                 is back for this cell (INFO ckpt_io_mode:buffered)",
+                dir.display()
+            );
+            Ok(CkptIoMode::Buffered)
+        }
+        Err(err) => {
+            let _ = fs.remove_file(&probe);
+            Err(err)
+        }
     }
 }
 
@@ -297,6 +629,10 @@ pub(crate) struct PendingManifest {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ManifestStats {
     pub published: u64,
+    /// M4.5-S36 (ADR-0088 D7): MANIFEST bytes written and barriers
+    /// issued (metered under `IoClass::Checkpoint`, never deferred).
+    pub bytes_written: u64,
+    pub syncs_issued: u64,
     /// Failed swaps (counted, old recovery unit kept — never fail-stop:
     /// nothing was acked against the new manifest, ADR-0017).
     pub aborted: u64,
@@ -391,6 +727,9 @@ pub(crate) struct ManifestCell<F: SegmentFs> {
     ckpt_dir: PathBuf,
     cell: u16,
     fs: F,
+    /// The node's key-hash identity (ADR-0094 D6): every manifest this
+    /// cell publishes names the secret that placed its checkpoint's refs.
+    key_hash_id: KeyHashId,
     /// Truncation floor from the durable manifest (`None` until the first
     /// manifest is published or recovered).
     floor: Option<SegmentId>,
@@ -416,6 +755,7 @@ impl<F: SegmentFs> ManifestCell<F> {
         shard_dir: PathBuf,
         ckpt_dir: PathBuf,
         cell: u16,
+        key_hash_id: KeyHashId,
         recovered: Option<PendingManifest>,
     ) -> ManifestCell<F> {
         // `recovered` is the manifest recovery loaded (not a pending swap):
@@ -426,6 +766,7 @@ impl<F: SegmentFs> ManifestCell<F> {
             ckpt_dir,
             cell,
             fs,
+            key_hash_id,
             floor: recovered.map(|m| m.begin_lsn.segment),
             named_ckpt: recovered.map(|m| m.ckpt_id),
             pending_epoch: 0,
@@ -487,7 +828,13 @@ impl<F: SegmentFs> ManifestCell<F> {
             SwapPhase::IckDirQueued { pending, .. } => SwapPhase::WatermarkWait { pending },
             SwapPhase::StageQueued { manifest, .. } => SwapPhase::StageSynced { manifest },
             SwapPhase::DirQueued { manifest, .. } => SwapPhase::DirSynced { manifest },
-            other => {
+            other @ (SwapPhase::Backoff { .. }
+            | SwapPhase::Idle
+            | SwapPhase::IckDirPending { .. }
+            | SwapPhase::WatermarkWait { .. }
+            | SwapPhase::StageSynced { .. }
+            | SwapPhase::DirSynced { .. }
+            | SwapPhase::Failed) => {
                 let _ = other;
                 panic!("ManifestSync completion with no barrier in flight")
             }
@@ -508,7 +855,13 @@ impl<F: SegmentFs> ManifestCell<F> {
             SwapPhase::StageQueued { manifest, .. } | SwapPhase::DirQueued { manifest, .. } => {
                 PendingManifest { ckpt_id: manifest.ckpt_id, begin_lsn: manifest.begin_lsn }
             }
-            other => {
+            other @ (SwapPhase::Backoff { .. }
+            | SwapPhase::Idle
+            | SwapPhase::IckDirPending { .. }
+            | SwapPhase::WatermarkWait { .. }
+            | SwapPhase::StageSynced { .. }
+            | SwapPhase::DirSynced { .. }
+            | SwapPhase::Failed) => {
                 let _ = other;
                 panic!("ManifestSync error with no barrier in flight")
             }
@@ -559,6 +912,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                 Ok(dir) => {
                     let fd = dir.raw_fd().expect("std tier has fds");
                     let token = self.next_token();
+                    self.stats.syncs_issued += 1;
                     cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                     self.phase = SwapPhase::IckDirQueued { pending, dir };
                     1
@@ -612,15 +966,19 @@ impl<F: SegmentFs> ManifestCell<F> {
                     begin_lsn: pending.begin_lsn,
                     segments: (floor.0..=active.0).map(SegmentId).collect(),
                     tiers,
+                    key_hash_id: self.key_hash_id,
                 };
                 let staged_write = self.fs.create_meta(&staged).and_then(|mut file| {
-                    file.write_at(0, &inf_log::manifest_envelope(&manifest))?;
-                    Ok(file)
+                    let envelope = inf_log::manifest_envelope(&manifest);
+                    file.write_at(0, &envelope)?;
+                    Ok((file, envelope.len() as u64))
                 });
                 match staged_write {
-                    Ok(file) => {
+                    Ok((file, bytes)) => {
                         let fd = file.raw_fd().expect("std tier has fds");
                         let token = self.next_token();
+                        self.stats.bytes_written += bytes;
+                        self.stats.syncs_issued += 1;
                         cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                         self.phase = SwapPhase::StageQueued { manifest, file };
                         3
@@ -656,6 +1014,7 @@ impl<F: SegmentFs> ManifestCell<F> {
                     Ok(dir) => {
                         let fd = dir.raw_fd().expect("std tier has fds");
                         let token = self.next_token();
+                        self.stats.syncs_issued += 1;
                         cx.push(inf_runtime::IoOp::Fdatasync { fd, token });
                         self.phase = SwapPhase::DirQueued { manifest, dir };
                         2
@@ -765,5 +1124,173 @@ impl<F: SegmentFs> ManifestCell<F> {
 
     pub fn stats(&self) -> ManifestStats {
         self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_foundation::time::Nanos;
+    use inf_log::create_cell_dirs;
+    use inf_log::fs::sim::SimDisk;
+
+    fn cell(fs: &SimDisk) -> CkptCell<SimDisk> {
+        let dirs = create_cell_dirs(fs, Path::new("data/shard-0")).expect("dirs");
+        CkptCell::new(fs.clone(), dirs.ckpt, 0, CkptConfig::default()).expect("cell")
+    }
+
+    /// ADR-0178 D5: a pending block's wait is its age on the cell's clock,
+    /// not at its last offer — a slice that makes no offer still ages it —
+    /// and the longest ended wait survives the next block.
+    #[test]
+    fn a_pending_block_ages_without_an_offer() {
+        let second = 1_000_000_000;
+        let mut wait = BlockWait::default();
+        wait.observed(Nanos(second));
+        assert_eq!(wait.max_ns(), 0, "no block waits");
+        wait.offered(Nanos(2 * second));
+        assert_eq!(wait.max_ns(), 0, "the first offer starts the wait");
+        wait.observed(Nanos(7 * second));
+        assert_eq!(wait.max_ns(), 5 * second, "aged by a slice that offered nothing");
+        wait.offered(Nanos(8 * second));
+        wait.ended();
+        assert_eq!(wait.max_ns(), 6 * second, "the ended wait is kept");
+        wait.offered(Nanos(9 * second));
+        wait.observed(Nanos(10 * second));
+        assert_eq!(wait.max_ns(), 6 * second, "a shorter pending wait does not lower it");
+    }
+
+    /// The boot probe decides the staging mode once (ADR-0088 D3 as
+    /// amended): a filesystem that refuses `O_DIRECT` selects `Buffered`
+    /// and the stream is still created — on `create_meta` — instead of
+    /// aborting every checkpoint; a filesystem that takes it stays
+    /// `Direct`. The probe file never survives the decision.
+    #[test]
+    fn probe_selects_buffered_where_direct_is_refused_and_still_opens_streams() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_meta();
+        let mut ckpt = cell(&fs);
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        assert_eq!(ckpt.stats(0).io_mode_buffered, 1);
+        assert!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir").is_empty(),
+            "no probe file left behind"
+        );
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("buffered staging file");
+        assert!(matches!(ckpt.phase, CkptPhase::Stream(_)));
+        assert_eq!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir"),
+            vec![ick_staging_file_name(1)]
+        );
+
+        let direct = cell(&SimDisk::new());
+        assert_eq!(direct.io_mode(), CkptIoMode::Direct);
+        assert_eq!(direct.stats(0).io_mode_buffered, 0);
+    }
+
+    /// The probe writes (ADR-0088 D3 as amended): a filesystem that takes
+    /// the `O_DIRECT` open but refuses the first direct write selects
+    /// `Buffered` at boot — and the probe's own block is what catches it.
+    #[test]
+    fn probe_writes_a_block_so_a_refused_direct_write_selects_buffered() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(0);
+        let ckpt = cell(&fs);
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        assert_eq!(ckpt.stats(0).io_mode_downgrades, 0, "a boot decision, not a downgrade");
+        assert!(
+            fs.list_dir(Path::new("data/shard-0/ckpt")).expect("dir").is_empty(),
+            "no probe file left behind"
+        );
+        // One allowed write: the probe's block passes, the mode is Direct.
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        assert_eq!(cell(&fs).io_mode(), CkptIoMode::Direct);
+    }
+
+    /// The in-band downgrade (ADR-0088 D3 as amended): `EINVAL` on a
+    /// checkpoint op under `Direct` flips the cell to `Buffered` for
+    /// good, aborts without the backoff, and the next stream opens
+    /// buffered — `create_meta`, which the refusing disk accepts.
+    #[test]
+    fn refused_direct_write_downgrades_once_and_retries_at_once() {
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        let mut ckpt = cell(&fs);
+        assert!(ckpt.io_mode_direct());
+        ckpt.requested = true;
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("direct stream");
+        ckpt.abort_refused_direct("I/O");
+        assert!(matches!(ckpt.phase, CkptPhase::Idle));
+        assert!(!ckpt.io_mode_direct());
+        assert_eq!(ckpt.io_mode(), CkptIoMode::Buffered);
+        let stats = ckpt.stats(0);
+        assert_eq!((stats.aborted, stats.io_mode_buffered, stats.io_mode_downgrades), (1, 1, 1));
+        assert!(!ckpt.tick_backoff(), "no backoff: the mode changed, retry now");
+        assert!(ckpt.should_begin(0, 0), "the trigger state is untouched");
+        ckpt.open_stream(2, Lsn::new(SegmentId(0), 80), vec![16], false, Nanos::ZERO)
+            .expect("buffered stream after the downgrade");
+        assert!(matches!(ckpt.phase, CkptPhase::Stream(_)));
+    }
+
+    /// N15 (batch 33, found by the `m4-tiered` `EINVAL` arm): the manual
+    /// latch is consumed at begin, so an aborted checkpoint used to drop
+    /// the request — `INF.CKPT WAIT` then hung until the bytes trigger
+    /// (256 MiB by default; forever on an idle node). The abort hands
+    /// the request back; the retry answers it.
+    #[test]
+    fn an_aborted_manual_checkpoint_keeps_its_request() {
+        let fs = SimDisk::new();
+        let mut ckpt = cell(&fs);
+        ckpt.requested = true;
+        ckpt.consume_request();
+        assert!(!ckpt.requested, "the latch is consumed at begin");
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(ckpt.requested, "an abort re-arms the manual request");
+        while ckpt.tick_backoff() {}
+        assert!(ckpt.should_begin(0, 0), "the retry serves the request");
+        // The in-band downgrade path too.
+        let fs = SimDisk::new();
+        fs.refuse_direct_writes_after(1);
+        let mut ckpt = cell(&fs);
+        ckpt.requested = true;
+        ckpt.consume_request();
+        ckpt.open_stream(2, Lsn::new(SegmentId(0), 80), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort_refused_direct("I/O");
+        assert!(ckpt.should_begin(0, 0), "the downgrade retry serves the request");
+        // A bytes-triggered checkpoint hands nothing back.
+        let mut ckpt = cell(&SimDisk::new());
+        ckpt.consume_request();
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(!ckpt.requested, "no request, nothing to hand back");
+    }
+
+    /// An aborted checkpoint holds the trigger for a backoff of slices —
+    /// a persistent fault no longer stages one `CkptBegin` per slice.
+    #[test]
+    fn abort_backs_off_before_the_trigger_refires() {
+        let fs = SimDisk::new();
+        let mut ckpt = cell(&fs);
+        assert!(!ckpt.tick_backoff(), "fresh cell: no backoff");
+        ckpt.requested = true;
+        ckpt.open_stream(1, Lsn::new(SegmentId(0), 40), vec![16], false, Nanos::ZERO)
+            .expect("stream");
+        ckpt.abort("test", "injected");
+        assert!(matches!(ckpt.phase, CkptPhase::Idle));
+        assert_eq!(ckpt.stats(0).aborted, 1);
+        let mut held = 0;
+        while ckpt.tick_backoff() {
+            held += 1;
+        }
+        assert_eq!(held, ABORT_BACKOFF_SLICES);
+        assert!(ckpt.should_begin(0, 0), "the manual request survives the backoff");
+        assert!(!ckpt.tick_backoff(), "backoff is one-shot per abort");
     }
 }
