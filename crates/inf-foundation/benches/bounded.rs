@@ -82,11 +82,11 @@ impl Merge<Entry> for Later {
 #[derive(Clone, Copy)]
 enum Leg {
     /// A.
-    Vecdeque,
+    VecDeque,
     /// A′: A with the site's own `len < cap` test.
-    VecdequeBounded,
+    VecDequeBounded,
     /// A plus one `nop`: the liveness plant on A.
-    VecdequePlusOne,
+    VecDequePlusOne,
     /// B, the `Reserve` crossing: a slot, then its publish.
     Reserve,
     /// B plus one `nop`: the liveness plant on B.
@@ -99,9 +99,9 @@ enum Leg {
 
 /// The one table of leg names: `--variant` is parsed against it.
 const LEGS: [(&str, Leg); 7] = [
-    ("vecdeque", Leg::Vecdeque),
-    ("vecdeque-bounded", Leg::VecdequeBounded),
-    ("vecdeque-plus-one", Leg::VecdequePlusOne),
+    ("vecdeque", Leg::VecDeque),
+    ("vecdeque-bounded", Leg::VecDequeBounded),
+    ("vecdeque-plus-one", Leg::VecDequePlusOne),
     ("reserve", Leg::Reserve),
     ("reserve-plus-one", Leg::ReservePlusOne),
     ("reserve-plus-four", Leg::ReservePlusFour),
@@ -232,8 +232,8 @@ fn step_coalesce(deque: &mut CappedDeque<Entry, Coalesce<Later>>, i: u64) -> u64
 // leg by those instructions alone and not by a select or a branch in both.
 #[inline(never)]
 fn calls_vecdeque<const NOPS: u8, const BOUNDED: bool>(cap: Cap, ops: u64) -> u64 {
-    let entries = cap.entries_max() as usize;
-    let mut deque: VecDeque<Entry> = VecDeque::with_capacity(entries);
+    let entries_max = cap.entries_max() as usize;
+    let mut deque: VecDeque<Entry> = VecDeque::with_capacity(entries_max);
     for i in 0..half(cap) {
         deque.push_back(Entry(i));
     }
@@ -241,7 +241,7 @@ fn calls_vecdeque<const NOPS: u8, const BOUNDED: bool>(cap: Cap, ops: u64) -> u6
     for i in 0..ops {
         plant::<NOPS>();
         accumulator ^= if BOUNDED {
-            step_vecdeque_bounded(&mut deque, entries, i)
+            step_vecdeque_bounded(&mut deque, entries_max, i)
         } else {
             step_vecdeque(&mut deque, i)
         };
@@ -283,15 +283,15 @@ fn calls_coalesce(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
 // and one left standalone would differ in codegen, not in the type.
 #[inline(never)]
 fn leg_vecdeque<const NOPS: u8, const BOUNDED: bool>(cap: Cap, ops: u64) -> u64 {
-    let entries = cap.entries_max() as usize;
-    let mut deque: VecDeque<Entry> = VecDeque::with_capacity(entries);
+    let entries_max = cap.entries_max() as usize;
+    let mut deque: VecDeque<Entry> = VecDeque::with_capacity(entries_max);
     for i in 0..half(cap) {
         deque.push_back(Entry(i));
     }
     let mut accumulator = 0u64;
     for i in 0..ops {
         plant::<NOPS>();
-        if !BOUNDED || deque.len() < entries {
+        if !BOUNDED || deque.len() < entries_max {
             deque.push_back(Entry(i));
         }
         if let Some(Entry(v)) = deque.pop_front() {
@@ -342,16 +342,16 @@ fn leg_coalesce(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
 fn run(args: &Args, census: &Rc<CapCensus>) -> u64 {
     let (cap, ops) = (args.cap, args.ops);
     match (args.leg, args.shape) {
-        (Leg::Vecdeque, Shape::Call) => calls_vecdeque::<0, false>(cap, ops),
-        (Leg::VecdequeBounded, Shape::Call) => calls_vecdeque::<0, true>(cap, ops),
-        (Leg::VecdequePlusOne, Shape::Call) => calls_vecdeque::<1, false>(cap, ops),
+        (Leg::VecDeque, Shape::Call) => calls_vecdeque::<0, false>(cap, ops),
+        (Leg::VecDequeBounded, Shape::Call) => calls_vecdeque::<0, true>(cap, ops),
+        (Leg::VecDequePlusOne, Shape::Call) => calls_vecdeque::<1, false>(cap, ops),
         (Leg::Reserve, Shape::Call) => calls_reserve::<0>(cap, census, ops),
         (Leg::ReservePlusOne, Shape::Call) => calls_reserve::<1>(cap, census, ops),
         (Leg::ReservePlusFour, Shape::Call) => calls_reserve::<4>(cap, census, ops),
         (Leg::Coalesce, Shape::Call) => calls_coalesce(cap, census, ops),
-        (Leg::Vecdeque, Shape::Loop) => leg_vecdeque::<0, false>(cap, ops),
-        (Leg::VecdequeBounded, Shape::Loop) => leg_vecdeque::<0, true>(cap, ops),
-        (Leg::VecdequePlusOne, Shape::Loop) => leg_vecdeque::<1, false>(cap, ops),
+        (Leg::VecDeque, Shape::Loop) => leg_vecdeque::<0, false>(cap, ops),
+        (Leg::VecDequeBounded, Shape::Loop) => leg_vecdeque::<0, true>(cap, ops),
+        (Leg::VecDequePlusOne, Shape::Loop) => leg_vecdeque::<1, false>(cap, ops),
         (Leg::Reserve, Shape::Loop) => leg_reserve::<0>(cap, census, ops),
         (Leg::ReservePlusOne, Shape::Loop) => leg_reserve::<1>(cap, census, ops),
         (Leg::ReservePlusFour, Shape::Loop) => leg_reserve::<4>(cap, census, ops),
