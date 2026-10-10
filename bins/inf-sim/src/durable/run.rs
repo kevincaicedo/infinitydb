@@ -128,14 +128,15 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
 
-    // The tier-budget shape's namespaces: tiered `always`, a 3 MiB window
-    // with a tenth of it mutable, every generated value inline (the
-    // threshold is above the generator's largest value, so the tier
+    // The tier-budget shape's namespaces: tiered `always`, the leg's
+    // window with a tenth of it mutable, every generated value inline
+    // (the threshold is above the generator's largest value, so the tier
     // class, not the blob class, carries the bytes), the shape's
     // `MAINTAIN-SLICE`.
     if let Some(shape) = scenario.tier_budget {
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
+            let load = shape.load(index);
             let create: &[&[u8]] = &[
                 b"INF.NS",
                 b"CREATE",
@@ -145,11 +146,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 b"FSYNC",
                 b"always",
                 b"MEM-BUDGET",
-                b"3mb",
+                load.mem_budget,
                 b"MUTABLE-FRACTION",
-                b"100",
+                load.mutable_permille,
                 b"MAINTAIN-SLICE",
-                shape.maintain_slice,
+                load.maintain_slice,
                 b"BLOB-THRESHOLD",
                 b"16kb",
                 b"TIER-IO-MODE",
@@ -243,11 +244,12 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     if let Some(shape) = scenario.tier_budget {
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
-            for _ in 0..shape.writers_per_ns {
+            let load = shape.load(index);
+            for _ in 0..load.writers {
                 let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
                 let fd = node.nets[cell].borrow_mut().connect();
                 let writer =
-                    Writer::new(id, cell, fd, class, scenario.seed, shape.ops_per_writer, true, 0);
+                    Writer::new(id, cell, fd, class, scenario.seed, load.ops_per_writer, true, 0);
                 node.nets[cell]
                     .borrow_mut()
                     .client_send(fd, &encode(&[b"INF.NS", b"USE", class.name()]));
@@ -484,6 +486,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut idle_steps = 0u64;
     let mut last_progress = 0u64;
     let mut log_oracle = LogOracle::new(scenario.cells);
+    let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
     for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
@@ -491,6 +494,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             return finish(report, &observer, &clock);
         }
         log_oracle.sample(&node, &mut report);
+        tier_oracle.sample(&node, &disk, scenario, &mut report);
         let quiesce = next_check < checks_at.len() && step >= checks_at[next_check];
         let mut progress = 0u64;
         for writer in &mut writers {
@@ -527,7 +531,10 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             let think = match writer.class {
                 NsClass::Everysec => scenario.esec_think_ns_max,
                 NsClass::Always => scenario.always_think_ns_max,
-                NsClass::Memory | NsClass::Tiered | NsClass::Indexed | NsClass::TierBudget(_) => 0,
+                NsClass::TierBudget(index) => {
+                    scenario.tier_budget.map_or(0, |s| s.load(index).think_ns_max)
+                }
+                NsClass::Memory | NsClass::Tiered | NsClass::Indexed => 0,
             };
             if think > 0 {
                 writer.idle_until = clock.now() + Nanos(writer.rng.next_below(think));
@@ -796,7 +803,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
     if let Some(shape) = scenario.tier_budget {
-        tier_budget_scrape(scenario, shape, &node, &mut report);
+        tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
     }
     engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
@@ -1013,6 +1020,17 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         observer.power_cut(&disk, clock.now(), scenario.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
+    // The recovered life's first turns: every tiered namespace whose
+    // replayed tail is past its mutable target seals a slice in its first
+    // MAINTAIN, before that turn's plan, so on the eight-namespace leg all
+    // eight are idle with work in one turn — the one-plan oracle's regime.
+    if scenario.tier_budget.is_some()
+        && let Err(err) =
+            tier_recovered_turns(&mut node, &mut rng, &clock, &disk, scenario, &mut report)
+    {
+        fail(&mut report, format!("the recovered life's first turns: {err}"));
+        return finish(report, &observer, &clock);
+    }
     // ADR-0124 D4's observable: a boot after a clean stop replays no tail
     // record on any cell — the stop checkpoint covered everything.
     if scenario.clean_stop && scenario.plant != Plant::StopKill {
@@ -1168,19 +1186,42 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 /// Preallocs that found the pool non-empty — neither a miss nor a space
 /// failure (ADR-0090 A16): the takes the recycle rules are about.
 /// The tier-budget shape's per-cell scrape at the cut (before the node
-/// drops: the counters are life-scoped), and its engagement. A cell whose
-/// budget model is absent, whose tier class never made an offer, or on
-/// which a tier-budget namespace never advanced its flush watermark is
-/// `VACUOUS`: the shape exists to flush several tiered namespaces under
-/// the model, and a run that did not is no evidence about the class.
+/// drops: the counters are life-scoped), and the tier class's oracles on
+/// it. A cell whose budget model is absent, whose tier class never made
+/// an offer, or on which a tier-budget namespace never advanced its
+/// flush watermark is `VACUOUS`: the shape exists to flush tiered
+/// namespaces under the model, and a run that did not is no evidence
+/// about the class. The oracles, each independent of the budget's code:
+/// no offer above the class cap and no overrun (the counters), one
+/// driver entry's tier bytes within the cap and the pool computed from
+/// the model (the driver's own tally), every ready group's wait within
+/// the fair turn's bound `n × T_c` computed from the model and the
+/// scenario's step (the plane's gauge, judged by the harness's
+/// arithmetic), the spend equal to the disk's tier bytes and ops with the
+/// ops a cut caught between push and submit (exact), and the leg's own
+/// reads: contention and refusals on the legs that reach them, a plan
+/// passed over on the eight-namespace leg, neither on the control leg;
+/// with the write-fault plant, a retry.
 fn tier_budget_scrape(
     scenario: &DurableScenario,
     shape: TierBudgetShape,
     node: &Node,
+    disk: &SimDisk,
     report: &mut DurableReport,
 ) {
     use inf_runtime::IoClass;
+    use inf_server::TierFlushGauge as G;
     let seed = scenario.seed;
+    let leg = shape.leg;
+    let bound_ns = fair_turn_bound_ns(
+        scenario.device.model_share,
+        u64::from(shape.namespaces.get()),
+        scenario.step_ns_max,
+    );
+    let pass_bound = tier_pass_bound_bytes(scenario.device.model_share);
+    if scenario.plant == crate::net::Plant::TierWriteEio {
+        report.plant_fired |= disk.faults_fired() > 0;
+    }
     for cell in 0..usize::from(scenario.cells) {
         let Some(stats) = node.plane(cell).durable_stats() else {
             report
@@ -1190,6 +1231,9 @@ fn tier_budget_scrape(
         };
         let counted = stats.io_budget[IoClass::TierFlush.index()];
         let observed = node.cells[cell].0.driver().observed_io();
+        let (queued_bytes, queued_ops) = node.cells[cell].0.driver().queued_tier_io();
+        let gauges = node.plane(cell).tier_flush_gauges();
+        let gauge = |slot: G| gauges[slot as usize];
         let flushed = tier_budget_flushed(&node.plane(cell).keyspace(), shape);
         if stats.io_budget_model_absent != 0 {
             report.violations.push(format!(
@@ -1218,6 +1262,66 @@ fn tier_budget_scrape(
                 ));
             }
         }
+        // G1, attainable: no tier offer above the class cap, no overrun;
+        // and from the driver's own tally, one pass's tier bytes within
+        // the cap and the pool.
+        if counted.unattainable != 0 || counted.overrun_bytes != 0 {
+            report.violations.push(format!(
+                "TIER-CAP VIOLATION seed {seed:#x} cell {cell}: {} tier offer(s) above the class \
+                 cap, {} B issued by the overrun (no tier offer is above the cap)",
+                counted.unattainable, counted.overrun_bytes
+            ));
+        }
+        if observed.tier_pass_bytes_max > pass_bound {
+            report.violations.push(format!(
+                "TIER-PASS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} B of \
+                 tier writes, above the class cap plus the pool, {pass_bound} B from the model",
+                observed.tier_pass_bytes_max
+            ));
+        }
+        // G2, fair: no ready group waited past n × T_c.
+        let group_wait_ns_max = gauge(G::GroupWaitNsMax);
+        if group_wait_ns_max > bound_ns {
+            report.violations.push(format!(
+                "TIER-TURN VIOLATION seed {seed:#x} cell {cell}: a ready group waited \
+                 {group_wait_ns_max} ns, past n × T_c = {bound_ns} ns from the model"
+            ));
+        }
+        if leg.expects_contention() && (gauge(G::TurnWaits) == 0 || gauge(G::TurnContended) == 0) {
+            report.violations.push(format!(
+                "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
+                 contended {} time(s); the leg needs both",
+                gauge(G::TurnWaits),
+                gauge(G::TurnContended)
+            ));
+        }
+        // G3, exact charge: the spend is what the disk saw plus what the
+        // cut caught between push and submit.
+        let seen_bytes = observed.bytes[IoClass::TierFlush.index()] + queued_bytes;
+        let seen_ops = observed.ops[IoClass::TierFlush.index()] + queued_ops;
+        if counted.spent_bytes != seen_bytes || counted.spent_ops != seen_ops {
+            report.violations.push(format!(
+                "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: the budget spent {} B {} ops, \
+                 the driver saw {} B {} ops ({queued_bytes} B {queued_ops} ops queued at the cut)",
+                counted.spent_bytes, counted.spent_ops, seen_bytes, seen_ops
+            ));
+        }
+        // The control leg's reads (G4's count is judged per iteration by
+        // `TierTurnOracle`, its engagement in the recovered life).
+        if leg.is_control() && (gauge(G::TurnContended) != 0 || gauge(G::PlanWaits) != 0) {
+            report.violations.push(format!(
+                "TIER-CONTROL VIOLATION seed {seed:#x} cell {cell}: one namespace read \
+                 tier_turn_contended {} tier_plan_waits {}",
+                gauge(G::TurnContended),
+                gauge(G::PlanWaits)
+            ));
+        }
+        if scenario.plant == crate::net::Plant::TierWriteEio && gauge(G::WriteRetries) == 0 {
+            report.violations.push(format!(
+                "TIER-RETRY ARM VACUOUS seed {seed:#x} cell {cell}: the write fault was planted \
+                 and no tier write was retried"
+            ));
+        }
         report.tier_budget_cells.push(TierBudgetCell {
             cell: cell as u16,
             unattainable: counted.unattainable,
@@ -1227,9 +1331,164 @@ fn tier_budget_scrape(
             overrun_bytes: counted.overrun_bytes,
             driver_bytes: observed.bytes[IoClass::TierFlush.index()],
             driver_ops: observed.ops[IoClass::TierFlush.index()],
+            queued_bytes,
+            queued_ops,
+            pass_bytes_max: observed.tier_pass_bytes_max,
+            pass_ops_max: observed.tier_pass_ops_max,
+            groups_deferred: gauge(G::GroupsDeferred),
+            group_wait_ns_max,
+            turn_waits: gauge(G::TurnWaits),
+            turn_contended: gauge(G::TurnContended),
+            plan_waits: gauge(G::PlanWaits),
+            rounds_planned: gauge(G::RoundsPlanned),
+            write_retries: gauge(G::WriteRetries),
             flushed,
         });
     }
+}
+
+/// The fair turn's bound on one ready group's wait, `n × T_c` in
+/// nanoseconds, from the cell's share and the scenario alone: `T_c = max
+/// over the budgeted axes of (B + 3) / r + 2Δ`, `B` one group (the
+/// group's byte and op bounds), `r` the tier class's floor share (one
+/// twentieth: the eighth floor times the class's four of ten weights),
+/// `Δ` the longest interval between two MAINTAIN entries (one scheduler
+/// step: its longest advance plus the microsecond every step adds).
+fn fair_turn_bound_ns(share: inf_runtime::DeviceModel, namespaces: u64, step_ns_max: u64) -> u64 {
+    let delta_ns = step_ns_max + 1_000;
+    let axis = |rate_per_s: u64, group: u64| -> Option<u64> {
+        let floor = rate_per_s / 20;
+        (floor > 0).then(|| (group + 3).saturating_mul(1_000_000_000) / floor + 2 * delta_ns)
+    };
+    let bytes = axis(share.write_bytes_per_s, inf_log::limits::TIER_GROUP_BYTES_MAX);
+    let ops = axis(share.write_ops_per_s, inf_log::limits::TIER_GROUP_OPS_MAX as u64);
+    let t_c = bytes.unwrap_or(0).max(ops.unwrap_or(0));
+    namespaces * t_c
+}
+
+/// The most tier bytes one MAINTAIN pass can draw, from the model: the
+/// class cap (the declared slice, or 50 ms of its weighted share) plus the
+/// write pool (50 ms of the share) — the budget refills once a pass.
+fn tier_pass_bound_bytes(share: inf_runtime::DeviceModel) -> u64 {
+    const HORIZON_NS: u64 = 50_000_000;
+    let horizon = |rate_per_s: u64| rate_per_s / 1_000 * HORIZON_NS / 1_000_000;
+    let cap = inf_log::limits::TIER_GROUP_BYTES_MAX.max(horizon(share.write_bytes_per_s) * 4 / 10);
+    cap + horizon(share.write_bytes_per_s)
+}
+
+/// The turn's per-iteration oracle, sampled after every scheduler step
+/// (one reactor iteration per cell): the plan count rises by at most one
+/// per cell per iteration (one plan per cell turn). With the write-fault
+/// plant it also arms the sim disk's fault on the first namespace's first
+/// tier file on each cell once that file exists.
+struct TierTurnOracle {
+    rounds_planned: Vec<u64>,
+    /// Whether this life arms the write-fault plant (the first life does;
+    /// the recovered life's turns are read, never planted).
+    arm_faults: bool,
+    fault_armed: Vec<bool>,
+}
+
+impl TierTurnOracle {
+    /// Starts from the gauges as they stand (a recovered life's own
+    /// boot turns planned before the harness read them), so the first
+    /// sample judges one step, never a life's history.
+    fn new(node: &Node, cells: u16, arm_faults: bool) -> TierTurnOracle {
+        use inf_server::TierFlushGauge as G;
+        let rounds_planned = (0..usize::from(cells))
+            .map(|cell| node.plane(cell).tier_flush_gauges()[G::RoundsPlanned as usize])
+            .collect();
+        TierTurnOracle { rounds_planned, arm_faults, fault_armed: vec![false; usize::from(cells)] }
+    }
+
+    fn sample(
+        &mut self,
+        node: &Node,
+        disk: &SimDisk,
+        scenario: &DurableScenario,
+        report: &mut DurableReport,
+    ) {
+        use inf_server::TierFlushGauge as G;
+        if scenario.tier_budget.is_none() {
+            return;
+        }
+        for cell in 0..usize::from(scenario.cells) {
+            let planned = node.plane(cell).tier_flush_gauges()[G::RoundsPlanned as usize];
+            let before = self.rounds_planned[cell];
+            if planned > before + 1 {
+                report.violations.push(format!(
+                    "TIER-PLAN VIOLATION seed {:#x} cell {cell}: {} rounds planned in one \
+                     iteration (one plan per cell turn)",
+                    scenario.seed,
+                    planned - before
+                ));
+            }
+            self.rounds_planned[cell] = planned;
+            if self.arm_faults
+                && scenario.plant == crate::net::Plant::TierWriteEio
+                && !self.fault_armed[cell]
+            {
+                let keyspace = node.plane(cell).keyspace();
+                let first = keyspace
+                    .ns_iter()
+                    .find(|spec| spec.name.as_slice() == NsClass::TierBudget(0).name())
+                    .map(|spec| spec.id);
+                if let Some(id) = first {
+                    let path = node
+                        .data_dir
+                        .join(format!("shard-{cell}"))
+                        .join(format!("ns-{}", id.0))
+                        .join("cold")
+                        .join(inf_log::tier_file_name(0));
+                    if disk.inject(&path, inf_log::fs::sim::DeviceFault::WriteEio, 1).is_ok() {
+                        self.fault_armed[cell] = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The recovered life's first turns, sampled per step by the one-plan
+/// oracle: the first MAINTAIN seals a slice of every namespace whose
+/// replayed tail is past its mutable target, so on the eight-namespace
+/// leg every namespace is idle with work in that turn and the cell's one
+/// plan passes seven over, one planning per turn after it — the regime
+/// the leg's engagement requires.
+fn tier_recovered_turns(
+    node: &mut Node,
+    rng: &mut SplitMix64,
+    clock: &Rc<VirtualClock>,
+    disk: &SimDisk,
+    scenario: &DurableScenario,
+    report: &mut DurableReport,
+) -> std::io::Result<()> {
+    use inf_server::TierFlushGauge as G;
+    const TURNS: u64 = 64;
+    let Some(shape) = scenario.tier_budget else { return Ok(()) };
+    let mut oracle = TierTurnOracle::new(node, scenario.cells, false);
+    for _ in 0..TURNS {
+        report.scheduler_steps += 1;
+        node.step(rng, clock, disk, scenario.step_ns_max)?;
+        oracle.sample(node, disk, scenario, report);
+    }
+    if shape.leg.expects_plan_waits() {
+        for cell in 0..usize::from(scenario.cells) {
+            let gauges = node.plane(cell).tier_flush_gauges();
+            if gauges[G::PlanWaits as usize] == 0 {
+                report.violations.push(format!(
+                    "TIER-PLAN VACUOUS seed {:#x} cell {cell}: no namespace with work was passed \
+                     over by the cell's one plan in the recovered life's first {TURNS} turns \
+                     (rounds planned {}, rounds {}; (namespace, flushed, ro, tail) {:?})",
+                    scenario.seed,
+                    gauges[G::RoundsPlanned as usize],
+                    gauges[G::Rounds as usize],
+                    tier_budget_flushed(&node.plane(cell).keyspace(), shape)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Each tier-budget namespace's flush watermark, ro-boundary and tail

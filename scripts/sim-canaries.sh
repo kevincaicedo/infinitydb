@@ -186,6 +186,32 @@ rows=(
   # max drops up to (α − 1)/α byte a refill near the crossover.
   "inf_canary_keepup_truncates crate-test inf-runtime lib the_keepup_floor_keeps_its_remainder_at_the_crossover"
   "inf_canary_keepup_truncates crate-test inf-runtime lib no_background_offer_waits_past_its_bound"
+  # ADR-0178 D3's tier row — the tier flush's groups and the cell's turn,
+  # one plant per rule, judged by the tier-budget shape's own oracles.
+  # The group is every unsent write: a whole 1 MiB round offered at once,
+  # above the class cap at the hostile share.
+  "inf_canary_tier_group_whole_round m4-tier-budget TIER-CAP --tier-leg two-1mb-hostile"
+  # The issue visit starts at index 0 and continues past a refusal: at the
+  # hostile share the second namespace's group waits past n × T_c.
+  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
+  # The same plant at the two-cell binary: the starved namespace's writer
+  # ends on the tail-stall timeout derived from the fair turn's bound.
+  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write STALLED"
+  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write STALLED"
+  # A retry group reaches the driver with no offer: the spend falls below
+  # what the disk saw, on the retry arm.
+  "inf_canary_tier_retry_ungranted m4-tier-budget TIER-SPEND --tier-leg two-8mb --plant tier-write-eio"
+  # The barrier group is offered with a write outstanding: the fsync lands
+  # before the write, the round completes, and a cut loses bytes the
+  # watermark covered — the durability audit after the cut.
+  "inf_canary_tier_barrier_early m4-tier-budget DURABILITY --tier-leg two-8mb"
+  # Every idle namespace with work plans in the same turn: the eight
+  # namespaces' per-iteration plan count reads two or more.
+  "inf_canary_tier_plan_every_namespace m4-tier-budget TIER-PLAN --tier-leg eight-1mb"
+  # The active file's cold window is planned from its staged length: a
+  # read below the confirmable length reaches frames a held round has not
+  # written, and the driver answers short.
+  "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
   # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
   # above the tail — no pad. The room property judges every demote target
   # (a page multiple above the head, at or below the tail) and the placed

@@ -102,6 +102,7 @@ fn main() {
                         "fsync-lies" => Plant::FsyncLies,
                         "accept-error" => Plant::AcceptError,
                         "tier-read-eio" => Plant::TierReadEio,
+                        "tier-write-eio" => Plant::TierWriteEio,
                         "stop-kill" => Plant::StopKill,
                         other => return Err(format!("unknown plant {other}")),
                     }
@@ -151,7 +152,7 @@ fn main() {
                     println!(
                         "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--cells N] \
                          [--connections N] [--commands N] [--wheel-nodes-max N] \
@@ -1563,7 +1564,11 @@ fn run_durable(
                 "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \
                  io_budget_deferrals_tier_flush {} io_budget_bytes_tier_flush {} \
                  io_budget_ops_tier_flush {} io_budget_overrun_bytes_tier_flush {} \
-                 driver tier-file bytes {} ops {}; (namespace, flushed, ro, tail) {:?}",
+                 driver tier-file bytes {} ops {} (queued at the cut {} B {} ops; one pass at \
+                 most {} B {} ops); turn: tier_flush_groups_deferred {} tier_group_wait_ns_max \
+                 {} tier_turn_waits {} tier_turn_contended {} tier_plan_waits {} \
+                 tier_rounds_planned {} tiering_flush_write_retries {}; (namespace, flushed, \
+                 ro, tail) {:?}",
                 cell.cell,
                 cell.unattainable,
                 cell.deferrals,
@@ -1572,6 +1577,17 @@ fn run_durable(
                 cell.overrun_bytes,
                 cell.driver_bytes,
                 cell.driver_ops,
+                cell.queued_bytes,
+                cell.queued_ops,
+                cell.pass_bytes_max,
+                cell.pass_ops_max,
+                cell.groups_deferred,
+                cell.group_wait_ns_max,
+                cell.turn_waits,
+                cell.turn_contended,
+                cell.plan_waits,
+                cell.rounds_planned,
+                cell.write_retries,
                 cell.flushed
             );
         }

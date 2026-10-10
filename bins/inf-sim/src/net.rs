@@ -55,6 +55,12 @@ pub enum Plant {
     /// lives on the disk, not the net; `m4-tiered` also runs it on every
     /// seed ≡ 7 (mod 8) without the flag.
     TierReadEio,
+    /// One tier-file write answers `EIO` on each cell (the sim disk's
+    /// per-file fault, armed on the first tier file of the tier-budget
+    /// shape's first namespace once it exists): the round turns the failed
+    /// write unsent again and offers it as a retry group, charged like any
+    /// group — the retry arm of the tier class's accounting oracle.
+    TierWriteEio,
 }
 
 #[derive(Debug, Default)]
@@ -255,6 +261,11 @@ pub struct ObservedIo {
     pub ops: [u64; IoClass::COUNT],
     pub read_bytes: u64,
     pub read_ops: u64,
+    /// The most tier-class bytes and ops one driver entry carried — what
+    /// one MAINTAIN pass submitted for the tier flush, read from the ops'
+    /// token class alone (the attainable oracle's disk-side clause).
+    pub tier_pass_bytes_max: u64,
+    pub tier_pass_ops_max: u64,
 }
 
 impl ObservedIo {
@@ -327,6 +338,38 @@ impl SimDriver {
     pub fn observed_io(&self) -> ObservedIo {
         self.observed
     }
+
+    /// Tier-class bytes and ops pushed and not yet submitted — what a cut
+    /// catches between the plane's push and the next driver entry; the
+    /// accounting oracle adds them to the observed ledger for an exact
+    /// equality.
+    pub fn queued_tier_io(&self) -> (u64, u64) {
+        tier_io_of(&self.ops)
+    }
+}
+
+/// The tier-class bytes and ops among `ops`, by each op's token class.
+fn tier_io_of(ops: &[IoOp]) -> (u64, u64) {
+    let is_tier = |token: CompletionToken| IoClass::of(token.class()) == Some(IoClass::TierFlush);
+    let mut tally = (0u64, 0u64);
+    for op in ops {
+        match op {
+            IoOp::LogWrite { data, token, .. } if is_tier(*token) => {
+                tally.0 += u64::from(data.len());
+                tally.1 += 1;
+            }
+            IoOp::Fdatasync { token, .. } if is_tier(*token) => tally.1 += 1,
+            IoOp::LogWrite { .. }
+            | IoOp::Fdatasync { .. }
+            | IoOp::AcceptArm { .. }
+            | IoOp::RecvArm { .. }
+            | IoOp::RecvDisarm { .. }
+            | IoOp::Send { .. }
+            | IoOp::Close { .. }
+            | IoOp::TierRead { .. } => {}
+        }
+    }
+    tally
 }
 
 /// Queue a deferred op in due order. Write-through and plain-write draws
@@ -424,6 +467,9 @@ impl BackendDriver for SimDriver {
         let before = out.len();
         let mut net = self.net.borrow_mut();
         let submitted = self.ops.len() as u64;
+        let (tier_bytes, tier_ops) = tier_io_of(&self.ops);
+        self.observed.tier_pass_bytes_max = self.observed.tier_pass_bytes_max.max(tier_bytes);
+        self.observed.tier_pass_ops_max = self.observed.tier_pass_ops_max.max(tier_ops);
 
         // M2.5-S14: release fsyncs whose device service time elapsed.
         // The flush is deferred WITH the completion — during the stall
