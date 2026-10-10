@@ -472,8 +472,9 @@ enum Swept {
 }
 
 /// The data directories live processes on this box name, as far as the
-/// box shows them: read from `/proc` on Linux; nowhere else, so there no
-/// directory can be proven idle.
+/// box shows them: read from `/proc` on Linux, and `Unseen` where it
+/// cannot be read (no procfs mounted) or off Linux — there no directory
+/// can be proven idle.
 enum Owners {
     Seen(Vec<(PathBuf, u32)>),
     Unseen,
@@ -494,7 +495,7 @@ impl Owners {
     fn read() -> Owners {
         #[cfg(target_os = "linux")]
         {
-            Owners::Seen(data_dir_owners())
+            data_dir_owners().map_or(Owners::Unseen, Owners::Seen)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -639,13 +640,14 @@ fn parse_count(digits: &str) -> Option<usize> {
 
 /// Every `(data directory, pid)` a live process on this box names with a
 /// `--data-dir` argument, read from `/proc/<pid>/cmdline` in one pass; a
-/// process that cannot be read (gone, or not ours) is skipped. The data
-/// directory is compared as the argument was given, which is how this
-/// instrument spawns a node (`--data-dir <path>`). Linux's `/proc` alone
-/// shows it; elsewhere `Owners::read` is `Unseen`.
+/// process that cannot be read (gone, or not ours) is skipped. `None`
+/// when `/proc` itself cannot be read: then nothing is seen, which is
+/// not the same as nothing live. The data directory is compared as the
+/// argument was given, which is how this instrument spawns a node
+/// (`--data-dir <path>`). Linux's `/proc` alone shows it.
 #[cfg(target_os = "linux")]
-fn data_dir_owners() -> Vec<(PathBuf, u32)> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+fn data_dir_owners() -> Option<Vec<(PathBuf, u32)>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
     let mut owners = Vec::new();
     for entry in entries.flatten() {
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
@@ -664,7 +666,7 @@ fn data_dir_owners() -> Vec<(PathBuf, u32)> {
             }
         }
     }
-    owners
+    Some(owners)
 }
 
 /// Removes `path` with everything under it; an absent path is nothing to
