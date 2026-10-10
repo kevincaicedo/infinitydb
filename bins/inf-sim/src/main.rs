@@ -197,6 +197,7 @@ fn main() {
             | "m2-ckpt-refused"
             | "m2-recycle"
             | "m3-document"
+            | "m4-tier-budget"
     ) {
         run_durable(
             &scenario_name,
@@ -1470,6 +1471,7 @@ fn run_durable(
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
             "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
+            "m4-tier-budget" => DurableScenario::m4_tier_budget(seed),
             _ => unreachable!("the caller filters durable scenario names"),
         };
         scenario.plant = plant;
@@ -1524,6 +1526,23 @@ fn run_durable(
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        for cell in &report.tier_budget_cells {
+            println!(
+                "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \
+                 io_budget_deferrals_tier_flush {} io_budget_bytes_tier_flush {} \
+                 io_budget_ops_tier_flush {} io_budget_overrun_bytes_tier_flush {} \
+                 driver tier-file bytes {} ops {}; (namespace, flushed, ro, tail) {:?}",
+                cell.cell,
+                cell.unattainable,
+                cell.deferrals,
+                cell.spent_bytes,
+                cell.spent_ops,
+                cell.overrun_bytes,
+                cell.driver_bytes,
+                cell.driver_ops,
+                cell.flushed
+            );
+        }
         for violation in report.violations.iter().take(5) {
             eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
         }

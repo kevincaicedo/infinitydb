@@ -62,6 +62,7 @@ rows=(
   "m4-tiered"
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
+  "m4-tier-budget"
   "m45-backfill"
   "m45-sidecar"
 )

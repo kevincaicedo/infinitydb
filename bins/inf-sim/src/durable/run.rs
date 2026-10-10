@@ -80,6 +80,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         torn_plants: 0,
         lift_plant_lifts: 0,
         lift_plant_sidecars: 0,
+        tier_budget_cells: Vec::new(),
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -123,6 +124,49 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             Err(err) => {
                 fail(&mut report, format!("DDL phase: {err}"));
                 return finish(report, &observer, &clock);
+            }
+        }
+    }
+
+    // The tier-budget shape's namespaces: tiered `always`, a 3 MiB window
+    // with a tenth of it mutable, every generated value inline (the
+    // threshold is above the generator's largest value, so the tier
+    // class, not the blob class, carries the bytes), the shape's
+    // `MAINTAIN-SLICE`.
+    if let Some(shape) = scenario.tier_budget {
+        for index in 0..shape.namespaces {
+            let class = NsClass::TierBudget(index);
+            let create: &[&[u8]] = &[
+                b"INF.NS",
+                b"CREATE",
+                class.name(),
+                b"MODE",
+                b"durable",
+                b"FSYNC",
+                b"always",
+                b"MEM-BUDGET",
+                b"3mb",
+                b"MUTABLE-FRACTION",
+                b"100",
+                b"MAINTAIN-SLICE",
+                shape.maintain_slice,
+                b"BLOB-THRESHOLD",
+                b"16kb",
+                b"TIER-IO-MODE",
+                b"buffered",
+            ];
+            let reply =
+                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create);
+            match reply {
+                Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+                Ok(other) => {
+                    fail(&mut report, format!("DDL CREATE {class:?} answered {other:?}"));
+                    return finish(report, &observer, &clock);
+                }
+                Err(err) => {
+                    fail(&mut report, format!("DDL phase: {err}"));
+                    return finish(report, &observer, &clock);
+                }
             }
         }
     }
@@ -194,6 +238,22 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             }
             writers.push(writer);
             id += 1;
+        }
+    }
+    if let Some(shape) = scenario.tier_budget {
+        for index in 0..shape.namespaces {
+            let class = NsClass::TierBudget(index);
+            for _ in 0..shape.writers_per_ns {
+                let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+                let fd = node.nets[cell].borrow_mut().connect();
+                let writer =
+                    Writer::new(id, cell, fd, class, scenario.seed, shape.ops_per_writer, true, 0);
+                node.nets[cell]
+                    .borrow_mut()
+                    .client_send(fd, &encode(&[b"INF.NS", b"USE", class.name()]));
+                writers.push(writer);
+                id += 1;
+            }
         }
     }
 
@@ -467,7 +527,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             let think = match writer.class {
                 NsClass::Everysec => scenario.esec_think_ns_max,
                 NsClass::Always => scenario.always_think_ns_max,
-                NsClass::Memory | NsClass::Tiered | NsClass::Indexed => 0,
+                NsClass::Memory | NsClass::Tiered | NsClass::Indexed | NsClass::TierBudget(_) => 0,
             };
             if think > 0 {
                 writer.idle_until = clock.now() + Nanos(writer.rng.next_below(think));
@@ -734,6 +794,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             report.ckpt_block_wait_ns_max =
                 report.ckpt_block_wait_ns_max.max(stats.ckpt_block_wait_ns_max);
         }
+    }
+    if let Some(shape) = scenario.tier_budget {
+        tier_budget_scrape(scenario, shape, &node, &mut report);
     }
     engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
@@ -1023,7 +1086,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             match writer.class {
                 NsClass::Tiered => report.lift_tiered_ops += acked,
                 NsClass::Indexed => report.lift_indexed_ops += acked,
-                NsClass::Always | NsClass::Everysec | NsClass::Memory => {}
+                NsClass::Always | NsClass::Everysec | NsClass::Memory | NsClass::TierBudget(_) => {}
             }
         }
         for cell in 0..usize::from(scenario.cells) {
@@ -1104,6 +1167,90 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 
 /// Preallocs that found the pool non-empty — neither a miss nor a space
 /// failure (ADR-0090 A16): the takes the recycle rules are about.
+/// The tier-budget shape's per-cell scrape at the cut (before the node
+/// drops: the counters are life-scoped), and its engagement. A cell whose
+/// budget model is absent, whose tier class never made an offer, or on
+/// which a tier-budget namespace never advanced its flush watermark is
+/// `VACUOUS`: the shape exists to flush several tiered namespaces under
+/// the model, and a run that did not is no evidence about the class.
+fn tier_budget_scrape(
+    scenario: &DurableScenario,
+    shape: TierBudgetShape,
+    node: &Node,
+    report: &mut DurableReport,
+) {
+    use inf_runtime::IoClass;
+    let seed = scenario.seed;
+    for cell in 0..usize::from(scenario.cells) {
+        let Some(stats) = node.plane(cell).durable_stats() else {
+            report
+                .violations
+                .push(format!("TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: no durable plane"));
+            continue;
+        };
+        let counted = stats.io_budget[IoClass::TierFlush.index()];
+        let observed = node.cells[cell].0.driver().observed_io();
+        let keyspace = node.plane(cell).keyspace();
+        let index_of = |ns: NsId| -> Option<u8> {
+            let spec = keyspace.ns_iter().find(|spec| spec.id == ns)?;
+            (0..shape.namespaces).find(|&i| NsClass::TierBudget(i).name() == spec.name.as_slice())
+        };
+        let mut flushed: Vec<(u8, u64, u64, u64)> = keyspace
+            .tiered_namespaces()
+            .filter_map(|(ns, table)| {
+                let index = index_of(ns)?;
+                let space = table.space();
+                let origin = space.life_origin().to_raw();
+                Some((
+                    index,
+                    space.flushed().to_raw() - origin,
+                    space.ro_boundary().to_raw() - origin,
+                    space.tail().to_raw() - origin,
+                ))
+            })
+            .collect();
+        flushed.sort_unstable();
+        if stats.io_budget_model_absent != 0 {
+            report.violations.push(format!(
+                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is absent"
+            ));
+        }
+        if counted.spent_ops + counted.deferrals + counted.unattainable == 0 {
+            report.violations.push(format!(
+                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the tier class never made an \
+                 offer under the model"
+            ));
+        }
+        if flushed.len() != usize::from(shape.namespaces) {
+            report.violations.push(format!(
+                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: {} of {} tier-budget \
+                 namespaces materialized",
+                flushed.len(),
+                shape.namespaces
+            ));
+        }
+        for &(index, bytes, _, _) in &flushed {
+            if bytes == 0 {
+                report.violations.push(format!(
+                    "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: namespace tb{index} \
+                     never advanced its flush watermark under the model"
+                ));
+            }
+        }
+        report.tier_budget_cells.push(TierBudgetCell {
+            cell: cell as u16,
+            unattainable: counted.unattainable,
+            deferrals: counted.deferrals,
+            spent_bytes: counted.spent_bytes,
+            spent_ops: counted.spent_ops,
+            overrun_bytes: counted.overrun_bytes,
+            driver_bytes: observed.bytes[IoClass::TierFlush.index()],
+            driver_ops: observed.ops[IoClass::TierFlush.index()],
+            flushed,
+        });
+    }
+}
+
 fn served_preallocs(stats: &inf_server::DurableStats) -> u64 {
     stats.segment_preallocs.saturating_sub(stats.recycle_misses + stats.segment_prealloc_failures)
 }

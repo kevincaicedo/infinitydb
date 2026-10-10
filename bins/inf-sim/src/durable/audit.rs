@@ -26,7 +26,11 @@ pub(super) fn audit_ledgers(
     report: &mut DurableReport,
 ) -> Result<(), ()> {
     let mut audit = MiniClient::connect(node, 0);
-    for class in [NsClass::Always, NsClass::Everysec, NsClass::Tiered, NsClass::Indexed] {
+    let mut classes = vec![NsClass::Always, NsClass::Everysec, NsClass::Tiered, NsClass::Indexed];
+    if let Some(shape) = scenario.tier_budget {
+        classes.extend((0..shape.namespaces).map(NsClass::TierBudget));
+    }
+    for class in classes {
         if !writers.iter().any(|w| w.class == class) {
             continue;
         }

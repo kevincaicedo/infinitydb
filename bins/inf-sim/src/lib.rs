@@ -125,6 +125,7 @@ pub const SCENARIOS: &[&str] = &[
     "m4-recovery",
     "m4-diskfull",
     "m4-tiered",
+    "m4-tier-budget",
     "m45-backfill",
     "m45-sidecar",
 ];

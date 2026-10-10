@@ -268,6 +268,50 @@ pub struct DurableScenario {
     /// 0, the value at which an idle iteration parks at once, and read the
     /// decision back from [`Node::iter_stats`].
     pub spin_iters: u32,
+    /// The tier-budget shape (`m4-tier-budget`): `Some` runs several
+    /// tiered `always` namespaces on every cell, each with its own
+    /// closed-loop writers, under the device model, so the tier-flush
+    /// class is offered, deferred and granted beside the foreground. The
+    /// lift regime's one tiered namespace is a different arm. `None`
+    /// everywhere else: every other trace stays byte-identical.
+    pub tier_budget: Option<TierBudgetShape>,
+}
+
+/// How many tiered namespaces the tier-budget shape runs, how they are
+/// written, and their `MAINTAIN-SLICE` (see [`DurableScenario::tier_budget`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TierBudgetShape {
+    /// Tiered namespaces created on the node, `1..=TIER_BUDGET_NS_MAX`;
+    /// every cell materializes each one (the DDL fans out).
+    pub namespaces: u8,
+    /// Closed-loop writers per namespace, each on a seeded cell.
+    pub writers_per_ns: usize,
+    /// Ops per tier-budget writer (the other classes keep
+    /// `ops_per_writer`).
+    pub ops_per_writer: u64,
+    /// The namespaces' `MAINTAIN-SLICE`, as the `INF.NS CREATE` argument:
+    /// `8mb` offers above the tier class's 1 MiB cap on every pass,
+    /// `1mb` exactly at it.
+    pub maintain_slice: &'static [u8],
+}
+
+/// One cell's tier-flush class at the cut of a tier-budget run: what the
+/// budget counted against what the sim disk saw, and the flush each
+/// namespace reached. Read from the budget's own ledger and the driver's
+/// observed bytes; `flushed` is each namespace's watermark advance.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierBudgetCell {
+    pub cell: u16,
+    pub unattainable: u64,
+    pub deferrals: u64,
+    pub spent_bytes: u64,
+    pub spent_ops: u64,
+    pub overrun_bytes: u64,
+    pub driver_bytes: u64,
+    pub driver_ops: u64,
+    /// `(namespace index, flushed, ro-boundary, tail)` bytes past the
+    /// life origin, per tier-budget namespace materialized on the cell.
+    pub flushed: Vec<(u8, u64, u64, u64)>,
 }
 
 /// The oversized-value pad of ADR-0178's sim arm (see
@@ -543,6 +587,7 @@ impl DurableScenario {
             recycle_open_fault: false,
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
+            tier_budget: None,
         }
     }
 
@@ -916,6 +961,70 @@ impl DurableScenario {
             recycle_open_fault: false,
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
+            tier_budget: None,
+        }
+    }
+
+    /// `m4-tier-budget`: the budget scenario's durable shape with several
+    /// tiered `always` namespaces on both cells, flushing under the
+    /// reference device model (489 MB/s, shared by the cells; the sim disk
+    /// carries the same bandwidth on its byte timeline, no stall episodes).
+    /// Even seeds run two namespaces at `MAINTAIN-SLICE 8mb`, so every tier
+    /// offer is above the class's 1 MiB cap; odd seeds run eight at `1mb`,
+    /// the fairness oracle's eight-namespace leg. Each namespace keeps a
+    /// 3 MiB window with a tenth of it mutable and every value inline
+    /// (seal marks land per 1 MiB commit page, so a cell seals once its
+    /// namespace's tail is a page past the mutable target: about 3 MiB of
+    /// inline writes per cell and namespace flush two pages). The m2
+    /// durability oracle and the
+    /// reply oracle run unchanged; the budget's accounting oracles do not
+    /// (the tier class is counted in record bytes until a round is issued
+    /// in groups), and the run reports the tier class per cell instead.
+    #[must_use]
+    pub fn m4_tier_budget(seed: u64) -> DurableScenario {
+        let cells: u16 = 2;
+        let model = inf_runtime::DeviceModel {
+            write_bytes_per_s: 489_000_000,
+            write_ops_per_s: 40_000,
+            read_bytes_per_s: 489_000_000,
+            read_ops_per_s: 40_000,
+        };
+        let mut stall = m2_stall_config();
+        stall.episode_gap_ns = u64::MAX;
+        stall.episode_ms_min = 0;
+        stall.episode_ms_max = 0;
+        stall.write_bytes_per_s = model.write_bytes_per_s;
+        stall.read_bytes_per_s = model.read_bytes_per_s;
+        let shape = if seed.is_multiple_of(2) {
+            TierBudgetShape {
+                namespaces: 2,
+                writers_per_ns: 3,
+                ops_per_writer: 1_000,
+                maintain_slice: b"8mb",
+            }
+        } else {
+            TierBudgetShape {
+                namespaces: TIER_BUDGET_NS_MAX,
+                writers_per_ns: 3,
+                ops_per_writer: 1_000,
+                maintain_slice: b"1mb",
+            }
+        };
+        DurableScenario {
+            cells,
+            // 64 KiB segments hold a frame of several inline tiered
+            // records (≤ 3 KiB each; blobs ride extents).
+            segment_bytes: 64 << 10,
+            stall: Some(stall),
+            device: inf_server::DeviceConfig {
+                model_share: model.share(cells),
+                seal_barriers_per_s: 2_000 / u64::from(cells),
+                provenance: Default::default(),
+            },
+            budget_oracle: false,
+            ckpt_overrun: None,
+            tier_budget: Some(shape),
+            ..DurableScenario::m2_device_budget(seed)
         }
     }
 
@@ -971,6 +1080,7 @@ impl DurableScenario {
             recycle_open_fault: false,
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
+            tier_budget: None,
         }
     }
 }
@@ -1134,6 +1244,10 @@ pub struct DurableReport {
     /// tail was torn after the cut so the FUA transition boot reopens
     /// packed data on the half the lift plant does not own.
     pub torn_plants: u64,
+    /// The tier-budget shape's per-cell tier-flush class at the cut
+    /// (empty off the shape): the budget's own counters beside the sim
+    /// disk's tier-file bytes and ops, and each namespace's flush.
+    pub tier_budget_cells: Vec<TierBudgetCell>,
 }
 
 impl DurableReport {
@@ -1217,7 +1331,20 @@ pub(crate) enum NsClass {
     Tiered,
     /// The lift regime's indexed document `always` namespace.
     Indexed,
+    /// One of the tier-budget shape's tiered `always` namespaces, by its
+    /// index below [`TIER_BUDGET_NS_MAX`]: several tiered namespaces on
+    /// the same cells, flushing under the device model.
+    TierBudget(u8),
 }
+
+/// The most tiered namespaces the tier-budget shape runs at once: the
+/// eight-namespace leg of the tier-flush fairness oracle, whose names
+/// are the fixed table below.
+pub const TIER_BUDGET_NS_MAX: u8 = 8;
+
+/// `INF.NS` names of the tier-budget namespaces, by index.
+const TIER_BUDGET_NS: [&[u8]; TIER_BUDGET_NS_MAX as usize] =
+    [b"tb0", b"tb1", b"tb2", b"tb3", b"tb4", b"tb5", b"tb6", b"tb7"];
 
 impl NsClass {
     pub(crate) fn name(self) -> &'static [u8] {
@@ -1226,6 +1353,7 @@ impl NsClass {
             NsClass::Everysec => b"esec",
             NsClass::Tiered => b"tier",
             NsClass::Indexed => b"idx",
+            NsClass::TierBudget(index) => TIER_BUDGET_NS[usize::from(index)],
             // The combined scenario's named memory-mode namespace
             // (M2.5-S14); the durable scenario's memory writers stay on
             // the default DB (`setup == false`) and never USE it.
@@ -1446,7 +1574,11 @@ impl Writer {
                     report.always_ack_latency_ms_max =
                         report.always_ack_latency_ms_max.max(latency.as_millis());
                 }
-                NsClass::Everysec | NsClass::Memory | NsClass::Tiered | NsClass::Indexed => {}
+                NsClass::Everysec
+                | NsClass::Memory
+                | NsClass::Tiered
+                | NsClass::Indexed
+                | NsClass::TierBudget(_) => {}
             }
         }
         self.replied += 1;
@@ -1481,7 +1613,7 @@ impl Writer {
         if scenario.workload == DurableWorkload::Document || self.class == NsClass::Indexed {
             return crate::document::next_document_command(self, scenario);
         }
-        if self.class == NsClass::Tiered {
+        if matches!(self.class, NsClass::Tiered | NsClass::TierBudget(_)) {
             return self.next_tiered_command(scenario);
         }
         let key = self.key(scenario.keys_per_writer);
@@ -1881,7 +2013,7 @@ pub(crate) fn required_index(
     ops.iter().rposition(|op| match op.acked_at {
         None => false,
         Some(at) => match class {
-            NsClass::Always | NsClass::Tiered | NsClass::Indexed => true,
+            NsClass::Always | NsClass::Tiered | NsClass::Indexed | NsClass::TierBudget(_) => true,
             // A clean stop (ADR-0124 D4) keeps every acked everysec op;
             // the window is a crash property only.
             NsClass::Everysec => clean_stop || at + EVERYSEC_WINDOW <= cut_time,

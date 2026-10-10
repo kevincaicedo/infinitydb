@@ -313,6 +313,7 @@ impl TieredScenario {
             recycle_open_fault: false,
             lift_regime: false,
             spin_iters: DurableScenario::SPIN_ITERS,
+            tier_budget: None,
         }
     }
 }
