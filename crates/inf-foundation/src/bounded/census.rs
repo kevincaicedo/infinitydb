@@ -281,22 +281,28 @@ mod tests {
     const MARKS: Cap = Cap::entries::<16>("epoch-marks", CapFill::Serving);
 
     /// Runs `plant` and requires both halves of a violation: the count, and
-    /// in a debug build the assertion carrying `cap-assembly-violated`.
+    /// in a debug build the assertion carrying `cap-assembly-violated`, the
+    /// cell and the violated row's name (every plant's row is `timer-owners`).
     fn expect_violation(census: &Rc<CapCensus>, before: u32, plant: impl FnOnce()) {
         let outcome = catch_unwind(AssertUnwindSafe(plant));
         if cfg!(debug_assertions) {
             let payload = outcome.expect_err("a debug build asserts the violation");
-            let text = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                .expect("a panic message");
+            let text = panic_text(payload.as_ref());
             assert!(text.contains("cap-assembly-violated"), "{text}");
             assert!(text.contains("cell3"), "{text}");
+            assert!(text.contains("`timer-owners`"), "{text}");
         } else {
             outcome.expect("a release build counts without asserting");
         }
         assert_eq!(census.cap_assembly_violations(), before + 1, "the violation is counted");
+    }
+
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .expect("a panic message")
     }
 
     fn fill(row: &CapRowHandle, count: u32) {
@@ -436,6 +442,25 @@ mod tests {
         assert_eq!(read.high_water, 4, "a high-water check would pass this host");
         assert_eq!(read.assembly_live, 3);
         expect_violation(&census, 0, || census.mark_serving());
+    }
+
+    #[test]
+    fn the_mark_names_the_short_row_behind_a_serving_one() {
+        // The name is resolved from the short row's index at the violation:
+        // row 0 is a full Serving row, so a text naming row 0 is wrong.
+        let census = CapCensus::new(CELL);
+        let marks = census.register(MARKS).expect("row 0");
+        let row = census.register(FOUR).expect("row 1");
+        fill(&marks, 16);
+        fill(&row, 3);
+        let outcome = catch_unwind(AssertUnwindSafe(|| census.mark_serving()));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("a debug build asserts the violation");
+            let text = panic_text(payload.as_ref());
+            assert!(text.contains("`timer-owners`"), "{text}");
+            assert!(!text.contains("`epoch-marks`"), "{text}");
+        }
+        assert_eq!(census.cap_assembly_violations(), 1);
     }
 
     #[test]
