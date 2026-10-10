@@ -18,3 +18,4 @@ crates/inf-doc/fuzz/corpus/json_parse
 tests/client-smoke/node_modules/
 .codegraph
 bins/*/fuzz/corpus/
+crates/inf-foundation/fuzz/corpus/

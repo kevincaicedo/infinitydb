@@ -14,6 +14,15 @@
 //! then on. A violation is counted in `cap_assembly_violations`, which the
 //! simulator reads as 0 on every seed, and is a debug assertion carrying the
 //! token `cap-assembly-violated`.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

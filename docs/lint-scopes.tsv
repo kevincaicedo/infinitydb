@@ -20,6 +20,9 @@ inf-doc/path_program	crates/inf-doc/src/path/ast.rs	cast,arith	deny
 inf-doc/path_program	crates/inf-doc/src/path/cache.rs	cast	deny
 inf-doc/path_program	crates/inf-doc/src/path/cache.rs	arith	ratchet
 inf-fabric/fabric_codec	crates/inf-fabric/src/codec.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/mod.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/census.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/deque.rs	cast,arith	deny
 inf-log/extent_decode	crates/inf-log/src/blob.rs	cast,arith	deny
 inf-log/frame_decode	crates/inf-log/src/frame.rs	cast,arith	deny
 inf-log/frame_decode	crates/inf-log/src/record.rs	cast,arith	deny

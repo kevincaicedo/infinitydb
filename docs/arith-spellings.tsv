@@ -7,6 +7,7 @@ saturating	9	crates/inf-doc/src/json.rs
 wrapping	13	crates/inf-doc/src/json.rs
 saturating	1	crates/inf-doc/src/tape.rs
 wrapping	1	crates/inf-doc/src/tape.rs
+saturating	3	crates/inf-foundation/src/bounded/census.rs
 saturating	5	crates/inf-log/src/blob.rs
 saturating	9	crates/inf-log/src/ckpt/read.rs
 saturating	2	crates/inf-log/src/frame.rs

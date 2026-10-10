@@ -10,6 +10,15 @@
 //! publish cannot allocate or refuse; no allocator call follows `Live`.
 //! There is no `Deref` to a std type, no `extend`, no `From<std>`, no
 //! `clear`, `retain` or `entry`: nothing grows around admission.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::fmt;
 use core::marker::PhantomData;

@@ -7,6 +7,15 @@
 //! and a pop or a merge tests no fill. `len <= entries_max` is held by this
 //! type's own compare, never by the backing's capacity, and no allocator
 //! call follows construction: the backing is reserved whole, exactly, once.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -483,5 +492,56 @@ mod tests {
             0,
             "a merge pass is not a crossing"
         );
+    }
+
+    /// The seeded model test (ADR-0151 D6): op sequences on both crossings
+    /// against `std::collections::VecDeque`, which shares no code with this
+    /// module, equal after every op.
+    #[test]
+    fn a_seeded_history_equals_the_std_model_after_every_op() {
+        for seed in 0..64 {
+            model_run(seed, 400);
+        }
+    }
+
+    fn model_run(seed: u64, ops: u32) {
+        const CAP: Cap = Cap::entries::<6>("model", CapFill::Serving);
+        let census = CapCensus::new(CellId(2));
+        let mut deque = CappedDeque::<u32, Reserve>::new(CAP, &census).expect("built");
+        let mut model: VecDeque<u32> = VecDeque::new();
+        let (mut full, mut high) = (0u64, 0u32);
+        let mut rng = SplitMix64::new(seed);
+        for value in 0..ops {
+            match rng.next_below(4) {
+                0 | 1 => {
+                    let took = publish(&mut deque, value);
+                    if model.len() < 6 {
+                        model.push_back(value);
+                        assert!(took);
+                    } else {
+                        full += 1;
+                        assert!(!took);
+                    }
+                }
+                2 => assert_eq!(deque.pop_front(), model.pop_front()),
+                _ => {
+                    let edit = rng.next_below(1000) as u32;
+                    if let Some(back) = model.back_mut() {
+                        *back = edit;
+                    }
+                    if let Some(back) = deque.back_mut() {
+                        *back = edit;
+                    }
+                }
+            }
+            high = high.max(model.len() as u32);
+            assert_eq!(deque.len(), model.len(), "seed {seed}");
+            assert!(deque.iter().eq(model.iter()), "seed {seed}");
+            assert_eq!(deque.front(), model.front());
+            assert_eq!(deque.back(), model.back());
+            assert!(deque.len() <= 6);
+        }
+        let row = census.row("model").expect("row");
+        assert_eq!((row.high_water, row.crossings, deque.high_water()), (high, full, high));
     }
 }

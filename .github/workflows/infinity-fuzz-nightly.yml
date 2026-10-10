@@ -75,6 +75,9 @@ jobs:
           - { dir: crates/inf-doc, target: path_program, seeds: fuzz/corpora/path_program }
           # M3 delta-apply decoder (readiness F2).
           - { dir: crates/inf-doc, target: fuzz_delta_apply }
+          # The capped containers' op sequences against std models (ADR-0151
+          # D6): the types every cell container grows through.
+          - { dir: crates/inf-foundation, target: bounded_ops }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
