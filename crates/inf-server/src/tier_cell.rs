@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use inf_alloc::AlignedPool;
 use inf_foundation::{FileOffset, LogHistogram};
 use inf_log::blob::ExtentId;
-use inf_log::flush::unlink_tier_file;
+use inf_log::flush::{PendingSealView, unlink_tier_file};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
@@ -196,12 +196,50 @@ pub(crate) struct TierFlushStats {
     pub rounds_deferred: u64,
 }
 
+/// A tier file's readable length: the data bytes below which a cold-read
+/// window may be planned. Made only by a sealed file's length, a staged
+/// seal's confirmed prefix, or the active file's confirmable length
+/// (ADR-0056 D5) — never by a staged length, which moves at stage time
+/// while its frames are still unwritten or in flight.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ReadableLen(u64);
+
+impl ReadableLen {
+    /// A sealed file: its whole data length, footer-terminated.
+    fn sealed(meta: &TierFileMeta) -> ReadableLen {
+        ReadableLen(meta.data_len)
+    }
+
+    /// A file whose seal is staged: the prefix its last completed barrier
+    /// covered.
+    fn confirmed(seal: &PendingSealView) -> ReadableLen {
+        ReadableLen(seal.confirmed_len)
+    }
+
+    /// The active file: the last full frame boundary its barriers
+    /// covered; `None` with no active file.
+    fn active<F: SegmentFs>(flush: &TierFlush<F>) -> Option<ReadableLen> {
+        // A planted canary: the active file's window planned from its
+        // staged length, the rule this type exists to refuse (the cold
+        // read below the confirmable length while a round is held must
+        // go red).
+        if cfg!(inf_canary_cold_window_staged_len) {
+            return flush.active().map(|(_, _, data_len, _, _)| ReadableLen(data_len));
+        }
+        flush.active_confirmable_len().map(ReadableLen)
+    }
+
+    fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
 impl<F: SegmentFs> TierNs<F> {
     /// Cold-read window plan for `addr`: `(fd, file, disk offset, frame
     /// count skip)` — the caller turns it into a `ColdReads::enqueue`.
     /// Returns `None` when the address is not inside any catalogued
-    /// file's range (a displaced-then-retired address raced the lookup;
-    /// the caller re-resolves — never an error).
+    /// file's readable range (a displaced-then-retired address raced the
+    /// lookup; the caller re-resolves — never an error).
     pub fn plan_cold_read(
         &self,
         addr: LogicalAddr,
@@ -231,19 +269,21 @@ impl<F: SegmentFs> TierNs<F> {
         prefix: bool,
     ) -> Option<(std::os::fd::RawFd, TierFileId, u64, u64, usize)> {
         let raw = addr.to_raw();
-        let locate = |base: u64, data_len: u64| raw >= base && raw < base + data_len;
+        let locate =
+            |base: u64, readable: ReadableLen| raw >= base && raw < base + readable.bytes();
         // Sealed catalog first (ascending by base; linear scan — a cell
         // holds tens to hundreds of files and this runs per cold miss,
         // not per command).
         for meta in self.flush.sealed() {
-            if locate(meta.base.to_raw(), meta.data_len) {
+            let readable = ReadableLen::sealed(meta);
+            if locate(meta.base.to_raw(), readable) {
                 let handle = self.files.iter().find(|(id, _)| *id == meta.id)?;
                 let fd = handle.1.raw_fd()?;
                 return Some(Self::window(
                     fd,
                     meta.id,
                     meta.base.to_raw(),
-                    meta.data_len,
+                    readable,
                     raw,
                     len,
                     prefix,
@@ -255,23 +295,28 @@ impl<F: SegmentFs> TierNs<F> {
         // held handle — the window is clamped to it (frames past it may
         // still be in flight).
         for pending in self.flush.pending_seals() {
-            if locate(pending.base.to_raw(), pending.confirmed_len) {
+            let readable = ReadableLen::confirmed(&pending);
+            if locate(pending.base.to_raw(), readable) {
                 let fd = pending.fd?;
                 return Some(Self::window(
                     fd,
                     pending.id,
                     pending.base.to_raw(),
-                    pending.confirmed_len,
+                    readable,
                     raw,
                     len,
                     prefix,
                 ));
             }
         }
-        let (id, base, data_len, durable_len, _) = self.flush.active()?;
-        if locate(base.to_raw(), durable_len) {
+        // The active file: located and windowed by its readable length,
+        // never by the staged one, so a window never reaches frames a
+        // held round has not written.
+        let (id, base, _, _, _) = self.flush.active()?;
+        let readable = ReadableLen::active(&self.flush)?;
+        if locate(base.to_raw(), readable) {
             let fd = self.flush.active_raw_fd()?;
-            return Some(Self::window(fd, id, base.to_raw(), data_len, raw, len, prefix));
+            return Some(Self::window(fd, id, base.to_raw(), readable, raw, len, prefix));
         }
         None
     }
@@ -280,17 +325,17 @@ impl<F: SegmentFs> TierNs<F> {
         fd: std::os::fd::RawFd,
         id: u32,
         base: u64,
-        data_len: u64,
+        readable: ReadableLen,
         raw: u64,
         len: usize,
         prefix: bool,
     ) -> (std::os::fd::RawFd, TierFileId, u64, u64, usize) {
         let (first, span, skip) = inf_log::tier_frame_span(raw - base, len.max(1));
-        let file_frames = data_len.div_ceil(inf_log::TIER_FRAME_DATA as u64);
+        let file_frames = readable.bytes().div_ceil(inf_log::TIER_FRAME_DATA as u64);
         let pool_frames = (COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64;
         let want = if prefix { pool_frames.min(u64::from(span)) } else { pool_frames };
         let window_frames = want.min(file_frames - first);
-        debug_assert!(window_frames > 0, "cold window inside the file's range");
+        debug_assert!(window_frames > 0, "cold window inside the file's readable range");
         (fd, TierFileId::new(id), inf_log::tier_frame_offset(first), window_frames, skip)
     }
 }
@@ -1362,5 +1407,164 @@ mod lane_tests {
         cell.create_ns(NsId(17), &spec());
         assert_eq!(cell.namespaces[0].lane, 0);
         assert_eq!(cell.namespaces[0].round_seq, 3);
+    }
+
+    use inf_foundation::LogicalAddr;
+    use inf_log::TIER_FRAME_BYTES;
+    use inf_log::fs::TierIoMode;
+
+    /// Admission with no durable plane: every offer `Now`, nothing metered.
+    struct NoBudget;
+
+    impl FlushAdmission for NoBudget {
+        fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
+            Issue::Now
+        }
+        fn refund(&mut self, _bytes: u64, _ops: u64) {}
+        fn charge(&mut self, _bytes: u64) {}
+    }
+
+    /// Materializes `ns` on `ks` with a `budget`-byte window of 4 KiB pages
+    /// and seals at least `sealed_bytes` behind the ro-boundary, one seal
+    /// step per page, nothing staged: 200 B values under 12 B keys. Returns
+    /// every inserted record's address in insertion order.
+    fn sealed_backlog_on(
+        ks: &mut Keyspace,
+        ns: NsId,
+        budget: u64,
+        sealed_bytes: u64,
+    ) -> Vec<LogicalAddr> {
+        const PAGE: u64 = 4 << 10;
+        let demote = DemotionConfig::for_budget(budget, PAGE);
+        let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+        let space = AddressSpaceConfig {
+            reserve_bytes,
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::ZERO,
+        };
+        assert!(ks.materialize_tiered(ns, space, demote, 65_536).is_ok());
+        let table = ks.tiered_store_mut(ns).expect("materialized");
+        let hasher = KeyHasher::default();
+        let mut addrs = Vec::new();
+        let mut sealed = 0u64;
+        while sealed < sealed_bytes {
+            let key = format!("round:{:06}", addrs.len()).into_bytes();
+            let addr = table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits");
+            addrs.push(addr);
+            assert!(addrs.len() < 1_000_000, "the fill reaches the demotion threshold");
+            if table.demote_due() {
+                sealed += table.seal_slice();
+            }
+        }
+        addrs
+    }
+
+    /// Executes `ops` on the cell's sim disk as the driver would and feeds
+    /// each completion back: a write lands whole, a barrier flushes.
+    fn complete_ops(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>) {
+        let disk = cell.fs.clone();
+        for op in ops {
+            match op {
+                IoOp::LogWrite { fd, offset, token, data: _, barrier: _ } => {
+                    let lane = token.slot() >> 8;
+                    let index = (token.slot() & 0xFF) as usize;
+                    let t = cell.namespaces.iter().find(|t| t.lane == lane).expect("lane");
+                    let view = t.flush.round_op(index);
+                    disk.driver_write_at(fd, offset, view.bytes).expect("sim write");
+                    cell.on_flush_completion(token, None);
+                }
+                IoOp::Fdatasync { fd, token } => {
+                    disk.driver_fdatasync(fd).expect("sim barrier");
+                    cell.on_flush_completion(token, None);
+                }
+                IoOp::AcceptArm { .. }
+                | IoOp::RecvArm { .. }
+                | IoOp::RecvDisarm { .. }
+                | IoOp::Send { .. }
+                | IoOp::Close { .. }
+                | IoOp::TierRead { .. } => {
+                    panic!("a flush round pushes writes and barriers only")
+                }
+            }
+        }
+    }
+
+    /// A cold read planned below the active file's readable length is
+    /// served while a later round's writes are held: its window lies
+    /// inside the bytes the file holds, so the driver fills it. Round 1
+    /// completes; round 2 stages (the staged length moves, nothing is
+    /// written); a record in the last three full frames below the
+    /// confirmable length is read through the plan. Before the readable
+    /// length the window was planned from the staged length and reached
+    /// two frames past the file's written end: a short read, which the
+    /// plane answers as a cold I/O error.
+    #[test]
+    fn a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held() {
+        const SLICE: u64 = 64 << 10;
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(
+            NsId(16),
+            &TierSpec { maintain_slice_bytes: SLICE, tier_io_mode: TierIoMode::Buffered, ..spec() },
+        );
+        let mut ks = Keyspace::new(StoreConfig::default());
+        let addrs = sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 160 << 10);
+        let mut admission = NoBudget;
+        let mut stats = TierFlushStats::default();
+        // Round 1: stage, writes, barriers, completion.
+        for _ in 0..3 {
+            let mut ops = Vec::new();
+            let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+            let t = &mut cell.namespaces[0];
+            drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission).expect("drives");
+            complete_ops(&mut cell, ops);
+        }
+        let t = &cell.namespaces[0];
+        assert!(t.round.is_none(), "engagement: round 1 completed");
+        let (_, base, data_len, durable_len, _) = t.flush.active().expect("an active file");
+        assert_eq!(data_len, durable_len, "engagement: round 1 is durable");
+        let data = inf_log::TIER_FRAME_DATA as u64;
+        let confirmable = durable_len / data * data;
+        let frames_written = data_len.div_ceil(data);
+        // Round 2: staged, its writes held.
+        let mut held = Vec::new();
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+        let t = &mut cell.namespaces[0];
+        drive_flush_round(table, t, &mut stats, 0, &mut held, &mut admission).expect("stages");
+        let (_, _, data_len2, durable_len2, _) = t.flush.active().expect("an active file");
+        assert!(
+            data_len2 > durable_len2 && !held.is_empty(),
+            "engagement: a round's writes are held ({} ops; staged {data_len2} B, durable \
+             {durable_len2} B)",
+            held.len()
+        );
+        // The record: starts in the last three full frames below the
+        // confirmable length and ends inside it.
+        let base_raw = base.to_raw();
+        let frames_confirmable = confirmable / data;
+        let table = ks.tiered_store(NsId(16)).expect("materialized");
+        let (addr, len) = addrs
+            .iter()
+            .rev()
+            .map(|&addr| (addr, table.record(addr).encoded_len as u64))
+            .find(|&(addr, len)| {
+                let start = addr.to_raw() - base_raw;
+                start / data + 3 >= frames_confirmable && start + len <= confirmable
+            })
+            .expect("a record in the last three full frames");
+        let first_frame = (addr.to_raw() - base_raw) / data;
+        let (fd, _, offset, frames, _) =
+            t.plan_cold_read(addr, len as usize).expect("the record is planned");
+        let mut buf = vec![0u8; frames as usize * TIER_FRAME_BYTES];
+        let offset = FileOffset::new(offset).expect("a file offset");
+        let n = cell.fs.driver_read_at(fd, offset, &mut buf).expect("sim read");
+        assert_eq!(
+            n,
+            buf.len(),
+            "the window is filled: a read of a record in frame {first_frame}, below the \
+             confirmable length ({confirmable} B, {frames_confirmable} frames), planned \
+             {frames} frames while the file holds {frames_written} written frames and \
+             {} staged",
+            data_len2.div_ceil(data)
+        );
     }
 }
