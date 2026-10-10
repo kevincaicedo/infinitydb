@@ -729,6 +729,16 @@ impl<F: SegmentFs> TierFlush<F> {
             .map(|w| (self.active_id, w.base(), w.data_len(), w.durable_len(), w.path()))
     }
 
+    /// The active file's data bytes a reader may rely on while it is
+    /// unsealed (ADR-0056 D5): the last full, final frame boundary its
+    /// barriers covered. Bytes past it are staged, in flight, or in the
+    /// partial tail frame a later append rewrites in place. `None` with
+    /// no active file.
+    #[must_use]
+    pub fn active_confirmable_len(&self) -> Option<u64> {
+        self.writer.as_ref().map(TierWriter::confirmable_len)
+    }
+
     /// The next append address, when a file is active — the drive loop's
     /// resume cursor (bytes staged ahead of `flushed` must never be
     /// re-appended). `None` when no file is active (fresh pipeline, or

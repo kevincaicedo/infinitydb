@@ -30,6 +30,7 @@ pub mod fault;
 pub mod flush;
 mod frame;
 pub mod fs;
+pub mod limits;
 mod lsn;
 pub mod manifest;
 pub mod meta;
