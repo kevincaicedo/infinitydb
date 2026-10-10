@@ -30,3 +30,18 @@ const _: () = assert!(
 // `FileOffset::from_u32_bytes` is total.
 const _: () =
     assert!(DRIVER_OP_BYTES_MAX <= FILE_OFFSET_BYTES_MAX, "every u32 position is addressable");
+
+/// Distinct cap names one cell's census holds (ADR-0163 D2): the rows of
+/// `CapCensus`, one per capped-container name registered on that cell, about
+/// 2.5 KiB. Owner: `inf_foundation::bounded::CapCensus`. Crossing: the 65th
+/// name is refused at construction with `CapError::Census`, before anything
+/// is served; a name registered again with the same cap and fill shares its
+/// row (one row per namespace-instanced container).
+pub const CAP_CENSUS_ROWS_MAX: usize = 64;
+
+/// Bytes of a `CappedDeque`'s one backing allocation, `entries × stride`
+/// (ADR-0151 D5's per-allocation bound, 64 KiB, lifted to the deque). Owner:
+/// `inf_foundation::bounded::CappedDeque`. Crossing: a cap whose entries
+/// times its payload stride passes it is refused at construction with
+/// `CapError::Layout`; a site that needs more says so in its record.
+pub const DEQUE_BACKING_BYTES_MAX: usize = 64 * 1024;
