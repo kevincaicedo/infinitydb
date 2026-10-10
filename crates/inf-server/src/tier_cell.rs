@@ -34,6 +34,7 @@
 
 #[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use inf_alloc::AlignedPool;
@@ -163,9 +164,12 @@ pub(crate) struct FlushRound {
     /// distinct states, so a barrier group is never built with a write
     /// unsent or outstanding).
     phase: RoundPhase,
-    /// The group builder's cursor: no unsent op lies below it. 0 at the
-    /// open, the first failed index at a retry, the first barrier in
-    /// the barrier phase, the granted group's end after an emit.
+    /// The group builder's cursor: the first unsent op of the phase's
+    /// range, or the range's end once the phase is spent — the one rule
+    /// every writer of it keeps through [`FlushRound::place_cursor`] (the
+    /// open, a retry, the barrier phase, each emit), so the walk starts
+    /// at an unsent op and no run of done ops ever stands between the
+    /// cursor and the next group.
     next_unsent: usize,
     /// When the group at the cursor became ready, on the injected clock
     /// in microseconds: the open, a grant that left unsent ops, a retry,
@@ -227,10 +231,37 @@ impl FlushRound {
         }
     }
 
+    /// The first unsent op of the current phase's range — the cursor, by
+    /// the rule its writers keep — or `None` once the phase is spent.
+    /// One primitive for "is a group ready" and "where does it start".
+    fn first_unsent(&self, writes: usize, op_count: usize) -> Option<usize> {
+        let range = self.phase_range(writes, op_count);
+        let first = range.clone().find(|&index| self.states[index] == OpState::Unsent);
+        debug_assert_eq!(
+            first.unwrap_or(range.end),
+            range.start,
+            "the op at the cursor is unsent, or the phase is spent"
+        );
+        first
+    }
+
     /// Whether an unsent op lies in the current phase's range: a group
     /// is ready to be built and offered.
     fn has_ready_group(&self, writes: usize, op_count: usize) -> bool {
-        self.phase_range(writes, op_count).any(|index| self.states[index] == OpState::Unsent)
+        self.first_unsent(writes, op_count).is_some()
+    }
+
+    /// Places the cursor at the first unsent op at or above `from` in the
+    /// current phase's range, or at the range's end when none is left:
+    /// the one writer of `next_unsent`. A retry calls it from 0 (a failed
+    /// write may lie below the old cursor), the barrier phase from the
+    /// first barrier, an emit from its group's end — so a run of done
+    /// ops is passed here, once, never charged to a turn's visits.
+    fn place_cursor(&mut self, from: usize, writes: usize, op_count: usize) {
+        self.next_unsent = from;
+        let range = self.phase_range(writes, op_count);
+        self.next_unsent =
+            range.clone().find(|&index| self.states[index] == OpState::Unsent).unwrap_or(range.end);
     }
 }
 
@@ -258,7 +289,8 @@ pub(crate) struct TierFlushStats {
     /// Turns a namespace idle with work at its cursor was passed over
     /// because the cell's one plan went to another, per namespace.
     pub plan_waits: u64,
-    /// Rounds the plan pass staged (one per turn at most).
+    /// Plans the pass made — a span, a gap or a refusal — one per turn at
+    /// most.
     pub rounds_planned: u64,
 }
 
@@ -446,7 +478,8 @@ pub(crate) struct GrantedGroup {
 
 /// A candidate group: the longest run of unsent ops from the round's
 /// cursor inside the phase's range that fits the group bounds and the
-/// turn's remaining descriptor visits; `visits` is what building it cost.
+/// turn's remaining descriptor visits; `visits` is what building it
+/// cost — its ops, and the first unsent op that did not fit.
 struct Group {
     first: usize,
     end: usize,
@@ -944,12 +977,13 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         (staged, result)
     }
 
-    /// The issue pass (T3): from the holder, else after the namespace
-    /// served last, in id order, wrapping, each namespace with a ready
-    /// group offers its next group at its exact device size; a grant
-    /// pushes it and the visit moves on, a refusal makes its namespace
-    /// the holder and ends the pass. Rotations repeat while a group was
-    /// issued and the turn's descriptor visits last.
+    /// The issue pass (ADR-0178 T3): from the holder, else after the
+    /// namespace served last, in id order, wrapping, each namespace with
+    /// a ready group offers its next group at its exact device size; a
+    /// grant pushes it and the visit moves on, a refusal makes its
+    /// namespace the holder and ends the pass. Rotations repeat while a
+    /// group was issued and the turn's descriptor visits last; the pass
+    /// ends where they are spent (`TIER_ISSUE_OPS_PER_TURN`'s crossing).
     fn issue_pass(
         &mut self,
         now_us: u64,
@@ -975,21 +1009,31 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         loop {
             let mut issued = false;
             for i in 0..n {
-                let at = (start + i) % n;
-                if !self.namespaces[at].has_ready_group() {
-                    continue;
-                }
-                let Some(group) = next_group(&self.namespaces[at], visits_left) else {
+                let Some(left) = NonZeroUsize::new(visits_left) else {
                     return; // the turn's visits are spent: the pass ends
                 };
-                visits_left -= group.visits;
-                match self.offer_and_emit(at, group, now_us, ops, admission) {
-                    Offered::Issued => issued = true,
-                    Offered::Refused if cfg!(inf_canary_tier_turn_index_order) => {}
-                    Offered::Refused => return,
+                let t = &mut self.namespaces[(start + i) % n];
+                match visit_namespace(
+                    &mut self.flush_stats,
+                    &mut self.turn,
+                    t,
+                    left,
+                    now_us,
+                    ops,
+                    admission,
+                ) {
+                    Visit::Idle => {}
+                    Visit::Issued { visits } => {
+                        visits_left -= visits;
+                        issued = true;
+                    }
+                    Visit::Refused { visits } if cfg!(inf_canary_tier_turn_index_order) => {
+                        visits_left -= visits;
+                    }
+                    Visit::Refused { .. } => return,
                 }
             }
-            if !issued || visits_left == 0 {
+            if !issued {
                 return;
             }
         }
@@ -1013,45 +1057,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         if ready >= 2 {
             self.flush_stats.turn_contended += 1;
         }
-    }
-
-    /// Offers `group` for the namespace at `at` and emits it on `Now`.
-    fn offer_and_emit(
-        &mut self,
-        at: usize,
-        group: Group,
-        now_us: u64,
-        ops: &mut Vec<IoOp>,
-        admission: &mut impl FlushAdmission,
-    ) -> Offered {
-        let stats = &mut self.flush_stats;
-        let t = &mut self.namespaces[at];
-        let round = t.round.as_mut().expect("a ready group implies a round");
-        // A planted canary: a retry group reaches the driver with no
-        // offer — the grant every emit needs (the accounting oracle's
-        // equality must go red on the retry arm).
-        let granted = if cfg!(inf_canary_tier_retry_ungranted) && round.retry {
-            Some(GrantedGroup { first: group.first, end: group.end, ops: group.ops })
-        } else {
-            offer_group(admission, &group)
-        };
-        let Some(granted) = granted else {
-            stats.groups_deferred += 1;
-            if self.turn.holder != Some(t.ns) {
-                stats.turn_waits += 1;
-            }
-            self.turn.holder = Some(t.ns);
-            return Offered::Refused;
-        };
-        if let Some(since) = round.ready_since_us {
-            stats.group_wait_us_max = stats.group_wait_us_max.max(now_us.saturating_sub(since));
-        }
-        emit_group(&t.flush, round, t.lane, granted, ops);
-        let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
-        round.ready_since_us = round.has_ready_group(writes, op_count).then_some(now_us);
-        self.turn.holder = None;
-        self.turn.served_last = Some(t.ns);
-        Offered::Issued
     }
 
     /// Bounded teardown slices for dropped namespaces (ADR-0062 D7).
@@ -1174,10 +1179,56 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     }
 }
 
-/// How an offer ended inside the issue pass.
-enum Offered {
-    Issued,
-    Refused,
+/// How one namespace's visit in the issue pass ended: no ready group, so
+/// no offer; its group granted and pushed; or its group refused. The
+/// visits a group cost come back with it, so the pass charges what the
+/// walk read.
+enum Visit {
+    Idle,
+    Issued { visits: usize },
+    Refused { visits: usize },
+}
+
+/// One namespace's visit in the issue pass: its next group, if its round
+/// holds one, offered at its exact size and emitted on a grant. The
+/// round and the group come from one borrow, so a visit of a namespace
+/// with no round is `Idle` by construction, never a claim on the caller.
+fn visit_namespace<F: SegmentFs>(
+    stats: &mut TierFlushStats,
+    turn: &mut TierTurn,
+    t: &mut TierNs<F>,
+    visits_left: NonZeroUsize,
+    now_us: u64,
+    ops: &mut Vec<IoOp>,
+    admission: &mut impl FlushAdmission,
+) -> Visit {
+    let Some(round) = t.round.as_mut() else { return Visit::Idle };
+    let Some(group) = next_group(&t.flush, round, visits_left) else { return Visit::Idle };
+    // A planted canary: a retry group reaches the driver with no
+    // offer — the grant every emit needs (the accounting oracle's
+    // equality must go red on the retry arm).
+    let granted = if cfg!(inf_canary_tier_retry_ungranted) && round.retry {
+        Some(GrantedGroup { first: group.first, end: group.end, ops: group.ops })
+    } else {
+        offer_group(admission, &group)
+    };
+    let Some(granted) = granted else {
+        stats.groups_deferred += 1;
+        if turn.holder != Some(t.ns) {
+            stats.turn_waits += 1;
+        }
+        turn.holder = Some(t.ns);
+        return Visit::Refused { visits: group.visits };
+    };
+    if let Some(since) = round.ready_since_us {
+        stats.group_wait_us_max = stats.group_wait_us_max.max(now_us.saturating_sub(since));
+    }
+    emit_group(&t.flush, round, t.lane, granted, ops);
+    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
+    round.ready_since_us = round.has_ready_group(writes, op_count).then_some(now_us);
+    turn.holder = None;
+    turn.served_last = Some(t.ns);
+    Visit::Issued { visits: group.visits }
 }
 
 /// The extent-reclaim leg of one namespace's MAINTAIN (ADR-0061 D5,
@@ -1313,7 +1364,7 @@ fn advance_round<F: SegmentFs>(
             source: std::io::Error::from_raw_os_error(errno),
         });
     }
-    let writes = t.flush.round_write_count();
+    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
     match round.phase {
         RoundPhase::Writes => {
             if round.pending > 0 && !cfg!(inf_canary_tier_barrier_early) {
@@ -1326,14 +1377,14 @@ fn advance_round<F: SegmentFs>(
                     table.note_flush_device_full();
                 }
                 stats.write_retries += 1;
-                let mut first_failed = writes;
-                for (index, state) in round.states[..writes].iter_mut().enumerate() {
+                for state in &mut round.states[..writes] {
                     if *state == OpState::Failed {
                         *state = OpState::Unsent;
-                        first_failed = first_failed.min(index);
                     }
                 }
-                round.next_unsent = first_failed;
+                // The failed writes lie below the old cursor: the cursor
+                // is placed from the round's start, at the first of them.
+                round.place_cursor(0, writes, op_count);
                 round.ready_since_us = Some(now_us);
                 round.retry = true;
                 return Ok(());
@@ -1346,14 +1397,13 @@ fn advance_round<F: SegmentFs>(
             let all_sent = round.states[..writes].iter().all(|s| *s != OpState::Unsent);
             if all_done || (cfg!(inf_canary_tier_barrier_early) && all_sent) {
                 round.phase = RoundPhase::Barriers;
-                round.next_unsent = writes;
+                round.place_cursor(writes, writes, op_count);
                 round.ready_since_us = Some(now_us);
                 round.retry = false;
             }
             Ok(())
         }
         RoundPhase::Barriers => {
-            let op_count = t.flush.round_op_count();
             let all_done = round.states[writes..op_count].iter().all(|s| *s == OpState::Done);
             if round.pending > 0 || !all_done {
                 return Ok(());
@@ -1397,46 +1447,51 @@ fn open_round<F: SegmentFs>(
     Ok(())
 }
 
-/// Builds the namespace's next group: the longest run of unsent ops from
-/// the round's cursor inside the phase's range with at most
-/// `TIER_GROUP_BYTES_MAX` device bytes and `TIER_GROUP_OPS_MAX` ops,
-/// whole ops, within `visits_left` descriptor visits. `None` only when
-/// the visits are spent before the first unsent op: a single write
-/// always fits a group (the assertion in `inf_log::limits`).
-fn next_group<F: SegmentFs>(t: &TierNs<F>, visits_left: usize) -> Option<Group> {
-    let round = t.round.as_ref()?;
-    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
-    let mut group: Option<Group> = None;
-    let mut visits = 0usize;
-    for index in round.phase_range(writes, op_count) {
-        if visits == visits_left {
-            break;
-        }
-        visits += 1;
+/// Builds the round's next group: the longest run of unsent ops from the
+/// cursor inside the phase's range with at most `TIER_GROUP_BYTES_MAX`
+/// device bytes and `TIER_GROUP_OPS_MAX` ops, whole ops, within
+/// `visits_left` descriptor visits; `None` when the phase holds no
+/// unsent op (no ready group). A visit is an unsent op's descriptor read
+/// — the group's ops and the first that did not fit, as
+/// `TIER_ISSUE_OPS_PER_TURN` defines it; a sent, done or failed op between
+/// two unsent ones costs one state read and no visit, and the cursor
+/// rule keeps such runs out of the walk's start, so a turn's walk over a
+/// namespace reads each of its round's states at most once (bounded by
+/// `TIER_ROUND_MAX_OPS`). At least one visit is left, so the first unsent
+/// op always starts the group: a single write fits one (the assertion in
+/// `inf_log::limits`).
+fn next_group<F: SegmentFs>(
+    flush: &TierFlush<F>,
+    round: &FlushRound,
+    visits_left: NonZeroUsize,
+) -> Option<Group> {
+    let (writes, op_count) = (flush.round_write_count(), flush.round_op_count());
+    let first = round.first_unsent(writes, op_count)?;
+    let mut group = Group { first, end: first, ops: 0, bytes: 0, visits: 0 };
+    for index in first..round.phase_range(writes, op_count).end {
         if round.states[index] != OpState::Unsent {
             continue;
         }
-        let view = t.flush.round_op(index);
-        let bytes = if view.is_barrier { 0 } else { view.bytes.len() as u64 };
-        match &mut group {
-            None => group = Some(Group { first: index, end: index + 1, ops: 1, bytes, visits }),
-            Some(g) => {
-                // A planted canary: the group is every unsent write — the
-                // one burst the bounds exist to split (the attainable
-                // oracle must read an offer above the class cap).
-                let fits = cfg!(inf_canary_tier_group_whole_round)
-                    || (g.ops < TIER_GROUP_OPS_MAX && g.bytes + bytes <= TIER_GROUP_BYTES_MAX);
-                g.visits = visits;
-                if !fits {
-                    break;
-                }
-                g.end = index + 1;
-                g.ops += 1;
-                g.bytes += bytes;
-            }
+        if group.visits == visits_left.get() {
+            break;
         }
+        group.visits += 1;
+        let view = flush.round_op(index);
+        let bytes = if view.is_barrier { 0 } else { view.bytes.len() as u64 };
+        // A planted canary: the group is every unsent write — the one
+        // burst the bounds exist to split (the attainable oracle must
+        // read an offer above the class cap).
+        let fits = cfg!(inf_canary_tier_group_whole_round)
+            || (group.ops < TIER_GROUP_OPS_MAX && group.bytes + bytes <= TIER_GROUP_BYTES_MAX);
+        if !fits {
+            break;
+        }
+        group.end = index + 1;
+        group.ops += 1;
+        group.bytes += bytes;
     }
-    group
+    debug_assert!(group.ops >= 1, "the first unsent op starts the group");
+    Some(group)
 }
 
 /// Offers `group` to the budget at its exact size: a `Now` answer is the
@@ -1494,7 +1549,7 @@ fn emit_group<F: SegmentFs>(
         emitted += 1;
     }
     debug_assert_eq!(emitted, group.ops, "the emit pushes exactly the granted group");
-    round.next_unsent = group.end;
+    round.place_cursor(group.end, flush.round_write_count(), flush.round_op_count());
 }
 
 #[cfg(test)]

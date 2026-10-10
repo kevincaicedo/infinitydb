@@ -559,7 +559,6 @@ I	1	crates/inf-server/src/recover.rs	unreachable	Io and foreign-segment reads ar
 I	1	crates/inf-server/src/tier_cell.rs	assert	tier flush lanes exhausted	lanes recycle once their namespace has no op in flight, so the bound is on live-plus-draining tiered namespaces: 2^16 pipelines of MiBs each — memory exhausts first
 I	1	crates/inf-server/src/tier_cell.rs	expect	matched above	`t.round` was matched `Some` at the top of the same function
 I	1	crates/inf-server/src/tier_cell.rs	expect	checked front	`front().is_some_and(..)` on the line above
-I	1	crates/inf-server/src/tier_cell.rs	expect	a ready group implies a round	`has_ready_group()` reads `self.round`, which the issue pass tested true on the line above
 I	2	crates/inf-simd/src/crc32c.rs	expect	4-byte slice	`chunk[0..4]`/`[4..8]` of an 8-byte `chunks_exact` chunk
 I	2	crates/inf-simd/src/crc32c.rs	expect	chunks_exact(8) yields 8 bytes	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
 C	1	crates/inf-simd/src/crlf.rs	panic	CRLF offset exceeds u32 range: {position}	no production caller reaches this site: `CrlfPositions` and `scan_crlf` are called only by this crate's unit tests and one `inf-server` test; the parser's line scan is `crates/inf-simd/src/crlf.rs:find_crlf`, which builds no position table

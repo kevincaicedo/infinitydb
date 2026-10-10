@@ -122,7 +122,13 @@ fn sealed_backlog_on(
         life_origin: LogicalAddr::ZERO,
     };
     assert!(ks.materialize_tiered(ns, space, demote, 65_536).is_ok());
-    let table = ks.tiered_store_mut(ns).expect("materialized");
+    fill_sealed(ks.tiered_store_mut(ns).expect("materialized"), sealed_bytes)
+}
+
+/// Inserts 200 B values under 12 B keys into `table` and seals as it
+/// goes until at least `sealed_bytes` lie behind the ro-boundary; returns
+/// every inserted record's address in insertion order.
+fn fill_sealed(table: &mut inf_store::TieredTable, sealed_bytes: u64) -> Vec<LogicalAddr> {
     let hasher = KeyHasher::default();
     let mut addrs = Vec::new();
     let mut sealed = 0u64;
@@ -138,143 +144,19 @@ fn sealed_backlog_on(
     addrs
 }
 
-/// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
-/// real reactor round, the new file's header write first (the
-/// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
-/// no fds.
-fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
-    let mut ks = sealed_backlog(1);
-    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-    let flush = &mut cell.namespaces[0].flush;
-    table.stage_flush_round(flush).expect("stage");
-    ks
-}
-
-/// The tier class's budget as the plane wires it: a real
-/// `DeviceBudget`, offered each group at its exact size.
-struct BudgetAdmission(DeviceBudget);
-
-impl FlushAdmission for BudgetAdmission {
-    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
-        self.0.offer(IoClass::TierFlush, bytes, ops)
-    }
-}
-
-/// Admission with no durable plane: every offer `Now`, nothing metered.
-struct NoBudget;
-
-impl FlushAdmission for NoBudget {
-    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
-        Issue::Now
-    }
-}
-
-/// Records every offer made through it, then asks `inner`.
-struct Recording<A: FlushAdmission> {
-    inner: A,
-    offers: Vec<(u64, u64)>,
-}
-
-impl<A: FlushAdmission> FlushAdmission for Recording<A> {
-    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
-        self.offers.push((bytes, ops));
-        self.inner.admit(bytes, ops)
-    }
-}
-
-/// Answers each offer from a script: `Now` where the script says so.
-struct Scripted<S: FnMut(usize) -> bool> {
-    grant: S,
-    offers: usize,
-}
-
-impl<S: FnMut(usize) -> bool> FlushAdmission for Scripted<S> {
-    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
-        let index = self.offers;
-        self.offers += 1;
-        if (self.grant)(index) { Issue::Now } else { Issue::NotThisSlice }
-    }
-}
-
-/// A device budget over `model`'s share at `cells`, with the tier
-/// class's declared slice (one group's bytes, the token op bound), as
-/// the durable cell builds it.
-fn plane_budget(model: DeviceModel, cells: u16) -> BudgetAdmission {
-    let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
-    slices[IoClass::TierFlush.index()] =
-        ClassSlice { bytes: TIER_GROUP_BYTES_MAX, ops: TIER_ROUND_MAX_OPS };
-    BudgetAdmission(DeviceBudget::new(model.share(cells), slices, 2, Nanos(0)))
-}
-
-/// The reference-shape model of the binary's budget tests.
-fn reference_model() -> DeviceModel {
-    DeviceModel {
-        write_bytes_per_s: 40_000_000,
-        write_ops_per_s: 40_000,
-        read_bytes_per_s: 40_000_000,
-        read_ops_per_s: 40_000,
-    }
-}
-
-/// One MAINTAIN's tier pass on `cell`: every round advanced on its
-/// completions, then the cell's turn. Returns the ops pushed.
-fn pass(
-    cell: &mut TierCell<SimDisk>,
-    ks: &mut Keyspace,
-    now_us: u64,
-    admission: &mut impl FlushAdmission,
-) -> Vec<IoOp> {
-    let stats = &mut cell.flush_stats;
-    for t in &mut cell.namespaces {
-        let table = ks.tiered_store_mut(t.ns).expect("materialized");
-        advance_round(table, t, stats, now_us).expect("no barrier failed");
-    }
-    let mut ops = Vec::new();
-    cell.turn(ks, now_us, &mut ops, admission).expect("the plan is not refused");
-    ops
-}
-
-/// Executes `ops` on the cell's sim disk as the driver would and feeds
-/// each completion back: a write lands whole, a barrier flushes; the op
-/// at `fail` (an index into `ops`) fails with `EIO` and lands nothing.
-/// Returns the device bytes the disk was handed, attempts included.
-fn complete_ops_failing(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>, fail: Option<usize>) -> u64 {
-    let disk = cell.fs.clone();
-    let mut bytes = 0u64;
-    for (at, op) in ops.into_iter().enumerate() {
-        match op {
-            IoOp::LogWrite { fd, offset, token, data: _, barrier: _ } => {
-                let lane = token.slot() >> 8;
-                let index = (token.slot() & 0xFF) as usize;
-                let t = cell.namespaces.iter().find(|t| t.lane == lane).expect("lane");
-                let view = t.flush.round_op(index);
-                bytes += view.bytes.len() as u64;
-                if fail == Some(at) {
-                    cell.on_flush_completion(token, Some(EIO));
-                    continue;
-                }
-                disk.driver_write_at(fd, offset, view.bytes).expect("sim write");
-                cell.on_flush_completion(token, None);
-            }
-            IoOp::Fdatasync { fd, token } => {
-                disk.driver_fdatasync(fd).expect("sim barrier");
-                cell.on_flush_completion(token, None);
-            }
-            IoOp::AcceptArm { .. }
-            | IoOp::RecvArm { .. }
-            | IoOp::RecvDisarm { .. }
-            | IoOp::Send { .. }
-            | IoOp::Close { .. }
-            | IoOp::TierRead { .. } => {
-                panic!("a flush round pushes writes and barriers only")
-            }
+/// The round op index an op's token carries.
+fn op_index(op: &IoOp) -> usize {
+    match op {
+        IoOp::LogWrite { token, .. } | IoOp::Fdatasync { token, .. } => {
+            (token.slot() & 0xFF) as usize
         }
+        IoOp::AcceptArm { .. }
+        | IoOp::RecvArm { .. }
+        | IoOp::RecvDisarm { .. }
+        | IoOp::Send { .. }
+        | IoOp::Close { .. }
+        | IoOp::TierRead { .. } => panic!("a flush round pushes writes and barriers only"),
     }
-    bytes
-}
-
-fn complete_ops(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>) -> u64 {
-    complete_ops_failing(cell, ops, None)
 }
 
 /// The lane of each op pushed, in order.
@@ -797,4 +679,206 @@ fn drained_namespace_lane_recycles_at_maintain() {
     cell.create_ns(NsId(17), &spec());
     assert_eq!(cell.namespaces[0].lane, 0);
     assert_eq!(cell.namespaces[0].round_seq, 3);
+}
+
+/// The design's hostile retry: a 64 MiB round (67 writes, 70 ops) whose
+/// first write stays in flight while the 65 after it land and the last
+/// write fails, then the first fails too. The retry makes writes 0 and
+/// 66 unsent again with 65 done writes between them. Every writer of the
+/// cursor places it at the first unsent op (or the phase's end), so the
+/// group after the retry group starts at write 66 and the round ends.
+/// Pre-fix the cursor stayed at write 1 after the retry group's emit and
+/// the walk spent every turn's 64 visits on the done run: the round
+/// never ended — no fail-stop, no counter, no wake — and the namespace's
+/// writers parked on the tail stall to the typed timeout for the life.
+#[test]
+fn a_retry_with_a_done_run_between_its_failed_writes_completes() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 64 << 20, ..spec() });
+    let mut ks = Keyspace::new(StoreConfig::default());
+    sealed_backlog_on(&mut ks, NsId(16), 128 << 20, 64 << 20);
+    let mut admission = NoBudget;
+    // Turn 1: the first group. Write 0 stays in flight; the rest land.
+    let first = pass(&mut cell, &mut ks, 0, &mut admission);
+    let writes = cell.namespaces[0].flush.round_write_count();
+    assert!(writes >= 66, "engagement: 64 or more done writes between two failed ones: {writes}");
+    assert!(first.len() <= TIER_ISSUE_OPS_PER_TURN, "a turn pushes at most its visits");
+    let (held, rest): (Vec<IoOp>, Vec<IoOp>) = first.into_iter().partition(|op| op_index(op) == 0);
+    complete_ops(&mut cell, rest);
+    // Later turns: write 0 is pending, so no retry fires; every other
+    // write issues and lands, except the round's last write, which fails.
+    let mut last_failed = false;
+    for turn in 1..8u64 {
+        let ops = pass(&mut cell, &mut ks, turn, &mut admission);
+        if ops.is_empty() {
+            break;
+        }
+        assert!(ops.len() <= TIER_ISSUE_OPS_PER_TURN, "a turn pushes at most its visits");
+        let fail_at = ops.iter().position(|op| op_index(op) == writes - 1);
+        last_failed |= fail_at.is_some();
+        complete_ops_failing(&mut cell, ops, fail_at);
+    }
+    assert!(last_failed, "engagement: the last write was sent and failed");
+    for op in held {
+        let IoOp::LogWrite { token, .. } = op else { panic!("write 0 is a write") };
+        cell.on_flush_completion(token, Some(EIO));
+    }
+    // Every sent op is terminal with writes 0 and `writes - 1` failed and
+    // every write between them done: the retry fires at the next advance.
+    for turn in 8..40u64 {
+        let ops = pass(&mut cell, &mut ks, turn, &mut admission);
+        assert!(ops.len() <= TIER_ISSUE_OPS_PER_TURN, "a turn pushes at most its visits");
+        complete_ops(&mut cell, ops);
+        if cell.namespaces[0].round.is_none() {
+            assert_eq!(cell.flush_stats.write_retries, 1, "one retry of both failed writes");
+            assert_eq!(cell.flush_stats.rounds, 1, "the round completed");
+            return;
+        }
+    }
+    let round = cell.namespaces[0].round.as_ref().expect("still open");
+    let unsent: Vec<usize> =
+        (0..round.states.len()).filter(|&index| round.states[index] == OpState::Unsent).collect();
+    panic!(
+        "the round never completed: retries {}, cursor {}, pending {}, unsent ops {unsent:?} of \
+         {writes} writes",
+        cell.flush_stats.write_retries, round.next_unsent, round.pending
+    );
+}
+
+/// The design's plan row: a write error on the first, a middle and the
+/// last group of a multi-group round (8 MiB: a group per batch write).
+/// Each is a charged retry — the failed write alone is unsent again once
+/// every sent op is terminal, offered at its exact size and charged like
+/// any group — and the round completes with the spend equal to the
+/// device bytes handed to the disk, both attempts counted.
+#[test]
+fn a_write_error_on_the_first_a_middle_and_the_last_group_is_a_charged_retry() {
+    const SLICE: u64 = 8 << 20;
+    #[derive(Debug)]
+    enum Pick {
+        First,
+        Middle,
+        Last,
+    }
+    for pick in [Pick::First, Pick::Middle, Pick::Last] {
+        let row = format!("{pick:?} group");
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SLICE, ..spec() });
+        let mut ks = Keyspace::new(StoreConfig::default());
+        sealed_backlog_on(&mut ks, NsId(16), 16 << 20, SLICE);
+        let mut admission =
+            Recording { inner: plane_budget(reference_model(), 2), offers: Vec::new() };
+        let mut ops = pass(&mut cell, &mut ks, 0, &mut admission);
+        let writes = cell.namespaces[0].flush.round_write_count();
+        assert!(writes >= 9, "{row}: engagement: a multi-group round ({writes} writes)");
+        let target = match pick {
+            Pick::First => 0,
+            Pick::Middle => writes / 2,
+            Pick::Last => writes - 1,
+        };
+        let target_bytes = cell.namespaces[0].flush.round_op(target).bytes.len() as u64;
+        let (mut device_bytes, mut pushed_ops, mut failed) = (0u64, 0u64, false);
+        for pass_index in 1..1_000u64 {
+            pushed_ops += ops.len() as u64;
+            let fail_at =
+                if failed { None } else { ops.iter().position(|op| op_index(op) == target) };
+            failed |= fail_at.is_some();
+            device_bytes += complete_ops_failing(&mut cell, ops, fail_at);
+            if cell.namespaces[0].round.is_none() {
+                break;
+            }
+            admission.inner.0.refill(Nanos(pass_index * 10_000_000));
+            ops = pass(&mut cell, &mut ks, pass_index * 10_000, &mut admission);
+            assert!(
+                ops.len() <= TIER_ISSUE_OPS_PER_TURN,
+                "{row}: a turn pushes at most its visits"
+            );
+        }
+        assert!(cell.namespaces[0].round.is_none(), "{row}: the round completed");
+        assert!(failed, "{row}: engagement: write {target} was sent and failed");
+        assert_eq!(cell.flush_stats.write_retries, 1, "{row}: one retry");
+        assert!(
+            admission.offers.contains(&(target_bytes, 1)),
+            "{row}: the retry group is the failed write alone, offered at its size: {:?}",
+            admission.offers
+        );
+        let counters = admission.inner.0.counters(IoClass::TierFlush);
+        assert_eq!(counters.spent_bytes, device_bytes, "{row}: both attempts' device bytes");
+        assert_eq!(counters.spent_ops, pushed_ops, "{row}: every attempt's ops");
+    }
+}
+
+/// The design's plan row "a drop in each state": a namespace dropped
+/// while its round is prepared (opened, nothing sent), in its writes (one
+/// group in flight, the rest unsent) or in its barriers (in flight)
+/// drains — no group of it is offered or pushed again, its in-flight ops
+/// complete into the parked round, and once every op is terminal the
+/// lane recycles and its files join the teardown queue; the unsent ops
+/// are never sent.
+#[test]
+fn a_dropped_namespace_drains_from_every_round_state() {
+    #[derive(Debug)]
+    enum State {
+        Prepared,
+        Writes,
+        Barriers,
+    }
+    for state in [State::Prepared, State::Writes, State::Barriers] {
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 8 << 20, ..spec() });
+        let mut ks = Keyspace::new(StoreConfig::default());
+        sealed_backlog_on(&mut ks, NsId(16), 16 << 20, 8 << 20);
+        let in_flight = match state {
+            State::Prepared => {
+                let ops =
+                    pass(&mut cell, &mut ks, 0, &mut Scripted { grant: |_| false, offers: 0 });
+                assert!(ops.is_empty(), "{state:?}: nothing granted");
+                ops
+            }
+            State::Writes => {
+                let ops = pass(
+                    &mut cell,
+                    &mut ks,
+                    0,
+                    &mut Scripted { grant: |index| index == 0, offers: 0 },
+                );
+                assert!(!ops.is_empty(), "{state:?}: the first group is in flight");
+                ops
+            }
+            State::Barriers => {
+                let writes = pass(&mut cell, &mut ks, 0, &mut NoBudget);
+                complete_ops(&mut cell, writes);
+                let barriers = pass(&mut cell, &mut ks, 1, &mut NoBudget);
+                assert!(!barriers.is_empty(), "{state:?}: the barrier group is in flight");
+                barriers
+            }
+        };
+        let (lane, seq) = (cell.namespaces[0].lane, cell.namespaces[0].round_seq);
+        let round = cell.namespaces[0].round.as_ref().expect("the round is open");
+        assert_eq!(round.pending as usize, in_flight.len(), "{state:?}: the in-flight count");
+        let unsent = round.states.iter().filter(|s| **s == OpState::Unsent).count();
+        assert_eq!(matches!(state, State::Barriers), unsent == 0, "{state:?}: unsent ops");
+        // The drop: the keyspace no longer holds the namespace.
+        let mut gone = Keyspace::new(StoreConfig::default());
+        cell.sync_namespaces(&gone, &mut vec![(NsId(16), 1)]);
+        assert!(cell.namespaces.is_empty(), "{state:?}: dropped");
+        assert_eq!(cell.round_drain.len(), 1, "{state:?}: the round parks whole");
+        let mut ops = Vec::new();
+        cell.turn(&mut gone, 2, &mut ops, &mut NoBudget).expect("nothing to plan");
+        assert!(ops.is_empty(), "{state:?}: no group of a parked round is pushed");
+        cell.maintain_teardown(|_| true);
+        let parked = usize::from(!in_flight.is_empty());
+        assert_eq!(cell.round_drain.len(), parked, "{state:?}: parked while an op is in flight");
+        for op in in_flight {
+            let (IoOp::LogWrite { token, .. } | IoOp::Fdatasync { token, .. }) = op else {
+                panic!("a flush round pushes writes and barriers only")
+            };
+            cell.on_flush_completion(token, None);
+        }
+        assert_eq!(cell.flush_stats.stale_completions, 0, "{state:?}: applied to the parked round");
+        cell.maintain_teardown(|_| true);
+        assert!(cell.round_drain.is_empty(), "{state:?}: drained once every op is terminal");
+        assert_eq!(cell.free_lanes, vec![(lane, seq)], "{state:?}: the lane recycled");
+        assert!(cell.teardown.iter().all(|tn| tn.files.is_empty()), "{state:?}: files unlinked");
+    }
 }
