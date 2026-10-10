@@ -493,14 +493,7 @@ enum Owner {
 
 impl Owners {
     fn read() -> Owners {
-        #[cfg(target_os = "linux")]
-        {
-            data_dir_owners().map_or(Owners::Unseen, Owners::Seen)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Owners::Unseen
-        }
+        data_dir_owners().map_or(Owners::Unseen, Owners::Seen)
     }
 
     fn of(&self, dir: &Path) -> Owner {
@@ -667,6 +660,12 @@ fn data_dir_owners() -> Option<Vec<(PathBuf, u32)>> {
         }
     }
     Some(owners)
+}
+
+/// Off Linux no process's arguments are shown, so nothing is seen.
+#[cfg(not(target_os = "linux"))]
+fn data_dir_owners() -> Option<Vec<(PathBuf, u32)>> {
+    None
 }
 
 /// Removes `path` with everything under it; an absent path is nothing to
