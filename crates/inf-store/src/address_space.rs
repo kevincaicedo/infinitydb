@@ -772,9 +772,9 @@ impl AddressSpace {
     /// Whether a flush stage whose cursor stands at the raw address
     /// `cursor` has a chunk to take: the cursor is below the ro-boundary.
     /// [`next_flush_chunk`](Self::next_flush_chunk) answers `None` exactly
-    /// when this is false, and the tier round asks it before offering its
-    /// slice to the device budget, so no credit is asked for work that
-    /// does not exist (ADR-0170 D3). The stage's cursor never passes the
+    /// when this is false, and the cell's plan asks it before staging a
+    /// round, so nothing at the cursor means no plan and no offer (ADR-0178
+    /// D3). The stage's cursor never passes the
     /// ro-boundary (`next_flush_chunk`'s chunks end at or below it).
     #[must_use]
     pub fn flush_work_at(&self, cursor: u64) -> bool {

@@ -1026,17 +1026,6 @@ the cap, which bounds recovery); `derive_interval` release-asserts
 
 ## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0178)
 
-> **Not built yet (ADR-0178).** ADR-0178 supersedes ADR-0170 and restates this section's
-> contract under the same decision numbers. The grant rule, the overrun, the receipt and the
-> one-producer progress bound below are unchanged. The tier flush changes when its part is
-> built: a round is issued in groups of at most 1 MiB and 64 ops, each offered on its own and
-> never above the class cap, so no tier offer overruns; a round issues exactly what it
-> offers, and the settlement below (the unstaged part refunded, the bytes past the slice
-> charged) is removed; a cell prepares at most one round per MAINTAIN pass; tiered namespaces
-> offer in id order, and a refused group ends the pass for the tier class and is offered
-> first on the next. Both deviations below end with that build. Until then the text below
-> describes the tree.
-
 ```rust
 pub enum IoClass { LogFrame, BlobWrite, ColdReadForeground,      // foreground: charged, never deferred
                    ZeroFill, TierFlush, Checkpoint, ColdReadMaintain } // background: priority order, weights 4:4:2:1
@@ -1076,9 +1065,9 @@ rounded once, with one remainder carried (ADR-0178 D2).
   A class is rested when every budgeted axis held its cap before a
   refill's grant. Refill alone decides it, so a draw ends the rest pass
   (the class drops below its cap) and a grant refunded in full does not.
-- `charge` (a checkpoint's header block and barriers, a tier round's
-  bytes staged past its grant, any foreground op) spends unconditionally
-  and owes what the credit cannot hold.
+- `charge` (a checkpoint's header block and barriers, any foreground op)
+  spends unconditionally and owes what the credit cannot hold. The tier
+  class has no charge site: every tier offer is a group at its exact size.
 - The budget keeps the last background `Now` answer's draws. The refund
   directly after it returns at most that — the debt first, then the pool,
   then the credit — so a full refund is the grant's exact inverse. Any
@@ -1086,13 +1075,20 @@ rounded once, with one remainder carried (ADR-0178 D2).
 
 Producers match `Issue` and nothing else; the three outcomes and the
 overrun are resolved in `offer`, once. Consult sites: zero-fill
-(`next_zero_slice` peek → offer → push), tier flush (a round offers its
-slice only when the stage has a chunk to take —
-`TieredTable::flush_pending` — before `stage_flush_round`, then settles the
-grant against the record bytes it staged: the unstaged part refunded, the
-bytes past the slice charged, since a chunk takes at least one seal cut
-past its cursor; a stage refused part-way settles what it staged first —
-ADR-0170 A2),
+(`next_zero_slice` peek → offer → push), tier flush (ADR-0178 D3's tier
+row: the cell's turn offers each ready namespace's next **group** — the
+longest run of its staged round's unsent ops within 1 MiB of device
+bytes and 64 ops, whole writes, `TIER_GROUP_BYTES_MAX` and
+`TIER_GROUP_OPS_MAX` in `inf-log::limits` — at its exact size, so a
+round issues exactly what it offers and nothing is settled afterwards; a
+refused group makes its namespace the holder, which ends the pass for the
+tier class and is visited first next turn, while a granted one moves the
+visit on; barriers are their own group once every write is done, and a
+failed write is unsent again and offered as a retry group, charged like
+any; the cell plans at most one round per MAINTAIN turn, taken by the
+first namespace after the one planned last, in id order, that is idle
+with work at its cursor — `TieredTable::flush_pending`, so nothing at the
+cursor means no plan and no offer),
 checkpoint (header/section/footer block at its padded length, before the
 seal; completion fdatasync charged as one op), cold-read drain
 (`drain_budgeted`: maintain reads offer the pool buffer bound and refund
@@ -1103,43 +1099,45 @@ offer `Now`, every counter counts, the checkpoint keeps its 64 MiB/s pace
 (ADR-0017) — reported as `io_budget_model:absent`. No client reply is
 ever derived from `NotThisSlice` or an overrun.
 
-**Progress (ADR-0170 D4).** A class with one producer on the cell —
-zero-fill, the checkpoint, the cold-read drain, and tier flush with one
-tiered namespace — has every offer issued within `max over budgeted axes
-of (O + cap_c + C_c + 3) / r_c + 2Δ` of injected time. `r_c = share ×
-w_c / (8 Σw)`, and on the checkpoint's byte axis `share × max(w_c /
-(8 Σw), w_c / (α w_c + Σw))` (`share / 7` at α = 2). `O` is the class's
-debt when the offer is first made, at most `(largest offer − cap_c)⁺ +
-C_c`; `C_c` its unconditional charges between two offers (the
-checkpoint's header block and barrier ops; a tier round's bytes staged
-past its slice, below one flush chunk); the 3 units cover the
-carries' lag — each carry stage (the rate product, the ⅛ floor, the
-weighted split or the keep-up floor's one carry) trails its exact sum
-by under one unit, under 2⅛ in all (ADR-0178 D4); `Δ` is the longest
-refill interval — one for quantization, one for the rest pass. It is a
-progress bound, not a latency promise: a tier round whose bound exceeds
-its namespace's `TAIL-STALL-TIMEOUT` parks writers into the typed
-timeout.
+**Progress (ADR-0178 D4).** A class with one producer on the cell —
+zero-fill, the checkpoint, the cold-read drain — has every offer issued
+within `max over budgeted axes of (O + cap_c + C_c + 3) / r_c + 2Δ` of
+injected time. `r_c = share × w_c / (8 Σw)`, and on the checkpoint's
+byte axis `share × max(w_c / (8 Σw), w_c / (α w_c + Σw))` (`share / 7`
+at α = 2). `O` is the class's debt when the offer is first made, at most
+`(largest offer − cap_c)⁺ + C_c`; `C_c` its unconditional charges
+between two offers (the checkpoint's header block and barrier ops; 0 for
+the others); the 3 units cover the carries' lag — each carry stage (the
+rate product, the ⅛ floor, the weighted split or the keep-up floor's one
+carry) trails its exact sum by under one unit, under 2⅛ in all; `Δ` is
+the longest refill interval — one for quantization, one for the rest
+pass. The tier class never owes (no offer above the cap, no charge
+site): a ready group is issued within `n × T_c`, `T_c = max over
+budgeted axes of (B + 3) / r_c + 2Δ` with `B` the group's own size and
+`n` the cell's tiered namespaces, and an idle namespace with work plans
+within `n − 1` further cell turns. INFO reads the longest group wait as
+`tier_group_wait_ns_max`, the turn's refusal episodes as
+`tier_turn_waits`, the contended turns as `tier_turn_contended`, the
+namespaces a plan passed over as `tier_plan_waits`, the rounds planned
+as `tier_rounds_planned` and the refused groups as
+`tier_flush_groups_deferred`. It is a progress bound, not a latency
+promise: a writer parked behind a round whose groups take longer than
+its namespace's `TAIL-STALL-TIMEOUT` takes the typed timeout.
 
-**The limit and the deviations** (ADR-0178 D4):
+**The limit** (ADR-0178 D4):
 
 - *Checkpoint block — a limit.* A section block holds one record plus
   less than one section target. Above the class cap it issues as one
   burst of up to the record bound (≤ 64 MiB + 8 KiB at the largest
   `--log-staging-mib`), the same device time the log already spent
-  writing that record as one frame. `--log-staging-mib` owns it.
-- *Several tiered namespaces on a cell (DV-1).* No per-namespace bound:
-  the plane visits namespaces in index order, and an overrunning
-  namespace waits while another has a flush backlog on every pass (an
-  idle one never delays it). Owner: grouped tier rounds and a fair host
-  visit (ADR-0155 D4). Expiry proposed 2026-10-31.
-- *Tier round bursts (DV-2).* A round issues as one burst of up to its
-  slice plus one flush chunk — one seal step, or up to the namespace's
-  ring once the flush's cut list has dropped cuts — every round. That
-  passes the 50 ms horizon premise for a `MAINTAIN-SLICE` above the class
-  cap, a record above the slice, or a span of many records. Owner: tier
-  groups of at most 1 MiB, each offered on its own, a round issuing at
-  most its offer (ADR-0155 D4). Expiry proposed 2026-10-31.
+  writing that record as one frame. `--log-staging-mib` owns it. The
+  checkpoint is the only producer that can overrun, and it is alone in
+  its class.
+- *Tier flush.* One group, at most 1 MiB of device bytes, behind a
+  foreground frame: 2.1 ms at 489 MB/s, 8.4 ms at 125 MB/s, inside the
+  50 ms premise at any `MAINTAIN-SLICE`; no tier offer is above the class
+  cap, so `io_budget_unattainable_tier_flush` and
+  `io_budget_overrun_bytes_tier_flush` read 0.
 
 INFO, per class and cell scope: `io_budget_bytes_c`, `io_budget_ops_c`,
 `io_budget_deferrals_c` (every `NotThisSlice`), `io_budget_unattainable_c`
@@ -2046,12 +2044,22 @@ The reactor-drive flush state machine (`TierFlush` round state in
   under class c`, ops likewise; the two cold-read classes together ==
   the driver's reads) — asserted every seed by the `m2-device-budget`
   oracle on the sim driver's `ObservedIo`; `refund` keeps it exact.
-- **A tier round's spend is what it staged** — test: the `tier_cell`
-  producer tests over a real budget (a round staged past its slice owes
-  the excess; a stage refused part-way keeps what it staged spent) and a
-  wire test in which `io_budget_bytes_tier_flush` covers every flushed
-  record byte. The basis is record bytes; no sim scenario runs a tiered
-  namespace under a model.
+- **A tier round issues exactly what it offers, in groups** — type: an
+  op reaches the driver only inside a `GrantedGroup`, made only by a
+  `Now` answer to an offer of the group's exact device bytes and ops; a
+  const assertion keeps a group within the tier class's declared slice,
+  so no tier offer is above the cap. Tests: the `tier_cell` producer
+  tests over a real budget (an 8 MiB round issues in groups, none above
+  the cap; a retry group is offered and charged again; a plan refused
+  part-way issues what it staged), the wire tests (`io_budget_bytes_tier_flush`
+  equal to `tiering_flush_bytes` once every round completed without a
+  retry; `io_budget_unattainable_tier_flush` 0 with a deferral), and the
+  `m4-tier-budget` scenario's oracles on every leg: no offer above the
+  cap and one pass's tier bytes within the cap plus the pool from the
+  model, every ready group's wait within `n × T_c` from the model, the
+  spend equal to the sim driver's tier bytes and ops (the ops a cut caught
+  between push and submit added), one plan per cell turn judged per
+  iteration — each with a planted canary.
 - **Rate bound** (background bytes over a run ≤ `share × elapsed + 2 ×
   horizon + Σ slices`, plus one largest block per class that can
   overrun) — the `m2-device-budget` oracle.

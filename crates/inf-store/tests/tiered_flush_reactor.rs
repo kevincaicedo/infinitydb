@@ -241,11 +241,11 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
     assert!(cold > 50, "the storm demoted a real cold set ({cold})");
 }
 
-/// ADR-0170 D3: the tier round's work gate is the stage's own test.
+/// ADR-0178 D3: the tier round's work gate is the stage's own test.
 /// `flush_pending` before a stage is true exactly when that stage opens a
-/// round, and false exactly when it stages nothing — so the plane asks
-/// the device budget for a slice only when a chunk (records or a ring-top
-/// gap) is there to take. A seeded storm drives both answers many times,
+/// round, and false exactly when it stages nothing — so the cell's plan
+/// stages a round only when a chunk (records or a ring-top gap) is there
+/// to take. A seeded storm drives both answers many times,
 /// across file rotations and ring wraps.
 #[test]
 fn flush_pending_is_true_exactly_when_the_stage_opens_a_round() {

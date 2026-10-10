@@ -45,9 +45,8 @@
 //!   budgeted axis already held its cap before the refill's grant. A draw
 //!   ends the rest pass (it leaves the class below its cap); a grant
 //!   refunded in full does not.
-//! - *Charge*: spend is unconditional — a checkpoint header or barrier,
-//!   or a tier round's bytes staged past its grant — and what the credit
-//!   cannot hold is owed.
+//! - *Charge*: spend is unconditional — a checkpoint header or barrier —
+//!   and what the credit cannot hold is owed.
 //! - *Receipt*: the budget remembers the last background `Now` answer's
 //!   draws; the refund directly after it returns at most that, the debt
 //!   first, then the pool, then the credit — so a full refund is the
@@ -824,7 +823,7 @@ impl DeviceBudget {
     fn offer_above_cap(&mut self, class: IoClass, request: [u64; 2], cap: ClassCap) -> Issue {
         self.meters[class.index()].unattainable += 1;
         // A planted canary: the pre-overrun answer, "not this slice" for
-        // ever (ADR-0170 R1–R3 and the sim arm must go red).
+        // ever (ADR-0178: R1, R2 and the sim arm must go red).
         if cfg!(inf_canary_unattainable_deferred) {
             return Issue::NotThisSlice;
         }
@@ -934,7 +933,7 @@ impl DeviceBudget {
 
     /// Spend unconditionally (ADR-0178 D2): the op is issued whatever the
     /// credit says (a checkpoint header — its file is already created —
-    /// its barriers, a tier round's bytes staged past its grant, or any
+    /// its barriers, or any
     /// foreground op). A background class owes what
     /// its credit cannot hold, repaid before its credit grows again; the
     /// counters stay exact. Never a deferral.
@@ -956,8 +955,8 @@ impl DeviceBudget {
     }
 
     /// Return the unissued part of the grant just before this call (a
-    /// tier round staged fewer bytes than its slice, a zero-fill found no
-    /// slice, a cold read found the pool dry). The receipt caps it at
+    /// zero-fill found no slice, a cold read found the pool dry). The
+    /// receipt caps it at
     /// that grant and returns it last-taken first — the debt, then the
     /// pool, then the credit — so a full refund is the grant's exact
     /// inverse and no refund lifts the credit or the pool above their
@@ -1774,7 +1773,7 @@ mod class_oracle {
         s
     }
 
-    /// Each producer's largest offer (ADR-0170 D3's table), as the
+    /// Each producer's largest offer (ADR-0178 D3's table), as the
     /// producers' constants state it: `ZERO_FILL_SLICE_BYTES`,
     /// `MAINTAIN-SLICE`'s 64 MiB ceiling,
     /// `ick_align_up(ICK_MAX_SECTION_BYTES + 13)` = 64 MiB + 8 KiB, and

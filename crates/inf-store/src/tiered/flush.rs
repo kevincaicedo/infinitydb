@@ -6,9 +6,9 @@ use super::*;
 use inf_log::flush::SeamFlush;
 
 /// A reactor-drive stage refused part-way (ADR-0084 D2): the round keeps
-/// what was staged before the refusal and is issued like any other, so
-/// the device budget settles the round's grant against `staged_bytes`,
-/// never against zero (ADR-0170 A2).
+/// what was staged before the refusal and is issued like any other, its
+/// groups offered to the device budget at their exact size (ADR-0178
+/// D3), so `staged_bytes` is what the round still holds.
 #[derive(Debug)]
 pub struct StageFailed {
     /// Record bytes the round holds, all staged before the refusal.
@@ -467,9 +467,9 @@ impl TieredTable {
     }
 
     /// True exactly when the next [`stage_flush_round`](Self::stage_flush_round)
-    /// would take a chunk (records or a gap) and so open a round. The tier
-    /// round offers its slice to the device budget only when this holds
-    /// (ADR-0170 D3): an idle namespace asks no credit.
+    /// would take a chunk (records or a gap) and so open a round. The cell's
+    /// plan stages a round only when this holds (ADR-0178 D3): nothing at the
+    /// cursor means no plan and no offer.
     #[must_use]
     pub fn flush_pending<F: SegmentFs>(&self, flush: &TierFlush<F>) -> bool {
         self.space.flush_work_at(self.flush_start_cursor(flush))
