@@ -45,7 +45,10 @@
 //! removed when the leg ends — on success, on an error and on a panic
 //! alike, since a guard value owns it. Only a killed process leaves one
 //! behind, so a run removes every leg directory it finds under the root
-//! before its first leg and prints each.
+//! before its first leg and prints each — unless a live `infinityd` still
+//! names that directory as its `--data-dir` (the orphan a killed run's
+//! node becomes): the sweep keeps that directory and says so, and a leg
+//! that would reuse it is refused, so no run removes a directory in use.
 //!
 //! The report labels its tier: without `--reference-box` every number is
 //! dev-tier, disclosed and never published.
@@ -445,9 +448,20 @@ fn generator_cpu_ticks() -> Result<u64, String> {
 /// `<leg>-c<connections>-r<replicate>`. `create` makes it fresh and the
 /// value removes it when dropped, so a leg that returns through `?` or
 /// unwinds leaves nothing behind; only a killed process can, and
-/// `clear_stale` removes those at the next run's start.
+/// `clear_stale` removes those at the next run's start. A directory a
+/// live `infinityd` names as its `--data-dir` is in use: the sweep keeps
+/// it and `create` refuses it, whatever its name says.
 struct LegDir {
     path: PathBuf,
+}
+
+/// What the sweep did with one leg directory it found under the root.
+#[derive(Debug, PartialEq, Eq)]
+enum Swept {
+    Removed(String),
+    /// Kept: the `infinityd` with this pid names the directory as its
+    /// `--data-dir`.
+    InUse(String, u32),
 }
 
 impl LegDir {
@@ -455,8 +469,10 @@ impl LegDir {
         format!("{leg}-c{connections}-r{replicate}")
     }
 
-    /// The inverse of `name`: `(leg, connections, replicate)` for a name
-    /// this instrument made, `None` for any other directory.
+    /// The exact inverse of `name`: `(leg, connections, replicate)` for a
+    /// name this instrument made, `None` for any other directory — a
+    /// count written with a leading zero included, since `name` never
+    /// writes one.
     fn parse_name(name: &str) -> Option<(&str, usize, usize)> {
         let (leg, rest) = name.split_once("-c")?;
         if !LEG_NAMES.contains(&leg) {
@@ -466,7 +482,8 @@ impl LegDir {
         Some((leg, parse_count(connections)?, parse_count(replicate)?))
     }
 
-    /// Removes whatever `root/<name>` holds and creates it empty.
+    /// Removes whatever `root/<name>` holds and creates it empty; refused
+    /// while a live `infinityd` names the directory as its data directory.
     fn create(
         root: &Path,
         leg: &str,
@@ -474,19 +491,28 @@ impl LegDir {
         replicate: usize,
     ) -> Result<LegDir, String> {
         let path = root.join(LegDir::name(leg, connections, replicate));
+        if let Some(pid) = live_owner(&path) {
+            return Err(format!(
+                "{}: in use by the infinityd with pid {pid}; stop it or choose another --data-root",
+                path.display()
+            ));
+        }
         remove_tree(&path)?;
         std::fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(LegDir { path })
     }
 
     /// Removes every leg directory under `root` that an earlier run left
-    /// behind (one a killed process could not remove), creating the root
-    /// when it is absent; returns the names removed, sorted. One pass
-    /// over the root's entries; a symbolic link is not followed.
-    fn clear_stale(root: &Path) -> Result<Vec<String>, String> {
+    /// behind (one a killed process could not remove) and no live
+    /// `infinityd` names as its data directory, creating the root when it
+    /// is absent; returns what it did with each, sorted by name. One pass
+    /// over the root's entries and one over `/proc`; a symbolic link is
+    /// not followed.
+    fn clear_stale(root: &Path) -> Result<Vec<Swept>, String> {
         let at = |e: std::io::Error| format!("{}: {e}", root.display());
         std::fs::create_dir_all(root).map_err(at)?;
-        let mut removed = Vec::new();
+        let owners = data_dir_owners();
+        let mut swept = Vec::new();
         for entry in std::fs::read_dir(root).map_err(at)? {
             let entry = entry.map_err(at)?;
             let name = entry.file_name();
@@ -494,11 +520,23 @@ impl LegDir {
             if LegDir::parse_name(name).is_none() || !entry.file_type().map_err(at)?.is_dir() {
                 continue;
             }
-            remove_tree(&entry.path())?;
-            removed.push(name.to_string());
+            let path = entry.path();
+            match owners.iter().find(|(dir, _)| *dir == path) {
+                Some(&(_, pid)) => swept.push(Swept::InUse(name.to_string(), pid)),
+                None => {
+                    remove_tree(&path)?;
+                    swept.push(Swept::Removed(name.to_string()));
+                }
+            }
         }
-        removed.sort();
-        Ok(removed)
+        swept.sort_by(|a, b| swept_name(a).cmp(swept_name(b)));
+        Ok(swept)
+    }
+}
+
+fn swept_name(swept: &Swept) -> &str {
+    match swept {
+        Swept::Removed(name) | Swept::InUse(name, _) => name,
     }
 }
 
@@ -510,12 +548,51 @@ impl Drop for LegDir {
     }
 }
 
-/// A decimal count, digits only: `+1` is not a name of ours.
+/// A decimal count exactly as `format!("{count}")` writes it: digits
+/// only, no leading zero but `0` itself. `+1` and `01` are not names of
+/// ours.
 fn parse_count(digits: &str) -> Option<usize> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
     digits.parse().ok()
+}
+
+/// The live `infinityd` that names `dir` as its `--data-dir`, by pid, if
+/// one exists: one pass over `/proc`.
+fn live_owner(dir: &Path) -> Option<u32> {
+    data_dir_owners().into_iter().find(|(owner, _)| owner == dir).map(|(_, pid)| pid)
+}
+
+/// Every `(data directory, pid)` a live process on this box names with a
+/// `--data-dir` argument, read from `/proc/<pid>/cmdline` in one pass; a
+/// process that cannot be read (gone, or not ours) is skipped. The data
+/// directory is compared as the argument was given, which is how this
+/// instrument spawns a node (`--data-dir <path>`).
+fn data_dir_owners() -> Vec<(PathBuf, u32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let mut owners = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else { continue };
+        let mut args = cmdline.split(|b| *b == 0).map(|arg| String::from_utf8_lossy(arg));
+        while let Some(arg) = args.next() {
+            let dir = match arg.strip_prefix("--data-dir=") {
+                Some(inline) => Some(inline.to_string()),
+                None if arg == "--data-dir" => args.next().map(|next| next.to_string()),
+                None => None,
+            };
+            if let Some(dir) = dir {
+                owners.push((PathBuf::from(dir), pid));
+            }
+        }
+    }
+    owners
 }
 
 /// Removes `path` with everything under it; an absent path is nothing to
@@ -988,8 +1065,17 @@ impl BlobSetArgs {
 /// and named.
 fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
     let data_root = Path::new(&run.data_root);
-    for name in LegDir::clear_stale(data_root)? {
-        println!("blob-set: removed the stale leg directory {}", data_root.join(name).display());
+    for swept in LegDir::clear_stale(data_root)? {
+        match swept {
+            Swept::Removed(name) => println!(
+                "blob-set: removed the stale leg directory {}",
+                data_root.join(name).display()
+            ),
+            Swept::InUse(name, pid) => println!(
+                "blob-set: kept the leg directory {}: in use by the infinityd with pid {pid}",
+                data_root.join(name).display()
+            ),
+        }
     }
     let spec = LegSpec {
         binary: &run.binary,
@@ -1224,15 +1310,29 @@ mod tests {
         assert_eq!(outcome_of(std::slice::from_ref(&point)), Outcome::Measured);
     }
 
-    /// A leg directory's name round-trips through its parser; a name the
-    /// instrument did not make is not ours to remove.
+    /// A leg directory's name round-trips through its parser, which is the
+    /// encoder's exact inverse: a count the encoder never writes (a
+    /// leading zero) is not a name of ours, nor is anything else the
+    /// instrument did not make.
     #[test]
     fn a_leg_directory_name_round_trips_and_other_names_are_not_ours() {
+        for (leg, connections, replicate) in [("a", 17, 3), ("b", 128, 0), ("a", 0, 0)] {
+            let name = LegDir::name(leg, connections, replicate);
+            assert_eq!(LegDir::parse_name(&name), Some((leg, connections, replicate)), "{name}");
+        }
         assert_eq!(LegDir::name("a", 17, 3), "a-c17-r3");
-        assert_eq!(LegDir::parse_name("a-c17-r3"), Some(("a", 17, 3)));
-        assert_eq!(LegDir::parse_name("b-c128-r0"), Some(("b", 128, 0)));
-        let others =
-            ["blob-set", "a-c1", "c-c1-r1", "a-cx-r1", "a-c1-r+1", "a-c1-r1-extra", "a-c-r1"];
+        let others = [
+            "blob-set",
+            "a-c1",
+            "c-c1-r1",
+            "a-cx-r1",
+            "a-c1-r+1",
+            "a-c1-r1-extra",
+            "a-c-r1",
+            "a-c01-r1",
+            "a-c1-r01",
+            "a-c00-r0",
+        ];
         for other in others {
             assert_eq!(LegDir::parse_name(other), None, "{other}");
         }
@@ -1249,7 +1349,7 @@ mod tests {
         let stale = root.join("a-c1-r3");
         std::fs::create_dir_all(stale.join("shard-0")).unwrap();
         std::fs::create_dir_all(root.join("notes")).unwrap();
-        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec!["a-c1-r3".to_string()]);
+        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::Removed("a-c1-r3".into())]);
         assert!(!stale.exists());
         assert!(root.join("notes").is_dir());
         let dir = LegDir::create(&root, "a", 1, 0).unwrap();
@@ -1263,6 +1363,39 @@ mod tests {
         };
         assert!(through_an_error().is_err());
         assert!(!root.join("b-c1-r0").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A leg directory a live process names as its `--data-dir` (the
+    /// orphaned node of a killed run) is kept by the sweep and refused to a
+    /// new leg; once that process is gone the sweep removes it. The owner
+    /// here is a shell holding the argument the way `infinityd` is spawned.
+    #[test]
+    fn a_leg_directory_a_live_node_names_is_kept_and_refused_until_the_node_is_gone() {
+        let root =
+            std::env::temp_dir().join(format!("inf-bench-blobset-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let held = root.join("a-c1-r2");
+        std::fs::create_dir_all(held.join("shard-0")).unwrap();
+        let mut owner = std::process::Command::new("sh")
+            .args(["-c", "sleep 30", "sh", "--data-dir", &held.display().to_string()])
+            .spawn()
+            .expect("a shell holds the directory's name");
+        let pid = owner.id();
+        assert_eq!(live_owner(&held), Some(pid), "the holder is found by its argument");
+        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::InUse("a-c1-r2".into(), pid)]);
+        assert!(held.is_dir(), "a directory in use is never removed");
+        let refused = match LegDir::create(&root, "a", 1, 2) {
+            Ok(_) => panic!("a directory in use is refused"),
+            Err(why) => why,
+        };
+        assert!(refused.contains(&format!("pid {pid}")), "{refused}");
+        assert!(held.join("shard-0").is_dir(), "a refused create touches nothing");
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert_eq!(live_owner(&held), None);
+        assert_eq!(LegDir::clear_stale(&root).unwrap(), vec![Swept::Removed("a-c1-r2".into())]);
+        assert!(!held.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
