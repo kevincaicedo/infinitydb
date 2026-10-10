@@ -17,11 +17,13 @@
 //!   a `SET` per second at the default 30 s. A latency reads to the bucket
 //!   of its histogram (32 per octave, about 3 %), disclosed in the report.
 //! - **Spread, with a same-binary control leg.** A point is `--replicates`
-//!   runs of two legs, `a` and `b`, interleaved (`a b`, then `b a`); both
-//!   run the same binary unless `--binary-b` names another. The legs'
-//!   means must agree within 5 % on `X` and 10 % on p99, else the point is
+//!   runs of two legs, `a` and `b`, interleaved (`a b`, then `b a`), both
+//!   of the one binary: the instrument's control. The legs' means must
+//!   agree within 5 % on `X` and 10 % on p99, else the point is
 //!   `Evidence-pending`: a number outside its own control's spread is
-//!   never a number.
+//!   never a number. An A/B of two binaries is four legs (A, A′, B, B′),
+//!   each binary with its own A/A spread, and a difference counts only
+//!   above both spreads; that shape is not built here.
 //! - **Liveness, with its planted red.** Over a leg, the server's
 //!   `tiering_blob_extents_created` must rise by the acknowledged `SET`s,
 //!   the warm-up's counted beside the window's, within the connections
@@ -60,7 +62,6 @@ const FLAGS: (&[&str], &[&str]) = (
         "unsafe-env",
         "reference-box",
         "infinityd-bin",
-        "binary-b",
         "data-root",
         "artifacts-root",
         "cells",
@@ -804,7 +805,6 @@ fn plant_reply_err() -> Result<(), String> {
 struct BlobSetArgs {
     env_ok: bool,
     bin: String,
-    binary_b: String,
     data_root: String,
     fstype: String,
     artifacts_root: String,
@@ -823,7 +823,6 @@ impl BlobSetArgs {
         let env_ok = env_gate(flags)?;
         let reference_box = flags.bool("reference-box");
         let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
-        let binary_b = flags.get("binary-b").map(str::to_string).unwrap_or_else(|| bin.clone());
         let data_root = flags.require("data-root")?.to_string();
         let fstype = admit_device_root(flags, Path::new(&data_root), reference_box)?;
         if crate::gaterun::is_memory_fs(&fstype) {
@@ -852,7 +851,6 @@ impl BlobSetArgs {
         Ok(BlobSetArgs {
             env_ok,
             bin,
-            binary_b,
             data_root,
             fstype,
             artifacts_root: flags.str_or("artifacts-root", ".artifacts/blob-set"),
@@ -868,21 +866,21 @@ impl BlobSetArgs {
     }
 }
 
-/// Every point of the curve: both legs over every replicate, interleaved
-/// `a b` then `b a`, so neither leg always warms the other; each leg on
-/// a fresh data directory, removed after it.
+/// Every point of the curve: both legs of the one binary over every
+/// replicate, interleaved `a b` then `b a`, so neither leg always warms
+/// the other; each leg on a fresh data directory, removed after it.
 fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
-    let specs = [("a", run.bin.as_str()), ("b", run.binary_b.as_str())];
+    let legs_of_the_binary = ["a", "b"];
     let mut points = Vec::new();
     for &c in &run.conns {
         let mut legs = Vec::new();
         for replicate in 0..run.replicates {
             let order: [usize; 2] = if replicate % 2 == 0 { [0, 1] } else { [1, 0] };
             for which in order {
-                let (name, leg_bin) = specs[which];
+                let name = legs_of_the_binary[which];
                 let data_dir = Path::new(&run.data_root).join(format!("{name}-c{c}-r{replicate}"));
                 let spec = LegSpec {
-                    bin: leg_bin,
+                    bin: &run.bin,
                     cells: run.cells,
                     data_dir: &data_dir,
                     pin_start: run.pin_start.as_deref(),

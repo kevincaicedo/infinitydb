@@ -81,7 +81,7 @@ USAGE:
                    [--pressure-mb 2048] [--data-root DIR] [--ready-timeout-s 10]
                    [--pin-start N] [--artifacts-root DIR]
                    (M2.5-S01 wedge regression; data-root must not be tmpfs)
-    inf-bench blob-set --data-root DIR [--infinityd-bin PATH] [--binary-b PATH]
+    inf-bench blob-set --data-root DIR [--infinityd-bin PATH]
                    [--cells N] [--pin-start N] [--conns 1,8,16,17,32,64,128]
                    [--replicates 5] [--warmup-s 5] [--duration-s 30]
                    [--value-size 65536] [--blob-threshold 4kb]
