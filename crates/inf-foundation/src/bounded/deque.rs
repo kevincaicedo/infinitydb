@@ -248,10 +248,13 @@ impl<T: Lossy, M: Merge<T>> CappedDeque<T, Coalesce<M>> {
     #[cold]
     #[inline(never)]
     fn merge_at_cap(&mut self, value: T) {
-        match self.backing.back_mut() {
-            Some(back) => M::merge(back, value),
-            // Never taken: at the cap the deque holds at least one entry.
-            None => self.backing.push_back(value),
+        // At the cap the deque holds an entry (the cap is nonzero), so the
+        // back is there. Were it not, `value` drops: a `Lossy` payload may be
+        // dropped at a cap, while a push here would be the one path past it
+        // (`len <= entries_max` is this type's own compare, not the backing's).
+        debug_assert!(!self.backing.is_empty(), "a Coalesce deque at its cap has a back");
+        if let Some(back) = self.backing.back_mut() {
+            M::merge(back, value);
         }
         self.row.report_full();
     }
