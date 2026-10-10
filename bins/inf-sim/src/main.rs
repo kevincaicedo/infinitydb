@@ -152,7 +152,8 @@ fn main() {
                     println!(
                         "inf-sim --scenario <name> (one of: {}) \
                          [--seed N|0xN] [--verify-determinism] \
-                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|tier-write-eio|stop-kill] \
+                         [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|\
+                         tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--cells N] \
                          [--connections N] [--commands N] [--wheel-nodes-max N] \

@@ -1209,10 +1209,6 @@ fn tier_budget_scrape(
     disk: &SimDisk,
     report: &mut DurableReport,
 ) {
-    use inf_runtime::IoClass;
-    use inf_server::TierFlushGauge as G;
-    let seed = scenario.seed;
-    let leg = shape.leg;
     let bound_ns = fair_turn_bound_ns(
         scenario.device.model_share,
         u64::from(shape.namespaces.get()),
@@ -1224,126 +1220,170 @@ fn tier_budget_scrape(
     }
     for cell in 0..usize::from(scenario.cells) {
         let Some(stats) = node.plane(cell).durable_stats() else {
-            report
-                .violations
-                .push(format!("TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: no durable plane"));
+            report.violations.push(format!(
+                "TIER BUDGET VACUOUS seed {:#x} cell {cell}: no durable plane",
+                scenario.seed
+            ));
             continue;
         };
-        let counted = stats.io_budget[IoClass::TierFlush.index()];
-        let observed = node.cells[cell].0.driver().observed_io();
-        let (queued_bytes, queued_ops) = node.cells[cell].0.driver().queued_tier_io();
-        let gauges = node.plane(cell).tier_flush_gauges();
-        let gauge = |slot: G| gauges[slot as usize];
-        let flushed = tier_budget_flushed(&node.plane(cell).keyspace(), shape);
-        if stats.io_budget_model_absent != 0 {
+        let record = tier_budget_cell(node, cell, shape, &stats);
+        tier_budget_vacuous(scenario, shape, stats.io_budget_model_absent, &record, report);
+        tier_budget_oracles(scenario, shape.leg, bound_ns, pass_bound, &record, report);
+        report.tier_budget_cells.push(record);
+    }
+}
+
+/// One cell's tier class at the cut: the budget's counters, the driver's
+/// observed and queued tier I/O, the turn's gauges and each namespace's
+/// watermarks.
+fn tier_budget_cell(
+    node: &Node,
+    cell: usize,
+    shape: TierBudgetShape,
+    stats: &inf_server::DurableStats,
+) -> TierBudgetCell {
+    use inf_runtime::IoClass;
+    use inf_server::TierFlushGauge as G;
+    let counted = stats.io_budget[IoClass::TierFlush.index()];
+    let observed = node.cells[cell].0.driver().observed_io();
+    let (queued_bytes, queued_ops) = node.cells[cell].0.driver().queued_tier_io();
+    let gauges = node.plane(cell).tier_flush_gauges();
+    let gauge = |slot: G| gauges[slot as usize];
+    TierBudgetCell {
+        cell: cell as u16,
+        unattainable: counted.unattainable,
+        deferrals: counted.deferrals,
+        spent_bytes: counted.spent_bytes,
+        spent_ops: counted.spent_ops,
+        overrun_bytes: counted.overrun_bytes,
+        driver_bytes: observed.bytes[IoClass::TierFlush.index()],
+        driver_ops: observed.ops[IoClass::TierFlush.index()],
+        queued_bytes,
+        queued_ops,
+        pass_bytes_max: observed.tier_pass_bytes_max,
+        pass_ops_max: observed.tier_pass_ops_max,
+        groups_deferred: gauge(G::GroupsDeferred),
+        group_wait_ns_max: gauge(G::GroupWaitNsMax),
+        turn_waits: gauge(G::TurnWaits),
+        turn_contended: gauge(G::TurnContended),
+        plan_waits: gauge(G::PlanWaits),
+        rounds_planned: gauge(G::RoundsPlanned),
+        write_retries: gauge(G::WriteRetries),
+        flushed: tier_budget_flushed(&node.plane(cell).keyspace(), shape),
+    }
+}
+
+/// The shape's engagement on one cell: the model present, the tier class
+/// offered, every namespace materialized and flushed, and on the retry
+/// arm a retry.
+fn tier_budget_vacuous(
+    scenario: &DurableScenario,
+    shape: TierBudgetShape,
+    model_absent: u64,
+    record: &TierBudgetCell,
+    report: &mut DurableReport,
+) {
+    let (seed, cell) = (scenario.seed, record.cell);
+    if model_absent != 0 {
+        report.violations.push(format!(
+            "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is absent"
+        ));
+    }
+    if record.spent_ops + record.deferrals + record.unattainable == 0 {
+        report.violations.push(format!(
+            "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the tier class never made an \
+             offer under the model"
+        ));
+    }
+    if record.flushed.len() != usize::from(shape.namespaces.get()) {
+        report.violations.push(format!(
+            "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: {} of {} tier-budget namespaces \
+             materialized",
+            record.flushed.len(),
+            shape.namespaces.get()
+        ));
+    }
+    for &(index, bytes, _, _) in &record.flushed {
+        if bytes == 0 {
             report.violations.push(format!(
-                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is absent"
+                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: namespace tb{index} never \
+                 advanced its flush watermark under the model"
             ));
         }
-        if counted.spent_ops + counted.deferrals + counted.unattainable == 0 {
-            report.violations.push(format!(
-                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the tier class never made an \
-                 offer under the model"
-            ));
-        }
-        if flushed.len() != usize::from(shape.namespaces.get()) {
-            report.violations.push(format!(
-                "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: {} of {} tier-budget \
-                 namespaces materialized",
-                flushed.len(),
-                shape.namespaces.get()
-            ));
-        }
-        for &(index, bytes, _, _) in &flushed {
-            if bytes == 0 {
-                report.violations.push(format!(
-                    "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: namespace tb{index} \
-                     never advanced its flush watermark under the model"
-                ));
-            }
-        }
-        // G1, attainable: no tier offer above the class cap, no overrun;
-        // and from the driver's own tally, one pass's tier bytes within
-        // the cap and the pool.
-        if counted.unattainable != 0 || counted.overrun_bytes != 0 {
-            report.violations.push(format!(
-                "TIER-CAP VIOLATION seed {seed:#x} cell {cell}: {} tier offer(s) above the class \
-                 cap, {} B issued by the overrun (no tier offer is above the cap)",
-                counted.unattainable, counted.overrun_bytes
-            ));
-        }
-        if observed.tier_pass_bytes_max > pass_bound {
-            report.violations.push(format!(
-                "TIER-PASS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} B of \
-                 tier writes, above the class cap plus the pool, {pass_bound} B from the model",
-                observed.tier_pass_bytes_max
-            ));
-        }
-        // G2, fair: no ready group waited past n × T_c.
-        let group_wait_ns_max = gauge(G::GroupWaitNsMax);
-        if group_wait_ns_max > bound_ns {
-            report.violations.push(format!(
-                "TIER-TURN VIOLATION seed {seed:#x} cell {cell}: a ready group waited \
-                 {group_wait_ns_max} ns, past n × T_c = {bound_ns} ns from the model"
-            ));
-        }
-        if leg.expects_contention() && (gauge(G::TurnWaits) == 0 || gauge(G::TurnContended) == 0) {
-            report.violations.push(format!(
-                "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
-                 contended {} time(s); the leg needs both",
-                gauge(G::TurnWaits),
-                gauge(G::TurnContended)
-            ));
-        }
-        // G3, exact charge: the spend is what the disk saw plus what the
-        // cut caught between push and submit.
-        let seen_bytes = observed.bytes[IoClass::TierFlush.index()] + queued_bytes;
-        let seen_ops = observed.ops[IoClass::TierFlush.index()] + queued_ops;
-        if counted.spent_bytes != seen_bytes || counted.spent_ops != seen_ops {
-            report.violations.push(format!(
-                "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: the budget spent {} B {} ops, \
-                 the driver saw {} B {} ops ({queued_bytes} B {queued_ops} ops queued at the cut)",
-                counted.spent_bytes, counted.spent_ops, seen_bytes, seen_ops
-            ));
-        }
-        // The control leg's reads (G4's count is judged per iteration by
-        // `TierTurnOracle`, its engagement in the recovered life).
-        if leg.is_control() && (gauge(G::TurnContended) != 0 || gauge(G::PlanWaits) != 0) {
-            report.violations.push(format!(
-                "TIER-CONTROL VIOLATION seed {seed:#x} cell {cell}: one namespace read \
-                 tier_turn_contended {} tier_plan_waits {}",
-                gauge(G::TurnContended),
-                gauge(G::PlanWaits)
-            ));
-        }
-        if scenario.plant == crate::net::Plant::TierWriteEio && gauge(G::WriteRetries) == 0 {
-            report.violations.push(format!(
-                "TIER-RETRY ARM VACUOUS seed {seed:#x} cell {cell}: the write fault was planted \
-                 and no tier write was retried"
-            ));
-        }
-        report.tier_budget_cells.push(TierBudgetCell {
-            cell: cell as u16,
-            unattainable: counted.unattainable,
-            deferrals: counted.deferrals,
-            spent_bytes: counted.spent_bytes,
-            spent_ops: counted.spent_ops,
-            overrun_bytes: counted.overrun_bytes,
-            driver_bytes: observed.bytes[IoClass::TierFlush.index()],
-            driver_ops: observed.ops[IoClass::TierFlush.index()],
-            queued_bytes,
-            queued_ops,
-            pass_bytes_max: observed.tier_pass_bytes_max,
-            pass_ops_max: observed.tier_pass_ops_max,
-            groups_deferred: gauge(G::GroupsDeferred),
-            group_wait_ns_max,
-            turn_waits: gauge(G::TurnWaits),
-            turn_contended: gauge(G::TurnContended),
-            plan_waits: gauge(G::PlanWaits),
-            rounds_planned: gauge(G::RoundsPlanned),
-            write_retries: gauge(G::WriteRetries),
-            flushed,
-        });
+    }
+    if scenario.plant == crate::net::Plant::TierWriteEio && record.write_retries == 0 {
+        report.violations.push(format!(
+            "TIER-RETRY ARM VACUOUS seed {seed:#x} cell {cell}: the write fault was planted and \
+             no tier write was retried"
+        ));
+    }
+}
+
+/// The tier class's oracles on one cell, each independent of the
+/// budget's code: no offer above the cap and no overrun, one driver
+/// entry's tier bytes within the cap and the pool, every ready group's
+/// wait within `n × T_c` (with the leg's engagement), the spend equal to
+/// the disk's tier bytes and ops with what a cut caught queued, and the
+/// control leg's reads.
+fn tier_budget_oracles(
+    scenario: &DurableScenario,
+    leg: TierBudgetLeg,
+    bound_ns: u64,
+    pass_bound: u64,
+    record: &TierBudgetCell,
+    report: &mut DurableReport,
+) {
+    let (seed, cell) = (scenario.seed, record.cell);
+    if record.unattainable != 0 || record.overrun_bytes != 0 {
+        report.violations.push(format!(
+            "TIER-CAP VIOLATION seed {seed:#x} cell {cell}: {} tier offer(s) above the class \
+             cap, {} B issued by the overrun (no tier offer is above the cap)",
+            record.unattainable, record.overrun_bytes
+        ));
+    }
+    if record.pass_bytes_max > pass_bound {
+        report.violations.push(format!(
+            "TIER-PASS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} B of \
+             tier writes, above the class cap plus the pool, {pass_bound} B from the model",
+            record.pass_bytes_max
+        ));
+    }
+    if record.group_wait_ns_max > bound_ns {
+        report.violations.push(format!(
+            "TIER-TURN VIOLATION seed {seed:#x} cell {cell}: a ready group waited {} ns, past \
+             n × T_c = {bound_ns} ns from the model",
+            record.group_wait_ns_max
+        ));
+    }
+    if leg.expects_contention() && (record.turn_waits == 0 || record.turn_contended == 0) {
+        report.violations.push(format!(
+            "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
+             contended {} time(s); the leg needs both",
+            record.turn_waits, record.turn_contended
+        ));
+    }
+    let seen_bytes = record.driver_bytes + record.queued_bytes;
+    let seen_ops = record.driver_ops + record.queued_ops;
+    if record.spent_bytes != seen_bytes || record.spent_ops != seen_ops {
+        report.violations.push(format!(
+            "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: the budget spent {} B {} ops, the \
+             driver saw {} B {} ops ({} B {} ops queued at the cut)",
+            record.spent_bytes,
+            record.spent_ops,
+            seen_bytes,
+            seen_ops,
+            record.queued_bytes,
+            record.queued_ops
+        ));
+    }
+    // G4's count is judged per iteration by `TierTurnOracle`, its
+    // engagement in the recovered life.
+    if leg.is_control() && (record.turn_contended != 0 || record.plan_waits != 0) {
+        report.violations.push(format!(
+            "TIER-CONTROL VIOLATION seed {seed:#x} cell {cell}: one namespace read \
+             tier_turn_contended {} tier_plan_waits {}",
+            record.turn_contended, record.plan_waits
+        ));
     }
 }
 
