@@ -24,12 +24,13 @@
 //!   never a number.
 //! - **Liveness, with its planted red.** Over a leg, the server's
 //!   `tiering_blob_extents_created` must rise by the acknowledged `SET`s,
-//!   within the connections (an extent whose reply the deadline cut off),
-//!   else the leg is `VACUOUS`; every reply must be `+OK`, else the leg is
-//!   red. `--plant blob-threshold-above` creates the namespace with a
-//!   threshold above the value size, so no extent is created and the run
-//!   must exit `VACUOUS`; `--plant reply-err` feeds the reply path a
-//!   fixture stream holding one `-ERR`, and the run must exit red.
+//!   the warm-up's counted beside the window's, within the connections
+//!   (an extent whose reply the deadline cut off), else the leg is
+//!   `VACUOUS`; every reply must be `+OK`, in the warm-up too, else the
+//!   leg is red. `--plant blob-threshold-above` creates the namespace
+//!   with a threshold above the value size, so no extent is created and
+//!   the run must exit `VACUOUS`; `--plant reply-err` feeds the reply
+//!   path a fixture stream holding one `-ERR`, and the run must exit red.
 //!
 //! The report labels its tier: without `--reference-box` every number is
 //! dev-tier, disclosed and never published.
@@ -121,8 +122,10 @@ struct Leg {
     conns: usize,
     replicate: usize,
     acked: u64,
+    /// `+OK` replies to commands sent before the window: no part of `X`,
+    /// but extents the liveness clause expects.
+    warmup_acked: u64,
     errors: u64,
-    warmup: Duration,
     window: Duration,
     hist_us: FineHistogram,
     extents_before: Option<u64>,
@@ -137,41 +140,62 @@ impl Leg {
     }
 }
 
+/// Which part of the leg a command was sent in, by its send instant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    WarmUp,
+    Window,
+}
+
 /// One connection's share of a leg: its acknowledged `SET`s inside the
-/// window, every non-`+OK` reply, and its latencies.
+/// window and before it, every non-`+OK` reply, and its latencies.
 struct ConnResult {
     acked: u64,
+    warmup_acked: u64,
     errors: u64,
     first_error: Option<String>,
     hist_us: FineHistogram,
 }
 
-/// Classifies one reply of the closed loop: `+OK` is an acknowledgement,
-/// anything else an error carried whole. The plant's fixture stream goes
-/// through this same function.
-fn classify_reply(reply: &[u8]) -> Result<(), String> {
-    if reply == b"+OK\r\n" {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(reply).trim_end().to_string())
+impl ConnResult {
+    fn new() -> ConnResult {
+        ConnResult {
+            acked: 0,
+            warmup_acked: 0,
+            errors: 0,
+            first_error: None,
+            hist_us: FineHistogram::new(),
+        }
     }
-}
 
-/// Consumes every whole reply at the front of `rx`, classifying each.
-/// Returns `(acked, errors, first error)`.
-fn drain_replies(rx: &mut Vec<u8>) -> (u64, u64, Option<String>) {
-    let (mut acked, mut errors, mut first) = (0u64, 0u64, None);
-    while let Some(n) = reply_len(rx) {
-        let reply: Vec<u8> = rx.drain(..n).collect();
-        match classify_reply(&reply) {
-            Ok(()) => acked += 1,
-            Err(text) => {
-                errors += 1;
-                first.get_or_insert(text);
+    /// Accounts one reply of the closed loop: `+OK` is an acknowledgement,
+    /// counted in its phase with its latency recorded only in the window;
+    /// anything else is an error carried whole, in either phase.
+    fn account(&mut self, reply: &[u8], phase: Phase, latency_us: u64) {
+        if reply != b"+OK\r\n" {
+            self.errors += 1;
+            self.first_error
+                .get_or_insert_with(|| String::from_utf8_lossy(reply).trim_end().to_string());
+            return;
+        }
+        match phase {
+            Phase::WarmUp => self.warmup_acked += 1,
+            Phase::Window => {
+                self.acked += 1;
+                self.hist_us.record(latency_us);
             }
         }
     }
-    (acked, errors, first)
+}
+
+/// Consumes every whole reply at the front of `rx` into `result`, each
+/// in `phase` with `latency_us`. The one reply loop: the connections
+/// and the plant's fixture stream both pass through it.
+fn drain_replies(rx: &mut Vec<u8>, result: &mut ConnResult, phase: Phase, latency_us: u64) {
+    while let Some(n) = reply_len(rx) {
+        let reply: Vec<u8> = rx.drain(..n).collect();
+        result.account(&reply, phase, latency_us);
+    }
 }
 
 /// One closed-loop connection: `USE`, then `SET`s with one in flight until
@@ -185,10 +209,11 @@ fn run_conn(
 ) -> Result<ConnResult, String> {
     let mut stream = connect("127.0.0.1", port)?;
     let reply = request(&mut stream, &[b"INF.NS", b"USE", NAMESPACE])?;
-    classify_reply(&reply).map_err(|e| format!("USE on connection {index}: {e}"))?;
+    if reply != b"+OK\r\n" {
+        return Err(format!("USE on connection {index}: {}", String::from_utf8_lossy(&reply)));
+    }
     let value = vec![0xABu8; value_size];
-    let mut result =
-        ConnResult { acked: 0, errors: 0, first_error: None, hist_us: FineHistogram::new() };
+    let mut result = ConnResult::new();
     let mut rx: Vec<u8> = Vec::with_capacity(256);
     let mut chunk = [0u8; 4096];
     let mut ordinal = 0u64;
@@ -204,32 +229,17 @@ fn run_conn(
             .write_all(&encode_command(&[b"SET", key.as_bytes(), &value]))
             .map_err(|e| format!("write: {e}"))?;
         let sent = Instant::now();
-        let reply = loop {
-            if let Some(n) = reply_len(&rx) {
-                break rx.drain(..n).collect::<Vec<u8>>();
-            }
+        let phase = if sent < warmup_end { Phase::WarmUp } else { Phase::Window };
+        // One command in flight: the next whole reply is its reply.
+        while reply_len(&rx).is_none() {
             let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
             if n == 0 {
                 return Err(format!("connection {index}: closed mid-reply"));
             }
             rx.extend_from_slice(&chunk[..n]);
-        };
-        let done = Instant::now();
-        let outcome = classify_reply(&reply);
-        if sent < warmup_end {
-            continue;
         }
-        match outcome {
-            Ok(()) => {
-                result.acked += 1;
-                let us = u64::try_from(done.duration_since(sent).as_micros()).unwrap_or(u64::MAX);
-                result.hist_us.record(us);
-            }
-            Err(text) => {
-                result.errors += 1;
-                result.first_error.get_or_insert(text);
-            }
-        }
+        let latency_us = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
+        drain_replies(&mut rx, &mut result, phase, latency_us);
     }
     Ok(result)
 }
@@ -350,8 +360,8 @@ fn run_leg(
         conns,
         replicate,
         acked: 0,
+        warmup_acked: 0,
         errors: 0,
-        warmup: spec.warmup,
         window: spec.window,
         hist_us: FineHistogram::new(),
         extents_before,
@@ -363,6 +373,7 @@ fn run_leg(
     for result in results {
         let result = result?;
         leg.acked += result.acked;
+        leg.warmup_acked += result.warmup_acked;
         leg.errors += result.errors;
         leg.hist_us.merge(&result.hist_us);
         if first_error.is_none() {
@@ -391,23 +402,18 @@ fn verdict_of(leg: &Leg, first_error: Option<&str>) -> LegVerdict {
         return LegVerdict::Vacuous("tiering_blob_extents_created is absent from INFO".into());
     };
     let created = after.saturating_sub(before);
-    // Every acknowledged SET created an extent; the warm-up's and the
-    // deadline's in-flight commands (at most the connections) are the
-    // slack between the counter and the window's count.
-    if created < leg.acked || created > leg.acked + 2 * leg.conns as u64 + warmup_slack(leg) {
+    // Every acknowledged SET, the warm-up's included, created an extent;
+    // a command whose reply the deadline cut off (at most one per
+    // connection) is the slack between the counter and the counts.
+    let acknowledged = leg.acked + leg.warmup_acked;
+    if created < acknowledged || created > acknowledged + leg.conns as u64 {
         return LegVerdict::Vacuous(format!(
-            "extents created {created} does not confirm {} acknowledged SETs within the \
-             connections ({})",
-            leg.acked, leg.conns
+            "extents created {created} does not confirm {acknowledged} acknowledged SETs ({} in \
+             the window, {} in the warm-up) within the connections ({})",
+            leg.acked, leg.warmup_acked, leg.conns
         ));
     }
     LegVerdict::Measured
-}
-
-/// The warm-up's acknowledged `SET`s also created extents: bounded by what
-/// the window's rate would have produced over the warm-up, doubled.
-fn warmup_slack(leg: &Leg) -> u64 {
-    (2.0 * leg.throughput() * leg.warmup.as_secs_f64()) as u64 + 1
 }
 
 /// A point of the curve: both legs over every replicate, and the spread
@@ -590,22 +596,23 @@ fn plant_reply_err() -> Result<(), String> {
     }
     rx.extend_from_slice(b"-ERR fixture: one refused SET\r\n");
     rx.extend_from_slice(b"+OK\r\n");
-    let (acked, errors, first) = drain_replies(&mut rx);
+    let mut result = ConnResult::new();
+    drain_replies(&mut rx, &mut result, Phase::Window, 0);
     let leg = Leg {
         name: "a",
         conns: 1,
         replicate: 0,
-        acked,
-        errors,
-        warmup: Duration::ZERO,
+        acked: result.acked,
+        warmup_acked: 0,
+        errors: result.errors,
         window: Duration::from_secs(1),
-        hist_us: FineHistogram::new(),
+        hist_us: result.hist_us,
         extents_before: Some(0),
-        extents_after: Some(acked),
+        extents_after: Some(result.acked),
         counters: BTreeMap::new(),
         verdict: LegVerdict::Measured,
     };
-    match verdict_of(&leg, first.as_deref()) {
+    match verdict_of(&leg, result.first_error.as_deref()) {
         LegVerdict::Red(why) => {
             println!("blob-set: plant reply-err: red as planted ({why})");
             Err("plant reply-err: the run is red".into())
@@ -771,8 +778,8 @@ mod tests {
             conns: 4,
             replicate: 0,
             acked,
+            warmup_acked: 0,
             errors,
-            warmup: Duration::ZERO,
             window: Duration::from_secs(10),
             hist_us: FineHistogram::new(),
             extents_before: before,
@@ -782,17 +789,49 @@ mod tests {
         }
     }
 
-    /// The liveness clause: the extent counter confirms the count within
-    /// the connections and the warm-up's share; fewer is vacuous.
+    /// The liveness clause: the extent counter confirms the window's and
+    /// the warm-up's acknowledged count within the connections; fewer, or
+    /// more than that, is vacuous.
     #[test]
-    fn extents_below_the_acknowledged_count_are_vacuous() {
+    fn extents_outside_the_acknowledged_count_are_vacuous() {
         assert_eq!(verdict_of(&leg(100, 0, Some(0), Some(100)), None), LegVerdict::Measured);
         assert_eq!(verdict_of(&leg(100, 0, Some(0), Some(104)), None), LegVerdict::Measured);
         assert!(matches!(
             verdict_of(&leg(100, 0, Some(0), Some(99)), None),
             LegVerdict::Vacuous(_)
         ));
+        assert!(matches!(
+            verdict_of(&leg(100, 0, Some(0), Some(105)), None),
+            LegVerdict::Vacuous(_)
+        ));
         assert!(matches!(verdict_of(&leg(100, 0, None, Some(100)), None), LegVerdict::Vacuous(_)));
+        let mut warmed = leg(100, 0, Some(0), Some(130));
+        warmed.warmup_acked = 30;
+        assert_eq!(verdict_of(&warmed, None), LegVerdict::Measured);
+        warmed.extents_after = Some(100);
+        assert!(matches!(verdict_of(&warmed, None), LegVerdict::Vacuous(_)));
+    }
+
+    /// Every reply passes through the one loop: an ack in the warm-up is
+    /// counted there without a latency, an ack in the window with one,
+    /// and an error is red in either phase.
+    #[test]
+    fn replies_are_accounted_by_phase_and_errors_in_both() {
+        let mut result = ConnResult::new();
+        let mut rx = b"+OK\r\n+OK\r\n".to_vec();
+        drain_replies(&mut rx, &mut result, Phase::WarmUp, 500);
+        assert_eq!((result.acked, result.warmup_acked, result.hist_us.count()), (0, 2, 0));
+        let mut rx = b"+OK\r\n".to_vec();
+        drain_replies(&mut rx, &mut result, Phase::Window, 700);
+        assert_eq!((result.acked, result.warmup_acked, result.hist_us.count()), (1, 2, 1));
+        let mut rx = b"-ERR warm\r\n".to_vec();
+        drain_replies(&mut rx, &mut result, Phase::WarmUp, 0);
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.first_error.as_deref(), Some("-ERR warm"));
+        let mut rx = b"+OK\r\n+O".to_vec();
+        drain_replies(&mut rx, &mut result, Phase::Window, 0);
+        assert_eq!(rx, b"+O", "a partial reply stays at the front");
+        assert_eq!(result.acked, 2);
     }
 
     /// The planted threshold above the value size creates no extent: the
@@ -806,11 +845,15 @@ mod tests {
     #[test]
     fn one_error_reply_is_red() {
         let mut rx = b"+OK\r\n-ERR nope\r\n+OK\r\n".to_vec();
-        let (acked, errors, first) = drain_replies(&mut rx);
-        assert_eq!((acked, errors), (2, 1));
-        assert_eq!(first.as_deref(), Some("-ERR nope"));
+        let mut result = ConnResult::new();
+        drain_replies(&mut rx, &mut result, Phase::Window, 0);
+        assert_eq!((result.acked, result.errors), (2, 1));
+        assert_eq!(result.first_error.as_deref(), Some("-ERR nope"));
         assert!(matches!(
-            verdict_of(&leg(acked, errors, Some(0), Some(2)), first.as_deref()),
+            verdict_of(
+                &leg(result.acked, result.errors, Some(0), Some(2)),
+                result.first_error.as_deref()
+            ),
             LegVerdict::Red(_)
         ));
     }
