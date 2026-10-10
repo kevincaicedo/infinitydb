@@ -4902,19 +4902,22 @@ fn a_checkpoint_holding_a_value_above_the_class_cap_completes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Creates R3's tiered namespace `t` (ADR-0170): `MEM-BUDGET 4mb`, a
-/// `MAINTAIN-SLICE` of 8 MiB — above the 20 MB/s share's tier cap plus
-/// pool — and a 20 s `TAIL-STALL-TIMEOUT`, above `T_tier(8 MiB)` at D4's
-/// floor rate (share / 20 = 1 MB/s) with a round's bytes staged past its
-/// slice `C_tier ≤ 3 MiB` (ADR-0170 D4, A2): (7 340 032 + 3 145 728 +
-/// 1 048 576 + 3 145 728 + 3) / 10⁶ s + 2Δ ≈ 14.7 s. Returns a connection
-/// on cell 0 using `t`, reading with a 60 s timeout.
+/// Creates R3's tiered namespace `t` (ADR-0178): `MEM-BUDGET 4mb`, a
+/// `MAINTAIN-SLICE` of 8 MiB — eight full groups a round, above the
+/// 20 MB/s share's tier cap plus pool, so the groups wait for refills —
+/// and a `TAIL-STALL-TIMEOUT` derived from the fair turn's bound for a
+/// round of that slice (`round_bound_ms`): 11 groups × `n × T_c` at one
+/// namespace, 13.7 s here. Returns a connection on cell 0 using `t`,
+/// reading with a 60 s timeout.
 fn overrun_tier_namespace(node: &Node) -> TcpStream {
-    tier_namespace_with_slice(node, b"8mb")
+    tier_namespace_with_slice(node, b"8mb", 8 << 20)
 }
 
-/// R3's namespace `t` with `MAINTAIN-SLICE slice`.
-fn tier_namespace_with_slice(node: &Node, slice: &[u8]) -> TcpStream {
+/// R3's namespace `t` with `MAINTAIN-SLICE slice` (`slice_bytes` the same
+/// value), its tail-stall timeout the fair turn's bound for one round of
+/// that slice at one namespace on the overrun-shape model.
+fn tier_namespace_with_slice(node: &Node, slice: &[u8], slice_bytes: u64) -> TcpStream {
+    let timeout_ms = round_bound_ms(overrun_test_model(), 2, 1, slice_bytes);
     let mut c = conn_on_cell(node, 0);
     c.write_all(&cmd(&[
         b"INF.NS",
@@ -4927,7 +4930,7 @@ fn tier_namespace_with_slice(node: &Node, slice: &[u8]) -> TcpStream {
         b"MAINTAIN-SLICE",
         slice,
         b"TAIL-STALL-TIMEOUT",
-        b"20000",
+        timeout_ms.to_string().as_bytes(),
     ]))
     .expect("write");
     read_exactly(&mut c, b"+OK\r\n");
@@ -4935,6 +4938,45 @@ fn tier_namespace_with_slice(node: &Node, slice: &[u8]) -> TcpStream {
     let c = conn_on_cell_use(node, 0, b"t");
     c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
     c
+}
+
+/// The fair turn's bound for one ready group of a tier namespace among
+/// `namespaces` on a cell, `n × T_c`, in milliseconds, from the model
+/// alone: `T_c = max over the budgeted axes of (B + 3) / r + 2Δ`, `B` one
+/// group (1 MiB, 64 ops), `r` the tier class's floor share of the cell's
+/// share (one twentieth: the eighth floor times the class's four of ten
+/// weights), `Δ` the longest interval between two MAINTAIN entries (the
+/// reactor's park ceiling). A fair build issues every ready group inside
+/// it; the gauge `tier_group_wait_ns_max` reads the longest wait.
+fn fair_turn_bound_ms(model: inf_runtime::DeviceModel, cells: u16, namespaces: u64) -> u64 {
+    const GROUP_BYTES: u64 = 1 << 20;
+    const GROUP_OPS: u64 = 64;
+    const PARK_CEILING_MS: u64 = 100;
+    let axis = |rate_per_s: u64, group: u64| -> u64 {
+        let floor_share = rate_per_s / u64::from(cells) / 20;
+        assert!(floor_share > 0, "the model's share at {cells} cells floors to zero");
+        ((group + 3) * 1_000).div_ceil(floor_share) + 2 * PARK_CEILING_MS
+    };
+    let t_c_ms =
+        axis(model.write_bytes_per_s, GROUP_BYTES).max(axis(model.write_ops_per_s, GROUP_OPS));
+    namespaces * t_c_ms
+}
+
+/// The bound on a parked writer's wait behind one round of
+/// `slice_bytes`: the round's groups — one per full batch, the file's
+/// header and tail writes, the barrier group — each issued within
+/// `n × T_c`. Capped at the largest `TAIL-STALL-TIMEOUT` a namespace
+/// accepts (60 s), which a leg's printout discloses when it binds: the
+/// leg's verdict is then stricter than the bound, never looser.
+fn round_bound_ms(
+    model: inf_runtime::DeviceModel,
+    cells: u16,
+    namespaces: u64,
+    slice_bytes: u64,
+) -> u64 {
+    const TAIL_STALL_TIMEOUT_MS_MAX: u64 = 60_000;
+    let groups = slice_bytes.div_ceil(1 << 20) + 3;
+    (groups * fair_turn_bound_ms(model, cells, namespaces)).min(TAIL_STALL_TIMEOUT_MS_MAX)
 }
 
 /// Writes `count` 64 KiB values to cell 0 of `t`, each acknowledged `+OK`.
@@ -4961,10 +5003,13 @@ fn wait_tier_round_completed(c: &mut TcpStream) {
     }
 }
 
-/// R3 (ADR-0170): a tier round of `MAINTAIN-SLICE 8mb` — above the tier
-/// cap plus the pool — is issued by an overrun. Before it, the round was
-/// deferred on every pass, nothing flushed, and the first write the full
-/// ring parked waited out the tail-stall timeout.
+/// R3 (ADR-0178 D3's tier row, D4's deviation table): a tier round of
+/// `MAINTAIN-SLICE 8mb` — eight full batches above the tier cap plus the
+/// pool — is issued in groups of at most one group's bytes and ops, each
+/// offered at its exact size, so no tier offer is above the class cap
+/// and the groups wait for refills. Before the groups, the round was
+/// offered whole and issued by the overrun, which the counter read as an
+/// unattainable offer.
 #[test]
 fn a_tier_round_above_the_class_cap_is_issued() {
     let dir = temp_data_dir("tier-overrun");
@@ -4974,61 +5019,67 @@ fn a_tier_round_above_the_class_cap_is_issued() {
     fill_tier_cell0(&mut c, 384);
     wait_tier_round_completed(&mut c);
     let info = info_text(&mut c, b"persistence");
+    assert_eq!(
+        info_field(&info, "io_budget_unattainable_tier_flush"),
+        0,
+        "no tier offer is above the class cap: {info}"
+    );
+    assert_eq!(info_field(&info, "io_budget_overrun_bytes_tier_flush"), 0, "{info}");
     assert!(
-        info_field(&info, "io_budget_unattainable_tier_flush") >= 1,
-        "engagement: the round was above the class cap: {info}"
+        info_field(&info, "io_budget_deferrals_tier_flush") >= 1,
+        "engagement: a group waited for a refill: {info}"
     );
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// ADR-0170 D2 and I10 at the wire: a tier round stages past its slice
-/// whenever the next seal cut lies beyond it — every round here, since a
-/// 512 KiB record is one cut and `MAINTAIN-SLICE` is 64 KiB — and the
-/// tier class's `spent` counts every staged byte. Without the charge each
-/// round counted its 64 KiB offer while the device wrote the record:
-/// eight times its grant, unmetered. Tiering is read before the budget,
-/// so every byte counted as flushed was staged before `spent` is read.
+/// ADR-0178 I10 at the wire: the tier class's spend is the device bytes
+/// its rounds wrote — the file header, every frame write and the footer,
+/// which `tiering_flush_bytes` counts as the pipeline stages them — read
+/// once every round has completed and nothing was retried (a retry is
+/// spent twice and staged once). Before the groups, the class counted the
+/// record bytes a round staged, below the device bytes by the frames'
+/// headers and trailers.
 #[test]
-fn a_tier_round_staged_past_its_slice_counts_every_byte() {
-    const SLICE: u64 = 64 << 10;
-    let dir = temp_data_dir("tier-past-slice");
+fn a_tier_rounds_spend_is_the_device_bytes_it_wrote() {
+    let dir = temp_data_dir("tier-spend-device-bytes");
     let node = Node::start_durable_with_device_model(2, &dir, overrun_test_model());
-    let mut c = tier_namespace_with_slice(&node, b"64kb");
+    let mut c = tier_namespace_with_slice(&node, b"64kb", 64 << 10);
     let value = vec![b'x'; 512 << 10];
     // 8 MiB on cell 0: 4 MiB past MEM-BUDGET, so at least 3 MiB flushes.
-    for key in keys_on_cell(2, 0, "past-slice", 16) {
+    for key in keys_on_cell(2, 0, "spend-device", 16) {
         c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
         read_exactly(&mut c, b"+OK\r\n");
     }
     let deadline = Instant::now() + Duration::from_secs(20);
-    let (rounds, flushed) = loop {
+    let flush_bytes = loop {
         let tiering = info_text(&mut c, b"tiering");
         let confirmed = info_field(&tiering, "tiering_flush_confirmed_bytes");
         let holes = info_field(&tiering, "tiering_seal_hole_bytes");
         let flushed = confirmed.saturating_sub(holes);
-        if flushed >= 3 << 20 {
-            break (info_field(&tiering, "tiering_flush_rounds"), flushed);
+        if flushed >= 3 << 20 && info_field(&tiering, "tiering_flush_rounds_inflight") == 0 {
+            assert_eq!(info_field(&tiering, "tiering_flush_write_retries"), 0, "{tiering}");
+            break info_field(&tiering, "tiering_flush_bytes");
         }
         assert!(Instant::now() < deadline, "the flush stalled: {tiering}");
         #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(flushed > rounds * SLICE, "engagement: {rounds} rounds flushed {flushed} B");
     let info = info_text(&mut c, b"persistence");
     let spent = info_field(&info, "io_budget_bytes_tier_flush");
-    assert!(spent >= flushed, "tier spent {spent} B, flushed {flushed} B (ADR-0170 I10): {info}");
+    assert!(flush_bytes >= 3 << 20, "engagement: {flush_bytes} B of tier files written");
+    assert_eq!(spent, flush_bytes, "tier spent {spent} B, device {flush_bytes} B: {info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// R5 (ADR-0170 D3): a tiered namespace with nothing to flush makes no
-/// tier offer. Before the gate, an idle namespace offered its whole slice
-/// on every pass — deferred every time at `MAINTAIN-SLICE 8mb` — and the
-/// budget's rule alone would overrun on every rested pass and refund.
-/// Then the gate opens on work: R3's writes are issued.
+/// R5 (ADR-0178 D3): a tiered namespace with nothing to flush makes no
+/// tier offer — nothing at the cursor means no plan and no group. Before
+/// the gate, an idle namespace offered its whole slice on every pass.
+/// Then the gate opens on work: R3's writes are issued in groups, none
+/// above the cap, some waiting for a refill.
 #[test]
 fn an_idle_tiered_namespace_makes_no_tier_offer() {
     let dir = temp_data_dir("tier-idle-offer");
@@ -5046,10 +5097,222 @@ fn an_idle_tiered_namespace_makes_no_tier_offer() {
     fill_tier_cell0(&mut c, 192);
     wait_tier_round_completed(&mut c);
     let info = info_text(&mut c, b"persistence");
-    assert!(info_field(&info, "io_budget_unattainable_tier_flush") >= 1, "{info}");
+    assert_eq!(info_field(&info, "io_budget_unattainable_tier_flush"), 0, "{info}");
+    assert!(info_field(&info, "io_budget_deferrals_tier_flush") >= 1, "{info}");
     drop(c);
     node.stop();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- R3-exit: two tiered namespaces on one cell under a device model ----
+
+/// The reference box's model (489 MB/s, 40,000 ops/s) at the share a
+/// cell holds among 256, carried by this two-cell node: the hostile share
+/// of the design's device-model row.
+fn reference_share_at_256_cells() -> inf_runtime::DeviceModel {
+    inf_runtime::DeviceModel {
+        write_bytes_per_s: 489_000_000 / 128,
+        write_ops_per_s: 40_000 / 128,
+        read_bytes_per_s: 489_000_000 / 128,
+        read_ops_per_s: 40_000 / 128,
+    }
+}
+
+/// Creates the tiered namespace `name` on `node`'s cell 0 at
+/// `MAINTAIN-SLICE slice` with a 4 MiB window and `TAIL-STALL-TIMEOUT
+/// timeout_ms` (1..=60000), acknowledged `+OK`.
+fn create_tier_namespace(node: &Node, name: &[u8], slice: &[u8], timeout_ms: u64) {
+    assert!((1..=60_000).contains(&timeout_ms), "TAIL-STALL-TIMEOUT {timeout_ms} is 1..=60000");
+    let mut c = conn_on_cell(node, 0);
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        name,
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"4mb",
+        b"MAINTAIN-SLICE",
+        slice,
+        b"TAIL-STALL-TIMEOUT",
+        timeout_ms.to_string().as_bytes(),
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+}
+
+/// Writes `count` 64 KiB values over `c`, a connection on cell 0 that
+/// selected `ns`, `pause` between writes, each expected `+OK`:
+/// `Ok(acked)`, or the first reply that was not `+OK` with the count
+/// acknowledged before it and the longest reply wait seen, in ms.
+fn fill_tier_namespace(
+    mut c: TcpStream,
+    ns: &[u8],
+    prefix: &str,
+    count: usize,
+    pause: Duration,
+) -> Result<(usize, u128), String> {
+    c.set_read_timeout(Some(Duration::from_secs(90))).expect("timeout");
+    let value = vec![b'x'; 64 << 10];
+    let mut acked = 0usize;
+    let mut longest_wait_ms = 0u128;
+    for key in keys_on_cell(2, 0, prefix, count) {
+        c.write_all(&cmd(&[b"SET", &key, &value])).expect("write");
+        let sent = Instant::now();
+        let reply = read_line(&mut c);
+        longest_wait_ms = longest_wait_ms.max(sent.elapsed().as_millis());
+        if reply != b"+OK\r\n" {
+            return Err(format!(
+                "{}: write {acked} answered {:?} after {} ms (the longest wait before it: \
+                 {longest_wait_ms} ms)",
+                String::from_utf8_lossy(ns),
+                String::from_utf8_lossy(&reply),
+                sent.elapsed().as_millis()
+            ));
+        }
+        acked += 1;
+        if !pause.is_zero() {
+            #[allow(clippy::disallowed_methods, reason = "test harness thread, not cell code")]
+            std::thread::sleep(pause);
+        }
+    }
+    Ok((acked, longest_wait_ms))
+}
+
+/// One leg's shape: the model, how many 64 KiB writes each namespace
+/// makes, and the pause between the light namespace's writes.
+struct TierExitLeg {
+    tag: &'static str,
+    model: inf_runtime::DeviceModel,
+    heavy_writes: usize,
+    light_writes: usize,
+    light_pause: Duration,
+}
+
+/// Two tiered namespaces on cell 0 under `leg.model`, `t8` at
+/// `MAINTAIN-SLICE 8mb` (the heavy one, created first, the lower id) and
+/// `t1` at `1mb`, written at once: every write of both is acknowledged
+/// `+OK`, and no ready group waited past the fair turn's bound. Each
+/// namespace's tail-stall timeout is the bound on one of its rounds
+/// behind the other's groups (`round_bound_ms`), so a `-STALLED` reply
+/// from either is a ready round that waited past the bound: the reply a
+/// starved namespace gives, whichever one the visit order starves.
+fn two_tiered_namespaces_acknowledge_every_write(leg: &TierExitLeg) {
+    let group_bound_ms = fair_turn_bound_ms(leg.model, 2, 2);
+    let heavy_timeout_ms = round_bound_ms(leg.model, 2, 2, 8 << 20);
+    let light_timeout_ms = round_bound_ms(leg.model, 2, 2, 1 << 20);
+    println!(
+        "\nleg {}: n × T_c = {group_bound_ms} ms; TAIL-STALL-TIMEOUT t8 {heavy_timeout_ms} ms, \
+         t1 {light_timeout_ms} ms (60000 is the configurable maximum, below the bound)",
+        leg.tag
+    );
+    let dir = temp_data_dir(leg.tag);
+    let node = Node::start_durable_with_device_model(2, &dir, leg.model);
+    create_tier_namespace(&node, b"t8", b"8mb", heavy_timeout_ms);
+    create_tier_namespace(&node, b"t1", b"1mb", light_timeout_ms);
+    // The connections are opened here: the node handle stays on this
+    // thread, each writer owns its own stream.
+    let heavy_conn = conn_on_cell_use(&node, 0, b"t8");
+    let light_conn = conn_on_cell_use(&node, 0, b"t1");
+    let (heavy, light) = std::thread::scope(|scope| {
+        let heavy = scope.spawn(|| {
+            fill_tier_namespace(heavy_conn, b"t8", "exit8", leg.heavy_writes, Duration::ZERO)
+        });
+        let light = scope.spawn(|| {
+            fill_tier_namespace(light_conn, b"t1", "exit1", leg.light_writes, leg.light_pause)
+        });
+        (heavy.join().expect("thread"), light.join().expect("thread"))
+    });
+    // The tier class, the turn and the flush as cell 0 reports them
+    // after the fills (printed, so a run's regime is visible beside its
+    // verdict).
+    let mut probe = conn_on_cell(&node, 0);
+    let persistence = info_text(&mut probe, b"persistence");
+    let tiering = info_text(&mut probe, b"tiering");
+    let model = persistence
+        .lines()
+        .find(|line| line.starts_with("io_budget_model:"))
+        .unwrap_or("io_budget_model: missing");
+    println!("cell 0 {model}");
+    for field in [
+        "io_budget_write_bytes_per_s",
+        "io_budget_unattainable_tier_flush",
+        "io_budget_deferrals_tier_flush",
+        "io_budget_bytes_tier_flush",
+        "io_budget_overrun_bytes_tier_flush",
+    ] {
+        println!("cell 0 {field}:{}", info_field(&persistence, field));
+    }
+    for field in [
+        "tiering_flush_rounds",
+        "tier_flush_groups_deferred",
+        "tier_group_wait_ns_max",
+        "tier_turn_waits",
+        "tier_turn_contended",
+        "tier_rounds_planned",
+        "tiering_tail_alloc_stalls",
+    ] {
+        println!("cell 0 {field}:{}", info_field(&tiering, field));
+    }
+    println!("t8 {heavy:?}; t1 {light:?} (acked, longest wait ms)");
+    let group_wait_ns_max = info_field(&tiering, "tier_group_wait_ns_max");
+    let unattainable = info_field(&persistence, "io_budget_unattainable_tier_flush");
+    drop(probe);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(heavy.is_ok(), "every write of the 8mb namespace is acknowledged: t8 {heavy:?}");
+    assert!(light.is_ok(), "every write of the 1mb namespace is acknowledged: t1 {light:?}");
+    assert_eq!(unattainable, 0, "no tier offer is above the class cap");
+    assert!(
+        group_wait_ns_max <= group_bound_ms * 1_000_000,
+        "a ready group waited {group_wait_ns_max} ns, past n × T_c = {group_bound_ms} ms"
+    );
+}
+
+/// R3-exit, leg one (ADR-0178 D4's deviation table): both namespaces
+/// with sustained backlogs on the overrun-shape model (40 MB/s, 20 MB/s
+/// a cell); the heavy one's lasts at least ten bounds (192 MiB at about
+/// 8 MB/s).
+#[test]
+fn two_backlogged_tiered_namespaces_on_one_cell_acknowledge_every_write() {
+    two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
+        tag: "tier-exit-backlogs",
+        model: overrun_test_model(),
+        heavy_writes: 3_072,
+        light_writes: 384,
+        light_pause: Duration::ZERO,
+    });
+}
+
+/// R3-exit, leg two: the `1mb` namespace under a light steady load
+/// beside the `8mb` one's backlog.
+#[test]
+fn a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write() {
+    two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
+        tag: "tier-exit-light",
+        model: overrun_test_model(),
+        heavy_writes: 3_072,
+        light_writes: 384,
+        light_pause: Duration::from_millis(100),
+    });
+}
+
+/// Leg three, the hostile share: both backlogged at a cell's share of the
+/// reference box among 256 (1.9 MB/s), where `n × T_c` is about 22 s and
+/// a round's bound passes the configurable timeout maximum. Before the
+/// turn, the `8mb` namespace's offer needed the overrun, the overrun
+/// needed a refill interval in which nothing of the class drew, and the
+/// `1mb` namespace's round outlasted every interval, so the `8mb` one
+/// waited for the other's whole backlog and timed out.
+#[test]
+fn two_backlogged_tiered_namespaces_at_the_256_cell_share_acknowledge_every_write() {
+    two_tiered_namespaces_acknowledge_every_write(&TierExitLeg {
+        tag: "tier-exit-256-share",
+        model: reference_share_at_256_cells(),
+        heavy_writes: 192,
+        light_writes: 96,
+        light_pause: Duration::ZERO,
+    });
 }
 
 /// Numeric INFO field (first match — single-cell tests).
