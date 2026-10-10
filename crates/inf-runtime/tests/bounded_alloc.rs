@@ -37,7 +37,7 @@ fn no_allocator_call_after_live_across_churn() {
     let mut entries = CappedDeque::<u64, Reserve>::new(ENTRIES, &census).expect("built");
     let mut marks = CappedDeque::<Mark, Coalesce<Later>>::new(MARKS, &census).expect("built");
     let before = ALLOC.thread_allocations();
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..CHURN {
         // Fill past the cap, drain by a third, merge: every path of both
         // crossings, reaching Full and the merge arm on every pass.
@@ -46,8 +46,8 @@ fn no_allocator_call_after_live_across_churn() {
         }
         marks.push(Mark(i));
         if i % 3 == 0 {
-            acc ^= entries.pop_front().unwrap_or(0);
-            acc ^= marks.pop_front().map_or(0, |m| m.0);
+            accumulator ^= entries.pop_front().unwrap_or(0);
+            accumulator ^= marks.pop_front().map_or(0, |m| m.0);
         }
         if i % 4096 == 4095 {
             // Pairs merge; between passes the deque gains two entries per
@@ -66,7 +66,7 @@ fn no_allocator_call_after_live_across_churn() {
     assert!(row.crossings > 0, "the churn reached Full");
     let row = census.row("alloc-marks").expect("row");
     assert!(row.crossings > 0, "the churn reached the merge arm");
-    assert_ne!(acc, 0);
+    assert_ne!(accumulator, 0);
 }
 
 #[test]

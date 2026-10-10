@@ -142,11 +142,11 @@ fn calls_vecdeque(cap: Cap, ops: u64) -> u64 {
     for i in 0..half(cap) {
         deque.push_back(Entry(i));
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
-        acc ^= step_vecdeque(&mut deque, i);
+        accumulator ^= step_vecdeque(&mut deque, i);
     }
-    acc
+    accumulator
 }
 
 #[inline(never)]
@@ -157,14 +157,14 @@ fn calls_reserve<const PLUS_ONE: bool>(cap: Cap, census: &Rc<CapCensus>, ops: u6
             slot.publish(Entry(i));
         }
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
-        acc ^= step_reserve(&mut deque, i);
+        accumulator ^= step_reserve(&mut deque, i);
         if PLUS_ONE {
             plus_one();
         }
     }
-    acc
+    accumulator
 }
 
 #[inline(never)]
@@ -174,11 +174,11 @@ fn calls_coalesce(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
     for i in 0..half(cap) {
         deque.push(Entry(i));
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
-        acc ^= step_coalesce(&mut deque, i);
+        accumulator ^= step_coalesce(&mut deque, i);
     }
-    acc
+    accumulator
 }
 
 // Each leg is one function of the same shape: a leg inlined into `main`
@@ -189,14 +189,14 @@ fn leg_vecdeque(cap: Cap, ops: u64) -> u64 {
     for i in 0..half(cap) {
         deque.push_back(Entry(i));
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
         deque.push_back(Entry(i));
         if let Some(Entry(v)) = deque.pop_front() {
-            acc ^= v;
+            accumulator ^= v;
         }
     }
-    acc
+    accumulator
 }
 
 // `PLUS_ONE` is a const so the liveness leg differs from B by one `add`
@@ -209,19 +209,19 @@ fn leg_reserve<const PLUS_ONE: bool>(cap: Cap, census: &Rc<CapCensus>, ops: u64)
             slot.publish(Entry(i));
         }
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
         if let Reserved::Slot(slot) = deque.reserve() {
             slot.publish(Entry(i));
         }
         if let Some(Entry(v)) = deque.pop_front() {
-            acc ^= v;
+            accumulator ^= v;
         }
         if PLUS_ONE {
             plus_one();
         }
     }
-    acc
+    accumulator
 }
 
 #[inline(never)]
@@ -231,14 +231,14 @@ fn leg_coalesce(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
     for i in 0..half(cap) {
         deque.push(Entry(i));
     }
-    let mut acc = 0u64;
+    let mut accumulator = 0u64;
     for i in 0..ops {
         deque.push(Entry(i));
         if let Some(Entry(v)) = deque.pop_front() {
-            acc ^= v;
+            accumulator ^= v;
         }
     }
-    acc
+    accumulator
 }
 
 fn main() -> ExitCode {
@@ -250,7 +250,7 @@ fn main() -> ExitCode {
         }
     };
     let census = CapCensus::new(CellId(0));
-    let acc = match (args.variant.as_str(), args.per_call) {
+    let accumulator = match (args.variant.as_str(), args.per_call) {
         ("vecdeque", false) => leg_vecdeque(args.cap, args.ops),
         ("reserve", false) => leg_reserve::<false>(args.cap, &census, args.ops),
         ("reserve-plus-one", false) => leg_reserve::<true>(args.cap, &census, args.ops),
@@ -268,11 +268,11 @@ fn main() -> ExitCode {
     };
     let shape = if args.per_call { "call" } else { "loop" };
     println!(
-        "{} {shape} cap {} ops {} acc {}",
+        "{} {shape} cap {} ops {} accumulator {}",
         args.variant,
         args.cap.entries_max(),
         args.ops,
-        black_box(acc)
+        black_box(accumulator)
     );
     ExitCode::SUCCESS
 }

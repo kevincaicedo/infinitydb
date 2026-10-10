@@ -66,9 +66,9 @@ pub struct CapCensus {
     cap_assembly_violations: Cell<u32>,
 }
 
-/// A container's handle on its row: the index is fixed at registration and
-/// the fill is kept beside it, so a report tests one byte.
-pub(super) struct CensusRow {
+/// A container's handle on its `CapRow`: the index is fixed at registration
+/// and the fill is kept beside it, so a report tests one byte.
+pub(super) struct CapRowHandle {
     census: Rc<CapCensus>,
     index: usize,
     fill: CapFill,
@@ -155,7 +155,7 @@ impl CapCensus {
     /// one name, an `Assembly` name a second time, or a name past
     /// `CAP_CENSUS_ROWS_MAX`. Registration is O(rows), at construction. An
     /// `Assembly` registration after the serve mark is a violation.
-    pub(super) fn register(self: &Rc<Self>, cap: Cap) -> Result<CensusRow, CapError> {
+    pub(super) fn register(self: &Rc<Self>, cap: Cap) -> Result<CapRowHandle, CapError> {
         let index = {
             let mut rows = self.rows.borrow_mut();
             let found = rows.iter().position(|row| row.is_some_and(|row| row.name == cap.name()));
@@ -186,7 +186,7 @@ impl CapCensus {
         };
         let late = cap.fill() == CapFill::Assembly && self.phase.get() != CensusPhase::Assembling;
         self.note_violations(u32::from(late), "a registration after the serve mark", index);
-        Ok(CensusRow { census: Rc::clone(self), index, fill: cap.fill() })
+        Ok(CapRowHandle { census: Rc::clone(self), index, fill: cap.fill() })
     }
 
     /// `count` violations of one kind on the row at `index`: counted first,
@@ -218,14 +218,15 @@ impl CapCensus {
     }
 }
 
-impl CensusRow {
+impl CapRowHandle {
     /// The container's live count rose to `live`. A `Serving` container
     /// reports only when its own high water rises; an `Assembly` one never
     /// raises its own, so it reports every publish, and the row keeps its
     /// live count. On an `Assembly` row after the serve mark it is a
-    /// violation. Off the hot path: the call takes the census and two
-    /// scalars, never a pointer into the container, so the container's
-    /// fields stay in registers around it.
+    /// violation. The report is cold and out of line, and it takes the
+    /// census and two scalars, never a pointer into the container: the rare
+    /// report stays apart from the one compare a publish pays, and borrows
+    /// nothing of the container that made it.
     #[cold]
     #[inline(never)]
     pub(super) fn report_publish(&self, live: u32) {
@@ -298,7 +299,7 @@ mod tests {
         assert_eq!(census.cap_assembly_violations(), before + 1, "the violation is counted");
     }
 
-    fn fill(row: &CensusRow, count: u32) {
+    fn fill(row: &CapRowHandle, count: u32) {
         for live in 1..=count {
             row.report_publish(live);
         }

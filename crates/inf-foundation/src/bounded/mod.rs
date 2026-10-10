@@ -85,6 +85,8 @@ impl Cap {
         self.entries.get()
     }
 
+    /// When the container's host fills it: while serving, or whole before
+    /// the cell's serve mark (`CapFill`); the census keeps it on the row.
     #[must_use]
     pub const fn fill(self) -> CapFill {
         self.fill
@@ -111,7 +113,7 @@ impl fmt::Display for CapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             CapError::Alloc => "the allocator refused the backing",
-            CapError::Layout => "entries times stride pass the backing's byte bound",
+            CapError::Layout => "entries times stride passes the backing's byte bound",
             CapError::Census => "the cell's cap census refused the row",
         })
     }

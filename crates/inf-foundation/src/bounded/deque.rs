@@ -21,7 +21,7 @@ use core::marker::PhantomData;
 use core::mem::size_of;
 use std::rc::Rc;
 
-use super::census::{CapCensus, CensusRow};
+use super::census::{CapCensus, CapRowHandle};
 use super::{Cap, CapError, CapFill, Coalesce, Lossy, Merge, Reserve};
 use crate::limits::DEQUE_BACKING_BYTES_MAX;
 
@@ -67,7 +67,7 @@ pub struct CappedDeque<T, X> {
     backing: std::collections::VecDeque<T>,
     entries_max: u32,
     high_water: u32,
-    row: CensusRow,
+    row: CapRowHandle,
     crossing: PhantomData<X>,
 }
 
@@ -187,14 +187,14 @@ impl<T, X> CappedDeque<T, X> {
     fn published(&mut self) {
         let live = self.published_count();
         if live > self.high_water {
-            self.rose(live);
+            self.high_water_rose(live);
         }
     }
 
     /// A new high water, off the hot path: kept here and reported.
     #[cold]
     #[inline(never)]
-    fn rose(&mut self, live: u32) {
+    fn high_water_rose(&mut self, live: u32) {
         self.high_water = live;
         self.row.report_publish(live);
     }
