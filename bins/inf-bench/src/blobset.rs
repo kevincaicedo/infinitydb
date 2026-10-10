@@ -66,7 +66,7 @@ const FLAGS: (&[&str], &[&str]) = (
         "artifacts-root",
         "cells",
         "pin-start",
-        "conns",
+        "connections",
         "replicates",
         "warmup-s",
         "duration-s",
@@ -77,7 +77,7 @@ const FLAGS: (&[&str], &[&str]) = (
 );
 
 /// The curve's default connection counts: both sides of a 16-entry window.
-const CONNS_DEFAULT: &str = "1,8,16,17,32,64,128";
+const CONNECTIONS_DEFAULT: &str = "1,8,16,17,32,64,128";
 /// The namespace every leg creates on a fresh data directory.
 const NAMESPACE: &[u8] = b"blobset";
 /// The spread budget on `X` between the two legs' means, in percent.
@@ -166,7 +166,7 @@ enum LegVerdict {
 /// One leg's measurement.
 struct Leg {
     name: &'static str,
-    conns: usize,
+    connections: usize,
     replicate: usize,
     acked: u64,
     /// `+OK` replies to commands sent before the window: no part of `X`,
@@ -174,7 +174,7 @@ struct Leg {
     warmup_acked: u64,
     errors: u64,
     window: Duration,
-    hist_us: FineHistogram,
+    latency_us: FineHistogram,
     /// Every cell's reads, in cell order.
     cells: Vec<CellScrape>,
     /// The generator's `utime + stime` over the window, in cores.
@@ -267,7 +267,7 @@ struct ConnResult {
     warmup_acked: u64,
     errors: u64,
     first_error: Option<String>,
-    hist_us: FineHistogram,
+    latency_us: FineHistogram,
 }
 
 impl ConnResult {
@@ -277,7 +277,7 @@ impl ConnResult {
             warmup_acked: 0,
             errors: 0,
             first_error: None,
-            hist_us: FineHistogram::new(),
+            latency_us: FineHistogram::new(),
         }
     }
 
@@ -295,18 +295,18 @@ impl ConnResult {
             Phase::WarmUp => self.warmup_acked += 1,
             Phase::Window => {
                 self.acked += 1;
-                self.hist_us.record(latency_us);
+                self.latency_us.record(latency_us);
             }
         }
     }
 }
 
-/// Consumes every whole reply at the front of `rx` into `result`, each
+/// Consumes every whole reply at the front of `received` into `result`, each
 /// in `phase` with `latency_us`. The one reply loop: the connections
 /// and the plant's fixture stream both pass through it.
-fn drain_replies(rx: &mut Vec<u8>, result: &mut ConnResult, phase: Phase, latency_us: u64) {
-    while let Some(n) = reply_len(rx) {
-        let reply: Vec<u8> = rx.drain(..n).collect();
+fn drain_replies(received: &mut Vec<u8>, result: &mut ConnResult, phase: Phase, latency_us: u64) {
+    while let Some(n) = reply_len(received) {
+        let reply: Vec<u8> = received.drain(..n).collect();
         result.account(&reply, phase, latency_us);
     }
 }
@@ -327,7 +327,7 @@ fn run_conn(
     }
     let value = vec![0xABu8; value_size];
     let mut result = ConnResult::new();
-    let mut rx: Vec<u8> = Vec::with_capacity(256);
+    let mut received: Vec<u8> = Vec::with_capacity(256);
     let mut chunk = [0u8; 4096];
     let mut ordinal = 0u64;
     loop {
@@ -344,15 +344,15 @@ fn run_conn(
         let sent = Instant::now();
         let phase = if sent < warmup_end { Phase::WarmUp } else { Phase::Window };
         // One command in flight: the next whole reply is its reply.
-        while reply_len(&rx).is_none() {
+        while reply_len(&received).is_none() {
             let n = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
             if n == 0 {
                 return Err(format!("connection {index}: closed mid-reply"));
             }
-            rx.extend_from_slice(&chunk[..n]);
+            received.extend_from_slice(&chunk[..n]);
         }
         let latency_us = u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX);
-        drain_replies(&mut rx, &mut result, phase, latency_us);
+        drain_replies(&mut received, &mut result, phase, latency_us);
     }
     Ok(result)
 }
@@ -431,9 +431,9 @@ fn generator_cpu_ticks() -> Result<u64, String> {
         .map_err(|e| format!("the generator's /proc/self/stat: {e}"))
 }
 
-/// Boots a fresh node from `bin` on `data_dir` (removed and recreated).
+/// Boots a fresh node from `binary` on `data_dir` (removed and recreated).
 fn boot(
-    bin: &str,
+    binary: &str,
     cells: u16,
     data_dir: &Path,
     pin_start: Option<&str>,
@@ -446,11 +446,11 @@ fn boot(
         extra.push("--pin-start");
         extra.push(pin);
     }
-    spawn_infinityd(bin, cells, &extra)
+    spawn_infinityd(binary, cells, &extra)
 }
 
 struct LegSpec<'a> {
-    bin: &'a str,
+    binary: &'a str,
     cells: u16,
     data_dir: &'a Path,
     pin_start: Option<&'a str>,
@@ -460,16 +460,16 @@ struct LegSpec<'a> {
     window: Duration,
 }
 
-/// Runs one leg: boot, the namespace, the counters before, `conns`
+/// Runs one leg: boot, the namespace, the counters before, `connections`
 /// closed-loop connections through the warm-up and the window, the
 /// counters after, the verdict.
 fn run_leg(
     spec: &LegSpec<'_>,
     name: &'static str,
-    conns: usize,
+    connections: usize,
     replicate: usize,
 ) -> Result<Leg, String> {
-    let server = boot(spec.bin, spec.cells, spec.data_dir, spec.pin_start)?;
+    let server = boot(spec.binary, spec.cells, spec.data_dir, spec.pin_start)?;
     let port = server.port;
     create_namespace(port, spec.cells, spec.threshold)?;
     let before = scrape(port, spec.cells)?;
@@ -477,7 +477,7 @@ fn run_leg(
     let warmup_end = start + spec.warmup;
     let deadline = warmup_end + spec.window;
     let (results, cpu_ticks) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..conns)
+        let handles: Vec<_> = (0..connections)
             .map(|index| {
                 scope.spawn(move || run_conn(port, index, spec.value_size, warmup_end, deadline))
             })
@@ -496,13 +496,13 @@ fn run_leg(
         cpu_ticks? as f64 / CLOCK_TICKS_PER_S as f64 / spec.window.as_secs_f64();
     let mut leg = Leg {
         name,
-        conns,
+        connections,
         replicate,
         acked: 0,
         warmup_acked: 0,
         errors: 0,
         window: spec.window,
-        hist_us: FineHistogram::new(),
+        latency_us: FineHistogram::new(),
         cells: Vec::new(),
         generator_cpu_cores,
         generator_cpus: std::thread::available_parallelism().map_or(1, usize::from),
@@ -514,7 +514,7 @@ fn run_leg(
         leg.acked += result.acked;
         leg.warmup_acked += result.warmup_acked;
         leg.errors += result.errors;
-        leg.hist_us.merge(&result.hist_us);
+        leg.latency_us.merge(&result.latency_us);
         if first_error.is_none() {
             first_error = result.first_error;
         }
@@ -551,11 +551,11 @@ fn verdict_of(leg: &Leg, first_error: Option<&str>) -> LegVerdict {
     // connection) is the slack between the counter and the counts.
     let created: u64 = per_cell.iter().sum();
     let acknowledged = leg.acked + leg.warmup_acked;
-    if created < acknowledged || created > acknowledged + leg.conns as u64 {
+    if created < acknowledged || created > acknowledged + leg.connections as u64 {
         return LegVerdict::Vacuous(format!(
             "extents created {created} does not confirm {acknowledged} acknowledged SETs ({} in \
              the window, {} in the warm-up) within the connections ({})",
-            leg.acked, leg.warmup_acked, leg.conns
+            leg.acked, leg.warmup_acked, leg.connections
         ));
     }
     // Scope one cell: the hash tag puts every key on one cell, so the
@@ -579,7 +579,7 @@ fn verdict_of(leg: &Leg, first_error: Option<&str>) -> LegVerdict {
 /// A point of the curve: both legs over every replicate, and the spread
 /// verdict between the legs' means.
 struct Point {
-    conns: usize,
+    connections: usize,
     legs: Vec<Leg>,
 }
 
@@ -606,8 +606,8 @@ fn spread_of(legs: &[Leg]) -> Option<Spread> {
     };
     let x = [mean("a", &Leg::throughput)?, mean("b", &Leg::throughput)?];
     let p99 = [
-        mean("a", &|l| l.hist_us.percentile(99.0) as f64)?,
-        mean("b", &|l| l.hist_us.percentile(99.0) as f64)?,
+        mean("a", &|l| l.latency_us.percentile(99.0) as f64)?,
+        mean("b", &|l| l.latency_us.percentile(99.0) as f64)?,
     ];
     let percent = |pair: [f64; 2]| {
         let hi = pair[0].max(pair[1]);
@@ -652,7 +652,7 @@ fn outcome_of(points: &[Point]) -> Outcome {
 }
 
 fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
-    let mut out = format!(
+    format!(
         "# blob-set curve\n\n{header}\noutcome: {outcome:?}\n\n\
          Latencies read to the bucket of a 32-per-octave histogram (about 3 %). `X` is the \
          count of `+OK` replies inside the window over its length. The spread column is the \
@@ -660,42 +660,53 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
          Evidence-pending. Counters are node sums of per-cell totals, except a percentile, \
          read from the loaded cell alone as its lifetime value (boot included). `gen cpu` is \
          this process's utime+stime over the window, in cores; above half its CPUs the leg \
-         is not server capacity.\n\n\
-         | conns | leg | rep | X (SET/s) | p50 us | p99 us | p99.9 us | acked | extents | \
-         gen cpu (cores) | counters | verdict |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|\n"
+         is not server capacity.\n\n{}\n## points\n\n{}",
+        leg_table(points),
+        point_table(points)
+    )
+}
+
+/// One row per leg: the measurement, the counters and the verdict.
+fn leg_table(points: &[Point]) -> String {
+    let mut out = String::from(
+        "| connections | leg | replicate | X (SET/s) | p50 us | p99 us | p99.9 us | acked | \
+         extents | gen cpu (cores) | counters | verdict |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
-    for point in points {
-        for leg in &point.legs {
-            let counters: Vec<String> = leg
-                .counters()
-                .iter()
-                .map(|(k, v)| format!("{k}={}", v.map_or("absent".to_string(), |v| v.to_string())))
-                .collect();
-            let extents = match leg.extents_created() {
-                Some(per_cell) => per_cell.iter().sum::<u64>().to_string(),
-                None => "absent".to_string(),
-            };
-            out.push_str(&format!(
-                "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {:.2} of {} | {} | {:?} |\n",
-                leg.conns,
-                leg.name,
-                leg.replicate,
-                leg.throughput(),
-                leg.hist_us.percentile(50.0),
-                leg.hist_us.percentile(99.0),
-                leg.hist_us.percentile(99.9),
-                leg.acked,
-                extents,
-                leg.generator_cpu_cores,
-                leg.generator_cpus,
-                counters.join(" "),
-                leg.verdict
-            ));
-        }
+    for leg in points.iter().flat_map(|point| point.legs.iter()) {
+        let counters: Vec<String> = leg
+            .counters()
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.map_or("absent".to_string(), |v| v.to_string())))
+            .collect();
+        let extents = match leg.extents_created() {
+            Some(per_cell) => per_cell.iter().sum::<u64>().to_string(),
+            None => "absent".to_string(),
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {:.2} of {} | {} | {:?} |\n",
+            leg.connections,
+            leg.name,
+            leg.replicate,
+            leg.throughput(),
+            leg.latency_us.percentile(50.0),
+            leg.latency_us.percentile(99.0),
+            leg.latency_us.percentile(99.9),
+            leg.acked,
+            extents,
+            leg.generator_cpu_cores,
+            leg.generator_cpus,
+            counters.join(" "),
+            leg.verdict
+        ));
     }
-    out.push_str(
-        "\n## points\n\n| conns | X a | X b | spread X % | p99 a | p99 b | spread p99 % | \
+    out
+}
+
+/// One row per point: the two legs' means and their spread verdict.
+fn point_table(points: &[Point]) -> String {
+    let mut out = String::from(
+        "| connections | X a | X b | spread X % | p99 a | p99 b | spread p99 % | \
          point |\n|---|---|---|---|---|---|---|---|\n",
     );
     for point in points {
@@ -709,19 +720,25 @@ fn render_report(points: &[Point], header: &str, outcome: Outcome) -> String {
                     };
                 out.push_str(&format!(
                     "| {} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {:.2} | {verdict} |\n",
-                    point.conns, s.x[0], s.x[1], s.x_percent, s.p99[0], s.p99[1], s.p99_percent
+                    point.connections,
+                    s.x[0],
+                    s.x[1],
+                    s.x_percent,
+                    s.p99[0],
+                    s.p99[1],
+                    s.p99_percent
                 ));
             }
             None => out.push_str(&format!(
                 "| {} | — | — | — | — | — | — | no measured leg |\n",
-                point.conns
+                point.connections
             )),
         }
     }
     out
 }
 
-fn env_header(flags: &Flags, env_ok: bool, fstype: &str, command: &str) -> String {
+fn env_header(flags: &Flags, env_ok: bool, filesystem: &str, command: &str) -> String {
     let stamp =
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let probes: Vec<String> = envcheck::run_system_probes()
@@ -741,7 +758,7 @@ fn env_header(flags: &Flags, env_ok: bool, fstype: &str, command: &str) -> Strin
         "dev (not a claim; never published)"
     };
     format!(
-        "date: {stamp} (unix)\ntier: {tier}\nenv-check: {}\ndata-root filesystem: {fstype}\n\
+        "date: {stamp} (unix)\ntier: {tier}\nenv-check: {}\ndata-root filesystem: {filesystem}\n\
          probes: {}\ncommand: {command}\n",
         if env_ok { "OK" } else { "FAILED (overridden — not citation-grade)" },
         probes.join("; ")
@@ -768,23 +785,23 @@ fn one_cell(before: Option<u64>, after: Option<u64>) -> CellScrape {
 /// one `-ERR` among `+OK`s, through the one reply loop the connections
 /// use.
 fn plant_reply_err() -> Result<(), String> {
-    let mut rx = Vec::new();
+    let mut received = Vec::new();
     for _ in 0..7 {
-        rx.extend_from_slice(b"+OK\r\n");
+        received.extend_from_slice(b"+OK\r\n");
     }
-    rx.extend_from_slice(b"-ERR fixture: one refused SET\r\n");
-    rx.extend_from_slice(b"+OK\r\n");
+    received.extend_from_slice(b"-ERR fixture: one refused SET\r\n");
+    received.extend_from_slice(b"+OK\r\n");
     let mut result = ConnResult::new();
-    drain_replies(&mut rx, &mut result, Phase::Window, 0);
+    drain_replies(&mut received, &mut result, Phase::Window, 0);
     let leg = Leg {
         name: "a",
-        conns: 1,
+        connections: 1,
         replicate: 0,
         acked: result.acked,
         warmup_acked: 0,
         errors: result.errors,
         window: Duration::from_secs(1),
-        hist_us: result.hist_us,
+        latency_us: result.latency_us,
         cells: vec![one_cell(Some(0), Some(result.acked))],
         generator_cpu_cores: 0.0,
         generator_cpus: 1,
@@ -804,13 +821,13 @@ fn plant_reply_err() -> Result<(), String> {
 /// The run's arguments, parsed and validated once at the boundary.
 struct BlobSetArgs {
     env_ok: bool,
-    bin: String,
+    binary: String,
     data_root: String,
-    fstype: String,
+    filesystem: String,
     artifacts_root: String,
     cells: u16,
     pin_start: Option<String>,
-    conns: Vec<usize>,
+    connections: Vec<usize>,
     replicates: usize,
     warmup: Duration,
     window: Duration,
@@ -822,22 +839,22 @@ impl BlobSetArgs {
     fn parse(flags: &Flags, plant: Plant) -> Result<BlobSetArgs, String> {
         let env_ok = env_gate(flags)?;
         let reference_box = flags.bool("reference-box");
-        let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+        let binary = flags.str_or("infinityd-bin", "target/release/infinityd");
         let data_root = flags.require("data-root")?.to_string();
-        let fstype = admit_device_root(flags, Path::new(&data_root), reference_box)?;
-        if crate::gaterun::is_memory_fs(&fstype) {
+        let filesystem = admit_device_root(flags, Path::new(&data_root), reference_box)?;
+        if crate::gaterun::is_memory_fs(&filesystem) {
             return Err(format!(
-                "data root {data_root} is {fstype}: a blob SET's extent and its fsync must hit a \
-                 device; point --data-root at the filesystem under test"
+                "data root {data_root} is {filesystem}: a blob SET's extent and its fsync must \
+                 hit a device; point --data-root at the filesystem under test"
             ));
         }
-        let conns: Vec<usize> = flags
-            .str_or("conns", CONNS_DEFAULT)
+        let connections: Vec<usize> = flags
+            .str_or("connections", CONNECTIONS_DEFAULT)
             .split(',')
-            .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--conns `{s}`: {e}")))
+            .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--connections `{s}`: {e}")))
             .collect::<Result<_, _>>()?;
-        if conns.contains(&0) {
-            return Err("--conns: every count is at least 1".into());
+        if connections.contains(&0) {
+            return Err("--connections: every count is at least 1".into());
         }
         let window = Duration::from_secs(flags.u64_or("duration-s", 30)?);
         if window.is_zero() {
@@ -850,13 +867,13 @@ impl BlobSetArgs {
         };
         Ok(BlobSetArgs {
             env_ok,
-            bin,
+            binary,
             data_root,
-            fstype,
+            filesystem,
             artifacts_root: flags.str_or("artifacts-root", ".artifacts/blob-set"),
             cells: flags.u16_or("cells", 4)?,
             pin_start: flags.get("pin-start").map(str::to_string),
-            conns,
+            connections,
             replicates: flags.usize_or("replicates", 5)?,
             warmup: Duration::from_secs(flags.u64_or("warmup-s", 5)?),
             window,
@@ -872,7 +889,7 @@ impl BlobSetArgs {
 fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
     let legs_of_the_binary = ["a", "b"];
     let mut points = Vec::new();
-    for &c in &run.conns {
+    for &c in &run.connections {
         let mut legs = Vec::new();
         for replicate in 0..run.replicates {
             let order: [usize; 2] = if replicate % 2 == 0 { [0, 1] } else { [1, 0] };
@@ -880,7 +897,7 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                 let name = legs_of_the_binary[which];
                 let data_dir = Path::new(&run.data_root).join(format!("{name}-c{c}-r{replicate}"));
                 let spec = LegSpec {
-                    bin: &run.bin,
+                    binary: &run.binary,
                     cells: run.cells,
                     data_dir: &data_dir,
                     pin_start: run.pin_start.as_deref(),
@@ -891,12 +908,12 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                 };
                 let leg = run_leg(&spec, name, c, replicate)?;
                 println!(
-                    "blob-set: conns {c} leg {name} rep {replicate}: X {:.2} SET/s, p50 {} us, \
-                     p99 {} us, p99.9 {} us, acked {}, gen cpu {:.2} cores, {:?}",
+                    "blob-set: connections {c} leg {name} replicate {replicate}: X {:.2} SET/s, \
+                     p50 {} us, p99 {} us, p99.9 {} us, acked {}, gen cpu {:.2} cores, {:?}",
                     leg.throughput(),
-                    leg.hist_us.percentile(50.0),
-                    leg.hist_us.percentile(99.0),
-                    leg.hist_us.percentile(99.9),
+                    leg.latency_us.percentile(50.0),
+                    leg.latency_us.percentile(99.0),
+                    leg.latency_us.percentile(99.9),
                     leg.acked,
                     leg.generator_cpu_cores,
                     leg.verdict
@@ -905,7 +922,7 @@ fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
                 legs.push(leg);
             }
         }
-        points.push(Point { conns: c, legs });
+        points.push(Point { connections: c, legs });
     }
     Ok(points)
 }
@@ -935,7 +952,7 @@ pub fn cmd_blob_set(args: &[String]) -> Result<(), String> {
     }
     let run = BlobSetArgs::parse(&flags, plant)?;
     let command = format!("inf-bench blob-set {}", args.join(" "));
-    let header = env_header(&flags, run.env_ok, &run.fstype, &command);
+    let header = env_header(&flags, run.env_ok, &run.filesystem, &command);
     let points = run_points(&run)?;
     let outcome = outcome_of(&points);
     let report = render_report(&points, &header, outcome);
@@ -951,13 +968,13 @@ mod tests {
     fn leg(acked: u64, errors: u64, before: Option<u64>, after: Option<u64>) -> Leg {
         Leg {
             name: "a",
-            conns: 4,
+            connections: 4,
             replicate: 0,
             acked,
             warmup_acked: 0,
             errors,
             window: Duration::from_secs(10),
-            hist_us: FineHistogram::new(),
+            latency_us: FineHistogram::new(),
             cells: vec![one_cell(before, after)],
             generator_cpu_cores: 0.0,
             generator_cpus: 4,
@@ -977,7 +994,7 @@ mod tests {
         busy.generator_cpu_cores = 2.5;
         busy.cells[0] = one_cell(Some(0), Some(99));
         assert!(matches!(verdict_of(&busy, None), LegVerdict::Vacuous(_)));
-        let mut saturated = Point { conns: 4, legs: vec![leg(100, 0, Some(0), Some(100))] };
+        let mut saturated = Point { connections: 4, legs: vec![leg(100, 0, Some(0), Some(100))] };
         saturated.legs[0].generator_cpu_cores = 3.0;
         saturated.legs[0].verdict = verdict_of(&saturated.legs[0], None);
         assert_eq!(outcome_of(std::slice::from_ref(&saturated)), Outcome::EvidencePending);
@@ -1047,19 +1064,19 @@ mod tests {
     #[test]
     fn replies_are_accounted_by_phase_and_errors_in_both() {
         let mut result = ConnResult::new();
-        let mut rx = b"+OK\r\n+OK\r\n".to_vec();
-        drain_replies(&mut rx, &mut result, Phase::WarmUp, 500);
-        assert_eq!((result.acked, result.warmup_acked, result.hist_us.count()), (0, 2, 0));
-        let mut rx = b"+OK\r\n".to_vec();
-        drain_replies(&mut rx, &mut result, Phase::Window, 700);
-        assert_eq!((result.acked, result.warmup_acked, result.hist_us.count()), (1, 2, 1));
-        let mut rx = b"-ERR warm\r\n".to_vec();
-        drain_replies(&mut rx, &mut result, Phase::WarmUp, 0);
+        let mut received = b"+OK\r\n+OK\r\n".to_vec();
+        drain_replies(&mut received, &mut result, Phase::WarmUp, 500);
+        assert_eq!((result.acked, result.warmup_acked, result.latency_us.count()), (0, 2, 0));
+        let mut received = b"+OK\r\n".to_vec();
+        drain_replies(&mut received, &mut result, Phase::Window, 700);
+        assert_eq!((result.acked, result.warmup_acked, result.latency_us.count()), (1, 2, 1));
+        let mut received = b"-ERR warm\r\n".to_vec();
+        drain_replies(&mut received, &mut result, Phase::WarmUp, 0);
         assert_eq!(result.errors, 1);
         assert_eq!(result.first_error.as_deref(), Some("-ERR warm"));
-        let mut rx = b"+OK\r\n+O".to_vec();
-        drain_replies(&mut rx, &mut result, Phase::Window, 0);
-        assert_eq!(rx, b"+O", "a partial reply stays at the front");
+        let mut received = b"+OK\r\n+O".to_vec();
+        drain_replies(&mut received, &mut result, Phase::Window, 0);
+        assert_eq!(received, b"+O", "a partial reply stays at the front");
         assert_eq!(result.acked, 2);
     }
 
@@ -1073,9 +1090,9 @@ mod tests {
     /// One reply that is not `+OK` is red before any count is read.
     #[test]
     fn one_error_reply_is_red() {
-        let mut rx = b"+OK\r\n-ERR nope\r\n+OK\r\n".to_vec();
+        let mut received = b"+OK\r\n-ERR nope\r\n+OK\r\n".to_vec();
         let mut result = ConnResult::new();
-        drain_replies(&mut rx, &mut result, Phase::Window, 0);
+        drain_replies(&mut received, &mut result, Phase::Window, 0);
         assert_eq!((result.acked, result.errors), (2, 1));
         assert_eq!(result.first_error.as_deref(), Some("-ERR nope"));
         assert!(matches!(
@@ -1093,16 +1110,16 @@ mod tests {
         let mut fast = leg(1000, 0, Some(0), Some(1000));
         let mut slow = leg(900, 0, Some(0), Some(900));
         slow.name = "b";
-        fast.hist_us.record(1000);
-        slow.hist_us.record(1000);
-        let point = Point { conns: 4, legs: vec![fast, slow] };
+        fast.latency_us.record(1000);
+        slow.latency_us.record(1000);
+        let point = Point { connections: 4, legs: vec![fast, slow] };
         assert_eq!(outcome_of(std::slice::from_ref(&point)), Outcome::EvidencePending);
         let mut even = leg(1000, 0, Some(0), Some(1000));
         even.name = "b";
-        even.hist_us.record(1000);
+        even.latency_us.record(1000);
         let mut a = leg(1000, 0, Some(0), Some(1000));
-        a.hist_us.record(1000);
-        let point = Point { conns: 4, legs: vec![a, even] };
+        a.latency_us.record(1000);
+        let point = Point { connections: 4, legs: vec![a, even] };
         assert_eq!(outcome_of(std::slice::from_ref(&point)), Outcome::Measured);
     }
 }
