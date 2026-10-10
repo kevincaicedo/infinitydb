@@ -17,6 +17,8 @@
 //!   `docs/milestones/m0-gates.toml` (M0-S18/S19 scaffold).
 //! - `zipfian` — zipfian LFU hit-rate parity vs Redis (M1 `hit_rate_parity`).
 //! - `doc-corpus` — seeded M3 JSON reference-corpus generator (M3-S20).
+//! - `blob-set` — the blob `SET` throughput instrument: a load-response
+//!   curve on one cell with a same-binary control leg.
 //!
 //! Tooling tier: `std::thread` and blocking sockets are fine here; this
 //! binary never runs on the data plane. It deliberately does not depend on
@@ -29,6 +31,7 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+mod blobset;
 mod bootstorm;
 mod cli;
 mod doc_corpus;
@@ -78,6 +81,19 @@ USAGE:
                    [--pressure-mb 2048] [--data-root DIR] [--ready-timeout-s 10]
                    [--pin-start N] [--artifacts-root DIR]
                    (M2.5-S01 wedge regression; data-root must not be tmpfs)
+    inf-bench blob-set --data-root DIR [--infinityd-bin PATH] [--binary-b PATH]
+                   [--cells N] [--pin-start N] [--conns 1,8,16,17,32,64,128]
+                   [--replicates 5] [--warmup-s 5] [--duration-s 30]
+                   [--value-size 65536] [--blob-threshold 4kb]
+                   [--plant blob-threshold-above|reply-err]
+                   [--artifacts-root DIR] [--allow-dirty] [--unsafe-env]
+                   [--reference-box]
+                   (the blob SET load-response curve on one cell: acked
+                    SETs per second and client ack latency by connection
+                    count, two interleaved legs of the same binary as
+                    the control, the server's extent counter as the
+                    liveness; data-root must not be tmpfs. Run the binary
+                    under `taskset -c <loadgen cpus>`)
     inf-bench zipfian [--keyspace N] [--ops N] [--warmup N] [--theta F] [--seed N]
                    [--maxmemory-mb N] [--value-size BYTES] [--cells N] [--window N]
                    [--threshold-pp F] [--infinityd-bin PATH] [--redis-bin PATH]
@@ -124,6 +140,7 @@ fn main() -> ExitCode {
         "load" => load::cmd_load(rest),
         "gate-run" => gaterun::cmd_gate_run(rest),
         "boot-storm" => bootstorm::cmd_boot_storm(rest),
+        "blob-set" => blobset::cmd_blob_set(rest),
         "zipfian" => zipfian::cmd_zipfian(rest),
         "doc-corpus" => doc_corpus::cmd_doc_corpus(rest),
         "mixed-audit" => mixedaudit::cmd_mixed_audit(rest),
