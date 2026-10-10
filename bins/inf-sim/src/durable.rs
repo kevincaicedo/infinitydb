@@ -271,27 +271,117 @@ pub struct DurableScenario {
     /// The tier-budget shape (`m4-tier-budget`): `Some` runs several
     /// tiered `always` namespaces on every cell, each with its own
     /// closed-loop writers, under the device model, so the tier-flush
-    /// class is offered, deferred and granted beside the foreground. The
+    /// class is offered beside the foreground. The regime reached is the
+    /// leg's ([`TierBudgetLeg`]): on the `8mb` leg each round's
+    /// whole-slice offer is above the class cap and issues by the
+    /// overrun; on the `1mb` leg every offer is under the cap and is
+    /// granted at once. Nothing is deferred on either leg: the generated
+    /// flush (about 0.3 MB/s per cell) is far under the class share. The
     /// lift regime's one tiered namespace is a different arm. `None`
     /// everywhere else: every other trace stays byte-identical.
     pub tier_budget: Option<TierBudgetShape>,
 }
 
+/// How many tiered namespaces the tier-budget shape runs:
+/// `1..=TIER_BUDGET_NS_MAX`, the indices the fixed name table covers. The
+/// one constructor checks the range, so every index below a count names
+/// a namespace.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TierBudgetCount(u8);
+
+impl TierBudgetCount {
+    /// `count` in `1..=TIER_BUDGET_NS_MAX`, else `None`.
+    pub const fn new(count: u8) -> Option<TierBudgetCount> {
+        if count >= 1 && count <= TIER_BUDGET_NS_MAX { Some(TierBudgetCount(count)) } else { None }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    /// The namespaces' indices, each a valid [`NsClass::TierBudget`] index.
+    pub fn indices(self) -> std::ops::Range<u8> {
+        0..self.0
+    }
+}
+
+/// The tier-budget shape's legs, chosen by name (`--tier-leg`), never by
+/// the seed: every seed of a run drives the one leg named, so a sweep is
+/// one shape and the smoke lane runs each leg on its own row. The list
+/// grows by a variant here and a row there.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TierBudgetLeg {
+    /// Two namespaces at `MAINTAIN-SLICE 8mb`: a round offered whole is
+    /// above the class cap and issues by the overrun.
+    TwoAt8mb,
+    /// Eight namespaces at `1mb`, the most a cell carries here: the
+    /// one-plan-per-turn oracle's leg; every offer is under the cap.
+    EightAt1mb,
+}
+
+impl TierBudgetLeg {
+    pub const ALL: [TierBudgetLeg; 2] = [TierBudgetLeg::TwoAt8mb, TierBudgetLeg::EightAt1mb];
+
+    /// The leg's name on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            TierBudgetLeg::TwoAt8mb => "two-8mb",
+            TierBudgetLeg::EightAt1mb => "eight-1mb",
+        }
+    }
+
+    /// The leg named `name`, if any.
+    pub fn parse(name: &str) -> Option<TierBudgetLeg> {
+        TierBudgetLeg::ALL.into_iter().find(|leg| leg.name() == name)
+    }
+
+    /// The leg's shape: 3 writers of 1,000 ops per namespace, since seal
+    /// marks land per 1 MiB commit page and a cell seals once a
+    /// namespace's tail is a page past the mutable target.
+    fn shape(self) -> TierBudgetShape {
+        const TWO: TierBudgetCount = match TierBudgetCount::new(2) {
+            Some(count) => count,
+            None => panic!("two tier-budget namespaces are within the name table"),
+        };
+        const EIGHT: TierBudgetCount = match TierBudgetCount::new(TIER_BUDGET_NS_MAX) {
+            Some(count) => count,
+            None => panic!("the name table's size is within itself"),
+        };
+        match self {
+            TierBudgetLeg::TwoAt8mb => TierBudgetShape {
+                namespaces: TWO,
+                writers_per_ns: 3,
+                ops_per_writer: 1_000,
+                maintain_slice: b"8mb",
+            },
+            TierBudgetLeg::EightAt1mb => TierBudgetShape {
+                namespaces: EIGHT,
+                writers_per_ns: 3,
+                ops_per_writer: 1_000,
+                maintain_slice: b"1mb",
+            },
+        }
+    }
+}
+
 /// How many tiered namespaces the tier-budget shape runs, how they are
-/// written, and their `MAINTAIN-SLICE` (see [`DurableScenario::tier_budget`]).
+/// written, and their `MAINTAIN-SLICE` (see [`DurableScenario::tier_budget`]);
+/// built only by [`TierBudgetLeg::shape`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TierBudgetShape {
-    /// Tiered namespaces created on the node, `1..=TIER_BUDGET_NS_MAX`;
-    /// every cell materializes each one (the DDL fans out).
-    pub namespaces: u8,
+    /// Tiered namespaces created on the node; every cell materializes
+    /// each one (the DDL fans out).
+    pub namespaces: TierBudgetCount,
     /// Closed-loop writers per namespace, each on a seeded cell.
     pub writers_per_ns: usize,
     /// Ops per tier-budget writer (the other classes keep
     /// `ops_per_writer`).
     pub ops_per_writer: u64,
-    /// The namespaces' `MAINTAIN-SLICE`, as the `INF.NS CREATE` argument:
-    /// `8mb` offers above the tier class's 1 MiB cap on every pass,
-    /// `1mb` exactly at it.
+    /// The namespaces' `MAINTAIN-SLICE`, as the `INF.NS CREATE` argument.
+    /// The tier class's cap is `max(slice, 50 ms of its weighted share)`,
+    /// 4,890,000 B at the reference share of 244.5 MB/s a cell: an `8mb`
+    /// round offered whole is above it on every pass and issues by the
+    /// overrun; a `1mb` offer is under it and is granted at once.
     pub maintain_slice: &'static [u8],
 }
 
@@ -969,19 +1059,21 @@ impl DurableScenario {
     /// tiered `always` namespaces on both cells, flushing under the
     /// reference device model (489 MB/s, shared by the cells; the sim disk
     /// carries the same bandwidth on its byte timeline, no stall episodes).
-    /// Even seeds run two namespaces at `MAINTAIN-SLICE 8mb`, so every tier
-    /// offer is above the class's 1 MiB cap; odd seeds run eight at `1mb`,
-    /// the fairness oracle's eight-namespace leg. Each namespace keeps a
-    /// 3 MiB window with a tenth of it mutable and every value inline
-    /// (seal marks land per 1 MiB commit page, so a cell seals once its
-    /// namespace's tail is a page past the mutable target: about 3 MiB of
-    /// inline writes per cell and namespace flush two pages). The m2
-    /// durability oracle and the
-    /// reply oracle run unchanged; the budget's accounting oracles do not
-    /// (the tier class is counted in record bytes until a round is issued
-    /// in groups), and the run reports the tier class per cell instead.
+    /// The leg names the namespaces and their slice ([`TierBudgetLeg`]):
+    /// two at `8mb`, where each whole-slice offer is above the class cap
+    /// (4,890,000 B at this share) and issues by the overrun, or eight at
+    /// `1mb`, where every offer is under it and is granted at once; on
+    /// neither is an offer deferred, the generated flush being far under
+    /// the share. Each namespace keeps a 3 MiB window with a tenth of it
+    /// mutable and every value inline (seal marks land per 1 MiB commit
+    /// page, so a cell seals once its namespace's tail is a page past the
+    /// mutable target: about 3 MiB of inline writes per cell and
+    /// namespace flush two pages). The m2 durability oracle and the reply
+    /// oracle run unchanged; the budget's accounting oracles do not (the
+    /// tier class is counted in record bytes until a round is issued in
+    /// groups), and the run reports the tier class per cell instead.
     #[must_use]
-    pub fn m4_tier_budget(seed: u64) -> DurableScenario {
+    pub fn m4_tier_budget(seed: u64, leg: TierBudgetLeg) -> DurableScenario {
         let cells: u16 = 2;
         let model = inf_runtime::DeviceModel {
             write_bytes_per_s: 489_000_000,
@@ -995,21 +1087,6 @@ impl DurableScenario {
         stall.episode_ms_max = 0;
         stall.write_bytes_per_s = model.write_bytes_per_s;
         stall.read_bytes_per_s = model.read_bytes_per_s;
-        let shape = if seed.is_multiple_of(2) {
-            TierBudgetShape {
-                namespaces: 2,
-                writers_per_ns: 3,
-                ops_per_writer: 1_000,
-                maintain_slice: b"8mb",
-            }
-        } else {
-            TierBudgetShape {
-                namespaces: TIER_BUDGET_NS_MAX,
-                writers_per_ns: 3,
-                ops_per_writer: 1_000,
-                maintain_slice: b"1mb",
-            }
-        };
         DurableScenario {
             cells,
             // 64 KiB segments hold a frame of several inline tiered
@@ -1023,7 +1100,7 @@ impl DurableScenario {
             },
             budget_oracle: false,
             ckpt_overrun: None,
-            tier_budget: Some(shape),
+            tier_budget: Some(leg.shape()),
             ..DurableScenario::m2_device_budget(seed)
         }
     }

@@ -28,6 +28,8 @@ bin=target/release/inf-sim
 # seed — a boot whose tiered replay exceeds the window demotes. D2 rule
 # 6: m4-recovery's spec-variant class, each case forced — a boot at a
 # window below its ring pads.
+# m4-tier-budget runs each of its legs (two namespaces at 8mb, eight at
+# 1mb) on its own row: a leg is named, never drawn from the seed.
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
@@ -62,7 +64,8 @@ rows=(
   "m4-tiered"
   "m4-tiered --plant tier-read-eio"
   "m4-tiered --replay-above-window --verify-determinism"
-  "m4-tier-budget"
+  "m4-tier-budget --tier-leg two-8mb --verify-determinism"
+  "m4-tier-budget --tier-leg eight-1mb --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )

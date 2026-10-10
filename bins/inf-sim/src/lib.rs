@@ -81,7 +81,7 @@ pub use bootstorm::{BootStormReport, BootStormScenario, run_boot_storm_scenario}
 pub use coldstorm::{ColdStormReport, ColdStormScenario, run_cold_storm_scenario};
 pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
 pub use diskfull::{DiskfullReport, DiskfullScenario, run_diskfull_scenario};
-pub use durable::{DurableReport, DurableScenario, run_durable_scenario};
+pub use durable::{DurableReport, DurableScenario, TierBudgetLeg, run_durable_scenario};
 pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
 pub use nsddl::{NsDdlRaceReport, run_ns_ddl_race_scenario};

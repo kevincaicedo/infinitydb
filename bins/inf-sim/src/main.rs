@@ -17,8 +17,8 @@
 
 use inf_sim::net::Plant;
 use inf_sim::{
-    CombinedScenario, DurableScenario, Scenario, run_combined_scenario, run_durable_scenario,
-    run_scenario,
+    CombinedScenario, DurableScenario, Scenario, TierBudgetLeg, run_combined_scenario,
+    run_durable_scenario, run_scenario,
 };
 use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
 
@@ -85,6 +85,8 @@ fn main() {
     // up to the inline maximum; a run that placed no pad is VACUOUS.
     let mut spec_variant: Option<SpecVariant> = None;
     let mut ops_override: Option<u64> = None;
+    // m4-tier-budget's leg, named on every run so a sweep is one shape.
+    let mut tier_leg: Option<TierBudgetLeg> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -134,6 +136,12 @@ fn main() {
                         other => return Err(format!("unknown spec variant {other}")),
                     });
                 }
+                "--tier-leg" => {
+                    let name = take("--tier-leg")?;
+                    tier_leg = Some(TierBudgetLeg::parse(&name).ok_or_else(|| {
+                        format!("unknown tier leg {name}; the legs are {}", tier_leg_names())
+                    })?);
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -145,11 +153,12 @@ fn main() {
                          [--seed N|0xN] [--verify-determinism] \
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
-                         [--spec-variant ring-top|page] [--cells N] \
+                         [--spec-variant ring-top|page] [--tier-leg {}] [--cells N] \
                          [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
-                        inf_sim::SCENARIOS.join("|")
+                        inf_sim::SCENARIOS.join("|"),
+                        tier_leg_names()
                     );
                     std::process::exit(0);
                 }
@@ -182,6 +191,19 @@ fn main() {
         (false, variant) => variant.map(SeedClass::SpecVariant),
     };
 
+    // m4-tier-budget names its leg, and only it has one.
+    match (scenario_name.as_str(), tier_leg) {
+        ("m4-tier-budget", None) => {
+            eprintln!("inf-sim: m4-tier-budget needs --tier-leg {}", tier_leg_names());
+            std::process::exit(2);
+        }
+        ("m4-tier-budget", Some(_)) | (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --tier-leg is m4-tier-budget's; {other} has no leg");
+            std::process::exit(2);
+        }
+    }
+
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
     if matches!(
@@ -205,6 +227,7 @@ fn main() {
             plant,
             replay_canary,
             lift_regime,
+            tier_leg,
             verify,
             sweep,
             shard,
@@ -1446,6 +1469,11 @@ fn main() {
 /// Shared durable runner: M2's key/value workload and M3's document
 /// workload differ only in scenario construction. Both write replayable
 /// per-seed results and a sweep manifest.
+/// The `--tier-leg` names, `|`-joined for a message.
+fn tier_leg_names() -> String {
+    TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
 #[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main
 fn run_durable(
     scenario_name: &str,
@@ -1453,6 +1481,7 @@ fn run_durable(
     plant: Plant,
     replay_canary: bool,
     lift_regime: bool,
+    tier_leg: Option<TierBudgetLeg>,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -1471,7 +1500,10 @@ fn run_durable(
             "m2-ckpt-refused" => DurableScenario::m2_ckpt_refused(seed),
             "m2-recycle" => DurableScenario::m2_recycle(seed),
             "m3-document" => DurableScenario::m3_document(seed),
-            "m4-tier-budget" => DurableScenario::m4_tier_budget(seed),
+            "m4-tier-budget" => DurableScenario::m4_tier_budget(
+                seed,
+                tier_leg.expect("the caller refused m4-tier-budget without a leg"),
+            ),
             _ => unreachable!("the caller filters durable scenario names"),
         };
         scenario.plant = plant;

@@ -134,7 +134,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     // class, not the blob class, carries the bytes), the shape's
     // `MAINTAIN-SLICE`.
     if let Some(shape) = scenario.tier_budget {
-        for index in 0..shape.namespaces {
+        for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
             let create: &[&[u8]] = &[
                 b"INF.NS",
@@ -241,7 +241,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
     if let Some(shape) = scenario.tier_budget {
-        for index in 0..shape.namespaces {
+        for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
             for _ in 0..shape.writers_per_ns {
                 let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
@@ -1190,26 +1190,7 @@ fn tier_budget_scrape(
         };
         let counted = stats.io_budget[IoClass::TierFlush.index()];
         let observed = node.cells[cell].0.driver().observed_io();
-        let keyspace = node.plane(cell).keyspace();
-        let index_of = |ns: NsId| -> Option<u8> {
-            let spec = keyspace.ns_iter().find(|spec| spec.id == ns)?;
-            (0..shape.namespaces).find(|&i| NsClass::TierBudget(i).name() == spec.name.as_slice())
-        };
-        let mut flushed: Vec<(u8, u64, u64, u64)> = keyspace
-            .tiered_namespaces()
-            .filter_map(|(ns, table)| {
-                let index = index_of(ns)?;
-                let space = table.space();
-                let origin = space.life_origin().to_raw();
-                Some((
-                    index,
-                    space.flushed().to_raw() - origin,
-                    space.ro_boundary().to_raw() - origin,
-                    space.tail().to_raw() - origin,
-                ))
-            })
-            .collect();
-        flushed.sort_unstable();
+        let flushed = tier_budget_flushed(&node.plane(cell).keyspace(), shape);
         if stats.io_budget_model_absent != 0 {
             report.violations.push(format!(
                 "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: the device model is absent"
@@ -1221,12 +1202,12 @@ fn tier_budget_scrape(
                  offer under the model"
             ));
         }
-        if flushed.len() != usize::from(shape.namespaces) {
+        if flushed.len() != usize::from(shape.namespaces.get()) {
             report.violations.push(format!(
                 "TIER BUDGET VACUOUS seed {seed:#x} cell {cell}: {} of {} tier-budget \
                  namespaces materialized",
                 flushed.len(),
-                shape.namespaces
+                shape.namespaces.get()
             ));
         }
         for &(index, bytes, _, _) in &flushed {
@@ -1249,6 +1230,34 @@ fn tier_budget_scrape(
             flushed,
         });
     }
+}
+
+/// Each tier-budget namespace's flush watermark, ro-boundary and tail
+/// past its life origin on one cell, by namespace index, sorted.
+fn tier_budget_flushed(
+    keyspace: &inf_store::Keyspace,
+    shape: TierBudgetShape,
+) -> Vec<(u8, u64, u64, u64)> {
+    let index_of = |ns: NsId| -> Option<u8> {
+        let spec = keyspace.ns_iter().find(|spec| spec.id == ns)?;
+        shape.namespaces.indices().find(|&i| NsClass::TierBudget(i).name() == spec.name.as_slice())
+    };
+    let mut flushed: Vec<(u8, u64, u64, u64)> = keyspace
+        .tiered_namespaces()
+        .filter_map(|(ns, table)| {
+            let index = index_of(ns)?;
+            let space = table.space();
+            let origin = space.life_origin().to_raw();
+            Some((
+                index,
+                space.flushed().to_raw() - origin,
+                space.ro_boundary().to_raw() - origin,
+                space.tail().to_raw() - origin,
+            ))
+        })
+        .collect();
+    flushed.sort_unstable();
+    flushed
 }
 
 fn served_preallocs(stats: &inf_server::DurableStats) -> u64 {
