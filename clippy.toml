@@ -82,6 +82,13 @@ disallowed-methods = [
     { path = "std::os::unix::fs::chroot", reason = "blocking filesystem call (ADR-0144 D5)" },
 ]
 
+# ADR-0144 A2: a reservation is consumed in the step that made it; held
+# across an `await` it is an error (`await_holding_invalid_type`, denied with
+# every warning), and the lint-scopes audit sanctions no allow of it.
+await-holding-invalid-types = [
+    { path = "inf_foundation::bounded::DequeSlot", reason = "a reservation is consumed before any await: a resumed step reserves again (ADR-0144 A2)" },
+]
+
 # INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch
 # 64, ADR-0125): clippy counts code lines (comments and blanks excluded).
 # The lint is not in the workspace lint table — scripts/check-lint-ratchet.sh

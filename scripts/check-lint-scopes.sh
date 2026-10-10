@@ -10,7 +10,8 @@
 #     classes. The audit is structural (ADR-0125 A3's): attributes are
 #     read whole; an inner attribute, an `expect`, a `cfg_attr`, a group
 #     (`clippy::pedantic`, `warnings`, …), a missing reason, a reason of
-#     another class, or a wrong scope is a violation;
+#     another class, or a wrong scope is a violation. A lint with no class
+#     (`await_holding_invalid_type`, ADR-0144 A2) admits no allow at all;
 #   * D1's frozen exemptions: the `ADR-0143:` allows are exactly the rows
 #     of docs/lint-exemptions.tsv, one allow per row, at most
 #     ADR0143_EXEMPTIONS_MAX, and the table only shrinks against its
@@ -23,7 +24,10 @@
 #     counts per file and record only shrink against the approved copies,
 #     and `container: capped-backing` is allowed exactly
 #     CAPPED_BACKING_SITES times, with no row. clippy.toml owns the banned
-#     paths and the ban's sentence; this gate reads both from it. A banned
+#     paths and the ban's sentence; this gate reads both from it. Every
+#     `impl Lossy for` site of cell production code is printed on the OK
+#     line: a payload that may be merged or dropped at a cap opts in by
+#     name, and each opt-in is a reviewed line (ADR-0151 D2). A banned
 #     name in cell production code outside every `container:` allow is red
 #     from the text too, so code this host's builds do not compile (another
 #     `target_os`, a feature neither build enables) is held the same. Test
@@ -125,10 +129,13 @@ LINTS = {
     "too_many_lines": ("fn", ("shape:",)),
     "disallowed_methods": ("statement", ("clock:", "fs-seam:", "boot:", "control-thread:")),
     "disallowed_types": ("item", ("fs-seam:", "boot:", "control-thread:", "container:")),
+    # ADR-0144 A2: a reservation is consumed before any await; no class, so
+    # no allow. clippy.toml's `await-holding-invalid-types` lists the types.
+    "await_holding_invalid_type": ("none", ()),
 }
 if os.environ.get("INF_LINT_RULES") == "1":
     for lint, (scope, classes) in LINTS.items():
-        example = next(cls for cls in classes if cls != "ADR-0143:")
+        example = next((cls for cls in classes if cls != "ADR-0143:"), "-")
         print(f"{lint}\t{scope}\t{example}")
     sys.exit(0)
 # The banned container paths and their sentence: clippy.toml's
@@ -163,6 +170,8 @@ REASON = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
 errors, oks, deny_sites, api_sites = [], [], [], []
 # (file, first line, last line, item key, record, site) per `container:` allow
 container_sites = []
+lossy_sites = []  # `file:line: impl Lossy for T` in cell production code
+LOSSY = re.compile(r"^\s*impl(?:<[^>]*>)?\s+(?:[A-Za-z_][A-Za-z_0-9]*::)*Lossy\s+for\s+([^\s{]+)")
 production_of = {}  # cell file -> its production lines (test modules blanked)
 STRIPPER = str(Path(os.environ["INF_SCRIPT_DIR"]) / "strip-test-modules.awk")
 TEST_ATTR = re.compile(r"^\s*#\[cfg\((?:test|all\(test,.*\))\)\]\s*$")  # the stripper's test-only attributes
@@ -430,6 +439,11 @@ def audit(path, exempt_sites):
                     if (n, m.start()) in code:
                         errors.append(f"{path}:{n + 1}: `Cap::entries` outside a `limits.rs` — a cap is a "
                                       "named const of its crate's `limits` module (ADR-0163 D2)")
+        if "Lossy" in "\n".join(production):
+            for n, line in enumerate(blanked(production)):
+                m = LOSSY.match(line)
+                if m:
+                    lossy_sites.append(f"{path}:{n + 1}: impl Lossy for {m.group(1)}")
     i = 0
     while i < len(lines):
         s = lines[i].strip()
@@ -473,6 +487,11 @@ def audit(path, exempt_sites):
                 valid = True
                 for lint in named:
                     scope, classes = LINTS[lint]
+                    if not classes:
+                        errors.append(f"{site}: {lint} admits no allow — a reservation is consumed before "
+                                      "any await, and a resumed step reserves again (ADR-0144 A2)")
+                        valid = False
+                        continue
                     if not why.startswith(classes) or not why.partition(":")[2].strip():
                         errors.append(f"{site}: reason class of {lint} must be one of {', '.join(classes)}")
                         valid = False
@@ -1015,7 +1034,7 @@ if errors:
         print(f"LINT-SCOPES violation: {e}")
     print(f"lint-scopes FAILED: {len(errors)} violation(s)")
     sys.exit(1)
-scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted"
+scope = f"{roots} crate roots under the wildcard deny, {files} files audited, {len(oks)} reasoned allow(s), {len(table)}/{MAX} ADR-0143 exemptions, {len(targets)} fuzz targets scoped, {len(scopes_tbl.scopes)} scope(s): {denied_n} (scope, family) denied, {ratchet_n} ratcheted, {len(lossy_sites)} Lossy payload(s)"
 scope += (f"; container exemptions: {len(crows)} row(s), counts {csum}/{CONTAINER_MAX}, "
           f"{len(backing)}/{BACKING_SITES} capped-backing, "
           + ("counts judged against the census" if diagnostics else "counts judged in the ratchet's API pass")
@@ -1029,6 +1048,8 @@ if notes:
 print(f"lint-scopes OK: {scope}")
 for ok in oks:
     print(f"    allow: {ok}")
+for lossy in lossy_sites:
+    print(f"    lossy: {lossy}")
 PY
 
 if [ "${INF_LINT_RULES:-0}" = 1 ] || [ -n "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
@@ -1051,6 +1072,14 @@ pwork=$(mktemp -d "$WS_ROOT/target/lint-scope-probe.XXXXXX")
 [ -n "$pwork" ] && [ -d "$pwork" ] || { echo "LINT-SCOPES SCOPE ERROR: mktemp failed"; exit 2; }
 trap '[ -n "$pwork" ] && [ -d "$pwork" ] && rm -rf "$pwork"' EXIT
 cp -R "$PROBE_SRC/." "$pwork/probe"
+# The await and discard plants hold the engine's own slot types: the copy
+# depends on crates/inf-foundation by the workspace's absolute path.
+[ -f "$WS_ROOT/crates/inf-foundation/Cargo.toml" ] ||
+    { echo "LINT-SCOPES SCOPE ERROR: $WS_ROOT/crates/inf-foundation is missing; the probe's slot plants need it"; exit 1; }
+sed -i.bak "s|path = \"../../crates/inf-foundation\"|path = \"$WS_ROOT/crates/inf-foundation\"|" "$pwork/probe/Cargo.toml"
+rm -f "$pwork/probe/Cargo.toml.bak"
+grep -q "path = \"$WS_ROOT/crates/inf-foundation\"" "$pwork/probe/Cargo.toml" ||
+    { echo "LINT-SCOPES SCOPE ERROR: the probe's inf-foundation dependency was not rewritten to $WS_ROOT"; exit 1; }
 # Fixture mutations may supply their own config; both judges read the exact
 # config Clippy uses. The shipped probe inherits the production config.
 if [ ! -f "$pwork/probe/clippy.toml" ]; then

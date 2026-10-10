@@ -1631,9 +1631,17 @@ done
 # constants set to the fixture's own by ls_gate (a container table's sum is
 # its CONTAINER_EXEMPTIONS_MAX exactly, so an empty fixture table runs at 0).
 LS_GATE="$work/gate"
-mkdir -p "$LS_GATE"
+mkdir -p "$LS_GATE/crates"
 cp -R "$SCRIPT_DIR" "$LS_GATE/scripts"
 cp rust-toolchain.toml clippy.toml "$LS_GATE/"
+# The probe's slot plants depend on the engine's inf-foundation (ADR-0144
+# A2): the gate copy resolves it under its own root, with a workspace whose
+# members are that crate alone (its manifest inherits from the workspace).
+cp -R crates/inf-foundation "$LS_GATE/crates/inf-foundation"
+rm -rf "$LS_GATE/crates/inf-foundation/fuzz"
+sed 's|^members = .*|members = ["crates/*"]|' Cargo.toml >"$LS_GATE/Cargo.toml"
+grep -q '^members = \["crates/\*"\]$' "$LS_GATE/Cargo.toml" ||
+    { echo "selftest: the gate copy's workspace members were not rewritten" >&2; exit 2; }
 LINTSCOPES="$LS_GATE/scripts/check-lint-scopes.sh"
 ls_gate() { # <maximum> <backing sites>
     sed -i.bak -e "s/^CONTAINER_EXEMPTIONS_MAX=[0-9][0-9]*\$/CONTAINER_EXEMPTIONS_MAX=$1/" \
@@ -1702,6 +1710,12 @@ LS_RULES=$(env INF_LINT_RULES=1 INF_CHECK_ROOT="$root" "$LINTSCOPES")
 [ -n "$LS_RULES" ] || { echo "selftest: the gate listed no lint rule" >&2; exit 2; }
 while IFS=$'\t' read -r lint scope cls; do
     cls=${cls%:}
+    if [ "$cls" = - ]; then
+        # No class: a reasoned allow at any scope is red too (ADR-0144 A2).
+        ls_case red "$lint — admits no allow, however reasoned" "#[allow(clippy::$lint, reason = \"consumed before the await\")]
+pub async fn f() {}"
+        expect_output "lint-scopes: $lint — the refusal names its rule" "$lint admits no allow" ls_run "$root"
+    fi
     ls_case red "$lint — allow without a reason" "#[allow(clippy::$lint)]
 pub fn f() {}"
     ls_case red "$lint — expect hides it" "#[expect(clippy::$lint, reason = \"$cls: x\")]
@@ -1716,6 +1730,7 @@ pub fn f() {}"
 impl S {}"
     ls_case red "$lint — a reason of no class" "#[allow(clippy::$lint, reason = \"it is fine\")]
 pub fn f() {}"
+    [ "$cls" = - ] && continue
     ls_case green "$lint — a reasoned function-level allow (multi-line)" "#[allow(
     clippy::$lint,
     reason = \"$cls: stated over two lines, through another attribute\"
@@ -2113,6 +2128,22 @@ ls_commit "$root" containers
 fx_git "$root" branch -q -f base-tip HEAD
 ls_gate "$LC_MAX" 0
 expect green "lint-scopes: containers — the table equals the census (control)" lc_run "$root"
+expect_output "lint-scopes: containers — no Lossy opt-in reads 0 on the OK line" \
+    "0 Lossy payload(s)" lc_run "$root"
+# ADR-0151 D2: every `impl Lossy for` site of cell production code is printed
+# on the OK line, so each opt-in is a reviewed line; one in a comment, one in
+# a string and one in a test module are not production code.
+lc_append 'pub trait Lossy {}' 'pub struct Mark;' 'impl Lossy for Mark {}' 'pub struct Pair<T>(T);' \
+    'impl<T: Copy> crate::a::Lossy for Pair<T> {}' '// impl Lossy for Hidden {}' \
+    'pub const TEXT: &str = "impl Lossy for Quoted {}";' '#[cfg(test)]' 'mod tests {' \
+    '    pub struct TestOnly;' '    impl super::Lossy for TestOnly {}' '}'
+expect_output "lint-scopes: containers — an impl Lossy for site is printed" \
+    "lossy: $LC_A:20: impl Lossy for Mark" lc_run "$root"
+expect_output "lint-scopes: containers — a generic, path-qualified impl Lossy for site is printed" \
+    "lossy: $LC_A:22: impl Lossy for Pair<T>" lc_run "$root"
+expect_output "lint-scopes: containers — the OK line counts the production opt-ins only" \
+    "2 Lossy payload(s)" lc_run "$root"
+lc_reset
 # the fixture edits' canaries: an escape BSD sed misreads is refused, and an
 # edit that matches nothing is a harness error; neither changes the file
 lc_escape_canary() (lc_edit 's|    pub queue: VecDeque<u8>,|    pub queue: VecDeque<u8>,\n|' "$LC_A")
@@ -2915,6 +2946,24 @@ cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-containers-new"
 printf 'pub struct Added {\n    pub value: std::collections::HashMap<u8, u8>,\n}\n' >>"$work/probe-containers-new/src/containers.rs"
 expect_red_because "lint-scopes: a new container with no plant marker is red by its lint and path" \
     "unmarked diagnostic \[('clippy::disallowed_types', 'std::collections::HashMap')\]" ls_probe "$work/probe-containers-new"
+
+# ADR-0144 A2: the slot plant draws `await_holding_invalid_type` naming its
+# configured path under the production config (the green case above). A
+# config without the slot type, a plant whose slot is consumed before the
+# await, and a discarded publish that is not discarded are each red for
+# their own reason.
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured"
+grep -v 'path = "inf_foundation::bounded::DequeSlot"' clippy.toml >"$work/probe-await-unconfigured/clippy.toml"
+expect_red_because "lint-scopes: a config without the slot type" \
+    "config needs 1 distinct slot type await-holding-invalid-types, found 0" ls_probe "$work/probe-await-unconfigured"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-consumed"
+sed -i.bak 's|            yield_once().await;|            slot.publish(0);|; s|            slot.publish(1);|            yield_once().await;|' "$work/probe-await-consumed/src/awaits.rs"
+expect_red_because "lint-scopes: a slot consumed before the await draws nothing on the plant" \
+    "did NOT draw clippy::await_holding_invalid_type inf_foundation::bounded::DequeSlot" ls_probe "$work/probe-await-consumed"
+cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-discard-published"
+sed -i.bak 's|        let _ = slot.publish(1); // PLANT clippy::let_unit_value|        slot.publish(1); // PLANT clippy::let_unit_value|' "$work/probe-discard-published/src/discards.rs"
+expect_red_because "lint-scopes: a publish that is not discarded draws no discard lint" \
+    "did NOT draw clippy::let_unit_value" ls_probe "$work/probe-discard-published"
 
 # ADR-0164: the parent doc gates state their scope — a standalone checkout
 # skips out loud; a parent whose gates are missing is red, not a skip.

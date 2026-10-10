@@ -8,7 +8,9 @@
     deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
 )]
 
+pub mod awaits;
 pub mod containers;
+pub mod discards;
 pub mod filesystem;
 
 pub enum Three {

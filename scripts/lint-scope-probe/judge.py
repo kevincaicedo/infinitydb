@@ -49,20 +49,27 @@ def container(path):
     return path.startswith("std::collections::")
 
 
+def slot(path):
+    return path.startswith("inf_foundation::bounded::")
+
+
 cfg = tomllib.loads(config.read_text())
 # Clippy's help for an unresolved entry is `allow-invalid = true`, which
 # silences it on every architecture: an inert entry would stay green
 # (ADR-0106 D7.5).
-for key in ("disallowed-methods", "disallowed-types"):
+for key in ("disallowed-methods", "disallowed-types", "await-holding-invalid-types"):
     for row in cfg.get(key, []):
         if isinstance(row, dict) and "allow-invalid" in row:
             errors.append(f"{key} entry {row.get('path')} carries allow-invalid, "
                           "which hides an entry that resolves to nothing")
 # (config key, lint, family, its name, the exact count): every entry needs a
 # plant naming its path and every plant an entry (ADR-0144 D5, ADR-0163 D2).
+# A slot type is a reservation of `inf_foundation::bounded`, held across an
+# `await` by its plant (ADR-0144 A2); each type lands with its own plant.
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
-          ("disallowed-types", "disallowed_types", container, "container", 3))
+          ("disallowed-types", "disallowed_types", container, "container", 3),
+          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 1))
 for key, lint, family, label, count in CENSUS:
     paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
     if len(paths) != count or len(set(paths)) != len(paths):
@@ -101,7 +108,8 @@ for raw in diag.read_text().splitlines():
         if d["level"] == "error" and not text.startswith(("aborting due to", "could not compile")):
             errors.append(f"unrelated compiler error: {text}")
         continue
-    path = re.search(r"use of a disallowed (?:method|type) `([^`]+)`", text)
+    path = (re.search(r"use of a disallowed (?:method|type) `([^`]+)`", text)
+            or re.search(r"holding a disallowed type across an await point `([^`]+)`", text))
     for sp in d["spans"]:
         if not sp.get("is_primary"):
             continue
@@ -129,8 +137,10 @@ for at in sorted(controls):
 for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
-if len(plants) < 63:  # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers
-    errors.append(f"{len(plants)} plants; expected at least 63")
+# nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
+# one slot across an await, three discarded publishes
+if len(plants) < 67:
+    errors.append(f"{len(plants)} plants; expected at least 67")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -202,7 +212,7 @@ if errors:
         print(f"lint-scopes probe: {disclosed[2:]}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
-      f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types and "
-      f"three containers covered{disclosed}")
+      f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types, "
+      f"three containers and one slot type across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

@@ -12,3 +12,8 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+# The await and discard plants hold the engine's own slot types. The gate
+# rewrites this path to the workspace's absolute one in the copy it builds.
+[dependencies]
+inf-foundation = { path = "../../crates/inf-foundation" }
