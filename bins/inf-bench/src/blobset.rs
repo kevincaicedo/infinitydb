@@ -616,68 +616,96 @@ fn plant_reply_err() -> Result<(), String> {
     }
 }
 
-/// `inf-bench blob-set`.
-pub fn cmd_blob_set(args: &[String]) -> Result<(), String> {
-    let flags = Flags::parse(args, FLAGS.0, FLAGS.1)?;
-    let plant = Plant::parse(flags.get("plant"))?;
-    if plant == Plant::ReplyErr {
-        return plant_reply_err();
+/// The run's arguments, parsed and validated once at the boundary.
+struct BlobSetArgs {
+    env_ok: bool,
+    bin: String,
+    binary_b: String,
+    data_root: String,
+    fstype: String,
+    artifacts_root: String,
+    cells: u16,
+    pin_start: Option<String>,
+    conns: Vec<usize>,
+    replicates: usize,
+    warmup: Duration,
+    window: Duration,
+    value_size: usize,
+    threshold: String,
+}
+
+impl BlobSetArgs {
+    fn parse(flags: &Flags, plant: Plant) -> Result<BlobSetArgs, String> {
+        let env_ok = env_gate(flags)?;
+        let reference_box = flags.bool("reference-box");
+        let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+        let binary_b = flags.get("binary-b").map(str::to_string).unwrap_or_else(|| bin.clone());
+        let data_root = flags.require("data-root")?.to_string();
+        let fstype = admit_device_root(flags, Path::new(&data_root), reference_box)?;
+        if crate::gaterun::is_memory_fs(&fstype) {
+            return Err(format!(
+                "data root {data_root} is {fstype}: a blob SET's extent and its fsync must hit a \
+                 device; point --data-root at the filesystem under test"
+            ));
+        }
+        let conns: Vec<usize> = flags
+            .str_or("conns", CONNS_DEFAULT)
+            .split(',')
+            .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--conns `{s}`: {e}")))
+            .collect::<Result<_, _>>()?;
+        if conns.contains(&0) {
+            return Err("--conns: every count is at least 1".into());
+        }
+        let window = Duration::from_secs(flags.u64_or("duration-s", 30)?);
+        if window.is_zero() {
+            return Err("--duration-s: the window is at least 1 s".into());
+        }
+        let value_size = flags.usize_or("value-size", 64 << 10)?;
+        let threshold = match plant {
+            Plant::BlobThresholdAbove => format!("{}", (value_size * 2).max(8 << 10)),
+            Plant::None | Plant::ReplyErr => flags.str_or("blob-threshold", "4kb"),
+        };
+        Ok(BlobSetArgs {
+            env_ok,
+            bin,
+            binary_b,
+            data_root,
+            fstype,
+            artifacts_root: flags.str_or("artifacts-root", ".artifacts/blob-set"),
+            cells: flags.u16_or("cells", 4)?,
+            pin_start: flags.get("pin-start").map(str::to_string),
+            conns,
+            replicates: flags.usize_or("replicates", 5)?,
+            warmup: Duration::from_secs(flags.u64_or("warmup-s", 5)?),
+            window,
+            value_size,
+            threshold,
+        })
     }
-    let env_ok = env_gate(&flags)?;
-    let reference_box = flags.bool("reference-box");
-    let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
-    let binary_b = flags.get("binary-b").map(str::to_string).unwrap_or_else(|| bin.clone());
-    let data_root = flags.require("data-root")?.to_string();
-    let fstype = admit_device_root(&flags, Path::new(&data_root), reference_box)?;
-    if crate::gaterun::is_memory_fs(&fstype) {
-        return Err(format!(
-            "data root {data_root} is {fstype}: a blob SET's extent and its fsync must hit a \
-             device; point --data-root at the filesystem under test"
-        ));
-    }
-    let artifacts_root = flags.str_or("artifacts-root", ".artifacts/blob-set");
-    let cells = flags.u16_or("cells", 4)?;
-    let pin_start = flags.get("pin-start").map(str::to_string);
-    let conns: Vec<usize> = flags
-        .str_or("conns", CONNS_DEFAULT)
-        .split(',')
-        .map(|s| s.trim().parse::<usize>().map_err(|e| format!("--conns `{s}`: {e}")))
-        .collect::<Result<_, _>>()?;
-    if conns.contains(&0) {
-        return Err("--conns: every count is at least 1".into());
-    }
-    let replicates = flags.usize_or("replicates", 5)?;
-    let warmup = Duration::from_secs(flags.u64_or("warmup-s", 5)?);
-    let window = Duration::from_secs(flags.u64_or("duration-s", 30)?);
-    if window.is_zero() {
-        return Err("--duration-s: the window is at least 1 s".into());
-    }
-    let value_size = flags.usize_or("value-size", 64 << 10)?;
-    let threshold = match plant {
-        Plant::BlobThresholdAbove => format!("{}", (value_size * 2).max(8 << 10)),
-        Plant::None | Plant::ReplyErr => flags.str_or("blob-threshold", "4kb"),
-    };
-    let command = format!("inf-bench blob-set {}", args.join(" "));
-    let header = env_header(&flags, env_ok, &fstype, &command);
-    let specs = [("a", bin.as_str()), ("b", binary_b.as_str())];
+}
+
+/// Every point of the curve: both legs over every replicate, interleaved
+/// `a b` then `b a`, so neither leg always warms the other; each leg on
+/// a fresh data directory, removed after it.
+fn run_points(run: &BlobSetArgs) -> Result<Vec<Point>, String> {
+    let specs = [("a", run.bin.as_str()), ("b", run.binary_b.as_str())];
     let mut points = Vec::new();
-    for &c in &conns {
+    for &c in &run.conns {
         let mut legs = Vec::new();
-        for replicate in 0..replicates {
-            // Interleaved: a b, then b a, so neither leg always warms the other.
+        for replicate in 0..run.replicates {
             let order: [usize; 2] = if replicate % 2 == 0 { [0, 1] } else { [1, 0] };
             for which in order {
                 let (name, leg_bin) = specs[which];
-                let data_dir = Path::new(&data_root).join(format!("{name}-c{c}-r{replicate}"));
+                let data_dir = Path::new(&run.data_root).join(format!("{name}-c{c}-r{replicate}"));
                 let spec = LegSpec {
                     bin: leg_bin,
-                    cells,
+                    cells: run.cells,
                     data_dir: &data_dir,
-                    pin_start: pin_start.as_deref(),
-                    threshold: &threshold,
-                    value_size,
-                    warmup,
-                    window,
+                    pin_start: run.pin_start.as_deref(),
+                    threshold: &run.threshold,
+                    value_size: run.value_size,
+                    warmup: run.warmup,
+                    window: run.window,
                 };
                 let leg = run_leg(&spec, name, c, replicate)?;
                 println!(
@@ -696,10 +724,12 @@ pub fn cmd_blob_set(args: &[String]) -> Result<(), String> {
         }
         points.push(Point { conns: c, legs });
     }
-    let outcome = outcome_of(&points);
-    let report = render_report(&points, &header, outcome);
-    let path = write_report(&artifacts_root, &report)?;
-    println!("blob-set: report {path}");
+    Ok(points)
+}
+
+/// The run's exit from its outcome: a vacuous or red leg fails the run;
+/// a point over the spread budget says so and exits 0.
+fn exit_of(outcome: Outcome) -> Result<(), String> {
     match outcome {
         Outcome::Measured => Ok(()),
         Outcome::EvidencePending => {
@@ -711,6 +741,24 @@ pub fn cmd_blob_set(args: &[String]) -> Result<(), String> {
             .into()),
         Outcome::Red => Err("red: a reply was not +OK".into()),
     }
+}
+
+/// `inf-bench blob-set`.
+pub fn cmd_blob_set(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args, FLAGS.0, FLAGS.1)?;
+    let plant = Plant::parse(flags.get("plant"))?;
+    if plant == Plant::ReplyErr {
+        return plant_reply_err();
+    }
+    let run = BlobSetArgs::parse(&flags, plant)?;
+    let command = format!("inf-bench blob-set {}", args.join(" "));
+    let header = env_header(&flags, run.env_ok, &run.fstype, &command);
+    let points = run_points(&run)?;
+    let outcome = outcome_of(&points);
+    let report = render_report(&points, &header, outcome);
+    let path = write_report(&run.artifacts_root, &report)?;
+    println!("blob-set: report {path}");
+    exit_of(outcome)
 }
 
 #[cfg(test)]
