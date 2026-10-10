@@ -309,8 +309,8 @@ pub struct GroupCommit<File> {
     /// still sits in the staging ring, so no standalone sync can cover it
     /// yet (M2.5-S07 completion-issue discharge check).
     always_unqueued: bool,
-    /// An `everysec` record was staged after the last frame queued (F-L01-01,
-    /// batch 42): the ledger is byte-clean but the cell is not idle — a
+    /// An `everysec` record was staged after the last frame queued: the
+    /// ledger is byte-clean but the cell is not idle — a
     /// tick over it owes the held frame its barrier, and a sync settling
     /// at `written_up_to` cannot discharge it.
     everysec_unqueued: bool,

@@ -238,8 +238,8 @@ pub(crate) struct CkptCell<F: SegmentFs> {
     next_id: u64,
     /// Manual trigger latch (`INF.CKPT` via the control handle — S20).
     pub requested: bool,
-    /// The checkpoint in flight was begun for a manual request (N15,
-    /// batch 33): an abort re-arms `requested`, so `INF.CKPT WAIT` is
+    /// The checkpoint in flight was begun for a manual request: an abort
+    /// re-arms `requested`, so `INF.CKPT WAIT` is
     /// answered by the retry instead of hanging until the bytes trigger.
     serving_request: bool,
     /// Latest `INF.CKPT` request epoch seen (M2-S20) — recorded at
