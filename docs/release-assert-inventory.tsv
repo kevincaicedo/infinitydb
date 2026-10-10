@@ -262,6 +262,7 @@ I	2	crates/inf-log/src/flush.rs	expect	created above	TierFlush drive / round / s
 I	1	crates/inf-log/src/flush.rs	expect	DurableTo without an active writer	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
 C	1	crates/inf-log/src/flush.rs	expect	reactor drive requires fd-backed dirs (ADR-0084)	`crates/inf-server/src/tier_cell.rs:TierCell::create_ns` and `TierCell::install_recovered` select TierDrive::Reactor only on the fd-backed real fs (the sim fs answers `raw_fd` too — ADR-0084)
 I	1	crates/inf-log/src/flush.rs	expect	round op view without a round	TierFlush drive / round / seal state machine (ADR-0084 D2: seam and reactor drives never interleave)
+I	1	crates/inf-log/src/limits.rs	assert	one staged write fits one tier group	const assertion — evaluated at compile time, never at run time; a full batch window (`TIER_BATCH_FRAMES` frames) is the largest write a round stages, so the group builder always fits the next unsent write (ADR-0178 D3)
 I	1	crates/inf-log/src/frame.rs	assert	append on a sealed frame (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
 C	1	crates/inf-log/src/frame.rs	assert	covered watermark leads the frame's own records	`crates/inf-server/src/durable.rs:DurableCell::queue_frame` stamps `covered` = the commit watermark, which the FIFO keeps below every unqueued record's LSN
 I	1	crates/inf-log/src/frame.rs	assert	double finalize (missing reset)	FrameBuilder seal state machine (append → finalize → sealed_frame; reset between frames)
@@ -555,11 +556,10 @@ I	1	crates/inf-server/src/recover.rs	expect	recovery complete before finish()	do
 I	1	crates/inf-server/src/recover.rs	expect	scan set	`scan` is stored in the start phase before any later phase runs
 I	1	crates/inf-server/src/recover.rs	expect	scan set in start	`scan` is stored in the start phase before any later phase runs
 I	1	crates/inf-server/src/recover.rs	unreachable	Io and foreign-segment reads are handled above	those two error kinds returned earlier in the same match
-C	1	crates/inf-server/src/tier_cell.rs	assert	flush round exceeds the token op-index bound (ADR-0084 D3)	the round is staged under `admission.admit(slice_bound, TIER_ROUND_MAX_OPS)` in the same function, and `crates/inf-store/src/tiered/flush.rs:TieredTable::stage_flush_round` stages at most the admitted ops (256)
 I	1	crates/inf-server/src/tier_cell.rs	assert	tier flush lanes exhausted	lanes recycle once their namespace has no op in flight, so the bound is on live-plus-draining tiered namespaces: 2^16 pipelines of MiBs each — memory exhausts first
-I	1	crates/inf-server/src/tier_cell.rs	expect	checked above	`t.round` was seen `Some` at the top of the same function
+I	1	crates/inf-server/src/tier_cell.rs	expect	matched above	`t.round` was matched `Some` at the top of the same function
 I	1	crates/inf-server/src/tier_cell.rs	expect	checked front	`front().is_some_and(..)` on the line above
-I	1	crates/inf-server/src/tier_cell.rs	expect	just created	`create_ns` pushed the namespace on the line above
+I	1	crates/inf-server/src/tier_cell.rs	expect	a ready group implies a round	`has_ready_group()` reads `self.round`, which the issue pass tested true on the line above
 I	2	crates/inf-simd/src/crc32c.rs	expect	4-byte slice	`chunk[0..4]`/`[4..8]` of an 8-byte `chunks_exact` chunk
 I	2	crates/inf-simd/src/crc32c.rs	expect	chunks_exact(8) yields 8 bytes	`chunks_exact(8)` yields 8-byte slices; the `try_into` is infallible
 C	1	crates/inf-simd/src/crlf.rs	panic	CRLF offset exceeds u32 range: {position}	no production caller reaches this site: `CrlfPositions` and `scan_crlf` are called only by this crate's unit tests and one `inf-server` test; the parser's line scan is `crates/inf-simd/src/crlf.rs:find_crlf`, which builds no position table
@@ -794,3 +794,5 @@ I	1	crates/inf-query/src/predicate/program.rs	assert	a path reference fits its u
 I	1	crates/inf-foundation/src/limits.rs	assert	a driver op's span end is at most i64::MAX	const assertion — evaluated at compile time, never at run time; `FileOffset::bytes_after`/`position_after` rest on it (ADR-0167 D1)
 I	1	crates/inf-foundation/src/limits.rs	assert	every u32 position is addressable	const assertion — evaluated at compile time, never at run time; `FileOffset::from_u32_bytes` is total by it (ADR-0167 D1)
 I	1	crates/inf-server/src/tier_cell.rs	assert	a cold-read pool buffer is one driver op	const assertion — evaluated at compile time, never at run time; the production pool meets `ColdReads::with_config`'s width check by it (ADR-0167 D1)
+I	1	crates/inf-server/src/tier_cell.rs	assert	a group fits the ops slice	const assertion — evaluated at compile time, never at run time; `TIER_GROUP_OPS_MAX` is at most the tier class's ops slice, so no tier offer is above the class cap on the ops axis (ADR-0178 D3)
+I	1	crates/inf-server/src/tier_cell.rs	assert	one plan permit per turn	const assertion — evaluated at compile time, never at run time; `TIER_PLANS_PER_TURN` is the one `PlanPermit` a MAINTAIN mints (ADR-0178 D3)

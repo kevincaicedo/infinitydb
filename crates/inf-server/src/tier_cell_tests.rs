@@ -1,0 +1,800 @@
+//! The tier cell's lane tests: the round's groups under a real device
+//! budget, the cell's turn, the cold window's bound, the lanes.
+
+use super::*;
+use inf_foundation::fault::FaultSpec;
+use inf_foundation::time::Nanos;
+use inf_log::TIER_FRAME_BYTES;
+use inf_log::fs::TierIoMode;
+use inf_log::fs::mem::MemFs;
+use inf_log::fs::sim::SimDisk;
+use inf_runtime::{ClassSlice, DeviceBudget, DeviceModel, IoClass};
+use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher};
+use inf_store::{Keyspace, StoreConfig, TierSpec};
+
+fn spec() -> TierSpec {
+    TierSpec::for_budget(64 << 20)
+}
+
+/// Batch 14 of the 2026-08-30 review: the op index has 8 token bits.
+/// Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
+/// 0 — a second op carrying the same completion token.
+#[test]
+#[should_panic(expected = "round op index is 8-bit")]
+fn round_slot_refuses_an_aliasing_index() {
+    assert_ne!(round_slot(1, 0), round_slot(1, 256));
+}
+
+/// Batch 12 of the 2026-08-30 review: flush lanes recycle once their
+/// namespace has no op in flight, and the reuser continues the round
+/// sequence. Before the fix `next_lane` was monotone: with the counter
+/// at the width this test starts from, the second `CREATE` was the
+/// release assert `tier flush lanes exhausted` (a DDL count over the
+/// cell's lifetime as a node kill).
+#[test]
+fn dropped_namespace_lane_recycles_with_its_round_sequence() {
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    cell.next_lane = inf_runtime::MAX_SLOT >> 8;
+    cell.create_ns(NsId(16), &spec());
+    let first = &cell.namespaces[0];
+    assert_eq!(first.lane, inf_runtime::MAX_SLOT >> 8, "the last fresh lane");
+    cell.namespaces[0].round_seq = 7;
+    // A keyspace without the namespace: MAINTAIN's reconcile drops it
+    // (no round in flight → the lane recycles immediately).
+    let ks = Keyspace::new(StoreConfig::default());
+    let mut releases = vec![(NsId(16), 1)];
+    cell.sync_namespaces(&ks, &mut releases);
+    assert!(cell.namespaces.is_empty());
+    assert_eq!(cell.free_lanes, vec![(inf_runtime::MAX_SLOT >> 8, 7)]);
+    // The next tiered namespace takes the recycled lane — pre-fix this
+    // call took lane `MAX_SLOT >> 8 + 1` and panicked.
+    cell.create_ns(NsId(17), &spec());
+    let second = &cell.namespaces[0];
+    assert_eq!(second.lane, inf_runtime::MAX_SLOT >> 8);
+    assert_eq!(second.round_seq, 7, "the round sequence continues past the last holder's");
+    assert!(cell.free_lanes.is_empty());
+    assert_eq!(cell.next_lane, (inf_runtime::MAX_SLOT >> 8) + 1, "no fresh lane was minted");
+}
+
+/// Namespaces are kept ascending by id whatever order they are created
+/// in: the turn's rotation is the vector's order.
+#[test]
+fn namespaces_are_kept_in_id_order() {
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    for id in [40, 16, 32, 17] {
+        cell.create_ns(NsId(id), &spec());
+    }
+    let ids: Vec<u32> = cell.namespaces.iter().map(|t| t.ns.0).collect();
+    assert_eq!(ids, vec![16, 17, 32, 40]);
+    assert_eq!(cell.rotation_start(None), 0);
+    assert_eq!(cell.rotation_start(Some(NsId(17))), 2, "the first id above 17");
+    assert_eq!(cell.rotation_start(Some(NsId(20))), 2, "a dropped id is passed in the order");
+    assert_eq!(cell.rotation_start(Some(NsId(40))), 0, "wrapping past the last");
+}
+
+/// A tiered keyspace on `NsId(16)` filled past its demotion threshold
+/// and sealed `seal_steps` times, nothing staged. Seal marks sit at
+/// page boundaries and the demotion slice is one 4 KiB page, so each
+/// step — one flush cut — is one page's records, about 4 KiB.
+fn sealed_backlog(seal_steps: u32) -> Keyspace {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    let mut ks = Keyspace::new(StoreConfig::default());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 2048).is_ok());
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let hasher = KeyHasher::default();
+    let mut index = 0u32;
+    let mut sealed = 0;
+    while sealed < seal_steps {
+        let key = format!("round:{index:06}").into_bytes();
+        table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits the window");
+        index += 1;
+        assert!(index < 100_000, "the fill reaches the demotion threshold");
+        if table.demote_due() && table.seal_slice() > 0 {
+            sealed += 1;
+        }
+    }
+    ks
+}
+
+/// Materializes `ns` on `ks` with a `budget`-byte window of 4 KiB pages
+/// and seals at least `sealed_bytes` behind the ro-boundary, one seal
+/// step per page, nothing staged: 200 B values under 12 B keys. Returns
+/// every inserted record's address in insertion order.
+fn sealed_backlog_on(
+    ks: &mut Keyspace,
+    ns: NsId,
+    budget: u64,
+    sealed_bytes: u64,
+) -> Vec<LogicalAddr> {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(budget, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    assert!(ks.materialize_tiered(ns, space, demote, 65_536).is_ok());
+    let table = ks.tiered_store_mut(ns).expect("materialized");
+    let hasher = KeyHasher::default();
+    let mut addrs = Vec::new();
+    let mut sealed = 0u64;
+    while sealed < sealed_bytes {
+        let key = format!("round:{:06}", addrs.len()).into_bytes();
+        let addr = table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits");
+        addrs.push(addr);
+        assert!(addrs.len() < 1_000_000, "the fill reaches the demotion threshold");
+        if table.demote_due() {
+            sealed += table.seal_slice();
+        }
+    }
+    addrs
+}
+
+/// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
+/// real reactor round, the new file's header write first (the
+/// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
+/// no fds.
+fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
+    let mut ks = sealed_backlog(1);
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let flush = &mut cell.namespaces[0].flush;
+    table.stage_flush_round(flush).expect("stage");
+    ks
+}
+
+/// The tier class's budget as the plane wires it: a real
+/// `DeviceBudget`, offered each group at its exact size.
+struct BudgetAdmission(DeviceBudget);
+
+impl FlushAdmission for BudgetAdmission {
+    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
+        self.0.offer(IoClass::TierFlush, bytes, ops)
+    }
+}
+
+/// Admission with no durable plane: every offer `Now`, nothing metered.
+struct NoBudget;
+
+impl FlushAdmission for NoBudget {
+    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
+        Issue::Now
+    }
+}
+
+/// Records every offer made through it, then asks `inner`.
+struct Recording<A: FlushAdmission> {
+    inner: A,
+    offers: Vec<(u64, u64)>,
+}
+
+impl<A: FlushAdmission> FlushAdmission for Recording<A> {
+    fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
+        self.offers.push((bytes, ops));
+        self.inner.admit(bytes, ops)
+    }
+}
+
+/// Answers each offer from a script: `Now` where the script says so.
+struct Scripted<S: FnMut(usize) -> bool> {
+    grant: S,
+    offers: usize,
+}
+
+impl<S: FnMut(usize) -> bool> FlushAdmission for Scripted<S> {
+    fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
+        let index = self.offers;
+        self.offers += 1;
+        if (self.grant)(index) { Issue::Now } else { Issue::NotThisSlice }
+    }
+}
+
+/// A device budget over `model`'s share at `cells`, with the tier
+/// class's declared slice (one group's bytes, the token op bound), as
+/// the durable cell builds it.
+fn plane_budget(model: DeviceModel, cells: u16) -> BudgetAdmission {
+    let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
+    slices[IoClass::TierFlush.index()] =
+        ClassSlice { bytes: TIER_GROUP_BYTES_MAX, ops: TIER_ROUND_MAX_OPS };
+    BudgetAdmission(DeviceBudget::new(model.share(cells), slices, 2, Nanos(0)))
+}
+
+/// The reference-shape model of the binary's budget tests.
+fn reference_model() -> DeviceModel {
+    DeviceModel {
+        write_bytes_per_s: 40_000_000,
+        write_ops_per_s: 40_000,
+        read_bytes_per_s: 40_000_000,
+        read_ops_per_s: 40_000,
+    }
+}
+
+/// One MAINTAIN's tier pass on `cell`: every round advanced on its
+/// completions, then the cell's turn. Returns the ops pushed.
+fn pass(
+    cell: &mut TierCell<SimDisk>,
+    ks: &mut Keyspace,
+    now_us: u64,
+    admission: &mut impl FlushAdmission,
+) -> Vec<IoOp> {
+    let stats = &mut cell.flush_stats;
+    for t in &mut cell.namespaces {
+        let table = ks.tiered_store_mut(t.ns).expect("materialized");
+        advance_round(table, t, stats, now_us).expect("no barrier failed");
+    }
+    let mut ops = Vec::new();
+    cell.turn(ks, now_us, &mut ops, admission).expect("the plan is not refused");
+    ops
+}
+
+/// Executes `ops` on the cell's sim disk as the driver would and feeds
+/// each completion back: a write lands whole, a barrier flushes; the op
+/// at `fail` (an index into `ops`) fails with `EIO` and lands nothing.
+/// Returns the device bytes the disk was handed, attempts included.
+fn complete_ops_failing(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>, fail: Option<usize>) -> u64 {
+    let disk = cell.fs.clone();
+    let mut bytes = 0u64;
+    for (at, op) in ops.into_iter().enumerate() {
+        match op {
+            IoOp::LogWrite { fd, offset, token, data: _, barrier: _ } => {
+                let lane = token.slot() >> 8;
+                let index = (token.slot() & 0xFF) as usize;
+                let t = cell.namespaces.iter().find(|t| t.lane == lane).expect("lane");
+                let view = t.flush.round_op(index);
+                bytes += view.bytes.len() as u64;
+                if fail == Some(at) {
+                    cell.on_flush_completion(token, Some(EIO));
+                    continue;
+                }
+                disk.driver_write_at(fd, offset, view.bytes).expect("sim write");
+                cell.on_flush_completion(token, None);
+            }
+            IoOp::Fdatasync { fd, token } => {
+                disk.driver_fdatasync(fd).expect("sim barrier");
+                cell.on_flush_completion(token, None);
+            }
+            IoOp::AcceptArm { .. }
+            | IoOp::RecvArm { .. }
+            | IoOp::RecvDisarm { .. }
+            | IoOp::Send { .. }
+            | IoOp::Close { .. }
+            | IoOp::TierRead { .. } => {
+                panic!("a flush round pushes writes and barriers only")
+            }
+        }
+    }
+    bytes
+}
+
+fn complete_ops(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>) -> u64 {
+    complete_ops_failing(cell, ops, None)
+}
+
+/// The lane of each op pushed, in order.
+fn lanes_of(ops: &[IoOp]) -> Vec<u32> {
+    ops.iter()
+        .map(|op| match op {
+            IoOp::LogWrite { token, .. } | IoOp::Fdatasync { token, .. } => token.slot() >> 8,
+            IoOp::AcceptArm { .. }
+            | IoOp::RecvArm { .. }
+            | IoOp::RecvDisarm { .. }
+            | IoOp::Send { .. }
+            | IoOp::Close { .. }
+            | IoOp::TierRead { .. } => panic!("a flush round pushes writes and barriers only"),
+        })
+        .collect()
+}
+
+/// Drives passes with the budget refilled every `pass_ns` until the
+/// cell holds no round, completing each pass's ops; returns the device
+/// bytes and ops handed to the disk. Panics past `passes_max`.
+fn flush_to_idle(
+    cell: &mut TierCell<SimDisk>,
+    ks: &mut Keyspace,
+    admission: &mut Recording<BudgetAdmission>,
+    pass_ns: u64,
+    passes_max: u64,
+) -> (u64, u64) {
+    let (mut device_bytes, mut device_ops) = (0u64, 0u64);
+    for pass_index in 0..passes_max {
+        admission.inner.0.refill(Nanos(pass_index * pass_ns));
+        let ops = pass(cell, ks, pass_index * pass_ns / 1_000, admission);
+        device_ops += ops.len() as u64;
+        device_bytes += complete_ops(cell, ops);
+        if cell.namespaces.iter().all(|t| t.round.is_none()) && pass_index > 0 {
+            return (device_bytes, device_ops);
+        }
+    }
+    panic!("the rounds did not complete in {passes_max} passes");
+}
+
+/// Every tier offer is at most one group's bytes and ops, so at most the
+/// class cap, and a staged round of 8 MiB (nine batch windows) issues in
+/// groups, never as one burst: the budget never reads an unattainable
+/// offer, and what it spent is what the disk was handed (ADR-0178 D3's
+/// tier row; the oracle's equality at this tier).
+#[test]
+fn a_round_above_the_class_cap_issues_in_groups_of_at_most_the_cap() {
+    const SLICE: u64 = 8 << 20;
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SLICE, ..spec() });
+    let mut ks = Keyspace::new(StoreConfig::default());
+    sealed_backlog_on(&mut ks, NsId(16), 16 << 20, SLICE);
+    let mut admission = Recording { inner: plane_budget(reference_model(), 2), offers: Vec::new() };
+    let cap = admission.inner.0.cap(IoClass::TierFlush);
+    let (device_bytes, device_ops) =
+        flush_to_idle(&mut cell, &mut ks, &mut admission, 10_000_000, 1_000);
+    let t = &cell.namespaces[0];
+    assert!(cell.flush_stats.rounds >= 1, "engagement: the round completed");
+    assert!(t.flush.sealed().is_empty() || t.flush.active().is_some());
+    assert!(
+        admission.offers.len() >= 9,
+        "engagement: nine batch windows among {} offers",
+        admission.offers.len()
+    );
+    for &(bytes, ops) in &admission.offers {
+        assert!(bytes <= TIER_GROUP_BYTES_MAX, "an offer of {bytes} B is at most one group");
+        assert!(ops <= TIER_GROUP_OPS_MAX as u64, "an offer of {ops} ops is at most one group");
+        assert!(bytes <= cap.bytes && ops <= cap.ops, "an offer is at most the class cap");
+    }
+    let counters = admission.inner.0.counters(IoClass::TierFlush);
+    assert_eq!(counters.unattainable, 0, "no tier offer is above the class cap");
+    assert_eq!(counters.overrun_bytes, 0);
+    assert_eq!(counters.spent_bytes, device_bytes, "spent is what the disk was handed");
+    assert_eq!(counters.spent_ops, device_ops);
+    assert!(counters.deferrals >= 1, "engagement: the class refilled between groups");
+}
+
+/// Two namespaces on one cell over a real budget whose refill per pass
+/// is below one 64 KiB slice: the first has a sustained backlog, the
+/// second one page. Under the turn the second's ready group is issued
+/// within `n × T_c` of its first offer, the bound computed from the
+/// model's share (`T_c = (B + 3) / r_c + 2Δ`, `r_c` the class's floor
+/// share, `Δ` the pass interval), while the first's group was refused
+/// beside it (the engagement the index-order visit of the design's DV-1
+/// never gave).
+#[test]
+fn a_second_namespace_is_granted_within_its_bound_beside_a_backlog() {
+    const SLICE: u64 = 64 << 10;
+    const PASS_NS: u64 = 10_000_000;
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let spec = TierSpec { maintain_slice_bytes: SLICE, ..spec() };
+    cell.create_ns(NsId(16), &spec);
+    cell.create_ns(NsId(17), &spec);
+    let mut ks = Keyspace::new(StoreConfig::default());
+    sealed_backlog_on(&mut ks, NsId(16), 16 << 20, 6 << 20);
+    sealed_backlog_on(&mut ks, NsId(17), 1 << 20, 4 << 10);
+    let model = DeviceModel {
+        write_bytes_per_s: 2_000_000,
+        write_ops_per_s: 100_000,
+        read_bytes_per_s: 2_000_000,
+        read_ops_per_s: 100_000,
+    };
+    let mut admission = plane_budget(model, 1);
+    // The boot credit (the class holds its cap at boot) is spent as a
+    // prior round's: both namespaces start from an empty credit.
+    let cap = admission.0.cap(IoClass::TierFlush);
+    assert!(matches!(admission.0.offer(IoClass::TierFlush, cap.bytes, 1), Issue::Now));
+    // n × T_c on the byte axis, in passes: r_c = share × 4 / (8 × 10).
+    let share = model.share(1).write_bytes_per_s;
+    let r_c = share * 4 / 80;
+    let t_c_ns = (SLICE + 3) * 1_000_000_000 / r_c + 2 * PASS_NS;
+    let bound_passes = 2 * t_c_ns / PASS_NS;
+    let second_lane = cell.namespaces[1].lane;
+    let mut first_offer_pass: Option<u64> = None;
+    for pass_index in 0..(bound_passes * 3) {
+        admission.0.refill(Nanos(pass_index * PASS_NS));
+        let ops = pass(&mut cell, &mut ks, pass_index * PASS_NS / 1_000, &mut admission);
+        if first_offer_pass.is_none() && cell.namespaces[1].round.is_some() {
+            first_offer_pass = Some(pass_index);
+        }
+        if lanes_of(&ops).contains(&second_lane) {
+            let first = first_offer_pass.expect("offered before granted");
+            let stats = &cell.flush_stats;
+            assert!(stats.turn_waits >= 1, "engagement: a group was refused");
+            assert!(stats.turn_contended >= 1, "engagement: both namespaces were ready in a pass");
+            assert!(
+                pass_index - first <= bound_passes,
+                "the second namespace waited {} passes, past n × T_c = {bound_passes}",
+                pass_index - first
+            );
+            return;
+        }
+        complete_ops(&mut cell, ops);
+    }
+    panic!("the second namespace was never granted in {} passes", bound_passes * 3);
+}
+
+/// A cold read planned below the active file's readable length is
+/// served while a later round's writes are held: its window lies inside
+/// the bytes the file holds, so the driver fills it. Round 1 completes;
+/// round 2 stages and its group is pushed but never completed (the staged
+/// length moves, nothing is written); a record in the last three full
+/// frames below the confirmable length is read through the plan.
+#[test]
+fn a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held() {
+    const SLICE: u64 = 64 << 10;
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(
+        NsId(16),
+        &TierSpec { maintain_slice_bytes: SLICE, tier_io_mode: TierIoMode::Buffered, ..spec() },
+    );
+    let mut ks = Keyspace::new(StoreConfig::default());
+    let addrs = sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 160 << 10);
+    let mut admission = NoBudget;
+    // Round 1: plan and writes, then barriers, each completed; the third
+    // turn completes round 1 and, in the same turn, plans round 2 and
+    // pushes its first group, which is held: nothing of it is written.
+    for _ in 0..2 {
+        let ops = pass(&mut cell, &mut ks, 0, &mut admission);
+        complete_ops(&mut cell, ops);
+    }
+    let held = pass(&mut cell, &mut ks, 0, &mut admission);
+    let t = &cell.namespaces[0];
+    assert_eq!(cell.flush_stats.rounds, 1, "engagement: round 1 completed");
+    let (_, base, data_len2, durable_len, _) = t.flush.active().expect("an active file");
+    assert!(durable_len > 0, "engagement: round 1 is durable");
+    assert!(
+        data_len2 > durable_len && !held.is_empty(),
+        "engagement: round 2's writes are held ({} ops; staged {data_len2} B, durable \
+         {durable_len} B)",
+        held.len()
+    );
+    let data = inf_log::TIER_FRAME_DATA as u64;
+    let confirmable = durable_len / data * data;
+    let frames_written = durable_len.div_ceil(data);
+    // The record: starts in the last three full frames below the
+    // confirmable length and ends inside it.
+    let base_raw = base.to_raw();
+    let frames_confirmable = confirmable / data;
+    let table = ks.tiered_store(NsId(16)).expect("materialized");
+    let (addr, len) = addrs
+        .iter()
+        .rev()
+        .map(|&addr| (addr, table.record(addr).encoded_len as u64))
+        .find(|&(addr, len)| {
+            let start = addr.to_raw() - base_raw;
+            start / data + 3 >= frames_confirmable && start + len <= confirmable
+        })
+        .expect("a record in the last three full frames");
+    let first_frame = (addr.to_raw() - base_raw) / data;
+    let (fd, _, offset, frames, _) = t.plan_cold_read(addr, len as usize).expect("planned");
+    let mut buf = vec![0u8; frames as usize * TIER_FRAME_BYTES];
+    let offset = FileOffset::new(offset).expect("a file offset");
+    let n = cell.fs.driver_read_at(fd, offset, &mut buf).expect("sim read");
+    assert_eq!(
+        n,
+        buf.len(),
+        "the window is filled: a read of a record in frame {first_frame}, below the confirmable \
+         length ({confirmable} B, {frames_confirmable} frames), planned {frames} frames while \
+         the file holds {frames_written} written frames and {} staged",
+        data_len2.div_ceil(data)
+    );
+}
+
+/// The budget's tier spend is the device bytes and ops the disk was
+/// handed, retries and barriers included: a write that fails is unsent
+/// again once every sent op is terminal, its retry group is offered and
+/// charged like any group, and both attempts count.
+#[test]
+fn a_retry_group_is_offered_and_charged_like_any_group() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 64 << 10, ..spec() });
+    let mut ks = Keyspace::new(StoreConfig::default());
+    sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 64 << 10);
+    let mut admission = Recording { inner: plane_budget(reference_model(), 1), offers: Vec::new() };
+    // The first group: the header, the 16-frame batch and the tail frame
+    // of a 64 KiB round, one offer. The batch write fails.
+    let first = pass(&mut cell, &mut ks, 0, &mut admission);
+    assert!(first.len() >= 3, "engagement: the first group holds several writes");
+    assert_eq!(admission.offers.len(), 1, "one group, one offer");
+    let mut pushed_ops = first.len() as u64;
+    let mut device_bytes = complete_ops_failing(&mut cell, first, Some(1));
+    for pass_index in 1..200u64 {
+        admission.inner.0.refill(Nanos(pass_index * 10_000_000));
+        let ops = pass(&mut cell, &mut ks, pass_index * 10_000, &mut admission);
+        pushed_ops += ops.len() as u64;
+        device_bytes += complete_ops(&mut cell, ops);
+        if cell.namespaces[0].round.is_none() {
+            break;
+        }
+    }
+    assert!(cell.namespaces[0].round.is_none(), "the round completed");
+    assert_eq!(cell.flush_stats.write_retries, 1, "engagement: one retry");
+    let retry_offer = admission.offers[1];
+    assert_eq!(retry_offer.1, 1, "the retry group is the one failed write: {retry_offer:?}");
+    let counters = admission.inner.0.counters(IoClass::TierFlush);
+    assert_eq!(counters.spent_bytes, device_bytes, "spent counts both attempts' device bytes");
+    assert_eq!(counters.spent_ops, pushed_ops, "spent counts every attempt's ops");
+    let offered_ops: u64 = admission.offers.iter().map(|o| o.1).sum();
+    assert_eq!(offered_ops, pushed_ops, "every pushed op was offered");
+}
+
+/// A plan that fails after staging part of its round (the pipeline
+/// rotates at a 4 KiB file capacity and the second file's first
+/// directory hold is refused — `tier_dir_open_fail`'s third firing, two
+/// holds per creation) keeps the first chunk and its file's seal; those
+/// ops are offered and issued like any group, so the spend is exactly
+/// what the disk was handed, and the error is not fatal.
+#[test]
+fn a_failed_plan_issues_what_it_staged() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 6 << 10, ..spec() });
+    let config = flush_config(&cell, 4 << 10, 6 << 10);
+    let fs = cell.fs.clone();
+    let t = &mut cell.namespaces[0];
+    t.flush = TierFlush::new(fs, config, 0);
+    t.flush.set_drive(TierDrive::Reactor);
+    let mut ks = sealed_backlog(3);
+    let mut admission = Recording { inner: plane_budget(reference_model(), 1), offers: Vec::new() };
+    inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(3));
+    let mut ops = Vec::new();
+    let refused = cell.turn(&mut ks, 0, &mut ops, &mut admission);
+    inf_foundation::fault::disarm_all();
+    let err = refused.expect_err("the second file's creation is refused");
+    assert!(!err.is_fatal(), "a refused creation retries next turn: {err}");
+    assert!(cell.namespaces[0].round.is_some(), "engagement: the partial round opened");
+    assert!(!ops.is_empty(), "the partial round's first group was issued");
+    let device_bytes = complete_ops(&mut cell, ops);
+    let counters = admission.inner.0.counters(IoClass::TierFlush);
+    assert_eq!(counters.spent_bytes, device_bytes, "the issued chunk's device bytes are spent");
+}
+
+/// The pipeline `create_ns` builds for `NsId(16)` on `cell`, at a file
+/// capacity of `file_capacity` data bytes and `slice_bytes`.
+fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64, slice_bytes: u64) -> TierFlushConfig {
+    TierFlushConfig {
+        shard_dir: cell.shard_dir.join("ns-16"),
+        cell: cell.cell,
+        ns: NsId(16),
+        mode: spec().tier_io_mode,
+        file_capacity,
+        slice_bytes,
+    }
+}
+
+/// The turn's two rules (T3): a refused group makes its namespace the
+/// holder and ends the pass — no later namespace offers — and the holder
+/// is visited first on the next pass; a granted group moves the visit on,
+/// and the next pass starts after the namespace served last.
+#[test]
+fn a_refused_group_ends_the_pass_and_its_namespace_is_visited_first_next_turn() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &spec());
+    cell.create_ns(NsId(17), &spec());
+    let mut ks = Keyspace::new(StoreConfig::default());
+    sealed_backlog_on(&mut ks, NsId(16), 4 << 20, 2 << 20);
+    sealed_backlog_on(&mut ks, NsId(17), 4 << 20, 2 << 20);
+    let (lane16, lane17) = (cell.namespaces[0].lane, cell.namespaces[1].lane);
+    // Two turns under refusal: each plans one namespace (16, then 17) and
+    // offers once — the first namespace's group, refused, holds the turn.
+    let mut refuse = Scripted { grant: |_| false, offers: 0 };
+    assert!(pass(&mut cell, &mut ks, 0, &mut refuse).is_empty());
+    assert!(pass(&mut cell, &mut ks, 1, &mut refuse).is_empty());
+    assert_eq!(refuse.offers, 2, "one offer per pass: the holder's; the second never offers");
+    assert_eq!(cell.turn.holder, Some(NsId(16)));
+    assert_eq!(cell.flush_stats.turn_waits, 1, "one refusal episode");
+    assert_eq!(cell.flush_stats.turn_contended, 1, "both ready in the second pass");
+    assert_eq!(cell.flush_stats.groups_deferred, 2);
+    // Grant the first offer only: the holder is visited first and served;
+    // the next namespace's group is refused after it.
+    let mut grant_first = Scripted { grant: |index| index == 0, offers: 0 };
+    let ops = pass(&mut cell, &mut ks, 2, &mut grant_first);
+    assert!(!ops.is_empty() && lanes_of(&ops).iter().all(|&l| l == lane16), "the holder's group");
+    assert_eq!(grant_first.offers, 2, "the holder, then the next namespace, refused");
+    assert_eq!(cell.turn.holder, Some(NsId(17)));
+    assert_eq!(cell.turn.served_last, Some(NsId(16)));
+    // Grant everything: the holder (17) first, then the rotation goes on.
+    let mut grant = Scripted { grant: |_| true, offers: 0 };
+    let ops = pass(&mut cell, &mut ks, 3, &mut grant);
+    let lanes = lanes_of(&ops);
+    assert_eq!(lanes.first(), Some(&lane17), "the holder is visited first");
+    assert!(
+        lanes.contains(&lane16) || cell.namespaces[0].round.as_ref().is_some_and(|r| r.pending > 0)
+    );
+    assert_eq!(cell.turn.holder, None);
+}
+
+/// The plan rule (T13): the cell plans one round per turn, taken by the
+/// first idle namespace with work after the one planned last, in id
+/// order, so with three ready namespaces each plans within two further
+/// turns and the passed-over ones are counted.
+#[test]
+fn the_cell_plans_one_round_per_turn_in_id_order() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut ks = Keyspace::new(StoreConfig::default());
+    for id in [18, 16, 17] {
+        cell.create_ns(NsId(id), &spec());
+        sealed_backlog_on(&mut ks, NsId(id), 4 << 20, 1 << 20);
+    }
+    let mut refuse = Scripted { grant: |_| false, offers: 0 };
+    let planned = |cell: &TierCell<SimDisk>| -> Vec<u32> {
+        cell.namespaces.iter().filter(|t| t.round.is_some()).map(|t| t.ns.0).collect()
+    };
+    pass(&mut cell, &mut ks, 0, &mut refuse);
+    assert_eq!(planned(&cell), vec![16], "the first id plans first");
+    assert_eq!(cell.flush_stats.rounds_planned, 1);
+    assert_eq!(cell.flush_stats.plan_waits, 2, "two namespaces with work were passed over");
+    pass(&mut cell, &mut ks, 1, &mut refuse);
+    assert_eq!(planned(&cell), vec![16, 17]);
+    assert_eq!(cell.flush_stats.plan_waits, 3);
+    pass(&mut cell, &mut ks, 2, &mut refuse);
+    assert_eq!(planned(&cell), vec![16, 17, 18], "every namespace planned within n − 1 turns");
+    assert_eq!(cell.flush_stats.rounds_planned, 3);
+    assert_eq!(cell.flush_stats.plan_waits, 3, "nothing left to pass over");
+    assert_eq!(cell.turn.planned_last, Some(NsId(18)));
+}
+
+/// The device-model row of the design's adversarial table: the model
+/// absent, 1 B/s, the reference share at 1, 8 and 256 cells, an ops rate
+/// of 0. Every offer is at most one group on both axes and never above
+/// the class cap; with no model every offer is `Now`; at 1 B/s nothing
+/// issues and every offer is deferred; with no ops rate the ops axis is
+/// never unattainable.
+#[test]
+fn every_offer_fits_one_group_on_every_device_model() {
+    let reference = DeviceModel {
+        write_bytes_per_s: 489_000_000,
+        write_ops_per_s: 40_000,
+        read_bytes_per_s: 489_000_000,
+        read_ops_per_s: 40_000,
+    };
+    let one_byte = DeviceModel {
+        write_bytes_per_s: 1,
+        write_ops_per_s: 1,
+        read_bytes_per_s: 1,
+        read_ops_per_s: 1,
+    };
+    let no_ops_rate = DeviceModel { write_ops_per_s: 0, read_ops_per_s: 0, ..reference };
+    let rows: [(&str, Option<(DeviceModel, u16)>); 6] = [
+        ("absent", None),
+        ("1 B/s", Some((one_byte, 1))),
+        ("the reference share at 1 cell", Some((reference, 1))),
+        ("the reference share at 8 cells", Some((reference, 8))),
+        ("the reference share at 256 cells", Some((reference, 256))),
+        ("an ops rate of 0", Some((no_ops_rate, 8))),
+    ];
+    for (row, model) in rows {
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 8 << 20, ..spec() });
+        let mut ks = Keyspace::new(StoreConfig::default());
+        sealed_backlog_on(&mut ks, NsId(16), 16 << 20, 8 << 20);
+        let mut recorded = Recording { inner: NoBudget, offers: Vec::new() };
+        let mut budgeted =
+            model.map(|(m, cells)| Recording { inner: plane_budget(m, cells), offers: Vec::new() });
+        let mut pushed = 0usize;
+        for pass_index in 0..3u64 {
+            let ops = match &mut budgeted {
+                None => pass(&mut cell, &mut ks, pass_index * 10_000, &mut recorded),
+                Some(b) => {
+                    b.inner.0.refill(Nanos(pass_index * 10_000_000));
+                    pass(&mut cell, &mut ks, pass_index * 10_000, b)
+                }
+            };
+            pushed += ops.len();
+            complete_ops(&mut cell, ops);
+        }
+        let offers = budgeted.as_ref().map_or(&recorded.offers, |b| &b.offers);
+        assert!(!offers.is_empty(), "{row}: engagement: offers were made");
+        for &(bytes, ops) in offers {
+            assert!(
+                bytes <= TIER_GROUP_BYTES_MAX && ops <= TIER_GROUP_OPS_MAX as u64,
+                "{row}: {bytes} B, {ops} ops"
+            );
+        }
+        let offered_ops: u64 = offers.iter().map(|o| o.1).sum();
+        match &budgeted {
+            None => assert_eq!(offered_ops, pushed as u64, "{row}: every offer is Now"),
+            Some(b) => {
+                let cap = b.inner.0.cap(IoClass::TierFlush);
+                let counters = b.inner.0.counters(IoClass::TierFlush);
+                assert_eq!(counters.unattainable, 0, "{row}: no offer above the cap {cap:?}");
+                for &(bytes, ops) in offers {
+                    assert!(
+                        bytes <= cap.bytes && ops <= cap.ops,
+                        "{row}: {bytes} B, {ops} ops under {cap:?}"
+                    );
+                }
+                if row == "1 B/s" {
+                    // The class holds its cap at boot, so the boot credit
+                    // issues one group; nothing refills after it.
+                    assert_eq!(pushed, 1, "{row}: the boot credit issues one group, then nothing");
+                    assert!(counters.deferrals >= 2, "{row}: every later offer is deferred");
+                    assert!(counters.spent_bytes <= TIER_GROUP_BYTES_MAX, "{row}");
+                } else {
+                    assert!(pushed >= 1, "{row}: groups issue");
+                }
+            }
+        }
+    }
+}
+
+/// A writer parked on the tail stall is woken at every MAINTAIN visit of
+/// its namespace, the visit whose plan is refused included (a tier file's
+/// creation refused by the device), so the typed timeout is always
+/// reachable: before this the visit left at the refused stage, ahead of
+/// the wake, and a parked writer on a device that kept refusing the
+/// file read no timeout at all.
+#[test]
+fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &spec());
+    let mut ks = sealed_backlog(2);
+    let parked = cell.namespaces[0].stall_waiters.wait(());
+    assert!(cell.namespaces[0].stall_waiters.any_waiting(), "engagement: a writer is parked");
+    inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+    let visited = cell.maintain_ns(&mut ks, 0, None, false, 0);
+    let mut ops = Vec::new();
+    let planned = cell.turn(&mut ks, 0, &mut ops, &mut NoBudget);
+    inf_foundation::fault::disarm_all();
+    assert!(visited.is_ok(), "the visit itself is not refused");
+    let err = planned.expect_err("engagement: the plan's file creation was refused");
+    assert!(!err.is_fatal(), "{err}");
+    assert!(cell.namespaces[0].round.is_none(), "nothing staged: the namespace stays idle");
+    assert_eq!(cell.namespaces[0].stall_waiters.waiting(), 0, "the parked writer was woken");
+    drop(parked);
+}
+
+/// ADR-0167 D4: a refused write position opens nothing — no round, no
+/// round sequence spent — and the error is fatal, carrying the value.
+/// The refusal is planted on the last write, so a check that stopped at
+/// the first good position would already have opened the round. The same
+/// staged round, unplanted, opens with every op unsent.
+#[test]
+fn unaddressable_round_opens_nothing() {
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &spec());
+    let _ks = staged_round(&mut cell);
+    let t = &mut cell.namespaces[0];
+    let writes = t.flush.round_write_count();
+    assert!(writes >= 2, "a header and at least one data write: {writes}");
+    let planted = i64::MAX.cast_unsigned() + 1;
+    let seq_before = t.round_seq;
+    let refused =
+        open_round(
+            t,
+            7,
+            |flush, index| {
+                if index + 1 == writes { planted } else { flush.round_op(index).offset }
+            },
+        );
+    let err = refused.expect_err("an unaddressable position refuses the round");
+    assert!(err.is_fatal(), "fail-stop, not a retry: {err}");
+    let TierFlushError::Unaddressable { offset_bytes, .. } = &err else { panic!("{err}") };
+    assert_eq!(*offset_bytes, planted, "the refusal carries the value");
+    assert!(t.round.is_none(), "no round opened");
+    assert_eq!(t.round_seq, seq_before, "no round sequence spent");
+    open_round(t, 7, |flush, index| flush.round_op(index).offset)
+        .expect("the unplanted round opens");
+    let round = t.round.as_ref().expect("the round is open");
+    assert!(round.states.iter().all(|s| *s == OpState::Unsent), "nothing is sent at the open");
+    assert_eq!(round.pending, 0);
+}
+
+/// A drained round returns its lane too (the `round_drain` path).
+#[test]
+fn drained_namespace_lane_recycles_at_maintain() {
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    cell.create_ns(NsId(16), &spec());
+    cell.namespaces[0].round_seq = 3;
+    // Park a finished round on it so the drop routes through the drain.
+    cell.namespaces[0].round = Some(FlushRound::new(0, Vec::new(), 3, 0));
+    let ks = Keyspace::new(StoreConfig::default());
+    let mut releases = vec![(NsId(16), 1)];
+    cell.sync_namespaces(&ks, &mut releases);
+    assert_eq!(cell.round_drain.len(), 1, "parked until every op is terminal");
+    assert!(cell.free_lanes.is_empty(), "not recycled while parked");
+    cell.maintain_teardown(|_| false);
+    assert!(cell.round_drain.is_empty());
+    assert_eq!(cell.free_lanes, vec![(0, 3)]);
+    cell.create_ns(NsId(17), &spec());
+    assert_eq!(cell.namespaces[0].lane, 0);
+    assert_eq!(cell.namespaces[0].round_seq, 3);
+}

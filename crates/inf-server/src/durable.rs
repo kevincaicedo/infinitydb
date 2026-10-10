@@ -1442,27 +1442,12 @@ impl<F: SegmentFs> DurableCell<F> {
         self.fail_stop("I/O", &format!("errno {errno} on {:?}", token.class()))
     }
 
-    /// Tier-flush and compaction offer their slices here (ADR-0088 D5,
-    /// ADR-0178 D1); the plane owns the tier cell, the cell owns the
-    /// budget.
+    /// Tier-flush groups and compaction reads are offered here (ADR-0088
+    /// D5, ADR-0178 D1), each at its exact size; the plane owns the tier
+    /// cell, the cell owns the budget.
     pub fn offer_background(&mut self, class: IoClass, bytes: u64, ops: u64) -> Issue {
         debug_assert!(!class.is_foreground(), "foreground classes charge, never ask");
         self.budget.offer(class, bytes, ops)
-    }
-
-    /// Return the unissued remainder of the grant just before this call
-    /// (ADR-0178 D2's receipt).
-    pub fn refund_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
-        debug_assert!(!class.is_foreground());
-        self.budget.refund(class, bytes, ops);
-    }
-
-    /// Background spend past the grant just before it (ADR-0170 D2's
-    /// charge row): a tier round that staged more than its offer. What the
-    /// class's credit cannot hold is owed, repaid before it grows again.
-    pub fn charge_background(&mut self, class: IoClass, bytes: u64, ops: u64) {
-        debug_assert!(!class.is_foreground(), "foreground classes are metered, never settled");
-        self.budget.charge(class, bytes, ops);
     }
 
     /// The cold-read drain's refund: either class (a foreground refund

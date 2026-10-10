@@ -30,6 +30,26 @@ pub const REPLAY_BARRIER_CHARGE_BYTES: u64 = 4 << 20;
 /// procfs record is refused and the read board retains its preceding sample.
 pub const PROCESS_STAT_BYTES_MAX: u64 = 16 * 1024;
 
+/// Flush rounds one cell plans per MAINTAIN turn, whatever the number of
+/// its tiered namespaces (ADR-0178 D3's tier row, ADR-0155 D1): one span
+/// of at most `max(MAINTAIN-SLICE, the largest inline record)` bytes, a
+/// gap, or a refusal. Owner: the cell's tier turn, which mints one plan
+/// permit per turn and spends it on the first namespace after the last
+/// planned one, in id order, that is idle with work at its cursor;
+/// charged to Maintenance. Crossing: pacing — every other namespace with
+/// work stays idle and plans in a later turn, in id order, so one plans
+/// within `n − 1` further turns; `tier_plan_waits` counts each one passed
+/// over.
+pub const TIER_PLANS_PER_TURN: usize = 1;
+
+/// Round-op descriptors the cell's issue pass visits per MAINTAIN turn
+/// (ADR-0155 D4): the ops of every group it builds, and the first op of
+/// the group that did not fit. Owner: the cell's tier turn; charged to
+/// Maintenance. Crossing: pacing — the pass ends, and the next turn's
+/// visit starts at the namespace whose group was refused, else after the
+/// one served last.
+pub const TIER_ISSUE_OPS_PER_TURN: usize = 64;
+
 /// Bytes of the longest reply root `JSON.SET` and `JSON.MERGE`'s root
 /// create write after their store call: `+OK\r\n`, or the NX/XX null
 /// (`$-1\r\n`; RESP3 `_\r\n`). A command whose reply budget has fewer

@@ -9,18 +9,28 @@
 //! namespace constructs `None` of this — the ADR-0062 D8 / S03
 //! zero-cost posture is structural, not conditional.
 //!
-//! Drive shape (M4.5-S31, ADR-0084 — the ADR-0056 D3 deviation
-//! discharged): the flush/seal legs ride the **reactor drive** — one
-//! bounded round per namespace stages `{fd, offset, aligned window}`
-//! intents that this module converts to `IoOp::LogWrite`/`Fdatasync`;
-//! `advance_flushed`, seal catalog commits, and gap crossings apply at
-//! the round's last barrier completion, never at submission. REAP only
+//! Drive shape (M4.5-S31, ADR-0084; the groups and the turn of ADR-0178
+//! D3 and ADR-0155 D4): the flush/seal legs ride the **reactor drive**.
+//! In every MAINTAIN each namespace's round first advances on the
+//! completions REAP recorded, then the cell's one turn runs: the **plan
+//! pass** stages one round on the cell — the first namespace after the
+//! last planned one, in id order, that is idle with work at its cursor
+//! — and the **issue pass** offers each ready namespace's next
+//! **group** (the longest run of its unsent ops within
+//! [`inf_log::limits::TIER_GROUP_BYTES_MAX`] device bytes and
+//! [`inf_log::limits::TIER_GROUP_OPS_MAX`] ops, whole writes) to the
+//! device budget at its exact size; only a granted group reaches the
+//! driver, and a refused one makes its namespace the holder, which ends
+//! the pass for the tier class and is visited first next turn. Barriers
+//! are their own group, offered once every write is done; a round's
+//! effects (`advance_flushed`, seal catalog commits, gap crossings)
+//! apply at its last barrier completion, never at submission. REAP only
 //! records completions ([`TierCell::on_flush_completion`]); MAINTAIN
-//! advances the state machine ([`drive_flush_round`]) — single-writer
-//! state, deterministic under DST. Cold reads are fully async from day
-//! one: intents queue on [`ColdReads`], drain once per reactor
-//! iteration into `IoOp::TierRead`, and complete through the custody
-//! table.
+//! advances the state machine — single-writer state, deterministic
+//! under DST. Cold reads are fully async from day one: intents queue on
+//! [`ColdReads`], drain once per reactor iteration into
+//! `IoOp::TierRead`, and complete through the custody table, each
+//! window planned below its file's [`ReadableLen`].
 
 #[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
@@ -31,12 +41,15 @@ use inf_foundation::{FileOffset, LogHistogram};
 use inf_log::blob::ExtentId;
 use inf_log::flush::{PendingSealView, unlink_tier_file};
 use inf_log::fs::{SegmentFile, SegmentFs};
+use inf_log::limits::{TIER_GROUP_BYTES_MAX, TIER_GROUP_OPS_MAX};
 use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
     ColdReadConfig, ColdReads, CompletionToken, IoOp, Issue, TierFileId, TokenClass, WaitList,
     WriteBarrier,
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
+
+use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN};
 
 /// `errno` values the completion handler classifies (ADR-0084 D4).
 const ENOSPC: i32 = 28;
@@ -59,18 +72,20 @@ const _: () = assert!(
 /// device budget (ADR-0178 D2).
 pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
 
-/// The device budget's answer to "may a flush round of up to `bytes`
-/// bytes and `ops` ops stage now?" (ADR-0178 D1's [`Issue`]) plus the
-/// settlement of what the round then staged (ADR-0170 D2): the unstaged
-/// part refunded against the grant's receipt, bytes staged past the
-/// grant charged. Generic, not `dyn`: one monomorphized closure per
-/// plane. `None` = no durable plane (the MemFs test tier) — always
-/// `Now`, nothing metered.
+// A group is at most the tier class's declared slice on both axes (T1 of
+// the tier write path's design), so no tier offer is above the class cap.
+const _: () =
+    assert!(TIER_GROUP_OPS_MAX as u64 <= TIER_ROUND_MAX_OPS, "a group fits the ops slice");
+// The plan permit is one value per MAINTAIN: the count the type carries.
+const _: () = assert!(TIER_PLANS_PER_TURN == 1, "one plan permit per turn");
+
+/// The device budget's answer to "may this group of `bytes` device bytes
+/// and `ops` ops issue now?" (ADR-0178 D1's [`Issue`]). Every group is
+/// offered at its exact size, so nothing is settled afterwards. Generic,
+/// not `dyn`: one monomorphized closure per plane. `None` = no durable
+/// plane (the MemFs test tier) — always `Now`, nothing metered.
 pub(crate) trait FlushAdmission {
     fn admit(&mut self, bytes: u64, ops: u64) -> Issue;
-    fn refund(&mut self, bytes: u64, ops: u64);
-    /// Spend past the grant: owed when the class's credit cannot hold it.
-    fn charge(&mut self, bytes: u64);
 }
 
 /// Extent-reclaim candidates examined per MAINTAIN slice (ADR-0061 D5
@@ -101,7 +116,8 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// advancement** (the release leg) — never on flush confirmation
     /// (the recorded 0xA4C01D07 class: flush-keyed wakes wedge when
     /// confirmation lands but no page released) — plus every MAINTAIN
-    /// tick while non-empty, so the typed timeout always fires.
+    /// visit of the namespace while non-empty, whatever its flush leg
+    /// returned, so the typed timeout always fires.
     pub stall_waiters: WaitList<()>,
     /// `(durable seq, wal epoch)` marks: once the fsync watermark
     /// covers `seq`, every extent death stamped ≤ `epoch` is durable —
@@ -131,8 +147,8 @@ pub(crate) struct TierNs<F: SegmentFs> {
 }
 
 /// Plane bookkeeping of one in-flight flush round (M4.5-S31): terminal
-/// op states parallel to `TierFlush::round_op`, the wave cursor, and
-/// the identity its completion tokens carry.
+/// op states parallel to `TierFlush::round_op`, the group cursor, the
+/// phase, and the identity its completion tokens carry.
 pub(crate) struct FlushRound {
     states: Vec<OpState>,
     /// Write positions checked when the round opened, indexed like
@@ -143,9 +159,21 @@ pub(crate) struct FlushRound {
     write_positions: Vec<FileOffset>,
     /// Ops submitted, not yet terminal.
     pending: u32,
-    /// Wave 2 submitted (barriers ride only after every write landed —
-    /// fdatasync covers only completed writes).
-    barriers_sent: bool,
+    /// Writes until every write is done, then barriers (T4: the two are
+    /// distinct states, so a barrier group is never built with a write
+    /// unsent or outstanding).
+    phase: RoundPhase,
+    /// The group builder's cursor: no unsent op lies below it. 0 at the
+    /// open, the first failed index at a retry, the first barrier in
+    /// the barrier phase, the granted group's end after an emit.
+    next_unsent: usize,
+    /// When the group at the cursor became ready, on the injected clock
+    /// in microseconds: the open, a grant that left unsent ops, a retry,
+    /// the barrier phase. `None` while nothing is unsent.
+    ready_since_us: Option<u64>,
+    /// The unsent ops are a retry of failed writes (the ungranted-retry
+    /// plant reads it).
+    retry: bool,
     round_seq: u32,
     staged_at_us: u64,
     /// Worst write error of the current attempt (ENOSPC dominates).
@@ -162,6 +190,12 @@ enum OpState {
     Failed,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum RoundPhase {
+    Writes,
+    Barriers,
+}
+
 impl FlushRound {
     fn new(
         op_count: usize,
@@ -174,33 +208,66 @@ impl FlushRound {
             states: vec![OpState::Unsent; op_count],
             write_positions,
             pending: 0,
-            barriers_sent: false,
+            phase: RoundPhase::Writes,
+            next_unsent: 0,
+            ready_since_us: Some(staged_at_us),
+            retry: false,
             round_seq,
             staged_at_us,
             write_error: None,
             fatal: None,
         }
     }
+
+    /// The op range the current phase may issue from, from the cursor.
+    fn phase_range(&self, writes: usize, op_count: usize) -> core::ops::Range<usize> {
+        match self.phase {
+            RoundPhase::Writes => self.next_unsent..writes,
+            RoundPhase::Barriers => self.next_unsent.max(writes)..op_count,
+        }
+    }
+
+    /// Whether an unsent op lies in the current phase's range: a group
+    /// is ready to be built and offered.
+    fn has_ready_group(&self, writes: usize, op_count: usize) -> bool {
+        self.phase_range(writes, op_count).any(|index| self.states[index] == OpState::Unsent)
+    }
 }
 
 /// Cell-scope reactor-drive flush observables (ADR-0084 D6 — the
-/// collapse must be visible from INFO).
+/// collapse must be visible from INFO), the turn's counters among them
+/// (ADR-0178 D5).
 #[derive(Default)]
 pub(crate) struct TierFlushStats {
     pub rounds: u64,
     pub write_retries: u64,
     pub stale_completions: u64,
     pub round_us: LogHistogram,
-    /// Rounds the device budget deferred (ADR-0088 D5) — the tier-flush
-    /// face of `io_budget_deferrals_tier_flush`, per namespace tick.
-    pub rounds_deferred: u64,
+    /// Groups the device budget refused (`NotThisSlice`) — the tier-flush
+    /// face of `io_budget_deferrals_tier_flush`, per offer.
+    pub groups_deferred: u64,
+    /// The longest wait of one ready group from the moment it became
+    /// ready to its grant, the pending one included, on the injected
+    /// clock in microseconds (the fair turn's progress bound, `n × T_c`).
+    pub group_wait_us_max: u64,
+    /// Refusal episodes: a namespace's group refused while it was not
+    /// already the holder.
+    pub turn_waits: u64,
+    /// Turns in which two or more namespaces held a ready group.
+    pub turn_contended: u64,
+    /// Turns a namespace idle with work at its cursor was passed over
+    /// because the cell's one plan went to another, per namespace.
+    pub plan_waits: u64,
+    /// Rounds the plan pass staged (one per turn at most).
+    pub rounds_planned: u64,
 }
 
-/// A tier file's readable length: the data bytes below which a cold-read
-/// window may be planned. Made only by a sealed file's length, a staged
-/// seal's confirmed prefix, or the active file's confirmable length
-/// (ADR-0056 D5) — never by a staged length, which moves at stage time
-/// while its frames are still unwritten or in flight.
+/// A tier file's readable length (T10 of the tier write path's design):
+/// the data bytes below which a cold-read window may be planned. Made
+/// only by a sealed file's length, a staged seal's confirmed prefix, or
+/// the active file's confirmable length (ADR-0056 D5) — never by a
+/// staged length, which moves at stage time while its frames are still
+/// unwritten or in flight.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ReadableLen(u64);
 
@@ -338,6 +405,54 @@ impl<F: SegmentFs> TierNs<F> {
         debug_assert!(window_frames > 0, "cold window inside the file's readable range");
         (fd, TierFileId::new(id), inf_log::tier_frame_offset(first), window_frames, skip)
     }
+
+    /// Whether this namespace's round holds a group it may offer.
+    fn has_ready_group(&self) -> bool {
+        self.round.as_ref().is_some_and(|r| {
+            r.has_ready_group(self.flush.round_write_count(), self.flush.round_op_count())
+        })
+    }
+}
+
+/// The cell's one turn (ADR-0178 D3's tier row, D4): which namespace
+/// plans, and which offers next. Ids, never indices, so a drop repairs
+/// nothing: a dropped id is simply passed in the order.
+#[derive(Default)]
+struct TierTurn {
+    /// The namespace whose group the budget refused last: it ends the
+    /// pass for the tier class and is visited first on the next (T3).
+    holder: Option<NsId>,
+    /// The namespace whose group was granted last: the next issue pass
+    /// starts after it when there is no holder.
+    served_last: Option<NsId>,
+    /// The namespace that planned last: the next plan goes to the first
+    /// idle namespace with work after it, in id order, wrapping (T13).
+    planned_last: Option<NsId>,
+}
+
+/// One MAINTAIN's permit to plan: made once per turn, consumed by the
+/// one planning call, so the cell plans at most
+/// [`TIER_PLANS_PER_TURN`] rounds a turn whatever its namespace count.
+pub(crate) struct PlanPermit(());
+
+/// A run of one round's unsent ops the device budget granted (T2): made
+/// only by a `Now` answer to an offer of its exact size, consumed by the
+/// emit, which pushes exactly these ops.
+pub(crate) struct GrantedGroup {
+    first: usize,
+    end: usize,
+    ops: usize,
+}
+
+/// A candidate group: the longest run of unsent ops from the round's
+/// cursor inside the phase's range that fits the group bounds and the
+/// turn's remaining descriptor visits; `visits` is what building it cost.
+struct Group {
+    first: usize,
+    end: usize,
+    ops: usize,
+    bytes: u64,
+    visits: usize,
 }
 
 /// The cell's tiered plane state. Constructed by `enable_durable` (a
@@ -347,6 +462,7 @@ pub(crate) struct TierCell<F: SegmentFs> {
     fs: F,
     cell: u32,
     shard_dir: PathBuf,
+    /// The cell's tiered namespaces, ascending by id: the turn's order.
     pub namespaces: Vec<TierNs<F>>,
     /// The custody engine (ADR-0055): one per cell, built at the first
     /// tiered materialization, sized from that namespace's
@@ -381,10 +497,13 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// Dropped namespaces whose flush round is still in flight: the
     /// windows the driver may touch live in their pipelines, so the
     /// whole [`TierNs`] parks here until every op is terminal, then its
-    /// files join the teardown queue (ADR-0084 D3 custody).
+    /// files join the teardown queue (ADR-0084 D3 custody). No further
+    /// group is offered for a parked round.
     round_drain: Vec<TierNs<F>>,
     /// Reactor-drive flush observables (ADR-0084 D6).
     pub(crate) flush_stats: TierFlushStats,
+    /// The cell's turn: one per cell, the two cell-wide orders.
+    turn: TierTurn,
 }
 
 /// A dropped namespace's file half, unlinked in bounded slices
@@ -460,6 +579,17 @@ impl<F: SegmentFs> TierCell<F> {
     pub fn ns_mut(&mut self, ns: NsId) -> Option<&mut TierNs<F>> {
         self.namespaces.iter_mut().find(|t| t.ns == ns)
     }
+
+    /// The index at which the rotation of `namespaces` (ascending by id)
+    /// begins for the first id above `after`, wrapping; 0 with no
+    /// namespace, no `after`, or none above it.
+    fn rotation_start(&self, after: Option<NsId>) -> usize {
+        let n = self.namespaces.len();
+        if n == 0 {
+            return 0;
+        }
+        after.map_or(0, |after| self.namespaces.partition_point(|t| t.ns.0 <= after.0) % n)
+    }
 }
 
 impl<F: SegmentFs + Clone> TierCell<F> {
@@ -478,6 +608,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             free_lanes: Vec::new(),
             round_drain: Vec::new(),
             flush_stats: TierFlushStats::default(),
+            turn: TierTurn::default(),
         }
     }
 
@@ -492,7 +623,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         let live: Vec<(NsId, TierSpec)> =
             ks.ns_iter().filter_map(|spec| spec.tier.map(|t| (spec.id, t))).collect();
         if live.len() == self.namespaces.len()
-            && live.iter().zip(&self.namespaces).all(|((id, _), t)| *id == t.ns)
+            && live.iter().all(|(id, _)| self.namespaces.iter().any(|t| t.ns == *id))
         {
             return;
         }
@@ -535,8 +666,10 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         }
     }
 
+    /// Builds `ns`'s pipeline and inserts it at its id's position, so the
+    /// turn's rotation is the vector's order. Returns that index.
     #[allow(clippy::disallowed_types, reason = "container: T")]
-    fn create_ns(&mut self, ns: NsId, spec: &TierSpec) {
+    fn create_ns(&mut self, ns: NsId, spec: &TierSpec) -> usize {
         if self.cold.is_none() {
             let qd = usize::from(spec.cold_read_qd);
             let pool = AlignedPool::new(qd, COLD_POOL_BUF);
@@ -571,23 +704,28 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             (lane, 0)
         });
         assert!(lane <= inf_runtime::MAX_SLOT >> 8, "tier flush lanes exhausted");
-        self.namespaces.push(TierNs {
-            ns,
-            flush,
-            files: Vec::new(),
-            retired: Vec::new(),
-            tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
-            io_mode: spec.tier_io_mode,
-            stall_waiters: WaitList::new(),
-            epoch_marks: VecDeque::new(),
-            durable_epoch: 0,
-            compact_inflight: false,
-            dir,
-            lane,
-            round_seq,
-            round: None,
-            release_epoch: 0,
-        })
+        let at = self.namespaces.partition_point(|t| t.ns.0 < ns.0);
+        self.namespaces.insert(
+            at,
+            TierNs {
+                ns,
+                flush,
+                files: Vec::new(),
+                retired: Vec::new(),
+                tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
+                io_mode: spec.tier_io_mode,
+                stall_waiters: WaitList::new(),
+                epoch_marks: VecDeque::new(),
+                durable_epoch: 0,
+                compact_inflight: false,
+                dir,
+                lane,
+                round_seq,
+                round: None,
+                release_epoch: 0,
+            },
+        );
+        at
     }
 
     /// Installs a recovered namespace's pipeline + file handles (boot —
@@ -606,8 +744,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             // Boot-time replacement: nothing is in flight before serving.
             self.free_lanes.push((replaced.lane, replaced.round_seq));
         }
-        self.create_ns(ns, spec);
-        let t = self.namespaces.last_mut().expect("just created");
+        let at = self.create_ns(ns, spec);
+        let t = &mut self.namespaces[at];
         t.flush = flush;
         // Recovery built the pipeline on the seam (boot, pre-serving);
         // its flush work from here rides the driver (ADR-0084 D1).
@@ -615,13 +753,16 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         t.files = files;
     }
 
-    /// The four MAINTAIN drivers for one namespace, bounded per slice.
-    /// Returns `(budget units used, compaction read to issue)` — the
-    /// caller charges Maintenance and spawns the read chain (it owns
-    /// the executor; this module owns no `Rc<Shared>`). `durable_mark`
-    /// is `(last staged seq, fsync watermark seq)` from the durable
-    /// cell — the extent-reclaim epoch handoff (ADR-0061 D5).
-    #[allow(clippy::too_many_arguments)] // the MAINTAIN driver's split inputs (ADR-0088 D5)
+    /// The MAINTAIN drivers for one namespace, bounded per slice: the
+    /// demote seal, the round's advance on its completions (no offer:
+    /// the turn makes those, [`TierCell::turn`]), the release, the stall
+    /// wake, the admission cadence, extent reclaim, the retirement
+    /// unlink and compaction. Returns `(budget units used, compaction
+    /// read to issue)` — the caller charges Maintenance and spawns the
+    /// read chain (it owns the executor; this module owns no
+    /// `Rc<Shared>`). `durable_mark` is `(last staged seq, fsync
+    /// watermark seq)` from the durable cell — the extent-reclaim epoch
+    /// handoff (ADR-0061 D5).
     pub fn maintain_ns(
         &mut self,
         ks: &mut Keyspace,
@@ -629,8 +770,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         durable_mark: Option<(u64, u64)>,
         transition_idle: bool,
         now_us: u64,
-        ops: &mut Vec<IoOp>,
-        admission: &mut impl FlushAdmission,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
         let cold = self.cold.clone();
         let stats = &mut self.flush_stats;
@@ -654,24 +793,28 @@ impl<F: SegmentFs + Clone> TierCell<F> {
 
         // ---- demote leg: seal → flush → release (§3.1 slice order).
         // The flush half rides the reactor drive (M4.5-S31, ADR-0084):
-        // stage a round when idle, advance the in-flight one on the
-        // completions REAP recorded, apply its effects at the last
-        // barrier CQE — the reactor never waits on the device here.
+        // advance the in-flight round on the completions REAP recorded
+        // and apply its effects at the last barrier CQE — the reactor
+        // never waits on the device here. Staging and issuing are the
+        // turn's, after every namespace was visited.
         let sealed = if table.demote_due() { table.seal_slice() } else { 0 };
-        let flush_bytes = drive_flush_round(table, t, stats, now_us, ops, admission)?;
+        let advanced = advance_round(table, t, stats, now_us);
         for (id, handle) in t.flush.take_sealed_handles() {
             t.files.push((id, handle));
         }
         let released = table.release_slice();
-        if (sealed | released | flush_bytes) > 0 {
-            units += 1 + ((sealed + released + flush_bytes) / 4096) as u32;
+        if (sealed | released) > 0 {
+            units += 1 + ((sealed + released) / 4096) as u32;
         }
         // Head advanced ⇒ ring space may have freed: wake stalled
         // writers. Also wake while any are parked so the typed timeout
-        // is always reachable (bounded: waiters re-check, then repark).
+        // is always reachable (bounded: waiters re-check, then repark),
+        // whatever the flush leg returned — a fatal barrier stops the
+        // cell after this visit, never before the wake.
         if released > 0 || t.stall_waiters.any_waiting() {
             t.stall_waiters.wake_all(());
         }
+        advanced?;
 
         // ---- admission cadence (ADR-0063 D2): both usage halves are
         // fresh exactly here (post-flush).
@@ -689,81 +832,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 t.durable_epoch = t.durable_epoch.max(epoch);
             }
         }
-        let reclaim = table.extent_reclaim_work(t.durable_epoch, EXTENT_RECLAIM_PER_SLICE);
-        for candidate in reclaim {
-            units += 1;
-            let extent_id = candidate.extent_id;
-            let id = ExtentId(extent_id);
-            /// How one candidate's disposal ended (drives the store ack).
-            enum Disposal {
-                Unlinked,
-                Quarantined,
-            }
-            let outcome = match candidate.origin {
-                // Refcount-proven death: the count is the proof
-                // (ADR-0061 D5) — unlink as always.
-                inf_store::ReclaimOrigin::Death => {
-                    inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
-                        .map(|()| Disposal::Unlinked)
-                }
-                // Boot orphan (ADR-0096 D2): probe the header first. A
-                // file that is not a well-formed extent of this id is
-                // garbage nothing can reference — unlink. A verifying
-                // header quarantines by rename: the bytes survive the
-                // life, and a later boot delivers the second verdict.
-                inf_store::ReclaimOrigin::BootOrphan => {
-                    let path = t.dir.join("cold").join(inf_log::extent_file_name(id));
-                    match inf_log::probe_extent_file(&self.fs, &path) {
-                        Ok(header) if header.extent_id == id => {
-                            inf_log::blob::quarantine_extent_file(&self.fs, &t.dir, id)
-                                .map(|()| Disposal::Quarantined)
-                        }
-                        Ok(_) => inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
-                            .map(|()| Disposal::Unlinked),
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                            inf_log::blob::unlink_extent_file(&self.fs, &t.dir, id)
-                                .map(|()| Disposal::Unlinked)
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            Ok(Disposal::Unlinked) // already gone — the goal state
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                // Second verdict (ADR-0096 D4): still unreferenced after
-                // a full boot cycle — unlink the quarantine twin.
-                inf_store::ReclaimOrigin::Quarantined => {
-                    inf_log::blob::unlink_quarantined_file(&self.fs, &t.dir, id)
-                        .map(|()| Disposal::Unlinked)
-                }
-            };
-            match outcome {
-                Ok(Disposal::Unlinked) => table.extent_reclaim_done(extent_id),
-                Ok(Disposal::Quarantined) => table.extent_reclaim_quarantined(extent_id),
-                // Non-fatal by contract (ADR-0061 D5): counted,
-                // re-offered with its origin intact, boot-sweep
-                // re-driven.
-                Err(_) => table.extent_reclaim_deferred(extent_id),
-            }
-        }
-
-        // ---- retirement unlink (§3.3: pins drain first; bounded).
-        let cold_ref = cold.as_ref();
-        let mut unlinked = 0;
-        let mut u = 0;
-        while u < t.retired.len() && unlinked < UNLINKS_PER_SLICE {
-            let pinned =
-                cold_ref.is_some_and(|c| c.inflight_on(TierFileId::new(t.retired[u].id)) > 0);
-            if pinned {
-                u += 1;
-                continue;
-            }
-            let meta = t.retired.remove(u);
-            t.files.retain(|(id, _)| *id != meta.id);
-            let _ = unlink_tier_file(&self.fs, &meta); // non-fatal: re-queued by boot GC
-            unlinked += 1;
-            units += 1;
-        }
+        units += reclaim_extents(&self.fs, table, t);
+        units += unlink_retired(&self.fs, cold.as_ref(), t);
 
         // ---- compaction (ADR-0059): one read chain in flight; the
         // caller spawns it with `ReadClass::Maintain`.
@@ -781,14 +851,218 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         Ok((units, compact))
     }
 
+    /// The cell's turn, once per MAINTAIN after every namespace's advance:
+    /// the plan pass under this turn's one permit, then the issue pass.
+    /// Returns the record bytes the plan staged (the unit-charge basis).
+    /// A fatal plan error (an unaddressable write position, ADR-0167 D4)
+    /// returns before the issue pass; a refused file creation is returned
+    /// after it, the namespace retrying at its next turn in the order.
+    ///
+    /// # Errors
+    /// The plan's: file-creation I/O (not fatal) or an unaddressable
+    /// position (fatal).
+    pub fn turn(
+        &mut self,
+        ks: &mut Keyspace,
+        now_us: u64,
+        ops: &mut Vec<IoOp>,
+        admission: &mut impl FlushAdmission,
+    ) -> Result<u64, TierFlushError> {
+        let permit = PlanPermit(());
+        let (staged, planned) = self.plan_pass(ks, now_us, permit);
+        if let Err(err) = &planned
+            && err.is_fatal()
+        {
+            return planned.map(|()| staged);
+        }
+        self.issue_pass(now_us, ops, admission);
+        planned.map(|()| staged)
+    }
+
+    /// The plan pass (T13): the first namespace after `planned_last`, in
+    /// id order, wrapping, that is idle with work at its cursor stages
+    /// its round — the cell's one preparation this turn, which consumes
+    /// the permit; every other idle namespace with work is counted
+    /// passed over. An effects-only round (a gap at a file boundary)
+    /// applies now; a refused creation that staged nothing leaves the
+    /// namespace idle, the permit spent.
+    fn plan_pass(
+        &mut self,
+        ks: &mut Keyspace,
+        now_us: u64,
+        permit: PlanPermit,
+    ) -> (u64, Result<(), TierFlushError>) {
+        let PlanPermit(()) = permit;
+        let n = self.namespaces.len();
+        let start = self.rotation_start(self.turn.planned_last);
+        let stats = &mut self.flush_stats;
+        let mut planned = false;
+        let mut staged = 0u64;
+        let mut result = Ok(());
+        for i in 0..n {
+            let t = &mut self.namespaces[(start + i) % n];
+            if t.round.is_some() {
+                continue;
+            }
+            let Some(table) = ks.tiered_store_mut(t.ns) else { continue };
+            if !table.flush_pending(&t.flush) {
+                continue;
+            }
+            // A planted canary: every idle namespace with work plans in
+            // this same turn — the one-plan rule the permit carries
+            // (the eight-namespace leg's per-iteration count must read
+            // two or more).
+            if planned && !cfg!(inf_canary_tier_plan_every_namespace) {
+                stats.plan_waits += 1;
+                continue;
+            }
+            planned = true;
+            self.turn.planned_last = Some(t.ns);
+            stats.rounds_planned += 1;
+            let stage = table.stage_flush_round(&mut t.flush);
+            staged = match &stage {
+                Ok(bytes) => *bytes,
+                Err(failed) => failed.staged_bytes,
+            };
+            if t.flush.round_active() {
+                if t.flush.round_op_count() == 0 {
+                    // Effects-only round (a gap at a file boundary): nothing
+                    // to wait on — the crossing applies now, as the seam
+                    // drive did.
+                    let _ = table.complete_flush_round(&mut t.flush);
+                    stats.rounds += 1;
+                } else if let Err(err) =
+                    open_round(t, now_us, |flush, index| flush.round_op(index).offset)
+                {
+                    return (staged, Err(err));
+                }
+            }
+            if let Err(failed) = stage {
+                result = Err(failed.error);
+            }
+        }
+        (staged, result)
+    }
+
+    /// The issue pass (T3): from the holder, else after the namespace
+    /// served last, in id order, wrapping, each namespace with a ready
+    /// group offers its next group at its exact device size; a grant
+    /// pushes it and the visit moves on, a refusal makes its namespace
+    /// the holder and ends the pass. Rotations repeat while a group was
+    /// issued and the turn's descriptor visits last.
+    fn issue_pass(
+        &mut self,
+        now_us: u64,
+        ops: &mut Vec<IoOp>,
+        admission: &mut impl FlushAdmission,
+    ) {
+        let n = self.namespaces.len();
+        if n == 0 {
+            return;
+        }
+        let mut start = match self.turn.holder {
+            Some(holder) => self.namespaces.partition_point(|t| t.ns.0 < holder.0) % n,
+            None => self.rotation_start(self.turn.served_last),
+        };
+        // A planted canary: the visit starts at index 0 and continues
+        // past a refusal — the index-order visit the turn replaces (the
+        // fair-turn oracle's wait bound must go red).
+        if cfg!(inf_canary_tier_turn_index_order) {
+            start = 0;
+        }
+        self.note_ready_groups(now_us);
+        let mut visits_left = TIER_ISSUE_OPS_PER_TURN;
+        loop {
+            let mut issued = false;
+            for i in 0..n {
+                let at = (start + i) % n;
+                if !self.namespaces[at].has_ready_group() {
+                    continue;
+                }
+                let Some(group) = next_group(&self.namespaces[at], visits_left) else {
+                    return; // the turn's visits are spent: the pass ends
+                };
+                visits_left -= group.visits;
+                match self.offer_and_emit(at, group, now_us, ops, admission) {
+                    Offered::Issued => issued = true,
+                    Offered::Refused if cfg!(inf_canary_tier_turn_index_order) => {}
+                    Offered::Refused => return,
+                }
+            }
+            if !issued || visits_left == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Reads every ready group's wait into the gauge (the pending ones
+    /// included) and counts the turn as contended when two or more
+    /// namespaces hold one.
+    fn note_ready_groups(&mut self, now_us: u64) {
+        let mut ready = 0u32;
+        for t in &self.namespaces {
+            if !t.has_ready_group() {
+                continue;
+            }
+            ready += 1;
+            if let Some(since) = t.round.as_ref().and_then(|r| r.ready_since_us) {
+                self.flush_stats.group_wait_us_max =
+                    self.flush_stats.group_wait_us_max.max(now_us.saturating_sub(since));
+            }
+        }
+        if ready >= 2 {
+            self.flush_stats.turn_contended += 1;
+        }
+    }
+
+    /// Offers `group` for the namespace at `at` and emits it on `Now`.
+    fn offer_and_emit(
+        &mut self,
+        at: usize,
+        group: Group,
+        now_us: u64,
+        ops: &mut Vec<IoOp>,
+        admission: &mut impl FlushAdmission,
+    ) -> Offered {
+        let stats = &mut self.flush_stats;
+        let t = &mut self.namespaces[at];
+        let round = t.round.as_mut().expect("a ready group implies a round");
+        // A planted canary: a retry group reaches the driver with no
+        // offer — the grant every emit needs (the accounting oracle's
+        // equality must go red on the retry arm).
+        let granted = if cfg!(inf_canary_tier_retry_ungranted) && round.retry {
+            Some(GrantedGroup { first: group.first, end: group.end, ops: group.ops })
+        } else {
+            offer_group(admission, &group)
+        };
+        let Some(granted) = granted else {
+            stats.groups_deferred += 1;
+            if self.turn.holder != Some(t.ns) {
+                stats.turn_waits += 1;
+            }
+            self.turn.holder = Some(t.ns);
+            return Offered::Refused;
+        };
+        if let Some(since) = round.ready_since_us {
+            stats.group_wait_us_max = stats.group_wait_us_max.max(now_us.saturating_sub(since));
+        }
+        emit_group(&t.flush, round, t.lane, granted, ops);
+        let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
+        round.ready_since_us = round.has_ready_group(writes, op_count).then_some(now_us);
+        self.turn.holder = None;
+        self.turn.served_last = Some(t.ns);
+        Offered::Issued
+    }
+
     /// Bounded teardown slices for dropped namespaces (ADR-0062 D7).
     /// Unlinks route through the injected fs (L7) and failure only
     /// defers disk space — the boot orphan sweep re-drives it.
     /// Also advances parked rounds of dropped namespaces (ADR-0084 D3):
     /// once every op is terminal, the windows recycle and the files
-    /// join the teardown queue. A queue whose catalog persist is not yet
-    /// durable (`persisted(release_epoch)` false — ADR-0100 D5) waits:
-    /// a cut before the swap must find every file.
+    /// join the teardown queue; a parked round's unsent ops are never
+    /// sent. A queue whose catalog persist is not yet durable
+    /// (`persisted(release_epoch)` false — ADR-0100 D5) waits: a cut
+    /// before the swap must find every file.
     pub fn maintain_teardown(&mut self, persisted: impl Fn(u64) -> bool) -> u32 {
         let mut i = 0;
         while i < self.round_drain.len() {
@@ -900,6 +1174,94 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     }
 }
 
+/// How an offer ended inside the issue pass.
+enum Offered {
+    Issued,
+    Refused,
+}
+
+/// The extent-reclaim leg of one namespace's MAINTAIN (ADR-0061 D5,
+/// ADR-0096 D2/D4): at most [`EXTENT_RECLAIM_PER_SLICE`] candidates, each
+/// unlinked, quarantined or deferred by its origin. Returns the units.
+fn reclaim_extents<F: SegmentFs>(fs: &F, table: &mut TieredTable, t: &TierNs<F>) -> u32 {
+    /// How one candidate's disposal ended (drives the store ack).
+    enum Disposal {
+        Unlinked,
+        Quarantined,
+    }
+    let mut units = 0;
+    let reclaim = table.extent_reclaim_work(t.durable_epoch, EXTENT_RECLAIM_PER_SLICE);
+    for candidate in reclaim {
+        units += 1;
+        let extent_id = candidate.extent_id;
+        let id = ExtentId(extent_id);
+        let outcome = match candidate.origin {
+            // Refcount-proven death: the count is the proof
+            // (ADR-0061 D5) — unlink as always.
+            inf_store::ReclaimOrigin::Death => {
+                inf_log::blob::unlink_extent_file(fs, &t.dir, id).map(|()| Disposal::Unlinked)
+            }
+            // Boot orphan (ADR-0096 D2): probe the header first. A
+            // file that is not a well-formed extent of this id is
+            // garbage nothing can reference — unlink. A verifying
+            // header quarantines by rename: the bytes survive the
+            // life, and a later boot delivers the second verdict.
+            inf_store::ReclaimOrigin::BootOrphan => {
+                let path = t.dir.join("cold").join(inf_log::extent_file_name(id));
+                match inf_log::probe_extent_file(fs, &path) {
+                    Ok(header) if header.extent_id == id => {
+                        inf_log::blob::quarantine_extent_file(fs, &t.dir, id)
+                            .map(|()| Disposal::Quarantined)
+                    }
+                    Ok(_) => inf_log::blob::unlink_extent_file(fs, &t.dir, id)
+                        .map(|()| Disposal::Unlinked),
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        inf_log::blob::unlink_extent_file(fs, &t.dir, id)
+                            .map(|()| Disposal::Unlinked)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Disposal::Unlinked) // already gone — the goal state
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            // Second verdict (ADR-0096 D4): still unreferenced after
+            // a full boot cycle — unlink the quarantine twin.
+            inf_store::ReclaimOrigin::Quarantined => {
+                inf_log::blob::unlink_quarantined_file(fs, &t.dir, id).map(|()| Disposal::Unlinked)
+            }
+        };
+        match outcome {
+            Ok(Disposal::Unlinked) => table.extent_reclaim_done(extent_id),
+            Ok(Disposal::Quarantined) => table.extent_reclaim_quarantined(extent_id),
+            // Non-fatal by contract (ADR-0061 D5): counted,
+            // re-offered with its origin intact, boot-sweep
+            // re-driven.
+            Err(_) => table.extent_reclaim_deferred(extent_id),
+        }
+    }
+    units
+}
+
+/// The retirement-unlink leg (§3.3: pins drain first; bounded by
+/// [`UNLINKS_PER_SLICE`]). Returns the units.
+fn unlink_retired<F: SegmentFs>(fs: &F, cold: Option<&ColdReads>, t: &mut TierNs<F>) -> u32 {
+    let mut unlinked = 0;
+    let mut u = 0;
+    while u < t.retired.len() && unlinked < UNLINKS_PER_SLICE {
+        let pinned = cold.is_some_and(|c| c.inflight_on(TierFileId::new(t.retired[u].id)) > 0);
+        if pinned {
+            u += 1;
+            continue;
+        }
+        let meta = t.retired.remove(u);
+        t.files.retain(|(id, _)| *id != meta.id);
+        let _ = unlink_tier_file(fs, &meta); // non-fatal: re-queued by boot GC
+        unlinked += 1;
+    }
+    unlinked as u32
+}
+
 /// The teardown file list of a dropped namespace: the sealed catalog,
 /// staged-but-uncommitted seals, and the active file.
 fn teardown_files<F: SegmentFs>(gone: &TierNs<F>) -> Vec<TierFileMeta> {
@@ -925,140 +1287,95 @@ fn teardown_files<F: SegmentFs>(gone: &TierNs<F>) -> Vec<TierFileMeta> {
     files
 }
 
-/// Advances one namespace's flush state machine by one MAINTAIN step
-/// (M4.5-S31, ADR-0084 D2/D4): completes a round whose barriers all
-/// landed, escalates a barrier failure to the §8.4 fatal class,
-/// resubmits failed writes byte-identical (the M4-S21 retained-batch
-/// retry — ENOSPC latches admission first), promotes a fully-written
-/// round to its barrier wave, or stages a fresh round when idle.
-/// Returns the record bytes staged this step (the unit-charge basis).
-fn drive_flush_round<F: SegmentFs>(
+/// Advances one namespace's round on the completions REAP recorded
+/// (M4.5-S31, ADR-0084 D2/D4), making no offer: completes a round whose
+/// barriers all landed, escalates a barrier failure to the §8.4 fatal
+/// class, turns failed writes unsent again byte-identical once every
+/// sent op is terminal (the M4-S21 retained-batch retry — ENOSPC latches
+/// admission first; the retry group is offered at the turn), or enters
+/// the barrier phase once every write is done.
+fn advance_round<F: SegmentFs>(
     table: &mut TieredTable,
     t: &mut TierNs<F>,
     stats: &mut TierFlushStats,
     now_us: u64,
-    ops: &mut Vec<IoOp>,
-    admission: &mut impl FlushAdmission,
-) -> Result<u64, TierFlushError> {
-    if let Some(round) = &mut t.round {
-        if let Some(errno) = round.fatal {
-            // A failed durability barrier freezes the watermark exactly
-            // where the last good round left it (ADR-0056 D4).
-            // fsync-fail-stop-allow: reactor-drive flush barrier: constructs and returns to
-            // maintain_ns, which routes it to DurableCell::fail_stop (ADR-0084 D4)
-            return Err(TierFlushError::Fsync {
-                path: t.dir.join("cold"),
-                source: std::io::Error::from_raw_os_error(errno),
-            });
-        }
-        if round.pending > 0 {
-            return Ok(0);
-        }
-        if let Some(errno) = round.write_error.take() {
-            if errno == ENOSPC {
-                table.note_flush_device_full();
+) -> Result<(), TierFlushError> {
+    let Some(round) = &mut t.round else { return Ok(()) };
+    if let Some(errno) = round.fatal {
+        // A failed durability barrier freezes the watermark exactly
+        // where the last good round left it (ADR-0056 D4).
+        // fsync-fail-stop-allow: reactor-drive flush barrier: constructs and returns to
+        // maintain_ns, which routes it to DurableCell::fail_stop (ADR-0084 D4)
+        return Err(TierFlushError::Fsync {
+            path: t.dir.join("cold"),
+            source: std::io::Error::from_raw_os_error(errno),
+        });
+    }
+    let writes = t.flush.round_write_count();
+    match round.phase {
+        RoundPhase::Writes => {
+            if round.pending > 0 && !cfg!(inf_canary_tier_barrier_early) {
+                return Ok(());
             }
-            stats.write_retries += 1;
-            for state in &mut round.states {
-                if *state == OpState::Failed {
-                    *state = OpState::Unsent;
+            if round.pending == 0
+                && let Some(errno) = round.write_error.take()
+            {
+                if errno == ENOSPC {
+                    table.note_flush_device_full();
                 }
+                stats.write_retries += 1;
+                let mut first_failed = writes;
+                for (index, state) in round.states[..writes].iter_mut().enumerate() {
+                    if *state == OpState::Failed {
+                        *state = OpState::Unsent;
+                        first_failed = first_failed.min(index);
+                    }
+                }
+                round.next_unsent = first_failed;
+                round.ready_since_us = Some(now_us);
+                round.retry = true;
+                return Ok(());
             }
-            emit_round_wave(&t.flush, round, t.lane, RoundWave::Writes, ops);
-            return Ok(0);
+            let all_done = round.states[..writes].iter().all(|s| *s == OpState::Done);
+            // A planted canary: the barrier group is offered once every
+            // write is sent, done or not — the write-then-barrier order
+            // T4 keeps (the power-cut audit must find flushed bytes the
+            // device never held).
+            let all_sent = round.states[..writes].iter().all(|s| *s != OpState::Unsent);
+            if all_done || (cfg!(inf_canary_tier_barrier_early) && all_sent) {
+                round.phase = RoundPhase::Barriers;
+                round.next_unsent = writes;
+                round.ready_since_us = Some(now_us);
+                round.retry = false;
+            }
+            Ok(())
         }
-        if !round.barriers_sent {
-            round.barriers_sent = true;
-            emit_round_wave(&t.flush, round, t.lane, RoundWave::Barriers, ops);
-            return Ok(0);
-        }
-        let round = t.round.take().expect("checked above");
-        let _ = table.complete_flush_round(&mut t.flush);
-        stats.rounds += 1;
-        stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
-        return Ok(0);
-    }
-    // ADR-0170 D3: a round offers only when a chunk is there to take — an
-    // idle namespace asks the budget for nothing. ADR-0088 D5: the slice
-    // is offered before anything stages; `NotThisSlice` leaves the sealed
-    // backlog where it is, re-offered next pass; the grant is settled
-    // once staging reports the exact bytes.
-    if !table.flush_pending(&t.flush) {
-        return Ok(0);
-    }
-    let slice_bound = t.flush.slice_bytes();
-    match admission.admit(slice_bound, TIER_ROUND_MAX_OPS) {
-        Issue::Now => {}
-        Issue::NotThisSlice => {
-            stats.rounds_deferred += 1;
-            return Ok(0);
-        }
-    }
-    // A refused stage may still leave a valid round (the chunks and the
-    // seal staged before a refused file creation): it is submitted like
-    // any other, its staged bytes are settled like any other, the error
-    // surfaces after, and the next slice retries.
-    let stage_result = table.stage_flush_round(&mut t.flush);
-    let staged_bytes = match &stage_result {
-        Ok(staged_bytes) => *staged_bytes,
-        Err(failed) => failed.staged_bytes,
-    };
-    let issued_ops = if t.flush.round_active() { t.flush.round_op_count() as u64 } else { 0 };
-    settle_round_grant(admission, slice_bound, staged_bytes, issued_ops);
-    if t.flush.round_active() {
-        let op_count = t.flush.round_op_count();
-        assert!(op_count <= 256, "flush round exceeds the token op-index bound (ADR-0084 D3)");
-        if op_count == 0 {
-            // Effects-only round (a gap at a file boundary): nothing to
-            // wait on — the crossing applies now, as the seam drive did.
+        RoundPhase::Barriers => {
+            let op_count = t.flush.round_op_count();
+            let all_done = round.states[writes..op_count].iter().all(|s| *s == OpState::Done);
+            if round.pending > 0 || !all_done {
+                return Ok(());
+            }
+            let round = t.round.take().expect("matched above");
             let _ = table.complete_flush_round(&mut t.flush);
             stats.rounds += 1;
-        } else {
-            // ADR-0167 D4: a refused position fails ahead of the stage's
-            // own result — the round opens whole or not at all.
-            open_round(t, now_us, ops, |flush, index| flush.round_op(index).offset)?;
+            stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
+            Ok(())
         }
-    }
-    stage_result.map_err(|failed| failed.error)?;
-    Ok(staged_bytes)
-}
-
-/// Settles a round's grant against the record bytes it staged (ADR-0170
-/// D2, A2): the unstaged part of the offer is refunded against the grant's
-/// receipt, and bytes staged past the offer are charged — owed when the
-/// class's credit cannot hold them. A stage can pass its offer: each
-/// chunk takes at least one seal cut past its cursor, and a span with no
-/// recorded cut runs to its hard bound (`AddressSpace::next_flush_chunk`).
-/// Either way `spent` counts every staged byte (I10). Ops never pass the
-/// offer: a round carries at most [`TIER_ROUND_MAX_OPS`].
-fn settle_round_grant(
-    admission: &mut impl FlushAdmission,
-    offered_bytes: u64,
-    staged_bytes: u64,
-    issued_ops: u64,
-) {
-    admission.refund(
-        offered_bytes.saturating_sub(staged_bytes),
-        TIER_ROUND_MAX_OPS.saturating_sub(issued_ops),
-    );
-    let past_offer_bytes = staged_bytes.saturating_sub(offered_bytes);
-    if past_offer_bytes > 0 {
-        admission.charge(past_offer_bytes);
     }
 }
 
 /// Opens the staged round whole or not at all (ADR-0167 D4): every write
 /// position is checked before a [`FlushRound`] exists, so a refusal opens
-/// no round, pushes no op and advances no round sequence, and the round
-/// never checks a position again. `position_of(flush, index)` reads the
-/// staged write's position — the production source is
-/// `flush.round_op(index).offset`; tests plant through it. Fatal on a
-/// refusal: the check follows staging, and a retry would stage the same
-/// position.
+/// no round and advances no round sequence, and the round never checks a
+/// position again. Nothing is pushed: the round's groups are offered at
+/// the turn. `position_of(flush, index)` reads the staged write's
+/// position — the production source is `flush.round_op(index).offset`;
+/// tests plant through it. Fatal on a refusal: the check follows
+/// staging, and a retry would stage the same position.
 fn open_round<F: SegmentFs>(
     t: &mut TierNs<F>,
     now_us: u64,
-    ops: &mut Vec<IoOp>,
     position_of: impl Fn(&TierFlush<F>, usize) -> u64,
 ) -> Result<(), TierFlushError> {
     let writes = t.flush.round_write_count();
@@ -1074,21 +1391,61 @@ fn open_round<F: SegmentFs>(
     }
     t.round_seq = t.round_seq.wrapping_add(1);
     let op_count = t.flush.round_op_count();
-    let mut round = FlushRound::new(op_count, write_positions, t.round_seq, now_us);
-    emit_round_wave(&t.flush, &mut round, t.lane, RoundWave::Writes, ops);
-    t.round = Some(round);
+    t.round = Some(FlushRound::new(op_count, write_positions, t.round_seq, now_us));
     Ok(())
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum RoundWave {
-    Writes,
-    Barriers,
+/// Builds the namespace's next group: the longest run of unsent ops from
+/// the round's cursor inside the phase's range with at most
+/// `TIER_GROUP_BYTES_MAX` device bytes and `TIER_GROUP_OPS_MAX` ops,
+/// whole ops, within `visits_left` descriptor visits. `None` only when
+/// the visits are spent before the first unsent op: a single write
+/// always fits a group (the assertion in `inf_log::limits`).
+fn next_group<F: SegmentFs>(t: &TierNs<F>, visits_left: usize) -> Option<Group> {
+    let round = t.round.as_ref()?;
+    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
+    let mut group: Option<Group> = None;
+    let mut visits = 0usize;
+    for index in round.phase_range(writes, op_count) {
+        if visits == visits_left {
+            break;
+        }
+        visits += 1;
+        if round.states[index] != OpState::Unsent {
+            continue;
+        }
+        let view = t.flush.round_op(index);
+        let bytes = if view.is_barrier { 0 } else { view.bytes.len() as u64 };
+        match &mut group {
+            None => group = Some(Group { first: index, end: index + 1, ops: 1, bytes, visits }),
+            Some(g) => {
+                // A planted canary: the group is every unsent write — the
+                // one burst the bounds exist to split (the attainable
+                // oracle must read an offer above the class cap).
+                let fits = cfg!(inf_canary_tier_group_whole_round)
+                    || (g.ops < TIER_GROUP_OPS_MAX && g.bytes + bytes <= TIER_GROUP_BYTES_MAX);
+                g.visits = visits;
+                if !fits {
+                    break;
+                }
+                g.end = index + 1;
+                g.ops += 1;
+                g.bytes += bytes;
+            }
+        }
+    }
+    group
 }
 
-/// Converts one wave of the staged round to driver ops. Windows stay
-/// pipeline-owned until `finish_round` — the `StableBytes` custody
-/// argument lives in `log_bytes::tier_round_bytes`.
+/// Offers `group` to the budget at its exact size: a `Now` answer is the
+/// one way a [`GrantedGroup`] is made (T2).
+fn offer_group(admission: &mut impl FlushAdmission, group: &Group) -> Option<GrantedGroup> {
+    match admission.admit(group.bytes, group.ops as u64) {
+        Issue::Now => Some(GrantedGroup { first: group.first, end: group.end, ops: group.ops }),
+        Issue::NotThisSlice => None,
+    }
+}
+
 /// Token slot of round op `index` on `lane` (ADR-0084 D3: `lane × 256 + op_index`).
 /// The index is narrowed, never masked: `TierRound::admit_op` bounds it at
 /// staging, and a wider index here would alias another op's completion.
@@ -1097,19 +1454,19 @@ fn round_slot(lane: u32, index: usize) -> u32 {
     (lane << 8) | u32::from(index)
 }
 
-fn emit_round_wave<F: SegmentFs>(
+/// Converts one granted group to driver ops: exactly the unsent ops in
+/// its range, each marked sent. Windows stay pipeline-owned until
+/// `finish_round` — the `StableBytes` custody argument lives in
+/// `log_bytes::tier_round_bytes`.
+fn emit_group<F: SegmentFs>(
     flush: &TierFlush<F>,
     round: &mut FlushRound,
     lane: u32,
-    wave: RoundWave,
+    group: GrantedGroup,
     ops: &mut Vec<IoOp>,
 ) {
-    let writes = flush.round_write_count();
-    let range = match wave {
-        RoundWave::Writes => 0..writes,
-        RoundWave::Barriers => writes..flush.round_op_count(),
-    };
-    for index in range {
+    let mut emitted = 0usize;
+    for index in group.first..group.end {
         if round.states[index] != OpState::Unsent {
             continue;
         }
@@ -1132,439 +1489,12 @@ fn emit_round_wave<F: SegmentFs>(
         }
         round.states[index] = OpState::Sent;
         round.pending += 1;
+        emitted += 1;
     }
+    debug_assert_eq!(emitted, group.ops, "the emit pushes exactly the granted group");
+    round.next_unsent = group.end;
 }
 
 #[cfg(test)]
-mod lane_tests {
-    use super::*;
-    use inf_foundation::fault::FaultSpec;
-    use inf_foundation::time::Nanos;
-    use inf_log::fs::mem::MemFs;
-    use inf_log::fs::sim::SimDisk;
-    use inf_runtime::{ClassSlice, DeviceBudget, DeviceModel, IoClass};
-    use inf_store::{AddressSpaceConfig, DemotionConfig, KeyHasher};
-    use inf_store::{Keyspace, StoreConfig, TierSpec};
-
-    fn spec() -> TierSpec {
-        TierSpec::for_budget(64 << 20)
-    }
-
-    /// Batch 14 of the 2026-08-30 review: the op index has 8 token bits.
-    /// Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
-    /// 0 — a second op carrying the same completion token.
-    #[test]
-    #[should_panic(expected = "round op index is 8-bit")]
-    fn round_slot_refuses_an_aliasing_index() {
-        assert_ne!(round_slot(1, 0), round_slot(1, 256));
-    }
-
-    /// Batch 12 of the 2026-08-30 review: flush lanes recycle once their
-    /// namespace has no op in flight, and the reuser continues the round
-    /// sequence. Before the fix `next_lane` was monotone: with the counter
-    /// at the width this test starts from, the second `CREATE` was the
-    /// release assert `tier flush lanes exhausted` (a DDL count over the
-    /// cell's lifetime as a node kill).
-    #[test]
-    fn dropped_namespace_lane_recycles_with_its_round_sequence() {
-        let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
-        cell.next_lane = inf_runtime::MAX_SLOT >> 8;
-        cell.create_ns(NsId(16), &spec());
-        let first = &cell.namespaces[0];
-        assert_eq!(first.lane, inf_runtime::MAX_SLOT >> 8, "the last fresh lane");
-        cell.namespaces[0].round_seq = 7;
-        // A keyspace without the namespace: MAINTAIN's reconcile drops it
-        // (no round in flight → the lane recycles immediately).
-        let ks = Keyspace::new(StoreConfig::default());
-        let mut releases = vec![(NsId(16), 1)];
-        cell.sync_namespaces(&ks, &mut releases);
-        assert!(cell.namespaces.is_empty());
-        assert_eq!(cell.free_lanes, vec![(inf_runtime::MAX_SLOT >> 8, 7)]);
-        // The next tiered namespace takes the recycled lane — pre-fix this
-        // call took lane `MAX_SLOT >> 8 + 1` and panicked.
-        cell.create_ns(NsId(17), &spec());
-        let second = &cell.namespaces[0];
-        assert_eq!(second.lane, inf_runtime::MAX_SLOT >> 8);
-        assert_eq!(second.round_seq, 7, "the round sequence continues past the last holder's");
-        assert!(cell.free_lanes.is_empty());
-        assert_eq!(cell.next_lane, (inf_runtime::MAX_SLOT >> 8) + 1, "no fresh lane was minted");
-    }
-
-    /// A tiered keyspace on `NsId(16)` filled past its demotion threshold
-    /// and sealed `seal_steps` times, nothing staged. Seal marks sit at
-    /// page boundaries and the demotion slice is one 4 KiB page, so each
-    /// step — one flush cut — is one page's records, about 4 KiB.
-    fn sealed_backlog(seal_steps: u32) -> Keyspace {
-        const PAGE: u64 = 4 << 10;
-        let demote = DemotionConfig::for_budget(1 << 20, PAGE);
-        let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
-        let space = AddressSpaceConfig {
-            reserve_bytes,
-            page_bytes: PAGE as usize,
-            life_origin: LogicalAddr::ZERO,
-        };
-        let mut ks = Keyspace::new(StoreConfig::default());
-        assert!(ks.materialize_tiered(NsId(16), space, demote, 2048).is_ok());
-        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let hasher = KeyHasher::default();
-        let mut index = 0u32;
-        let mut sealed = 0;
-        while sealed < seal_steps {
-            let key = format!("round:{index:06}").into_bytes();
-            table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits the window");
-            index += 1;
-            assert!(index < 100_000, "the fill reaches the demotion threshold");
-            if table.demote_due() && table.seal_slice() > 0 {
-                sealed += 1;
-            }
-        }
-        ks
-    }
-
-    /// A sealed keyspace staged into `cell`'s own `SimDisk` pipeline: a
-    /// real reactor round, the new file's header write first (the
-    /// `tiered_flush_reactor` recipe). `MemFs` cannot stage one — it has
-    /// no fds.
-    fn staged_round(cell: &mut TierCell<SimDisk>) -> Keyspace {
-        let mut ks = sealed_backlog(1);
-        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let flush = &mut cell.namespaces[0].flush;
-        table.stage_flush_round(flush).expect("stage");
-        ks
-    }
-
-    /// The tier class's budget as the plane wires it: a real
-    /// `DeviceBudget`, called in the order `drive_flush_round` calls it.
-    struct BudgetAdmission(DeviceBudget);
-
-    impl FlushAdmission for BudgetAdmission {
-        fn admit(&mut self, bytes: u64, ops: u64) -> Issue {
-            self.0.offer(IoClass::TierFlush, bytes, ops)
-        }
-        fn refund(&mut self, bytes: u64, ops: u64) {
-            self.0.refund(IoClass::TierFlush, bytes, ops);
-        }
-        fn charge(&mut self, bytes: u64) {
-            self.0.charge(IoClass::TierFlush, bytes, 0);
-        }
-    }
-
-    /// The flush slice of the settlement tests: above one ~4 KiB seal
-    /// step and below two, so a backlog of three steps stages two — the
-    /// second through `next_flush_chunk`'s minimum-progress cut.
-    const SETTLE_SLICE: u64 = 6 << 10;
-
-    /// A budget whose tier cap is [`SETTLE_SLICE`] (1 000 B/s: the 50 ms
-    /// horizon of the tier's 400 B/s is 20 B), so the class holds exactly
-    /// one slice at boot and refills 400 B a second.
-    fn slice_capped_budget() -> BudgetAdmission {
-        let model = DeviceModel {
-            write_bytes_per_s: 1_000,
-            write_ops_per_s: 1_000,
-            read_bytes_per_s: 0,
-            read_ops_per_s: 0,
-        };
-        let mut slices = [ClassSlice { bytes: 0, ops: 0 }; IoClass::COUNT];
-        slices[IoClass::TierFlush.index()] =
-            ClassSlice { bytes: SETTLE_SLICE, ops: TIER_ROUND_MAX_OPS };
-        let budget = DeviceBudget::new(model, slices, 2, Nanos(0));
-        assert_eq!(budget.cap(IoClass::TierFlush).bytes, SETTLE_SLICE);
-        BudgetAdmission(budget)
-    }
-
-    fn settle_cell() -> TierCell<SimDisk> {
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
-        cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SETTLE_SLICE, ..spec() });
-        cell
-    }
-
-    /// ADR-0170 D2 and I10: a round stages past the slice it was granted
-    /// whenever the next seal cut lies beyond the slice's remainder (the
-    /// stage takes at least one cut), and `spent` must count every staged
-    /// byte, the excess owed — never forgiven by a refund that saturates
-    /// at zero. The class held exactly one slice, so the excess is debt:
-    /// a refill smaller than it leaves a debtor that is granted nothing.
-    #[test]
-    fn a_round_staged_past_its_slice_is_charged_in_full() {
-        let mut cell = settle_cell();
-        let mut ks = sealed_backlog(3);
-        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let mut admission = slice_capped_budget();
-        let (mut stats, mut ops) = (TierFlushStats::default(), Vec::new());
-        let t = &mut cell.namespaces[0];
-        let staged = drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission)
-            .expect("the round stages");
-        assert!(staged > SETTLE_SLICE, "engagement: staged {staged} B past the slice");
-        let spent = admission.0.counters(IoClass::TierFlush).spent_bytes;
-        assert_eq!(spent, staged, "spent counts every staged byte (ADR-0170 I10)");
-        admission.0.refill(Nanos(1_000_000_000));
-        let next = admission.0.offer(IoClass::TierFlush, 1, 1);
-        assert!(matches!(next, Issue::NotThisSlice), "the excess is owed: {next:?}");
-    }
-
-    /// ADR-0178, Publication and failure: a stage that fails after staging
-    /// part of its round still issues that part (its round opens; the
-    /// error surfaces after), so those bytes stay spent. The pipeline
-    /// rotates at a 4 KiB file capacity and the second file's first
-    /// directory hold is refused — `tier_dir_open_fail`'s third firing,
-    /// two holds per creation — so the round keeps the first chunk and
-    /// its file's seal. The first chunk's length comes from a twin
-    /// pipeline staged with a one-byte slice: the minimum-progress cut.
-    #[test]
-    fn a_failed_stage_keeps_the_bytes_it_staged_spent() {
-        let mut twin = settle_cell();
-        let config = TierFlushConfig { slice_bytes: 1, ..flush_config(&twin, 1 << 20) };
-        let fs = twin.fs.clone();
-        let twin_flush = &mut twin.namespaces[0].flush;
-        *twin_flush = TierFlush::new(fs, config, 0);
-        twin_flush.set_drive(TierDrive::Reactor);
-        let mut twin_ks = sealed_backlog(3);
-        let twin_table = twin_ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let first_chunk =
-            twin_table.stage_flush_round(twin_flush).expect("the twin stages a chunk");
-        let mut cell = settle_cell();
-        let mut ks = sealed_backlog(3);
-        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let config = flush_config(&cell, 4 << 10);
-        let fs = cell.fs.clone();
-        let t = &mut cell.namespaces[0];
-        t.flush = TierFlush::new(fs, config, 0);
-        t.flush.set_drive(TierDrive::Reactor);
-        let mut admission = slice_capped_budget();
-        let (mut stats, mut ops) = (TierFlushStats::default(), Vec::new());
-        inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(3));
-        let refused = drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission);
-        inf_foundation::fault::disarm_all();
-        let err = refused.expect_err("the second file's creation is refused");
-        assert!(!err.is_fatal(), "a refused creation retries next slice: {err}");
-        assert!(t.round.is_some(), "engagement: the partial round opened");
-        assert!(first_chunk > 0 && first_chunk < SETTLE_SLICE, "first chunk {first_chunk} B");
-        let spent = admission.0.counters(IoClass::TierFlush).spent_bytes;
-        assert_eq!(spent, first_chunk, "the issued chunk stays spent");
-    }
-
-    /// The pipeline `create_ns` builds for `NsId(16)` on `cell`, at a file
-    /// capacity of `file_capacity` data bytes.
-    fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64) -> TierFlushConfig {
-        TierFlushConfig {
-            shard_dir: cell.shard_dir.join("ns-16"),
-            cell: cell.cell,
-            ns: NsId(16),
-            mode: spec().tier_io_mode,
-            file_capacity,
-            slice_bytes: SETTLE_SLICE,
-        }
-    }
-
-    /// ADR-0167 D4: a refused write position opens nothing — no round, no
-    /// op, no round sequence spent — and the error is fatal, carrying the
-    /// value. The refusal is planted on the last write, so a check that
-    /// emitted as it went would already have pushed the others. The same
-    /// staged round, unplanted, opens with every write in wave 1.
-    #[test]
-    fn unaddressable_round_opens_nothing() {
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
-        cell.create_ns(NsId(16), &spec());
-        let _ks = staged_round(&mut cell);
-        let t = &mut cell.namespaces[0];
-        let writes = t.flush.round_write_count();
-        assert!(writes >= 2, "a header and at least one data write: {writes}");
-        let planted = i64::MAX.cast_unsigned() + 1;
-        let seq_before = t.round_seq;
-        let mut ops = Vec::new();
-        let refused = open_round(t, 7, &mut ops, |flush, index| {
-            if index + 1 == writes { planted } else { flush.round_op(index).offset }
-        });
-        let err = refused.expect_err("an unaddressable position refuses the round");
-        assert!(err.is_fatal(), "fail-stop, not a retry: {err}");
-        let TierFlushError::Unaddressable { offset_bytes, .. } = &err else { panic!("{err}") };
-        assert_eq!(*offset_bytes, planted, "the refusal carries the value");
-        assert!(ops.is_empty(), "no op was pushed");
-        assert!(t.round.is_none(), "no round opened");
-        assert_eq!(t.round_seq, seq_before, "no round sequence spent");
-        open_round(t, 7, &mut ops, |flush, index| flush.round_op(index).offset)
-            .expect("the unplanted round opens");
-        assert_eq!(ops.len(), writes, "wave 1 carries every write");
-        assert!(t.round.is_some(), "the round is open");
-    }
-
-    /// A drained round returns its lane too (the `round_drain` path).
-    #[test]
-    fn drained_namespace_lane_recycles_at_maintain() {
-        let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
-        cell.create_ns(NsId(16), &spec());
-        cell.namespaces[0].round_seq = 3;
-        // Park a finished round on it so the drop routes through the drain.
-        cell.namespaces[0].round = Some(FlushRound::new(0, Vec::new(), 3, 0));
-        let ks = Keyspace::new(StoreConfig::default());
-        let mut releases = vec![(NsId(16), 1)];
-        cell.sync_namespaces(&ks, &mut releases);
-        assert_eq!(cell.round_drain.len(), 1, "parked until every op is terminal");
-        assert!(cell.free_lanes.is_empty(), "not recycled while parked");
-        cell.maintain_teardown(|_| false);
-        assert!(cell.round_drain.is_empty());
-        assert_eq!(cell.free_lanes, vec![(0, 3)]);
-        cell.create_ns(NsId(17), &spec());
-        assert_eq!(cell.namespaces[0].lane, 0);
-        assert_eq!(cell.namespaces[0].round_seq, 3);
-    }
-
-    use inf_foundation::LogicalAddr;
-    use inf_log::TIER_FRAME_BYTES;
-    use inf_log::fs::TierIoMode;
-
-    /// Admission with no durable plane: every offer `Now`, nothing metered.
-    struct NoBudget;
-
-    impl FlushAdmission for NoBudget {
-        fn admit(&mut self, _bytes: u64, _ops: u64) -> Issue {
-            Issue::Now
-        }
-        fn refund(&mut self, _bytes: u64, _ops: u64) {}
-        fn charge(&mut self, _bytes: u64) {}
-    }
-
-    /// Materializes `ns` on `ks` with a `budget`-byte window of 4 KiB pages
-    /// and seals at least `sealed_bytes` behind the ro-boundary, one seal
-    /// step per page, nothing staged: 200 B values under 12 B keys. Returns
-    /// every inserted record's address in insertion order.
-    fn sealed_backlog_on(
-        ks: &mut Keyspace,
-        ns: NsId,
-        budget: u64,
-        sealed_bytes: u64,
-    ) -> Vec<LogicalAddr> {
-        const PAGE: u64 = 4 << 10;
-        let demote = DemotionConfig::for_budget(budget, PAGE);
-        let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
-        let space = AddressSpaceConfig {
-            reserve_bytes,
-            page_bytes: PAGE as usize,
-            life_origin: LogicalAddr::ZERO,
-        };
-        assert!(ks.materialize_tiered(ns, space, demote, 65_536).is_ok());
-        let table = ks.tiered_store_mut(ns).expect("materialized");
-        let hasher = KeyHasher::default();
-        let mut addrs = Vec::new();
-        let mut sealed = 0u64;
-        while sealed < sealed_bytes {
-            let key = format!("round:{:06}", addrs.len()).into_bytes();
-            let addr = table.insert(&key, &[0x5A; 200], hasher.hash(&key)).expect("fits");
-            addrs.push(addr);
-            assert!(addrs.len() < 1_000_000, "the fill reaches the demotion threshold");
-            if table.demote_due() {
-                sealed += table.seal_slice();
-            }
-        }
-        addrs
-    }
-
-    /// Executes `ops` on the cell's sim disk as the driver would and feeds
-    /// each completion back: a write lands whole, a barrier flushes.
-    fn complete_ops(cell: &mut TierCell<SimDisk>, ops: Vec<IoOp>) {
-        let disk = cell.fs.clone();
-        for op in ops {
-            match op {
-                IoOp::LogWrite { fd, offset, token, data: _, barrier: _ } => {
-                    let lane = token.slot() >> 8;
-                    let index = (token.slot() & 0xFF) as usize;
-                    let t = cell.namespaces.iter().find(|t| t.lane == lane).expect("lane");
-                    let view = t.flush.round_op(index);
-                    disk.driver_write_at(fd, offset, view.bytes).expect("sim write");
-                    cell.on_flush_completion(token, None);
-                }
-                IoOp::Fdatasync { fd, token } => {
-                    disk.driver_fdatasync(fd).expect("sim barrier");
-                    cell.on_flush_completion(token, None);
-                }
-                IoOp::AcceptArm { .. }
-                | IoOp::RecvArm { .. }
-                | IoOp::RecvDisarm { .. }
-                | IoOp::Send { .. }
-                | IoOp::Close { .. }
-                | IoOp::TierRead { .. } => {
-                    panic!("a flush round pushes writes and barriers only")
-                }
-            }
-        }
-    }
-
-    /// A cold read planned below the active file's readable length is
-    /// served while a later round's writes are held: its window lies
-    /// inside the bytes the file holds, so the driver fills it. Round 1
-    /// completes; round 2 stages (the staged length moves, nothing is
-    /// written); a record in the last three full frames below the
-    /// confirmable length is read through the plan. Before the readable
-    /// length the window was planned from the staged length and reached
-    /// two frames past the file's written end: a short read, which the
-    /// plane answers as a cold I/O error.
-    #[test]
-    fn a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held() {
-        const SLICE: u64 = 64 << 10;
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
-        cell.create_ns(
-            NsId(16),
-            &TierSpec { maintain_slice_bytes: SLICE, tier_io_mode: TierIoMode::Buffered, ..spec() },
-        );
-        let mut ks = Keyspace::new(StoreConfig::default());
-        let addrs = sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 160 << 10);
-        let mut admission = NoBudget;
-        let mut stats = TierFlushStats::default();
-        // Round 1: stage, writes, barriers, completion.
-        for _ in 0..3 {
-            let mut ops = Vec::new();
-            let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-            let t = &mut cell.namespaces[0];
-            drive_flush_round(table, t, &mut stats, 0, &mut ops, &mut admission).expect("drives");
-            complete_ops(&mut cell, ops);
-        }
-        let t = &cell.namespaces[0];
-        assert!(t.round.is_none(), "engagement: round 1 completed");
-        let (_, base, data_len, durable_len, _) = t.flush.active().expect("an active file");
-        assert_eq!(data_len, durable_len, "engagement: round 1 is durable");
-        let data = inf_log::TIER_FRAME_DATA as u64;
-        let confirmable = durable_len / data * data;
-        let frames_written = data_len.div_ceil(data);
-        // Round 2: staged, its writes held.
-        let mut held = Vec::new();
-        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
-        let t = &mut cell.namespaces[0];
-        drive_flush_round(table, t, &mut stats, 0, &mut held, &mut admission).expect("stages");
-        let (_, _, data_len2, durable_len2, _) = t.flush.active().expect("an active file");
-        assert!(
-            data_len2 > durable_len2 && !held.is_empty(),
-            "engagement: a round's writes are held ({} ops; staged {data_len2} B, durable \
-             {durable_len2} B)",
-            held.len()
-        );
-        // The record: starts in the last three full frames below the
-        // confirmable length and ends inside it.
-        let base_raw = base.to_raw();
-        let frames_confirmable = confirmable / data;
-        let table = ks.tiered_store(NsId(16)).expect("materialized");
-        let (addr, len) = addrs
-            .iter()
-            .rev()
-            .map(|&addr| (addr, table.record(addr).encoded_len as u64))
-            .find(|&(addr, len)| {
-                let start = addr.to_raw() - base_raw;
-                start / data + 3 >= frames_confirmable && start + len <= confirmable
-            })
-            .expect("a record in the last three full frames");
-        let first_frame = (addr.to_raw() - base_raw) / data;
-        let (fd, _, offset, frames, _) =
-            t.plan_cold_read(addr, len as usize).expect("the record is planned");
-        let mut buf = vec![0u8; frames as usize * TIER_FRAME_BYTES];
-        let offset = FileOffset::new(offset).expect("a file offset");
-        let n = cell.fs.driver_read_at(fd, offset, &mut buf).expect("sim read");
-        assert_eq!(
-            n,
-            buf.len(),
-            "the window is filled: a read of a record in frame {first_frame}, below the \
-             confirmable length ({confirmable} B, {frames_confirmable} frames), planned \
-             {frames} frames while the file holds {frames_written} written frames and \
-             {} staged",
-            data_len2.div_ceil(data)
-        );
-    }
-}
+#[path = "tier_cell_tests.rs"]
+mod tier_cell_tests;

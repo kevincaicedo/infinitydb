@@ -42,6 +42,37 @@ pub(crate) struct DocLogAdmission {
     pub record_max: usize,
 }
 
+/// The slots of [`NodeState::tier_flush`], one gauge each, in the order
+/// the tiered MAINTAIN writes them (the reactor-drive flush observables
+/// of ADR-0084 D6 and the turn's counters of ADR-0178 D5).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TierFlushGauge {
+    Rounds = 0,
+    WriteRetries,
+    StaleCompletions,
+    RoundP50Us,
+    RoundP99Us,
+    RoundsInflight,
+    FilesSealed,
+    FilesActive,
+    /// Groups the device budget refused.
+    GroupsDeferred,
+    /// The longest wait of one ready group, the pending one included, ns.
+    GroupWaitNsMax,
+    /// Refusal episodes of the turn.
+    TurnWaits,
+    /// Namespaces with work passed over by the cell's one plan, per turn.
+    PlanWaits,
+    /// Turns in which two or more namespaces held a ready group.
+    TurnContended,
+    /// Rounds the plan pass staged.
+    RoundsPlanned,
+}
+
+/// The number of [`TierFlushGauge`] slots.
+pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::RoundsPlanned as usize + 1;
+
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
 /// can't see, and the M1 cell-local registries (clients, config), the
@@ -66,11 +97,10 @@ pub struct NodeState {
     /// `INFO` renders them absent-with-disclosure while tiered is live,
     /// never as numbers (v0.4.0-alpha instrument fix).
     pub tiering_split: Cell<[u64; 15]>,
-    /// Reactor-drive flush gauges (M4.5-S31, ADR-0084 D6), flushed by
-    /// MAINTAIN: rounds, write_retries, stale_completions, round_p50_us,
-    /// round_p99_us, rounds_inflight, files_sealed, files_active.
+    /// Reactor-drive flush gauges (M4.5-S31, ADR-0084 D6; the turn's,
+    /// ADR-0178 D5), flushed by MAINTAIN, in [`TierFlushGauge`]'s order.
     /// Identically zero on nodes that never created a tiered namespace.
-    pub tier_flush: Cell<[u64; 9]>,
+    pub tier_flush: Cell<[u64; TIER_FLUSH_GAUGES]>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,

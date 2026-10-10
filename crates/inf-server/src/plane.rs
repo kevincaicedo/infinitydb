@@ -111,8 +111,8 @@ use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
-    ConnCx, ConnNamespace, NodeInfo, execute, execute_slices, stall_request,
-    unavailable_default_allows,
+    ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
+    stall_request, unavailable_default_allows,
 };
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
@@ -977,16 +977,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// The tiered MAINTAIN half (M4-S26): reconcile the namespace set,
-    /// run the per-namespace drivers (demote → flush → release,
-    /// admission cadence, extent reclaim, retirement unlink), spawn
-    /// compaction read chains, tear down dropped namespaces, and drain
-    /// queued cold-read intents into `IoOp::TierRead`s — once per
-    /// reactor iteration (the S10 admission rule). Zero-cost when no
-    /// tiered namespace was ever created: one `None` check.
+    /// run the per-namespace drivers (demote → the round's advance →
+    /// release, admission cadence, extent reclaim, retirement unlink),
+    /// then the cell's one turn (the plan pass and the issue pass, which
+    /// offer the round's groups to the device budget — ADR-0178 D3's
+    /// tier row), spawn compaction read chains, tear down dropped
+    /// namespaces, and drain queued cold-read intents into
+    /// `IoOp::TierRead`s — once per reactor iteration (the S10 admission
+    /// rule). Zero-cost when no tiered namespace was ever created: one
+    /// `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
         /// The plane's flush admission: a short borrow of the durable
         /// cell per offer (the tier borrow is held by the caller; the
-        /// durable cell is not — no nested `RefCell` conflict).
+        /// durable cell is not — no nested `RefCell` conflict). Every
+        /// group is offered at its exact size, so nothing is settled
+        /// after the answer.
         struct DurableFlushAdmission<'a, F: SegmentFs> {
             durable: &'a RefCell<Option<DurableCell<F>>>,
         }
@@ -995,16 +1000,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 match self.durable.borrow_mut().as_mut() {
                     Some(cell) => cell.offer_background(IoClass::TierFlush, bytes, ops),
                     None => Issue::Now,
-                }
-            }
-            fn refund(&mut self, bytes: u64, ops: u64) {
-                if let Some(cell) = self.durable.borrow_mut().as_mut() {
-                    cell.refund_background(IoClass::TierFlush, bytes, ops);
-                }
-            }
-            fn charge(&mut self, bytes: u64) {
-                if let Some(cell) = self.durable.borrow_mut().as_mut() {
-                    cell.charge_background(IoClass::TierFlush, bytes, 0);
                 }
             }
         }
@@ -1033,32 +1028,33 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            // ADR-0088 D5: flush rounds offer their slice to the durable
-            // cell's device budget (the tier cell has no budget of its
-            // own — one owner per fact). No durable plane ⇒ admit all.
-            let mut admission = DurableFlushAdmission { durable: &self.shared.durable };
             for at in 0..tier.namespaces.len() {
-                match tier.maintain_ns(
-                    &mut ks,
-                    at,
-                    durable_mark,
-                    transition_idle,
-                    now_us,
-                    &mut flush_ops,
-                    &mut admission,
-                ) {
+                match tier.maintain_ns(&mut ks, at, durable_mark, transition_idle, now_us) {
                     Ok((used, work)) => {
                         units += used;
                         compact_reads.extend(work);
                     }
-                    // Tier fsync failure (§8.4, ADR-0056 D4) and an
-                    // unaddressable round write position (ADR-0167 D4)
-                    // are fatal; typed I/O refusals already latched the
-                    // device-full state inside the flush slice.
+                    // A tier fsync failure (§8.4, ADR-0056 D4) is fatal.
                     Err(err) if err.is_fatal() => {
                         fatal = Some(err.to_string());
                         break;
                     }
+                    Err(_) => {}
+                }
+            }
+            // ADR-0178 D3: the cell's turn offers each ready group to the
+            // durable cell's device budget at its exact device size (the
+            // tier cell has no budget of its own — one owner per fact).
+            // No durable plane ⇒ admit all.
+            if fatal.is_none() {
+                let mut admission = DurableFlushAdmission { durable: &self.shared.durable };
+                match tier.turn(&mut ks, now_us, &mut flush_ops, &mut admission) {
+                    Ok(staged) if staged > 0 => units += 1 + (staged / 4096) as u32,
+                    Ok(_) => {}
+                    // An unaddressable round write position (ADR-0167 D4)
+                    // is fatal; typed I/O refusals already latched the
+                    // device-full state inside the plan.
+                    Err(err) if err.is_fatal() => fatal = Some(err.to_string()),
                     Err(_) => {}
                 }
             }
@@ -1090,17 +1086,28 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let stats = &tier.flush_stats;
             let files_sealed: u64 =
                 tier.namespaces.iter().map(|t| t.flush.sealed().len() as u64).sum();
-            self.shared.node.tier_flush.set([
-                stats.rounds,
-                stats.write_retries,
-                stats.stale_completions,
-                stats.round_us.percentile(50.0),
-                stats.round_us.percentile(99.0),
-                tier.flush_rounds_inflight(),
-                files_sealed,
-                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64,
-                stats.rounds_deferred,
-            ]);
+            let mut gauges = [0u64; TIER_FLUSH_GAUGES];
+            let files_active =
+                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64;
+            for (slot, value) in [
+                (TierFlushGauge::Rounds, stats.rounds),
+                (TierFlushGauge::WriteRetries, stats.write_retries),
+                (TierFlushGauge::StaleCompletions, stats.stale_completions),
+                (TierFlushGauge::RoundP50Us, stats.round_us.percentile(50.0)),
+                (TierFlushGauge::RoundP99Us, stats.round_us.percentile(99.0)),
+                (TierFlushGauge::RoundsInflight, tier.flush_rounds_inflight()),
+                (TierFlushGauge::FilesSealed, files_sealed),
+                (TierFlushGauge::FilesActive, files_active),
+                (TierFlushGauge::GroupsDeferred, stats.groups_deferred),
+                (TierFlushGauge::GroupWaitNsMax, stats.group_wait_us_max.saturating_mul(1_000)),
+                (TierFlushGauge::TurnWaits, stats.turn_waits),
+                (TierFlushGauge::PlanWaits, stats.plan_waits),
+                (TierFlushGauge::TurnContended, stats.turn_contended),
+                (TierFlushGauge::RoundsPlanned, stats.rounds_planned),
+            ] {
+                gauges[slot as usize] = value;
+            }
+            self.shared.node.tier_flush.set(gauges);
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1228,6 +1235,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// Durable counters for tests/stats (`None` = memory-only cell).
     pub fn durable_stats(&self) -> Option<crate::durable::DurableStats> {
         self.shared.durable.borrow().as_ref().map(DurableCell::stats)
+    }
+
+    /// The tier-flush gauges as the last tiered MAINTAIN flushed them
+    /// (the simulator's turn oracles read them between scheduler steps);
+    /// all zero on a cell that never created a tiered namespace.
+    pub fn tier_flush_gauges(&self) -> [u64; TIER_FLUSH_GAUGES] {
+        self.shared.node.tier_flush.get()
     }
 
     /// Checkpoint `(completed, aborted)` for the simulator's oracles

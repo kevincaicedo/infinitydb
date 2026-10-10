@@ -821,17 +821,28 @@ fn tiering_flush_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("tiering_flush_confirmed_bytes:{}", tiering.flush_confirmed_bytes));
     // M4.5-S31 (ADR-0084 D6): reactor-drive flush rounds — the sealing
     // path's visibility, cell scope, flushed by the tiered MAINTAIN.
+    use crate::exec::TierFlushGauge as G;
     let flush = node.tier_flush.get();
-    push(text, &format!("tiering_flush_rounds:{}", flush[0]));
-    push(text, &format!("tiering_flush_write_retries:{}", flush[1]));
-    push(text, &format!("tiering_flush_stale_completions:{}", flush[2]));
-    push(text, &format!("tiering_flush_round_p50_us:{}", flush[3]));
-    push(text, &format!("tiering_flush_round_p99_us:{}", flush[4]));
-    push(text, &format!("tiering_flush_rounds_inflight:{}", flush[5]));
-    push(text, &format!("tiering_files_sealed:{}", flush[6]));
-    push(text, &format!("tiering_files_active:{}", flush[7]));
-    // M4.5-S36 (ADR-0088 D5): rounds the device budget deferred.
-    push(text, &format!("tiering_flush_rounds_deferred:{}", flush[8]));
+    let gauge = |slot: G| flush[slot as usize];
+    push(text, &format!("tiering_flush_rounds:{}", gauge(G::Rounds)));
+    push(text, &format!("tiering_flush_write_retries:{}", gauge(G::WriteRetries)));
+    push(text, &format!("tiering_flush_stale_completions:{}", gauge(G::StaleCompletions)));
+    push(text, &format!("tiering_flush_round_p50_us:{}", gauge(G::RoundP50Us)));
+    push(text, &format!("tiering_flush_round_p99_us:{}", gauge(G::RoundP99Us)));
+    push(text, &format!("tiering_flush_rounds_inflight:{}", gauge(G::RoundsInflight)));
+    push(text, &format!("tiering_files_sealed:{}", gauge(G::FilesSealed)));
+    push(text, &format!("tiering_files_active:{}", gauge(G::FilesActive)));
+    // ADR-0178 D3 and D5: the tier class's groups and the cell's turn —
+    // groups the device budget refused, the longest wait of one ready
+    // group (the pending one included), the turn's refusal episodes, the
+    // namespaces with work the one plan per turn passed over, the turns
+    // with two or more namespaces ready, and the rounds planned.
+    push(text, &format!("tier_flush_groups_deferred:{}", gauge(G::GroupsDeferred)));
+    push(text, &format!("tier_group_wait_ns_max:{}", gauge(G::GroupWaitNsMax)));
+    push(text, &format!("tier_turn_waits:{}", gauge(G::TurnWaits)));
+    push(text, &format!("tier_plan_waits:{}", gauge(G::PlanWaits)));
+    push(text, &format!("tier_turn_contended:{}", gauge(G::TurnContended)));
+    push(text, &format!("tier_rounds_planned:{}", gauge(G::RoundsPlanned)));
     // M4-S15: copy-forward slices — same zero contract.
     push(text, &format!("tiering_compact_slices:{}", tiering.compact_slices));
 }
