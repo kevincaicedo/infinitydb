@@ -261,3 +261,242 @@ impl CensusRow {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    const CELL: CellId = CellId(3);
+    const FOUR: Cap = Cap::entries::<4>("timer-owners", CapFill::Assembly);
+    const FOUR_SERVING: Cap = Cap::entries::<4>("timer-owners", CapFill::Serving);
+    const THREE: Cap = Cap::entries::<3>("timer-owners", CapFill::Assembly);
+    const MARKS: Cap = Cap::entries::<16>("epoch-marks", CapFill::Serving);
+
+    /// Runs `plant` and requires both halves of a violation: the count, and
+    /// in a debug build the assertion carrying `cap-assembly-violated`.
+    fn expect_violation(census: &Rc<CapCensus>, before: u32, plant: impl FnOnce()) {
+        let outcome = catch_unwind(AssertUnwindSafe(plant));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("a debug build asserts the violation");
+            let text = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .expect("a panic message");
+            assert!(text.contains("cap-assembly-violated"), "{text}");
+            assert!(text.contains("cell3"), "{text}");
+        } else {
+            outcome.expect("a release build counts without asserting");
+        }
+        assert_eq!(census.cap_assembly_violations(), before + 1, "the violation is counted");
+    }
+
+    fn fill(row: &CensusRow, count: u32) {
+        for live in 1..=count {
+            row.report_publish(live);
+        }
+    }
+
+    #[test]
+    fn a_census_is_born_assembling_with_its_cell_and_no_row() {
+        let census = CapCensus::new(CELL);
+        assert_eq!(census.cell(), CELL);
+        assert_eq!(census.phase(), CensusPhase::Assembling);
+        assert_eq!(census.rows().count(), 0);
+        assert_eq!(census.row("epoch-marks"), None);
+        assert_eq!(census.cap_assembly_violations(), 0);
+    }
+
+    #[test]
+    fn phases_go_assembling_serving_stopping() {
+        let census = CapCensus::new(CELL);
+        census.mark_serving();
+        assert_eq!(census.phase(), CensusPhase::Serving);
+        census.mark_stopping();
+        assert_eq!(census.phase(), CensusPhase::Stopping);
+        // A cell whose loop never ran still stops.
+        let never_served = CapCensus::new(CELL);
+        never_served.mark_stopping();
+        assert_eq!(never_served.phase(), CensusPhase::Stopping);
+        assert_eq!(census.cap_assembly_violations(), 0);
+    }
+
+    #[test]
+    fn one_name_with_one_cap_and_fill_shares_a_row() {
+        let census = CapCensus::new(CELL);
+        let first = census.register(MARKS).expect("first instance");
+        let second = census.register(MARKS).expect("a per-namespace second instance");
+        assert_eq!(first.index, second.index);
+        assert_eq!(census.rows().count(), 1);
+        // high_water is the maximum over the instances, crossings the sum.
+        fill(&first, 5);
+        fill(&second, 9);
+        first.report_full();
+        second.report_full();
+        second.report_full();
+        let row = census.row("epoch-marks").expect("row");
+        assert_eq!(row.high_water, 9);
+        assert_eq!(row.crossings, 3);
+        assert_eq!(row.assembly_live, 0, "a Serving row keeps no live count");
+        assert_eq!(row.entries_max, 16);
+        assert_eq!(row.fill, CapFill::Serving);
+    }
+
+    #[test]
+    fn a_second_cap_value_under_one_name_is_census() {
+        let census = CapCensus::new(CELL);
+        census.register(MARKS).expect("first");
+        const OTHER: Cap = Cap::entries::<17>("epoch-marks", CapFill::Serving);
+        assert_eq!(census.register(OTHER).map(|_| ()), Err(CapError::Census));
+        assert_eq!(census.rows().count(), 1, "nothing was registered");
+    }
+
+    #[test]
+    fn a_second_fill_under_one_name_is_census() {
+        let census = CapCensus::new(CELL);
+        census.register(FOUR).expect("the Assembly instance");
+        assert_eq!(census.register(FOUR_SERVING).map(|_| ()), Err(CapError::Census));
+        let other = CapCensus::new(CELL);
+        other.register(FOUR_SERVING).expect("the Serving instance");
+        assert_eq!(other.register(FOUR).map(|_| ()), Err(CapError::Census));
+    }
+
+    #[test]
+    fn an_assembly_name_registered_twice_is_census() {
+        let census = CapCensus::new(CELL);
+        census.register(FOUR).expect("one instance per cell");
+        assert_eq!(census.register(FOUR).map(|_| ()), Err(CapError::Census));
+        assert_eq!(census.rows().count(), 1);
+    }
+
+    #[test]
+    fn the_name_past_the_row_bound_is_census() {
+        let one = core::num::NonZeroU32::MIN;
+        let census = CapCensus::new(CELL);
+        for name in &NAME_TABLE[..CAP_CENSUS_ROWS_MAX] {
+            let cap = Cap { name, entries: one, fill: CapFill::Serving };
+            census.register(cap).expect("within the bound");
+        }
+        assert_eq!(census.rows().count(), CAP_CENSUS_ROWS_MAX);
+        let over =
+            Cap { name: NAME_TABLE[CAP_CENSUS_ROWS_MAX], entries: one, fill: CapFill::Serving };
+        assert_eq!(census.register(over).map(|_| ()), Err(CapError::Census));
+        // A known name still shares its row at the bound.
+        let known = Cap { name: NAME_TABLE[0], entries: one, fill: CapFill::Serving };
+        census.register(known).expect("shares row 0");
+        assert_eq!(census.rows().count(), CAP_CENSUS_ROWS_MAX);
+    }
+
+    const NAME_TABLE: [&str; CAP_CENSUS_ROWS_MAX + 1] = [
+        "n00", "n01", "n02", "n03", "n04", "n05", "n06", "n07", "n08", "n09", "n10", "n11", "n12",
+        "n13", "n14", "n15", "n16", "n17", "n18", "n19", "n20", "n21", "n22", "n23", "n24", "n25",
+        "n26", "n27", "n28", "n29", "n30", "n31", "n32", "n33", "n34", "n35", "n36", "n37", "n38",
+        "n39", "n40", "n41", "n42", "n43", "n44", "n45", "n46", "n47", "n48", "n49", "n50", "n51",
+        "n52", "n53", "n54", "n55", "n56", "n57", "n58", "n59", "n60", "n61", "n62", "n63", "n64",
+    ];
+
+    // The serve mark's plants (I13). Each requires the assertion and the
+    // count; the full row is the control.
+
+    #[test]
+    fn an_assembly_row_full_at_the_mark_is_the_control() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 4);
+        census.mark_serving();
+        assert_eq!(census.cap_assembly_violations(), 0);
+        let read = census.row("timer-owners").expect("row");
+        assert_eq!((read.assembly_live, read.high_water), (4, 4));
+    }
+
+    #[test]
+    fn an_assembly_row_under_filled_at_the_mark_is_asserted_and_counted() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 3);
+        expect_violation(&census, 0, || census.mark_serving());
+        assert_eq!(census.phase(), CensusPhase::Serving);
+    }
+
+    #[test]
+    fn an_assembly_row_filled_then_one_removed_is_caught_by_the_live_count() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 4);
+        row.report_removal(3);
+        let read = census.row("timer-owners").expect("row");
+        assert_eq!(read.high_water, 4, "a high-water check would pass this host");
+        assert_eq!(read.assembly_live, 3);
+        expect_violation(&census, 0, || census.mark_serving());
+    }
+
+    #[test]
+    fn two_short_assembly_rows_count_two_at_the_mark() {
+        let census = CapCensus::new(CELL);
+        let timers = census.register(FOUR).expect("row");
+        const CLASSES: Cap = Cap::entries::<2>("task-classes", CapFill::Assembly);
+        let classes = census.register(CLASSES).expect("row");
+        fill(&timers, 3);
+        fill(&classes, 1);
+        let outcome = catch_unwind(AssertUnwindSafe(|| census.mark_serving()));
+        assert_eq!(outcome.is_err(), cfg!(debug_assertions));
+        assert_eq!(census.cap_assembly_violations(), 2);
+    }
+
+    #[test]
+    fn an_assembly_publish_after_the_mark_is_asserted_and_counted() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 4);
+        census.mark_serving();
+        row.report_removal(3);
+        expect_violation(&census, 0, || row.report_publish(4));
+    }
+
+    #[test]
+    fn an_assembly_crossing_after_the_mark_is_asserted_and_counted() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 4);
+        census.mark_serving();
+        expect_violation(&census, 0, || row.report_full());
+        assert_eq!(census.row("timer-owners").expect("row").crossings, 1);
+    }
+
+    #[test]
+    fn an_assembly_registration_after_the_mark_is_asserted_and_counted() {
+        let census = CapCensus::new(CELL);
+        census.mark_serving();
+        expect_violation(&census, 0, || {
+            census.register(THREE).expect("registered, and counted");
+        });
+        assert_eq!(census.rows().count(), 1);
+    }
+
+    #[test]
+    fn a_serving_row_is_outside_the_assembly_checks() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(MARKS).expect("row");
+        fill(&row, 3);
+        census.mark_serving();
+        row.report_publish(4);
+        row.report_full();
+        census.register(MARKS).expect("a Serving registration while serving");
+        assert_eq!(census.cap_assembly_violations(), 0);
+        let read = census.row("epoch-marks").expect("row");
+        assert_eq!((read.high_water, read.crossings, read.assembly_live), (4, 1, 0));
+    }
+
+    #[test]
+    fn violations_accumulate_across_plants() {
+        let census = CapCensus::new(CELL);
+        let row = census.register(FOUR).expect("row");
+        fill(&row, 2);
+        expect_violation(&census, 0, || census.mark_serving());
+        expect_violation(&census, 1, || row.report_publish(3));
+        expect_violation(&census, 2, || row.report_full());
+        assert_eq!(census.cap_assembly_violations(), 3);
+    }
+}
