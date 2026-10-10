@@ -54,10 +54,9 @@ ADR0143_EXEMPTIONS_MAX=15
 # The sum of the container table's counts, exactly (a sum above or below it
 # is red), and only a lower number may replace it. The approved copies read
 # it from this one line, so it stays spelled `NAME=<digits>` alone. The
-# capped-backing allows are exact: 1 once `struct CappedDeque` lands
-# (ADR-0151 D6).
+# capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
 CONTAINER_EXEMPTIONS_MAX=104
-CAPPED_BACKING_SITES=0
+CAPPED_BACKING_SITES=1
 if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
     # The census reads the ratchet's two passes; the ratchet calls back here.
     exec "$SCRIPT_DIR/check-lint-ratchet.sh"
