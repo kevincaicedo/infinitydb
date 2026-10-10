@@ -8,11 +8,11 @@
 //!
 //! The verdict rule: B − A ≤ 10 instructions per push-and-pop pair at the
 //! `call` shape, for either crossing at either cap; the `loop` shape is
-//! reported, never judged. The bound is what the type adds to the pair at
-//! that shape, read on its disassembly: the cap compare, the high-water
-//! compare, and what their cold arms cost the pop that follows them. `call`
-//! is judged because it is every site's shape: a site holds its deque in a
-//! long-lived owner and performs one op per command, frame or parked op
+//! reported, never judged. The bound counts what the type can add to the
+//! pair at that shape, read on its disassembly: the two compares, the count
+//! they re-read, and what they and their cold arms cost the pop after them.
+//! `call` is judged because it is every site's shape: a site holds its deque
+//! in a long-lived owner and performs one op per command, frame or parked op
 //! through `&mut`, so every op loads and stores the deque's fields. `loop`,
 //! the ops in one tight loop over a local deque, lets the compiler keep
 //! those fields in registers, and an arm that calls out costs the whole loop
