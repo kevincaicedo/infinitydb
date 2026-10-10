@@ -73,8 +73,11 @@ const _: () = assert!(
 /// device budget (ADR-0178 D2).
 pub(crate) const TIER_ROUND_MAX_OPS: u64 = 256;
 
-// A group is at most the tier class's declared slice on both axes (T1 of
-// the tier write path's design), so no tier offer is above the class cap.
+// A group is at most the tier class's declared slice on both axes
+// (ADR-0178 T1), so no tier offer is above the class cap: on the byte
+// axis the declared slice is `TIER_GROUP_BYTES_MAX` itself (one const,
+// read by the durable cell's class slices); on the ops axis this
+// assertion ties the group to the round's op bound.
 const _: () =
     assert!(TIER_GROUP_OPS_MAX as u64 <= TIER_ROUND_MAX_OPS, "a group fits the ops slice");
 // The plan permit is one value per MAINTAIN: the count the type carries.
@@ -160,9 +163,9 @@ pub(crate) struct FlushRound {
     write_positions: Vec<FileOffset>,
     /// Ops submitted, not yet terminal.
     pending: u32,
-    /// Writes until every write is done, then barriers (T4: the two are
-    /// distinct states, so a barrier group is never built with a write
-    /// unsent or outstanding).
+    /// Writes until every write is done, then barriers (ADR-0178 T4: the
+    /// two are distinct states, so a barrier group is never built with a
+    /// write unsent or outstanding).
     phase: RoundPhase,
     /// The group builder's cursor: the first unsent op of the phase's
     /// range, or the range's end once the phase is spent — the one rule
@@ -294,8 +297,8 @@ pub(crate) struct TierFlushStats {
     pub rounds_planned: u64,
 }
 
-/// A tier file's readable length (T10 of the tier write path's design):
-/// the data bytes below which a cold-read window may be planned. Made
+/// A tier file's readable length: the data bytes below which a cold-read
+/// window may be planned. Made
 /// only by a sealed file's length, a staged seal's confirmed prefix, or
 /// the active file's confirmable length (ADR-0056 D5) — never by a
 /// staged length, which moves at stage time while its frames are still
@@ -462,7 +465,8 @@ struct TierTurn {
     /// starts after it when there is no holder.
     served_last: Option<NsId>,
     /// The namespace that planned last: the next plan goes to the first
-    /// idle namespace with work after it, in id order, wrapping (T13).
+    /// idle namespace with work after it, in id order, wrapping (ADR-0178
+    /// T13).
     planned_last: Option<NsId>,
 }
 
@@ -471,9 +475,9 @@ struct TierTurn {
 /// [`TIER_PLANS_PER_TURN`] rounds a turn whatever its namespace count.
 pub(crate) struct PlanPermit(());
 
-/// A run of one round's unsent ops the device budget granted (T2): made
-/// only by a `Now` answer to an offer of its exact size, consumed by the
-/// emit, which pushes exactly these ops.
+/// A run of one round's unsent ops the device budget granted (ADR-0178
+/// T2): made only by a `Now` answer to an offer of its exact size,
+/// consumed by the emit, which pushes exactly these ops.
 pub(crate) struct GrantedGroup {
     first: usize,
     end: usize,
@@ -921,7 +925,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         planned.map(|()| staged)
     }
 
-    /// The plan pass (T13): the first namespace after `planned_last`, in
+    /// The plan pass (ADR-0178 T13): the first namespace after `planned_last`, in
     /// id order, wrapping, that is idle with work at its cursor stages
     /// its round — the cell's one preparation this turn, which consumes
     /// the permit; every other idle namespace with work is counted
@@ -1401,8 +1405,8 @@ fn advance_round<F: SegmentFs>(
             let all_done = round.states[..writes].iter().all(|s| *s == OpState::Done);
             // A planted canary: the barrier group is offered once every
             // write is sent, done or not — the write-then-barrier order
-            // T4 keeps (the power-cut audit must find flushed bytes the
-            // device never held).
+            // ADR-0178 T4 keeps (the cut's boot must refuse a tier frame
+            // the device never held below the manifested watermark).
             let all_sent = round.states[..writes].iter().all(|s| *s != OpState::Unsent);
             if all_done || (cfg!(inf_canary_tier_barrier_early) && all_sent) {
                 round.phase = RoundPhase::Barriers;
@@ -1504,7 +1508,7 @@ fn next_group<F: SegmentFs>(
 }
 
 /// Offers `group` to the budget at its exact size: a `Now` answer is the
-/// one way a [`GrantedGroup`] is made (T2).
+/// one way a [`GrantedGroup`] is made (ADR-0178 T2).
 fn offer_group(admission: &mut impl FlushAdmission, group: &Group) -> Option<GrantedGroup> {
     match admission.admit(group.bytes, group.ops as u64) {
         Issue::Now => Some(GrantedGroup { first: group.first, end: group.end, ops: group.ops }),
