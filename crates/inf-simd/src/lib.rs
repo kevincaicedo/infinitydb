@@ -3,8 +3,10 @@
 //! `vortex-proto`, §24), 16-way Swiss-table group probes (M0-S14), and the
 //! hardware CRC32C kernel for the log spine (M2-S01).
 //!
-//! `unsafe` is platform intrinsics only, inventoried in `SAFETY.md`; every
-//! SIMD path is property-tested against a scalar oracle.
+//! `unsafe` is platform intrinsics and, in `json.rs`, raw-pointer stores into
+//! a `Vec`'s reserved spare capacity that `set_len` then exposes; both are
+//! inventoried in `SAFETY.md`. Each vectorized module is property-tested
+//! against its scalar oracle.
 
 #![deny(unsafe_code)]
 // ADR-0144 D1: a production `match` names every variant of its enum.

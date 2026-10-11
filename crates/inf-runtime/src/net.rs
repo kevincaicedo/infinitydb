@@ -1,6 +1,6 @@
 //! Node-assembly helpers (M0): `SO_REUSEPORT` listeners — one acceptor per
 //! cell, the kernel spreads connections (master plan §5.3) — and
-//! best-effort thread pinning. Lives here so `infinityd`/`inf-sim` stay
+//! best-effort thread pinning. Lives here so `infinityd` stays
 //! `#![forbid(unsafe_code)]`; this crate owns the socket/thread FFI.
 
 use std::io;
