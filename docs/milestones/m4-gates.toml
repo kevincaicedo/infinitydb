@@ -111,13 +111,13 @@ measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonze
 
 [[gate]]
 id = "tiering_counters_zero"
-name = "Listed tiering code-path counters identically zero (inf-bench's m4 tripwire reads a fixed list; counters outside it, such as tiering_cold_read_errors, tiering_promotions and the tiering_shadow_* family, are not read)"
+name = "Listed tiering code-path counters identically zero"
 threshold = 0
 comparator = "<="
 unit = "counter sum"
 tier = "any"
 source = "tripwire:tiering_counter_total"
-measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero)"
+measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonzero); inf-bench's m4 tripwire sums a fixed list of counters, and counters outside it, such as tiering_cold_read_errors, tiering_promotions and the tiering_shadow_* family, are not read"
 
 [[gate]]
 id = "write_amplification"
