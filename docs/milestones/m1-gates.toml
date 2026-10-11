@@ -137,7 +137,7 @@ measured_by = "gate-run m1: unread subscriber under 16 KiB publishes, pubsub cap
 
 [[gate]]
 id = "compat_full_green"
-name = "100% byte-diff green on declared-full"
+name = "every compared corpus case of a declared-full command green"
 threshold = 1
 comparator = ">="
 unit = "green (bool)"

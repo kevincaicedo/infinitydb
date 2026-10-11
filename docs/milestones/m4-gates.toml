@@ -111,7 +111,7 @@ measured_by = "INFO tiering scrape on the M4 leg after every row (abort on nonze
 
 [[gate]]
 id = "tiering_counters_zero"
-name = "Tiering code-path counters identically zero"
+name = "Listed tiering code-path counters identically zero (inf-bench's m4 tripwire reads a fixed list; counters outside it, such as tiering_cold_read_errors, tiering_promotions and the tiering_shadow_* family, are not read)"
 threshold = 0
 comparator = "<="
 unit = "counter sum"
@@ -237,7 +237,7 @@ comparator = "<"
 unit = "pct per 24 h (storm-resistant first/last-5% medians)"
 tier = "linux-reference-box"
 source = "endurance:rss_slope_pct_per_24h"
-measured_by = "soak-m4.sh verdict; carried into gate-run m4 via --endurance-rss-slope-pct + --campaign-note"
+measured_by = "an external 24 h soak verdict, typed into gate-run m4 via --endurance-rss-slope-pct + --campaign-note; gate-run does not measure it or read the soak's output"
 
 [[gate]]
 id = "endurance_crashes"
@@ -247,7 +247,7 @@ comparator = "<="
 unit = "crashes"
 tier = "any"
 source = "endurance:crashes"
-measured_by = "soak-m4.sh verdict; carried via --endurance-crashes + --campaign-note"
+measured_by = "an external 24 h soak's crash count, typed into gate-run m4 via --endurance-crashes + --campaign-note; gate-run does not measure it or read the soak's alerts"
 
 [[gate]]
 id = "m3_regression_worst"
@@ -297,7 +297,7 @@ comparator = "<="
 unit = "violations"
 tier = "any"
 source = "dst:never_none_violations"
-measured_by = "inf-sim m4 scenario sweeps (m4-recovery / m4-diskfull / m4-pressure / m4-cold at 10k seeds); carried via --dst-violations + --campaign-note"
+measured_by = "inf-sim m4 scenarios: m4-recovery through its --sweep mode at 10k seeds; m4-diskfull, m4-pressure and m4-cold have no sweep mode and run the one seed they are given; carried via --dst-violations + --campaign-note"
 
 [[gate]]
 id = "crash_matrix"

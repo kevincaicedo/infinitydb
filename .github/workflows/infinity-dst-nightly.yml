@@ -11,8 +11,8 @@
 # semantics, pub/sub delivery (confirmed ⇒ reachable, per-publisher FIFO,
 # exact final ledger), accounting reconciliation at quiescence, durable
 # admissible-set + survival audit, everysec ack-deferral (M2.5-S14),
-# L2 memory-volatility + log-scan (M2.5-S14), boot-storm fsync-free ready
-# path (M2.5-S01).
+# L2 memory-volatility + log-scan (M2.5-S14), boot-storm (blocking
+# `sync_dir` calls on the ready path).
 #
 # A failure auto-files an issue carrying the exact scenario + seed + commit
 # (the determinism contract makes that a complete repro) and uploads the

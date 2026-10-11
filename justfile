@@ -19,25 +19,27 @@ check:
     # panic/unreachable in cell code is a classified inventory row.
     ./scripts/check-release-asserts.sh
     ./scripts/check-safety-inventory.sh
-    # ADR-0125 (review 2026-08-30, L18 R1/R2): the counted disciplines had
-    # no mechanical check — 2000 production lines per file, 100 columns
-    # on every line, and the 70-line function ratchet.
+    # ADR-0125: the counted disciplines are gates: 3000 production lines per
+    # file, 100 columns on every line, and the 70-line function ratchet.
     ./scripts/check-file-length.sh
     ./scripts/check-line-width.sh
     # ADR-0144 D3: one ratchet — fn-length, and the cast / arithmetic
     # backlog of the decoder files docs/lint-scopes.tsv lists — judged
     # against the table's approved copies in history.
     ./scripts/check-lint-ratchet.sh
-    # ADR-0144 (architecture review 2026-09-17, W5): every crate root is
-    # under the wildcard deny, no attribute hides a lint of the ADR, the
-    # ADR-0143 exemptions are frozen, and the probe's plants draw their lint.
+    # ADR-0144: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root
+    # under crates/ and bins/ is under the wildcard deny, an attribute
+    # silences a lint of the ADR only as a reasoned allow of one of that
+    # lint's classes, the ADR-0143 exemptions are frozen, and the probe's
+    # plants draw their lint.
     ./scripts/check-lint-scopes.sh
     # ADR-0165 D2: every saturating_/wrapping_ call in a deny-arith scope is a
     # counted row of docs/arith-spellings.tsv, reviewed against D1's rows.
     ./scripts/check-arith-spellings.sh
-    # ADR-0121 (review 2026-08-30, F-L17-09): every crate root forbids or
-    # denies unsafe_code, the deny set is the audited-leaf list, and every
-    # allow is module-scoped — the unsafe posture, mechanical.
+    # ADR-0121: every `src/lib.rs`, `src/main.rs` and `src/bin/*.rs` root of
+    # the workspace forbids or denies unsafe_code, the deny set is the
+    # audited-leaf list, and every allow written exactly
+    # `allow(unsafe_code)` is module-scoped.
     ./scripts/check-unsafe-roots.sh
     # ADR-0107 (review 2026-08-30, F-L16-01): no normal dependency edge may
     # request fault-points/collision-oracle — a workspace build would link

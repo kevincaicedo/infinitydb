@@ -69,8 +69,10 @@ infinity-embedded = ["inf-foundation", "inf-server"]
 # `DeviceIdentity` value the parser in inf-server reads back).
 inf-probe = ["inf-foundation"]
 
-# bins — infinityd assembles the node from the parts (cells, mesh, drivers),
-# which inf-server deliberately does not re-export.
+# bins — infinityd assembles the node from the parts (cells, mesh, drivers).
+# Its shipping code names `inf-log` items through `inf-server`'s re-exports
+# and has no normal `inf-log` edge; its tests take `inf-log` as a
+# dev-dependency.
 infinityd = [
     "inf-foundation",
     "inf-alloc",

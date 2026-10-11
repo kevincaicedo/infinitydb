@@ -88,6 +88,13 @@ tier = "node"
 test = "crash-matrix::tier::tier_torn_frame_reseal_at_watermark"
 expect = "reseal-at-watermark"
 
+# The `tier_fsync_err` and `tier_write_nospace` rows whose tests are in
+# `tests/tier.rs` and `tests/recovery_v2.rs` (this row,
+# `tier_fsync_frozen_watermark_bounds_manifest` and the two ENOSPC rows)
+# drive the tier write path below the server: the pipeline's seam
+# (`flush_slice`), or a `TierWriter` directly in the kill-mid-exhaustion
+# row. The server flushes through the reactor rounds
+# (`stage_flush_round`), which these rows do not run.
 [[row]]
 point = "tier_fsync_err"
 tier = "node"
@@ -177,10 +184,11 @@ tier = "node"
 test = "crash-matrix::recovery_v2::s15_unlink_failure_is_nonfatal_and_redriven"
 expect = "reclaim-deferred-nonfatal"
 
-# Review 2026-08-30, F-L01-02: a tier-file creation refused at its
-# directory hold (EMFILE physics) must stage nothing — the round keeps
-# only the ops it staged before, each on a handle the pipeline owns —
-# and the cut after that round recovers the sealed file whole.
+# A tier-file creation refused at its directory hold (an I/O error with
+# no errno, standing in for descriptor exhaustion) must stage nothing —
+# the round keeps only the ops it staged before, each on a handle the
+# pipeline owns — and the cut after that round recovers the sealed file
+# whole.
 [[row]]
 point = "tier_dir_open_fail"
 tier = "node"
@@ -308,6 +316,10 @@ expect = "blob-write-fails-typed"
 #                       done-prefix keeps it un-acked; recovery admits
 #                       either outcome for it and every acked key exactly
 
+# The rows below whose `point` is `torn_frame`, `power_cut_after_seal` or
+# `manifest_rename_fail` are carried by `tests/fua.rs` and `tests/ickv3.rs`,
+# which build the crash image by hand and arm no fault point: `point` names
+# the shape the image reproduces, and the receipt echoes it.
 [[row]]
 point = "torn_frame"
 tier = "node"

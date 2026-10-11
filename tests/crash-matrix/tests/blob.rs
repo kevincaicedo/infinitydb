@@ -1,11 +1,12 @@
 //! M4-S17 blob-extent crash rows (ADR-0061 D3/D5/D9) — carried at the
 //! node tier per `m4.toml`:
 //!
-//! - `blob-write-fails-typed` — a short device write or a failed
-//!   fdatasync abandons the extent typed: no `SealedExtent` exists, so
-//!   reference position is unreachable by construction, and the debris
-//!   file is the sweep's to reclaim. Never fail-stop (the ADR-0061 D3
-//!   narrower behavior), never a dangling reference.
+//! - `blob-write-fails-typed` — a short device write (the append fails)
+//!   or a failed fdatasync (`finish` fails) abandons the extent typed: no
+//!   `SealedExtent` is returned, so `TieredTable::insert_extent`, which
+//!   takes one, cannot reference the extent, and the debris file is the
+//!   sweep's to reclaim. Never fail-stop (the ADR-0061 D3 narrower
+//!   behavior), never a dangling reference.
 //! - `orphan-reclaimed-never-served` — the AC1 cut, both halves: an
 //!   extent whose bytes are durable but whose referencing frame never
 //!   made the log recovers as an orphan (no reference anywhere, swept,

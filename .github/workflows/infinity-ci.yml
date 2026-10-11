@@ -79,7 +79,7 @@ jobs:
       # against a colliding hasher until this fence existed.
       - name: shipping-feature fence (ADR-0107)
         run: ./scripts/check-shipping-features.sh
-      - name: check scripts self-test (planted violations turn each gate red)
+      - name: check scripts self-test (each gate exits non-zero on its planted case)
         run: ./scripts/check-scripts-selftest.sh
       # ADR-0106 first amendment (review 2026-08-30 F-L18-05): the clock
       # ban is type-resolved; the gate compiles a planted-bypass probe under
@@ -275,8 +275,10 @@ jobs:
         working-directory: crates/inf-wire
 
   compat-diff:
-    # M0-S15 / M1-S14 / M3-S21: declared command x edge-case matrix
-    # byte-identical to pinned Redis + RedisJSON oracles.
+    # The declared command x edge-case corpus against the pinned Redis and
+    # RedisJSON oracles: a compared case whose reply differs with no
+    # recorded deviation for it fails the job, and so does a stale
+    # generated matrix.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

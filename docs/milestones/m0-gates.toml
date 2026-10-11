@@ -59,7 +59,7 @@ comparator = "<"
 unit = "us"
 tier = "linux-reference-box"
 source = "external:fabric_token_histogram"
-measured_by = "in-process histogram around fabric token round-trip, loaded run"
+measured_by = "in-process lifetime histogram around the fabric token round trip, stamped with the loop-cached clock: each of its two stamps can be off by up to one loop step, which nothing bounds below the 2 us threshold, so a reading below the threshold does not show the gate met"
 
 # Amended by ADR-0006 (2026-06-12): the STOP gate is comparator-anchored
 # (RC-4's own method); the penalty-vs-all-local row below is demoted to an
