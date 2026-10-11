@@ -58,7 +58,7 @@ fn scratch_base() -> &'static Path {
 }
 
 const SPANNING_REFUSAL: &[u8] =
-    b"-ERR multi-key commands spanning cells are not yet supported in named namespaces (M2)\r\n";
+    b"-ERR multi-key commands spanning cells are not supported in named namespaces\r\n";
 const TAG: &str = "{twin}";
 
 /// The bindings the script runs under. Each is a fresh connection per

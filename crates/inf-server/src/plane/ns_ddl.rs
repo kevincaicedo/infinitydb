@@ -195,13 +195,12 @@ pub(super) async fn dispatch_ns<O: PlaneObserver + 'static, F: SegmentFs + Clone
                 pending.push_back(PendingReply::Gather { parts, proto, unwrap_single: true });
                 return true;
             }
-            // Recorded M2 limitation (ADR-0015 deviations): multi-key
-            // commands spanning cells bind with the M3 named-ns programs.
+            // Every other multi-key command that spans cells is refused in
+            // a named namespace (ADR-0015 deviations).
             pending.push_back(PendingReply::Done(error_reply(
                 shared,
                 proto,
-                "ERR multi-key commands spanning cells are not yet supported in named namespaces \
-                     (M2)",
+                "ERR multi-key commands spanning cells are not supported in named namespaces",
             )));
             return true;
         }

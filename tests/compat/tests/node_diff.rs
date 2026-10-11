@@ -52,7 +52,7 @@ const NODE_OVERRIDES: &[CaseOverride] = &[CaseOverride {
     // durable namespace, node-wide FLUSHALL refuses typed.
     argv: &["FLUSHALL"],
     expect: Expect::CandidateExact(
-        b"-ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)\r\n",
+        b"-ERR FLUSHALL on a node with durable namespaces is not supported\r\n",
     ),
     why: "FLUSHALL with durable namespaces refuses (ADR-0015 M2 cut)",
 }];
@@ -354,10 +354,7 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
     // refusal is caught (the candidate side only — the oracle has no
     // namespaces to compare against).
     for (argv, expected) in [
-        (
-            &["FLUSHDB"][..],
-            &b"-ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)\r\n"[..],
-        ),
+        (&["FLUSHDB"][..], &b"-ERR FLUSHDB on a named namespace is not supported\r\n"[..]),
         (
             // 16 distinct keys: the key hash is secret-seeded (ADR-0094),
             // so no fixed pair provably spans cells — but P(16 keys all
@@ -366,8 +363,8 @@ fn node_fanout_and_tier_match_redis_under_namespace() {
                 "EXISTS", "s:0", "s:1", "s:2", "s:3", "s:4", "s:5", "s:6", "s:7", "s:8", "s:9",
                 "s:a", "s:b", "s:c", "s:d", "s:e", "s:f",
             ][..],
-            &b"-ERR multi-key commands spanning cells are not yet supported in named namespaces \
-                 (M2)\r\n"[..],
+            &b"-ERR multi-key commands spanning cells are not supported in named \
+                 namespaces\r\n"[..],
         ),
         (
             &["KEYS", "*"][..],

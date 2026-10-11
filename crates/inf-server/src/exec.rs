@@ -744,9 +744,7 @@ pub fn execute(
             // A durable flush needs per-key Delete records (S10/S11 makes
             // truncation cheap); refuse loudly until then (ADR-0015).
             if ks.ns_iter().any(|s| s.mode == inf_store::NsMode::Durable) {
-                return w.error(
-                    "ERR FLUSHALL on a node with durable namespaces is not yet supported (M2)",
-                );
+                return w.error("ERR FLUSHALL on a node with durable namespaces is not supported");
             }
             flush(argv, ks, None, now, &mut w);
         }
@@ -754,8 +752,7 @@ pub fn execute(
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
             if cx.ns.named().is_some() {
-                return w
-                    .error("ERR FLUSHDB on a named namespace is not yet supported (M2, ADR-0015)");
+                return w.error("ERR FLUSHDB on a named namespace is not supported");
             }
             flush(argv, ks, Some(db), now, &mut w);
         }
@@ -763,7 +760,7 @@ pub fn execute(
             let db = cx.db;
             let mut w = RespWriter::new(out, cx.proto);
             if cx.ns.named().is_some() {
-                return w.error("ERR COPY within a named namespace is not yet supported (M2)");
+                return w.error("ERR COPY within a named namespace is not supported");
             }
             copy(argv, ks, db, now, &mut w);
         }
