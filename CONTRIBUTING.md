@@ -180,9 +180,8 @@ shipping features, file length and line width, lint ratchet and scopes,
 documentation links); the gates' own self-test, which runs each gate on
 planted cases and requires each to exit non-zero (a case written with
 `expect_red_because` also requires its cause in the gate's output); clippy
-with `-D warnings`;
-and the workspace tests. The `check` recipe in the [`justfile`](justfile)
-is the exact list.
+with `-D warnings`; and the workspace tests. The `check` recipe in the
+[`justfile`](justfile) is the exact list.
 
 Layer-specific checks, run them when you touch the relevant area:
 
