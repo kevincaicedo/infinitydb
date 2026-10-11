@@ -6,12 +6,12 @@
 # list below (drift either way is red — a leaf that lost its unsafe drops
 # off the list by ADR, a new one joins by ADR); and every allow written
 # exactly `allow(unsafe_code)` in shipped source is module-scoped: an outer
-# `#[allow(unsafe_code)]` on a `mod` item of a `deny` crate's root, or an
-# inner `#![allow(unsafe_code)]` at the top of a module file the root
-# declares. An allow in another spelling (a reasoned
+# `#[allow(unsafe_code)]` on a `mod` item (at a `deny` crate's root, or
+# inside one of its module files), or an inner `#![allow(unsafe_code)]` at
+# the top of a module file. An allow in another spelling (a reasoned
 # `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
-# allow) is not read by this gate, on a function, impl or block included.
-# The compiler refuses new unsafe outside an allowed item, and
+# allow) is not read by this gate, including one on a function, impl or
+# block. The compiler refuses new unsafe outside an allowed item, and
 # `check-safety-inventory.sh` refuses a named module SAFETY.md omits.
 #
 # Scope is asserted (ADR-0106): missing directories, zero roots, or a
