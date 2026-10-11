@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "harness crate: process deadlines and run stamps, not cell code"
+)]
 //! M2-S17 fsyncgate row (ADR-0020 D3, §8.4): injected EIO on the fsync
 //! completion of a live uring node → the process **fail-stops** with
 //! [`inf_server::EXIT_DURABLE_FAILSTOP`], **zero acks** are emitted for
@@ -20,6 +24,9 @@
 //! the un-acked write. §8.2 makes no promise either way for un-acked
 //! writes; the tier where those bytes vanish is the M2-S18 sim disk.
 #![cfg(target_os = "linux")]
+
+#[path = "../receipt.rs"]
+mod receipt;
 
 use std::io::Read;
 use std::io::Write;
@@ -57,8 +64,10 @@ fn start_node(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let control =
-        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), 1, boot_unix_ms);
+    let one_cell = inf_foundation::CellCount::new(1).expect("one cell");
+    let (control, issuers) =
+        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms);
+    let issuer = issuers.cells.into_iter().next().expect("one cell's issuer");
     let dir = data_dir.to_path_buf();
     let fabric = Mesh::new(1, MeshConfig { ring_capacity: 1024, data_credits: 256 })
         .into_iter()
@@ -82,7 +91,11 @@ fn start_node(
             segment: inf_log::SegmentConfig::default(),
             ckpt: inf_log::CkptConfig { interval_bytes: 0, ..Default::default() },
             recover: Default::default(),
-            sync_pipeline: 1,
+            flush_bound: 1,
+            fua_p50_us_probed: 0,
+            device: Default::default(),
+            fill: Default::default(),
+            group: Default::default(),
         };
         let mut plane = ServerPlane::new(
             CellId(0),
@@ -90,11 +103,11 @@ fn start_node(
             listener.into_raw_fd(),
             ks,
             fabric,
-            Rc::new(NodeInfo::default()),
+            Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
             NoopObserver,
             false,
         );
-        plane.set_control(Arc::clone(&board));
+        plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
         let config =
             LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };
@@ -102,7 +115,7 @@ fn start_node(
         while !stop.load(Ordering::Relaxed) {
             cell_loop.run_iteration(&mut plane).expect("iteration");
             if let Some(err) = plane.take_boot_error() {
-                panic!("recovery failed (fail-stop, §8.4): {err}");
+                panic!("recovery failed (fail-stop): {err}");
             }
         }
     });
@@ -253,7 +266,7 @@ fn fsyncgate_fail_stop() {
     let mut stderr = String::new();
     child.stderr.take().expect("piped").read_to_string(&mut stderr).expect("stderr");
     assert!(
-        stderr.contains("fail-stop, §8.4") && stderr.contains("errno 5"),
+        stderr.contains("(fail-stop)") && stderr.contains("errno 5"),
         "typed fail-stop line missing from stderr: {stderr}"
     );
 
@@ -276,4 +289,5 @@ fn fsyncgate_fail_stop() {
         handle.join().expect("cell thread");
     }
     std::fs::remove_dir_all(&dir).ok();
+    receipt::verified("durable_fsync_eio", "fail-stop");
 }

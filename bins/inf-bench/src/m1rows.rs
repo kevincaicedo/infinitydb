@@ -8,7 +8,8 @@
 //! values with non-binding verdicts; only `--reference-box` runs can bind
 //! the milestone verdict. Rows whose tooling lives elsewhere (zipfian LFU
 //! parity, M0-regression A/B vs the M0 baseline artifact, 24 h soak,
-//! flamegraph attribution) report PENDING from this command by design.
+//! flamegraph attribution) remain UNMEASURED until supplied; selected STOP
+//! omissions make the run incomplete (ADR-0132).
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -20,8 +21,13 @@ use crate::gaterun::{
     Measurements, env_gate, finish_report, load_gates, scrape_cells, spawn_infinityd, spawn_redis,
     sum_field,
 };
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, encode_command, request};
+
+mod empty_node;
+mod memory;
+
+pub(crate) use empty_node::EmptyNodeValues;
 
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut conn = connect("127.0.0.1", port)?;
@@ -95,7 +101,10 @@ impl SubFleet {
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: orchestration script: linear rows, not branchy logic"
+)]
 pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m1")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m1");
@@ -121,6 +130,21 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         m.note("dev-tier run: reference-box gates report measured values, non-binding verdicts");
     }
 
+    // The empty-node rows run first, before any fill leaves dirty
+    // writeback on the device the durable legs boot from.
+    empty_node::run(flags, &gates_list, &mut m, &infinityd, cells, reference_box)?;
+    if flags.bool("only-empty-node") {
+        return finish_report(
+            "m1",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!("cells: {cells} · replicates: {replicates} · empty-node rows only"),
+        );
+    }
+
     // Row 1 — baseline (M0-regression leg): same shape as the m0 pipelined
     // replicates; comparison against the M0 baseline artifact is a manual
     // A/B (the gate's source stays external).
@@ -139,6 +163,9 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         m.raw_section(&format!("baseline rep {rep}"), &render(&report));
         base_ops.push(report.ops_per_sec);
         base_p999.push(report.p999_us as f64);
+        if rep + 1 == replicates {
+            m.probe_generator("m1 baseline", &spec, &report);
+        }
     }
     m.set("loadgen:baseline_ops_per_sec", crate::gaterun::median(&mut base_ops));
     m.set("loadgen:baseline_p999_us", crate::gaterun::median(&mut base_p999));
@@ -164,6 +191,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         sum_field(&infos, "expired_active"),
         sum_field(&infos, "expired_lazy")
     ));
+    m.probe_generator("m1 TTL-heavy", &spec, &report);
     control(server.port, &[b"FLUSHALL"])?;
 
     // Row 3 — expiry storm: `storm_keys` keys all expire at one absolute
@@ -217,7 +245,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             }
             // Bench poller thread, not cell code: ~5 ms DBSIZE cadence keeps
             // the probe load negligible against the foreground fleet.
-            #[allow(clippy::disallowed_methods)]
+            #[allow(clippy::disallowed_methods, reason = "bench orchestration, not cell code")]
             std::thread::sleep(Duration::from_millis(5));
         }
     });
@@ -257,24 +285,8 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     m.raw_section("eviction-pressure", &render(&report));
     m.set("loadgen:eviction_storm_p999_us", report.p999_us as f64);
     let infos = scrape_cells(server.port, cells)?;
-    let evicted = sum_field(&infos, "evicted_keys");
-    // The pressure bound compares LOGICAL used bytes (live records + index +
-    // wheel + CMS — the shape `Keyspace::used_bytes` enforces); INFO's
-    // `used_memory` additionally carries allocator slack + wire buffers +
-    // conn state, whose bound is the RSS/attribution story, not this gate.
-    let logical = sum_field(&infos, "records_live_bytes")
-        + sum_field(&infos, "index_bytes")
-        + sum_field(&infos, "wheel_bytes")
-        + sum_field(&infos, "evict_bytes");
-    let resident = sum_field(&infos, "used_memory");
-    m.set("loadgen:eviction_used_over_limit", logical as f64 / mb as f64);
-    m.note(format!(
-        "eviction pressure: {evicted} evictions; logical {logical} B vs limit {mb} B \
-         (resident incl. slack/buffers: {resident} B)"
-    ));
-    if evicted == 0 {
-        m.note("WARNING: zero evictions — the row did not generate pressure (check sizing)");
-    }
+    memory::record_eviction_memory(&mut m, &infos, mb)?;
+    m.probe_generator("m1 eviction pressure", &spec, &report);
     control(server.port, &[b"CONFIG", b"SET", b"maxmemory", b"0"])?;
     control(server.port, &[b"CONFIG", b"SET", b"maxmemory-policy", b"noeviction"])?;
     control(server.port, &[b"FLUSHALL"])?;
@@ -373,10 +385,12 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             ..Default::default()
         };
         let report = run_load(&spec)?;
+        m.probe_generator("m1 KV under pubsub", &spec, &report);
         stop_pub.store(true, Ordering::Relaxed);
         let published = bg.join().expect("bg publisher")?;
         println!(
-            "  KV under pub/sub background: p999 {} µs ({published} publishes behind it)",
+            "  KV under pub/sub background: p999 {} µs \
+             ({published} publishes across measurement + generator probe)",
             report.p999_us
         );
         m.raw_section("pubsub-background", &render(&report));
@@ -387,7 +401,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             d.join().expect("drainer");
         }
         m.note(format!(
-            "pub/sub deliveries drained by the fleet: {}",
+            "pub/sub deliveries drained by the fleet (including generator probe): {}",
             fleet.delivered.load(Ordering::Relaxed)
         ));
         Ok(())
@@ -455,17 +469,27 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
             ..Default::default()
         };
         run_load(&fill)?;
-        let our_rss = ours.rss_bytes();
+        // A server that exited after the fill is an unreaped zombie with no
+        // `VmRSS`: that read fails, so the release-blocking row stays unset.
+        let our_rss = ours.proc_sample().map(|sample| sample.rss_bytes());
         drop(ours);
-        match spawn_redis(&redis_bin) {
-            Err(e) => m.note(format!("redis RSS leg skipped: {e}")),
-            Ok(redis) => {
+        match (our_rss, spawn_redis(&redis_bin)) {
+            (Err(e), _) => m.fail(format!("infinityd RSS after the fill: {e}")),
+            (Ok(_), Err(e)) => m.fail(format!("Redis RSS startup failed: {e}")),
+            (Ok(our_rss), Ok(redis)) => {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 run_load(&fill)?;
-                let redis_rss = redis.rss_bytes();
-                let ratio = our_rss as f64 / redis_rss as f64;
-                println!("  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x");
-                m.set("external:rss_attribution", ratio);
+                match redis.proc_sample() {
+                    Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
+                    Ok(sample) => {
+                        let redis_rss = sample.rss_bytes();
+                        let ratio = our_rss as f64 / redis_rss as f64;
+                        println!(
+                            "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"
+                        );
+                        m.set("external:rss_attribution", ratio);
+                    }
+                }
             }
         }
     }
@@ -499,6 +523,11 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
         m.set("external:zipfian_lfu", pp);
     }
 
+    m.note(
+        "generator scope: expiry/FLUSHALL are transient event rows, pub/sub fan-out and \
+         slow-subscriber checks are manually paced; no saturation inference for those rows. \
+         Deterministic fills measure memory and zipfian measures hit-rate, not capacity.",
+    );
     finish_report(
         "m1",
         &gates_list,

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "build: provenance files before any runtime exists (ADR-0144 D5)"
+)]
 //! Build provenance for `infinityd --version` (M1-S14): release version,
 //! git SHA (+`-dirty` marker), and build target are stamped into the binary
 //! at compile time. The release pipeline injects `INF_RELEASE_VERSION` from

@@ -110,10 +110,11 @@ pub(crate) fn cmd_boot_storm(args: &[String]) -> Result<(), String> {
         };
 
         // 3. All cells ready (INFO loading == 0) inside the bound. A server
-        //    that *exits* while we poll is a fail-stop (its listener bound
-        //    at setup step 10, before the ring create at step 12, so it can
-        //    die after accepting the readiness probe) — classified as the
-        //    named Phase-H item, never as a silent wedge.
+        //    that *exits* while we poll is a fail-stop (its listener binds
+        //    after the ring create and buffer registration but before
+        //    recovery, so a failed recovery can die after accepting the
+        //    readiness probe) — classified as the named Phase-H item, never
+        //    as a silent wedge.
         let deadline = started + ready_timeout;
         let mut loaded = false;
         let mut exited = None;
@@ -174,7 +175,8 @@ pub(crate) fn cmd_boot_storm(args: &[String]) -> Result<(), String> {
          - data-root: {root} (must not be tmpfs)\n\n\
          | metric | value |\n|---|---|\n\
          | wedges (gate: 0) | {wedges} |\n\
-         | named fail-stop exits (ADR-0026 D3 Phase-H item; informational under pressure) | {spawn_failstops} |\n\
+         | named fail-stop exits (ADR-0026 D3 Phase-H item; informational under pressure) | \
+         {spawn_failstops} |\n\
          | retries consumed (by design) | 0 |\n\
          | time-to-all-ready p50 | {p50} ms |\n\
          | time-to-all-ready p99 | {p99} ms |\n\

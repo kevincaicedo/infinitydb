@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! Durability crash-matrix harness. M2 fault-point coverage lives in
 //! `m2.toml`; M3 document record/checkpoint cuts live in `m3.toml`.
 //! Both are reviewable data, while this crate supplies the shared schema
@@ -23,10 +27,12 @@
 //!   final unflushed/torn records (within the loss window by
 //!   construction here; the ack-stream oracle proper binds at S19);
 //! - recovery is idempotent (second recovery digest-equal).
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use inf_foundation::KeyHasher;
 use inf_foundation::fault::{self, FaultSpec};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
@@ -52,6 +58,17 @@ pub fn anchor() -> WallAnchor {
     WallAnchor { internal_ms: 0, unix_ms: UNIX_BASE }
 }
 
+/// A matrix seed override must execute work, never turn a row vacuous.
+pub fn seed_count(default: u64) -> u64 {
+    let seeds = match std::env::var("CRASH_MATRIX_SEEDS") {
+        Ok(value) => value.parse().expect("CRASH_MATRIX_SEEDS must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("invalid CRASH_MATRIX_SEEDS: {error}"),
+    };
+    assert!(seeds > 0, "CRASH_MATRIX_SEEDS must be positive");
+    seeds
+}
+
 // ---------------------------------------------------------------------
 // Matrix definition (m2.toml): hand-rolled reader for exactly this
 // schema (`[[row]]` tables of scalars + string lists — the house
@@ -65,10 +82,12 @@ pub struct MatrixRow {
     pub workloads: Vec<String>,
     pub expect: String,
     /// "memfs" (default — the runner executes it) or "node" (carried by
-    /// the named test; counted for coverage, skipped by the runner).
+    /// an exact test executed by `run_node_rows.py`).
     pub tier: String,
-    /// Node-tier rows: the test file that carries the row.
+    /// Node-tier rows: `package::target::test_function`.
     pub test: String,
+    /// Empty for portable rows; `linux` for the real io_uring carriers.
+    pub platform: String,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +138,7 @@ pub fn load_matrix(path: &Path) -> MatrixDef {
             "expect" => row.expect = unquote(value),
             "tier" => row.tier = unquote(value),
             "test" => row.test = unquote(value),
+            "platform" => row.platform = unquote(value),
             "policies" => row.policies = string_list(value),
             "workloads" => row.workloads = string_list(value),
             other => panic!("{}:{}: unknown row field {other}", path.display(), lineno + 1),
@@ -190,10 +210,14 @@ pub fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
-        sync_pipeline: 1,
+        flush_bound: 1,
+        fua_p50_us_probed: 0,
+        device: Default::default(),
+        fill: Default::default(),
+        group: Default::default(),
     }
 }
 
@@ -501,7 +525,13 @@ fn publish(
     write_manifest(
         fs,
         Path::new("data/shard-0"),
-        &Manifest { ckpt_id: u64::from(id), begin_lsn: begin, segments, tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: u64::from(id),
+            begin_lsn: begin,
+            segments,
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -526,7 +556,7 @@ pub fn reference_replay(fs: &MemFs, class: FsyncClass) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor()).expect("apply");
+                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });

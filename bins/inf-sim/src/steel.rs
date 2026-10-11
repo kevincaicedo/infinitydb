@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBufId, AlignedPool, BufferPool};
-use inf_foundation::hash64;
 use inf_foundation::rng::{Entropy, SplitMix64};
+use inf_foundation::{FileOffset, hash64};
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
@@ -37,8 +37,8 @@ use inf_runtime::{
     PollImmediate, RawFd, StableBytesMut, TokenClass, Wait,
 };
 use inf_store::{
-    AddrClass, AddressSpaceConfig, DemotionConfig, Keyspace, LogicalAddr, NsId, StoreConfig,
-    TieredLookup, TieredTable,
+    AddrClass, AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId,
+    StoreConfig, TieredLookup, TieredTable,
 };
 
 use crate::net::{CellNet, Plant, SimDriver};
@@ -71,6 +71,8 @@ pub struct SteelReport {
     pub cold_reads: u64,
     pub promotions: u64,
     pub trace_hash: u64,
+    pub state_hash: u64,
+    state: crate::state::StateHash,
 }
 
 impl SteelReport {
@@ -151,14 +153,15 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
             let fd = tier.fd;
             let buf = ctx.pool.try_lease().expect("scenario pool is sized");
             let token = ctx.mint_token();
-            let dest = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
+            let target = &mut ctx.pool.bytes_mut(buf)[..frame_count * TIER_FRAME_BYTES];
             // SAFETY: the pool buffer's address is stable for the pool's
             // lifetime and the lease is held (untouched) until this op's
             // terminal completion resumes us.
-            let stable = unsafe { StableBytesMut::new(dest) };
+            let stable = unsafe { StableBytesMut::new(target) };
             ctx.driver.push(IoOp::TierRead {
                 fd,
-                offset: tier_frame_offset(first_frame),
+                offset: FileOffset::new(tier_frame_offset(first_frame))
+                    .expect("a 48-bit address is addressable"),
                 buf: stable,
                 token,
             });
@@ -171,7 +174,7 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
 /// The scenario GET — fetch-verify-retry over real suspension, resuming
 /// with a re-resolve (the M0 custody rule).
 async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
-    let hash = TieredTable::hash_key(&key);
+    let hash = ctx.borrow().ks.hasher().hash(&key);
     let mut exclude: Vec<LogicalAddr> = Vec::new();
     loop {
         let (buf, addr, frame_count, skip, waiter) = match plan(&ctx, &key, hash, &exclude) {
@@ -278,9 +281,10 @@ fn run_life(
     ledger: &[(Vec<u8>, Vec<u8>)],
     updates_from: Option<UpdateLeg<'_>>,
     report: &mut SteelReport,
+    hasher: KeyHasher,
 ) -> (LogicalAddr, u32) {
     // Replay the ledger into a fresh life (the harness plays the WAL).
-    let mut ks = Keyspace::new(StoreConfig::default());
+    let mut ks = Keyspace::new(StoreConfig { hasher, ..Default::default() });
     assert!(
         ks.materialize_tiered(
             NS,
@@ -294,7 +298,7 @@ fn run_life(
     {
         let table = ks.tiered_store_mut(NS).expect("materialized");
         for (key, value) in ledger {
-            let hash = TieredTable::hash_key(key);
+            let hash = table.hash_key(key);
             let placed = match table.lookup(key, hash, &[]) {
                 TieredLookup::Ram(old) => {
                     let (old_len, old_version) = {
@@ -310,6 +314,8 @@ fn run_life(
             model.insert(key.clone(), Expect { value: value.clone(), version: parts.version });
         }
     }
+    report.state.number(b"recovered-life", life_origin.to_raw());
+    report.state.keyspace(&ks, inf_foundation::time::Nanos(0));
     // Seal → flush through the S11 pipeline (rotation, gaps, footer,
     // fdatasync, watermark confirmation — the harness leg retired) →
     // release.
@@ -396,7 +402,7 @@ fn run_life(
             let value = vec![(rng.next_u64() % 251) as u8; value_len];
             let ctx = &mut *ctx.borrow_mut();
             let table = ctx.table();
-            let hash = TieredTable::hash_key(&key);
+            let hash = table.hash_key(&key);
             let TieredLookup::Cold(old) = table.lookup(&key, hash, &[]) else {
                 // Already promoted by an earlier update this round: RAM.
                 let TieredLookup::Ram(old) = table.lookup(&key, hash, &[]) else {
@@ -439,6 +445,8 @@ fn run_life(
     }
 
     let ctx = ctx.borrow();
+    report.state.keyspace(&ctx.ks, inf_foundation::time::Nanos(0));
+    report.state.disk(disk);
     if ctx.pool.reconcile().is_err() {
         report.violations.push("aligned-pool lease leak".into());
     }
@@ -471,13 +479,26 @@ pub fn run_steel_scenario(scenario: &SteelScenario) -> SteelReport {
         &ledger.clone(),
         Some((&mut rng, scenario.updates, &mut ledger)),
         &mut report,
+        KeyHasher::from_seed(scenario.seed),
     );
 
     // The S06 crash leg: tear un-fsynced state, then a new life replays
     // the ledger at a fresh origin — content survives, addresses don't.
+    report.state.number(b"cut", scenario.seed ^ 0x0FF5_EED0);
     disk.power_cut(scenario.seed ^ 0x0FF5_EED0);
+    report.state.disk(&disk);
     let origin = LogicalAddr::from_raw(tail.to_raw().next_multiple_of(PAGE as u64))
         .expect("origin fits 48 bits");
-    run_life(&disk, &shard_dir, next_file_id, origin, &ledger, None, &mut report);
+    run_life(
+        &disk,
+        &shard_dir,
+        next_file_id,
+        origin,
+        &ledger,
+        None,
+        &mut report,
+        KeyHasher::from_seed(scenario.seed),
+    );
+    report.state_hash = report.state.value();
     report
 }

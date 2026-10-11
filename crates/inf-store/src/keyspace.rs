@@ -13,9 +13,13 @@
 //! are enforced per ADR-0068: a store without its own `MAXMEMORY` inherits
 //! the node policy and joins the global eviction hand; a store with its own
 //! budget carries a cached per-store `over_limit` flag and reclaims through
-//! its own step-limited pass — never through the global hand, so a
-//! namespace at its budget cannot disturb the numbered dbs (structural
-//! isolation, not tuning). Durable named namespaces stay hard-`NoEviction`
+//! its own step-limited pass — never through the global hand, and its
+//! bytes never drive the global hand either (ADR-0068 A1: the node
+//! `maxmemory` bounds the **pool** — numbered dbs plus every named store
+//! without a budget of its own — while a budgeted namespace is its own
+//! authority), so a namespace at or under its budget cannot disturb the
+//! numbered dbs (structural isolation, not tuning). `used_bytes` still
+//! counts everything (L5 attribution, D5). Durable named namespaces stay hard-`NoEviction`
 //! (ADR-0015 D5 — eviction without `Delete` records resurrects keys on
 //! replay); tiered namespaces refuse the knobs outright (ADR-0062 owns
 //! their budget — one authority per namespace, never two).
@@ -29,25 +33,36 @@
 //! (`limit − limit/16`, hysteresis) under its own budget so a storm of
 //! writes cannot monopolize the loop (the bounded-everything rule).
 
-use inf_foundation::hash64;
 use inf_foundation::time::Nanos;
+use inf_foundation::{KeyHasher, hash64};
 use inf_log::{FsyncClass, NsId, RecordView as LogRecordView};
 
 use inf_foundation::LogicalAddr;
 
 use crate::address_space::{AddressSpaceConfig, TieringCounters};
-use crate::catalog::NsCatalog;
+use crate::catalog::{IndexCatalog, NsCatalog};
 use crate::demote::{DemoteStats, DemotionConfig, EvictionPressure};
 use crate::evict::{EvictStats, EvictionPolicy};
+use crate::index_backfill::{BackfillInfo, BackfillJob, BackfillTickStats};
+use crate::index_registry::{IndexError, IndexId, IndexRegistry, IndexSpec, IndexState};
 use crate::ns::{FIRST_NAMED_NS_ID, NsError, NsMode, NsRegistry, NsSpec};
-use crate::record::ExtentRef;
+use crate::record::{ExtentRef, InternalDeadline};
 use crate::store::{
     CellStore, CheckpointImage, ExpiryStats, MemoryReport, OpError, StoreConfig, StoreStats,
+    SweepStop,
 };
 use crate::tiered::TieredTable;
+use crate::tiered::promote::PromotionCounters;
+use crate::tiered::replay::{ReplayRefusal, ReplaySpill};
+use crate::tiered::shadow::ShadowCounters;
 use crate::wall::WallAnchor;
 use crate::wheel::ExpiryBudget;
 use crate::write_accounting::{WriteAccountingTotals, WriteAmpSummary};
+
+mod index;
+mod tiering;
+
+// ---- shared data definitions (behaviour lives in the child modules) ----------
 
 /// Redis default database count (`SELECT 0..15`; CONFIG `databases`).
 pub const DEFAULT_DBS: usize = 16;
@@ -71,8 +86,10 @@ const DRY_STEPS_PER_MEMBER: u32 = 2;
 const NS_DRY_STEP_LIMIT: u32 = 8;
 /// Replay displacement-register bound (ADR-0059 D9): one displacing
 /// mutation stages at most `RELOC_ORIGIN_CAP + 1` markers, so a longer
-/// run inside one pairing is corrupt input, not load.
-const DISPLACE_REGISTER_CAP: usize = 4;
+/// run inside one pairing is corrupt input, not load. Public so the
+/// plane checks the run it is about to stage against the bound recovery
+/// enforces (ADR-0093 A11) instead of restating it.
+pub const DISPLACE_REGISTER_CAP: usize = 4;
 
 /// Per-cell pressure configuration (pushed from the typed CONFIG store
 /// within one MAINTAIN round — the M1-S03 `hot-per-cell` class).
@@ -160,16 +177,86 @@ pub struct Keyspace {
     /// `0..DEFAULT_DBS` are the numbered dbs, `DEFAULT_DBS..` index into
     /// `named_stores` (ADR-0068 D2 inheritance leg).
     hand_db: usize,
+    /// Expiry rotation cursor over the same position space as `hand_db`:
+    /// the first store the previous slice left unserved (F-L05-03).
+    expire_hand: usize,
     /// This cell's share of the node's reserved-VA admission bound
     /// (M4-S19, ADR-0062 D4). Admission-only: lowering it under standing
     /// reservations refuses new creations, never evicts.
     tiered_va_limit_bytes: u64,
+    /// Read-driven promotion admission (M4.5-S30, ADR-0085 D6): the
+    /// `tiered-promote-on-read` CONFIG key's cell-local value, applied
+    /// to every standing and future tiered table.
+    tier_promote: bool,
+    /// Shadow-slot admission (M4.5-S37, ADR-0093 D8): the
+    /// `tiered-shadow-overwrite` CONFIG key's cell-local value — the
+    /// A/B arm, default off.
+    tier_shadow: bool,
+    /// `tiered-shadow-reconcile` (ADR-0093 A8): `false` pauses every
+    /// table's reconciler; tickets stay open, bounded by their caps.
+    tier_shadow_reconcile: bool,
     /// Replay displacement register (ADR-0057 D4, widened to a bounded
     /// list by ADR-0059 D9): `ColdDisplace` markers park here until the
     /// paired mutation record — the very next record, same namespace —
     /// drains them. Non-empty at end-of-log is a decode error the
     /// recovery driver checks via [`displace_register_len`](Self::displace_register_len).
     pending_displace: Vec<(NsId, u64)>,
+    /// The parked markers as addresses, handed to the replay entry with
+    /// their paired mutation (capacity retained: no allocation per record).
+    displace_scratch: Vec<LogicalAddr>,
+    /// Per-cell index registry (M4.5-S03, ADR-0075/ADR-0072 D2):
+    /// declarations replicated by the DDL fan, this cell's trees and
+    /// machine states beside them. Consulted at DDL/MAINTAIN rate only —
+    /// the mutation path reads a cached flag (S04).
+    indexes: IndexRegistry,
+    /// Per-cell backfill jobs (M4.5-S05, ADR-0077): volatile by design —
+    /// nothing here is durable or recovery-load-bearing; boot re-derives
+    /// jobs from the seeded registry (D2: crash ⇒ restart the walk).
+    pub(crate) backfill: Vec<BackfillJob>,
+    /// Cumulative walk totals for INFO (per boot, like the S04 `idx_*`
+    /// counter lines).
+    backfill_docs_total: u64,
+    backfill_inserted_total: u64,
+    /// This boot's sidecar load fold (M4.5-S06, ADR-0078 D6) — written
+    /// once by the loader's commit, rendered by `INFO stats`.
+    sidecar_info: crate::index_sidecar::SidecarBootInfo,
+    /// Drop tombstones as the boot catalog carried them (ADR-0100 D6):
+    /// recovery's read-only witness that a `MANIFEST` tier section or
+    /// `ns-N/` directory naming an unknown id is the residue of an acked
+    /// `DROP`. The live set is the catalog writer's; this is a snapshot.
+    dropped_ns: Vec<NsId>,
+    /// Tiered entries whose `BLOB-THRESHOLD` the last `seed_catalog`
+    /// clamped to their ring's inline bound (ADR-0102 D4 — a catalog
+    /// written before the rule); reported on the boot line, never
+    /// silent.
+    seed_normalized_thresholds: u32,
+}
+
+/// Whether `rec` may follow an armed displacement marker of `pending_ns`:
+/// only further markers or the paired mutation, in the marker's namespace
+/// (ADR-0057 D4).
+fn follows_displace_marker(rec: &LogRecordView<'_>, pending_ns: NsId) -> bool {
+    match *rec {
+        LogRecordView::ColdDisplace { ns, .. }
+        | LogRecordView::StringPostImage { ns, .. }
+        | LogRecordView::Delete { ns, .. }
+        | LogRecordView::StringExtentRef { ns, .. } => ns == pending_ns,
+        LogRecordView::ExpireAt { .. }
+        | LogRecordView::NsOp { .. }
+        | LogRecordView::CkptBegin { .. }
+        | LogRecordView::DocDelta { .. }
+        | LogRecordView::DocFull { .. } => false,
+    }
+}
+
+/// One tiered replay entry's inputs (ADR-0174 D3): the namespace's table,
+/// its parked markers as addresses and the record key's hash — answered
+/// only for a namespace that is tiered here, so no arm reaches a table it
+/// did not find.
+struct TieredEntry<'a> {
+    table: &'a mut TieredTable,
+    markers: &'a [LogicalAddr],
+    hash: u64,
 }
 
 impl Keyspace {
@@ -182,12 +269,24 @@ impl Keyspace {
             named: NsRegistry::default(),
             named_stores: Vec::new(),
             tiered_stores: Vec::new(),
+            dropped_ns: Vec::new(),
+            seed_normalized_thresholds: 0,
             pressure: PressureConfig::default(),
             budget_shares: 1,
             over_limit: false,
             hand_db: 0,
+            expire_hand: 0,
             tiered_va_limit_bytes: TIERED_VA_LIMIT_DEFAULT,
+            tier_promote: true,
+            tier_shadow: false,
+            tier_shadow_reconcile: true,
             pending_displace: Vec::new(),
+            displace_scratch: Vec::with_capacity(DISPLACE_REGISTER_CAP),
+            indexes: IndexRegistry::default(),
+            backfill: Vec::new(),
+            backfill_docs_total: 0,
+            backfill_inserted_total: 0,
+            sidecar_info: Default::default(),
         };
         // db0 is eager: it serves every connection that never SELECTs.
         let _ = ks.db_mut(0);
@@ -206,6 +305,10 @@ impl Keyspace {
             cfg.evict_seed = self.cfg.evict_seed ^ (db as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut store = Box::new(CellStore::new(cfg));
             store.set_eviction_policy(self.pressure.policy);
+            // Attach-block sync point (ADR-0076 D1): declarations that
+            // predate materialization install their trees now.
+            #[cfg(feature = "doc")]
+            install_ns_attaches(&self.indexes, NsId(db as u32), &mut store);
             self.dbs[db] = Some(store);
         }
         self.dbs[db].as_mut().expect("materialized above")
@@ -232,6 +335,7 @@ impl Keyspace {
             records_resident_bytes: 0,
             index_bytes: 0,
             wheel_bytes: 0,
+            wheel_live_bytes: 0,
             evict_bytes: 0,
             doc_tape_bytes: 0,
             doc_arena_bytes: 0,
@@ -240,6 +344,8 @@ impl Keyspace {
             doc_slack_bytes: 0,
             doc_scratch_bytes: 0,
             doc_path_cache_bytes: 0,
+            idx_tree_bytes: 0,
+            idx_slack_bytes: 0,
             live_records: 0,
             docs_live: 0,
         };
@@ -250,6 +356,7 @@ impl Keyspace {
             total.records_resident_bytes += r.records_resident_bytes;
             total.index_bytes += r.index_bytes;
             total.wheel_bytes += r.wheel_bytes;
+            total.wheel_live_bytes += r.wheel_live_bytes;
             total.evict_bytes += r.evict_bytes;
             total.doc_tape_bytes += r.doc_tape_bytes;
             total.doc_arena_bytes += r.doc_arena_bytes;
@@ -258,289 +365,12 @@ impl Keyspace {
             total.doc_slack_bytes += r.doc_slack_bytes;
             total.doc_scratch_bytes += r.doc_scratch_bytes;
             total.doc_path_cache_bytes += r.doc_path_cache_bytes;
+            // Index trees live in the owning store's attach block since
+            // ADR-0076 D1 — the fold rides the per-store reports.
+            total.idx_tree_bytes += r.idx_tree_bytes;
+            total.idx_slack_bytes += r.idx_slack_bytes;
             total.live_records += r.live_records;
             total.docs_live += r.docs_live;
-        }
-        total
-    }
-
-    /// Number of durable-tiered tables on this cell (0 until the M4-S04
-    /// steel thread materializes one).
-    pub fn tiered_tables(&self) -> usize {
-        self.tiered_stores.len()
-    }
-
-    /// Materializes the tiered record table for namespace `ns` (M4-S04 —
-    /// the first `tiered_stores` entry; M4-S07 adds the demotion
-    /// configuration; M4-S19 adds the aggregate reserved-VA admission
-    /// bound, checked **before** any mmap — ADR-0062 D4). Command
-    /// routing to tiered tables remains the standing wiring obligation;
-    /// the flush/demotion drivers and the harnesses reach the table
-    /// through [`tiered_store_mut`](Self::tiered_store_mut).
-    ///
-    /// # Errors
-    /// [`TieredCreateError`] — refusal mutates nothing.
-    pub fn materialize_tiered(
-        &mut self,
-        ns: NsId,
-        config: AddressSpaceConfig,
-        demote: DemotionConfig,
-        initial_keys: usize,
-    ) -> Result<(), TieredCreateError> {
-        if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
-            return Err(TieredCreateError::Exists);
-        }
-        let requested_bytes = config.reserve_bytes as u64;
-        let admitted_bytes = self.tiering_usage().reserved_bytes;
-        let limit_bytes = self.tiered_va_limit_bytes;
-        // Checked arithmetic, refused before the Region exists: the
-        // reservation is the VA truth this bound counts, so the check
-        // and the mmap can never disagree.
-        if admitted_bytes.checked_add(requested_bytes).is_none_or(|total| total > limit_bytes) {
-            return Err(TieredCreateError::VaLimitExceeded {
-                requested_bytes,
-                admitted_bytes,
-                limit_bytes,
-            });
-        }
-        let table = TieredTable::new(config, demote, initial_keys)
-            .ok_or(TieredCreateError::Unrepresentable)?;
-        self.tiered_stores.push((ns, Box::new(table)));
-        Ok(())
-    }
-
-    /// Materializes a tiered table from a registered spec's tier block
-    /// (M4-S19): derives the ring from the spec's budget + slice, applies
-    /// every derived config, and enforces the D4 admission bound. Fresh
-    /// life at origin zero — recovery-time re-materialization supplies
-    /// its own origin through the recovery path.
-    ///
-    /// # Errors
-    /// [`TieredCreateError`] — refusal mutates nothing.
-    pub fn materialize_tiered_spec(
-        &mut self,
-        ns: NsId,
-        tier: &crate::ns::TierSpec,
-    ) -> Result<(), TieredCreateError> {
-        let demote = tier.demotion_config();
-        let reserve_bytes =
-            demote.ring_reserve_bytes().ok_or(TieredCreateError::Unrepresentable)?;
-        let config = AddressSpaceConfig {
-            reserve_bytes,
-            page_bytes: inf_alloc::REGION_PAGE_BYTES,
-            life_origin: LogicalAddr::ZERO,
-        };
-        // Index presize: tables grow; a fixed hint keeps creation O(1).
-        self.materialize_tiered(ns, config, demote, 1024)?;
-        let table = self.tiered_store_mut(ns).expect("materialized above");
-        table.set_compaction_config(tier.compaction_config());
-        table.set_blob_config(tier.blob_config());
-        table.set_disk_budget(tier.disk_budget_bytes);
-        Ok(())
-    }
-
-    /// Replaces a namespace's fresh-at-origin-zero table with the
-    /// recovered one (M4-S26; ADR-0057 D6 step 2 — `seed_catalog`
-    /// materializes fresh, boot recovery swaps the recovered life in
-    /// before any checkpoint entry or tail record applies). The spec's
-    /// derived knobs re-apply on the recovered table.
-    ///
-    /// # Panics
-    /// Panics when the namespace is not a registered tiered namespace —
-    /// the recovery driver only recovers manifested tiered sections.
-    pub fn install_recovered_tiered(&mut self, ns: NsId, table: TieredTable) {
-        let tier = self
-            .ns_get_by_id(ns)
-            .and_then(|spec| spec.tier)
-            .expect("recovered namespace carries a tier block");
-        let entry = self
-            .tiered_stores
-            .iter_mut()
-            .find(|(id, _)| *id == ns)
-            .expect("seed_catalog materialized the namespace");
-        *entry.1 = table;
-        entry.1.set_compaction_config(tier.compaction_config());
-        entry.1.set_blob_config(tier.blob_config());
-        entry.1.set_disk_budget(tier.disk_budget_bytes);
-    }
-
-    /// This cell's share of the node reserved-VA limit (ADR-0062 D4).
-    #[must_use]
-    pub fn tiered_va_limit(&self) -> u64 {
-        self.tiered_va_limit_bytes
-    }
-
-    /// Pushes the cell's VA-limit share (the CONFIG sweep — Hot class,
-    /// admission-only: standing reservations are never evicted).
-    pub fn set_tiered_va_limit(&mut self, bytes: u64) {
-        self.tiered_va_limit_bytes = bytes;
-    }
-
-    /// EvictionPressure v2 (M4-S07, §3.2): how namespace `ns` answers
-    /// memory pressure. Table-granular, never per-op — cache namespaces
-    /// keep the M1 eviction path instruction-identical (ADR-0053 D5).
-    pub fn pressure_response(&self, ns: NsId) -> EvictionPressure {
-        if self.tiered_stores.iter().any(|(nid, _)| *nid == ns) {
-            EvictionPressure::Demote
-        } else {
-            EvictionPressure::Evict
-        }
-    }
-
-    /// One demotion MAINTAIN round (M4-S07, ADR-0053): per tiered table,
-    /// one seal step toward the mutable-fraction target and one release
-    /// step below the flushed watermark — each bounded by the table's
-    /// `slice_bytes`. The flush leg between them (`flushed` advancement
-    /// after fdatasync) is the S11 pipeline's; its confirmation call
-    /// sites are `advance_flushed` on each table's space (ADR-0053 D6).
-    /// On a node with no tiered namespaces this iterates an empty Vec —
-    /// the degenerate case executes nothing and counts nothing (S03).
-    pub fn demote_tick(&mut self) -> DemoteStats {
-        let mut stats = DemoteStats::default();
-        for (_, table) in &mut self.tiered_stores {
-            let sealed = table.seal_slice();
-            let released = table.release_slice();
-            if sealed > 0 || released > 0 {
-                stats.sealed_bytes += sealed;
-                stats.released_bytes += released;
-                stats.tables_active += 1;
-            }
-        }
-        stats
-    }
-
-    /// Aggregated tiered-table memory attribution (L5): reserved and
-    /// committed ring bytes, live/dead record bytes, and index bytes
-    /// across every tiered table on this cell. All-zero on memory-mode
-    /// nodes (no table exists — the S03 degenerate case).
-    pub fn tiering_usage(&self) -> TieredUsage {
-        let mut usage = TieredUsage::default();
-        for (_, table) in &self.tiered_stores {
-            let report = table.space().report();
-            usage.reserved_bytes += report.reserved_bytes;
-            usage.committed_bytes += report.committed_bytes;
-            usage.allocated_bytes += report.allocated_bytes;
-            usage.dead_bytes += report.dead_bytes;
-            usage.live_bytes += table.live_bytes();
-            usage.index_bytes += table.index_bytes();
-        }
-        usage
-    }
-
-    /// Aggregated write-path byte counters across this cell's tiered
-    /// namespaces (M4-S13): the `INFO tiering` totals. Exactly the
-    /// field-wise sum of the per-namespace lines rendered beside it, so
-    /// the two can never disagree — and identically zero on a
-    /// memory-mode node, where no `TieredTable` exists to hold them.
-    ///
-    /// Node-wide write amplification is deliberately **not** derivable
-    /// from this value: blending namespaces hides a runaway tiered
-    /// namespace behind a quiet one, so the return type carries totals
-    /// only and [`tiering_write_amp`](Self::tiering_write_amp) reports the
-    /// worst namespace instead (M4-S16, ADR-0060 D4).
-    pub fn tiering_write_accounting(&self) -> WriteAccountingTotals {
-        let mut totals = WriteAccountingTotals::default();
-        for (_, table) in &self.tiered_stores {
-            totals.add(table.write_accounting());
-        }
-        totals
-    }
-
-    /// This cell's write-amplification summary (M4-S16): the worst
-    /// per-namespace ratio and how many namespaces have no denominator.
-    /// Zero on a memory-mode node for the same structural reason the
-    /// counters are — there is no tiered namespace to ask.
-    pub fn tiering_write_amp(&self) -> WriteAmpSummary {
-        let mut summary = WriteAmpSummary::default();
-        for (_, table) in &self.tiered_stores {
-            summary.add(table.write_accounting().write_amplification());
-        }
-        summary
-    }
-
-    /// This cell's blob write-amplification summary (M4-S18, ADR-0061
-    /// D8): the worst per-namespace `blob_bytes / blob_user_bytes` ratio
-    /// and how many namespaces wrote extent bytes without a blob
-    /// denominator. The same worst-not-blend rule as
-    /// [`tiering_write_amp`](Self::tiering_write_amp), on the disjoint
-    /// device leg — and the same structural zero on memory-mode nodes.
-    pub fn tiering_blob_write_amp(&self) -> WriteAmpSummary {
-        let mut summary = WriteAmpSummary::default();
-        for (_, table) in &self.tiered_stores {
-            summary.add(table.write_accounting().blob_write_amplification());
-        }
-        summary
-    }
-
-    /// This cell's tiered namespaces in materialization order — the
-    /// per-namespace `INFO tiering` lines (watermarks + write counters)
-    /// and any future per-namespace reporting walk this.
-    pub fn tiered_namespaces(&self) -> impl Iterator<Item = (NsId, &TieredTable)> {
-        self.tiered_stores.iter().map(|(ns, table)| (*ns, table.as_ref()))
-    }
-
-    /// The tiered table for namespace `ns`, if materialized.
-    pub fn tiered_store_mut(&mut self, ns: NsId) -> Option<&mut TieredTable> {
-        let i = self.tiered_stores.iter().position(|(nid, _)| *nid == ns)?;
-        Some(self.tiered_stores[i].1.as_mut())
-    }
-
-    /// Aggregated tiering code-path counters across every tiered table on
-    /// this cell (M4-S03): identically zero unless tiering code executed —
-    /// the §3.3 "provably unexecuted" rule as a scrapeable fact, asserted
-    /// by the degenerate-case A/B report and cache-profile CI runs.
-    pub fn tiering_counters(&self) -> TieringCounters {
-        let mut total = TieringCounters::default();
-        for (_, table) in &self.tiered_stores {
-            let counters = table.space().counters();
-            total.tail_allocs += counters.tail_allocs;
-            total.seal_holes += counters.seal_holes;
-            total.seal_hole_bytes += counters.seal_hole_bytes;
-            total.region_commit_pages += counters.region_commit_pages;
-            total.region_decommit_pages += counters.region_decommit_pages;
-            total.cold_resolves += counters.cold_resolves;
-            total.tail_alloc_stalls += counters.tail_alloc_stalls;
-            total.demote_slices += counters.demote_slices;
-            total.demote_sealed_bytes += counters.demote_sealed_bytes;
-            total.flush_slices += counters.flush_slices;
-            total.flush_confirmed_bytes += counters.flush_confirmed_bytes;
-            total.compact_slices += counters.compact_slices;
-        }
-        total
-    }
-
-    /// Aggregated blob-extent observables across every tiered table on
-    /// this cell (M4-S17, ADR-0061 D8) — identically zero on a
-    /// memory-mode node (no table, no extents; the §3.3 zero contract).
-    pub fn tiering_extent_stats(&self) -> crate::extents::ExtentStats {
-        let mut total = crate::extents::ExtentStats::default();
-        for (_, table) in &self.tiered_stores {
-            let stats = table.extent_stats();
-            total.live += stats.live;
-            total.live_bytes += stats.live_bytes;
-            total.created += stats.created;
-            total.reclaimed += stats.reclaimed;
-            total.reclaimable += stats.reclaimable;
-            total.reclaim_slices += stats.reclaim_slices;
-            total.reclaim_deferred += stats.reclaim_deferred;
-            total.rmw_ops += stats.rmw_ops;
-            total.disk_bytes += stats.disk_bytes;
-        }
-        total
-    }
-
-    /// Aggregated disk-admission observables across every tiered table
-    /// on this cell (M4-S21, ADR-0063 D5) — identically zero on a
-    /// memory-mode node (the §3.3 zero contract).
-    pub fn tiering_disk_admission(&self) -> DiskAdmissionTotals {
-        let mut total = DiskAdmissionTotals::default();
-        for (_, table) in &self.tiered_stores {
-            if table.disk_full().is_some() {
-                total.full_namespaces += 1;
-            }
-            total.refusals += table.diskfull_refusals();
-            total.compact_idle_pressure += table.compact_idle_pressure();
-            total.used_bytes += table.disk_admission_used();
         }
         total
     }
@@ -557,7 +387,14 @@ impl Keyspace {
             total.ttl_live += s.ttl_live;
             total.wheel_stale += s.wheel_stale;
             total.wheel_fallback += s.wheel_fallback;
+            total.expired_swept += s.expired_swept;
+            total.wheel_refiled += s.wheel_refiled;
+            total.sweep_passes_voided += s.sweep_passes_voided;
+            total.expiry_alias_over += s.expiry_alias_over;
+            total.wheel_tombstones += s.wheel_tombstones;
             total.evicted_keys += s.evicted_keys;
+            total.index_grows += s.index_grows;
+            total.json_scalar_patches_in_place += s.json_scalar_patches_in_place;
         }
         total
     }
@@ -589,33 +426,67 @@ impl Keyspace {
         self.refresh_pressure();
     }
 
-    /// One budgeted expiry MAINTAIN slice across every materialized db
-    /// (M1-S05 over M1-S08): the fire/step budget is shared — later dbs see
-    /// what earlier dbs left, so a storm in one db cannot multiply the
-    /// slice by the db count. `lag_ms` reports the worst db (it drives the
-    /// plane's debt escalation).
+    /// One budgeted expiry MAINTAIN slice across every materialized store
+    /// (M1-S05 over M1-S08): the fire, step and sweep-slot budgets are
+    /// shared — later stores see what earlier ones left, so a storm in one
+    /// db cannot multiply the slice by the store count (ADR-0008 A1 rule
+    /// 6 for the sweep: a spent slot budget withholds only the sweep; the
+    /// wheels still tick). The walk rotates: each slice starts at the
+    /// first store the previous one left unserved on any budget
+    /// (`expire_hand`, the Redis `current_db` shape), so a db whose storm
+    /// exhausts every slice cannot starve the others — it yields one slice
+    /// per rotation. `lag_ms` is the worst wheel debt across every store,
+    /// served or not (it drives the plane's debt escalation and renders as
+    /// `expiry_debt_ms`); a store the slice never reached reports its
+    /// standing debt, never 0.
     pub fn expire_tick(&mut self, now: Nanos, budget: ExpiryBudget) -> ExpiryStats {
         let mut total = ExpiryStats::default();
         let mut left = budget;
-        let named = self.named_stores.iter_mut().map(|e| e.store.as_mut());
-        for store in self.dbs.iter_mut().flatten().map(Box::as_mut).chain(named) {
+        let rotation = DEFAULT_DBS + self.named_stores.len();
+        let start = self.expire_hand % rotation;
+        let mut unserved: Option<usize> = None;
+        for k in 0..rotation {
+            let at = (start + k) % rotation;
+            let store = if at < DEFAULT_DBS {
+                match self.dbs[at].as_deref_mut() {
+                    Some(store) => store,
+                    None => continue,
+                }
+            } else {
+                self.named_stores[at - DEFAULT_DBS].store.as_mut()
+            };
             if left.max_fires == 0 || left.max_steps == 0 {
+                unserved.get_or_insert(at);
                 break;
             }
+            // A store whose sweep an earlier store's slots left no budget
+            // is unserved; one that spent the budget itself had its turn.
+            let withheld = left.max_sweep_slots == 0;
             let s = store.expire_tick(now, left);
-            let consumed = (s.reaped + s.stale).min(u64::from(u32::MAX)) as u32;
-            left.max_fires = left.max_fires.saturating_sub(consumed);
+            if withheld && s.sweep_stop == SweepStop::Budget {
+                unserved.get_or_insert(at);
+            }
+            let consumed = s.fires_charged();
+            left.max_fires =
+                left.max_fires.saturating_sub(consumed.min(u64::from(u32::MAX)) as u32);
             left.max_steps = left.max_steps.saturating_sub(s.steps);
-            total.reaped += s.reaped;
-            total.stale += s.stale;
-            total.steps += s.steps;
-            total.lag_ms = total.lag_ms.max(s.lag_ms);
-            total.armed += s.armed;
+            left.max_sweep_slots = left.max_sweep_slots.saturating_sub(s.sweep_slots);
+            fold_expiry(&mut total, &s);
         }
-        if total.reaped > 0 {
+        self.expire_hand = unserved.unwrap_or(start);
+        total.lag_ms = self.expiry_lag_ms(now);
+        if total.reaped + total.swept > 0 {
             self.refresh_pressure();
         }
         total
+    }
+
+    /// The drain predicate over every store (ADR-0008 A1 O3): each wheel
+    /// has caught up to `now` and each sweep owes nothing a drain frozen at
+    /// `now` must wait for. A pure read; the drain ticks until it holds.
+    #[must_use]
+    pub fn expiry_settled(&self, now: Nanos) -> bool {
+        self.all_stores().all(|store| store.expiry_settled(now))
     }
 
     // ---- pressure (M1-S07) ----
@@ -667,28 +538,67 @@ impl Keyspace {
         self.over_limit
     }
 
-    /// Logical used bytes across dbs and named stores (the `maxmemory`
-    /// comparable). Every named store counts toward the global flag — L5
-    /// attribution truth (ADR-0068 D5) — but reclaim authority differs:
-    /// budget-less memory stores join the global hand, budgeted ones own
-    /// their per-namespace pass, and durable/tiered stores never evict, so
-    /// their sustained pressure resolves as honest OOM refusals.
+    /// Logical used bytes across dbs, named stores, and index trees —
+    /// L5 attribution truth (ADR-0068 D5), the `sum(domains)` figure.
+    /// Not the `maxmemory` comparable: that is
+    /// [`pool_used_bytes`](Self::pool_used_bytes) (ADR-0068 A1), which
+    /// leaves out the stores with a budget authority of their own.
+    /// Reclaim authority differs per store: budget-less memory stores
+    /// join the global hand, budgeted ones own their per-namespace pass,
+    /// and durable/tiered stores never evict, so their sustained pressure
+    /// resolves as honest OOM refusals. Index trees count too (ADR-0075
+    /// D6: an unattributed byte is a lie) — eviction shrinks them back
+    /// through the S04 removal hook, never directly.
     pub fn used_bytes(&self) -> u64 {
         let named: u64 = self.named_stores.iter().map(|e| e.store.used_bytes()).sum();
-        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named
+        let idx: u64 = self.all_stores().map(|s| s.idx_memory().idx_tree_bytes).sum();
+        self.dbs().map(|(_, s)| s.used_bytes()).sum::<u64>() + named + idx
+    }
+
+    /// Bytes the node hand may reclaim (ADR-0068 A1): the numbered dbs
+    /// and every named store **without** its own budget authority, index
+    /// trees included. A budgeted memory namespace is its own authority
+    /// — its bytes stay in [`used_bytes`](Self::used_bytes) (D5) but never
+    /// drive the global flag or the hand.
+    pub fn pool_used_bytes(&self) -> u64 {
+        let dbs: u64 =
+            self.dbs().map(|(_, s)| s.used_bytes() + s.idx_memory().idx_tree_bytes).sum();
+        let named: u64 = self
+            .named_stores
+            .iter()
+            .filter(|e| e.budget_share == 0)
+            .map(|e| e.store.used_bytes() + e.store.idx_memory().idx_tree_bytes)
+            .sum();
+        dbs + named
+    }
+
+    /// The worst standing wheel debt across every materialized store at
+    /// `now` — the `expiry_debt` figure the plane escalates on and INFO
+    /// renders (F-L05-03: the fold covers stores the slice never reached).
+    #[must_use]
+    pub fn expiry_lag_ms(&self, now: Nanos) -> u64 {
+        self.all_stores().map(|s| s.expiry_lag_ms(now)).max().unwrap_or(0)
     }
 
     /// Recomputes the cached pressure flags — global and per-namespace
     /// (ADR-0068 D5: the per-ns flags cache at the same touch points).
     /// Called after mutations (cheap: a few loads per materialized store;
-    /// the global half short-circuits when no limit is set).
+    /// the global half short-circuits when no limit is set). Per-ns
+    /// comparisons include the namespace's index-tree bytes (ADR-0075
+    /// D6 — index growth tightens the document budget).
     #[inline]
     pub fn refresh_pressure(&mut self) {
         self.over_limit =
-            self.pressure.limit_bytes != 0 && self.used_bytes() > self.pressure.limit_bytes;
-        for entry in &mut self.named_stores {
-            entry.over_limit =
-                entry.budget_share != 0 && entry.store.used_bytes() > entry.budget_share;
+            self.pressure.limit_bytes != 0 && self.pool_used_bytes() > self.pressure.limit_bytes;
+        for i in 0..self.named_stores.len() {
+            let entry = &self.named_stores[i];
+            if entry.budget_share == 0 {
+                self.named_stores[i].over_limit = false;
+                continue;
+            }
+            let idx = entry.store.idx_memory().idx_tree_bytes;
+            let used = self.named_stores[i].store.used_bytes() + idx;
+            self.named_stores[i].over_limit = used > self.named_stores[i].budget_share;
         }
     }
 
@@ -724,7 +634,10 @@ impl Keyspace {
         if !self.named_stores[i].over_limit {
             return Some(Ok(()));
         }
-        let target = self.named_stores[i].budget_share;
+        // The store-side target leaves room for the namespace's index
+        // trees (ADR-0075 D6: the flag compares store + idx vs share).
+        let idx = self.named_stores[i].store.idx_memory().idx_tree_bytes;
+        let target = self.named_stores[i].budget_share.saturating_sub(idx);
         self.evict_ns_toward(i, target, INLINE_MAX_EVICTIONS, now);
         self.refresh_pressure();
         Some(if self.named_stores[i].over_limit { Err(OpError::OutOfMemory) } else { Ok(()) })
@@ -763,7 +676,11 @@ impl Keyspace {
         while i < self.named_stores.len() && left > 0 {
             let share = self.named_stores[i].budget_share;
             if share != 0 {
-                let step = self.evict_ns_toward(i, share - share / 16, left, now);
+                // Store-side watermark: the share minus the namespace's
+                // index-tree bytes (ADR-0075 D6 accounting).
+                let idx = self.named_stores[i].store.idx_memory().idx_tree_bytes;
+                let target = (share - share / 16).saturating_sub(idx);
+                let step = self.evict_ns_toward(i, target, left, now);
                 left -= (step.evicted as u32).min(left);
                 stats.absorb(step);
             }
@@ -778,7 +695,10 @@ impl Keyspace {
     /// memory store **without** its own budget whose effective policy
     /// evicts. One victim per step until usage reaches `target`, the
     /// budget is spent, or a dry rotation proves nothing qualifies —
-    /// [`DRY_STEPS_PER_MEMBER`] chances per rotation member.
+    /// [`DRY_STEPS_PER_MEMBER`] chances per rotation member. The target
+    /// is measured on the pool (ADR-0068 A1): the hand can reach every
+    /// byte it is asked to reclaim, so a budgeted namespace's growth can
+    /// never turn into numbered-db key death (F-L05-02).
     fn evict_toward(&mut self, target: u64, max_evictions: u32, now: Nanos) -> EvictStats {
         let mut stats = EvictStats::default();
         let samples = self.pressure.samples;
@@ -792,7 +712,7 @@ impl Keyspace {
         let rotation = DEFAULT_DBS + self.named_stores.len();
         let mut evicted = 0u32;
         let mut dry_steps = 0u32;
-        while self.used_bytes() > target && evicted < max_evictions && dry_steps < dry_limit {
+        while self.pool_used_bytes() > target && evicted < max_evictions && dry_steps < dry_limit {
             // Rotate to the next hand member without spending dry budget
             // on holes and out-of-hand stores (at least one member is
             // eligible — checked above — so this terminates); only real
@@ -873,27 +793,88 @@ impl Keyspace {
 
     // ---- cross-db ops (M1-S08) ----
 
-    /// `COPY src dst DB n` across databases: value, TTL, and encoding move
+    /// `COPY source destination DB n` across databases: value, TTL, and encoding move
     /// exactly like the single-db copy. Same-db calls delegate.
     pub fn copy_between(
         &mut self,
-        src_db: usize,
-        src: &[u8],
-        dst_db: usize,
-        dst: &[u8],
+        source_db: usize,
+        source: &[u8],
+        target_db: usize,
+        target: &[u8],
         replace: bool,
         now: Nanos,
     ) -> Result<crate::store::CopyResult, OpError> {
-        if src_db == dst_db {
-            return self.db_mut(src_db).copy(src, dst, replace, now);
+        if source_db == target_db {
+            return self.db_mut(source_db).copy(source, target, replace, now);
         }
-        let Some(rec) = self.db_mut(src_db).copy_out(src, now) else {
+        let Some(rec) = self.db_mut(source_db).copy_out(source, now) else {
             return Ok(crate::store::CopyResult::SourceMissing);
         };
-        self.db_mut(dst_db).copy_in(dst, &rec, replace, now)
+        // Cross-db COPY is excluded from the plane brackets (ADR-0139
+        // D3): the destination store is only unambiguous here. The
+        // bracket commits on every outcome — see `CellStore::copy`.
+        let dst_store = self.db_mut(target_db);
+        #[cfg(feature = "doc")]
+        {
+            dst_store.idx_bracket_begin(&[target], None).map_err(OpError::IndexMaintenance)?;
+            let result = dst_store.copy_in(target, &rec, replace, now);
+            #[cfg(inf_canary_copy_abort_after_death)]
+            if !matches!(result, Ok(crate::store::CopyResult::Copied)) {
+                dst_store.idx_bracket_abort_canary();
+            }
+            dst_store.idx_bracket_commit(&[target], crate::index_maint::MaintMode::Strict);
+            result
+        }
+        #[cfg(not(feature = "doc"))]
+        dst_store.copy_in(target, &rec, replace, now)
     }
 
     // ---- named namespaces (M1-S08 registry; M2-S08 stores + catalog) ----
+
+    /// Tiered entries whose threshold the last [`seed_catalog`]
+    /// (Self::seed_catalog) normalized (ADR-0102 D4).
+    #[must_use]
+    pub fn seed_normalized_thresholds(&self) -> u32 {
+        self.seed_normalized_thresholds
+    }
+
+    /// Everything [`ns_create`](Self::ns_create) would refuse, without
+    /// applying anything (ADR-0103 D3): the registry rules, the tier
+    /// gauntlet, and the reserved-VA admission arithmetic. The one
+    /// apply-time failure it cannot foresee is the OS refusing the ring
+    /// reservation itself.
+    ///
+    /// # Errors
+    /// The refusal `ns_create` would answer.
+    pub fn ns_create_check(&self, spec: &NsSpec) -> Result<(), NsError> {
+        self.named.check(spec)?;
+        if let Some(tier) = &spec.tier {
+            let reserve = tier.ring_bytes().ok_or(NsError::InvalidTierConfig(
+                "MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation",
+            ))?;
+            if self.tiered_store(spec.id).is_some() {
+                return Err(NsError::Exists);
+            }
+            if let Err(e) = self.tiered_admit_check(reserve) {
+                return Err(match e {
+                    TieredCreateError::Exists => NsError::Exists,
+                    TieredCreateError::Unrepresentable => NsError::InvalidTierConfig(
+                        "MEM-BUDGET + MAINTAIN-SLICE has no representable ring reservation",
+                    ),
+                    TieredCreateError::VaLimitExceeded {
+                        requested_bytes,
+                        admitted_bytes,
+                        limit_bytes,
+                    } => NsError::TierVaLimitExceeded {
+                        requested_bytes,
+                        admitted_bytes,
+                        limit_bytes,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
 
     /// Registers `spec` and, for a tiered spec (M4-S19), materializes the
     /// cell's `TieredTable` under the D4 admission bound. Registration
@@ -956,15 +937,33 @@ impl Keyspace {
     /// admitted sum — structurally, not by bookkeeping. The plane owns
     /// the file half of the teardown (tier + blob unlinks after pin
     /// drain — `inf-store` never does I/O, §3.3).
-    pub fn ns_drop(&mut self, name: &[u8]) -> Result<(), NsError> {
-        let id = self.named.get(name).map(|s| s.id);
-        self.named.drop_ns(name)?;
-        if let Some(id) = id {
-            self.named_stores.retain(|e| e.id != id);
-            self.tiered_stores.retain(|(nid, _)| *nid != id);
-            self.refresh_pressure();
-        }
-        Ok(())
+    /// Drops a named namespace, returning the spec it had (the DDL
+    /// program reads the mode and id off it — ADR-0100 D3/D4).
+    ///
+    /// # Errors
+    /// `Unknown` / `DefaultImmutable` from the registry.
+    pub fn ns_drop(&mut self, name: &[u8]) -> Result<NsSpec, NsError> {
+        let spec = self.named.drop_ns(name)?;
+        let id = spec.id;
+        self.named_stores.retain(|e| e.id != id);
+        self.tiered_stores.retain(|(nid, _)| *nid != id);
+        // A namespace drop takes its index declarations and trees
+        // with it (M4.5-S03) — their ids stay retired.
+        self.indexes.remove_ns(id);
+        self.refresh_pressure();
+        Ok(spec)
+    }
+
+    /// True when the boot catalog tombstoned `ns` (ADR-0100 D6): residue
+    /// naming it is the leftover of an acked `DROP`, not corruption.
+    pub fn ns_tombstoned(&self, ns: NsId) -> bool {
+        self.dropped_ns.contains(&ns)
+    }
+
+    /// The boot catalog's tombstones (recovery sweeps each one's
+    /// directory whether or not a `MANIFEST` section still names it).
+    pub fn ns_tombstones(&self) -> &[NsId] {
+        &self.dropped_ns
     }
 
     /// Hot-reloads a tiered namespace's spec (M4-S19, ADR-0062 D3): the
@@ -1022,12 +1021,16 @@ impl Keyspace {
                 spec.policy.unwrap_or(self.pressure.policy),
                 ns_budget_share(spec.maxmemory, self.budget_shares),
             ),
-            _ => (EvictionPolicy::NoEviction, 0),
+            NsMode::Durable | NsMode::Topic => (EvictionPolicy::NoEviction, 0),
         };
         let mut cfg = self.cfg;
         cfg.evict_seed = self.cfg.evict_seed ^ u64::from(id.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut store = Box::new(CellStore::new(cfg));
         store.set_eviction_policy(policy);
+        // Attach-block sync point (ADR-0076 D1): declarations that
+        // predate materialization install their trees now.
+        #[cfg(feature = "doc")]
+        install_ns_attaches(&self.indexes, id, &mut store);
         self.named_stores.push(NamedStore { id, store, budget_share, over_limit: false });
         Some(self.named_stores.last_mut().expect("pushed above").store.as_mut())
     }
@@ -1046,6 +1049,15 @@ impl Keyspace {
         }
         let spec = self.named.get_by_id(id)?;
         if spec.mode == NsMode::Durable { spec.fsync } else { None }
+    }
+
+    /// True when any durable namespace runs `FSYNC always` — the only
+    /// consumer of write-through frames, and therefore of segment
+    /// pre-zeroing (M4.5-S36, ADR-0088 D5 amended: an `everysec`-only
+    /// cell never pays the zero-fill's second write).
+    #[must_use]
+    pub fn has_always_namespace(&self) -> bool {
+        self.ns_iter().any(|s| s.mode == NsMode::Durable && s.fsync == Some(FsyncClass::Always))
     }
 
     /// Ascending ids of durable namespaces — the checkpoint walk order
@@ -1067,6 +1079,14 @@ impl Keyspace {
     /// standing wiring obligation, and no live-node write can predate it
     /// (the D8 `USE` refusal keeps the data plane unreachable).
     ///
+    /// Index declarations seed per ADR-0075 D4: `dropping` entries resume
+    /// their drop (not seeded — removal persists with the next swap);
+    /// every other entry survives with id/generation/program/type intact
+    /// and regresses to `backfilling` (contents are projections and must
+    /// rebuild before planning resumes), with the pre-crash-`ready` hint
+    /// retained for S06's sidecar path. Generations never bump at boot
+    /// (a bump would permanently stale every sidecar — ADR-0073 D5.1).
+    ///
     /// # Errors
     /// The first registry-rule or admission violation — a failing catalog
     /// is a fail-stop at boot, never a partial seed.
@@ -1074,18 +1094,83 @@ impl Keyspace {
         self.named = NsRegistry::default();
         self.named_stores.clear();
         self.tiered_stores.clear();
+        self.indexes = IndexRegistry::default();
+        self.dropped_ns = cat.dropped.iter().map(|&id| NsId(id)).collect();
+        self.seed_normalized_thresholds = 0;
+        // Boot restarts every build (ADR-0077 D2): jobs re-derive from
+        // the seeded registry at the first MAINTAIN tick.
+        self.backfill.clear();
         for spec in &cat.entries {
+            // ADR-0102 D4: a catalog written before the ring's inline
+            // bound was a gauntlet rule may carry a small budget with
+            // the old 16 MiB default threshold. Clamp it to the bound
+            // (the value the store would enforce anyway), count it, and
+            // let the next persist re-export the normalized spec — a
+            // refused boot would strand the directory over a default
+            // the operator never chose.
+            let mut spec = spec.clone();
+            if let Some(tier) = spec.tier.as_mut()
+                && let Some(ring) = tier.ring_bytes()
+            {
+                let cap = crate::ns::TierSpec::blob_threshold_max(ring);
+                if tier.blob_threshold_bytes > cap {
+                    tier.blob_threshold_bytes = cap;
+                    self.seed_normalized_thresholds += 1;
+                }
+            }
             // `ns_create` materializes tiered entries under the D4 bound
             // — seeding and DDL share one path, so they cannot drift.
-            self.ns_create(spec.clone())?;
+            self.ns_create(spec)?;
         }
+        for spec in &cat.index.entries {
+            if spec.state == IndexState::Dropping {
+                continue;
+            }
+            let was_ready = spec.state == IndexState::Ready;
+            let seeded = IndexSpec { state: IndexState::Backfilling, ..spec.clone() };
+            // Decode already ran every record rule (ADR-0075 D2.4), so a
+            // refusal here is a violated invariant, not an operating error.
+            self.indexes.create(seeded, was_ready).expect("catalog decode validated the record");
+        }
+        // Attach-block resync (ADR-0076 D1): default dbs survive a
+        // re-seed materialized, so any stale attach is rebuilt from the
+        // fresh registry (named stores were just cleared and rebuild
+        // their attaches at materialization).
+        #[cfg(feature = "doc")]
+        {
+            let Keyspace { dbs, indexes, .. } = self;
+            for (db, store) in dbs.iter_mut().enumerate() {
+                if let Some(store) = store.as_deref_mut() {
+                    store.idx = crate::index_maint::CellIndexes::default();
+                    install_ns_attaches(indexes, NsId(db as u32), store);
+                }
+            }
+        }
+        self.refresh_pressure();
         Ok(())
     }
 
-    /// Snapshot the registry as a catalog (the DDL persist path; the caller
-    /// owns `next_id` — it lives on the node-level allocator).
-    pub fn export_catalog(&self, next_id: u32) -> NsCatalog {
-        NsCatalog { next_id, entries: self.ns_iter().cloned().collect() }
+    /// Snapshot the registry as a catalog (the DDL persist path; the
+    /// caller owns all three counters — they live on the node-level
+    /// allocator and never regress). `dropped` is left empty: the
+    /// tombstone set is the catalog writer's (ADR-0100 D2) and is merged
+    /// into the payload there.
+    pub fn export_catalog(
+        &self,
+        next_id: u32,
+        next_index_id: u32,
+        next_index_generation: u64,
+    ) -> NsCatalog {
+        NsCatalog {
+            next_id,
+            entries: self.ns_iter().cloned().collect(),
+            index: IndexCatalog {
+                next_id: next_index_id,
+                next_generation: next_index_generation,
+                entries: self.indexes.export(),
+            },
+            dropped: Vec::new(),
+        }
     }
 
     // ---- replay (M2-S08, ADR-0015 D7) ----
@@ -1094,6 +1179,8 @@ impl Keyspace {
     /// ADR-0011 D4. Records naming an unregistered id (dropped namespace)
     /// or a reserved one are skipped and counted, never an error: the
     /// catalog is authoritative and foreign logs must not wedge recovery.
+    /// `spill` lends a tiered namespace's boot replay machine (ADR-0174
+    /// D1, D2); the machine keeps the I/O it did for the seam's owner.
     ///
     /// `ExpireAt` deadlines convert from record Unix-ms through `anchor`;
     /// a deadline too far in the future for the internal clock clamps to
@@ -1101,41 +1188,60 @@ impl Keyspace {
     /// deadlines to the past would expire keys that should live).
     ///
     /// # Errors
-    /// Arena/bounds failures from the store (recovery fail-stop).
+    /// Arena/bounds failures from the store and the typed replay refusals
+    /// of a tiered namespace (recovery fail-stop).
     pub fn apply_record(
         &mut self,
         rec: &LogRecordView<'_>,
         now: Nanos,
         anchor: WallAnchor,
+        spill: &mut impl ReplaySpill,
     ) -> Result<ReplayOutcome, ReplayError> {
         // Tiered namespaces own their records' replay (ADR-0057 D4,
         // routed by M4-S26) — intercepted before the CellStore arms
         // because a tiered namespace also materializes a named CellStore
         // shell, and applying a tiered record there would build state the
         // tiered index never serves (invisible until the first restart).
-        if let Some(outcome) = self.apply_record_tiered(rec)? {
+        if let Some(outcome) = self.apply_record_tiered(rec, spill)? {
             return Ok(outcome);
         }
         match *rec {
             LogRecordView::StringPostImage { ns, key, value } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
-                store.replay_set(key, value, now).map_err(ReplayError::Store)?;
+                // Replay maintenance (ADR-0072 D4): a string image over a
+                // document key is an overwrite death — the same bracket,
+                // the same code path, dialed by the store's replay mode.
+                #[cfg(feature = "doc")]
+                let maint = store.idx_replay_begin(key);
+                let outcome = store.replay_set(key, value, now);
+                #[cfg(feature = "doc")]
+                if let Some(mode) = maint {
+                    store.idx_bracket_commit(&[key], mode);
+                }
+                outcome.map_err(ReplayError::Store)?;
                 Ok(ReplayOutcome::Applied)
             }
             LogRecordView::Delete { ns, key } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
+                #[cfg(feature = "doc")]
+                let maint = store.idx_replay_begin(key);
                 store.replay_del(key, now);
+                #[cfg(feature = "doc")]
+                if let Some(mode) = maint {
+                    store.idx_bracket_commit(&[key], mode);
+                }
                 Ok(ReplayOutcome::Applied)
             }
             LogRecordView::ExpireAt { ns, at_unix_ms, key } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
-                let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(Nanos(u64::MAX));
+                let never = InternalDeadline::At(crate::record::saturating_deadline(u64::MAX));
+                let at = anchor.internal_from_unix(at_unix_ms).unwrap_or(never);
                 store.replay_expire_at(key, at, now);
                 Ok(ReplayOutcome::Applied)
             }
@@ -1158,11 +1264,16 @@ impl Keyspace {
             LogRecordView::CkptBegin { .. } => Ok(ReplayOutcome::SkippedMarker),
             LogRecordView::DocFull { ns, key, lineage, version, idoc } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 #[cfg(feature = "doc")]
                 {
-                    store.replay_json_full(key, lineage, version, idoc, now)?;
+                    let maint = store.idx_replay_begin(key);
+                    let outcome = store.replay_json_full(key, lineage, version, idoc, now);
+                    if let Some(mode) = maint {
+                        store.idx_bracket_commit(&[key], mode);
+                    }
+                    outcome?;
                     Ok(ReplayOutcome::Applied)
                 }
                 #[cfg(not(feature = "doc"))]
@@ -1183,7 +1294,7 @@ impl Keyspace {
                 operand,
             } => {
                 let Some(store) = self.replay_store(ns) else {
-                    return Ok(ReplayOutcome::SkippedUnknownNs);
+                    return Ok(ReplayOutcome::SkippedUnknownNs(ns));
                 };
                 #[cfg(feature = "doc")]
                 {
@@ -1191,7 +1302,8 @@ impl Keyspace {
                         .map_err(ReplayError::InvalidPathProgram)?;
                     let op = inf_doc::decode_apply_op(opcode, operand)
                         .map_err(ReplayError::InvalidDelta)?;
-                    match store.replay_json_delta(
+                    let maint = store.idx_replay_begin(key);
+                    let outcome = store.replay_json_delta(
                         key,
                         crate::doc::DocDeltaWitness {
                             lineage,
@@ -1202,7 +1314,11 @@ impl Keyspace {
                         &program,
                         &op,
                         now,
-                    )? {
+                    );
+                    if let Some(mode) = maint {
+                        store.idx_bracket_commit(&[key], mode);
+                    }
+                    match outcome? {
                         crate::doc::DocReplayOutcome::Applied => Ok(ReplayOutcome::Applied),
                         crate::doc::DocReplayOutcome::SkippedStale => {
                             Ok(ReplayOutcome::SkippedDocDeltaStale)
@@ -1232,41 +1348,37 @@ impl Keyspace {
         }
     }
 
-    /// The tiered replay arms (ADR-0057 D4 rules 1–3; register bound by
-    /// ADR-0059 D9). Returns `None` when the record is not tiered-routed
-    /// — the caller's CellStore arms own it.
+    /// The tiered replay arms (ADR-0174 D3; register bound by ADR-0059
+    /// D9): each record enters the table's replay entry with its parked
+    /// markers, so the room question and a `DEL`'s reads precede the
+    /// marker drain (ADR-0174 D1, R6). Returns `None` when the
+    /// record is not tiered-routed — the caller's CellStore arms own it.
     ///
     /// # Errors
-    /// Register overflow, marker adjacency violations, and store space
-    /// refusals — all recovery fail-stop at the caller.
+    /// Register overflow, marker adjacency violations, and the replay
+    /// entry's typed refusals — all recovery fail-stop at the caller.
     fn apply_record_tiered(
         &mut self,
         rec: &LogRecordView<'_>,
+        spill: &mut impl ReplaySpill,
     ) -> Result<Option<ReplayOutcome>, ReplayError> {
         // Strict marker adjacency (ADR-0057 D4: markers stage in the same
         // frame immediately before their mutation): while the register is
         // armed, only further markers or the paired mutation — all in the
         // marker's namespace — are legal.
-        if let Some(&(pending_ns, _)) = self.pending_displace.first() {
-            let legal = match *rec {
-                LogRecordView::ColdDisplace { ns, .. }
-                | LogRecordView::StringPostImage { ns, .. }
-                | LogRecordView::Delete { ns, .. }
-                | LogRecordView::StringExtentRef { ns, .. } => ns == pending_ns,
-                _ => false,
-            };
-            if !legal {
-                return Err(ReplayError::Displacement(
-                    "displacement marker not followed by its paired mutation",
-                ));
-            }
+        if let Some(&(pending_ns, _)) = self.pending_displace.first()
+            && !follows_displace_marker(rec, pending_ns)
+        {
+            return Err(ReplayError::Displacement(
+                "displacement marker not followed by its paired mutation",
+            ));
         }
         match *rec {
             LogRecordView::ColdDisplace { ns, old_addr } => {
                 if !self.is_tiered(ns) {
                     // Dropped namespace or a foreign log: the paired
                     // mutation skips the same way — no register entry.
-                    return Ok(Some(ReplayOutcome::SkippedUnknownNs));
+                    return Ok(Some(ReplayOutcome::SkippedUnknownNs(ns)));
                 }
                 if self.pending_displace.len() >= DISPLACE_REGISTER_CAP {
                     return Err(ReplayError::Displacement(
@@ -1276,29 +1388,35 @@ impl Keyspace {
                 self.pending_displace.push((ns, old_addr));
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::StringPostImage { ns, key, value } if self.is_tiered(ns) => {
-                let hash = TieredTable::hash_key(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table.apply_image(key, value, hash).map_err(ReplayError::Store)?;
+            LogRecordView::StringPostImage { ns, key, value } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
+                let machine = spill.replay_mut(ns);
+                entry
+                    .table
+                    .replay_upsert_lent(machine, entry.markers, key, value, entry.hash)
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::Delete { ns, key } if self.is_tiered(ns) => {
-                let hash = TieredTable::hash_key(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table.apply_delete(key, hash);
+            LogRecordView::Delete { ns, key } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
+                let machine = spill.replay_mut(ns);
+                entry
+                    .table
+                    .replay_delete_lent(machine, entry.markers, key, entry.hash)
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
-            LogRecordView::StringExtentRef { ns, key, extent_id, offset, len }
-                if self.is_tiered(ns) =>
-            {
-                let hash = TieredTable::hash_key(key);
-                self.drain_displace(ns, hash)?;
-                let table = self.tiered_store_mut(ns).expect("is_tiered checked");
-                table
-                    .apply_extent_image(key, hash, ExtentRef { extent_id, offset, len })
-                    .map_err(ReplayError::Store)?;
+            LogRecordView::StringExtentRef { ns, key, extent_id, offset, len } => {
+                let Some(entry) = self.tiered_entry(ns, key)? else { return Ok(None) };
+                let ext = ExtentRef { extent_id, offset, len };
+                let machine = spill.replay_mut(ns);
+                entry
+                    .table
+                    .replay_upsert_extent_lent(machine, entry.markers, key, entry.hash, ext)
+                    .map_err(|refusal| ReplayError::Replay { ns, refusal })?;
+                self.pending_displace.clear();
                 Ok(Some(ReplayOutcome::Applied))
             }
             // Tiered namespaces carry no expiry and no documents in M4
@@ -1311,28 +1429,47 @@ impl Keyspace {
             {
                 Ok(Some(ReplayOutcome::SkippedReserved))
             }
-            _ => Ok(None),
+            LogRecordView::ExpireAt { .. }
+            | LogRecordView::NsOp { .. }
+            | LogRecordView::CkptBegin { .. }
+            | LogRecordView::DocDelta { .. }
+            | LogRecordView::DocFull { .. } => Ok(None),
         }
     }
 
-    /// Applies every parked marker with the paired mutation's key hash
-    /// (D4 rule 1): exact `(hash, old_addr)` removal, zero disk reads.
-    fn drain_displace(&mut self, ns: NsId, hash: u64) -> Result<(), ReplayError> {
-        if self.pending_displace.is_empty() {
-            return Ok(());
-        }
-        let pending = core::mem::take(&mut self.pending_displace);
-        let table = self.tiered_store_mut(ns).expect("caller checked tiered");
-        for &(marker_ns, old_addr) in &pending {
+    /// The tiered replay entry of a record of `ns` keyed `key`, from one
+    /// lookup: `None` when `ns` names no tiered table here — the caller's
+    /// CellStore arms own the record. Otherwise the table, its parked
+    /// markers as addresses (D4 rule 1) and the key's hash: the entry
+    /// drains the markers exactly — by `(hash, old_addr)` — after its room
+    /// question and a `DEL`'s reads (ADR-0174 R3, R4, R6). The register
+    /// stays armed until the entry succeeds, so a refused record leaves the
+    /// keyspace as it found it. An empty register — every record but a
+    /// displacing one's mutation — copies nothing.
+    fn tiered_entry(
+        &mut self,
+        ns: NsId,
+        key: &[u8],
+    ) -> Result<Option<TieredEntry<'_>>, ReplayError> {
+        let Keyspace { tiered_stores, pending_displace, displace_scratch, cfg, .. } = self;
+        let Some((_, table)) = tiered_stores.iter_mut().find(|(id, _)| *id == ns) else {
+            return Ok(None);
+        };
+        displace_scratch.clear();
+        for &(marker_ns, old_addr) in pending_displace.iter() {
             debug_assert_eq!(marker_ns, ns, "adjacency check pinned the namespace");
             let Some(addr) = LogicalAddr::from_raw(old_addr) else {
                 return Err(ReplayError::Displacement(
                     "displacement address exceeds the 48-bit logical space",
                 ));
             };
-            table.apply_displace(hash, addr);
+            displace_scratch.push(addr);
         }
-        Ok(())
+        Ok(Some(TieredEntry {
+            table: table.as_mut(),
+            markers: displace_scratch.as_slice(),
+            hash: cfg.hasher.hash(key),
+        }))
     }
 
     /// Parked displacement markers awaiting their paired mutation — the
@@ -1347,6 +1484,15 @@ impl Keyspace {
     #[must_use]
     pub fn is_tiered(&self, ns: NsId) -> bool {
         self.tiered_stores.iter().any(|(id, _)| *id == ns)
+    }
+
+    /// The node's key hasher (ADR-0094): every store of this keyspace
+    /// hashes with it, and the plane copies it for its stage-time
+    /// prefetch so the hash it computes is the one the store probes.
+    #[inline]
+    #[must_use]
+    pub fn hasher(&self) -> KeyHasher {
+        self.cfg.hasher
     }
 
     /// Shared view of a tiered table (the command layer's lookup path —
@@ -1397,7 +1543,11 @@ impl Keyspace {
     /// part of the state; L7 injects the clock that interprets them).
     ///
     /// Empty stores contribute nothing: a materialized-but-empty db
-    /// digests the same as one never touched.
+    /// digests the same as one never touched. **Tiered namespaces are not
+    /// folded** — their records live in the `TieredTable`s, whose
+    /// determinism oracle is the m4-tiered/m4-recovery DST's own
+    /// reconciliation (never-none + content audits), not this digest
+    /// (review 2026-08-30, lane L05).
     pub fn state_digest(&self, now: Nanos) -> StateDigest {
         let mut acc = StateDigest::default();
         for (db, store) in self.dbs() {
@@ -1409,8 +1559,10 @@ impl Keyspace {
         acc
     }
 
-    /// Every materialized store: default dbs, then named (aggregation
-    /// order is stable but unspecified).
+    /// Every materialized `CellStore`: default dbs, then named (aggregation
+    /// order is stable but unspecified). Tiered namespaces' tables are not
+    /// `CellStore`s and are not here — their footprint is
+    /// `tiering_committed_bytes` (ADR-0062), their content the tiered DST's.
     fn all_stores(&self) -> impl Iterator<Item = &CellStore> {
         self.dbs
             .iter()
@@ -1419,11 +1571,55 @@ impl Keyspace {
     }
 }
 
+/// Adds one store's slice to the keyspace total: counts sum, the sweep
+/// state folds to the least-settled store, and the stop to the most
+/// constrained one.
+fn fold_expiry(total: &mut ExpiryStats, s: &ExpiryStats) {
+    total.fired += s.fired;
+    total.reaped += s.reaped;
+    total.stale += s.stale;
+    total.steps += s.steps;
+    total.armed += s.armed;
+    total.refiled += s.refiled;
+    total.swept += s.swept;
+    total.sweep_slots += s.sweep_slots;
+    total.tombstones += s.tombstones;
+    total.sweep = total.sweep.fold(s.sweep);
+    total.sweep_stop = match (total.sweep_stop, s.sweep_stop) {
+        (SweepStop::Budget, _) | (_, SweepStop::Budget) => SweepStop::Budget,
+        (SweepStop::PassEnd, _) | (_, SweepStop::PassEnd) => SweepStop::PassEnd,
+        (SweepStop::NotOwed, SweepStop::NotOwed) => SweepStop::NotOwed,
+    };
+}
+
 /// This cell's share of a per-namespace `MAXMEMORY` (ADR-0068 D2): the
 /// node-wide budget divides by the symmetric cell count exactly like the
 /// node `maxmemory`. `0` means "no budget" (the inheritance leg), so a
 /// budget smaller than the cell count floors at 1 byte per cell — a
 /// nonsense-tiny budget stays a budget, never accidentally unlimited.
+/// Install every declaration of `ns` into a store's attach block — the
+/// ADR-0076 D1 sync helper shared by materialization, DDL, and the seed
+/// resync. The registry validated each program at its trust boundary.
+#[cfg(feature = "doc")]
+fn install_ns_attaches(indexes: &IndexRegistry, ns: NsId, store: &mut CellStore) {
+    for spec in indexes.iter().filter(|s| s.ns == ns) {
+        store.idx.install(spec.id, spec.generation, spec.key_type, &spec.program);
+    }
+}
+
+/// The DDL-side program gauntlet (ADR-0075 D2.4) — byte-valid M3
+/// bytecode inside the indexable-path fence. A doc-less build refuses:
+/// it could not maintain the projection it would be declaring (L8).
+#[cfg(feature = "doc")]
+fn validate_program_gate(bytes: &[u8]) -> Result<(), IndexError> {
+    crate::index_registry::validate_index_program(bytes).map_err(IndexError::InvalidProgram)
+}
+
+#[cfg(not(feature = "doc"))]
+fn validate_program_gate(_bytes: &[u8]) -> Result<(), IndexError> {
+    Err(IndexError::InvalidProgram("indexes require the document engine (doc feature)"))
+}
+
 fn ns_budget_share(maxmemory: Option<u64>, shares: u64) -> u64 {
     maxmemory.map_or(0, |bytes| (bytes / shares.max(1)).max(1))
 }
@@ -1526,9 +1722,13 @@ fn fold_store(acc: &mut StateDigest, store: &CellStore, tag: u64, now: Nanos) {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ReplayOutcome {
     Applied,
-    /// The record names an id the catalog doesn't know (dropped namespace,
-    /// or a reserved default id) — skipped and counted by the caller.
-    SkippedUnknownNs,
+    /// The record names an id the catalog doesn't know — a dropped
+    /// namespace (its tombstone explains it — ADR-0100 D6) or, after
+    /// ADR-0103, a foreign log: a namespace is never servable before its
+    /// definition is durable, so the created-but-unpersisted case is
+    /// unreachable. Skipped and counted by the caller, which tells the
+    /// two apart by the id.
+    SkippedUnknownNs(NsId),
     /// A record type M2 never emits (`NsOp`) — reserved, skipped.
     SkippedReserved,
     /// A checkpoint-begin marker (M2-S10): expected in every log with
@@ -1545,6 +1745,13 @@ pub enum ReplayOutcome {
 #[derive(Debug)]
 pub enum ReplayError {
     Store(OpError),
+    /// A tiered namespace's typed boot refusal (ADR-0174 D1), naming the
+    /// namespace: the window's refusal is never one — it is a `Room` the
+    /// entry answers with a demote step.
+    Replay {
+        ns: NsId,
+        refusal: ReplayRefusal,
+    },
     /// Displacement-marker stream violation (ADR-0057 D4 pairing /
     /// ADR-0059 D9 bound) — corrupt or truncated tiered replay input.
     Displacement(&'static str),
@@ -1564,6 +1771,7 @@ pub enum ReplayError {
 mod tests {
     use super::*;
     use crate::store::{SetExpire, SetOptions, StoreConfig};
+    use crate::tiered::replay::NoSpill;
 
     fn now() -> Nanos {
         Nanos(1_000_000)
@@ -1744,11 +1952,169 @@ mod tests {
     fn catalog_seed_and_export_round_trip() {
         let mut ks = Keyspace::new(StoreConfig::default());
         ks.ns_create(durable_spec(16, b"ledger")).expect("create");
-        let cat = ks.export_catalog(17);
+        let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
         fresh.seed_catalog(&cat).expect("seed");
-        assert_eq!(fresh.export_catalog(17), cat);
+        assert_eq!(fresh.export_catalog(17, 1, 1), cat);
         assert!(fresh.ns_store_mut(NsId(16)).is_some());
+    }
+
+    // ---- M4.5-S03 (ADR-0075): index registry + catalog + accounting ----
+
+    #[cfg(feature = "doc")]
+    fn idx_spec(id: u32, generation: u64, ns: u32, name: &[u8], state: IndexState) -> IndexSpec {
+        IndexSpec {
+            id: IndexId(id),
+            generation,
+            ns: NsId(ns),
+            name: name.to_vec(),
+            program: inf_doc::path::compile(b"$.price").expect("valid path").as_bytes().to_vec(),
+            key_type: crate::IndexKeyType::F64,
+            state,
+        }
+    }
+
+    /// The DDL gates: tiered namespaces refuse (ADR-0072 D8a), unknown
+    /// named targets refuse, default dbs and plain namespaces accept,
+    /// and a fenced-out path refuses through the shared gauntlet.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn idx_create_gates_by_namespace_mode() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.ns_create(NsSpec {
+            fsync: Some(FsyncClass::Everysec),
+            tier: Some(crate::ns::TierSpec::for_budget(64 << 20)),
+            ..durable_spec(17, b"cold")
+        })
+        .expect("tiered create");
+        ks.idx_create(idx_spec(1, 1, 0, b"on-db0", IndexState::Declared)).expect("default db");
+        ks.idx_create(idx_spec(2, 2, 16, b"on-ledger", IndexState::Declared)).expect("named ns");
+        assert_eq!(
+            ks.idx_create(idx_spec(3, 3, 17, b"on-cold", IndexState::Declared)),
+            Err(IndexError::TierRefusesIndexes)
+        );
+        assert_eq!(
+            ks.idx_create(idx_spec(3, 3, 99, b"nowhere", IndexState::Declared)),
+            Err(IndexError::UnknownNamespace(99))
+        );
+        let fenced = IndexSpec {
+            program: inf_doc::path::compile(b"$..a").expect("valid path").as_bytes().to_vec(),
+            ..idx_spec(3, 3, 16, b"fenced", IndexState::Declared)
+        };
+        assert!(matches!(ks.idx_create(fenced), Err(IndexError::InvalidProgram(_))));
+        assert!(ks.ns_has_indexes(NsId(0)));
+        assert!(ks.ns_has_indexes(NsId(16)));
+        assert!(!ks.ns_has_indexes(NsId(17)));
+    }
+
+    /// The ADR-0075 D4 restart semantics: `dropping` resumes its drop
+    /// (gone after seed, gone from the next export); every other state
+    /// survives with id/generation intact and regresses to
+    /// `backfilling`, with the pre-crash-`ready` hint retained for S06.
+    /// Driving the rebuild to completion returns the pre-crash-ready
+    /// index to `ready` — the AC's end state.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn catalog_restart_maps_index_states_per_d4() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.idx_create(idx_spec(1, 10, 16, b"was-ready", IndexState::Declared)).expect("create");
+        ks.idx_create(idx_spec(2, 11, 16, b"mid-backfill", IndexState::Declared)).expect("create");
+        ks.idx_create(idx_spec(3, 12, 16, b"mid-drop", IndexState::Declared)).expect("create");
+        let reg = ks.idx_registry_mut();
+        reg.set_catalog_state(IndexId(1), IndexState::Backfilling).expect("edge");
+        reg.set_catalog_state(IndexId(1), IndexState::Ready).expect("edge");
+        reg.set_catalog_state(IndexId(2), IndexState::Backfilling).expect("edge");
+        reg.set_catalog_state(IndexId(3), IndexState::Dropping).expect("edge");
+        let cat = ks.export_catalog(17, 4, 13);
+
+        let mut fresh = Keyspace::new(StoreConfig::default());
+        fresh.seed_catalog(&cat).expect("seed");
+        let reg = fresh.idx_registry();
+        // The dropping entry resumed its drop: not seeded.
+        assert!(reg.get_by_id(IndexId(3)).is_none());
+        // Survivors regress to backfilling, generations un-bumped
+        // (ADR-0073 D5.1 — a boot bump would stale every sidecar).
+        let ready = reg.get_by_id(IndexId(1)).expect("survives");
+        assert_eq!(ready.state, IndexState::Backfilling);
+        assert_eq!(ready.generation, 10);
+        assert_eq!(reg.was_ready(IndexId(1)), Some(true), "the S06 sidecar hint");
+        let mid = reg.get_by_id(IndexId(2)).expect("survives");
+        assert_eq!(mid.state, IndexState::Backfilling);
+        assert_eq!(reg.was_ready(IndexId(2)), Some(false));
+        // Planning refuses both until rebuild completes...
+        assert!(fresh.idx_registry().validate_binding(NsId(16), IndexId(1), 10).is_err());
+        // ...and the next export no longer carries the dropped entry.
+        assert!(!fresh.export_catalog(17, 4, 13).index.entries.iter().any(|e| e.id == IndexId(3)));
+        // Rebuild completion returns the pre-crash-ready index to ready.
+        fresh.idx_registry_mut().set_catalog_state(IndexId(1), IndexState::Ready).expect("edge");
+        fresh.idx_registry().validate_binding(NsId(16), IndexId(1), 10).expect("ready again");
+    }
+
+    /// ADR-0075 D6 (the ADR-0072 D8c decision): `idx_tree_bytes` counts
+    /// toward the namespace's `MAXMEMORY` used bytes — index growth
+    /// tightens the document budget, and the OOM verdict is honest when
+    /// nothing evictable remains below `share − idx`.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn idx_tree_bytes_count_toward_the_namespace_budget() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(NsSpec {
+            id: NsId(16),
+            name: b"cache".to_vec(),
+            mode: NsMode::Memory,
+            fsync: None,
+            policy: Some(EvictionPolicy::AllKeysRandom),
+            maxmemory: None,
+            tier: None,
+        })
+        .expect("create");
+        ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
+        // Fill documents-side bytes, then set the budget just above the
+        // store's own usage — without index bytes the flag stays clear.
+        for i in 0..64u64 {
+            let key = format!("k{i}");
+            ks.ns_store_mut(NsId(16))
+                .expect("store")
+                .set(key.as_bytes(), &[0u8; 128], SetOptions::default(), now())
+                .expect("set");
+        }
+        let store_used = ks.ns_store(NsId(16)).expect("store").used_bytes();
+        ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(store_used + 4096))
+            .expect("budget");
+        assert!(!ks.ns_over_limit(NsId(16)), "no index bytes yet — under budget");
+        // Grow the tree past the headroom; the flag must flip on the
+        // combined comparison and the report must attribute the bytes.
+        let tree = ks.idx_tree_mut(NsId(16), IndexId(1)).expect("tree");
+        for i in 0..4096u64 {
+            let pk_ref = crate::ordered::PkRef::from_key_hash(i);
+            tree.insert(&i.to_be_bytes(), pk_ref).expect("insert");
+        }
+        ks.refresh_pressure();
+        assert!(ks.ns_over_limit(NsId(16)), "index growth tightens the namespace budget");
+        let report = ks.report();
+        assert!(report.idx_tree_bytes > 4096, "trees attribute (L5)");
+        assert!(report.idx_slack_bytes < report.idx_tree_bytes);
+        assert!(ks.used_bytes() >= store_used + report.idx_tree_bytes);
+        // Dropping the index returns the namespace under budget.
+        ks.idx_drop_finish(IndexId(1)).expect("drop");
+        assert!(!ks.ns_over_limit(NsId(16)), "drop returns the budget");
+        assert_eq!(ks.report().idx_tree_bytes, 0);
+    }
+
+    /// A namespace drop takes its declarations with it; the ids stay
+    /// retired and the flags recompute.
+    #[cfg(feature = "doc")]
+    #[test]
+    fn ns_drop_removes_its_index_declarations() {
+        let mut ks = Keyspace::new(StoreConfig::default());
+        ks.ns_create(durable_spec(16, b"ledger")).expect("create");
+        ks.idx_create(idx_spec(1, 1, 16, b"by-price", IndexState::Declared)).expect("create");
+        assert!(ks.ns_has_indexes(NsId(16)));
+        ks.ns_drop(b"ledger").expect("drop");
+        assert!(!ks.ns_has_indexes(NsId(16)));
+        assert!(ks.idx_registry().get_by_id(IndexId(1)).is_none());
     }
 
     /// M4-S27 (ADR-0068): a memory namespace's persisted pressure knobs
@@ -1768,7 +2134,7 @@ mod tests {
             tier: None,
         };
         ks.ns_create(spec).expect("create");
-        let cat = ks.export_catalog(17);
+        let cat = ks.export_catalog(17, 1, 1);
         let mut fresh = Keyspace::new(StoreConfig::default());
         fresh.seed_catalog(&cat).expect("seed");
         let store = fresh.ns_store_mut(NsId(16)).expect("live");
@@ -1857,14 +2223,20 @@ mod tests {
         let set = LogRecordView::StringPostImage { ns: NsId(16), key: b"k", value: b"v1" };
         for _ in 0..2 {
             // Double apply: replay from an older checkpoint re-covers records.
-            assert_eq!(ks.apply_record(&set, now, anchor).expect("apply"), ReplayOutcome::Applied);
+            assert_eq!(
+                ks.apply_record(&set, now, anchor, &mut NoSpill).expect("apply"),
+                ReplayOutcome::Applied
+            );
         }
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
 
         // ExpireAt in the future keeps the key; a past deadline kills it.
         let future_unix = anchor.unix_from_internal(Nanos::from_millis(60_000));
         let exp = LogRecordView::ExpireAt { ns: NsId(16), at_unix_ms: future_unix, key: b"k" };
-        assert_eq!(ks.apply_record(&exp, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        assert_eq!(
+            ks.apply_record(&exp, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::Applied
+        );
         assert_eq!(ks.ns_store_mut(NsId(16)).expect("live").get(b"k", now), Some(&b"v1"[..]));
         assert_eq!(
             ks.ns_store_mut(NsId(16)).expect("live").get(b"k", Nanos::from_millis(61_000)),
@@ -1873,22 +2245,25 @@ mod tests {
         );
 
         let del = LogRecordView::Delete { ns: NsId(16), key: b"gone" };
-        assert_eq!(ks.apply_record(&del, now, anchor).expect("apply"), ReplayOutcome::Applied);
+        assert_eq!(
+            ks.apply_record(&del, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::Applied
+        );
 
         // Unknown / reserved ids skip, never error (dropped-ns tolerance).
         let foreign = LogRecordView::StringPostImage { ns: NsId(99), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&foreign, now, anchor).expect("apply"),
-            ReplayOutcome::SkippedUnknownNs
+            ks.apply_record(&foreign, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::SkippedUnknownNs(NsId(99))
         );
         let reserved = LogRecordView::StringPostImage { ns: NsId(3), key: b"x", value: b"y" };
         assert_eq!(
-            ks.apply_record(&reserved, now, anchor).expect("apply"),
-            ReplayOutcome::SkippedUnknownNs
+            ks.apply_record(&reserved, now, anchor, &mut NoSpill).expect("apply"),
+            ReplayOutcome::SkippedUnknownNs(NsId(3))
         );
         let nsop = LogRecordView::NsOp { ns: NsId(16), payload: b"reserved" };
         assert_eq!(
-            ks.apply_record(&nsop, now, anchor).expect("apply"),
+            ks.apply_record(&nsop, now, anchor, &mut NoSpill).expect("apply"),
             ReplayOutcome::SkippedReserved
         );
     }

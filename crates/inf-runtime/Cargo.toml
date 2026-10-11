@@ -12,7 +12,7 @@ inf-foundation.workspace = true
 inf-alloc.workspace = true
 libc.workspace = true
 
-# The only crate allowed to name io_uring symbols (milestone M0 §3.3).
+# The only crate allowed to name io_uring symbols (docs/dep-dag.toml).
 # Feature-gated: Linux CI runs `--features uring`; default builds stay
 # backend-free so the workspace compiles on any host.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -29,6 +29,9 @@ proptest.workspace = true
 criterion.workspace = true
 # Conformance tests poke sockets (setsockopt) directly.
 libc.workspace = true
+# The capped containers' allocation census (tests/bounded_alloc.rs) counts
+# through inf-alloc's allocator, so inf-foundation stays dependency-free.
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # M4-S04 steel thread: the integration vertical crosses store/log/alloc.
 # Dev-only — tests may cross layers (dep-dag exemption).
 inf-store.workspace = true
@@ -76,4 +79,14 @@ required-features = ["uring"]
 name = "cold_shaping"
 harness = false
 test = false
+required-features = ["uring"]
+
+[[test]]
+name = "accept_exhaustion"
+path = "tests/accept_exhaustion.rs"
+required-features = ["uring"]
+
+[[test]]
+name = "close_fd_reuse"
+path = "tests/close_fd_reuse.rs"
 required-features = ["uring"]

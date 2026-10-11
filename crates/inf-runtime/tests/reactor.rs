@@ -1,3 +1,11 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: harness deadlines and timings, not cell code"
+)]
 //! Reactor-loop structure (M0-S07): bounded steps, HoL fairness via budgets,
 //! spin→park idle policy, timer-driven park timeouts, and the always-on
 //! iteration histogram. Uses a null in-memory driver — backend behavior has
@@ -151,6 +159,19 @@ impl CellPlane for BusyThenIdle {
     fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
 }
 
+/// Batch 61 (lane L11 `reactor.rs:239`): the first iteration polls — the
+/// plane arms its accept in its first PARSE, which runs *after* the wait,
+/// so a park there costs boot one full `park_default` for nothing.
+#[test]
+fn the_first_iteration_polls_before_anything_is_armed() {
+    for spin_iters in [4, 0] {
+        let mut lp = test_loop(LoopConfig { spin_iters, ..LoopConfig::default() });
+        let mut plane = BusyThenIdle { busy_left: 0 };
+        let first = lp.run_iteration(&mut plane).expect("iteration");
+        assert!(!first.parked, "spin_iters {spin_iters}: boot parked: {:?}", lp.driver().waits);
+    }
+}
+
 #[test]
 fn idle_policy_spins_then_parks() {
     let spin = 4;
@@ -161,8 +182,8 @@ fn idle_policy_spins_then_parks() {
         lp.run_iteration(&mut plane).expect("iteration");
     }
     let waits = &lp.driver().waits;
-    // First iteration parks (nothing has happened yet), then work keeps it
-    // polling, then `spin` more polls, then parks forever.
+    // The first iteration polls (batch 61), work keeps it polling, then
+    // `spin` more polls, then it parks forever.
     let tail: Vec<_> = waits.iter().rev().take(3).collect();
     assert!(tail.iter().all(|w| **w == "park"), "loop must park when idle: {waits:?}");
     assert!(
@@ -329,5 +350,82 @@ fn remote_first_execute_early_flush_needs_a_resumed_future() {
             vec!["parse_execute", "fabric_out"],
             "lever={lever} spawned={spawned}"
         );
+    }
+}
+
+/// F-L11-07: the wake lands in MAINTAIN — after `run_ready`, with no
+/// completion, command, fabric message or queued op beside it (the shape
+/// of every wake driven by another thread's state: `ddl_waiters`,
+/// `ckpt_waiters`, `stall_waiters`). The test arms the wake itself, in
+/// an otherwise idle iteration.
+struct WakeInMaintain {
+    waker: std::rc::Rc<std::cell::RefCell<Option<std::task::Waker>>>,
+    done: std::rc::Rc<std::cell::Cell<bool>>,
+    spawned: bool,
+    wake_now: bool,
+}
+
+impl CellPlane for WakeInMaintain {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        if !self.spawned {
+            self.spawned = true;
+            cx.executor.spawn_local(ParkedReply {
+                waker: std::rc::Rc::clone(&self.waker),
+                done: std::rc::Rc::clone(&self.done),
+            });
+        }
+    }
+    fn maintain(&mut self, _cx: &mut LoopCx<'_>) {
+        if !self.wake_now {
+            return;
+        }
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            self.done.set(true);
+            waker.wake();
+        }
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+}
+
+#[test]
+fn a_task_woken_in_maintain_is_polled_before_any_park() {
+    // spin_iters = 1 reaches the park decision through the idle count;
+    // spin_iters = 0 parks every idle iteration — the ready queue alone
+    // must veto it.
+    for spin_iters in [1, 0] {
+        let mut lp = test_loop(LoopConfig {
+            spin_iters,
+            park_default: Some(Duration::from_secs(10)),
+            ..LoopConfig::default()
+        });
+        let mut plane = WakeInMaintain {
+            waker: std::rc::Rc::default(),
+            done: std::rc::Rc::default(),
+            spawned: false,
+            wake_now: false,
+        };
+        let spawn = lp.run_iteration(&mut plane).expect("iteration");
+        assert_eq!(spawn.polled, 1, "the task is spawned and parks");
+        let idle = lp.run_iteration(&mut plane).expect("iteration");
+        assert_eq!((idle.polled, idle.parked), (0, spin_iters == 0));
+        // The parked iteration: nothing happens in it except the wake in
+        // MAINTAIN (a board edge seen after run_ready).
+        plane.wake_now = true;
+        let wake = lp.run_iteration(&mut plane).expect("iteration");
+        assert_eq!(
+            (wake.polled, wake.parked),
+            (0, true),
+            "the wake lands in a parked, idle iteration"
+        );
+        // The runnable task is work: no park on top of it, and it runs now.
+        let next = lp.run_iteration(&mut plane).expect("iteration");
+        assert!(
+            !next.parked,
+            "spin_iters {spin_iters}: parked on top of a runnable task: {:?}",
+            lp.driver().waits
+        );
+        assert_eq!(next.polled, 1, "the woken task runs on the next iteration");
+        assert_eq!(lp.executor().live_tasks(), 0, "and completes");
     }
 }

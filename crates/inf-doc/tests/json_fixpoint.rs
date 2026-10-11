@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test target: std containers in test code, outside cell code (ADR-0163 D2)"
+)]
 //! M3-S06 serializer ACs:
 //!
 //! - **Fixpoint** (plan AC 1): serialize → parse → serialize is

@@ -4,6 +4,16 @@
 //! exceeds one level and is handled by a flag, not a stack). Grammar
 //! authority: `infinitydb/docs/jsonpath-subset.md`; typed errors carry
 //! the byte offset like `JsonParseError`.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 use super::ast::{Member, PathAst, Segment, SliceSpec};
 use super::{PathError, PathErrorKind, SEGMENTS_MAX, UNION_MEMBERS_MAX};
@@ -40,6 +50,11 @@ pub(crate) fn parse(text: &[u8]) -> Result<PathAst, PathError> {
 }
 
 /// One segment starting at `at`: `.name`, `.*`, `..sel`, or `[...]`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: text[at] is indexed first, so at < text.len() <= isize::MAX and every \
+              cursor here is at most at + 3"
+)]
 fn parse_segment(text: &[u8], at: usize) -> Result<(Segment, usize), PathError> {
     match text[at] {
         b'[' => parse_bracket(text, at),
@@ -79,8 +94,15 @@ fn parse_segment(text: &[u8], at: usize) -> Result<(Segment, usize), PathError> 
 }
 
 /// `[` ws ( `*` / selector *( ws `,` ws selector ) ) ws `]`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: each `+ 1` is on a cursor text.get() has just returned Some for (open \
+              included), so it is < text.len() <= isize::MAX"
+)]
 fn parse_bracket(text: &[u8], open: usize) -> Result<(Segment, usize), PathError> {
-    debug_assert_eq!(text[open], b'[');
+    if text.get(open) != Some(&b'[') {
+        return err(open, PathErrorKind::UnexpectedChar);
+    }
     let mut at = skip_ws(text, open + 1);
     if text.get(at) == Some(&b'*') {
         let close = skip_ws(text, at + 1);
@@ -119,6 +141,11 @@ fn parse_bracket(text: &[u8], open: usize) -> Result<(Segment, usize), PathError
 }
 
 /// One union-capable selector: quoted name, index, or slice.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `at + 1` sits in the arm where text.get(at) is Some, so at < text.len() \
+              <= isize::MAX"
+)]
 fn parse_selector(text: &[u8], at: usize) -> Result<(Member, usize), PathError> {
     match text.get(at) {
         Some(b'\'') | Some(b'"') => {
@@ -136,6 +163,11 @@ fn parse_selector(text: &[u8], at: usize) -> Result<(Member, usize), PathError> 
 
 /// `int`, `int? ":" int? (":" int?)?` — slice fields keep their
 /// omitted-ness (canonical encoding, ADR-0040 D2); `step == 0` rejects.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: each `i + 1` follows text.get(i) == Some(b':'), so i < text.len() <= \
+              isize::MAX"
+)]
 fn parse_index_or_slice(text: &[u8], at: usize) -> Result<(Member, usize), PathError> {
     let (start, mut i) = parse_opt_int(text, at)?;
     if text.get(i) != Some(&b':') {
@@ -159,6 +191,13 @@ fn parse_index_or_slice(text: &[u8], at: usize) -> Result<(Member, usize), PathE
 
 /// Optional canonical int: no leading zeros, no `-0`, i64 range.
 /// Returns `(None, at)` when `text[at]` does not start a number.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `at + 1` is taken only when text.get(at) is Some(b'-'), `i += 1` only \
+              under the loop's text.get(i) guard, `digits_at + 1` after text[digits_at] is \
+              indexed — all < text.len() <= isize::MAX; `b - b'0'` is on a byte that guard \
+              matched as b'0'..=b'9'"
+)]
 fn parse_opt_int(text: &[u8], at: usize) -> Result<(Option<i64>, usize), PathError> {
     let negative = text.get(at) == Some(&b'-');
     let digits_at = at + usize::from(negative);
@@ -181,7 +220,7 @@ fn parse_opt_int(text: &[u8], at: usize) -> Result<(Option<i64>, usize), PathErr
     for &b in &text[digits_at..i] {
         value = value
             .checked_mul(10)
-            .and_then(|v| v.checked_sub((b - b'0') as i64))
+            .and_then(|v| v.checked_sub(i64::from(b - b'0')))
             .ok_or(PathError { offset: at, kind: PathErrorKind::BadNumber })?;
     }
     if negative {
@@ -196,6 +235,13 @@ fn parse_opt_int(text: &[u8], at: usize) -> Result<(Option<i64>, usize), PathErr
 }
 
 /// Quoted name with JSON escape semantics plus `\'`/`\"` (grammar §2).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: text[open] is indexed first and every `i + 1` / `i += 1` is in an arm \
+              where text.get(i) is Some; `i += 2` follows text.get(i + 1) being Some, and the \
+              escape length is a count of bytes push_unicode_escape read from text[escape_at..] \
+              — every cursor stays <= text.len() <= isize::MAX"
+)]
 fn parse_quoted(text: &[u8], open: usize) -> Result<(Vec<u8>, usize), PathError> {
     let quote = text[open];
     let mut name = Vec::new();
@@ -208,6 +254,7 @@ fn parse_quoted(text: &[u8], open: usize) -> Result<(Vec<u8>, usize), PathError>
                 let Some(&esc) = text.get(i + 1) else {
                     return err(i, PathErrorKind::BadEscape);
                 };
+                let escape_at = i;
                 i += 2;
                 match esc {
                     b'\'' | b'"' | b'\\' | b'/' => name.push(esc),
@@ -216,8 +263,13 @@ fn parse_quoted(text: &[u8], open: usize) -> Result<(Vec<u8>, usize), PathError>
                     b'n' => name.push(b'\n'),
                     b'r' => name.push(b'\r'),
                     b't' => name.push(b'\t'),
-                    b'u' => i = push_unicode_escape(text, i, &mut name)?,
-                    _ => return err(i - 2, PathErrorKind::BadEscape),
+                    b'u' => {
+                        let Some(used) = push_unicode_escape(&text[escape_at..], &mut name) else {
+                            return err(escape_at, PathErrorKind::BadEscape);
+                        };
+                        i = escape_at + used;
+                    }
+                    _ => return err(escape_at, PathErrorKind::BadEscape),
                 }
             }
             Some(&b) if b < 0x20 => return err(i, PathErrorKind::UnexpectedChar),
@@ -229,41 +281,43 @@ fn parse_quoted(text: &[u8], open: usize) -> Result<(Vec<u8>, usize), PathError>
     }
 }
 
-/// `\uXXXX` starting with its hex digits at `i` (the `\u` is consumed);
-/// surrogate pairs follow the JSON string rules (the S05 discipline).
-fn push_unicode_escape(text: &[u8], i: usize, name: &mut Vec<u8>) -> Result<usize, PathError> {
-    let escape_at = i - 2;
-    let hi = parse_hex4(text, i)
-        .ok_or(PathError { offset: escape_at, kind: PathErrorKind::BadEscape })?;
-    let mut next = i + 4;
-    let code = if (0xD800..=0xDBFF).contains(&hi) {
-        if text.get(next) != Some(&b'\\') || text.get(next + 1) != Some(&b'u') {
-            return err(escape_at, PathErrorKind::BadEscape); // lone high surrogate
+/// One escape whose backslash opens `tail`: `\uXXXX`, or a surrogate
+/// pair `\uXXXX\uXXXX` under the JSON string rules (the S05 discipline).
+/// Returns the bytes consumed; `None` is a bad escape.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: hi is in 0xD800..=0xDBFF and lo in 0xDC00..=0xDFFF by the range checks \
+              above the sum, which is therefore at most 0x10FFFF"
+)]
+fn push_unicode_escape(tail: &[u8], name: &mut Vec<u8>) -> Option<usize> {
+    const ESCAPE_LEN: usize = 6;
+    let hi = parse_hex4(tail.get(2..)?)?;
+    let (code, used) = if (0xD800..=0xDBFF).contains(&hi) {
+        // A lone high surrogate is refused: a `\u` low half must follow.
+        let low = tail.get(ESCAPE_LEN..)?;
+        if low.first() != Some(&b'\\') || low.get(1) != Some(&b'u') {
+            return None;
         }
-        let lo = parse_hex4(text, next + 2)
-            .ok_or(PathError { offset: escape_at, kind: PathErrorKind::BadEscape })?;
+        let lo = parse_hex4(low.get(2..)?)?;
         if !(0xDC00..=0xDFFF).contains(&lo) {
-            return err(escape_at, PathErrorKind::BadEscape);
+            return None;
         }
-        next += 6;
-        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+        (0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), 2 * ESCAPE_LEN)
     } else if (0xDC00..=0xDFFF).contains(&hi) {
-        return err(escape_at, PathErrorKind::BadEscape); // lone low surrogate
+        return None; // lone low surrogate
     } else {
-        hi
+        (hi, ESCAPE_LEN)
     };
     let ch = char::from_u32(code).expect("surrogates handled; scalar remains");
     let mut utf8 = [0u8; 4];
     name.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
-    Ok(next)
+    Some(used)
 }
 
-fn parse_hex4(text: &[u8], i: usize) -> Option<u32> {
-    if text.len() < i + 4 {
-        return None;
-    }
+/// The four hex digits that open `digits`.
+fn parse_hex4(digits: &[u8]) -> Option<u32> {
     let mut v = 0u32;
-    for &b in &text[i..i + 4] {
+    for &b in digits.first_chunk::<4>()? {
         v = v << 4 | (b as char).to_digit(16)?;
     }
     Some(v)
@@ -271,6 +325,11 @@ fn parse_hex4(text: &[u8], i: usize) -> Option<u32> {
 
 /// Space/tab, inside brackets only — every caller sits between `[`
 /// and `]` (grammar §2).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `at += 1` runs only under the loop's text.get(at) guard, so at < \
+              text.len() <= isize::MAX"
+)]
 fn skip_ws(text: &[u8], mut at: usize) -> usize {
     while matches!(text.get(at), Some(b' ') | Some(b'\t')) {
         at += 1;
@@ -283,11 +342,47 @@ fn starts_shorthand(b: u8) -> bool {
 }
 
 /// Longest shorthand name from `at` (caller checked the first byte).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: text[at] is indexed first and `i += 1` runs only under the loop's \
+              text.get(i) guard, so both cursors are < text.len() <= isize::MAX"
+)]
 fn take_shorthand(text: &[u8], at: usize) -> (Vec<u8>, usize) {
-    debug_assert!(starts_shorthand(text[at]));
+    let first = text[at];
+    debug_assert!(starts_shorthand(first));
     let mut i = at + 1;
     while matches!(text.get(i), Some(&b) if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80) {
         i += 1;
     }
     (text[at..i].to_vec(), i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surrogate_escape_cuts_refuse_without_appending_a_name() {
+        let cuts: &[&[u8]] = &[br"\ud83d", br"\ud83d\", br"\ud83d\u", br"\ud83d\ude0"];
+        for cut in cuts {
+            let mut name = b"prefix".to_vec();
+            assert_eq!(push_unicode_escape(cut, &mut name), None);
+            assert_eq!(name, b"prefix");
+            let mut text = b"$['".to_vec();
+            text.extend_from_slice(cut);
+            let error = parse(&text).unwrap_err();
+            assert_eq!((error.offset, error.kind), (3, PathErrorKind::BadEscape));
+        }
+        let mut name = Vec::new();
+        assert_eq!(push_unicode_escape(br"\ud83d\ude00", &mut name), Some(12));
+        assert_eq!(name, "😀".as_bytes());
+    }
+
+    #[test]
+    fn bracket_parser_checks_its_open_before_advancing() {
+        for text in [b"x".as_slice(), b"".as_slice()] {
+            let error = parse_bracket(text, 0).unwrap_err();
+            assert_eq!((error.offset, error.kind), (0, PathErrorKind::UnexpectedChar));
+        }
+    }
 }

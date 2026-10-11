@@ -6,10 +6,10 @@
 //! `PROPTEST_CASES=100000 cargo test --release -p inf-store --test mutation_error_atomicity`
 #![cfg(feature = "doc")]
 
-use inf_doc::TapeDoc;
 use inf_doc::apply::{ApplyError, ApplyOp, apply};
 use inf_doc::model::{self, Value};
 use inf_doc::path::{EvalLimits, compile};
+use inf_doc::{CanonicalDoc, TapeDoc};
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, JsonSetOptions, StoreConfig};
 use proptest::prelude::*;
@@ -51,7 +51,8 @@ proptest! {
             _ => unreachable!("strategy emits 0..3"),
         };
         let mut store = CellStore::new(cfg);
-        store.json_set(b"doc", &idoc, JsonSetOptions::default(), NOW).expect("set");
+        let receipt = CanonicalDoc::validate(&idoc).expect("canonical fixture");
+        store.json_set(b"doc", &receipt, JsonSetOptions::default(), NOW).expect("set");
         let before_bytes = store.json_freeze(b"doc", NOW).unwrap().unwrap();
         let before_version = store.json_get(b"doc", NOW).unwrap().unwrap().version;
         let before_domain = store.doc_domain();
@@ -66,7 +67,7 @@ proptest! {
             &program,
             &ApplyOp::ArrInsert { index: index as i64, elements: &elements },
             &EvalLimits::default(),
-            store.doc_max_bytes(),
+            store.doc_limits(),
         )
         .expect_err("the k-th array is too short");
         prop_assert_eq!(error, ApplyError::OutOfBounds);

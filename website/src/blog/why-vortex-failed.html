@@ -1,0 +1,43 @@
+<!--
+title: Why Vortex failed
+dek: And what InfinityDB does differently because of it.
+topic: Post-mortem · Prologue
+group: Engineering
+crumb: Post-mortem
+kicker: Prologue · before M0
+excerpt: InfinityDB started as a restart. Its predecessor had a SIMD parser, crash-point testing and a thousand-run concurrency lab, and still missed every target that mattered. It wasn't effort. It was the architecture.
+-->
+<p class="lede">InfinityDB is a restart. Its predecessor, Vortex, had a SIMD RESP parser, a SwissTable engine, a typed append-only file with crash-point testing, and a concurrency lab that ran more than a thousand experiments. It still missed its throughput, memory and tail-latency targets. It wasn't lack of effort. It was the architecture, and the absence of any gate that could have told us sooner.</p>
+
+<h2 id="p1"><span class="num">1</span>A microbenchmark chose the architecture.</h2>
+<p>The shared-keyspace lock design scored near-perfect in our concurrency lab, which measured the data plane in isolation. Then the flamegraphs of the real server arrived: most of the CPU went to io_uring completion handling and syscalls, and the effective command batch size was one. The locks we had optimized were never the bottleneck. The I/O plane we treated as plumbing was.</p>
+<aside class="law"><div class="law-label">Law derived</div><p>The end-to-end system is the unit of validation. InfinityDB's first milestone was an end-to-end skeleton with hard gates, before any feature.</p></aside>
+
+<h2 id="p2"><span class="num">2</span>A shared keyspace made everything global.</h2>
+<p>Because every reactor mutated one keyspace, every feature threaded through global coordination: a global log sequence number, a merge on replay, epoch validation, stop-the-world rewrites that ended up disabled, and memory accounting that never reconciled.</p>
+<aside class="law"><div class="law-label">Law derived · L1</div><p>Every byte has exactly one owning core. Persistence, expiry, eviction and accounting become local, single-threaded problems, and each core replays its own log in parallel.</p></aside>
+
+<h2 id="p3"><span class="num">3</span>Fixed-size entries traded memory for elegance.</h2>
+<p>Cache-line-aligned entries were beautiful in a probe benchmark and ruinous in resident memory. For a cache server, memory is not a tuning parameter. It is the product.</p>
+<aside class="law"><div class="law-label">Law derived · L5</div><p>Records are variable-size and compact by default, and memory gates are release blockers from the first alpha.</p></aside>
+
+<h2 id="p4"><span class="num">4</span>An invalid experiment rejected shared-nothing.</h2>
+<p>Our shared-nothing prototype measured cross-core hops far slower than production thread-per-core systems demonstrably achieve. It had benchmarked a bad message fabric, with a wake-up per message, no batching and no pipelining, not the architecture. Nobody checked the result against reality before it bound the decision.</p>
+<aside class="law"><div class="law-label">Law derived</div><p>Experiments are validated against external reference points before they bind decisions. A result that contradicts production systems is presumed to be an artifact.</p></aside>
+
+<h2 id="p5"><span class="num">5</span>Features came before proof.</h2>
+<p>We built features on a foundation that had never been proven end to end, then spent months retrofitting fairness budgets, backpressure, admission control and memory attribution.</p>
+<aside class="law"><div class="law-label">Law derived</div><p>Every milestone ends in STOP gates. Fail one and the train halts; the fix happens in the architecture, not in a later optimization pass.</p></aside>
+
+<h2 id="kept">What we kept</h2>
+<p>The post-mortem was not a purge. These survived contact with reality and moved into InfinityDB:</p>
+<ul class="dots">
+<li>SWAR integer parsing and perfect-hash command dispatch; the SIMD CRLF scanner came along too, and the RESP parser does not call it.</li>
+<li>The io_uring backend's typed buffer lifecycle and completion discipline.</li>
+<li>Crash-point testing, the fault-injection harness and typed durability errors.</li>
+<li>Clock-sweep eviction with a Count-Min Sketch and the hierarchical timing wheel, now per core.</li>
+<li>The evidence methodology: replicates, clean trees, memory attribution and the claim ledger.</li>
+</ul>
+
+<h2 id="inverted">The order, inverted</h2>
+<p>InfinityDB inverts the order. One law, one core, one shard, one owner, makes every hard subsystem local. One primitive, the per-core log, makes durability, queues, replication and tiering the same mechanism. One discipline, gates before features and evidence before claims, makes sure we never again publish a target we haven't earned.</p>

@@ -1,0 +1,53 @@
+<!--
+title: InfinityStyle
+section: Engineering
+description: A one-page summary of InfinityStyle, the normative engineering style for InfinityDB designs and code, adapted from TigerBeetle's TIGER_STYLE.
+lede: InfinityStyle is the engineering style every InfinityDB design and every line of code is reviewed against. It is adapted from TigerBeetle's TIGER_STYLE to Rust and to the design laws. This page is the short form.
+chips: Normative | Law L12 | Law L13
+-->
+<p>The style is normative, not advisory: the reviewer of a design affirms that the design conforms, and the reviewer of the code affirms the same for the code. Read the <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/INFINITY_STYLE.md">full text</a> before you write either. It descends from <a href="https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md">TIGER_STYLE</a> and draws on the NASA Power of Ten rules.</p>
+
+<h2 id="order">Safety, performance, experience</h2>
+<p>Another word for style is design. The goals are safety, performance and developer experience, in that order. All three matter; the order settles arguments. The unit of correctness and performance is the whole system: an elegant component that complicates recovery, hides memory or stalls another cell is an incomplete design.</p>
+<p>A rule is enforced by the strongest mechanism available: a type, then a lint, then a generated table, then a self-tested script, then review. What the compiler enforces holds through every review; what a comment enforces drifts. A new rule lands with its enforcement, or is recorded as review-only with the reason.</p>
+
+<h2 id="design">Design before code</h2>
+<p>Work starts on a written design, reviewed by someone who did not write it. The design answers in tables and arithmetic, not prose:</p>
+<ul class="dots">
+<li>the state machine as state × event → state and effect, with each invariant marked as a type, lint, assertion or test;</li>
+<li>the publication point, what is validated and reserved before it, and what each failure leaves behind;</li>
+<li>the cost at 10³, 10⁶, 10⁹ and 10¹² units, for steady state and for construction, resize, teardown and recovery;</li>
+<li>the hardware budget, and the resource expected to saturate;</li>
+<li>every new limit, with its unit, owner and crossing behaviour;</li>
+<li>the hostile inputs, the oracle that sees a violation and its canary;</li>
+<li>where the decision lives, and the observation that would reject the design.</li>
+</ul>
+<p>If a state machine cannot be drawn as a table, it is not understood yet. Build one thin path through every seam first, then polish.</p>
+
+<h2 id="debt">Zero technical debt</h2>
+<p>Do not merge known correctness defects, broken invariants, unbounded work or shortcuts that need a later repair. If the scope is too large to finish correctly, shrink the scope to a complete, tested contract. Recording debt does not make it acceptable. A fix answers its class question: which type, table or lint makes the sibling bug impossible, or why no such class exists. A recorded deviation carries an owner and an expiry date, and a document sentence the code contradicts is an open defect until one of them changes.</p>
+
+<h2 id="safety">Safety rules</h2>
+<ul class="dots">
+<li><strong>Invalid states are unrepresentable.</strong> Newtypes for ids and offsets, enums for state machines, typestate for phase-ordered resources, generation tokens where reuse lurks. Distinct outcomes are an enum, never a boolean or a sentinel. Never infer an outcome from encoded output, such as a reply's first byte.</li>
+<li><strong>Check once, at the trust boundary.</strong> A value from a client, a peer or a file is parsed where it enters into a type whose only constructor is that check. Inner code takes the type and does not check again.</li>
+<li><strong>Validate and reserve, then publish.</strong> Know the worst-case resources a mutation needs before visible state changes, so an error means nothing changed. What recovery depends on, such as the catalog and the topology, is durable before any cell serves it.</li>
+<li><strong>Nothing validated before a suspension is valid after it.</strong> No lease, borrow, ring slot, staged record or position crosses an <code>await</code>. A walker resumes through a typed cursor and validates again.</li>
+<li><strong>Every limit has a unit, an owner and a crossing behaviour.</strong> Every loop, queue, cache, batch and retry is bounded, by bytes and work as well as count. Backpressure is credits, budgets, caps and refusals, never an unbounded queue.</li>
+<li><strong>Assertions catch programmer errors.</strong> Assert preconditions, postconditions and invariants; handle operating errors. An assertion about a caller is a debt; move the claim to the type that makes it true. Panics are for violated invariants and sanctioned fail-stops only.</li>
+<li><strong>In shipped source, unsafe lives in audited leaf crates and named modules.</strong> Safe Rust by default. Every <code>unsafe</code> block has a <code>// SAFETY:</code> argument and Miri or Loom coverage where they apply; in shipped source it also has a <code>SAFETY.md</code> entry.</li>
+<li><strong>Decoders are iterative, bounded and total.</strong> No recursion, and the fuzz target lands in the same change.</li>
+</ul>
+
+<h2 id="performance">Performance</h2>
+<p>Do the napkin math before the code: network, disk, memory and CPU, each in latency and bandwidth, weighted by frequency. Name the resource you expect to saturate; a run where another resource saturates is a finding before it is a number. Keep the common path direct, use static dispatch in hot loops, give every allocation a named, counted domain, and batch every boundary. An optimization is a hypothesis until an A/B shows it, and an instrument is specified before it measures, with a same-binary control leg.</p>
+
+<h2 id="experience">Names, comments and tests</h2>
+<ul class="dots">
+<li><strong>Naming.</strong> Get the nouns and verbs right. Units and qualifiers go last, most significant first: <code>latency_ms_max</code>. No abbreviations beyond a short allowlist. One word, one meaning: a cell owns execution, and a shard is only the on-disk directory of a cell.</li>
+<li><strong>Comments and commits.</strong> Comments say why: the constraint, the invariant, the rejected alternative. One logical change per commit, with a short one-line message.</li>
+<li><strong>Off-by-one.</strong> Keep index, count and size distinct in names and types, and prefer half-open ranges.</li>
+<li><strong>Tests.</strong> A defect gets a red-first regression test at the layer that owns the invariant. An oracle is independent of what it checks and has a canary that turns it red. Generate hostile inputs from the limits: 0, 1, limit − 1, limit, limit + 1 and the integer maximum.</li>
+<li><strong>Format.</strong> <code>rustfmt</code> at 100 columns, warnings as errors, and a check that counts the lines <code>rustfmt</code> cannot see.</li>
+</ul>
+<p>Keep revising until the design is simple enough to draw as a table, the failure paths are explicit and the evidence can go red. Leave the next engineer a smaller problem and a stronger proof.</p>

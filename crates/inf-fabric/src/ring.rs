@@ -13,8 +13,9 @@
 //! ns/msg` amortized gate is measured against these paths.
 //!
 //! Verification: the `loom_*` tests model this module under
-//! `RUSTFLAGS="--cfg loom"` (publish/consume/wrap-around/full/empty across
-//! two threads); the non-loom unit tests run under Miri in CI. The `perf c2c`
+//! `RUSTFLAGS="--cfg loom"` (publish/consume/wrap-around/full/empty and the
+//! stale-cache consume path across two threads); the non-loom unit tests run
+//! under Miri in CI. The `perf c2c`
 //! false-sharing artifact required by M0-S08 is **deferred to the Linux
 //! reference box** (`scripts/perf-c2c-ring.sh`); macOS has no equivalent.
 //!
@@ -128,6 +129,10 @@ pub struct Consumer<T> {
     head: usize,
     /// Last observed producer index; refreshed only when the ring looks empty.
     tail_cache: usize,
+    /// `Acquire` loads of `tail` so far — the loom suite proves the
+    /// stale-cache branch of `consume_batch` runs under the model (F-L12-05).
+    #[cfg(loom)]
+    tail_refreshes: usize,
 }
 
 /// Creates a bounded SPSC ring of `capacity` slots.
@@ -153,7 +158,13 @@ pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         slots,
     });
     let producer = Producer { shared: sync::Arc::clone(&shared), tail: 0, head_cache: 0 };
-    let consumer = Consumer { shared, head: 0, tail_cache: 0 };
+    let consumer = Consumer {
+        shared,
+        head: 0,
+        tail_cache: 0,
+        #[cfg(loom)]
+        tail_refreshes: 0,
+    };
     (producer, consumer)
 }
 
@@ -278,7 +289,15 @@ impl<T> Consumer<T> {
             // per call, amortized over the whole batch.
             self.tail_cache = self.shared.tail.load(Ordering::Acquire);
             available = self.tail_cache.wrapping_sub(self.head);
+            #[cfg(loom)]
+            {
+                self.tail_refreshes += 1;
+            }
         }
+        // Otherwise the slots `head..tail_cache` are read on the strength
+        // of an *earlier* Acquire: the cache is a lower bound on the
+        // published tail, every slot below it was ordered by that load,
+        // and `head` only advances inside that range (SAFETY.md).
         if available == 0 {
             return 0;
         }
@@ -393,6 +412,46 @@ mod loom_tests {
             }
             join.join().unwrap();
             assert_eq!(got, [1, 2]);
+        });
+    }
+
+    /// F-L12-05 (review of 2026-08-30): the `consume_batch` branch that
+    /// reads slots without a fresh `Acquire` — the cached tail already
+    /// covers the request — was reached by no loom test, though FABRIC-IN
+    /// takes it on every loaded drain. Cap 4: one batch of four consumed
+    /// two at a time (the second pair rides the first call's load) while
+    /// the producer recycles the freed slot with a fifth value — the write
+    /// a stale-range read would race with.
+    #[test]
+    fn loom_stale_tail_cache_serves_without_a_refresh() {
+        loom::model(|| {
+            let (mut producer, mut consumer) = ring::<u32>(4);
+            let join = loom::thread::spawn(move || {
+                assert_eq!(producer.publish_batch([1u32, 2, 3, 4].into_iter()), 4);
+                let mut value = 5u32;
+                loop {
+                    match producer.try_push(value) {
+                        Ok(()) => break,
+                        Err(back) => {
+                            value = back;
+                            loom::thread::yield_now();
+                        }
+                    }
+                }
+            });
+            let mut got = Vec::new();
+            let mut calls = 0usize;
+            while got.len() < 5 {
+                calls += 1;
+                if consumer.consume_batch(2, |v| got.push(v)) == 0 {
+                    loom::thread::yield_now();
+                }
+            }
+            join.join().unwrap();
+            assert_eq!(got, [1, 2, 3, 4, 5]);
+            // Exactly one call read on a stale cache: the pair after the
+            // batch became visible. Every other call refreshed.
+            assert_eq!(calls - consumer.tail_refreshes, 1, "calls {calls}");
         });
     }
 

@@ -79,7 +79,8 @@ fn finish_padded(mut json: String, target: usize, rng: &mut Rng) -> String {
 fn small(seed: u64) -> String {
     let mut rng = Rng::new(seed, 0x534D_414C_4C20_0200);
     let json = format!(
-        "{{\"id\":{},\"name\":\"{}\",\"active\":true,\"score\":{},\"tags\":[\"{}\",\"{}\"],\"pad\":\"",
+        "{{\"id\":{},\"name\":\"{}\",\"active\":true,\"score\":{},\"tags\":[\"{}\",\"{}\"],\"pad\"\
+             :\"",
         rng.below(1_000_000),
         rng.word(),
         rng.below(10_000),

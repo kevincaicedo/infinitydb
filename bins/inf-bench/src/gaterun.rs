@@ -9,16 +9,22 @@
 //! reference-box runs can bind the milestone verdict.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::cli::Flags;
 use crate::envcheck;
 use crate::gates;
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, parse_info, request};
+
+mod loop_scrape;
+pub(crate) mod proc;
+mod saturation;
+pub(crate) mod serving;
+
+pub(crate) use proc::{CLOCK_TICKS_PER_S, PeakRssSampler, ProcReadError, ProcSample, read_proc};
 
 pub(crate) struct ServerGuard {
     child: Child,
@@ -44,34 +50,83 @@ impl Drop for ServerGuard {
 }
 
 impl ServerGuard {
-    pub(crate) fn rss_bytes(&self) -> u64 {
-        std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmRSS:"))
-                    .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-            })
-            .map_or(0, |kb| kb * 1024)
-    }
-
     /// Server pid for out-of-band samplers (M2-S12 RSS tracking).
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
+
+    /// One `/proc` read of the server. The guard holds the child unreaped
+    /// until it drops, so its pid cannot name another process: a server
+    /// that exited reads `ProcReadError::Exited`, never a zero.
+    pub(crate) fn proc_sample(&self) -> Result<ProcSample, ProcReadError> {
+        read_proc(self.child.id(), None)
+    }
+
+    /// `SIGTERM`, then exit 0 within `deadline`: the stop drained and
+    /// wrote its stop checkpoint (ADR-0124 D2/D3), so the data directory is
+    /// warm. Any other end is a [`StopError`], and the guard's drop kills
+    /// and reaps the child. `deadline` is [`GRACEFUL_STOP_DEADLINE_S`]
+    /// outside tests.
+    pub(crate) fn stop_graceful(mut self, deadline: Duration) -> Result<CleanStop, StopError> {
+        let pid = self.child.id().to_string();
+        let signal = Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .map_err(|e| StopError::Signal(format!("kill -TERM {pid}: {e}")))?;
+        if !signal.success() {
+            return Err(StopError::Signal(format!("kill -TERM {pid}: {signal}")));
+        }
+        let give_up = Instant::now() + deadline;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(CleanStop(())),
+                Ok(Some(status)) => return Err(StopError::Exit(status)),
+                Ok(None) => {}
+                Err(e) => return Err(StopError::Signal(format!("wait {pid}: {e}"))),
+            }
+            if Instant::now() >= give_up {
+                return Err(StopError::Deadline(deadline));
+            }
+            std::thread::sleep(Duration::from_millis(GRACEFUL_STOP_POLL_MS));
+        }
+    }
 }
 
-/// Peak-VmRSS of `pid` (same parse as [`ServerGuard::rss_bytes`], usable
-/// from a sampler thread that must not borrow the guard).
-pub(crate) fn rss_bytes_of(pid: u32) -> u64 {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse::<u64>().ok()))
-        })
-        .map_or(0, |kb| kb * 1024)
+/// The longest wait for a graceful stop, in seconds: infinityd's
+/// `--shutdown-timeout-ms` default (10 s of drain) plus 5 s for the stop
+/// checkpoint and the exit. Crossing: `StopError::Deadline`; the guard's
+/// drop kills the child and the caller discards the directory.
+pub(crate) const GRACEFUL_STOP_DEADLINE_S: u64 = 15;
+
+/// The poll period while waiting for the stopped child. Fixed.
+const GRACEFUL_STOP_POLL_MS: u64 = 10;
+
+/// Proof that a server exited 0 after `SIGTERM`. Only
+/// [`ServerGuard::stop_graceful`] builds it.
+#[derive(Debug)]
+pub(crate) struct CleanStop(());
+
+/// Why a graceful stop did not end in exit 0.
+#[derive(Debug)]
+pub(crate) enum StopError {
+    /// The signal could not be sent, or the child could not be waited.
+    Signal(String),
+    /// The server exited, but not 0 (a drain timeout exits 1).
+    Exit(std::process::ExitStatus),
+    /// The server outlived the stop deadline.
+    Deadline(Duration),
+}
+
+impl std::fmt::Display for StopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopError::Signal(why) => write!(f, "stop signal failed: {why}"),
+            StopError::Exit(status) => write!(f, "stopped with {status}, not exit 0"),
+            StopError::Deadline(deadline) => {
+                write!(f, "still running {} ms after SIGTERM", deadline.as_millis())
+            }
+        }
+    }
 }
 
 fn free_port() -> u16 {
@@ -95,36 +150,27 @@ fn wait_ready(port: u16) -> Result<(), String> {
     }
 }
 
+/// Spawns infinityd and waits for its port to accept (the orchestration
+/// readiness most rows use; the empty-node rows time the first `+PONG`
+/// instead, through [`launch_infinityd`] and [`serving::wait_pong`]).
 pub(crate) fn spawn_infinityd(
     bin: &str,
     cells: u16,
     extra: &[&str],
 ) -> Result<ServerGuard, String> {
-    let port = free_port();
-    let mut cmd = Command::new(bin);
-    cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()])
-        .args(extra)
-        .stdout(Stdio::null());
-    // S22 watch item ("server closed connection under load", stderr was
-    // nulled in every sighting): INF_GATERUN_STDERR_DIR=<dir> captures
-    // each spawned server's stderr as <dir>/infinityd-<port>.stderr.
-    match std::env::var("INF_GATERUN_STDERR_DIR") {
-        Ok(dir) => {
-            let path = format!("{dir}/infinityd-{port}.stderr");
-            let file = std::fs::File::create(&path).map_err(|e| format!("{path}: {e}"))?;
-            cmd.stderr(Stdio::from(file));
-        }
-        Err(_) => {
-            cmd.stderr(Stdio::null());
-        }
-    }
-    let child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
-    let mut guard = ServerGuard { child, port };
+    // A boot that probes (ADR-0091 D1: `--device-probe auto` on a fresh
+    // directory, ≈ 10 s on the reference device, bounded by
+    // `--probe-seconds` × nine rows) needs a longer ready deadline than
+    // the instant start every explicit arm gets.
+    let probes = extra.windows(2).any(|w| w[0] == "--device-probe" && w[1] == "auto");
+    let ready_within = Duration::from_secs(if probes { 180 } else { 10 });
+    let (mut guard, started) = launch_infinityd(bin, cells, extra)?;
+    let port = guard.port;
     // Poll the child alongside the port: a fail-stopped server (M2.5-S01 —
     // e.g. io_uring_setup ENOMEM prints `cell N failed: …` and exits) is
     // detected in milliseconds and named, instead of burning the full TCP
     // deadline on a corpse and reporting an unclassified "never came up".
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = started + ready_within;
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return Ok(guard);
@@ -140,6 +186,42 @@ pub(crate) fn spawn_infinityd(
         }
         std::thread::yield_now();
     }
+}
+
+/// Spawns infinityd without waiting for it: the guard and the spawn
+/// instant, from which a caller times its own readiness.
+pub(crate) fn launch_infinityd(
+    bin: &str,
+    cells: u16,
+    extra: &[&str],
+) -> Result<(ServerGuard, Instant), String> {
+    let port = free_port();
+    let mut cmd = Command::new(bin);
+    cmd.args(["--port", &port.to_string(), "--cells", &cells.to_string()]);
+    // M4.5-S42 (ADR-0091 D4): a harness spawn never probes silently — arms
+    // are explicit (`copy_probe_file`, `--barrier-class`, `--model-absent`);
+    // a campaign measuring the shipped first boot forwards `--device-probe
+    // auto` itself.
+    if !extra.contains(&"--device-probe") {
+        cmd.args(["--device-probe", "off"]);
+    }
+    cmd.args(extra).stdout(Stdio::null());
+    // S22 watch item ("server closed connection under load", stderr was
+    // nulled in every sighting): INF_GATERUN_STDERR_DIR=<dir> captures
+    // each spawned server's stderr as <dir>/infinityd-<port>.stderr.
+    match std::env::var("INF_GATERUN_STDERR_DIR") {
+        Ok(dir) => {
+            let path = format!("{dir}/infinityd-{port}.stderr");
+            let file = std::fs::File::create(&path).map_err(|e| format!("{path}: {e}"))?;
+            cmd.stderr(Stdio::from(file));
+        }
+        Err(_) => {
+            cmd.stderr(Stdio::null());
+        }
+    }
+    let started = Instant::now();
+    let child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
+    Ok((ServerGuard { child, port }, started))
 }
 
 /// Comparator spawn (ADR-0006 shape): thread count matched to our cell
@@ -219,14 +301,105 @@ pub fn max_field(infos: &[BTreeMap<String, String>], field: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Raw counters summed across cells: (submits, sqes, cqes).
-fn raw_counters(infos: &[BTreeMap<String, String>]) -> (u64, u64, u64) {
-    (sum_field(infos, "raw_submits"), sum_field(infos, "raw_sqes"), sum_field(infos, "raw_cqes"))
+/// The filesystem type a path resolves to, from `/proc/self/mounts`
+/// (longest mount-point prefix of the canonicalized path). `None` off
+/// Linux or when the table cannot be read — callers treat unknown as
+/// "not a memory filesystem" and say so.
+///
+/// The reason this is a table lookup and not a `/tmp` prefix test: the
+/// S35 reference-box arms (2026-08-21) wrote every FUA frame to tmpfs
+/// because the `m2` flow read only `--pressure-data-root` (default =
+/// the system temp dir) and the prefix heuristic was a *note*, not a
+/// refusal — three "binding" reports at 1.7 M ops/s with 113 µs
+/// "barriers" (tmpfs swallows `O_DIRECT` and `RWF_DSYNC`; the arm
+/// measured a memcpy).
+pub(crate) fn fs_type_of(path: &std::path::Path) -> Option<String> {
+    let probe = {
+        // The directory may not exist yet (rows create it); walk up to
+        // the nearest existing ancestor before canonicalizing.
+        let mut p = path.to_path_buf();
+        while !p.exists() {
+            p = p.parent()?.to_path_buf();
+        }
+        std::fs::canonicalize(p).ok()?
+    };
+    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in table.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(_src), Some(target), Some(fstype)) = (cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        // /proc/self/mounts escapes spaces as `\040`; mount points with
+        // spaces are not a shape this harness runs on, so unescape the
+        // common case only.
+        let target = target.replace("\\040", " ");
+        let target_path = std::path::Path::new(&target);
+        if probe.starts_with(target_path)
+            && best.as_ref().is_none_or(|(len, _)| target.len() > *len)
+        {
+            best = Some((target.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// A memory-backed filesystem: a durable row on it measures the page
+/// cache (fsync ~77 µs) and a FUA-class row measures a memcpy.
+pub(crate) fn is_memory_fs(fstype: &str) -> bool {
+    matches!(fstype, "tmpfs" | "ramfs" | "devtmpfs" | "hugetlbfs")
+}
+
+/// The device-row admission rule, checked **before any row runs** (the
+/// M2-S24 lesson: a carrier validated after the rows is a report that
+/// cannot be un-written). Returns the fstype for the report header.
+///
+/// - binding (`--reference-box`) ⇒ refuse on a memory filesystem: a
+///   binding durable row must hit the device or it binds nothing;
+/// - `--barrier-class fua` ⇒ refuse on a memory filesystem in any tier:
+///   tmpfs accepts `O_DIRECT|RWF_DSYNC` and does nothing with them, so
+///   the arm's "barrier" is a memcpy and the A/B compares two memcpys;
+/// - otherwise a memory filesystem is disclosed as a note by the caller.
+pub(crate) fn admit_device_root(
+    flags: &Flags,
+    root: &std::path::Path,
+    reference_box: bool,
+) -> Result<String, String> {
+    let fstype = fs_type_of(root).unwrap_or_else(|| "unknown".to_string());
+    if is_memory_fs(&fstype) {
+        if reference_box {
+            return Err(format!(
+                "data root {} is {fstype}: a binding (--reference-box) durable row on a memory \
+                 filesystem measures the page cache, not the device — point --data-root at \
+                 the filesystem under test",
+                root.display()
+            ));
+        }
+        if flags.get("barrier-class").is_some_and(|c| c.eq_ignore_ascii_case("fua")) {
+            return Err(format!(
+                "data root {} is {fstype}: --barrier-class fua on a memory filesystem is a \
+                 memcpy (O_DIRECT|RWF_DSYNC are accepted and ignored) — the arm would measure \
+                 nothing; point --data-root at the filesystem under test",
+                root.display()
+            ));
+        }
+    }
+    Ok(fstype)
 }
 
 pub(crate) fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     values[values.len() / 2]
+}
+
+/// Where a gate source's value lives.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SourceValue {
+    /// A proof table owns the source: its published value, or unset.
+    Proven(Option<f64>),
+    /// No table owns it: [`Measurements::set`] holds it.
+    Plain,
 }
 
 /// One workload row's write-amplification obligation (M4-S16). Opened by
@@ -239,20 +412,29 @@ struct RowWriteAmp {
 
 pub(crate) struct Measurements {
     pub(crate) values: BTreeMap<&'static str, f64>,
+    /// The empty-node rows' values. Its one writer consumes a row's proof,
+    /// and [`measured`](Self::measured) reads those rows' sources only
+    /// from here.
+    pub(crate) empty_node: crate::m1rows::EmptyNodeValues,
     pub(crate) notes: Vec<String>,
     pub(crate) raw: String,
     rows: Vec<RowWriteAmp>,
     sidecars: Vec<(String, String)>,
+    failures: Vec<String>,
+    generator_probes: Vec<saturation::GeneratorProbe>,
 }
 
 impl Measurements {
     pub(crate) fn new() -> Measurements {
         Measurements {
             values: BTreeMap::new(),
+            empty_node: crate::m1rows::EmptyNodeValues::default(),
             notes: Vec::new(),
             raw: String::new(),
             rows: Vec::new(),
             sidecars: Vec::new(),
+            failures: Vec::new(),
+            generator_probes: Vec::new(),
         }
     }
 
@@ -288,8 +470,22 @@ impl Measurements {
         self.values.insert(key, value);
     }
 
+    /// A gate source's measured value. A source a proof table owns reads
+    /// only from that table, so a plain [`set`](Self::set) of its key, from
+    /// any module, is never a measurement.
+    pub(crate) fn measured(&self, source: &str) -> Option<f64> {
+        match self.empty_node.lookup(source) {
+            SourceValue::Proven(value) => value,
+            SourceValue::Plain => self.values.get(source).copied(),
+        }
+    }
+
     pub(crate) fn note(&mut self, text: impl Into<String>) {
         self.notes.push(text.into());
+    }
+
+    pub(crate) fn fail(&mut self, reason: impl Into<String>) {
+        self.failures.push(reason.into());
     }
 
     pub(crate) fn raw_section(&mut self, title: &str, body: &str) {
@@ -334,106 +530,8 @@ pub(crate) fn env_gate(flags: &Flags) -> Result<bool, String> {
     Ok(env_ok)
 }
 
-/// Per-gate verdicts + the report file (shared epilogue). Errs when any
-/// binding gate failed, or when a declared workload row never reported its
-/// write amplification (M4-S16: a row missing WA is an invalid row — the
-/// generator refuses it rather than publishing a report whose silence
-/// reads like a good number).
-pub(crate) fn finish_report(
-    milestone: &str,
-    gates_list: &[gates::Gate],
-    m: &Measurements,
-    env_ok: bool,
-    reference_box: bool,
-    artifacts_root: &str,
-    header_facts: &str,
-) -> Result<(), String> {
-    // The row obligation is checked *before* anything is written: an
-    // invalid run must not leave a report file behind to be cited later.
-    let unreported: Vec<&str> =
-        m.rows.iter().filter(|r| r.disposition.is_none()).map(|r| r.name.as_str()).collect();
-    if !unreported.is_empty() {
-        return Err(format!(
-            "row(s) [{}] finished without a write-amplification disposition — an M4 report row \
-             without WA is an invalid row (M4-S16); measure it or name why there is none",
-            unreported.join(", ")
-        ));
-    }
-
-    let stamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_secs();
-    let dir = format!("{artifacts_root}/{stamp}-gate-run");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
-
-    let mut report = String::new();
-    report.push_str(&format!(
-        "# {} gate-run report\n\ndate: {stamp} (unix) · {header_facts}\nenv-check: {}\ntier: {}\n\nnotes:\n",
-        milestone.to_uppercase(),
-        if env_ok { "OK" } else { "FAILED (overridden — NOT citation-grade)" },
-        if reference_box { "reference-box (binding)" } else { "dev (non-binding)" },
-    ));
-    for note in &m.notes {
-        report.push_str(&format!("- {note}\n"));
-    }
-    report.push_str("\n| gate | threshold | measured | verdict |\n|---|---|---|---|\n");
-    println!("\n== gate verdicts ==");
-    let mut binding_failures = 0;
-    for gate in gates_list {
-        let measured = m.values.get(gate.source.as_str()).copied();
-        let (measured_text, verdict) = match measured {
-            None => ("—".to_string(), "PENDING (tooling)".to_string()),
-            Some(value) => {
-                let pass = gate.passes(value);
-                let tag = if pass { "PASS" } else { "FAIL" };
-                let verdict = if gate.informational {
-                    format!("{tag} (informational)")
-                } else if gate.tier == "linux-reference-box" && !reference_box {
-                    format!("{tag} (DEV-TIER, non-binding)")
-                } else {
-                    if !pass {
-                        binding_failures += 1;
-                    }
-                    tag.to_string()
-                };
-                (format!("{value:.2}"), verdict)
-            }
-        };
-        println!("  {:<38} {}", gate.name, verdict);
-        report.push_str(&format!(
-            "| {} | {} {} {} | {} | {} |\n",
-            gate.name, gate.comparator, gate.threshold, gate.unit, measured_text, verdict
-        ));
-    }
-    if !m.rows.is_empty() {
-        report.push_str(
-            "\n## write amplification by row\n\n\
-             Per namespace, worst first — never a node-wide blend (M4-S16).\n\n\
-             | row | write amplification |\n|---|---|\n",
-        );
-        for row in &m.rows {
-            let disposition = row.disposition.as_deref().unwrap_or("MISSING");
-            report.push_str(&format!("| {} | {} |\n", row.name, disposition));
-        }
-    }
-    report.push_str(&m.raw);
-
-    let report_path = format!("{dir}/report.md");
-    let mut file =
-        std::fs::File::create(&report_path).map_err(|e| format!("{report_path}: {e}"))?;
-    file.write_all(report.as_bytes()).map_err(|e| format!("{report_path}: {e}"))?;
-    println!("\ngate-run: report written to {report_path}");
-    for (name, body) in &m.sidecars {
-        let path = format!("{dir}/{name}");
-        std::fs::write(&path, body).map_err(|e| format!("{path}: {e}"))?;
-        println!("gate-run: sidecar written to {path}");
-    }
-    if binding_failures > 0 {
-        return Err(format!("{binding_failures} binding gate(s) FAILED"));
-    }
-    Ok(())
-}
+mod report;
+pub(crate) use report::finish_report;
 
 pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
     &[
@@ -454,6 +552,41 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         "no-deasync-dispatch",
         "skip-comparator",
         "only-always",
+        // M4.5 S27 row (the A/B arms skip the S29 legs).
+        "only-s27",
+        // M4.5 S31 A/B (the mirror: the S29 row without the S27 legs).
+        "only-s29",
+        // M4.5 S35 frame-pipeline arms (the row alone, one report per arm).
+        "only-s35",
+        // M4.5 S36 device-budget row (the row alone, one report per arm),
+        // and its unbudgeted baseline arm (no probe file copied in).
+        "only-s36",
+        "only-s39b",
+        "only-s39d",
+        // M4.5-S34 (2026-08-27): the S39d row's cold boot — every file of
+        // the crashed image evicted from the page cache (`inf cache-evict`)
+        // before the one recovery boot, both arms.
+        "s39d-cold-boot",
+        "only-s40",
+        "only-s37",
+        // M4.5-S37 step 2 (ADR-0093 D9): the shadow-slot arm — the
+        // shipping binary, `tiered-shadow-overwrite yes` on arm B.
+        "s37-shadow",
+        // M4.5-S37 (ADR-0093 A13, batch 30): the ticketed-DEL RSS/tail row.
+        "s37-ticketed-del",
+        "s37-dbsize",
+        "s37-controls",
+        // M4.5-S42 (ADR-0091 D6): the stock first-boot row.
+        "only-s42",
+        // M4.5-S34 (2026-08-25): the m2 everysec penalty row alone (the
+        // barrier-class A/B leg).
+        "only-everysec",
+        // M4.5-S34 (2026-08-26): the S35 read leg on a filled, quiesced
+        // namespace (both arms read the same keys, no misses).
+        "read-leg-fill",
+        "model-absent",
+        // The empty-node rows alone (gate-run m1).
+        "only-empty-node",
     ],
     &[
         "allow-dirty",
@@ -502,12 +635,101 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
         // dir, which is often tmpfs — point it at a real filesystem for
         // rows that must exercise the device (disclosed in the report).
         "pressure-data-root",
+        // M4.5 S29 row: server data-dir root. Must not be tmpfs — the
+        // row's fsyncs must hit a real device (same rule as above).
+        "data-root",
         // M2-S22 campaign: durable attribution fill size, external gate
         // artifacts (values measured by campaign tooling; provenance is
         // mandatory via --campaign-note), and the provenance note itself.
         "attribution-keys",
+        // Retired by ADR-0087 D5 (accepted for one campaign, logged as a
+        // no-op, never forwarded — the S27 recipe must not break mid-run).
         "sync-pipeline",
+        // M4.5-S35 (ADR-0087 D5/D8) A/B arms, forwarded to every durable
+        // spawn and disclosed in the report notes: the frame pipeline
+        // depth, the barrier class, and the per-buffer staging size the
+        // L5-neutral pairing needs (`--frames-in-flight 3
+        // --log-staging-mib 2`).
+        "frames-in-flight",
+        // M4.5-S39b (ADR-0090 D6): the recycling row's knobs — segment
+        // size, the checkpoint floor that follows it, the pool bound,
+        // and the block device whose sectors-written the row samples.
+        "segment-bytes",
+        "ckpt-interval-bytes",
+        "segment-recycle-slots",
+        // ADR-0090 D9 (A9): the arm's pool wait (`off|quarter|eighth`,
+        // forwarded to the arm spawn only) and the row's baseline
+        // (`recycle-off` = D6's `--no-segment-recycle`, `wait-off` = the
+        // same pool bound with the wait off — the causal D9 A/B).
+        "recycle-wait",
+        "s39b-baseline",
+        "device-stat",
+        "barrier-class",
+        "staging-mib",
         "only-always",
+        "only-s27",
+        "only-s29",
+        "only-s35",
+        "only-s36",
+        "only-s39b",
+        // M4.5-S39d (ADR-0090 A10): the fixed-work recovery row and its
+        // two record counts (warm = before the boundary checkpoint,
+        // tail = after it).
+        "only-s39d",
+        "s39d-warm-records",
+        "s39d-tail-records",
+        // M4.5-S34 (2026-08-27): the `inf` binary the cold-boot step
+        // spawns (default: `inf` beside `--infinityd-bin`), and the step.
+        "inf-bin",
+        "s39d-cold-boot",
+        // M4.5-S40: the stall-attribution row's key space (the memtier
+        // shape's `--keyspace`).
+        "only-s40",
+        "s40-keys",
+        // M4.5-S37 step 1: the ceiling row's key space (beyond-RAM by
+        // construction against the row's 128 MB budget).
+        "only-s37",
+        "s37-keys",
+        // M4.5-S37 step 2 discriminator: `COLD-READ-QD` arms, baseline first.
+        "s37-cold-read-qd",
+        "s37-shadow",
+        "s37-ticketed-del",
+        "s37-del-keys",
+        "s37-del-cycles",
+        "s37-dbsize",
+        "s37-controls",
+        // M4.5-S42 / M4.5-S34.
+        "only-s42",
+        "only-everysec",
+        // M4.5-S39d baseline: `recycling-off` (ADR-0090 A10) or
+        // `flush-class` (the S34 C38b replay clause).
+        "s39d-baseline",
+        "read-leg-fill",
+        "model-absent",
+        "only-empty-node",
+        // M4.5-S35 row: seconds idled before every durable leg (the S34
+        // drive-state rule; default 40, 0 for harness smoke).
+        "leg-idle-s",
+        // M4.5-S36 row (ADR-0088 D7): the offered rate of the S27 D5
+        // `max` leg (comparator-matched, disclosed), the tmpfs control
+        // root (the 0.85× denominator — the one memory-fs root the
+        // admission rule exempts, labelled as a control), and the
+        // server's device-model override forwarded to every spawn.
+        "offered-ops",
+        "tmpfs-control-root",
+        "device-write-mbps",
+        "seal-pace",
+        // M4.5-S39a: the frame-fill arms, forwarded to every durable spawn
+        // through `pipeline_args` (window in µs — 0 = the baseline arm —
+        // and target in KiB).
+        "fill-window-us",
+        "fill-target-kib",
+        // M4.5-S43 (ADR-0092 D4): the FLUSH-class group-hold arm (window
+        // in µs — 0 = the baseline arm), forwarded through `pipeline_args`.
+        "flush-group-window-us",
+        // M4.5-S42 (ADR-0091 D4): every spawn names its tier — `off`
+        // unless a campaign measures the shipped first boot (`auto`).
+        "device-probe",
         "recovery-gbps-per-cell",
         "recovery-boot-s",
         // ADR-0070 D7 (2026-08-16): Phase::Start overhead, split out of the
@@ -537,22 +759,26 @@ pub(crate) const GATE_RUN_FLAGS: (&[&str], &[&str]) = (
     ],
 );
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+#[allow(clippy::too_many_lines, reason = "shape: orchestration script: linear, not branchy")]
 pub fn cmd_gate_run(args: &[String]) -> Result<(), String> {
     let Some((milestone, rest)) = args.split_first() else {
         return Err("usage: gate-run m0|m1 [flags]".into());
     };
     let flags = Flags::parse(rest, GATE_RUN_FLAGS.0, GATE_RUN_FLAGS.1)?;
+    if flags.usize_or("replicates", 3)? == 0 {
+        return Err("--replicates must be >= 1".into());
+    }
     match milestone.as_str() {
         "m0" => cmd_gate_run_m0(&flags),
         "m1" => crate::m1rows::cmd_gate_run_m1(&flags),
         "m2" => crate::m2rows::cmd_gate_run_m2(&flags),
         "m4" => crate::m4rows::cmd_gate_run_m4(&flags),
-        other => Err(format!("unknown milestone {other} (have: m0, m1, m2, m4)")),
+        "m4.5" => crate::m45rows::cmd_gate_run_m45(&flags),
+        other => Err(format!("unknown milestone {other} (have: m0, m1, m2, m4, m4.5)")),
     }
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear, not branchy
+#[allow(clippy::too_many_lines, reason = "shape: orchestration script: linear, not branchy")]
 fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m0")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m0");
@@ -614,19 +840,38 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         server_extra.push("--no-deasync-dispatch");
     }
     let natural = spawn_infinityd(&infinityd, cells, &server_extra)?;
+    let mut loop_scraper = loop_scrape::LoopScraper::connect(natural.port, cells)?;
     let mut pipelined_ops: Vec<f64> = Vec::new();
     let mut pipelined_p999: Vec<f64> = Vec::new();
     let mut windowed_sqes_per_submit: Vec<f64> = Vec::new();
+    let mut loop_p999_us = 0;
+    let mut generator_baseline = None;
     for rep in 0..replicates {
-        let before = raw_counters(&scrape_cells(natural.port, cells)?);
+        let before = loop_scraper.fresh()?;
         let spec = LoadSpec {
             port: natural.port,
             duration: Duration::from_secs(duration),
             ..Default::default()
         };
         let report = run_load(&spec)?;
-        let after = raw_counters(&scrape_cells(natural.port, cells)?);
-        let sqes = (after.1 - before.1) as f64 / (after.0 - before.0).max(1) as f64;
+        let after = loop_scraper.fresh()?;
+        let window = crate::loop_histogram::LoadWindow::between(&before, &after)?;
+        let sqes = window.sqes_per_submit;
+        loop_p999_us = loop_p999_us.max(window.p999_us);
+        for (label, snapshots) in [("before", &before), ("after", &after)] {
+            for snapshot in snapshots {
+                m.raw_section(
+                    &format!("loop histogram rep {rep} cell {} {label}", snapshot.cell),
+                    &snapshot.render(),
+                );
+            }
+        }
+        for cell in &window.cells {
+            m.note(format!(
+                "loop window rep {rep} cell {}: {} samples, p999 {} us (bucket upper bound)",
+                cell.cell, cell.samples, cell.p999_us
+            ));
+        }
         println!(
             "  rep {rep}: {:.0} ops/s, p999 {} us, windowed sqes/submit {sqes:.1}",
             report.ops_per_sec, report.p999_us
@@ -635,17 +880,25 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         pipelined_ops.push(report.ops_per_sec);
         pipelined_p999.push(report.p999_us as f64);
         windowed_sqes_per_submit.push(sqes);
+        generator_baseline = Some((spec, report));
     }
     m.set("loadgen:ops_per_sec", median(&mut pipelined_ops));
     m.set("loadgen:p999_us", median(&mut pipelined_p999));
     m.set("tripwire:sqes_per_submit", median(&mut windowed_sqes_per_submit));
+    m.set("tripwire:loop_iter_p999_us", loop_p999_us as f64);
+    m.note(
+        "loop histogram windows bracket pipelined load including warmup/drain and scrape RTTs; \
+            worst cell/window across replicates, lifetime history and generator probes excluded",
+    );
     let infos = scrape_cells(natural.port, cells)?;
-    m.set("tripwire:loop_iter_p999_us", max_field(&infos, "loop_iter_p999_us") as f64);
     m.set(
         "external:fabric_token_histogram",
         max_field(&infos, "fabric_rtt_p50_ns") as f64 / 1000.0,
     );
     m.note("fabric RTT measured at loop granularity (shared.now updates once per step)");
+    if let Some((spec, report)) = generator_baseline {
+        m.probe_generator("m0 pipelined", &spec, &report);
+    }
 
     // 3. Cross-cell penalty: same workload, --route-local-only A/B.
     println!("\n== cross-cell penalty (natural vs --route-local-only) ==");
@@ -654,14 +907,19 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     let local_only = spawn_infinityd(&infinityd, cells, &local_extra)?;
     let mut natural_ops: Vec<f64> = Vec::new();
     let mut local_ops: Vec<f64> = Vec::new();
-    for _ in 0..replicates {
+    for rep in 0..replicates {
         for (target, bucket) in [(&natural, &mut natural_ops), (&local_only, &mut local_ops)] {
             let spec = LoadSpec {
                 port: target.port,
                 duration: Duration::from_secs(duration.min(5)),
                 ..Default::default()
             };
-            bucket.push(run_load(&spec)?.ops_per_sec);
+            let report = run_load(&spec)?;
+            bucket.push(report.ops_per_sec);
+            if rep + 1 == replicates {
+                let label = if target.port == natural.port { "natural" } else { "all-local" };
+                m.probe_generator(&format!("m0 routing {label}"), &spec, &report);
+            }
         }
     }
     let nat = median(&mut natural_ops);
@@ -675,12 +933,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     // without Dragonfly in the same run does not exist). Interleaved ABBA
     // against `dragonfly --proactor_threads=<cells>`, same workload.
     if flags.bool("skip-comparator") {
-        m.note("comparator leg skipped (--skip-comparator): comparator_ab PENDING");
+        m.note("comparator leg skipped (--skip-comparator): comparator_ab UNMEASURED");
     } else {
         println!("\n== comparator anchor (dragonfly --proactor_threads={cells}) ==");
         let dragonfly_bin = flags.str_or("dragonfly-bin", "dragonfly");
         match spawn_dragonfly(&dragonfly_bin, cells) {
-            Err(e) => m.note(format!("comparator leg skipped: {e} — comparator_ab PENDING")),
+            Err(e) => m.fail(format!("Dragonfly comparator startup failed: {e}")),
             Ok(dragonfly) => {
                 let mut ours: Vec<f64> = Vec::new();
                 let mut theirs: Vec<f64> = Vec::new();
@@ -697,7 +955,13 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                             duration: Duration::from_secs(duration.min(5)),
                             ..Default::default()
                         };
-                        bucket.push(run_load(&spec)?.ops_per_sec);
+                        let report = run_load(&spec)?;
+                        bucket.push(report.ops_per_sec);
+                        if rep + 1 == replicates {
+                            let label =
+                                if port == natural.port { "infinityd" } else { "Dragonfly" };
+                            m.probe_generator(&format!("m0 comparator {label}"), &spec, &report);
+                        }
                     }
                 }
                 let a = median(&mut ours);
@@ -719,11 +983,11 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
     // 4. Unpipelined 512-conn A/B vs Redis (interleaved replicates).
     println!("\n== unpipelined 512-conn A/B vs redis ==");
     match spawn_redis(&redis_bin) {
-        Err(e) => m.note(format!("A/B skipped: {e} — unpipelined ratio PENDING")),
+        Err(e) => m.fail(format!("Redis A/B startup failed: {e}")),
         Ok(redis) => {
             let mut ours: Vec<f64> = Vec::new();
             let mut theirs: Vec<f64> = Vec::new();
-            for _ in 0..replicates {
+            for rep in 0..replicates {
                 for (port, bucket) in [(natural.port, &mut ours), (redis.port, &mut theirs)] {
                     let spec = LoadSpec {
                         port,
@@ -732,7 +996,12 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
                         duration: Duration::from_secs(duration.min(5)),
                         ..Default::default()
                     };
-                    bucket.push(run_load(&spec)?.ops_per_sec);
+                    let report = run_load(&spec)?;
+                    bucket.push(report.ops_per_sec);
+                    if rep + 1 == replicates {
+                        let label = if port == natural.port { "infinityd" } else { "Redis" };
+                        m.probe_generator(&format!("m0 unpipelined {label}"), &spec, &report);
+                    }
                 }
             }
             let a = median(&mut ours);
@@ -759,7 +1028,10 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         };
         let fill_report = run_load(&fill)?;
         println!("  infinityd fill: {:.0} sets/s", fill_report.ops_per_sec);
-        let our_rss = ours.rss_bytes();
+        let our_rss = ours
+            .proc_sample()
+            .map_err(|e| format!("infinityd RSS after the fill: {e}"))?
+            .rss_bytes();
         let infos = scrape_cells(ours.port, cells)?;
         let domains = sum_field(&infos, "records_resident_bytes")
             + sum_field(&infos, "index_bytes")
@@ -780,20 +1052,28 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
         drop(ours);
 
         match spawn_redis(&redis_bin) {
-            Err(e) => m.note(format!("redis RSS leg skipped: {e}")),
+            Err(e) => m.fail(format!("Redis RSS startup failed: {e}")),
             Ok(redis) => {
                 let fill = LoadSpec { port: redis.port, ..fill.clone() };
                 let report = run_load(&fill)?;
                 println!("  redis fill: {:.0} sets/s", report.ops_per_sec);
-                let redis_rss = redis.rss_bytes();
-                let ratio = our_rss as f64 / redis_rss as f64;
-                println!("  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x");
-                m.set("external:rss_attribution", ratio);
+                match redis.proc_sample() {
+                    Err(e) => m.fail(format!("Redis RSS after the fill: {e}")),
+                    Ok(sample) => {
+                        let redis_rss = sample.rss_bytes();
+                        let ratio = our_rss as f64 / redis_rss as f64;
+                        println!(
+                            "  RSS: infinityd {our_rss} B vs redis {redis_rss} B => {ratio:.3}x"
+                        );
+                        m.set("external:rss_attribution", ratio);
+                    }
+                }
             }
         }
     }
 
     // 6. Per-gate verdicts + report.
+    m.note("generator scope: RSS fills measure memory; fill speed is not capacity evidence");
     finish_report(
         "m0",
         &gates_list,
@@ -808,6 +1088,113 @@ fn cmd_gate_run_m0(flags: &Flags) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmeasured_stop_gates_refuse_in_both_tiers() {
+        let dir = std::env::temp_dir().join(format!("inf-bench-missing-{}", std::process::id()));
+        let root = dir.to_str().unwrap();
+        let mut gates = one_gate();
+        gates[0].tier = "linux-reference-box".into();
+        for reference_box in [false, true] {
+            let result = finish_report(
+                "m0",
+                &gates,
+                &Measurements::new(),
+                true,
+                reference_box,
+                root,
+                "test",
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let error = result.expect_err("missing STOP gate must fail");
+            assert!(error.contains("probe"), "{error}");
+        }
+    }
+
+    /// Polls `/proc/<pid>/stat` field 3 until the unreaped child is a
+    /// zombie (at most 5 s, every 1 ms).
+    #[cfg(target_os = "linux")]
+    fn wait_zombie(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("child stat");
+            let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next());
+            if state == Some("Z") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "child {pid} never became a zombie");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A server that exited and was not reaped is a zombie: its `status`
+    /// has no `VmRSS` line. A reader that folds that into 0 passes every
+    /// `<=` row (the `memory_1x` false green), so the read must fail.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_zombie_is_not_a_measurement() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        wait_zombie(pid);
+        assert_eq!(read_proc(pid, None), Err(ProcReadError::Exited));
+        assert_eq!(proc::read_io_bytes(pid, None), Err(ProcReadError::Exited));
+        child.wait().expect("reap");
+    }
+
+    /// A warm directory needs exit 0 after `SIGTERM`: a process the signal
+    /// kills, or one that exits 1 (a drain timeout), is a `StopError`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_graceful_stop_needs_exit_zero() {
+        let guard = |script: &str| {
+            let child = Command::new("sh").args(["-c", script]).spawn().expect("spawn sh");
+            ServerGuard { child, port: 0 }
+        };
+        // `sh` runs a trap only once its foreground `sleep` returns, so the
+        // loop sleeps briefly and the trap lands within one pass.
+        let traps = |code: u8| format!("trap 'exit {code}' TERM; while :; do sleep 0.01; done");
+        let settle = || std::thread::sleep(Duration::from_millis(100));
+        let deadline = Duration::from_secs(GRACEFUL_STOP_DEADLINE_S);
+        let clean = guard(&traps(0));
+        settle();
+        assert!(clean.stop_graceful(deadline).is_ok(), "exit 0 after SIGTERM");
+        let failing = guard(&traps(1));
+        settle();
+        let result = failing.stop_graceful(deadline);
+        assert!(matches!(result, Err(StopError::Exit(s)) if s.code() == Some(1)), "{result:?}");
+        let killed = guard("while :; do sleep 0.01; done");
+        settle();
+        let result = killed.stop_graceful(deadline);
+        assert!(matches!(result, Err(StopError::Exit(s)) if s.code().is_none()), "{result:?}");
+    }
+
+    /// A server still running at the stop deadline is a `StopError`, never
+    /// a clean stop, and the guard's drop kills and reaps it: the caller
+    /// discards its directory and no warm boot reuses it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_stop_past_its_deadline_is_refused_and_the_child_reaped() {
+        let script = "trap '' TERM; while :; do sleep 0.01; done";
+        let child = Command::new("sh").args(["-c", script]).spawn().expect("spawn sh");
+        let pid = child.id();
+        let deaf = ServerGuard { child, port: 0 };
+        // The trap must be installed before the signal lands.
+        std::thread::sleep(Duration::from_millis(100));
+        let deadline = Duration::from_millis(100);
+        let asked = Instant::now();
+        let result = deaf.stop_graceful(deadline);
+        assert!(matches!(result, Err(StopError::Deadline(d)) if d == deadline), "{result:?}");
+        assert!(asked.elapsed() >= deadline, "gave up before the deadline");
+        assert_eq!(read_proc(pid, None), Err(ProcReadError::Missing), "killed and reaped");
+    }
+
+    /// A pid that names no process is not a measurement of zero.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_gone_pid_is_not_a_measurement() {
+        assert_eq!(read_proc(u32::MAX, None), Err(ProcReadError::Missing));
+        assert_eq!(proc::read_io_bytes(u32::MAX, None), Err(ProcReadError::Missing));
+    }
 
     fn one_gate() -> Vec<gates::Gate> {
         vec![gates::Gate {
@@ -843,5 +1230,42 @@ mod tests {
         finish_report("m4", &one_gate(), &m, true, false, root, "unit test").expect("reported");
         assert!(dir.exists(), "the reported run wrote its artifact");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M4.5-S35 (2026-08-21): a binding run or a FUA arm on a memory
+    /// filesystem refuses before any row runs; a non-memory root admits.
+    /// (Linux-only facts: `/proc/self/mounts` and the fstype of `/`.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn device_root_admission_refuses_memory_filesystems_for_binding_and_fua_runs() {
+        let root_fs = fs_type_of(std::path::Path::new("/")).expect("the root mount is listed");
+        assert!(!root_fs.is_empty());
+        // A path that does not exist yet resolves through its ancestors.
+        assert_eq!(fs_type_of(std::path::Path::new("/definitely/not/here")), Some(root_fs));
+        assert!(is_memory_fs("tmpfs") && is_memory_fs("ramfs") && !is_memory_fs("ext4"));
+
+        let (bools, values) = GATE_RUN_FLAGS;
+        let fua =
+            Flags::parse(&["--barrier-class".into(), "fua".into()], bools, values).expect("flags");
+        let plain = Flags::parse(&[], bools, values).expect("flags");
+        let Some(tmpfs) = ["/dev/shm", "/run", "/tmp"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|p| fs_type_of(p).is_some_and(|t| is_memory_fs(&t)))
+        else {
+            eprintln!("no memory filesystem mounted — refusal legs skipped");
+            return;
+        };
+        let err = admit_device_root(&plain, tmpfs, true).expect_err("binding on tmpfs refuses");
+        assert!(err.contains("binding"), "{err}");
+        let err = admit_device_root(&fua, tmpfs, false).expect_err("fua on tmpfs refuses");
+        assert!(err.contains("memcpy"), "{err}");
+        // Dev-tier non-FUA on tmpfs admits (disclosed by the caller).
+        assert!(is_memory_fs(&admit_device_root(&plain, tmpfs, false).expect("admitted")));
+        // A non-memory root admits in every mode.
+        let home = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !fs_type_of(home).is_some_and(|t| is_memory_fs(&t)) {
+            admit_device_root(&fua, home, true).expect("device root admits a binding fua run");
+        }
     }
 }

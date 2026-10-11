@@ -8,3 +8,8 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# `probe-device` (M4.5-S34, ADR-0086 D7; shared with infinityd since
+# M4.5-S42, ADR-0091).
+inf-probe.workspace = true

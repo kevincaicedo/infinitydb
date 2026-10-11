@@ -21,6 +21,14 @@ default = ["doc"]
 doc = ["dep:inf-doc"]
 # Repeated-key interning experiment (M3-S04, ADR-0038) - default-off.
 doc-intern-keys = ["doc", "inf-doc/doc-intern-keys"]
+# ADR-0094 D3: the collision oracle as a hasher mode (tests and the
+# simulators only — never a shipping build; see inf-foundation).
+collision-oracle = ["inf-foundation/collision-oracle"]
+# Constructors that stand in for engine state a bare-tree suite does not
+# have (an `AliasView` with no record table behind it — ADR-0139 D2).
+# Tests and benches only; `check-shipping-features.sh` keeps it off
+# every normal dependency edge.
+test-support = []
 
 [dev-dependencies]
 proptest.workspace = true
@@ -29,7 +37,13 @@ criterion.workspace = true
 libc.workspace = true
 # M4-S21: the `*_nospace` injection legs in `tiered_diskfull.rs` — the
 # same dev-dependency feature unification the inf-log tests ride.
-inf-foundation = { workspace = true, features = ["fault-points"] }
+inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
+# Thread-local allocation counter: the ADR-0139 D10 control that
+# attributes the commit-half's remaining allocations to `path::eval`.
+inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
+# The collision-key builders are behind this crate's own feature; the
+# store suite reaches them through the self dev-edge.
+inf-store = { path = ".", default-features = false, features = ["collision-oracle", "test-support"] }
 
 [[bench]]
 name = "store"
@@ -38,6 +52,21 @@ test = false
 
 [[bench]]
 name = "resolver"
+harness = false
+test = false
+
+[[bench]]
+name = "ordered"
+harness = false
+test = false
+
+[[bench]]
+name = "index_key"
+harness = false
+test = false
+
+[[bench]]
+name = "index_sidecar"
 harness = false
 test = false
 
@@ -65,6 +94,24 @@ test = false
 name = "write_accounting"
 harness = false
 test = false
+
+[[bench]]
+name = "index_maint"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
+name = "index_alias_walk"
+harness = false
+test = false
+required-features = ["doc"]
+
+[[bench]]
+name = "index_backfill"
+harness = false
+test = false
+required-features = ["doc"]
 
 [[bench]]
 name = "doc_ingest"

@@ -1,38 +1,54 @@
-<!-- InfinityDB PR checklist (M2.5-S23). The full lifecycle is
+<!-- InfinityDB PR checklist. The full lifecycle is
      CONTRIBUTING.md + docs/INFINITY_STYLE.md (normative). Deviations are
      review rejects, not style preferences. -->
 
 ## What & why
 
-<!-- One paragraph: the change, and the invariant/story/issue it serves. -->
+<!-- One paragraph: the change, and the invariant/issue it serves. -->
 
 ## Author checklist
 
+- [ ] **Design** written and reviewed by someone who is not the author
+      **before** this code was written (L12) — linked issue or design note;
+      the change matches it, or the design carries a dated revision (third
+      revision = stop)
+- [ ] **Fix? Class question answered:** the type, table or lint that makes
+      the sibling impossible — or why no class exists
+- [ ] One logical change per commit; reachable from the wire at the shipped
+      topology, or the deviation names its owner and expiry
 - [ ] `just check` green locally (fmt, dep-DAG, cell deny-list, fault-point
       + fsync greps, panic policy, safety inventory, clippy `-D warnings`,
       workspace tests)
 - [ ] Tests land **with** the change (the DST scenario / fuzz target /
       regression test that guards it — not in a follow-up)
-- [ ] Layer checks for touched areas: `just loom` (inf-fabric) ·
+- [ ] Layer checks for touched areas: `just loom` (inf-fabric, inf-foundation `issue`) ·
       `just compat` (reply bytes) · `just sim-smoke` (determinism) ·
       Miri (unsafe leaves) · fuzz smoke (decoders)
 - [ ] **Performance work (L4):** hypothesis + target metric + workload stated
-      *before* the change; A/B artifact attached (3–5 replicates, environment
-      named); a losing A/B is recorded and the code **not merged**
+      *before* the change; A/B commands, baseline revisions and results recorded
+      (3–5 replicates, environment named); a losing A/B is recorded and the code **not merged**
+- [ ] Generated output stays ignored; tests, seeds and harnesses are committed
 - [ ] **Correctness-only** label if shipping without perf acceptance
-- [ ] Frozen seam / dep-DAG edge / format change → the ADR merged **first**
+- [ ] Frozen seam / dep-DAG edge / format change → the decision (ADR)
+      accepted by maintainers **before** the code
 - [ ] Unsafe touched → `// SAFETY:` on every block, crate `SAFETY.md`
-      inventory updated (script-checked), Miri/Loom run
+      inventory updated for code under `crates/*/src` or `bins/*/src` (a
+      script checks that each file there using `unsafe` is named), Miri/Loom run
 
 ## Reviewer checklist
 
 - [ ] **INFINITY_STYLE conformance affirmed** (`docs/INFINITY_STYLE.md`):
       invalid states unrepresentable · panics only for violated internal
       invariants · no hot-path allocation/dispatch/locks without an A/B
-      artifact · bounded queues & explicit backpressure · decoders
-      iterative + depth/size-bounded + fuzzed
+      measurement and reproduction recipe · bounded queues & explicit backpressure · decoders
+      iterative + depth/size-bounded + fuzzed · outcomes are enums, never
+      inferred from encoded output · trust-boundary values parsed into a type
+      once · nothing validated before a suspension used after it · every new
+      limit has a crossing behavior · no second copy of a decision (L13)
+- [ ] Every new oracle or gate names its canary and the canary ran; the
+      oracle shares no code with what it checks
 - [ ] Evidence discipline holds (L10): no number or "faster/slower" claim
-      in code, docs, or the PR description without its artifact
+      in code, docs, or the PR description without measured results and reproduction details
 - [ ] Crate fences respected (dep-DAG green is necessary, not sufficient —
       check the *semantic* boundary: e.g. `inf-store` sees no sockets,
       `inf-log` knows no RESP)

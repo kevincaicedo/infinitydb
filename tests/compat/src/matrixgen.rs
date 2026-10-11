@@ -23,11 +23,13 @@
 
 use inf_wire::{COMMANDS, CmdFlags};
 
+use crate::candidate::Candidate;
 use crate::json_oracle::{
     DEVIATIONS as JSON_DEVIATIONS, JSON_CASES, Protocol as JsonProtocol, REDIS_STACK_DIGEST,
     REDIS_STACK_IMAGE, REDISJSON_MODULE_VERSION,
 };
 use crate::matrix::{Check, MATRIX};
+use crate::resp::encode_command;
 
 /// Declared compatibility level (see the module-level decision rule).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -75,23 +77,52 @@ pub static DECLARED: &[Declared] = &[
     d("ECHO", Status::Full, "M0", ""),
     d(
         "HELLO",
-        Status::Full,
+        Status::Partial,
         "M0",
-        "identity fields (server/version) are InfinityDB's own, as for any non-Redis server",
+        "the reply's identity fields (server, version, id) are InfinityDB's own, so no \
+         handshake case byte-compares (its one compared case is the subscriber-mode refusal, \
+         an error path); the protocol switch is proven by the RESP3-keyed cases that follow it",
     ),
     d(
         "QUIT",
         Status::Partial,
         "M1",
-        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus because closing tears down the shared oracle connection — covered by a unit test and the client-smoke suite",
+        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus \
+             because closing tears down the shared oracle connection — covered by a unit test and \
+             the client-smoke suite",
     ),
     d("GET", Status::Full, "M0", ""),
-    d("SET", Status::Full, "M0", ""),
+    d(
+        "SET",
+        Status::Full,
+        "M0",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111); bulk values \
+             are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; Redis 512 \
+             MiB): a longer one is a protocol error that closes the connection, as in Redis past \
+             its own cap (ADR-0122)",
+    ),
     d("SETNX", Status::Full, "M0", ""),
-    d("SETEX", Status::Full, "M0", ""),
-    d("PSETEX", Status::Full, "M0", ""),
+    d(
+        "SETEX",
+        Status::Full,
+        "M0",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
+    d(
+        "PSETEX",
+        Status::Full,
+        "M0",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
     d("GETSET", Status::Full, "M0", ""),
-    d("GETDEL", Status::Full, "M0", ""),
+    d(
+        "GETDEL",
+        Status::Partial,
+        "M0",
+        "on a tiered namespace with shadow tickets (`tiered-shadow-overwrite yes`, or tickets \
+         rebuilt at boot) the reply can be a value the delete did not remove: a same-length \
+         `SET` during the delete's cold read rewrites the record in place",
+    ),
     d("DEL", Status::Full, "M0", ""),
     d("EXISTS", Status::Full, "M0", ""),
     d("TYPE", Status::Full, "M0", "only the string type exists until M3"),
@@ -99,18 +130,41 @@ pub static DECLARED: &[Declared] = &[
     d("DECR", Status::Full, "M0", ""),
     d("INCRBY", Status::Full, "M0", ""),
     d("DECRBY", Status::Full, "M0", ""),
-    d("APPEND", Status::Full, "M0", ""),
+    d(
+        "APPEND",
+        Status::Full,
+        "M0",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
+             Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
+             Redis past its own cap (ADR-0122); on a tiered namespace the grown value is bounded \
+             by the namespace's BLOB-MAX (1 GiB default), refused typed before it is built",
+    ),
     d("STRLEN", Status::Full, "M0", ""),
-    d("EXPIRE", Status::Full, "M0", "TTLs ≥ ~34.8 years clamp to the u40 record bound"),
+    d(
+        "EXPIRE",
+        Status::Full,
+        "M0",
+        "TTLs ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
     d("PEXPIRE", Status::Full, "M0", "same u40 clamp"),
-    d("TTL", Status::Full, "M0", ""),
-    d("PTTL", Status::Full, "M0", ""),
+    d("TTL", Status::Full, "M0", "a clamped deadline reads as the u40 bound (ADR-0111)"),
+    d("PTTL", Status::Full, "M0", "a clamped deadline reads as the u40 bound (ADR-0111)"),
     d("PERSIST", Status::Full, "M0", ""),
     d(
         "INFO",
         Status::Partial,
         "M0",
-        "sections + field vocabulary present; gauges are this cell's slice until the control plane aggregates (client-smoke CI is the open M1-S14 AC)",
+        "sections + field vocabulary present; every name appears once per reply — `# Memory` and \
+             `# Keyspace` are the node fold (`memory_scope`/`keyspace_scope`, the attribution \
+             family under `used_memory_*`, `used_memory_pool` = the figure `maxmemory` compares \
+             against (ADR-0068 A2), the process-wide `process_rss`; `# Keyspace` lags a peer's \
+             publish by ≤ one period, `DBSIZE` is exact), `# Stats` carries `expiry_debt_ms` (the \
+             worst wheel debt across every store); `# Tiering` and `# Tripwires` are this \
+             cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); `# Persistence` \
+             is this cell's slice except the values it renders from node state, among them \
+             `loading` and the `loading_*` fields, `ns_drop_tombstones` and the \
+             `recover_node_tier_` fields; an unknown section name selects nothing (empty body, \
+             Redis shape); client-smoke CI is the open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -119,53 +173,118 @@ pub static DECLARED: &[Declared] = &[
         "COMMAND DOCS is an honest empty map; the registry covers the implemented surface only",
     ),
     d("MGET", Status::Full, "M1", ""),
-    d("MSET", Status::Full, "M1", ""),
+    d(
+        "MSET",
+        Status::Partial,
+        "M1",
+        "bulk values are bounded by `proto-max-bulk-len` (default 16 MiB — the record bound; \
+             Redis 512 MiB): a longer one is a protocol error that closes the connection, as in \
+             Redis past its own cap (ADR-0122); the whole frame is bounded at the bulk cap + 64 \
+             KiB (Redis bounds the query buffer separately at 1 GiB); a bounds error (a key or a \
+             value over its limit) implies no mutation on a single-cell, non-tiered path only: \
+             a cross-cell `MSET` skips the bounds pre-pass, applies each local pair whose `SET` \
+             succeeds and, when no local pair failed, sends each remote pair to its owner, which \
+             applies or refuses it on its own, and a tiered `MSET` applies pair by pair and \
+             stops at the first error, so either can answer an error after applying some of \
+             the pairs (on a tiered namespace, a prefix); an out-of-memory refusal part-way \
+             keeps the pairs already applied on every path",
+    ),
     d(
         "MSETNX",
         Status::Partial,
         "M1",
-        "cross-cell keys are check-then-set until M4 transactions; single-cell exact",
+        "cross-cell keys are check-then-set, and a cross-cell `MSETNX` skips the bounds \
+         pre-pass, so it can answer a bounds error after applying a prefix; single-cell exact",
     ),
-    d("GETRANGE", Status::Full, "M1", ""),
-    d("SETRANGE", Status::Full, "M1", "values bound at 16 MiB − 1 (record format v0)"),
-    d("GETEX", Status::Full, "M1", ""),
+    d(
+        "GETRANGE",
+        Status::Partial,
+        "M1",
+        "on a tiered namespace an `end` below `-len` is not clamped: `GETRANGE k 0 -100` on an \
+         11-byte value answers an empty string where Redis and a memory namespace answer the \
+         first byte",
+    ),
+    d(
+        "SETRANGE",
+        Status::Full,
+        "M1",
+        "values bound at 16 MiB − 1 (record format v0), reachable through the wire since ADR-0122 \
+             (proto-max-bulk-len 16 MiB); on a tiered namespace the post-image is bounded by the \
+             namespace's BLOB-MAX (1 GiB default), refused typed before it is built — an empty \
+             patch is a length read on every path, as in Redis",
+    ),
+    d(
+        "GETEX",
+        Status::Full,
+        "M1",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
     d(
         "INCRBYFLOAT",
         Status::Partial,
         "M1",
-        "computes in f64 (Redis: long double); formatting matches on the pinned corpus, precision tails may differ",
+        "computes in f64 (Redis: long double); on a memory namespace formatting matches on the \
+             pinned corpus and precision tails may differ; a tiered namespace renders 17 decimal \
+             places and trims trailing zeros (`10.5 + 0.1` answers `10.59999999999999964` \
+             where Redis answers `10.6`)",
     ),
-    d("SUBSTR", Status::Full, "M1", ""),
+    d(
+        "SUBSTR",
+        Status::Partial,
+        "M1",
+        "as `GETRANGE`: on a tiered namespace an `end` below `-len` is not clamped",
+    ),
     d(
         "RENAME",
         Status::Partial,
         "M1",
-        "cross-owner pairs run as a two-cell fabric program — atomic per cell, not across cells until M4; same-owner pairs exact",
+        "cross-owner string moves use snapshot/put/conditional-delete (ADR-0110); destination \
+             refusal preserves source; changed-source cleanup returns -BUSY and may leave a copy; \
+             destination OOM remains possible because the SET leg is DENYOOM; full atomicity at M6",
     ),
-    d("RENAMENX", Status::Partial, "M1", "same cross-owner window as RENAME"),
+    d(
+        "RENAMENX",
+        Status::Partial,
+        "M1",
+        "same cross-owner window and -BUSY cleanup error as RENAME; retry after -BUSY can return 0 \
+             against the leftover destination copy without removing the source",
+    ),
     d(
         "COPY",
         Status::Partial,
         "M1",
-        "same cross-owner window as RENAME; TTL transfers as relative ms across cells",
+        "cross-owner string copy uses an absolute expiry deadline (ADR-0110); destination NX is \
+             checked at write; same cross-owner window as RENAME",
     ),
     d("TOUCH", Status::Full, "M1", ""),
     d("UNLINK", Status::Full, "M1", ""),
     d("DBSIZE", Status::Full, "M1", ""),
-    d("KEYS", Status::Full, "M1", "result ordering is engine-defined (set equality holds)"),
-    d("RANDOMKEY", Status::Full, "M1", "two-level random: cell, then key"),
+    d("KEYS", Status::Full, "M1", "result ordering is engine-defined; the corpus compares the set"),
     d(
-        "SCAN",
+        "RANDOMKEY",
         Status::Full,
         "M1",
-        "cursor values are engine-internal; the every-resident-key-≥-once guarantee is proptested",
+        "two-level random (cell, then key); the corpus compares the draw against the oracle's \
+         live keys",
+    ),
+    d(
+        "SCAN",
+        Status::Partial,
+        "M1",
+        "cursor values are engine-internal; the corpus compares the key set a full cursor \
+         walk enumerates (ADR-0129 D3), the store-tier proptest covers \
+         every-resident-key-≥-once under concurrent mutation; outside tiered namespaces the \
+         `TYPE` option compares its argument with the word `string` and never reads a \
+         record's type: `TYPE string` returns every key, documents included, and any other \
+         type returns none; a tiered namespace refuses `MATCH` and `TYPE` with a typed error",
     ),
     d("FLUSHDB", Status::Full, "M1", ""),
     d(
         "FLUSHALL",
         Status::Partial,
         "M1",
-        "atomic per cell, eventually complete across cells within one scatter round (no global pause)",
+        "atomic per cell, eventually complete across cells within one scatter round (no global \
+             pause)",
     ),
     d(
         "OBJECT",
@@ -177,19 +296,49 @@ pub static DECLARED: &[Declared] = &[
         "DEBUG",
         Status::Partial,
         "M1",
-        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE; SLEEP stalls one cell, never the node",
+        "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel \
+             stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner \
+             cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never \
+             the node",
     ),
-    d("EXPIREAT", Status::Full, "M1", ""),
-    d("PEXPIREAT", Status::Full, "M1", ""),
-    d("EXPIRETIME", Status::Full, "M1", ""),
-    d("PEXPIRETIME", Status::Full, "M1", ""),
+    d(
+        "EXPIREAT",
+        Status::Full,
+        "M1",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
+    d(
+        "PEXPIREAT",
+        Status::Full,
+        "M1",
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound (ADR-0008, ADR-0111)",
+    ),
+    d("EXPIRETIME", Status::Full, "M1", "a clamped deadline reads as the u40 bound (ADR-0111)"),
+    d("PEXPIRETIME", Status::Full, "M1", "a clamped deadline reads as the u40 bound (ADR-0111)"),
     d("SELECT", Status::Full, "M1", ""),
-    d("CONFIG", Status::Partial, "M1", "typed M1 key subset with frozen hot-reload classes"),
+    d(
+        "CONFIG",
+        Status::Partial,
+        "M1",
+        "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 \
+             MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next \
+             MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell \
+             refuses with Redis's error while a sibling may have headroom), `timeout` closes idle \
+             unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
+             connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
+             enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \
+             replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); \
+             `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; \
+             0 disables caching), set by `--doc-path-cache-size`; larger boot requests \
+             are refused and slim builds omit the key (ADR-0146)",
+    ),
     d(
         "CLIENT",
         Status::Partial,
         "M1",
-        "KILL supports the ID filter form; LIST addr/fd are placeholders until peername capture",
+        "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, \
+             resp, db, sub, psub) — addr/fd are placeholders until peername capture, and \
+             idle/cmd/tot-*/buffer gauges are untracked zeros",
     ),
     d(
         "LOLWUT",
@@ -206,12 +355,7 @@ pub static DECLARED: &[Declared] = &[
     ),
     d("PSUBSCRIBE", Status::Full, "M1", ""),
     d("PUNSUBSCRIBE", Status::Full, "M1", "same bare-form ordering note as UNSUBSCRIBE"),
-    d(
-        "PUBLISH",
-        Status::Full,
-        "M1",
-        "a publisher subscribed to its own channel via a remote owner cell may receive its frame before the publish reply (local owners match Redis order)",
-    ),
+    d("PUBLISH", Status::Full, "M1", ""),
     d(
         "PUBSUB",
         Status::Partial,
@@ -222,8 +366,11 @@ pub static DECLARED: &[Declared] = &[
         "INF.NS",
         Status::Extension,
         "M1",
-        "namespace registry (M2 durability seam; M4-S19 adds SET + the ADR-0062 tiering keys; \
-         M4-S26 lifts the D8 `USE` refusal — the string family, `SCAN`, and `DBSIZE` serve \
+        "namespace registry (M2 durability seam; M4-S19 adds SET and the tiering keys \
+         `MEM-BUDGET`, `DISK-BUDGET`, `MUTABLE-FRACTION`, `MAINTAIN-SLICE`, `COLD-READ-QD`, \
+         `COMPACTION-DEAD-RATIO`, `COMPACTION-SLICE`, `BLOB-THRESHOLD`, `TIER-IO-MODE` and \
+         `TAIL-STALL-TIMEOUT` (ADR-0062); M4-S26 lifts the refusal of `USE` on a tiered \
+         namespace — the string family, `SCAN`, and `DBSIZE` serve \
          tiered namespaces; two extension error classes are live on their writes: `DISKFULL …` \
          (ADR-0063 — disk budget or device full; new-tier-byte placements only) and \
          `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \
@@ -232,32 +379,65 @@ pub static DECLARED: &[Declared] = &[
          families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): \
          `MAXMEMORY`/`EVICTION` on named *memory* namespaces are enforced and Hot via `SET` \
          (`inherit`/`0` reset them); a namespace with its own budget answers the Redis-exact \
-         OOM error scoped to that namespace and reclaims only its own keys; durable and \
-         tiered namespaces refuse both keys typed (tiered budgets belong to `MEM-BUDGET`)",
+         OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave \
+         the node `maxmemory` comparison — the node budget bounds the pool, numbered dbs + \
+         budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys \
+         typed (tiered budgets belong to `MEM-BUDGET`). A durable `CREATE`/`DROP` reserves two \
+         checkpoint units of its cell's quota before any effect; an exhausted quota answers \
+         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2)",
     ),
     d(
         "INF.CKPT",
         Status::Extension,
         "M2",
         "checkpoint operator surface (M2-S20): [CELL k] [WAIT]; WAIT returns after the new \
-         MANIFEST is durable — no fork, per-cell timing (ADR-0021)",
+         MANIFEST is durable — no fork, per-cell timing (ADR-0021); each request spends one unit \
+         of its cell's checkpoint quota, and an exhausted quota answers \
+         `-ERR checkpoint identity space exhausted` before any request (ADR-0159 A1.2)",
     ),
     d(
         "BGSAVE",
         Status::Partial,
         "M2",
         "maps onto INF.CKPT (fuzzy checkpoint, no fork, no RDB file); SCHEDULE accepted and \
-         moot; reply byte-identical; memory-only nodes answer a documented error",
+         moot; reply byte-identical; memory-only nodes answer a documented error; an exhausted \
+         checkpoint quota answers `-ERR checkpoint identity space exhausted` (ADR-0159 A1.2)",
     ),
     d(
         "LASTSAVE",
         Status::Partial,
         "M2",
-        "unix seconds of the newest durable MANIFEST publication; 0 before the first \
-         (Redis reports process-start time); loading flag docs-derived, not capture-verified",
+        "unix seconds of the newest durable MANIFEST publication this cell has observed; 0 \
+         before the first (Redis reports process-start time); the observation can trail the \
+         board by up to two bounded sweeps, except after a `WAIT` on the same cell (ADR-0159 \
+         A1.4); loading flag docs-derived, not capture-verified",
     ),
-    d("INF.TAKE", Status::Internal, "M1", "cross-cell RENAME/COPY program primitive"),
-    d("INF.PEEK", Status::Internal, "M1", "cross-cell COPY program primitive"),
+    d(
+        "INF.TAKE",
+        Status::Internal,
+        "M1",
+        "fabric-program primitive (ADR-0115): unknown to every client, hidden from COMMAND, \
+             executed only on a program-marked Apply; read/delete+TTL, IF value deadline \
+             conditionally deletes the matching string snapshot (ADR-0110)",
+    ),
+    d(
+        "INF.PEEK",
+        Status::Internal,
+        "M1",
+        "fabric-program primitive (ADR-0115): unknown to every client; read+TTL, ABS reads a \
+             string snapshot with absolute Unix expiry, ABS NOSTATS omits client hit/miss \
+             accounting (ADR-0110)",
+    ),
+    d(
+        "INF.PUT",
+        Status::Internal,
+        "M1",
+        "fabric-program primitive (ADR-0115): unknown to every client — a client-typed INF.PUT is \
+             byte-identical to Redis (unknown command), also under maxmemory; the RENAME/RENAMENX \
+             destination leg: `key value deadline [NX]`, absolute Unix-ms deadline or -1, SET's \
+             replies; admitted as RENAME is — no DENYOOM — while the arena's own refusal still \
+             answers OOM (ADR-0110 third amendment)",
+    ),
     // ---- M3-S11/S12 · `JSON.*` (ADR-0041). S21 supplies the pinned
     // RedisJSON RESP2/RESP3 byte corpus and explicit deviation allowlist;
     // S22 (2026-07-16) audited every row: `full` requires byte-compared
@@ -270,8 +450,12 @@ pub static DECLARED: &[Declared] = &[
         "JSON.SET",
         Status::Partial,
         "M3",
-        "S21 corpus exact except parser-specific malformed-input text; root sets preserve TTL \
-         (as RedisJSON — S22 probe); durable writes use M3-S17 document records",
+        "S21 corpus exact except parser-specific malformed-input text, a 128-level value \
+         (accepted; RedisJSON refuses a parsed value's 128th container) and the composed-depth \
+         refusal: a path write whose result would nest past 128 containers answers `ERR document \
+         nesting too deep` and changes nothing, where RedisJSON stores a document its own \
+         JSON.SET cannot read back — a permanent product boundary (ADR-0042 A1); root sets \
+         preserve TTL (as RedisJSON — S22 probe); durable writes use M3-S17 document records",
     ),
     d(
         "JSON.GET",
@@ -338,10 +522,11 @@ pub static DECLARED: &[Declared] = &[
     ),
     d(
         "JSON.TOGGLE",
-        Status::Full,
+        Status::Partial,
         "M3",
-        "S21 RESP2/RESP3 corpus exact; non-boolean skip (modern) / error (legacy) split \
-         matches the pinned oracle (S22 probe)",
+        "S21 RESP2/RESP3 corpus exact; on a non-boolean the modern path skips and the legacy \
+         path errors, as the pinned RedisJSON does; the legacy error text differs from \
+         RedisJSON's in path spelling and wording, and no corpus case compares it",
     ),
     d(
         "JSON.CLEAR",
@@ -356,14 +541,18 @@ pub static DECLARED: &[Declared] = &[
         "JSON.ARRAPPEND",
         Status::Partial,
         "M3",
-        "S21 corpus exact; three-argument form appends one value at the legacy root, a form \
-         the pinned RedisJSON rejects with an arity error (S22 probe)",
+        "S21 corpus exact except the composed-depth refusal — an append whose result would nest \
+         past 128 containers answers `ERR document nesting too deep` and changes nothing, a \
+         permanent product boundary (ADR-0042 A1) — and a 128-level element's refusal text \
+         (RedisJSON answers its recursion-limit parse error; both refuse before the key \
+         lookup); three-argument form appends one value at the legacy root, a form the pinned \
+         RedisJSON rejects with an arity error (S22 probe)",
     ),
     d(
         "JSON.ARRINSERT",
         Status::Partial,
         "M3",
-        "resolved index outside 0..=len aborts the whole command atomically (§3.4 R4); \
+        "resolved index outside 0..=len aborts the whole command atomically; \
          RedisJSON can mutate an earlier match before a later index error",
     ),
     d(
@@ -428,7 +617,37 @@ pub struct CommandRow {
     pub arity: i8,
     pub flags: String,
     pub compared_cases: usize,
+    /// Compared cases whose reply is neither an error nor a null — the
+    /// cases that exercise the command's guarantee rather than its
+    /// argument validation (ADR-0129 D3). JSON cases
+    /// count as compared and as evidence unclassified (S22 audited every
+    /// `JSON.*` row by hand under both protocols).
+    pub evidence_cases: usize,
     pub deviations: Vec<String>,
+}
+
+/// An error (`-`) or a null (`$-1`, `*-1`, `_`) reply: a compared case
+/// answering one proves the command's validation, not its guarantee.
+fn is_error_or_null(reply: &[u8]) -> bool {
+    reply.first() == Some(&b'-')
+        || reply.starts_with(b"$-1\r\n")
+        || reply.starts_with(b"*-1\r\n")
+        || reply.starts_with(b"_\r\n")
+}
+
+/// The core corpus run once on the in-process candidate, in script
+/// order (state accumulates): each case's reply classified for the
+/// `full` bar. The candidate's own reply is the conservative choice —
+/// a command that wrongly errors loses its evidence and the bar goes red.
+pub fn classify_corpus(mut candidate: Candidate) -> Vec<bool> {
+    MATRIX
+        .iter()
+        .map(|case| {
+            let argv: Vec<String> = case.argv.iter().map(|s| (*s).to_string()).collect();
+            let reply = candidate.execute_wire(&encode_command(&argv));
+            case.check.compared() && !is_error_or_null(&reply)
+        })
+        .collect()
 }
 
 /// Joins the registry, the declaration, and the corpus — panicking on any
@@ -441,6 +660,8 @@ pub fn rows() -> Vec<CommandRow> {
         DECLARED.len(),
         "every registry command needs a compat declaration (and vice versa)"
     );
+    let evidence = classify_corpus(Candidate::new());
+    let mut no_evidence: Vec<String> = Vec::new();
     let mut rows = Vec::with_capacity(COMMANDS.len());
     for meta in &COMMANDS {
         let declared = DECLARED
@@ -448,22 +669,26 @@ pub fn rows() -> Vec<CommandRow> {
             .find(|d| d.name == meta.name)
             .unwrap_or_else(|| panic!("{} has no compat declaration", meta.name));
         let mut compared_cases = 0;
+        let mut evidence_cases = 0;
         let mut deviations: Vec<String> = Vec::new();
-        for case in MATRIX {
+        for (case, evidence) in MATRIX.iter().zip(&evidence) {
             if !case.argv[0].eq_ignore_ascii_case(meta.name) {
                 continue;
             }
             if case.check.compared() {
                 compared_cases += 1;
+                evidence_cases += usize::from(*evidence);
             } else if let Check::SkipDiff(why) = case.check
                 && !deviations.iter().any(|deviation| deviation == why)
             {
                 deviations.push(why.to_string());
             }
         }
-        compared_cases +=
+        let json_cases =
             JSON_CASES.iter().filter(|case| case.argv[0].eq_ignore_ascii_case(meta.name)).count()
                 * JsonProtocol::ALL.len();
+        compared_cases += json_cases;
+        evidence_cases += json_cases;
         deviations.extend(
             JSON_DEVIATIONS
                 .iter()
@@ -483,6 +708,11 @@ pub fn rows() -> Vec<CommandRow> {
                 "{} is declared full but has no byte-compared corpus case",
                 meta.name
             );
+            // A `full` claim needs a case that exercises the guarantee: an
+            // error or a null proves only validation (ADR-0129 D3).
+            if evidence_cases == 0 {
+                no_evidence.push(format!("{} ({compared_cases} compared)", meta.name));
+            }
         }
         if matches!(declared.status, Status::Partial | Status::Stub) {
             assert!(
@@ -512,9 +742,16 @@ pub fn rows() -> Vec<CommandRow> {
             arity: meta.arity,
             flags: flags.join(" "),
             compared_cases,
+            evidence_cases,
             deviations,
         });
     }
+    assert!(
+        no_evidence.is_empty(),
+        "declared full, but every compared case answers an error or a null — no case exercises \
+         the guarantee; add one, or declare partial: {}",
+        no_evidence.join(", ")
+    );
     rows
 }
 
@@ -526,13 +763,14 @@ pub fn rows() -> Vec<CommandRow> {
 // (old M6) shipped at M3 — caught by the M3-S13/S15 review.
 pub static ABSENT: &[(&str, &str)] = &[
     ("Persistence admin (SAVE, …)", "M9 — RDB import/export"),
+    ("SHUTDOWN", "M9 — persistence admin; the operator's stop is SIGTERM/SIGINT (ADR-0124)"),
     ("Hashes, lists, sets, zsets, bitmaps, bitfield, HyperLogLog", "M5 — data types"),
     ("Keyspace notifications, SLOWLOG, MONITOR, sharded pub/sub (SSUBSCRIBE/SPUBLISH)", "M5"),
     ("Connection control (RESET)", "M6 (RESET pairs with transaction state)"),
     ("MULTI / EXEC / WATCH / DISCARD, EVAL / Lua, FUNCTION, WAIT", "M6 — transactions"),
     ("Streams (X*), AUTH / TLS / ACL, CLIENT TRACKING", "M7"),
     ("JSONPath filter expressions `?(@…)`, secondary indexes, query engine", "M4.5 — ADR-0024"),
-    ("`JSON.RESP`", "Never — deprecated upstream; declared absent per the M3 plan anti-goals"),
+    ("`JSON.RESP`", "Never — deprecated upstream; declared absent"),
     ("Vector sets", "M8"),
     ("Replication / cluster admin", "M9+"),
 ];
@@ -561,11 +799,22 @@ pub fn render() -> String {
     push(&format!(
         "**{REDIS_STACK_IMAGE}@{REDIS_STACK_DIGEST}** with ReJSON/{REDISJSON_MODULE_VERSION}."
     ));
-    push("Every covered behavior is byte-diffed under its declared protocol; any new or");
-    push("stale deviation fails CI (L8 — honesty is total).");
+    push("Every compared case is diffed against its oracle under its declared protocol:");
+    push("byte for byte, except where the corpus compares a key set (`KEYS`, `SCAN`), a");
+    push("membership (`RANDOMKEY`) or a time within a tolerance (`TTL`, `PTTL`). A");
+    push("mismatch that no recorded deviation names fails CI. A case recorded as a");
+    push("deviation is held to no bytes: a core deviation is not compared, and a");
+    push("`JSON.*` deviation accepts any reply that differs from the oracle's and is");
+    push("refused as stale only when the two match again.");
+    push("Candidates: the in-process executor **and**, since 2026-09-01, a spawned");
+    push("**4-cell durable `infinityd`** behind TCP — the core corpus runs against");
+    push("both, plus a namespace-bound fan-out/tier lane");
+    push("(`tests/compat/tests/node_diff.rs`); node-topology deviations are pinned");
+    push("byte-exact there, never silently excused.");
     push("");
     push(&format!(
-        "**Corpus:** {compared} byte-compared executions · {deviations} documented deviations · 0 tolerated failures.",
+        "**Corpus:** {compared} compared executions · {deviations} documented deviations · 0 \
+             tolerated failures.",
     ));
     push(&format!(
         "**Surface:** {} commands — {} full · {} partial · {} stub · {} extension · {} internal.",
@@ -581,21 +830,27 @@ pub fn render() -> String {
     push("are representational: ordering, identity payloads, opaque cursors/art);");
     push("`partial` = a documented semantic difference exists; `stub` = accepted but");
     push("inert; `extension` = `INF.*` surface unknown to Redis; `internal` = fabric");
-    push("program primitives, not a client surface.");
+    push("program primitives — unknown to clients and hidden from COMMAND (ADR-0115).");
+    push("`Cases` = compared corpus executions; `Evidence` = those answering neither an");
+    push("error nor a null — a `full` row needs at least one, so an error-path case alone");
+    push("never makes a command `full` (ADR-0129 D3). `KEYS` compares as a set, `SCAN` as");
+    push("the set a full cursor walk enumerates, `RANDOMKEY` as membership in the oracle's");
+    push("live keys.");
     push("");
     push("## Commands");
     push("");
-    push("| Command | Status | Since | Flags | Arity | Cases | Notes |");
-    push("|---|---|---|---|---|---|---|");
+    push("| Command | Status | Since | Flags | Arity | Cases | Evidence | Notes |");
+    push("|---|---|---|---|---|---|---|---|");
     for row in &rows {
         push(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
             row.name,
             row.status.name(),
             row.since,
             row.flags,
             row.arity,
             row.compared_cases,
+            row.evidence_cases,
             row.note,
         ));
     }
@@ -617,6 +872,73 @@ pub fn render() -> String {
         }
         push("");
     }
+    push("## Durable write backpressure (extension surface, L8 note — M4.5-S27, ADR-0083)");
+    push("");
+    push("Durable namespaces under log-staging pressure **pace** (the reply is");
+    push("delayed while the command stays suspended) instead of erroring — every");
+    push("path, local and fabric-routed (ADR-0083 D1). Redis has no equivalent");
+    push("surface (no durable log). Mainstream Redis clients do not auto-retry");
+    push("`-BUSY`, which is why refusal is not the design response to pressure;");
+    push("the remaining typed `-BUSY` emitters are the document exact late");
+    push("admission and the tiered cold-read queue cap, both counted");
+    push("(`log_admission_busy`) and expected ≈ 0 — a climbing rate is a finding,");
+    push("not designed behaviour. A durable write whose record can never fit the");
+    push("staging domain refuses up front with typed");
+    push("`ERR write exceeds durable log staging capacity` — non-retryable by");
+    push("design (ADR-0083 D2; retrying it is a livelock). That bound is the");
+    push("staging buffer minus the frame framing: **4 MiB − 56 B per record at the");
+    push("default `--log-staging-mib 4`** (2 MiB − 56 B under the measured");
+    push("`--frames-in-flight 3 --log-staging-mib 2` arm, ADR-0087 D1) — below the");
+    push("16 MiB − 1 record-format cap memory namespaces honour in full; tiered");
+    push("namespaces route values at or above `BLOB-THRESHOLD` out of line and are");
+    push("not bound by it. The barrier class (`--barrier-class`, ADR-0086) and the");
+    push("frame pipeline depth do not move the bound; only the staging buffer size does.");
+    push("The pipeline depth is class-derived since the ADR-0087 fourth amendment");
+    push("(2026-08-22): `--frames-in-flight auto` resolves to 3 under the FUA class and 1");
+    push("under FLUSH, both at 4 MiB buffers — the record bound is the same in either.");
+    push("Segment recycling (M4.5-S39b, ADR-0090; `--no-segment-recycle` turns it off)");
+    push("changes which file the next log segment is, never a client-visible semantic;");
+    push("its pool wait (ADR-0090 D9, `--recycle-wait off|quarter|eighth`) only moves");
+    push("when the next segment file is created.");
+    push("`infinityd --conn-default-ns NAME` (M4.5-S40, off by default) starts every");
+    push("accepted connection as if it had sent `INF.NS USE NAME` — an operator opt-in");
+    push("for clients that cannot send a per-connection prelude (`memtier_benchmark`,");
+    push("drop-in Redis clients wanting a durable default); `SELECT` and `INF.NS USE`");
+    push("still work. A name that does not exist (or names a topic) leaves the connection");
+    push("fail-closed: data commands error until `SELECT` or a successful `INF.NS USE`;");
+    push("inspection and `INF.NS CREATE` remain available. It never falls through to db0.");
+    push("Redis has no equivalent.");
+    push("");
+    push("`FSYNC everysec` namespaces ack on apply and fsync on the 1 s tick — the");
+    push("`appendfsync everysec` loss window (≤ 1 s on power loss). Under the frame-fill");
+    push("policy (M4.5-S39a, ADR-0089; on by default at `--fill-window-us 1000` since the");
+    push("third amendment of 2026-08-22 — the rerun at the shipping K = 1 / 4 MiB; 0 turns");
+    push("it off) a barrier-less frame on an aligned segment may hold un-sealed for up to");
+    push("the window before it reaches the device: the **process-crash** exposure of");
+    push("`everysec` records is then ≤ 1 ms of writes per cell, where Redis's AOF buffer");
+    push("reaches the page cache every event loop. The power-loss window is unchanged;");
+    push("`always` acks are never held (their frames carry the barrier the ack waits on).");
+    push("");
+    push("On the FLUSH class (a device the probe ruled `flush`, or `--device-probe off`");
+    push("with no model) a due barrier frame on a packed segment may wait, bounded, for");
+    push("the round of clients it just acked to re-arrive (M4.5-S43, ADR-0092; on by");
+    push("default at `--flush-group-window-us 250` since the binding A/B of 2026-08-26;");
+    push("0 turns it off; inert under the FUA class): an `always` ack may then arrive up");
+    push("to 250 µs later than its barrier alone would allow, and `everysec` records");
+    push("riding that held frame carry the same ≤ 250 µs of extra process-crash exposure.");
+    push("The power-loss window is unchanged; durability semantics are unchanged.");
+    push("");
+    push("A **clean stop** (`SIGTERM`/`SIGINT`, ADR-0124) keeps every acked write of");
+    push("every class: each cell stops admitting, flushes and closes its connections (a");
+    push("pipeline still arriving is answered up to the stop — every executed command is");
+    push("answered — then a FIN), publishes a stop checkpoint (`--shutdown-checkpoint");
+    push("on|off`, default on: the next boot replays nothing) and lands its final sync;");
+    push("the node exits 0 only once every cell is drained, else 1 within");
+    push("`--shutdown-timeout-ms` (10 000, Redis's `shutdown-timeout`) with the phase named.");
+    push("The `everysec` window is a crash property only. Redis's `SIGTERM` handler fsyncs");
+    push("the AOF and closes clients without answering them; `SHUTDOWN` the command stays");
+    push("absent (below).");
+    push("");
     push("## Absent (owner milestone)");
     push("");
     push("| Family | Arrives |");
@@ -627,7 +949,6 @@ pub fn render() -> String {
     push("");
     push("---");
     push("");
-    push("Master plan §14 owns the staging policy; milestone plans own acceptance");
-    push("criteria. Performance claims live in the claim ledger, never here (L10).");
+    push("Performance claims are never made here (L10).");
     out
 }

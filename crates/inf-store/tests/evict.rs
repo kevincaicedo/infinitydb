@@ -6,20 +6,20 @@
 
 use inf_foundation::time::Nanos;
 use inf_store::{
-    EvictBudget, EvictionPolicy, Keyspace, NsId, NsMode, NsSpec, OpError, PressureConfig,
-    SetExpire, SetOptions, StoreConfig,
+    AddressSpaceConfig, CellStore, DemotionConfig, EvictBudget, EvictionPolicy, Keyspace,
+    LogicalAddr, NsId, NsMode, NsSpec, OpError, PressureConfig, SetExpire, SetOptions, StoreConfig,
 };
 
 const NOW: Nanos = Nanos(1_000_000_000); // 1 s
 
-fn fresh() -> Keyspace {
+fn fresh_cfg() -> StoreConfig {
     // Pre-sized index: growth steps are part of `used`, so a tight slack
     // assertion wants the table at steady-state capacity from the start.
-    Keyspace::new(StoreConfig {
-        evict_seed: 0xE71C_7E57,
-        initial_keys: 4096,
-        ..StoreConfig::default()
-    })
+    StoreConfig { evict_seed: 0xE71C_7E57, initial_keys: 4096, ..StoreConfig::default() }
+}
+
+fn fresh() -> Keyspace {
+    Keyspace::new(fresh_cfg())
 }
 
 /// A limit that budgets the RECORD bytes to `num/den` of their current
@@ -519,4 +519,189 @@ fn eviction_and_wheel_stay_consistent() {
     let stats = ks.stats();
     assert_eq!(stats.expired_active + stats.expired_lazy + evicted, 100, "census closes exactly");
     assert_eq!(ks.db_mut(0).len(), 0);
+}
+
+/// F-L05-02 (ADR-0068 A1): a named memory namespace with its own
+/// `MAXMEMORY` is its own budget authority — its bytes count in
+/// `used_bytes` (L5 attribution, D5) but never drive the node hand.
+/// Pre-fix the global target was computed from bytes the hand may not
+/// reclaim, so a cache *inside* its budget drained db0 through MAINTAIN
+/// alone, then the drained pool answered OOM forever.
+#[test]
+fn budgeted_ns_under_its_own_budget_does_not_evict_numbered_dbs() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    for i in 0..100 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    for i in 0..400 {
+        ns_set(&mut ks, 16, &format!("c:{i}"), 200);
+    }
+    let cache_used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(cache_used * 2))
+        .expect("hot");
+    assert!(!ks.ns_over_limit(NsId(16)), "the cache is comfortably inside its budget");
+    // The node limit sits below db0 + cache, above db0 alone.
+    let limit = ks.used_bytes() * 3 / 4;
+    assert!(ks.pool_used_bytes() < limit, "db0 alone fits the node budget");
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    let db0_before = ks.db_mut(0).len();
+    for _ in 0..100 {
+        ks.evict_tick(NOW, EvictBudget::default());
+    }
+    assert_eq!(
+        ks.db_mut(0).len(),
+        db0_before,
+        "a namespace inside its budget evicted db0 keys (F-L05-02)"
+    );
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").len(), 400, "the cache lost nothing");
+    assert!(!ks.over_limit(), "the pool is inside the node budget: no global pressure");
+    assert!(ks.used_bytes() > limit, "attribution still counts the cache (ADR-0068 D5)");
+    // The write path agrees with MAINTAIN: db0 writes are admitted.
+    assert_eq!(gated_set(&mut ks, "db0:new", 200), Ok(()));
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").stats().evicted_keys, 0);
+}
+
+/// The pool half of the same rule: db0 growth alone still evicts db0
+/// (the node budget bounds the pool, Redis semantics) and never reaches
+/// into the budgeted namespace.
+#[test]
+fn pool_pressure_reclaims_from_the_pool_only() {
+    let mut ks = fresh();
+    ks.ns_create(memory_ns(16, b"cache", Some(EvictionPolicy::AllKeysRandom))).expect("create");
+    for i in 0..200 {
+        ns_set(&mut ks, 16, &format!("c:{i}"), 200);
+    }
+    let cache_used = ks.ns_store(NsId(16)).expect("live").used_bytes();
+    ks.ns_set_memory(b"cache", Some(EvictionPolicy::AllKeysRandom), Some(cache_used * 2))
+        .expect("hot");
+    for i in 0..400 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    let limit = ks.pool_used_bytes() * 3 / 4;
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, limit);
+    assert!(ks.over_limit(), "db0 alone exceeds the pool budget");
+    let mut slices = 0;
+    while ks.over_limit() && slices < 10_000 {
+        ks.evict_tick(NOW, EvictBudget::default());
+        slices += 1;
+    }
+    assert!(ks.pool_used_bytes() <= limit, "MAINTAIN reaches the pool budget");
+    assert!(ks.db_mut(0).len() < 400, "db0 paid for its own growth");
+    assert_eq!(ks.ns_store(NsId(16)).expect("live").len(), 200, "the cache lost nothing");
+    assert!(ks.used_bytes() > ks.pool_used_bytes(), "attribution unchanged (D5)");
+}
+
+/// Batch 57 (review 2026-08-30, the L05-02 follow-up row): a tiered
+/// namespace's resident bytes are **not** in the pool comparable — its
+/// records live in the tiered table, which `used_bytes`/`pool_used_bytes`
+/// never sum (ADR-0062's `MEM-BUDGET` is their authority, rendered under
+/// `# Tiering`); the named `CellStore` shell the plane materializes beside
+/// the table stays empty by construction (replay intercepts tiered records,
+/// `reserve_ns` skips the shell), so it contributes an empty store's fixed
+/// overhead and nothing that grows. Verification, not a fix: green on the
+/// batch-56 tree by design — no A1 extension is needed.
+#[test]
+fn tiered_shells_carry_no_resident_bytes_into_the_pool() {
+    const NS: NsId = NsId(31);
+    const BUDGET: u64 = 256 << 10;
+    const PAGE: u64 = 4 << 10;
+    let mut ks = fresh();
+    ks.ns_create(NsSpec {
+        id: NS,
+        name: b"tiered".to_vec(),
+        mode: NsMode::Durable,
+        fsync: None,
+        policy: None,
+        maxmemory: None,
+        tier: None,
+    })
+    .expect("register");
+    let demote = DemotionConfig::for_budget(BUDGET, PAGE);
+    let ring = demote.ring_reserve_bytes().expect("valid budget");
+    ks.materialize_tiered(
+        NS,
+        AddressSpaceConfig {
+            reserve_bytes: ring,
+            page_bytes: PAGE as usize,
+            life_origin: LogicalAddr::ZERO,
+        },
+        demote,
+        1024,
+    )
+    .expect("materialize");
+    for i in 0..100 {
+        set(&mut ks, &format!("db0:{i}"), 200);
+    }
+    // The plane's shape: the shell materializes beside the table. Its
+    // bytes are an empty store's fixed overhead under the keyspace's own
+    // config (the `initial_keys` index presize; 64 slots on the binary).
+    let shell = ks.ns_store_mut(NS).expect("registered").used_bytes();
+    assert_eq!(shell, CellStore::new(fresh_cfg()).used_bytes(), "an empty store");
+    assert_eq!(ks.ns_store(NS).expect("live").eviction_policy(), EvictionPolicy::NoEviction);
+    let pool_before = ks.pool_used_bytes();
+    let used_before = ks.used_bytes();
+    let hasher = ks.hasher();
+    let table = ks.tiered_store_mut(NS).expect("materialized");
+    for i in 0..2_000u32 {
+        let key = format!("t:{i}");
+        table.insert(key.as_bytes(), &[7u8; 64], hasher.hash(key.as_bytes())).expect("insert");
+    }
+    let usage = ks.tiering_usage();
+    assert!(usage.committed_bytes > 0 && usage.live_bytes > 0, "the table holds them: {usage:?}");
+    assert_eq!(ks.pool_used_bytes(), pool_before, "tiered records never enter the pool");
+    assert_eq!(ks.used_bytes(), used_before, "nor `used_bytes` (their authority is MEM-BUDGET)");
+    assert_eq!(ks.ns_store(NS).expect("live").len(), 0, "the shell stays empty");
+    // And the pool bound still cannot be moved by them: a limit above db0
+    // alone stays unpressured with 2,000 tiered records resident.
+    pressure(&mut ks, EvictionPolicy::AllKeysRandom, pool_before + 1);
+    assert!(!ks.over_limit(), "tiered residency raised the global flag");
+}
+
+/// Lane L05 perf row (batch 58 A/B witness, `--ignored --release`): the
+/// cost of one `evict_step` under a non-LFU policy, where the per-slot
+/// key hash is needed only for the victim and for expired records. Prints
+/// ns per step over three replicates; compare the pre- and post-change
+/// trees on the same box (`.artifacts/review/batch58/ab-evict-hash-*.log`).
+#[test]
+#[ignore = "timing witness, run explicitly in release"]
+#[allow(clippy::disallowed_methods)] // wall-clock timing on the test thread, not cell code
+fn evict_step_timing_witness() {
+    const KEYS: u32 = 200_000;
+    const STEPS: u32 = 2_000;
+    // `ttl_every`: 1 = every key volatile (short walks — the sample cap
+    // binds); 100 = one key in a hundred (the volatile policies walk the
+    // full 256-slot span past non-qualifying records — the row's regime).
+    for (policy, ttl_every) in [
+        (EvictionPolicy::AllKeysLru, 1),
+        (EvictionPolicy::VolatileTtl, 1),
+        (EvictionPolicy::VolatileTtl, 100),
+        (EvictionPolicy::VolatileLru, 100),
+    ] {
+        let mut store =
+            CellStore::new(StoreConfig { initial_keys: KEYS as usize, ..StoreConfig::default() });
+        for i in 0..KEYS {
+            let key = format!("k:{i:08}");
+            let expire = if i % ttl_every == 0 {
+                SetExpire::At(Nanos(1_000_000_000_000))
+            } else {
+                SetExpire::Keep
+            };
+            let opts = SetOptions { expire, ..Default::default() };
+            store.set(key.as_bytes(), b"12345678", opts, Nanos(1)).expect("set");
+        }
+        store.set_eviction_policy(policy);
+        for rep in 0..3 {
+            let t0 = std::time::Instant::now();
+            let mut evicted = 0u64;
+            for _ in 0..STEPS {
+                evicted += store.evict_step(5, Nanos(2)).evicted;
+            }
+            let ns = t0.elapsed().as_nanos() / u128::from(STEPS);
+            println!(
+                "evict-step-ab: policy={policy:?} ttl_every={ttl_every} rep={rep} ns_per_step={ns} \
+                     evicted={evicted}"
+            );
+        }
+    }
 }

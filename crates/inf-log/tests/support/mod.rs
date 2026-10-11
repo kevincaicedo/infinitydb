@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
+use inf_foundation::FileOffset;
 use inf_foundation::time::Nanos;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
@@ -26,7 +27,7 @@ use inf_log::{
 };
 use inf_runtime::{
     BackendDriver, Capabilities, CellPlane, Completion, CompletionResult, CompletionToken, IoOp,
-    LoopCx, RawFd, StableBytes, SubmitStats, TokenClass, Wait, WatermarkGate,
+    LoopCx, RawFd, StableBytes, SubmitStats, TokenClass, Wait, WatermarkGate, WriteBarrier,
 };
 
 /// Fresh per-test directory under the system temp dir (the pattern the S02
@@ -69,7 +70,7 @@ pub enum IoMode {
 enum PendingKind {
     Write {
         fd: RawFd,
-        offset: u64,
+        offset: FileOffset,
         data: StableBytes,
         written: u32,
         token: CompletionToken,
@@ -133,7 +134,14 @@ impl ScriptedDriver {
         self.delays.pop_front().unwrap_or(0)
     }
 
-    fn write_chunk(&self, fd: RawFd, offset: u64, data: StableBytes, written: u32, chunk: u32) {
+    fn write_chunk(
+        &self,
+        fd: RawFd,
+        offset: FileOffset,
+        data: StableBytes,
+        written: u32,
+        chunk: u32,
+    ) {
         if self.mode == IoMode::Recorded {
             return;
         }
@@ -146,7 +154,7 @@ impl ScriptedDriver {
         let slice = unsafe {
             std::slice::from_raw_parts(data.as_ptr().add(written as usize), chunk as usize)
         };
-        file.write_all_at(slice, offset + u64::from(written)).expect("test pwrite");
+        file.write_all_at(slice, offset.bytes_after(written)).expect("test pwrite");
     }
 
     fn sync_fd(&self, fd: RawFd) {
@@ -177,10 +185,10 @@ impl BackendDriver for ScriptedDriver {
         // (see `held`): the op keeps executing on the dup'd fd even if the
         // app closes its own copy before a delayed schedule runs the op.
         let op = match op {
-            IoOp::LogWrite { fd, offset, data, token, fsync_token }
+            IoOp::LogWrite { fd, offset, data, token, barrier }
                 if self.mode != IoMode::Recorded =>
             {
-                IoOp::LogWrite { fd: self.hold(fd), offset, data, token, fsync_token }
+                IoOp::LogWrite { fd: self.hold(fd), offset, data, token, barrier }
             }
             IoOp::Fdatasync { fd, token } if self.mode != IoMode::Recorded => {
                 IoOp::Fdatasync { fd: self.hold(fd), token }
@@ -201,8 +209,15 @@ impl BackendDriver for ScriptedDriver {
         for op in std::mem::take(&mut self.queued) {
             let delay = self.next_delay();
             let kind = match op {
-                IoOp::LogWrite { fd, offset, data, token, fsync_token } => {
+                IoOp::LogWrite { fd, offset, data, token, barrier } => {
                     self.log_writes_submitted += 1;
+                    // This harness drives buffered segments only: a
+                    // write-through frame would be a plane bug here.
+                    assert!(
+                        !matches!(barrier, WriteBarrier::WriteThrough),
+                        "scripted driver models FLUSH-class barriers only"
+                    );
+                    let fsync_token = barrier.fsync_token();
                     if fsync_token.is_some() {
                         self.fsyncs_submitted += 1;
                     }
@@ -345,7 +360,9 @@ pub struct DurablePlane {
     pub rotor: SegmentRotor<StdSegmentFs>,
     pub commit: GroupCommit<<StdSegmentFs as SegmentFs>::File>,
     pub gate: WatermarkGate,
-    pub in_flight: Option<inf_log::FrameLease>,
+    /// Frames sealed and awaiting `LogWritten` (ADR-0087 D2): any
+    /// completion order; keyed by the write token's sequence == `FrameId`.
+    pub in_flight: VecDeque<(u64, inf_log::FrameLease)>,
     /// Workload script: staged up to `jobs_per_iter` per EXECUTE.
     pub jobs: VecDeque<Job>,
     pub jobs_per_iter: usize,
@@ -378,7 +395,7 @@ impl DurablePlane {
             rotor,
             commit: GroupCommit::new(),
             gate: WatermarkGate::new(),
-            in_flight: None,
+            in_flight: VecDeque::new(),
             jobs: VecDeque::new(),
             jobs_per_iter: 8,
             staged_always: Vec::new(),
@@ -414,8 +431,14 @@ impl CellPlane for DurablePlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion) {
         match (c.token.class(), c.result) {
             (TokenClass::LogWrite, CompletionResult::LogWritten) => {
-                self.commit.note_frame_written();
-                let lease = self.in_flight.take().expect("LogWritten with no in-flight lease");
+                let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
+                let index = self
+                    .in_flight
+                    .iter()
+                    .position(|(id, _)| *id == seq)
+                    .expect("LogWritten with no in-flight lease");
+                let (_, lease) = self.in_flight.remove(index).expect("index from position");
+                self.commit.note_frame_written(inf_log::FrameId(seq));
                 self.staging.release(lease);
             }
             (TokenClass::Fsync, CompletionResult::Synced) => {
@@ -433,7 +456,9 @@ impl CellPlane for DurablePlane {
                 } else {
                     // The write's lease is terminal — release so teardown
                     // asserts stay meaningful; the cell is failed regardless.
-                    if let Some(lease) = self.in_flight.take() {
+                    let seq = u64::from(c.token.slot()) | (u64::from(c.token.generation()) << 24);
+                    if let Some(index) = self.in_flight.iter().position(|(id, _)| *id == seq) {
+                        let (_, lease) = self.in_flight.remove(index).expect("index");
                         self.staging.release(lease);
                     }
                 }
@@ -497,6 +522,17 @@ impl CellPlane for DurablePlane {
         }
         if self.staging.can_seal() {
             let frame_len = self.staging.pending_frame_len();
+            // ADR-0087 D3/D4: rotation drains the pipeline; a due frame
+            // that cannot carry its barrier yet waits. This harness drives
+            // buffered segments only, so write-through is never offered.
+            let rotation_due = self.rotor.rotation_due(frame_len);
+            if rotation_due && !self.staging.drained() {
+                return;
+            }
+            let plan = self.commit.frame_plan(false, rotation_due);
+            if plan == inf_log::FramePlan::Wait {
+                return;
+            }
             let (slot, seal) =
                 self.rotor.begin_frame_deferred(frame_len, cx.now.as_millis()).expect("reserve");
             if let Some(handoff) = seal {
@@ -505,9 +541,9 @@ impl CellPlane for DurablePlane {
                 self.fsync_submits.push((SyncReason::Seal, cx.now));
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
-            let end = slot.base().advance(frame_len);
+            let end = slot.base().advance(slot.len());
             let covered = self.commit.watermark().map_or(0, |lsn| lsn.to_u64());
-            let lease = self.staging.seal(slot.first_record_lsn(), covered);
+            let lease = self.staging.seal(slot.first_record_lsn(), covered, slot.layout());
             // Records have LSNs now: resolve the replay log + spawn gated
             // ack futures for `always` records (S06).
             for (at, idx) in self.pending_lsn_resolve.drain(..) {
@@ -527,29 +563,32 @@ impl CellPlane for DurablePlane {
                     acks.borrow_mut().push((lsn, watermark));
                 });
             }
-            self.commit.note_frame_queued(end, frame_len);
-            let fsync = self.commit.frame_fsync_due().then(|| {
+            let id = self.commit.note_frame_queued(end, lease.frame_len());
+            let barrier = if plan == inf_log::FramePlan::LinkedFsync {
                 let ticket = self.commit.register_linked_fsync(cx.now);
                 self.fsync_submits.push((SyncReason::Linked, cx.now));
-                fsync_token(ticket)
-            });
-            let offset = u64::from(slot.base().offset);
+                WriteBarrier::LinkedFsync { fsync_token: fsync_token(ticket) }
+            } else {
+                WriteBarrier::None
+            };
+            let offset = FileOffset::from_u32_bytes(slot.base().offset);
             let fd = self.rotor.active_raw_fd().expect("std tier has fds");
             self.rotor.commit_frame_queued(slot);
             self.write_seq += 1;
+            assert_eq!(self.write_seq, id.0, "write token sequence is the frame id");
             self.writes_this_iter += 1;
             let bytes = self.staging.leased_frame(&lease);
             // SAFETY: the FrameLease is held in `self.in_flight` until the
             // LogWritten completion releases it (ADR-0013 D1) — the sealed
             // buffer neither moves nor resets while this op is in flight.
             let data = unsafe { StableBytes::new(bytes) };
-            self.in_flight = Some(lease);
+            self.in_flight.push_back((id.0, lease));
             cx.push(IoOp::LogWrite {
                 fd,
                 offset,
                 data,
                 token: write_token(self.write_seq),
-                fsync_token: fsync,
+                barrier,
             });
         } else if self.commit.standalone_fsync_due() {
             let ticket = self.commit.register_standalone_fsync(cx.now);
@@ -564,7 +603,7 @@ impl CellPlane for DurablePlane {
     fn fabric_out(&mut self, _cx: &mut LoopCx<'_>) -> bool {
         !self.jobs.is_empty()
             || !self.staging.is_empty()
-            || self.in_flight.is_some()
+            || !self.in_flight.is_empty()
             || self.commit.pending_fsyncs() > 0
     }
 }
