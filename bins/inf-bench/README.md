@@ -13,7 +13,9 @@ correctness oracle. `inf-compare` supplies the separate external generators.
 
 Latency reports disclose their instrument: native load/cache/document rows
 use FineHistogram (256 sub-buckets per octave, about 0.391% bucket width);
-YCSB and mixed-audit tiered rows retain LogHistogram (32, about 3.125%).
+YCSB rows and mixed-audit's document legs use LogHistogram (32, about
+3.125%); mixed-audit's cache and tiered legs run through the native load
+generator and use FineHistogram.
 YCSB's memory-hit sidecar carries the same disclosure. Old unlabelled reports
 retain their original resolution; this repair does not remeasure them.
 

@@ -21,6 +21,7 @@ run on the Linux reference box against `UringDriver` only.
 `UringDriver` validation status: authored against `io-uring` 0.7,
 compile-checked for Linux targets, exercised by the same conformance suite
 as kqueue in CI (`kernel-matrix` job, probed + forced-degraded modes).
-Runtime validation on real kernels is pending the Linux reference box.
+The conformance suite is green on Linux 7.0 in probed and forced-degraded
+modes (2026-06-11).
 
 See `SAFETY.md` for the unsafe-code audit areas.

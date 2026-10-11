@@ -1,8 +1,8 @@
 # inf-sim — unsafe inventory
 
-`inf-sim` is not an unsafe-leaf crate; it carries exactly two
-audited `unsafe` constructions, following the `inf-server::log_bytes`
-precedent (ADR-0015 D4).
+`inf-sim` is not an unsafe-leaf crate; it carries three audited `unsafe`
+constructions, following the `inf-server::log_bytes` precedent
+(ADR-0015 D4).
 
 ## 1. `net.rs::stable_slice` — reading a `StableBytes` op payload
 

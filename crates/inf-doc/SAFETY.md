@@ -25,11 +25,14 @@ uninitialized byte is ever exposed.
   enforced upstream by `DOC_BYTES_MAX` ≤ 16 MiB − 1).
 - **`begin`**: `reserve(4)`; one 4-byte store (tag + zeroed u24
   placeholder); `set_len(+4)`.
-- **`append_overlapped`**: `reserve(len + 7)` bounds the overshooting
-  word stores (each begins at `< len`, writes 8); the happy path
-  `set_len(+len)` exposes only source-copied bytes; the slack-exhausted
-  path first `set_len`s the words actually written, then grows through
-  safe `extend_from_slice`.
+- **`append_overlapped`**: `reserve(len + 7)` bounds the
+  overshooting word stores (each begins at `< len`, writes 8) and the
+  happy path `set_len(+len)` exposes only source-copied bytes, provided
+  `start + len` and `len + 7` do not wrap: neither sum is checked and the
+  release profile has no overflow checks, so the bound rests on every
+  caller passing a `len` inside the source; the slack-exhausted path
+  first `set_len`s the words actually written, then grows through safe
+  `extend_from_slice`.
 
 **Verification**: unit tests in-module compare every primitive
 byte-for-byte against safe oracles and run under Miri
