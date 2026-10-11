@@ -13,17 +13,20 @@
 //! - `node_matrix_replies_match_redis`: the whole scripted `MATRIX`
 //!   against the redis-server oracle on a 4-cell durable node, each case
 //!   compared as its `Check` mode says (a `SkipDiff` case is not
-//!   compared), so every compared case also runs where fan-out, the
-//!   control plane and the durable root are real.
+//!   compared; a case whose compare fails passes only on its pinned
+//!   node override, `FLUSHALL` once a durable namespace exists, on the
+//!   candidate's bytes alone), so every compared case also runs where
+//!   fan-out, the control plane and the durable root are real.
 //! - `node_fanout_and_tier_match_redis_under_namespace`: a connection
 //!   bound by `INF.NS USE` to a durable namespace, then to a durable
 //!   **tiered** one, driving the scatter/fan-out surface with
 //!   boundary-length keys and values across the 16,368 B cold window:
 //!   single-key replies, `DBSIZE` and `DEL` byte-exact, the `SCAN` walk
 //!   compared as a set and, on the plain namespace, `KEYS *` as a set and
-//!   `RANDOMKEY` by membership; `FLUSHDB`, a spanning `EXISTS`, and
-//!   `KEYS`/`RANDOMKEY` on the tiered namespace are refusals pinned on
-//!   the candidate alone.
+//!   `RANDOMKEY` by membership, `DEBUG OBJECT` on each resident key by
+//!   its reply prefix on the candidate alone; `FLUSHDB`, a spanning
+//!   `EXISTS`, and `KEYS`/`RANDOMKEY` on the tiered namespace are
+//!   refusals pinned on the candidate alone.
 //!   Honesty note: values ride the tiered write/read path but the lane
 //!   does not force demotion — cold-read-after-demotion byte fidelity
 //!   stays with the m4-tiered DST lane and the N1 e2e.
