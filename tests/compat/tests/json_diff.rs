@@ -1,4 +1,7 @@
-//! M3-S21: byte-exact InfinityDB vs pinned RedisJSON under RESP2 and RESP3.
+//! InfinityDB against a pinned RedisJSON, under RESP2 and RESP3: a reply that
+//! differs from the oracle's fails unless its case and protocol are on the
+//! allowlist, which admits it whatever its bytes, and an allowlist entry
+//! that no differing reply used fails as stale.
 
 use compat::candidate::Candidate;
 use compat::json_oracle::{

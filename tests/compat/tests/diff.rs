@@ -1,5 +1,7 @@
-//! M0-S15 AC: the command × edge-case matrix replied byte-identical to real
-//! Redis (allowlisted introspection payloads excepted, per the AC).
+//! The command × edge-case matrix against real Redis: each case is compared
+//! as its `Check` mode says (byte for byte by default; as sets, as a cursor
+//! walk's union, as `KEYS *` membership or as integers within a tolerance
+//! where the mode says so), and a `SkipDiff` case is not compared.
 //!
 //! Spawns a throwaway `redis-server` (no persistence) as the oracle and the
 //! in-process executor as the candidate, runs the scripted matrix on both,
