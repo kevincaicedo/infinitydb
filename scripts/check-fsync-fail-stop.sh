@@ -26,9 +26,10 @@
 #     shape, ADR-0106 D4). Bare markers and stale markers fail; every
 #     reason is printed on every run;
 #   * a second rule flags a raw `sync_data`/`sync_all`/`fdatasync`/
-#     `libc::fsync` whose result is DISCARDED (`let _ =`, `.ok()`,
-#     `.unwrap_or…`, `.is_ok()/.is_err()`, `drop(`) — the act of syncing,
-#     not the spelling of a type;
+#     `libc::fsync` call whose result is DISCARDED (`let _ =`, `.ok()`,
+#     `.unwrap_or…`, `.is_ok()/.is_err()`, `drop(`): these four call
+#     spellings only. A sync issued as an io_uring op is not a call this
+#     rule sees; the cell loop routes its completion by token class;
 #   * comments and test-only modules are stripped (ADR-0106 D3): 11 of the
 #     41 raw hits in this tree are prose naming the contract, and prose is
 #     not a handler.

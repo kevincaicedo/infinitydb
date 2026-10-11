@@ -25,8 +25,8 @@
 #     the inline test-only items scanned as production.
 # Banned: naked unwrap and the unfinished-code macros. `expect(`, `assert`,
 # `panic!`, `unreachable!` are intentionally NOT banned (assertions /
-# audited fail-stops) — the Theme-4 gate (release asserts justified by a
-# claim about a caller) is a separate instrument, still owed.
+# audited fail-stops) — release asserts justified by a claim about a
+# caller are a separate gate, `check-release-asserts.sh` (ADR-0107 D2).
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"

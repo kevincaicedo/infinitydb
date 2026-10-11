@@ -20,9 +20,12 @@
 #     and every `ALL` member must be a declared const (the runtime uses ALL);
 #   * (a) firing is read from PRODUCTION source only (test modules stripped
 #     — ADR-0106 D3), so a fire site that exists only in a unit test fails;
-#   * (b) arming is a *statement-shaped* reference (scripts/fault-arming.awk):
-#     `fault::arm(` or a `(POINT, FaultSpec::…)` plan row, never a comment
-#     and never a message string. The exerciser set spans crate `tests/`
+#   * (b) arming is read by `scripts/fault-arming.awk`: a `fault::CONST`
+#     path, or a string literal that is exactly a point's name, within two
+#     lines of a `fault::arm(` call or a `FaultSpec::` plan row is credited
+#     as armed, whether or not it is that arm's argument. Comments are
+#     stripped, and a string that only mentions a point inside other text
+#     is not credited. The exerciser set spans crate `tests/`
 #     trees, the workspace test crates (`tests/*`), the test-only modules
 #     inside `crates/*/src`, and `bins/inf-sim/src` — the DST scenarios arm
 #     two points that no test can arm directly (a real node's registry is

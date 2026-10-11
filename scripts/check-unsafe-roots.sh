@@ -4,12 +4,14 @@
 # under crates/, bins/ and tests/ carries `#![forbid(unsafe_code)]` or
 # `#![deny(unsafe_code)]`; the set of `deny` roots equals the audited-leaf
 # list below (drift either way is red — a leaf that lost its unsafe drops
-# off the list by ADR, a new one joins by ADR); and every
-# `allow(unsafe_code)` in shipped source is module-scoped: an outer
+# off the list by ADR, a new one joins by ADR); and every allow written
+# exactly `allow(unsafe_code)` in shipped source is module-scoped: an outer
 # `#[allow(unsafe_code)]` on a `mod` item of a `deny` crate's root, or an
 # inner `#![allow(unsafe_code)]` at the top of a module file the root
-# declares — never on a function, impl or block, never in a `forbid`
-# crate. The compiler then refuses new unsafe outside a named module, and
+# declares. An allow in another spelling (a reasoned
+# `#[allow(unsafe_code, reason = …)]`, `#[expect(unsafe_code)]`, a grouped
+# allow) is not read by this gate, on a function, impl or block included.
+# The compiler refuses new unsafe outside an allowed item, and
 # `check-safety-inventory.sh` refuses a named module SAFETY.md omits.
 #
 # Scope is asserted (ADR-0106): missing directories, zero roots, or a
@@ -119,5 +121,5 @@ if errors:
     print("\n".join(errors))
     print(f"unsafe-roots FAILED: {scope}")
     sys.exit(1)
-print(f"unsafe-roots OK: {scope}; every root governed, every allow a named module of a listed leaf")
+print(f"unsafe-roots OK: {scope}; every root governed, every `allow(unsafe_code)` a named module of a listed leaf")
 PY

@@ -10,7 +10,8 @@
 #
 # Fixture trees are built under mktemp and handed to the gates through
 # INF_CHECK_ROOT (the gates) and INF_SIM_BIN / INF_SWEEP_SHARDS (the sweep
-# runner, with a stub simulator). Shell only; no cargo.
+# runner, with a stub simulator). No cargo, except in the lint-scope probe
+# cases, which run `cargo clippy` on the pinned toolchain.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR/.."
@@ -3161,4 +3162,4 @@ if [ "$fail" -ne 0 ]; then
     echo "check-scripts self-test FAILED: $fail of $((pass + fail)) cases"
     exit 1
 fi
-echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each red on a planted violation)"
+echo "check-scripts self-test OK ($pass cases: deny-list, panic-policy, run-sweep, shipping-features, sim-canaries, release-asserts, clock-ban, waker-atomics, fault-points, fsync-fail-stop, unsafe-roots, safety-inventory, file-length, line-width, lint-ratchet, doc-artifacts, parent-doc-gates, arith-spellings, lint-scopes each exiting non-zero on its planted case)"
