@@ -919,8 +919,8 @@ Use distinct names and types for different quantities:
 - One hundred columns fits two files side by side. Use the width; never
   exceed it. `cargo fmt --check` cannot see a long string literal, comment,
   attribute or macro body (rustfmt leaves them alone), so
-  `scripts/check-line-width.sh` counts every line of every Rust file
-  (ADR-0125).
+  `scripts/check-line-width.sh` counts every line of the Rust files
+  under `crates/`, `bins/` and `tests/` (ADR-0125).
 
 ## Dependencies
 

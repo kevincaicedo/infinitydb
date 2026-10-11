@@ -20,7 +20,8 @@ check:
     ./scripts/check-release-asserts.sh
     ./scripts/check-safety-inventory.sh
     # ADR-0125: the counted disciplines are gates: 3000 production lines per
-    # file, 100 columns on every line, and the 70-line function ratchet.
+    # file, 100 columns on every line of the Rust files under crates/, bins/
+    # and tests/, and the 70-line function ratchet.
     ./scripts/check-file-length.sh
     ./scripts/check-line-width.sh
     # ADR-0144 D3: one ratchet — fn-length, and the cast / arithmetic
