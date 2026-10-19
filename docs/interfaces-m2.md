@@ -1185,6 +1185,37 @@ takes the later pair whole: the back's deaths wait for the later class's
 barrier, a crossing on the row); the covered front pops again. A merge never
 makes reclaim earlier than the uncapped rule's.
 
+**Extent-seal window (`extent-window`, ADR-0061 D3).** A blob `SET`'s extent
+barrier holds the extent's open file until the barrier folds into the
+ledger's durable prefix, so each cell's `GroupCommit` bounds its extent
+barriers with a `CappedDeque<ExtentSync, Reserve>` over
+`EXTENT_SEAL_WINDOW_ENTRIES` = 16 (`inf-log::limits`): one `(ticket, fd)`
+entry per extent barrier registered and not folded, in ledger order.
+`GroupCommit::register_extent` reserves a unit before the effect that makes
+the extent (its id, its file, its bytes, the store's reference) and
+publishes the ledger entry and the window entry in one step; a refused
+effect gives the unit back; the fold frees it; MAINTAIN issues each entry's
+fdatasync once, at most 16 a tick. Who reserves is the durable cell's
+`ExtentWaiters`: `len` window entries, `w` turns out, `q` writers parked.
+An arrival (a blob writer with no turn) reserves only while the window is
+open and no writer is parked and, with turns out, while `len + w < 16`;
+else it parks in FIFO order with nothing created. The LOG step that holds
+the staged frame for an outstanding extent barrier closes the window; the
+step that seals that frame, or finds nothing staged, opens it and wakes
+`min(16 − len − w, q)` writers from the queue's head, each a turn. A woken
+writer resolves its key once more and reserves with its turn — every turn
+has a unit (`len + w ≤ 16`) — and publishes or leaves; a turn that leaves
+gives its unit back, to the queue's head while the window is open. A fold
+wakes no one. A writer that parks on staging or the tail stall gives its
+turn back first. The pacing is latency only: no reply of its own.
+
+INFO, cell scope: `frame_waits_extent` (`# Persistence`, beside the other
+`frame_waits_*`: frames held for an extent barrier, one per closing),
+`extent_parks` (blob writers' park episodes) and `turn_refused` (turns that
+found the window full, 0 by the arithmetic above), beside
+`fsync_latency_p99_us`; the window's row in `INFO caps`, whose `crossings`
+count the arrivals that found it full.
+
 ## Boot recovery orchestration (`inf-server::recover`/`plane`, M2-S15 — ADR-0019)
 
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with
@@ -1826,6 +1857,8 @@ so promotion is free.
 | 1.20 | `pending_covers_within(lo, hi)` / `written_up_to()` / `pending_entries()`: the plane's LSN→seq ack map (`DurableCell::frame_seqs`) coalesces written entries across which no unfolded ledger coverage point lies — every later barrier covers both or neither — at each `LogWritten`, and release-asserts `len ≤ frames_behind_prefix() + pending_entries() + 1` | One entry per sealed frame accumulated for the whole life of a stalled barrier and between two ticks (the reorder window bounded the sibling FIFO, ADR-0087 D2 as amended; this map was the last unbounded structure on the commit path — L3) | `assert!` **release** in `coalesce_frame_seqs`; the DST's `frames_awaiting_watermark` gauge against `REORDER_WINDOW_FRAMES + fsync_entries + 1` on every durable scenario; `ack_map_tests` pin the merge rule (a coverage point between two written frames keeps the earlier; an unwritten frame is never merged into) | keep — **added 2026-09-13 (ADR-0087 D2 second amendment)** |
 | 1.21 | `frame_plan(_, seal_ahead = true)`: the FLUSH-slot arm counts the seal fdatasync the rotation registers ahead of the frame — `syncs_in_flight() + 1 < flush_bound`, so at bound 1 the frame seals `Plain` and its due accumulates behind the seal | Two FLUSH-class barriers in one iteration queue on the device-wide flush unit (ADR-0086 Context: ~1 000/s) — the batch=1.0 disease at the device tier; no durability consequence | by-construction (the arm); `assert!` **release** in `push_pending` for `Linked`/`Standalone`/`Completion` (`FLUSH-class barrier into a full pipeline`); pinned by `rotation_seal_and_linked_sync_respect_the_flush_bound` and `a_discretionary_barrier_never_enters_a_full_pipeline`; the `m2-durable` DST dies on the assert with the plan unfixed | keep — **added 2026-09-13 (ADR-0087 D3/D4 amendment)** |
 | 1.23 | `register_write_through`: `write_through_pending < WRITE_THROUGH_WINDOW_ENTRIES` (16 — write-through tickets registered and not yet folded into the durable prefix) | Behind a wedged FLUSH-class front (seal, dir barrier, linked sync) every FUA frame completes at `LogWritten` and its ticket stays in `pending` until the front folds — one entry per frame, bounded only by the gated clients' outstanding commands; the reorder window does not reach it (a FUA frame is written the moment its ticket completes) | `assert!` **release** (per write-through, free); `frame_plan` declines the write-through arm while `write_through_window_full()` — the frame seals `Plain`, the due accumulates, the first barrier after the front covers it (a linked sync: `write_through_due` is false over an uncovered plain frame); `DurableStats::write_through_entries` under the DST's gauge oracle on every durable scenario (`m2-fua-pending` 6/24 seeds red pre-fix at peaks 17–20, 0/24 and peak 16 after); pinned by `write_through_tickets_behind_a_wedged_front_are_bounded` | keep — **added 2026-09-13 (ADR-0087 D2 third amendment)** |
+| 1.24 | `register_extent`: the extent-seal window holds one entry per unfolded `ExtentSeal` ledger entry, in ledger order, and at most `EXTENT_SEAL_WINDOW_ENTRIES` (16) | Each extent barrier holds its open file until the fold; unbounded, one iteration's burst held one descriptor per blob write until a create failed on the descriptor limit and its client read an error | the capped deque's reservation, taken before any effect (a full window runs none); `debug_assert!` of each folded ticket against the window's front; pinned by `seventeen_blob_writes_register_sixteen_extent_barriers` and `window_units_return_at_the_fold_in_ledger_order`; the `m4-extent-window` DST's sim-disk peak of open extent files ≤ 16 and its `extent-window` census row | keep |
+| 1.25 | `ExtentWaiters`: `len + w ≤ 16` — every turn has a unit; an arrival reserves only while the window is open, no writer is parked and, with turns out, a unit is free beyond theirs | A refused turn parks a woken writer again behind later arrivals: the FIFO broken, a reply past its turnover | `admit`'s table test; a refused turn is a `debug_assert!` and, in release, a counted re-park (`turn_refused`, read 0 by the DST's census oracle on every durable scenario) | keep |
 | 1.22 | `DurableCell::note_issued`: a hold episode (`frame_held`, `fill_since`, `group_since`) ends only at the issue — the frame's `queue_frame` or the standalone's fdatasync; a reservation that waits keeps the episode | The standalone path left `group_since` open, so the next episode's first sight read as elapsed and sealed at once (the hold intermittently inert, `frame_waits_group` under-counted); the reservation-failure returns inflated `frame_waits_*` by one per return | two `assert!` **release** at each decision (`open group-hold episode without a held frame`, the fill twin); `DurableStats::{hold_open, fill_hold_open, group_hold_open}` under the DST's hold-episode oracle on every durable scenario (`m2-group-hold` 24/24 seeds red pre-fix, `m2-durable` 6/24 — the ARM seeds) | keep — **added 2026-09-13 (ADR-0092 D1 rule 6 amendment)** |
 
 ---
