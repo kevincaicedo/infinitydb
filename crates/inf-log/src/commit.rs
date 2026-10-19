@@ -399,7 +399,7 @@ pub struct GroupCommit<File> {
     pending: VecDeque<PendingFsync<File>>,
     next_ticket: u64,
     /// The extent-seal window (ADR-0163 D2): one entry per extent barrier
-    /// in `pending`, in ledger order (I10), published with the barrier and
+    /// in `pending`, in ledger order, published with the barrier and
     /// popped at its fold. Its unit is reserved before the extent exists.
     extent_window: CappedDeque<ExtentSync, Reserve>,
     /// Window entries, at the back, whose fdatasync MAINTAIN has not issued.
@@ -831,10 +831,10 @@ impl<File: SegmentFile> GroupCommit<File> {
     }
 
     /// The fold reached an extent barrier: its window entry, the front one
-    /// (I10: one window entry per unfolded extent barrier, in ledger
-    /// order), leaves and its unit is free. The unit returns at the fold,
-    /// never at the completion: a done entry behind an undone one stays in
-    /// the ledger, so only the fold bounds the ledger's extent class.
+    /// (one window entry per unfolded extent barrier, in ledger order),
+    /// leaves and its unit is free. The unit returns at the fold, never at
+    /// the completion: a done entry behind an undone one stays in the
+    /// ledger, so only the fold bounds the ledger's extent class.
     fn fold_extent(&mut self, ticket: FsyncTicket) {
         let front = self.extent_window.pop_front();
         debug_assert_eq!(
@@ -2128,8 +2128,9 @@ mod tests {
     /// Seventeen blob writes in one iteration: sixteen register an extent
     /// barrier each, and the seventeenth finds the window full before any
     /// effect — no extent, no file, the ledger unchanged — so at most
-    /// sixteen extent files are held open (the record's red at HEAD read
-    /// seventeen). The window's census row reads its cap and one crossing.
+    /// sixteen extent files are held open (before the window, a
+    /// seventeenth was held). The window's census row reads its cap and one
+    /// crossing.
     #[test]
     fn seventeen_blob_writes_register_sixteen_extent_barriers() {
         let fs = crate::fs::mem::MemFs::new();

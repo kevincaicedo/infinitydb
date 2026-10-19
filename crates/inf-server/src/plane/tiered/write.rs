@@ -481,8 +481,8 @@ fn make_extent<F: SegmentFs>(
 }
 
 /// The window answered `Full`. An arrival parks at the queue's tail: its
-/// `Full` is the window row's crossing. A turn always has a unit (I12); a
-/// refused one is counted and parks again.
+/// `Full` is the window row's crossing. A turn always has a unit
+/// (`len + w ≤ 16`); a refused one is counted and parks again.
 fn park_at_full<F: SegmentFs>(
     cell: &mut DurableCell<F>,
     turn: &mut Option<ExtentTurn>,

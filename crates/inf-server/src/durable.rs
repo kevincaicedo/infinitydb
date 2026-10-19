@@ -1130,16 +1130,16 @@ impl<F: SegmentFs> DurableCell<F> {
         }
     }
 
-    /// ADR-0061 D3 (amended 2026-08-06): an extent-seal barrier awaiting
-    /// its `Synced` holds the staged frame. The frame may carry the
-    /// barrier's referencing record, and a durable record naming torn
-    /// extent bytes replays as a dangling reference — the ledger barrier
-    /// fences the ack, never the device order. The barrier's fdatasync
-    /// rode a MAINTAIN push before this LOG step, so the hold is one device
-    /// sync; the frame waits like the ENOSPC branch. The hold closes the
-    /// extent-seal window (ADR-0163 D2): no blob writer registers another
-    /// extent this frame would wait for until it has sealed, beyond the
-    /// turns already out. One closing is one hold episode.
+    /// ADR-0061 D3: an extent-seal barrier awaiting its `Synced` holds the
+    /// staged frame. The frame may carry the barrier's referencing record,
+    /// and a durable record naming torn extent bytes replays as a dangling
+    /// reference — the ledger barrier fences the ack, never the device
+    /// order. The barrier's fdatasync rode a MAINTAIN push before this LOG
+    /// step, so the hold is one device sync; the frame waits like the
+    /// ENOSPC branch. The hold closes the extent-seal window (ADR-0163 D2):
+    /// no blob writer registers another extent this frame would wait for
+    /// until it has sealed, beyond the turns already out. One closing is
+    /// one hold episode.
     fn extent_hold(&mut self) -> bool {
         if !self.commit.extent_barrier_pending() {
             return false;

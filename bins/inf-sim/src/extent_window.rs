@@ -21,7 +21,7 @@
 //! - every writer whose extent file was created at the first step that
 //!   created one has its reply by the step that creates the 33rd file: a
 //!   frame held for extent barriers is held for one turnover, not for the
-//!   whole queue (`extent-hold-overran`, the window's H3);
+//!   whole queue (`extent-hold-overran`, the hold rule);
 //! - no writer is left waiting: a run that stops making progress with a
 //!   reply owed, or ends with a writer parked or a turn out, is red
 //!   (`writer-left-parked`). On the burst two clients disconnect with a
@@ -33,11 +33,12 @@
 //!
 //! And the product's own counts, read as wiring checks with their
 //! engagement: the window's census row held its cap, with a crossing on the
-//! burst and none at exactly the cap (H2; `cap-row-unfilled`,
-//! `cap-row-crossed`), and at least three frames were held for extent
-//! barriers (H3's engagement, `extent-hold-unengaged`). The cap bound, the
-//! assembly rule, the turn rule (H4) and their liveness are the census
-//! oracle's, read at the node's drop. A violation's token is whitespace-free
+//! burst and none at exactly the cap (the cap row's fill;
+//! `cap-row-unfilled`, `cap-row-crossed`), and at least three frames were
+//! held for extent barriers (the hold rule's engagement,
+//! `extent-hold-unengaged`). The cap bound, the assembly rule, the turn
+//! rule and their liveness are the census oracle's, read at the node's
+//! drop. A violation's token is whitespace-free
 //! and carried by that violation's text alone, so a canary row can expect it.
 //!
 //! The cold leg ([`cold`]) paces writers that overwrite cold keys, whose
@@ -69,12 +70,13 @@ const NS_NAME: &[u8] = b"ew";
 /// The window's cap, as the oracles read it: unfolded extent barriers per
 /// cell.
 const WINDOW_ENTRIES: usize = 16;
-/// The frame holds H3 needs to be engaged: three turnovers.
-const H3_HOLDS_MIN: u64 = 3;
-/// The file count by which H3 requires the first cohort's replies: two
-/// windows' worth of files, so a correct build has sealed the first
-/// cohort's frame and acknowledged it before the third window registers.
-const H3_FILES: usize = 2 * WINDOW_ENTRIES + 1;
+/// The frame holds the hold rule needs to be engaged: three turnovers.
+const HOLD_RULE_HOLDS_MIN: u64 = 3;
+/// The file count by which the hold rule requires the first cohort's
+/// replies: two windows' worth of files, so a correct build has sealed the
+/// first cohort's frame and acknowledged it before the third window
+/// registers.
+const HOLD_RULE_FILES: usize = 2 * WINDOW_ENTRIES + 1;
 /// A blob value: at the namespace's 4 KiB `BLOB-THRESHOLD`.
 const VALUE_LEN: usize = 4 << 10;
 /// The extent header block: a value's first byte lies at this file offset.
@@ -131,8 +133,8 @@ impl ExtentWindowLeg {
         }
     }
 
-    /// Blob `SET`s per writer: enough files for H3 on the burst and cap
-    /// legs; one overwrite of its key on the cold leg.
+    /// Blob `SET`s per writer: enough files for the hold rule on the burst
+    /// and cap legs; one overwrite of its key on the cold leg.
     fn ops_per_writer(self) -> u64 {
         match self {
             ExtentWindowLeg::Burst => 3,
@@ -672,24 +674,26 @@ fn judge(
             report.writers_left
         ));
     }
-    // H2 and H3 are the burst's and the cap's: the cold leg's pacing is its
-    // own, and its writers overwrite one key each.
+    // The cap row's fill and the hold rule are the burst's and the cap's:
+    // the cold leg's pacing is its own, and its writers overwrite one key
+    // each.
     if scenario.leg == ExtentWindowLeg::Cold {
         return;
     }
     hold_oracle(seed, writers, creations, report);
-    if report.frame_waits_extent < H3_HOLDS_MIN {
+    if report.frame_waits_extent < HOLD_RULE_HOLDS_MIN {
         report.violations.push(format!(
             "VACUOUS seed {seed:#x}: extent-hold-unengaged — {} frame(s) held for extent \
-             barriers, fewer than {H3_HOLDS_MIN}",
+             barriers, fewer than {HOLD_RULE_HOLDS_MIN}",
             report.frame_waits_extent
         ));
     }
     window_row_oracle(scenario, report);
 }
 
-/// H2 on the window's census row: it held its cap, and crossed it on the
-/// burst (the 17th arrival of one iteration) and never at exactly the cap.
+/// The cap row's fill, on the window's census row: it held its cap, and
+/// crossed it on the burst (the 17th arrival of one iteration) and never at
+/// exactly the cap.
 fn window_row_oracle(scenario: &ExtentWindowScenario, report: &mut ExtentWindowReport) {
     let seed = scenario.seed;
     let Some(row) = report.window_row else {
@@ -718,8 +722,9 @@ fn window_row_oracle(scenario: &ExtentWindowScenario, report: &mut ExtentWindowR
     report.violations.push(what);
 }
 
-/// H3: each writer whose extent file was created at the first step that
-/// created one has its first reply by the step that creates the 33rd file.
+/// The hold rule: each writer whose extent file was created at the first
+/// step that created one has its first reply by the step that creates the
+/// 33rd file.
 fn hold_oracle(
     seed: u64,
     writers: &[Writer],
@@ -727,11 +732,11 @@ fn hold_oracle(
     report: &mut ExtentWindowReport,
 ) {
     let (Some(&(first, _)), Some(&(by, _))) =
-        (creations.log.first(), creations.log.get(H3_FILES - 1))
+        (creations.log.first(), creations.log.get(HOLD_RULE_FILES - 1))
     else {
         report.violations.push(format!(
             "VACUOUS seed {seed:#x}: extent-hold-unreached — {} extent files, fewer than \
-             {H3_FILES}",
+             {HOLD_RULE_FILES}",
             creations.log.len()
         ));
         return;
@@ -752,7 +757,7 @@ fn hold_oracle(
         report.violations.push(format!(
             "EXTENT WINDOW VIOLATION seed {seed:#x}: extent-hold-overran — {} of the {} writers \
              whose files the first step created (step {first}) had no reply by step {by}, which \
-             created file {H3_FILES}: {}",
+             created file {HOLD_RULE_FILES}: {}",
             late.len(),
             cohort.len(),
             late.join(", ")

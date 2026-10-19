@@ -7,7 +7,7 @@
 //!   `cap-assembly-violated`), and the census left `Assembling`: a census
 //!   never marked means the cell's loop took no serve mark, or marked
 //!   another census (token `census-never-marked`).
-//! - **The window's turn rule** (H4): a cell's durable plane counts no turn
+//! - **The window's turn rule**: a cell's durable plane counts no turn
 //!   that found the extent-seal window full (`turn_refused = 0`, the
 //!   release form of `len + w ≤ 16`; token `turn-refused`).
 //! - Liveness: a cell holding a tiered namespace has the reclaim marks'

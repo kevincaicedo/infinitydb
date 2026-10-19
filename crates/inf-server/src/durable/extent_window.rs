@@ -11,7 +11,7 @@
 //! opens once that frame has sealed (or nothing is staged); at the opening
 //! the LOG step hands out `min(16 − len − w, q)` turns from the queue's head.
 //! A woken writer resolves its key once more and reserves with its turn,
-//! open or closed: every turn has a unit (I12, `len + w ≤ 16`). A fold frees
+//! open or closed: every turn has a unit (`len + w ≤ 16`). A fold frees
 //! units and wakes no one. There is no retry on the window: a woken writer
 //! publishes or leaves, and a turn that leaves gives its unit back, to the
 //! queue's head while the window is open and to the next handout while it
@@ -47,9 +47,10 @@ pub(crate) enum Arrival {
     Park,
 }
 
-/// The arrival test (I12): an arrival reserves only while the window is
-/// `open` and no writer is `parked` ahead of it, and, with `turns_out`,
-/// only while a unit is free beyond the `len` entries and the turns.
+/// The arrival test (`len + w ≤ 16`): an arrival reserves only while the
+/// window is `open` and no writer is `parked` ahead of it, and, with
+/// `turns_out`, only while a unit is free beyond the `len` entries and the
+/// turns.
 pub(crate) fn admit(open: bool, parked: usize, len: usize, turns_out: usize) -> Arrival {
     #[cfg(not(inf_canary_extent_window_arrival_blind))]
     {
@@ -105,7 +106,8 @@ pub(crate) struct ExtentWaiters {
     queue: Rc<Queue>,
     /// Park episodes (cell scope): every writer that joined the queue.
     parks: u64,
-    /// Turns that found the window full (cell scope); I12 makes it 0.
+    /// Turns that found the window full (cell scope); `len + w ≤ 16` makes
+    /// it 0.
     turn_refused: u64,
 }
 
@@ -137,10 +139,11 @@ impl ExtentWaiters {
         ExtentTurn { queue: Rc::clone(queue), wait: Some(queue.list.wait(())) }
     }
 
-    /// A turn found the window full, which I12 rules out: debug-asserted,
-    /// and counted, so the release form reads the count. The turn settles
-    /// and passes nothing on, since it found no unit to give back, and the
-    /// writer parks again at the tail for a later handout.
+    /// A turn found the window full, which `len + w ≤ 16` rules out:
+    /// debug-asserted, and counted, so the release form reads the count.
+    /// The turn settles and passes nothing on, since it found no unit to
+    /// give back, and the writer parks again at the tail for a later
+    /// handout.
     pub(crate) fn refuse_turn(&mut self, turn: ExtentTurn) -> ExtentTurn {
         debug_assert!(false, "a turn found the extent-seal window full (len + w ≤ 16 broken)");
         self.turn_refused = self.turn_refused.saturating_add(1);
@@ -163,7 +166,10 @@ impl ExtentWaiters {
         let queue = &self.queue;
         queue.open.set(true);
         let turns_out = queue.turns_out.get();
-        debug_assert!(len.saturating_add(turns_out) <= ENTRIES, "every turn has a unit (I12)");
+        debug_assert!(
+            len.saturating_add(turns_out) <= ENTRIES,
+            "every turn has a unit (len + w ≤ 16)"
+        );
         let free = ENTRIES.saturating_sub(len).saturating_sub(turns_out);
         #[cfg(not(any(inf_canary_extent_window_no_wake, inf_canary_extent_window_wake_all)))]
         let wakes = free.min(queue.parked.get());
@@ -289,9 +295,10 @@ impl Drop for ExtentTurn {
 mod tests {
     use super::*;
 
-    /// `admit`'s table (I12): every arrival behind a parked writer or into a
-    /// closed window parks; with turns out an arrival reserves only a unit
-    /// free beyond theirs; with none, the window answers.
+    /// `admit`'s table (`len + w ≤ 16`): every arrival behind a parked
+    /// writer or into a closed window parks; with turns out an arrival
+    /// reserves only a unit free beyond theirs; with none, the window
+    /// answers.
     #[test]
     fn admit_parks_behind_the_queue_and_never_takes_a_turns_unit() {
         let rows = [
