@@ -106,7 +106,7 @@ pub(crate) struct ExtentWaiters {
     /// Park episodes (cell scope): every writer that joined the queue.
     parks: u64,
     /// Turns that found the window full (cell scope); I12 makes it 0.
-    turns_refused: u64,
+    turn_refused: u64,
 }
 
 impl ExtentWaiters {
@@ -118,7 +118,7 @@ impl ExtentWaiters {
             turns_out: Cell::new(0),
             list: WaitList::new(),
         };
-        ExtentWaiters { queue: Rc::new(queue), parks: 0, turns_refused: 0 }
+        ExtentWaiters { queue: Rc::new(queue), parks: 0, turn_refused: 0 }
     }
 
     /// The arrival test for a writer with no turn, against the window's
@@ -143,7 +143,7 @@ impl ExtentWaiters {
     /// writer parks again at the tail for a later handout.
     pub(crate) fn refuse_turn(&mut self, turn: ExtentTurn) -> ExtentTurn {
         debug_assert!(false, "a turn found the extent-seal window full (len + w ≤ 16 broken)");
-        self.turns_refused = self.turns_refused.saturating_add(1);
+        self.turn_refused = self.turn_refused.saturating_add(1);
         turn.settle_refused();
         self.park()
     }
@@ -202,8 +202,8 @@ impl ExtentWaiters {
     }
 
     /// Turns that found the window full (cell scope).
-    pub(crate) fn turns_refused(&self) -> u64 {
-        self.turns_refused
+    pub(crate) fn turn_refused(&self) -> u64 {
+        self.turn_refused
     }
 }
 

@@ -1883,7 +1883,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
             tiered_tables: plane.keyspace().tiered_tables(),
-            turns_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+            turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
         };
         census.judge(index, plane.cap_census(), facts);
     }

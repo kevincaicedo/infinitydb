@@ -37,7 +37,7 @@ pub(crate) struct CellFacts {
     pub(crate) tiered_tables: usize,
     /// The cell's durable plane, once built: its turns that found the
     /// extent-seal window full.
-    pub(crate) turns_refused: Option<u64>,
+    pub(crate) turn_refused: Option<u64>,
 }
 
 /// The census verdict of one run: every cell of every life it judged.
@@ -76,7 +76,7 @@ impl CensusVerdict {
                  namespace(s) and no `{EPOCH_MARKS_ROW}` row"
             ));
         }
-        let Some(refused) = facts.turns_refused else { return };
+        let Some(refused) = facts.turn_refused else { return };
         if census.row(EXTENT_WINDOW_ROW).is_none() {
             self.violations.push(format!(
                 "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — a durable plane and no \
@@ -125,12 +125,12 @@ mod tests {
         let (census, serve_mark) = CapCensus::new(CellId(0));
         serve_mark.take();
         let mut verdict = CensusVerdict::default();
-        verdict.judge(0, &census, CellFacts { tiered_tables: 1, turns_refused: None });
+        verdict.judge(0, &census, CellFacts { tiered_tables: 1, turn_refused: None });
         assert_eq!(verdict.rows_checked, 0);
         assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
         assert!(verdict.violations[0].contains("cap-row-missing"), "{:?}", verdict.violations);
         let mut durable = CensusVerdict::default();
-        durable.judge(0, &census, CellFacts { tiered_tables: 0, turns_refused: Some(0) });
+        durable.judge(0, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0) });
         assert_eq!(durable.violations.len(), 1, "{:?}", durable.violations);
         assert!(durable.violations[0].contains("extent-window"), "{:?}", durable.violations);
         let mut control = CensusVerdict::default();
@@ -147,11 +147,11 @@ mod tests {
         serve_mark.take();
         let _window = CappedDeque::<u64, Reserve>::new(WINDOW, &census).expect("built");
         let mut red = CensusVerdict::default();
-        red.judge(3, &census, CellFacts { tiered_tables: 0, turns_refused: Some(1) });
+        red.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(1) });
         assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
         assert!(red.violations[0].contains("turn-refused"), "{:?}", red.violations);
         let mut green = CensusVerdict::default();
-        green.judge(3, &census, CellFacts { tiered_tables: 0, turns_refused: Some(0) });
+        green.judge(3, &census, CellFacts { tiered_tables: 0, turn_refused: Some(0) });
         assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
@@ -194,7 +194,7 @@ mod tests {
             }
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(1, &census, CellFacts { tiered_tables: 1, turns_refused: None });
+        verdict.judge(1, &census, CellFacts { tiered_tables: 1, turn_refused: None });
         assert_eq!(verdict.rows_checked, 2);
         assert!(verdict.violations.is_empty(), "full rows are within their caps: {verdict:?}");
         // A row past its cap: no correct container writes one, so a row

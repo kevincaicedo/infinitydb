@@ -1602,7 +1602,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_reorder: self.frame_waits_reorder,
             frame_waits_extent: self.frame_waits_extent,
             extent_parks: self.extent_waiters.parks(),
-            turn_refused: self.extent_waiters.turns_refused(),
+            turn_refused: self.extent_waiters.turn_refused(),
             extent_parked: self.extent_waiters.parked() as u64,
             extent_turns_out: self.extent_waiters.turns_out() as u64,
             frame_waits_fill: self.frame_waits_fill,
