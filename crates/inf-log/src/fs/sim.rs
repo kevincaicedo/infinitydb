@@ -765,6 +765,9 @@ struct DiskState {
     stall: Option<StallModel>,
     /// Per-file faults consumed (F-L04-02): the engagement witness.
     faults_fired: u64,
+    /// `Some`: fdatasyncs on files whose name the predicate accepts are
+    /// held by the driver until the hold lifts ([`SimDisk::hold_syncs`]).
+    hold_syncs: Option<fn(&Path) -> bool>,
 }
 
 impl DiskState {
@@ -969,6 +972,44 @@ impl SimDisk {
     #[must_use]
     pub fn open_dir_count(&self) -> usize {
         self.state.borrow().dir_fds.len()
+    }
+
+    /// Open file descriptors whose inode carries an OS name `named`
+    /// accepts: a scenario's count of one family of handles, read from the
+    /// model's own descriptor table (two opens of one file are two).
+    #[must_use]
+    pub fn open_files_named(&self, named: fn(&Path) -> bool) -> usize {
+        let state = self.state.borrow();
+        let inos: BTreeSet<u64> =
+            state.os_names.iter().filter(|(name, _)| named(name)).map(|(_, &ino)| ino).collect();
+        state.open_files.values().filter(|open| inos.contains(&open.ino)).count()
+    }
+
+    /// The OS-view names `named` accepts, in name order.
+    #[must_use]
+    pub fn names_where(&self, named: fn(&Path) -> bool) -> Vec<PathBuf> {
+        self.state.borrow().os_names.keys().filter(|name| named(name)).cloned().collect()
+    }
+
+    /// Holds every fdatasync on a file whose OS name `named` accepts until
+    /// the hold is lifted with `None`: a device that keeps one class of
+    /// barrier in its queue, the driver submitting the op only once the
+    /// hold lifts. With no hold armed every trace is unchanged.
+    pub fn hold_syncs(&self, named: Option<fn(&Path) -> bool>) {
+        self.state.borrow_mut().hold_syncs = named;
+    }
+
+    /// Whether an fdatasync on the driver file fd `fd` is held now: a hold
+    /// is armed and its predicate accepts a name of the fd's inode.
+    #[must_use]
+    pub fn sync_held(&self, fd: i32) -> bool {
+        let state = self.state.borrow();
+        let Some(named) = state.hold_syncs else { return false };
+        let Some(open) = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index))
+        else {
+            return false;
+        };
+        state.os_names.iter().any(|(name, &ino)| ino == open.ino && named(name))
     }
 
     /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
@@ -1849,6 +1890,33 @@ mod model_tests {
         }
         let bytes = copied();
         assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
+    }
+
+    /// The family accessors read the model's own tables: open descriptors
+    /// by the name of their inode, names by the predicate, and a sync held
+    /// by the name behind its fd until the hold lifts.
+    #[test]
+    fn a_named_family_counts_its_open_files_and_holds_its_syncs() {
+        fn is_blob(name: &Path) -> bool {
+            name.extension().is_some_and(|ext| ext == "iblob")
+        }
+        let disk = SimDisk::new();
+        disk.create_dir_all(Path::new("d")).expect("dirs");
+        let one = disk.create_tier(&Path::new("d").join("blob-1.iblob"), TierIoMode::Buffered);
+        let two = disk.create_tier(&Path::new("d").join("blob-2.iblob"), TierIoMode::Buffered);
+        let seg = disk.create_segment(&Path::new("d").join("seg-0.ilog"), 4096).expect("seg");
+        let (one, two) = (one.expect("blob 1"), two.expect("blob 2"));
+        assert_eq!(disk.open_files_named(is_blob), 2);
+        assert_eq!(disk.names_where(is_blob).len(), 2);
+        let (blob_fd, seg_fd) = (one.raw_fd().expect("fd"), seg.raw_fd().expect("fd"));
+        assert!(!disk.sync_held(blob_fd), "no hold armed");
+        disk.hold_syncs(Some(is_blob));
+        assert!(disk.sync_held(blob_fd));
+        assert!(!disk.sync_held(seg_fd), "the hold names one family");
+        drop(two);
+        assert_eq!(disk.open_files_named(is_blob), 1, "a closed handle leaves the count");
+        disk.hold_syncs(None);
+        assert!(!disk.sync_held(blob_fd), "the hold lifted");
     }
 
     /// Perf row (L04): the determinism digest hashes the resident image

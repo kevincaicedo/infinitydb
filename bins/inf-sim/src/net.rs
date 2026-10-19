@@ -92,6 +92,10 @@ pub struct CellNet {
     rng: SplitMix64,
     plant: Plant,
     plant_fired: bool,
+    /// Each reap delivers a connection's whole pending bytes, up to one
+    /// receive buffer, instead of a seeded chunk: commands sent at one
+    /// step arrive at one reap ([`CellNet::deliver_whole`]).
+    whole_chunks: bool,
 }
 
 /// Synthetic listener fd for a cell (never a real fd).
@@ -128,7 +132,17 @@ impl CellNet {
             rng: SplitMix64::new(seed ^ 0xD15C_0000 ^ u64::from(cell)),
             plant,
             plant_fired: false,
+            whole_chunks: false,
         }))
+    }
+
+    /// Deliver every connection's pending bytes whole, one receive buffer
+    /// a reap, from now on: commands of one size sent at one step reach
+    /// the server at one reap, the burst a stopped-then-resumed process
+    /// reads. The seeded chunking stays every other scenario's (no draw is
+    /// taken here, so their traces are unchanged).
+    pub fn deliver_whole(&mut self) {
+        self.whole_chunks = true;
     }
 
     /// Client side: open a connection to this cell; returns the fd handle.
@@ -205,6 +219,10 @@ pub struct SimDriver {
     /// Deferred fsync CQEs, due-time order (the disk's serial timeline
     /// keeps due times monotone, so pushes append in order).
     pending_syncs: Vec<PendingSync>,
+    /// Fdatasyncs the disk holds ([`SimDisk::hold_syncs`]), submission
+    /// order: each is submitted at the first driver entry after its hold
+    /// lifts, ahead of that entry's own ops.
+    held_syncs: Vec<(RawFd, CompletionToken)>,
     ops: Vec<IoOp>,
     stats: SubmitStats,
     /// Bytes/ops observed per class (ADR-0088 D8).
@@ -284,6 +302,7 @@ impl SimDriver {
             disk: None,
             clock: None,
             pending_syncs: Vec::new(),
+            held_syncs: Vec::new(),
             ops: Vec::new(),
             stats: SubmitStats::default(),
             observed: ObservedIo::default(),
@@ -346,6 +365,29 @@ impl SimDriver {
     pub fn queued_tier_io(&self) -> (u64, u64) {
         tier_io_of(&self.ops)
     }
+}
+
+/// Moves every held fdatasync whose hold has lifted to the front of `ops`,
+/// in submission order, so the driver entry submits it first. A free
+/// function over the fields, so the drain's `net` borrow stays disjoint.
+fn release_held_syncs(
+    disk: Option<&SimDisk>,
+    held_syncs: &mut Vec<(RawFd, CompletionToken)>,
+    ops: &mut Vec<IoOp>,
+) {
+    let Some(disk) = disk else { return };
+    if held_syncs.iter().all(|&(fd, _)| disk.sync_held(fd)) {
+        return;
+    }
+    let mut released = Vec::new();
+    held_syncs.retain(|&(fd, token)| {
+        let held = disk.sync_held(fd);
+        if !held {
+            released.push(IoOp::Fdatasync { fd, token });
+        }
+        held
+    });
+    ops.splice(0..0, released);
 }
 
 /// The tier-class bytes and ops among `ops`, by each op's token class.
@@ -532,6 +574,7 @@ impl BackendDriver for SimDriver {
         // Reused backing storage: the drain below may push deferred
         // syncs, which needs `self` free of the `ops` borrow.
         let mut ops = core::mem::take(&mut self.ops);
+        release_held_syncs(self.disk.as_ref(), &mut self.held_syncs, &mut ops);
         for op in ops.drain(..) {
             match op {
                 IoOp::AcceptArm { token, .. } => {
@@ -700,6 +743,12 @@ impl BackendDriver for SimDriver {
                         .disk
                         .as_ref()
                         .expect("durable sim scenarios construct SimDriver::with_disk (M2-S18)");
+                    // A held barrier reaches the device only once its hold
+                    // lifts: it is observed then, not now.
+                    if disk.sync_held(fd) {
+                        self.held_syncs.push((fd, token));
+                        continue;
+                    }
                     self.observed.note(token, 0);
                     // Stall device (M2.5-S14): standalone fsyncs (barrier
                     // dirs, everysec ticks) defer exactly like linked ones.
@@ -755,7 +804,7 @@ impl BackendDriver for SimDriver {
         // frames exercise the parser's accumulator on every run.
         let fds: Vec<RawFd> = net.conns.keys().copied().collect();
         for fd in fds {
-            let CellNet { conns, rng, plant, plant_fired, .. } = &mut *net;
+            let CellNet { conns, rng, plant, plant_fired, whole_chunks, .. } = &mut *net;
             let Some(conn) = conns.get_mut(&fd) else { continue };
             if !conn.recv_armed || conn.server_closed || conn.suppressed {
                 continue;
@@ -782,7 +831,7 @@ impl BackendDriver for SimDriver {
             }
             let Some(buf) = pool.try_lease(LeaseKind::Recv) else { continue };
             let max = conn.to_server.len().min(pool.buf_size());
-            let chunk = 1 + (rng.next_u64() as usize) % max;
+            let chunk = if *whole_chunks { max } else { 1 + (rng.next_u64() as usize) % max };
             let bytes = pool.bytes_mut(buf);
             for (i, b) in conn.to_server.drain(..chunk).enumerate() {
                 bytes[i] = b;
