@@ -3278,6 +3278,55 @@ fn blob_write_at_disk_full_replies_diskfull() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// ADR-0163 D2: a blob write whose extent fails inside the extent-seal
+/// window's reservation gives its unit back. Twenty refused blob writes in
+/// a row each answer `DISKFULL` — a unit kept by a refusal would park the
+/// seventeenth for good — and the window's census row reads no entry ever
+/// published, no writer parked.
+#[test]
+fn a_blob_write_refused_inside_the_window_gives_its_unit_back() {
+    let dir = temp_data_dir("tiered-blob-window-refused");
+    let node = Node::start_durable_with_faults(
+        1,
+        &dir,
+        vec![(inf_log::fault::BLOB_WRITE_NOSPACE, inf_foundation::fault::FaultSpec::Always)],
+    );
+    let mut c = node.connect();
+    c.write_all(&cmd(&[
+        b"INF.NS",
+        b"CREATE",
+        b"b",
+        b"MODE",
+        b"durable",
+        b"FSYNC",
+        b"always",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"BLOB-THRESHOLD",
+        b"4kb",
+    ]))
+    .expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    c.write_all(&cmd(&[b"INF.NS", b"USE", b"b"])).expect("write");
+    read_exactly(&mut c, b"+OK\r\n");
+    for i in 0..20 {
+        c.write_all(&cmd(&[b"SET", format!("big{i}").as_bytes(), &vec![0xA1u8; 8 << 10]]))
+            .expect("write");
+        let reply = read_line(&mut c);
+        assert!(reply.starts_with(b"-DISKFULL"), "write {i}: {}", String::from_utf8_lossy(&reply));
+    }
+    let caps = info_text(&mut c, b"caps");
+    let row = caps
+        .lines()
+        .find_map(|line| line.strip_prefix("cap_row_extent-window:"))
+        .unwrap_or_else(|| panic!("no extent-window row in {caps}"));
+    assert!(row.contains("high_water=0,crossings=0"), "no unit was ever kept: {row}");
+    assert_eq!(info_field(&info_persistence(&mut c), "extent_parks"), 0);
+    drop(c);
+    node.stop();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Reads one GET reply: `Ok(body)` for a bulk, `Err(line)` for an error
 /// reply, `Ok(empty)` is unreachable here (no test key is empty).
 fn read_get(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
