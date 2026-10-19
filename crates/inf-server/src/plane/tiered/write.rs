@@ -391,8 +391,7 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     if turn.is_none()
         && cell.extent_waiters.arrival(cell.commit.extent_window_len()) == Arrival::Park
     {
-        *turn = Some(cell.extent_waiters.park());
-        return Err(WriteBlock::ExtentWindow);
+        return Err(WriteBlock::ExtentWindow(cell.extent_waiters.park()));
     }
     let table = ks.tiered_store_mut(write.ns).expect("caller resolved the table");
     let t = tier.ns(write.ns).expect("tiered namespace has plane state");
@@ -492,8 +491,7 @@ fn park_at_full<F: SegmentFs>(
         Some(held) => cell.extent_waiters.refuse_turn(held),
         None => cell.extent_waiters.park(),
     };
-    *turn = Some(parked);
-    WriteBlock::ExtentWindow
+    WriteBlock::ExtentWindow(parked)
 }
 
 /// The reply or park a refused extent answers. A space refusal is
@@ -641,15 +639,14 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             Err(WriteBlock::Stall) => {
                 park_write(shared, ns, Park::Stall, deadline, &mut turn, proto).await?;
             }
-            Err(WriteBlock::ExtentWindow) => {
-                park_write(shared, ns, Park::ExtentWindow, deadline, &mut turn, proto).await?;
-            }
+            Err(WriteBlock::ExtentWindow(parked)) => turn.insert(parked).await,
             Err(WriteBlock::Reply(reply)) => return Err(reply),
         }
     }
 }
 
-/// Where a write attempt waits before it re-resolves.
+/// Where a write attempt waits before it re-resolves, besides the
+/// extent-seal window, whose park is the turn its block carries.
 #[derive(Copy, Clone)]
 enum Park {
     /// Staging backpressure: the in-flight frame's release.
@@ -657,13 +654,11 @@ enum Park {
     /// The tail stall: flush and release progress, deadline-bounded
     /// (ADR-0053 D4).
     Stall,
-    /// The extent-seal window: the writer's turn (ADR-0163 D2).
-    ExtentWindow,
 }
 
 /// Waits out one park of a write attempt. A park on staging or the tail
 /// stall gives a held window turn back first, so no turn waits behind
-/// another gate; the window's park awaits the turn the attempt took.
+/// another gate.
 async fn park_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -697,11 +692,6 @@ async fn park_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 t.stall_waiters.wait(())
             };
             wait.await;
-        }
-        Park::ExtentWindow => {
-            if let Some(held) = turn.as_mut() {
-                held.await;
-            }
         }
     }
     Ok(())
@@ -840,7 +830,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                 ShadowAttempt::Blocked(WriteBlock::Reply(reply)) => return Err(reply),
                 // The shadow path writes inline values alone: it neither
                 // reserves in the extent-seal window nor parks there.
-                ShadowAttempt::Blocked(WriteBlock::Replan | WriteBlock::ExtentWindow)
+                ShadowAttempt::Blocked(WriteBlock::Replan | WriteBlock::ExtentWindow(_))
                 | ShadowAttempt::Ineligible => {}
             }
         }
@@ -890,9 +880,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             Err(WriteBlock::Stall) => {
                 park_write(shared, ns, Park::Stall, deadline, &mut turn, proto).await?;
             }
-            Err(WriteBlock::ExtentWindow) => {
-                park_write(shared, ns, Park::ExtentWindow, deadline, &mut turn, proto).await?;
-            }
+            Err(WriteBlock::ExtentWindow(parked)) => turn.insert(parked).await,
             Err(WriteBlock::Reply(reply)) => return Err(reply),
         }
     }

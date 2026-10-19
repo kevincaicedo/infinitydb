@@ -127,10 +127,12 @@ enum WriteBlock {
     /// extent read (review of 2026-08-30, F-L06-03) — re-resolve; the
     /// caller bounds the retries.
     Replan,
-    /// The extent-seal window gave no unit (ADR-0163 D2): the writer holds
-    /// a turn parked in the window's queue — await it, re-resolve, and
-    /// reserve with it. Nothing was created; no reply of its own.
-    ExtentWindow,
+    /// The extent-seal window gave no unit (ADR-0163 D2): the writer's turn,
+    /// parked in the window's queue — the write loop holds it, awaits it,
+    /// re-resolves and reserves with it. A park always carries its turn, so
+    /// the loop never re-runs without a wake. Nothing was created; no reply
+    /// of its own.
+    ExtentWindow(crate::durable::ExtentTurn),
     /// Terminal typed reply.
     Reply(Vec<u8>),
 }
