@@ -43,6 +43,7 @@ use inf_fabric::{
     ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
     Outcome, SendError,
 };
+use inf_foundation::bounded::{CapCensus, ServeMark};
 use inf_foundation::time::Nanos;
 use inf_foundation::{CellId, LogHistogram};
 #[cfg(feature = "doc")]
@@ -301,6 +302,11 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// The durable plane (M2-S08, ADR-0015): `None` = memory-only cell —
     /// the zero-cost branch every memory-path check reduces to (M2-S09).
     durable: RefCell<Option<DurableCell<F>>>,
+    /// The cell's cap census (ADR-0163 D2): every capped container of the
+    /// cell registers its row here. Built once, with the cell's id, by
+    /// [`ServerPlane::new`], beside its one serve mark, which the cell's
+    /// loop takes as its first iteration begins.
+    census: Rc<CapCensus>,
     /// The tiered plane half (M4-S26): flush pipelines, cold-read
     /// custody, MAINTAIN drivers. `None` until the durable plane exists
     /// (a tiered namespace is a configuration of `MODE durable` —
@@ -667,6 +673,9 @@ enum StopCheckpoint {
 
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
+    /// Returns the plane and its cell's serve mark: the cap census is built
+    /// here, once, with `cell`, and the host hands the mark to the cell's
+    /// loop, which takes it as its first iteration begins (ADR-0163 D2).
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
     #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
@@ -678,12 +687,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node: Rc<NodeInfo>,
         observer: O,
         route_local_only: bool,
-    ) -> ServerPlane<O, F> {
+    ) -> (ServerPlane<O, F>, ServeMark) {
         node.cell.set(cell.0);
         node.cells.set(cells);
+        let (census, serve_mark) = CapCensus::new(cell);
+        node.cap_census.replace(Some(Rc::clone(&census)));
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
-        ServerPlane {
+        let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
                 cells,
@@ -718,6 +729,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
+                census,
                 tier: RefCell::new(None),
                 ns_drop_releases: RefCell::new(Vec::new()),
                 ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
@@ -766,7 +778,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             final_credit: None,
             stop: None,
             stop_checkpoint: true,
-        }
+        };
+        (plane, serve_mark)
     }
 
     /// Starts loop-resident boot recovery (M2-S15): the cell serves from
@@ -1552,6 +1565,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// F-L12-02; tooling — never the data plane).
     pub fn fabric_stats(&self) -> inf_fabric::FabricStats {
         self.shared.fabric.borrow().stats()
+    }
+
+    /// This cell's cap census (ADR-0163 D2): the DST's census oracle reads
+    /// its rows, phase and violations between scheduler iterations.
+    pub fn cap_census(&self) -> &CapCensus {
+        &self.shared.census
     }
 
     /// Memory attribution for this cell's keyspace slice (sim accounting

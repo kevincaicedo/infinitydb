@@ -260,7 +260,7 @@ impl Rig {
             .into_iter()
             .enumerate()
             .map(|(cell, fabric)| {
-                ServerPlane::new(
+                let (plane, _serve_mark) = ServerPlane::new(
                     CellId(cell as u16),
                     2,
                     -1,
@@ -269,7 +269,8 @@ impl Rig {
                     Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
                     NoopObserver,
                     false,
-                )
+                );
+                plane
             })
             .collect();
         let key = |owner| {

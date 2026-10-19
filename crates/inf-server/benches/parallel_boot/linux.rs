@@ -227,7 +227,7 @@ fn drive_cell(
         tier: None,
     })
     .expect("ns");
-    let mut plane = ServerPlane::new(
+    let (mut plane, serve_mark) = ServerPlane::new(
         CellId(i as u16),
         cells,
         listener.into_raw_fd(),
@@ -247,7 +247,7 @@ fn drive_cell(
         park_default: Some(std::time::Duration::from_micros(500)),
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
     while !stop.load(Ordering::Relaxed) {
         cell_loop.run_iteration(&mut plane).expect("iteration");
         if let Some(err) = plane.take_boot_error() {

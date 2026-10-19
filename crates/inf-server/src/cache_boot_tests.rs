@@ -72,7 +72,7 @@ fn plane(permit: crate::CacheBootPermit) -> (TestLoop, ServerPlane) {
     let node = NodeInfo::try_default().unwrap().into_boot_group(permit);
     let fabric =
         Mesh::new(2, MeshConfig { ring_capacity: 8, data_credits: 4 }).into_iter().next().unwrap();
-    let plane = ServerPlane::new(
+    let (plane, serve_mark) = ServerPlane::new(
         CellId(0),
         2,
         7,
@@ -87,6 +87,7 @@ fn plane(permit: crate::CacheBootPermit) -> (TestLoop, ServerPlane) {
         VirtualClock::default(),
         BufferPool::new(4, 4096),
         LoopConfig::default(),
+        serve_mark,
     );
     (reactor, plane)
 }

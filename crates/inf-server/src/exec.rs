@@ -101,6 +101,10 @@ pub struct NodeState {
     /// ADR-0178 D5), flushed by MAINTAIN, in [`TierFlushGauge`]'s order.
     /// Identically zero on nodes that never created a tiered namespace.
     pub tier_flush: Cell<[u64; TIER_FLUSH_GAUGES]>,
+    /// The cell's cap census (ADR-0163 D2), attached by the plane at its
+    /// construction: INFO's `# Caps` renders it, cell scope. A bare harness
+    /// that attaches none renders no `# Caps` section.
+    pub cap_census: RefCell<Option<Rc<inf_foundation::bounded::CapCensus>>>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
     pub raw_counters: Cell<[u64; 6]>,

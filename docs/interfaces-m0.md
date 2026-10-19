@@ -832,6 +832,14 @@ pub struct NodeInfo { /* Cells: tripwires, raw_counters, wire_buffers_bytes,
                          fabric_rtt_p50_ns, cell, cells */ }
 ```
 
+**Cap census extension note (ADR-0163 D2):** `ServerPlane::new(...)` builds
+the cell's cap census (`inf_foundation::bounded::CapCensus`) with its `cell`
+and returns `(ServerPlane, ServeMark)`; `CellLoop::new(driver, clock, pool,
+config, serve_mark)` takes that mark and consumes it as its first
+`run_iteration` begins, so every step before it is the cell's assembly. The
+mark is a token the census mints once, never `Clone`: a census is marked at
+most once. `NodeInfo::cap_census` holds the census for the cell's readers.
+
 `inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
 `listen_reuseport(port) -> TcpListener` · `bound_port` ·
 `pin_current_thread(core)`. `CellLoop` additionally exposes

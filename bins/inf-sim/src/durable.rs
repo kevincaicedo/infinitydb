@@ -2071,7 +2071,7 @@ pub(crate) fn boot(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
             })?;
         }
-        let mut plane = SimPlane::new(
+        let (mut plane, serve_mark) = SimPlane::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -2090,7 +2090,7 @@ pub(crate) fn boot(
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
         let config = LoopConfig { spin_iters: scenario.spin_iters, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config);
+        let cell_loop = CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark);
         nets.push(net);
         cells.push((cell_loop, plane));
     }

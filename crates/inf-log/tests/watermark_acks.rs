@@ -18,6 +18,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
+use inf_foundation::CellId;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_log::{FsyncClass, SegmentConfig, StagingConfig};
 use inf_runtime::{CellExecutor, CellLoop, LoopConfig, WatermarkGate};
@@ -46,8 +48,14 @@ fn run_schedule(seed: u64, dir: &Path) {
         driver.delays.push_back(rng.below(4) as u32);
     }
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let mut lp =
-        CellLoop::new(driver, Rc::clone(&clock), BufferPool::new(4, 1024), LoopConfig::default());
+    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let mut lp = CellLoop::new(
+        driver,
+        Rc::clone(&clock),
+        BufferPool::new(4, 1024),
+        LoopConfig::default(),
+        serve_mark,
+    );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
     let mut plane = DurablePlane::new(
         dir,

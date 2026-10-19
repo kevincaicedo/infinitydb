@@ -27,7 +27,7 @@ use core::num::NonZeroU32;
 mod census;
 mod deque;
 
-pub use census::{CapCensus, CapRow, CensusPhase};
+pub use census::{CapCensus, CapRow, CensusPhase, ServeMark};
 pub use deque::{CappedDeque, DequeSlot, Reserved};
 
 /// When a container's host fills it: while the cell serves, or whole before

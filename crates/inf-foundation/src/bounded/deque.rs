@@ -32,7 +32,7 @@ use crate::limits::DEQUE_BACKING_BYTES_MAX;
 /// ```compile_fail
 /// # use inf_foundation::bounded::{Cap, CapCensus, CapFill, CappedDeque, Reserve};
 /// # use inf_foundation::CellId;
-/// let census = CapCensus::new(CellId(0));
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
 /// let Ok(mut deque) = CappedDeque::<u8, Reserve>::new(
 ///     Cap::entries::<4>("x", CapFill::Serving), &census) else { return };
 /// deque.push_back(1u8); // no such method: growth needs a slot
@@ -43,7 +43,7 @@ use crate::limits::DEQUE_BACKING_BYTES_MAX;
 /// ```compile_fail
 /// # use inf_foundation::bounded::{Cap, CapCensus, CapFill, CappedDeque, Reserve};
 /// # use inf_foundation::CellId;
-/// let census = CapCensus::new(CellId(0));
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
 /// let Ok(mut deque) = CappedDeque::<u8, Reserve>::new(
 ///     Cap::entries::<4>("x", CapFill::Serving), &census) else { return };
 /// deque.reserve().ok();
@@ -54,7 +54,7 @@ use crate::limits::DEQUE_BACKING_BYTES_MAX;
 /// ```compile_fail
 /// # use inf_foundation::bounded::{Cap, CapCensus, CapFill, CappedDeque, Reserve, Reserved};
 /// # use inf_foundation::CellId;
-/// let census = CapCensus::new(CellId(0));
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
 /// let Ok(mut deque) = CappedDeque::<u8, Reserve>::new(
 ///     Cap::entries::<4>("x", CapFill::Serving), &census) else { return };
 /// if let Reserved::Slot(slot) = deque.reserve() {
@@ -317,7 +317,7 @@ mod tests {
     }
 
     fn deque(cap: Cap) -> (Rc<CapCensus>, CappedDeque<u32, Reserve>) {
-        let census = CapCensus::new(CELL);
+        let (census, _serve_mark) = CapCensus::new(CELL);
         let deque = CappedDeque::new(cap, &census).expect("built");
         (census, deque)
     }
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn an_assembly_cap_is_refused_and_registers_no_row() {
-        let census = CapCensus::new(CELL);
+        let (census, _serve_mark) = CapCensus::new(CELL);
         let refused = CappedDeque::<u32, Reserve>::new(ASSEMBLY, &census);
         assert!(matches!(refused, Err(CapError::Census)));
         assert_eq!(census.rows().count(), 0);
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn a_layout_past_the_backing_bound_is_refused() {
-        let census = CapCensus::new(CELL);
+        let (census, _serve_mark) = CapCensus::new(CELL);
         const PAGES_64: Cap = Cap::entries::<64>("pages", CapFill::Serving);
         const PAGES_65: Cap = Cap::entries::<65>("pages-over", CapFill::Serving);
         let fits = CappedDeque::<[u8; 1024], Reserve>::new(PAGES_64, &census);
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn coalesce_appends_below_the_cap_and_merges_at_it() {
-        let census = CapCensus::new(CELL);
+        let (census, _serve_mark) = CapCensus::new(CELL);
         const MARKS: Cap = Cap::entries::<3>("marks", CapFill::Serving);
         let mut deque =
             CappedDeque::<Mark, Coalesce<LaterMark>>::new(MARKS, &census).expect("built");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn merge_adjacent_keeps_the_later_entry_of_each_pair() {
-        let census = CapCensus::new(CELL);
+        let (census, _serve_mark) = CapCensus::new(CELL);
         const MARKS: Cap = Cap::entries::<8>("marks", CapFill::Serving);
         let mut deque =
             CappedDeque::<Mark, Coalesce<LaterMark>>::new(MARKS, &census).expect("built");
@@ -511,7 +511,7 @@ mod tests {
 
     fn model_run(seed: u64, ops: u32) {
         const CAP: Cap = Cap::entries::<6>("model", CapFill::Serving);
-        let census = CapCensus::new(CellId(2));
+        let (census, _serve_mark) = CapCensus::new(CellId(2));
         let mut deque = CappedDeque::<u32, Reserve>::new(CAP, &census).expect("built");
         let mut model: VecDeque<u32> = VecDeque::new();
         let (mut full, mut high) = (0u64, 0u32);

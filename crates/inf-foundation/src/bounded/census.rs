@@ -8,7 +8,9 @@
 //!
 //! Phases: `Assembling` from construction until the cell's loop takes the
 //! serve mark at its first iteration, `Serving` after it, `Stopping` once
-//! the loop has exited. At the mark the census walks its rows: an
+//! the loop has exited. The mark is a token, [`ServeMark`], minted once
+//! beside the census and consumed by its one `take`, so a census is marked
+//! at most once. At the mark the census walks its rows: an
 //! `Assembly` row whose live count is below its cap is a violation, and so
 //! is every publish, crossing or registration on an `Assembly` row from
 //! then on. A violation is counted in `cap_assembly_violations`, which the
@@ -24,6 +26,7 @@
     )
 )]
 
+use core::fmt;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -66,6 +69,43 @@ pub struct CapCensus {
     cap_assembly_violations: Cell<u32>,
 }
 
+impl fmt::Debug for CapCensus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapCensus")
+            .field("cell", &self.cell)
+            .field("phase", &self.phase.get())
+            .field("rows", &self.rows().count())
+            .field("cap_assembly_violations", &self.cap_assembly_violations.get())
+            .finish()
+    }
+}
+
+/// The cell's serve mark: minted once, beside its census, and consumed by
+/// the cell's loop as its first iteration begins. It is neither `Clone` nor
+/// `Copy`, so a census is marked at most once: a second mark has no token
+/// to take. Every step before the take is the cell's assembly.
+#[must_use = "the cell's loop takes the serve mark as its first iteration begins"]
+pub struct ServeMark {
+    census: Rc<CapCensus>,
+}
+
+impl ServeMark {
+    /// Takes the mark: the census leaves `Assembling` for `Serving` and
+    /// walks its rows once. An `Assembly` row whose live count is below its
+    /// cap is a violation, counted and asserted; the live count, never
+    /// `high_water`: a host that fills 4 of 4 and removes one before the
+    /// mark leaves `high_water = 4` with 3 live.
+    pub fn take(self) {
+        self.census.mark_serving();
+    }
+
+    /// The census this mark belongs to.
+    #[must_use]
+    pub fn census(&self) -> &Rc<CapCensus> {
+        &self.census
+    }
+}
+
 /// A container's handle on its `CapRow`: the index is fixed at registration
 /// and the fill is kept beside it, so a report tests one byte.
 pub(super) struct CapRowHandle {
@@ -75,16 +115,18 @@ pub(super) struct CapRowHandle {
 }
 
 impl CapCensus {
-    /// The census of `cell`, `Assembling`, with no row. The one allocation is
-    /// the `Rc`, at the cell's assembly, before it serves.
-    #[must_use]
-    pub fn new(cell: CellId) -> Rc<CapCensus> {
-        Rc::new(CapCensus {
+    /// The census of `cell`, `Assembling`, with no row, and its one serve
+    /// mark, which the cell's loop takes as its first iteration begins. The
+    /// one allocation is the `Rc`, at the cell's assembly, before it serves.
+    pub fn new(cell: CellId) -> (Rc<CapCensus>, ServeMark) {
+        let census = Rc::new(CapCensus {
             cell,
             phase: Cell::new(CensusPhase::Assembling),
             rows: RefCell::new([None; CAP_CENSUS_ROWS_MAX]),
             cap_assembly_violations: Cell::new(0),
-        })
+        });
+        let mark = ServeMark { census: Rc::clone(&census) };
+        (census, mark)
     }
 
     #[must_use]
@@ -105,18 +147,10 @@ impl CapCensus {
         self.cap_assembly_violations.get()
     }
 
-    /// The serve mark, taken once by the cell's loop as its first iteration
-    /// begins: every step before it was the cell's assembly. One walk of the
-    /// rows: each `Assembly` row whose live count is below its cap is counted
-    /// and asserted. The live count, never `high_water`: a host that fills 4
-    /// of 4 and removes one before the mark leaves `high_water = 4` with 3
-    /// live.
-    pub fn mark_serving(&self) {
-        debug_assert!(
-            self.phase.get() == CensusPhase::Assembling,
-            "the serve mark is taken once, by the cell's loop ({})",
-            self.cell
-        );
+    /// The serve mark's effect, reached only through [`ServeMark::take`], of
+    /// which the census mints one: the phase becomes `Serving` and one walk
+    /// of the rows counts and asserts each `Assembly` row under its cap.
+    fn mark_serving(&self) {
         self.phase.set(CensusPhase::Serving);
         let mut short: u32 = 0;
         let mut first = 0;
@@ -313,7 +347,7 @@ mod tests {
 
     #[test]
     fn a_census_is_born_assembling_with_its_cell_and_no_row() {
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         assert_eq!(census.cell(), CELL);
         assert_eq!(census.phase(), CensusPhase::Assembling);
         assert_eq!(census.rows().count(), 0);
@@ -323,13 +357,13 @@ mod tests {
 
     #[test]
     fn phases_go_assembling_serving_stopping() {
-        let census = CapCensus::new(CELL);
-        census.mark_serving();
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
         assert_eq!(census.phase(), CensusPhase::Serving);
         census.mark_stopping();
         assert_eq!(census.phase(), CensusPhase::Stopping);
         // A cell whose loop never ran still stops.
-        let never_served = CapCensus::new(CELL);
+        let (never_served, _mark) = CapCensus::new(CELL);
         never_served.mark_stopping();
         assert_eq!(never_served.phase(), CensusPhase::Stopping);
         assert_eq!(census.cap_assembly_violations(), 0);
@@ -337,7 +371,7 @@ mod tests {
 
     #[test]
     fn one_name_with_one_cap_and_fill_shares_a_row() {
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         let first = census.register(MARKS).expect("first instance");
         let second = census.register(MARKS).expect("a per-namespace second instance");
         assert_eq!(first.index, second.index);
@@ -358,7 +392,7 @@ mod tests {
 
     #[test]
     fn a_second_cap_value_under_one_name_is_census() {
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         census.register(MARKS).expect("first");
         const OTHER: Cap = Cap::entries::<17>("epoch-marks", CapFill::Serving);
         assert_eq!(census.register(OTHER).map(|_| ()), Err(CapError::Census));
@@ -367,17 +401,17 @@ mod tests {
 
     #[test]
     fn a_second_fill_under_one_name_is_census() {
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         census.register(FOUR).expect("the Assembly instance");
         assert_eq!(census.register(FOUR_SERVING).map(|_| ()), Err(CapError::Census));
-        let other = CapCensus::new(CELL);
+        let (other, _other_mark) = CapCensus::new(CELL);
         other.register(FOUR_SERVING).expect("the Serving instance");
         assert_eq!(other.register(FOUR).map(|_| ()), Err(CapError::Census));
     }
 
     #[test]
     fn an_assembly_name_registered_twice_is_census() {
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         census.register(FOUR).expect("one instance per cell");
         assert_eq!(census.register(FOUR).map(|_| ()), Err(CapError::Census));
         assert_eq!(census.rows().count(), 1);
@@ -386,7 +420,7 @@ mod tests {
     #[test]
     fn the_name_past_the_row_bound_is_census() {
         let one = core::num::NonZeroU32::MIN;
-        let census = CapCensus::new(CELL);
+        let (census, _mark) = CapCensus::new(CELL);
         for name in &NAME_TABLE[..CAP_CENSUS_ROWS_MAX] {
             let cap = Cap { name, entries: one, fill: CapFill::Serving };
             census.register(cap).expect("within the bound");
@@ -414,10 +448,10 @@ mod tests {
 
     #[test]
     fn an_assembly_row_full_at_the_mark_is_the_control() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 4);
-        census.mark_serving();
+        mark.take();
         assert_eq!(census.cap_assembly_violations(), 0);
         let read = census.row("timer-owners").expect("row");
         assert_eq!((read.assembly_live, read.high_water), (4, 4));
@@ -425,35 +459,35 @@ mod tests {
 
     #[test]
     fn an_assembly_row_under_filled_at_the_mark_is_asserted_and_counted() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 3);
-        expect_violation(&census, 0, || census.mark_serving());
+        expect_violation(&census, 0, || mark.take());
         assert_eq!(census.phase(), CensusPhase::Serving);
     }
 
     #[test]
     fn an_assembly_row_filled_then_one_removed_is_caught_by_the_live_count() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 4);
         row.report_removal(3);
         let read = census.row("timer-owners").expect("row");
         assert_eq!(read.high_water, 4, "a high-water check would pass this host");
         assert_eq!(read.assembly_live, 3);
-        expect_violation(&census, 0, || census.mark_serving());
+        expect_violation(&census, 0, || mark.take());
     }
 
     #[test]
     fn the_mark_names_the_short_row_behind_a_serving_one() {
         // The name is resolved from the short row's index at the violation:
         // row 0 is a full Serving row, so a text naming row 0 is wrong.
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let marks = census.register(MARKS).expect("row 0");
         let row = census.register(FOUR).expect("row 1");
         fill(&marks, 16);
         fill(&row, 3);
-        let outcome = catch_unwind(AssertUnwindSafe(|| census.mark_serving()));
+        let outcome = catch_unwind(AssertUnwindSafe(|| mark.take()));
         if cfg!(debug_assertions) {
             let payload = outcome.expect_err("a debug build asserts the violation");
             let text = panic_text(payload.as_ref());
@@ -465,41 +499,41 @@ mod tests {
 
     #[test]
     fn two_short_assembly_rows_count_two_at_the_mark() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let timers = census.register(FOUR).expect("row");
         const CLASSES: Cap = Cap::entries::<2>("task-classes", CapFill::Assembly);
         let classes = census.register(CLASSES).expect("row");
         fill(&timers, 3);
         fill(&classes, 1);
-        let outcome = catch_unwind(AssertUnwindSafe(|| census.mark_serving()));
+        let outcome = catch_unwind(AssertUnwindSafe(|| mark.take()));
         assert_eq!(outcome.is_err(), cfg!(debug_assertions));
         assert_eq!(census.cap_assembly_violations(), 2);
     }
 
     #[test]
     fn an_assembly_publish_after_the_mark_is_asserted_and_counted() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 4);
-        census.mark_serving();
+        mark.take();
         row.report_removal(3);
         expect_violation(&census, 0, || row.report_publish(4));
     }
 
     #[test]
     fn an_assembly_crossing_after_the_mark_is_asserted_and_counted() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 4);
-        census.mark_serving();
+        mark.take();
         expect_violation(&census, 0, || row.report_full());
         assert_eq!(census.row("timer-owners").expect("row").crossings, 1);
     }
 
     #[test]
     fn an_assembly_registration_after_the_mark_is_asserted_and_counted() {
-        let census = CapCensus::new(CELL);
-        census.mark_serving();
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
         expect_violation(&census, 0, || {
             census.register(THREE).expect("registered, and counted");
         });
@@ -508,10 +542,10 @@ mod tests {
 
     #[test]
     fn a_serving_row_is_outside_the_assembly_checks() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(MARKS).expect("row");
         fill(&row, 3);
-        census.mark_serving();
+        mark.take();
         row.report_publish(4);
         row.report_full();
         census.register(MARKS).expect("a Serving registration while serving");
@@ -522,10 +556,10 @@ mod tests {
 
     #[test]
     fn violations_accumulate_across_plants() {
-        let census = CapCensus::new(CELL);
+        let (census, mark) = CapCensus::new(CELL);
         let row = census.register(FOUR).expect("row");
         fill(&row, 2);
-        expect_violation(&census, 0, || census.mark_serving());
+        expect_violation(&census, 0, || mark.take());
         expect_violation(&census, 1, || row.report_publish(3));
         expect_violation(&census, 2, || row.report_full());
         assert_eq!(census.cap_assembly_violations(), 3);

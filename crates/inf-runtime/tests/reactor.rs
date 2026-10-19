@@ -16,6 +16,8 @@ use std::io;
 use std::time::Duration;
 
 use inf_alloc::BufferPool;
+use inf_foundation::CellId;
+use inf_foundation::bounded::{CapCensus, CensusPhase};
 use inf_foundation::time::StdClock;
 use inf_runtime::{
     BackendDriver, Capabilities, CellLoop, CellPlane, Completion, GroupClass, IoOp, LoopConfig,
@@ -66,7 +68,14 @@ impl BackendDriver for NullDriver {
 }
 
 fn test_loop(config: LoopConfig) -> CellLoop<NullDriver, StdClock> {
-    CellLoop::new(NullDriver::default(), StdClock::new(), BufferPool::new(4, 1024), config)
+    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    CellLoop::new(
+        NullDriver::default(),
+        StdClock::new(),
+        BufferPool::new(4, 1024),
+        config,
+        serve_mark,
+    )
 }
 
 /// Two synthetic connections: A holds a deep pipeline, B sends one PING per
@@ -170,6 +179,27 @@ fn the_first_iteration_polls_before_anything_is_armed() {
         let first = lp.run_iteration(&mut plane).expect("iteration");
         assert!(!first.parked, "spin_iters {spin_iters}: boot parked: {:?}", lp.driver().waits);
     }
+}
+
+/// The cell's census serves from the loop's first iteration: every step
+/// before it is assembly, and the mark is taken once (it is a token).
+#[test]
+fn the_first_iteration_takes_the_serve_mark() {
+    let (census, serve_mark) = CapCensus::new(CellId(7));
+    let mut lp = CellLoop::new(
+        NullDriver::default(),
+        StdClock::new(),
+        BufferPool::new(4, 1024),
+        LoopConfig::default(),
+        serve_mark,
+    );
+    assert_eq!(census.phase(), CensusPhase::Assembling, "constructing the loop is assembly");
+    let mut plane = BusyThenIdle { busy_left: 1 };
+    lp.run_iteration(&mut plane).expect("iteration");
+    assert_eq!(census.phase(), CensusPhase::Serving);
+    lp.run_iteration(&mut plane).expect("iteration");
+    assert_eq!(census.phase(), CensusPhase::Serving);
+    assert_eq!(census.cap_assembly_violations(), 0);
 }
 
 #[test]

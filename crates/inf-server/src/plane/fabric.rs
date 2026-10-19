@@ -698,7 +698,7 @@ mod fabric_batch_depth {
         const DEPTH: usize = 100_000;
         let mut fabrics = Mesh::new(2, MeshConfig::default());
         let fabric = fabrics.remove(0);
-        let plane = ServerPlane::<_, crate::StdSegmentFs>::new(
+        let (plane, _serve_mark) = ServerPlane::<_, crate::StdSegmentFs>::new(
             CellId(0),
             2,
             -1,

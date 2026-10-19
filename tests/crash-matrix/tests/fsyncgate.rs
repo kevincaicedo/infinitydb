@@ -97,7 +97,7 @@ fn start_node(
             fill: Default::default(),
             group: Default::default(),
         };
-        let mut plane = ServerPlane::new(
+        let (mut plane, serve_mark) = ServerPlane::new(
             CellId(0),
             1,
             listener.into_raw_fd(),
@@ -111,7 +111,7 @@ fn start_node(
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
         let config =
             LoopConfig { park_default: Some(Duration::from_millis(5)), ..Default::default() };
-        let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+        let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
         while !stop.load(Ordering::Relaxed) {
             cell_loop.run_iteration(&mut plane).expect("iteration");
             if let Some(err) = plane.take_boot_error() {

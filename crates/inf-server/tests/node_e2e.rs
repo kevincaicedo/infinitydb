@@ -742,7 +742,7 @@ impl Node {
                     };
                     durable = Some((cfg, Arc::clone(control)));
                 }
-                let mut plane = ServerPlane::new(
+                let (mut plane, serve_mark) = ServerPlane::new(
                     CellId(i as u16),
                     cells,
                     listener.into_raw_fd(),
@@ -776,7 +776,7 @@ impl Node {
                     Some(held) => CellClock::Held(held.internal),
                     None => CellClock::Running(gate.start()),
                 };
-                let mut cell_loop = CellLoop::new(driver, clock, pool, config);
+                let mut cell_loop = CellLoop::new(driver, clock, pool, config, serve_mark);
                 let (mut counted_quiet, mut counted) = (false, false);
                 while !stop.load(Ordering::Relaxed) {
                     cell_loop.run_iteration(&mut plane).expect("iteration");
@@ -6347,7 +6347,7 @@ fn unwired_plane(
     fabric: inf_fabric::CellFabric,
 ) -> ServerPlane<NoopObserver, inf_server::StdSegmentFs> {
     let listener = listen_reuseport(0).expect("listen");
-    ServerPlane::new(
+    let (plane, _serve_mark) = ServerPlane::new(
         CellId(cell),
         cells,
         listener.into_raw_fd(),
@@ -6356,7 +6356,8 @@ fn unwired_plane(
         Rc::new(NodeInfo::try_default().expect("fixture cache allocation")),
         NoopObserver,
         false,
-    )
+    );
+    plane
 }
 
 /// ADR-0159 A1.2 at the wiring seam: a credit issues only into its own

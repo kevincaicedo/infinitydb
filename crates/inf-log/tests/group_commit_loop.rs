@@ -16,6 +16,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
+use inf_foundation::CellId;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
@@ -33,6 +35,7 @@ fn cell(
     segment_bytes: u32,
 ) -> (TestLoop, DurablePlane, Rc<VirtualClock>) {
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
+    let (_census, serve_mark) = CapCensus::new(CellId(0));
     let lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
@@ -43,6 +46,7 @@ fn cell(
             park_default: Some(std::time::Duration::from_millis(1)),
             remote_first_execute: false,
         },
+        serve_mark,
     );
     let plane = DurablePlane::new(
         dir,
@@ -212,6 +216,7 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
     let mut driver = ScriptedDriver::new(IoMode::Real);
     driver.delays = std::iter::repeat_n(3, 1 << 16).collect();
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
+    let (_census, serve_mark) = CapCensus::new(CellId(0));
     let mut lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
@@ -222,6 +227,7 @@ fn four_frames_in_flight_pipeline_rotates_drained_and_replays_identically() {
             park_default: Some(std::time::Duration::from_millis(1)),
             remote_first_execute: false,
         },
+        serve_mark,
     );
     let mut plane = DurablePlane::new(
         &dir,

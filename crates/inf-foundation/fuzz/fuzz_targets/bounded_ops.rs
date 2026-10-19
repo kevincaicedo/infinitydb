@@ -79,7 +79,7 @@ impl<T> Model<T> {
 fuzz_target!(|data: &[u8]| {
     let Some((&head, ops)) = data.split_first() else { return };
     let which = usize::from(head & 7);
-    let census = CapCensus::new(CellId(u16::from(head)));
+    let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
     let mut reserve = CappedDeque::<u16, Reserve>::new(CAPS[which], &census).expect("fits");
     let mut marks =
         CappedDeque::<Mark, Coalesce<Later>>::new(MARK_CAPS[which], &census).expect("fits");

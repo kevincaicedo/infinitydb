@@ -1372,7 +1372,7 @@ fn cell_main(
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }
     mark(15); // setup:plane
-    let mut plane = ServerPlane::new(
+    let (mut plane, serve_mark) = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
@@ -1422,7 +1422,7 @@ fn cell_main(
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config);
+    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;

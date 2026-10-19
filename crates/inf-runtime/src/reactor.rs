@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use inf_alloc::BufferPool;
 use inf_foundation::LogHistogram;
+use inf_foundation::bounded::ServeMark;
 use inf_foundation::time::{Clock, Nanos};
 
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
@@ -180,6 +181,9 @@ pub trait CellPlane {
 /// single step — `inf-sim` drives it deterministically; `infinityd` wraps it
 /// in `loop {}`.
 pub struct CellLoop<D: BackendDriver, C: Clock> {
+    /// The cell's serve mark until the first iteration takes it: every step
+    /// before that iteration is the cell's assembly (ADR-0163 D2's census).
+    serve_mark: Option<ServeMark>,
     driver: D,
     clock: C,
     pool: BufferPool,
@@ -205,8 +209,18 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
 }
 
 impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
-    pub fn new(driver: D, clock: C, pool: BufferPool, config: LoopConfig) -> CellLoop<D, C> {
+    /// The loop of one cell. `serve_mark` is that cell's census mark, minted
+    /// beside the census its containers register with: the loop takes it as
+    /// its first iteration begins, so the census serves from then on.
+    pub fn new(
+        driver: D,
+        clock: C,
+        pool: BufferPool,
+        config: LoopConfig,
+        serve_mark: ServeMark,
+    ) -> CellLoop<D, C> {
         CellLoop {
+            serve_mark: Some(serve_mark),
             driver,
             clock,
             pool,
@@ -238,6 +252,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// Backend-fatal errors only (the ring/queue itself failed); per-op
     /// errors arrive as completions.
     pub fn run_iteration(&mut self, plane: &mut impl CellPlane) -> io::Result<IterStats> {
+        self.take_serve_mark();
         // ---- steps 9 (prev iteration's ops) + 1 (reap): ONE driver entry.
         // A queued task vetoes the park outright (F-L11-07; also what makes
         // `spin_iters == 0` safe). `before_park` runs only when spin is
@@ -363,6 +378,14 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         }
 
         Ok(IterStats { reaped, polled, commands, fabric_msgs, submitted, parked, active })
+    }
+
+    /// The serve mark, once, as the first iteration begins: the census its
+    /// containers registered with leaves `Assembling` here and nowhere else.
+    fn take_serve_mark(&mut self) {
+        if let Some(mark) = self.serve_mark.take() {
+            mark.take();
+        }
     }
 
     fn park_timeout(&self) -> Option<Duration> {

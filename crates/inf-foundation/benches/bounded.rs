@@ -367,7 +367,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let census = CapCensus::new(CellId(0));
+    let (census, _serve_mark) = CapCensus::new(CellId(0));
     let accumulator = run(&args, &census);
     let shape = match args.shape {
         Shape::Call => "call",

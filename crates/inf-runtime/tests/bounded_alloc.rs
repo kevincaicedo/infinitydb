@@ -33,7 +33,7 @@ impl Merge<Mark> for Later {
 
 #[test]
 fn no_allocator_call_after_live_across_churn() {
-    let census = CapCensus::new(CellId(0));
+    let (census, _serve_mark) = CapCensus::new(CellId(0));
     let mut entries = CappedDeque::<u64, Reserve>::new(ENTRIES, &census).expect("built");
     let mut marks = CappedDeque::<Mark, Coalesce<Later>>::new(MARKS, &census).expect("built");
     let before = ALLOC.thread_allocations();
@@ -71,7 +71,7 @@ fn no_allocator_call_after_live_across_churn() {
 
 #[test]
 fn a_refused_backing_builds_nothing() {
-    let census = CapCensus::new(CellId(1));
+    let (census, _serve_mark) = CapCensus::new(CellId(1));
     // The deque's construction makes exactly one allocation: the backing.
     let before = ALLOC.thread_allocations();
     let built = CappedDeque::<u64, Reserve>::new(ENTRIES, &census).expect("built");

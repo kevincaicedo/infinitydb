@@ -1321,7 +1321,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             ..Default::default()
         });
         seed_namespaces(&mut keyspace, scenario.namespaces);
-        let plane = ServerPlane::<_, inf_server::StdSegmentFs>::new(
+        let (plane, serve_mark) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
             CellId(i as u16),
             scenario.cells,
             listener_fd(i as u16),
@@ -1332,7 +1332,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             false,
         );
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(&clock), pool, config);
+        let cell_loop = CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
