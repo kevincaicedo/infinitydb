@@ -2,6 +2,8 @@
 //! budget, the cell's turn, the cold window's bound, the lanes.
 
 use super::*;
+use crate::durable::AckClass;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::time::Nanos;
 use inf_log::TIER_FRAME_BYTES;
@@ -15,6 +17,14 @@ use inf_store::{Keyspace, StoreConfig, TierSpec};
 fn spec() -> TierSpec {
     TierSpec::for_budget(64 << 20)
 }
+
+/// A cell's cap census for a tier cell under test.
+fn census() -> Rc<CapCensus> {
+    CapCensus::new(inf_foundation::CellId(0)).0
+}
+
+/// No durable plane: MAINTAIN ticks no reclaim mark.
+const NO_DURABLE: Option<&crate::durable::DurableCell<SimDisk>> = None;
 
 /// The op index has 8 token bits, so a wider index is refused, never
 /// masked. Pre-fix `round_slot(1, 256)` was `(1 << 8) | 0x100` — lane 1's op
@@ -33,7 +43,7 @@ fn round_slot_refuses_an_aliasing_index() {
 /// cell's lifetime as a node kill).
 #[test]
 fn dropped_namespace_lane_recycles_with_its_round_sequence() {
-    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
     cell.next_lane = inf_runtime::MAX_SLOT >> 8;
     cell.create_ns(NsId(16), &spec());
     let first = &cell.namespaces[0];
@@ -60,7 +70,7 @@ fn dropped_namespace_lane_recycles_with_its_round_sequence() {
 /// in: the turn's rotation is the vector's order.
 #[test]
 fn namespaces_are_kept_in_id_order() {
-    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
     for id in [40, 16, 32, 17] {
         cell.create_ns(NsId(id), &spec());
     }
@@ -371,7 +381,7 @@ fn flush_to_idle(
 #[test]
 fn a_round_above_the_class_cap_issues_in_groups_of_at_most_the_cap() {
     const SLICE: u64 = 8 << 20;
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SLICE, ..spec() });
     let mut ks = Keyspace::new(StoreConfig::default());
     sealed_backlog_on(&mut ks, NsId(16), 16 << 20, SLICE);
@@ -412,7 +422,7 @@ fn a_round_above_the_class_cap_issues_in_groups_of_at_most_the_cap() {
 fn a_second_namespace_is_granted_within_its_bound_beside_a_backlog() {
     const SLICE: u64 = 64 << 10;
     const PASS_NS: u64 = 10_000_000;
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     let spec = TierSpec { maintain_slice_bytes: SLICE, ..spec() };
     cell.create_ns(NsId(16), &spec);
     cell.create_ns(NsId(17), &spec);
@@ -469,7 +479,7 @@ fn a_second_namespace_is_granted_within_its_bound_beside_a_backlog() {
 #[test]
 fn a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held() {
     const SLICE: u64 = 64 << 10;
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(
         NsId(16),
         &TierSpec { maintain_slice_bytes: SLICE, tier_io_mode: TierIoMode::Buffered, ..spec() },
@@ -533,7 +543,7 @@ fn a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_he
 /// charged like any group, and both attempts count.
 #[test]
 fn a_retry_group_is_offered_and_charged_like_any_group() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 64 << 10, ..spec() });
     let mut ks = Keyspace::new(StoreConfig::default());
     sealed_backlog_on(&mut ks, NsId(16), 1 << 20, 64 << 10);
@@ -573,7 +583,7 @@ fn a_retry_group_is_offered_and_charged_like_any_group() {
 /// what the disk was handed, and the error is not fatal.
 #[test]
 fn a_failed_plan_issues_what_it_staged() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 6 << 10, ..spec() });
     let config = flush_config(&cell, 4 << 10, 6 << 10);
     let fs = cell.fs.clone();
@@ -614,7 +624,7 @@ fn flush_config(cell: &TierCell<SimDisk>, file_capacity: u64, slice_bytes: u64) 
 /// and the next pass starts after the namespace served last.
 #[test]
 fn a_refused_group_ends_the_pass_and_its_namespace_is_visited_first_next_turn() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &spec());
     cell.create_ns(NsId(17), &spec());
     let mut ks = Keyspace::new(StoreConfig::default());
@@ -656,7 +666,7 @@ fn a_refused_group_ends_the_pass_and_its_namespace_is_visited_first_next_turn() 
 /// turns and the passed-over ones are counted.
 #[test]
 fn the_cell_plans_one_round_per_turn_in_id_order() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     let mut ks = Keyspace::new(StoreConfig::default());
     for id in [18, 16, 17] {
         cell.create_ns(NsId(id), &spec());
@@ -710,7 +720,7 @@ fn every_offer_fits_one_group_on_every_device_model() {
         ("an ops rate of 0", Some((no_ops_rate, 8))),
     ];
     for (row, model) in rows {
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
         cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 8 << 20, ..spec() });
         let mut ks = Keyspace::new(StoreConfig::default());
         sealed_backlog_on(&mut ks, NsId(16), 16 << 20, 8 << 20);
@@ -772,13 +782,13 @@ fn every_offer_fits_one_group_on_every_device_model() {
 /// file read no timeout at all.
 #[test]
 fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &spec());
     let mut ks = sealed_backlog(2);
     let parked = cell.namespaces[0].stall_waiters.wait(());
     assert!(cell.namespaces[0].stall_waiters.any_waiting(), "engagement: a writer is parked");
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
-    let visited = cell.maintain_ns(&mut ks, 0, None, false, 0);
+    let visited = cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0);
     let mut ops = Vec::new();
     let planned = cell.turn(&mut ks, 0, &mut ops, &mut NoBudget);
     inf_foundation::fault::disarm_all();
@@ -797,7 +807,7 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
 /// staged round, unplanted, opens with every op unsent.
 #[test]
 fn unaddressable_round_opens_nothing() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &spec());
     let _ks = staged_round(&mut cell);
     let t = &mut cell.namespaces[0];
@@ -829,7 +839,7 @@ fn unaddressable_round_opens_nothing() {
 /// A drained round returns its lane too (the `round_drain` path).
 #[test]
 fn drained_namespace_lane_recycles_at_maintain() {
-    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &spec());
     cell.namespaces[0].round_seq = 3;
     // Park a finished round on it so the drop routes through the drain.
@@ -859,7 +869,7 @@ fn drained_namespace_lane_recycles_at_maintain() {
 /// writers parked on the tail stall to the typed timeout for the life.
 #[test]
 fn a_retry_with_a_done_run_between_its_failed_writes_completes() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 64 << 20, ..spec() });
     let mut ks = Keyspace::new(StoreConfig::default());
     sealed_backlog_on(&mut ks, NsId(16), 128 << 20, 64 << 20);
@@ -928,7 +938,7 @@ fn a_write_error_on_the_first_a_middle_and_the_last_group_is_a_charged_retry() {
     }
     for pick in [Pick::First, Pick::Middle, Pick::Last] {
         let row = format!("{pick:?} group");
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
         cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: SLICE, ..spec() });
         let mut ks = Keyspace::new(StoreConfig::default());
         sealed_backlog_on(&mut ks, NsId(16), 16 << 20, SLICE);
@@ -990,7 +1000,7 @@ fn a_dropped_namespace_drains_from_every_round_state() {
         Barriers,
     }
     for state in [State::Prepared, State::Writes, State::Barriers] {
-        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+        let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
         cell.create_ns(NsId(16), &TierSpec { maintain_slice_bytes: 8 << 20, ..spec() });
         let mut ks = Keyspace::new(StoreConfig::default());
         sealed_backlog_on(&mut ks, NsId(16), 16 << 20, 8 << 20);
@@ -1058,7 +1068,7 @@ fn a_dropped_namespace_drains_from_every_round_state() {
 /// first id above it, wrapping to 16, which was served again before 17.
 #[test]
 fn a_dropped_holder_releases_the_turn_to_the_namespace_after_the_one_served_last() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     let mut ks = Keyspace::new(StoreConfig::default());
     for (id, name) in [(16, &b"t16"[..]), (17, b"t17"), (18, b"t18")] {
         register_tiered(&mut ks, NsId(id), name, eight_mib_rounds());
@@ -1095,7 +1105,7 @@ fn a_dropped_holder_releases_the_turn_to_the_namespace_after_the_one_served_last
 /// first id above it, wrapping — and the plan rule holds as before.
 #[test]
 fn a_dropped_planned_last_passes_the_plan_to_the_first_id_above_it() {
-    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"));
+    let mut cell = TierCell::new(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
     let mut ks = Keyspace::new(StoreConfig::default());
     for (id, name) in [(16, &b"t16"[..]), (17, b"t17"), (18, b"t18")] {
         register_tiered(&mut ks, NsId(id), name, eight_mib_rounds());
@@ -1119,4 +1129,87 @@ fn a_dropped_planned_last_passes_the_plan_to_the_first_id_above_it() {
     assert_eq!(cell.flush_stats.rounds_planned, 3);
     pass(&mut cell, &mut ks, 3, &mut refuse);
     assert_eq!(cell.flush_stats.rounds_planned, 3, "every live namespace holds a round");
+}
+
+/// A durable plane as MAINTAIN's reclaim marks read it: the staged seq, a
+/// watermark held at 0, and each seq's ack class from `class_of`.
+struct HeldWatermark {
+    staged: u64,
+    class_of: fn(u64, u64) -> AckClass,
+}
+
+impl AckClasses for HeldWatermark {
+    fn staged_seq(&self) -> u64 {
+        self.staged
+    }
+
+    fn durable_seq(&self) -> u64 {
+        0
+    }
+
+    fn ack_class(&self, seq: u64) -> AckClass {
+        (self.class_of)(seq, self.staged)
+    }
+}
+
+/// A fresh cell with tiered namespace 16 materialized: `(cell, keyspace)`.
+fn marks_fixture() -> (TierCell<MemFs>, Keyspace) {
+    const PAGE: u64 = 4 << 10;
+    let demote = DemotionConfig::for_budget(1 << 20, PAGE);
+    let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
+    let space = AddressSpaceConfig {
+        reserve_bytes,
+        page_bytes: PAGE as usize,
+        life_origin: LogicalAddr::ZERO,
+    };
+    let mut ks = Keyspace::new(StoreConfig::default());
+    assert!(ks.materialize_tiered(NsId(16), space, demote, 64).is_ok());
+    let mut cell = TierCell::new(MemFs::new(), 0, PathBuf::from("/shard-0"), census());
+    cell.create_ns(NsId(16), &spec());
+    (cell, ks)
+}
+
+/// `ticks` MAINTAIN ticks, each after the namespace staged one record (its
+/// WAL epoch moves), with the watermark held; returns the marks held.
+fn tick_marks(class_of: fn(u64, u64) -> AckClass, ticks: u64) -> (TierCell<MemFs>, usize) {
+    let (mut cell, mut ks) = marks_fixture();
+    let mut ring = inf_log::StagingRing::new(inf_log::StagingConfig::with_capacity(1 << 20));
+    for staged in 1..=ticks {
+        let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+        table
+            .stage_wal(&mut ring, &inf_log::MutationEffect::Delete { ns: NsId(16), key: b"k" })
+            .expect("room");
+        let durable = HeldWatermark { staged, class_of };
+        cell.maintain_ns(&mut ks, 0, Some(&durable), false, staged).expect("maintain");
+    }
+    let marks = cell.namespaces[0].epoch_marks.len();
+    (cell, marks)
+}
+
+/// 1,000 ticks inside one barrier period: every earlier write sealed into a
+/// written frame with no barrier between them, one ack class, and the
+/// tick's own write in the builder. Uncapped, the namespace held a mark per
+/// tick, 1,000; one mark per class holds two.
+#[test]
+fn a_thousand_ticks_inside_one_barrier_period_keep_at_most_two_marks() {
+    let written_run = |seq: u64, staged: u64| {
+        if seq < staged { AckClass::Frame(staged - 1) } else { AckClass::Builder }
+    };
+    let (cell, marks) = tick_marks(written_run, 1_000);
+    assert!(marks <= 2, "{marks} reclaim marks after 1,000 ticks inside one barrier period");
+    let row = cell.census.row("epoch-marks").expect("the marks' row");
+    assert_eq!(row.crossings, 0, "every merge was exact");
+}
+
+/// 17 ticks, each sealed into a frame with a barrier of its own, the
+/// watermark held: 17 ack classes. Uncapped, 17 marks; capped, the cap's 16
+/// and one crossing, the row at its cap.
+#[test]
+fn seventeen_sealed_ticks_keep_the_cap_and_count_one_crossing() {
+    let own_frame =
+        |seq: u64, staged: u64| if seq < staged { AckClass::Frame(seq) } else { AckClass::Builder };
+    let (cell, marks) = tick_marks(own_frame, 17);
+    assert!(marks <= 16, "{marks} reclaim marks after 17 sealed ticks with the watermark held");
+    let row = cell.census.row("epoch-marks").expect("the marks' row");
+    assert_eq!((row.high_water, row.crossings), (16, 1));
 }

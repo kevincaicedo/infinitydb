@@ -1171,6 +1171,20 @@ assertion carrying `cap-assembly-violated`.
 `cap_row_<name>:entries_max=…,fill=…,high_water=…,crossings=…`. A harness
 that attaches no census renders no section.
 
+**Extent-reclaim marks (`epoch-marks`, ADR-0061 D5).** Each tiered
+namespace's `(seq, epoch)` reclaim marks are a
+`CappedDeque<EpochMark, Coalesce<LaterMark>>` over `EPOCH_MARKS_MAX` = 16
+(`inf-server::limits`), one per ack class. MAINTAIN reads the durable cell's
+staged seq, watermark and `ack_class(seq)` → `Covered | Frame(last seq) |
+Builder` (the ack-map entry that will release the seq, by one binary search;
+the builder when none). A tick pops the covered front marks; then, with the
+staged seq and the namespace's WAL epoch both past the back mark, adjacent
+marks of one class merge into the later, the pair replaces a back of its own
+class or is pushed, and at 16 classes it merges into the back (`LaterMark`
+takes the later pair whole: the back's deaths wait for the later class's
+barrier, a crossing on the row); the covered front pops again. A merge never
+makes reclaim earlier than the uncapped rule's.
+
 ## Boot recovery orchestration (`inf-server::recover`/`plane`, M2-S15 — ADR-0019)
 
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with

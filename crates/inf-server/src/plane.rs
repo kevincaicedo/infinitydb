@@ -973,6 +973,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             fs.clone(),
             u32::from(cell_id),
             shard_dir.clone(),
+            Rc::clone(&self.shared.census),
         ));
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
@@ -1029,20 +1030,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             if tier.namespaces.is_empty() && tier.cold.is_none() {
                 return;
             }
-            let (durable_mark, transition_idle) = {
-                let durable = self.shared.durable.borrow();
-                let mark = durable
-                    .as_ref()
-                    .map(|cell| (cell.stats().records_appended, cell.ack_gate.watermark()));
-                let idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
-                (mark, idle)
-            };
+            // The durable plane is read, never borrowed mutably, while the
+            // namespaces' drivers run: each tick of the reclaim marks reads
+            // its staged seq, its watermark and ack classes in this step.
+            let durable = self.shared.durable.borrow();
+            let transition_idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
             let mut ks = self.shared.store.borrow_mut();
             let mut units = 0u32;
             let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
             for at in 0..tier.namespaces.len() {
-                match tier.maintain_ns(&mut ks, at, durable_mark, transition_idle, now_us) {
+                match tier.maintain_ns(&mut ks, at, durable.as_ref(), transition_idle, now_us) {
                     Ok((used, work)) => {
                         units += used;
                         compact_reads.extend(work);
@@ -1056,6 +1054,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                     Err(_) => {}
                 }
             }
+            drop(durable);
             // ADR-0178 D3: the cell's turn offers each ready group to the
             // durable cell's device budget at its exact device size (the
             // tier cell has no budget of its own — one owner per fact).

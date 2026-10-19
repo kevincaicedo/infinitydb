@@ -32,12 +32,12 @@
 //! `IoOp::TierRead`, and complete through the custody table, each
 //! window planned below its file's [`ReadableLen`].
 
-#[allow(clippy::disallowed_types, reason = "container: T")]
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use inf_alloc::AlignedPool;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::{FileOffset, LogHistogram};
 use inf_log::blob::ExtentId;
 use inf_log::flush::{PendingSealView, unlink_tier_file};
@@ -51,6 +51,10 @@ use inf_runtime::{
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
 use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN};
+
+mod marks;
+
+pub(crate) use marks::{AckClasses, EpochMarks};
 
 /// `errno` values the completion handler classifies (ADR-0084 D4).
 const ENOSPC: i32 = 28;
@@ -100,7 +104,6 @@ const EXTENT_RECLAIM_PER_SLICE: usize = 8;
 const UNLINKS_PER_SLICE: usize = 8;
 
 /// One tiered namespace's plane-side state.
-#[allow(clippy::disallowed_types, reason = "container: T")]
 pub(crate) struct TierNs<F: SegmentFs> {
     pub ns: NsId,
     pub flush: TierFlush<F>,
@@ -123,12 +126,9 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// visit of the namespace while non-empty, whatever its flush leg
     /// returned, so the typed timeout always fires.
     pub stall_waiters: WaitList<()>,
-    /// `(durable seq, wal epoch)` marks: once the fsync watermark
-    /// covers `seq`, every extent death stamped ≤ `epoch` is durable —
-    /// the ADR-0061 D5 reclaim gate's plane-supplied input.
-    epoch_marks: VecDeque<(u64, u64)>,
-    /// The reclaim epoch derived from drained marks.
-    durable_epoch: u64,
+    /// The extent-reclaim marks, one per ack class, and the reclaim epoch
+    /// they yield: ADR-0061 D5's gate input, capped (ADR-0163 D2).
+    epoch_marks: EpochMarks,
     /// One compaction read chain in flight at a time (bounded).
     pub compact_inflight: bool,
     /// Namespace directory (teardown unlink root).
@@ -545,6 +545,9 @@ pub(crate) struct TierCell<F: SegmentFs> {
     pub(crate) flush_stats: TierFlushStats,
     /// The cell's turn: one per cell, the two cell-wide orders.
     turn: TierTurn,
+    /// The cell's cap census: each namespace's reclaim marks register
+    /// their row on it.
+    census: Rc<CapCensus>,
 }
 
 /// A dropped namespace's file half, unlinked in bounded slices
@@ -634,7 +637,7 @@ impl<F: SegmentFs> TierCell<F> {
 }
 
 impl<F: SegmentFs + Clone> TierCell<F> {
-    pub fn new(fs: F, cell: u32, shard_dir: PathBuf) -> TierCell<F> {
+    pub fn new(fs: F, cell: u32, shard_dir: PathBuf, census: Rc<CapCensus>) -> TierCell<F> {
         TierCell {
             fs,
             cell,
@@ -650,6 +653,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             round_drain: Vec::new(),
             flush_stats: TierFlushStats::default(),
             turn: TierTurn::default(),
+            census,
         }
     }
 
@@ -714,7 +718,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
 
     /// Builds `ns`'s pipeline and inserts it at its id's position, so the
     /// turn's rotation is the vector's order. Returns that index.
-    #[allow(clippy::disallowed_types, reason = "container: T")]
     fn create_ns(&mut self, ns: NsId, spec: &TierSpec) -> usize {
         if self.cold.is_none() {
             let qd = usize::from(spec.cold_read_qd);
@@ -750,6 +753,13 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             (lane, 0)
         });
         assert!(lane <= inf_runtime::MAX_SLOT >> 8, "tier flush lanes exhausted");
+        // The marks' one allocation, sized here and never grown. A refusal
+        // is the allocation fail-stop each growth of this constructor takes;
+        // their layout is a const assertion, and the census refuses only a
+        // cap name declared with a second value, which a test's first boot
+        // shows.
+        let epoch_marks = EpochMarks::new(&self.census)
+            .unwrap_or_else(|refused| panic!("tiered namespace reclaim marks refused: {refused}"));
         let at = self.namespaces.partition_point(|t| t.ns.0 < ns.0);
         self.namespaces.insert(
             at,
@@ -761,8 +771,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
                 io_mode: spec.tier_io_mode,
                 stall_waiters: WaitList::new(),
-                epoch_marks: VecDeque::new(),
-                durable_epoch: 0,
+                epoch_marks,
                 compact_inflight: false,
                 dir,
                 lane,
@@ -806,14 +815,14 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// unlink and compaction. Returns `(budget units used, compaction
     /// read to issue)` — the caller charges Maintenance and spawns the
     /// read chain (it owns the executor; this module owns no
-    /// `Rc<Shared>`). `durable_mark` is `(last staged seq, fsync
-    /// watermark seq)` from the durable cell — the extent-reclaim epoch
-    /// handoff (ADR-0061 D5).
+    /// `Rc<Shared>`). `durable` is the cell's durable plane, read in this
+    /// step for the extent-reclaim marks: its staged seq, its watermark and
+    /// the ack class of a seq (ADR-0061 D5).
     pub fn maintain_ns(
         &mut self,
         ks: &mut Keyspace,
         at: usize,
-        durable_mark: Option<(u64, u64)>,
+        durable: Option<&impl AckClasses>,
         transition_idle: bool,
         now_us: u64,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
@@ -868,15 +877,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
 
         // ---- extent reclaim epoch (ADR-0061 D5): a mark drains once
         // the fsync watermark covers its seq.
-        if let Some((staged_seq, durable_seq)) = durable_mark {
-            let epoch = table.wal_epoch();
-            if t.epoch_marks.back().is_none_or(|&(s, e)| s < staged_seq && e < epoch) {
-                t.epoch_marks.push_back((staged_seq, epoch));
-            }
-            while t.epoch_marks.front().is_some_and(|&(s, _)| s <= durable_seq) {
-                let (_, epoch) = t.epoch_marks.pop_front().expect("checked front");
-                t.durable_epoch = t.durable_epoch.max(epoch);
-            }
+        if let Some(durable) = durable {
+            t.epoch_marks.tick(table.wal_epoch(), durable);
         }
         units += reclaim_extents(&self.fs, table, t);
         units += unlink_retired(&self.fs, cold.as_ref(), t);
@@ -1254,7 +1256,8 @@ fn reclaim_extents<F: SegmentFs>(fs: &F, table: &mut TieredTable, t: &TierNs<F>)
         Quarantined,
     }
     let mut units = 0;
-    let reclaim = table.extent_reclaim_work(t.durable_epoch, EXTENT_RECLAIM_PER_SLICE);
+    let reclaim =
+        table.extent_reclaim_work(t.epoch_marks.durable_epoch(), EXTENT_RECLAIM_PER_SLICE);
     for candidate in reclaim {
         units += 1;
         let extent_id = candidate.extent_id;

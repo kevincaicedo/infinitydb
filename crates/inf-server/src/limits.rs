@@ -1,5 +1,28 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
+use inf_foundation::bounded::{Cap, CapFill};
+
+/// Reclaim marks one tiered namespace holds on its cell: ADR-0061 D5's
+/// `(seq, epoch)` marks, one per ack class (ADR-0163 D2). After MAINTAIN
+/// merges each pair of adjacent marks that one barrier releases, a mark
+/// stands for each class, so the marks are at most `F + C + 2`: `F` frames
+/// behind the written prefix (at most the frames in flight while writes land
+/// in order, the reorder window's 16 behind a late front write), `C`
+/// coverage points in the unfolded fsync ledger, one trailing written ack
+/// entry and the staging builder. The cap binds only behind a wedge: a late
+/// front write, or a FLUSH-class front entry held while write-through frames
+/// complete behind it. Owner: the namespace's `TierNs`, one deque per tiered
+/// namespace per cell, sized at its construction. Crossing: coalesce — at 16
+/// classes the back mark takes the later pair whole, so its extent deaths
+/// wait for the later class's barrier: reclaim is delayed by at most one
+/// barrier, never early, and each such merge counts as the row's crossing in
+/// `INFO caps`.
+pub const EPOCH_MARKS_MAX: u32 = 16;
+
+/// The reclaim marks' cap: `EPOCH_MARKS_MAX` entries under the census name
+/// `epoch-marks`, filled while the cell serves.
+pub const EPOCH_MARKS: Cap = Cap::entries::<EPOCH_MARKS_MAX>("epoch-marks", CapFill::Serving);
+
 /// Checkpoint-board slots one cell's sweep visits per MAINTAIN turn
 /// (ADR-0159 D4, A1.4). Owner: the cell's `BoardSweep`, charged as one
 /// Maintenance unit per turn as MAINTAIN's first budgeted step. Crossing:

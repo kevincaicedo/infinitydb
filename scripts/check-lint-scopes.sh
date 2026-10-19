@@ -65,7 +65,7 @@ ADR0143_EXEMPTIONS_MAX=15
 # is red), and only a lower number may replace it. The approved copies read
 # it from this one line, so it stays spelled `NAME=<digits>` alone. The
 # capped-backing allows are exact: 1, on `struct CappedDeque` (ADR-0151 D6).
-CONTAINER_EXEMPTIONS_MAX=104
+CONTAINER_EXEMPTIONS_MAX=101
 CAPPED_BACKING_SITES=1
 if [ "${INF_CONTAINER_CENSUS:-0}" = 1 ] && [ -z "${INF_LINT_API_DIAGNOSTICS:-}" ]; then
     # The census reads the ratchet's two passes; the ratchet calls back here.

@@ -1303,6 +1303,14 @@ impl<F: SegmentFs> DurableCell<F> {
         );
     }
 
+    /// Which barrier makes `seq` durable (ADR-0061 D5's reclaim marks):
+    /// `Covered` at or below the watermark, else the ack-map entry that will
+    /// release it, else the staging builder. One binary search of the map.
+    pub(crate) fn ack_class(&self, seq: u64) -> AckClass {
+        let (front, back) = self.frame_seqs.as_slices();
+        ack_class_of(front, back, self.ack_gate.watermark(), seq)
+    }
+
     /// One admission park episode began (local pump or fabric pump) —
     /// the pacing observable's cumulative half (ADR-0083 D5).
     pub fn note_parked(&mut self) {
@@ -1669,6 +1677,59 @@ fn coalesce_ack_map(
         } else {
             map.remove(i);
         }
+    }
+}
+
+/// The reclaim marks' read of this cell (ADR-0061 D5): the last staged seq,
+/// the watermark, and the ack class of a seq, in one MAINTAIN step.
+impl<F: SegmentFs> crate::tier_cell::AckClasses for DurableCell<F> {
+    fn staged_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    fn durable_seq(&self) -> u64 {
+        self.ack_gate.watermark()
+    }
+
+    fn ack_class(&self, seq: u64) -> AckClass {
+        DurableCell::ack_class(self, seq)
+    }
+}
+
+/// Which barrier makes a staged durable seq durable: the class of a reclaim
+/// mark taken at that seq (ADR-0061 D5's marks hold one mark per class).
+/// Two seqs of one class are made durable by one completion, since the
+/// watermark only ever takes the last seq of an ack-map entry it pops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AckClass {
+    /// At or below the watermark: durable already.
+    Covered,
+    /// Released by the ack map's entry whose last seq is this one: the
+    /// first entry whose last seq is at or above the seq asked about.
+    Frame(u64),
+    /// Staged and not yet sealed: the next sealed frame carries it, the
+    /// staging builder sealing whole into one frame.
+    Builder,
+}
+
+/// The class of `seq` over the ack map `(front, back)` (its two slices, in
+/// order) and the watermark: one binary search of the map, whose entries'
+/// seqs strictly increase.
+pub(crate) fn ack_class_of(
+    front: &[(Lsn, u64)],
+    back: &[(Lsn, u64)],
+    watermark: u64,
+    seq: u64,
+) -> AckClass {
+    if seq <= watermark {
+        return AckClass::Covered;
+    }
+    let first_at_or_above = |entries: &[(Lsn, u64)]| {
+        entries.get(entries.partition_point(|&(_, last)| last < seq)).map(|&(_, last)| last)
+    };
+    match first_at_or_above(front).or_else(|| first_at_or_above(back)) {
+        Some(last) => AckClass::Frame(last),
+        None => AckClass::Builder,
     }
 }
 
