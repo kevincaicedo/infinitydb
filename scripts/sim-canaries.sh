@@ -217,6 +217,13 @@ rows=(
   # read below the confirmable length reaches frames a held round has not
   # written, and the driver answers short.
   "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
+  # ADR-0163 D2 — the reclaim marks, one plant per rule. The back merge
+  # takes the later epoch and keeps the earlier seq: a merged mark pops at
+  # the earlier class's barrier and reclaims deaths whose killing records
+  # are not durable, so the wedge leg's cut (the first extent reclaim after
+  # a crossing) loses an acknowledged blob value's extent — on a sweep,
+  # since a seed's cut need not land before the later barrier.
+  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks DURABILITY --marks-leg wedge --sweep 16"
   # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
   # above the tail — no pad. The room property judges every demote target
   # (a page multiple above the head, at or below the tail) and the placed

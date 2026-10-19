@@ -45,7 +45,16 @@ pub(crate) struct LaterMark;
 
 impl Merge<EpochMark> for LaterMark {
     fn merge(back: &mut EpochMark, new: EpochMark) {
-        *back = new;
+        #[cfg(not(inf_canary_epoch_mark_keeps_old_seq))]
+        {
+            *back = new;
+        }
+        // Canary: the back takes the later epoch and keeps its own seq, so
+        // it pops at the earlier class's barrier with the later deaths.
+        #[cfg(inf_canary_epoch_mark_keeps_old_seq)]
+        {
+            back.epoch = new.epoch;
+        }
     }
 }
 
