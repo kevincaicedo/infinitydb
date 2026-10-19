@@ -2326,7 +2326,8 @@ pub(crate) fn boot(
 
 impl Drop for Node {
     /// The end of a life: its state observed, and every cell's cap census
-    /// judged after the cell's last iteration (H1, H5 and their liveness).
+    /// judged after the cell's last iteration (the cap bound, the assembly
+    /// rule and their liveness).
     fn drop(&mut self) {
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();

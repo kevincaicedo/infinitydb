@@ -1877,7 +1877,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     }
 
     // The cap census oracle (ADR-0163 D2): every cell's census after its
-    // last iteration — H1 per row, H5 and their liveness.
+    // last iteration — the cap bound per row, the assembly rule and their
+    // liveness.
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
         census.judge(index, plane.cap_census(), plane.keyspace().tiered_tables());

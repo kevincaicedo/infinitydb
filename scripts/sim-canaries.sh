@@ -219,13 +219,14 @@ rows=(
   "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
   # ADR-0163 D2: the cell's loop never takes its serve mark, so the census
   # its containers registered with stays assembling — what a loop marking
-  # another census leaves. H5's liveness, on every cell; no `Assembly` row
-  # is needed (the counter's own plant is the census test's).
+  # another census leaves. The assembly rule's liveness, on every cell; no
+  # `Assembly` row is needed (the counter's own plant is the census test's).
   "inf_canary_serve_mark_skipped m0-smoke census-never-marked"
   # ADR-0163 D2 — the capped deque's admission compare, both plants on the
-  # reclaim marks' wedge leg. K1 admits one entry fewer on a `Serving` row
-  # (it reads the row's fill): the row reaches 15 of its 16 and H2 reads it
-  # unfilled. K2 admits at the cap: the row holds 17 and H1 reads it over.
+  # reclaim marks' wedge leg. The first admits one entry fewer on a
+  # `Serving` row (it reads the row's fill): the row reaches 15 of its 16 and
+  # the leg's engagement reads it unfilled. The second admits at the cap: the
+  # row holds 17 and the census's cap bound reads it over.
   "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
   "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
   # ADR-0163 D2 — the reclaim marks, one plant per rule. The back merge

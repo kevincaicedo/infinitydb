@@ -182,9 +182,9 @@ impl<T, X> CappedDeque<T, X> {
     }
 
     /// Whether one more entry fits: the type's one admission compare,
-    /// `len < entries_max`, which holds `len <= entries_max` (I7) on both
-    /// crossings. Two canaries plant it: K1 admits one entry fewer on a
-    /// `Serving` row (it reads the row's fill), K2 admits at the cap.
+    /// `len < entries_max`, which holds `len <= entries_max` on both
+    /// crossings. Two canaries plant it: one admits one entry fewer on a
+    /// `Serving` row (it reads the row's fill), the other admits at the cap.
     #[inline]
     fn has_room(&self) -> bool {
         #[cfg(inf_canary_cap_minus_one)]

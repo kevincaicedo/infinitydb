@@ -1797,8 +1797,8 @@ impl MarksCut {
 }
 
 /// The epoch-marks shape at the cut: each cell's reclaim-marks census row.
-/// The wedge leg's H2 (ADR-0163 D2): the row has held its cap and crossed it
-/// at least once, else the run met no wedge and is vacuous (token
+/// The wedge leg's engagement (ADR-0163 D2): the row has held its cap and
+/// crossed it at least once, else the run met no wedge and is vacuous (token
 /// `cap-row-unfilled`). The everysec leg: no crossing, every merge exact
 /// (token `everysec-marks-crossed`), with at least two marks held, else
 /// vacuous.

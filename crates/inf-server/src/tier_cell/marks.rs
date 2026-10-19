@@ -157,7 +157,7 @@ impl EpochMarks {
         })
     }
 
-    /// I9: the marks strictly increase in both fields.
+    /// The marks strictly increase in both fields.
     fn strictly_increasing(&self) -> bool {
         self.marks
             .iter()

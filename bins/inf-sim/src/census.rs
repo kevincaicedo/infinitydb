@@ -1,18 +1,18 @@
 //! The cap census oracle (ADR-0163 D2), read for every cell at the end of
 //! every node life, after the cell's last loop iteration:
 //!
-//! - **H1**, per row: `high_water ≤ entries_max` — no capped container held
-//!   more than its cap. Violation token `cap-high-water-over`.
-//! - **H5**: `cap_assembly_violations = 0` (token `cap-assembly-violated`),
-//!   and the census left `Assembling`: a census never marked means the
-//!   cell's loop took no serve mark, or marked another census (token
-//!   `census-never-marked`).
+//! - **The cap bound**, per row: `high_water ≤ entries_max` — no capped
+//!   container held more than its cap. Violation token `cap-high-water-over`.
+//! - **The assembly rule**: `cap_assembly_violations = 0` (token
+//!   `cap-assembly-violated`), and the census left `Assembling`: a census
+//!   never marked means the cell's loop took no serve mark, or marked
+//!   another census (token `census-never-marked`).
 //! - Liveness: a cell holding a tiered namespace has the reclaim marks'
 //!   row (token `cap-row-missing`), and the rows checked are summed on the
 //!   report line (`cap_rows_checked`), so a run whose census read nothing is
 //!   visible.
 //!
-//! H1 and H5 read the product's own counts: wiring checks. The independent
+//! Both rules read the product's own counts: wiring checks. The independent
 //! evidence is each site's model test and the DST rows' disk-side oracles.
 //! Each violation's token is whitespace-free, so a canary row can expect it.
 
@@ -25,7 +25,7 @@ const EPOCH_MARKS_ROW: &str = "epoch-marks";
 /// The census verdict of one run: every cell of every life it judged.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CensusVerdict {
-    /// Rows H1 read, summed over the cells and lives (node sum).
+    /// Rows the cap bound read, summed over the cells and lives (node sum).
     pub(crate) rows_checked: u64,
     pub(crate) violations: Vec<String>,
 }
@@ -67,7 +67,7 @@ impl CensusVerdict {
     }
 }
 
-/// H1 on one row: its high water above its cap is red.
+/// The cap bound on one row: its high water above its cap is red.
 fn over_cap(cell: usize, row: &CapRow) -> Option<String> {
     (row.high_water > row.entries_max).then(|| {
         format!(
@@ -88,7 +88,7 @@ mod tests {
     use super::*;
 
     /// The liveness red: a cell with a tiered namespace and an empty census
-    /// (no reclaim marks' row) fails, though H1 and H5 have nothing to read.
+    /// (no reclaim marks' row) fails, though neither rule has a row to read.
     #[test]
     fn an_empty_census_beside_a_tiered_namespace_is_red() {
         let (census, serve_mark) = CapCensus::new(CellId(0));
@@ -103,8 +103,8 @@ mod tests {
         assert!(control.violations.is_empty(), "no tiered namespace, no row owed");
     }
 
-    /// H5's liveness: a census its cell's loop never marked is red, by the
-    /// token only that violation carries.
+    /// The assembly rule's liveness: a census its cell's loop never marked
+    /// is red, by the token only that violation carries.
     #[test]
     fn a_census_never_marked_is_red() {
         let (census, _serve_mark) = CapCensus::new(CellId(2));
@@ -115,9 +115,10 @@ mod tests {
         assert!(!verdict.violations[0].contains("cap-assembly-violated"));
     }
 
-    /// H1 reads each row; a full row is green and a row past its cap red.
+    /// The cap bound reads each row; a full row is green and a row past its
+    /// cap red.
     #[test]
-    fn h1_reads_every_row_and_is_red_past_a_cap() {
+    fn the_cap_bound_reads_every_row_and_is_red_past_a_cap() {
         struct Mark;
         impl Lossy for Mark {}
         struct Later;
