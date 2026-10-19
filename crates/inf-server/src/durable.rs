@@ -1721,15 +1721,25 @@ pub(crate) fn ack_class_of(
     watermark: u64,
     seq: u64,
 ) -> AckClass {
-    if seq <= watermark {
-        return AckClass::Covered;
+    // Canary: every seq reads as the builder's, so a tick takes any two
+    // marks for one class and the back is replaced by every later pair.
+    #[cfg(inf_canary_epoch_mark_class_blind)]
+    {
+        let _ = (front, back, watermark, seq);
+        AckClass::Builder
     }
-    let first_at_or_above = |entries: &[(Lsn, u64)]| {
-        entries.get(entries.partition_point(|&(_, last)| last < seq)).map(|&(_, last)| last)
-    };
-    match first_at_or_above(front).or_else(|| first_at_or_above(back)) {
-        Some(last) => AckClass::Frame(last),
-        None => AckClass::Builder,
+    #[cfg(not(inf_canary_epoch_mark_class_blind))]
+    {
+        if seq <= watermark {
+            return AckClass::Covered;
+        }
+        let first_at_or_above = |entries: &[(Lsn, u64)]| {
+            entries.get(entries.partition_point(|&(_, last)| last < seq)).map(|&(_, last)| last)
+        };
+        match first_at_or_above(front).or_else(|| first_at_or_above(back)) {
+            Some(last) => AckClass::Frame(last),
+            None => AckClass::Builder,
+        }
     }
 }
 

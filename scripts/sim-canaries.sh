@@ -224,6 +224,11 @@ rows=(
   # a crossing) loses an acknowledged blob value's extent — on a sweep,
   # since a seed's cut need not land before the later barrier.
   "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks DURABILITY --marks-leg wedge --sweep 16"
+  # The class search answers the builder for every seq: a tick replaces the
+  # back by every later pair, so a standalone over the written frame leaves
+  # its death waiting — the model test reads the reclaim epoch below the
+  # uncapped rule's.
+  "inf_canary_epoch_mark_class_blind crate-test inf-server lib a_standalone_over_the_written_frame_reclaims_its_death below the list's"
   # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
   # above the tail — no pad. The room property judges every demote target
   # (a page multiple above the head, at or below the tail) and the placed
