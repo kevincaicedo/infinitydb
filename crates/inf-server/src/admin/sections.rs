@@ -1,8 +1,9 @@
 //! `INFO` — the section renderers. Scope trap (documented, measured):
-//! the Memory section is a node fold, Tiering/Persistence/Tripwires are
-//! cell-scope; a reader multiplies by cells before comparing to RSS.
+//! the Memory section is a node fold, Tiering/Persistence/Tripwires/Caps
+//! are cell-scope; a reader multiplies by cells before comparing to RSS.
 
 use super::*;
+use inf_foundation::bounded::{CapFill, CensusPhase};
 
 // ---- INFO --------------------------------------------------------------------
 
@@ -12,6 +13,7 @@ const SECTIONS: &[&str] = &[
     "memory",
     "persistence",
     "tiering",
+    "caps",
     "stats",
     "replication",
     "cpu",
@@ -85,6 +87,9 @@ pub(crate) fn info(
     }
     if wants("tiering") {
         tiering_section(ks, node, &mut text);
+    }
+    if wants("caps") {
+        caps_section(node, &mut text);
     }
     let stats = ks.stats();
     if wants("stats") {
@@ -1085,6 +1090,43 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     tiering_write_lines(ks, text);
     tiering_extent_lines(ks, text);
     tiering_namespace_lines(ks, text);
+}
+
+/// `INFO caps` — the cell's cap census (ADR-0163 D2), cell scope: one line
+/// per capped container's row, `cap_row_<name>:` with its cap, its fill,
+/// its `high_water` (the most entries any one instance of the row has held
+/// at once, the maximum over the cell's instances) and its `crossings` (the
+/// `Full` answers and cap merges, summed over them), beside the census's
+/// phase and `cap_assembly_violations`, this cell's count. A bare harness
+/// with no census attached renders no section; a node fold is the reader's
+/// sum over the cells.
+fn caps_section(node: &NodeInfo, text: &mut String) {
+    let census = node.cap_census.borrow();
+    let Some(census) = census.as_ref() else { return };
+    push(text, "# Caps");
+    push(text, "caps_scope:cell");
+    let phase = match census.phase() {
+        CensusPhase::Assembling => "assembling",
+        CensusPhase::Serving => "serving",
+        CensusPhase::Stopping => "stopping",
+    };
+    push(text, &format!("cap_census_phase:{phase}"));
+    push(text, &format!("cap_assembly_violations:{}", census.cap_assembly_violations()));
+    push(text, &format!("cap_rows:{}", census.rows().count()));
+    for row in census.rows() {
+        let fill = match row.fill {
+            CapFill::Serving => "serving",
+            CapFill::Assembly => "assembly",
+        };
+        push(
+            text,
+            &format!(
+                "cap_row_{}:entries_max={},fill={fill},high_water={},crossings={}",
+                row.name, row.entries_max, row.high_water, row.crossings
+            ),
+        );
+    }
+    text.push_str("\r\n");
 }
 
 /// VmRSS from procfs (Linux); 0 where unavailable.

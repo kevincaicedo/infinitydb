@@ -1149,6 +1149,28 @@ cells`, capacity K. The LOG step asks only when `!staging.drained()`;
 a refusal holds the frame (it keeps accumulating; `frame_waits_pace`
 per episode). A drained cell always seals — never slower than K = 1.
 
+## Cap census and `INFO caps` (`inf-foundation::bounded`, `inf-server` — ADR-0163 D2)
+
+Every capped container of a cell registers a row of that cell's
+`CapCensus`: its cap name, its cap, its fill (`Serving`: filled while the
+cell serves; `Assembly`: filled whole before the serve mark), its
+`high_water` (the most entries one instance has held, the maximum over the
+row's instances in the cell) and its `crossings` (`Full` answers and cap
+merges, summed over them). Instances of one cap name share one row.
+`ServerPlane::new` builds the census once, with its cell's id, beside its
+one `ServeMark`; the cell's loop takes the mark as its first iteration
+begins (the census goes `Assembling` → `Serving`). At the mark an
+`Assembly` row whose live count is below its cap is a violation, and so
+is any publish, crossing or registration on an `Assembly` row after it:
+each counts in `cap_assembly_violations` (cell scope) and is a debug
+assertion carrying `cap-assembly-violated`.
+
+`INFO caps`, cell scope (a node fold is the reader's sum):
+`caps_scope:cell`, `cap_census_phase` (`assembling`, `serving`,
+`stopping`), `cap_assembly_violations`, `cap_rows`, and per row
+`cap_row_<name>:entries_max=…,fill=…,high_water=…,crossings=…`. A harness
+that attaches no census renders no section.
+
 ## Boot recovery orchestration (`inf-server::recover`/`plane`, M2-S15 — ADR-0019)
 
 - Recovery is a **resumable state machine**: `Recovery<F: SegmentFs>` with

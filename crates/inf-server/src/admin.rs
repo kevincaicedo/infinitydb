@@ -1325,6 +1325,59 @@ mod tests {
         );
     }
 
+    /// `# Caps` renders the cell's census: its scope, phase and violation
+    /// count, and one line per row with the row's own numbers. A harness
+    /// with no census attached renders no section.
+    #[test]
+    fn info_caps_renders_the_cells_census() {
+        use inf_foundation::CellId;
+        use inf_foundation::bounded::{
+            Cap, CapCensus, CapFill, CappedDeque, Coalesce, Lossy, Merge, Reserve, Reserved,
+        };
+        struct Mark;
+        impl Lossy for Mark {}
+        struct Later;
+        impl Merge<Mark> for Later {
+            fn merge(back: &mut Mark, new: Mark) {
+                *back = new;
+            }
+        }
+        const PAIRS: Cap = Cap::entries::<2>("pairs", CapFill::Serving);
+        const MARKS: Cap = Cap::entries::<3>("marks", CapFill::Serving);
+        let mut cx = ConnCx::try_default().expect("fixture cache allocation");
+        let mut store = Keyspace::new(StoreConfig::default());
+        let bare = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
+        assert!(!bare.contains("# Caps"), "no census attached: {bare}");
+        let (census, serve_mark) = CapCensus::new(CellId(3));
+        let mut pairs = CappedDeque::<u8, Reserve>::new(PAIRS, &census).expect("built");
+        let mut marks = CappedDeque::<Mark, Coalesce<Later>>::new(MARKS, &census).expect("built");
+        for _ in 0..3 {
+            if let Reserved::Slot(slot) = pairs.reserve() {
+                slot.publish(1);
+            }
+        }
+        for _ in 0..5 {
+            marks.push(Mark);
+        }
+        serve_mark.take();
+        cx.node.cap_census.replace(Some(census));
+        let caps = String::from_utf8(run(&mut cx, &mut store, &[b"INFO", b"caps"])).expect("ascii");
+        assert!(caps.contains("# Caps\r\ncaps_scope:cell\r\n"), "{caps}");
+        assert!(caps.contains("cap_census_phase:serving\r\n"), "{caps}");
+        assert!(caps.contains("cap_assembly_violations:0\r\n"), "{caps}");
+        assert!(caps.contains("cap_rows:2\r\n"), "{caps}");
+        assert!(
+            caps.contains("cap_row_pairs:entries_max=2,fill=serving,high_water=2,crossings=1\r\n"),
+            "{caps}"
+        );
+        assert!(
+            caps.contains("cap_row_marks:entries_max=3,fill=serving,high_water=3,crossings=2\r\n"),
+            "{caps}"
+        );
+        let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");
+        assert!(all.contains("# Caps"), "`INFO` renders every section: {all}");
+    }
+
     #[test]
     fn info_process_gauges_are_zero_before_the_board_and_render_its_values() {
         let mut cx = ConnCx::try_default().expect("fixture cache allocation");

@@ -1365,13 +1365,14 @@ Two things are unbounded by default:
 
 ## Observability
 
-`INFO` has `server`, `clients`, `memory`, `persistence`, `tiering`, `stats`,
-`replication`, `cpu`, `tripwires`, `loophist` and `keyspace` sections.
-Mind the scope: on a node with a data directory, `memory` and `keyspace` are
-totals over every cell (without one they describe the serving cell), while
-`persistence`, `tiering` and `tripwires` always describe the cell that
-served the `INFO` command. Multiply before comparing those to the process as
-a whole.
+`INFO` has `server`, `clients`, `memory`, `persistence`, `tiering`, `caps`,
+`stats`, `replication`, `cpu`, `tripwires`, `loophist` and `keyspace`
+sections. Mind the scope: on a node with a data directory, `memory` and
+`keyspace` are totals over every cell (without one they describe the serving
+cell), while `persistence`, `tiering`, `caps` and `tripwires` always describe
+the cell that served the `INFO` command. Multiply before comparing those to
+the process as a whole. `caps` lists the cell's capped containers, one line
+each: its cap, the most entries it has held and how many times it was full.
 
 The tripwires are always on, and turning them off is only possible in an
 A/B build that proves they cost nothing: SQEs per submit, CQEs per reap,
