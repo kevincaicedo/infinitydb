@@ -435,6 +435,11 @@ mod tests {
     /// classes; the standalone over the written frame reclaims its death as
     /// the list does. Taking the two marks for one class (the back replaced
     /// by the later pair) would leave the death waiting for the later frame.
+    /// A tick with nothing staged since the last mark takes no mark and asks
+    /// no class, so the history stages a second record before the second
+    /// tick: the first mark's record is then in a sealed frame and the
+    /// second's in the builder, two classes, and the standalone covers the
+    /// first frame alone.
     #[test]
     fn a_standalone_over_the_written_frame_reclaims_its_death() {
         let mut rig = Rig::new();
