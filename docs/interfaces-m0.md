@@ -141,6 +141,31 @@ impl Arena {
 > `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
 > every tree position before the payload is built (ADR-0151 D1, D2).
 
+> **Accepted 2026-10-19, implementation open — ADR-0177:** the executor
+> and the gates, as this decision rebuilds them, change the ADR-0149
+> note above and, for the fabric gate only, what the ADR-0151 note says
+> of gate keys. A task class is an erased `TaskClass` id from
+> `ExecutorLayout::class(&factory, cap)`; `reserve(class)` answers
+> Granted, Full, Exhausted or Foreign, and no Closed.
+> `CellExecutor::wake(TaskId)` and the leaf future `park()` are added.
+> `FabricGate<V, Cleanup>` has one limit and mints its key:
+> `reserve(&units)` answers Granted, NoUnit or Full. The key travels in
+> `FabricToken`'s sequence (`tag:1 | generation:23 | index:24`), every
+> bit checked; a caller no longer supplies it. A fabric waiter dropped
+> before delivery leaves its holder Orphaned until its request
+> completes. `KeyedGate<K, V, Cleanup>` and `IoGate` keep their caller's
+> key, both limits and `Duplicate`. A keyed wait registered with
+> `register_held()` gives its queue a `GateHold`: `waiting(&hold)`
+> replaces `has_waiter(key)` in the cold-read note below, and the holder
+> returns at `release(hold)`. The cold gate is built with `ColdReads`,
+> not before the cell serves, until the cold-read host is built before
+> serving (a deviation, expiry 2026-11-30). `WaitList` and
+> `WatermarkGate` take one wait node per parked task from a per-cell
+> pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
+> unchanged, and no type joins the suspension primitives sketched below.
+> No wire, durable or token layout changes. The old signatures below do
+> not establish that the replacement is built.
+
 > **Accepted 2026-09-22, implementation open — ADR-0154:** fixed timer
 > ownership and bounded callback delivery replaces TimerWheel/TimerId and
 > the raw-key on_timer contract below. Fallible boot construction admits

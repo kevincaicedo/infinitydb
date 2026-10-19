@@ -1865,6 +1865,17 @@ so promotion is free.
 
 ## 2. `WatermarkGate` — LSN-keyed ack gate (`inf-runtime/src/gate.rs`)
 
+> **Accepted 2026-10-19, implementation open — ADR-0177:** D5 rebuilds this
+> gate as an indexed minimum heap over the cell's wait-node pool. A pending
+> `always` reply carries its record's LSN, and its task waits on the gate
+> for one LSN at a time, where the group-commit section above has every
+> `always` future register. `waiter(lsn)` becomes `wait_for(lsn)`: at or
+> below the watermark it is Ready at its first poll and takes no node
+> (row 2.3). A dropped wait leaves the heap in the same step, so row 2.4's
+> cancelled state and its `unreachable!` go; an `always` reply's wait is
+> still dropped only with its task. Rows 2.1, 2.2 and 2.5 are unchanged.
+> The rows below do not establish that the replacement is built.
+
 Wakes `always` response futures when the durability watermark reaches their
 record LSN. It *trusts* the LSN fed by `GroupCommit` (machine 1); its own
 job is monotonicity + correct FIFO wake.
