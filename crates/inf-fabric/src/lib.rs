@@ -1,4 +1,4 @@
-//! `inf-fabric` — the cross-shard plane (master plan §6, milestone M0-E3):
+//! `inf-fabric` — the cross-cell plane (master plan §6, milestone M0-E3):
 //! SPSC rings, the N×(N−1) mesh with doorbells and credit flow control, and
 //! the fabric op codec v0.
 //!
@@ -12,6 +12,11 @@
 //! inventoried in `SAFETY.md`; the rest of the crate is `#![deny(unsafe_code)]`.
 
 #![deny(unsafe_code)]
+// ADR-0144 D1: a production `match` names every variant of its enum.
+#![cfg_attr(
+    not(test),
+    deny(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants)
+)]
 
 mod codec;
 #[cfg(not(loom))]
@@ -21,8 +26,8 @@ mod msg;
 mod ring;
 
 pub use codec::{
-    ApplyArgs, CODEC_VERSION, CodecError, ErrCode, MAX_APPLY_ARGS, MAX_BATCH_OPS, Op, Outcome,
-    WriteFlags, decode, encode,
+    ApplyArgs, CODEC_VERSION, CodecError, ErrCode, MAX_APPLY_ARGS, MAX_BATCH_OPS,
+    MAX_INLINE_APPLY_ARGS, Op, Outcome, WriteFlags, decode, encode,
 };
 #[cfg(not(loom))]
 pub use mesh::{CellFabric, FabricStats, Mesh, MeshConfig, SendError};

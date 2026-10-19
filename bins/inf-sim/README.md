@@ -1,8 +1,7 @@
 # inf-sim
 
-The **deterministic simulator** for InfinityDB (milestone M0-S20, master plan
-§17.1) — the project's main tool for finding concurrency and correctness bugs
-and making them *reproducible*.
+The **deterministic simulator** for InfinityDB — the project's main tool for
+finding concurrency and correctness bugs and making them *reproducible*.
 
 ## What it is
 
@@ -10,13 +9,14 @@ and making them *reproducible*.
 the store, and the command plane — single-threaded, with **time and entropy
 injected**. It does not use a forked or mocked data plane: it drives the *real*
 `ServerPlane` / `CellLoop` over a `SimDriver` whose "network" is in-memory
-per-cell byte queues with seeded chunk boundaries (so the RESP parser's
-resumability is exercised on every run).
+per-cell byte queues with seeded chunk boundaries (so frames that span
+reads exercise the RESP parser's accumulator).
 
 The key property:
 
-> **Same seed ⇒ byte-identical event trace.** Every failure is a single seed
-> you can replay verbatim.
+> **Same seed ⇒ byte-identical event trace.** A violation is reported with
+> the seed that replays it verbatim; a panic inside a sweep is not caught, so
+> its seed is lost.
 
 This turns the usual nightmare of "a flaky concurrency bug that reproduces once
 a week" into "seed `0xC0FFEE` fails — here is the exact trace."
@@ -69,15 +69,21 @@ window (the lost-wakeup tripwire).
 ## Usage
 
 ```bash
-# from the repository root
-cargo run --release --bin inf-sim -- --scenario m0-smoke --seed 0xC0FFEE
+# from the repository root; the simulator refuses to run without `--features dst`
+cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+  --scenario m0-smoke --seed 0xC0FFEE
 
 # verify determinism: run twice, byte-compare the traces
-cargo run --release --bin inf-sim -- --scenario m1-cache --seed 0xCAFE --verify-determinism
+cargo run --release -p inf-sim --features dst --bin inf-sim -- \
+  --scenario m2-durable --seed 0xCAFE --verify-determinism
 
-# the just shortcut
+# every scenario the binary accepts, once, determinism-verified
 just sim-smoke
 ```
+
+`scripts/sim-smoke.sh` is the registry of every scenario (cache, durability,
+device, document, tiering and index scenarios); the table below
+describes the original two.
 
 ### Flags
 
@@ -133,5 +139,6 @@ caught. Format is `<scenario> <seed>` per line. The contract:
 Deterministic simulation testing (DST) is how InfinityDB makes its
 shared-nothing concurrency trustworthy. Injecting all nondeterminism — clock,
 randomness, network chunking, scheduler order — means the test suite explores
-real interleavings and any failure is a replayable artifact, not a Heisenbug.
+real interleavings and a violation an oracle reports is a replayable artifact,
+not a Heisenbug; a panic inside a sweep is not caught, and its seed is lost.
 This is the same discipline used by FoundationDB and TigerBeetle.

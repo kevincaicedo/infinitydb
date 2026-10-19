@@ -1,0 +1,49 @@
+<!--
+title: Durability belongs to the namespace
+dek: Three durability classes, one log per cell, and a defect only a real disk could show.
+date: 2026-07-05
+topic: M2 · Engineering
+group: Engineering
+crumb: Engineering
+kicker: M2 · Durability
+excerpt: memory, everysec and always are three promises made by one log. The campaign that measured them also caught a real group-commit defect.
+-->
+<p class="lede">M2 builds the log spine and makes durability a property of the namespace, not of the server. A namespace picks its promise when it is created: <code>memory</code>, <code>everysec</code> or <code>always</code>. Each cell has one log, and it keeps all three promises, the memory one by never being touched. The gate campaign that measured them ran on the reference box, and its central finding was not a number. It was a real defect in group commit, one that every rehearsal on tmpfs had certified as healthy.</p>
+
+<h2 id="s1"><span class="num">1</span>A promise per namespace.</h2>
+<p>The classes differ in one thing: when the reply goes out, relative to the disk.</p>
+<ul class="dots">
+<li><code>memory</code>: acknowledged on apply, never logged, gone on restart. Cache semantics, at no cost to the log.</li>
+<li><code>everysec</code>: acknowledged on apply. Group commit runs every loop iteration, and a one-second timer makes sure a barrier runs. As with Redis's <code>appendfsync everysec</code>, a power loss can lose up to about one second of acknowledged writes.</li>
+<li><code>always</code>: the write applies at once, but its reply waits until a barrier covering its log record has completed. Nothing is acknowledged before it is durable.</li>
+</ul>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.NS CREATE orders MODE durable FSYNC always
+OK
+127.0.0.1:6379&gt; INF.NS USE orders
+OK
+127.0.0.1:6379&gt; SET order:1 shipped
+OK</pre>
+<p>The numbered databases, <code>SELECT 0</code> to <code>15</code>, are always memory-only. A durable namespace never evicts, because evicting a key without logging a delete would bring the key back on replay.</p>
+
+<h2 id="s2"><span class="num">2</span>One log per cell, shared by every class.</h2>
+<p>The log is per cell: checksummed frames in append-only segments, and a MANIFEST that names the checkpoint, the segment set and the truncation point in one atomic swap. A record's address is a segment and an offset in one cell's log. There is no global sequence number, so every cell recovers on its own, in parallel.</p>
+<p>Each iteration seals at most one frame, written with one write, and one barrier covers every durable write due. One end-to-end test interleaves <code>memory</code>, <code>everysec</code> and <code>always</code> namespaces on a single cell of a real io_uring node: each class keeps its own acknowledgment semantics, they share one frame and one fsync per iteration, and the memory namespace appends zero log records, asserted through a counter rather than inferred.</p>
+<aside class="law"><div class="law-label">Law derived · L2</div><p>The log is the database. One mechanism carries every durable fact, so there is one thing to make correct, and the classes that skip it really do skip it.</p></aside>
+
+<h2 id="s3"><span class="num">3</span>Nothing is served before it is durable.</h2>
+<p>An <code>always</code> reply is held on a gate keyed to the durable watermark, so it is structurally unreachable before the sync that covers it. The watermark advances only over the longest prefix of the log in which every barrier has completed; a later completion alone proves nothing about the bytes before it.</p>
+<p>Failure is loud. A failed fsync is fail-stop: the process exits, no write in the failed batch is acknowledged, and a check in <code>just check</code> keeps that error type out of any match arm that would carry on. Retrying an fsync against pages the kernel may already have dropped is how a database loses data quietly. Recovery truncates a torn final frame, which is expected after a power cut, but a corrupt frame with valid data after it means the disk lied, and the node stops with a named error.</p>
+<p>The simulator's durability oracle checks every acknowledgment against what survives a seeded power cut, and it must catch a planted driver that reports a sync it never performed, or its silence means nothing.</p>
+
+<h2 id="s4"><span class="num">4</span>The defect the gate caught.</h2>
+<p>The first binding run on the reference box measured the <code>always</code> row well under its gate, with far fewer acknowledgments per fsync than the load offered. Every iteration that carried <code>always</code> traffic linked its own <code>fdatasync</code>. On a device with real fsync latency, dozens of tiny syncs queued behind each other, each covering about one iteration's records. It was the batch-of-one disease that sank Vortex's I/O plane, this time at the device.</p>
+<p>Nothing earlier had seen it. On tmpfs an fsync costs almost nothing, so each sync finished before the next iteration and grouping looked fine. Simulated fsyncs complete deterministically, so the simulator missed it too: after the fix, the 10,000-seed sweep produced byte-identical results. Only the device made it visible.</p>
+<p>The fix makes the design literal: one durability fsync in flight. Barriers that come due while a sync is outstanding wait behind it and issue when it completes, covering everything queued since. Segment-seal syncs stay ungated, and the <code>everysec</code> window still holds. A unit test pins the discipline: twelve frames, two fsyncs.</p>
+<aside class="law"><div class="law-label">Law derived · L3</div><p>Batch every boundary. An fsync is paid per batch, never per write, and a rehearsal on a device where the barrier is free cannot see a batching defect. The device that charges for the barrier is part of the test.</p></aside>
+
+<h2 id="s5"><span class="num">5</span>Disclosed, not narrowed.</h2>
+<p>The <code>always</code> row still did not reach its gate on this box. The reference box's drive is a consumer PCIe Gen3 DRAM-less NVMe, a disclosed deviation from the Gen4 class the device-bound gates were written for. So <code>always</code> throughput, the <code>everysec</code> penalty and the absolute checkpoint tail are Evidence-pending with the device named as the limiter. Per-cell replay was rejected on this box, with its remedy named: overlap read-ahead with apply. No gate value was narrowed.</p>
+<p>The rest of the campaign is the subject of the reference-box re-run before the first release; until then its rows stay pending on this site, whatever a development run says.</p>
+
+<h2 id="close">What the namespace owns.</h2>
+<p>A namespace now owns its promise, and a cell keeps all of them with one log. The campaign showed why promises are measured on hardware that can say no: the gate that failed found a real defect, and the fix landed with a test that pins it. The <a href="../docs/durability.html">durability</a> and <a href="../docs/log.html">log</a> pages cover the classes, frames and recovery.</p>

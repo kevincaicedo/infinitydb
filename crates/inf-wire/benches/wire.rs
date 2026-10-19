@@ -6,7 +6,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use inf_wire::{ConnParser, Parsed, ParserLimits, lookup};
+use inf_wire::{ConnParser, Parsed, ParserLimits, Protocol, RespWriter, lookup};
 
 /// Pipelined GET/SET mix, RESP-encoded — the regime the node throughput
 /// gate runs (memtier P=16 shape).
@@ -137,5 +137,75 @@ fn bench_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parse, bench_dispatch);
+/// Reply-write cost (M0-S11 serializer). `simple("OK")` is the reply every
+/// `SET` pays, so the C6 line sanitization (CR/LF mapped on the way out —
+/// ADR-0097) lands directly on the write path: this group is the A/B for it.
+/// Dev-tier numbers; the gate rows come from the reference box.
+fn bench_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resp_write");
+    let value = vec![0xABu8; 512];
+
+    // Literal text is what every hot reply actually passes (`w.simple("OK")`,
+    // `w.error("ERR value is not an integer or out of range")`), so the C6
+    // line scan const-folds there; the `black_box`ed variants below are the
+    // worst case, where the text is opaque to the compiler.
+    group.bench_function("simple_ok_literal_x64", |b| {
+        let mut out = Vec::with_capacity(1024);
+        b.iter(|| {
+            out.clear();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            for _ in 0..64 {
+                w.simple("OK");
+            }
+            black_box(out.len())
+        });
+    });
+    group.bench_function("error_literal_x64", |b| {
+        let mut out = Vec::with_capacity(8192);
+        b.iter(|| {
+            out.clear();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            for _ in 0..64 {
+                w.error("ERR value is not an integer or out of range");
+            }
+            black_box(out.len())
+        });
+    });
+    group.bench_function("simple_ok_x64", |b| {
+        let mut out = Vec::with_capacity(1024);
+        b.iter(|| {
+            out.clear();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            for _ in 0..64 {
+                w.simple(black_box("OK"));
+            }
+            black_box(out.len())
+        });
+    });
+    group.bench_function("bulk_512b_x64", |b| {
+        let mut out = Vec::with_capacity(64 * 1024);
+        b.iter(|| {
+            out.clear();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            for _ in 0..64 {
+                w.bulk(black_box(&value));
+            }
+            black_box(out.len())
+        });
+    });
+    group.bench_function("error_x64", |b| {
+        let mut out = Vec::with_capacity(8192);
+        b.iter(|| {
+            out.clear();
+            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            for _ in 0..64 {
+                w.error(black_box("ERR value is not an integer or out of range"));
+            }
+            black_box(out.len())
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_parse, bench_dispatch, bench_write);
 criterion_main!(benches);

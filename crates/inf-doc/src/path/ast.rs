@@ -5,6 +5,16 @@
 //! text. The printer exists for the `parse(print(ast)) == ast` property,
 //! diagnostics, and the S15 matrix. Grammar authority:
 //! `infinitydb/docs/jsonpath-subset.md`.
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 /// One parsed path: mode + segments (root is implicit — the encoder
 /// emits `Root` as the first op).
@@ -72,7 +82,36 @@ pub fn print(ast: &PathAst) -> String {
     out
 }
 
+/// `Descend(inner)` prints its inner segment through the leaf printer —
+/// the AST forbids a nested descend, so this is a two-level walk, not a
+/// self-call (ADR-0125 A4).
 fn print_segment(out: &mut String, segment: &Segment) {
+    let Segment::Descend(inner) = segment else { return print_leaf_segment(out, segment) };
+    // `..name` / `..*` fuse; bracketed selectors keep their `[`.
+    out.push('.');
+    match inner.as_ref() {
+        Segment::Child(name) if is_shorthand(name) => {
+            out.push('.');
+            out.push_str(str::from_utf8(name).expect("AST keys are validated UTF-8"));
+        }
+        Segment::ChildAny => out.push_str(".*"),
+        other @ (Segment::Child(_)
+        | Segment::Index(_)
+        | Segment::Slice(_)
+        | Segment::Union(_)
+        | Segment::Descend(_)) => {
+            out.push('.');
+            // Bracket forms print without the leading dot they never
+            // had; the leaf printer emits `[...]` directly.
+            let mut inner_text = String::new();
+            print_leaf_segment(&mut inner_text, other);
+            debug_assert!(inner_text.starts_with('['), "descend inner is a bracket form");
+            out.push_str(&inner_text);
+        }
+    }
+}
+
+fn print_leaf_segment(out: &mut String, segment: &Segment) {
     match segment {
         Segment::Child(name) if is_shorthand(name) => {
             out.push('.');
@@ -108,27 +147,7 @@ fn print_segment(out: &mut String, segment: &Segment) {
             }
             out.push(']');
         }
-        Segment::Descend(inner) => {
-            // `..name` / `..*` fuse; bracketed selectors keep their `[`.
-            out.push('.');
-            match inner.as_ref() {
-                Segment::Child(name) if is_shorthand(name) => {
-                    out.push('.');
-                    out.push_str(str::from_utf8(name).expect("AST keys are validated UTF-8"));
-                }
-                Segment::ChildAny => out.push_str(".*"),
-                other => {
-                    out.push('.');
-                    // Bracket forms print without the leading dot they
-                    // never had; `print_segment` emits `[...]` directly.
-                    debug_assert!(!matches!(other, Segment::Descend(_)), "descend never nests");
-                    let mut inner_text = String::new();
-                    print_segment(&mut inner_text, other);
-                    debug_assert!(inner_text.starts_with('['), "descend inner is a bracket form");
-                    out.push_str(&inner_text);
-                }
-            }
-        }
+        Segment::Descend(_) => unreachable!("descend never nests (AST invariant)"),
     }
 }
 
@@ -155,14 +174,15 @@ fn print_quoted(out: &mut String, name: &[u8]) {
         match ch {
             '\\' => out.push_str("\\\\"),
             '\'' => out.push_str("\\'"),
-            c if (c as u32) < 0x20 => {
-                let b = c as u32 as u8;
-                let hex = b"0123456789abcdef";
-                out.push_str("\\u00");
-                out.push(hex[(b >> 4) as usize] as char);
-                out.push(hex[(b & 0xF) as usize] as char);
-            }
-            c => out.push(c),
+            c => match u8::try_from(c) {
+                Ok(b) if b < 0x20 => {
+                    let hex = b"0123456789abcdef";
+                    out.push_str("\\u00");
+                    out.push(hex[(b >> 4) as usize] as char);
+                    out.push(hex[(b & 0xF) as usize] as char);
+                }
+                Ok(_) | Err(_) => out.push(c),
+            },
         }
     }
     out.push('\'');

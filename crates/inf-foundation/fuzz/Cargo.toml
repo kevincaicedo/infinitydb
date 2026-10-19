@@ -1,0 +1,24 @@
+# cargo-fuzz crate for inf-foundation: the capped containers' op sequences
+# against std models (ADR-0151 D6; 300 s per slice, nightly hours). Standalone
+# workspace — built only by `cargo +nightly fuzz`.
+[package]
+name = "inf-foundation-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+inf-foundation = { path = ".." }
+
+[[bin]]
+name = "bounded_ops"
+path = "fuzz_targets/bounded_ops.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

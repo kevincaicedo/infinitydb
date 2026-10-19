@@ -17,56 +17,27 @@
 //! This is the composition proof, not the campaign: the durability
 //! oracle over the ack stream and the 10k-seed sweep bind at M2-S19.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use inf_foundation::rng::{Entropy, SplitMix64};
-use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    CkptConfig, Lsn, MutationEffect, NsId, SegmentConfig, SegmentReader, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs, scan_log_dir, segment_file_name,
+    Lsn, MutationEffect, SegmentConfig, SegmentReader, SegmentRotor, StagingRing, create_cell_dirs,
+    scan_log_dir, segment_file_name,
 };
 use inf_server::{DurableConfig, open_cell_log};
-use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
+use inf_store::StateDigest;
 
-const NS: NsId = NsId(16);
-const CELL: u16 = 0;
-const LOG_DIR: &str = "data/shard-0/log";
+mod support;
+use support::*;
 
-fn now() -> Nanos {
-    Nanos::from_millis(1)
-}
-
-fn anchor() -> WallAnchor {
-    WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 }
-}
-
+/// 8 KiB segments: many rotations per run.
 fn cfg() -> DurableConfig {
-    DurableConfig {
-        data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 8 << 10, seal_after_ms: None },
-        ckpt: CkptConfig::default(),
-        recover: Default::default(),
-        sync_pipeline: 1,
-    }
+    cfg_with(SegmentConfig { segment_bytes: 8 << 10, ..Default::default() })
 }
 
-fn fresh_keyspace() -> Keyspace {
-    let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
-    .expect("ns");
-    ks
-}
+const LOG_DIR: &str = "data/shard-0/log";
 
 /// Seeded tail-only workload on the sim disk: frames at random
 /// boundaries, occasional explicit fdatasync of the active segment (the
@@ -96,7 +67,7 @@ fn build_and_cut(disk: &SimDisk, seed: u64) -> Lsn {
                 // attests the watermark — here, the last explicit
                 // fdatasync's coverage.
                 let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
-                let lease = ring.seal(slot.first_record_lsn(), synced_end.to_u64());
+                let lease = ring.seal(slot.first_record_lsn(), synced_end.to_u64(), slot.layout());
                 let frame = ring.leased_frame(&lease).to_vec();
                 rotor.commit_frame(slot, &frame).expect("commit");
                 ring.release(lease);
@@ -133,7 +104,7 @@ fn reference_replay(disk: &SimDisk) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor()).expect("apply");
+                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });

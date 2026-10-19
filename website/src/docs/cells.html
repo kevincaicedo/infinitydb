@@ -1,0 +1,32 @@
+<!--
+title: Cells & ownership
+description: Every key in InfinityDB belongs to exactly one CPU core, which takes locks off the data path.
+lede: Every key in InfinityDB belongs to exactly one CPU core. That single rule takes locks off the data path and turns persistence, expiry, eviction and memory accounting into local problems.
+chips: Available · alpha | Law L1
+-->
+<div class="doc-fig">{{fig:ownership}}</div>
+<p class="fig-note">Three requests, three hashes. Two share a hash tag and land on the same cell.</p>
+
+<h2 id="what">What a cell is</h2>
+<p>A cell is one pinned thread running one loop: its own network listener, protocol parser, executor, slice of the keyspace, allocator and log writer. Cells never touch each other's memory. They talk only through the <a href="fabric.html">fabric</a>, in batches.</p>
+<p>Every cell binds the same port, and the kernel spreads incoming connections across them. A control thread runs the slow plane, such as configuration, statistics and checkpoint scheduling, and is never on the data path.</p>
+
+<h2 id="owner">How a key finds its owner</h2>
+<pre class="code" data-label="">owner(key) = slot_to_cell[ crc16(hashtag(key)) % 16384 ]</pre>
+<p>The keyspace uses the same 16,384 slots as Redis Cluster, even on one node. A hash tag decides the slot: <code>{user:42}.cart</code> and <code>{user:42}.profile</code> both hash on <code>user:42</code>, so they live on the same cell.</p>
+<p>Multi-key commands such as <code>MGET</code> that span cells still work; they pay a fabric hop instead of returning <code>CROSSSLOT</code>. Cross-cell transactions are a separately gated capability (M6).</p>
+
+<h2 id="elsewhere">When the key lives elsewhere</h2>
+<table class="doc-table"><thead><tr><th>Situation</th><th>What happens</th></tr></thead><tbody>
+<tr><td>The key is local and in memory</td><td>Completes synchronously. No suspension, no waker.</td></tr>
+<tr><td>Another cell owns the key</td><td>One fabric message; the command suspends until the reply arrives.</td></tr>
+<tr><td>The record is in the cold tier (M4)</td><td>An async disk read; other commands keep flowing.</td></tr>
+<tr><td>A write in an <code>always</code> namespace</td><td>Applied, then acknowledged after the group fsync that covers it.</td></tr>
+</tbody></table>
+<p>Each of those waits suspends the command, never the core (law L6). A suspended command resumes through its own state, and checks again what it validated before it waited.</p>
+
+<h2 id="tradeoff">The trade-off, stated honestly</h2>
+<p>One owner means one hot key is served by one core. A single cell sustains high rates on one key, and RESP3 client-side caching (M7) spreads reads. We document the limit instead of hiding it.</p>
+<p>The cell count is fixed for the life of a data directory: each cell recovers only its own shard, and the count is stamped at the first boot. See <a href="configuration.html">Configuration</a> for <code>--cells</code>.</p>
+
+<aside class="law-box"><span class="law-code">L1</span><div><div class="law-title">One core, one shard, one owner.</div><p>Every key, vector, topic partition and log segment is owned by exactly one core. No data-plane locks, no shared mutable state on the hot path.</p></div></aside>

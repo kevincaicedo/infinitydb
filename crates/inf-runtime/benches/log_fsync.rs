@@ -1,3 +1,11 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! Driver-tier group-commit rehearsal (M2-S06 AC dry-run, dev tier): one
 //! `LogWrite` frame + linked fdatasync per iteration against a real
 //! preallocated file, at several group sizes. Grouped-write throughput =
@@ -18,10 +26,10 @@ use std::os::fd::IntoRawFd;
 use std::time::{Duration, Instant};
 
 use inf_alloc::BufferPool;
-use inf_foundation::LogHistogram;
+use inf_foundation::{FileOffset, LogHistogram};
 use inf_runtime::{
     BackendDriver, CompletionResult, CompletionToken, IoOp, StableBytes, TokenClass, UringDriver,
-    Wait,
+    Wait, WriteBarrier,
 };
 
 const FILE_BYTES: u64 = 1 << 30;
@@ -80,10 +88,12 @@ fn main() {
             let t0 = Instant::now();
             driver.push(IoOp::LogWrite {
                 fd,
-                offset,
+                offset: FileOffset::new(offset).expect("bench positions are addressable"),
                 data,
                 token: CompletionToken::new(TokenClass::LogWrite, 1, 0),
-                fsync_token: Some(CompletionToken::new(TokenClass::Fsync, 1, 0)),
+                barrier: WriteBarrier::LinkedFsync {
+                    fsync_token: CompletionToken::new(TokenClass::Fsync, 1, 0),
+                },
             });
             let mut got = 0;
             while got < 2 {

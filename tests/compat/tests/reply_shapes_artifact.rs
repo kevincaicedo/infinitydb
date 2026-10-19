@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
+)]
 //! M3-S15 (ADR-0042 D8): the published reply-shape matrix is generated,
 //! never hand-edited — the M1-S13 staleness rule applied verbatim.
 //!

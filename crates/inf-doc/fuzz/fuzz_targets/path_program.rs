@@ -78,7 +78,7 @@ fuzz_target!(|data: &[u8]| {
     // Program-byte arm (the replay trust boundary).
     if let Ok(program) = PathProgram::from_bytes(data) {
         let ast = program.decode();
-        let re = path::encode_ast(&ast);
+        let re = path::encode_ast(&ast).expect("accepted bytes re-encode under the ceiling");
         assert_eq!(
             re.as_bytes(),
             data,
@@ -91,12 +91,22 @@ fuzz_target!(|data: &[u8]| {
         let printed = path::ast::print(&ast);
         let reparsed = path::parse_ast(printed.as_bytes()).expect("canonical print reparses");
         assert_eq!(reparsed, ast, "print(parse(text)) must reparse identically");
-        let program = path::compile(data).expect("parsed text compiles");
-        assert_eq!(
-            path::encode_ast(&ast).as_bytes(),
-            program.as_bytes(),
-            "compile ≡ parse+encode"
-        );
-        exercise(&program);
+        // `compile ≡ parse+encode` at the text ceiling, including the one
+        // way both may refuse: a program past `PROGRAM_BYTES_CEILING`
+        // (F-L10-04 — the encoder refuses typed instead of emitting it).
+        match (
+            path::compile_with_max_bytes(data, path::PATH_BYTES_CEILING),
+            path::encode_ast(&ast),
+        ) {
+            (Ok(program), Ok(encoded)) => {
+                assert_eq!(encoded.as_bytes(), program.as_bytes(), "compile ≡ parse+encode");
+                exercise(&program);
+            }
+            (Err(a), Err(b)) => {
+                assert_eq!(a.kind, path::PathErrorKind::PathTooLong, "{a:?}");
+                assert_eq!(b.kind, path::PathErrorKind::PathTooLong, "{b:?}");
+            }
+            (a, b) => panic!("compile ≢ parse+encode: {:?} vs {:?}", a.err(), b.err()),
+        }
     }
 });

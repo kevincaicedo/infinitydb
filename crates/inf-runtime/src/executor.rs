@@ -27,6 +27,7 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::alloc::{alloc, dealloc, handle_alloc_error};
+#[allow(clippy::disallowed_types, reason = "container: E")]
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -66,15 +67,14 @@ enum TaskState {
     Dead,
 }
 
-/// Ready queue shared between the executor and every waker. `Rc<RefCell<…>>`
-/// — single-threaded interior mutability, no atomics (L1).
-type ReadyQueue = Rc<RefCell<VecDeque<u32>>>;
-
 /// Per-task shared state. Wakers are `Rc<TaskHeader>` behind a raw vtable.
+#[allow(clippy::disallowed_types, reason = "container: E")]
 struct TaskHeader {
     state: Cell<TaskState>,
     slot: Cell<u32>,
-    ready: ReadyQueue,
+    /// The ready queue shared between the executor and every waker:
+    /// `Rc<RefCell<…>>`, single-threaded interior mutability, no atomics (L1).
+    ready: Rc<RefCell<VecDeque<u32>>>,
 }
 
 /// The wake transition. Runs inside `Waker::wake`, so it must not touch the
@@ -97,6 +97,9 @@ fn wake_header(header: &TaskHeader) {
 
 // ---- Rc waker vtable (no atomics; see module docs + SAFETY.md) ------------
 
+/// # Safety
+/// `data` is the `Rc<TaskHeader>` raw pointer `waker_ref` built this waker from (or a clone of it),
+/// still live.
 unsafe fn waker_clone(data: *const ()) -> RawWaker {
     // SAFETY: `data` originates from `Rc::as_ptr` on a live `Rc<TaskHeader>`
     // (waker_ref) or from a previous clone; incrementing the non-atomic
@@ -106,6 +109,9 @@ unsafe fn waker_clone(data: *const ()) -> RawWaker {
     RawWaker::new(data, &WAKER_VTABLE)
 }
 
+/// # Safety
+/// `data` is the live `Rc<TaskHeader>` raw pointer this waker owns; the call consumes the waker's
+/// strong count.
 unsafe fn waker_wake(data: *const ()) {
     // SAFETY: `data` is a live `Rc<TaskHeader>` raw pointer owned by this
     // waker; we consume the waker, so we also drop its strong count.
@@ -115,11 +121,16 @@ unsafe fn waker_wake(data: *const ()) {
     }
 }
 
+/// # Safety
+/// `data` is the live `Rc<TaskHeader>` raw pointer this waker owns; nothing is consumed.
 unsafe fn waker_wake_by_ref(data: *const ()) {
     // SAFETY: as in `waker_wake`, minus consuming the reference.
     unsafe { wake_header(&*data.cast::<TaskHeader>()) };
 }
 
+/// # Safety
+/// `data` is the live `Rc<TaskHeader>` raw pointer this waker owns; its strong count is released
+/// exactly once.
 unsafe fn waker_drop(data: *const ()) {
     // SAFETY: drops the strong count this waker owned.
     unsafe { Rc::decrement_strong_count(data.cast::<TaskHeader>()) };
@@ -180,6 +191,8 @@ impl Drop for RawFut {
     }
 }
 
+/// # Safety
+/// `ptr` points at a live `F` placed by `spawn`, pinned in place since before its first poll.
 unsafe fn poll_shim<F: Future<Output = ()>>(ptr: *mut u8, cx: &mut Context<'_>) -> Poll<()> {
     // SAFETY: caller contract — `ptr` holds a live `F`, pinned in place
     // since before its first poll.
@@ -189,6 +202,8 @@ unsafe fn poll_shim<F: Future<Output = ()>>(ptr: *mut u8, cx: &mut Context<'_>) 
     unsafe { Pin::new_unchecked(fut) }.poll(cx)
 }
 
+/// # Safety
+/// `ptr` points at a live `F` placed by `spawn`; the slot is dead after the call.
 unsafe fn drop_shim<F>(ptr: *mut u8) {
     // SAFETY: caller contract — `ptr` holds a live `F`; drops it in place.
     unsafe { core::ptr::drop_in_place(ptr.cast::<F>()) }
@@ -238,11 +253,12 @@ struct TaskEntry {
     generation: u64,
 }
 
-/// Single-threaded task executor for one shard cell. See module docs.
+/// Single-threaded task executor for one cell. See module docs.
+#[allow(clippy::disallowed_types, reason = "container: E")]
 pub struct CellExecutor {
     entries: Vec<Option<TaskEntry>>,
     free: Vec<u32>,
-    ready: ReadyQueue,
+    ready: Rc<RefCell<VecDeque<u32>>>,
     /// Recycled header for the fast path (no allocation on Ready).
     spare_header: Option<Rc<TaskHeader>>,
     /// Recycled storage for the fast path (no malloc on Ready).
@@ -255,6 +271,7 @@ impl CellExecutor {
     /// `capacity` reserves slab and queue space up front; the slab may still
     /// grow beyond it at M0 (a hard cap with backpressure arrives with the
     /// connection budget work).
+    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(capacity: usize) -> CellExecutor {
         CellExecutor {
             entries: Vec::with_capacity(capacity),
@@ -368,7 +385,9 @@ impl CellExecutor {
                 self.ready.borrow_mut().push_back(slot);
             }
             TaskState::Running => header.state.set(TaskState::Idle),
-            other => unreachable!("inserting task in state {other:?}"),
+            other @ (TaskState::Idle | TaskState::Queued | TaskState::Dead) => {
+                unreachable!("inserting task in state {other:?}")
+            }
         }
         self.next_generation += 1;
         let generation = self.next_generation;
@@ -403,7 +422,9 @@ impl CellExecutor {
                         self.ready.borrow_mut().push_back(slot);
                     }
                     TaskState::Running => header.state.set(TaskState::Idle),
-                    other => unreachable!("post-poll task state {other:?}"),
+                    other @ (TaskState::Idle | TaskState::Queued | TaskState::Dead) => {
+                        unreachable!("post-poll task state {other:?}")
+                    }
                 },
             }
         }
@@ -423,6 +444,12 @@ impl CellExecutor {
     /// after a quiesced workload this must be 0.
     pub fn live_tasks(&self) -> usize {
         self.live
+    }
+
+    /// Whether a task is queued to run — work the loop's park decision
+    /// must see (a wake landing after `run_ready`, F-L11-07).
+    pub fn has_ready(&self) -> bool {
+        !self.ready.borrow().is_empty()
     }
 
     /// Whether `id` still names a live task (slots are recycled; stale ids

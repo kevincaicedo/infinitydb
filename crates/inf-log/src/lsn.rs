@@ -4,6 +4,13 @@
 //! `txid` records (M4), and recovery replays cells independently (L1).
 
 use core::fmt;
+use std::io;
+
+/// Largest physical segment length whose one-past-the-end byte is still a
+/// representable [`Lsn`] offset. The log's address range is the format's,
+/// not the current rotation size: an older segment may be larger than
+/// today's `segment_bytes` and still be replayable.
+pub const MAX_SEGMENT_LEN: u64 = u32::MAX as u64;
 
 /// Monotonic id of one segment file within a cell's log directory.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -73,6 +80,23 @@ impl Lsn {
     }
 }
 
+/// Refuse a segment file whose end cannot be addressed by an [`Lsn`]
+/// offset (ADR-0018). The rotor seals before a frame would cross
+/// `segment_bytes` (a `u32`), so an oversized file is planted or foreign;
+/// recovery and both read paths name it rather than wrap the cursor.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] naming the segment, its length and the limit.
+pub fn check_segment_len(segment: SegmentId, len: u64) -> io::Result<()> {
+    if len > MAX_SEGMENT_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{segment}: size {len} exceeds u32 segment address limit {MAX_SEGMENT_LEN}"),
+        ));
+    }
+    Ok(())
+}
+
 impl fmt::Display for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{:08x}", self.segment, self.offset)
@@ -95,6 +119,15 @@ mod tests {
     fn advance_stays_in_segment() {
         let base = Lsn::new(SegmentId(17), 0x100);
         assert_eq!(base.advance(0x20), Lsn::new(SegmentId(17), 0x120));
+    }
+
+    #[test]
+    fn segment_len_bound_is_the_representable_end() {
+        assert!(check_segment_len(SegmentId(3), MAX_SEGMENT_LEN).is_ok());
+        let err = check_segment_len(SegmentId(3), MAX_SEGMENT_LEN + 1).expect_err("one past");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("seg-000003"), "{err}");
+        assert_eq!(Lsn::new(SegmentId(3), 0).advance(u32::MAX).offset, u32::MAX);
     }
 
     #[test]

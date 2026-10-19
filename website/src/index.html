@@ -1,0 +1,213 @@
+<main id="main">
+
+<section class="hero" id="top">
+<canvas data-field="hero" aria-hidden="true"></canvas>
+<div class="wrap hero-in">
+<div class="badge mono"><span class="sq8 bg-sig pulse" aria-hidden="true"></span><span>Alpha · {{now_code}} {{now_name}}</span></div>
+<h1>Deterministic<br>to the core.</h1>
+<p class="hero-p d-only">InfinityDB is a Redis-compatible, multi-model database: cache, durable key-value and JSON documents today, with queues and vectors on the roadmap. Built thread-per-core on a single log, and tested by deterministic simulation.</p>
+<p class="hero-p m-only">A Redis-compatible, multi-model database: cache, durable key-value and JSON documents today, queues and vectors next. Thread-per-core, one log, tested by deterministic simulation.</p>
+<div class="btns">
+<a class="btn btn-ink" href="#start">Get started</a>
+<a class="btn btn-line" href="#how">How it works<span aria-hidden="true">→</span></a>
+</div>
+<div class="hero-term mono"><span>$ redis-cli -p 6379 ping</span><span class="ink">PONG</span></div>
+</div>
+</section>
+
+<section class="sec" aria-label="Why InfinityDB">
+<div class="wrap grid12 why">
+<div class="eyebrow">Why InfinityDB</div>
+<div class="why-lines">
+<div class="hl" style="animation-delay:0s">Every key has one owner.</div>
+<div class="hl" style="animation-delay:1.6s">Every write is an append.</div>
+<div class="hl" style="animation-delay:3.2s">Every limit has a number.</div>
+<div class="hl" style="animation-delay:4.8s">Every violation has a seed.</div>
+<div class="why-end">That's determinism.<span class="sq14 bg-sig" aria-hidden="true"></span></div>
+</div>
+</div>
+</section>
+
+<section class="sec">
+<div class="wrap workloads">
+<div class="eyebrow">One engine</div>
+<h2 class="h2">Five workloads. One log underneath.</h2>
+<p class="sec-lede">Durability is a property of the namespace, not the server. Run a cache and a system of record on the same node, and move workloads over one namespace at a time without changing client libraries.</p>
+<div class="wl-grid">
+<div class="wl"><div class="wl-st mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Alpha · M1</div><h3>Cache</h3><p>In-memory strings and keys, TTL and all eight Redis eviction policies.</p><div class="wl-class mono">Redis-class</div></div>
+<div class="wl"><div class="wl-st mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Alpha · M2</div><h3>Durable key-value</h3><p>Pick memory, everysec or always per namespace. always acknowledges only after fsync.</p><div class="wl-class mono">DynamoDB-class, single region</div></div>
+<div class="wl"><div class="wl-st mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Alpha · M3</div><h3>JSON documents</h3><p>RedisJSON-compatible JSON.* with JSONPath and in-place path updates.</p><div class="wl-class mono">Document-store class</div></div>
+<div class="wl"><div class="wl-st mono"><span class="sq6 sq-line" aria-hidden="true"></span>Planned · M7</div><h3>Queues &amp; streams</h3><p>Topics and consumer groups on the same log that makes your keys durable.</p><div class="wl-class mono">Kafka / RabbitMQ core class</div></div>
+<div class="wl"><div class="wl-st mono"><span class="sq6 sq-line" aria-hidden="true"></span>Planned · M8</div><h3>Vectors</h3><p>HNSW per core, quantized, stored as ordinary durable records.</p><div class="wl-class mono">Vector-set class</div></div>
+</div>
+<div class="train-row"><span class="eyebrow">Also on the train</span>{{train_row}}</div>
+</div>
+</section>
+
+<section id="how" class="wrap grid12 how-head">
+<div>
+<div class="eyebrow">How it works</div>
+<h2>Five ideas, drawn simply.</h2>
+</div>
+<p>Each idea in plain words first. Then what is underneath, for the engineers.</p>
+</section>
+
+<section class="feature" aria-label="Thread-per-core">
+<div class="wrap grid12 feature-in">
+<div class="f-text">
+<div class="f-head"><span class="pix">01</span><span class="eyebrow">Thread-per-core</span></div>
+<h3>Every key has exactly one owner.</h3>
+<p class="f-p">InfinityDB gives each CPU core its own slice of your data, its own network loop and its own memory. Nothing is shared, so nothing waits on a lock, and every request knows exactly where it has to go.</p>
+<div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">One pinned thread per core. owner(key) = slot_to_cell[crc16(hashtag(key)) % 16384], the same 16,384 slots as Redis Cluster, so hash tags like {user:42} keep related keys together.</p></div>
+<div class="lawtag mono">L1 · One core, one shard, one owner</div>
+</div>
+<div class="f-fig">{{fig:ownership}}</div>
+</div>
+</section>
+
+<section class="feature" aria-label="The fabric">
+<div class="wrap grid12 feature-in">
+<div class="f-text">
+<div class="f-head"><span class="pix">02</span><span class="eyebrow">The fabric</span></div>
+<h3>Cores talk in batches, not interruptions.</h3>
+<p class="f-p">When a request needs data another core owns, it sends a message down a private lane between the two. Messages are grouped and delivered once per loop, so the busier the system gets, the cheaper each message becomes.</p>
+<div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">A full mesh of lock-free single-producer, single-consumer rings. One doorbell per batch, never per message. Credit-based flow control pushes back on the client instead of growing a queue.</p></div>
+<div class="lawtag mono">L3 · Batch every boundary</div>
+</div>
+<div class="f-fig">{{fig:fabric}}</div>
+</div>
+</section>
+
+<section class="feature" aria-label="The log spine">
+<div class="wrap grid12 feature-in">
+<div class="f-text">
+<div class="f-head"><span class="pix">03</span><span class="eyebrow">The log spine</span></div>
+<h3>The log is the database.</h3>
+<p class="f-p">Every durable change is first an append to a per-core log. A cache is that log switched off. A durable store is the log plus an index. A queue is the log read forward. One mechanism, made correct once.</p>
+<div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">Per-cell segments with CRC32C batch frames. Group commit: one write per loop iteration. Fuzzy checkpoints in bounded slices, with no fork() and no stop-the-world.</p></div>
+<div class="lawtag mono">L2 · The log is the database</div>
+</div>
+<div class="f-fig">{{fig:log}}</div>
+</div>
+</section>
+
+<section class="feature" aria-label="Deterministic simulation">
+<div class="wrap grid12 feature-in">
+<div class="f-text">
+<div class="f-head"><span class="pix">04</span><span class="eyebrow">Deterministic simulation</span></div>
+<h3>Every violation is a seed.</h3>
+<p class="f-p">The whole database can run inside a simulator where time and chance are controlled. We cut power, tear writes and reorder messages on purpose. When an oracle catches a violation, one number replays it exactly.</p>
+<div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">Time, randomness and I/O are injected. Simulated disks lose, tear and reorder unsynced writes. Invariant oracles run continuously, and a nightly fleet runs fresh seeds.</p></div>
+<div class="lawtag mono">L7 · Determinism is a feature</div>
+</div>
+<div class="f-fig">{{fig:dst}}</div>
+</div>
+</section>
+
+<section class="feature" aria-label="Redis-compatible">
+<div class="wrap grid12 feature-in">
+<div class="f-text">
+<div class="f-head"><span class="pix">05</span><span class="eyebrow">Redis-compatible</span></div>
+<h3>Keep your clients. Upgrade your guarantees.</h3>
+<p class="f-p">InfinityDB speaks the Redis protocol, so redis-cli and the SDKs you already use simply connect. Then, one namespace at a time, turn on durability, store JSON documents, and pick up queues and vectors as they land.</p>
+<div class="f-hood"><div class="eyebrow">Under the hood</div><p class="mono">RESP2 and RESP3 on port 6379. A generated compatibility matrix marks every command full, partial, stub or absent. A difference the corpus finds fails CI until the matrix records it as a deviation.</p></div>
+<div class="lawtag mono">L8 · Compatibility is staged, honesty is total</div>
+</div>
+<div class="f-fig">{{fig:redis}}</div>
+</div>
+</section>
+
+<section id="roadmap" class="sec-top">
+<div class="wrap roadmap">
+<div class="eyebrow">Roadmap</div>
+<h2 class="h2" style="margin-top:16px">Built in the open, gate by gate.</h2>
+<p class="sec-lede">Every milestone ends in STOP gates. If one fails, feature work halts until the architecture is fixed, not patched later. We are an alpha, and we say so.</p>
+<div class="dive-bar"><span class="mono"><span class="sq8 bg-ink" aria-hidden="true"></span>Deep dive · M4 Tiered storage</span><span>Hot records in memory, cold records on NVMe. The same key, the same command.</span></div>
+{{fig:tiers}}
+<p class="dive-note">Hot records gather at the tail, in memory. Untouched records drift toward disk. No separate LRU: the shape of the log does the sorting.</p>
+<ol class="rm-grid" style="--stops:{{train_stops}}" aria-label="Milestone train">{{train_grid}}</ol>
+<ol class="rm-list vrail" aria-label="Milestone train">{{train_list}}</ol>
+</div>
+</section>
+
+<section class="sec-top">
+<div class="wrap laws">
+<div class="eyebrow">Design laws</div>
+<h2 class="h2" style="margin-top:16px">Thirteen laws. Changed only by amendment.</h2>
+<p class="sec-lede">Every design decision cites one. Code follows InfinityStyle, adapted from TigerBeetle's TIGER_STYLE: safety, performance and developer experience, in that order.</p>
+<div class="law-grid">
+<div class="lw"><div class="pix">L1</div><div class="lw-t">One core, one owner.</div><div class="lw-d">One shard per core. No data-plane locks, no shared mutable state.</div></div>
+<div class="lw"><div class="pix">L2</div><div class="lw-t">The log is the database.</div><div class="lw-d">Every durable fact is an append first. Indexes are rebuildable.</div></div>
+<div class="lw"><div class="pix">L3</div><div class="lw-t">Batch every boundary.</div><div class="lw-d">Syscalls, hops and fsyncs are paid per batch, never per operation.</div></div>
+<div class="lw"><div class="pix">L4</div><div class="lw-t">Measured, not assumed.</div><div class="lw-d">Every hot-path trick ships with a reproducible A/B, or behind a flag.</div></div>
+<div class="lw"><div class="pix">L5</div><div class="lw-t">Memory is the product.</div><div class="lw-d">Compact variable-size records. Every byte attributed to a named domain.</div></div>
+<div class="lw"><div class="pix">L6</div><div class="lw-t">Commands are resumable.</div><div class="lw-d">Disk, fabric and fsync waits suspend a command, never the core.</div></div>
+<div class="lw"><div class="pix">L7</div><div class="lw-t">Determinism is a feature.</div><div class="lw-d">Same input, same state, same log, byte for byte.</div></div>
+<div class="lw"><div class="pix">L8</div><div class="lw-t">Compatibility is staged.</div><div class="lw-d">Honesty is total: every command marked in a public, generated matrix.</div></div>
+<div class="lw"><div class="pix">L9</div><div class="lw-t">Safety is layered.</div><div class="lw-d">In shipped source, unsafe lives in audited leaf crates and named modules, and every decoder is fuzzed.</div></div>
+<div class="lw"><div class="pix">L10</div><div class="lw-t">Claims follow evidence.</div><div class="lw-d">No public number without replicates, a clean tree and the rival in the run.</div></div>
+<div class="lw"><div class="pix">L11</div><div class="lw-t">Extend by seam, not fork.</div><div class="lw-d">Engines attach through versioned seams. First-party code gets no shortcut.</div></div>
+<div class="lw"><div class="pix">L12</div><div class="lw-t">Design before code.</div><div class="lw-d">Nothing is built until a reviewed record proves the design.</div></div>
+<div class="lw"><div class="pix">L13</div><div class="lw-t">One decision, one place.</div><div class="lw-d">Enforced by a type, a lint or a generated table before a reviewer.</div></div>
+<a class="lw lw-next" href="docs/style.html"><div class="mono">Read next</div><div class="lw-t">InfinityStyle →</div><div class="lw-d">The rules for every design and every line of code. Read it before writing either.</div></a>
+</div>
+</div>
+</section>
+
+<section id="evidence" class="sec-top">
+<div class="wrap grid12 evidence">
+<div class="ev-text">
+<div class="eyebrow">Evidence</div>
+<h2 class="h2" style="margin-top:16px">Claims follow evidence.</h2>
+<p>We don't publish a performance number until it has been reproduced on the reference box: three to five replicates, a clean tree, and the system we compare against running in the same campaign. Until then, the ledger says pending.</p>
+<p class="mono">This site contains no benchmark numbers. That is deliberate.</p>
+</div>
+<div class="ev-table">
+<div class="ledger" role="table" aria-label="Claim ledger">
+<div class="lr lr-h mono" role="row"><span role="columnheader">Claim</span><span role="columnheader">Measured by</span><span role="columnheader" style="text-align:right">Status</span></div>
+<div class="lr" role="row"><span role="cell" class="lr-claim">Throughput vs Redis, Valkey, Dragonfly</span><span role="cell" class="lr-by mono">inf-compare · same box, same run</span><span role="cell" class="lr-st"><span class="pending mono">PENDING</span></span></div>
+<div class="lr" role="row"><span role="cell" class="lr-claim">Memory per key</span><span role="cell" class="lr-by mono">RSS with full attribution</span><span role="cell" class="lr-st"><span class="pending mono">PENDING</span></span></div>
+<div class="lr" role="row"><span role="cell" class="lr-claim">Tail latency under load</span><span role="cell" class="lr-by mono">p99.9 · reference box</span><span role="cell" class="lr-st"><span class="pending mono">PENDING</span></span></div>
+<div class="lr" role="row"><span role="cell" class="lr-claim">Recovery after a crash</span><span role="cell" class="lr-by mono">cold replay · power-cut sweeps</span><span role="cell" class="lr-st"><span class="pending mono">PENDING</span></span></div>
+<div class="lr" role="row"><span role="cell" class="lr-claim">No acknowledged write lost</span><span role="cell" class="lr-by mono">DST sweeps · crash-point matrix</span><span role="cell" class="lr-st"><span class="pending mono">PENDING</span></span></div>
+</div>
+<div class="ev-legend mono">
+<span><b>ALLOWED</b> — measured and reproducible</span>
+<span><b>NARROWED</b> — true within stated limits</span>
+<span><b>REJECTED</b> — the evidence said no</span>
+<span><b>PENDING</b> — not yet measured to standard</span>
+</div>
+</div>
+</div>
+</section>
+
+<section id="start" class="sec-top">
+<div class="wrap grid12 start">
+<div class="start-moss">
+<div class="moss-box">
+<div class="cap">moss · walk cycle</div>
+{{moss_start}}
+<div class="ground" aria-hidden="true"></div>
+</div>
+<p><strong>Moss, the moss piglet.</strong> Tardigrades survive boiling, freezing and vacuum. Moss survives torn writes, lying fsyncs and power cuts, in simulation, every night. Eight legs, eight cells.</p>
+</div>
+<div class="start-text">
+<div class="eyebrow">Get started</div>
+<h2>Run it. Break it.<br>Replay the seed.</h2>
+<p>Single node, alpha, Apache 2.0. Point redis-cli at it and watch what changes when a namespace becomes durable.</p>
+<div class="btns">
+<a class="btn btn-ink" href="docs/quickstart.html">Read the quickstart</a>
+<a class="btn btn-line" href="https://github.com/kevincaicedo/infinitydb">Star on GitHub{{ext}}</a>
+</div>
+<pre class="code" data-label="shell">$ git clone {{repo}} &amp;&amp; cd infinitydb
+$ docker build -t infinitydb:dev .
+$ docker run -d --rm -p 127.0.0.1:6379:6379 \
+    --security-opt seccomp=deploy/seccomp/infinitydb-seccomp.json \
+    infinitydb:dev
+$ redis-cli -p 6379 ping
+PONG</pre>
+</div>
+</div>
+</section>
+
+</main>

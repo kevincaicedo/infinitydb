@@ -1,0 +1,47 @@
+<!--
+title: JSON documents
+section: Data models
+description: JSON as a first-class value: a compact binary tape, RedisJSON-compatible JSON.* commands, a JSONPath subset, delta logging and per-document accounting.
+lede: A JSON document is an ordinary record whose value is a compact binary tape. It is durable, evictable and versioned like any other value, and the JSON.* commands are diffed against RedisJSON.
+chips: Available · alpha | Law L9
+-->
+<h2 id="tape">The tape</h2>
+<p>A document is stored as an <code>idoc</code> tape: one-byte tags, small integers and short strings inline, 64-bit integers and doubles, and objects and arrays with a 24-bit length, so any subtree can be skipped in one step. Each value has exactly one encoding and the validator rejects any other, so two equal documents are byte-identical. That lets replay and tests compare raw bytes.</p>
+<p>A document of up to 512 bytes lives inside its record; a larger one lives in the cell's document arena and the record points to it. Nesting is capped at 128 containers and a document body at 16,777,192 bytes, so every document fits one record and one full-image log record. A write whose result would cross either bound is refused before anything changes, for example with <code>ERR document nesting too deep</code>.</p>
+<p>The parser follows simdjson: SIMD classification of 64-byte blocks, then one streaming pass that writes the canonical tape directly, with no intermediate tree.</p>
+
+<h2 id="commands">Commands</h2>
+<p>The 22 commands of the <code>JSON.*</code> family are compared, in RESP2 and RESP3, against a pinned RedisJSON:</p>
+<table class="doc-table"><thead><tr><th>Group</th><th>Commands</th></tr></thead><tbody>
+<tr><td>Documents</td><td><code>JSON.SET</code> <code>JSON.GET</code> <code>JSON.MGET</code> <code>JSON.DEL</code> <code>JSON.FORGET</code> <code>JSON.TYPE</code> <code>JSON.MERGE</code> <code>JSON.CLEAR</code> <code>JSON.DEBUG</code></td></tr>
+<tr><td>Numbers, strings, booleans</td><td><code>JSON.NUMINCRBY</code> <code>JSON.NUMMULTBY</code> <code>JSON.STRAPPEND</code> <code>JSON.STRLEN</code> <code>JSON.TOGGLE</code></td></tr>
+<tr><td>Arrays</td><td><code>JSON.ARRAPPEND</code> <code>JSON.ARRINSERT</code> <code>JSON.ARRINDEX</code> <code>JSON.ARRLEN</code> <code>JSON.ARRPOP</code> <code>JSON.ARRTRIM</code></td></tr>
+<tr><td>Objects</td><td><code>JSON.OBJKEYS</code> <code>JSON.OBJLEN</code></td></tr>
+</tbody></table>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; JSON.SET catalog:{sku9} $ '{"name":"Desk lamp","price":4999,"tags":["home"]}'
+OK
+127.0.0.1:6379&gt; JSON.GET catalog:{sku9} $.price
+"[4999]"
+127.0.0.1:6379&gt; JSON.NUMINCRBY catalog:{sku9} $.price -500
+"[4499]"
+127.0.0.1:6379&gt; JSON.ARRAPPEND catalog:{sku9} $.tags '"sale"'
+1) (integer) 2
+127.0.0.1:6379&gt; JSON.GET catalog:{sku9} $.name
+"[\"Desk lamp\"]"</pre>
+<p>Where the corpus finds a difference, the <a href="compat.html">matrix</a> says so. A few deviations are product boundaries: InfinityDB refuses a write that would nest past 128 containers, where RedisJSON stores a document it cannot read back; <code>JSON.ARRINSERT</code> validates every match before it changes any, where RedisJSON can mutate an earlier match before a later index error; type errors use the core Redis <code>WRONGTYPE</code> text. <code>JSON.MGET</code> is atomic per key, with no snapshot across cells. <code>JSON.RESP</code> is deprecated upstream and will not be added.</p>
+
+<h2 id="paths">JSONPath and reply shapes</h2>
+<p>Paths use the <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/jsonpath-subset.md">JSONPath subset</a>: <code>$</code>, <code>.name</code> and <code>['name']</code>, <code>.*</code> and <code>[*]</code>, indices including negatives, Python-style slices such as <code>[::-1]</code>, unions of 2 to 16 selectors, and recursive descent with <code>..</code>. A path that does not start with <code>$</code> is a legacy path with an implicit root, as in RedisJSON. Path text is bounded (4 KiB by default, at most 128 segments).</p>
+<p>Each path compiles once to a small bytecode program, cached per cell in a bounded LRU (<code>doc-path-cache-size</code>, 1,024 entries by default, 0 to 4,096, set at boot with <code>--doc-path-cache-size</code>). The compiled bytes are the program, so the same bytes are cached and written to the log.</p>
+<p>The mode decides the reply. A <code>$</code> path answers the whole match set, as JSON text holding an array: <code>"[4499]"</code> above. A legacy path answers one value: the first match for reads, the last applied match for writes. The generated <a href="https://github.com/kevincaicedo/infinitydb/blob/main/docs/json-reply-shapes.md">reply-shape table</a> lists every command in both modes and both protocols. Serialization runs against a reply budget, 128 MiB by default, and answers <code>ERR reply too large</code> beyond it, because <code>$..*</code> or repeated paths can make a reply far larger than its document.</p>
+
+<h2 id="updates">Path updates and durability</h2>
+<p>A path write changes only what the path selects; the client never re-sends the document. The mutation is planned against the whole match set first: every edit is validated (types, integer range, the size of the result) before any output exists. Then one pass writes the new tape. There is no rollback path, because nothing partial is ever built. Integers stay exact 64-bit values, and an overflow fails the whole command.</p>
+<p>On a durable namespace a write is logged as a small delta, the path program and the operation, instead of the whole document. After 64 deltas, or once the deltas since the last full image add up to the document's own size, the next write logs a full image, which bounds how much replay must apply to rebuild any document. A lineage number ties each delta to one incarnation of the key, so a delta can never apply to a document that was deleted and recreated in between. Replay applies the same pure function of document, program and operation.</p>
+<p>Document memory is attributed per document. <code>JSON.DEBUG MEMORY key</code> reports the record and external document bytes charged to that key; shared pools and allocator slack stay in <code>INFO memory</code>, under the <code>used_memory_doc_*</code> fields. See <a href="memory.html">Memory &amp; eviction</a>.</p>
+
+<h2 id="not-yet">Not yet</h2>
+<aside class="callout"><div class="callout-label">Not yet</div><p>JSONPath filter expressions (<code>?(@…)</code>) are refused today with a typed error. They arrive with <a href="indexes.html">secondary indexes and queries</a>, later in M4. Documents beyond RAM, with expiry and indexes on tiered namespaces, are <a href="roadmap.html#m4">the last phase of M4</a>: a tiered namespace refuses <code>JSON.*</code> today.</p></aside>
+<p>The document engine is feature-gated. Building the <code>inf-server</code> library without default features leaves out all document and path code, and the <code>JSON.*</code> rows answer unknown-command; CI checks that build's symbols. The <code>infinityd</code> binary always includes the document engine for now.</p>
+
+<aside class="law-box"><span class="law-code">L9</span><div><div class="law-title">Safety is layered.</div><p>Every document byte is untrusted until a decoder has checked it. The JSON parser, the path compiler and the tape validator are iterative, bounded and total, with no recursion. Each of them, and delta replay, has a fuzz target in the nightly campaign.</p></div></aside>

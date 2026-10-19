@@ -268,16 +268,39 @@ fn arb_name() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+/// The `i64` extremes and `u32` aliases (review C10/C11): the text form
+/// must print and reparse every one of them exactly.
+static EXTREME_INTS: [i64; 8] = [
+    u32::MAX as i64,
+    1 << 32,
+    (1 << 32) + 1,
+    i64::MAX,
+    -(1 << 32),
+    -(1 << 32) - 1,
+    i64::MIN + 1,
+    i64::MIN,
+];
+
+fn arb_int() -> BoxedStrategy<i64> {
+    prop_oneof![8 => -9i64..9, 1 => proptest::sample::select(&EXTREME_INTS[..])].boxed()
+}
+
 fn arb_slice() -> impl Strategy<Value = SliceSpec> {
-    let field = proptest::option::of(-9i64..9);
-    let step = proptest::option::of(prop_oneof![(-4i64..0), (1i64..4)]);
+    let field = proptest::option::of(arb_int());
+    let step = proptest::option::of(
+        prop_oneof![
+            8 => prop_oneof![(-4i64..0), (1i64..4)],
+            1 => proptest::sample::select(&EXTREME_INTS[..]),
+        ]
+        .boxed(),
+    );
     (field.clone(), field, step).prop_map(|(start, end, step)| SliceSpec { start, end, step })
 }
 
 fn arb_member() -> impl Strategy<Value = Member> {
     prop_oneof![
         arb_name().prop_map(Member::Name),
-        (-9i64..9).prop_map(Member::Index),
+        arb_int().prop_map(Member::Index),
         arb_slice().prop_map(Member::Slice),
     ]
 }
@@ -286,7 +309,7 @@ fn arb_selector() -> impl Strategy<Value = Segment> {
     prop_oneof![
         arb_name().prop_map(Segment::Child),
         Just(Segment::ChildAny),
-        (-9i64..9).prop_map(Segment::Index),
+        arb_int().prop_map(Segment::Index),
         arb_slice().prop_map(Segment::Slice),
         proptest::collection::vec(arb_member(), 2..5).prop_map(Segment::Union),
     ]
@@ -299,6 +322,22 @@ fn arb_path() -> impl Strategy<Value = PathAst> {
     ];
     (any::<bool>(), proptest::collection::vec(segment, 0..6))
         .prop_map(|(legacy, segments)| PathAst { legacy, segments })
+}
+
+/// M4.5 §3.1 indexable-path fence (ADR-0075 D2.4): child steps, `[*]`,
+/// and array indices are inside; recursive descent, slices, and unions
+/// are outside — each case pinned on the compiled program, the exact
+/// bytes the index catalog stores.
+#[test]
+fn index_fence_splits_the_grammar() {
+    for text in ["$", "$.a", "$.a.b", "$[0]", "$.items[2].price", "$.tags[*]", "$.a[*].b"] {
+        let program = compile(text.as_bytes()).expect("valid path");
+        assert!(program.within_index_fence(), "{text} is inside the fence");
+    }
+    for text in ["$..a", "$.a..b", "$[1:3]", "$[:2]", "$['a','b']", "$[0,1]", "$..[*]"] {
+        let program = compile(text.as_bytes()).expect("valid path");
+        assert!(!program.within_index_fence(), "{text} is outside the fence");
+    }
 }
 
 proptest! {
@@ -316,9 +355,44 @@ proptest! {
     /// encoded bytes revalidate through the foreign-byte boundary.
     #[test]
     fn bytecode_round_trip(ast in arb_path()) {
-        let program = path::encode_ast(&ast);
+        let program = path::encode_ast(&ast).expect("a generated AST encodes under the ceiling");
         prop_assert_eq!(&program.decode(), &ast);
         let revalidated = inf_doc::PathProgram::from_bytes(program.as_bytes()).expect("validates");
         prop_assert_eq!(&revalidated, &program);
     }
+}
+
+/// F-L10-04 (review 2026-08-30, batch 59): the encoder is the only
+/// writer of program bytes, so nothing it emits may be refused by its
+/// own trust boundary. Encoding is not size-preserving (`$.<name>` is
+/// `2 + n` text bytes and `7 + n` program bytes), so a text under the
+/// ceiling can encode past it; the compiler now refuses that typed
+/// (`PathTooLong`) instead of emitting bytes `from_bytes` rejects.
+#[test]
+fn encoded_programs_always_revalidate() {
+    let ceiling = path::PATH_BYTES_CEILING;
+    let (mut accepted, mut refused) = (0, 0);
+    for slack in 0..16 {
+        let text = format!("$.{}", "a".repeat(ceiling - 2 - slack));
+        assert_eq!(text.len(), ceiling - slack);
+        match path::compile_with_max_bytes(text.as_bytes(), ceiling) {
+            Ok(program) => {
+                accepted += 1;
+                inf_doc::PathProgram::from_bytes(program.as_bytes()).unwrap_or_else(|e| {
+                    panic!(
+                        "text {} B encoded to {} B, which the validator refuses: {e:?}",
+                        text.len(),
+                        program.as_bytes().len()
+                    )
+                });
+            }
+            Err(e) => {
+                refused += 1;
+                assert_eq!(e.kind, K::PathTooLong, "text {} B", text.len());
+            }
+        }
+    }
+    // Both arms are real: the ceiling text is refused, a few bytes of
+    // slack compiles and revalidates.
+    assert!(accepted >= 1 && refused >= 1, "{accepted} accepted, {refused} refused");
 }

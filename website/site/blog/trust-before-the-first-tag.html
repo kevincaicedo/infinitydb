@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trust before the first tag — InfinityDB Blog</title>
+<meta name="description" content="We moved the first public release back so every critical and high finding from the safety review could be closed red-first. Here is what changed, and why.">
+<link rel="canonical" href="https://kevincaicedo.github.io/infinitydb/blog/trust-before-the-first-tag.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="InfinityDB">
+<meta property="og:title" content="Trust before the first tag — InfinityDB Blog">
+<meta property="og:description" content="We moved the first public release back so every critical and high finding from the safety review could be closed red-first. Here is what changed, and why.">
+<meta property="og:url" content="https://kevincaicedo.github.io/infinitydb/blog/trust-before-the-first-tag.html">
+<meta name="theme-color" content="#F4F4F0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0B0B0A" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate" type="application/rss+xml" title="InfinityDB engineering notes" href="../blog/feed.xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Doto:wght@700;900&family=Geist+Mono:wght@400;500&family=Geist:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<script>try{var t=localStorage.getItem("inf-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}</script>
+<script src="../assets/site.js" defer></script>
+</head>
+<body>
+<a class="skip mono" href="#main">Skip to content</a>
+<div class="announce mono">
+<span class="sq8 bg-sig" aria-hidden="true"></span>
+<span>M4 · Tiered storage<span class="m-only"> — in progress</span></span>
+<span class="muted d-only">datasets beyond RAM, indexes and query — in progress</span>
+<a class="d-only u" href="../index.html#roadmap">Follow the build</a>
+</div>
+<header class="nav">
+<div class="wrap nav-in">
+<a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></a>
+<nav class="nav-links mono" aria-label="Primary"><a href="../docs/index.html">Docs</a><a href="../index.html#how">Architecture</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence</a><a href="../blog/index.html" aria-current="page" class="on"><span class="sq6 bg-sig" aria-hidden="true"></span>Blog</a></nav>
+<div class="nav-cta">
+<a class="btn-sm btn-line mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a>
+<a class="btn-sm btn-ink" href="../index.html#start">Get started</a>
+</div>
+<button type="button" class="icon-btn nav-burger" data-menu-open aria-controls="menu" aria-expanded="false" aria-label="Open menu"><svg width="20" height="12" viewBox="0 0 20 12" aria-hidden="true"><rect x="0" y="1" width="20" height="2" fill="currentColor"/><rect x="0" y="9" width="20" height="2" fill="currentColor"/></svg></button>
+</div>
+</header>
+<div class="menu" id="menu" hidden>
+<div class="menu-head"><a class="brand" href="../index.html" aria-label="InfinityDB home"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name brand-name-sm">InfinityDB</span></a><button type="button" class="icon-btn" data-menu-close aria-label="Close menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 2L14 14M14 2L2 14" stroke="currentColor" stroke-width="2"/></svg></button></div>
+<nav class="menu-links" aria-label="Mobile"><a href="../docs/index.html">Docs<span aria-hidden="true">→</span></a><a href="../index.html#how">Architecture<span aria-hidden="true">→</span></a><a href="../index.html#roadmap">Roadmap<span aria-hidden="true">→</span></a><a href="../index.html#evidence">Evidence<span aria-hidden="true">→</span></a><a href="../blog/index.html">Blog<span aria-hidden="true">→</span></a><a class="menu-gh mono" href="https://github.com/kevincaicedo/infinitydb">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></nav>
+<div class="menu-foot">
+<div class="theme-seg" role="group" aria-label="Theme"><button type="button" class="mono" data-theme-set="light" aria-pressed="false">Light</button><button type="button" class="mono" data-theme-set="dark" aria-pressed="false">Dark</button></div>
+<a class="btn btn-ink btn-block" href="../index.html#start" data-menu-close>Get started</a>
+<div class="menu-alpha mono"><span class="sq6 bg-sig" aria-hidden="true"></span>Alpha · M4 Tiered storage</div>
+</div>
+</div>
+<main id="main" class="wrap post">
+<a class="back-m mono" href="index.html"><span aria-hidden="true">←</span>All posts</a>
+<header class="post-head">
+<div class="crumb mono"><a href="index.html">Blog</a><span>/</span><span class="ink">Release notes</span></div>
+<div class="kicker-m mono">M4 · Trust and contracts</div>
+<h1>Trust before the first tag</h1>
+<p class="dek">A safety review said no public tag. We agreed, and put the release behind the fixes.</p>
+<div class="post-by"><span class="avatar av36 mono" aria-hidden="true">KC</span><span class="ink">Kevin Caicedo</span><span class="d-only dim">·</span><span class="d-only mono kicker">M4 · Trust and contracts</span><span class="d-only dim">·</span><span class="d-only mono kicker">2026-09-08</span></div>
+</header>
+<figure class="post-cover" aria-hidden="true"><svg class="px cover" width="1196" height="446" viewBox="0 0 64 24" aria-hidden="true"><path class="f-dim" d="M2.12 12.12h.76v.76h-.76zM4.12 12.12h.76v.76h-.76zM6.12 12.12h.76v.76h-.76zM8.12 12.12h.76v.76h-.76zM10.12 12.12h.76v.76h-.76zM12.12 12.12h.76v.76h-.76zM14.12 12.12h.76v.76h-.76zM16.12 12.12h.76v.76h-.76zM18.12 12.12h.76v.76h-.76zM20.12 12.12h.76v.76h-.76zM22.12 12.12h.76v.76h-.76zM24.12 12.12h.76v.76h-.76zM26.12 12.12h.76v.76h-.76zM28.12 12.12h.76v.76h-.76z"/><path class="f-ink" d="M10.12 3.12h.76v.76h-.76zM11.12 3.12h.76v.76h-.76zM21.12 3.12h.76v.76h-.76zM22.12 3.12h.76v.76h-.76zM32.12 3.12h.76v.76h-.76zM33.12 3.12h.76v.76h-.76zM42.12 3.12h.76v.76h-.76zM43.12 3.12h.76v.76h-.76zM53.12 3.12h.76v.76h-.76zM54.12 3.12h.76v.76h-.76zM10.12 4.12h.76v.76h-.76zM11.12 4.12h.76v.76h-.76zM21.12 4.12h.76v.76h-.76zM22.12 4.12h.76v.76h-.76zM32.12 4.12h.76v.76h-.76zM33.12 4.12h.76v.76h-.76zM42.12 4.12h.76v.76h-.76zM43.12 4.12h.76v.76h-.76zM53.12 4.12h.76v.76h-.76zM54.12 4.12h.76v.76h-.76zM10.12 5.12h.76v.76h-.76zM11.12 5.12h.76v.76h-.76zM21.12 5.12h.76v.76h-.76zM22.12 5.12h.76v.76h-.76zM32.12 5.12h.76v.76h-.76zM33.12 5.12h.76v.76h-.76zM42.12 5.12h.76v.76h-.76zM43.12 5.12h.76v.76h-.76zM53.12 5.12h.76v.76h-.76zM54.12 5.12h.76v.76h-.76zM10.12 6.12h.76v.76h-.76zM11.12 6.12h.76v.76h-.76zM21.12 6.12h.76v.76h-.76zM22.12 6.12h.76v.76h-.76zM32.12 6.12h.76v.76h-.76zM33.12 6.12h.76v.76h-.76zM42.12 6.12h.76v.76h-.76zM43.12 6.12h.76v.76h-.76zM53.12 6.12h.76v.76h-.76zM54.12 6.12h.76v.76h-.76zM10.12 7.12h.76v.76h-.76zM11.12 7.12h.76v.76h-.76zM21.12 7.12h.76v.76h-.76zM22.12 7.12h.76v.76h-.76zM32.12 7.12h.76v.76h-.76zM33.12 7.12h.76v.76h-.76zM42.12 7.12h.76v.76h-.76zM43.12 7.12h.76v.76h-.76zM53.12 7.12h.76v.76h-.76zM54.12 7.12h.76v.76h-.76zM10.12 8.12h.76v.76h-.76zM11.12 8.12h.76v.76h-.76zM21.12 8.12h.76v.76h-.76zM22.12 8.12h.76v.76h-.76zM32.12 8.12h.76v.76h-.76zM33.12 8.12h.76v.76h-.76zM42.12 8.12h.76v.76h-.76zM43.12 8.12h.76v.76h-.76zM53.12 8.12h.76v.76h-.76zM54.12 8.12h.76v.76h-.76zM10.12 9.12h.76v.76h-.76zM11.12 9.12h.76v.76h-.76zM21.12 9.12h.76v.76h-.76zM22.12 9.12h.76v.76h-.76zM32.12 9.12h.76v.76h-.76zM33.12 9.12h.76v.76h-.76zM42.12 9.12h.76v.76h-.76zM43.12 9.12h.76v.76h-.76zM53.12 9.12h.76v.76h-.76zM54.12 9.12h.76v.76h-.76zM10.12 10.12h.76v.76h-.76zM11.12 10.12h.76v.76h-.76zM21.12 10.12h.76v.76h-.76zM22.12 10.12h.76v.76h-.76zM32.12 10.12h.76v.76h-.76zM33.12 10.12h.76v.76h-.76zM42.12 10.12h.76v.76h-.76zM43.12 10.12h.76v.76h-.76zM53.12 10.12h.76v.76h-.76zM54.12 10.12h.76v.76h-.76zM32.12 11.12h.76v.76h-.76zM33.12 11.12h.76v.76h-.76zM42.12 11.12h.76v.76h-.76zM43.12 11.12h.76v.76h-.76zM53.12 11.12h.76v.76h-.76zM54.12 11.12h.76v.76h-.76zM32.12 12.12h.76v.76h-.76zM33.12 12.12h.76v.76h-.76zM42.12 12.12h.76v.76h-.76zM43.12 12.12h.76v.76h-.76zM53.12 12.12h.76v.76h-.76zM54.12 12.12h.76v.76h-.76zM32.12 13.12h.76v.76h-.76zM33.12 13.12h.76v.76h-.76zM42.12 13.12h.76v.76h-.76zM43.12 13.12h.76v.76h-.76zM53.12 13.12h.76v.76h-.76zM54.12 13.12h.76v.76h-.76zM10.12 14.12h.76v.76h-.76zM11.12 14.12h.76v.76h-.76zM21.12 14.12h.76v.76h-.76zM22.12 14.12h.76v.76h-.76zM32.12 14.12h.76v.76h-.76zM33.12 14.12h.76v.76h-.76zM42.12 14.12h.76v.76h-.76zM43.12 14.12h.76v.76h-.76zM53.12 14.12h.76v.76h-.76zM54.12 14.12h.76v.76h-.76zM10.12 15.12h.76v.76h-.76zM11.12 15.12h.76v.76h-.76zM21.12 15.12h.76v.76h-.76zM22.12 15.12h.76v.76h-.76zM32.12 15.12h.76v.76h-.76zM33.12 15.12h.76v.76h-.76zM42.12 15.12h.76v.76h-.76zM43.12 15.12h.76v.76h-.76zM53.12 15.12h.76v.76h-.76zM54.12 15.12h.76v.76h-.76zM10.12 16.12h.76v.76h-.76zM11.12 16.12h.76v.76h-.76zM21.12 16.12h.76v.76h-.76zM22.12 16.12h.76v.76h-.76zM32.12 16.12h.76v.76h-.76zM33.12 16.12h.76v.76h-.76zM42.12 16.12h.76v.76h-.76zM43.12 16.12h.76v.76h-.76zM53.12 16.12h.76v.76h-.76zM54.12 16.12h.76v.76h-.76zM10.12 17.12h.76v.76h-.76zM11.12 17.12h.76v.76h-.76zM21.12 17.12h.76v.76h-.76zM22.12 17.12h.76v.76h-.76zM32.12 17.12h.76v.76h-.76zM33.12 17.12h.76v.76h-.76zM42.12 17.12h.76v.76h-.76zM43.12 17.12h.76v.76h-.76zM53.12 17.12h.76v.76h-.76zM54.12 17.12h.76v.76h-.76zM10.12 18.12h.76v.76h-.76zM11.12 18.12h.76v.76h-.76zM21.12 18.12h.76v.76h-.76zM22.12 18.12h.76v.76h-.76zM32.12 18.12h.76v.76h-.76zM33.12 18.12h.76v.76h-.76zM42.12 18.12h.76v.76h-.76zM43.12 18.12h.76v.76h-.76zM53.12 18.12h.76v.76h-.76zM54.12 18.12h.76v.76h-.76zM10.12 19.12h.76v.76h-.76zM11.12 19.12h.76v.76h-.76zM21.12 19.12h.76v.76h-.76zM22.12 19.12h.76v.76h-.76zM32.12 19.12h.76v.76h-.76zM33.12 19.12h.76v.76h-.76zM42.12 19.12h.76v.76h-.76zM43.12 19.12h.76v.76h-.76zM53.12 19.12h.76v.76h-.76zM54.12 19.12h.76v.76h-.76zM10.12 20.12h.76v.76h-.76zM11.12 20.12h.76v.76h-.76zM21.12 20.12h.76v.76h-.76zM22.12 20.12h.76v.76h-.76zM32.12 20.12h.76v.76h-.76zM33.12 20.12h.76v.76h-.76zM42.12 20.12h.76v.76h-.76zM43.12 20.12h.76v.76h-.76zM53.12 20.12h.76v.76h-.76zM54.12 20.12h.76v.76h-.76z"/><path class="f-sig" d="M30.12 12.12h.76v.76h-.76z"/></svg></figure>
+<div class="post-grid">
+<article class="post-body">
+<p class="lede">InfinityDB has never been tagged. The first public alpha was planned for the v0.4 train. On 7 September a security and safety review of the development tree returned a plain verdict: no public tag, binary, container image or non-isolated deployment at this revision. On 8 September we accepted it in full, including the no. The first public tag is now v0.4.6-alpha, cut at the end of a new phase of M4 that exists to close what the review found.</p>
+
+<h2 id="s1" class="post-h2"><span class="pix num">1</span>Two critical findings: one in safe Rust, one in the default.</h2>
+<p>The review recorded two Critical, ten High and ten Medium confirmed findings, each backed by a bounded reproduction, a Miri run or a source invariant with an executable assertion. None described an exploited release: there was no release to exploit.</p>
+<p>The first Critical was in the executor. Its standard <code>Waker</code> was backed by state that is not thread-safe: <code>Rc</code>, <code>Cell</code>, <code>RefCell</code>. The standard library declares <code>Waker</code> as <code>Send</code> and <code>Sync</code>, so any future can clone its waker and hand it to another thread. The review did so in safe Rust, woke two clones on two threads, and Miri reported a data race. No wire path exported a waker yet. That limits exploitability; it does not make the API sound.</p>
+<p>The second Critical was the default. The server bound every IPv4 interface, with no bind option and no <code>AUTH</code>. Unauthenticated <code>SET</code>, <code>GET</code> and <code>FLUSHALL</code> all succeeded, and our own container example published the port on every host interface.</p>
+<aside class="law"><div class="law-label mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Law derived · L9</div><p>A safe API is sound for every caller, not only today's. A comment that says "do not send this across threads" is not a contract the compiler can see.</p></aside>
+
+<h2 id="s2" class="post-h2"><span class="pix num">2</span>Most of the Highs were limits the server only claimed.</h2>
+<p>Most Highs shared one shape: a setting accepted and not enforced. The normal-client output cap was parsed and never applied. The idle timeout was ignored, and <code>maxclients</code> was not an admission bound. The frame limit was checked per argument, not per frame. <code>DEBUG SLEEP</code> stalled a whole cell for as long as the client asked, and pub/sub did quadratic work on adversarial globs.</p>
+<p>One was a cross-protocol confusion: the inline parser kept a connection open after bytes that were plainly not RESP, where Redis closes it, so traffic meant for another protocol could reach the command executor. The fix is to fail closed. The remaining Highs sat in the unsafe leaves, where safe calls could reach invalid memory or skip a destructor, and in a release pipeline that ran mutable third-party actions with write permissions.</p>
+
+<h2 id="s3" class="post-h2"><span class="pix num">3</span>Red first, with the review's own harness.</h2>
+<p>A finding closes only when two things are true. The review's own reproducer no longer reproduces against the repair. And an in-tree regression test is red on the reviewed revision and green on the fix, at the layer that owns the invariant, plus a client-level test when a client can reach the bug.</p>
+<p>The whole ladder stays green as well: <code>just check</code>, <code>cargo deny check</code>, the compatibility diff, the simulator, and Miri, Loom and fuzzing where they apply. Red first matters: a test written after a fix often tests the fix.</p>
+<aside class="law"><div class="law-label mono"><span class="sq6 bg-ink" aria-hidden="true"></span>Law derived · L10</div><p>Evidence that cannot go red is not evidence. A regression test proves something only after it has failed on the bug it guards.</p></aside>
+
+<h2 id="s4" class="post-h2"><span class="pix num">4</span>Why a phase of its own, not a batch of fixes.</h2>
+<p>We considered fixing the findings inside the indexes phase and rejected it. A safe exposure boundary, and authentication pulled forward from M7, amend frozen things: the listener interface fixed at M0, and the recorded decisions that placed authentication at M7 and the first alpha in the v0.4 train. Frozen things change by decision first, then code.</p>
+<p>The waker repair changes the executor seam, so its decision record is amended before implementation too. The irony: M0 checked that the waker path contained no atomic instructions, and that property is exactly what made it unsound across threads. The repair may not be rejected for missing that old target. The target is revised first, and optimized after. Planned contracts that two architecture reviews found wrong as written, in replication, cross-cell locking and <code>WATCH</code>, needed the same home.</p>
+
+<h2 id="s5" class="post-h2"><span class="pix num">5</span>What the trust phase owns, in order.</h2>
+<ul class="dots">
+<li>Soundness: a waker safe Rust cannot misuse, and the unsafe-leaf fixes, each with its Miri reproducer in CI.</li>
+<li>A safe exposure boundary: a loopback or protected default, a bind option, an explicit acknowledgement before exposing a node without a password, minimal <code>requirepass</code> and <code>AUTH</code>, HTTP fail-close, and no <code>DEBUG</code> in release builds.</li>
+<li>A bounded request envelope: output, partial input, frame size, admission, glob work and subscriptions, each with an enforced bound and a typed refusal.</li>
+<li>Boot validation before allocation, safe data-directory permissions, and a pinned release pipeline.</li>
+<li>Four contract decisions, modelled before code: acknowledgment classes and HA profiles, transaction publication and <code>WATCH</code> history, partition identity, and a retention registry.</li>
+<li>Capability truth: an inventory of every on-disk and wire format, and a generated support matrix that CI checks against the code.</li>
+</ul>
+<p>The release acts planned for v0.4.0 and v0.4.5 fold into this tag, and those version strings retire unused. The train also moves documents beyond RAM ahead of new data types, which makes an old roadmap sentence true: tiered namespaces hold string values today, not documents.</p>
+
+<h2 id="close" class="post-h2">Until then.</h2>
+<p>Until the Critical and remotely reachable High findings close, the only defensible use of a development build is an isolated one: loopback only, a dedicated unprivileged user, a data directory created as <code>0700</code>. Those controls contain a build; they close nothing. The <a href="../docs/roadmap.html">roadmap</a> shows trust and safety as planned until every finding has gone red, then green. The first tag should be the first artifact strangers can run: safe to expose, honest about what it supports, correct in the contracts it has not built yet.</p>
+
+<div class="author"><span class="avatar av56 mono" aria-hidden="true">KC</span><div class="author-t"><div class="author-n">Kevin Caicedo</div><div class="muted">Building InfinityDB.</div></div><a class="btn-xs btn-line mono" href="https://github.com/kevincaicedo">GitHub<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 8L8 2M3 2h5v5" stroke="currentColor" stroke-width="1.4"/></svg></a></div>
+<a class="next-post" href="documents-as-tape.html"><div><div class="mono pn-k">Next post</div><div class="next-t">Documents as tape</div></div><span aria-hidden="true">→</span></a>
+</article>
+<aside class="post-side">
+<nav aria-label="On this page" class="post-toc"><div class="eyebrow">On this page</div><div class="toc"><a href="#s1" data-toc="s1" class=on><span class="sq5" aria-hidden="true"></span>Two critical findings: one in safe Rust, one in the default.</a><a href="#s2" data-toc="s2"><span class="sq5" aria-hidden="true"></span>Most of the Highs were limits the server only claimed.</a><a href="#s3" data-toc="s3"><span class="sq5" aria-hidden="true"></span>Red first, with the review&#x27;s own harness.</a><a href="#s4" data-toc="s4"><span class="sq5" aria-hidden="true"></span>Why a phase of its own, not a batch of fixes.</a><a href="#s5" data-toc="s5"><span class="sq5" aria-hidden="true"></span>What the trust phase owns, in order.</a><a href="#close" data-toc="close"><span class="sq5" aria-hidden="true"></span>Until then.</a></div></nav>
+<div class="side-card"><div class="eyebrow">The laws, in full</div><p>Each lesson became one of thirteen design laws. Read them with the code rules they produced.</p><a class="btn-sm btn-line" href="../docs/laws.html">Design laws →</a></div>
+<button type="button" class="btn-xs btn-line mono copy-link" data-copy-url><svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="4.5" y="4.5" width="7" height="7" stroke="currentColor"/><path d="M9.5 2.5h-7v7" stroke="currentColor"/></svg><span>Copy link</span></button>
+</aside>
+</div>
+</main>
+<footer class="footer">
+<div class="wrap">
+<div class="foot-grid">
+<div class="foot-brand">
+<div class="brand"><svg class="px" width="45" height="21" viewBox="0 0 15 7" aria-hidden="true"><path class="f-ink" d="M2 0h3v1h-3zM10 0h3v1h-3zM1 1h1v1h-1zM5 1h1v1h-1zM9 1h1v1h-1zM13 1h1v1h-1zM0 2h1v1h-1zM6 2h1v1h-1zM8 2h1v1h-1zM14 2h1v1h-1zM0 3h1v1h-1zM14 3h1v1h-1zM0 4h1v1h-1zM6 4h1v1h-1zM8 4h1v1h-1zM14 4h1v1h-1zM1 5h1v1h-1zM5 5h1v1h-1zM9 5h1v1h-1zM13 5h1v1h-1zM2 6h3v1h-3zM10 6h3v1h-3z"/><path class="f-sig" d="M7 3h1v1h-1z"/></svg><span class="brand-name">InfinityDB</span></div>
+<p>A Redis-compatible, multi-model database. Deterministic to the core.</p>
+</div>
+<nav aria-label="Product" class="foot-col"><div class="eyebrow">Product</div><a href="../index.html#how">How it works</a><a href="../index.html#roadmap">Roadmap</a><a href="../index.html#evidence">Evidence ledger</a><a href="../blog/index.html">Blog</a></nav>
+<nav aria-label="Docs" class="foot-col"><div class="eyebrow">Docs</div><a href="../docs/quickstart.html">Quickstart</a><a href="../docs/cells.html">Concepts</a><a href="../docs/compat.html">Compatibility matrix</a><a href="../docs/style.html">InfinityStyle</a></nav>
+<nav aria-label="Project" class="foot-col"><div class="eyebrow">Project</div><a href="https://github.com/kevincaicedo/infinitydb">GitHub</a><a href="https://github.com/kevincaicedo/infinitydb/releases">Releases</a><a href="https://github.com/kevincaicedo/infinitydb/security">Security</a><a href="https://github.com/kevincaicedo/infinitydb/blob/main/LICENSE">License</a></nav>
+</div>
+<div class="foot-bar mono"><span>© 2026 InfinityDB contributors · Apache 2.0</span><span>Public numbers appear only when the ledger says Allowed.</span></div>
+</div>
+</footer>
+</body>
+</html>

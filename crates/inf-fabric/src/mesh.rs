@@ -167,6 +167,10 @@ impl Outbound {
 struct Inbound {
     consumer: Consumer<FabricMsg>,
     doorbell: Arc<Doorbell>,
+    /// Consecutive budget-exhausted drains that ended before reaching this
+    /// peer while its doorbell was rung (F-L12-02 fairness oracle; reset
+    /// on every visit). Bounded by `peers − 1` under the rotating cursor.
+    skip_streak: u32,
 }
 
 /// Always-on fabric counters (feeds `fabric_msgs_per_batch` and the spill
@@ -184,6 +188,10 @@ pub struct FabricStats {
     pub decode_errors: u64,
     /// Stale replies drained for tokens nobody waits on (counted, not fatal).
     pub orphan_replies: u64,
+    /// Longest run of consecutive budget-exhausted drains during which one
+    /// peer with a rung doorbell went unvisited (F-L12-02). The rotating
+    /// cursor bounds it by `peers − 1`; the DST asserts that bound.
+    pub drain_skip_streak_max: u32,
 }
 
 /// One cell's handle on the mesh: producers toward every peer, consumers
@@ -198,6 +206,10 @@ pub struct CellFabric {
     out: Vec<Option<Outbound>>,
     /// Indexed by source cell id; `None` at `self.cell`.
     inn: Vec<Option<Inbound>>,
+    /// Source index the next `drain` starts at: one past the peer a
+    /// budget-exhausted drain stopped in, so a hot low-numbered peer cannot
+    /// starve the rest (F-L12-02).
+    next_source: usize,
     /// Per-cell parked flags (single-writer, set by each cell's park
     /// handshake) — read at flush to decide a doorbell wakeup (M0-R1).
     park_flags: Option<Arc<Vec<AtomicBool>>>,
@@ -225,8 +237,9 @@ impl Mesh {
     #[allow(clippy::new_ret_no_self)]
     pub fn new(cells: u16, config: MeshConfig) -> Vec<CellFabric> {
         assert!(cells > 0, "mesh needs at least one cell");
+        assert!(config.data_credits > 0, "data_credits must be non-zero");
         assert!(
-            config.data_credits > 0 && config.ring_capacity >= 2 * config.data_credits as usize,
+            config.ring_capacity >= 2 * config.data_credits as usize,
             "ring_capacity {} < 2 × data_credits {} — replies must always have headroom",
             config.ring_capacity,
             config.data_credits,
@@ -240,19 +253,20 @@ impl Mesh {
                 config,
                 out: (0..n).map(|_| None).collect(),
                 inn: (0..n).map(|_| None).collect(),
+                next_source: 0,
                 park_flags: None,
                 peer_wake: None,
                 stats: FabricStats::default(),
             })
             .collect();
-        for src in 0..n {
-            for dst in 0..n {
-                if src == dst {
+        for from in 0..n {
+            for to in 0..n {
+                if from == to {
                     continue;
                 }
                 let (producer, consumer) = ring::<FabricMsg>(config.ring_capacity);
                 let doorbell = Arc::new(Doorbell::default());
-                fabrics[src].out[dst] = Some(Outbound {
+                fabrics[from].out[to] = Some(Outbound {
                     producer,
                     doorbell: Arc::clone(&doorbell),
                     staged: Vec::new(),
@@ -260,7 +274,7 @@ impl Mesh {
                     pack: Vec::with_capacity(PACK_SEAL_BYTES),
                     pack_frames: 0,
                 });
-                fabrics[dst].inn[src] = Some(Inbound { consumer, doorbell });
+                fabrics[to].inn[from] = Some(Inbound { consumer, doorbell, skip_streak: 0 });
             }
         }
         fabrics
@@ -284,7 +298,13 @@ impl CellFabric {
     #[inline]
     pub fn next_token(&mut self) -> FabricToken {
         let token = FabricToken::new(self.cell, self.next_seq);
-        self.next_seq += 1;
+        // Wrap at the token's 48-bit sequence width (`FabricToken::MAX_SEQ`):
+        // uniqueness is required among in-flight ops only (≤ the ring
+        // capacities), so a wrapped sequence never collides with a live
+        // one. Before batch 12 this counter ran unbounded into
+        // `FabricToken::new`'s assert — a cell-lifetime send count as a
+        // release panic.
+        self.next_seq = (self.next_seq + 1) & FabricToken::MAX_SEQ;
         token
     }
 
@@ -294,7 +314,11 @@ impl CellFabric {
         match op {
             Op::Batch { ops } => ops.len() as u32,
             Op::Reply { .. } => 0,
-            _ => 1,
+            Op::Read { .. }
+            | Op::Write { .. }
+            | Op::Apply { .. }
+            | Op::ApplyNs { .. }
+            | Op::AdoptConn { .. } => 1,
         }
     }
 
@@ -360,7 +384,7 @@ impl CellFabric {
     pub fn flush(&mut self) -> usize {
         let mut published_total = 0;
         let mut seal_spills = 0;
-        for (dst, slot) in self.out.iter_mut().enumerate() {
+        for (to, slot) in self.out.iter_mut().enumerate() {
             let Some(outbound) = slot.as_mut() else { continue };
             if outbound.seal() {
                 seal_spills += 1;
@@ -384,8 +408,8 @@ impl CellFabric {
                 // never a hang.
                 if let (Some(flags), Some(wake)) = (&self.park_flags, &self.peer_wake) {
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    if flags[dst].load(Ordering::Relaxed) {
-                        wake(CellId(dst as u16));
+                    if flags[to].load(Ordering::Relaxed) {
+                        wake(CellId(to as u16));
                     }
                 }
             }
@@ -410,10 +434,17 @@ impl CellFabric {
         self.peer_wake = Some(Box::new(wake));
     }
 
-    /// FABRIC-IN: drains inbound frames up to a budget of `max` (round-robin
-    /// across peers, bounded), decoding each and handing it to `f(from, op)`.
-    /// `Op::Reply` frames return their credit to the `from` destination
-    /// *before* `f` sees them. Returns frames drained.
+    /// FABRIC-IN: drains inbound frames up to a budget of `max`, decoding
+    /// each and handing it to `f(from, op)`. `Op::Reply` frames return their
+    /// credit to the `from` destination *before* `f` sees them. Returns
+    /// frames drained.
+    ///
+    /// Round-robin across peers: each call starts at a rotating cursor and
+    /// visits peers in index order from there; when the budget runs out the
+    /// cursor moves one past the peer it stopped in, so every peer with
+    /// frames is reached within `peers − 1` further calls no matter how hot
+    /// its predecessors are (F-L12-02). A drain that finishes under budget
+    /// leaves the cursor where it is — every peer was served in full.
     ///
     /// Slots are packed (M0-R1): one slot carries up to [`PACK_SEAL_FRAMES`]
     /// concatenated frames, decoded in send order. Slots are consumed in
@@ -425,12 +456,18 @@ impl CellFabric {
     pub fn drain(&mut self, max: usize, mut f: impl FnMut(CellId, Op<'_>)) -> usize {
         let mut drained_total = 0;
         let peers = self.inn.len();
-        for source in 0..peers {
+        let start = self.next_source;
+        // Peers visited this call, as an offset count from `start`.
+        let mut visited = 0;
+        for offset in 0..peers {
             if drained_total >= max {
                 break;
             }
+            visited = offset + 1;
+            let source = (start + offset) % peers;
             let Some(inbound) = self.inn[source].as_mut() else { continue };
             inbound.doorbell.take();
+            inbound.skip_streak = 0;
             // Split borrows: credits live in `out[source]`, frames in
             // `inn[source]` — disjoint fields.
             let mut credits = self.out[source].as_mut().map(|o| &mut o.credits);
@@ -463,6 +500,24 @@ impl CellFabric {
                 drained_total += frames;
                 if consumed < chunk {
                     break;
+                }
+            }
+        }
+        if drained_total >= max && visited < peers {
+            // Budget-exhausted before every peer was reached: resume one
+            // past the last visited peer next call, and score the skipped
+            // peers that had frames waiting (their bells are still rung —
+            // untouched, so `before_park` keeps vetoing the park).
+            self.next_source = (start + visited) % peers;
+            for offset in visited..peers {
+                let source = (start + offset) % peers;
+                let Some(inbound) = self.inn[source].as_mut() else { continue };
+                if inbound.doorbell.pending() {
+                    inbound.skip_streak += 1;
+                    self.stats.drain_skip_streak_max =
+                        self.stats.drain_skip_streak_max.max(inbound.skip_streak);
+                } else {
+                    inbound.skip_streak = 0;
                 }
             }
         }
@@ -524,5 +579,28 @@ impl core::fmt::Debug for CellFabric {
             self.staged_frames(),
             self.stats
         )
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod token_tests {
+    use super::*;
+
+    /// Batch 12 of the 2026-08-30 review: the per-cell sequence wraps at
+    /// 48 bits instead of running into `FabricToken::new`'s assert after
+    /// 2^48 sends (under a year at 10 M/s).
+    #[test]
+    fn next_token_wraps_at_the_48_bit_width() {
+        let mut cells = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 8 });
+        let a = &mut cells[0];
+        a.next_seq = FabricToken::MAX_SEQ - 1;
+        let t1 = a.next_token();
+        let t2 = a.next_token();
+        let t3 = a.next_token();
+        assert_eq!(t1.seq(), FabricToken::MAX_SEQ - 1);
+        assert_eq!(t2.seq(), FabricToken::MAX_SEQ);
+        assert_eq!(t3.seq(), 0, "wrapped, not panicked");
+        assert_eq!(t3.origin_cell(), CellId(0));
+        assert_ne!(t2, t3);
     }
 }

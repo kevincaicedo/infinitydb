@@ -1,0 +1,58 @@
+# ADR-0144 D2/D3: which file is under which lint set, by the fuzz target that
+# enters it (the relation is checked, not derived: targets call crate-root
+# re-exports). The tier is per (scope, lint family) — a scope whose families
+# differ is split over two rows: `deny` = the scope (the file's own inner
+# attribute, or the outer attribute on the item) denies that family;
+# `ratchet` = its backlog is rows of docs/lint-baseline.tsv;
+# a target that enters no decoder says `none: <reason>` in the file column.
+# fuzz target<TAB>file[::item]<TAB>lints<TAB>tier
+inf-doc/fuzz_delta_apply	crates/inf-doc/src/delta.rs	cast,arith	deny
+inf-doc/idoc_decode	crates/inf-doc/src/tape.rs	cast,arith	deny
+inf-doc/idoc_decode	crates/inf-doc/src/model.rs	cast,arith	deny
+inf-doc/idoc_decode	crates/inf-doc/src/arena.rs	cast	deny
+inf-doc/idoc_decode	crates/inf-doc/src/arena.rs	arith	ratchet
+inf-doc/json_parse	crates/inf-doc/src/json.rs	cast,arith	deny
+inf-doc/path_program	crates/inf-doc/src/path/parse.rs	cast,arith	deny
+inf-doc/path_program	crates/inf-doc/src/path/program.rs	cast,arith	deny
+inf-doc/path_program	crates/inf-doc/src/path/eval.rs	cast	deny
+inf-doc/path_program	crates/inf-doc/src/path/eval.rs	arith	ratchet
+inf-doc/path_program	crates/inf-doc/src/path/ast.rs	cast,arith	deny
+inf-doc/path_program	crates/inf-doc/src/path/cache.rs	cast	deny
+inf-doc/path_program	crates/inf-doc/src/path/cache.rs	arith	ratchet
+inf-fabric/fabric_codec	crates/inf-fabric/src/codec.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/mod.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/census.rs	cast,arith	deny
+inf-foundation/bounded_ops	crates/inf-foundation/src/bounded/deque.rs	cast,arith	deny
+inf-log/extent_decode	crates/inf-log/src/blob.rs	cast,arith	deny
+inf-log/frame_decode	crates/inf-log/src/frame.rs	cast,arith	deny
+inf-log/frame_decode	crates/inf-log/src/record.rs	cast,arith	deny
+inf-log/fuzz_index_sidecar	crates/inf-log/src/ckpt/read.rs	cast,arith	deny
+inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	cast	deny
+inf-log/fuzz_tierfile_decode	crates/inf-log/src/tier.rs	arith	ratchet
+inf-log/ick_decode	crates/inf-log/src/ckpt/read.rs	cast,arith	deny
+inf-log/manifest_decode	crates/inf-log/src/manifest.rs	cast,arith	deny
+inf-log/manifest_decode	crates/inf-log/src/meta.rs	cast,arith	deny
+inf-log/segment_read	crates/inf-log/src/reader.rs	cast,arith	deny
+inf-query/fuzz_access_program	crates/inf-query/src/access.rs	cast,arith	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/lex.rs	cast,arith	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/parse.rs	cast,arith	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/compile.rs	cast,arith	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/partiql/cache.rs	cast,arith	deny
+inf-query/fuzz_partiql_parse	crates/inf-query/src/page.rs	cast,arith	deny
+inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/program.rs	cast,arith	deny
+inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/vm.rs	cast	deny
+inf-query/fuzz_predicate_program	crates/inf-query/src/predicate/vm.rs	arith	ratchet
+inf-server/glob_match	crates/inf-server/src/glob.rs	cast,arith	deny
+inf-server/process_stat	crates/inf-server/src/process_info/stat.rs	cast,arith	deny
+inf-server/move_snapshot	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
+inf-server/scan_cursor	crates/inf-server/src/exec.rs::parse_cursor	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_array_header	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_scan_head	cast,arith	deny
+inf-server/scatter_replies	crates/inf-server/src/plane/scatter.rs::parse_take_reply	cast,arith	deny
+inf-store/fuzz_catalog	crates/inf-store/src/catalog.rs	cast,arith	deny
+inf-store/fuzz_cold_key	crates/inf-store/src/record.rs::from_window	cast,arith	deny
+inf-store/fuzz_index_key	crates/inf-store/src/index_key.rs	cast,arith	deny
+inf-wire/resp_parse	crates/inf-wire/src/parser.rs	cast,arith	deny
+inf-wire/resp_reply_frame	crates/inf-wire/src/writer.rs	cast	deny
+inf-wire/resp_reply_frame	crates/inf-wire/src/writer.rs	arith	ratchet
+inf-server/command_surface	none: enters the whole executor through the command registry; its decoders are the rows above	-	-

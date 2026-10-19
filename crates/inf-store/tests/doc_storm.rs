@@ -13,8 +13,10 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 
+use inf_doc::CanonicalDoc;
 use inf_doc::model::{self, Value};
 use inf_foundation::time::Nanos;
+use inf_store::InternalDeadline::At;
 use inf_store::{
     CellStore, ExpireCond, ExpiryBudget, JsonSetOptions, JsonSetOutcome, OpError, StoreConfig,
 };
@@ -121,6 +123,7 @@ proptest! {
                 Op::Set { key, size } => {
                     let doc = doc_for(size, key as i64);
                     let name = key_name(key);
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     let outcome = store
                         .json_set(name.as_bytes(), &doc, JsonSetOptions::default(), now)
                         .expect("set");
@@ -133,6 +136,7 @@ proptest! {
                 Op::Replace { key, size } => {
                     let doc = doc_for(size, -(key as i64) - 1);
                     let name = key_name(key);
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     let replaced = store.json_replace(name.as_bytes(), &doc, now).expect("ok");
                     let e = &mut expect[key];
                     prop_assert_eq!(replaced, e.version.is_some());
@@ -172,7 +176,7 @@ proptest! {
                     let name = key_name(key);
                     let deadline = Nanos::from_millis(now_ms + 3);
                     let applied =
-                        store.expire(name.as_bytes(), Some(deadline), ExpireCond::Always, now);
+                        store.expire(name.as_bytes(), Some(At(deadline)), ExpireCond::Always, now);
                     let e = &mut expect[key];
                     prop_assert_eq!(applied, e.version.is_some());
                     if let Some(v) = e.version {
@@ -238,6 +242,7 @@ proptest! {
                 1 => {
                     let doc = doc_for(SizeClass::Blob, key as i64);
                     // WrongType when a string sits there; overwrite via DEL.
+                    let doc = CanonicalDoc::validate(&doc).expect("canonical fixture");
                     match store.json_set(name.as_bytes(), &doc, JsonSetOptions::default(), now) {
                         Ok(_) => {}
                         Err(OpError::WrongType) => {

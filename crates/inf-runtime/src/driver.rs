@@ -18,6 +18,7 @@ use std::io;
 use std::time::Duration;
 
 use inf_alloc::{AlignedPool, BufferId, BufferPool};
+use inf_foundation::FileOffset;
 
 use crate::token::CompletionToken;
 
@@ -117,6 +118,38 @@ impl StableBytesMut {
     }
 }
 
+/// The durability contract riding one [`IoOp::LogWrite`] (M4.5-S34,
+/// ADR-0086 D1). One frame, one barrier: the state "write-through *and* a
+/// linked fsync" is unrepresentable.
+#[derive(Copy, Clone, Debug)]
+pub enum WriteBarrier {
+    /// No barrier: `LogWritten` means the bytes reached the fd — the page
+    /// cache on a buffered fd, the device's volatile cache on `O_DIRECT`.
+    /// Never durable; a later `Fdatasync` covers them.
+    None,
+    /// Write-through (`RWF_DSYNC` on an `O_DIRECT` fd — the FUA class):
+    /// `LogWritten` is delivered only once the bytes are on stable media.
+    /// The durability fact for this frame; no `Synced` follows. Fallback
+    /// tiers (kqueue) execute it as write + fdatasync — same promise,
+    /// FLUSH-class cost (the correctness tier, ADR-0086 D1).
+    WriteThrough,
+    /// Linked fdatasync (the FLUSH class, ADR-0013 D1): `Synced` on
+    /// `fsync_token` is the durability fact; `LogWritten` on the write's
+    /// own token is the staging lease's release point only.
+    LinkedFsync { fsync_token: CompletionToken },
+}
+
+impl WriteBarrier {
+    /// The linked sync's token, when the barrier is one.
+    #[must_use]
+    pub fn fsync_token(self) -> Option<CompletionToken> {
+        match self {
+            WriteBarrier::LinkedFsync { fsync_token } => Some(fsync_token),
+            WriteBarrier::None | WriteBarrier::WriteThrough => None,
+        }
+    }
+}
+
 /// Operations a cell may queue. `push` never performs a syscall — everything
 /// goes out in the single `submit_and_reap` per loop iteration (L3).
 #[derive(Debug)]
@@ -124,7 +157,14 @@ pub enum IoOp {
     /// Arm accepting on a listening socket. Multishot where the backend
     /// supports it (one arm yields `Accepted` completions until disarmed or
     /// terminal error); re-armed internally otherwise. The same token rides
-    /// on every resulting completion.
+    /// on every resulting completion. An `accept(2)` failure is classified
+    /// by [`classify_accept_errno`] on every backend (F-L11-02/F-L11-06):
+    /// a transient one never surfaces; an exhaustion or broken-listener
+    /// one is delivered as ONE `Error` and the arm is **parked** — the
+    /// driver never re-arms into a persistent failure (the L3 spin). A
+    /// parked arm resumes on a later `AcceptArm` for the same listener
+    /// (idempotent while armed), and an exhaustion-parked arm also resumes
+    /// on its own once any `Close` on this driver returns an fd.
     AcceptArm { listener: RawFd, token: CompletionToken },
     /// Arm receiving on a connection. The DRIVER leases recv buffers from
     /// the pool and delivers them in completions; the consumer owns each
@@ -138,23 +178,33 @@ pub enum IoOp {
     /// ownership returns in the completion (`Sent` or `Error`).
     Send { fd: RawFd, buf: BufferId, len: u32, token: CompletionToken },
     /// Close the fd. Pending sends on it complete with `Error(ECANCELED)`
-    /// (returning their buffers) before `Closed` is delivered.
+    /// (returning their buffers) before `Closed` is delivered — a send
+    /// short-written when the close is queued included: its remainder is
+    /// never sent, the fd number may already be the next connection's
+    /// (F-L11-01). Exactly one `Closed` per `Close`, whatever the kernel
+    /// does with the number in between.
     Close { fd: RawFd, token: CompletionToken },
     /// Positional write of one sealed log frame (M2-S05, ADR-0013). Short
     /// writes are resubmitted internally: `LogWritten` means ALL bytes hit
-    /// the fd. With `fsync_token`, an fdatasync is chained after the write
-    /// — `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
+    /// the fd — what that promises about durability is the
+    /// [`WriteBarrier`] the op carries (M4.5-S34, ADR-0086 D1). Under
+    /// `LinkedFsync`, an fdatasync is chained after the write —
+    /// `IOSQE_IO_LINK` on io_uring (ordering enforced in-kernel), issued
     /// after the write's completion on fallback tiers. The chained sync's
     /// `Synced` is delivered only once every byte of THIS write is both
     /// written and covered (a sync that raced a short write is superseded
-    /// internally); a failed write cancels it (`Error{ECANCELED}` on
-    /// `fsync_token` — never a sync-past-failed-write).
+    /// internally); a failed write cancels it (`Error{ECANCELED}` on the
+    /// fsync token — never a sync-past-failed-write). A short
+    /// `WriteThrough` write re-arms its remainder write-through, so
+    /// `LogWritten` never names a partially durable frame.
     LogWrite {
         fd: RawFd,
-        offset: u64,
+        /// The frame's position: a `FileOffset`, so the op's span end is
+        /// at most `i64::MAX`, never the kernel's `−1` (ADR-0167 D1).
+        offset: FileOffset,
         data: StableBytes,
         token: CompletionToken,
-        fsync_token: Option<CompletionToken>,
+        barrier: WriteBarrier,
     },
     /// Standalone fdatasync-class barrier (everysec tick, segment seal —
     /// M2-S05). `Synced` on completion is the durability fact (L2).
@@ -168,8 +218,53 @@ pub enum IoOp {
     /// `BufferId` rides the completion because the recv pool is not
     /// involved. A read past EOF that cannot fill the buffer completes
     /// `Error{EIO}` — tier reads are always within the flushed range, so
-    /// a short file is corruption, not a condition.
-    TierRead { fd: RawFd, offset: u64, buf: StableBytesMut, token: CompletionToken },
+    /// a short file is corruption, not a condition. The position is a
+    /// `FileOffset`, like `LogWrite`'s (ADR-0167 D1).
+    TierRead { fd: RawFd, offset: FileOffset, buf: StableBytesMut, token: CompletionToken },
+}
+
+/// How every backend treats an `accept(2)` failure — one table, so the
+/// kqueue dev tier and io_uring cannot disagree on which failures are
+/// conditions and which are errors (F-L11-06), and no tier re-arms into a
+/// failure that will repeat on the next submit (F-L11-02).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AcceptFailure {
+    /// Routine on any listener (the peer aborted before we accepted, a
+    /// signal, a pending network error the kernel hands over on the new
+    /// socket — `accept(2)` says treat these like `EAGAIN`): the arm stays
+    /// up and nothing is delivered.
+    Transient,
+    /// Descriptor or memory exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`): an operating condition at `maxclients`, not a bug. One
+    /// `Error` is delivered and the arm is parked until an fd returns
+    /// (`Close`) or the consumer re-arms.
+    Exhausted,
+    /// The listener itself is unusable (`EBADF`, `EINVAL`, `ENOTSOCK`,
+    /// `EOPNOTSUPP`, `EFAULT`, anything unknown): one `Error`, the arm is
+    /// parked, and only an explicit `AcceptArm` tries again.
+    Broken,
+}
+
+/// The accept-failure table (see [`AcceptFailure`]). `errno` is positive.
+#[must_use]
+pub fn classify_accept_errno(errno: i32) -> AcceptFailure {
+    match errno {
+        libc::EAGAIN
+        | libc::EINTR
+        | libc::ECONNABORTED
+        | libc::EPROTO
+        | libc::EPERM
+        | libc::ENETDOWN
+        | libc::ENETUNREACH
+        | libc::EHOSTDOWN
+        | libc::EHOSTUNREACH
+        | libc::ENOPROTOOPT
+        | libc::ETIMEDOUT => AcceptFailure::Transient,
+        #[cfg(target_os = "linux")]
+        libc::ENONET => AcceptFailure::Transient,
+        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => AcceptFailure::Exhausted,
+        _ => AcceptFailure::Broken,
+    }
 }
 
 /// One reaped completion: the token that was armed plus the outcome.
@@ -199,8 +294,12 @@ pub enum CompletionResult {
     Sent {
         buf: BufferId,
     },
-    /// Every byte of a `LogWrite` reached the fd (page cache, NOT durable).
-    /// This is the staging lease's release point — never an ack point.
+    /// Every byte of a `LogWrite` reached the fd. Under
+    /// [`WriteBarrier::None`]/[`WriteBarrier::LinkedFsync`] that is the
+    /// page cache (NOT durable) — the staging lease's release point, never
+    /// an ack point. Under [`WriteBarrier::WriteThrough`] it is the frame's
+    /// durability fact (ADR-0086 D2): the consumer completes the frame's
+    /// write-through ledger ticket here.
     LogWritten,
     /// An fdatasync completed: everything it covers is durable. The ONLY
     /// event that may advance the durability watermark (§8.2, ADR-0013).

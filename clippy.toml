@@ -1,10 +1,103 @@
-# Cell code must never block or share state through std primitives (master plan L1/L6).
+# Cell code must never block or share state through std primitives (laws L1/L6).
 # `std::sync::Mutex` etc. are additionally grepped by scripts/check-cell-denylist.sh,
 # which scopes the ban to cell-resident crates.
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "no locks on the data plane (L1); control-thread code may use parking primitives via inf-server::control only" },
     { path = "std::sync::RwLock", reason = "no locks on the data plane (L1)" },
+    # Review 2026-08-30 F-L18-05: the grep in check-cell-denylist.sh cannot see
+    # through `use std::sync::{Condvar}`; this entry is type-resolved and can.
+    { path = "std::sync::Condvar", reason = "no blocking waits on the data plane (L1/L6); cells park via the backend idle strategy" },
+    # ADR-0144 D5: acquisition is allowed only at audited seam/boot/control sites.
+    { path = "std::fs::File", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::OpenOptions", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::ReadDir", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::DirEntry", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder", reason = "blocking filesystem acquisition: use the injected filesystem seam (ADR-0144 D5)" },
+    # ADR-0163 D2: a cell site not migrated yet holds a `container: <record>`
+    # allow counted by docs/container-exemptions.tsv, which only shrinks.
+    { path = "std::collections::HashMap", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
+    { path = "std::collections::HashSet", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
+    { path = "std::collections::VecDeque", reason = "cell code holds no growable std container: use `inf_foundation::bounded::{CappedDeque, CappedSlab, CappedMap}` over a `limits` const (ADR-0163 D2)" },
 ]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "cells park via the backend driver idle strategy, never thread::sleep" },
+    # Review 2026-08-30 F-L18-05 (batch 14, ADR-0106 first amendment): the
+    # ambient-clock ban is type-resolved — `use std::time::Instant;` and a
+    # renamed/aliased/glob import defeat the grep in check-cell-denylist.sh
+    # and none of these. `elapsed` is banned too: `UNIX_EPOCH.elapsed()`
+    # reads the wall clock without spelling `now`. Sanctioned sites carry
+    # `#[allow(clippy::disallowed_methods, reason = "…")]` on the statement
+    # or fn; scripts/check-clock-ban.sh lists every allow in cell code and
+    # proves the ban on planted bypass shapes.
+    { path = "std::time::Instant::now", reason = "no ambient clocks in cell code (L7): time is injected through inf_foundation::time::Clock" },
+    { path = "std::time::Instant::elapsed", reason = "no ambient clocks in cell code (L7): elapsed() reads the real clock" },
+    { path = "std::time::SystemTime::now", reason = "no ambient clocks in cell code (L7): time is injected through inf_foundation::time::Clock" },
+    { path = "std::time::SystemTime::elapsed", reason = "no ambient clocks in cell code (L7): UNIX_EPOCH.elapsed() is SystemTime::now() in disguise" },
+    { path = "libc::clock_gettime", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "libc::gettimeofday", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "libc::time", reason = "no ambient clocks in cell code (L7) — the libc spelling" },
+    { path = "core::arch::x86_64::_rdtsc", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+    # `__rdtscp` (two underscores — the Intel intrinsic name std uses). An
+    # entry that names no reachable function bans nothing, since clippy only
+    # warns ("does not refer to a reachable function"), so
+    # `check-clock-ban.sh` refuses one (ADR-0106 D7.5).
+    { path = "core::arch::x86_64::__rdtscp", reason = "no ambient clocks in cell code (L7) — the TSC spelling" },
+    # Every entry has an exact-path plant in lint-scope-probe (ADR-0144 D5).
+    { path = "std::fs::read", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_to_string", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::write", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::metadata", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::symlink_metadata", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::rename", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_file", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::remove_dir_all", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::create_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::create_dir_all", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::copy", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::hard_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::soft_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::read_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::canonicalize", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::exists", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::set_permissions", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::fs::set_times", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::exists", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::try_exists", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::is_dir", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::is_file", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::metadata", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::symlink_metadata", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::path::Path::read_dir", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::read_link", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::canonicalize", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::path::Path::is_symlink", reason = "blocking filesystem stat (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder::new", reason = "blocking filesystem acquisition (ADR-0144 D5)" },
+    { path = "std::fs::DirBuilder::create", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::symlink", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::chown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::lchown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::fchown", reason = "blocking filesystem call (ADR-0144 D5)" },
+    { path = "std::os::unix::fs::chroot", reason = "blocking filesystem call (ADR-0144 D5)" },
 ]
+
+# ADR-0144 A2: a reservation is consumed in the step that made it; held
+# across an `await` it is an error (`await_holding_invalid_type`, denied with
+# every warning), and the lint-scopes audit sanctions no allow of it. The
+# lint matches the outermost type of each local live across the await, so
+# the slot and the answer that carries it are both listed, and every public
+# type of `inf_foundation::bounded` with a lifetime parameter joins this list
+# (the lint-scopes gate holds that); a wrapper of the caller's own (an
+# `Option`, a tuple or a struct holding a slot) is not matched and is review's.
+await-holding-invalid-types = [
+    { path = "inf_foundation::bounded::DequeSlot", reason = "a reservation is consumed before any await: a resumed step reserves again (ADR-0144 A2)" },
+    { path = "inf_foundation::bounded::Reserved", reason = "the answer to reserve() carries the slot: it is matched in the step that reserved, before any await (ADR-0144 A2)" },
+]
+
+# INFINITY_STYLE "~70 lines per function" (review 2026-08-30 L18 R1; batch
+# 64, ADR-0125): clippy counts code lines (comments and blanks excluded).
+# The lint is not in the workspace lint table — scripts/check-lint-ratchet.sh
+# (ADR-0144 D3) enables it on production targets only and ratchets the
+# `fn_length` rows of docs/lint-baseline.tsv.
+too-many-lines-threshold = 70

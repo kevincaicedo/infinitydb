@@ -1,10 +1,10 @@
 # inf-runtime SAFETY
 
-`inf-runtime` is one of the four crates allowed `unsafe` (milestone M0
-§3.3). Every unsafe block carries a `// SAFETY:` comment (clippy
+`inf-runtime` is one of the four audited unsafe-leaf crates. Every unsafe
+block carries a `// SAFETY:` comment (clippy
 `undocumented_unsafe_blocks = deny`); this file records the audited areas
 and the invariants they rest on. Inventory-vs-code agreement is
-script-checked (`scripts/check-safety-inventory.sh`, M2.5-S16): every
+script-checked (`scripts/check-safety-inventory.sh`): every
 src file using unsafe must be named here.
 
 ## 1. Backend FFI (`kqueue.rs`, `uring.rs`, `net.rs`)
@@ -80,11 +80,37 @@ boot-scoped read-ahead worker). The kernel copies the mask; no caller
 memory is retained. tid 0 = the calling thread; a full mask is intersected
 with the online set by the kernel, so no error path depends on topology.
 
+## 1d. Termination signals (`signal.rs`, ADR-0124 D1)
+
+One `sigaction` per signal (`SIGTERM`, `SIGINT`) from a zeroed struct with
+the handler stored through `sa_sigaction`, `SA_RESETHAND | SA_RESTART`,
+an emptied mask and no old-action pointer. The handler is `extern "C"`
+and performs exactly one `AtomicBool` store into a `static` — the only
+operation it does is async-signal-safe; nothing allocates, locks or
+formats. The flag outlives every reader (`'static`). The test raises the
+signal at the test process once; the reset disposition then makes a
+second delivery default, which no test performs.
+
 ## 2. Rc waker vtable (`executor.rs`)
 
 `RawWakerVTable` whose data pointer is `Rc<TaskHeader>` — refcounts are
 **non-atomic by design** (L1, ADR-0003; verified by
-`scripts/check-waker-atomics.sh` against release asm).
+`scripts/check-waker-atomics.sh` against release asm, in `just check` and
+Linux PR CI since ADR-0106 D8). The gate resolves the four wakers from the
+vtable static, scans each body from `.cfi_startproc` to `.cfi_endproc`, and
+follows direct calls transitively through every callee whose body is in the
+same asm (`Rc::drop_slow`, `VecDeque::grow` today); callees with no body in
+the asm — the allocator shim, `memcpy`/`memmove`, the cold panic/unwind
+edges — are listed on every run, not assumed clean.
+
+Before ADR-0106 D8 this sentence was not evidence: the gate ran in no
+recipe and no workflow, its `awk` reset at the `.Lfunc_beginN:` label that
+`line-tables-only` debuginfo puts on every body's first line (2 lines and
+**zero instructions** scanned per waker), and its mnemonic set was anchored
+at the line start, so an x86 `lock` prefix — its own tab-separated field —
+could not match. A `compare_exchange_weak` retry loop planted in
+`waker_wake_by_ref` compiled to `lock cmpxchgq` and the gate printed
+"zero atomic instructions".
 
 This deliberately does not satisfy `Waker`'s documented thread-safety
 contract. Soundness rests on the **thread-locality invariant**: a waker

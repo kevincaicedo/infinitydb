@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
+)]
 //! M4-S13 accounting-vs-block-layer validation — target root.
 //!
 //! The measurement is the database's own per-namespace write counters

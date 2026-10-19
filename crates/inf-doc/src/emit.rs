@@ -197,6 +197,9 @@ pub(crate) fn begin(out: &mut Vec<u8>, tag: u8) -> usize {
 /// children never move (the D3 backpatch argument).
 #[inline]
 pub(crate) fn end(out: &mut [u8], len_at: usize) {
+    // `len_at + 3 <= out.len()` for every placeholder `begin` returned;
+    // a wrong `len_at` wraps here in release and then trips the slice
+    // index below before any byte lands (lane L10 style row, batch 59).
     let body_len = out.len() - (len_at + 3);
     debug_assert!(body_len <= DOC_BYTES_MAX, "cap enforced incrementally by the driver");
     let bytes = (body_len as u32).to_le_bytes();
@@ -216,10 +219,14 @@ pub(crate) fn append_overlapped(out: &mut Vec<u8>, input: &[u8], start: usize, l
     out.reserve(len + 7);
     let base = out.len();
     let mut n = start;
-    // SAFETY: `reserve(len + 7)` above bounds every 8-byte store below
-    // (`n - start < len` on entry to each iteration); `set_len` exposes
-    // exactly `len` bytes, all initialized (full words below, remainder
-    // via the safe `extend_from_slice` arm which manages its own length).
+    // SAFETY: provided `start + len` and `len + 7` do not wrap,
+    // `reserve(len + 7)` above bounds every 8-byte store below
+    // (`n - start < len` on entry to each iteration), and `set_len` exposes
+    // exactly `len` bytes, all initialized (full words below, the remainder
+    // through the safe `extend_from_slice` arm, which manages its own
+    // length). Neither sum is checked and the release profile has no
+    // overflow checks, so the bound rests on every caller passing a `len`
+    // inside `input`.
     unsafe {
         let p = out.as_mut_ptr().add(base);
         while n < end && n + 8 <= input.len() {

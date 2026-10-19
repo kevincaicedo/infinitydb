@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the wall clock is the instrument, not cell code"
+)]
 //! The Linux body of the `write_accounting` bench — see the target root
 //! (`../write_accounting.rs`) for why it lives in its own module: the
 //! whole measurement is `/proc/diskstats` against the database's own
@@ -40,9 +44,10 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
+use inf_store::KeyHasher;
 use inf_store::{
     AddressSpaceConfig, CompactionWork, DemotionConfig, Keyspace, LogicalAddr, StoreConfig,
-    TieredLookup, TieredTable, WriteAccounting,
+    TieredLookup, WriteAccounting,
 };
 
 const NS: NsId = NsId(31);
@@ -140,8 +145,8 @@ struct Run {
     /// shared envelope the counters deliberately do not pro-rate.
     wal_frame_bytes: u64,
     /// The namespace's `INFO tiering` per-namespace fields at the end of
-    /// the run, in `INFO`'s own order — printed so the operator guide's
-    /// worked example carries measured values, never invented ones.
+    /// the run, in `INFO`'s own order — printed so a worked example quotes
+    /// measured values, never invented ones.
     ns_line: String,
     records: u64,
     seconds: f64,
@@ -188,7 +193,7 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
     let mut rotor = SegmentRotor::create_fresh(
         StdSegmentFs,
         dirs.log.clone(),
-        SegmentConfig { segment_bytes: SEGMENT_BYTES, seal_after_ms: None },
+        SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() },
     )
     .expect("fresh log");
     let mut ring = StagingRing::new(StagingConfig::default());
@@ -226,7 +231,7 @@ fn workload(dir: &Path, user_mib: u64, leg: Leg) -> Run {
         let effect = MutationEffect::StringSet { ns: NS, key: key.as_bytes(), value: &value };
         let table = ks.tiered_store_mut(NS).expect("materialized");
         table.stage_wal(&mut ring, &effect).expect("frame has room");
-        let hash = TieredTable::hash_key(key.as_bytes());
+        let hash = KeyHasher::default().hash(key.as_bytes());
         let placed = if i < keys {
             table
                 .insert(key.as_bytes(), &value, hash)

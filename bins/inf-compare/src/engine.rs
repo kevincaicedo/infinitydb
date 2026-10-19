@@ -11,12 +11,13 @@
 //! configs" section (master plan §22: no comparison without the competitor in
 //! the run, configs published).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::resp;
+use crate::{affinity, resp};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum EngineKind {
@@ -70,6 +71,16 @@ impl EngineKind {
             EngineKind::RedisStack | EngineKind::Dragonfly | EngineKind::InfinityDb => true,
         }
     }
+
+    pub fn validate_durability(self, durability: Durability) -> Result<(), String> {
+        if self == Self::Dragonfly && durability == Durability::Everysec {
+            return Err("dragonfly does not support --durability everysec in inf-compare: \
+                no verified AOF/every-second fsync launch mode; snapshots are not equivalent. \
+                Use --engines redis,infinitydb or --durability none"
+                .into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,6 +100,38 @@ impl Mode {
     }
 }
 
+/// Requested durability class for launched engines (M4.5-S40):
+/// `None` is the in-memory row (redis `--appendonly no`, infinitydb's
+/// default dbs); `Everysec` is redis `--appendonly yes --appendfsync
+/// everysec` against an infinitydb `FSYNC everysec` namespace every
+/// connection starts in (`--conn-default-ns`). Dragonfly has no verified
+/// equivalent launch mode and is refused for `Everysec` (L20-19).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Durability {
+    None,
+    Everysec,
+}
+
+impl Durability {
+    pub fn parse(s: &str) -> Result<Durability, String> {
+        match s {
+            "none" => Ok(Durability::None),
+            "everysec" => Ok(Durability::Everysec),
+            other => Err(format!("--durability {other}: expected none|everysec")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Durability::None => "none (in-memory)",
+            Durability::Everysec => "everysec",
+        }
+    }
+}
+
+/// The namespace infinitydb's connections start in under a durable run.
+pub const DURABLE_NS: &str = "cmp";
+
 /// How to launch one engine.
 #[derive(Clone, Debug)]
 pub struct Spec {
@@ -98,6 +141,16 @@ pub struct Spec {
     pub threads: u16,
     pub pin_start: Option<usize>,
     pub maxmemory_mb: Option<u64>,
+    pub durability: Durability,
+    /// Per-engine durable state directory (wiped at launch); `None`
+    /// under `Durability::None`.
+    pub data_dir: Option<PathBuf>,
+    /// `io-properties.toml` copied into infinitydb's data dir (the
+    /// probed barrier class and device model); absent = FLUSH class.
+    pub probe_file: Option<PathBuf>,
+    /// Diagnostic-only Redis arm: disable automatic AOF rewrites. Never a
+    /// production comparison and always disclosed in the report.
+    pub redis_no_auto_rewrite: bool,
 }
 
 /// Docker image references (defaults overridable on the CLI).
@@ -114,14 +167,15 @@ pub struct Images {
     pub seccomp: PathBuf,
 }
 
-/// A launched-or-attached engine. Dropping it does NOT stop it — call
-/// [`teardown`].
+/// An owned engine is stopped and reaped on every exit path, including setup failure.
 #[derive(Debug)]
 pub struct Target {
     pub kind: EngineKind,
     pub host: String,
     pub port: u16,
     pub mode: Mode,
+    /// Configured by this harness; attached servers remain unverified.
+    pub durability: Option<Durability>,
     pub version: String,
     pub launch_cmd: String,
     pid: Option<u32>,
@@ -138,27 +192,110 @@ impl Target {
 /// Spawn `spec` as a host child process, wait until it answers `PING`.
 pub fn launch_host(spec: &Spec, log_dir: &Path) -> Result<Target, String> {
     let (program, argv) = host_argv(spec)?;
+    prepare_data_dir(spec)?;
     let launch_cmd = render_cmd(&program, &argv);
     let child = spawn(&program, &argv, log_dir, spec.kind.label())?;
     let pid = child.id();
-    wait_ready(&spec.host, spec.port, Duration::from_secs(20))
-        .map_err(|e| format!("{} (host): {e}", spec.kind.label()))?;
-    let version = host_version(&program, &argv);
-    Ok(Target {
+    let mut target = Target {
         kind: spec.kind,
         host: spec.host.clone(),
         port: spec.port,
         mode: Mode::Host,
-        version,
+        durability: Some(spec.durability),
+        version: String::new(),
         launch_cmd,
         pid: Some(pid),
         child: Some(child),
         container: None,
-    })
+    };
+    wait_ready(&spec.host, spec.port, Duration::from_secs(20))
+        .map_err(|e| format!("{} (host): {e}", spec.kind.label()))?;
+    durable_setup(spec)?;
+    target.version = host_version(&program, &argv);
+    Ok(target)
+}
+
+/// A fresh durable state directory for the engine (M4.5-S40): wiped and
+/// recreated so every run starts from an empty log/AOF; the probe file
+/// is copied in for infinitydb.
+fn prepare_data_dir(spec: &Spec) -> Result<(), String> {
+    let Some(dir) = &spec.data_dir else { return Ok(()) };
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove {}: {e}", dir.display())),
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if spec.kind == EngineKind::InfinityDb
+        && let Some(probe) = &spec.probe_file
+    {
+        std::fs::copy(probe, dir.join("io-properties.toml"))
+            .map_err(|e| format!("copy {}: {e}", probe.display()))?;
+    }
+    Ok(())
+}
+
+/// Post-launch durable setup (M4.5-S40): infinitydb's `everysec`
+/// namespace, created before any generator connection is opened so
+/// `--conn-default-ns` puts every one of them in it. Redis needs
+/// nothing: its AOF is a server-wide setting.
+fn durable_setup(spec: &Spec) -> Result<(), String> {
+    if spec.durability == Durability::Everysec && spec.kind == EngineKind::InfinityDb {
+        let reply = resp::command(
+            &spec.host,
+            spec.port,
+            &[
+                b"INF.NS",
+                b"CREATE",
+                DURABLE_NS.as_bytes(),
+                b"MODE",
+                b"durable",
+                b"FSYNC",
+                b"everysec",
+            ],
+        )?;
+        if !reply.starts_with(b"+OK") {
+            return Err(format!(
+                "infinitydb INF.NS CREATE {DURABLE_NS}: {}",
+                String::from_utf8_lossy(&reply).trim()
+            ));
+        }
+        // Prove a fresh connection lands in the namespace (the knob is
+        // what makes a memtier row durable at all): a probe SET on a
+        // fresh connection must be visible under `cmp` and absent from
+        // db0 — then it is removed.
+        resp::command(&spec.host, spec.port, &[b"SET", b"__inf_compare_probe", b"1"])?;
+        let in_db0 = resp::commands(
+            &spec.host,
+            spec.port,
+            &[&[b"INF.NS", b"USE", b"db0"], &[b"EXISTS", b"__inf_compare_probe"]],
+        )?;
+        let in_ns = resp::commands(
+            &spec.host,
+            spec.port,
+            &[&[b"INF.NS", b"USE", DURABLE_NS.as_bytes()], &[b"EXISTS", b"__inf_compare_probe"]],
+        )?;
+        if !in_db0.starts_with(b":0") || !in_ns.starts_with(b":1") {
+            return Err(format!(
+                "infinitydb --conn-default-ns {DURABLE_NS} did not take (probe in db0: {}, in \
+                 {DURABLE_NS}: {})",
+                String::from_utf8_lossy(&in_db0).trim(),
+                String::from_utf8_lossy(&in_ns).trim()
+            ));
+        }
+        resp::command(&spec.host, spec.port, &[b"DEL", b"__inf_compare_probe"])?;
+    }
+    Ok(())
 }
 
 /// `docker run -d` `spec` as a container; wait until it answers `PING`.
 pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Target, String> {
+    spec.kind.validate_durability(spec.durability)?;
+    if spec.durability != Durability::None {
+        return Err("--durability is a host-launch row (the data dir is a host path); drop \
+                    --docker and --attach"
+            .into());
+    }
     let name = format!("inf-compare-{}-{}", spec.kind.label(), spec.port);
     // Best-effort: clear a stale container of the same name from a prior run.
     let _ = Command::new("docker")
@@ -183,24 +320,26 @@ pub fn launch_docker(spec: &Spec, images: &Images, log_dir: &Path) -> Result<Tar
     // Persist the container id for debugging next to the host logs.
     let _ = std::fs::write(log_dir.join(format!("{}.container", spec.kind.label())), &out.stdout);
 
+    let mut target = Target {
+        kind: spec.kind,
+        host: spec.host.clone(),
+        port: spec.port,
+        mode: Mode::Docker,
+        durability: Some(spec.durability),
+        version: String::new(),
+        launch_cmd,
+        pid: None,
+        child: None,
+        container: Some(name.clone()),
+    };
     wait_ready(&spec.host, spec.port, Duration::from_secs(30)).map_err(|e| {
         let logs = Command::new("docker").args(["logs", "--tail", "20", &name]).output();
         let tail =
             logs.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_default();
         format!("{} (docker): {e}\n--- docker logs {name} ---\n{tail}", spec.kind.label())
     })?;
-    let version = info_version(&spec.host, spec.port);
-    Ok(Target {
-        kind: spec.kind,
-        host: spec.host.clone(),
-        port: spec.port,
-        mode: Mode::Docker,
-        version,
-        launch_cmd,
-        pid: None,
-        child: None,
-        container: Some(name),
-    })
+    target.version = info_version(&spec.host, spec.port);
+    Ok(target)
 }
 
 /// Verify an already-running engine at `host:port` is reachable; read version
@@ -213,6 +352,7 @@ pub fn attach(kind: EngineKind, host: &str, port: u16) -> Result<Target, String>
         host: host.to_string(),
         port,
         mode: Mode::Attach,
+        durability: None,
         version: info_version(host, port),
         launch_cmd: format!("(attached at {host}:{port})"),
         pid: None,
@@ -270,23 +410,22 @@ pub fn rss_peak_mib(target: &Target) -> Option<f64> {
 
 /// Stop the engine: host → SIGKILL + reap; docker → `rm -f`; attach → nothing.
 pub fn teardown(target: Target) {
-    match target.mode {
-        Mode::Host => {
-            if let Some(mut child) = target.child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+    drop(target);
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Mode::Docker => {
-            if let Some(name) = target.container {
-                let _ = Command::new("docker")
-                    .args(["rm", "-f", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
+        if let Some(name) = self.container.take() {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
-        Mode::Attach => {}
     }
 }
 
@@ -300,7 +439,7 @@ fn wait_ready(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
         }
         // Tooling tier (never the data plane): a readiness poll legitimately
         // sleeps. The ban targets cell-resident code; mirrors inf-bench.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(clippy::disallowed_methods, reason = "bench orchestration, not cell code")]
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())
@@ -309,33 +448,41 @@ fn wait_ready(host: &str, port: u16, timeout: Duration) -> Result<(), String> {
 // ---- host argv ----------------------------------------------------------
 
 fn host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
-    match spec.kind {
-        EngineKind::Redis => {
-            let (p, a) = redis_argv(spec, false);
-            Ok(maybe_pin(p, a, spec.pin_start, 1)) // redis is single-threaded
-        }
-        EngineKind::RedisStack => {
-            Err("redis-stack is docker-only (no host binary); pass --docker".into())
-        }
-        EngineKind::Dragonfly => {
-            let (p, a) = dragonfly_argv(spec, false);
-            Ok(maybe_pin(p, a, spec.pin_start, spec.threads as usize))
-        }
-        // infinityd pins its own cells via --pin-start; never taskset-wrapped.
-        EngineKind::InfinityDb => infinity_host_argv(spec),
+    spec.kind.validate_durability(spec.durability)?;
+    if spec.durability == Durability::Everysec && spec.data_dir.is_none() {
+        return Err(format!("{} everysec launch requires a data directory", spec.kind.label()));
     }
+    let (program, argv) = match spec.kind {
+        EngineKind::Redis => redis_argv(spec, false),
+        EngineKind::RedisStack => {
+            return Err("redis-stack is docker-only (no host binary); pass --docker".into());
+        }
+        EngineKind::Dragonfly => dragonfly_argv(spec, false)?,
+        EngineKind::InfinityDb => infinity_host_argv(spec)?,
+    };
+    let cpus =
+        spec.pin_start.map(|start| affinity::CpuRange::new(start, spec.threads)).transpose()?;
+    Ok(affinity::wrap(program, argv, cpus))
 }
 
 fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
     let port = if in_docker { 6379 } else { spec.port };
-    let mut argv = vec![
-        "--port".to_string(),
-        port.to_string(),
-        "--save".to_string(),
-        String::new(),
-        "--appendonly".to_string(),
-        "no".to_string(),
-    ];
+    let mut argv =
+        vec!["--port".to_string(), port.to_string(), "--save".to_string(), String::new()];
+    match (spec.durability, &spec.data_dir) {
+        (Durability::Everysec, Some(dir)) => argv.extend([
+            "--appendonly".to_string(),
+            "yes".to_string(),
+            "--appendfsync".to_string(),
+            "everysec".to_string(),
+            "--dir".to_string(),
+            dir.display().to_string(),
+        ]),
+        _ => argv.extend(["--appendonly".to_string(), "no".to_string()]),
+    }
+    if spec.redis_no_auto_rewrite {
+        argv.extend(["--auto-aof-rewrite-percentage".to_string(), "0".to_string()]);
+    }
     if let Some(mb) = spec.maxmemory_mb {
         argv.extend([
             "--maxmemory".to_string(),
@@ -347,7 +494,8 @@ fn redis_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
     ("redis-server".to_string(), argv)
 }
 
-fn dragonfly_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
+fn dragonfly_argv(spec: &Spec, in_docker: bool) -> Result<(String, Vec<String>), String> {
+    EngineKind::Dragonfly.validate_durability(spec.durability)?;
     let port = if in_docker { 6379 } else { spec.port };
     let mut argv = vec![
         "--port".to_string(),
@@ -365,27 +513,7 @@ fn dragonfly_argv(spec: &Spec, in_docker: bool) -> (String, Vec<String>) {
         // keep snapshots out of cwd; send logs to stderr so we capture them
         argv.extend(["--logtostderr".to_string(), "--dir".to_string(), "/tmp".to_string()]);
     }
-    ("dragonfly".to_string(), argv)
-}
-
-/// Wrap a host command in `taskset -c LO-HI` (`width` cores from `pin_start`)
-/// when pinning is requested and `taskset` exists; no-op otherwise.
-fn maybe_pin(
-    program: String,
-    argv: Vec<String>,
-    pin: Option<usize>,
-    width: usize,
-) -> (String, Vec<String>) {
-    match pin {
-        Some(base) if taskset_available() => {
-            let hi = base + width.max(1) - 1;
-            let range = if hi > base { format!("{base}-{hi}") } else { base.to_string() };
-            let mut wrapped = vec!["-c".to_string(), range, program];
-            wrapped.extend(argv);
-            ("taskset".to_string(), wrapped)
-        }
-        _ => (program, argv),
-    }
+    Ok(("dragonfly".to_string(), argv))
 }
 
 fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
@@ -395,11 +523,175 @@ fn infinity_host_argv(spec: &Spec) -> Result<(String, Vec<String>), String> {
         spec.port.to_string(),
         "--cells".to_string(),
         spec.threads.to_string(),
+        // M4.5-S42 (ADR-0091 D4): the comparator's arm is explicit
+        // (`--probe-file` copies the model in); never a silent probe.
+        "--device-probe".to_string(),
+        "off".to_string(),
     ];
     if let Some(core) = spec.pin_start {
-        argv.extend(["--pin-start".to_string(), core.to_string()]);
+        argv.extend([
+            "--pin-start".to_string(),
+            core.to_string(),
+            "--pin-stride".to_string(),
+            "1".to_string(),
+        ]);
+    }
+    if let (Durability::Everysec, Some(dir)) = (spec.durability, &spec.data_dir) {
+        argv.extend([
+            "--data-dir".to_string(),
+            dir.display().to_string(),
+            "--conn-default-ns".to_string(),
+            DURABLE_NS.to_string(),
+        ]);
     }
     Ok((bin.to_string_lossy().into_owned(), argv))
+}
+
+/// CPU time (user + system, clock ticks of 1/100 s) a host-launched
+/// engine has consumed — `/proc/<pid>/stat` fields 14 + 15; `None` for
+/// docker/attach targets. The S40 row discloses server CPU per leg.
+pub fn cpu_ticks(target: &Target) -> Option<u64> {
+    let pid = target.pid?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// One before/after observability sample. `cpu_seconds` covers the host
+/// process plus Redis's completed AOF children and any live descendants;
+/// INFO is retained raw and parsed for report deltas.
+pub struct Observation {
+    pub cpu_seconds: Option<f64>,
+    pub raw_info: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+pub fn observe(target: &Target) -> Result<Observation, String> {
+    let section = if target.kind == EngineKind::Redis { b"all".as_slice() } else { b"persistence" };
+    let reply = resp::command(&target.host, target.port, &[b"INFO", section])?;
+    let raw_info = resp::bulk_text(&reply)?;
+    let fields = parse_info(&raw_info);
+    let parent = cpu_ticks(target).map(|ticks| ticks as f64 / 100.0);
+    let completed_children = if target.kind == EngineKind::Redis {
+        info_f64(&fields, "used_cpu_sys_children") + info_f64(&fields, "used_cpu_user_children")
+    } else {
+        0.0
+    };
+    let live_children = target.pid.map(descendant_ticks).unwrap_or(0) as f64 / 100.0;
+    Ok(Observation {
+        cpu_seconds: parent.map(|v| v + completed_children + live_children),
+        raw_info,
+        fields,
+    })
+}
+
+pub fn observation_delta(kind: EngineKind, before: &Observation, after: &Observation) -> String {
+    match kind {
+        EngineKind::Redis => format!(
+            "aof_rewrites +{}; aof_delayed_fsync +{}; aof_last_status {}; child_cpu_s +{:.3}",
+            info_delta(&before.fields, &after.fields, "aof_rewrites"),
+            info_delta(&before.fields, &after.fields, "aof_delayed_fsync"),
+            after.fields.get("aof_last_bgrewrite_status").map_or("n/a", String::as_str),
+            (info_f64(&after.fields, "used_cpu_sys_children")
+                + info_f64(&after.fields, "used_cpu_user_children")
+                - info_f64(&before.fields, "used_cpu_sys_children")
+                - info_f64(&before.fields, "used_cpu_user_children"))
+            .max(0.0)
+        ),
+        EngineKind::InfinityDb => format!(
+            "parks +{}; ckpt_bytes +{}; stall_p99_us {}; stall_p999_us {}",
+            info_delta(&before.fields, &after.fields, "log_admission_parked_total"),
+            info_delta(&before.fields, &after.fields, "ckpt_bytes_total"),
+            after.fields.get("log_write_stall_p99_us").map_or("n/a", String::as_str),
+            after.fields.get("log_write_stall_p999_us").map_or("n/a", String::as_str)
+        ),
+        EngineKind::RedisStack | EngineKind::Dragonfly => "raw INFO captured".into(),
+    }
+}
+
+fn parse_info(raw: &str) -> BTreeMap<String, String> {
+    raw.lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim_end_matches('\r').split_once(':')?;
+            (!key.is_empty()).then(|| (key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn info_f64(fields: &BTreeMap<String, String>, key: &str) -> f64 {
+    fields.get(key).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+}
+
+fn info_delta(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    key: &str,
+) -> u64 {
+    let value = |m: &BTreeMap<String, String>| -> u64 {
+        m.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
+    };
+    value(after).saturating_sub(value(before))
+}
+
+fn descendant_ticks(pid: u32) -> u64 {
+    const PROCESS_TREE_CAP: usize = 4096;
+    let mut total = 0u64;
+    let mut pending = vec![pid];
+    let mut visited = 0usize;
+    while let Some(parent) = pending.pop() {
+        if visited == PROCESS_TREE_CAP {
+            break;
+        }
+        visited += 1;
+        let children = std::fs::read_to_string(format!("/proc/{parent}/task/{parent}/children"))
+            .unwrap_or_default();
+        for child in children.split_whitespace().filter_map(|v| v.parse::<u32>().ok()) {
+            total = total.saturating_add(proc_ticks(child).unwrap_or(0));
+            if pending.len() < PROCESS_TREE_CAP {
+                pending.push(child);
+            }
+        }
+    }
+    total
+}
+
+fn proc_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()?.saturating_add(fields.get(12)?.parse().ok()?))
+}
+
+/// Ambient Redis processes invalidate an in-run comparison because their
+/// background work and page cache are not attributable to either leg.
+pub fn ambient_redis_processes() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim() != "redis-server" {
+            continue;
+        }
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|v| String::from_utf8_lossy(&v).replace('\0', " "))
+            .unwrap_or_else(|| "redis-server".into());
+        found.push(format!("pid {pid}: {}", cmd.trim()));
+    }
+    found.sort();
+    found
+}
+
+/// Sectors written on `/sys/block/<dev>/stat` (field 7): the block
+/// device's view of a leg, journal and metadata included.
+pub fn device_sectors_written(dev: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/block/{dev}/stat"))
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(6).and_then(|v| v.parse().ok()))
 }
 
 // ---- docker argv --------------------------------------------------------
@@ -435,7 +727,7 @@ fn docker_argv(spec: &Spec, images: &Images, name: &str) -> Result<Vec<String>, 
             // dragonfly needs unlimited locked memory for its io_uring rings.
             argv.splice(1..1, ["--ulimit".to_string(), "memlock=-1".to_string()]);
             argv.push(images.dragonfly.clone());
-            let (_, inner) = dragonfly_argv(spec, true);
+            let (_, inner) = dragonfly_argv(spec, true)?;
             argv.extend(inner);
         }
         EngineKind::InfinityDb => {
@@ -464,8 +756,12 @@ fn docker_argv(spec: &Spec, images: &Images, name: &str) -> Result<Vec<String>, 
 // ---- versions -----------------------------------------------------------
 
 /// First line of `<program> --version`, ANSI-stripped (dragonfly colorizes).
-fn host_version(program: &str, _argv: &[String]) -> String {
-    Command::new(program)
+fn host_version(program: &str, argv: &[String]) -> String {
+    let mut command = Command::new(program);
+    if program == "taskset" {
+        command.args(&argv[..3]);
+    }
+    command
         .arg("--version")
         .output()
         .ok()
@@ -611,16 +907,6 @@ fn resolve_infinityd() -> PathBuf {
     PathBuf::from("infinityd")
 }
 
-fn taskset_available() -> bool {
-    Command::new("taskset")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn on_path(program: &str) -> bool {
     Command::new(program)
         .arg("--version")
@@ -629,4 +915,93 @@ fn on_path(program: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(kind: EngineKind, durability: Durability) -> Spec {
+        Spec {
+            kind,
+            host: "127.0.0.1".into(),
+            port: 7000,
+            threads: 1,
+            pin_start: None,
+            maxmemory_mb: None,
+            durability,
+            data_dir: (durability == Durability::Everysec).then(|| PathBuf::from("data")),
+            probe_file: None,
+            redis_no_auto_rewrite: false,
+        }
+    }
+
+    #[test]
+    fn infinity_process_and_competitors_share_the_cpu_allowance() {
+        for kind in [EngineKind::Redis, EngineKind::Dragonfly, EngineKind::InfinityDb] {
+            let mut spec = spec(kind, Durability::None);
+            spec.threads = 2;
+            spec.pin_start = Some(4);
+            let (program, argv) = host_argv(&spec).unwrap();
+            assert_eq!(program, "taskset", "{kind:?} process was not confined");
+            assert_eq!(&argv[..2], ["-c", "4-5"]);
+            if kind == EngineKind::InfinityDb {
+                assert!(argv.windows(2).any(|pair| pair == ["--pin-start", "4"]));
+                assert!(argv.windows(2).any(|pair| pair == ["--pin-stride", "1"]));
+            }
+        }
+    }
+
+    #[test]
+    fn dragonfly_everysec_cannot_produce_a_memory_launch() {
+        let spec = spec(EngineKind::Dragonfly, Durability::Everysec);
+        let result = host_argv(&spec);
+        assert!(result.is_err(), "must refuse an unmatched durability configuration: {result:?}");
+        assert!(dragonfly_argv(&spec, false).is_err());
+        assert!(dragonfly_argv(&spec, true).is_err());
+    }
+
+    #[test]
+    fn durable_host_launch_requires_a_data_directory() {
+        for kind in [EngineKind::Redis, EngineKind::InfinityDb] {
+            let mut spec = spec(kind, Durability::Everysec);
+            spec.data_dir = None;
+            assert!(host_argv(&spec).is_err(), "{kind:?} silently fell back to memory");
+        }
+    }
+
+    #[test]
+    fn supported_launches_keep_their_explicit_durability_configuration() {
+        let (_, argv) = host_argv(&spec(EngineKind::Redis, Durability::Everysec)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--appendonly", "yes"]));
+        assert!(argv.windows(2).any(|w| w == ["--appendfsync", "everysec"]));
+        assert!(argv.windows(2).any(|w| w == ["--dir", "data"]));
+        let (_, argv) = host_argv(&spec(EngineKind::InfinityDb, Durability::Everysec)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--data-dir", "data"]));
+        assert!(argv.windows(2).any(|w| w == ["--conn-default-ns", DURABLE_NS]));
+        let (_, argv) = host_argv(&spec(EngineKind::Dragonfly, Durability::None)).unwrap();
+        assert!(argv.windows(2).any(|w| w == ["--dbfilename", ""]));
+    }
+
+    #[test]
+    fn info_parser_and_selected_deltas_are_explicit() {
+        let before_raw = "aof_rewrites:2\r\naof_delayed_fsync:1\r\nused_cpu_sys_children:0.5\r\nus\
+             ed_cpu_user_children:1.0\r\n";
+        let after_raw = "aof_rewrites:5\r\naof_delayed_fsync:2\r\naof_last_bgrewrite_status:ok\r\n\
+             used_cpu_sys_children:1.0\r\nused_cpu_user_children:2.0\r\n";
+        let before = Observation {
+            cpu_seconds: Some(0.0),
+            raw_info: before_raw.into(),
+            fields: parse_info(before_raw),
+        };
+        let after = Observation {
+            cpu_seconds: Some(0.0),
+            raw_info: after_raw.into(),
+            fields: parse_info(after_raw),
+        };
+        assert_eq!(
+            observation_delta(EngineKind::Redis, &before, &after),
+            "aof_rewrites +3; aof_delayed_fsync +1; aof_last_status ok; child_cpu_s +1.500"
+        );
+    }
 }

@@ -1,0 +1,72 @@
+<!--
+title: Beyond RAM
+section: Concepts
+description: Tiered durable namespaces keep a hot tail in RAM and the rest on disk, with budgeted demotion, suspending cold reads and per-namespace budgets.
+lede: A durable namespace created with a MEM-BUDGET is tiered. Its recently written records and its working set stay in RAM; the rest lives in tier files on disk. Today this works for string values.
+chips: Available · alpha | Law L6
+-->
+{{fig:tiers}}
+<p class="fig-note">One logical address space per cell and tiered namespace: a mutable tail in RAM, a read-only RAM region, and a cold region on disk.</p>
+
+<h2 id="hybrid-log">The hybrid log</h2>
+<p>The design follows the hybrid log of Microsoft's FASTER. Each pair of a cell and a tiered namespace has a logical address space. Records are appended at increasing 48-bit addresses, and watermarks divide that space into regions:</p>
+<table class="doc-table"><thead><tr><th>Region</th><th>Where it lives</th><th>Rule</th></tr></thead><tbody>
+<tr><td>Mutable tail</td><td>RAM</td><td>records are updated in place</td></tr>
+<tr><td>Read-only</td><td>RAM, then RAM and disk once flushed</td><td>never changed; an update writes a new copy at the tail</td></tr>
+<tr><td>Cold</td><td>tier files on disk only</td><td>read through a suspending cold read</td></tr>
+</tbody></table>
+<p>The API enforces the read-only rule, because an in-place write there would diverge from a copy already on disk, and it releases RAM pages only below the flushed watermark. The index has the same shape as the in-memory index, but its address field holds a logical address. It keeps each entry's full 64-bit hash beside the table, so growing the table never reads a cold record.</p>
+
+<h2 id="create">Create a tiered namespace</h2>
+<p>Start the server with a data directory, then give a durable namespace a memory budget. <code>MEM-BUDGET</code> is what makes a namespace tiered; it applies only to <code>MODE durable</code>, and every other tier key is refused without it.</p>
+<pre class="code" data-label="redis-cli">127.0.0.1:6379&gt; INF.NS CREATE archive MODE durable FSYNC everysec MEM-BUDGET 1gb DISK-BUDGET 100gb
+OK
+127.0.0.1:6379&gt; INF.NS USE archive
+OK
+127.0.0.1:6379&gt; SET report:2026-10 "quarterly totals"
+OK
+127.0.0.1:6379&gt; INF.NS SET archive MUTABLE-FRACTION 300
+OK</pre>
+<table class="doc-table"><thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>MEM-BUDGET</code></td><td>required</td><td>The RAM window. With <code>MAINTAIN-SLICE</code> it must reserve at least <code>4mb</code>.</td></tr>
+<tr><td><code>DISK-BUDGET</code></td><td><code>0</code> (unbounded)</td><td>Bound on tier files and blob extents; <code>0</code> or at least <code>1mb</code>.</td></tr>
+<tr><td><code>MUTABLE-FRACTION</code></td><td><code>250</code></td><td>Share of the budget kept mutable, in permille (1 to 999).</td></tr>
+<tr><td><code>MAINTAIN-SLICE</code></td><td><code>1mb</code></td><td>The seal, flush and release quantum (64kb to 64mb).</td></tr>
+<tr><td><code>COMPACTION-DEAD-RATIO</code></td><td><code>50</code></td><td>Percent dead at which a tier file is compacted (50 to 100).</td></tr>
+<tr><td><code>COMPACTION-SLICE</code></td><td><code>1mb</code></td><td>Compaction work per slice (64kb to 64mb).</td></tr>
+<tr><td><code>BLOB-THRESHOLD</code></td><td>a quarter of the RAM ring, at most <code>16mb</code></td><td>Values at or above it go out of line to blob extents (4kb to 16mb).</td></tr>
+<tr><td><code>COLD-READ-QD</code></td><td><code>64</code></td><td>Cold-read queue depth (1 to 4096). Create-only.</td></tr>
+<tr><td><code>TIER-IO-MODE</code></td><td><code>direct</code></td><td><code>direct</code> or <code>buffered</code> tier file I/O. Create-only.</td></tr>
+<tr><td><code>TAIL-STALL-TIMEOUT</code></td><td><code>1000</code></td><td>Milliseconds a write may wait for flush progress (1 to 60000).</td></tr>
+</tbody></table>
+<p><code>INF.NS SET name KEY value</code> changes any key except the two create-only ones; drop and recreate the namespace to change those. Sizes use Redis units: <code>kb</code>, <code>mb</code> and <code>gb</code> are powers of 1024. The budgets apply per cell: each cell enforces <code>MEM-BUDGET</code> and <code>DISK-BUDGET</code> on its own part of the namespace. <code>MAXMEMORY</code> and <code>EVICTION</code> are refused on a tiered namespace, because <code>MEM-BUDGET</code> is its one memory authority.</p>
+
+<h2 id="demote">Demote, don't evict</h2>
+<p>A cache namespace answers memory pressure by evicting keys. A tiered namespace answers by demoting them, in three budgeted MAINTAIN steps: seal the mutable region down to its share of the budget, flush the sealed bytes to tier files, and release the RAM pages below the flushed watermark.</p>
+<p>Tier files hold one contiguous address range each, in 4 KiB frames with a CRC32C apiece, so finding a byte is arithmetic. Each file keeps exact live and dead byte counts. Once a file is at least <code>COMPACTION-DEAD-RATIO</code> percent dead, compaction copies its live records forward to the tail a slice at a time and retires the file. Compaction only allocates space and never waits for it, so it cannot deadlock the flush it belongs to. Tier flush and compaction spend the cell's device budget, its share of the device model measured at first boot, alongside checkpoints and log zero-fill.</p>
+
+<h2 id="cold-reads">Cold reads suspend</h2>
+<p>When a lookup lands on a cold address, the store does no I/O. It returns the address as a candidate and the command suspends, so the cell keeps serving every other key it owns:</p>
+<ul class="dots">
+<li>The read joins a bounded queue for its class, foreground or maintenance.</li>
+<li>Once per iteration the queues drain into <code>O_DIRECT</code> reads, up to <code>COLD-READ-QD</code> in flight, three foreground reads for each maintenance read, with adjacent ranges of a file merged.</li>
+<li>When the read completes, the command resumes, compares the full key and looks the key up again through the index, because anything may have changed while it waited.</li>
+</ul>
+<p>A key read again soon after a cold read is promoted to the tail, so its next read is served from RAM; a key touched once by a sweep stays cold. <code>CONFIG SET tiered-promote-on-read no</code> turns promotion off.</p>
+
+<h2 id="refusals">Budgets and refusals</h2>
+<p>Every pressure point answers with a typed error:</p>
+<table class="doc-table"><thead><tr><th>Error</th><th>When</th></tr></thead><tbody>
+<tr><td><code>DISKFULL tiered namespace disk budget exhausted (used=… budget=…)</code></td><td>a write would place new tier bytes past <code>DISK-BUDGET</code></td></tr>
+<tr><td><code>DISKFULL tier device out of space (ENOSPC)</code></td><td>the device is full</td></tr>
+<tr><td><code>STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)</code></td><td>a write waited longer than its timeout; retry it</td></tr>
+<tr><td><code>BUSY cold-read queue saturated, try again</code></td><td>the cold-read queue is full</td></tr>
+</tbody></table>
+<p>Recovery does not scan cold data. The MANIFEST names each tier file and how far it is durable, the checkpoint holds address references for records already in tier files, and the log tail replays on top. <code>INFO tiering</code> reports the address space, watermarks and budgets of the cell that served it.</p>
+
+<h2 id="today">What works today</h2>
+<p>Tiered namespaces serve the string family (<code>GET</code>, <code>SET</code> without expiry options, <code>MGET</code>, <code>MSET</code>, <code>INCR</code> and friends, <code>APPEND</code>, <code>GETRANGE</code>, <code>SETRANGE</code>, <code>DEL</code>, <code>EXISTS</code>), plus <code>SCAN</code> and <code>DBSIZE</code>. Multi-key commands resolve key by key.</p>
+<aside class="callout"><div class="callout-label">Not yet</div><p>Tiered namespaces have no key expiry: the <code>EXPIRE</code> family and <code>SET</code> expiry options are refused, and <code>TTL</code> answers <code>-1</code>. JSON documents, other value types and secondary indexes on tiered namespaces arrive with documents beyond RAM, <a href="roadmap.html#m4">the last phase of M4</a>.</p></aside>
+<p>Memory namespaces, the numbered databases and durable namespaces without a <code>MEM-BUDGET</code> have no hybrid log. A cell that is not durable runs none of this code; a durable cell runs the tiered maintenance step on every loop iteration, which reconciles its namespace set whether or not one is tiered.</p>
+
+<aside class="law-box"><span class="law-code">L6</span><div><div class="law-title">Every command is a resumable state machine.</div><p>A cold read is the case the rule was written for. The command suspends on a typed gate while the read goes out through the same <code>io_uring</code> ring as everything else, then resumes and validates again, and the in-memory fast path pays nothing for it.</p></div></aside>

@@ -54,7 +54,8 @@ pub fn render() -> String {
     push("> **GENERATED — do not edit.** Rendered by `tests/compat/src/replyshapes.rs`");
     push("> from `inf_server::JSON_REPLY_SHAPES` (the table beside the handlers).");
     push(
-        "> Regenerate: `INF_REGEN_REPLY_SHAPES=1 cargo test -p compat --test reply_shapes_artifact`",
+        "> Regenerate: `INF_REGEN_REPLY_SHAPES=1 cargo test -p compat --test \
+             reply_shapes_artifact`",
     );
     push("> (CI fails when this file is stale — the release pipeline inherits that refusal).");
     push("");
@@ -92,7 +93,7 @@ pub fn render() -> String {
     push("");
     push("Compatibility status per command lives in `docs/compat-matrix.md`; this");
     push("artifact pins the *shapes* the corpus executes under both protocols");
-    push("(`inf-server/tests/json_commands.rs`). Performance claims live in the");
-    push("claim ledger, never here (L10).");
+    push("(`inf-server/tests/json_commands.rs`). Performance claims are never made");
+    push("here (L10).");
     out
 }

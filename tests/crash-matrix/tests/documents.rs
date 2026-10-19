@@ -8,6 +8,7 @@ use crash_matrix::load_matrix;
 use inf_doc::apply::{ApplyOp, Number};
 use inf_doc::path::compile;
 use inf_doc::{JsonParser, encode_apply_op};
+use inf_foundation::KeyHasher;
 use inf_foundation::time::Nanos;
 use inf_log::ckpt::SyncIckWriter;
 use inf_log::fs::mem::MemFs;
@@ -37,10 +38,14 @@ fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
         staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, seal_after_ms: None },
+        segment: SegmentConfig { segment_bytes, ..Default::default() },
         ckpt: CkptConfig::default(),
         recover: Default::default(),
-        sync_pipeline: 1,
+        flush_bound: 1,
+        fua_p50_us_probed: 0,
+        device: Default::default(),
+        fill: Default::default(),
+        group: Default::default(),
     }
 }
 
@@ -138,7 +143,7 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
         self.rotor.maintain(0).expect("maintain");
         let slot = self.rotor.begin_frame(self.ring.pending_frame_len(), 0).expect("reserve");
         let base = slot.base();
-        let lease = self.ring.seal(slot.first_record_lsn(), covered_lsn);
+        let lease = self.ring.seal(slot.first_record_lsn(), covered_lsn, slot.layout());
         let first_record = lease.lsn_of(staged[0]);
         let bytes = self.ring.leased_frame(&lease).to_vec();
         self.rotor.commit_frame(slot, &bytes).expect("commit frame");
@@ -198,7 +203,13 @@ fn publish_checkpoint<F: SegmentFs + Clone>(
     write_manifest(
         fs,
         Path::new(SHARD_DIR),
-        &Manifest { ckpt_id: 1, begin_lsn: begin, segments, tiers: Vec::new() },
+        &Manifest {
+            ckpt_id: 1,
+            begin_lsn: begin,
+            segments,
+            tiers: Vec::new(),
+            key_hash_id: KeyHasher::default().identity(),
+        },
     )
     .expect("manifest publish");
 }

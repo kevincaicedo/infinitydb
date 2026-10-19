@@ -1,0 +1,2 @@
+# Preserve authored RESP fuzz seeds byte-for-byte, including CRLF.
+bins/inf-compare/fuzz/seeds/compare_resp_frame/* binary

@@ -96,7 +96,11 @@ impl CombinedScenario {
 pub struct CombinedReport {
     pub trace: Vec<u8>,
     pub trace_hash: u64,
+    pub state_hash: u64,
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     pub commands_done: u64,
     pub sim_seconds: f64,
@@ -214,20 +218,24 @@ fn next_memory_command(
 
 /// Runs one seeded combined scenario. See the module docs for the phase
 /// order and oracle inventory.
-#[allow(clippy::too_many_lines)] // one linear phase script, like run_durable_scenario
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: one linear phase script, like run_durable_scenario"
+)]
 #[must_use]
-pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
+fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> CombinedReport {
     let dur = &scenario.durable;
     let clock = Rc::new(VirtualClock::new(Nanos(1)));
     let disk = build_disk(dur.seed, dur.stall.as_ref());
-    let observer = TraceObserver::default();
     // A scheduler stream distinct from the durable scenario's, so shared
     // seeds don't correlate the two fleets.
     let mut rng = SplitMix64::new(dur.seed ^ 0xC0B1_4ED5);
     let mut report = CombinedReport {
         trace: Vec::new(),
         trace_hash: 0,
+        state_hash: 0,
         violations: Vec::new(),
+        cap_rows_checked: 0,
         stalled: false,
         commands_done: 0,
         sim_seconds: 0.0,
@@ -439,7 +447,12 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
                             report.always_ack_latency_ms_max =
                                 report.always_ack_latency_ms_max.max(latency.as_millis());
                         }
-                        _ => {}
+                        NsClass::Everysec
+                        | NsClass::Memory
+                        | NsClass::Tiered
+                        | NsClass::Indexed
+                        | NsClass::TierBudget(_)
+                        | NsClass::EpochMarks(_) => {}
                     }
                 }
                 writer.replied += 1;
@@ -579,7 +592,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
     // ---- POWER CUT ------------------------------------------------------
     let cut_time = clock.now();
     drop(node); // the process dies: in-flight state vanishes
-    disk.power_cut(dur.seed ^ 0x0FF5_EED0);
+    observer.power_cut(&disk, clock.now(), dur.seed ^ 0x0FF5_EED0);
 
     // ---- reboot (+ optional second cut mid-recovery, inherited) ---------
     let mut boots = 0;
@@ -635,7 +648,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
         // The second cut: recovery itself was interrupted (idempotence),
         // now with memory + expiry + quiesced pub/sub state present.
         drop(node);
-        disk.power_cut(dur.seed ^ 0x0FF5_EED1 ^ boots);
+        observer.power_cut(&disk, clock.now(), dur.seed ^ 0x0FF5_EED1 ^ boots);
     };
     let mut node = node;
 
@@ -657,7 +670,7 @@ pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
         for writer in writers.iter().filter(|w| w.class == class) {
             for (key, ops) in &writer.ledger {
                 report.audited_keys += 1;
-                let required = required_index(class, ops, cut_time);
+                let required = required_index(class, ops, cut_time, false);
                 report.required_ops += required.map_or(0, |i| i as u64 + 1);
                 report.allowed_lost_ops += ops.len() as u64 - required.map_or(0, |i| i as u64 + 1);
                 let reply = match audit.call(
@@ -825,5 +838,17 @@ fn finish(
     report.trace = observer.trace_bytes();
     report.trace_hash = hash64(&report.trace, 0xC0B1);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
+    report
+}
+
+/// Runs the scenario and seals state evidence after every node has been dropped.
+#[must_use]
+pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
+    let observer = TraceObserver::default();
+    let mut report = run_observed(scenario, observer.clone());
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

@@ -7,8 +7,23 @@
 //! Classic CVE surface in Redis — the M1 test plan fuzzes it from day one;
 //! the unit oracle below pins the Redis edge behaviors (unterminated
 //! classes, reversed ranges, trailing backslash).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 /// Does `pattern` match all of `string`?
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: s and star_s are incremented only while below string.len(), p only while \
+              below pattern.len(); a slice length is <= isize::MAX, so + 1 cannot overflow"
+)]
 pub fn glob_match(pattern: &[u8], string: &[u8], nocase: bool) -> bool {
     let (mut p, mut s) = (0usize, 0usize);
     // Backtrack point: position after the last `*` and the string position
@@ -50,6 +65,11 @@ enum Advance {
 }
 
 /// Consumes one pattern element at `*p`, matching it against byte `c`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: *p < pattern.len() is tested on entry and each step of k follows a test \
+              that *p + k - 1 is in bounds, so *p stays <= pattern.len() <= isize::MAX"
+)]
 fn advance(pattern: &[u8], p: &mut usize, c: u8, nocase: bool) -> Advance {
     if *p >= pattern.len() {
         return Advance::Mismatch;
@@ -98,6 +118,11 @@ fn advance(pattern: &[u8], p: &mut usize, c: u8, nocase: bool) -> Advance {
 /// after the class). Redis edge semantics preserved: `^` negates, `a-b`
 /// ranges normalize when reversed, `\x` escapes inside, an unterminated
 /// class consumes to the end of the pattern.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: start indexes the `[` the caller matched, and i advances by k only after \
+              i + k - 1 tested in bounds, so i <= pattern.len() <= isize::MAX and i + 2 fits"
+)]
 fn class_match(pattern: &[u8], start: usize, c: u8, nocase: bool) -> (bool, usize) {
     let mut i = start + 1;
     let negate = pattern.get(i) == Some(&b'^');
@@ -211,6 +236,21 @@ mod tests {
         assert!(!m("h[abc", "hd"));
         // And nothing may follow the matched byte.
         assert!(!m("h[abc", "hab"));
+    }
+
+    #[test]
+    fn final_pattern_bytes_do_not_advance_past_the_slice() {
+        for (pattern, text, expected) in [
+            (br"\".as_slice(), br"\".as_slice(), true),
+            (br"\", b"", false),
+            (b"[", b"a", false),
+            (b"[a-", b"a", true),
+            (b"[a-", b"-", true),
+            (b"[a-", b"b", false),
+            (b"[^", b"a", true),
+        ] {
+            assert_eq!(glob_match(pattern, text, false), expected, "{pattern:?} {text:?}");
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 # M3-S18 document crash matrix: the five record/checkpoint cut classes
-# named by the milestone plan. The runner uses the real tag-6/tag-7 log
+# of the document durability design. The runner uses the real tag-6/tag-7 log
 # codec and `open_cell_log` recovery path; this file is the reviewable
 # coverage inventory, not a second durability model.
 

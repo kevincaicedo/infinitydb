@@ -8,20 +8,21 @@
 //! Tier honesty (L10): identical to the m0/m1 flows — dev runs report
 //! measured values with non-binding verdicts on reference-box gates; the
 //! `log_records_appended` tripwire is box-independent and always binds.
-//! Resolution honesty: p99.9 comes from `LogHistogram` (32 linear
-//! sub-buckets per octave ⇒ ~3% quantization); a 0.0% delta means "same
-//! bucket", and any non-zero delta is at least one bucket (~3%) — disclosed
-//! as a note in every report this command writes.
+//! Resolution honesty: p99.9 comes from the client `FineHistogram` (256
+//! linear sub-buckets per octave ⇒ ~0.4% quantization since 2026-08-22;
+//! the 32-sub-bucket ~3% `LogHistogram` before); a 0.0% delta means "same
+//! bucket", and any non-zero delta is at least one bucket — disclosed as a
+//! note in every report this command writes.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::cli::Flags;
 use crate::gaterun::{
-    Measurements, ServerGuard, env_gate, finish_report, load_gates, max_field, median,
-    rss_bytes_of, scrape_cells, spawn_infinityd, sum_field,
+    Measurements, PeakRssSampler, ServerGuard, env_gate, finish_report, load_gates, max_field,
+    median, scrape_cells, spawn_infinityd, sum_field,
 };
-use crate::load::{LoadSpec, render, run as run_load};
+use crate::load::{LoadSpec, render, run_checked as run_load};
 use crate::resp::{connect, request};
 
 /// Measurement keys for one A/B row (`Measurements` keys are `'static`).
@@ -62,7 +63,7 @@ pub(crate) fn delta_pct(a: f64, b: f64) -> f64 {
 /// Both legs stay equally fresh within a replicate.
 ///
 /// With no baseline binary the M2 leg still runs (the counter tripwire
-/// needs it) and the delta gates stay PENDING.
+/// needs it) and the delta gates stay UNMEASURED.
 #[allow(clippy::too_many_arguments)] // orchestration row: linear, not branchy
 fn ab_row(
     m: &mut Measurements,
@@ -114,6 +115,9 @@ fn ab_row(
             // move as `m4rows::degenerate_row`).
             if *is_m2 {
                 assert_zero_log_records(m, server.port, cells, name)?;
+            }
+            if rep + 1 == replicates {
+                m.probe_generator(&format!("m2 {name} {label}"), &spec_for(server.port), &report);
             }
         }
     }
@@ -291,7 +295,7 @@ fn sweep_stale_row_dirs(data_root: &std::path::Path) {
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // orchestration script
+#[allow(clippy::too_many_lines, clippy::too_many_arguments, reason = "shape: orchestration script")]
 fn pressure_leg(
     m: &mut Measurements,
     infinityd: &str,
@@ -344,51 +348,52 @@ fn pressure_leg(
 
     // VmRSS + live ckpt-buffer sampler (100 ms) across the whole mix.
     let stop = AtomicBool::new(false);
-    let rss_peak = AtomicU64::new(0);
+    let rss_peak = PeakRssSampler::new(server.pid());
     let buf_peak = AtomicU64::new(0);
-    let pid = server.pid();
     let port = server.port;
+    let spec = LoadSpec {
+        port: server.port,
+        conns: 64,
+        pipeline: 16,
+        duration: Duration::from_secs(duration),
+        set_weight: 1,
+        get_weight: 1,
+        keys: PRESSURE_KEYS,
+        key_prefix: "p:".into(),
+        value_size: PRESSURE_VALUE,
+        setup: use_press,
+        ..Default::default()
+    };
     let (report, ()) = std::thread::scope(|scope| {
         let sampler = scope.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
-                rss_peak.fetch_max(rss_bytes_of(pid), Ordering::Relaxed);
+                rss_peak.record();
                 // One INFO per ~300 ms: the live ckpt_buffer_bytes gauge
                 // (the L5 attribution observable) at whichever cell answers.
                 for _ in 0..3 {
                     #[allow(clippy::disallowed_methods)] // bench sampler thread, not cell code
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    rss_peak.fetch_max(rss_bytes_of(pid), Ordering::Relaxed);
+                    rss_peak.record();
                 }
                 if let Ok(infos) = scrape_cells(port, 1) {
                     buf_peak.fetch_max(sum_field(&infos, "ckpt_buffer_bytes"), Ordering::Relaxed);
                 }
             }
         });
-        let report = run_load(&LoadSpec {
-            port: server.port,
-            conns: 64,
-            pipeline: 16,
-            duration: Duration::from_secs(duration),
-            set_weight: 1,
-            get_weight: 1,
-            keys: PRESSURE_KEYS,
-            key_prefix: "p:".into(),
-            value_size: PRESSURE_VALUE,
-            setup: use_press,
-            ..Default::default()
-        });
+        let report = run_load(&spec);
         stop.store(true, Ordering::Relaxed);
         sampler.join().expect("rss sampler");
         (report, ())
     });
     let report = report?;
+    let rss_peak = rss_peak.finish().map_err(|e| format!("ckpt-pressure {label}: {e}"))?;
     m.raw_section(&format!("ckpt-pressure {label}"), &render(&report));
 
     let infos = scrape_cells(server.port, cells)?;
     let leg = PressureLeg {
         ops_per_sec: report.ops_per_sec,
         p999_us: report.p999_us,
-        rss_peak: rss_peak.load(Ordering::Relaxed),
+        rss_peak,
         ckpts_completed: sum_field(&infos, "ckpts_completed"),
         manifests_published: sum_field(&infos, "manifests_published"),
         segments_truncated: sum_field(&infos, "segments_truncated"),
@@ -397,6 +402,7 @@ fn pressure_leg(
         fsync_p99_us: max_field(&infos, "fsync_latency_p99_us"),
         fsync_p999_us: max_field(&infos, "fsync_latency_p999_us"),
     };
+    m.probe_generator(&format!("m2 ckpt-pressure {label}"), &spec, &report);
     drop(server);
     drop(guard);
     Ok(leg)
@@ -454,7 +460,7 @@ fn always_row(
     let before = scrape_cells(server.port, cells)?;
     let (frames_0, iters_0) =
         (sum_field(&before, "log_frames_queued"), sum_field(&before, "raw_iterations"));
-    let report = run_load(&LoadSpec {
+    let spec = LoadSpec {
         port: server.port,
         conns,
         pipeline,
@@ -466,7 +472,8 @@ fn always_row(
         value_size: 64,
         setup: use_alw,
         ..Default::default()
-    })?;
+    };
+    let report = run_load(&spec)?;
     m.raw_section(&format!("always grouped writes ({label})"), &render(&report));
 
     let infos = scrape_cells(server.port, cells)?;
@@ -489,6 +496,9 @@ fn always_row(
     let group_p99 = max_field(&infos, "fsync_group_p99");
     let available_per_cell = conns as f64 * pipeline as f64 / f64::from(cells);
     let formation = group_p50 as f64 / available_per_cell;
+    if !canary {
+        m.probe_generator("m2 always grouped writes", &spec, &report);
+    }
     drop(server);
     drop(guard);
 
@@ -544,6 +554,7 @@ fn always_row(
 /// namespaces are *named* (both ride the pump — ADR-0015), so the row
 /// isolates the durability cost, not the named-ns dispatch cost.
 /// §8.2: the everysec legs attach their fsync histogram.
+#[allow(clippy::too_many_arguments)]
 fn everysec_row(
     m: &mut Measurements,
     infinityd: &str,
@@ -552,10 +563,19 @@ fn everysec_row(
     duration: u64,
     replicates: usize,
     data_root: &std::path::Path,
+    flags: &Flags,
 ) -> Result<(), String> {
     println!("\n== row: everysec penalty vs memory-mode ns (interleaved ABBA × {replicates}) ==");
     let guard =
         DataDirGuard::create(data_root.join(format!("inf-m2-esec-{}", std::process::id())))?;
+    // M4.5-S34 (2026-08-25): the barrier-class A/B rides this row — a
+    // `--barrier-class fua` arm carries the device model the S35 row
+    // carries (`<data-root>/io-properties.toml`), `--model-absent`
+    // withholds it.
+    let probe_present = copy_probe_file(flags, guard.path())?;
+    if probe_present {
+        m.note("everysec row: io-properties.toml copied into the row's data dir");
+    }
     let dir_s = guard.path().to_string_lossy().into_owned();
     let seg_s = PRESSURE_SEGMENT_BYTES.to_string();
     let mut extra: Vec<&str> = server_extra.to_vec();
@@ -614,6 +634,7 @@ fn everysec_row(
     let mut mem_p999: Vec<f64> = Vec::new();
     let mut esec_ops: Vec<f64> = Vec::new();
     let mut esec_p999: Vec<f64> = Vec::new();
+    let mut generator_samples = Vec::new();
     for rep in 0..replicates {
         let mem_first = rep % 2 == 0;
         for leg in 0..2 {
@@ -626,6 +647,9 @@ fn everysec_row(
                 m.raw_section(&format!("everysec row memory-ns rep {rep}"), &render(&report));
                 mem_ops.push(report.ops_per_sec);
                 mem_p999.push(report.p999_us as f64);
+                if rep + 1 == replicates {
+                    generator_samples.push(("m2 everysec memory arm", spec_for(b"memns"), report));
+                }
             } else {
                 let report = run_load(&spec_for(b"esec"))?;
                 println!(
@@ -635,6 +659,9 @@ fn everysec_row(
                 m.raw_section(&format!("everysec row everysec rep {rep}"), &render(&report));
                 esec_ops.push(report.ops_per_sec);
                 esec_p999.push(report.p999_us as f64);
+                if rep + 1 == replicates {
+                    generator_samples.push(("m2 everysec durable arm", spec_for(b"esec"), report));
+                }
             }
         }
     }
@@ -642,6 +669,9 @@ fn everysec_row(
     let p50 = max_field(&infos, "fsync_latency_p50_us");
     let p99 = max_field(&infos, "fsync_latency_p99_us");
     let p999f = max_field(&infos, "fsync_latency_p999_us");
+    for (name, spec, report) in generator_samples {
+        m.probe_generator(name, &spec, &report);
+    }
     drop(server);
     drop(guard);
 
@@ -718,14 +748,11 @@ fn attribution_row(
     let doc_domains = sum_field(&infos, "doc_resident_bytes")
         + sum_field(&infos, "doc_scratch_bytes")
         + sum_field(&infos, "doc_path_cache_bytes");
-    let rss = server.rss_bytes();
+    let rss =
+        server.proc_sample().map_err(|e| format!("attribution row: VmRSS read: {e}"))?.rss_bytes();
     drop(server);
     drop(guard);
-    let divergence = if rss == 0 {
-        return Err("attribution row: VmRSS read failed".into());
-    } else {
-        ((rss as f64 - domains as f64) / rss as f64 * 100.0).abs()
-    };
+    let divergence = ((rss as f64 - domains as f64) / rss as f64 * 100.0).abs();
     m.set("attribution_divergence_pct", divergence);
     m.note(format!(
         "attribution (durable fill leg, log domains included): sum(domains) {domains} B \
@@ -861,7 +888,10 @@ fn pressure_rows(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // orchestration script: linear rows, not branchy logic
+#[allow(
+    clippy::too_many_lines,
+    reason = "shape: orchestration script: linear rows, not branchy logic"
+)]
 pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     let gates_list = load_gates(flags, "m2")?;
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m2");
@@ -877,37 +907,52 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         .get("pin-start")
         .map(|v| vec!["--pin-start".to_string(), v.to_string()])
         .unwrap_or_default();
-    // M2.5-S07 A/B knob: the durability-sync pipeline bound rides every
-    // durable spawn in this campaign (disclosed in the report notes).
-    if let Some(bound) = flags.get("sync-pipeline") {
-        pin_args.push("--sync-pipeline".to_string());
-        pin_args.push(bound.to_string());
+    // `--sync-pipeline` was retired by ADR-0087 D5: accepted, announced,
+    // never forwarded (the server refuses it).
+    if flags.get("sync-pipeline").is_some() {
+        println!("note: --sync-pipeline is retired (ADR-0087 D5) — no-op; use --frames-in-flight");
     }
+    // M4.5-S35 A/B arms (ADR-0087 D5/D8) ride every durable spawn in this
+    // campaign and are disclosed in the report notes.
+    pin_args.extend(pipeline_args(flags));
     let server_extra: Vec<&str> = pin_args.iter().map(String::as_str).collect();
 
     let env_ok = env_gate(flags)?;
     // One resolution for every device-exercising row; sweep what a killed
     // prior run left behind before this one writes its own ~13 GB.
-    let data_root =
-        flags.get("pressure-data-root").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    // `--data-root` is the campaign-wide spelling (the m4.5 rows' flag);
+    // `--pressure-data-root` is this flow's older name — either resolves
+    // every device-exercising row here. The 2026-08-21 S35 arms passed
+    // `--data-root` to this flow and silently wrote to the temp dir.
+    let data_root = flags
+        .get("pressure-data-root")
+        .or_else(|| flags.get("data-root"))
+        .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    // Admission before any row: a binding run or a FUA arm on a memory
+    // filesystem refuses here (never a note the reader may miss).
+    let root_fstype = crate::gaterun::admit_device_root(flags, &data_root, reference_box)?;
     sweep_stale_row_dirs(&data_root);
     let mut m = Measurements::new();
+    m.note("generator scope: deterministic attribution fills measure memory, not capacity");
     if !env_ok {
         m.note("env-check FAILED and was overridden (--unsafe-env): not citation-grade");
     }
-    if data_root.starts_with("/tmp") || data_root.starts_with("/dev/shm") {
-        m.note(
-            "pressure-data-root resolves under /tmp (tmpfs-likely): the everysec row writes \
-             ~13 GB with truncation disabled — a 16 GB tmpfs exhausts mid-row and the engine \
-             fail-stops per §8.4. Pass --pressure-data-root on a real filesystem.",
-        );
+    m.note(format!("data root: {} ({root_fstype})", data_root.display()));
+    if crate::gaterun::is_memory_fs(&root_fstype) {
+        m.note(format!(
+            "data root is {root_fstype} (memory-backed): the durable rows measure the page \
+             cache, not a device — dev-tier smoke only; the everysec row writes ~13 GB with \
+             truncation disabled and a 16 GB tmpfs exhausts mid-row (the engine \
+             fail-stops). Pass --data-root on the filesystem under test."
+        ));
     }
     if !reference_box {
         m.note("dev-tier run: reference-box gates report measured values, non-binding verdicts");
     }
     m.note(
-        "p99.9 deltas are quantized by LogHistogram (32 sub-buckets/octave ≈ 3%): \
-         0.0% = same bucket; any non-zero delta spans ≥ 1 bucket",
+        "p99.9 deltas are quantized by the client histogram (256 sub-buckets/octave ≈ 0.4% \
+         since 2026-08-22; 32 ≈ 3% before): 0.0% = same bucket; any non-zero delta spans \
+         ≥ 1 bucket",
     );
     m.note(
         "M2 leg of the zero-cost rows runs without --data-dir (the memory-only assembly — \
@@ -916,7 +961,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
     );
     if baseline_bin.is_none() {
         m.note(
-            "--baseline-bin not given: zero-cost delta rows report PENDING \
+            "--baseline-bin not given: zero-cost delta rows report UNMEASURED \
              (build the pre-M2 commit's infinityd and pass its path)",
         );
     }
@@ -958,9 +1003,37 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
             reference_box,
             &artifacts_root,
             &format!(
-                "cells: {cells} · duration: {duration}s · ONLY-ALWAYS (M2.5-S07 A/B leg; \
-                 sync-pipeline {})",
-                flags.str_or("sync-pipeline", "1")
+                "cells: {cells} · duration: {duration}s · ONLY-ALWAYS (A/B leg; {})",
+                pipeline_note(flags)
+            ),
+        );
+    }
+
+    // M4.5-S34 (2026-08-25): the everysec penalty row alone — the
+    // barrier-class A/B (`--barrier-class flush|fua`, the probe file at
+    // `--data-root`) the S34 AC binds on, interleaved by the campaign
+    // script the way `--only-always` is.
+    if flags.bool("only-everysec") {
+        everysec_row(
+            &mut m,
+            &infinityd,
+            cells,
+            &server_extra,
+            duration,
+            replicates,
+            &data_root,
+            flags,
+        )?;
+        return finish_report(
+            "m2",
+            &gates_list,
+            &m,
+            env_ok,
+            reference_box,
+            &artifacts_root,
+            &format!(
+                "cells: {cells} · duration: {duration}s · ONLY-EVERYSEC (A/B leg; {})",
+                pipeline_note(flags)
             ),
         );
     }
@@ -1034,7 +1107,7 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
 
     // S21: always grouped writes + the grouping-ratio tripwire.
     if flags.bool("skip-pressure") {
-        m.note("S21 always row SKIPPED (--skip-pressure): always_grouped_wps stays PENDING");
+        m.note("S21 always row SKIPPED (--skip-pressure): always_grouped_wps stays UNMEASURED");
     } else {
         always_row(
             &mut m,
@@ -1047,14 +1120,23 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
             false,
         )?;
         // §6 everysec penalty + the durable attribution rows (S22).
-        everysec_row(&mut m, &infinityd, cells, &server_extra, duration, replicates, &data_root)?;
+        everysec_row(
+            &mut m,
+            &infinityd,
+            cells,
+            &server_extra,
+            duration,
+            replicates,
+            &data_root,
+            flags,
+        )?;
         let attr_keys = flags.u64_or("attribution-keys", 2_000_000)?;
         attribution_row(&mut m, &infinityd, cells, &server_extra, attr_keys, &data_root)?;
     }
 
     // S12: checkpoint under full durable load (anti-BGREWRITEAOF + RSS).
     if flags.bool("skip-pressure") {
-        m.note("S12 pressure rows SKIPPED (--skip-pressure): ckpt gates stay PENDING");
+        m.note("S12 pressure rows SKIPPED (--skip-pressure): ckpt gates stay UNMEASURED");
     } else {
         let pressure_reps = flags.usize_or("pressure-replicates", 3)?;
         pressure_rows(
@@ -1121,5 +1203,81 @@ pub fn cmd_gate_run_m2(flags: &Flags) -> Result<(), String> {
         reference_box,
         &artifacts_root,
         &format!("cells: {cells} · replicates: {replicates} · duration: {duration}s"),
+    )
+}
+
+/// The M4.5-S35 server arms (ADR-0087 D5): `--frames-in-flight K`,
+/// `--barrier-class flush|fua`, `--log-staging-mib N` from the campaign
+/// flags, forwarded verbatim to every durable spawn.
+pub(crate) fn pipeline_args(flags: &Flags) -> Vec<String> {
+    let mut args = Vec::new();
+    for (flag, server_flag) in [
+        ("frames-in-flight", "--frames-in-flight"),
+        ("barrier-class", "--barrier-class"),
+        ("staging-mib", "--log-staging-mib"),
+        // M4.5-S36 (ADR-0088 D6): the device-model arm. `--seal-pace`
+        // rides only the spawns that carry a probe file (`seal_pace_args`).
+        ("device-write-mbps", "--device-write-mbps"),
+        // M4.5-S39a: the frame-fill arms (window µs — 0 is the
+        // pre-S39a cadence, the baseline arm — and target KiB).
+        ("fill-window-us", "--fill-window-us"),
+        ("fill-target-kib", "--fill-target-kib"),
+        // M4.5-S43 (ADR-0092 D4): the FLUSH-class group-hold arm.
+        ("flush-group-window-us", "--flush-group-window-us"),
+        // M4.5-S42 (ADR-0091 D4): the probe tier (`spawn_infinityd`
+        // adds `off` when absent).
+        ("device-probe", "--device-probe"),
+    ] {
+        if let Some(value) = flags.get(flag) {
+            args.push(server_flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    args
+}
+
+/// The M4.5-S36 seal-pace arm (ADR-0088 D2b), forwarded only when the
+/// spawn can honour it: `--seal-pace probe` needs a schema-2 probe file
+/// in the spawn's data dir (`probe_present`), a numeric rate needs none.
+pub(crate) fn seal_pace_args(flags: &Flags, probe_present: bool) -> Vec<String> {
+    match flags.get("seal-pace") {
+        Some(value) if value != "probe" || probe_present => {
+            vec!["--seal-pace".to_string(), value.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Copies the campaign root's `io-properties.toml` into a spawn's data
+/// dir (ADR-0088 D6: `infinityd` reads its own data dir; every spawn is
+/// fresh). Returns whether a file was copied. `--model-absent` skips it
+/// — the unbudgeted baseline arm, disclosed in the report.
+pub(crate) fn copy_probe_file(flags: &Flags, dir: &std::path::Path) -> Result<bool, String> {
+    if flags.bool("model-absent") {
+        return Ok(false);
+    }
+    let root = flags.str_or("data-root", ".artifacts/m4.5/s29-gate-data");
+    let probe = std::path::Path::new(&root).join("io-properties.toml");
+    if !probe.exists() {
+        return Ok(false);
+    }
+    std::fs::copy(&probe, dir.join("io-properties.toml"))
+        .map_err(|e| format!("copy {}: {e}", probe.display()))?;
+    Ok(true)
+}
+
+/// The same arms for the report notes (defaults spelled out, so a
+/// K = 1 / flush row is never mistaken for an unknown configuration).
+pub(crate) fn pipeline_note(flags: &Flags) -> String {
+    format!(
+        "frames-in-flight {} · barrier-class {} · staging-mib {} · device-write-mbps {} · \
+         seal-pace {} · flush-group-window-us {} · device-probe {}",
+        flags.str_or("frames-in-flight", "auto (fua 3 / flush 1)"),
+        flags.str_or("barrier-class", "flush"),
+        flags.str_or("staging-mib", "4"),
+        flags.str_or("device-write-mbps", "probe-file"),
+        flags.str_or("seal-pace", "off"),
+        flags.str_or("flush-group-window-us", "0 (off)"),
+        flags.str_or("device-probe", "off")
     )
 }

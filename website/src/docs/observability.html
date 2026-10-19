@@ -1,0 +1,72 @@
+<!--
+title: Observability
+description: What an InfinityDB node tells you: boot and LOADING, what recovery repairs and refuses, runtime fail-stops, the INFO persistence fields, and the alpha boundary.
+lede: What the node tells you, and when: how it boots and loads, what recovery repairs and what it refuses, the two runtime fail-stops, the fields in INFO persistence, and the honest list of what this alpha does not do.
+chips: Available · alpha
+-->
+<h2 id="boot">Boot, step by step</h2>
+<p>A node started with <code>--data-dir</code> boots in a fixed order: the namespace catalog loads first, then every cell recovers its own shard, independently and in parallel: <code>MANIFEST</code>, the named checkpoint, then the log tail. Recovery time follows the largest shard, not the sum.</p>
+<ul class="dots">
+<li><strong>The node accepts connections from the start, behind a gate.</strong> While any cell is still replaying, gated commands receive the exact Redis reply <code>-LOADING Redis is loading the dataset in memory</code>. Clients never see a half-recovered keyspace.</li>
+<li><strong>The exempt set is Redis's</strong>, captured from a live instance: <code>HELLO</code>, <code>ECHO</code>, <code>QUIT</code>, <code>SELECT</code>, <code>INFO</code>, <code>COMMAND</code>, <code>CONFIG</code>, <code>CLIENT</code>, <code>DEBUG</code>, the subscribe family, <code>PUBLISH</code>, <code>PUBSUB</code> and <code>LASTSAVE</code>. <code>PING</code> is gated, because it is in Redis.</li>
+<li><strong>Progress is visible</strong> the whole time in <code>INFO persistence</code>, and stderr narrates each cell. The node is ready when it prints <code>control: recovery complete</code>.</li>
+</ul>
+
+<h2 id="repairs">What recovery repairs</h2>
+<p>Damage that is provably inside the defined crash window is repaired, and always counted:</p>
+<ul class="dots">
+<li>A torn final frame, detected by its checksum, is truncated, and replay resumes behind it. That is what a power cut mid-write looks like.</li>
+<li>A gap that was never fsync-covered, in the unsynced tail or in a segment whose seal never completed. Every frame carries an epoch, a sequence number and the watermark at seal time under its checksum, so recovery can prove nothing at or past the gap was ever acknowledged, and truncate there.</li>
+<li>Leftover frames from a discarded life of the log, which the epoch stamp identifies, so discarded data never resurrects.</li>
+<li>Leftovers of interrupted maintenance, such as stale segments and orphaned checkpoint stagings, are collected at boot.</li>
+</ul>
+
+<h2 id="refusals">What recovery refuses</h2>
+<p>Damage that could hide lost acknowledged data stops the boot with the evidence named:</p>
+<ul class="dots">
+<li>A surviving frame that attests fsync coverage past the point where valid data ends: the log itself proves the disk dropped bytes that were acknowledged.</li>
+<li>A <code>MANIFEST</code> that names missing or corrupt state, or a log whose valid data ends below the position the <code>MANIFEST</code> replays from.</li>
+<li>An unknown record type or flag inside a valid frame, or a frame-format downgrade that no honest writer can produce.</li>
+</ul>
+<p>A refusal is one line on stderr naming the cell and the evidence. Here cell 2's log ends below the position its <code>MANIFEST</code> starts replay from:</p>
+<pre class="code" data-label="stderr">infinityd: cell 2 boot failed (fail-stop): the log's valid data ends at seg-000000:00064000, below the MANIFEST begin-LSN seg-000000:00064028: fsync-covered bytes are missing — refusing to start</pre>
+<p>The process exits with code 1 and the whole node stops: a half-recovered node must never serve. Treat the volume as suspect, then restore the data directory from a backup, or rebuild the namespace from an upstream source of truth. There is deliberately no <code>--force</code> flag that truncates through the evidence.</p>
+
+<h2 id="failstops">Runtime fail-stops</h2>
+<ul class="dots">
+<li><strong>fsync failure.</strong> The durability watermark freezes, nothing in the affected batch or after it is acknowledged, and the process exits with code 3.</li>
+<li><strong>A failed catalog swap</strong> after a namespace change was acknowledged is the same class and takes the same exit code.</li>
+</ul>
+<p>A checkpoint I/O failure is narrower: it aborts the checkpoint, never the process. You see it as <code>ckpts_aborted</code> rising, which is worth investigating before the same disk fails an fsync.</p>
+
+<h2 id="info">INFO persistence</h2>
+<p>Every field below is emitted today. Dashboards built on the Redis shapes keep parsing; the InfinityDB fields carry the durable plane.</p>
+<table class="doc-table"><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>loading</code></td><td><code>1</code> while any cell is still replaying. The <code>loading_*</code> fields appear only then.</td></tr>
+<tr><td><code>loading_cells_ready</code>, <code>loading_cells</code></td><td>How many cells have finished recovery, out of how many.</td></tr>
+<tr><td><code>loading_loaded_bytes</code>, <code>loading_total_bytes</code></td><td>Bytes replayed and bytes to replay. Totals are file extents including preallocated slack, a disclosed upper bound.</td></tr>
+<tr><td><code>rdb_bgsave_in_progress</code>, <code>rdb_last_save_time</code></td><td>A checkpoint is streaming; the newest durable <code>MANIFEST</code>, in unix seconds.</td></tr>
+<tr><td><code>last_durable_lsn</code>, <code>watermark_lag_lsn</code></td><td>The durability watermark, and how far it trails the append cursor.</td></tr>
+<tr><td><code>pending_log_bytes</code></td><td>Bytes written or staged but not yet fsync-covered.</td></tr>
+<tr><td><code>fsyncs_completed</code>, <code>acks_gated</code></td><td>Durability fsyncs completed; <code>always</code> replies that waited on the watermark.</td></tr>
+<tr><td><code>fsync_latency_p50_us</code> and siblings</td><td>The device's fsync latency, reported as it is: <code>always</code> is storage-bound by definition.</td></tr>
+<tr><td><code>fsync_group_p50</code>, <code>fsync_group_p99</code></td><td>Records covered per fsync: the group-commit shape.</td></tr>
+<tr><td><code>ckpts_completed</code>, <code>ckpts_aborted</code>, <code>ckpt_age_s</code></td><td>Checkpoints finished and aborted, and the age of the last one.</td></tr>
+<tr><td><code>segments_truncated</code>, <code>log_segments_live</code></td><td>Segments reclaimed so far, and live now.</td></tr>
+</tbody></table>
+<h3>What to watch</h3>
+<ul class="dots">
+<li><strong>Grouping.</strong> <code>always</code> throughput is group commit. If records per fsync collapse toward one, read it together with the device's fsync latency.</li>
+<li><strong>Watermark lag.</strong> Sustained growth in <code>watermark_lag_lsn</code> or <code>pending_log_bytes</code> means the device is not absorbing the offered write rate. Backpressure is explicit: you see refusals, never unbounded memory growth.</li>
+<li><strong>Reclamation.</strong> <code>log_segments_live</code> and <code>ckpt_age_s</code> stay bounded in steady state. If they climb, check <code>ckpts_aborted</code> for the disk trouble behind it.</li>
+</ul>
+
+<h2 id="limits">The alpha boundary</h2>
+<ul class="dots">
+<li><strong>Single node.</strong> No replication, no cluster, no failover until M9. <code>always</code> survives any crash of this node, not the loss of its disk.</li>
+<li><strong>No authentication or TLS.</strong> Bind-address control and <code>AUTH</code> arrive before the first public tag, TLS and ACLs with M7.</li>
+<li><strong>Strings, keys, expiry, pub/sub and JSON documents.</strong> No hashes, lists, sets or sorted sets until M5, no transactions or Lua until M6, no streams until M7. The <a href="compat.html">compatibility matrix</a> is exact.</li>
+<li><strong>Beyond RAM for strings only.</strong> A tiered namespace keeps string values without expiry on disk; JSON documents stay in memory until the last phase of M4.</li>
+<li><strong>Durability is opt-in.</strong> A fresh node persists nothing until you create a durable namespace and bind connections to it.</li>
+<li><strong>Linux with io_uring</strong> is the deployment target. macOS builds run for development only.</li>
+</ul>

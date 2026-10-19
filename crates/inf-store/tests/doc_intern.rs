@@ -5,6 +5,7 @@
 //! with interning off.
 #![cfg(all(feature = "doc", feature = "doc-intern-keys"))]
 
+use inf_doc::CanonicalDoc;
 use inf_doc::model::{self, Value};
 use inf_foundation::time::Nanos;
 use inf_store::{CellStore, CopyResult, DocDomain, JsonLogDecision, JsonSetOptions, StoreConfig};
@@ -30,7 +31,14 @@ fn interning_on_and_off_are_observationally_identical() {
     let mut off = CellStore::new(StoreConfig::default());
     let mut on = CellStore::new(StoreConfig { doc_intern_keys: true, ..StoreConfig::default() });
     for store in [&mut off, &mut on] {
-        store.json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+        store
+            .json_set(
+                b"k",
+                &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+                JsonSetOptions::default(),
+                now(),
+            )
+            .expect("set");
     }
     // The knob changes stored bytes (attributed), never observable state.
     assert_eq!(off.doc_domain().intern_bytes, 0);
@@ -79,9 +87,43 @@ fn documents_without_winning_keys_stay_plain_under_the_knob() {
         Value::Str("x".repeat(700)), // blob tier, single-use key
     )]))
     .expect("encodes");
-    s.json_set(b"k", &doc, JsonSetOptions::default(), now()).expect("set");
+    s.json_set(
+        b"k",
+        &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+        JsonSetOptions::default(),
+        now(),
+    )
+    .expect("set");
     let d = s.doc_domain();
     assert_eq!(d.intern_bytes, 0, "no winner ⇒ stored plain");
     assert_eq!(d.tape_bytes, doc.len() as u64);
     assert_eq!(s.json_freeze(b"k", now()).expect("doc").expect("present"), doc);
+}
+
+/// Review of 2026-08-30, F-L10-05 (report C12): the store-level twin of
+/// the writer bound. A document whose winning-key table would exceed
+/// the `u16` count field once stored an unreadable interned tape (the
+/// next `json_get` reached `split_dict(..).expect(..)` — a cell panic on
+/// an acked write, reproducible after restart because the bytes were in
+/// the record). With the bound the store keeps it plain and every read
+/// path serves it.
+#[test]
+fn oversized_intern_table_stays_readable() {
+    let distinct = usize::from(u16::MAX) + 1;
+    let obj = || Value::Obj((0..distinct).map(|i| (format!("{i:04x}"), Value::I64(0))).collect());
+    let doc = model::encode(&Value::Arr(vec![obj(), obj(), obj(), obj()])).expect("encodes");
+    let mut on = CellStore::new(StoreConfig { doc_intern_keys: true, ..StoreConfig::default() });
+    on.json_set(
+        b"k",
+        &CanonicalDoc::validate(&doc).expect("canonical fixture"),
+        JsonSetOptions::default(),
+        now(),
+    )
+    .expect("set");
+    assert_eq!(on.doc_domain().intern_bytes, 0, "no table representable — stored plain");
+    let read = on.json_get(b"k", now()).expect("doc").expect("present");
+    let inf_doc::DocValue::Arr(arr) = read.root else { panic!("array root") };
+    assert_eq!(arr.len(), 4);
+    let frozen = on.json_freeze(b"k", now()).expect("doc").expect("present");
+    assert_eq!(frozen, doc, "canonical emission is the plain input");
 }

@@ -1,0 +1,764 @@
+//! Per-cell compiled-statement cache (M4.5-S09, ADR-0080 D5) — the
+//! M3-S10 `ProgramCache` shape: bounded LRU keyed by raw statement
+//! text, fixed-seed FNV-1a (deterministic under DST — ambient hashing
+//! randomness is the L7 violation the M3 cache already names), entry
+//! cap × byte budget, exact `bytes()`.
+//!
+//! Compilation reads the catalog, so residency alone cannot prove a
+//! hit is still right: every entry records the catalog epoch it
+//! compiled under, and an epoch mismatch is an `invalidations`-counted
+//! miss that recompiles — resolution stays a pure function of
+//! (statement text, catalog) instead of drifting with cache residency
+//! (L7). Rejections are not cached (client errors; the M3 rule).
+// ADR-0144 D2/D3: a decoder scope; docs/lint-scopes.tsv names its tier per lint family.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
+
+use std::collections::TryReserveError;
+use std::rc::Rc;
+
+pub use crate::limits::STATEMENT_CACHE_DEFAULT_ENTRIES;
+use crate::limits::{STATEMENT_CACHE_ENTRIES_MAX, StatementCacheCapacity};
+
+use super::{CatalogView, CompiledStatement, QlError, compile_with_max_bytes};
+
+const NIL: u32 = u32::MAX;
+
+struct Entry {
+    hash: u64,
+    key: Box<[u8]>,
+    compiled: Rc<CompiledStatement>,
+    /// The catalog epoch this entry compiled under (ADR-0080 D5).
+    epoch: u64,
+    chain: u32,
+    prev: u32,
+    next: u32,
+}
+
+impl Entry {
+    /// Key text and every allocation the retained compiled value owns.
+    fn heap_bytes(&self) -> usize {
+        heap_bytes_of(&self.key, &self.compiled)
+    }
+}
+
+/// A prospective entry's complete resident charge, before admission.
+fn heap_bytes_of(text: &[u8], compiled: &CompiledStatement) -> usize {
+    text.len().saturating_add(compiled.heap_bytes())
+}
+
+/// Bounded LRU of compiled statements, keyed by raw statement text.
+pub struct StatementCache {
+    buckets: Vec<u32>,
+    slab: Vec<Entry>,
+    lru_head: u32,
+    lru_tail: u32,
+    capacity: u32,
+    budget_bytes: usize,
+    entry_bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    invalidations: u64,
+}
+
+const _: () =
+    assert!((STATEMENT_CACHE_ENTRIES_MAX as usize).checked_mul(size_of::<Entry>()).is_some());
+
+impl StatementCache {
+    /// Reserve all metadata before installation (ADR-0146 D2).
+    /// Zero capacity allocates nothing and compiles every lookup uncached.
+    pub fn try_new(capacity: StatementCacheCapacity) -> Result<StatementCache, TryReserveError> {
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(capacity.buckets())?;
+        buckets.resize(capacity.buckets(), NIL);
+        let mut slab = Vec::new();
+        slab.try_reserve_exact(capacity.entries())?;
+        Ok(StatementCache {
+            buckets,
+            slab,
+            lru_head: NIL,
+            lru_tail: NIL,
+            capacity: capacity.slots(),
+            budget_bytes: capacity.budget_bytes(),
+            entry_bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            invalidations: 0,
+        })
+    }
+
+    /// Look up `text`, compiling and inserting on miss. A resident
+    /// entry whose catalog epoch is stale is invalidated and recompiled
+    /// (which may now produce a different program *or a rejection*).
+    ///
+    /// # Errors
+    /// The compiler's documented rejection — never cached.
+    pub fn get_or_compile<C: CatalogView>(
+        &mut self,
+        text: &[u8],
+        catalog: &C,
+        max_bytes: usize,
+    ) -> Result<Rc<CompiledStatement>, QlError> {
+        let epoch = catalog.catalog_epoch();
+        if self.capacity == 0 {
+            self.misses = self.misses.saturating_add(1);
+            return Ok(Rc::new(compile_with_max_bytes(text, catalog, max_bytes)?));
+        }
+        let hash = fnv1a(text);
+        if let Some(slot) = self.find(hash, text) {
+            if self.slab[slot as usize].epoch == epoch {
+                self.hits = self.hits.saturating_add(1);
+                self.touch(slot);
+                return Ok(Rc::clone(&self.slab[slot as usize].compiled));
+            }
+            self.invalidations = self.invalidations.saturating_add(1);
+            self.remove(slot);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let compiled = Rc::new(compile_with_max_bytes(text, catalog, max_bytes)?);
+        let entry_heap = heap_bytes_of(text, &compiled);
+        if entry_heap <= self.budget_bytes {
+            self.insert(hash, text, Rc::clone(&compiled), epoch, entry_heap);
+        }
+        Ok(compiled)
+    }
+
+    /// Exact resident bytes: slab slots + entry heap + bucket table.
+    /// A gauge: it saturates rather than wrap.
+    pub fn bytes(&self) -> usize {
+        let slab_bytes = self.slab.capacity().saturating_mul(size_of::<Entry>());
+        let bucket_bytes = self.buckets.capacity().saturating_mul(size_of::<u32>());
+        slab_bytes.saturating_add(self.entry_bytes).saturating_add(bucket_bytes)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slab.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slab.is_empty()
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Epoch-stale entries dropped on lookup (a DDL happened) — the
+    /// S12 `query_*` counter family renders all four.
+    pub fn invalidations(&self) -> u64 {
+        self.invalidations
+    }
+
+    // ---- internals (the M3-S10 slab/LRU mechanics) ----
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation,
+        reason = "bound: a nonzero cache has a power-of-two bucket length >= 1 and nothing \
+                  resizes it, so `len - 1` cannot underflow; the masked hash is below that \
+                  length, itself a usize"
+    )]
+    fn bucket_of(&self, hash: u64) -> usize {
+        (hash & (self.buckets.len() as u64 - 1)) as usize
+    }
+
+    fn find(&self, hash: u64, text: &[u8]) -> Option<u32> {
+        let mut slot = self.buckets[self.bucket_of(hash)];
+        while slot != NIL {
+            let entry = &self.slab[slot as usize];
+            if entry.hash == hash && *entry.key == *text {
+                return Some(slot);
+            }
+            slot = entry.chain;
+        }
+        None
+    }
+
+    fn touch(&mut self, slot: u32) {
+        if self.lru_head == slot {
+            return;
+        }
+        self.unlink_lru(slot);
+        self.link_front(slot);
+    }
+
+    /// Drop `slot` entirely (epoch invalidation, eviction): swap-remove
+    /// keeps the slab dense, so the displaced tail entry's links
+    /// re-target.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: `entry_bytes` is the sum of `heap_bytes()` over resident entries — \
+                  `insert` adds exactly that for the entry it pushes, and this is the only \
+                  subtraction — so it is at least this resident entry's share"
+    )]
+    fn remove(&mut self, slot: u32) {
+        self.unlink_lru(slot);
+        self.unlink_chain(slot);
+        self.entry_bytes -= self.slab[slot as usize].heap_bytes();
+        self.slab.swap_remove(slot as usize);
+        // The former tail now sits at `slot`; its old index is the new length.
+        let moved_from = self.slab.len();
+        if slot as usize != moved_from {
+            self.retarget(moved_from, slot);
+        }
+    }
+
+    /// Every link that pointed at slab index `from` now points at `to`
+    /// (the swap-remove fixup).
+    fn retarget(&mut self, from: usize, to: u32) {
+        let (hash, prev, next) = {
+            let e = &self.slab[to as usize];
+            (e.hash, e.prev, e.next)
+        };
+        if prev != NIL {
+            self.slab[prev as usize].next = to;
+        } else if self.lru_head as usize == from {
+            self.lru_head = to;
+        }
+        if next != NIL {
+            self.slab[next as usize].prev = to;
+        } else if self.lru_tail as usize == from {
+            self.lru_tail = to;
+        }
+        let bucket = self.bucket_of(hash);
+        if self.buckets[bucket] as usize == from {
+            self.buckets[bucket] = to;
+        } else {
+            let mut cursor = self.buckets[bucket];
+            while cursor != NIL {
+                if self.slab[cursor as usize].chain as usize == from {
+                    self.slab[cursor as usize].chain = to;
+                    break;
+                }
+                cursor = self.slab[cursor as usize].chain;
+            }
+        }
+    }
+
+    fn unlink_lru(&mut self, slot: u32) {
+        let (prev, next) = {
+            let e = &mut self.slab[slot as usize];
+            let links = (e.prev, e.next);
+            // An unlinked slot carries no links a later splice could read.
+            (e.prev, e.next) = (NIL, NIL);
+            links
+        };
+        if prev != NIL {
+            self.slab[prev as usize].next = next;
+        } else {
+            self.lru_head = next;
+        }
+        if next != NIL {
+            self.slab[next as usize].prev = prev;
+        } else {
+            self.lru_tail = prev;
+        }
+    }
+
+    fn link_front(&mut self, slot: u32) {
+        let old_head = self.lru_head;
+        {
+            let e = &mut self.slab[slot as usize];
+            e.prev = NIL;
+            e.next = old_head;
+        }
+        if old_head != NIL {
+            self.slab[old_head as usize].prev = slot;
+        }
+        self.lru_head = slot;
+        if self.lru_tail == NIL {
+            self.lru_tail = slot;
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: the eviction loop exits only once `entry_bytes + entry_heap` was \
+                  computed checked and found <= budget_bytes, or the slab is empty, where \
+                  `entry_bytes` (the residents' sum) is 0"
+    )]
+    fn insert(
+        &mut self,
+        hash: u64,
+        text: &[u8],
+        compiled: Rc<CompiledStatement>,
+        epoch: u64,
+        entry_heap: usize,
+    ) {
+        debug_assert!(entry_heap <= self.budget_bytes, "oversize entries stay uncached");
+        // Every victim leaves the slab (F-L09-01): unlinking alone kept
+        // the slot resident — unreachable, uncounted, with stale links.
+        while self.slab.len() >= self.capacity as usize
+            || (self.over_budget_with(entry_heap) && !self.slab.is_empty())
+        {
+            let victim = self.lru_tail;
+            debug_assert_ne!(victim, NIL, "eviction requires a resident entry");
+            self.remove(victim);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        // A slot is a u32 below NIL; the entry cap keeps every index there.
+        let Ok(slot) = u32::try_from(self.slab.len()) else {
+            return;
+        };
+        self.slab.push(Entry {
+            hash,
+            key: text.into(),
+            compiled,
+            epoch,
+            chain: NIL,
+            prev: NIL,
+            next: NIL,
+        });
+        self.entry_bytes += entry_heap;
+        let bucket = self.bucket_of(hash);
+        self.slab[slot as usize].chain = self.buckets[bucket];
+        self.buckets[bucket] = slot;
+        self.link_front(slot);
+    }
+
+    /// Would admitting `entry_heap` more bytes pass the budget?
+    fn over_budget_with(&self, entry_heap: usize) -> bool {
+        self.entry_bytes.checked_add(entry_heap).is_none_or(|total| total > self.budget_bytes)
+    }
+
+    fn unlink_chain(&mut self, slot: u32) {
+        let (hash, next) = {
+            let e = &self.slab[slot as usize];
+            (e.hash, e.chain)
+        };
+        let bucket = self.bucket_of(hash);
+        let mut cursor = self.buckets[bucket];
+        if cursor == slot {
+            self.buckets[bucket] = next;
+            return;
+        }
+        while cursor != NIL {
+            let cursor_next = self.slab[cursor as usize].chain;
+            if cursor_next == slot {
+                self.slab[cursor as usize].chain = next;
+                return;
+            }
+            cursor = cursor_next;
+        }
+        unreachable!("resident entries are chained");
+    }
+}
+
+/// Fixed-seed FNV-1a (deterministic — module docs). Statements are
+/// tens of bytes; byte-at-a-time sits inside the hit path's budget.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::partiql::STATEMENT_BYTES_CEILING;
+
+    fn cache_with_capacity(entries: usize) -> StatementCache {
+        StatementCache::try_new(StatementCacheCapacity::try_from(entries).expect("test capacity"))
+            .expect("test cache allocation")
+    }
+    use std::cell::Cell;
+
+    use inf_doc::path;
+    use inf_store::{IndexId, IndexKeyType, IndexSpec, IndexState, NsId};
+
+    use super::*;
+    use crate::access::AccessStep;
+    use crate::partiql::QlErrorKind;
+
+    /// A catalog whose epoch and index liveness the test mutates —
+    /// the DDL stand-in.
+    struct TestCatalog {
+        spec: IndexSpec,
+        epoch: Cell<u64>,
+        dropped: Cell<bool>,
+    }
+
+    impl TestCatalog {
+        fn new() -> TestCatalog {
+            TestCatalog {
+                spec: IndexSpec {
+                    id: IndexId(1),
+                    generation: 1,
+                    ns: NsId(1),
+                    name: b"idx".to_vec(),
+                    program: path::compile(b"$.v").expect("path").as_bytes().to_vec(),
+                    key_type: IndexKeyType::I64,
+                    state: IndexState::Ready,
+                },
+                epoch: Cell::new(1),
+                dropped: Cell::new(false),
+            }
+        }
+
+        fn drop_index(&self) {
+            self.dropped.set(true);
+            self.epoch.set(self.epoch.get() + 1);
+        }
+    }
+
+    impl CatalogView for TestCatalog {
+        fn resolve_ns(&self, name: &[u8]) -> Option<NsId> {
+            (name == b"ns").then_some(NsId(1))
+        }
+
+        fn index_by_name(&self, ns: NsId, name: &[u8]) -> Option<&IndexSpec> {
+            (!self.dropped.get() && ns == NsId(1) && name == b"idx").then_some(&self.spec)
+        }
+
+        fn indexes(&self, ns: NsId) -> impl Iterator<Item = &IndexSpec> {
+            (!self.dropped.get() && ns == NsId(1)).then_some(&self.spec).into_iter()
+        }
+
+        fn catalog_epoch(&self) -> u64 {
+            self.epoch.get()
+        }
+    }
+
+    const CAP: usize = STATEMENT_BYTES_CEILING;
+
+    #[test]
+    fn metadata_backing_stays_fixed_through_eviction() {
+        let mut cache = cache_with_capacity(3);
+        let before = (
+            cache.slab.capacity(),
+            cache.buckets.capacity(),
+            cache.slab.as_ptr(),
+            cache.buckets.as_ptr(),
+        );
+        let catalog = TestCatalog::new();
+        for i in 0..64 {
+            cache
+                .get_or_compile(format!("SELECT * FROM ns WHERE v = {i}").as_bytes(), &catalog, CAP)
+                .unwrap();
+            assert_eq!(
+                (
+                    cache.slab.capacity(),
+                    cache.buckets.capacity(),
+                    cache.slab.as_ptr(),
+                    cache.buckets.as_ptr()
+                ),
+                before
+            );
+        }
+        assert!(cache.evictions() > 0);
+    }
+
+    #[test]
+    fn hit_returns_the_cached_statement_and_counts() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(8);
+        let a = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        assert_eq!((cache.hits(), cache.misses()), (0, 1));
+        let b = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        assert_eq!((cache.hits(), cache.misses()), (1, 1));
+        assert!(Rc::ptr_eq(&a, &b), "a hit serves the resident compilation");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn spelling_variants_are_distinct_keys() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(8);
+        let a = cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        let b = cache.get_or_compile(b"select * from ns where v = 1", &catalog, CAP).expect("ok");
+        assert_eq!(a.program.as_bytes(), b.program.as_bytes(), "same compilation");
+        assert_eq!(cache.len(), 2, "text is the key (the M3 posture)");
+    }
+
+    /// The ADR-0080 D5 point: a DDL that changes what a statement
+    /// compiles to must not be masked by residency — here the resident
+    /// program becomes a rejection after the drop.
+    #[test]
+    fn epoch_invalidation_recompiles_and_can_reject() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(8);
+        let compiled =
+            cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        assert!(matches!(compiled.access.step, AccessStep::IndexRange { .. }));
+        catalog.drop_index();
+        let err = cache
+            .get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP)
+            .expect_err("the index is gone; resolution now rejects");
+        assert_eq!(err.kind, QlErrorKind::NoAccessPath);
+        assert_eq!(cache.invalidations(), 1);
+        assert_eq!(cache.len(), 0, "the stale entry is gone and the rejection is not cached");
+        assert_eq!((cache.hits(), cache.misses()), (0, 2));
+    }
+
+    #[test]
+    fn rejections_are_never_cached() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(8);
+        for _ in 0..2 {
+            cache
+                .get_or_compile(b"SELECT * FROM ns ORDER BY v", &catalog, CAP)
+                .expect_err("documented rejection");
+        }
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn lru_evicts_the_coldest_entry() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(2);
+        let s1 = b"SELECT * FROM ns WHERE v = 1".as_slice();
+        let s2 = b"SELECT * FROM ns WHERE v = 2".as_slice();
+        let s3 = b"SELECT * FROM ns WHERE v = 3".as_slice();
+        cache.get_or_compile(s1, &catalog, CAP).expect("ok");
+        cache.get_or_compile(s2, &catalog, CAP).expect("ok");
+        cache.get_or_compile(s1, &catalog, CAP).expect("hit");
+        cache.get_or_compile(s3, &catalog, CAP).expect("ok, evicting s2");
+        assert_eq!(cache.evictions(), 1);
+        let misses = cache.misses();
+        cache.get_or_compile(s2, &catalog, CAP).expect("recompiles");
+        assert_eq!(cache.misses(), misses + 1, "s2 was the evicted tail");
+    }
+
+    /// Invalidation removes via swap-remove; the displaced entry's
+    /// bucket chain and LRU links must survive (the retarget path).
+    #[test]
+    fn invalidation_keeps_the_table_consistent() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(8);
+        let statements: Vec<Vec<u8>> =
+            (0..5).map(|i| format!("SELECT * FROM ns WHERE v = {i}").into_bytes()).collect();
+        for s in &statements {
+            cache.get_or_compile(s, &catalog, CAP).expect("ok");
+        }
+        assert_eq!(cache.len(), 5);
+        catalog.epoch.set(2); // pure epoch bump — same compilation result
+        cache.get_or_compile(&statements[2], &catalog, CAP).expect("recompiles under epoch 2");
+        assert_eq!(cache.invalidations(), 1);
+        assert_eq!(cache.len(), 5, "removed then re-inserted");
+        // Every other entry is still resident and findable (each will
+        // invalidate once under the new epoch, then hit).
+        for s in &statements {
+            cache.get_or_compile(s, &catalog, CAP).expect("ok");
+        }
+        assert_eq!(cache.invalidations(), 5, "the four stale entries invalidated once each");
+        let hits = cache.hits();
+        for s in &statements {
+            cache.get_or_compile(s, &catalog, CAP).expect("ok");
+        }
+        assert_eq!(cache.hits(), hits + 5, "all resident under the current epoch");
+        // Exact byte accounting after churn.
+        let expected: usize = (0..cache.len()).map(|s| cache.slab[s].heap_bytes()).sum::<usize>()
+            + cache.slab.capacity() * size_of::<Entry>()
+            + cache.buckets.len() * size_of::<u32>();
+        assert_eq!(cache.bytes(), expected);
+    }
+
+    /// The §4.1 hit-rate row as a property: a hot statement mix an
+    /// order of magnitude smaller than the default capacity misses
+    /// exactly once per distinct statement — every steady-state lookup
+    /// hits, so the rate is bounded below by (n − mix)/n ≥ 99% for any
+    /// n ≥ 100 × mix. 100k lookups over 20 statements: 99.98%.
+    #[test]
+    fn cache_hot_mix_hits_over_99_percent() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(STATEMENT_CACHE_DEFAULT_ENTRIES);
+        let mix: Vec<Vec<u8>> = (0..20)
+            .map(|i| format!("SELECT * FROM ns WHERE v > {i} LIMIT 100").into_bytes())
+            .collect();
+        for round in 0..5_000usize {
+            let statement = &mix[round % mix.len()];
+            cache.get_or_compile(statement, &catalog, CAP).expect("ok");
+        }
+        assert_eq!(cache.misses(), 20, "one cold compile per distinct statement");
+        assert_eq!(cache.evictions(), 0, "the hot set fits the default capacity");
+        let total = cache.hits() + cache.misses();
+        let rate = cache.hits() as f64 / total as f64;
+        assert!(rate >= 0.99, "hot-mix hit rate {rate:.4} below the §4.1 gate");
+    }
+
+    #[test]
+    fn capacity_zero_disables_but_still_serves() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(0);
+        cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        cache.get_or_compile(b"SELECT * FROM ns WHERE v = 1", &catalog, CAP).expect("ok");
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.misses(), 2);
+    }
+
+    /// The structural invariants the slab/LRU mechanics promise: every
+    /// slab slot is chained from its bucket, the LRU list threads exactly
+    /// the slab, the byte ledger is the sum of the resident entries.
+    fn check_invariants(cache: &StatementCache) {
+        let n = cache.slab.len();
+        assert!(n <= cache.capacity as usize, "slab {n} over capacity {}", cache.capacity);
+        let mut heap = 0usize;
+        for (s, e) in cache.slab.iter().enumerate() {
+            assert_eq!(
+                cache.find(e.hash, &e.key),
+                Some(s as u32),
+                "slot {s} is orphaned from its bucket chain"
+            );
+            heap += e.heap_bytes();
+        }
+        assert_eq!(cache.entry_bytes, heap, "entry_bytes drifted from the resident entries");
+        assert!(cache.entry_bytes <= cache.budget_bytes, "budget exceeded");
+        let (mut seen, mut prev, mut cur) = (0usize, NIL, cache.lru_head);
+        while cur != NIL {
+            let e = &cache.slab[cur as usize];
+            assert_eq!(e.prev, prev, "LRU prev link at slot {cur}");
+            prev = cur;
+            cur = e.next;
+            seen += 1;
+            assert!(seen <= n, "LRU list cycles");
+        }
+        assert_eq!(prev, cache.lru_tail, "LRU tail");
+        assert_eq!(seen, n, "the LRU list threads {seen} of {n} slots");
+        let expected = heap
+            + cache.slab.capacity() * size_of::<Entry>()
+            + cache.buckets.len() * size_of::<u32>();
+        assert_eq!(cache.bytes(), expected, "bytes() is not exact");
+    }
+
+    /// A statement whose text is padded to `len` bytes (whitespace is
+    /// not part of the compilation, only of the key).
+    fn padded(i: usize, len: usize) -> Vec<u8> {
+        let mut s = format!("SELECT * FROM ns WHERE v = {i}").into_bytes();
+        s.resize(len.max(s.len()), b' ');
+        s
+    }
+
+    /// F-L09-01: an insert whose byte budget needs a second victim used
+    /// to unlink both but reuse one slot — the other stayed in the slab,
+    /// unreachable, uncounted, with stale LRU links.
+    #[test]
+    fn multi_victim_eviction_does_not_leak_slots() {
+        let catalog = TestCatalog::new();
+        let mut cache = cache_with_capacity(4); // budget = 4 × 8192
+        let tiny = padded(0, 0);
+        cache.get_or_compile(&tiny, &catalog, CAP).expect("ok");
+        let big: Vec<Vec<u8>> = (1..=4).map(|i| padded(i, CAP)).collect();
+        for s in &big[..3] {
+            cache.get_or_compile(s, &catalog, CAP).expect("ok");
+        }
+        assert_eq!((cache.len(), cache.evictions()), (4, 0));
+        // Evicting `tiny` frees ~100 B: the fourth big entry takes a
+        // second victim.
+        cache.get_or_compile(&big[3], &catalog, CAP).expect("ok");
+        assert_eq!(cache.evictions(), 2);
+        assert_eq!(cache.len(), 3, "two victims out, one entry in");
+        check_invariants(&cache);
+    }
+
+    #[test]
+    fn resident_heap_budget_accepts_equality_and_evicts_one_byte_over() {
+        let catalog = TestCatalog::new();
+        let first = b"SELECT * FROM ns WHERE v = 1";
+        let second = b"SELECT * FROM ns WHERE v = 2";
+        let compiled_first = compile_with_max_bytes(first, &catalog, CAP).unwrap();
+        let compiled_second = compile_with_max_bytes(second, &catalog, CAP).unwrap();
+        let exact = heap_bytes_of(first, &compiled_first) + heap_bytes_of(second, &compiled_second);
+        for (short_by, resident, evictions) in [(0, 2, 0), (1, 1, 1)] {
+            let mut cache = cache_with_capacity(2);
+            cache.budget_bytes = exact - short_by;
+            cache.get_or_compile(first, &catalog, CAP).unwrap();
+            cache.get_or_compile(second, &catalog, CAP).unwrap();
+            assert_eq!((cache.len(), cache.evictions()), (resident, evictions));
+            check_invariants(&cache);
+        }
+    }
+
+    #[test]
+    fn oversized_decoded_value_still_compiles_without_becoming_resident() {
+        let catalog = TestCatalog::new();
+        let text = b"SELECT * FROM ns WHERE v BETWEEN 1 AND 9 AND label = 'open'";
+        let compiled = compile_with_max_bytes(text, &catalog, CAP).unwrap();
+        let charge = heap_bytes_of(text, &compiled);
+        for (short_by, expected_entries) in [(0, 1), (1, 0)] {
+            let mut cache = cache_with_capacity(1);
+            cache.budget_bytes = charge - short_by;
+            for _ in 0..2 {
+                let returned = cache.get_or_compile(text, &catalog, CAP).unwrap();
+                assert_eq!(returned.program.as_bytes(), compiled.program.as_bytes());
+            }
+            assert_eq!(cache.len(), expected_entries);
+            assert_eq!(cache.misses(), if short_by == 0 { 1 } else { 2 });
+            check_invariants(&cache);
+        }
+    }
+
+    /// The same shape driven by a generator: mixed sizes, hits, epoch
+    /// bumps (the swap-remove path) — every step keeps the structure.
+    #[test]
+    fn eviction_and_invalidation_keep_the_structure() {
+        use proptest::prelude::*;
+        // Sizes at both ends of the share: the byte budget binds only
+        // when near-cap entries meet, and a second victim is taken only
+        // when the tail is tiny — the generator must reach that regime.
+        let pad = prop_oneof![Just(0usize), (CAP - 256)..=CAP];
+        let op = (0u8..8, 0usize..12, pad);
+        let multi_victim = Cell::new(0u64);
+        proptest!(
+            ProptestConfig::with_cases(512),
+            |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..64))| {
+            let catalog = TestCatalog::new();
+            let mut cache = cache_with_capacity(capacity);
+            for (kind, idx, pad) in ops {
+                if kind == 7 {
+                    catalog.epoch.set(catalog.epoch.get() + 1);
+                }
+                let before = cache.evictions();
+                let text = padded(idx, pad);
+                cache.get_or_compile(&text, &catalog, CAP).expect("ok");
+                if cache.evictions() >= before + 2 {
+                    multi_victim.set(multi_victim.get() + 1);
+                }
+                check_invariants(&cache);
+            }
+        });
+        assert!(multi_victim.get() > 0, "the generator never took two victims in one insert");
+    }
+
+    /// The review's "Likely" tail: an orphan swap-removed into a live
+    /// slot splices its stale links into the LRU list, and a later
+    /// eviction walks a bucket chain that does not hold it. No structure
+    /// checks here — only that the sequence never panics.
+    #[test]
+    fn eviction_and_invalidation_never_panic() {
+        use proptest::prelude::*;
+        let pad = prop_oneof![Just(0usize), (CAP - 256)..=CAP];
+        let op = (0u8..8, 0usize..12, pad);
+        proptest!(
+            ProptestConfig::with_cases(4096),
+            |(capacity in 1usize..6, ops in proptest::collection::vec(op, 1..96))| {
+            let catalog = TestCatalog::new();
+            let mut cache = cache_with_capacity(capacity);
+            for (kind, idx, pad) in ops {
+                if kind == 7 {
+                    catalog.epoch.set(catalog.epoch.get() + 1);
+                }
+                cache.get_or_compile(&padded(idx, pad), &catalog, CAP).expect("ok");
+            }
+        });
+    }
+}

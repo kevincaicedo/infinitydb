@@ -89,6 +89,8 @@ pub struct StdClock {
 
 impl StdClock {
     pub fn new() -> StdClock {
+        #[allow(clippy::disallowed_methods, reason = "clock: injected real-time origin (L7)")]
+        // denylist-allow: the injected clock's real-time origin - the one sanctioned call (L7).
         StdClock { origin: Instant::now() }
     }
 }
@@ -101,6 +103,7 @@ impl Default for StdClock {
 
 impl Clock for StdClock {
     #[inline]
+    #[allow(clippy::disallowed_methods, reason = "clock: injected real-clock read (L7)")]
     fn now(&self) -> Nanos {
         Nanos(u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX))
     }

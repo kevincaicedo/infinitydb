@@ -20,10 +20,23 @@ pub enum Check {
     IntWithin(i64),
     /// Replies differ by design; both must frame-parse.
     SkipDiff(&'static str),
+    /// `*N` of bulks compared as sets — element order is engine-defined
+    /// (`KEYS`: home-group order vs dict order), the set is the guarantee
+    /// (review 2026-08-30, F-L19-10).
+    SetEqual,
+    /// A cursor walk: the case is the first page; the harness follows each
+    /// engine's own cursor until `0` and compares the union of every page
+    /// as a set. Cursor bytes are engine-internal; the enumerated set is
+    /// the guarantee (F-L19-10).
+    ScanWalk,
+    /// A random draw: nil on both engines, or the candidate's bulk is a
+    /// member of the oracle's `KEYS *` set and the oracle drew a bulk too
+    /// (`RANDOMKEY` — F-L19-10).
+    MemberOfKeys,
 }
 
 impl Check {
-    /// Whether this case byte-compares against the oracle (feeds the
+    /// Whether this case compares against the oracle (feeds the
     /// declared-`full` enforcement in the generated matrix — M1-S13).
     pub fn compared(self) -> bool {
         !matches!(self, Check::SkipDiff(_))
@@ -47,6 +60,23 @@ const fn frames(argv: &'static [&'static str], n: usize) -> Case {
 const fn skip(argv: &'static [&'static str], why: &'static str) -> Case {
     Case { argv, check: Check::SkipDiff(why) }
 }
+
+const fn set_equal(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::SetEqual }
+}
+
+const fn scan_walk(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::ScanWalk }
+}
+
+const fn member_of_keys(argv: &'static [&'static str]) -> Case {
+    Case { argv, check: Check::MemberOfKeys }
+}
+
+/// 130 bytes — two past the oracle's 128-byte argument/name budget, so a
+/// case using it sees the truncation and not just the copy (C6).
+const LONG_ARG: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /// The v0 script. Order matters: later cases read state earlier ones wrote.
 pub static MATRIX: &[Case] = &[
@@ -93,6 +123,22 @@ pub static MATRIX: &[Case] = &[
     c(&["SET", "k1", "v", "EX", "10", "KEEPTTL"]),
     c(&["SET", "k1", "v", "NX", "XX"]),
     c(&["SET", "k1", "v", "BOGUSOPT"]),
+    // Batch 52 (review 2026-08-30, L13): Redis's option-family rule — a
+    // repeat is accepted (last value wins), only a conflict is a syntax
+    // error; PERSIST is GETEX-only.
+    c(&["SET", "k1", "v", "NX", "NX"]),
+    c(&["SET", "k1", "v7", "XX", "XX"]),
+    c(&["GET", "k1"]),
+    c(&["SET", "k1", "v", "EX", "100", "EX", "200"]),
+    c(&["TTL", "k1"]),
+    c(&["SET", "k1", "v", "EX", "10", "PX", "20"]),
+    c(&["SET", "k1", "v", "EXAT", "1", "EX", "10"]),
+    c(&["SET", "k1", "v8", "KEEPTTL", "KEEPTTL"]),
+    c(&["TTL", "k1"]),
+    c(&["SET", "k1", "v", "KEEPTTL", "EX", "10"]),
+    c(&["SET", "k1", "v", "PERSIST"]),
+    c(&["SET", "k1", "v9", "GET", "GET"]),
+    c(&["SET", "k1", "v6"]),
     // --- SETNX / SETEX / PSETEX ---
     c(&["SETNX", "k1", "loses"]),
     c(&["SETNX", "newnx", "wins"]),
@@ -193,13 +239,63 @@ pub static MATRIX: &[Case] = &[
     c(&["TTL"]),
     c(&["NOSUCHCOMMAND"]),
     c(&["NOSUCHCOMMAND", "arg1", "arg2"]),
+    // --- C6 (review 2026-08-30): client bytes inside a line-framed reply ---
+    // The unknown-command reply quotes the name and the arguments raw, so it
+    // is where a client's own bytes can open a second RESP frame. Redis maps
+    // CR/LF to spaces (`sdsmapchars`) and trims a trailing run (`sdstrim`);
+    // before the fix the corpus had only clean names and could not see it.
+    c(&["BAD\r\n+INJECTED", "x"]),
+    c(&["NOSUCHCOMMAND", "a\r\n$3\r\nfoo"]),
+    c(&["BAD\r\n"]),
+    c(&["BAD\nLF", "x"]),
+    c(&["BAD\rCR", "x"]),
+    // …and the oracle's bounds on the reply it builds from them: the name is
+    // truncated at 128 bytes and the argument tail stops once it passes 128,
+    // each argument cut to what is left (`LONG_ARG` is 130 bytes).
+    c(&["NOSUCHCOMMAND", LONG_ARG]),
+    c(&["NOSUCHCOMMAND", LONG_ARG, LONG_ARG]),
+    c(&[
+        "NOSUCHCOMMAND",
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+        "a4",
+        "a5",
+        "a6",
+        "a7",
+        "a8",
+        "a9",
+        "a10",
+        "a11",
+        "a12",
+        "a13",
+        "a14",
+        "a15",
+        "a16",
+        "a17",
+        "a18",
+        "a19",
+        "a20",
+        "a21",
+        "a22",
+        "a23",
+        "a24",
+    ]),
+    c(&[LONG_ARG, "x"]),
+    skip(
+        &["NOSUCHCOMMAND", "a\0b"],
+        "Redis truncates the message at an embedded NUL (C `%s`); InfinityDB quotes the raw bytes \
+             — same framing, longer text",
+    ),
     // --- introspection (documented deviations) ---
     skip(&["HELLO"], "identity fields differ by design (L8: server/version)"),
     skip(&["HELLO", "3"], "identity fields differ; proto switch verified locally"),
     skip(&["HELLO", "9"], "NOPROTO error text verified in unit tests"),
     skip(
         &["INFO"],
-        "section payloads differ (InfinityDB identity/tripwires); shape client-parseable",
+        "section payloads differ (InfinityDB identity/tripwires; run_id/master_replid are one \
+         40-hex node identity, immutable for the process life — ADR-0124); shape client-parseable",
     ),
     skip(&["COMMAND"], "registry is the M0+M1 surface, not the full Redis set"),
     skip(&["COMMAND", "COUNT"], "registry size differs by design"),
@@ -250,6 +346,12 @@ pub static MATRIX: &[Case] = &[
     c(&["GETEX", "gx2", "EX", "0"]),
     c(&["GETEX", "gx2", "EX", "100", "PERSIST"]),
     c(&["GETEX", "gx2", "BOGUS"]),
+    c(&["GETEX", "gx2", "PERSIST", "PERSIST"]),
+    c(&["GETEX", "gx2", "EX", "100", "EX", "200"]),
+    c(&["TTL", "gx2"]),
+    c(&["GETEX", "gx2", "EX", "100", "PX", "5"]),
+    c(&["GETEX", "gx2", "PERSIST", "EX", "10"]),
+    c(&["GETEX", "gx2", "KEEPTTL"]),
     // --- INCRBYFLOAT ---
     c(&["SET", "fl", "10.5"]),
     c(&["INCRBYFLOAT", "fl", "0.1"]),
@@ -291,6 +393,13 @@ pub static MATRIX: &[Case] = &[
     c(&["RENAMENX", "rnx1", "rnxfresh"]),
     c(&["GET", "rnxfresh"]),
     c(&["RENAMENX", "missing", "x"]),
+    // F-L13-03 (batch 46): the same-key case answers before the store is
+    // touched — `:0` for RENAMENX, `+OK` for RENAME (renameGenericCommand).
+    c(&["SET", "rnself", "v"]),
+    c(&["RENAMENX", "rnself", "rnself"]),
+    c(&["RENAME", "rnself", "rnself"]),
+    c(&["GET", "rnself"]),
+    c(&["RENAMENX", "rnabsent", "rnabsent"]),
     c(&["SET", "cp1", "tocopy", "EX", "100"]),
     c(&["COPY", "cp1", "cp2"]),
     c(&["GET", "cp2"]),
@@ -339,22 +448,110 @@ pub static MATRIX: &[Case] = &[
     c(&["PEXPIRETIME", "px"]),
     c(&["SET", "sxp", "v", "EXAT", "1"]),
     c(&["GET", "sxp"]),
+    // An instant before any server's clock origin over a live key: the
+    // old value answers and no key stays (ADR-0111 A1).
+    c(&["SET", "sxg", "old"]),
+    c(&["SET", "sxg", "v", "PXAT", "1", "GET"]),
+    c(&["EXISTS", "sxg"]),
+    c(&["SET", "sxn", "v", "NX", "EXAT", "1"]),
+    c(&["EXISTS", "sxn"]),
     c(&["SET", "sx", "v", "EXAT", "notanint"]),
     c(&["SET", "sx", "v", "EX", "10", "EXAT", "2208988800"]),
+    // --- SET/GETEX absolute deadlines ≤ 0 (review 2026-08-30, M1 / F-L13-02):
+    // Redis's one gate refuses every non-positive expire value before the
+    // write; a positive past deadline still applies (born expired).
+    c(&["SET", "sxz", "v"]),
+    c(&["SET", "sxz", "v2", "EXAT", "0"]),
+    c(&["SET", "sxz", "v2", "EXAT", "-1"]),
+    c(&["SET", "sxz", "v2", "PXAT", "0"]),
+    c(&["SET", "sxz", "v2", "PXAT", "-1"]),
+    c(&["SET", "sxz", "v2", "EXAT", "0", "GET"]),
+    c(&["SET", "sxz", "v2", "XX", "EXAT", "0"]),
+    c(&["SET", "sxzn", "v2", "NX", "EXAT", "0"]),
+    c(&["SET", "sxz", "v2", "EXAT", "9223372036854775807"]),
+    c(&["GET", "sxz"]),
+    c(&["TTL", "sxz"]),
+    c(&["EXISTS", "sxzn"]),
+    c(&["GETEX", "sxz", "EXAT", "0"]),
+    c(&["GETEX", "sxz", "PXAT", "-1"]),
+    c(&["GETEX", "sxz", "EXAT", "9223372036854775807"]),
+    c(&["TTL", "sxz"]),
+    // GETEX looks the key up before it validates the value: nil first.
+    c(&["GETEX", "gxmissing", "EXAT", "0"]),
+    c(&["GETEX", "gxmissing", "EX", "0"]),
+    c(&["GETEX", "gxmissing", "EX", "notanint"]),
+    // Every option parses before any value is read (syntax errors first).
+    c(&["SET", "sxz", "v2", "EXAT", "0", "BOGUS"]),
+    c(&["SET", "sxz", "v2", "EX", "notanint", "BOGUS"]),
+    c(&["GETEX", "sxz", "EXAT", "0", "BOGUS"]),
+    c(&["GETEX", "gxmissing", "EX", "notanint", "BOGUS"]),
+    // --- far-future deadlines (review 2026-08-30 follow-up, batch 17,
+    // ADR-0111): Redis decides acceptance in i64 Unix milliseconds
+    // (seconds must fit i64 ms; a relative TTL adds the wall clock and must
+    // not exceed i64::MAX); every instant it represents is accepted. The
+    // store keeps them by saturating into its u40-ms bound, so read-backs
+    // of a saturated deadline are the recorded clamp deviation (SkipDiff).
+    c(&["SET", "ff", "v", "PXAT", "9223372036854775807"]),
+    c(&["EXISTS", "ff"]),
+    skip(
+        &["PEXPIRETIME", "ff"],
+        "deadlines ≥ ~34.8 years clamp to the u40 record bound — the read-back reports the bound, \
+             not Redis's i64 instant (ADR-0008, ADR-0111)",
+    ),
+    skip(&["PTTL", "ff"], "same u40 clamp — the remaining TTL is measured to the bound (ADR-0111)"),
+    c(&["SET", "ff", "v", "EXAT", "9223372036854775"]),
+    c(&["SET", "ff", "v", "EXAT", "9223372036854776"]),
+    c(&["SET", "ff", "v", "PX", "9223372036854775807"]),
+    c(&["SET", "ff", "v", "EX", "9223372036854775"]),
+    c(&["SET", "ff", "v", "EX", "9223000000000000"]),
+    c(&["SET", "ff", "v", "PX", "9223000000000000000"]),
+    c(&["SETEX", "ff", "9223000000000000", "v"]),
+    c(&["PSETEX", "ff", "9223000000000000000", "v"]),
+    c(&["SETEX", "ff", "9223372036854775", "v"]),
+    c(&["PSETEX", "ff", "9223372036854775807", "v"]),
+    c(&["GETEX", "ff", "PXAT", "9223372036854775807"]),
+    c(&["GETEX", "ff", "EXAT", "9223372036854775"]),
+    c(&["GETEX", "ff", "EX", "9223372036854775"]),
+    c(&["GETEX", "ff", "PX", "9223372036854775807"]),
+    c(&["PEXPIREAT", "ff", "9223372036854775807"]),
+    c(&["EXPIREAT", "ff", "9223372036854775807"]),
+    c(&["EXPIREAT", "ff", "9223372036854775"]),
+    c(&["EXPIRE", "ff", "9223000000000000"]),
+    c(&["EXPIRE", "ff", "9223372036854775"]),
+    c(&["PEXPIRE", "ff", "9223372036854775807"]),
+    c(&["PEXPIRE", "ff", "9223000000000000000"]),
+    c(&["EXISTS", "ff"]),
+    // The lower side: seconds refuse below i64::MIN / 1000; milliseconds
+    // never refuse — a pre-epoch instant deletes on apply (Redis's rule).
+    c(&["EXPIRE", "ff", "-9223372036854775808"]),
+    c(&["EXPIREAT", "ff", "-9223372036854775808"]),
+    c(&["EXISTS", "ff"]),
+    c(&["PEXPIREAT", "ff", "-9223372036854775808"]),
+    c(&["EXISTS", "ff"]),
+    c(&["SET", "ff", "v"]),
+    c(&["EXPIREAT", "ff", "-9223372036854775"]),
+    c(&["EXISTS", "ff"]),
+    c(&["SET", "ff", "v"]),
+    c(&["EXPIRE", "ff", "-9223372036854775"]),
+    c(&["EXISTS", "ff"]),
+    c(&["SET", "ff", "v"]),
+    c(&["PEXPIRE", "ff", "-9223372036854775808"]),
+    c(&["EXISTS", "ff"]),
     // --- KEYS / SCAN / DBSIZE / RANDOMKEY ---
     c(&["KEYS", "gr"]),
     c(&["KEYS", "rnxfre*"]),
     c(&["KEYS", "no-such-prefix:*"]),
-    skip(
-        &["KEYS", "m*"],
-        "result ordering differs (home-group vs dict order); set equality via DBSIZE",
-    ),
-    skip(&["SCAN", "0"], "cursor values are engine-internal; guarantee proptested in inf-store"),
-    skip(&["SCAN", "0", "MATCH", "m*", "COUNT", "100"], "cursor values engine-internal"),
+    // F-L19-10 (review 2026-08-30): the guarantee is compared, not the
+    // representation — KEYS as a set, SCAN as the set a full walk from
+    // this cursor enumerates (MATCH/COUNT ride along), RANDOMKEY as a
+    // draw from the oracle's live keys.
+    set_equal(&["KEYS", "m*"]),
+    scan_walk(&["SCAN", "0"]),
+    scan_walk(&["SCAN", "0", "MATCH", "m*", "COUNT", "100"]),
     c(&["SCAN", "notacursor"]),
     c(&["SCAN", "0", "COUNT", "0"]),
     c(&["DBSIZE"]),
-    skip(&["RANDOMKEY"], "two-level random (cell, then key) — documented deviation"),
+    member_of_keys(&["RANDOMKEY"]),
     // --- SELECT + database isolation (M1-E4 namespaces v1) ---
     c(&["SELECT", "0"]),
     c(&["SELECT", "17"]),
@@ -385,9 +582,38 @@ pub static MATRIX: &[Case] = &[
     skip(&["CONFIG", "GET", "maxmemory*"], "InfinityDB returns the typed M1 key subset"),
     skip(&["CONFIG", "SET", "maxmemory-policy", "bogus"], "error detail text differs; both reject"),
     skip(&["CONFIG", "SET", "nonexistent-param", "1"], "error text shape differs slightly"),
+    // Review of 2026-08-30 (H1 / ADR-0098): multi-pair CONFIG SET is
+    // all-or-nothing — a failing pair rolls back the valid one (both
+    // GETs must answer the pre-command value), and duplicates are
+    // refused byte-exactly (oracle-measured 8.0.5).
+    c(&["CONFIG", "SET", "maxmemory", "12345678", "databases", "32"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "1mb", "MAXMEMORY", "2mb"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "7mb", "timeout", "0"]),
+    c(&["CONFIG", "GET", "maxmemory"]),
+    c(&["CONFIG", "SET", "maxmemory", "0"]),
+    // Batch 50 (review 2026-08-30, F-L15-10): a section name this build
+    // lacks is an empty body, byte-exact (`$0`).
+    c(&["INFO", "nosuchsection"]),
+    // Batch 50 (F-L15-05, ADR-0123): `maxclients` is settable like Redis
+    // and both engines refuse the out-of-range values (detail text
+    // differs); the `normal` output-buffer class merges and echoes.
+    c(&["CONFIG", "SET", "maxclients", "20000"]),
+    c(&["CONFIG", "GET", "maxclients"]),
+    c(&["CONFIG", "SET", "maxclients", "10000"]),
+    skip(&["CONFIG", "SET", "maxclients", "0"], "error detail text differs; both reject"),
+    skip(&["CONFIG", "SET", "timeout", "-1"], "error detail text differs; both reject"),
+    skip(&["CONFIG", "SET", "tcp-keepalive", "-1"], "error detail text differs; both reject"),
+    c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 64mb 16mb 10"]),
+    c(&["CONFIG", "GET", "client-output-buffer-limit"]),
+    c(&["CONFIG", "SET", "client-output-buffer-limit", "normal 0 0 0"]),
     c(&["CONFIG", "REWRITE"]),
     // --- CLIENT ---
-    skip(&["CLIENT", "ID"], "connection ids are engine-internal counters"),
+    skip(
+        &["CLIENT", "ID"],
+        "connection ids are engine-internal (cell<<48|seq, ≥ 1, never reused — ADR-0124 D6)",
+    ),
     c(&["CLIENT", "GETNAME"]),
     c(&["CLIENT", "SETNAME", "compat-suite"]),
     c(&["CLIENT", "GETNAME"]),
@@ -398,7 +624,10 @@ pub static MATRIX: &[Case] = &[
     // --- DEBUG subset / LOLWUT ---
     skip(
         &["DEBUG", "JMAP"],
-        "removed in Redis 8; InfinityDB accepts it as a no-op (M1-S03 surface)",
+        "`DEBUG JMAP` is removed in Redis 8; InfinityDB accepts it and answers `+OK` without \
+         doing anything (`DEBUG SLEEP` and `DEBUG OBJECT` are served, `DEBUG SET-ACTIVE-EXPIRE` \
+         is accepted and ignored, and any other subcommand answers an error: see the `DEBUG` \
+         row)",
     ),
     c(&["DEBUG", "SLEEP", "0"]),
     c(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]),
@@ -550,8 +779,10 @@ pub static MATRIX: &[Case] = &[
     ),
     skip(
         &["LASTSAVE"],
-        "M2-S20: newest durable MANIFEST publication time; 0 before the first save vs \
-         Redis's process-start time; the planeless candidate answers its documented error",
+        "M2-S20: newest durable MANIFEST publication time this cell has observed (it can \
+         trail the board by up to two bounded sweeps, except after a `WAIT` on the same cell — \
+         ADR-0159 A1.4); 0 before the first save vs Redis's process-start time; the planeless \
+         candidate answers its documented error",
     ),
     skip(&["INF.NS", "LIST"], "InfinityDB extension"),
     skip(&["INF.NS", "INFO", "cache"], "InfinityDB extension"),
