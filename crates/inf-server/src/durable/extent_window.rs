@@ -19,9 +19,10 @@
 //! began, beyond the turns already out, and position `q` is woken within
 //! `⌈q / 16⌉` turnovers.
 //!
-//! The counts are exact: `q` writers parked, `w` turns out. A turn's drop
-//! polls its own wait once: a wake that had landed was a turn out, any
-//! other a parked writer.
+//! The counts are exact: `q` writers parked, `w` turns out. A turn settles
+//! its own count once, at its publish, its refusal or its drop, by one poll
+//! of its wait: a wake that had landed was a turn out, any other a parked
+//! writer. Only a drop passes a unit on.
 
 use core::cell::Cell;
 use core::future::Future;
@@ -137,12 +138,13 @@ impl ExtentWaiters {
     }
 
     /// A turn found the window full, which I12 rules out: debug-asserted,
-    /// and counted, so the release form reads the count. The turn gives its
-    /// unit back and the writer parks again at the tail.
+    /// and counted, so the release form reads the count. The turn settles
+    /// and passes nothing on, since it found no unit to give back, and the
+    /// writer parks again at the tail for a later handout.
     pub(crate) fn refuse_turn(&mut self, turn: ExtentTurn) -> ExtentTurn {
         debug_assert!(false, "a turn found the extent-seal window full (len + w ≤ 16 broken)");
         self.turns_refused = self.turns_refused.saturating_add(1);
-        drop(turn);
+        turn.settle_refused();
         self.park()
     }
 
@@ -223,13 +225,34 @@ impl ExtentTurn {
     /// The writer published its extent with this turn: the unit is the
     /// window's entry now (`w − 1`), and nothing is passed on.
     pub(crate) fn spend(mut self) {
-        let landed = self.wait.as_mut().is_some_and(landed);
+        let landed = self.settle();
         debug_assert!(landed, "a turn is spent only after its wake landed");
+    }
+
+    /// The turn found the window full: `w − 1`, and nothing is passed on.
+    /// It had no unit to give back, so a wake would send the queue's head
+    /// into the same full window.
+    fn settle_refused(mut self) {
+        let landed = self.settle();
+        debug_assert!(landed, "a turn reserves only after its wake landed");
+    }
+
+    /// Settles the turn's own count, once: a wake that had landed was a
+    /// turn out (`w − 1`), any other a parked writer (`q − 1`), whose wait
+    /// cancels in place. Returns whether the wake had landed; a settled
+    /// turn settles nothing again.
+    fn settle(&mut self) -> bool {
+        let Some(mut wait) = self.wait.take() else { return false };
+        let queue = &self.queue;
+        let landed = landed(&mut wait);
         if landed {
-            let queue = &self.queue;
             queue.turns_out.set(queue.turns_out.get().saturating_sub(1));
+        } else {
+            queue.parked.set(queue.parked.get().saturating_sub(1));
         }
-        self.wait = None;
+        // An unlanded wait cancels in place; a landed one was polled done.
+        drop(wait);
+        landed
     }
 }
 
@@ -252,19 +275,13 @@ impl Future for ExtentTurn {
 }
 
 impl Drop for ExtentTurn {
+    /// A turn that leaves gives its unit back: one wake passes it to the
+    /// queue's head while the window is open; while it is closed the next
+    /// handout counts it free.
     fn drop(&mut self) {
-        let Some(mut wait) = self.wait.take() else { return };
-        let queue = &self.queue;
-        if landed(&mut wait) {
-            queue.turns_out.set(queue.turns_out.get().saturating_sub(1));
-            if queue.open.get() {
-                queue.wake_head();
-            }
-        } else {
-            queue.parked.set(queue.parked.get().saturating_sub(1));
+        if self.settle() && self.queue.open.get() {
+            self.queue.wake_head();
         }
-        // An unlanded wait cancels in place; a landed one was polled done.
-        drop(wait);
     }
 }
 
@@ -355,5 +372,21 @@ mod tests {
         first.spend();
         assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0));
         assert!(!poll_turn(&mut turns[0]), "the spent unit went to the window, not the queue");
+    }
+
+    /// A refused turn settles its own count and wakes no one: it found no
+    /// unit to give back, so the queue's head stays parked for a later
+    /// handout instead of resolving into the same full window.
+    #[test]
+    fn a_refused_turn_settles_its_count_and_wakes_no_one() {
+        let mut waiters = ExtentWaiters::new();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| waiters.park()).collect();
+        waiters.hand_out(15);
+        let mut refused = turns.remove(0);
+        assert!(poll_turn(&mut refused), "the head's wake landed");
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 1));
+        refused.settle_refused();
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0), "w − 1, the queue in place");
+        assert!(!poll_turn(&mut turns[0]), "no head woken into the full window");
     }
 }
