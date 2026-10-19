@@ -384,7 +384,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
     /// containers registered with leaves `Assembling` here and nowhere else.
     fn take_serve_mark(&mut self) {
         if let Some(mark) = self.serve_mark.take() {
+            #[cfg(not(inf_canary_serve_mark_skipped))]
             mark.take();
+            // Canary: the mark is dropped untaken, so the census stays
+            // `Assembling` — what a loop marking another census leaves.
+            #[cfg(inf_canary_serve_mark_skipped)]
+            drop(mark);
         }
     }
 
