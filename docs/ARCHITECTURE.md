@@ -1143,7 +1143,11 @@ Values at or above the namespace's `BLOB-THRESHOLD` are written out of line to
 blob extent files, synchronously on the command path, and the record holds a
 24-byte reference. An extent is durable before the record that points to it
 can be acknowledged, and it is reclaimed only after the record that killed it
-is durable and no reader holds it.
+is durable and no reader holds it. A cell holds at most 16 extents awaiting
+their fdatasync: the extent-seal window parks a further blob write, with
+nothing created, until the log frame held for the outstanding extent barriers
+has sealed, then wakes the parked writers in arrival order, at most one per
+free unit.
 
 Tier flush and compaction spend the cell's device budget, described
 under [Background work](#background-work-maintain).
