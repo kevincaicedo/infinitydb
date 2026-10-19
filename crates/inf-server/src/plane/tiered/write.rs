@@ -379,8 +379,8 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     cell: &mut DurableCell<F>,
     turn: &mut Option<ExtentTurn>,
 ) -> Result<u64, WriteBlock> {
-    let mut tier_slot = shared.tier.borrow_mut();
-    let Some(tier) = tier_slot.as_mut() else {
+    let tier_slot = shared.tier.borrow();
+    let Some(tier) = tier_slot.as_ref() else {
         return Err(WriteBlock::Reply(error_bytes(shared, write.proto, ERR_FAILED)));
     };
     // Canary: a woken writer gives its turn back and retries as an arrival.
@@ -395,11 +395,9 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         return Err(WriteBlock::ExtentWindow);
     }
     let table = ks.tiered_store_mut(write.ns).expect("caller resolved the table");
-    let (cell_index, dir, mode) = {
-        let t = tier.ns(write.ns).expect("tiered namespace has plane state");
-        (tier.cell_index(), t.dir.clone(), t.io_mode)
-    };
-    let place = ExtentPlace { fs: tier.fs(), dir: &dir, cell: cell_index, mode };
+    let t = tier.ns(write.ns).expect("tiered namespace has plane state");
+    let place =
+        ExtentPlace { fs: tier.fs(), dir: &t.dir, cell: tier.cell_index(), mode: t.io_mode };
     // The unit is reserved before the extent id, the file and the table
     // change; the ledger entry and the window entry publish in one step.
     let registered =
