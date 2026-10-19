@@ -35,6 +35,10 @@ bin=target/release/inf-sim
 # where the 64 MiB round is more ops than one turn's visits and the
 # retry group is built behind a run of done writes: a leg is named,
 # never drawn from the seed.
+# m4-epoch-marks runs its two legs on their own rows: the everysec leg (no
+# wedge, every merge of the reclaim marks exact, no crossing) and the wedge
+# leg (a seal held at the ledger's front with write-through frames behind
+# it: the marks' row must reach its cap and cross it).
 rows=(
   "m0-smoke"
   "m0-smoke --plant accept-error"
@@ -75,6 +79,8 @@ rows=(
   "m4-tier-budget --tier-leg two-1mb-hostile --verify-determinism"
   "m4-tier-budget --tier-leg two-8mb --plant tier-write-eio --verify-determinism"
   "m4-tier-budget --tier-leg one-64mb-no-model --plant tier-write-eio --verify-determinism"
+  "m4-epoch-marks --marks-leg everysec --verify-determinism"
+  "m4-epoch-marks --marks-leg wedge --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )

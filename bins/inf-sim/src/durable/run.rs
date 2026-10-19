@@ -82,6 +82,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         lift_plant_lifts: 0,
         lift_plant_sidecars: 0,
         tier_budget_cells: Vec::new(),
+        epoch_marks_cells: Vec::new(),
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -173,6 +174,43 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
 
+    // The epoch-marks shape's namespace: tiered, in its leg's `FSYNC` class
+    // and blob threshold, the m4 tiered budget shape (a 3 MiB window, a
+    // tenth of it mutable, 1 MiB slices).
+    if let Some(leg) = scenario.epoch_marks {
+        let class = NsClass::EpochMarks(leg);
+        let create: &[&[u8]] = &[
+            b"INF.NS",
+            b"CREATE",
+            class.name(),
+            b"MODE",
+            b"durable",
+            b"FSYNC",
+            leg.fsync(),
+            b"MEM-BUDGET",
+            b"3mb",
+            b"MUTABLE-FRACTION",
+            b"100",
+            b"MAINTAIN-SLICE",
+            b"1mb",
+            b"BLOB-THRESHOLD",
+            leg.blob_threshold(),
+            b"TIER-IO-MODE",
+            b"buffered",
+        ];
+        match setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create) {
+            Ok(Some(ok)) if ok == b"+OK\r\n" => {}
+            Ok(other) => {
+                fail(&mut report, format!("DDL CREATE {class:?} answered {other:?}"));
+                return finish(report, &observer, &clock);
+            }
+            Err(err) => {
+                fail(&mut report, format!("DDL phase: {err}"));
+                return finish(report, &observer, &clock);
+            }
+        }
+    }
+
     let mut lift_ns = None;
     if scenario.lift_regime {
         match lift_regime_ddl(&mut node, &mut setup, &mut rng, &clock, &disk, scenario, &mut report)
@@ -257,6 +295,21 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 writers.push(writer);
                 id += 1;
             }
+        }
+    }
+
+    if let Some(leg) = scenario.epoch_marks {
+        let class = NsClass::EpochMarks(leg);
+        for _ in 0..scenario.epoch_marks_writers() {
+            let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+            let fd = node.nets[cell].borrow_mut().connect();
+            let writer =
+                Writer::new(id, cell, fd, class, scenario.seed, scenario.ops_per_writer, true, 0);
+            node.nets[cell]
+                .borrow_mut()
+                .client_send(fd, &encode(&[b"INF.NS", b"USE", class.name()]));
+            writers.push(writer);
+            id += 1;
         }
     }
 
@@ -475,6 +528,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     // checkpoint/manifest mid-swap — gets cut across the seed corpus.
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
+    let cut_step = scenario.epoch_marks.map_or(cut_step, |leg| leg.cut_step(cut_step));
     // M3-S23: two seeded mid-run equivalence instants. Each quiesces
     // (drain in-flight, send nothing new), compares live state against a
     // read-only shadow replay, then resumes. The cut itself is never
@@ -493,11 +547,16 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         tier_oracle.arm_after_the_visits_bound();
     }
     let mut epilogue_sent = false;
+    let mut marks_cut =
+        (scenario.epoch_marks == Some(EpochMarksLeg::Wedge)).then(MarksCut::default);
     for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
             fail(&mut report, format!("traffic phase: {err}"));
             return finish(report, &observer, &clock);
+        }
+        if marks_cut.as_mut().is_some_and(|cut| cut.due(&node)) {
+            break;
         }
         log_oracle.sample(&node, &mut report);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
@@ -540,6 +599,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 NsClass::TierBudget(index) => {
                     scenario.tier_budget.map_or(0, |s| s.load(index).think_ns_max)
                 }
+                NsClass::EpochMarks(leg) => leg.think_ns_max(),
                 NsClass::Memory | NsClass::Tiered | NsClass::Indexed => 0,
             };
             if think > 0 {
@@ -705,6 +765,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 
     // ---- POWER CUT ----------------------------------------------------
     let cut_time = clock.now();
+    if let Some(leg) = scenario.epoch_marks {
+        epoch_marks_scrape(scenario, leg, &node, &mut report);
+    }
     for cell in 0..usize::from(scenario.cells) {
         if let Some(stats) = node.plane(cell).durable_stats() {
             report.frames_in_flight_max =
@@ -1140,7 +1203,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             match writer.class {
                 NsClass::Tiered => report.lift_tiered_ops += acked,
                 NsClass::Indexed => report.lift_indexed_ops += acked,
-                NsClass::Always | NsClass::Everysec | NsClass::Memory | NsClass::TierBudget(_) => {}
+                NsClass::Always
+                | NsClass::Everysec
+                | NsClass::Memory
+                | NsClass::TierBudget(_)
+                | NsClass::EpochMarks(_) => {}
             }
         }
         for cell in 0..usize::from(scenario.cells) {
@@ -1701,6 +1768,76 @@ fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> Ope
         ))
     } else {
         OpenFaultVerdict::Ok
+    }
+}
+
+/// The wedge leg's cut: the first step at which the namespace's extents
+/// were reclaimed after its reclaim marks first crossed their cap. A merged
+/// mark that reclaimed before its later class's barrier would lose the
+/// acknowledged blob values those deaths killed to this cut; a correct one
+/// reclaims only what is durable, and the audit after the reboot reads
+/// every key.
+#[derive(Default)]
+struct MarksCut {
+    reclaimed: u64,
+}
+
+impl MarksCut {
+    fn due(&mut self, node: &Node) -> bool {
+        let (mut crossed, mut reclaimed) = (false, 0);
+        for cell in 0..node.cells.len() {
+            let plane = node.plane(cell);
+            crossed |= plane.cap_census().row("epoch-marks").is_some_and(|row| row.crossings > 0);
+            reclaimed += plane.keyspace().tiering_extent_stats().reclaimed;
+        }
+        let rose = reclaimed > self.reclaimed;
+        self.reclaimed = reclaimed;
+        crossed && rose
+    }
+}
+
+/// The epoch-marks shape at the cut: each cell's reclaim-marks census row.
+/// The wedge leg's H2 (ADR-0163 D2): the row has held its cap and crossed it
+/// at least once, else the run met no wedge and is vacuous (token
+/// `cap-row-unfilled`). The everysec leg: no crossing, every merge exact
+/// (token `everysec-marks-crossed`), with at least two marks held, else
+/// vacuous.
+fn epoch_marks_scrape(
+    scenario: &DurableScenario,
+    leg: EpochMarksLeg,
+    node: &Node,
+    report: &mut DurableReport,
+) {
+    for cell in 0..usize::from(scenario.cells) {
+        let Some(row) = node.plane(cell).cap_census().row("epoch-marks") else {
+            let what = format!(
+                "VACUOUS seed {:#x} cell {cell}: cap-row-unfilled — no `epoch-marks` row at the cut",
+                scenario.seed
+            );
+            report.violations.push(what);
+            continue;
+        };
+        report.epoch_marks_cells.push((row.high_water, row.entries_max, row.crossings));
+        let (wedge, held) = (row.high_water, row.entries_max);
+        let what = match leg {
+            EpochMarksLeg::Wedge if wedge < held || row.crossings == 0 => format!(
+                "VACUOUS seed {:#x} cell {cell}: cap-row-unfilled — the `epoch-marks` row held \
+                 {wedge} of {held} marks with {} crossing(s): the wedge never filled it",
+                scenario.seed, row.crossings
+            ),
+            EpochMarksLeg::Everysec if row.crossings > 0 => format!(
+                "EPOCH MARKS VIOLATION seed {:#x} cell {cell}: everysec-marks-crossed — {} cap \
+                 merge(s) with no wedge: a merge that is not exact",
+                scenario.seed, row.crossings
+            ),
+            EpochMarksLeg::Everysec if wedge < 2 => format!(
+                "VACUOUS seed {:#x} cell {cell}: everysec-marks-unheld — the `epoch-marks` row \
+                 never held two marks",
+                scenario.seed
+            ),
+            EpochMarksLeg::Wedge | EpochMarksLeg::Everysec => continue,
+        };
+        report.violations.push(what);
     }
 }
 

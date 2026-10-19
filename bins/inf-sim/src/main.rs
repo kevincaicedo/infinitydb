@@ -17,8 +17,8 @@
 
 use inf_sim::net::Plant;
 use inf_sim::{
-    CombinedScenario, DurableScenario, Scenario, TierBudgetLeg, run_combined_scenario,
-    run_durable_scenario, run_scenario,
+    CombinedScenario, DurableScenario, EpochMarksLeg, Scenario, TierBudgetLeg,
+    run_combined_scenario, run_durable_scenario, run_scenario,
 };
 use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
 
@@ -87,6 +87,8 @@ fn main() {
     let mut ops_override: Option<u64> = None;
     // m4-tier-budget's leg, named on every run so a sweep is one shape.
     let mut tier_leg: Option<TierBudgetLeg> = None;
+    // m4-epoch-marks's leg, named the same way.
+    let mut marks_leg: Option<EpochMarksLeg> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -143,6 +145,12 @@ fn main() {
                         format!("unknown tier leg {name}; the legs are {}", tier_leg_names())
                     })?);
                 }
+                "--marks-leg" => {
+                    let name = take("--marks-leg")?;
+                    marks_leg = Some(EpochMarksLeg::parse(&name).ok_or_else(|| {
+                        format!("unknown marks leg {name}; the legs are {}", marks_leg_names())
+                    })?);
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -155,12 +163,13 @@ fn main() {
                          [--plant lost-wakeup|fsync-lies|accept-error|tier-read-eio|\
                          tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
-                         [--spec-variant ring-top|page] [--tier-leg {}] [--cells N] \
-                         [--connections N] [--commands N] [--wheel-nodes-max N] \
+                         [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
+                         [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
                         inf_sim::SCENARIOS.join("|"),
-                        tier_leg_names()
+                        tier_leg_names(),
+                        marks_leg_names()
                     );
                     std::process::exit(0);
                 }
@@ -205,6 +214,18 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // m4-epoch-marks names its leg, and only it has one.
+    match (scenario_name.as_str(), marks_leg) {
+        ("m4-epoch-marks", None) => {
+            eprintln!("inf-sim: m4-epoch-marks needs --marks-leg {}", marks_leg_names());
+            std::process::exit(2);
+        }
+        ("m4-epoch-marks", Some(_)) | (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --marks-leg is m4-epoch-marks's; {other} has no leg");
+            std::process::exit(2);
+        }
+    }
 
     // The M2-S19 durable scenario has its own runner (power cuts, the
     // durability oracle, the sweep mode).
@@ -222,6 +243,7 @@ fn main() {
             | "m2-recycle"
             | "m3-document"
             | "m4-tier-budget"
+            | "m4-epoch-marks"
     ) {
         run_durable(
             &scenario_name,
@@ -230,6 +252,7 @@ fn main() {
             replay_canary,
             lift_regime,
             tier_leg,
+            marks_leg,
             verify,
             sweep,
             shard,
@@ -1489,6 +1512,11 @@ fn tier_leg_names() -> String {
     TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
 }
 
+/// The `--marks-leg` names, `|`-joined for a message.
+fn marks_leg_names() -> String {
+    EpochMarksLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
 #[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main
 fn run_durable(
     scenario_name: &str,
@@ -1497,6 +1525,7 @@ fn run_durable(
     replay_canary: bool,
     lift_regime: bool,
     tier_leg: Option<TierBudgetLeg>,
+    marks_leg: Option<EpochMarksLeg>,
     verify: bool,
     sweep: Option<u64>,
     (shard_i, shard_k): (u64, u64),
@@ -1518,6 +1547,10 @@ fn run_durable(
             "m4-tier-budget" => DurableScenario::m4_tier_budget(
                 seed,
                 tier_leg.expect("the caller refused m4-tier-budget without a leg"),
+            ),
+            "m4-epoch-marks" => DurableScenario::m4_epoch_marks(
+                seed,
+                marks_leg.expect("the caller refused m4-epoch-marks without a leg"),
             ),
             _ => unreachable!("the caller filters durable scenario names"),
         };
@@ -1574,6 +1607,14 @@ fn run_durable(
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         print_census(report.cap_rows_checked);
+        for (cell, (high_water, entries_max, crossings)) in
+            report.epoch_marks_cells.iter().enumerate()
+        {
+            println!(
+                "inf-sim: epoch marks cell {cell}: high_water {high_water} of {entries_max}, \
+                 crossings {crossings}"
+            );
+        }
         for cell in &report.tier_budget_cells {
             println!(
                 "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \

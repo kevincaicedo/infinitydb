@@ -281,6 +281,92 @@ pub struct DurableScenario {
     /// is a different arm. `None` everywhere else: every other trace
     /// stays byte-identical.
     pub tier_budget: Option<TierBudgetShape>,
+    /// The epoch-marks shape (`m4-epoch-marks`): `Some` runs one tiered
+    /// namespace, `em`, whose writers drive the extent-reclaim marks in the
+    /// leg's regime ([`EpochMarksLeg`]), and reads the marks' census row at
+    /// the cut. `None` everywhere else: every other trace stays
+    /// byte-identical.
+    pub epoch_marks: Option<EpochMarksLeg>,
+}
+
+/// The epoch-marks shape's legs, chosen by name (`--marks-leg`), never by
+/// the seed: every seed of a run drives the one leg named, and the smoke
+/// lane runs each leg on its own row.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EpochMarksLeg {
+    /// Two cells, a tiered `everysec` namespace whose closed-loop writers
+    /// set inline and blob values, overwrite and delete them (extent
+    /// deaths), many MAINTAIN ticks inside each everysec period, on a device
+    /// with no stall episode: no wedge holds a barrier, so every merge of
+    /// the marks is exact and the marks row reads no crossing.
+    Everysec,
+    /// One cell, a tiered `always` namespace on `Direct` segments of
+    /// 256 KiB over a device whose FLUSH-class barrier is slow while
+    /// write-through writes are fast: each rotation's seal fdatasync holds
+    /// the front of the fsync ledger while write-through frames carrying
+    /// the namespace's inline writes complete behind it, so the marks see
+    /// more ack classes than their cap. Each writer's first write of its
+    /// first key is a blob, which a later write kills: the deaths a merged
+    /// mark gates. The row must read its cap and at least one crossing at
+    /// the cut, else the run is vacuous; the cut is the first extent
+    /// reclaim after the first crossing (`MarksCut`).
+    Wedge,
+}
+
+impl EpochMarksLeg {
+    pub const ALL: [EpochMarksLeg; 2] = [EpochMarksLeg::Everysec, EpochMarksLeg::Wedge];
+
+    /// The leg's name on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            EpochMarksLeg::Everysec => "everysec",
+            EpochMarksLeg::Wedge => "wedge",
+        }
+    }
+
+    /// The leg named `name`, if any.
+    pub fn parse(name: &str) -> Option<EpochMarksLeg> {
+        EpochMarksLeg::ALL.into_iter().find(|leg| leg.name() == name)
+    }
+
+    /// The scheduler step of the leg's cut, given the seeded one: the
+    /// everysec leg cuts at the seeded step; the wedge leg runs until its
+    /// own cut (`MarksCut`: the first extent reclaim after the marks crossed
+    /// their cap) or, past every writer's quota, this ceiling.
+    pub(crate) fn cut_step(self, seeded: u64) -> u64 {
+        match self {
+            EpochMarksLeg::Everysec => seeded,
+            EpochMarksLeg::Wedge => 40_000,
+        }
+    }
+
+    /// The namespace's `FSYNC` class.
+    fn fsync(self) -> &'static [u8] {
+        match self {
+            EpochMarksLeg::Everysec => b"everysec",
+            EpochMarksLeg::Wedge => b"always",
+        }
+    }
+
+    /// The longest think time after a writer's send: none on the everysec
+    /// leg; on the wedge leg up to one FLUSH-class barrier (10 ms), so the
+    /// writers acked together at a barrier send again spread over the next
+    /// one, a write-through frame each, instead of in one frame.
+    pub(crate) fn think_ns_max(self) -> u64 {
+        match self {
+            EpochMarksLeg::Everysec => 0,
+            EpochMarksLeg::Wedge => 10_000_000,
+        }
+    }
+
+    /// The namespace's `BLOB-THRESHOLD`: at its 4 KiB floor, so the
+    /// generators' larger values ride extents and their overwrites and
+    /// deletes are extent deaths: the deaths the marks gate.
+    fn blob_threshold(self) -> &'static [u8] {
+        match self {
+            EpochMarksLeg::Everysec | EpochMarksLeg::Wedge => b"4kb",
+        }
+    }
 }
 
 /// How many tiered namespaces the tier-budget shape runs:
@@ -858,6 +944,7 @@ impl DurableScenario {
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
+            epoch_marks: None,
         }
     }
 
@@ -1232,6 +1319,7 @@ impl DurableScenario {
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
+            epoch_marks: None,
         }
     }
 
@@ -1293,6 +1381,58 @@ impl DurableScenario {
         }
     }
 
+    /// `m4-epoch-marks`: the extent-reclaim marks' steel-thread row, the
+    /// leg's regime ([`EpochMarksLeg`]). The everysec leg is the m2 shape
+    /// on 1 MiB segments with the stall device's episodes off, six writers
+    /// of 400 ops on six keys each; the wedge leg is `m2-fua-pending`'s
+    /// device and pipeline (one cell, `Direct` segments, a 10 ms FLUSH-class
+    /// barrier beside 40 µs write-through writes, fine steps) with its 48
+    /// writers on the tiered namespace, on 256 KiB segments: on 64 KiB ones
+    /// a rotation's wedge fills its next segment before 16 write-through
+    /// frames complete behind it, so the write-through window and the marks
+    /// never fill.
+    #[must_use]
+    pub fn m4_epoch_marks(seed: u64, leg: EpochMarksLeg) -> DurableScenario {
+        match leg {
+            EpochMarksLeg::Everysec => {
+                let mut stall = m2_stall_config();
+                stall.episode_gap_ns = u64::MAX;
+                stall.episode_ms_min = 0;
+                stall.episode_ms_max = 0;
+                DurableScenario {
+                    always_writers: 0,
+                    esec_writers: 0,
+                    mem_writers: 0,
+                    ops_per_writer: 400,
+                    keys_per_writer: 6,
+                    segment_bytes: 1 << 20,
+                    stall: Some(stall),
+                    epoch_marks: Some(leg),
+                    ..DurableScenario::m2_durable(seed)
+                }
+            }
+            EpochMarksLeg::Wedge => {
+                let base = DurableScenario::m2_fua_pending(seed);
+                DurableScenario {
+                    always_writers: 0,
+                    segment_bytes: 256 << 10,
+                    epoch_marks: Some(leg),
+                    ..base
+                }
+            }
+        }
+    }
+
+    /// The epoch-marks shape's writers on its namespace: six on the
+    /// everysec leg, `m2-fua-pending`'s 48 on the wedge leg.
+    pub(crate) fn epoch_marks_writers(&self) -> usize {
+        match self.epoch_marks {
+            Some(EpochMarksLeg::Everysec) => 6,
+            Some(EpochMarksLeg::Wedge) => 48,
+            None => 0,
+        }
+    }
+
     /// M3-S18/S23/S24 document workload. It deliberately retains the M2
     /// disk, scheduling, checkpoint, fsync, and ack machinery; only the
     /// commands and audit reads change. One key per writer plus ~90
@@ -1346,6 +1486,7 @@ impl DurableScenario {
             lift_regime: false,
             spin_iters: Self::SPIN_ITERS,
             tier_budget: None,
+            epoch_marks: None,
         }
     }
 }
@@ -1516,6 +1657,9 @@ pub struct DurableReport {
     /// (empty off the shape): the budget's own counters beside the sim
     /// disk's tier-file bytes and ops, and each namespace's flush.
     pub tier_budget_cells: Vec<TierBudgetCell>,
+    /// The epoch-marks shape's reclaim-marks row per cell at the cut (empty
+    /// off the shape): `(high_water, entries_max, crossings)`.
+    pub epoch_marks_cells: Vec<(u32, u32, u64)>,
 }
 
 impl DurableReport {
@@ -1623,6 +1767,8 @@ pub(crate) enum NsClass {
     /// index below [`TIER_BUDGET_NS_MAX`]: several tiered namespaces on
     /// the same cells, flushing under the device model.
     TierBudget(u8),
+    /// The epoch-marks shape's tiered namespace, in its leg's `FSYNC` class.
+    EpochMarks(EpochMarksLeg),
 }
 
 /// The most tiered namespaces the tier-budget shape runs at once: the
@@ -1642,6 +1788,7 @@ impl NsClass {
             NsClass::Tiered => b"tier",
             NsClass::Indexed => b"idx",
             NsClass::TierBudget(index) => TIER_BUDGET_NS[usize::from(index)],
+            NsClass::EpochMarks(_) => b"em",
             // The combined scenario's named memory-mode namespace
             // (M2.5-S14); the durable scenario's memory writers stay on
             // the default DB (`setup == false`) and never USE it.
@@ -1804,6 +1951,42 @@ impl Writer {
         }
     }
 
+    /// The epoch-marks wedge leg's traffic: the first write of a writer's
+    /// first key is a blob of 4 KiB to 6 KiB (an extent), every other `SET`
+    /// inline at 64 B to 1 KiB, and one later command in eight a `DEL`,
+    /// every reply exact. One blob a writer, early: its next write kills its
+    /// extent, and a blob's extent barrier, which holds every frame, holds
+    /// few of the wedges; every frame stays small.
+    fn next_inline_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        let key = self.key(scenario.keys_per_writer);
+        let first_write = !self.ledger.contains_key(&key) && key.ends_with(b":0");
+        if !first_write && self.rng.next_below(8) == 0 {
+            let existed = self.last_state(&key).is_some();
+            let expect = if existed { b":1\r\n".to_vec() } else { b":0\r\n".to_vec() };
+            let wire = encode(&[b"DEL", &key]);
+            return (
+                wire,
+                Pending { key, state_after: None, expect, mutates: true, taints: false },
+            );
+        }
+        let len = if first_write {
+            (4 << 10) + self.rng.next_below(2049) as usize
+        } else {
+            64 + self.rng.next_below(961) as usize
+        };
+        let stamp = format!("w:{}:{}:", self.id, self.sent).into_bytes();
+        let value: Vec<u8> = stamp.iter().copied().cycle().take(len).collect();
+        let wire = encode(&[b"SET", &key, &value]);
+        let pending = Pending {
+            key,
+            state_after: Some(value),
+            expect: b"+OK\r\n".to_vec(),
+            mutates: true,
+            taints: false,
+        };
+        (wire, pending)
+    }
+
     pub(crate) fn key(&mut self, keys_per_writer: u64) -> Vec<u8> {
         format!("k:{}:{}", self.id, self.rng.next_below(keys_per_writer)).into_bytes()
     }
@@ -1870,7 +2053,8 @@ impl Writer {
                 | NsClass::Memory
                 | NsClass::Tiered
                 | NsClass::Indexed
-                | NsClass::TierBudget(_) => {}
+                | NsClass::TierBudget(_)
+                | NsClass::EpochMarks(_) => {}
             }
         }
         self.replied += 1;
@@ -1905,7 +2089,13 @@ impl Writer {
         if scenario.workload == DurableWorkload::Document || self.class == NsClass::Indexed {
             return crate::document::next_document_command(self, scenario);
         }
-        if matches!(self.class, NsClass::Tiered | NsClass::TierBudget(_)) {
+        if self.class == NsClass::EpochMarks(EpochMarksLeg::Wedge) {
+            return self.next_inline_command(scenario);
+        }
+        if matches!(
+            self.class,
+            NsClass::Tiered | NsClass::TierBudget(_) | NsClass::EpochMarks(EpochMarksLeg::Everysec)
+        ) {
             return self.next_tiered_command(scenario);
         }
         let key = self.key(scenario.keys_per_writer);
@@ -2317,10 +2507,16 @@ pub(crate) fn required_index(
     ops.iter().rposition(|op| match op.acked_at {
         None => false,
         Some(at) => match class {
-            NsClass::Always | NsClass::Tiered | NsClass::Indexed | NsClass::TierBudget(_) => true,
+            NsClass::Always
+            | NsClass::Tiered
+            | NsClass::Indexed
+            | NsClass::TierBudget(_)
+            | NsClass::EpochMarks(EpochMarksLeg::Wedge) => true,
             // A clean stop (ADR-0124 D4) keeps every acked everysec op;
             // the window is a crash property only.
-            NsClass::Everysec => clean_stop || at + EVERYSEC_WINDOW <= cut_time,
+            NsClass::Everysec | NsClass::EpochMarks(EpochMarksLeg::Everysec) => {
+                clean_stop || at + EVERYSEC_WINDOW <= cut_time
+            }
             NsClass::Memory => false,
         },
     })

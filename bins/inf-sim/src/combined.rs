@@ -451,7 +451,8 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
                         | NsClass::Memory
                         | NsClass::Tiered
                         | NsClass::Indexed
-                        | NsClass::TierBudget(_) => {}
+                        | NsClass::TierBudget(_)
+                        | NsClass::EpochMarks(_) => {}
                     }
                 }
                 writer.replied += 1;

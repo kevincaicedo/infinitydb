@@ -152,6 +152,7 @@ fn base(scenario: &SidecarScenario) -> DurableScenario {
         lift_regime: false,
         spin_iters: DurableScenario::SPIN_ITERS,
         tier_budget: None,
+        epoch_marks: None,
     }
 }
 

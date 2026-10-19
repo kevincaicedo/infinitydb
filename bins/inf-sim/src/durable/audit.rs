@@ -30,6 +30,9 @@ pub(super) fn audit_ledgers(
     if let Some(shape) = scenario.tier_budget {
         classes.extend(shape.namespaces.indices().map(NsClass::TierBudget));
     }
+    if let Some(leg) = scenario.epoch_marks {
+        classes.push(NsClass::EpochMarks(leg));
+    }
     for class in classes {
         if !writers.iter().any(|w| w.class == class) {
             continue;
