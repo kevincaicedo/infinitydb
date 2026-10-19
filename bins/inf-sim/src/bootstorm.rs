@@ -58,6 +58,9 @@ impl BootStormScenario {
 #[derive(Debug)]
 pub struct BootStormReport {
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub boots: u64,
     pub ready_steps_max: u64,
     /// Determinism currency: chained hash over per-cycle
@@ -84,6 +87,7 @@ fn run_observed(scenario: &BootStormScenario, observer: TraceObserver) -> BootSt
     let mut rng = SplitMix64::new(scenario.seed ^ 0xB007_5708);
     let mut report = BootStormReport {
         violations: Vec::new(),
+        cap_rows_checked: 0,
         boots: 0,
         ready_steps_max: 0,
         trace_hash: 0,
@@ -232,6 +236,9 @@ fn run_observed(scenario: &BootStormScenario, observer: TraceObserver) -> BootSt
 pub fn run_boot_storm_scenario(scenario: &BootStormScenario) -> BootStormReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

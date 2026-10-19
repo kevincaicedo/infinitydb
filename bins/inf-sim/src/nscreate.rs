@@ -42,6 +42,9 @@ pub struct NsCreateWindowReport {
     pub trace_hash: u64,
     pub state_hash: u64,
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     pub commands_done: u64,
     pub scheduler_steps: u64,
@@ -126,6 +129,7 @@ fn run_observed(seed: u64, observer: TraceObserver) -> NsCreateWindowReport {
         trace_hash: 0,
         state_hash: 0,
         violations: Vec::new(),
+        cap_rows_checked: 0,
         stalled: false,
         commands_done: 0,
         scheduler_steps: 0,
@@ -421,6 +425,9 @@ fn run_observed(seed: u64, observer: TraceObserver) -> NsCreateWindowReport {
 pub fn run_ns_create_window_scenario(seed: u64) -> NsCreateWindowReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(seed, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

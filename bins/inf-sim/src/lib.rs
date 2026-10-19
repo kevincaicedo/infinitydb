@@ -55,6 +55,7 @@
 
 pub mod backfill;
 pub mod bootstorm;
+mod census;
 pub mod coldstorm;
 pub mod combined;
 pub mod diskfull;

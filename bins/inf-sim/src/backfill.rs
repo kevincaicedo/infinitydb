@@ -68,6 +68,9 @@ impl BackfillScenario {
 #[derive(Debug, Default)]
 pub struct BackfillReport {
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     /// Boots driven (setup + one per phase cut).
     pub boots: u64,
     /// Power cuts in order, each with the walk progress it landed on.
@@ -650,6 +653,9 @@ fn alias_leg(
 pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

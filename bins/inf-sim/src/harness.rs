@@ -397,6 +397,9 @@ pub struct SimReport {
     pub events: u64,
     pub commands_done: u64,
     pub oracle_violations: Vec<String>,
+    /// Cap census rows read at the end of the run, summed over the cells
+    /// (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     pub scheduler_steps: u64,
     /// Virtual time the run covered (nightly-fleet budget accounting).
@@ -1434,6 +1437,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         events: 0,
         commands_done: 0,
         oracle_violations: Vec::new(),
+        cap_rows_checked: 0,
         stalled: false,
         scheduler_steps: 0,
         sim_seconds: 0.0,
@@ -1871,6 +1875,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             }
         }
     }
+
+    // The cap census oracle (ADR-0163 D2): every cell's census after its
+    // last iteration — H1 per row, H5 and their liveness.
+    let mut census = crate::census::CensusVerdict::default();
+    for (index, (_, plane)) in cells.iter().enumerate() {
+        census.judge(index, plane.cap_census(), plane.keyspace().tiered_tables());
+    }
+    report.cap_rows_checked = census.rows_checked;
+    violations.extend(census.violations);
 
     let oracle = oracle.0.borrow();
     report.events = oracle.events;

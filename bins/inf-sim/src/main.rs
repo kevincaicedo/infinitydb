@@ -293,6 +293,7 @@ fn main() {
             report.scheduler_steps,
             report.trace_hash
         );
+        print_census(report.cap_rows_checked);
         if verify {
             let second = inf_sim::run_backfill_scenario(&scenario);
             verify_hashes(
@@ -334,6 +335,7 @@ fn main() {
             report.scheduler_steps,
             report.trace_hash
         );
+        print_census(report.cap_rows_checked);
         if verify {
             let second = inf_sim::run_sidecar_scenario(&scenario);
             verify_hashes(
@@ -1043,6 +1045,7 @@ fn main() {
             report.scan_cold_pages,
             report.scan_cold_reads
         );
+        print_census(report.cap_rows_checked);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1153,6 +1156,7 @@ fn main() {
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        print_census(report.cap_rows_checked);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1257,6 +1261,7 @@ fn main() {
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        print_census(report.cap_rows_checked);
         if verify {
             let second = run_one(seed);
             verify_hashes(
@@ -1338,6 +1343,7 @@ fn main() {
              hash {:#018x}",
             report.boots, report.ready_steps_max, report.trace_hash
         );
+        print_census(report.cap_rows_checked);
         if verify {
             let second = inf_sim::run_boot_storm_scenario(&scenario);
             verify_hashes(
@@ -1431,6 +1437,7 @@ fn main() {
         report.shadow_checked,
         report.shadow_unmodeled
     );
+    print_census(report.cap_rows_checked);
     if let Some(path) = &trace_out
         && let Err(e) = std::fs::write(path, &report.trace)
     {
@@ -1471,6 +1478,12 @@ fn main() {
 /// Shared durable runner: M2's key/value workload and M3's document
 /// workload differ only in scenario construction. Both write replayable
 /// per-seed results and a sweep manifest.
+/// The cap census oracle's liveness, on its own machine-readable line: the
+/// rows it read at the end of every life (node sum, ADR-0163 D2).
+fn print_census(rows_checked: u64) {
+    println!("inf-sim: cap_rows_checked={rows_checked}");
+}
+
 /// The `--tier-leg` names, `|`-joined for a message.
 fn tier_leg_names() -> String {
     TierBudgetLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
@@ -1560,6 +1573,7 @@ fn run_durable(
             report.trace_hash
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
+        print_census(report.cap_rows_checked);
         for cell in &report.tier_budget_cells {
             println!(
                 "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \
@@ -1875,6 +1889,7 @@ fn run_m2_combined(
             "inf-sim: sim_seconds={:.6} published={} delivered={}",
             report.sim_seconds, report.published, report.delivered
         );
+        print_census(report.cap_rows_checked);
         for violation in report.violations.iter().take(5) {
             eprintln!("inf-sim: ORACLE VIOLATION: {violation}");
         }

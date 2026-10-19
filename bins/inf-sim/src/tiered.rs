@@ -339,6 +339,9 @@ pub struct TieredNodeReport {
     pub trace_hash: u64,
     pub state_hash: u64,
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     /// ADR-0174 D1: per cell, the record bytes of the tiered `SET`s
     /// acknowledged in phase 2 (header + key + value — what the reboot
@@ -2022,6 +2025,9 @@ fn run_observed(scenario: &TieredScenario, observer: TraceObserver) -> TieredNod
 pub fn run_tiered_scenario(scenario: &TieredScenario) -> TieredNodeReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

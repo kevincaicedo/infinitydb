@@ -98,6 +98,9 @@ pub struct CombinedReport {
     pub trace_hash: u64,
     pub state_hash: u64,
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     pub commands_done: u64,
     pub sim_seconds: f64,
@@ -232,6 +235,7 @@ fn run_observed(scenario: &CombinedScenario, observer: TraceObserver) -> Combine
         trace_hash: 0,
         state_hash: 0,
         violations: Vec::new(),
+        cap_rows_checked: 0,
         stalled: false,
         commands_done: 0,
         sim_seconds: 0.0,
@@ -841,6 +845,9 @@ fn finish(
 pub fn run_combined_scenario(scenario: &CombinedScenario) -> CombinedReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

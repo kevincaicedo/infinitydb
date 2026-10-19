@@ -74,6 +74,9 @@ impl SidecarScenario {
 #[derive(Debug, Default)]
 pub struct SidecarReport {
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub boots: u64,
     /// Cuts in order, each with its disclosed landing state.
     pub cuts: Vec<String>,
@@ -650,6 +653,9 @@ fn run_observed(scenario: &SidecarScenario, observer: TraceObserver) -> SidecarR
 pub fn run_sidecar_scenario(scenario: &SidecarScenario) -> SidecarReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }

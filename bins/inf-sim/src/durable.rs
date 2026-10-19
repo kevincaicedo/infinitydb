@@ -1363,6 +1363,9 @@ pub struct DurableReport {
     pub trace_hash: u64,
     pub state_hash: u64,
     pub violations: Vec<String>,
+    /// Cap census rows read at the end of every life, summed over the
+    /// cells and lives (node sum): the census oracle's liveness.
+    pub cap_rows_checked: u64,
     pub stalled: bool,
     /// ADR-0124: scheduler steps the clean stop took to drain every cell
     /// (0 without `clean_stop`), and the reboot's tail records applied
@@ -1525,7 +1528,19 @@ impl DurableReport {
 // ---- trace observer (no model replay — the ledger is the oracle) -------
 
 #[derive(Clone, Default)]
-pub(crate) struct TraceObserver(Rc<RefCell<Vec<u8>>>, crate::state::Recorder);
+pub(crate) struct TraceObserver(
+    Rc<RefCell<Vec<u8>>>,
+    crate::state::Recorder,
+    Rc<RefCell<crate::census::CensusVerdict>>,
+);
+
+/// A run's observer once every node has been dropped: the state hash (the
+/// determinism artifact) and the cap census verdict of every cell of every
+/// life, which each node recorded as it was dropped.
+pub(crate) struct Sealed {
+    pub(crate) state_hash: u64,
+    pub(crate) census: crate::census::CensusVerdict,
+}
 
 impl TraceObserver {
     /// The accumulated apply-event trace (the determinism artifact). Used
@@ -1534,8 +1549,16 @@ impl TraceObserver {
         self.0.borrow().clone()
     }
 
+    /// The state hash alone, for the observer's own tests; a run seals.
+    #[cfg(test)]
     pub(crate) fn state_hash(&self) -> u64 {
         self.1.value()
+    }
+
+    /// Seals the run after every node has been dropped: its state hash and
+    /// the census verdict of every life, which the run's report carries.
+    pub(crate) fn seal(&self) -> Sealed {
+        Sealed { state_hash: self.1.value(), census: self.2.take() }
     }
 
     pub(crate) fn power_cut(&self, disk: &SimDisk, now: Nanos, seed: u64) {
@@ -2112,8 +2135,16 @@ pub(crate) fn boot(
 }
 
 impl Drop for Node {
+    /// The end of a life: its state observed, and every cell's cap census
+    /// judged after the cell's last iteration (H1, H5 and their liveness).
     fn drop(&mut self) {
         self.observe_state(b"node-end");
+        let mut verdict = crate::census::CensusVerdict::default();
+        for (index, (_, plane)) in self.cells.iter().enumerate() {
+            let tiered_tables = plane.keyspace().tiered_tables();
+            verdict.judge(index, plane.cap_census(), tiered_tables);
+        }
+        self.observer.2.borrow_mut().absorb(verdict);
     }
 }
 

@@ -22,6 +22,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         trace_hash: 0,
         state_hash: 0,
         violations: Vec::new(),
+        cap_rows_checked: 0,
         stalled: false,
         clean_stop_steps: 0,
         clean_stop_replay_records: 0,
@@ -1708,7 +1709,10 @@ fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> Ope
 pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let observer = TraceObserver::default();
     let mut report = run_observed(scenario, observer.clone());
-    report.state_hash = observer.state_hash();
+    let sealed = observer.seal();
+    report.state_hash = sealed.state_hash;
+    report.cap_rows_checked = sealed.census.rows_checked;
+    report.violations.extend(sealed.census.violations);
     report
 }
 
