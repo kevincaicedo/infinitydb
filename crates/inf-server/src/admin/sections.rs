@@ -22,6 +22,38 @@ const SECTIONS: &[&str] = &[
     "keyspace",
 ];
 
+/// The sections an `INFO` argv selects. Redis's section set: a bare `INFO`
+/// (or `all`/`default`/`everything` anywhere in argv) is every section;
+/// otherwise only the named ones, and a name this build lacks selects
+/// nothing — `INFO nosuchsection` is an empty body, never everything.
+struct Selection {
+    everything: bool,
+    named: Vec<&'static str>,
+}
+
+impl Selection {
+    fn of(argv: &(impl Argv + ?Sized)) -> Selection {
+        let mut named: Vec<&'static str> = Vec::new();
+        let mut everything = argv.len() == 1;
+        for i in 1..argv.len() {
+            let arg = argv.arg(i).to_ascii_lowercase();
+            match arg.as_slice() {
+                b"all" | b"default" | b"everything" => everything = true,
+                section => {
+                    if let Some(name) = SECTIONS.iter().find(|s| s.as_bytes() == section) {
+                        named.push(name);
+                    }
+                }
+            }
+        }
+        Selection { everything, named }
+    }
+
+    fn wants(&self, name: &str) -> bool {
+        self.everything || self.named.contains(&name)
+    }
+}
+
 pub(crate) fn info(
     argv: &(impl Argv + ?Sized),
     ks: &Keyspace,
@@ -29,25 +61,8 @@ pub(crate) fn info(
     now: Nanos,
     w: &mut RespWriter<'_>,
 ) {
-    // Redis's section set: a bare `INFO` (or `all`/`default`/`everything`
-    // anywhere in argv) is every section; otherwise only the named ones,
-    // and a name this build lacks selects nothing — `INFO nosuchsection`
-    // is an empty body (F-L15-10: "nothing selected" once meant
-    // "everything", so an argv of only unknown names rendered it all).
-    let mut selected: Vec<&str> = Vec::new();
-    let mut everything = argv.len() == 1;
-    for i in 1..argv.len() {
-        let arg = argv.arg(i).to_ascii_lowercase();
-        match arg.as_slice() {
-            b"all" | b"default" | b"everything" => everything = true,
-            section => {
-                if let Some(name) = SECTIONS.iter().find(|s| s.as_bytes() == section) {
-                    selected.push(name);
-                }
-            }
-        }
-    }
-    let wants = |name: &str| everything || selected.contains(&name);
+    let selection = Selection::of(argv);
+    let wants = |name: &str| selection.wants(name);
     let mut text = String::new();
 
     if wants("server") {
@@ -105,7 +120,7 @@ pub(crate) fn info(
         tripwires_section(&mut text, node, &report, &stats);
     }
     // Explicit only: ordinary INFO must not request or serialize 1920 buckets.
-    if selected.contains(&"loophist") {
+    if selection.named.contains(&"loophist") {
         node.loop_snapshot.append_info(&mut text);
     }
     if let Some((scope, g)) = fold.filter(|_| wants("keyspace")) {
