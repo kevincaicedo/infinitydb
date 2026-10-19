@@ -32,7 +32,8 @@ pub(crate) struct CensusVerdict {
 
 impl CensusVerdict {
     /// Judges one cell's census at the end of a life: `tiered_tables` is the
-    /// number of tiered namespaces the cell holds.
+    /// number of tiered namespaces the cell's tier plane serves (none before
+    /// the cell's recovery has built that plane).
     pub(crate) fn judge(&mut self, cell: usize, census: &CapCensus, tiered_tables: usize) {
         if census.phase() == CensusPhase::Assembling {
             self.violations.push(format!(

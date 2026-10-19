@@ -2141,7 +2141,11 @@ impl Drop for Node {
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();
         for (index, (_, plane)) in self.cells.iter().enumerate() {
-            let tiered_tables = plane.keyspace().tiered_tables();
+            // A cell cut before its recovery completed has replayed its
+            // tiered namespaces into the keyspace but not yet built their
+            // plane half, which registers the marks' row: none is owed.
+            let recovered = plane.durable_stats().is_some();
+            let tiered_tables = if recovered { plane.keyspace().tiered_tables() } else { 0 };
             verdict.judge(index, plane.cap_census(), tiered_tables);
         }
         self.observer.2.borrow_mut().absorb(verdict);
