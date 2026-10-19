@@ -17,7 +17,7 @@
 
 use inf_sim::net::Plant;
 use inf_sim::{
-    CombinedScenario, DurableScenario, EpochMarksLeg, Scenario, TierBudgetLeg,
+    CombinedScenario, DurableScenario, EpochMarksLeg, ExtentWindowLeg, Scenario, TierBudgetLeg,
     run_combined_scenario, run_durable_scenario, run_scenario,
 };
 use inf_sim::{RecoveryScenario, SeedClass, SpecVariant};
@@ -89,6 +89,8 @@ fn main() {
     let mut tier_leg: Option<TierBudgetLeg> = None;
     // m4-epoch-marks's leg, named the same way.
     let mut marks_leg: Option<EpochMarksLeg> = None;
+    // m4-extent-window's leg, named the same way.
+    let mut window_leg: Option<ExtentWindowLeg> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -151,6 +153,12 @@ fn main() {
                         format!("unknown marks leg {name}; the legs are {}", marks_leg_names())
                     })?);
                 }
+                "--window-leg" => {
+                    let name = take("--window-leg")?;
+                    window_leg = Some(ExtentWindowLeg::parse(&name).ok_or_else(|| {
+                        format!("unknown window leg {name}; the legs are {}", window_leg_names())
+                    })?);
+                }
                 // m4-cold: total op count (the AC's 10⁶ run sets it; the
                 // smoke default is lighter).
                 "--ops" => {
@@ -164,12 +172,14 @@ fn main() {
                          tier-write-eio|stop-kill] \
                          [--replay-canary] [--lift-regime] [--replay-above-window] \
                          [--spec-variant ring-top|page] [--tier-leg {}] [--marks-leg {}] \
+                         [--window-leg {}] \
                          [--cells N] [--connections N] [--commands N] [--wheel-nodes-max N] \
                          [--trace-out FILE] \
                          [--sweep N [--shard I/K] [--out DIR]] [--list-scenarios]",
                         inf_sim::SCENARIOS.join("|"),
                         tier_leg_names(),
-                        marks_leg_names()
+                        marks_leg_names(),
+                        window_leg_names()
                     );
                     std::process::exit(0);
                 }
@@ -223,6 +233,22 @@ fn main() {
         ("m4-epoch-marks", Some(_)) | (_, None) => {}
         (other, Some(_)) => {
             eprintln!("inf-sim: --marks-leg is m4-epoch-marks's; {other} has no leg");
+            std::process::exit(2);
+        }
+    }
+    // m4-extent-window names its leg, and only it has one.
+    match (scenario_name.as_str(), window_leg) {
+        ("m4-extent-window", None) => {
+            eprintln!("inf-sim: m4-extent-window needs --window-leg {}", window_leg_names());
+            std::process::exit(2);
+        }
+        ("m4-extent-window", Some(leg)) => {
+            run_extent_window(seed, leg, verify);
+            return;
+        }
+        (_, None) => {}
+        (other, Some(_)) => {
+            eprintln!("inf-sim: --window-leg is m4-extent-window's; {other} has no leg");
             std::process::exit(2);
         }
     }
@@ -1515,6 +1541,52 @@ fn tier_leg_names() -> String {
 /// The `--marks-leg` names, `|`-joined for a message.
 fn marks_leg_names() -> String {
     EpochMarksLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
+/// The `--window-leg` names, `|`-joined for a message.
+fn window_leg_names() -> String {
+    ExtentWindowLeg::ALL.iter().map(|leg| leg.name()).collect::<Vec<_>>().join("|")
+}
+
+/// `m4-extent-window`: one seeded leg, its disk-side counts, its verdict,
+/// and with `--verify-determinism` a second run that must be identical.
+fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: bool) {
+    let scenario = inf_sim::ExtentWindowScenario::m4_extent_window(seed, leg);
+    let report = inf_sim::run_extent_window_scenario(&scenario);
+    println!(
+        "inf-sim: scenario m4-extent-window leg {} seed {seed:#x}: {} blob writes acked, {} \
+         extent files created, peak {} open, {} frame holds, {} parks, {} steps, hash {:#018x}",
+        leg.name(),
+        report.sets_acked,
+        report.files_created,
+        report.handles_peak,
+        report.frame_waits_extent,
+        report.extent_parks,
+        report.scheduler_steps,
+        report.trace_hash
+    );
+    if let Some(row) = report.window_row {
+        println!(
+            "inf-sim: extent window cell 0: high_water {} of {}, crossings {}",
+            row.high_water, row.entries_max, row.crossings
+        );
+    }
+    print_census(report.cap_rows_checked);
+    if !report.ok() {
+        for v in &report.violations {
+            eprintln!("inf-sim: VIOLATION: {v}");
+        }
+        std::process::exit(1);
+    }
+    if verify {
+        let second = inf_sim::run_extent_window_scenario(&scenario);
+        verify_hashes(
+            (report.trace_hash, report.state_hash),
+            (second.trace_hash, second.state_hash),
+        );
+        assert!(second.ok(), "second run failed its oracles");
+        println!("inf-sim: determinism verified — second run hash-identical");
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // one linear CLI dispatch, like main

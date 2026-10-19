@@ -81,6 +81,8 @@ rows=(
   "m4-tier-budget --tier-leg one-64mb-no-model --plant tier-write-eio --verify-determinism"
   "m4-epoch-marks --marks-leg everysec --verify-determinism"
   "m4-epoch-marks --marks-leg wedge --verify-determinism"
+  "m4-extent-window --window-leg burst --verify-determinism"
+  "m4-extent-window --window-leg cap --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )

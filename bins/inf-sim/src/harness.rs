@@ -1881,7 +1881,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     // liveness.
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
-        census.judge(index, plane.cap_census(), plane.keyspace().tiered_tables());
+        let facts = crate::census::CellFacts {
+            tiered_tables: plane.keyspace().tiered_tables(),
+            turns_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+        };
+        census.judge(index, plane.cap_census(), facts);
     }
     report.cap_rows_checked = census.rows_checked;
     violations.extend(census.violations);

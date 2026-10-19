@@ -7,12 +7,16 @@
 //!   `cap-assembly-violated`), and the census left `Assembling`: a census
 //!   never marked means the cell's loop took no serve mark, or marked
 //!   another census (token `census-never-marked`).
+//! - **The window's turn rule** (H4): a cell's durable plane counts no turn
+//!   that found the extent-seal window full (`turn_refused = 0`, the
+//!   release form of `len + w ≤ 16`; token `turn-refused`).
 //! - Liveness: a cell holding a tiered namespace has the reclaim marks'
-//!   row (token `cap-row-missing`), and the rows checked are summed on the
-//!   report line (`cap_rows_checked`), so a run whose census read nothing is
-//!   visible.
+//!   row, and a cell whose durable plane is built has the extent-seal
+//!   window's row (token `cap-row-missing`); the rows checked are summed on
+//!   the report line (`cap_rows_checked`), so a run whose census read
+//!   nothing is visible.
 //!
-//! Both rules read the product's own counts: wiring checks. The independent
+//! The rules read the product's own counts: wiring checks. The independent
 //! evidence is each site's model test and the DST rows' disk-side oracles.
 //! Each violation's token is whitespace-free, so a canary row can expect it.
 
@@ -21,6 +25,20 @@ use inf_foundation::bounded::{CapCensus, CapRow, CensusPhase};
 /// The reclaim marks' census row, which every cell with a tiered namespace
 /// registers.
 const EPOCH_MARKS_ROW: &str = "epoch-marks";
+/// The extent-seal window's census row, which every cell's durable plane
+/// registers when it is built.
+const EXTENT_WINDOW_ROW: &str = "extent-window";
+
+/// What a cell's planes hold at the end of a life, beside its census.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CellFacts {
+    /// Tiered namespaces the cell's tier plane serves (none before the
+    /// cell's recovery has built that plane).
+    pub(crate) tiered_tables: usize,
+    /// The cell's durable plane, once built: its turns that found the
+    /// extent-seal window full.
+    pub(crate) turns_refused: Option<u64>,
+}
 
 /// The census verdict of one run: every cell of every life it judged.
 #[derive(Clone, Debug, Default)]
@@ -31,10 +49,9 @@ pub(crate) struct CensusVerdict {
 }
 
 impl CensusVerdict {
-    /// Judges one cell's census at the end of a life: `tiered_tables` is the
-    /// number of tiered namespaces the cell's tier plane serves (none before
-    /// the cell's recovery has built that plane).
-    pub(crate) fn judge(&mut self, cell: usize, census: &CapCensus, tiered_tables: usize) {
+    /// Judges one cell's census at the end of a life, beside what its
+    /// planes hold (`facts`).
+    pub(crate) fn judge(&mut self, cell: usize, census: &CapCensus, facts: CellFacts) {
         if census.phase() == CensusPhase::Assembling {
             self.violations.push(format!(
                 "CAP CENSUS VIOLATION cell {cell}: census-never-marked — the census its \
@@ -52,10 +69,24 @@ impl CensusVerdict {
             self.rows_checked += 1;
             self.violations.extend(over_cap(cell, &row));
         }
+        let tiered_tables = facts.tiered_tables;
         if tiered_tables > 0 && census.row(EPOCH_MARKS_ROW).is_none() {
             self.violations.push(format!(
                 "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — {tiered_tables} tiered \
                  namespace(s) and no `{EPOCH_MARKS_ROW}` row"
+            ));
+        }
+        let Some(refused) = facts.turns_refused else { return };
+        if census.row(EXTENT_WINDOW_ROW).is_none() {
+            self.violations.push(format!(
+                "CAP CENSUS VIOLATION cell {cell}: cap-row-missing — a durable plane and no \
+                 `{EXTENT_WINDOW_ROW}` row"
+            ));
+        }
+        if refused > 0 {
+            self.violations.push(format!(
+                "EXTENT WINDOW VIOLATION cell {cell}: turn-refused — {refused} turn(s) found the \
+                 extent-seal window full: a unit handed out twice"
             ));
         }
     }
@@ -94,13 +125,34 @@ mod tests {
         let (census, serve_mark) = CapCensus::new(CellId(0));
         serve_mark.take();
         let mut verdict = CensusVerdict::default();
-        verdict.judge(0, &census, 1);
+        verdict.judge(0, &census, CellFacts { tiered_tables: 1, turns_refused: None });
         assert_eq!(verdict.rows_checked, 0);
         assert_eq!(verdict.violations.len(), 1, "{:?}", verdict.violations);
         assert!(verdict.violations[0].contains("cap-row-missing"), "{:?}", verdict.violations);
+        let mut durable = CensusVerdict::default();
+        durable.judge(0, &census, CellFacts { tiered_tables: 0, turns_refused: Some(0) });
+        assert_eq!(durable.violations.len(), 1, "{:?}", durable.violations);
+        assert!(durable.violations[0].contains("extent-window"), "{:?}", durable.violations);
         let mut control = CensusVerdict::default();
-        control.judge(0, &census, 0);
+        control.judge(0, &census, CellFacts::default());
         assert!(control.violations.is_empty(), "no tiered namespace, no row owed");
+    }
+
+    /// The window's turn rule: a refused turn is red by its token; none is
+    /// green.
+    #[test]
+    fn a_refused_turn_is_red() {
+        const WINDOW: Cap = Cap::entries::<16>("extent-window", CapFill::Serving);
+        let (census, serve_mark) = CapCensus::new(CellId(3));
+        serve_mark.take();
+        let _window = CappedDeque::<u64, Reserve>::new(WINDOW, &census).expect("built");
+        let mut red = CensusVerdict::default();
+        red.judge(3, &census, CellFacts { tiered_tables: 0, turns_refused: Some(1) });
+        assert_eq!(red.violations.len(), 1, "{:?}", red.violations);
+        assert!(red.violations[0].contains("turn-refused"), "{:?}", red.violations);
+        let mut green = CensusVerdict::default();
+        green.judge(3, &census, CellFacts { tiered_tables: 0, turns_refused: Some(0) });
+        assert!(green.violations.is_empty(), "{:?}", green.violations);
     }
 
     /// The assembly rule's liveness: a census its cell's loop never marked
@@ -109,7 +161,7 @@ mod tests {
     fn a_census_never_marked_is_red() {
         let (census, _serve_mark) = CapCensus::new(CellId(2));
         let mut verdict = CensusVerdict::default();
-        verdict.judge(2, &census, 0);
+        verdict.judge(2, &census, CellFacts::default());
         assert_eq!(verdict.violations.len(), 1);
         assert!(verdict.violations[0].contains("census-never-marked"));
         assert!(!verdict.violations[0].contains("cap-assembly-violated"));
@@ -142,7 +194,7 @@ mod tests {
             }
         }
         let mut verdict = CensusVerdict::default();
-        verdict.judge(1, &census, 1);
+        verdict.judge(1, &census, CellFacts { tiered_tables: 1, turns_refused: None });
         assert_eq!(verdict.rows_checked, 2);
         assert!(verdict.violations.is_empty(), "full rows are within their caps: {verdict:?}");
         // A row past its cap: no correct container writes one, so a row

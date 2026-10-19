@@ -2344,10 +2344,14 @@ impl Drop for Node {
         for (index, (_, plane)) in self.cells.iter().enumerate() {
             // A cell cut before its recovery completed has replayed its
             // tiered namespaces into the keyspace but not yet built their
-            // plane half, which registers the marks' row: none is owed.
-            let recovered = plane.durable_stats().is_some();
-            let tiered_tables = if recovered { plane.keyspace().tiered_tables() } else { 0 };
-            verdict.judge(index, plane.cap_census(), tiered_tables);
+            // plane half, which registers the marks' row, nor its durable
+            // plane, which registers the window's row: neither is owed.
+            let durable = plane.durable_stats();
+            let tiered_tables =
+                if durable.is_some() { plane.keyspace().tiered_tables() } else { 0 };
+            let turns_refused = durable.map(|stats| stats.turn_refused);
+            let facts = crate::census::CellFacts { tiered_tables, turns_refused };
+            verdict.judge(index, plane.cap_census(), facts);
         }
         self.observer.2.borrow_mut().absorb(verdict);
     }

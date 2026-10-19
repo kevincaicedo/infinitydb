@@ -61,6 +61,7 @@ pub mod combined;
 pub mod diskfull;
 mod document;
 pub mod durable;
+pub mod extent_window;
 pub mod harness;
 mod lift;
 #[allow(unsafe_code)]
@@ -84,6 +85,9 @@ pub use combined::{CombinedReport, CombinedScenario, run_combined_scenario};
 pub use diskfull::{DiskfullReport, DiskfullScenario, run_diskfull_scenario};
 pub use durable::{
     DurableReport, DurableScenario, EpochMarksLeg, TierBudgetLeg, run_durable_scenario,
+};
+pub use extent_window::{
+    ExtentWindowLeg, ExtentWindowReport, ExtentWindowScenario, run_extent_window_scenario,
 };
 pub use harness::{Scenario, SimReport, run_scenario};
 pub use nscreate::{NsCreateWindowReport, run_ns_create_window_scenario};
@@ -130,6 +134,7 @@ pub const SCENARIOS: &[&str] = &[
     "m4-tiered",
     "m4-tier-budget",
     "m4-epoch-marks",
+    "m4-extent-window",
     "m45-backfill",
     "m45-sidecar",
 ];
