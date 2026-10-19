@@ -181,6 +181,28 @@ impl<T, X> CappedDeque<T, X> {
         self.backing.len() as u32
     }
 
+    /// Whether one more entry fits: the type's one admission compare,
+    /// `len < entries_max`, which holds `len <= entries_max` (I7) on both
+    /// crossings. Two canaries plant it: K1 admits one entry fewer on a
+    /// `Serving` row (it reads the row's fill), K2 admits at the cap.
+    #[inline]
+    fn has_room(&self) -> bool {
+        #[cfg(inf_canary_cap_minus_one)]
+        {
+            let serving = self.row.fill() == CapFill::Serving;
+            let one_short = self.entries_max.checked_sub(1).unwrap_or_default();
+            self.published_count() < if serving { one_short } else { self.entries_max }
+        }
+        #[cfg(inf_canary_cap_admits_at_cap)]
+        {
+            self.published_count() <= self.entries_max
+        }
+        #[cfg(not(any(inf_canary_cap_minus_one, inf_canary_cap_admits_at_cap)))]
+        {
+            self.published_count() < self.entries_max
+        }
+    }
+
     /// After a publish: the one compare a publish pays. A rise is reported
     /// to the row, at most `entries_max` times over the instance's life.
     #[inline]
@@ -205,11 +227,7 @@ impl<T> CappedDeque<T, Reserve> {
     /// the row's crossings up by one.
     #[inline]
     pub fn reserve(&mut self) -> Reserved<'_, T> {
-        if self.published_count() < self.entries_max {
-            Reserved::Slot(DequeSlot { deque: self })
-        } else {
-            self.full()
-        }
+        if self.has_room() { Reserved::Slot(DequeSlot { deque: self }) } else { self.full() }
     }
 
     /// The pacing crossing, off the hot path.
@@ -236,7 +254,7 @@ impl<T: Lossy, M: Merge<T>> CappedDeque<T, Coalesce<M>> {
     /// folds it into the last entry and the row's crossings go up by one.
     #[inline]
     pub fn push(&mut self, value: T) {
-        if self.published_count() < self.entries_max {
+        if self.has_room() {
             self.backing.push_back(value);
             self.published();
         } else {

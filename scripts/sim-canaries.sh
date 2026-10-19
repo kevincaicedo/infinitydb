@@ -217,6 +217,12 @@ rows=(
   # read below the confirmable length reaches frames a held round has not
   # written, and the driver answers short.
   "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
+  # ADR-0163 D2 — the capped deque's admission compare, both plants on the
+  # reclaim marks' wedge leg. K1 admits one entry fewer on a `Serving` row
+  # (it reads the row's fill): the row reaches 15 of its 16 and H2 reads it
+  # unfilled. K2 admits at the cap: the row holds 17 and H1 reads it over.
+  "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
+  "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
   # ADR-0163 D2 — the reclaim marks, one plant per rule. The back merge
   # takes the later epoch and keeps the earlier seq: a merged mark pops at
   # the earlier class's barrier and reclaims deaths whose killing records

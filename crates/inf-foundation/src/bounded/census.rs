@@ -253,6 +253,13 @@ impl CapCensus {
 }
 
 impl CapRowHandle {
+    /// The fill the row was declared with: the cap-minus-one canary admits
+    /// one entry fewer on a `Serving` row only.
+    #[cfg(inf_canary_cap_minus_one)]
+    pub(super) fn fill(&self) -> CapFill {
+        self.fill
+    }
+
     /// The container's live count rose to `live`. A `Serving` container
     /// reports only when its own high water rises; an `Assembly` one never
     /// raises its own, so it reports every publish, and the row keeps its
