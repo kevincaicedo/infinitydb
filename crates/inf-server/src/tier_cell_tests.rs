@@ -2,7 +2,7 @@
 //! budget, the cell's turn, the cold window's bound, the lanes.
 
 use super::*;
-use crate::durable::AckClass;
+use crate::durable::ack_class::{AckClass, AckClasses};
 use inf_foundation::bounded::CapCensus;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::time::Nanos;

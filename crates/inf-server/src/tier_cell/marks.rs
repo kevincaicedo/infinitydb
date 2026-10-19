@@ -15,7 +15,7 @@ use std::rc::Rc;
 use inf_foundation::bounded::{CapCensus, CapError, CappedDeque, Coalesce, Lossy, Merge};
 use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 
-use crate::durable::AckClass;
+use crate::durable::ack_class::{AckClass, AckClasses};
 use crate::limits::{EPOCH_MARKS, EPOCH_MARKS_MAX};
 
 // The marks' one allocation fits a deque's backing bound, so their
@@ -56,17 +56,6 @@ impl Merge<EpochMark> for LaterMark {
             back.epoch = new.epoch;
         }
     }
-}
-
-/// What one MAINTAIN tick reads of the cell's durable plane: one handle,
-/// read in the same step, never across a suspension.
-pub(crate) trait AckClasses {
-    /// The last durable seq assigned to a staged record.
-    fn staged_seq(&self) -> u64;
-    /// The fsync watermark: every seq at or below it is durable.
-    fn durable_seq(&self) -> u64;
-    /// Which barrier makes `seq` durable.
-    fn ack_class(&self, seq: u64) -> AckClass;
 }
 
 /// One tiered namespace's reclaim marks and the reclaim epoch they yield.
@@ -180,7 +169,7 @@ mod tests {
     use inf_log::{Lsn, SegmentId};
 
     use super::*;
-    use crate::durable::ack_class_of;
+    use crate::durable::ack_class::ack_class_of;
 
     /// The rule the capped marks replace, kept as the oracle: a mark per
     /// tick whose staged seq and epoch both moved past the last mark, every

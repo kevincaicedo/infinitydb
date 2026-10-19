@@ -50,11 +50,12 @@ use inf_runtime::{
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
+use crate::durable::ack_class::AckClasses;
 use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN};
 
 mod marks;
 
-pub(crate) use marks::{AckClasses, EpochMarks};
+pub(crate) use marks::EpochMarks;
 
 /// `errno` values the completion handler classifies (ADR-0084 D4).
 const ENOSPC: i32 = 28;
