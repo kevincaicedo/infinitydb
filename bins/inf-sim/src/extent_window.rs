@@ -33,6 +33,12 @@
 //! assembly rule, the turn rule (H4) and their liveness are the census
 //! oracle's, read at the node's drop. A violation's token is whitespace-free
 //! and carried by that violation's text alone, so a canary row can expect it.
+//!
+//! The cold leg ([`cold`]) paces writers that overwrite cold keys, whose
+//! every resolve is a cold read: there a reply that is `BUSY` is red
+//! (`extent-reply-busy`).
+
+mod cold;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -41,7 +47,7 @@ use std::rc::Rc;
 use inf_foundation::bounded::CapRow;
 use inf_foundation::hash64;
 use inf_foundation::rng::SplitMix64;
-use inf_foundation::time::{Nanos, VirtualClock};
+use inf_foundation::time::{Clock, Nanos, VirtualClock};
 use inf_log::fs::sim::SimDisk;
 use inf_server::StallConfig;
 
@@ -86,16 +92,23 @@ pub enum ExtentWindowLeg {
     /// 16 writers, exactly the cap: the window fills and never crosses —
     /// the control leg.
     Cap,
+    /// 56 writers overwrite 56 cold keys with blob values, so each resolve
+    /// is a cold read, against a cold FIFO of 16 places; a 57th writer, on
+    /// a key in RAM, arrives while the first handout's turns resolve
+    /// ([`cold`]).
+    Cold,
 }
 
 impl ExtentWindowLeg {
-    pub const ALL: [ExtentWindowLeg; 2] = [ExtentWindowLeg::Burst, ExtentWindowLeg::Cap];
+    pub const ALL: [ExtentWindowLeg; 3] =
+        [ExtentWindowLeg::Burst, ExtentWindowLeg::Cap, ExtentWindowLeg::Cold];
 
     /// The leg's name on the command line.
     pub fn name(self) -> &'static str {
         match self {
             ExtentWindowLeg::Burst => "burst",
             ExtentWindowLeg::Cap => "cap",
+            ExtentWindowLeg::Cold => "cold",
         }
     }
 
@@ -108,14 +121,38 @@ impl ExtentWindowLeg {
         match self {
             ExtentWindowLeg::Burst => 3 * WINDOW_ENTRIES,
             ExtentWindowLeg::Cap => WINDOW_ENTRIES,
+            ExtentWindowLeg::Cold => cold::WRITERS,
         }
     }
 
-    /// Blob `SET`s per writer: enough files for H3 on either leg.
+    /// Blob `SET`s per writer: enough files for H3 on the burst and cap
+    /// legs; one overwrite of its key on the cold leg.
     fn ops_per_writer(self) -> u64 {
         match self {
             ExtentWindowLeg::Burst => 3,
             ExtentWindowLeg::Cap => 4,
+            ExtentWindowLeg::Cold => 1,
+        }
+    }
+
+    /// Max virtual nanoseconds per scheduler step.
+    fn step_ns_max(self) -> u64 {
+        match self {
+            ExtentWindowLeg::Burst | ExtentWindowLeg::Cap => STEP_NS_MAX,
+            ExtentWindowLeg::Cold => cold::STEP_NS_MAX,
+        }
+    }
+
+    /// The device: the fdatasync on the flush unit's one timeline, plain
+    /// writes off it at a page copy's 8 µs (so the boot's write-reorder
+    /// window is open); on the cold leg its tier reads on the byte
+    /// timeline too.
+    fn stall(self) -> StallConfig {
+        match self {
+            ExtentWindowLeg::Burst | ExtentWindowLeg::Cap => {
+                StallConfig { base_ns: SYNC_NS, write_base_ns: 8_000, ..StallConfig::instant() }
+            }
+            ExtentWindowLeg::Cold => cold::stall(),
         }
     }
 }
@@ -173,13 +210,39 @@ struct Writer {
     replied_at: Vec<u64>,
     setup_done: bool,
     inflight: bool,
+    /// The one key it overwrites (the cold leg); `None`: a fresh key a
+    /// write, `k:<id>:<n>`.
+    key: Option<Vec<u8>>,
+    /// It sends nothing before this instant (the cold leg's pacing).
+    not_before: Nanos,
 }
 
 impl Writer {
+    fn new(node: &mut Node, id: usize, quota: u64) -> Writer {
+        let fd = node.nets[0].borrow_mut().connect();
+        node.nets[0].borrow_mut().client_send(fd, &encode(&[b"INF.NS", b"USE", NS_NAME]));
+        Writer {
+            id,
+            fd,
+            rx: Vec::new(),
+            sent: 0,
+            quota,
+            replied_at: Vec::new(),
+            setup_done: false,
+            inflight: true,
+            key: None,
+            not_before: Nanos(0),
+        }
+    }
+
     fn value(&self) -> Vec<u8> {
         let mut value = format!("{:0width$}", self.id, width = ID_DIGITS).into_bytes();
         value.resize(VALUE_LEN, b'v');
         value
+    }
+
+    fn next_key(&self) -> Vec<u8> {
+        self.key.clone().unwrap_or_else(|| format!("k:{}:{}", self.id, self.sent).into_bytes())
     }
 
     fn done(&self) -> bool {
@@ -229,12 +292,6 @@ impl ExtentWindowScenario {
         ExtentWindowScenario { seed, leg }
     }
 
-    /// The fdatasync on the flush unit's timeline; plain writes off it at
-    /// a page copy's 8 µs, so the boot's write-reorder window is open.
-    fn stall(&self) -> StallConfig {
-        StallConfig { base_ns: SYNC_NS, write_base_ns: 8_000, ..StallConfig::instant() }
-    }
-
     /// The harness plumbing view (`boot` and `Node::step` read the cell
     /// count, the seed, the segment and checkpoint shape through it).
     fn harness(&self) -> DurableScenario {
@@ -251,7 +308,7 @@ impl ExtentWindowScenario {
             keys_per_writer: 0,
             value_max: 0,
             value_pad_max: 0,
-            step_ns_max: STEP_NS_MAX,
+            step_ns_max: self.leg.step_ns_max(),
             double_cut: false,
             plant: Plant::None,
             segment_bytes: 1 << 20,
@@ -260,7 +317,7 @@ impl ExtentWindowScenario {
             ckpt_stream_bytes_per_sec: None,
             ckpt_section_bytes: None,
             ckpt_section_bound: None,
-            stall: Some(self.stall()),
+            stall: Some(self.leg.stall()),
             replay_canary: false,
             clean_stop: false,
             io_mode: inf_server::SegmentIoMode::Buffered,
@@ -314,13 +371,21 @@ fn run_observed(scenario: &ExtentWindowScenario, observer: &TraceObserver) -> Ex
         }
     };
     node.nets[0].borrow_mut().deliver_whole();
-    if let Err(what) = create_namespace(&mut node, &mut rng, &clock, &disk) {
+    if let Err(what) = create_namespace(&mut node, &mut rng, &clock, &disk, scenario.leg) {
         report.violations.push(what);
         return report;
     }
-    let mut writers = connect_writers(&mut node, scenario.leg);
+    let mut writers: Vec<Writer> = (0..scenario.leg.writers())
+        .map(|id| Writer::new(&mut node, id, scenario.leg.ops_per_writer()))
+        .collect();
     let mut creations = Creations::default();
-    drive(scenario, &mut node, &mut writers, &mut creations, &mut rng, &clock, &disk, &mut report);
+    let mut run = Run { scenario, node: &mut node, rng: &mut rng, clock: &clock, disk: &disk };
+    match scenario.leg {
+        ExtentWindowLeg::Burst | ExtentWindowLeg::Cap => {
+            drive(&mut run, &mut writers, &mut creations, &mut report);
+        }
+        ExtentWindowLeg::Cold => cold::run(&mut run, &mut writers, &mut creations, &mut report),
+    }
     report.handles_peak = creations.handles_peak;
     report.files_created = creations.seen.len();
     report.sets_acked = writers.iter().map(|w| w.replied_at.len() as u64).sum();
@@ -330,17 +395,35 @@ fn run_observed(scenario: &ExtentWindowScenario, observer: &TraceObserver) -> Ex
     report
 }
 
+/// One run's node and its instruments, for the traffic phases.
+struct Run<'a> {
+    scenario: &'a ExtentWindowScenario,
+    node: &'a mut Node,
+    rng: &'a mut SplitMix64,
+    clock: &'a Rc<VirtualClock>,
+    disk: &'a SimDisk,
+}
+
+impl Run<'_> {
+    /// One scheduler step at the leg's step size.
+    fn step(&mut self) -> std::io::Result<()> {
+        self.node.step(self.rng, self.clock, self.disk, self.scenario.leg.step_ns_max())
+    }
+}
+
 /// `INF.NS CREATE` of the tiered `always` namespace: the m4 tiered shape's
 /// smallest window (3 MiB, a tenth mutable, 1 MiB slices) and the 4 KiB
-/// blob threshold, so every writer's value rides an extent.
+/// blob threshold, so every writer's value rides an extent; on the cold
+/// leg a `COLD-READ-QD` of 4, so the cell's cold FIFO has 16 places.
 fn create_namespace(
     node: &mut Node,
     rng: &mut SplitMix64,
     clock: &Rc<VirtualClock>,
     disk: &SimDisk,
+    leg: ExtentWindowLeg,
 ) -> Result<(), String> {
     let mut setup = MiniClient::connect(node, 0);
-    let create: &[&[u8]] = &[
+    let mut create: Vec<&[u8]> = vec![
         b"INF.NS",
         b"CREATE",
         NS_NAME,
@@ -359,85 +442,83 @@ fn create_namespace(
         b"TIER-IO-MODE",
         b"buffered",
     ];
-    match setup.call(node, rng, clock, disk, STEP_NS_MAX, create) {
+    if leg == ExtentWindowLeg::Cold {
+        create.extend_from_slice(&[b"COLD-READ-QD", cold::READ_QD]);
+    }
+    match setup.call(node, rng, clock, disk, leg.step_ns_max(), &create) {
         Ok(Some(ok)) if ok == b"+OK\r\n" => Ok(()),
         Ok(other) => Err(format!("DDL CREATE answered {other:?}")),
         Err(err) => Err(format!("DDL phase: {err}")),
     }
 }
 
-fn connect_writers(node: &mut Node, leg: ExtentWindowLeg) -> Vec<Writer> {
-    (0..leg.writers())
-        .map(|id| {
-            let fd = node.nets[0].borrow_mut().connect();
-            node.nets[0].borrow_mut().client_send(fd, &encode(&[b"INF.NS", b"USE", NS_NAME]));
-            Writer {
-                id,
-                fd,
-                rx: Vec::new(),
-                sent: 0,
-                quota: leg.ops_per_writer(),
-                replied_at: Vec::new(),
-                setup_done: false,
-                inflight: true,
-            }
-        })
-        .collect()
-}
-
 /// Steps the node until every writer has its replies, sampling the disk
 /// after each step; a run that makes no progress for `STALL_STEPS` steps
 /// with a reply owed is red.
-#[allow(clippy::too_many_arguments, reason = "the run's one traffic phase and its instruments")]
 fn drive(
-    scenario: &ExtentWindowScenario,
-    node: &mut Node,
+    run: &mut Run<'_>,
     writers: &mut [Writer],
     creations: &mut Creations,
-    rng: &mut SplitMix64,
-    clock: &Rc<VirtualClock>,
-    disk: &SimDisk,
     report: &mut ExtentWindowReport,
 ) {
     let mut idle = 0u64;
-    let mut step = 0u64;
     while writers.iter().any(|w| !w.done()) {
-        step += 1;
-        report.scheduler_steps += 1;
-        if let Err(err) = node.step(rng, clock, disk, STEP_NS_MAX) {
-            report.violations.push(format!("traffic phase: {err}"));
-            return;
-        }
-        creations.sample(disk, step);
-        let mut progress = false;
-        for writer in writers.iter_mut() {
-            progress |= pump(scenario, node, writer, step, report);
-        }
-        idle = if progress { 0 } else { idle + 1 };
-        if idle >= STALL_STEPS {
-            let owed: Vec<String> = writers
-                .iter()
-                .filter(|w| !w.done())
-                .map(|w| format!("writer {} ({} of {} replied)", w.id, w.replied_at.len(), w.quota))
-                .collect();
-            report.violations.push(format!(
-                "EXTENT WINDOW LIVENESS VIOLATION seed {:#x}: writer-left-parked — no progress \
-                 in {STALL_STEPS} steps with replies owed: {}",
-                scenario.seed,
-                owed.join(", ")
-            ));
+        if !traffic_step(run, writers, creations, report, &mut idle) {
             return;
         }
     }
 }
 
+/// One step of the traffic phase: the node steps, the disk is sampled, and
+/// each writer reads its replies and sends. Returns `false` once the run
+/// must end: a step failed, or no progress for `STALL_STEPS` steps with a
+/// reply owed.
+fn traffic_step(
+    run: &mut Run<'_>,
+    writers: &mut [Writer],
+    creations: &mut Creations,
+    report: &mut ExtentWindowReport,
+    idle: &mut u64,
+) -> bool {
+    report.scheduler_steps += 1;
+    let step = report.scheduler_steps;
+    if let Err(err) = run.step() {
+        report.violations.push(format!("traffic phase: {err}"));
+        return false;
+    }
+    creations.sample(run.disk, step);
+    let now = run.clock.now();
+    let mut progress = false;
+    for writer in writers.iter_mut() {
+        progress |= pump(run.scenario.seed, run.node, writer, step, now, report);
+    }
+    *idle = if progress { 0 } else { *idle + 1 };
+    if *idle < STALL_STEPS {
+        return true;
+    }
+    let owed: Vec<String> = writers
+        .iter()
+        .filter(|w| !w.done())
+        .map(|w| format!("writer {} ({} of {} replied)", w.id, w.replied_at.len(), w.quota))
+        .collect();
+    report.violations.push(format!(
+        "EXTENT WINDOW LIVENESS VIOLATION seed {:#x}: writer-left-parked — no progress in \
+         {STALL_STEPS} steps with replies owed: {}",
+        run.scenario.seed,
+        owed.join(", ")
+    ));
+    false
+}
+
 /// One writer's turn after a step: read its replies, then send its next
-/// `SET` if it has none in flight. Returns whether anything moved.
+/// `SET` if it has none in flight and its pacing allows. Returns whether
+/// anything moved.
 fn pump(
-    scenario: &ExtentWindowScenario,
+    seed: u64,
     node: &mut Node,
     writer: &mut Writer,
     step: u64,
+    now: Nanos,
     report: &mut ExtentWindowReport,
 ) -> bool {
     let mut net = node.nets[0].borrow_mut();
@@ -448,10 +529,13 @@ fn pump(
         let reply: Vec<u8> = writer.rx.drain(..n).collect();
         writer.inflight = false;
         if reply != b"+OK\r\n" {
+            let token = if reply.starts_with(b"-BUSY") {
+                "extent-reply-busy"
+            } else {
+                "extent-reply-wrong"
+            };
             report.violations.push(format!(
-                "EXTENT WINDOW REPLY VIOLATION seed {:#x}: extent-reply-wrong — writer {} read \
-                 {:?}",
-                scenario.seed,
+                "EXTENT WINDOW REPLY VIOLATION seed {seed:#x}: {token} — writer {} read {:?}",
                 writer.id,
                 String::from_utf8_lossy(&reply)
             ));
@@ -460,9 +544,13 @@ fn pump(
         }
         writer.setup_done = true;
     }
-    if writer.setup_done && !writer.inflight && writer.sent < writer.quota {
-        let key = format!("k:{}:{}", writer.id, writer.sent);
-        net.client_send(writer.fd, &encode(&[b"SET", key.as_bytes(), &writer.value()]));
+    if writer.setup_done
+        && !writer.inflight
+        && writer.sent < writer.quota
+        && now >= writer.not_before
+    {
+        let key = writer.next_key();
+        net.client_send(writer.fd, &encode(&[b"SET", &key, &writer.value()]));
         writer.sent += 1;
         writer.inflight = true;
         progress = true;
@@ -505,7 +593,6 @@ fn judge(
             report.sets_acked
         ));
     }
-    hold_oracle(seed, writers, creations, report);
     if report.extent_parked > 0 || report.extent_turns_out > 0 {
         report.violations.push(format!(
             "EXTENT WINDOW LIVENESS VIOLATION seed {seed:#x}: writer-left-parked — {} writer(s) \
@@ -513,6 +600,12 @@ fn judge(
             report.extent_parked, report.extent_turns_out
         ));
     }
+    // H2 and H3 are the burst's and the cap's: the cold leg's pacing is its
+    // own, and its writers overwrite one key each.
+    if scenario.leg == ExtentWindowLeg::Cold {
+        return;
+    }
+    hold_oracle(seed, writers, creations, report);
     if report.frame_waits_extent < H3_HOLDS_MIN {
         report.violations.push(format!(
             "VACUOUS seed {seed:#x}: extent-hold-unengaged — {} frame(s) held for extent \
@@ -548,7 +641,7 @@ fn window_row_oracle(scenario: &ExtentWindowScenario, report: &mut ExtentWindowR
             "EXTENT WINDOW VIOLATION seed {seed:#x}: cap-row-crossed — {crossings} crossing(s) \
              with exactly {cap} writers"
         ),
-        ExtentWindowLeg::Burst | ExtentWindowLeg::Cap => return,
+        ExtentWindowLeg::Burst | ExtentWindowLeg::Cap | ExtentWindowLeg::Cold => return,
     };
     report.violations.push(what);
 }

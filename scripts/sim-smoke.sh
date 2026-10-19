@@ -83,6 +83,7 @@ rows=(
   "m4-epoch-marks --marks-leg wedge --verify-determinism"
   "m4-extent-window --window-leg burst --verify-determinism"
   "m4-extent-window --window-leg cap --verify-determinism"
+  "m4-extent-window --window-leg cold --verify-determinism"
   "m45-backfill"
   "m45-sidecar"
 )
