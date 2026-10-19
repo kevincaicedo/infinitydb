@@ -233,9 +233,15 @@ rows=(
   # takes the later epoch and keeps the earlier seq: a merged mark pops at
   # the earlier class's barrier and reclaims deaths whose killing records
   # are not durable, so the wedge leg's cut (the first extent reclaim after
-  # a crossing) loses an acknowledged blob value's extent — on a sweep,
-  # since a seed's cut need not land before the later barrier.
-  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks DURABILITY --marks-leg wedge --sweep 16"
+  # a crossing) loses an acknowledged blob value's extent. Only some seeds
+  # do: the cut must land while the later class's write-through entry is
+  # still in flight. On the planted build 115 of 1,024 seeds from 0xC0FFEE
+  # are red (about 1 in 9; the longest green run is 53 seeds), so the row
+  # sweeps 128, where all green has a chance of about 2e-7. The rule: at
+  # least twice the seeds that bring that chance below 1e-3 at the measured
+  # rate (58 here); re-measure on 1,024 seeds whenever the wedge leg's
+  # traffic changes.
+  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks DURABILITY --marks-leg wedge --sweep 128"
   # The class search answers the builder for every seq: a tick replaces the
   # back by every later pair, so a standalone over the written frame leaves
   # its death waiting — the model test reads the reclaim epoch below the
