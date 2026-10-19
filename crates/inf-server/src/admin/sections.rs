@@ -491,6 +491,12 @@ fn fsync_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("fsync_latency_p50_us:{}", node.fsync_p50_us.get()));
     push(text, &format!("fsync_latency_p99_us:{}", node.fsync_p99_us.get()));
     push(text, &format!("fsync_latency_p999_us:{}", node.fsync_p999_us.get()));
+    // ADR-0163 D2: the extent-seal window's pacing, cell scope — blob
+    // writers parked for a unit (park episodes; a rising rate beside the
+    // fsync latency is the device's barrier rate binding), and turns that
+    // found the window full, which the window's arithmetic makes 0.
+    push(text, &format!("extent_parks:{}", node.extent_parks.get()));
+    push(text, &format!("turn_refused:{}", node.turn_refused.get()));
     // M2.5-S07: group formation — records covered per durability
     // fsync (the >= 0.8x available-in-flight-writes gate observable).
     push(text, &format!("fsync_group_p50:{}", node.fsync_group_p50.get()));
@@ -539,6 +545,9 @@ fn barrier_gauge_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("frame_waits_barrier:{}", node.frame_waits_barrier.get()));
     push(text, &format!("frame_waits_rotation:{}", node.frame_waits_rotation.get()));
     push(text, &format!("frame_waits_reorder:{}", node.frame_waits_reorder.get()));
+    // ADR-0163 D2 (cell scope): frames held for an outstanding extent
+    // barrier, per episode — each episode closes the extent-seal window.
+    push(text, &format!("frame_waits_extent:{}", node.frame_waits_extent.get()));
     // M4.5-S39a: the fill policy in force and its hold episodes.
     push(text, &format!("frame_waits_fill:{}", node.frame_waits_fill.get()));
     push(text, &format!("fill_window_us:{}", node.fill_window_us.get()));

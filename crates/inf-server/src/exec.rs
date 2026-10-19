@@ -324,6 +324,12 @@ pub struct NodeState {
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,
+    /// The extent-seal window (ADR-0163 D2), cell scope: frames held for an
+    /// outstanding extent barrier, per episode; blob writers' park episodes;
+    /// turns that found the window full (0 by `len + w ≤ 16`).
+    pub frame_waits_extent: Cell<u64>,
+    pub extent_parks: Cell<u64>,
+    pub turn_refused: Cell<u64>,
     pub frame_waits_fill: Cell<u64>,
     pub fill_window_us: Cell<u64>,
     pub fill_target_bytes: Cell<u64>,
