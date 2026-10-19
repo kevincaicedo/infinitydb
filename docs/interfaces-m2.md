@@ -1330,6 +1330,13 @@ count the arrivals that found it full.
   > normalization and required cleanup. A META above 64 MiB is refused by
   > binaries built before ADR-0158.
 
+  > **Accepted 2026-10-19, implementation open — ADR-0182:** ADR-0182
+  > restates ADR-0158 whole and is the META envelope contract once
+  > accepted: the bound and its band are unchanged. A META above 64 MiB is
+  > refused by binaries built before ADR-0158, a recorded deviation (expiry
+  > 2026-12-31, or the first public tag if that comes earlier), after which
+  > it is a documented format boundary. Not built.
+
   Payload: magic `INFMAN1\0`, `epoch: u32 = 1`, `ckpt_id: u64`, packed
   `begin: u64`, count + u32 segment ids (strictly ascending; `segments[0]
   == begin.segment` = the truncation floor). Canonical decode: trailing
