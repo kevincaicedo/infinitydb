@@ -103,6 +103,12 @@ fn direct_cfg() -> SegmentConfig {
     }
 }
 
+/// The rig's ledger, its extent-seal window a row of the rig's own census
+/// (no cell loop marks it).
+fn ledger() -> GroupCommit<inf_log::fs::sim::SimFile> {
+    GroupCommit::new(&inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0)
+}
+
 impl Rig {
     /// A fresh Direct cell driven to its first pre-zeroed segment: the
     /// next segment zero-fills (unpaced, the active is sparse), the
@@ -116,7 +122,7 @@ impl Rig {
             disk,
             rotor,
             ring: StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 }),
-            commit: GroupCommit::new(),
+            commit: ledger(),
             model: BTreeMap::new(),
             frame_keys: Vec::new(),
             seq: 0,
@@ -137,7 +143,7 @@ impl Rig {
         let mut ring =
             StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 });
         ring.set_frame_epoch(rotor.resume_epoch());
-        Rig { disk, rotor, ring, commit: GroupCommit::new(), model, frame_keys: Vec::new(), seq }
+        Rig { disk, rotor, ring, commit: ledger(), model, frame_keys: Vec::new(), seq }
     }
 
     /// MAINTAIN's job: preallocate the next segment and pre-zero it to

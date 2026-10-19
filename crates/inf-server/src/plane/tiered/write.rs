@@ -3,6 +3,8 @@
 //! string-family write commands that enter through it.
 
 use super::*;
+use crate::durable::{Arrival, ExtentTurn};
+use inf_log::ExtentRegistration;
 
 // ---- the write funnel ----
 
@@ -10,6 +12,8 @@ use super::*;
 /// stage markers-then-record (ADR-0057 D4 order). Returns the staged
 /// mutation seq. Apply precedes staging so a typed apply failure stages
 /// nothing; staging is infallible after `would_fit` (no await between).
+/// `turn` is the writer's place in the extent-seal window's order, which a
+/// blob write reserves with and spends at its publish (ADR-0163 D2).
 #[allow(clippy::too_many_arguments)] // one internal write funnel
 fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
@@ -21,6 +25,7 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     old: Displaced,
     guard: WriteGuard,
     proto: Protocol,
+    turn: &mut Option<ExtentTurn>,
 ) -> Result<u64, WriteBlock> {
     let mut ks = shared.store.borrow_mut();
     let mut durable = shared.durable.borrow_mut();
@@ -83,7 +88,8 @@ fn try_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
     let class = class.expect("tiered namespaces always carry a durability class");
     if blob {
-        return write_blob(shared, ns, class, key, hash, value, old, proto, &mut ks, cell);
+        let write = BlobWrite { ns, class, key, hash, value, old, proto };
+        return write_blob(shared, &write, &mut ks, cell, turn);
     }
     let table = ks.tiered_store_mut(ns).expect("resolved above");
     let applied = match old {
@@ -316,14 +322,6 @@ pub(in crate::plane) async fn read_cold_record<
     }
 }
 
-/// The blob write path (M4-S17 wired by M4-S26): extent create + chunk
-/// writes (blocking, bounded by the value — the ADR-0061 cost the plan
-/// accepts), `finish_deferred`, the coverage-neutral ledger barrier
-/// registered **before** the referencing record stages (D3 — the
-/// done-prefix rule fences the ack behind extent durability; the
-/// fdatasync op itself rides the next MAINTAIN), then markers + the
-/// `StringSetExtent` record. A typed apply failure abandons the extent
-/// file to the orphan sweep — the D3 quarantine rule.
 /// Why an out-of-line write failed, typed end to end (F-L04-09): the
 /// plane used to erase `ExtentWriteFailure` into `io::Error::other` and
 /// then string-match for a word the message never carried.
@@ -342,94 +340,182 @@ impl BlobWriteError {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // the write funnel's blob half
-fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+/// One blob write's operands, as the write funnel resolved them.
+struct BlobWrite<'a> {
     ns: NsId,
     class: FsyncClass,
-    key: &[u8],
+    key: &'a [u8],
     hash: u64,
-    value: &[u8],
+    value: &'a [u8],
     old: Displaced,
     proto: Protocol,
+}
+
+/// Why a blob write's extent was not referenced, inside the window's
+/// reservation: the extent is abandoned (never referenced, its id never
+/// reused) and the orphan sweep reclaims its file (ADR-0061 D3).
+enum ExtentRefusal {
+    /// Creating, writing or sealing the extent failed.
+    Write(BlobWriteError),
+    /// The store refused the reference; the extent's handle closes.
+    Store(inf_store::OpError),
+}
+
+/// The blob write path (M4-S17 wired by M4-S26): through the extent-seal
+/// window (ADR-0163 D2), a unit reserved before any effect; inside the
+/// reservation the extent's create and chunk writes (blocking, bounded by
+/// the value — the ADR-0061 cost the plan accepts), `finish_deferred` and
+/// the store's reference; the coverage-neutral ledger barrier and its
+/// window entry published **before** the referencing record stages (D3 —
+/// the done-prefix rule fences the ack behind extent durability; the
+/// fdatasync op itself rides the next MAINTAIN); then the markers and the
+/// `StringSetExtent` record. A full window parks the writer with nothing
+/// created; a typed failure abandons the extent file to the orphan sweep —
+/// the D3 quarantine rule.
+fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    write: &BlobWrite<'_>,
     ks: &mut Keyspace,
     cell: &mut DurableCell<F>,
+    turn: &mut Option<ExtentTurn>,
 ) -> Result<u64, WriteBlock> {
     let mut tier_slot = shared.tier.borrow_mut();
     let Some(tier) = tier_slot.as_mut() else {
-        return Err(WriteBlock::Reply(error_bytes(shared, proto, ERR_FAILED)));
+        return Err(WriteBlock::Reply(error_bytes(shared, write.proto, ERR_FAILED)));
     };
-    let table = ks.tiered_store_mut(ns).expect("caller resolved the table");
-    let extent_id = table.allocate_extent_id();
+    // ADR-0163 D2: the extent-seal window paces a blob write before any
+    // effect. A writer with no turn passes the arrival test or parks.
+    if turn.is_none()
+        && cell.extent_waiters.arrival(cell.commit.extent_window_len()) == Arrival::Park
+    {
+        *turn = Some(cell.extent_waiters.park());
+        return Err(WriteBlock::ExtentWindow);
+    }
+    let table = ks.tiered_store_mut(write.ns).expect("caller resolved the table");
     let (cell_index, dir, mode) = {
-        let t = tier.ns(ns).expect("tiered namespace has plane state");
+        let t = tier.ns(write.ns).expect("tiered namespace has plane state");
         (tier.cell_index(), t.dir.clone(), t.io_mode)
     };
-    let sealed = inf_log::blob::ExtentWriter::create(
-        tier.fs(),
-        &dir,
-        inf_log::blob::ExtentId(extent_id),
-        cell_index,
-        ns,
-        value.len() as u64,
-        mode,
-    )
-    .map_err(BlobWriteError::Open)
-    .and_then(|mut writer| {
-        writer.append_chunk(value).map_err(BlobWriteError::Chunk)?;
-        writer.finish_deferred().map_err(BlobWriteError::Seal)
-    });
+    let place = ExtentPlace { fs: tier.fs(), dir: &dir, cell: cell_index, mode };
+    // The unit is reserved before the extent id, the file and the table
+    // change; the ledger entry and the window entry publish in one step.
+    let registered =
+        cell.commit.register_extent(shared.now.get(), || make_extent(&place, write, table));
     // ADR-0088 D1/D5 (recorded limitation 2): the extent write is
     // synchronous foreground device I/O outside the driver — metered as
     // `BlobWrite` so the budget's foreground term is complete, never
-    // deferred (the M5 blob story owns the `IoOp` path).
-    cell.charge_foreground(inf_runtime::IoClass::BlobWrite, value.len() as u64, 1);
-    let (sealed, handle) = match sealed {
-        Ok(pair) => pair,
-        // The failed extent is abandoned (never referenced, id never
-        // reused); the orphan sweep reclaims the file (ADR-0061 D3).
-        // The type survives to the reply (F-L04-09): a space refusal is
-        // `DISKFULL` on the blob path exactly as on the inline path.
-        Err(err) => {
-            let reply = if err.is_storage_full() {
-                diskfull_bytes(shared, proto, inf_store::DiskFullCause::Device)
-            } else {
-                error_bytes(shared, proto, ERR_BLOB_READ)
-            };
-            return Err(WriteBlock::Reply(reply));
+    // deferred; charged on every arm that wrote, once the window's
+    // reservation has ended.
+    let sealed = match registered {
+        ExtentRegistration::Registered(_, sealed) => sealed,
+        ExtentRegistration::Full => return Err(park_at_full(cell, turn)),
+        ExtentRegistration::Refused(refusal) => {
+            cell.charge_foreground(inf_runtime::IoClass::BlobWrite, write.value.len() as u64, 1);
+            return Err(refused_block(shared, write, table, refusal));
         }
     };
-    let applied = match old {
-        None => table.insert_extent(key, hash, &sealed),
-        Some((addr, len, version)) => table.update_extent(key, hash, &sealed, addr, len, version),
-    };
-    if let Err(err) = applied {
-        // Abandon: the extent is durable-referenced by nothing; the
-        // sweep reclaims it. The handle just closes. The stall probe is
-        // sized from the 24-byte reference the store refused, never
-        // from the value (F-L06-05, ADR-0102 D3).
-        drop(handle);
-        return Err(write_block_of(shared, table, key, StallProbe::Extent, err, proto));
-    }
-    // D3 ordering: the barrier's ledger position precedes this
-    // iteration's linked frame fsync (seal_log registers later in the
-    // same iteration) — the ack is fenced mechanically.
-    let fd = inf_log::fs::SegmentFile::raw_fd(&handle);
-    let ticket = cell.commit.register_extent_barrier(handle, shared.now.get());
-    if let Some(fd) = fd {
-        tier.queue_extent_sync(fd, ticket);
+    cell.charge_foreground(inf_runtime::IoClass::BlobWrite, write.value.len() as u64, 1);
+    if let Some(spent) = turn.take() {
+        spent.spend();
     }
     // Extent updates are never in-place (ADR-0061 D4 — the branch is
     // structurally excluded), so the displacement marker always stages.
-    stage_displacements(cell, table, ns, hash, old, class, true);
+    stage_displacements(cell, table, write.ns, write.hash, write.old, write.class, true);
     let effect = MutationEffect::StringSetExtent {
-        ns,
-        key,
+        ns: write.ns,
+        key: write.key,
         extent_id: sealed.extent_id().0,
         offset: 0,
         len: sealed.data_len(),
     };
-    Ok(cell.stage_tiered(table, &effect, class))
+    Ok(cell.stage_tiered(table, &effect, write.class))
+}
+
+/// Where a namespace's extents are made: its cell's filesystem and its
+/// directory, the cell's index, its creation I/O mode.
+struct ExtentPlace<'a, F> {
+    fs: &'a F,
+    dir: &'a std::path::Path,
+    cell: u32,
+    mode: inf_log::TierIoMode,
+}
+
+/// Makes one blob write's extent inside the window's reservation: a fresh
+/// extent id, the file created, written and sealed with its fdatasync
+/// deferred to the ledger, then the store's reference. Returns the open
+/// file the ledger holds until the barrier folds, and the sealed extent.
+fn make_extent<F: SegmentFs>(
+    place: &ExtentPlace<'_, F>,
+    write: &BlobWrite<'_>,
+    table: &mut TieredTable,
+) -> Result<(F::File, inf_log::blob::SealedExtent), ExtentRefusal> {
+    let extent_id = table.allocate_extent_id();
+    let (sealed, handle) = inf_log::blob::ExtentWriter::create(
+        place.fs,
+        place.dir,
+        inf_log::blob::ExtentId(extent_id),
+        place.cell,
+        write.ns,
+        write.value.len() as u64,
+        place.mode,
+    )
+    .map_err(BlobWriteError::Open)
+    .and_then(|mut writer| {
+        writer.append_chunk(write.value).map_err(BlobWriteError::Chunk)?;
+        writer.finish_deferred().map_err(BlobWriteError::Seal)
+    })
+    .map_err(ExtentRefusal::Write)?;
+    let applied = match write.old {
+        None => table.insert_extent(write.key, write.hash, &sealed),
+        Some((addr, len, version)) => {
+            table.update_extent(write.key, write.hash, &sealed, addr, len, version)
+        }
+    };
+    match applied {
+        Ok(_) => Ok((handle, sealed)),
+        Err(err) => {
+            drop(handle);
+            Err(ExtentRefusal::Store(err))
+        }
+    }
+}
+
+/// The window answered `Full`. An arrival parks at the queue's tail: its
+/// `Full` is the window row's crossing. A turn always has a unit (I12); a
+/// refused one is counted and parks again.
+fn park_at_full<F: SegmentFs>(
+    cell: &mut DurableCell<F>,
+    turn: &mut Option<ExtentTurn>,
+) -> WriteBlock {
+    let parked = match turn.take() {
+        Some(held) => cell.extent_waiters.refuse_turn(held),
+        None => cell.extent_waiters.park(),
+    };
+    *turn = Some(parked);
+    WriteBlock::ExtentWindow
+}
+
+/// The reply or park a refused extent answers. A space refusal is
+/// `DISKFULL` on the blob path exactly as on the inline path; any other
+/// write failure is the blob error. A store refusal is sized from the
+/// 24-byte reference the store refused, never from the value.
+fn refused_block<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    write: &BlobWrite<'_>,
+    table: &mut TieredTable,
+    refusal: ExtentRefusal,
+) -> WriteBlock {
+    match refusal {
+        ExtentRefusal::Write(err) if err.is_storage_full() => {
+            WriteBlock::Reply(diskfull_bytes(shared, write.proto, inf_store::DiskFullCause::Device))
+        }
+        ExtentRefusal::Write(_) => {
+            WriteBlock::Reply(error_bytes(shared, write.proto, ERR_BLOB_READ))
+        }
+        ExtentRefusal::Store(err) => {
+            write_block_of(shared, table, write.key, StallProbe::Extent, err, write.proto)
+        }
+    }
 }
 
 /// Maps a typed apply failure onto park-or-reply.
@@ -504,9 +590,10 @@ fn diskfull_bytes<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 }
 
 /// Drives one value write to completion: resolve → attempt → park loops
-/// (staging drain / tail stall with the ADR-0053 D4 typed timeout).
-/// `compute` turns the resolved old value into the new value bytes (or
-/// a terminal reply — the INCR family's parse errors).
+/// (staging drain / tail stall with the ADR-0053 D4 typed timeout / the
+/// extent-seal window's turn). `compute` turns the resolved old value into
+/// the new value bytes (or a terminal reply — the INCR family's parse
+/// errors).
 async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -518,6 +605,9 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
+    // The writer's place in the extent-seal window's order: held from a
+    // park until its blob write publishes, or dropped when it leaves.
+    let mut turn: Option<ExtentTurn> = None;
     loop {
         let resolved = resolve(shared, ns, key, hash, PromoteOnCold::Never).await;
         let guard = WriteGuard::of(&resolved);
@@ -536,7 +626,7 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
             Resolved::Fail(message) => return Err(error_bytes(shared, proto, message)),
         };
         let value = compute(old_value.as_deref(), old.map(|(_, _, v)| v))?;
-        match try_write(shared, ns, class, key, hash, &value, old, guard, proto) {
+        match try_write(shared, ns, class, key, hash, &value, old, guard, proto, &mut turn) {
             Ok(seq) => return Ok((seq, old_value)),
             Err(WriteBlock::Replan) => {
                 replans += 1;
@@ -545,31 +635,75 @@ async fn write_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                 }
             }
             Err(WriteBlock::StagingFull) => {
-                let wait = {
-                    let durable = shared.durable.borrow();
-                    let Some(cell) = durable.as_ref() else {
-                        return Err(error_bytes(shared, proto, ERR_FAILED));
-                    };
-                    cell.drained.wait(())
-                };
-                wait.await;
+                park_write(shared, ns, Park::Staging, deadline, &mut turn, proto).await?;
             }
             Err(WriteBlock::Stall) => {
-                if shared.now.get() >= deadline {
-                    return Err(error_bytes(shared, proto, ERR_STALLED));
-                }
-                let wait = {
-                    let tier = shared.tier.borrow();
-                    let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
-                        return Err(error_bytes(shared, proto, ERR_STALLED));
-                    };
-                    t.stall_waiters.wait(())
-                };
-                wait.await;
+                park_write(shared, ns, Park::Stall, deadline, &mut turn, proto).await?;
+            }
+            Err(WriteBlock::ExtentWindow) => {
+                park_write(shared, ns, Park::ExtentWindow, deadline, &mut turn, proto).await?;
             }
             Err(WriteBlock::Reply(reply)) => return Err(reply),
         }
     }
+}
+
+/// Where a write attempt waits before it re-resolves.
+#[derive(Copy, Clone)]
+enum Park {
+    /// Staging backpressure: the in-flight frame's release.
+    Staging,
+    /// The tail stall: flush and release progress, deadline-bounded
+    /// (ADR-0053 D4).
+    Stall,
+    /// The extent-seal window: the writer's turn (ADR-0163 D2).
+    ExtentWindow,
+}
+
+/// Waits out one park of a write attempt. A park on staging or the tail
+/// stall gives a held window turn back first, so no turn waits behind
+/// another gate; the window's park awaits the turn the attempt took.
+async fn park_write<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    park: Park,
+    deadline: Nanos,
+    turn: &mut Option<ExtentTurn>,
+    proto: Protocol,
+) -> Result<(), Vec<u8>> {
+    match park {
+        Park::Staging => {
+            drop(turn.take());
+            let wait = {
+                let durable = shared.durable.borrow();
+                let Some(cell) = durable.as_ref() else {
+                    return Err(error_bytes(shared, proto, ERR_FAILED));
+                };
+                cell.drained.wait(())
+            };
+            wait.await;
+        }
+        Park::Stall => {
+            drop(turn.take());
+            if shared.now.get() >= deadline {
+                return Err(error_bytes(shared, proto, ERR_STALLED));
+            }
+            let wait = {
+                let tier = shared.tier.borrow();
+                let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
+                    return Err(error_bytes(shared, proto, ERR_STALLED));
+                };
+                t.stall_waiters.wait(())
+            };
+            wait.await;
+        }
+        Park::ExtentWindow => {
+            if let Some(held) = turn.as_mut() {
+                held.await;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stall_deadline<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -668,6 +802,8 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
     let hash = shared.hasher.hash(key);
     let deadline = stall_deadline(shared, ns);
     let mut replans: u8 = 0;
+    // The writer's place in the extent-seal window's order (`write_value`).
+    let mut turn: Option<ExtentTurn> = None;
     loop {
         // M4.5-S37 step 1 (`bench-diagnostics` only): the ceiling arm —
         // a plain SET (no NX/XX: the reply does not depend on the old
@@ -693,32 +829,18 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
             match try_shadow_write(shared, ns, class, key, hash, value, proto) {
                 ShadowAttempt::Staged(seq) => return Ok((seq, None, true)),
                 ShadowAttempt::Blocked(WriteBlock::StagingFull) => {
-                    let wait = {
-                        let durable = shared.durable.borrow();
-                        let Some(cell) = durable.as_ref() else {
-                            return Err(error_bytes(shared, proto, ERR_FAILED));
-                        };
-                        cell.drained.wait(())
-                    };
-                    wait.await;
+                    park_write(shared, ns, Park::Staging, deadline, &mut turn, proto).await?;
                     continue;
                 }
                 ShadowAttempt::Blocked(WriteBlock::Stall) => {
-                    if shared.now.get() >= deadline {
-                        return Err(error_bytes(shared, proto, ERR_STALLED));
-                    }
-                    let wait = {
-                        let tier = shared.tier.borrow();
-                        let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
-                            return Err(error_bytes(shared, proto, ERR_STALLED));
-                        };
-                        t.stall_waiters.wait(())
-                    };
-                    wait.await;
+                    park_write(shared, ns, Park::Stall, deadline, &mut turn, proto).await?;
                     continue;
                 }
                 ShadowAttempt::Blocked(WriteBlock::Reply(reply)) => return Err(reply),
-                ShadowAttempt::Blocked(WriteBlock::Replan) | ShadowAttempt::Ineligible => {}
+                // The shadow path writes inline values alone: it neither
+                // reserves in the extent-seal window nor parks there.
+                ShadowAttempt::Blocked(WriteBlock::Replan | WriteBlock::ExtentWindow)
+                | ShadowAttempt::Ineligible => {}
             }
         }
         let (old, old_value, guard): (Displaced, Option<Vec<u8>>, WriteGuard) = if blind {
@@ -753,7 +875,7 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
         if (nx && old.is_some()) || (xx && old.is_none()) {
             return Ok((0, old_value, false));
         }
-        match try_write(shared, ns, class, key, hash, value, old, guard, proto) {
+        match try_write(shared, ns, class, key, hash, value, old, guard, proto, &mut turn) {
             Ok(seq) => return Ok((seq, old_value, true)),
             Err(WriteBlock::Replan) => {
                 replans += 1;
@@ -762,27 +884,13 @@ async fn write_conditional<O: PlaneObserver + 'static, F: SegmentFs + Clone + 's
                 }
             }
             Err(WriteBlock::StagingFull) => {
-                let wait = {
-                    let durable = shared.durable.borrow();
-                    let Some(cell) = durable.as_ref() else {
-                        return Err(error_bytes(shared, proto, ERR_FAILED));
-                    };
-                    cell.drained.wait(())
-                };
-                wait.await;
+                park_write(shared, ns, Park::Staging, deadline, &mut turn, proto).await?;
             }
             Err(WriteBlock::Stall) => {
-                if shared.now.get() >= deadline {
-                    return Err(error_bytes(shared, proto, ERR_STALLED));
-                }
-                let wait = {
-                    let tier = shared.tier.borrow();
-                    let Some(t) = tier.as_ref().and_then(|t| t.ns(ns)) else {
-                        return Err(error_bytes(shared, proto, ERR_STALLED));
-                    };
-                    t.stall_waiters.wait(())
-                };
-                wait.await;
+                park_write(shared, ns, Park::Stall, deadline, &mut turn, proto).await?;
+            }
+            Err(WriteBlock::ExtentWindow) => {
+                park_write(shared, ns, Park::ExtentWindow, deadline, &mut turn, proto).await?;
             }
             Err(WriteBlock::Reply(reply)) => return Err(reply),
         }

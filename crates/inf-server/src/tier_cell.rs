@@ -519,11 +519,6 @@ pub(crate) struct TierCell<F: SegmentFs> {
     pub cold_us: LogHistogram,
     /// Dropped namespaces' teardown queues (pins drain before unlink).
     teardown: Vec<TeardownNs>,
-    /// Extent-seal fdatasyncs awaiting the driver (ADR-0061 D3): the
-    /// ledger barrier registered at stage time; the op itself rides the
-    /// next MAINTAIN's push (ordering lives in the ledger, not the
-    /// submission queue).
-    pending_syncs: Vec<(std::os::fd::RawFd, inf_log::FsyncTicket)>,
     /// Next fresh completion-token lane (M4.5-S31). Lanes are 16 bits of
     /// the token slot (`MAX_SLOT >> 8`), so they recycle (batch 12 of the
     /// 2026-08-30 review): a lane returns to `free_lanes` only once its
@@ -584,18 +579,6 @@ impl<F: SegmentFs> TierCell<F> {
         self.namespaces.iter().find(|t| t.ns == ns)
     }
 
-    /// Queues one registered extent-seal barrier's fdatasync for the
-    /// next MAINTAIN drain (ADR-0061 D3 — M4-S26).
-    pub fn queue_extent_sync(&mut self, fd: std::os::fd::RawFd, ticket: inf_log::FsyncTicket) {
-        self.pending_syncs.push((fd, ticket));
-    }
-
-    /// Drains the queued extent-seal fdatasyncs (the plane pushes them
-    /// as driver ops each MAINTAIN).
-    pub fn take_pending_syncs(&mut self) -> Vec<(std::os::fd::RawFd, inf_log::FsyncTicket)> {
-        core::mem::take(&mut self.pending_syncs)
-    }
-
     /// Opens a blob extent for reading in the namespace's creation
     /// I/O mode (M4-S26 blob reads; the §3.3 open is metadata-cheap and
     /// the returned reader owns the fd across the chunked reads).
@@ -648,7 +631,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             ram_hit_us: LogHistogram::new(),
             cold_us: LogHistogram::new(),
             teardown: Vec::new(),
-            pending_syncs: Vec::new(),
             next_lane: 0,
             free_lanes: Vec::new(),
             round_drain: Vec::new(),

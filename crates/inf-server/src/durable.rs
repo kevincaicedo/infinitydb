@@ -19,9 +19,11 @@
 #[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use inf_alloc::AlignedBox;
 use inf_foundation::FileOffset;
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::time::Nanos;
 use inf_log::fs::SegmentFs;
 use inf_log::{
@@ -45,6 +47,9 @@ use crate::log_bytes;
 
 pub(crate) mod ack_class;
 mod ckpt;
+mod extent_window;
+
+pub(crate) use extent_window::{Arrival, ExtentTurn, ExtentWaiters};
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
@@ -436,6 +441,16 @@ pub struct DurableStats {
     /// episode like the other two; a non-zero value names a wedging
     /// device, never an engine regression.
     pub frame_waits_reorder: u64,
+    /// The extent-seal window (ADR-0163 D2), cell scope: frames held for an
+    /// outstanding extent barrier, per episode (the window closed at the
+    /// hold); blob writers' park episodes; turns that found the window full,
+    /// which `len + w ≤ 16` makes 0; and the writers parked and the turns
+    /// out now.
+    pub frame_waits_extent: u64,
+    pub extent_parks: u64,
+    pub turn_refused: u64,
+    pub extent_parked: u64,
+    pub extent_turns_out: u64,
     /// M4.5-S39a: frames held by the fill policy (per episode), and the
     /// policy in force (`fill_window_us` 0 = off).
     pub frame_waits_fill: u64,
@@ -602,6 +617,10 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     /// Wakes pump futures parked on staging backpressure (`StagingFull`)
     /// once the in-flight frame releases.
     pub drained: WaitList<()>,
+    /// The extent-seal window's queue (ADR-0163 D2): who may reserve one of
+    /// the ledger's extent units, in what order; opened and closed by the
+    /// LOG step.
+    pub extent_waiters: ExtentWaiters,
     /// Fuzzy-checkpoint driver (M2-S10, ADR-0016).
     pub ckpt: CkptCell<F>,
     /// MANIFEST + truncation driver (M2-S11, ADR-0017).
@@ -640,6 +659,9 @@ pub(crate) struct DurableCell<F: SegmentFs> {
     frame_waits_barrier: u64,
     frame_waits_rotation: u64,
     frame_waits_reorder: u64,
+    /// Frames held for an outstanding extent barrier, per episode: the
+    /// holds that closed the extent-seal window.
+    frame_waits_extent: u64,
     frame_held: bool,
     /// M4.5-S39a: the fill policy and the hold it is in — `fill_since`
     /// is the instant the LOG step first saw the pending frame (set at
@@ -706,6 +728,7 @@ impl<F: SegmentFs> DurableCell<F> {
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
+        census: &Rc<CapCensus>,
     ) -> DurableCell<F> {
         let (staging, flush_bound, fua_p50_us_probed, device, fill, group) =
             (cfg.staging, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
@@ -740,9 +763,10 @@ impl<F: SegmentFs> DurableCell<F> {
         DurableCell {
             staging,
             rotor,
-            commit: GroupCommit::with_flush_bound(usize::from(flush_bound)),
+            commit: GroupCommit::with_flush_bound(usize::from(flush_bound), census),
             ack_gate: WatermarkGate::new(),
             drained: WaitList::new(),
+            extent_waiters: ExtentWaiters::new(),
             ckpt,
             manifest,
             in_flight,
@@ -759,6 +783,7 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: 0,
             frame_waits_rotation: 0,
             frame_waits_reorder: 0,
+            frame_waits_extent: 0,
             frame_held: false,
             fill,
             fill_since: None,
@@ -991,21 +1016,16 @@ impl<F: SegmentFs> DurableCell<F> {
     /// a rotation while frames are in flight, when a sync is due that
     /// neither write-through nor a linked fdatasync may carry yet, or
     /// when the ledger's reorder window is full behind a late front
-    /// write (ADR-0087 D2 as amended).
+    /// write (ADR-0087 D2 as amended). A frame held for an extent barrier
+    /// closes the extent-seal window; the step that seals the frame, or
+    /// finds nothing staged, opens it and hands out its free units
+    /// (ADR-0163 D2).
     pub fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
         if self.failed {
             return;
         }
         if self.staging.can_seal() {
-            // ADR-0061 D3 (amended 2026-08-06): a pending extent-seal
-            // barrier holds this frame. The staged frame may carry the
-            // barrier's referencing record, and a durable record naming
-            // torn extent bytes replays as a dangling reference — the
-            // ledger barrier fences the ack, never the device order.
-            // The barrier's fdatasync rode this iteration's MAINTAIN
-            // push, so the hold is one device sync; the frame waits
-            // exactly like the ENOSPC branch below.
-            if self.commit.extent_barrier_pending() {
+            if self.extent_hold() {
                 return;
             }
             // ADR-0088 D2b: a second frame behind in-flight ones seals at
@@ -1086,7 +1106,13 @@ impl<F: SegmentFs> DurableCell<F> {
                 cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
             }
             self.queue_frame(cx, slot, plan);
-        } else if self.commit.standalone_fsync_due() {
+            self.extent_waiters.hand_out(self.commit.extent_window_len());
+            return;
+        }
+        if self.staging.is_empty() {
+            self.extent_waiters.hand_out(self.commit.extent_window_len());
+        }
+        if self.commit.standalone_fsync_due() {
             // M4.5-S43 (ADR-0092 D1 as amended by campaign B): a barrier
             // completing with nothing pending would issue a standalone
             // fdatasync for the plain frames at once — the same round the
@@ -1102,6 +1128,26 @@ impl<F: SegmentFs> DurableCell<F> {
             self.budget.charge(IoClass::LogFrame, 0, 1); // ledger-class barrier (ADR-0088 D7)
             cx.push(IoOp::Fdatasync { fd, token: fsync_token(ticket) });
         }
+    }
+
+    /// ADR-0061 D3 (amended 2026-08-06): an extent-seal barrier awaiting
+    /// its `Synced` holds the staged frame. The frame may carry the
+    /// barrier's referencing record, and a durable record naming torn
+    /// extent bytes replays as a dangling reference — the ledger barrier
+    /// fences the ack, never the device order. The barrier's fdatasync
+    /// rode a MAINTAIN push before this LOG step, so the hold is one device
+    /// sync; the frame waits like the ENOSPC branch. The hold closes the
+    /// extent-seal window (ADR-0163 D2): no blob writer registers another
+    /// extent this frame would wait for until it has sealed, beyond the
+    /// turns already out. One closing is one hold episode.
+    fn extent_hold(&mut self) -> bool {
+        if !self.commit.extent_barrier_pending() {
+            return false;
+        }
+        if self.extent_waiters.close() {
+            self.frame_waits_extent += 1;
+        }
+        true
     }
 
     /// The LOG step issued what it was holding — a frame or a standalone
@@ -1548,6 +1594,11 @@ impl<F: SegmentFs> DurableCell<F> {
             frame_waits_barrier: self.frame_waits_barrier,
             frame_waits_rotation: self.frame_waits_rotation,
             frame_waits_reorder: self.frame_waits_reorder,
+            frame_waits_extent: self.frame_waits_extent,
+            extent_parks: self.extent_waiters.parks(),
+            turn_refused: self.extent_waiters.turns_refused(),
+            extent_parked: self.extent_waiters.parked() as u64,
+            extent_turns_out: self.extent_waiters.turns_out() as u64,
             frame_waits_fill: self.frame_waits_fill,
             fill_window_us: self.fill.window.as_micros(),
             fill_target_bytes: u64::from(self.fill.target_bytes),

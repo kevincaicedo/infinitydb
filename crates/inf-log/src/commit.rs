@@ -98,15 +98,31 @@
 //! builder absorbs the hold, and the existing staging backpressure
 //! (admission parking, M4.5-S27) takes over from there. Release-asserted
 //! at the queue; frames are found by ordinal arithmetic, never a scan.
+//!
+//! **The extent-seal window (ADR-0163 D2, ADR-0061 D3).** A blob extent's
+//! barrier holds the extent's open file until the barrier folds, so the
+//! ledger's extent class is bounded by a capped deque of
+//! [`EXTENT_SEAL_WINDOW_ENTRIES`](crate::limits::EXTENT_SEAL_WINDOW_ENTRIES)
+//! entries, one per extent barrier registered and not folded, in ledger
+//! order. [`GroupCommit::register_extent`] reserves a unit before the
+//! extent exists and publishes the ledger entry and the window entry in
+//! one step; the fold frees the unit; MAINTAIN issues each entry's
+//! fdatasync once ([`GroupCommit::issue_extent_syncs`]). Who waits for a
+//! unit, and in what order, is the plane's.
 
 use core::fmt;
 #[allow(clippy::disallowed_types, reason = "container: T")]
 use std::collections::VecDeque;
+use std::os::fd::RawFd;
+use std::rc::Rc;
 
 use inf_foundation::LogHistogram;
+use inf_foundation::bounded::{CapCensus, CappedDeque, Reserve, Reserved};
+use inf_foundation::limits::DEQUE_BACKING_BYTES_MAX;
 use inf_foundation::time::Nanos;
 
 use crate::fs::SegmentFile;
+use crate::limits::{EXTENT_SEAL_WINDOW, EXTENT_SEAL_WINDOW_ENTRIES};
 use crate::lsn::Lsn;
 use crate::segment::SealHandoff;
 use crate::staging::MAX_FRAMES_IN_FLIGHT;
@@ -202,6 +218,37 @@ impl FsyncTicket {
     pub fn from_u64(raw: u64) -> FsyncTicket {
         FsyncTicket(raw)
     }
+}
+
+/// One extent barrier the extent-seal window holds: the ledger ticket of the
+/// extent's fdatasync and the descriptor that fdatasync targets (`None` on
+/// an in-memory tier, which no driver runs).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct ExtentSync {
+    pub ticket: FsyncTicket,
+    pub fd: Option<RawFd>,
+}
+
+// The window's one allocation fits a deque's backing bound, so its
+// construction never refuses on its layout.
+const _: () = assert!(
+    EXTENT_SEAL_WINDOW_ENTRIES as usize * core::mem::size_of::<ExtentSync>()
+        <= DEQUE_BACKING_BYTES_MAX,
+    "the extent-seal window fits one deque allocation"
+);
+
+/// What [`GroupCommit::register_extent`] did with one blob extent.
+#[must_use = "a registration's effect ran, or no effect ran: the caller says which reply follows"]
+pub enum ExtentRegistration<T, E> {
+    /// The window had a unit: the effect made the extent, and the ledger
+    /// entry holding its file and the window entry published in one step.
+    Registered(FsyncTicket, T),
+    /// The window is full: no effect ran and nothing changed but the
+    /// window row's crossings.
+    Full,
+    /// The window had a unit and the effect refused: the unit is restored
+    /// and nothing was registered.
+    Refused(E),
 }
 
 /// Ordinal of a queued frame (ADR-0087 D2): returned by
@@ -351,6 +398,12 @@ pub struct GroupCommit<File> {
     durable_bytes: u64,
     pending: VecDeque<PendingFsync<File>>,
     next_ticket: u64,
+    /// The extent-seal window (ADR-0163 D2): one entry per extent barrier
+    /// in `pending`, in ledger order (I10), published with the barrier and
+    /// popped at its fold. Its unit is reserved before the extent exists.
+    extent_window: CappedDeque<ExtentSync, Reserve>,
+    /// Window entries, at the back, whose fdatasync MAINTAIN has not issued.
+    extent_unsent: usize,
     /// Every durability barrier's latency (all classes) — `fsync_latency_*`.
     fsync_hist_us: LogHistogram,
     /// Write-through frames only (ADR-0086 D5/D7) — `fua_latency_*`, the
@@ -375,30 +428,32 @@ impl<File> fmt::Debug for GroupCommit<File> {
     }
 }
 
-impl<File: SegmentFile> Default for GroupCommit<File> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<File: SegmentFile> GroupCommit<File> {
+    /// The ledger of one cell, its extent-seal window a row of `census`.
     #[must_use]
-    pub fn new() -> GroupCommit<File> {
-        GroupCommit::with_flush_bound(1)
+    pub fn new(census: &Rc<CapCensus>) -> GroupCommit<File> {
+        GroupCommit::with_flush_bound(1, census)
     }
 
     /// `bound` FLUSH-class durability syncs may be in flight at once
     /// (ADR-0022 D3; the two-in-flight arm is M2.5-S07's measured shape,
     /// reachable by construction here — `--sync-pipeline` retired,
-    /// ADR-0087 D5).
+    /// ADR-0087 D5). The extent-seal window is a row of `census`: one
+    /// allocation of `EXTENT_SEAL_WINDOW_ENTRIES` entries, never grown.
     ///
     /// # Panics
     /// Outside `1..=2` — the pipeline is bounded by construction, never a
-    /// queue.
+    /// queue. The window's backing refused by the allocator is the
+    /// allocation fail-stop every growth of this constructor takes; its
+    /// layout is a const assertion, and the census refuses only a cap name
+    /// declared with a second value or fill, which any test's first boot
+    /// shows.
     #[must_use]
     #[allow(clippy::disallowed_types, reason = "container: T")]
-    pub fn with_flush_bound(bound: usize) -> GroupCommit<File> {
+    pub fn with_flush_bound(bound: usize, census: &Rc<CapCensus>) -> GroupCommit<File> {
         assert!((1..=2).contains(&bound), "FLUSH-class bound is 1 or 2, never a queue");
+        let extent_window = CappedDeque::new(EXTENT_SEAL_WINDOW, census)
+            .unwrap_or_else(|refused| panic!("the extent-seal window refused: {refused}"));
         GroupCommit {
             sync_due: false,
             always_pending: false,
@@ -419,6 +474,8 @@ impl<File: SegmentFile> GroupCommit<File> {
             durable_bytes: 0,
             pending: VecDeque::new(),
             next_ticket: 0,
+            extent_window,
+            extent_unsent: 0,
             fsync_hist_us: LogHistogram::new(),
             write_through_hist_us: LogHistogram::new(),
             stats: CommitStats::default(),
@@ -709,21 +766,86 @@ impl<File: SegmentFile> GroupCommit<File> {
         )
     }
 
-    /// Registers a sealed blob extent's fdatasync as a coverage-neutral
-    /// ledger barrier (M4-S26 realizing ADR-0061 D3): call **before**
-    /// staging the referencing record, so this barrier's ledger position
-    /// precedes the frame's linked fsync and the done-prefix rule fences
-    /// the referencing ack behind extent durability. The handle stays
-    /// held until the `Synced` completion.
-    pub fn register_extent_barrier(&mut self, extent: File, now: Nanos) -> FsyncTicket {
+    /// Registers one blob extent's fdatasync as a coverage-neutral ledger
+    /// barrier through the extent-seal window (ADR-0061 D3, ADR-0163 D2).
+    /// A window unit is reserved before `effect` runs, so a full window
+    /// runs no effect: no extent id, no file. `effect` makes the extent and
+    /// hands back its open file, which the ledger holds until the
+    /// barrier's `Synced`; then the ledger entry and the window entry
+    /// publish in one step, and a refused effect restores the unit. Call
+    /// **before** staging the referencing record, so the barrier's ledger
+    /// position precedes the frame's linked fsync and the done-prefix rule
+    /// fences the referencing ack behind extent durability. The effect
+    /// cannot reach the ledger (it is borrowed here), so the coverage tail
+    /// and the ticket read before it are the ones the entry takes.
+    pub fn register_extent<T, E>(
+        &mut self,
+        now: Nanos,
+        effect: impl FnOnce() -> Result<(File, T), E>,
+    ) -> ExtentRegistration<T, E> {
         let (covers_up_to, covers_bytes) = self.coverage_tail();
-        self.push_pending(
+        let ticket = self.next_ticket();
+        let Reserved::Slot(unit) = self.extent_window.reserve() else {
+            return ExtentRegistration::Full;
+        };
+        let (extent, made) = match effect() {
+            Ok(made) => made,
+            Err(refused) => return ExtentRegistration::Refused(refused),
+        };
+        unit.publish(ExtentSync { ticket, fd: extent.raw_fd() });
+        self.extent_unsent += 1;
+        let minted = self.push_pending(
             covers_up_to,
             covers_bytes,
             now,
             SyncReason::ExtentSeal,
             HeldHandle::Extent(extent),
-        )
+        );
+        debug_assert_eq!(minted, ticket, "the window entry names the ticket the ledger minted");
+        ExtentRegistration::Registered(ticket, made)
+    }
+
+    /// Hands each window entry whose fdatasync is not issued yet to
+    /// `issue`, oldest first, once: MAINTAIN's driver ops for the extent
+    /// barriers, at most the window's `EXTENT_SEAL_WINDOW_ENTRIES` a tick.
+    pub fn issue_extent_syncs(&mut self, mut issue: impl FnMut(ExtentSync)) {
+        debug_assert!(self.extent_unsent <= self.extent_window.len(), "unsent entries are held");
+        let issued = self.extent_window.len().saturating_sub(self.extent_unsent);
+        for sync in self.extent_window.iter().skip(issued) {
+            issue(*sync);
+        }
+        self.extent_unsent = 0;
+    }
+
+    /// Extent barriers the window holds: registered and not yet folded, at
+    /// most `EXTENT_SEAL_WINDOW_ENTRIES`.
+    #[must_use]
+    pub fn extent_window_len(&self) -> usize {
+        self.extent_window.len()
+    }
+
+    /// The ticket the next registration mints: tickets are consecutive
+    /// ordinals, the ledger's one minting rule.
+    fn next_ticket(&self) -> FsyncTicket {
+        FsyncTicket(self.next_ticket + 1)
+    }
+
+    /// The fold reached an extent barrier: its window entry, the front one
+    /// (I10: one window entry per unfolded extent barrier, in ledger
+    /// order), leaves and its unit is free. The unit returns at the fold,
+    /// never at the completion: a done entry behind an undone one stays in
+    /// the ledger, so only the fold bounds the ledger's extent class.
+    fn fold_extent(&mut self, ticket: FsyncTicket) {
+        let front = self.extent_window.pop_front();
+        debug_assert_eq!(
+            front.map(|sync| sync.ticket),
+            Some(ticket),
+            "the window mirrors the ledger's extent barriers in order"
+        );
+        debug_assert!(
+            self.extent_unsent <= self.extent_window.len(),
+            "a folded barrier was issued"
+        );
     }
 
     /// Register one zero-fill barrier (ADR-0086 D4): the fdatasync on a
@@ -950,10 +1072,10 @@ impl<File: SegmentFile> GroupCommit<File> {
         } else {
             self.flush_in_flight += 1;
         }
-        self.next_ticket += 1;
-        let ticket = self.next_ticket;
+        let ticket = self.next_ticket();
+        self.next_ticket = ticket.0;
         self.pending.push_back(PendingFsync {
-            ticket,
+            ticket: ticket.0,
             covers_up_to,
             covers_bytes,
             submitted_at: now,
@@ -967,7 +1089,7 @@ impl<File: SegmentFile> GroupCommit<File> {
             self.pending.iter().filter(|p| p.reason == SyncReason::WriteThrough).count(),
             "write-through count tracks the FIFO"
         );
-        FsyncTicket(ticket)
+        ticket
     }
 
     // ---- REAP completions --------------------------------------------------
@@ -1083,10 +1205,14 @@ impl<File: SegmentFile> GroupCommit<File> {
             }
             self.durable_up_to = Some(front.covers_up_to);
             self.durable_bytes = front.covers_bytes;
-            if front.reason == SyncReason::WriteThrough {
+            let (reason, folded) = (front.reason, FsyncTicket(front.ticket));
+            if reason == SyncReason::WriteThrough {
                 self.write_through_pending -= 1;
             }
             self.pending.pop_front();
+            if reason == SyncReason::ExtentSeal {
+                self.fold_extent(folded);
+            }
         }
         (self.durable_up_to != before).then(|| self.durable_up_to.expect("advanced past None"))
     }
@@ -1213,7 +1339,15 @@ mod tests {
     }
 
     fn commit() -> GroupCommit<MemFile> {
-        GroupCommit::new()
+        GroupCommit::new(&census())
+    }
+
+    /// A cell's census, its serve mark taken: the ledger's window row lives
+    /// on it.
+    fn census() -> Rc<CapCensus> {
+        let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
+        serve_mark.take();
+        census
     }
 
     /// One late plain write at the front with barrier-less frames landing
@@ -1343,7 +1477,7 @@ mod tests {
     fn watermark_advances_only_on_completion_and_by_done_prefix() {
         // Two linked syncs in flight: the measured bound-2 arm (at bound 1
         // the second registration is refused — batch 43).
-        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);
@@ -1462,7 +1596,7 @@ mod tests {
         // M2.5-S07: at bound 2 the LOG step may link a second sync while
         // the first flushes; a third due accumulates (bounded, never a
         // queue). Completions drain in done-prefix order as ever.
-        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc.note_staged(FsyncClass::Always);
         gc.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
@@ -1498,7 +1632,7 @@ mod tests {
         gc1.on_fsync_complete(t, Nanos::from_micros(10));
         assert!(!gc1.completion_fsync_due(), "bound 1 never completion-issues");
 
-        let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc2.note_staged(FsyncClass::Always);
         gc2.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc2.register_linked_fsync(Nanos::ZERO);
@@ -1947,7 +2081,7 @@ mod tests {
         // still lets a FUA-capable frame go write-through.
         assert_eq!(gc.frame_plan(true, true), FramePlan::WriteThrough);
         // Bound 2 keeps one slot for the frame behind the seal.
-        let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        let mut gc2: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc2.note_staged(FsyncClass::Always);
         assert_eq!(gc2.frame_plan(false, true), FramePlan::LinkedFsync);
     }
@@ -1972,6 +2106,120 @@ mod tests {
         assert!(outcome.is_err(), "a second FLUSH-class barrier at bound 1 is refused");
     }
 
+    /// An extent's open handle, as the blob writer hands it to the ledger.
+    fn extent_file(fs: &crate::fs::mem::MemFs) -> MemFile {
+        fs.create_dir_all(std::path::Path::new("cold")).expect("mem dir");
+        fs.open_dir(std::path::Path::new("cold")).expect("mem handle")
+    }
+
+    /// Registers one extent through the window; `ran` records whether the
+    /// effect was run.
+    fn register(
+        gc: &mut GroupCommit<MemFile>,
+        fs: &crate::fs::mem::MemFs,
+        ran: &mut bool,
+    ) -> ExtentRegistration<(), ()> {
+        gc.register_extent(Nanos::ZERO, || {
+            *ran = true;
+            Ok((extent_file(fs), ()))
+        })
+    }
+
+    /// Seventeen blob writes in one iteration: sixteen register an extent
+    /// barrier each, and the seventeenth finds the window full before any
+    /// effect — no extent, no file, the ledger unchanged — so at most
+    /// sixteen extent files are held open (the record's red at HEAD read
+    /// seventeen). The window's census row reads its cap and one crossing.
+    #[test]
+    fn seventeen_blob_writes_register_sixteen_extent_barriers() {
+        let fs = crate::fs::mem::MemFs::new();
+        let census = census();
+        let mut gc: GroupCommit<MemFile> = GroupCommit::new(&census);
+        for i in 0..16 {
+            let mut ran = false;
+            let registered = register(&mut gc, &fs, &mut ran);
+            assert!(matches!(registered, ExtentRegistration::Registered(..)), "write {i}");
+            assert!(ran);
+        }
+        let mut ran = false;
+        assert!(matches!(register(&mut gc, &fs, &mut ran), ExtentRegistration::Full));
+        assert!(!ran, "a full window runs no effect");
+        assert_eq!(gc.pending_entries(), 16, "extent barriers unfolded");
+        assert_eq!(gc.extent_window_len(), 16);
+        let row = census.row("extent-window").expect("the window's row");
+        assert_eq!((row.high_water, row.crossings), (16, 1));
+    }
+
+    /// A refused effect (the create, the write or the store failed) gives
+    /// its unit back and registers nothing.
+    #[test]
+    fn a_refused_effect_restores_its_unit() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc = commit();
+        let refused: ExtentRegistration<(), &str> =
+            gc.register_extent(Nanos::ZERO, || Err("the store refused the reference"));
+        assert!(matches!(refused, ExtentRegistration::Refused("the store refused the reference")));
+        assert_eq!((gc.pending_entries(), gc.extent_window_len()), (0, 0));
+        let mut ran = false;
+        assert!(matches!(register(&mut gc, &fs, &mut ran), ExtentRegistration::Registered(..)));
+        assert_eq!((gc.pending_entries(), gc.extent_window_len()), (1, 1));
+    }
+
+    /// Units return at the fold, never at a completion: a done barrier
+    /// behind an undone one keeps its unit until the front folds, and the
+    /// fold frees every unit it passes, in ledger order.
+    #[test]
+    fn window_units_return_at_the_fold_in_ledger_order() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc = commit();
+        let mut tickets = Vec::new();
+        for _ in 0..3 {
+            let mut ran = false;
+            match register(&mut gc, &fs, &mut ran) {
+                ExtentRegistration::Registered(ticket, ()) => tickets.push(ticket),
+                ExtentRegistration::Full | ExtentRegistration::Refused(()) => {
+                    panic!("an empty window registers")
+                }
+            }
+        }
+        // MAINTAIN issues the three fdatasyncs; they complete out of order.
+        gc.issue_extent_syncs(|_| {});
+        gc.on_fsync_complete(tickets[1], Nanos::from_micros(5));
+        assert_eq!(gc.extent_window_len(), 3, "a done barrier behind an undone one holds its unit");
+        gc.on_fsync_complete(tickets[0], Nanos::from_micros(6));
+        assert_eq!(gc.extent_window_len(), 1, "the fold frees both units");
+        gc.on_fsync_complete(tickets[2], Nanos::from_micros(7));
+        assert_eq!((gc.extent_window_len(), gc.pending_entries()), (0, 0));
+    }
+
+    /// MAINTAIN issues each extent barrier's fdatasync once: the entries
+    /// registered since the last issue, oldest first.
+    #[test]
+    fn each_extent_sync_is_issued_once() {
+        let fs = crate::fs::mem::MemFs::new();
+        let mut gc = commit();
+        let mut registered = Vec::new();
+        for _ in 0..2 {
+            let mut ran = false;
+            if let ExtentRegistration::Registered(ticket, ()) = register(&mut gc, &fs, &mut ran) {
+                registered.push(ticket);
+            }
+        }
+        let mut issued = Vec::new();
+        gc.issue_extent_syncs(|sync| issued.push(sync.ticket));
+        assert_eq!(issued, registered);
+        let mut ran = false;
+        let ExtentRegistration::Registered(third, ()) = register(&mut gc, &fs, &mut ran) else {
+            panic!("the window has room");
+        };
+        issued.clear();
+        gc.issue_extent_syncs(|sync| issued.push(sync.ticket));
+        assert_eq!(issued, vec![third], "only the unsent suffix");
+        issued.clear();
+        gc.issue_extent_syncs(|sync| issued.push(sync.ticket));
+        assert!(issued.is_empty(), "nothing is issued twice");
+    }
+
     #[test]
     fn zero_fill_barrier_is_coverage_neutral() {
         // ADR-0086 D4: the zero-fill fdatasync enters at the coverage tail
@@ -1989,7 +2237,7 @@ mod tests {
 
     #[test]
     fn failed_fsync_freezes_the_watermark() {
-        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2);
+        let mut gc: GroupCommit<MemFile> = GroupCommit::with_flush_bound(2, &census());
         gc.note_frame_queued(lsn(0, 100), 100);
         let t1 = gc.register_linked_fsync(Nanos::ZERO);
         write_oldest(&mut gc);

@@ -441,8 +441,8 @@ impl<F: SegmentFs> ExtentWriter<F> {
     /// commit ledger (M4-S26 realizing ADR-0061 D3): writes the tail
     /// frame and returns the durability token **plus the open handle**.
     /// The caller MUST register the handle as a coverage-neutral ledger
-    /// barrier (`GroupCommit::register_extent_barrier`) before staging
-    /// the referencing record, in one synchronous block — the
+    /// barrier (`GroupCommit::register_extent`) before staging the
+    /// referencing record, in one synchronous block — the
     /// done-prefix rule then fences the referencing ack behind the
     /// extent's fdatasync, and a barrier failure freezes the durable
     /// plane (`on_fsync_error` — the ADR's failure half).

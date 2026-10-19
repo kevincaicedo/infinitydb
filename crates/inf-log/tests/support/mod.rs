@@ -393,7 +393,11 @@ impl DurablePlane {
         DurablePlane {
             staging: StagingRing::new(staging),
             rotor,
-            commit: GroupCommit::new(),
+            // The harness's own census: the ledger's extent-seal window
+            // registers its row there (no cell loop marks it).
+            commit: GroupCommit::new(
+                &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+            ),
             gate: WatermarkGate::new(),
             in_flight: VecDeque::new(),
             jobs: VecDeque::new(),
