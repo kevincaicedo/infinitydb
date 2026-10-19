@@ -1607,12 +1607,10 @@ fn run_durable(
         );
         println!("inf-sim: sim_seconds={:.6} published=0 delivered=0", report.sim_seconds);
         print_census(report.cap_rows_checked);
-        for (cell, (high_water, entries_max, crossings)) in
-            report.epoch_marks_cells.iter().enumerate()
-        {
+        for marks in &report.epoch_marks_cells {
             println!(
-                "inf-sim: epoch marks cell {cell}: high_water {high_water} of {entries_max}, \
-                 crossings {crossings}"
+                "inf-sim: epoch marks cell {}: high_water {} of {}, crossings {}",
+                marks.cell, marks.row.high_water, marks.row.entries_max, marks.row.crossings
             );
         }
         for cell in &report.tier_budget_cells {

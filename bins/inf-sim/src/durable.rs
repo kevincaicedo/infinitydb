@@ -29,6 +29,7 @@ use std::rc::Rc;
 use inf_alloc::BufferPool;
 use inf_doc::path::compile;
 use inf_fabric::{Mesh, MeshConfig};
+use inf_foundation::bounded::CapRow;
 use inf_foundation::fault::FaultSpec;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
@@ -1658,8 +1659,17 @@ pub struct DurableReport {
     /// disk's tier-file bytes and ops, and each namespace's flush.
     pub tier_budget_cells: Vec<TierBudgetCell>,
     /// The epoch-marks shape's reclaim-marks row per cell at the cut (empty
-    /// off the shape): `(high_water, entries_max, crossings)`.
-    pub epoch_marks_cells: Vec<(u32, u32, u64)>,
+    /// off the shape).
+    pub epoch_marks_cells: Vec<EpochMarksCell>,
+}
+
+/// One cell's reclaim-marks census row at the cut of an epoch-marks run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochMarksCell {
+    /// The cell the row was read on; a cell with no row has no entry.
+    pub cell: u16,
+    /// The `epoch-marks` row as the cell's census reads it at the cut.
+    pub row: CapRow,
 }
 
 impl DurableReport {

@@ -1812,8 +1812,8 @@ fn epoch_marks_scrape(
     node: &Node,
     report: &mut DurableReport,
 ) {
-    for cell in 0..usize::from(scenario.cells) {
-        let Some(row) = node.plane(cell).cap_census().row("epoch-marks") else {
+    for cell in 0..scenario.cells {
+        let Some(row) = node.plane(usize::from(cell)).cap_census().row("epoch-marks") else {
             let what = format!(
                 "VACUOUS seed {:#x} cell {cell}: cap-row-unfilled — no `epoch-marks` row at the \
                  cut",
@@ -1822,7 +1822,7 @@ fn epoch_marks_scrape(
             report.violations.push(what);
             continue;
         };
-        report.epoch_marks_cells.push((row.high_water, row.entries_max, row.crossings));
+        report.epoch_marks_cells.push(EpochMarksCell { cell, row });
         let (wedge, held) = (row.high_water, row.entries_max);
         let what = match leg {
             EpochMarksLeg::Wedge if wedge < held || row.crossings == 0 => format!(
