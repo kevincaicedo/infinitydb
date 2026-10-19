@@ -166,6 +166,20 @@ impl Arena {
 > No wire, durable or token layout changes. The old signatures below do
 > not establish that the replacement is built.
 
+> **Accepted 2026-10-19, implementation open — ADR-0003 A1:** a standard
+> `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
+> atomics are its foreign lane's; on its own cell's thread a waker
+> operation runs no atomic read-modify-write. A wake from another thread
+> is queued on the executor's remote stack and delivered at its next
+> `run_ready`, and `has_ready` reports it; a parked loop reaches it within
+> its park ceiling, at most 100 ms (`LoopConfig::park_default` is a
+> `ParkCeiling`). A waker that outlives its executor keeps its own header
+> only, freed at its last drop on any thread. A clone that would make
+> one lane count more than 2⁶⁰ − 1 live wakers aborts the process, as
+> `Rc`'s does at its bound. The sketch's "Rc wakers (no atomics)" reads
+> "bridge wakers (no atomics on the owner lane)". No signature in this
+> document changes.
+
 > **Accepted 2026-09-22, implementation open — ADR-0154:** fixed timer
 > ownership and bounded callback delivery replaces TimerWheel/TimerId and
 > the raw-key on_timer contract below. Fallible boot construction admits
@@ -411,7 +425,7 @@ pub trait BackendDriver {
 }
 // impls: KqueueDriver (macOS dev tier) · UringDriver (linux + --features uring) · SimDriver (inf-sim)
 
-// Executor (ADR-0003): !Send futures, Rc wakers (no atomics), slab tasks.
+// Executor (ADR-0003 A1): !Send futures, bridge wakers (no atomics on the owner lane), slab tasks.
 // NOTE: the original sketch (`poll_immediate -> PollImmediate<F>` returning
 // the future on Pending) was unsound — a !Unpin future cannot move after its
 // first poll. The shipped shape places the future into stable storage BEFORE
