@@ -1555,9 +1555,11 @@ fn run_extent_window(seed: u64, leg: ExtentWindowLeg, verify: bool) {
     let report = inf_sim::run_extent_window_scenario(&scenario);
     println!(
         "inf-sim: scenario m4-extent-window leg {} seed {seed:#x}: {} blob writes acked, {} \
-         extent files created, peak {} open, {} frame holds, {} parks, {} steps, hash {:#018x}",
+         clients left, {} extent files created, peak {} open, {} frame holds, {} parks, {} \
+         steps, hash {:#018x}",
         leg.name(),
         report.sets_acked,
+        report.writers_left,
         report.files_created,
         report.handles_peak,
         report.frame_waits_extent,

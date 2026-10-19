@@ -14,8 +14,9 @@
 //!
 //! - the sim disk's peak of open extent descriptors is at most the cap
 //!   (token `extent-handles-over`);
-//! - the extent files the sim disk saw created equal the blob writes
-//!   acknowledged: a parked writer creates none (`extent-files-over-writes`);
+//! - the extent files the sim disk saw created are at most the blob writes
+//!   acknowledged, and the writes of the clients that left: a parked writer
+//!   creates none (`extent-files-over-writes`);
 //! - every reply is the exact `+OK` (`extent-reply-wrong`);
 //! - every writer whose extent file was created at the first step that
 //!   created one has its reply by the step that creates the 33rd file: a
@@ -23,7 +24,12 @@
 //!   whole queue (`extent-hold-overran`, the window's H3);
 //! - no writer is left waiting: a run that stops making progress with a
 //!   reply owed, or ends with a writer parked or a turn out, is red
-//!   (`writer-left-parked`).
+//!   (`writer-left-parked`). On the burst two clients disconnect with a
+//!   write in flight, one parked behind the first window and one at the
+//!   first handout: a disconnect does not cancel a command already parsed
+//!   (the plane runs it to completion, its reply dropped), so their writes
+//!   take their turns like any other and the rest are not held behind
+//!   them.
 //!
 //! And the product's own counts, read as wiring checks with their
 //! engagement: the window's census row held its cap, with a crossing on the
@@ -178,6 +184,8 @@ pub struct ExtentWindowReport {
     pub files_created: usize,
     /// Blob `SET`s acknowledged `+OK`.
     pub sets_acked: u64,
+    /// Clients that disconnected with a write in flight.
+    pub writers_left: u64,
     /// Rows the census oracle read (node sum).
     pub cap_rows_checked: u64,
     /// The cell's `extent-window` census row at the end of the traffic.
@@ -215,6 +223,9 @@ struct Writer {
     key: Option<Vec<u8>>,
     /// It sends nothing before this instant (the cold leg's pacing).
     not_before: Nanos,
+    /// The client closed its connection with a write in flight: no reply
+    /// is read, nothing more is sent.
+    left: bool,
 }
 
 impl Writer {
@@ -232,6 +243,7 @@ impl Writer {
             inflight: true,
             key: None,
             not_before: Nanos(0),
+            left: false,
         }
     }
 
@@ -246,7 +258,13 @@ impl Writer {
     }
 
     fn done(&self) -> bool {
-        self.setup_done && !self.inflight && self.sent >= self.quota
+        self.left || (self.setup_done && !self.inflight && self.sent >= self.quota)
+    }
+
+    /// The client disconnects, its write in flight.
+    fn leave(&mut self, node: &mut Node) {
+        node.nets[0].borrow_mut().client_close(self.fd);
+        self.left = true;
     }
 }
 
@@ -462,9 +480,52 @@ fn drive(
     report: &mut ExtentWindowReport,
 ) {
     let mut idle = 0u64;
+    let mut leavers = Leavers::default();
     while writers.iter().any(|w| !w.done()) {
         if !traffic_step(run, writers, creations, report, &mut idle) {
             return;
+        }
+        if run.scenario.leg == ExtentWindowLeg::Burst {
+            leavers.step(run.node, writers, creations);
+        }
+    }
+    report.writers_left = writers.iter().filter(|w| w.left).count() as u64;
+}
+
+/// The burst's two disconnects, each with a write in flight: the highest
+/// writer outside the first cohort once the cohort's files exist (parked
+/// at the queue's tail), and the lowest outside it once the first handout
+/// has turns out (at the queue's head).
+#[derive(Default)]
+struct Leavers {
+    parked: Option<usize>,
+    at_handout: Option<usize>,
+}
+
+impl Leavers {
+    fn step(&mut self, node: &mut Node, writers: &mut [Writer], creations: &Creations) {
+        let Some(&(first, _)) = creations.log.first() else { return };
+        let cohort: BTreeSet<usize> = creations
+            .log
+            .iter()
+            .take_while(|&&(step, _)| step == first)
+            .filter_map(|&(_, writer)| writer)
+            .collect();
+        let candidate = |w: &&mut Writer| !cohort.contains(&w.id) && !w.left && w.inflight;
+        if self.parked.is_none() {
+            if let Some(writer) = writers.iter_mut().rev().find(candidate) {
+                writer.leave(node);
+                self.parked = Some(writer.id);
+            }
+            return;
+        }
+        let turns_out = node.plane(0).durable_stats().map_or(0, |s| s.extent_turns_out);
+        if self.at_handout.is_none()
+            && turns_out > 0
+            && let Some(writer) = writers.iter_mut().find(candidate)
+        {
+            writer.leave(node);
+            self.at_handout = Some(writer.id);
         }
     }
 }
@@ -521,6 +582,9 @@ fn pump(
     now: Nanos,
     report: &mut ExtentWindowReport,
 ) -> bool {
+    if writer.left {
+        return false;
+    }
     let mut net = node.nets[0].borrow_mut();
     let bytes = net.client_recv(writer.fd);
     let mut progress = !bytes.is_empty();
@@ -585,12 +649,13 @@ fn judge(
             creations.handles_peak
         ));
     }
-    if creations.seen.len() as u64 > report.sets_acked {
+    if creations.seen.len() as u64 > report.sets_acked + report.writers_left {
         report.violations.push(format!(
             "EXTENT WINDOW VIOLATION seed {seed:#x}: extent-files-over-writes — {} extent files \
-             created for {} acknowledged blob writes",
+             created for {} acknowledged blob writes and {} writes of clients that left",
             creations.seen.len(),
-            report.sets_acked
+            report.sets_acked,
+            report.writers_left
         ));
     }
     if report.extent_parked > 0 || report.extent_turns_out > 0 {
@@ -598,6 +663,13 @@ fn judge(
             "EXTENT WINDOW LIVENESS VIOLATION seed {seed:#x}: writer-left-parked — {} writer(s) \
              parked and {} turn(s) out after every reply",
             report.extent_parked, report.extent_turns_out
+        ));
+    }
+    if scenario.leg == ExtentWindowLeg::Burst && report.writers_left < 2 {
+        report.violations.push(format!(
+            "VACUOUS seed {seed:#x}: extent-leave-unengaged — {} of the burst's 2 clients left \
+             with a write in flight",
+            report.writers_left
         ));
     }
     // H2 and H3 are the burst's and the cap's: the cold leg's pacing is its
