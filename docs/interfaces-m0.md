@@ -355,6 +355,16 @@ impl Arena {
 > is published. A cancelled `ColdWait` notifies the cold owner after the
 > gate restores custody (ADR-0152 A2).
 
+> **Accepted 2026-10-19, implementation open — ADR-0181:** ADR-0181
+> restates ADR-0152 with its A1 and A2 in one place (R1–R7) and is the
+> cold-read delivery and preparation contract once accepted. Three
+> changes: the two per-turn limits, `COLD_DELIVERIES_PER_TURN` and
+> `COLD_PREPARATION_WORK_PER_TURN` (64 each), are `inf-runtime::limits`
+> constants; `record_completion` takes the outcome as `Result<(), i32>`
+> and returns `ColdReceipt`, not `()`; and `enqueue` takes the tiered
+> lifetime its pin key names. The three notes above summarize it. Not
+> built.
+
 > **Accepted 2026-09-22, implementation open — ADR-0153:** cold-pool
 > construction and native registration establishes a fallible chunked pool
 > and owned driver binding/release lifecycle. Registration remains on the
