@@ -392,6 +392,43 @@ mod tests {
         assert_eq!(rig.crossings(), 0, "every merge was exact");
     }
 
+    /// `count` ticks, each sealed into a frame with a barrier of its own
+    /// that is written but not folded, the watermark held, then one tick
+    /// more: `count` ack classes.
+    fn sealed_ticks_with_the_watermark_held(count: u32) -> Rig {
+        let mut rig = Rig::new();
+        for _ in 0..count {
+            rig.durable.stage(true);
+            rig.tick();
+            assert!(rig.durable.seal(true));
+            assert!(rig.durable.write());
+        }
+        rig.tick();
+        rig
+    }
+
+    /// The cap's edge from below: 15 and 16 ack classes with the watermark
+    /// held keep one mark each and cross nothing, the row's high water the
+    /// class count; the reclaim epoch equals the list's after every tick
+    /// (the rig checks it while nothing crossed), through every barrier's
+    /// fold.
+    #[test]
+    fn fifteen_and_sixteen_sealed_ticks_hold_one_mark_each_without_a_crossing() {
+        for count in [15, 16] {
+            let mut rig = sealed_ticks_with_the_watermark_held(count);
+            assert_eq!(rig.list.marks.len(), count as usize, "the uncapped rule's marks");
+            assert_eq!(rig.marks.len(), count as usize);
+            let row = rig.census.row("epoch-marks").expect("the marks' row");
+            assert_eq!((row.high_water, row.crossings), (count, 0));
+            for _ in 0..count {
+                assert!(rig.durable.complete(0), "the front barrier completes and folds");
+                rig.tick();
+            }
+            assert_eq!(rig.marks.durable_epoch(), u64::from(count));
+            assert_eq!(rig.crossings(), 0);
+        }
+    }
+
     /// The wedge: 17 ticks, each sealed into a frame with a barrier of its
     /// own that is written but not folded, the watermark held: 17 ack
     /// classes. The marks hold their cap of 16 and count one crossing (the
@@ -399,14 +436,7 @@ mod tests {
     /// fold the reclaim epoch is the list's.
     #[test]
     fn seventeen_sealed_ticks_with_the_watermark_held_hold_sixteen_marks() {
-        let mut rig = Rig::new();
-        for _ in 0..17 {
-            rig.durable.stage(true);
-            rig.tick();
-            assert!(rig.durable.seal(true));
-            assert!(rig.durable.write());
-        }
-        rig.tick();
+        let mut rig = sealed_ticks_with_the_watermark_held(17);
         assert_eq!(rig.list.marks.len(), 17, "the uncapped rule's marks");
         assert_eq!(rig.marks.len(), 16);
         assert_eq!(rig.crossings(), 1);

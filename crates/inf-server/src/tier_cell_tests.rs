@@ -1201,13 +1201,32 @@ fn a_thousand_ticks_inside_one_barrier_period_keep_at_most_two_marks() {
     assert_eq!(row.crossings, 0, "every merge was exact");
 }
 
+/// Every earlier tick's record sealed into a frame with a barrier of its
+/// own, the tick's own record in the builder: one ack class per tick.
+fn own_frame(seq: u64, staged: u64) -> AckClass {
+    if seq < staged { AckClass::Frame(seq) } else { AckClass::Builder }
+}
+
+/// The cap's edge from below: 15 and 16 ticks, each sealed into a frame
+/// with a barrier of its own, the watermark held, keep one mark per ack
+/// class and cross nothing; the row's high water is the class count, and
+/// nothing is reclaimed while nothing is durable, as the uncapped rule.
+#[test]
+fn fifteen_and_sixteen_sealed_ticks_keep_one_mark_each_and_cross_nothing() {
+    for ticks in [15, 16] {
+        let (cell, marks) = tick_marks(own_frame, ticks);
+        assert_eq!(marks as u64, ticks, "{marks} reclaim marks after {ticks} sealed ticks");
+        let row = cell.census.row("epoch-marks").expect("the marks' row");
+        assert_eq!((u64::from(row.high_water), row.crossings), (ticks, 0));
+        assert_eq!(cell.namespaces[0].epoch_marks.durable_epoch(), 0, "nothing durable yet");
+    }
+}
+
 /// 17 ticks, each sealed into a frame with a barrier of its own, the
 /// watermark held: 17 ack classes. Uncapped, 17 marks; capped, the cap's 16
 /// and one crossing, the row at its cap.
 #[test]
 fn seventeen_sealed_ticks_keep_the_cap_and_count_one_crossing() {
-    let own_frame =
-        |seq: u64, staged: u64| if seq < staged { AckClass::Frame(seq) } else { AckClass::Builder };
     let (cell, marks) = tick_marks(own_frame, 17);
     assert!(marks <= 16, "{marks} reclaim marks after 17 sealed ticks with the watermark held");
     let row = cell.census.row("epoch-marks").expect("the marks' row");
