@@ -1771,28 +1771,32 @@ fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> Ope
     }
 }
 
-/// The wedge leg's cut: the first step at which the namespace's extents
-/// were reclaimed after its reclaim marks first crossed their cap. A merged
-/// mark that reclaimed before its later class's barrier would lose the
+/// The wedge leg's cut: the first step at which a cell's namespace extents
+/// were reclaimed after that cell's reclaim marks first crossed their cap. A
+/// merged mark that reclaimed before its later class's barrier would lose the
 /// acknowledged blob values those deaths killed to this cut; a correct one
 /// reclaims only what is durable, and the audit after the reboot reads
-/// every key.
+/// every key. Each cell is judged on its own row and its own reclaims: a
+/// crossing on one cell says nothing of a reclaim on another.
 #[derive(Default)]
 struct MarksCut {
-    reclaimed: u64,
+    /// Each cell's extents reclaimed as of the last step read.
+    reclaimed: Vec<u64>,
 }
 
 impl MarksCut {
     fn due(&mut self, node: &Node) -> bool {
-        let (mut crossed, mut reclaimed) = (false, 0);
-        for cell in 0..node.cells.len() {
+        self.reclaimed.resize(node.cells.len(), 0);
+        let mut due = false;
+        for (cell, last) in self.reclaimed.iter_mut().enumerate() {
             let plane = node.plane(cell);
-            crossed |= plane.cap_census().row("epoch-marks").is_some_and(|row| row.crossings > 0);
-            reclaimed += plane.keyspace().tiering_extent_stats().reclaimed;
+            let crossed =
+                plane.cap_census().row("epoch-marks").is_some_and(|row| row.crossings > 0);
+            let reclaimed = plane.keyspace().tiering_extent_stats().reclaimed;
+            due |= crossed && reclaimed > *last;
+            *last = reclaimed;
         }
-        let rose = reclaimed > self.reclaimed;
-        self.reclaimed = reclaimed;
-        crossed && rose
+        due
     }
 }
 
