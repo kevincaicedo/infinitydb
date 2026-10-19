@@ -1811,7 +1811,8 @@ fn epoch_marks_scrape(
     for cell in 0..usize::from(scenario.cells) {
         let Some(row) = node.plane(cell).cap_census().row("epoch-marks") else {
             let what = format!(
-                "VACUOUS seed {:#x} cell {cell}: cap-row-unfilled — no `epoch-marks` row at the cut",
+                "VACUOUS seed {:#x} cell {cell}: cap-row-unfilled — no `epoch-marks` row at the \
+                 cut",
                 scenario.seed
             );
             report.violations.push(what);
