@@ -383,6 +383,9 @@ fn write_blob<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     let Some(tier) = tier_slot.as_mut() else {
         return Err(WriteBlock::Reply(error_bytes(shared, write.proto, ERR_FAILED)));
     };
+    // Canary: a woken writer gives its turn back and retries as an arrival.
+    #[cfg(inf_canary_extent_window_wake_all)]
+    drop(turn.take());
     // ADR-0163 D2: the extent-seal window paces a blob write before any
     // effect. A writer with no turn passes the arrival test or parks.
     if turn.is_none()

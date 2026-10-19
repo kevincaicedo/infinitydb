@@ -1144,6 +1144,8 @@ impl<F: SegmentFs> DurableCell<F> {
         if !self.commit.extent_barrier_pending() {
             return false;
         }
+        // Canary: nothing closes the window.
+        #[cfg(not(inf_canary_extent_window_handout_at_fold))]
         if self.extent_waiters.close() {
             self.frame_waits_extent += 1;
         }
@@ -1375,7 +1377,11 @@ impl<F: SegmentFs> DurableCell<F> {
             self.zero_fill_ticket = None;
             self.rotor.note_zero_fill_synced();
         }
-        if let Some(end) = self.commit.on_fsync_complete(ticket, cx.now) {
+        let watermark = self.commit.on_fsync_complete(ticket, cx.now);
+        // Canary: the fold hands its freed units out at once.
+        #[cfg(inf_canary_extent_window_handout_at_fold)]
+        self.extent_waiters.hand_out(self.commit.extent_window_len());
+        if let Some(end) = watermark {
             let mut last_covered = None;
             while self.frame_seqs.front().is_some_and(|&(end_lsn, _)| end_lsn <= end) {
                 last_covered = self.frame_seqs.pop_front().map(|(_, seq)| seq);

@@ -50,13 +50,23 @@ pub(crate) enum Arrival {
 /// `open` and no writer is `parked` ahead of it, and, with `turns_out`,
 /// only while a unit is free beyond the `len` entries and the turns.
 pub(crate) fn admit(open: bool, parked: usize, len: usize, turns_out: usize) -> Arrival {
-    if !open || parked > 0 {
-        return Arrival::Park;
+    #[cfg(not(inf_canary_extent_window_arrival_blind))]
+    {
+        if !open || parked > 0 {
+            return Arrival::Park;
+        }
+        if turns_out == 0 || len.saturating_add(turns_out) < ENTRIES {
+            Arrival::Reserve
+        } else {
+            Arrival::Park
+        }
     }
-    if turns_out == 0 || len.saturating_add(turns_out) < ENTRIES {
-        Arrival::Reserve
-    } else {
-        Arrival::Park
+    // Canary: while the window is open every arrival reserves, past the
+    // turns out and the writers parked.
+    #[cfg(inf_canary_extent_window_arrival_blind)]
+    {
+        let _ = (parked, len, turns_out);
+        if open { Arrival::Reserve } else { Arrival::Park }
     }
 }
 
@@ -153,7 +163,20 @@ impl ExtentWaiters {
         let turns_out = queue.turns_out.get();
         debug_assert!(len.saturating_add(turns_out) <= ENTRIES, "every turn has a unit (I12)");
         let free = ENTRIES.saturating_sub(len).saturating_sub(turns_out);
+        #[cfg(not(any(inf_canary_extent_window_no_wake, inf_canary_extent_window_wake_all)))]
         let wakes = free.min(queue.parked.get());
+        // Canary: the handout skips its wakes.
+        #[cfg(inf_canary_extent_window_no_wake)]
+        let wakes = {
+            let _ = free;
+            0
+        };
+        // Canary: the handout wakes every parked writer.
+        #[cfg(inf_canary_extent_window_wake_all)]
+        let wakes = {
+            let _ = free;
+            queue.parked.get()
+        };
         for _ in 0..wakes {
             if !queue.wake_head() {
                 break;

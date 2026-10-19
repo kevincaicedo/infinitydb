@@ -229,6 +229,30 @@ rows=(
   # row holds 17 and the census's cap bound reads it over.
   "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
   "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
+  # The same two plants on the extent-seal window's burst leg. One short,
+  # the window holds 15 of its 16 and the leg's engagement reads it
+  # unfilled; at the cap it admits a 17th extent barrier, which the census
+  # reads over its cap and the sim disk reads as a 17th open extent file.
+  "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg burst"
+  "inf_canary_cap_admits_at_cap m4-extent-window cap-high-water-over --window-leg burst"
+  "inf_canary_cap_admits_at_cap m4-extent-window extent-handles-over --window-leg burst"
+  # ADR-0163 D2 — the extent-seal window's queue, one plant per rule. The
+  # handout skips its wakes: the writers parked behind the first window are
+  # never woken, and the run stops with replies owed.
+  "inf_canary_extent_window_no_wake m4-extent-window writer-left-parked --window-leg burst"
+  # The handout wakes every parked writer and each retries as an arrival:
+  # some 50 cold resolves at once overflow a cold FIFO of 16 places, and a
+  # writer reads `BUSY`.
+  "inf_canary_extent_window_wake_all m4-extent-window extent-reply-busy --window-leg cold"
+  # The fold hands its freed units out at once and nothing closes the
+  # window: blob writers keep registering behind the held frame, so the
+  # first writers' frame waits for the whole queue and they have no reply
+  # by the step that creates the 33rd extent file.
+  "inf_canary_extent_window_handout_at_fold m4-extent-window extent-hold-overran --window-leg burst"
+  # The arrival test ignores the turns out and the writers parked while the
+  # window is open: the 57th writer, sent while the first handout's turns
+  # resolve, takes a unit, and the 16th turn finds the window full.
+  "inf_canary_extent_window_arrival_blind m4-extent-window turn-refused --window-leg cold"
   # ADR-0163 D2 — the reclaim marks, one plant per rule. The back merge
   # takes the later epoch and keeps the earlier seq: a merged mark pops at
   # the earlier class's barrier and reclaims deaths whose killing records
