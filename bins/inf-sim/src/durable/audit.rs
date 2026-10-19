@@ -4,6 +4,13 @@
 
 use super::*;
 
+/// The reply a read answers when a value's blob extent cannot be read, as
+/// the wire carries it: the audit holds its own copy, sharing only the wire
+/// with the server. A recovered key that answers it has lost its extent,
+/// and its violation carries the whitespace-free token
+/// `blob-extent-unreadable`, which no other violation text carries.
+const BLOB_EXTENT_UNREADABLE: &[u8] = b"-ERR blob extent read failed (tier I/O error)\r\n";
+
 /// The §8.2 audit of every durable ledger against the recovered node:
 /// per key, the required op (the last one acked inside the class's
 /// promise before `cut_time`) and the admissible states. With
@@ -71,8 +78,13 @@ pub(super) fn audit_ledgers(
                     .map(|state| state.as_ref().map_or(b"$-1\r\n".to_vec(), |v| bulk(v)))
                     .collect();
                 if !admissible.contains(&reply) {
+                    let loss = if reply == BLOB_EXTENT_UNREADABLE {
+                        "blob-extent-unreadable, "
+                    } else {
+                        ""
+                    };
                     report.violations.push(format!(
-                        "DURABILITY VIOLATION seed {:#x} class {class:?} key {:?}: recovered \
+                        "DURABILITY VIOLATION seed {:#x} class {class:?} key {:?}: {loss}recovered \
                          {:?} is outside the admissible set (required op index {required:?}, \
                          {} ops, ledger tail: {:?})",
                         scenario.seed,

@@ -240,8 +240,9 @@ rows=(
   # sweeps 128, where all green has a chance of about 2e-7. The rule: at
   # least twice the seeds that bring that chance below 1e-3 at the measured
   # rate (58 here); re-measure on 1,024 seeds whenever the wedge leg's
-  # traffic changes.
-  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks DURABILITY --marks-leg wedge --sweep 128"
+  # traffic changes. The expected text is the audit's token for a key whose
+  # extent read fails after the reboot, which no other violation carries.
+  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks blob-extent-unreadable --marks-leg wedge --sweep 128"
   # The class search answers the builder for every seq: a tick replaces the
   # back by every later pair, so a standalone over the written frame leaves
   # its death waiting — the model test reads the reclaim epoch below the
