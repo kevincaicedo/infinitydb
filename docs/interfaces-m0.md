@@ -219,6 +219,20 @@ impl Arena {
 > request. The sketch below is the implemented shape; these additions are
 > not built.
 
+> **Accepted 2026-10-19, implementation open — ADR-0179:** driver op
+> admission. Each op the driver holds takes a slot of its class's slab,
+> from admission to its last completion and, if it was cancelled, its
+> cancellation's; the shares are derived at boot from the cell's capacity
+> (connections, refused-socket custody, listeners) and the producers'
+> constants. `push` still never fails: at the next entry an op of a full
+> class completes `Error { errno: ENOBUFS, buf }` if it is a `RecvArm` or
+> a `Send`, with its buffer and no syscall, and otherwise waits in push
+> order for the first entry with room. A `RecvArm` on an armed descriptor
+> issues nothing; a re-arm while its receive is being cancelled waits for
+> both completions, and `Closed` follows the completions of every op the
+> close cancelled and of their cancellations. The ring's completion queue
+> is sized from the shares.
+
 > (edition-2024 keyword), the Pin-sound `PollImmediate` shape,
 > `FabricGate<V>`, `submit_stats()`/`performance_tier`, fallible
 > `run_iteration`, `CellPlane::on_timer`.

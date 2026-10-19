@@ -569,6 +569,14 @@ interface-freeze discipline). The token *layout* is unchanged; `TokenClass` gain
   refusal aborts the checkpoint with nothing admitted or sealed. A tier
   flush round's write positions are checked when the round opens (the
   flush-round inventory below).
+
+  > **Accepted 2026-10-19, implementation open — ADR-0179:** a `LogWrite`,
+  > `Fdatasync` or `TierRead` whose class (log, tier flush or tier read)
+  > is full waits in push order for the first driver entry with room; it
+  > is never refused and its completion is unchanged. A short write with a
+  > linked sync issues its remainder only once the superseded sync's
+  > completion is reaped, so one frame holds one op slot.
+
 - `WriteBarrier::LinkedFsync { fsync_token }` chains an fdatasync —
   `IOSQE_IO_LINK` on uring (kept unsplittable across submit boundaries),
   issued after the write's completion on fallback tiers.
