@@ -1032,6 +1032,15 @@ the cap, which bounds recovery); `derive_interval` release-asserts
 `ckpt_padding_bytes`, `manifest_bytes_total`, `log_frame_bytes`, and the figure
 `write_amp_milli_log_checkpoint` (+ `_undefined`, ADR-0060 D3 rule).
 
+> **Accepted 2026-10-19, implementation open — ADR-0180:** ADR-0180 restates
+> this section's rule and the ADR-0145 note above it in one place. Before
+> the first checkpoint the interval is the floor alone, not a live-bytes
+> estimate. `derive_interval` asserts `floor ≤ interval`, and
+> `interval ≤ max(cap, floor)` when a cap exists: a cap below the floor
+> yields the floor. `replay_bytes_per_s` is the probed read rows' per-cell
+> share (1 GiB/s only on an unprobed node). `interval_bytes = 0` disables
+> the interval cause only; the relocation-pressure cause is not built.
+
 ## Device budget (`inf-runtime::budget`, M4.5-S36 — ADR-0088 D1/D2b, ADR-0178)
 
 ```rust
