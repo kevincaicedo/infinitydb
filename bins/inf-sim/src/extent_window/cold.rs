@@ -11,7 +11,9 @@
 //! foreground cold intents are the turns' second resolves, at most the
 //! window's 16 — the FIFO's 16 places — so no reply is `BUSY`. A 57th
 //! writer, on a key in RAM, arrives while the first handout's turns
-//! resolve; it parks behind the queue. Every reply is `+OK`, at most 16
+//! resolve; it parks behind the queue. Its command is sent ahead but for
+//! its last two bytes, which follow the handout, so it arrives at the next
+//! iteration, before any turn has resolved. Every reply is `+OK`, at most 16
 //! extent files are open, no turn is refused and no writer is left parked.
 //! Engagement: the release found every writer registered or parked, one to
 //! four of them registered, and the 57th writer was sent while turns were
@@ -89,27 +91,44 @@ pub(super) fn run(
         writer.not_before = Nanos(start + writer.id as u64 * ARRIVAL_GAP_NS);
     }
     let mut phase = Phase::Held;
+    let mut tail: Option<Vec<u8>> = None;
     let mut idle = 0u64;
     while writers.iter().any(|w| !w.done()) {
         if !traffic_step(run, writers, creations, report, &mut idle) {
             return;
         }
+        let last = &mut writers[COLD_WRITERS];
+        if tail.is_none() && last.setup_done && !last.inflight {
+            tail = Some(prime(run.node, last));
+        }
         let Some(stats) = run.node.plane(0).durable_stats() else { continue };
-        phase = match phase {
-            Phase::Held
+        phase = match (phase, &tail) {
+            (Phase::Held, _)
                 if creations.seen.len() as u64 + stats.extent_parks >= COLD_WRITERS as u64 =>
             {
                 run.disk.hold_syncs(None);
                 Phase::Released { registered: creations.seen.len() }
             }
-            Phase::Released { registered } if stats.extent_turns_out > 0 => {
-                writers[COLD_WRITERS].not_before = run.clock.now();
+            (Phase::Released { registered }, Some(bytes)) if stats.extent_turns_out > 0 => {
+                run.node.nets[0].borrow_mut().client_send(writers[COLD_WRITERS].fd, bytes);
                 Phase::Sent { registered }
             }
-            Phase::Held | Phase::Released { .. } | Phase::Sent { .. } => phase,
+            (Phase::Held | Phase::Released { .. } | Phase::Sent { .. }, _) => phase,
         };
     }
     engagement(run.scenario.seed, phase, report);
+}
+
+/// Sends the 57th writer's `SET` but for its last two bytes, which it
+/// returns: the server holds the partial command, unexecuted, until they
+/// follow.
+fn prime(node: &mut Node, last: &mut Writer) -> Vec<u8> {
+    let mut wire = encode(&[b"SET", &last.next_key(), &last.value()]);
+    let tail = wire.split_off(wire.len() - 2);
+    node.nets[0].borrow_mut().client_send(last.fd, &wire);
+    last.sent = 1;
+    last.inflight = true;
+    tail
 }
 
 /// Where the leg is: syncs held; released, with the writers registered at
