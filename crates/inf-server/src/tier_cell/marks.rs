@@ -417,7 +417,11 @@ mod tests {
         for count in [15, 16] {
             let mut rig = sealed_ticks_with_the_watermark_held(count);
             assert_eq!(rig.list.marks.len(), count as usize, "the uncapped rule's marks");
-            assert_eq!(rig.marks.len(), count as usize);
+            let held = rig.marks.len();
+            assert_eq!(
+                held, count as usize,
+                "marks-edge-short — {held} reclaim marks after {count} sealed ticks"
+            );
             let row = rig.census.row("epoch-marks").expect("the marks' row");
             assert_eq!((row.high_water, row.crossings), (count, 0));
             for _ in 0..count {

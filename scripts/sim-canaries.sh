@@ -229,6 +229,13 @@ rows=(
   # row holds 17 and the census's cap bound reads it over.
   "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
   "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
+  # The first plant at the marks' cap edge, at both unit tiers: 15 and 16
+  # ack classes held with the watermark held keep one mark each. One
+  # short, the 16th class merges into the back, and the edge's count
+  # assertion reads 15 where 16 by its token, which no other assertion of
+  # the two tests prints.
+  "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_hold_one_mark_each_without_a_crossing marks-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_keep_one_mark_each_and_cross_nothing marks-edge-short"
   # The same two plants on the extent-seal window's burst leg. One short,
   # the window holds 15 of its 16 and the leg's engagement reads it
   # unfilled; at the cap it admits a 17th extent barrier, which the census

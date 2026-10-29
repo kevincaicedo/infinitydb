@@ -1215,7 +1215,10 @@ fn own_frame(seq: u64, staged: u64) -> AckClass {
 fn fifteen_and_sixteen_sealed_ticks_keep_one_mark_each_and_cross_nothing() {
     for ticks in [15, 16] {
         let (cell, marks) = tick_marks(own_frame, ticks);
-        assert_eq!(marks as u64, ticks, "{marks} reclaim marks after {ticks} sealed ticks");
+        assert_eq!(
+            marks as u64, ticks,
+            "marks-edge-short — {marks} reclaim marks after {ticks} sealed ticks"
+        );
         let row = cell.census.row("epoch-marks").expect("the marks' row");
         assert_eq!((u64::from(row.high_water), row.crossings), (ticks, 0));
         assert_eq!(cell.namespaces[0].epoch_marks.durable_epoch(), 0, "nothing durable yet");
