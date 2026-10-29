@@ -660,9 +660,10 @@ impl FrameStaging {
 
 #[cfg(test)]
 mod tests {
+    use inf_foundation::FileOffset;
     use inf_foundation::bounded::CapCensus;
 
-    use super::{Reservation, WindowKind, WindowNeeds, WindowPool};
+    use super::{PlannedWrites, Reservation, WindowKind, WindowNeeds, WindowPool};
 
     fn pool() -> WindowPool {
         let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
@@ -724,5 +725,45 @@ mod tests {
         let second = pool.take(WindowKind::Batch);
         pool.put(second);
         pool.put(first);
+    }
+
+    fn planned(positions: &[u32]) -> PlannedWrites {
+        let mut writes = PlannedWrites::new();
+        for &position in positions {
+            writes.push(FileOffset::from_u32_bytes(position));
+        }
+        writes
+    }
+
+    /// A writer that reckons a position other than the plan's stops the
+    /// cell at that write, in release builds too: the frame is never
+    /// written at a position the plan laid out for another.
+    #[test]
+    #[should_panic(expected = "the round plan's position is the stage's")]
+    fn a_staged_position_off_the_plan_stops_the_cell() {
+        let mut writes = planned(&[4096, 8192]);
+        let _ = writes.next(4096);
+        let _ = writes.next(12288);
+    }
+
+    /// A writer that pushes a write past the plan's list stops the cell.
+    #[test]
+    #[should_panic(expected = "a staged tier write the plan did not list")]
+    fn a_staged_write_past_the_plan_stops_the_cell() {
+        let mut writes = planned(&[4096]);
+        let _ = writes.next(4096);
+        let _ = writes.next(8192);
+    }
+
+    /// A stage that took fewer positions than its plan listed reads
+    /// unspent — the reading `stage_round` asserts before it issues any op
+    /// of the round — and spent only once the last is taken.
+    #[test]
+    fn a_plan_with_a_position_left_is_not_spent() {
+        let mut writes = planned(&[4096, 8192]);
+        assert_eq!(writes.next(4096).bytes(), 4096);
+        assert!(!writes.is_spent(), "one planned position is left");
+        assert_eq!(writes.next(8192).bytes(), 8192);
+        assert!(writes.is_spent());
     }
 }
