@@ -693,33 +693,46 @@ fn judge(
 
 /// The cap row's fill, on the window's census row: it held its cap, and
 /// crossed it on the burst (the 17th arrival of one iteration) and never at
-/// exactly the cap.
+/// exactly the cap. At exactly the cap the two clauses are judged apart, so
+/// a window that admits one entry fewer reads both: the row holds 15, and
+/// the 16th arrival finds it full, a crossing. A missing row reads
+/// `cap-row-missing`, the census oracle's token for the same fact, never a
+/// fill clause's.
 fn window_row_oracle(scenario: &ExtentWindowScenario, report: &mut ExtentWindowReport) {
     let seed = scenario.seed;
     let Some(row) = report.window_row else {
         report.violations.push(format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — no `extent-window` row at the end"
+            "VACUOUS seed {seed:#x}: cap-row-missing — no `extent-window` row at the end"
         ));
         return;
     };
     let (held, cap, crossings) = (row.high_water, row.entries_max, row.crossings);
     let unfilled = held < cap;
-    let what = match scenario.leg {
-        ExtentWindowLeg::Burst if unfilled || crossings == 0 => format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held {held} of \
-             {cap} with {crossings} crossing(s): the burst never filled it"
-        ),
-        ExtentWindowLeg::Cap if unfilled => format!(
-            "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held {held} of \
-             {cap}: the writers never filled it"
-        ),
-        ExtentWindowLeg::Cap if crossings > 0 => format!(
-            "EXTENT WINDOW VIOLATION seed {seed:#x}: cap-row-crossed — {crossings} crossing(s) \
-             with exactly {cap} writers"
-        ),
-        ExtentWindowLeg::Burst | ExtentWindowLeg::Cap | ExtentWindowLeg::Cold => return,
-    };
-    report.violations.push(what);
+    match scenario.leg {
+        ExtentWindowLeg::Burst => {
+            if unfilled || crossings == 0 {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held \
+                     {held} of {cap} with {crossings} crossing(s): the burst never filled it"
+                ));
+            }
+        }
+        ExtentWindowLeg::Cap => {
+            if unfilled {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x}: cap-row-unfilled — the `extent-window` row held \
+                     {held} of {cap}: the writers never filled it"
+                ));
+            }
+            if crossings > 0 {
+                report.violations.push(format!(
+                    "EXTENT WINDOW VIOLATION seed {seed:#x}: cap-row-crossed — {crossings} \
+                     crossing(s) with exactly {cap} writers"
+                ));
+            }
+        }
+        ExtentWindowLeg::Cold => {}
+    }
 }
 
 /// The hold rule: each writer whose extent file was created at the first

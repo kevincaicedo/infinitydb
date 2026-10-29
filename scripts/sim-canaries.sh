@@ -243,6 +243,14 @@ rows=(
   "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window cap-high-water-over --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window extent-handles-over --window-leg burst"
+  # The first plant on the window's cap leg, whose 16 writers each hold at
+  # most one entry, so at exactly the cap the window fills and never
+  # crosses. One short, the row holds 15 of its 16 and the 16th arrival of
+  # the first burst finds the window full and parks: both of the leg's
+  # clauses read it, each by its own token, on every seed (the refusal is
+  # the writer count's, not the timing's).
+  "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg cap"
+  "inf_canary_cap_minus_one m4-extent-window cap-row-crossed --window-leg cap"
   # ADR-0163 D2 — the extent-seal window's queue, one plant per rule. The
   # handout skips its wakes: the writers parked behind the first window are
   # never woken, and the run stops with replies owed.
