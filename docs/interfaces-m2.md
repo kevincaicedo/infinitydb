@@ -342,6 +342,27 @@ those driver ops against the same `SimDisk`.
 
 ### M4.5-S34 additions (ADR-0086 D4) — `Direct` log segments
 
+> **ADR-0191 (2026-10-29), implementation open:** `SegmentConfig::assert_valid`
+> goes. `Direct` still requires `segment_bytes % 4096 == 0`; the check is row 4
+> of `LogGeometry::new`, the one constructor of the log's checked pair (the
+> log staging domain section, below), which also requires
+> `segment_bytes ≥ max_sealed_frame_bytes(staging, io_mode)`: a segment holds
+> at least the largest frame the staging ring can seal as it lies on the
+> device — `capacity_bytes` packed on a `Buffered` segment, `align_up(
+> capacity_bytes, 4096)` on a `Direct` one — and under `Direct` the two rows
+> together read `segment_bytes ≥ capacity_bytes`. `SegmentRotor::create_fresh`,
+> `create_fresh_deferred` and `open_existing` take a `LogGeometry` in place of a
+> `SegmentConfig` and keep `geometry.segment()` as their configuration; no
+> other constructor takes a `SegmentConfig`. A refused pair is a
+> `LogGeometryError` at construction, never a panic and never a frame refused
+> while serving: `LogError::FrameTooLarge` goes, and `begin_frame` and
+> `begin_frame_deferred` keep the compare
+> `padded_bound(frame_len) ≤ segment_bytes` as a release assertion over an
+> invariant the geometry proves.
+> `SegmentIoMode::layout()` names the mode's `FrameLayout` once
+> (`Buffered → Packed`, `Direct → Aligned`). Not built; the bullets below
+> state the shape as implemented today (ADR-0191 D1, D3, D4).
+
 - `SegmentIoMode::{Buffered, Direct}` on `SegmentConfig::io_mode`
   (default `Buffered` — the M2 path byte-for-byte) plus
   `fua_max_frame_bytes` (the probed write-through crossover, default
@@ -460,6 +481,31 @@ the observed high-water mark (`frames_in_flight_max`). Operator surface:
 `infinityd --frames-in-flight K`; the L5-neutral pairing is `--frames-in-flight
 3 --log-staging-mib 2` (4 × 2 MiB). `StagingConfig::with_capacity(bytes)`
 is the K = 1 constructor tests and tooling use.
+
+> **ADR-0191 (2026-10-29), implementation open:** a ring is built from a
+> `LogGeometry`, the log's checked pair of a `StagingConfig` and a
+> `SegmentConfig`: `StagingRing::new(geometry: LogGeometry)` reads
+> `geometry.staging()`, and no other constructor takes a `StagingConfig`.
+> `LogGeometry::new(staging, segment) -> Result<LogGeometry, LogGeometryError>`
+> is the type's only constructor. It refuses, as a typed error naming the
+> numbers, a `capacity_bytes` below `MIN_FRAME_LEN` (48) or above
+> `DEFAULT_MAX_FRAME_LEN` (64 MiB), a `frames_in_flight` outside
+> `1..=MAX_FRAMES_IN_FLIGHT` (8), a `Direct` `segment_bytes` that is not a
+> multiple of `FRAME_ALIGN`, and a `segment_bytes` below the largest frame the
+> ring can seal as it lies on the device, `max_sealed_frame_bytes(staging,
+> io_mode)` — `capacity_bytes` on a `Buffered` segment (packed),
+> `align_up(capacity_bytes, 4096)` on a `Direct` one (aligned); nothing is
+> allocated before the check. `LogGeometry::DEFAULT` is `new` of the two
+> defaults, evaluated at compile time; `with_staging(staging)` is `new` with
+> the default segment, for a ring with no rotor. `StagingConfig`,
+> `with_capacity(bytes)`, `capacity_bytes`'s per-buffer meaning,
+> `max_record_len` and `resident_bytes` are unchanged: the geometry adds a
+> check, not a value. `infinityd` builds the geometry once the device probe
+> has named the class and refuses a pair the type refuses before it listens,
+> naming `--segment-bytes` and `--log-staging-mib`; `--log-staging-mib`'s own
+> domain is `1..=DEFAULT_MAX_FRAME_LEN >> 20`, written from the constant. Not
+> built; the bullets below state the shape as implemented today (ADR-0191
+> D1, D3).
 
 - EXECUTE: `stage(&MutationEffect) -> Result<StagedAt, StagingFull>` —
   in-place encode, zero steady-state allocation (counting-allocator
@@ -1931,6 +1977,18 @@ idempotence affordance, documented, not a promotion target.
 ---
 
 ## 3. `StagingRing` custody — log-staging domain (`inf-log/src/staging.rs`)
+
+> **ADR-0191 (2026-10-29), implementation open:** rows 3.5 and 3.9 reverse
+> their "keep (per-boot)". The bounds they name —
+> `capacity_bytes ∈ [MIN_FRAME_LEN, DEFAULT_MAX_FRAME_LEN]` and
+> `frames_in_flight ∈ 1..=MAX_FRAMES_IN_FLIGHT` — are rows 1–3 of
+> `LogGeometry::new`, checked once into the type the ring is built from, and
+> `StagingRing::new` asserts neither: a pair outside them is a
+> `LogGeometryError` at construction, never a panic. Row 3.9's allocation
+> facts — buffers = K + 1 allocated once, `resident_bytes` = (K + 1) ×
+> (capacity + 2 × FRAME_ALIGN) — hold by construction, as before. Rows 3.1–3.4
+> and 3.6–3.8 are unchanged. The rows below do not establish that the
+> replacement is built.
 
 Double-buffered frame pair; the **generation token** is the custody
 mechanism (a stale `StagedAt`/`FrameLease` resolving to the wrong LSN would
