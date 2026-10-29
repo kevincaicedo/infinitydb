@@ -361,7 +361,10 @@ impl<F: SegmentFs> TierFlush<F> {
                 }
             }
         }
-        debug_assert!(writes.is_spent(), "the stage pushed every planned write");
+        // Once per round, before any op of it is issued: with the pairing
+        // at every write, a stage that pushed fewer writes than the plan
+        // listed stops here rather than leave a planned position unwritten.
+        assert!(writes.is_spent(), "the stage pushed every planned write");
         debug_assert!(self.round_handles_owned(), "every staged op names a held handle");
     }
 

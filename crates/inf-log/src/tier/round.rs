@@ -541,18 +541,22 @@ impl PlannedWrites {
     }
 
     /// The next planned position. `expected` is the writer's own reckoning
-    /// of it, paired in debug builds: the plan and the stage walk one
-    /// layout.
+    /// of it: the plan and the stage walk one layout, paired at every write
+    /// (with [`is_spent`](Self::is_spent) at the stage's end, a writer that
+    /// pushes more, fewer or other writes than the plan listed stops the
+    /// cell before any op is issued, never writing a frame at a position
+    /// meant for another).
     ///
     /// # Panics
-    /// Panics past the round plan's writes: the plan lists every write its stage
-    /// pushes.
+    /// Panics past the round plan's writes, or on a position the writer
+    /// reckons differently: the plan lists every write its stage pushes,
+    /// in order.
     pub(crate) fn next(&mut self, expected: u64) -> FileOffset {
         let position = self.list[..self.len]
             .get(self.next)
             .copied()
             .expect("a staged tier write the plan did not list");
-        debug_assert_eq!(position.bytes(), expected, "the round plan's position is the stage's");
+        assert_eq!(position.bytes(), expected, "the round plan's position is the stage's");
         self.next += 1;
         position
     }
