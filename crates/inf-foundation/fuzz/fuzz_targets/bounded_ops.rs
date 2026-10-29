@@ -1,21 +1,32 @@
-//! Capped-container op sequences against std models (ADR-0151 D6): a
-//! `Reserve` deque beside a `VecDeque` the target caps by hand, a `Coalesce`
-//! deque beside one the target merges by hand, equal after every op and at
-//! every place (`get`, and `get_mut` edits at a place or the back); the
-//! census row's `high_water` and `crossings` equal the models' at the end;
-//! `len` never passes the cap; a layout past 64 KiB is refused. The models
-//! share no code with `inf_foundation::bounded`.
+//! Capped-container op sequences against std models (ADR-0151 D6, ADR-0171
+//! D5). The first byte picks the family. Deques: a `Reserve` deque beside a
+//! `VecDeque` the target caps by hand, a `Coalesce` deque beside one the
+//! target merges by hand, equal after every op and at every place (`get`,
+//! and `get_mut` edits at a place or the back); the census row's
+//! `high_water` and `crossings` equal the models' at the end; `len` never
+//! passes the cap; a layout past 64 KiB is refused. Slabs: a slab of either
+//! generation policy beside a `BTreeMap<(index, generation), value>`, with
+//! reserves, publishes, dropped reservations, reads, writes, takes of live
+//! and stale handles and slots placed at their last generation, so `Retire`
+//! shrinks the capacity to `Exhausted` and `WrapWithProof` wraps; every
+//! handle read back against the model after every op, and the row's high
+//! water, crossings and capacity equal the model's at the end; the slab is
+//! built and retired one step per chunk or directory. The models share no
+//! code with `inf_foundation::bounded`.
 #![no_main]
 #![allow(
     clippy::disallowed_types,
     reason = "fuzz target: the std models the capped types are checked against"
 )]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::rc::Rc;
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Cap, CapCensus, CapError, CapFill, CappedDeque, Coalesce, Lossy, Merge, Reserve, Reserved,
+    Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedSlab, Coalesce, Generation,
+    GenerationPolicy, Lookup, LookupMut, Lossy, Merge, Reserve, Reserved, Retire, Retiring,
+    SlabReserved, SlotId, Taken, WrapWithProof,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -79,6 +90,14 @@ impl<T> Model<T> {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&head, ops)) = data.split_first() else { return };
+    match (head >> 3) & 3 {
+        0 | 1 => deques(head, ops),
+        2 => slab::<u32, Retire>(head, ops),
+        _ => slab::<u64, WrapWithProof>(head, ops),
+    }
+});
+
+fn deques(head: u8, ops: &[u8]) {
     let which = usize::from(head & 7);
     let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
     let mut reserve = CappedDeque::<u16, Reserve>::new(CAPS[which], &census).expect("fits");
@@ -199,4 +218,162 @@ fuzz_target!(|data: &[u8]| {
     let row = census.row("fuzz-marks").expect("row");
     assert_eq!((row.high_water, row.crossings), (marks_model.high_water, marks_model.crossings));
     assert_eq!(marks.high_water(), marks_model.high_water);
-});
+}
+
+// A chunk holds 64 slots and a directory 256 chunks: one chunk, a chunk
+// edge, and a directory over three chunks.
+// Ops a slab run reads: every op reads back every handle minted, so the run
+// is quadratic in this bound.
+const SLAB_OPS_MAX: usize = 512;
+const SLAB_CAPS: [Cap; 8] = [
+    Cap::entries::<1>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<2>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<3>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<5>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<63>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<64>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<65>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<130>("fuzz-slab", CapFill::Serving),
+];
+
+/// Builds a slab by steps: the steps it took.
+fn built<G: Generation, P: GenerationPolicy>(
+    cap: Cap,
+    census: &Rc<CapCensus>,
+) -> (CappedSlab<u16, G, P>, u32) {
+    let mut builder = CappedSlab::<u16, G, P>::builder(cap, census).expect("fits");
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match builder.step() {
+            Built::More(next) => builder = next,
+            Built::Live(slab) => return (slab, steps),
+            Built::Refused(_, refused) => panic!("{refused}"),
+        }
+    }
+}
+
+/// The slot generations a slab's model expects: the generation each index's
+/// next occupant takes (absent: never used, the first), and the indices
+/// retired at their last generation.
+struct Slots<G> {
+    next: BTreeMap<u32, G>,
+    retired: Vec<u32>,
+}
+
+fn slab<G: Generation + Ord, P: GenerationPolicy>(head: u8, ops: &[u8]) {
+    let cap = SLAB_CAPS[usize::from(head & 7)];
+    let retires = (head >> 3) & 3 == 2;
+    let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
+    let (mut slab, build_steps) = built::<G, P>(cap, &census);
+    let mut model: BTreeMap<(u32, G), u16> = BTreeMap::new();
+    let mut slots = Slots { next: BTreeMap::new(), retired: Vec::new() };
+    // Every handle minted, live or stale; bounded by the ops read.
+    let mut handles: Vec<SlotId<G>> = Vec::new();
+    let mut capacity = cap.entries_max();
+    let (mut high_water, mut crossings) = (0u32, 0u64);
+    for &byte in ops.iter().take(SLAB_OPS_MAX) {
+        let value = u16::from(byte >> 3);
+        let pick = usize::from(value);
+        match byte & 7 {
+            0 | 1 => match slab.reserve() {
+                SlabReserved::Slot(slot) => {
+                    assert!((model.len() as u32) < capacity, "a slot past the capacity");
+                    let id = slot.publish(value);
+                    let (index, generation) = (id.index(), id.generation());
+                    assert!(index < cap.entries_max(), "an index past the cap");
+                    assert!(!slots.retired.contains(&index), "a retired slot served again");
+                    let expected = slots.next.get(&index).copied().unwrap_or(G::FIRST);
+                    assert_eq!(generation, expected, "the slot's next generation");
+                    assert!(model.insert((index, generation), value).is_none(), "one occupant");
+                    handles.push(id);
+                    high_water = high_water.max(model.len() as u32);
+                }
+                SlabReserved::Full => {
+                    assert!(capacity > 0, "Full with no capacity left");
+                    assert_eq!(model.len() as u32, capacity, "Full below the capacity");
+                    crossings += 1;
+                }
+                SlabReserved::Exhausted => assert_eq!(capacity, 0, "Exhausted with capacity"),
+            },
+            2 => match slab.reserve() {
+                SlabReserved::Slot(slot) => drop(slot),
+                SlabReserved::Full => crossings += 1,
+                SlabReserved::Exhausted => assert_eq!(capacity, 0),
+            },
+            3 | 4 if !handles.is_empty() => {
+                let id = handles[pick % handles.len()];
+                let (index, generation) = (id.index(), id.generation());
+                let Some(expected) = model.remove(&(index, generation)) else {
+                    assert_eq!(slab.take(id), Taken::Stale, "a stale handle");
+                    continue;
+                };
+                assert_eq!(slab.take(id), Taken::Value(expected));
+                let next =
+                    if retires { generation.after() } else { Some(generation.after_wrapped()) };
+                match next {
+                    Some(next) => {
+                        slots.next.insert(index, next);
+                    }
+                    None => {
+                        slots.retired.push(index);
+                        capacity -= 1;
+                    }
+                }
+            }
+            5 if !handles.is_empty() => {
+                let at = pick % handles.len();
+                let mut id = handles[at];
+                let (index, generation) = (id.index(), id.generation());
+                let placed = slab.place_generation_last(&mut id);
+                match model.remove(&(index, generation)) {
+                    Some(held) => {
+                        assert!(matches!(placed, LookupMut::Live(_)), "a live slot is placed");
+                        model.insert((index, G::LAST), held);
+                        assert_eq!(id.generation(), G::LAST);
+                        handles[at] = id;
+                    }
+                    None => assert!(matches!(placed, LookupMut::Stale), "a stale handle"),
+                }
+            }
+            6 if !handles.is_empty() => {
+                let id = handles[pick % handles.len()];
+                match (slab.get_mut(id), model.get_mut(&(id.index(), id.generation()))) {
+                    (LookupMut::Live(found), Some(expected)) => {
+                        *found = value;
+                        *expected = value;
+                    }
+                    (LookupMut::Stale, None) => {}
+                    (LookupMut::Live(_) | LookupMut::Stale | LookupMut::Vacant, _) => {
+                        panic!("get_mut disagrees with the model")
+                    }
+                }
+            }
+            _ => {}
+        }
+        assert_eq!(slab.len() as usize, model.len());
+        assert_eq!(slab.capacity_now(), capacity);
+        for id in &handles {
+            match (slab.get(*id), model.get(&(id.index(), id.generation()))) {
+                (Lookup::Live(found), Some(expected)) => assert_eq!(found, expected),
+                (Lookup::Stale, None) => {}
+                (Lookup::Live(_) | Lookup::Stale | Lookup::Vacant, _) => {
+                    panic!("get disagrees with the model")
+                }
+            }
+        }
+    }
+    let row = census.row("fuzz-slab").expect("row");
+    assert_eq!((row.high_water, row.crossings), (high_water, crossings));
+    assert_eq!(row.capacity_now, capacity);
+    let mut retiring = slab.retire();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match retiring.step() {
+            Retiring::More(next) => retiring = next,
+            Retiring::Done => break,
+        }
+    }
+    assert_eq!(steps, build_steps, "one retire step per item built");
+}

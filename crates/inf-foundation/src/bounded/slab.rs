@@ -106,7 +106,9 @@ impl GenerationPolicy for WrapWithProof {
 }
 
 /// A slot's identity: its index, the generation its occupant took and the
-/// slab that minted it. Only a slab mints one, at `publish`.
+/// slab that minted it. Only a slab mints one, at `publish`; its parts read
+/// out, so a model or an adapter can name them, but nothing outside this
+/// module builds one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SlotId<G> {
     index: u32,
@@ -114,7 +116,19 @@ pub struct SlotId<G> {
     instance: SlabInstance,
 }
 
-impl<G> SlotId<G> {
+impl<G: Copy> SlotId<G> {
+    /// The slot's index in the slab that minted this handle.
+    #[must_use]
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// The generation the occupant this handle names took.
+    #[must_use]
+    pub fn generation(&self) -> G {
+        self.generation
+    }
+
     /// The slab that minted this handle.
     #[must_use]
     pub fn instance(&self) -> SlabInstance {

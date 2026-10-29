@@ -12,7 +12,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-inf-foundation = { path = ".." }
+# `fault-points` compiles the slab's `place_generation_last` hook, which the
+# slab runs use to reach each policy's last generation; this standalone
+# workspace builds nothing that ships.
+inf-foundation = { path = "..", features = ["fault-points"] }
 
 [[bin]]
 name = "bounded_ops"
