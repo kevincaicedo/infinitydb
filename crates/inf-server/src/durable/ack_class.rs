@@ -71,7 +71,15 @@ pub(crate) fn ack_class_of(
         let _ = (front, back, watermark, seq);
         AckClass::Builder
     }
-    #[cfg(not(inf_canary_epoch_mark_class_blind))]
+    // Canary: every seq above the watermark reads as a class of its own, so
+    // no two marks merge and each tick that staged a write takes a mark:
+    // inside one barrier period the marks fill to their cap and cross it.
+    #[cfg(inf_canary_epoch_mark_class_per_seq)]
+    {
+        let _ = (front, back);
+        if seq <= watermark { AckClass::Covered } else { AckClass::Frame(seq) }
+    }
+    #[cfg(not(any(inf_canary_epoch_mark_class_blind, inf_canary_epoch_mark_class_per_seq)))]
     {
         if seq <= watermark {
             return AckClass::Covered;

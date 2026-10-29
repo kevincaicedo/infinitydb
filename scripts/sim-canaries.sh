@@ -279,6 +279,19 @@ rows=(
   # its death waiting — the model test reads the reclaim epoch below the
   # uncapped rule's.
   "inf_canary_epoch_mark_class_blind crate-test inf-server lib a_standalone_over_the_written_frame_reclaims_its_death below the list's"
+  # The marks' everysec leg, below the cap: no wedge, so every merge is
+  # exact, no crossing, and at least two marks held. A class search that
+  # reads every seq above the watermark as its own class merges nothing:
+  # the hundreds of ticks inside one barrier period fill the marks and
+  # cross their cap. On the planted build 256 of 256 seeds from 0xC0FFEE
+  # are red (at least 16 crossings a cell), so one seed catches;
+  # re-measure on 256 seeds whenever the leg's traffic changes.
+  "inf_canary_epoch_mark_class_per_seq m4-epoch-marks everysec-marks-crossed --marks-leg everysec"
+  # The class-blind search on the same leg: every tick replaces the back,
+  # so one mark is held where the leg holds two, and its vacuity clause
+  # reads it. On the planted build 256 of 256 seeds from 0xC0FFEE are red
+  # (one mark on every cell), so one seed catches.
+  "inf_canary_epoch_mark_class_blind m4-epoch-marks everysec-marks-unheld --marks-leg everysec"
   # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
   # above the tail — no pad. The room property judges every demote target
   # (a page multiple above the head, at or below the tail) and the placed
