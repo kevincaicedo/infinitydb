@@ -712,54 +712,308 @@ mod tests {
         assert_eq!(census.row("one").expect("row").crossings, 0);
     }
 
-    /// The model: one `BTreeMap<(index, generation), value>` per instance,
-    /// sharing no code with the slab. Every op is checked against it, and
-    /// every live handle the run holds is read back after it.
-    fn model_run<G: Generation + Ord, P: GenerationPolicy>(cap: Cap, seed: u64, ops: u32) {
-        let (census, _mark) = census();
-        let (mut slab, _) = built::<u64, G, P>(cap, &census);
-        let mut model: BTreeMap<(u32, G), u64> = BTreeMap::new();
-        let mut handles: Vec<SlotId<G>> = Vec::new();
-        let mut rng = SplitMix64::new(seed);
-        let cap_entries = u64::from(cap.entries_max());
-        for op in 0..ops {
-            let value = u64::from(op);
-            match rng.next_below(4) {
-                0 | 1 => match slab.reserve() {
-                    SlabReserved::Slot(slot) => {
-                        assert!((model.len() as u64) < cap_entries, "a slot below the cap");
-                        let id = slot.publish(value);
-                        assert_eq!(id.instance, slab.instance());
-                        assert!(model.insert((id.index, id.generation), value).is_none());
-                        handles.push(id);
-                    }
-                    SlabReserved::Full => assert_eq!(model.len() as u64, cap_entries, "Full"),
-                    SlabReserved::Exhausted => panic!("no slot of this run retires"),
-                },
-                2 if !handles.is_empty() => {
-                    let pick = rng.next_below(handles.len() as u64) as usize;
-                    let id = handles[pick];
-                    match model.remove(&(id.index, id.generation)) {
-                        Some(expected) => assert_eq!(slab.take(id), Taken::Value(expected)),
-                        None => assert_eq!(slab.take(id), Taken::Stale, "a stale handle"),
+    /// The model's own generation arithmetic, sharing no code with
+    /// `Generation`: a wrong `FIRST`, `LAST` or step there disagrees with it.
+    trait ModelGeneration: Copy + Ord + fmt::Debug {
+        const ZERO: Self;
+        const MAX: Self;
+        fn successor(self) -> Option<Self>;
+    }
+
+    macro_rules! model_generation {
+        ($($width:ty),*) => {$(
+            impl ModelGeneration for $width {
+                const ZERO: Self = 0;
+                const MAX: Self = <$width>::MAX;
+
+                fn successor(self) -> Option<Self> {
+                    self.checked_add(1)
+                }
+            }
+        )*};
+    }
+    model_generation!(u32, u64);
+
+    /// What the model expects of a policy when a slot's last generation is
+    /// taken (ADR-0171 D2).
+    #[derive(Clone, Copy)]
+    enum AtLast {
+        /// The slot never serves again; the slab serves one slot fewer.
+        Retires,
+        /// The slot's next occupant takes the first generation.
+        Wraps,
+    }
+
+    trait ModelPolicy {
+        const AT_LAST: AtLast;
+    }
+
+    impl ModelPolicy for Retire {
+        const AT_LAST: AtLast = AtLast::Retires;
+    }
+
+    impl ModelPolicy for WrapWithProof {
+        const AT_LAST: AtLast = AtLast::Wraps;
+    }
+
+    /// The four accesses that answer a handle against its slot.
+    #[derive(Clone, Copy)]
+    enum Access {
+        Get,
+        GetMut,
+        Take,
+        Hook,
+    }
+
+    /// Per access, the ops that named a handle whose slot is free at the
+    /// handle's generation (a wrap brought it back) or retired: the states
+    /// an answer for a slot not live at the handle's generation is read on.
+    /// A zero means the model checked nothing of that state on that access.
+    #[derive(Default)]
+    struct Reach {
+        free_at_generation: [u64; 4],
+        retired: [u64; 4],
+    }
+
+    /// The model of one slab: its occupants by `(index, generation)`, by
+    /// index the generation the slot's next occupant takes (`None`: the slot
+    /// retired), the slots left to serve, the row's high water and
+    /// crossings, and what its ops reached.
+    struct Model<G> {
+        live: BTreeMap<(u32, G), u64>,
+        next: Vec<Option<G>>,
+        capacity: u32,
+        high_water: u32,
+        crossings: u64,
+        reach: Reach,
+    }
+
+    impl<G: ModelGeneration> Model<G> {
+        /// The generation slot `index`'s next occupant takes, `None` once
+        /// the slot retired.
+        fn next_generation(&self, index: u32) -> Option<G> {
+            self.next[index as usize]
+        }
+
+        /// Counts an access to `id` on the model's state before the op.
+        fn note(&mut self, id: &SlotId<G>, access: Access) {
+            let access = access as usize;
+            match self.next_generation(id.index) {
+                None => self.reach.retired[access] += 1,
+                Some(next) if next == id.generation => {
+                    let range = (id.index, G::ZERO)..=(id.index, G::MAX);
+                    if self.live.range(range).next().is_none() {
+                        self.reach.free_at_generation[access] += 1;
                     }
                 }
-                _ => {}
+                Some(_) => {}
             }
-            assert_eq!(slab.len() as usize, model.len());
+        }
+
+        /// The occupant at `(index, generation)` left: the next generation,
+        /// or at the last the policy's answer.
+        fn vacate(&mut self, index: u32, generation: G, at_last: AtLast) {
+            let next = &mut self.next[index as usize];
+            assert_eq!(*next, Some(generation), "the occupant took the slot's generation");
+            match (generation.successor(), at_last) {
+                (Some(after), AtLast::Retires | AtLast::Wraps) => *next = Some(after),
+                (None, AtLast::Retires) => {
+                    *next = None;
+                    self.capacity -= 1;
+                }
+                (None, AtLast::Wraps) => *next = Some(G::ZERO),
+            }
+        }
+    }
+
+    /// A handle for an op to name, from the limits of a generation: any
+    /// handle the run minted, a live occupant's (so the hook and a take
+    /// reach the last generation), or one at the first generation (the
+    /// handle a wrap brings a free slot back to).
+    fn pick<G: ModelGeneration>(
+        rng: &mut SplitMix64,
+        handles: &[SlotId<G>],
+        model: &Model<G>,
+    ) -> usize {
+        let uniform = rng.next_below(handles.len() as u64) as usize;
+        let live = |id: &SlotId<G>| model.live.contains_key(&(id.index, id.generation));
+        let first = |id: &SlotId<G>| id.generation == G::ZERO;
+        let wanted: &dyn Fn(&SlotId<G>) -> bool = match rng.next_below(3) {
+            0 => return uniform,
+            1 => &live,
+            _ => &first,
+        };
+        let count = handles.iter().filter(|id| wanted(id)).count();
+        if count == 0 {
+            return uniform;
+        }
+        let nth = rng.next_below(count as u64) as usize;
+        handles.iter().enumerate().filter(|(_, id)| wanted(id)).nth(nth).map_or(uniform, |(i, _)| i)
+    }
+
+    fn model_publish<G: Generation + ModelGeneration, P: GenerationPolicy>(
+        slab: &mut CappedSlab<u64, G, P>,
+        model: &mut Model<G>,
+        handles: &mut Vec<SlotId<G>>,
+        value: u64,
+    ) {
+        let instance = slab.instance();
+        match slab.reserve() {
+            SlabReserved::Slot(slot) => {
+                assert!((model.live.len() as u64) < u64::from(model.capacity), "a slot to serve");
+                let id = slot.publish(value);
+                assert_eq!(id.instance, instance);
+                assert!((id.index as usize) < model.next.len(), "an index past the cap");
+                let next = model.next_generation(id.index).expect("a retired slot served again");
+                assert_eq!(id.generation, next, "the slot's next generation");
+                assert!(model.live.insert((id.index, id.generation), value).is_none());
+                model.high_water = model.high_water.max(model.live.len() as u32);
+                handles.push(id);
+            }
+            SlabReserved::Full => {
+                assert!(model.capacity > 0, "Full with no slot left");
+                assert_eq!(model.live.len() as u64, u64::from(model.capacity), "Full");
+                model.crossings += 1;
+            }
+            SlabReserved::Exhausted => assert_eq!(model.capacity, 0, "Exhausted with a slot left"),
+        }
+    }
+
+    fn model_take<G: Generation + ModelGeneration, P: GenerationPolicy + ModelPolicy>(
+        slab: &mut CappedSlab<u64, G, P>,
+        model: &mut Model<G>,
+        id: SlotId<G>,
+    ) {
+        model.note(&id, Access::Take);
+        match model.live.remove(&(id.index, id.generation)) {
+            Some(expected) => {
+                assert_eq!(slab.take(id), Taken::Value(expected));
+                model.vacate(id.index, id.generation, P::AT_LAST);
+            }
+            None => assert_eq!(slab.take(id), Taken::Stale, "{id:?}: a stale take"),
+        }
+    }
+
+    fn model_write<G: Generation + ModelGeneration, P: GenerationPolicy>(
+        slab: &mut CappedSlab<u64, G, P>,
+        model: &mut Model<G>,
+        id: SlotId<G>,
+        value: u64,
+    ) {
+        model.note(&id, Access::GetMut);
+        match (slab.get_mut(id), model.live.get_mut(&(id.index, id.generation))) {
+            (LookupMut::Live(found), Some(expected)) => {
+                assert_eq!(*found, *expected);
+                *found = value;
+                *expected = value;
+            }
+            (LookupMut::Stale, None) => {}
+            (found, expected) => panic!("{id:?}: get_mut {found:?}, model {expected:?}"),
+        }
+    }
+
+    /// The test hook on `handles[at]`: a live occupant moves to the model's
+    /// last generation with its handle; any other handle is `Stale` and
+    /// keeps its generation.
+    fn model_place_last<G: Generation + ModelGeneration, P: GenerationPolicy>(
+        slab: &mut CappedSlab<u64, G, P>,
+        model: &mut Model<G>,
+        handles: &mut [SlotId<G>],
+        at: usize,
+    ) {
+        let before = handles[at];
+        model.note(&before, Access::Hook);
+        let held = model.live.remove(&(before.index, before.generation));
+        match (slab.place_generation_last(&mut handles[at]), held) {
+            (LookupMut::Live(found), Some(expected)) => assert_eq!(*found, expected),
+            (LookupMut::Stale, None) => {}
+            (found, expected) => panic!("{before:?}: the hook {found:?}, model {expected:?}"),
+        }
+        let after = handles[at];
+        assert_eq!((after.index, after.instance), (before.index, before.instance));
+        match held {
+            Some(value) => {
+                assert_eq!(after.generation, G::MAX, "the hook re-stamps a live handle");
+                assert!(model.live.insert((after.index, G::MAX), value).is_none());
+                model.next[after.index as usize] = Some(G::MAX);
+            }
+            None => assert_eq!(after.generation, before.generation, "a stale handle stays"),
+        }
+    }
+
+    /// The model: a `BTreeMap<(index, generation), value>` per instance with
+    /// the slots' next generations, the retired slots and the capacity left,
+    /// sharing no code with the slab. Publishes, takes, writes through
+    /// `get_mut` and the test hook's placements at the last generation are
+    /// each checked against it, so a slot retires (`Retire`) or wraps
+    /// (`WrapWithProof`) under random sequences; every handle the run minted
+    /// is read back through `get` after every op, and the row's high water,
+    /// crossings and capacity equal the model's at the end. Returns what the
+    /// run's ops reached.
+    fn model_run<G, P>(cap: Cap, seed: u64, ops: u32) -> Reach
+    where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy + ModelPolicy,
+    {
+        let (census, _mark) = census();
+        let (mut slab, _) = built::<u64, G, P>(cap, &census);
+        let mut model = Model {
+            live: BTreeMap::new(),
+            next: vec![Some(G::ZERO); cap.entries_max() as usize],
+            capacity: cap.entries_max(),
+            high_water: 0,
+            crossings: 0,
+            reach: Reach::default(),
+        };
+        let mut handles: Vec<SlotId<G>> = Vec::new();
+        let mut rng = SplitMix64::new(seed);
+        for op in 0..ops {
+            let value = u64::from(op);
+            let kind = rng.next_below(16);
+            if kind < 8 || handles.is_empty() {
+                model_publish(&mut slab, &mut model, &mut handles, value);
+            } else {
+                let at = pick(&mut rng, &handles, &model);
+                match kind {
+                    8..=10 => model_take(&mut slab, &mut model, handles[at]),
+                    11 | 12 => model_write(&mut slab, &mut model, handles[at], value),
+                    13 => model_place_last(&mut slab, &mut model, &mut handles, at),
+                    _ => {}
+                }
+            }
+            assert_eq!(slab.len() as usize, model.live.len());
+            assert_eq!(slab.capacity_now(), model.capacity);
             for id in &handles {
-                match (model.get(&(id.index, id.generation)), slab.get(*id)) {
+                model.note(id, Access::Get);
+                match (model.live.get(&(id.index, id.generation)), slab.get(*id)) {
                     (Some(expected), Lookup::Live(found)) => assert_eq!(found, expected),
                     (None, Lookup::Stale) => {}
-                    (expected, _) => panic!("{id:?}: model {expected:?}, slab disagrees"),
+                    (expected, found) => panic!("{id:?}: get {found:?}, model {expected:?}"),
                 }
             }
         }
+        let row = census.row(cap.name()).expect("row");
+        assert_eq!(
+            (row.high_water, row.crossings, row.capacity_now),
+            (model.high_water, model.crossings, model.capacity)
+        );
         census.mark_stopping();
+        model.reach
     }
 
+    fn add(sum: &mut [u64; 4], run: [u64; 4]) {
+        for (total, count) in sum.iter_mut().zip(run) {
+            *total += count;
+        }
+    }
+
+    /// Both policies at both widths, across the chunk and directory edges.
+    /// Engagement: each of the four accesses named a handle whose slot had
+    /// retired (`Retire` runs) and one whose slot had wrapped back to the
+    /// handle's generation while free (`WrapWithProof` runs).
     #[test]
     fn the_slab_equals_its_model_across_chunk_and_directory_edges() {
+        let (mut retired, mut wrapped) = ([0; 4], [0; 4]);
         for (index, cap) in [
             Cap::entries::<1>("m-1", CapFill::Serving),
             Cap::entries::<2>("m-2", CapFill::Serving),
@@ -771,9 +1025,17 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            model_run::<u32, Retire>(cap, 0x51AB + index as u64, 3_000);
-            model_run::<u64, WrapWithProof>(cap, 0x51AC + index as u64, 3_000);
+            let seed = 0x51AB + 4 * index as u64;
+            add(&mut retired, model_run::<u32, Retire>(cap, seed, 3_000).retired);
+            add(&mut retired, model_run::<u64, Retire>(cap, seed + 1, 3_000).retired);
+            let wraps = model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000);
+            add(&mut wrapped, wraps.free_at_generation);
+            let wraps = model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000);
+            add(&mut wrapped, wraps.free_at_generation);
         }
+        // Get, GetMut, Take, Hook.
+        assert!(retired.iter().all(|count| *count > 0), "a retired slot unread: {retired:?}");
+        assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
     }
 
     /// Two instances on one census, built and populated by the same ops,
