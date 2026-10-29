@@ -1365,13 +1365,20 @@ mod tests {
         assert!(caps.contains("# Caps\r\ncaps_scope:cell\r\n"), "{caps}");
         assert!(caps.contains("cap_census_phase:serving\r\n"), "{caps}");
         assert!(caps.contains("cap_assembly_violations:0\r\n"), "{caps}");
+        assert!(caps.contains("cap_unsliced_drops:0\r\n"), "{caps}");
         assert!(caps.contains("cap_rows:2\r\n"), "{caps}");
         assert!(
-            caps.contains("cap_row_pairs:entries_max=2,fill=serving,high_water=2,crossings=1\r\n"),
+            caps.contains(
+                "cap_row_pairs:entries_max=2,fill=serving,high_water=2,crossings=1,\
+                 capacity_now=2\r\n"
+            ),
             "{caps}"
         );
         assert!(
-            caps.contains("cap_row_marks:entries_max=3,fill=serving,high_water=3,crossings=2\r\n"),
+            caps.contains(
+                "cap_row_marks:entries_max=3,fill=serving,high_water=3,crossings=2,\
+                 capacity_now=3\r\n"
+            ),
             "{caps}"
         );
         let all = String::from_utf8(run(&mut cx, &mut store, &[b"INFO"])).expect("ascii");

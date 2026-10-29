@@ -1376,7 +1376,8 @@ sections. Mind the scope: on a node with a data directory, `memory` and
 cell), while `persistence`, `tiering`, `caps` and `tripwires` always describe
 the cell that served the `INFO` command. Multiply before comparing those to
 the process as a whole. `caps` lists the cell's capped containers, one line
-each: its cap, the most entries it has held and how many times it was full.
+each: its cap, the most entries it has held, how many times it was full, and
+its capacity now, which a slab that retires worn-out slots lowers.
 
 The tripwires are always on, and turning them off is only possible in an
 A/B build that proves they cost nothing: SQEs per submit, CQEs per reap,

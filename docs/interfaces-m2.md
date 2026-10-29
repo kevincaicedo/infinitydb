@@ -1172,21 +1172,34 @@ Every capped container of a cell registers a row of that cell's
 `CapCensus`: its cap name, its cap, its fill (`Serving`: filled while the
 cell serves; `Assembly`: filled whole before the serve mark), its
 `high_water` (the most entries one instance has held, the maximum over the
-row's instances in the cell) and its `crossings` (`Full` answers and cap
-merges, summed over them). Instances of one cap name share one row.
+row's instances in the cell), its `crossings` (`Full` answers and cap
+merges, summed over them) and its `capacity_now` (the cap, less the slots a
+`Retire` slab retired at their last generation: the minimum over the
+instances, so a row that crossed holds `capacity_now ≤ high_water`).
+Instances of one cap name share one row.
 `ServerPlane::new` builds the census once, with its cell's id, beside its
 one `ServeMark`; the cell's loop takes the mark as its first iteration
 begins (the census goes `Assembling` → `Serving`). At the mark an
 `Assembly` row whose live count is below its cap is a violation, and so
 is any publish, crossing or registration on an `Assembly` row after it:
 each counts in `cap_assembly_violations` (cell scope) and is a debug
-assertion carrying `cap-assembly-violated`.
+assertion carrying `cap-assembly-violated`. Each of the cell's two
+aggregates that own its containers, its loop (`CellLoop`) and its plane
+(`ServerPlane`), marks the census `Stopping` in its `Drop`, before its
+fields drop; the mark is idempotent, so the order between the two is no
+one's. A slab's slot store (ADR-0171 D3) dropped holding a chunk or a
+directory while the census is `Serving` is a release
+no step sliced: it counts in `cap_unsliced_drops` (cell scope) and is a
+debug assertion carrying `unsliced-drop`, outside an unwind. Dropped while
+`Assembling` it is an abandoned assembly, once `Stopping` process teardown;
+neither counts.
 
 `INFO caps`, cell scope (a node fold is the reader's sum):
 `caps_scope:cell`, `cap_census_phase` (`assembling`, `serving`,
-`stopping`), `cap_assembly_violations`, `cap_rows`, and per row
-`cap_row_<name>:entries_max=…,fill=…,high_water=…,crossings=…`. A harness
-that attaches no census renders no section.
+`stopping`), `cap_assembly_violations`, `cap_unsliced_drops`, `cap_rows`,
+and per row
+`cap_row_<name>:entries_max=…,fill=…,high_water=…,crossings=…,capacity_now=…`.
+A harness that attaches no census renders no section.
 
 **Extent-reclaim marks (`epoch-marks`, ADR-0061 D5).** Each tiered
 namespace's `(seq, epoch)` reclaim marks are a

@@ -1124,11 +1124,14 @@ fn tiering_section(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
 /// `INFO caps` — the cell's cap census (ADR-0163 D2), cell scope: one line
 /// per capped container's row, `cap_row_<name>:` with its cap, its fill,
 /// its `high_water` (the most entries any one instance of the row has held
-/// at once, the maximum over the cell's instances) and its `crossings` (the
-/// `Full` answers and cap merges, summed over them), beside the census's
-/// phase and `cap_assembly_violations`, this cell's count. A bare harness
-/// with no census attached renders no section; a node fold is the reader's
-/// sum over the cells.
+/// at once, the maximum over the cell's instances), its `crossings` (the
+/// `Full` answers and cap merges, summed over them) and its `capacity_now`
+/// (the cap, less the slots a slab retired at their last generation: the
+/// minimum over the instances), beside the census's phase,
+/// `cap_assembly_violations` and `cap_unsliced_drops` (capped stores dropped
+/// whole while the cell served), this cell's counts. A bare harness with no
+/// census attached renders no section; a node fold is the reader's sum over
+/// the cells.
 fn caps_section(node: &NodeInfo, text: &mut String) {
     let census = node.cap_census.borrow();
     let Some(census) = census.as_ref() else { return };
@@ -1141,6 +1144,7 @@ fn caps_section(node: &NodeInfo, text: &mut String) {
     };
     push(text, &format!("cap_census_phase:{phase}"));
     push(text, &format!("cap_assembly_violations:{}", census.cap_assembly_violations()));
+    push(text, &format!("cap_unsliced_drops:{}", census.unsliced_drops()));
     push(text, &format!("cap_rows:{}", census.rows().count()));
     for row in census.rows() {
         let fill = match row.fill {
@@ -1150,8 +1154,8 @@ fn caps_section(node: &NodeInfo, text: &mut String) {
         push(
             text,
             &format!(
-                "cap_row_{}:entries_max={},fill={fill},high_water={},crossings={}",
-                row.name, row.entries_max, row.high_water, row.crossings
+                "cap_row_{}:entries_max={},fill={fill},high_water={},crossings={},capacity_now={}",
+                row.name, row.entries_max, row.high_water, row.crossings, row.capacity_now
             ),
         );
     }
