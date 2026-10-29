@@ -262,7 +262,7 @@ fn window_row(caps: &str) -> (u64, u64) {
 }
 
 #[test]
-fn a_burst_of_blob_writes_holds_at_most_the_window_of_extent_descriptors() {
+fn a_blob_burst_holds_at_most_the_window_of_extent_descriptors_and_a_closed_writer_lands() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/e2e-extent-window")
         .join(std::process::id().to_string());
