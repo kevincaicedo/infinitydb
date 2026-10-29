@@ -1,10 +1,16 @@
 #![allow(
     clippy::disallowed_types,
-    reason = "bench target: the std deque is the A leg the capped type is measured against"
+    reason = "bench target: the std containers are the A legs the capped types are measured against"
 )]
 //! The capped deque's A/B by instructions (L4): one push and one pop per op
 //! on `VecDeque::with_capacity` (A) and on `CappedDeque` (B, both
-//! crossings), at caps 16 and 1,024, from one binary.
+//! crossings), at caps 16 and 1,024, from one binary. Beside it, the capped
+//! slab's row, reported and not judged: one op publishes one entry, reads it
+//! back and takes the oldest, on a `HashMap` keyed by sequential `u64` ids
+//! under the integer hasher (A, the driver's operation-id table) and on a
+//! `CappedSlab<_, u32, Retire>` (B: its instance compare and fill test), at
+//! caps 1,024, 16,384 and 65,536 — one directory link up to 16,384 slots,
+//! two at 65,536 — with the oldest id from a `VecDeque` of ids in both legs.
 //!
 //! The verdict rule: B − A ≤ 10 instructions per push-and-pop pair at the
 //! `call` shape, for either crossing at either cap; the `loop` shape is
@@ -47,23 +53,33 @@
 //!   taskset -c <core> perf stat -e instructions:u -x, -- <binary> \
 //!       --variant <v> --cap <c> --ops <n> [--shape <s>]
 //!
-//! `v` is a leg of `LEGS`; `c` ∈ 16 | 1024; `n` ≥ 0 (0 is the I(0) leg);
-//! `s` ∈ call (the default: one op per `#[inline(never)]` call through
-//! `&mut`) | loop. The deque is half full throughout, so every op pays the
-//! cap compare and no op crosses it.
+//! `v` is a leg of `LEGS`; `c` ∈ 16 | 1024 for a deque leg, 1024 | 16384 |
+//! 65536 for a slab leg; `n` ≥ 0 (0 is the I(0) leg); `s` ∈ call (the
+//! default: one op per `#[inline(never)]` call through `&mut`) | loop, a
+//! deque leg's alone. The deque is half full throughout, so every op pays
+//! the cap compare and no op crosses it; the slab and its `HashMap` hold
+//! `N / 2` entries throughout (`N` the cap), so no op crosses either and
+//! every op walks the directory depth of its `N`. The slab row's controls:
+//! A against A and B against B within 0.05 per op; `hashmap-plus-one` and
+//! `slab-plus-one` read A + 1.00 and B + 1.00, ± 0.05; `ids-only-u64` and
+//! `ids-only-slot`, the id queue alone (push one, pop the oldest) at each
+//! handle width, attribute the queue's own cost.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hint::black_box;
 use std::process::ExitCode;
 use std::rc::Rc;
 
-use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Cap, CapCensus, CapFill, CappedDeque, Coalesce, Lossy, Merge, Reserve, Reserved,
+    Built, Cap, CapCensus, CapFill, CappedDeque, CappedSlab, Coalesce, Lookup, Lossy, Merge,
+    Reserve, Reserved, Retire, SlabReserved, SlotId, Taken,
 };
+use inf_foundation::{BuildIntHasher, CellId};
 
 const CAP_16: Cap = Cap::entries::<16>("bench-16", CapFill::Serving);
 const CAP_1024: Cap = Cap::entries::<1024>("bench-1024", CapFill::Serving);
+const CAP_16384: Cap = Cap::entries::<16384>("bench-16384", CapFill::Serving);
+const CAP_65536: Cap = Cap::entries::<65536>("bench-65536", CapFill::Serving);
 
 #[derive(Clone, Copy)]
 struct Entry(u64);
@@ -95,10 +111,22 @@ enum Leg {
     ReservePlusFour,
     /// B, the `Coalesce` crossing.
     Coalesce,
+    /// The slab row's A: a `HashMap` of sequential `u64` ids.
+    HashMap,
+    /// A plus one `nop`: the liveness plant on the slab row's A.
+    HashMapPlusOne,
+    /// The slab row's B: a `CappedSlab<_, u32, Retire>`.
+    Slab,
+    /// B plus one `nop`: the liveness plant on the slab row's B.
+    SlabPlusOne,
+    /// The id queue alone, holding A's `u64` ids.
+    IdsOnlyU64,
+    /// The id queue alone, holding B's `SlotId<u32>` handles.
+    IdsOnlySlot,
 }
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg); 7] = [
+const LEGS: [(&str, Leg); 13] = [
     ("vecdeque", Leg::VecDeque),
     ("vecdeque-bounded", Leg::VecDequeBounded),
     ("vecdeque-plus-one", Leg::VecDequePlusOne),
@@ -106,6 +134,12 @@ const LEGS: [(&str, Leg); 7] = [
     ("reserve-plus-one", Leg::ReservePlusOne),
     ("reserve-plus-four", Leg::ReservePlusFour),
     ("coalesce", Leg::Coalesce),
+    ("hashmap", Leg::HashMap),
+    ("hashmap-plus-one", Leg::HashMapPlusOne),
+    ("slab", Leg::Slab),
+    ("slab-plus-one", Leg::SlabPlusOne),
+    ("ids-only-u64", Leg::IdsOnlyU64),
+    ("ids-only-slot", Leg::IdsOnlySlot),
 ];
 
 #[derive(Clone, Copy)]
@@ -147,7 +181,9 @@ fn parse() -> Result<Args, String> {
                 cap = Some(match value.as_str() {
                     "16" => CAP_16,
                     "1024" => CAP_1024,
-                    other => return Err(format!("--cap {other}: 16 or 1024")),
+                    "16384" => CAP_16384,
+                    "65536" => CAP_65536,
+                    other => return Err(format!("--cap {other}: 16, 1024, 16384 or 65536")),
                 });
             }
             "--ops" => ops = Some(value.parse::<u64>().map_err(|e| format!("--ops: {e}"))?),
@@ -162,13 +198,29 @@ fn parse() -> Result<Args, String> {
         }
     }
     let (variant, leg) = leg.ok_or("--variant is required")?;
-    Ok(Args {
-        variant,
+    let cap = cap.ok_or("--cap is required")?;
+    let deque = matches!(
         leg,
-        cap: cap.ok_or("--cap is required")?,
-        ops: ops.ok_or("--ops is required")?,
-        shape,
-    })
+        Leg::VecDeque
+            | Leg::VecDequeBounded
+            | Leg::VecDequePlusOne
+            | Leg::Reserve
+            | Leg::ReservePlusOne
+            | Leg::ReservePlusFour
+            | Leg::Coalesce
+    );
+    let fits = if deque {
+        cap.entries_max() <= 1024
+    } else {
+        cap.entries_max() >= 1024 && matches!(shape, Shape::Call)
+    };
+    if !fits {
+        return Err(format!(
+            "{variant}: a deque leg takes --cap 16 or 1024; a slab leg 1024, 16384 or 65536, \
+             at the call shape"
+        ));
+    }
+    Ok(Args { variant, leg, cap, ops: ops.ok_or("--ops is required")?, shape })
 }
 
 /// The plants: `NOPS` instructions per op at the top of the loop body, each
@@ -339,6 +391,125 @@ fn leg_coalesce(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
     accumulator
 }
 
+// The slab row. One op publishes one entry, reads it back by its id and
+// takes the oldest, whose id the queue holds: `N / 2` entries throughout.
+
+/// The driver's operation-id table: ids minted in sequence, never reused.
+type IdTable = HashMap<u64, Entry, BuildIntHasher>;
+
+#[inline(never)]
+fn step_hashmap(map: &mut IdTable, ids: &mut VecDeque<u64>, id: u64) -> u64 {
+    map.insert(id, Entry(id));
+    ids.push_back(id);
+    let read = map.get(&id).map_or(0, |Entry(v)| *v);
+    let oldest = ids.pop_front().map_or(0, |old| map.remove(&old).map_or(0, |Entry(v)| v));
+    read ^ oldest
+}
+
+#[inline(never)]
+fn step_slab(
+    slab: &mut CappedSlab<Entry, u32, Retire>,
+    ids: &mut VecDeque<SlotId<u32>>,
+    i: u64,
+) -> u64 {
+    if let SlabReserved::Slot(slot) = slab.reserve() {
+        ids.push_back(slot.publish(Entry(i)));
+    }
+    let read = match ids.back().map(|id| slab.get(*id)) {
+        Some(Lookup::Live(Entry(v))) => *v,
+        Some(Lookup::Stale | Lookup::Vacant) | None => 0,
+    };
+    let oldest = match ids.pop_front().map(|id| slab.take(id)) {
+        Some(Taken::Value(Entry(v))) => v,
+        Some(Taken::Stale | Taken::Vacant) | None => 0,
+    };
+    read ^ oldest
+}
+
+#[inline(never)]
+fn step_ids<I: Copy>(ids: &mut VecDeque<I>, id: I) -> I {
+    ids.push_back(id);
+    ids.pop_front().unwrap_or(id)
+}
+
+#[inline(never)]
+fn calls_hashmap<const NOPS: u8>(cap: Cap, ops: u64) -> u64 {
+    let entries_max = cap.entries_max() as usize;
+    let mut map = IdTable::with_capacity_and_hasher(entries_max, BuildIntHasher);
+    let mut ids = VecDeque::with_capacity(entries_max);
+    let mut next = 0u64;
+    for _ in 0..half(cap) {
+        next += 1;
+        map.insert(next, Entry(next));
+        ids.push_back(next);
+    }
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        plant::<NOPS>();
+        next += 1;
+        accumulator ^= step_hashmap(&mut map, &mut ids, next);
+    }
+    accumulator
+}
+
+fn slab(cap: Cap, census: &Rc<CapCensus>) -> CappedSlab<Entry, u32, Retire> {
+    let mut builder = CappedSlab::builder(cap, census).expect("the bench cap fits");
+    loop {
+        builder = match builder.step() {
+            Built::More(next) => next,
+            Built::Live(slab) => return slab,
+            Built::Refused(_, refused) => panic!("the bench slab: {refused}"),
+        };
+    }
+}
+
+#[inline(never)]
+fn calls_slab<const NOPS: u8>(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
+    let mut slab = slab(cap, census);
+    let mut ids = VecDeque::with_capacity(cap.entries_max() as usize);
+    for i in 0..half(cap) {
+        if let SlabReserved::Slot(slot) = slab.reserve() {
+            ids.push_back(slot.publish(Entry(i)));
+        }
+    }
+    let mut accumulator = 0u64;
+    for i in 0..ops {
+        plant::<NOPS>();
+        accumulator ^= step_slab(&mut slab, &mut ids, i);
+    }
+    // Dropped whole here: the bench's census never serves, so the drop is
+    // an abandoned assembly, uncounted.
+    accumulator
+}
+
+#[inline(never)]
+fn calls_ids_u64(cap: Cap, ops: u64) -> u64 {
+    let mut ids: VecDeque<u64> = (0..half(cap)).collect();
+    let mut accumulator = 0u64;
+    for i in 0..ops {
+        accumulator ^= step_ids(&mut ids, i);
+    }
+    accumulator
+}
+
+#[inline(never)]
+fn calls_ids_slot(cap: Cap, census: &Rc<CapCensus>, ops: u64) -> u64 {
+    // Real handles, minted once, cycled through the queue.
+    let mut slab = slab(cap, census);
+    let mut ids = VecDeque::with_capacity(cap.entries_max() as usize);
+    for i in 0..half(cap) {
+        if let SlabReserved::Slot(slot) = slab.reserve() {
+            ids.push_back(slot.publish(Entry(i)));
+        }
+    }
+    let mut accumulator = 0u64;
+    for _ in 0..ops {
+        let Some(&front) = ids.front() else { break };
+        accumulator ^= u64::from(step_ids(&mut ids, front).index());
+    }
+    accumulator
+}
+
 fn run(args: &Args, census: &Rc<CapCensus>) -> u64 {
     let (cap, ops) = (args.cap, args.ops);
     match (args.leg, args.shape) {
@@ -356,6 +527,12 @@ fn run(args: &Args, census: &Rc<CapCensus>) -> u64 {
         (Leg::ReservePlusOne, Shape::Loop) => leg_reserve::<1>(cap, census, ops),
         (Leg::ReservePlusFour, Shape::Loop) => leg_reserve::<4>(cap, census, ops),
         (Leg::Coalesce, Shape::Loop) => leg_coalesce(cap, census, ops),
+        (Leg::HashMap, _) => calls_hashmap::<0>(cap, ops),
+        (Leg::HashMapPlusOne, _) => calls_hashmap::<1>(cap, ops),
+        (Leg::Slab, _) => calls_slab::<0>(cap, census, ops),
+        (Leg::SlabPlusOne, _) => calls_slab::<1>(cap, census, ops),
+        (Leg::IdsOnlyU64, _) => calls_ids_u64(cap, ops),
+        (Leg::IdsOnlySlot, _) => calls_ids_slot(cap, census, ops),
     }
 }
 
