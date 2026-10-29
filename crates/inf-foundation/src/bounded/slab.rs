@@ -309,7 +309,10 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
             // The chain holds `capacity_now - live` slots, so this arm is
             // never reached by a correct build.
             None => {
-                debug_assert!(*live >= capacity, "a free slot below capacity_now");
+                debug_assert!(
+                    *live >= capacity,
+                    "the free chain is empty with live below capacity_now"
+                );
                 row.report_full();
                 SlabReserved::Full
             }
