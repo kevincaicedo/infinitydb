@@ -2000,6 +2000,20 @@ mod tests {
         assert_eq!(flush.round_op(0).bytes, &bytes[..], "the retry is byte-identical");
     }
 
+    /// A span continues the active file's stream whether or not it rotates
+    /// the file: one off the write cursor stops the cell on the rotating
+    /// arm too, where a rotation would make it the new file's base.
+    #[test]
+    #[should_panic(expected = "a tier span starts at the write cursor")]
+    fn a_rotating_span_off_the_write_cursor_stops_the_cell() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 4096);
+        stage(&mut flush, span(0, 600, None), &[0x5C; 600]).expect("an active file");
+        let effects = run_round(&disk, &mut flush);
+        apply(&mut flush, &effects);
+        let _ = stage(&mut flush, span(5000, 4000, None), &[0x5C; 4000]);
+    }
+
     /// Fd-less filesystems never take the reactor drive, and a pipeline
     /// refuses a drive flip while a round is staged.
     #[test]

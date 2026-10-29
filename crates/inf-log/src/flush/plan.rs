@@ -236,6 +236,9 @@ impl<F: SegmentFs> TierFlush<F> {
     /// The round plan's shape: a span rotates the active file when it holds data
     /// and the span would take it past the file target (ADR-0056 D2's
     /// early seal, one check per span: the span stays in one file).
+    /// Whether it rotates or not, a span continues the active file's
+    /// logical stream: it starts at that writer's cursor, which a rotation
+    /// makes the new file's base.
     fn shape_of(&self, selection: Selection) -> PlanShape {
         match selection {
             Selection::Span { addr, len, gap_end } => {
@@ -243,7 +246,7 @@ impl<F: SegmentFs> TierFlush<F> {
                 let rotate = self.writer.as_ref().is_some_and(|w| {
                     w.data_len() > 0 && w.data_len().saturating_add(len.get()) > capacity
                 });
-                if let Some(w) = self.writer.as_ref().filter(|_| !rotate) {
+                if let Some(w) = self.writer.as_ref() {
                     let cursor = w.base().to_raw() + w.data_len();
                     assert_eq!(addr.to_raw(), cursor, "a tier span starts at the write cursor");
                 }
