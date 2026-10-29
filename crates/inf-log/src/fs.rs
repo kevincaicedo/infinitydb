@@ -40,6 +40,15 @@ pub enum TierIoMode {
     Direct,
 }
 
+impl TierIoMode {
+    /// The mode a namespace gets without `TIER-IO-MODE`: `Direct` on Linux
+    /// (ADR-0054 D5), `Buffered` on the kqueue/macOS dev tier, which has no
+    /// `O_DIRECT` (D6). An explicit `Direct` there still fails at file
+    /// creation (D3).
+    pub const PLATFORM_DEFAULT: TierIoMode =
+        if cfg!(target_os = "linux") { TierIoMode::Direct } else { TierIoMode::Buffered };
+}
+
 /// Log-segment I/O mode (M4.5-S34, ADR-0086 D1) — fixed at segment
 /// creation, carried by the segment. `Buffered` is the M2 path byte-for-
 /// byte (sparse prealloc, frame format v2, buffered write + linked

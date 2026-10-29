@@ -6,7 +6,8 @@
 //! replay demotes the tail that does not fit instead of failing the boot,
 //! a replayed delete verifies and removes the copy the boot demoted (R6),
 //! and every acknowledged key answers its bytes. Two arms, `FSYNC always`
-//! and `everysec`; `TIER-IO-MODE direct` (the default) on a disk
+//! and `everysec`; `TIER-IO-MODE` at its default (`direct` on Linux,
+//! `buffered` on the kqueue tier — ADR-0054 D6) on a disk
 //! filesystem, the workspace `target/` directory. Red before the replay
 //! seam: the restarted process exits non-zero (`replay apply failed …
 //! OutOfMemory`). The control leg is the same load under `MEM-BUDGET

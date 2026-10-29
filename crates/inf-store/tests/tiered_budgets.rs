@@ -477,3 +477,30 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         "statvfs shows the teardown returned the space (start {avail_start}, end {avail_end})"
     );
 }
+
+/// A namespace created without `TIER-IO-MODE` gets a tier file this host's
+/// filesystem opens (ADR-0054 D5, D6). D3 forbids a fallback, so a default
+/// the host refuses — `Direct` on the kqueue/macOS tier — fails every
+/// tiered write there, and goes red here first. The target directory, not
+/// `TMPDIR`: a tmpfs may refuse `O_DIRECT`.
+#[cfg(unix)]
+#[test]
+fn the_default_tier_io_mode_opens_on_this_host() {
+    use inf_log::fs::{SegmentFs, StdSegmentFs};
+
+    let mode = TierSpec::for_budget(4 << 20).tier_io_mode;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("inf-tier-default-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("tier");
+    // Created, closed, then reopened: the write path and the recovery reopen.
+    let opened = StdSegmentFs
+        .create_tier(&path, mode)
+        .and_then(|created| {
+            drop(created);
+            StdSegmentFs.open_tier(&path, mode)
+        })
+        .map(drop);
+    let _ = std::fs::remove_dir_all(&dir);
+    opened.unwrap_or_else(|e| panic!("a {mode:?} tier file on this host: {e}"));
+}

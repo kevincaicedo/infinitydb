@@ -122,7 +122,7 @@ impl TierSpec {
             compaction_dead_ratio_pct: 50,
             compaction_slice_bytes: 1 << 20,
             blob_threshold_bytes: BLOB_THRESHOLD_DEFAULT,
-            tier_io_mode: TierIoMode::Direct,
+            tier_io_mode: TierIoMode::PLATFORM_DEFAULT,
             tail_stall_timeout_ms: 1_000,
         }
         .with_default_blob_threshold()
