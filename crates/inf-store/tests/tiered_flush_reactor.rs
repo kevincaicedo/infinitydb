@@ -12,7 +12,9 @@
 //! their file boundaries and watermarks between rounds may differ; the
 //! bytes may not. Neither may the pace: both drives flush the stream to
 //! within the RAM window of its end, the reactor to within a commit page
-//! of the seam, so a short stream cannot narrow what is compared.
+//! of the seam, so a short stream cannot narrow what is compared. The byte
+//! clauses carry their canary in the test itself: one byte flipped in one
+//! reactor file must turn both red on every run.
 //!
 //! Round-scoped invariants asserted every MAINTAIN: no watermark moves
 //! between stage and completion (the §3.1 chain — durability facts
@@ -171,6 +173,36 @@ fn sim_image(disk: &SimDisk, path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// The byte clauses' canary, run on every storm: one data byte flipped in
+/// one reactor file below `upto` must turn both clauses red — the logical
+/// stream differs at that byte's address, and the file's frame check fails
+/// at its frame. An oracle that read the wrong file, the wrong range or
+/// no bytes at all would pass the planted image.
+fn planted_flip_turns_both_byte_clauses_red(
+    seam_stream: &[u8],
+    reactor_files: &[(u64, u64, Vec<u8>)],
+    upto: u64,
+) {
+    const D: u64 = inf_log::TIER_FRAME_DATA as u64;
+    const V: u64 = inf_log::TIER_FRAME_BYTES as u64;
+    const HEADER: u64 = 4096;
+    let at_file = reactor_files
+        .iter()
+        .position(|(base, len, _)| *len > 0 && base + len <= upto)
+        .expect("a sealed reactor file below the compared window");
+    let mut planted = reactor_files.to_vec();
+    let (base, data_len, image) = &mut planted[at_file];
+    let d = *data_len / 2;
+    let at = usize::try_from(HEADER + (d / D) * V + d % D).expect("fits");
+    image[at] ^= 0xFF;
+    let summary = inspect_tier_bytes(image).expect("the planted image parses");
+    assert_eq!(summary.first_bad_frame, Some(d / D), "the frame check catches the plant");
+    let addr = *base + d;
+    let stream = logical_bytes(&planted, upto);
+    let first = seam_stream.iter().zip(&stream).position(|(a, b)| a != b).map(|i| i as u64);
+    assert_eq!(first, Some(addr), "the byte comparison catches the plant at its address");
+}
+
 /// The equivalence storm: both drives, one op sequence, one outcome.
 #[test]
 fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
@@ -274,10 +306,12 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
     let upto =
         seam_flushed.min(reactor_flushed).min(covered(&seam_files)).min(covered(&reactor_files));
     assert!(upto > 1 << 20, "the drives flushed a common prefix ({upto} B)");
+    let seam_stream = logical_bytes(&seam_files, upto);
     assert!(
-        logical_bytes(&seam_files, upto) == logical_bytes(&reactor_files, upto),
+        seam_stream == logical_bytes(&reactor_files, upto),
         "the drives' tier files hold the same bytes below {upto}"
     );
+    planted_flip_turns_both_byte_clauses_red(&seam_stream, &reactor_files, upto);
 
     // Both tables place every key at the same address (one workload, one
     // allocation order); a RAM record holds the model's value; a record one
