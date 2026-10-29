@@ -82,18 +82,6 @@ pub enum FlushChunk {
     },
 }
 
-/// The flush cuts an address space retains, as
-/// [`AddressSpace::flush_cut_view`] reads them: raw addresses.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct FlushCutView {
-    /// Cuts retained, at most the space's cut cap.
-    pub retained: usize,
-    /// The highest retained cut.
-    pub last: Option<u64>,
-    /// The first retained cut above the asked address.
-    pub first_above: Option<u64>,
-}
-
 /// What one tail allocation would do to the space — the one computation
 /// of the ring-top hole, the start and the committed top an allocation
 /// of `len` bytes needs (ADR-0174 D2 rule 1). [`AddressSpace::alloc`],
@@ -975,22 +963,6 @@ impl AddressSpace {
     #[inline]
     pub fn head(&self) -> LogicalAddr {
         LogicalAddr::from_raw(self.head).expect("watermarks stay 48-bit")
-    }
-
-    /// The flush cuts retained now: how many, the highest, and the first
-    /// above `addr`. An observation for the simulator's coarse-cut leg,
-    /// which reads where the retained cuts end and how far the flush
-    /// cursor stands from the next one; no flush decision reads it.
-    /// O(log cuts): the cuts ascend.
-    #[must_use]
-    pub fn flush_cut_view(&self, addr: LogicalAddr) -> FlushCutView {
-        let a = addr.to_raw();
-        let above = self.flush_cuts.partition_point(|&cut| cut <= a);
-        FlushCutView {
-            retained: self.flush_cuts.len(),
-            last: self.flush_cuts.back().copied(),
-            first_above: self.flush_cuts.get(above).copied(),
-        }
     }
 
     /// Durably-flushed boundary (§3.1: `head ≤ flushed ≤ ro_boundary`).

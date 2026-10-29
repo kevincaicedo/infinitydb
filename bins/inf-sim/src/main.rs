@@ -1687,20 +1687,6 @@ fn run_durable(
                 marks.cell, marks.row.high_water, marks.row.entries_max, marks.row.crossings
             );
         }
-        if let Some(cut) = &report.coarse_cut {
-            println!(
-                "inf-sim: coarse-cuts: flush cuts retained at most {} (capped at step {:?}, \
-                 highest {:?}); cut_gap_bytes_max {}; at the cut flushed {} ro {}; cut reached \
-                 {}",
-                cut.retained_max,
-                cut.capped_at_step,
-                cut.dense_end,
-                cut.cut_gap_bytes_max,
-                cut.flushed,
-                cut.ro_boundary,
-                cut.reached
-            );
-        }
         for cell in &report.tier_budget_cells {
             println!(
                 "inf-sim: tier class cell {}: io_budget_unattainable_tier_flush {} \

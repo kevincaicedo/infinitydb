@@ -44,7 +44,7 @@ mod wheel;
 mod write_accounting;
 
 pub use address_space::{
-    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, FlushCutView, PadTarget, Room,
+    AddrClass, AddressSpace, AddressSpaceConfig, AddressSpaceReport, PadTarget, Room,
     TieringCounters, WindowFull,
 };
 pub use catalog::{CatalogError, IndexCatalog, NsCatalog};
