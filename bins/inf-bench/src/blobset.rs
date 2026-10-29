@@ -1490,8 +1490,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let held = root.join("a-c1-r2");
         std::fs::create_dir_all(held.join("shard-0")).unwrap();
+        // A loop, not a lone `sleep`: `sh -c` execs a single command in its
+        // place, which drops the `--data-dir` argument the scan reads.
         let mut owner = std::process::Command::new("sh")
-            .args(["-c", "sleep 30", "sh", "--data-dir", &held.display().to_string()])
+            .args([
+                "-c",
+                "while :; do sleep 1; done",
+                "sh",
+                "--data-dir",
+                &held.display().to_string(),
+            ])
             .spawn()
             .expect("a shell holds the directory's name");
         let pid = owner.id();
