@@ -1772,6 +1772,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 }
 
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Drop for ServerPlane<O, F> {
+    /// The cell stops here: the census is marked `Stopping` before the
+    /// plane's fields drop, so every container of its `Shared` drops after
+    /// the mark (at the plane's last `Rc` or at the last future in the
+    /// loop's executor that holds one). The cell's loop marks it too, in its
+    /// own `Drop`; the mark is idempotent, so the order between the two is
+    /// no one's.
+    fn drop(&mut self) {
+        self.shared.census.mark_stopping();
+    }
+}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// The namespace a fresh connection starts in (M4.5-S40,
     /// `--conn-default-ns`): resolved by name against the catalog at
@@ -1818,3 +1830,7 @@ mod move_tests;
 #[cfg(test)]
 #[path = "close_tests.rs"]
 mod close_tests;
+
+#[cfg(test)]
+#[path = "stop_tests.rs"]
+mod stop_tests;

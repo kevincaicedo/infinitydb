@@ -8,14 +8,19 @@
 //!
 //! Phases: `Assembling` from construction until the cell's loop takes the
 //! serve mark at its first iteration, `Serving` after it, `Stopping` once
-//! the loop has exited. The mark is a token, [`ServeMark`], minted once
+//! either of the cell's two aggregates that own its containers, its loop or
+//! its plane, is dropped: each marks it in its `Drop` before its fields
+//! drop. The mark is a token, [`ServeMark`], minted once
 //! beside the census and consumed by its one `take`, so a census is marked
 //! at most once. At the mark the census walks its rows: an
 //! `Assembly` row whose live count is below its cap is a violation, and so
 //! is every publish, crossing or registration on an `Assembly` row from
 //! then on. A violation is counted in `cap_assembly_violations`, which the
 //! simulator reads as 0 on every seed, and is a debug assertion carrying the
-//! token `cap-assembly-violated`.
+//! token `cap-assembly-violated`. A capped store dropped whole while the
+//! cell serves, holding backing no step sliced, is counted in
+//! `unsliced_drops`, also 0 on every seed, and asserted with the token
+//! `unsliced-drop`.
 #![cfg_attr(
     not(test),
     deny(
@@ -41,8 +46,8 @@ pub enum CensusPhase {
     Assembling,
     /// The serve mark was taken; `Assembly` rows are frozen at their cap.
     Serving,
-    /// The loop has exited: process teardown, where an unsliced drop is
-    /// legal.
+    /// The cell's loop or its plane was dropped, each marking this before
+    /// its fields drop: process teardown, where an unsliced drop is legal.
     Stopping,
 }
 
@@ -74,6 +79,7 @@ pub struct CapCensus {
     phase: Cell<CensusPhase>,
     rows: RefCell<[Option<CapRow>; CAP_CENSUS_ROWS_MAX]>,
     cap_assembly_violations: Cell<u32>,
+    unsliced_drops: Cell<u32>,
 }
 
 impl fmt::Debug for CapCensus {
@@ -83,6 +89,7 @@ impl fmt::Debug for CapCensus {
             .field("phase", &self.phase.get())
             .field("rows", &self.rows().count())
             .field("cap_assembly_violations", &self.cap_assembly_violations.get())
+            .field("unsliced_drops", &self.unsliced_drops.get())
             .finish()
     }
 }
@@ -131,6 +138,7 @@ impl CapCensus {
             phase: Cell::new(CensusPhase::Assembling),
             rows: RefCell::new([None; CAP_CENSUS_ROWS_MAX]),
             cap_assembly_violations: Cell::new(0),
+            unsliced_drops: Cell::new(0),
         });
         let mark = ServeMark { census: Rc::clone(&census) };
         (census, mark)
@@ -154,6 +162,15 @@ impl CapCensus {
         self.cap_assembly_violations.get()
     }
 
+    /// Capped stores dropped whole while the cell served, each holding a
+    /// chunk or a directory: a release of backing no step sliced. Cell
+    /// scope, one per store (a map is two). A correct host reads 0 on
+    /// every seed.
+    #[must_use]
+    pub fn unsliced_drops(&self) -> u32 {
+        self.unsliced_drops.get()
+    }
+
     /// The serve mark's effect, reached only through [`ServeMark::take`], of
     /// which the census mints one: the phase becomes `Serving` and one walk
     /// of the rows counts and asserts each `Assembly` row under its cap.
@@ -173,9 +190,37 @@ impl CapCensus {
         self.note_violations(short, "under-filled at the serve mark", first);
     }
 
-    /// After the loop has exited: an unsliced drop is process teardown now.
+    /// The cell is stopping: an unsliced drop is process teardown now. Each
+    /// of the cell's two aggregates that own its containers, its loop and
+    /// its plane, calls this in its `Drop` before its fields drop, so every
+    /// container drops after the first of them; the call is idempotent, so
+    /// the order between the two is no one's.
     pub fn mark_stopping(&self) {
         self.phase.set(CensusPhase::Stopping);
+    }
+
+    /// A capped store was dropped holding `items_held` chunks or directories
+    /// (its one `Drop`, under every phase type of a slab or a map). While
+    /// the cell serves that is a release no step sliced: counted first, so
+    /// the count is read after the assertion unwinds, then asserted in a
+    /// debug build unless the thread is already unwinding, so one failure
+    /// stays one panic. While assembling it is an abandoned assembly and
+    /// once stopping it is process teardown: legal, uncounted. A store
+    /// holding nothing frees nothing.
+    #[allow(dead_code, reason = "the slab's and the map's storage layer is its one caller")]
+    pub(super) fn note_store_drop(&self, items_held: u32) {
+        if items_held == 0 || self.phase.get() != CensusPhase::Serving {
+            return;
+        }
+        let total = self.unsliced_drops.get().saturating_add(1);
+        self.unsliced_drops.set(total);
+        // Outside an unwind the assertion fires; inside one it holds.
+        debug_assert!(
+            std::thread::panicking(),
+            "unsliced-drop: a capped store holding {items_held} chunk(s) or directories \
+             was dropped whole while {} serves",
+            self.cell
+        );
     }
 
     /// Every row, copied out in registration order (at most
@@ -568,6 +613,81 @@ mod tests {
         assert_eq!(census.cap_assembly_violations(), 0);
         let read = census.row("epoch-marks").expect("row");
         assert_eq!((read.high_water, read.crossings, read.assembly_live), (4, 1, 0));
+    }
+
+    // The unsliced-drop plants: a store dropped holding backing while the
+    // cell serves is counted and asserted; the controls are uncounted.
+
+    /// A capped store's drop accounting as the slab's and the map's storage
+    /// layer makes it: the items it held when it was dropped.
+    struct StoreStub {
+        census: Rc<CapCensus>,
+        items_held: u32,
+    }
+
+    impl Drop for StoreStub {
+        fn drop(&mut self) {
+            self.census.note_store_drop(self.items_held);
+        }
+    }
+
+    fn store(census: &Rc<CapCensus>, items_held: u32) -> StoreStub {
+        StoreStub { census: Rc::clone(census), items_held }
+    }
+
+    #[test]
+    fn a_store_dropped_holding_backing_while_serving_is_asserted_and_counted() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        let held = store(&census, 2);
+        let outcome = catch_unwind(AssertUnwindSafe(|| drop(held)));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("unsliced-drop: a debug build asserts the drop");
+            let text = panic_text(payload.as_ref());
+            assert!(text.contains("unsliced-drop"), "{text}");
+            assert!(text.contains("cell3"), "{text}");
+        } else {
+            outcome.expect("a release build counts without asserting");
+        }
+        assert_eq!(census.unsliced_drops(), 1, "unsliced-drop: the drop is counted");
+        assert_eq!(census.cap_assembly_violations(), 0);
+    }
+
+    #[test]
+    fn a_store_holding_nothing_frees_nothing_and_is_not_counted() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        drop(store(&census, 0));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_while_assembling_is_an_abandoned_assembly() {
+        let (census, _mark) = CapCensus::new(CELL);
+        drop(store(&census, 3));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_once_stopping_is_process_teardown() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        census.mark_stopping();
+        drop(store(&census, 3));
+        assert_eq!(census.unsliced_drops(), 0);
+    }
+
+    #[test]
+    fn a_store_dropped_while_unwinding_is_counted_and_the_step_panics_once() {
+        let (census, mark) = CapCensus::new(CELL);
+        mark.take();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _held = store(&census, 1);
+            panic!("the step's own failure");
+        }));
+        let payload = outcome.expect_err("the step's failure unwinds");
+        assert_eq!(panic_text(payload.as_ref()), "the step's own failure", "one panic");
+        assert_eq!(census.unsliced_drops(), 1, "unsliced-drop: the drop is counted");
     }
 
     #[test]

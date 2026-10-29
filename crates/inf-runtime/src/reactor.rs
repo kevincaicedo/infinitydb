@@ -27,11 +27,12 @@
 //! FABRIC-OUT) in microseconds — `loop_iter_p999_us` is the frozen tripwire.
 
 use std::io;
+use std::rc::Rc;
 use std::time::Duration;
 
 use inf_alloc::BufferPool;
 use inf_foundation::LogHistogram;
-use inf_foundation::bounded::ServeMark;
+use inf_foundation::bounded::{CapCensus, ServeMark};
 use inf_foundation::time::{Clock, Nanos};
 
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
@@ -184,6 +185,9 @@ pub struct CellLoop<D: BackendDriver, C: Clock> {
     /// The cell's serve mark until the first iteration takes it: every step
     /// before that iteration is the cell's assembly (ADR-0163 D2's census).
     serve_mark: Option<ServeMark>,
+    /// The census the mark belongs to, kept after the mark is taken (or
+    /// dropped untaken) so the loop's `Drop` marks it `Stopping`.
+    census: Rc<CapCensus>,
     driver: D,
     clock: C,
     pool: BufferPool,
@@ -220,6 +224,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         serve_mark: ServeMark,
     ) -> CellLoop<D, C> {
         CellLoop {
+            census: Rc::clone(serve_mark.census()),
             serve_mark: Some(serve_mark),
             driver,
             clock,
@@ -463,5 +468,16 @@ impl<D: BackendDriver, C: Clock> core::fmt::Debug for CellLoop<D, C> {
             self.executor.live_tasks(),
             self.timers.armed()
         )
+    }
+}
+
+impl<D: BackendDriver, C: Clock> Drop for CellLoop<D, C> {
+    /// The cell stops here: the census is marked `Stopping` before the
+    /// loop's fields (its executor, timers and driver) drop, so a container
+    /// they own drops as process teardown. The cell's plane marks it too,
+    /// in its own `Drop`, and the mark is idempotent, so whichever of the
+    /// two drops first marks and the order between them is no one's.
+    fn drop(&mut self) {
+        self.census.mark_stopping();
     }
 }
