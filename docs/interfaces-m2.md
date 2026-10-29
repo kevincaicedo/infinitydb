@@ -2057,19 +2057,31 @@ call sites after the split).
 
 ### A.7 — Tier-flush round machine (M4.5-S31, ADR-0084)
 
-**Open conformance gap (2026-09-22):** one in-flight round does not
-bound its staged bytes/operations. A production-API coarse-cut witness
-reaches the operation assertion with validated geometry. The existing
-token/custody/durability contracts remain binding. ADR-0155 (accepted
-2026-09-22) supersedes the affected round/preparation/issue contract;
-its replacement is not built.
-
 The reactor-drive flush state machine (`TierFlush` round state in
-`inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell.rs`):
+`inf-log`, `FlushRound` bookkeeping in `inf-server/tier_cell/round.rs`):
 
+- **A round is planned before it stages** (ADR-0155 D1–D3): its span is
+  the largest whole-record prefix at the flush cursor within the slice
+  `S`, or the first record alone, chosen by the records' own headers and
+  ending at a hole, the ro-boundary or the ring top — never by a recorded
+  seal cut — so it is at most `max(S, M)` bytes (`M` the largest record
+  the namespace admits). The plan holds at most one capacity rotation,
+  the span in one file and at most one trailing gap; it parses every
+  write position into a `FileOffset`, reserves the windows its round
+  takes, then creates the next file, its id checked first (an id never
+  wraps: `TierFlushError::FileIdsExhausted`, typed, not fatal). The parse
+  and the creation are its two fallible steps, both before any writer
+  effect, so a refused plan stages nothing. A round is at most 70 writes,
+  4 barriers and 3 effects — 74 ops under the 8-bit op index — in capped
+  holders built with the pipeline, with its staged seals (2) and
+  directory holds (2); its windows come from a pool built whole with the
+  pipeline, `⌈max(S, M)/Q⌉` batch windows and 5 single ones, capacity
+  reserved at the build and each window zeroed at its first take
+  (`tier_window_capacity_bytes`, `tier_window_written_bytes` in INFO
+  `# Tripwires`). Staging cannot fail; the round allocates nothing.
 - **One round in flight per namespace** — by-construction
-  (`TierNs::round: Option<FlushRound>`; staging debug-asserts
-  `!round_active()`).
+  (`TierNs::round: Option<FlushRound>`; a plan asserts no round is
+  staged).
 - **No durability fact at submission**: `advance_flushed`, `durable_len`,
   seal catalog commits, and gap crossings apply only in
   `complete_flush_round`, after every op's terminal completion —
@@ -2082,8 +2094,9 @@ The reactor-drive flush state machine (`TierFlush` round state in
   gates on `pending == 0` with no write errors); conservative across
   files (a two-file round waits for both files' writes).
 - **Effects apply in stage order** (`SealCommit` before the `GapCross`
-  it covers — ADR-0052 D2) — by-construction (a `Vec`, drained in
-  order); `commit_oldest_seal` release-asserts a pending seal exists,
+  it covers — ADR-0052 D2) — by-construction (a capped holder, drained
+  in order); `commit_oldest_seal` release-asserts a pending seal exists
+  and hands the sealed file's handle back as its completion's value,
   `confirm_durable_to` release-asserts monotone-and-bounded.
 - **Window custody**: pool windows return only in `finish_round`
   (all-terminal), and a dropped namespace parks whole in `round_drain`
@@ -2094,14 +2107,17 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `fail_stop` — checked by `check-fsync-fail-stop.sh` (allowlisted with
   the review note); write errors resubmit byte-identical (ENOSPC latches
   admission first, ADR-0063 D4).
-- **Amended 2026-09-30 (ADR-0167 D4):** an
-  unaddressable write position is fatal too. The round checks every write
-  position before `FlushRound` exists; a refusal opens no round, pushes
-  no op and returns `TierFlushError::Unaddressable { path, offset_bytes }`
-  from the same MAINTAIN, to the plane's fatal arm and `fail_stop`.
-  `is_fatal` names both causes, and `Unaddressable` is not storage-full. A
-  write-error resubmission reads the position the round holds, never
-  checked again.
+- **An unaddressable write position is fatal too** (ADR-0167 D4 and A1):
+  the round's plan parses every write position, before the file creation
+  and any writer effect; a refusal stages nothing — no op, no window, no
+  file — and returns `TierFlushError::Unaddressable { path, offset_bytes }`
+  from the same MAINTAIN, to the plane's fatal arm and `fail_stop`, since
+  a retry would plan the same position. A staged write holds its position
+  as a `FileOffset` beside its op state, so no consumer parses a
+  tier-round position and no table beside the ops exists; a write-error
+  resubmission emits the staged position as it is. `is_fatal` names the
+  causes (with a span above the pipeline's pool), and none is
+  storage-full.
 - **Deliberately unchecked**: op-index/kind agreement between the token
   and the round table is a `debug_assert` (the generation check already
   rejects cross-round routing); resubmitted write bytes are not
