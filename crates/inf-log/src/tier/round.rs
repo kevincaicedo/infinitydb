@@ -324,13 +324,25 @@ pub(crate) enum WindowKind {
 pub(crate) struct WindowPool {
     batch: CappedDeque<FrameStaging, Reserve>,
     single: CappedDeque<FrameStaging, Reserve>,
-    /// Windows out: the first `batch_out` and `single_out` of each holder.
-    batch_out: usize,
-    single_out: usize,
+    /// The windows of each holder out of the pool.
+    batch_out: WindowsOut,
+    single_out: WindowsOut,
     /// Windows the staged round's plan reserved and has not yet taken.
     reserved: WindowNeeds,
     /// Bytes of the windows written at least once (the LIFO high water).
     written_bytes: u64,
+}
+
+/// The windows of one kind out of the pool: indexes `[returned, taken)`
+/// of its holder. A round takes upward from `taken` only once every window
+/// of the last round is back (`taken = 0`, which [`WindowPool::reserve`]
+/// checks), and its end returns them in take order, oldest first; the
+/// last return empties the range. So each round takes the same windows
+/// first, and the windows ever written number the most out at once.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct WindowsOut {
+    returned: usize,
+    taken: usize,
 }
 
 /// The windows one plan needs, by kind.
@@ -377,8 +389,8 @@ impl WindowPool {
         Ok(WindowPool {
             batch,
             single,
-            batch_out: 0,
-            single_out: 0,
+            batch_out: WindowsOut::default(),
+            single_out: WindowsOut::default(),
             reserved: WindowNeeds::default(),
             written_bytes: 0,
         })
@@ -394,7 +406,7 @@ impl WindowPool {
     /// that many windows free and no round holds a reservation; `false`
     /// changes nothing.
     pub(crate) fn reserve(&mut self, needs: WindowNeeds) -> bool {
-        let idle = self.batch_out == 0 && self.single_out == 0;
+        let idle = self.windows_out() == 0;
         let none_held = self.reserved == WindowNeeds::default();
         let fits = needs.batch <= self.batch.len() && needs.single <= self.single.len();
         if !(idle && none_held && fits) {
@@ -402,6 +414,12 @@ impl WindowPool {
         }
         self.reserved = needs;
         true
+    }
+
+    /// Windows of both kinds out of the pool.
+    fn windows_out(&self) -> usize {
+        let out = |o: WindowsOut| o.taken - o.returned;
+        out(self.batch_out) + out(self.single_out)
     }
 
     /// Drops a reservation no window was taken from (a plan refused after
@@ -424,32 +442,40 @@ impl WindowPool {
             }
         };
         assert!(*left > 0, "a tier window past the round plan's reservation");
+        debug_assert_eq!(out.returned, 0, "a take while the last round's windows return");
         *left -= 1;
-        let index = *out;
+        let index = out.taken;
         let window = holder.get_mut(index).expect("a reservation is within the pool");
         if window.zero_once() {
             self.written_bytes += window.capacity_bytes();
         }
-        *out += 1;
+        out.taken += 1;
         PooledWindow { kind, index }
     }
 
     /// Returns a window the round held. One round holds every window out
-    /// and returns them all at its end, so the LIFO top falls back to the
-    /// holder's front and the next round takes the same windows first.
+    /// and returns them all at its end in take order, so the returns walk
+    /// the out range from its oldest window; the last empties it, the LIFO
+    /// top falls back to the holder's front and the next round takes the
+    /// same windows first (the `tier_window_written_bytes` high water).
     ///
     /// # Panics
-    /// Panics on a return below none out: a token is made once per take
-    /// and consumed once (release-checked: a floor a debug assert alone
-    /// would let wrap).
+    /// Panics on a return with no window out: a token is made once per
+    /// take and consumed once (release-checked: a floor a debug assert
+    /// alone would let pass).
     pub(super) fn put(&mut self, window: PooledWindow) {
         let PooledWindow { kind, index } = window;
-        let out = match kind {
-            WindowKind::Batch => &mut self.batch_out,
-            WindowKind::Single => &mut self.single_out,
+        let (holder_len, out) = match kind {
+            WindowKind::Batch => (self.batch.len(), &mut self.batch_out),
+            WindowKind::Single => (self.single.len(), &mut self.single_out),
         };
-        debug_assert!(index < TIER_ROUND_WRITES_MAX as usize, "a window of the pool");
-        *out = out.checked_sub(1).expect("window returned twice");
+        assert!(out.returned < out.taken, "window returned twice");
+        debug_assert!(index < holder_len, "a window of its kind's holder");
+        debug_assert_eq!(index, out.returned, "windows return in take order, oldest first");
+        out.returned += 1;
+        if out.returned == out.taken {
+            *out = WindowsOut::default();
+        }
     }
 
     /// The window a token names.
@@ -474,8 +500,8 @@ impl WindowPool {
     /// window goes back to the free lists while the round still holds its
     /// tokens. Compiled into every build, reached only by the plant.
     pub(crate) fn recycle_early(&mut self) {
-        self.batch_out = 0;
-        self.single_out = 0;
+        self.batch_out = WindowsOut::default();
+        self.single_out = WindowsOut::default();
     }
 
     /// Writes `byte` over every window the pool holds free and has
@@ -485,7 +511,7 @@ impl WindowPool {
         for (holder, out) in
             [(&mut self.batch, self.batch_out), (&mut self.single, self.single_out)]
         {
-            for index in out..holder.len() {
+            for index in (0..holder.len()).filter(|&i| i < out.returned || i >= out.taken) {
                 if let Some(window) = holder.get_mut(index) {
                     window.raw.fill(byte);
                 }
@@ -497,7 +523,7 @@ impl WindowPool {
     /// round).
     #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
-        self.batch_out + self.single_out
+        self.windows_out()
     }
 
     /// The bytes the pool reserved at its build: every window's capacity.
@@ -606,5 +632,53 @@ impl FrameStaging {
 
     fn capacity_bytes_usize(&self) -> usize {
         TIER_FRAME_BYTES * (self.frames + 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inf_foundation::bounded::CapCensus;
+
+    use super::{WindowKind, WindowNeeds, WindowPool};
+
+    fn pool() -> WindowPool {
+        let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
+        drop(serve_mark);
+        WindowPool::new(4 << 20, &census).expect("a pool")
+    }
+
+    /// A round's end returns its windows in take order, oldest first, and
+    /// the last return empties the out range, so the next round takes the
+    /// same windows from the holder's front.
+    #[test]
+    fn windows_return_in_take_order_and_the_next_round_takes_them_first() {
+        let mut pool = pool();
+        assert!(pool.reserve(WindowNeeds { batch: 2, single: 0 }));
+        let first = pool.take(WindowKind::Batch);
+        let second = pool.take(WindowKind::Batch);
+        assert_eq!((first.index, second.index), (0, 1));
+        pool.put(first);
+        pool.put(second);
+        assert_eq!(pool.outstanding(), 0);
+        let written = pool.written_bytes();
+        assert!(pool.reserve(WindowNeeds { batch: 1, single: 0 }));
+        let again = pool.take(WindowKind::Batch);
+        assert_eq!(again.index, 0, "the next round takes the front window again");
+        assert_eq!(pool.written_bytes(), written, "no window written a second time");
+        pool.put(again);
+    }
+
+    /// A return out of take order is caught where the LIFO high water
+    /// relies on it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "windows return in take order, oldest first")]
+    fn a_window_returned_out_of_take_order_is_caught() {
+        let mut pool = pool();
+        assert!(pool.reserve(WindowNeeds { batch: 2, single: 0 }));
+        let first = pool.take(WindowKind::Batch);
+        let second = pool.take(WindowKind::Batch);
+        pool.put(second);
+        pool.put(first);
     }
 }
