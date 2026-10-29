@@ -42,10 +42,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                 let key = Self::key_of(c.token);
                 if len == 0 {
                     cx.pool.release(buf);
-                    let live = self.shared.with_conn(key, |conn| !conn.closing).unwrap_or(false);
-                    if live {
-                        self.initiate_close(cx, key);
-                    }
+                    self.initiate_close(cx, key);
                 } else {
                     self.inbox.push((key, buf, len));
                 }
@@ -174,16 +171,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     return;
                 }
                 let key = Self::key_of(c.token);
-                let live = self
-                    .shared
-                    .with_conn(key, |conn| {
-                        conn.send_inflight = false;
-                        !conn.closing
-                    })
-                    .unwrap_or(false);
-                if live {
-                    self.initiate_close(cx, key);
-                }
+                self.shared.with_conn(key, |conn| conn.send_inflight = false);
+                self.initiate_close(cx, key);
             }
             // Log + checkpoint file ops (M2-S05/S08/S10): routed by token
             // class into the durable cell — lease release on a write's
@@ -1154,7 +1143,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 enforce_output_cap(node, conn, now_ms, caps);
             }
             // `timeout` (ADR-0123 D2): idle unsubscribed connections
-            // close; subscribers are exempt, as in Redis.
+            // close; subscribers are exempt, as in Redis. A connection
+            // already closing is skipped so `idle_disconnections` counts
+            // each close once.
             if knobs.timeout_ms != 0
                 && !subscribed
                 && !conn.closing

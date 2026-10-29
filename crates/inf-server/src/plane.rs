@@ -1680,11 +1680,19 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
     }
 
+    /// Starts a connection's one close. A slot already closing returns at
+    /// once, so no caller needs a guard of its own: its `Close` is in flight
+    /// until `Closed`, and a second `close(2)` after the first has freed the
+    /// number may close the socket or file the next accept or open holds.
     fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        if let Some(fd) = self.shared.with_conn(key, |conn| {
+        let fd = self.shared.with_conn(key, |conn| {
+            if conn.closing {
+                return None;
+            }
             conn.closing = true;
-            conn.fd
-        }) {
+            Some(conn.fd)
+        });
+        if let Some(fd) = fd.flatten() {
             cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
         }
     }
@@ -1785,3 +1793,7 @@ mod conn_default_tests {
 #[cfg(test)]
 #[path = "move_tests.rs"]
 mod move_tests;
+
+#[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
