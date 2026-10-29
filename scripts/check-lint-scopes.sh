@@ -1106,8 +1106,10 @@ for label, ref in ccopies:
         if was is not None and due > was and (onto is None or due > onto):
             errors.append(f"{CONTAINERS}: row {f} `{key}` expiry {due} is later than the {label}'s {was} — "
                           "a date only moves earlier"
-                          + (f", or up to {record}'s {onto} (CONTAINER_EXPIRY_MOVES)" if onto else
-                             f"; record {record} has no CONTAINER_EXPIRY_MOVES date"))
+                          + (f", or up to {record}'s {onto} (CONTAINER_EXPIRY_MOVES, ADR-0163 A1)"
+                             if onto else
+                             f"; record {record} has no CONTAINER_EXPIRY_MOVES date — a record "
+                             "joins the line only by the ADR that changes this rule (ADR-0163 A1)"))
 
 # ADR-0163 A1: the CONTAINER_EXPIRY_MOVES line's own ratchet, against HEAD,
 # the base tip and the commit that introduced the line (the table's
