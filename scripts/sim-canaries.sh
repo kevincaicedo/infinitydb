@@ -244,6 +244,21 @@ rows=(
   # the two tests prints.
   "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_hold_one_mark_each_without_a_crossing marks-edge-short"
   "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_keep_one_mark_each_and_cross_nothing marks-edge-short"
+  # The same plant on a `Retire` slab, whose arm admits one occupant fewer
+  # than its capacity now: two slots retire one at a time (the high water
+  # stays 1, the capacity now falls to 2), so the fill answers `Full` at 1
+  # live and the census's crossing rule reads the row crossed below its
+  # capacity now. Two slots live before the retirements would raise the
+  # high water to 2 first, and the rule could not go red.
+  "inf_canary_cap_minus_one crate-test inf-sim lib a_retire_slab_crossing_after_two_retirements_reads_its_capacity_now cap-crossed-short"
+  # ADR-0171 A2.2: the slab's access skips the instance compare, so another
+  # slab's live handle, holding the same index and generation, reads and
+  # takes this slab's occupant; the two-instance model test reads it.
+  "inf_canary_slab_instance_blind crate-test inf-foundation lib another_slabs_live_handle_is_stale_and_changes_neither slab-instance-blind"
+  # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
+  # path every site uses. On a serving cell the census counts the unsliced
+  # drop, and this debug build asserts it with its token.
+  "inf_canary_unsliced_drop crate-test inf-foundation lib a_live_slab_retires_by_steps_with_no_unsliced_drop unsliced-drop"
   # The same two plants on the extent-seal window's burst leg. One short,
   # the window holds 15 of its 16 and the leg's engagement reads it
   # unfilled; at the cap it admits a 17th extent barrier, which the census

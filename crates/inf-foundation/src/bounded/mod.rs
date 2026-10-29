@@ -26,9 +26,15 @@ use core::num::NonZeroU32;
 
 mod census;
 mod deque;
+mod slab;
+mod store;
 
-pub use census::{CapCensus, CapRow, CensusPhase, ServeMark};
+pub use census::{CapCensus, CapRow, CensusPhase, ServeMark, SlabInstance};
 pub use deque::{CappedDeque, DequeSlot, Reserved};
+pub use slab::{
+    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, Retire, Retiring,
+    SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, Taken, WrapWithProof,
+};
 
 /// When a container's host fills it: while the cell serves, or whole before
 /// the cell's serve mark (ADR-0163 D2). The census keeps the fill on the row

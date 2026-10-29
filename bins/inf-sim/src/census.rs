@@ -147,7 +147,8 @@ fn crossed_short(cell: usize, row: &CapRow) -> Option<String> {
 mod tests {
     use inf_foundation::CellId;
     use inf_foundation::bounded::{
-        Cap, CapFill, CappedDeque, Coalesce, Lossy, Merge, Reserve, Reserved,
+        Built, Cap, CapFill, CappedDeque, CappedSlab, Coalesce, LookupMut, Lossy, Merge, Reserve,
+        Reserved, Retire, SlabReserved, Taken,
     };
 
     use super::*;
@@ -245,6 +246,46 @@ mod tests {
         let text = over_cap(1, &over).expect("red past the cap");
         assert!(text.contains("cap-high-water-over"), "{text}");
         assert_eq!(over_cap(1, &CapRow { high_water: 2, ..over }), None, "at the cap is legal");
+    }
+
+    /// The crossing rule on a real `Retire` slab of 4: two slots retire one
+    /// at a time — one entry published, placed at its last generation and
+    /// taken, twice — so the high water is 1 and the capacity now 2 before
+    /// the fill, which publishes up to the first `Full` and asserts nothing
+    /// on the way. The verdict is the first assertion: a correct slab fills
+    /// 2 (`(4, 2, 2, 1)`, green); one that answers `Full` a slot short fills
+    /// 1 and crosses at a high water of 1 (`(4, 2, 1, 1)`), which only this
+    /// rule reads. The row's values are asserted after it, the control.
+    #[test]
+    fn a_retire_slab_crossing_after_two_retirements_reads_its_capacity_now() {
+        const SLAB: Cap = Cap::entries::<4>("retire-slab", CapFill::Serving);
+        let (census, serve_mark) = CapCensus::new(CellId(4));
+        let mut builder = CappedSlab::<u8, u32, Retire>::builder(SLAB, &census).expect("row");
+        let mut slab = loop {
+            match builder.step() {
+                Built::More(next) => builder = next,
+                Built::Live(slab) => break slab,
+                Built::Refused(_, refused) => panic!("{refused}"),
+            }
+        };
+        serve_mark.take();
+        for value in 0..2 {
+            let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+            let mut id = slot.publish(value);
+            assert!(matches!(slab.place_generation_last(&mut id), LookupMut::Live(_)));
+            assert_eq!(slab.take(id), Taken::Value(value), "the slot retires");
+        }
+        while let SlabReserved::Slot(slot) = slab.reserve() {
+            slot.publish(9);
+        }
+        let mut verdict = CensusVerdict::default();
+        verdict.judge(4, &census, CellFacts::default());
+        assert!(verdict.violations.is_empty(), "{:?}", verdict.violations);
+        let row = census.row("retire-slab").expect("row");
+        let shape = (row.entries_max, row.capacity_now, row.high_water, row.crossings);
+        assert_eq!(shape, (4, 2, 2, 1));
+        assert_eq!(verdict.rows_crossed, 1);
+        census.mark_stopping();
     }
 
     /// The crossing rule on planted rows: a row that crossed holds its high

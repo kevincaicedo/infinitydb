@@ -9,7 +9,9 @@ publish.workspace = true
 [features]
 # M2-S16 fault-point registry. OFF in every shipping build — test builds
 # get it through dev-dependency feature unification; `fault::fire` is a
-# constant `false` without it (zero cost, A/B-verified).
+# constant `false` without it (zero cost, A/B-verified). It also compiles
+# the capped slab's test hook `place_generation_last`, which another
+# crate's tests (the simulator's, through `dst`) call.
 fault-points = []
 # ADR-0094 D3: the S37 collision oracle as a hasher mode — a 48-byte key
 # under the `{shadow-collide}` hashtag hashes its first 32 bytes only, so

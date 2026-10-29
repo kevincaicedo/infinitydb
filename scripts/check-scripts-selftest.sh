@@ -3030,7 +3030,7 @@ expect_red_because "lint-scopes: a new container with no plant marker is red by 
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured"
 grep -v 'path = "inf_foundation::bounded::DequeSlot"' clippy.toml >"$work/probe-await-unconfigured/clippy.toml"
 expect_red_because "lint-scopes: a config without the slot type" \
-    "config needs 2 distinct slot type await-holding-invalid-types, found 1" ls_probe "$work/probe-await-unconfigured"
+    "config needs 6 distinct slot type await-holding-invalid-types, found 5" ls_probe "$work/probe-await-unconfigured"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured-answer"
 grep -v 'path = "inf_foundation::bounded::Reserved"' clippy.toml >"$work/probe-await-unconfigured-answer/clippy.toml"
 expect_red_because "lint-scopes: a config without the answer that carries the slot" \
