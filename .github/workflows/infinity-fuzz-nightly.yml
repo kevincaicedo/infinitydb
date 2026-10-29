@@ -78,6 +78,9 @@ jobs:
           # The capped containers' op sequences against std models (ADR-0151
           # D6): the types every cell container grows through.
           - { dir: crates/inf-foundation, target: bounded_ops }
+          # The tier round's span selector against its prefix-sum oracle
+          # (ADR-0155 D6): whole records within the slice, or the first alone.
+          - { dir: crates/inf-store, target: tier_span_select }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly

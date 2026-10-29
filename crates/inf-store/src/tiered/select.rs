@@ -5,6 +5,16 @@
 //! found by their headers' lengths, never by scanning payloads and never
 //! by a recorded seal cut, which is a hint and no authority to exceed the
 //! slice. A selected span is at most `max(S, M)` bytes.
+// ADR-0144 D2/D3: the `tier_span_select` fuzz target's scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 /// The end of the span selected at `start` (ADR-0155 D1): records are
 /// taken while their bytes from `start` fit `slice_bytes`, the first
