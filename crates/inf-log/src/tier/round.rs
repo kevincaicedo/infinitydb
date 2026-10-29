@@ -339,13 +339,25 @@ pub(crate) struct WindowPool {
 /// The windows of one kind out of the pool: indexes `[returned, taken)`
 /// of its holder. A round takes upward from `taken` only once every window
 /// of the last round is back (`taken = 0`, which [`WindowPool::reserve`]
-/// checks), and its end returns them in take order, oldest first; the
+/// asserts), and its end returns them in take order, oldest first; the
 /// last return empties the range. So each round takes the same windows
 /// first, and the windows ever written number the most out at once.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct WindowsOut {
     returned: usize,
     taken: usize,
+}
+
+/// The pool's answer to a plan's reservation. A window out or a
+/// reservation already held is no answer: both are the pool's own
+/// invariants, asserted by [`WindowPool::reserve`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reservation {
+    /// The windows are the round's until its end.
+    Reserved,
+    /// The plan needs more windows of a kind than the pool holds: the
+    /// span is above the `max(S, M)` the pool was built for.
+    OverPool,
 }
 
 /// The windows one plan needs, by kind.
@@ -408,18 +420,22 @@ impl WindowPool {
         self.batch.len() as u64 * TIER_BATCH_PAYLOAD_BYTES
     }
 
-    /// Reserves `needs` for one round's plan: `true` when both kinds have
-    /// that many windows free and no round holds a reservation; `false`
-    /// changes nothing.
-    pub(crate) fn reserve(&mut self, needs: WindowNeeds) -> bool {
-        let idle = self.windows_out() == 0;
-        let none_held = self.reserved == WindowNeeds::default();
-        let fits = needs.batch <= self.batch.len() && needs.single <= self.single.len();
-        if !(idle && none_held && fits) {
-            return false;
+    /// Reserves `needs` for one round's plan when both kinds hold that
+    /// many windows; `OverPool` changes nothing.
+    ///
+    /// # Panics
+    /// Panics with a window out or a reservation held: the pipeline plans
+    /// one round at a time, and a round's end returns every window and
+    /// drops its reservation, so either state is a defect of the pool's
+    /// owner, never a span the plan can refuse.
+    pub(crate) fn reserve(&mut self, needs: WindowNeeds) -> Reservation {
+        assert_eq!(self.windows_out(), 0, "a tier window pool reserved with windows out");
+        assert_eq!(self.reserved, WindowNeeds::default(), "a tier window pool reserved twice");
+        if needs.batch > self.batch.len() || needs.single > self.single.len() {
+            return Reservation::OverPool;
         }
         self.reserved = needs;
-        true
+        Reservation::Reserved
     }
 
     /// Windows of both kinds out of the pool.
@@ -646,7 +662,7 @@ impl FrameStaging {
 mod tests {
     use inf_foundation::bounded::CapCensus;
 
-    use super::{WindowKind, WindowNeeds, WindowPool};
+    use super::{Reservation, WindowKind, WindowNeeds, WindowPool};
 
     fn pool() -> WindowPool {
         let (census, serve_mark) = CapCensus::new(inf_foundation::CellId(0));
@@ -660,7 +676,7 @@ mod tests {
     #[test]
     fn windows_return_in_take_order_and_the_next_round_takes_them_first() {
         let mut pool = pool();
-        assert!(pool.reserve(WindowNeeds { batch: 2, single: 0 }));
+        assert_eq!(pool.reserve(WindowNeeds { batch: 2, single: 0 }), Reservation::Reserved);
         let first = pool.take(WindowKind::Batch);
         let second = pool.take(WindowKind::Batch);
         assert_eq!((first.index, second.index), (0, 1));
@@ -668,7 +684,7 @@ mod tests {
         pool.put(second);
         assert_eq!(pool.outstanding(), 0);
         let written = pool.written_bytes();
-        assert!(pool.reserve(WindowNeeds { batch: 1, single: 0 }));
+        assert_eq!(pool.reserve(WindowNeeds { batch: 1, single: 0 }), Reservation::Reserved);
         let again = pool.take(WindowKind::Batch);
         assert_eq!(again.index, 0, "the next round takes the front window again");
         assert_eq!(pool.written_bytes(), written, "no window written a second time");
@@ -688,7 +704,7 @@ mod tests {
         let want = batches * (TIER_BATCH_FRAMES as u64 + 1) * frame
             + u64::from(TIER_POOL_SINGLE_WINDOWS) * 2 * frame;
         assert_eq!(pool.capacity_bytes(), want);
-        assert!(pool.reserve(WindowNeeds { batch: 1, single: 1 }));
+        assert_eq!(pool.reserve(WindowNeeds { batch: 1, single: 1 }), Reservation::Reserved);
         let batch = pool.take(WindowKind::Batch);
         let single = pool.take(WindowKind::Single);
         pool.put(batch);
@@ -703,7 +719,7 @@ mod tests {
     #[should_panic(expected = "windows return in take order, oldest first")]
     fn a_window_returned_out_of_take_order_is_caught() {
         let mut pool = pool();
-        assert!(pool.reserve(WindowNeeds { batch: 2, single: 0 }));
+        assert_eq!(pool.reserve(WindowNeeds { batch: 2, single: 0 }), Reservation::Reserved);
         let first = pool.take(WindowKind::Batch);
         let second = pool.take(WindowKind::Batch);
         pool.put(second);

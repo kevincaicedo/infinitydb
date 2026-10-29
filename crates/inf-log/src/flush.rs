@@ -2000,6 +2000,53 @@ mod tests {
         assert_eq!(flush.round_op(0).bytes, &bytes[..], "the retry is byte-identical");
     }
 
+    /// The pool's own state is no refusal: a plan made while an earlier
+    /// plan's reservation is held (planned, never staged) stops the cell,
+    /// where a `bool` answer once reported it as a span above the pool.
+    #[test]
+    #[should_panic(expected = "a tier window pool reserved twice")]
+    fn a_plan_while_a_reservation_is_held_stops_the_cell() {
+        let disk = SimDisk::new();
+        let mut flush = sim_pipeline(&disk, 1 << 20);
+        let Planned::Round(_held) = flush.plan_round(span(0, 100, None)) else {
+            panic!("the first plan is admitted")
+        };
+        let _ = flush.plan_round(span(0, 100, None));
+    }
+
+    /// A reservation with a window out stops the cell: the windows a round
+    /// took come back only at its end, so a reservation beside them is a
+    /// defect of the pool's owner (the round plan's own staged-round check
+    /// precedes this one; the pool answers for itself).
+    #[test]
+    #[should_panic(expected = "a tier window pool reserved with windows out")]
+    fn a_reservation_with_windows_out_stops_the_cell() {
+        let mut pool = WindowPool::new(1 << 20, &census()).expect("a pool");
+        let one = crate::tier::WindowNeeds { batch: 1, single: 0 };
+        assert_eq!(pool.reserve(one), crate::tier::Reservation::Reserved);
+        let _window = pool.take(crate::tier::WindowKind::Batch);
+        let _ = pool.reserve(one);
+    }
+
+    /// A span the pool cannot hold is the round plan's typed refusal and changes
+    /// nothing; the pool answers `OverPool`, and its own state is as it was.
+    #[test]
+    fn a_span_above_the_pool_is_refused_typed_before_any_effect() {
+        let disk = SimDisk::new();
+        let mut flush = sim_reactor(&disk, 1 << 30, 1 << 20, 0);
+        let inodes = disk.inode_count();
+        let over = 3 * crate::tier::TIER_BATCH_PAYLOAD_BYTES as usize;
+        let Planned::Refused(err) = flush.plan_round(span(0, over, None)) else {
+            panic!("a span above the pool is refused")
+        };
+        assert!(matches!(err, TierFlushError::SpanOverPool { .. }), "{err}");
+        assert!(err.is_fatal() && !err.is_storage_full());
+        assert!(!flush.round_active(), "no round");
+        assert_eq!(flush.pool_outstanding(), 0, "no window");
+        assert_eq!(disk.inode_count(), inodes, "no file");
+        stage(&mut flush, span(0, 100, None), &[0x44; 100]).expect("the pool holds no reservation");
+    }
+
     /// A span continues the active file's stream whether or not it rotates
     /// the file: one off the write cursor stops the cell on the rotating
     /// arm too, where a rotation would make it the new file's base.

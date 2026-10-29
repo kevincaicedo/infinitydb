@@ -17,8 +17,9 @@ use inf_foundation::{FileOffset, LogicalAddr};
 use super::{PendingSeal, TierDrive, TierFlush, TierFlushError};
 use crate::fs::{SegmentFile, SegmentFs};
 use crate::tier::{
-    PlannedWrites, RoundEffect, SealReason, TIER_BATCH_FRAMES, TIER_FOOTER_BYTES, TIER_FRAME_BYTES,
-    TIER_FRAME_DATA, TIER_HEADER_BYTES, TierWriter, WindowNeeds, tier_file_name, tier_frame_offset,
+    PlannedWrites, Reservation, RoundEffect, SealReason, TIER_BATCH_FRAMES, TIER_FOOTER_BYTES,
+    TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES, TierWriter, WindowNeeds, tier_file_name,
+    tier_frame_offset,
 };
 
 /// What the store selected at its flush cursor (ADR-0155 D1): whole
@@ -166,8 +167,9 @@ impl<F: SegmentFs> TierFlush<F> {
     /// took and changes nothing else.
     ///
     /// # Panics
-    /// Panics on the seam drive or with a round staged: one round per
-    /// pipeline, planned only when the last one finished.
+    /// Panics on the seam drive, with a round staged, or with a plan's
+    /// reservation still held: one round per pipeline, planned only when
+    /// the last one finished.
     pub fn plan_round(&mut self, selection: Selection) -> Planned<F> {
         self.plan_round_with(selection, |_, _, position| position)
     }
@@ -206,8 +208,9 @@ impl<F: SegmentFs> TierFlush<F> {
         if cfg!(inf_canary_tier_plan_window_short) {
             needs.batch = needs.batch.saturating_sub(1);
         }
-        if !self.pool.reserve(needs) {
-            return Planned::Refused(self.span_over_pool(shape));
+        match self.pool.reserve(needs) {
+            Reservation::Reserved => {}
+            Reservation::OverPool => return Planned::Refused(self.span_over_pool(shape)),
         }
         let created = match shape {
             PlanShape::Span { rotate, .. } if rotate || self.writer.is_none() => {

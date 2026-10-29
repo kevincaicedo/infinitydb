@@ -2081,7 +2081,9 @@ The reactor-drive flush state machine (`TierFlush` round state in
   `# Tripwires`). Staging cannot fail; the round allocates nothing.
 - **One round in flight per namespace** — by-construction
   (`TierNs::round: Option<FlushRound>`; a plan asserts no round is
-  staged).
+  staged, and the pool, on its own state, that no window is out and no
+  reservation held: neither is a refusal, which the pool answers only for
+  a span above it).
 - **No durability fact at submission**: `advance_flushed`, `durable_len`,
   seal catalog commits, and gap crossings apply only in
   `complete_flush_round`, after every op's terminal completion —

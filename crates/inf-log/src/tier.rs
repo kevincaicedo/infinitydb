@@ -42,7 +42,9 @@ use crate::record::NsId;
 mod round;
 
 pub use round::{OpState, RoundEffect, RoundEffects, TierOpView, TierRound};
-pub(crate) use round::{PlannedWrites, PooledWindow, WindowKind, WindowNeeds, WindowPool};
+pub(crate) use round::{
+    PlannedWrites, PooledWindow, Reservation, WindowKind, WindowNeeds, WindowPool,
+};
 
 /// On-disk frame size — one aligned read unit.
 pub const TIER_FRAME_BYTES: usize = 4096;
