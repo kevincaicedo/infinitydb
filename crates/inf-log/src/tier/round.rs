@@ -329,6 +329,9 @@ pub(crate) struct WindowPool {
     single_out: WindowsOut,
     /// Windows the staged round's plan reserved and has not yet taken.
     reserved: WindowNeeds,
+    /// Bytes of every window's capacity, reserved at the build and fixed
+    /// for the pool's life.
+    capacity_bytes: u64,
     /// Bytes of the windows written at least once (the LIFO high water).
     written_bytes: u64,
 }
@@ -374,12 +377,14 @@ impl WindowPool {
         }
         let mut batch = CappedDeque::new(TIER_POOL_BATCH_WINDOWS, census)?;
         let mut single = CappedDeque::new(TIER_POOL_SINGLE_WINDOWS_CAP, census)?;
+        let mut capacity_bytes = 0u64;
         for (holder, count, frames) in [
             (&mut batch, batches, TIER_BATCH_FRAMES),
             (&mut single, TIER_POOL_SINGLE_WINDOWS as usize, 1),
         ] {
             for _ in 0..count {
                 let window = FrameStaging::reserved(frames)?;
+                capacity_bytes += window.capacity_bytes();
                 match holder.reserve() {
                     Reserved::Slot(slot) => slot.publish(window),
                     Reserved::Full => return Err(CapError::Layout),
@@ -392,6 +397,7 @@ impl WindowPool {
             batch_out: WindowsOut::default(),
             single_out: WindowsOut::default(),
             reserved: WindowNeeds::default(),
+            capacity_bytes,
             written_bytes: 0,
         })
     }
@@ -526,9 +532,10 @@ impl WindowPool {
         self.windows_out()
     }
 
-    /// The bytes the pool reserved at its build: every window's capacity.
+    /// The bytes the pool reserved at its build: every window's capacity,
+    /// summed once there (the gauge reads it every MAINTAIN).
     pub(crate) fn capacity_bytes(&self) -> u64 {
-        self.batch.iter().chain(self.single.iter()).map(FrameStaging::capacity_bytes).sum()
+        self.capacity_bytes
     }
 
     /// The bytes of the windows written at least once.
@@ -666,6 +673,27 @@ mod tests {
         assert_eq!(again.index, 0, "the next round takes the front window again");
         assert_eq!(pool.written_bytes(), written, "no window written a second time");
         pool.put(again);
+    }
+
+    /// The capacity the gauge reads is every window the build reserved:
+    /// `⌈S/Q⌉` batch windows and the single ones, each its frames plus one
+    /// frame of alignment slack — summed at the build, unchanged by use.
+    #[test]
+    fn the_capacity_is_every_window_the_build_reserved() {
+        use crate::limits::TIER_POOL_SINGLE_WINDOWS;
+        use crate::tier::{TIER_BATCH_FRAMES, TIER_BATCH_PAYLOAD_BYTES, TIER_FRAME_BYTES};
+        let mut pool = pool();
+        let batches = (4u64 << 20).div_ceil(TIER_BATCH_PAYLOAD_BYTES);
+        let frame = TIER_FRAME_BYTES as u64;
+        let want = batches * (TIER_BATCH_FRAMES as u64 + 1) * frame
+            + u64::from(TIER_POOL_SINGLE_WINDOWS) * 2 * frame;
+        assert_eq!(pool.capacity_bytes(), want);
+        assert!(pool.reserve(WindowNeeds { batch: 1, single: 1 }));
+        let batch = pool.take(WindowKind::Batch);
+        let single = pool.take(WindowKind::Single);
+        pool.put(batch);
+        pool.put(single);
+        assert_eq!(pool.capacity_bytes(), want, "use moves no capacity");
     }
 
     /// A return out of take order is caught where the LIFO high water
