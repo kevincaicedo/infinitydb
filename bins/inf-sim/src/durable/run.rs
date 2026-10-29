@@ -83,6 +83,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         lift_plant_sidecars: 0,
         tier_budget_cells: Vec::new(),
         epoch_marks_cells: Vec::new(),
+        coarse_cut: None,
     };
     let fail = |report: &mut DurableReport, what: String| {
         report.violations.push(what);
@@ -139,7 +140,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
             let load = shape.load(index);
-            let create: &[&[u8]] = &[
+            let mut create: Vec<&[u8]> = vec![
                 b"INF.NS",
                 b"CREATE",
                 class.name(),
@@ -158,8 +159,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 b"TIER-IO-MODE",
                 b"buffered",
             ];
+            if let Some(timeout_ms) = load.tail_stall_timeout_ms {
+                create.extend_from_slice(&[b"TAIL-STALL-TIMEOUT", timeout_ms]);
+            }
             let reply =
-                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, create);
+                setup.call(&mut node, &mut rng, &clock, &disk, scenario.step_ns_max, &create);
             match reply {
                 Ok(Some(ok)) if ok == b"+OK\r\n" => {}
                 Ok(other) => {
@@ -529,6 +533,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
     let cut_step = scenario.epoch_marks.map_or(cut_step, |leg| leg.cut_step(cut_step));
+    let cut_step = scenario.tier_budget.map_or(cut_step, |shape| shape.leg.cut_step(cut_step));
     // M3-S23: two seeded mid-run equivalence instants. Each quiesces
     // (drain in-flight, send nothing new), compares live state against a
     // read-only shadow replay, then resumes. The cut itself is never
@@ -549,6 +554,10 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut epilogue_sent = false;
     let mut marks_cut =
         (scenario.epoch_marks == Some(EpochMarksLeg::Wedge)).then(MarksCut::default);
+    let mut coarse_cut = scenario
+        .tier_budget
+        .is_some_and(|shape| shape.leg.is_coarse_cuts())
+        .then(CoarseCut::default);
     for step in 0..cut_step {
         report.scheduler_steps += 1;
         if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
@@ -556,6 +565,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             return finish(report, &observer, &clock);
         }
         if marks_cut.as_mut().is_some_and(|cut| cut.due(&node)) {
+            break;
+        }
+        if coarse_cut.as_mut().is_some_and(|cut| cut.due(&node, step)) {
             break;
         }
         log_oracle.sample(&node, &mut report);
@@ -690,6 +702,13 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
     let _ = last_progress;
+    if let Some(cut) = coarse_cut {
+        let reached = cut.verdict(scenario, &mut report);
+        report.coarse_cut = Some(cut.scrape());
+        if !reached {
+            return finish(report, &observer, &clock);
+        }
+    }
 
     // ---- CLEAN STOP (ADR-0124) ------------------------------------------
     // Every cell is asked to stop; the harness plays the assembly: once
@@ -1768,6 +1787,104 @@ fn open_fault_verdict(seed: u64, served: u64, fired: u64, fallbacks: u64) -> Ope
         ))
     } else {
         OpenFaultVerdict::Ok
+    }
+}
+
+/// The coarse-cuts leg's own cut (`TierBudgetLeg::CoarseCuts`), sampled
+/// each step on the one cell's tier-budget namespace: the flush cuts its
+/// address space retains, the highest of them once they reached their cap
+/// (the end of the dense run every later seal step's cut was dropped
+/// behind), and the bytes from `flushed` to the first retained cut above
+/// it, else to the ro-boundary (`cut_gap_bytes`, its maximum kept). The
+/// cut falls at the first sample where `flushed` lies above the dense
+/// run's end: the cut-less run behind it has been flushed through.
+#[derive(Default)]
+struct CoarseCut {
+    retained_max: usize,
+    /// The step at which the retained cuts first reached their cap.
+    capped_at_step: Option<u64>,
+    /// The highest cut retained while the cuts were at their cap.
+    dense_end: Option<u64>,
+    cut_gap_bytes_max: u64,
+    flushed: u64,
+    ro_boundary: u64,
+    reached: bool,
+}
+
+impl CoarseCut {
+    /// The flush cuts an address space retains at most (the store's cut
+    /// cap): the engagement's first half.
+    const CUTS_RETAINED_CAP: usize = 4_096;
+    /// The cut-less run the engagement needs: past the op bound's
+    /// threshold of about 253 batch windows.
+    const CUT_GAP_BYTES_MIN: u64 = 256 << 20;
+
+    fn due(&mut self, node: &Node, step: u64) -> bool {
+        let keyspace = node.plane(0).keyspace();
+        let Some((_, table)) = keyspace.tiered_namespaces().next() else { return false };
+        let space = table.space();
+        let (flushed, ro) = (space.flushed().to_raw(), space.ro_boundary().to_raw());
+        let view = space.flush_cut_view(space.flushed());
+        self.retained_max = self.retained_max.max(view.retained);
+        if view.retained >= Self::CUTS_RETAINED_CAP {
+            if self.capped_at_step.is_none() {
+                self.capped_at_step = Some(step);
+                eprintln!(
+                    "inf-sim: coarse-cuts: {} flush cuts retained at step {step} (highest {:?}, \
+                     flushed {flushed}, ro {ro})",
+                    view.retained, view.last
+                );
+            }
+            self.dense_end = self.dense_end.max(view.last);
+        }
+        let gap = view.first_above.unwrap_or(ro).saturating_sub(flushed);
+        self.cut_gap_bytes_max = self.cut_gap_bytes_max.max(gap);
+        (self.flushed, self.ro_boundary) = (flushed, ro);
+        self.reached = self.dense_end.is_some_and(|end| flushed > end);
+        self.reached
+    }
+
+    /// The run's verdict at the end of its traffic: its cut never reached
+    /// is `CUT NOT REACHED` (the run ends there); a cut reached with fewer
+    /// than the cap's cuts retained, or no cut-less run of 256 MiB, never
+    /// held the regime and is vacuous. Returns whether the cut was reached.
+    fn verdict(&self, scenario: &DurableScenario, report: &mut DurableReport) -> bool {
+        let scrape = self.scrape();
+        if !self.reached {
+            report.violations.push(format!(
+                "CUT NOT REACHED seed {:#x}: the coarse-cuts leg ran its step ceiling and \
+                 `flushed` never passed the last retained flush cut ({scrape:?})",
+                scenario.seed
+            ));
+            return false;
+        }
+        if self.retained_max < Self::CUTS_RETAINED_CAP
+            || self.cut_gap_bytes_max < Self::CUT_GAP_BYTES_MIN
+        {
+            report.violations.push(format!(
+                "VACUOUS seed {:#x}: coarse-cuts-unengaged — the cuts retained reached {} of \
+                 {} and the longest cut-less run was {} B of the {} B the op bound needs \
+                 ({scrape:?})",
+                scenario.seed,
+                self.retained_max,
+                Self::CUTS_RETAINED_CAP,
+                self.cut_gap_bytes_max,
+                Self::CUT_GAP_BYTES_MIN
+            ));
+        }
+        true
+    }
+
+    fn scrape(&self) -> CoarseCutScrape {
+        CoarseCutScrape {
+            retained_max: self.retained_max,
+            capped_at_step: self.capped_at_step,
+            dense_end: self.dense_end,
+            cut_gap_bytes_max: self.cut_gap_bytes_max,
+            flushed: self.flushed,
+            ro_boundary: self.ro_boundary,
+            reached: self.reached,
+        }
     }
 }
 

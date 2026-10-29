@@ -430,16 +430,40 @@ pub enum TierBudgetLeg {
     /// driver has seen a pass of the turn's 64 ops, so the retry is that
     /// round's.
     OneAt64mbNoModel,
+    /// The op bound's wire leg (campaign tier: one seed, run alone, never a
+    /// smoke row; about 9 × 10⁶ scheduler steps, 13.5 GiB resident through
+    /// the drain, 18 GiB at the boot that replays the whole log): one cell,
+    /// one namespace at `1mb` in a 4,609 MiB window with one permille
+    /// mutable, filled by 64 writers with 4,800 `SET`s each of 15,360 B
+    /// values on unique keys (4,505 MiB, under the window by 104 MiB), on a
+    /// `Buffered` log of 256 MiB segments with no automatic checkpoint, the
+    /// model at a thousandth of the disk. The fill ends inside the second
+    /// round's 42.9 s wait for credit, while one seal step a scheduler step
+    /// records a flush cut per 1 MiB: 4,096 cuts are retained and every
+    /// later one is dropped, so the run from the last retained cut to the
+    /// ro-boundary has no cut and is far above 256 MiB. A stage that ends
+    /// its span at a cut takes that run whole, past the round's op bound;
+    /// a span selected by the records' own lengths takes 1 MiB. The run
+    /// cuts once `flushed` passes the last retained cut
+    /// ([`TierBudgetLeg::cut_step`] is the ceiling), with the TAIL-STALL
+    /// timeout at its 60 s maximum so no writer is answered while it waits.
+    CoarseCuts,
 }
 
 impl TierBudgetLeg {
-    pub const ALL: [TierBudgetLeg; 5] = [
+    pub const ALL: [TierBudgetLeg; 6] = [
         TierBudgetLeg::TwoAt8mb,
         TierBudgetLeg::EightAt1mb,
         TierBudgetLeg::OneAt1mb,
         TierBudgetLeg::TwoAt1mbHostile,
         TierBudgetLeg::OneAt64mbNoModel,
+        TierBudgetLeg::CoarseCuts,
     ];
+
+    /// The coarse-cuts leg's step ceiling: its fill is about 1.2 × 10⁴
+    /// steps and its drain of 4,096 one-cut rounds at a thousandth of the
+    /// disk about 8.8 × 10⁶, so a run that has not cut by here never will.
+    const COARSE_CUTS_STEP_CEILING: u64 = 30_000_000;
 
     /// The leg's name on the command line.
     pub fn name(self) -> &'static str {
@@ -449,7 +473,28 @@ impl TierBudgetLeg {
             TierBudgetLeg::OneAt1mb => "one-1mb",
             TierBudgetLeg::TwoAt1mbHostile => "two-1mb-hostile",
             TierBudgetLeg::OneAt64mbNoModel => "one-64mb-no-model",
+            TierBudgetLeg::CoarseCuts => "coarse-cuts",
         }
+    }
+
+    /// The scheduler step of the leg's cut, given the seeded one: every
+    /// leg cuts at the seeded step but the coarse-cuts leg, which runs
+    /// until its own cut (`flushed` past the last retained flush cut) or,
+    /// failing that, its ceiling.
+    pub(crate) fn cut_step(self, seeded: u64) -> u64 {
+        match self {
+            TierBudgetLeg::CoarseCuts => TierBudgetLeg::COARSE_CUTS_STEP_CEILING,
+            TierBudgetLeg::TwoAt8mb
+            | TierBudgetLeg::EightAt1mb
+            | TierBudgetLeg::OneAt1mb
+            | TierBudgetLeg::TwoAt1mbHostile
+            | TierBudgetLeg::OneAt64mbNoModel => seeded,
+        }
+    }
+
+    /// The coarse-cuts leg.
+    pub fn is_coarse_cuts(self) -> bool {
+        matches!(self, TierBudgetLeg::CoarseCuts)
     }
 
     /// The leg named `name`, if any.
@@ -460,11 +505,14 @@ impl TierBudgetLeg {
     /// The leg's device model: the reference box's (489 MB/s, 40,000
     /// ops/s), shared by the node's cells, or that box's rate at the
     /// share a cell holds among 256, carried by the two cells here; the
+    /// coarse-cuts leg's at a thousandth of it, so its second round waits
+    /// 20 MiB of share at 489 kB/s, 42.9 s, longer than its fill; the
     /// no-model leg has none (`DeviceModel::ABSENT`).
     pub fn model(self) -> inf_runtime::DeviceModel {
         let divisor = match self {
             TierBudgetLeg::TwoAt8mb | TierBudgetLeg::EightAt1mb | TierBudgetLeg::OneAt1mb => 1,
             TierBudgetLeg::TwoAt1mbHostile => 128,
+            TierBudgetLeg::CoarseCuts => 1_000,
             TierBudgetLeg::OneAt64mbNoModel => return inf_runtime::DeviceModel::ABSENT,
         };
         inf_runtime::DeviceModel {
@@ -543,6 +591,8 @@ impl TierBudgetLeg {
                 mem_budget: b"3mb",
                 mutable_permille: b"100",
                 maintain_slice,
+                tail_stall_timeout_ms: None,
+                values: TierBudgetValues::Mixed,
             };
             TierBudgetShape { leg: self, namespaces, first: load, rest: load }
         };
@@ -556,24 +606,8 @@ impl TierBudgetLeg {
             TierBudgetLeg::TwoAt1mbHostile => TierBudgetShape {
                 leg: self,
                 namespaces: TWO,
-                first: TierBudgetLoad {
-                    writers: 12,
-                    ops_per_writer: 4_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"256mb",
-                    mutable_permille: b"10",
-                    maintain_slice: b"1mb",
-                },
-                rest: TierBudgetLoad {
-                    writers: 1,
-                    ops_per_writer: 6_000,
-                    keys_per_writer: 40,
-                    think_ns_max: 0,
-                    mem_budget: b"8mb",
-                    mutable_permille: b"100",
-                    maintain_slice: b"64kb",
-                },
+                first: TierBudgetLoad::HOSTILE_FIRST,
+                rest: TierBudgetLoad::HOSTILE_REST,
             },
             TierBudgetLeg::OneAt64mbNoModel => {
                 let load = TierBudgetLoad {
@@ -584,7 +618,13 @@ impl TierBudgetLeg {
                     mem_budget: b"72mb",
                     mutable_permille: b"900",
                     maintain_slice: b"64mb",
+                    tail_stall_timeout_ms: None,
+                    values: TierBudgetValues::Mixed,
                 };
+                TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
+            }
+            TierBudgetLeg::CoarseCuts => {
+                let load = TierBudgetLoad::COARSE_CUTS;
                 TierBudgetShape { leg: self, namespaces: ONE, first: load, rest: load }
             }
         }
@@ -614,6 +654,68 @@ pub struct TierBudgetLoad {
     /// round issues in groups of at most one group's bytes and ops
     /// whatever the slice.
     pub maintain_slice: &'static [u8],
+    /// The `TAIL-STALL-TIMEOUT` the `CREATE` names, in milliseconds;
+    /// `None` keeps the namespace default (1,000 ms).
+    pub tail_stall_timeout_ms: Option<&'static [u8]>,
+    /// What the writers send.
+    pub values: TierBudgetValues,
+}
+
+impl TierBudgetLoad {
+    /// The hostile leg's first namespace: twelve writers bursting into a
+    /// 256 MiB window with one percent of it mutable, at `1mb`.
+    const HOSTILE_FIRST: TierBudgetLoad = TierBudgetLoad {
+        writers: 12,
+        ops_per_writer: 4_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"256mb",
+        mutable_permille: b"10",
+        maintain_slice: b"1mb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::Mixed,
+    };
+
+    /// The hostile leg's second namespace: one writer into an 8 MiB window
+    /// at a 64 KiB slice.
+    const HOSTILE_REST: TierBudgetLoad = TierBudgetLoad {
+        writers: 1,
+        ops_per_writer: 6_000,
+        keys_per_writer: 40,
+        think_ns_max: 0,
+        mem_budget: b"8mb",
+        mutable_permille: b"100",
+        maintain_slice: b"64kb",
+        tail_stall_timeout_ms: None,
+        values: TierBudgetValues::Mixed,
+    };
+
+    /// The coarse-cuts leg's load: 4,800 `SET`s a writer, each a new key,
+    /// so the fill is 64 × 4,800 records of at most 8 + 9 + 15,360 B,
+    /// 4,505 MiB, under the 4,609 MiB window (`MEM-BUDGET` plus the slice)
+    /// with the head at 0: no writer parks on its tail.
+    const COARSE_CUTS: TierBudgetLoad = TierBudgetLoad {
+        writers: 64,
+        ops_per_writer: 4_800,
+        keys_per_writer: 4_800,
+        think_ns_max: 0,
+        mem_budget: b"4608mb",
+        mutable_permille: b"1",
+        maintain_slice: b"1mb",
+        tail_stall_timeout_ms: Some(b"60000"),
+        values: TierBudgetValues::SetOnlyUnique { value_bytes: 15_360 },
+    };
+}
+
+/// The value class of a tier-budget namespace's writers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TierBudgetValues {
+    /// The lift regime's mix: `SET`s of 1–10 KiB, `GET`s and `DEL`s over
+    /// the writer's keys.
+    Mixed,
+    /// `SET`s alone, each of a new key (`k:<writer>:<sent>`), each value
+    /// `value_bytes` long: every record lands once and stays live.
+    SetOnlyUnique { value_bytes: usize },
 }
 
 /// How many tiered namespaces the tier-budget shape runs and how each
@@ -1362,6 +1464,9 @@ impl DurableScenario {
         stall.episode_ms_max = 0;
         stall.write_bytes_per_s = disk.write_bytes_per_s;
         stall.read_bytes_per_s = disk.read_bytes_per_s;
+        if leg.is_coarse_cuts() {
+            return DurableScenario::coarse_cuts(seed, leg, stall, model);
+        }
         DurableScenario {
             cells,
             // 64 KiB segments hold a frame of several inline tiered
@@ -1373,6 +1478,42 @@ impl DurableScenario {
             device: inf_server::DeviceConfig {
                 model_share: model.share(cells),
                 seal_barriers_per_s: 2_000 / u64::from(cells),
+                provenance: Default::default(),
+            },
+            budget_oracle: false,
+            ckpt_overrun: None,
+            tier_budget: Some(leg.shape()),
+            ..DurableScenario::m2_device_budget(seed)
+        }
+    }
+
+    /// The coarse-cuts leg of `m4-tier-budget` (see
+    /// [`TierBudgetLeg::CoarseCuts`]): one cell, so the model's share is
+    /// the whole thousandth; a `Buffered` log of 256 MiB segments (a frame
+    /// of at most 64 records, 0.94 MiB, fits one, so 18 rotations carry the
+    /// fill, none zero-filled; the inherited `Direct` 64 KiB segments carry
+    /// at most four records a frame and zero-fill each next segment at the
+    /// class floor); a 5 ms step bound (2.5 ms mean, so the fill's
+    /// ≈ 1.2 × 10⁴ steps take 24–36 sim-seconds, inside the second round's
+    /// wait); no automatic checkpoint, so the log keeps the fill and no walk
+    /// pins the table.
+    fn coarse_cuts(
+        seed: u64,
+        leg: TierBudgetLeg,
+        stall: StallConfig,
+        model: inf_runtime::DeviceModel,
+    ) -> DurableScenario {
+        let cells: u16 = 1;
+        DurableScenario {
+            cells,
+            segment_bytes: 256 << 20,
+            io_mode: SegmentIoMode::Buffered,
+            step_ns_max: 5_000_000,
+            ckpt_interval_bytes: 0,
+            stall: Some(stall),
+            device: inf_server::DeviceConfig {
+                model_share: model.share(cells),
+                seal_barriers_per_s: 2_000,
                 provenance: Default::default(),
             },
             budget_oracle: false,
@@ -1661,6 +1802,25 @@ pub struct DurableReport {
     /// The epoch-marks shape's reclaim-marks row per cell at the cut (empty
     /// off the shape).
     pub epoch_marks_cells: Vec<EpochMarksCell>,
+    /// The coarse-cuts leg's cut sampler at the end of its traffic (`None`
+    /// off the leg).
+    pub coarse_cut: Option<CoarseCutScrape>,
+}
+
+/// The coarse-cuts leg's cut sampler as it stood when its traffic ended:
+/// the most flush cuts the namespace's address space retained, the step
+/// they first reached their cap and the highest of them then (the dense
+/// run's end), the longest cut-less run read from `flushed`, the last
+/// watermarks read, and whether `flushed` passed the dense run's end.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoarseCutScrape {
+    pub retained_max: usize,
+    pub capped_at_step: Option<u64>,
+    pub dense_end: Option<u64>,
+    pub cut_gap_bytes_max: u64,
+    pub flushed: u64,
+    pub ro_boundary: u64,
+    pub reached: bool,
 }
 
 /// One cell's reclaim-marks census row at the cut of an epoch-marks run.
@@ -1925,6 +2085,11 @@ impl Writer {
     /// extents, overwrites and deletes of cold keys that stage
     /// displacement pairs — every reply exact.
     fn next_tiered_command(&mut self, scenario: &DurableScenario) -> (Vec<u8>, Pending) {
+        if let (NsClass::TierBudget(index), Some(shape)) = (self.class, scenario.tier_budget)
+            && let TierBudgetValues::SetOnlyUnique { value_bytes } = shape.load(index).values
+        {
+            return self.next_unique_set(value_bytes);
+        }
         let keys = match (self.class, scenario.tier_budget) {
             (NsClass::TierBudget(index), Some(shape)) => shape.load(index).keys_per_writer,
             _ => scenario.keys_per_writer,
@@ -1959,6 +2124,24 @@ impl Writer {
             let wire = encode(&[b"DEL", &key]);
             (wire, Pending { key, state_after: None, expect, mutates: true, taints: false })
         }
+    }
+
+    /// A `SET` of a key this writer never wrote (`k:<writer>:<sent>`) to a
+    /// `value_bytes` value stamped with the writer and its count: the
+    /// coarse-cuts leg's fill, every record live until the cut.
+    fn next_unique_set(&mut self, value_bytes: usize) -> (Vec<u8>, Pending) {
+        let key = format!("k:{}:{}", self.id, self.sent).into_bytes();
+        let stamp = format!("u:{}:{}:", self.id, self.sent).into_bytes();
+        let value: Vec<u8> = stamp.iter().copied().cycle().take(value_bytes).collect();
+        let wire = encode(&[b"SET", &key, &value]);
+        let pending = Pending {
+            key,
+            state_after: Some(value),
+            expect: b"+OK\r\n".to_vec(),
+            mutates: true,
+            taints: false,
+        };
+        (wire, pending)
     }
 
     /// The epoch-marks wedge leg's traffic: the first write of a writer's
