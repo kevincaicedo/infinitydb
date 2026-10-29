@@ -319,25 +319,21 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     /// The occupant `id` names, if it is this slab's and current.
     #[inline]
     pub fn get(&self, id: SlotId<G>) -> Lookup<'_, T> {
-        if self.foreign(&id) {
-            return Lookup::Stale;
-        }
-        match self.store.slot(id.index) {
-            Some(Slot::Live { generation, value }) if *generation == id.generation => {
-                Lookup::Live(value)
-            }
-            Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => Lookup::Stale,
-            None => Lookup::Vacant,
+        match named(self.foreign(&id), || self.store.slot(id.index), id.generation) {
+            Named::Live(value) => Lookup::Live(value),
+            Named::Stale => Lookup::Stale,
+            Named::Vacant => Lookup::Vacant,
         }
     }
 
     /// The occupant `id` names, mutably, if it is this slab's and current.
     #[inline]
     pub fn get_mut(&mut self, id: SlotId<G>) -> LookupMut<'_, T> {
-        if self.foreign(&id) {
-            return LookupMut::Stale;
+        match named(self.foreign(&id), || self.store.slot_mut(id.index), id.generation) {
+            Named::Live((_, value)) => LookupMut::Live(value),
+            Named::Stale => LookupMut::Stale,
+            Named::Vacant => LookupMut::Vacant,
         }
-        lookup_mut(self.store.slot_mut(id.index), id.generation)
     }
 
     /// The occupant `id` names returns to its owner and the slot frees: its
@@ -347,30 +343,19 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     /// tested once). A stale or foreign handle changes nothing.
     #[inline]
     pub fn take(&mut self, id: SlotId<G>) -> Taken<T> {
-        if self.foreign(&id) {
-            return Taken::Stale;
-        }
-        let head = self.store.free_head();
-        let Some(slot) = self.store.slot_mut(id.index) else { return Taken::Vacant };
-        let (value, retired) = match mem::replace(slot, Slot::Closed) {
-            Slot::Live { generation, value } if generation == id.generation => {
-                match P::advance(generation) {
-                    Some(next) => {
-                        *slot = Slot::Free { generation: next, next: head };
-                        (value, false)
-                    }
-                    None => (value, true),
-                }
+        let (head, foreign) = (self.store.free_head(), self.foreign(&id));
+        let (value, slot) =
+            match named(foreign, || self.store.slot_mut(id.index).map(Vacate), id.generation) {
+                Named::Live(occupant) => occupant,
+                Named::Stale => return Taken::Stale,
+                Named::Vacant => return Taken::Vacant,
+            };
+        match P::advance(id.generation) {
+            Some(next) => {
+                *slot = Slot::Free { generation: next, next: head };
+                self.store.chain(id.index);
             }
-            other @ (Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => {
-                *slot = other;
-                return Taken::Stale;
-            }
-        };
-        if retired {
-            self.retired();
-        } else {
-            self.store.chain(id.index);
+            None => self.retired(),
         }
         self.live = live_taken(self.live);
         if self.row.fill() == CapFill::Assembly {
@@ -391,17 +376,15 @@ impl<T, G: Generation, P: GenerationPolicy> CappedSlab<T, G, P> {
     /// `get_mut` does.
     #[cfg(any(test, feature = "fault-points"))]
     pub fn place_generation_last(&mut self, id: &mut SlotId<G>) -> LookupMut<'_, T> {
-        if self.foreign(id) {
-            return LookupMut::Stale;
-        }
-        match self.store.slot_mut(id.index) {
-            Some(Slot::Live { generation, value }) if *generation == id.generation => {
+        let index = id.index;
+        match named(self.foreign(id), || self.store.slot_mut(index), id.generation) {
+            Named::Live((generation, value)) => {
                 *generation = G::LAST;
                 id.generation = G::LAST;
                 LookupMut::Live(value)
             }
-            Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => LookupMut::Stale,
-            None => LookupMut::Vacant,
+            Named::Stale => LookupMut::Stale,
+            Named::Vacant => LookupMut::Vacant,
         }
     }
 
@@ -520,13 +503,93 @@ impl<T, G: Generation, P> SlabRetiring<T, G, P> {
     }
 }
 
-/// `get_mut`'s answer for the slot at a handle's index.
+/// What a handle names in this slab, decided once, by [`named`], for
+/// `get`, `get_mut`, `take` and the test hook (ADR-0171 D1, A2.2).
+enum Named<O> {
+    /// The slot's occupant, live at the handle's generation.
+    Live(O),
+    /// Another slab's handle, or a slot of this slab holding no occupant at
+    /// the handle's generation: live at another, free at any (a wrap brings
+    /// a free slot back to an old handle's), or retired.
+    Stale,
+    /// The handle names no slot of this slab.
+    Vacant,
+}
+
+/// A borrow of one slot that yields its occupant while the slot is live at
+/// a generation, and nothing otherwise. It sees neither the handle's slab
+/// nor whether the slot exists, so no state of a slot can answer `Vacant`.
+trait SlotBorrow<G> {
+    type Occupant;
+
+    fn occupant(self, generation: G) -> Option<Self::Occupant>;
+}
+
+/// A handle against this slab: another slab's is `Stale` and `slot`, the
+/// store's walk to the handle's index, never runs for it; no slot is
+/// `Vacant`; a slot's occupant at `generation` is `Live`; any other slot is
+/// `Stale`.
 #[inline]
-fn lookup_mut<T, G: Generation>(slot: Option<&mut Slot<T, G>>, expected: G) -> LookupMut<'_, T> {
-    match slot {
-        Some(Slot::Live { generation, value }) if *generation == expected => LookupMut::Live(value),
-        Some(Slot::Live { .. } | Slot::Free { .. } | Slot::Closed) => LookupMut::Stale,
-        None => LookupMut::Vacant,
+fn named<G, S: SlotBorrow<G>>(
+    foreign: bool,
+    slot: impl FnOnce() -> Option<S>,
+    generation: G,
+) -> Named<S::Occupant> {
+    if foreign {
+        return Named::Stale;
+    }
+    let Some(slot) = slot() else { return Named::Vacant };
+    match slot.occupant(generation) {
+        Some(occupant) => Named::Live(occupant),
+        None => Named::Stale,
+    }
+}
+
+impl<'s, T, G: Generation> SlotBorrow<G> for &'s Slot<T, G> {
+    type Occupant = &'s T;
+
+    #[inline]
+    fn occupant(self, at: G) -> Option<&'s T> {
+        match self {
+            Slot::Live { generation, value } if *generation == at => Some(value),
+            Slot::Live { .. } | Slot::Free { .. } | Slot::Closed => None,
+        }
+    }
+}
+
+/// The occupant with its generation, which the test hook sets.
+impl<'s, T, G: Generation> SlotBorrow<G> for &'s mut Slot<T, G> {
+    type Occupant = (&'s mut G, &'s mut T);
+
+    #[inline]
+    fn occupant(self, at: G) -> Option<(&'s mut G, &'s mut T)> {
+        match self {
+            Slot::Live { generation, value } if *generation == at => Some((generation, value)),
+            Slot::Live { .. } | Slot::Free { .. } | Slot::Closed => None,
+        }
+    }
+}
+
+/// A slot whose occupant at a generation moves out, leaving the slot
+/// `Closed` for `take` to free or retire; any other slot is not written.
+struct Vacate<'s, T, G>(&'s mut Slot<T, G>);
+
+impl<'s, T, G: Generation> SlotBorrow<G> for Vacate<'s, T, G> {
+    type Occupant = (T, &'s mut Slot<T, G>);
+
+    #[inline]
+    fn occupant(self, at: G) -> Option<(T, &'s mut Slot<T, G>)> {
+        let Vacate(slot) = self;
+        if !matches!(slot, Slot::Live { generation, .. } if *generation == at) {
+            return None;
+        }
+        match mem::replace(slot, Slot::Closed) {
+            Slot::Live { value, .. } => Some((value, slot)),
+            other @ (Slot::Free { .. } | Slot::Closed) => {
+                *slot = other;
+                None
+            }
+        }
     }
 }
 
