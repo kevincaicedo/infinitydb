@@ -2144,12 +2144,14 @@ The reactor-drive flush state machine (`TierFlush` round state in
   and the creation are its two fallible steps, both before any writer
   effect, so a refused plan stages nothing. A round is at most 70 writes,
   4 barriers and 3 effects — 74 ops under the 8-bit op index — in capped
-  holders built with the pipeline, with its staged seals (2) and
-  directory holds (2); its windows come from a pool built whole with the
-  pipeline, `⌈max(S, M)/Q⌉` batch windows and 5 single ones, capacity
-  reserved at the build and each window zeroed at its first take
-  (`tier_window_capacity_bytes`, `tier_window_written_bytes` in INFO
-  `# Tripwires`). Staging cannot fail; the round allocates nothing.
+  holders built empty with the pipeline, with its staged seals (2); the
+  created file's two directory handles are one value, held from the
+  file's stage to the round's end; its windows come from fixed storage
+  built whole with the pipeline, `⌈max(S, M)/Q⌉` batch windows and 5
+  single ones, capacity reserved at the build and each window zeroed at
+  its first take (`tier_window_capacity_bytes`,
+  `tier_window_written_bytes` in INFO `# Tripwires`). No holder is filled
+  at the build. Staging cannot fail; the round allocates nothing.
 - **One round in flight per namespace** — by-construction
   (`TierNs::round: Option<FlushRound>`; a plan asserts no round is
   staged, and the pool, on its own state, that no window is out and no
