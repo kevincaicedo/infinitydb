@@ -10,7 +10,9 @@
 //! the reactor's round is the records' own whole-record prefix within the
 //! slice (ADR-0155 D1), the seam's chunks end at recorded seal cuts — so
 //! their file boundaries and watermarks between rounds may differ; the
-//! bytes may not.
+//! bytes may not. Neither may the pace: both drives flush the stream to
+//! within the RAM window of its end, the reactor to within a commit page
+//! of the seam, so a short stream cannot narrow what is compared.
 //!
 //! Round-scoped invariants asserted every MAINTAIN: no watermark moves
 //! between stage and completion (the §3.1 chain — durability facts
@@ -241,16 +243,36 @@ fn reactor_drive_matches_the_seam_drive_byte_for_byte() {
         reactor_files.push((meta.base.to_raw(), meta.data_len, image));
     }
     // The bytes: below both drives' watermarks, one logical stream.
-    let flushed = seam_ks
-        .tiered_store_mut(NS)
-        .expect("t")
-        .space()
-        .flushed()
-        .min(reactor_ks.tiered_store_mut(NS).expect("t").space().flushed())
-        .to_raw();
+    let seam_flushed = seam_ks.tiered_store_mut(NS).expect("t").space().flushed().to_raw();
+    let reactor_table = reactor_ks.tiered_store_mut(NS).expect("t");
+    let reactor_flushed = reactor_table.space().flushed().to_raw();
+    // One workload, one allocation order: both tables share this tail.
+    let tail = reactor_table.space().tail().to_raw();
     let covered =
         |files: &[(u64, u64, Vec<u8>)]| files.iter().map(|f| f.0 + f.1).max().unwrap_or(0);
-    let upto = flushed.min(covered(&seam_files)).min(covered(&reactor_files));
+    // The comparison's liveness: a short stream cannot narrow the window the
+    // bytes are compared over. Each drive drains every MAINTAIN, so each
+    // flushed all of the stream but the RAM window, and sealed all of what
+    // it flushed but its active file; and the reactor reaches the seam's
+    // watermark within a commit page (the seam's chunks end at seal cuts,
+    // one a page, the reactor's rounds at the ro-boundary itself). A drive
+    // that stalled or lost spans fails here instead of shrinking `upto`.
+    assert!(
+        reactor_flushed + PAGE >= seam_flushed,
+        "the reactor flushed {reactor_flushed} B against the seam's {seam_flushed} B"
+    );
+    for (drive, flushed, files) in
+        [("seam", seam_flushed, &seam_files), ("reactor", reactor_flushed, &reactor_files)]
+    {
+        assert!(flushed + BUDGET + PAGE >= tail, "{drive} flushed {flushed} B of {tail} B");
+        let sealed = covered(files);
+        assert!(
+            sealed + FILE_CAPACITY + PAGE >= flushed,
+            "{drive} sealed {sealed} B below its {flushed} B watermark"
+        );
+    }
+    let upto =
+        seam_flushed.min(reactor_flushed).min(covered(&seam_files)).min(covered(&reactor_files));
     assert!(upto > 1 << 20, "the drives flushed a common prefix ({upto} B)");
     assert!(
         logical_bytes(&seam_files, upto) == logical_bytes(&reactor_files, upto),
