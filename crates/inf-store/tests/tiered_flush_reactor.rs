@@ -145,7 +145,7 @@ fn maintain_seam(ks: &mut Keyspace, flush: &mut TierFlush<MemFs>) {
 fn logical_bytes(files: &[(u64, u64, Vec<u8>)], upto: u64) -> Vec<u8> {
     const D: u64 = inf_log::TIER_FRAME_DATA as u64;
     const V: u64 = inf_log::TIER_FRAME_BYTES as u64;
-    const HEADER: u64 = 4096;
+    const HEADER: u64 = inf_log::TIER_HEADER_BYTES as u64;
     let mut out = vec![0u8; usize::try_from(upto).expect("fits")];
     for (base, data_len, image) in files {
         for d in 0..*data_len {
@@ -185,7 +185,7 @@ fn planted_flip_turns_both_byte_clauses_red(
 ) {
     const D: u64 = inf_log::TIER_FRAME_DATA as u64;
     const V: u64 = inf_log::TIER_FRAME_BYTES as u64;
-    const HEADER: u64 = 4096;
+    const HEADER: u64 = inf_log::TIER_HEADER_BYTES as u64;
     let at_file = reactor_files
         .iter()
         .position(|(base, len, _)| *len > 0 && base + len <= upto)
