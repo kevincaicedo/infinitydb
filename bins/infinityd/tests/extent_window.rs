@@ -227,7 +227,16 @@ fn read_back(reader: &mut Client, key: &[u8], value: &[u8]) {
             return;
         }
         let key = String::from_utf8_lossy(key);
-        assert_eq!(reply, b"$-1\r\n", "GET {key} while its write is pending");
+        // Quote the header line, which names the reply's type and length or
+        // carries the error text, not the payload: a blob is 4 KiB.
+        let header = reply.split(|&byte| byte == b'\r').next().unwrap_or_default();
+        let header = String::from_utf8_lossy(header);
+        let bytes = reply.len();
+        assert!(
+            reply == b"$-1\r\n",
+            "GET {key} answered {header:?} ({bytes} bytes), neither nil nor its value, while \
+             the write was pending"
+        );
         assert!(
             Instant::now() < deadline,
             "GET {key} read nil for {READ_BACK_DEADLINE:?}: the closed writer's write did not land"
